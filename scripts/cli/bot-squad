@@ -207,6 +207,31 @@ Next steps (in $repo):
 EOF
 }
 
+cmd_render_agents_md() {
+    local slug="" config_dir="$BOT_SQUAD/config" data_dir="$BOT_SQUAD/data" dry_run=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --config-dir) config_dir="$2"; shift 2 ;;
+            --data-dir)   data_dir="$2";   shift 2 ;;
+            --dry-run)    dry_run="--dry-run"; shift ;;
+            -h|--help)    echo "Usage: bot-squad render-agents-md <slug> [--dry-run]"; exit 0 ;;
+            *)
+                if [ -z "$slug" ]; then slug="$1"; shift
+                else echo "unexpected arg: $1" >&2; exit 2
+                fi
+                ;;
+        esac
+    done
+
+    [ -n "$slug" ] || { echo "missing <slug>" >&2; exit 2; }
+
+    python3 "$BOT_SQUAD/scripts/cli/render_agents_md.py" \
+        "$slug" \
+        --config-dir "$config_dir" \
+        --data-dir   "$data_dir" \
+        ${dry_run:+"$dry_run"}
+}
+
 case "${1:-}" in
     project)
         shift
@@ -215,6 +240,7 @@ case "${1:-}" in
             *) echo "usage: bot-squad project init <slug> --repo <path> ..." >&2; exit 2 ;;
         esac
         ;;
+    render-agents-md) shift; cmd_render_agents_md "$@" ;;
     -h|--help|"") sed -n '4,9p' "$0"; exit 0 ;;
     *) echo "unknown command: $1" >&2; exit 2 ;;
 esac

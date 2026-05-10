@@ -55,6 +55,23 @@ def build_app() -> FastAPI:
         except WorkerError as e:
             raise HTTPException(status_code=502, detail=str(e))
 
+    # Serve the React bundle from /app/web/dist (set by Dockerfile).
+    web_dist = Path(os.environ.get("WEB_DIST", "/app/web/dist"))
+    if web_dist.exists():
+        # Mount last so /api/* takes precedence; fall through to index.html via SPA route.
+        from fastapi.responses import FileResponse
+        from fastapi import HTTPException as _HE
+
+        @app.get("/{full_path:path}")
+        def spa(full_path: str) -> FileResponse:
+            # Don't intercept /api routes (already routed above).
+            if full_path.startswith("api"):
+                raise _HE(status_code=404)
+            file = web_dist / full_path
+            if file.is_file():
+                return FileResponse(file)
+            return FileResponse(web_dist / "index.html")
+
     return app
 
 

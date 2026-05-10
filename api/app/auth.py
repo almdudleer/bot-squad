@@ -1,13 +1,9 @@
-"""JWT cookie issuance/check for bot-squad API sessions.
-
-TG Login Widget HMAC verification has moved to the worker (bot_squad_worker/auth.py)
-as of spec #3 — the bot token is now held exclusively by the worker.
-The API proxies TG-Login verification to the worker action `tg_verify_login`.
-"""
+"""JWT cookie issuance/check and password verification for bot-squad API sessions."""
 from __future__ import annotations
 
 import time
 
+import bcrypt
 import jwt as pyjwt
 
 
@@ -28,3 +24,10 @@ def verify_jwt(token: str, secret: str) -> dict:
         raise AuthError("session expired") from e
     except pyjwt.InvalidTokenError as e:
         raise AuthError(f"bad session token: {e}") from e
+
+
+def verify_password(plaintext: str, bcrypt_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(plaintext.encode(), bcrypt_hash.encode())
+    except (ValueError, TypeError):
+        return False

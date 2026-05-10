@@ -9,6 +9,7 @@ dependencies = [
     "pyjwt>=2.8",
     "python-multipart>=0.0.9",
     "pyyaml>=6.0",
+    "bcrypt>=5",
 ]
 
 [project.optional-dependencies]

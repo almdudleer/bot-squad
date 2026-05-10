@@ -1,38 +1,28 @@
-"""Auth routes — TG Login (proxied to worker) + logout."""
+"""Auth routes — username/password login, logout, me."""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from app.auth import AuthError, issue_jwt, verify_jwt
-from app.worker_client import WorkerClient, WorkerError
+from app.auth import AuthError, issue_jwt, verify_jwt, verify_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 COOKIE_NAME = "session"
 
 
-@router.post("/tg")
-async def tg_login(request: Request, response: Response, payload: dict) -> dict:
-    """TG Login Widget endpoint.
-
-    The HMAC verification is delegated to the worker (which holds the bot token).
-    The API only checks the allowed_ids list and issues the session JWT.
-    """
+@router.post("/login")
+def login(request: Request, response: Response, payload: dict) -> dict:
     cfg = request.app.state.auth_config
-    client = WorkerClient(request.app.state.sock_path)
-    try:
-        result = await client.call_action("tg_verify_login", {"payload": payload})
-    except WorkerError as e:
-        raise HTTPException(status_code=502, detail=f"worker unavailable: {e}")
-    if not result.get("ok"):
-        raise HTTPException(
-            status_code=401, detail=result.get("error", "tg login rejected")
-        )
-    user = result["user"]
-    if int(user["id"]) not in cfg.allowed_ids:
-        raise HTTPException(status_code=403, detail="not allowed")
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+    expected = cfg.users.get(username)
+    if expected is None or not verify_password(password, expected):
+        raise HTTPException(status_code=401, detail="bad credentials")
+
     token = issue_jwt(
-        {"tg_id": int(user["id"]), "name": user.get("first_name", "")},
+        {"username": username},
         request.app.state.jwt_secret,
         ttl_seconds=cfg.session_ttl_seconds,
     )
@@ -44,13 +34,25 @@ async def tg_login(request: Request, response: Response, payload: dict) -> dict:
         secure=request.app.state.cookie_secure,
         samesite="lax",
     )
-    return {"ok": True, "tg_id": int(user["id"])}
+    return {"ok": True, "username": username}
 
 
 @router.post("/logout")
 def logout(response: Response) -> dict:
     response.delete_cookie(COOKIE_NAME)
     return {"ok": True}
+
+
+@router.get("/me")
+def me(request: Request) -> dict:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    try:
+        claims = verify_jwt(token, request.app.state.jwt_secret)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    return {"username": claims.get("username", "")}
 
 
 def require_auth(request: Request) -> dict:

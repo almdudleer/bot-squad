@@ -1,8 +1,6 @@
 """API test fixtures."""
 from __future__ import annotations
 
-import hashlib
-import hmac
 import threading
 import time
 from pathlib import Path
@@ -38,36 +36,21 @@ def tmp_bot_squad(tmp_path: Path) -> Path:
         'created_at = 2026-05-10\n'
     )
     (tmp_path / "config" / "auth.toml").write_text(
-        '[telegram_login]\n'
-        'allowed_ids = [12345]\n'
-        'session_ttl = "7d"\n'
+        '[users]\n'
+        # bcrypt hash of "test" (rounds=12)
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[session]\nttl = "7d"\n'
     )
     return tmp_path
 
 
 @pytest.fixture
-def fake_worker_tg(tmp_bot_squad: Path):
-    """Start a fake worker (handles tg_verify_login) in a background thread."""
+def fake_worker(tmp_bot_squad: Path):
+    """Start a minimal fake worker in a background thread."""
     sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
     sock.parent.mkdir(parents=True, exist_ok=True)
 
     fake = FastAPI()
-
-    BOT_TOKEN = "TESTBOT:TOKEN"
-
-    @fake.post("/actions/tg_verify_login")
-    def tg_verify_login(body: dict) -> dict:
-        payload = body.get("payload", {})
-        if "hash" not in payload or "auth_date" not in payload or "id" not in payload:
-            return {"ok": False, "error": "missing required field"}
-        received_hash = payload["hash"]
-        fields = {k: v for k, v in payload.items() if k != "hash"}
-        data_check_string = "\n".join(f"{k}={fields[k]}" for k in sorted(fields))
-        secret = hashlib.sha256(BOT_TOKEN.encode()).digest()
-        expected = hmac.new(secret, data_check_string.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, received_hash):
-            return {"ok": False, "error": "bad TG login hash"}
-        return {"ok": True, "user": {"id": int(fields["id"]), "first_name": fields.get("first_name", "")}}
 
     @fake.post("/actions/noop")
     def noop(params: dict | None = None) -> dict:
@@ -89,3 +72,9 @@ def fake_worker_tg(tmp_bot_squad: Path):
 
     server.should_exit = True
     thread.join(timeout=5)
+
+
+# Keep alias for test files that still reference fake_worker_tg
+@pytest.fixture
+def fake_worker_tg(fake_worker):
+    return fake_worker

@@ -26,3 +26,6 @@ web/dist/
 # Editor
 .vscode/
 .idea/
+
+# Initial credentials file (for stakeholder reference)
+INITIAL_LOGIN.txt

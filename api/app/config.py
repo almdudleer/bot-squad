@@ -71,7 +71,7 @@ class ApiConfig:
 
 @dataclass(frozen=True)
 class AuthConfig:
-    allowed_ids: tuple[int, ...]
+    users: dict[str, str]                 # username -> bcrypt hash
     session_ttl_seconds: int
 
     @staticmethod
@@ -86,8 +86,6 @@ class AuthConfig:
     @classmethod
     def load(cls, config_dir: Path) -> "AuthConfig":
         raw = tomllib.loads((config_dir / "auth.toml").read_text())
-        tg = raw["telegram_login"]
-        return cls(
-            allowed_ids=tuple(int(i) for i in tg["allowed_ids"]),
-            session_ttl_seconds=cls._parse_ttl(tg["session_ttl"]),
-        )
+        users = dict(raw.get("users", {}))
+        ttl_str = raw.get("session", {}).get("ttl", "7d")
+        return cls(users=users, session_ttl_seconds=cls._parse_ttl(ttl_str))

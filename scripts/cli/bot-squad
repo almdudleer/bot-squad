@@ -10,11 +10,14 @@ BOT_SQUAD="${BOT_SQUAD:-/home/www/bot-squad}"
 
 cmd_project_init() {
     local slug="" repo="" master="master" deploy_branch="agent_team/dev"
+    local create_deploy_branch="true" scaffold_recipes="true"
     while [ $# -gt 0 ]; do
         case "$1" in
             --repo) repo="$2"; shift 2 ;;
             --master) master="$2"; shift 2 ;;
             --deploy-branch) deploy_branch="$2"; shift 2 ;;
+            --no-create-deploy-branch) create_deploy_branch="false"; shift ;;
+            --no-scaffold-recipes) scaffold_recipes="false"; shift ;;
             -h|--help) sed -n '4,9p' "$0"; exit 0 ;;
             *)
                 if [ -z "$slug" ]; then slug="$1"; shift
@@ -63,9 +66,40 @@ EOF
     fi
 
     # Drop in-repo files.
-    if [ ! -e "$repo/.claude/settings.json" ]; then
+    # .claude/settings.json — write on first init; on re-run overwrite only if
+    # the existing file contains only the "SessionStart" hook (the spec #1
+    # template), which is a known safe-to-upgrade state.  If it has more hooks,
+    # leave it alone and emit a warning.
+    local settings_path="$repo/.claude/settings.json"
+    local write_settings="false"
+    if [ ! -e "$settings_path" ]; then
         mkdir -p "$repo/.claude"
-        cat > "$repo/.claude/settings.json" <<EOF
+        write_settings="true"
+    else
+        # Check if current file is the spec-1 template (only SessionStart key).
+        local hook_keys
+        hook_keys=$(python3 - <<'PY' "$settings_path"
+import json, sys
+try:
+    d = json.loads(open(sys.argv[1]).read())
+    hooks = d.get("hooks", {})
+    print(",".join(sorted(hooks.keys())))
+except Exception:
+    print("ERROR")
+PY
+        )
+        if [ "$hook_keys" = "SessionStart" ]; then
+            write_settings="true"
+        elif [ "$hook_keys" = "ERROR" ]; then
+            echo "warning: could not parse $settings_path — leaving it unchanged" >&2
+        else
+            echo "info: $settings_path has custom hooks ($hook_keys) — leaving unchanged"
+        fi
+    fi
+
+    if [ "$write_settings" = "true" ]; then
+        mkdir -p "$repo/.claude"
+        cat > "$settings_path" <<EOF
 {
   "hooks": {
     "SessionStart": [
@@ -74,10 +108,25 @@ EOF
           { "type": "command", "command": "$BOT_SQUAD/scripts/hooks/session_start.sh" }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$BOT_SQUAD/scripts/hooks/user_prompt_submit.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$BOT_SQUAD/scripts/hooks/stop.sh" }
+        ]
+      }
     ]
   }
 }
 EOF
+        echo "Written: $settings_path (3 hooks: SessionStart, UserPromptSubmit, Stop)"
     fi
 
     if [ ! -e "$repo/ops/bot-squad" ]; then
@@ -85,8 +134,17 @@ EOF
         ln -sf "$data" "$repo/ops/bot-squad"
     fi
 
+    # Drop ops/bot-squad-bin/deploy symlink.
+    local bin_dir="$repo/ops/bot-squad-bin"
+    if [ ! -e "$bin_dir/deploy" ]; then
+        mkdir -p "$bin_dir"
+        ln -sf "$BOT_SQUAD/scripts/cli/deploy.sh" "$bin_dir/deploy"
+        echo "Created: $bin_dir/deploy -> $BOT_SQUAD/scripts/cli/deploy.sh"
+    fi
+
     # Patch .gitignore (idempotent).
     touch "$repo/.gitignore"
+    local gitignore_updated="false"
     if ! grep -q "^!.claude/settings.json$" "$repo/.gitignore"; then
         cat >> "$repo/.gitignore" <<'EOF'
 
@@ -94,6 +152,44 @@ EOF
 !.claude/settings.json
 ops/bot-squad
 EOF
+        gitignore_updated="true"
+    fi
+    if ! grep -q "^ops/bot-squad-bin/$" "$repo/.gitignore"; then
+        printf '\nops/bot-squad-bin/\n' >> "$repo/.gitignore"
+        gitignore_updated="true"
+    fi
+    [ "$gitignore_updated" = "true" ] && echo "Updated: $repo/.gitignore"
+
+    # Create agent_team/dev branch if missing.
+    if [ "$create_deploy_branch" = "true" ]; then
+        if ! git -C "$repo" rev-parse --verify "$deploy_branch" >/dev/null 2>&1; then
+            git -C "$repo" checkout -b "$deploy_branch" "$master"
+            git -C "$repo" checkout "$master"
+            echo "Created branch: $deploy_branch (from $master)"
+        else
+            echo "Branch already exists: $deploy_branch"
+        fi
+    fi
+
+    # Scaffold deploy recipe templates.
+    if [ "$scaffold_recipes" = "true" ]; then
+        local deploy_dir="$data/deploy"
+        mkdir -p "$deploy_dir"
+        for tgt in staging dev; do
+            local example_file="$deploy_dir/${tgt}.sh.example"
+            if [ ! -f "$example_file" ]; then
+                cat > "$example_file" <<EOF
+#!/usr/bin/env bash
+# $slug → $tgt — STUB. Replace with real recipe.
+# See spec #3 §4.4 for the canonical pattern.
+set -euo pipefail
+echo "$tgt.sh recipe is a stub; real one comes in spec #3 Phase 5"
+exit 99
+EOF
+                chmod 644 "$example_file"
+                echo "Created: $example_file"
+            fi
+        done
     fi
 
     cat <<EOF
@@ -101,6 +197,7 @@ Project '$slug' initialized.
   data:   $data
   repo:   $repo
   symlink: $repo/ops/bot-squad -> $data
+  deploy shim: $repo/ops/bot-squad-bin/deploy
 
 Next steps (in $repo):
   1. Fill in vision: $data/vision/{north-star,strategy,tactical}.md

@@ -1,0 +1,240 @@
+"""Tests for markdown_writer module — atomic writes + frontmatter merge."""
+from __future__ import annotations
+
+import os
+import threading
+import time
+from pathlib import Path
+
+import fcntl
+import pytest
+
+from app.markdown_writer import (
+    allocate_next_id,
+    append_comment,
+    merge_task_update,
+    slugify,
+    write_task,
+)
+
+
+# ---------------------------------------------------------------------------
+# write_task
+# ---------------------------------------------------------------------------
+
+def test_write_task_produces_parseable_file(tmp_path: Path):
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0001-hello.md"
+    fm = {"id": "T-0001", "title": "Hello", "status": "open"}
+    write_task(p, fm, "body text\n")
+    task = parse_task(p)
+    assert task["id"] == "T-0001"
+    assert task["title"] == "Hello"
+    assert task["status"] == "open"
+    assert "body text" in task["body"]
+
+
+def test_write_task_atomic_no_tmp_leftover(tmp_path: Path):
+    p = tmp_path / "T-0002-atomic.md"
+    fm = {"id": "T-0002", "title": "Atomic", "status": "open"}
+    write_task(p, fm, "body\n")
+    # After successful write, the .tmp file must be gone
+    tmp = tmp_path / "T-0002-atomic.md.tmp"
+    assert not tmp.exists()
+    assert p.exists()
+
+
+def test_write_task_handles_unicode_title(tmp_path: Path):
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0003-ru.md"
+    fm = {"id": "T-0003", "title": "Задача на русском", "status": "open"}
+    write_task(p, fm, "тело\n")
+    task = parse_task(p)
+    assert task["title"] == "Задача на русском"
+
+
+# ---------------------------------------------------------------------------
+# merge_task_update
+# ---------------------------------------------------------------------------
+
+def test_merge_task_update_rejects_unknown_keys(tmp_path: Path):
+    p = tmp_path / "T-0010-x.md"
+    write_task(p, {"id": "T-0010", "title": "X", "status": "open"}, "body\n")
+    with pytest.raises(ValueError, match="disallowed"):
+        merge_task_update(p, {"secret": "hax"})
+
+
+def test_merge_task_update_bumps_updated_timestamp(tmp_path: Path):
+    p = tmp_path / "T-0011-x.md"
+    write_task(p, {"id": "T-0011", "title": "X", "status": "open"}, "body\n")
+    new_fm = merge_task_update(p, {"status": "closed"})
+    assert new_fm["status"] == "closed"
+    assert "updated" in new_fm
+
+
+def test_merge_task_update_changes_title(tmp_path: Path):
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0012-x.md"
+    write_task(p, {"id": "T-0012", "title": "Old", "status": "open"}, "body\n")
+    merge_task_update(p, {"title": "New"})
+    task = parse_task(p)
+    assert task["title"] == "New"
+
+
+def test_merge_task_update_changes_body(tmp_path: Path):
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0013-x.md"
+    write_task(p, {"id": "T-0013", "title": "X", "status": "open"}, "old body\n")
+    merge_task_update(p, {}, body="new body\n")
+    task = parse_task(p)
+    assert "new body" in task["body"]
+
+
+def test_merge_task_update_fills_created_from_mtime(tmp_path: Path):
+    """Tasks without created field get it filled from file mtime on first write."""
+    p = tmp_path / "T-0014-x.md"
+    # Write without created/updated (old-style task)
+    p.write_text("---\nid: T-0014\ntitle: Old task\nstatus: open\n---\n\nbody\n")
+    new_fm = merge_task_update(p, {"status": "totest"})
+    assert "created" in new_fm
+    assert "updated" in new_fm
+
+
+# ---------------------------------------------------------------------------
+# append_comment
+# ---------------------------------------------------------------------------
+
+def test_append_comment_adds_header_if_missing(tmp_path: Path):
+    p = tmp_path / "T-0020-c.md"
+    write_task(p, {"id": "T-0020", "title": "C", "status": "open"}, "body\n")
+    append_comment(p, "first comment", "alice")
+    text = p.read_text()
+    assert "## Comments" in text
+    assert "first comment" in text
+    assert "alice" in text
+
+
+def test_append_comment_appends_to_existing(tmp_path: Path):
+    p = tmp_path / "T-0021-c.md"
+    write_task(p, {"id": "T-0021", "title": "C", "status": "open"}, "body\n")
+    append_comment(p, "first", "alice")
+    append_comment(p, "second", "bob")
+    text = p.read_text()
+    # Both comments must appear in order
+    pos_first = text.index("first")
+    pos_second = text.index("second")
+    assert pos_first < pos_second
+    assert "bob" in text
+
+
+def test_append_comment_rejects_empty_body(tmp_path: Path):
+    p = tmp_path / "T-0022-c.md"
+    write_task(p, {"id": "T-0022", "title": "C", "status": "open"}, "body\n")
+    with pytest.raises(ValueError, match="empty"):
+        append_comment(p, "   ", "alice")
+
+
+def test_append_comment_bumps_updated(tmp_path: Path):
+    p = tmp_path / "T-0023-c.md"
+    write_task(p, {"id": "T-0023", "title": "C", "status": "open"}, "body\n")
+    from app.markdown_parser import parse_task
+    append_comment(p, "hi", "alice")
+    task = parse_task(p)
+    assert "updated" in task
+
+
+# ---------------------------------------------------------------------------
+# allocate_next_id
+# ---------------------------------------------------------------------------
+
+def test_allocate_next_id_empty_dir(tmp_path: Path):
+    assert allocate_next_id(tmp_path) == "T-0001"
+
+
+def test_allocate_next_id_with_existing(tmp_path: Path):
+    (tmp_path / "T-0001-foo.md").touch()
+    (tmp_path / "T-0042-bar.md").touch()
+    assert allocate_next_id(tmp_path) == "T-0043"
+
+
+def test_allocate_next_id_ignores_non_task_files(tmp_path: Path):
+    (tmp_path / "README.md").touch()
+    (tmp_path / ".lock").touch()
+    assert allocate_next_id(tmp_path) == "T-0001"
+
+
+# ---------------------------------------------------------------------------
+# slugify
+# ---------------------------------------------------------------------------
+
+def test_slugify_basic():
+    assert slugify("Hello World") == "hello-world"
+
+
+def test_slugify_strips_punctuation():
+    assert slugify("Hello, World!") == "hello-world"
+
+
+def test_slugify_lowercases():
+    assert slugify("UPPER") == "upper"
+
+
+def test_slugify_truncates_to_max_len():
+    long_str = "a" * 100
+    result = slugify(long_str, max_len=10)
+    assert len(result) <= 10
+
+
+def test_slugify_handles_consecutive_separators():
+    result = slugify("hello  --  world")
+    assert "--" not in result
+    assert "hello" in result
+    assert "world" in result
+
+
+def test_slugify_handles_russian_text():
+    # Non-ASCII should be stripped/transliterated; result is ASCII kebab
+    result = slugify("Задача первая")
+    # Should not crash; result should be ASCII only
+    assert result.isascii() or result == ""
+
+
+# ---------------------------------------------------------------------------
+# flock correctness
+# ---------------------------------------------------------------------------
+
+def test_flock_second_acquire_blocks(tmp_path: Path):
+    """Two threads: first holds lock, second cannot acquire immediately (LOCK_NB)."""
+    lock_path = tmp_path / ".lock"
+
+    acquired = threading.Event()
+    released = threading.Event()
+    blocked = threading.Event()
+
+    def holder():
+        with open(lock_path, "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            acquired.set()
+            released.wait(timeout=2)
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    t = threading.Thread(target=holder, daemon=True)
+    t.start()
+    acquired.wait(timeout=2)
+
+    # Try non-blocking acquire — should fail while holder has the lock
+    with open(lock_path, "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Should not reach here
+            blocked.set()
+        except (BlockingIOError, OSError):
+            pass  # Expected: lock is held
+
+    assert not blocked.is_set(), "Non-blocking acquire should have failed"
+    released.set()
+    t.join(timeout=2)

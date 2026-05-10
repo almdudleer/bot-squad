@@ -40,8 +40,10 @@ def test_unknown_action_raises():
 
 
 def test_registry_lists_only_allowed_actions():
-    # Closed allowlist — spec #3 phase 2 adds tg_notify.
-    assert set(ACTION_REGISTRY.keys()) == {"noop", "tg_verify_login", "tg_notify"}
+    # Closed allowlist — spec #3 phase 3 adds deploy + kick_stuck_now.
+    assert set(ACTION_REGISTRY.keys()) == {
+        "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now"
+    }
 
 
 def test_noop_rejects_extra_params():
@@ -189,3 +191,144 @@ def test_tg_notify_sid_and_user_forwarded(tmp_config_dir, monkeypatch):
     call = fake.calls[0]
     assert call["sid"] == "S-x-p1"
     assert call["user"] == "alexey"
+
+
+# ---------------------------------------------------------------------------
+# deploy action tests
+# ---------------------------------------------------------------------------
+
+
+def _make_deploy_config(tmp_path: Path) -> "tuple[Config, Path]":
+    """Create a config with a project that has a real repo dir for deploy tests."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), check=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "f.txt"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(repo), check=True)
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.deploy-test]\n'
+        f'slug = "deploy-test"\n'
+        f'display_name = "Deploy Test"\n'
+        f'repo_path = "{repo}"\n'
+        f'deploy_branch = "agent_team/dev"\n'
+        f'master_branch = "master"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "0"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    return cfg, repo
+
+
+def test_deploy_action_enqueues(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, repo = _make_deploy_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    out = A.dispatch("deploy", {
+        "slug": "deploy-test",
+        "target": "staging",
+        "reason": "smoke test",
+        "requested_by": "pytest",
+    })
+    assert out["ok"] is True
+    assert "queue_id" in out
+    assert "queued_at" in out
+
+
+def test_deploy_action_rejects_bad_target(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, repo = _make_deploy_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="unknown target"):
+        A.dispatch("deploy", {
+            "slug": "deploy-test",
+            "target": "prod",
+            "reason": "bad",
+            "requested_by": "pytest",
+        })
+
+
+def test_deploy_action_rejects_unknown_slug(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, repo = _make_deploy_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="unknown project"):
+        A.dispatch("deploy", {
+            "slug": "no-such-project",
+            "target": "staging",
+            "reason": "bad",
+            "requested_by": "pytest",
+        })
+
+
+def test_deploy_action_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, repo = _make_deploy_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("deploy", {
+            "slug": "deploy-test",
+            "target": "staging",
+            "reason": "r",
+            "requested_by": "u",
+            "evil": "extra",
+        })
+
+
+def test_deploy_action_requires_all_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, repo = _make_deploy_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("deploy", {"slug": "deploy-test", "target": "staging"})
+
+
+# ---------------------------------------------------------------------------
+# kick_stuck_now action tests
+# ---------------------------------------------------------------------------
+
+
+def test_kick_stuck_now_returns_ok(tmp_config_dir, monkeypatch):
+    """kick_stuck_now with no params runs and returns {ok: True, ran: True}."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import jobs as J
+
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    # Patch kick_stuck so it doesn't actually try to send TG messages
+    monkeypatch.setattr(J, "kick_stuck", lambda _cfg: None)
+
+    out = A.dispatch("kick_stuck_now", {})
+    assert out == {"ok": True, "ran": True}
+
+
+def test_kick_stuck_now_rejects_params(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="takes no params"):
+        A.dispatch("kick_stuck_now", {"extra": "bad"})

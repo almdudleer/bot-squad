@@ -145,10 +145,69 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "sent": sent}
 
 
+_DEPLOY_REQUIRED = {"slug", "target", "reason", "requested_by"}
+_DEPLOY_ALLOWED = _DEPLOY_REQUIRED
+
+
+def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
+    """Queue a deploy request for a registered project.
+
+    Required params: slug, target, reason, requested_by
+    Returns: {ok: true, queue_id: str, queued_at: float}
+
+    Raises ActionError on unknown slug, unknown target, extra/missing params.
+    """
+    extra = set(params) - _DEPLOY_ALLOWED
+    if extra:
+        raise ActionError(f"deploy got unexpected params: {sorted(extra)}")
+    missing = _DEPLOY_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"deploy missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    target = params["target"]
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"deploy: unknown project slug {slug!r}")
+
+    from bot_squad_worker import deploy as _deploy
+    try:
+        queue_id = _deploy.enqueue(
+            cfg,
+            slug=slug,
+            target=target,
+            reason=params["reason"],
+            requested_by=params["requested_by"],
+        )
+    except ValueError as e:
+        raise ActionError(f"deploy: {e}") from e
+
+    import time as _time
+    return {"ok": True, "queue_id": queue_id, "queued_at": _time.time()}
+
+
+def _action_kick_stuck_now(params: dict[str, Any]) -> dict[str, Any]:
+    """Run the kick_stuck daily summary job immediately.
+
+    Takes no params. Returns {ok: true, ran: true}.
+    """
+    if params:
+        raise ActionError(f"kick_stuck_now takes no params, got: {sorted(params)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import jobs as _jobs
+    _jobs.kick_stuck(cfg)
+    return {"ok": True, "ran": True}
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
     "tg_notify": _action_tg_notify,
+    "deploy": _action_deploy,
+    "kick_stuck_now": _action_kick_stuck_now,
 }
 
 

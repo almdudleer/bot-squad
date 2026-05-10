@@ -31,7 +31,7 @@ def test_projects_list_requires_auth(tmp_bot_squad: Path, monkeypatch):
     assert r.status_code == 401
 
 
-def test_projects_list_after_login(tmp_bot_squad: Path, monkeypatch):
+def test_projects_list_after_login(tmp_bot_squad: Path, monkeypatch, fake_worker_tg):
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         r = client.get("/api/projects")
@@ -40,7 +40,7 @@ def test_projects_list_after_login(tmp_bot_squad: Path, monkeypatch):
     assert body == [{"slug": "test-project", "display_name": "Test Project"}]
 
 
-def test_project_get(tmp_bot_squad: Path, monkeypatch):
+def test_project_get(tmp_bot_squad: Path, monkeypatch, fake_worker_tg):
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         r = client.get("/api/projects/test-project")
@@ -50,7 +50,7 @@ def test_project_get(tmp_bot_squad: Path, monkeypatch):
     assert "counts" in body
 
 
-def test_project_get_unknown_404(tmp_bot_squad: Path, monkeypatch):
+def test_project_get_unknown_404(tmp_bot_squad: Path, monkeypatch, fake_worker_tg):
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         r = client.get("/api/projects/nope")

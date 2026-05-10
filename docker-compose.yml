@@ -16,7 +16,8 @@ services:
       - COOKIE_SECURE=1
       - BUILD_AT_IMPORT=1
     volumes:
-      - ./config:/config:ro
+      - ./config/projects.toml:/config/projects.toml:ro
+      - ./config/auth.toml:/config/auth.toml:ro
       - ./data:/data:rw
     networks:
       - avo_backend

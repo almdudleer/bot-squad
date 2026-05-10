@@ -29,3 +29,33 @@ def test_data_dir_resolves_relative_to_config(tmp_config_dir: Path) -> None:
     cfg = Config.load(tmp_config_dir)
     assert cfg.data_dir == tmp_config_dir.parent / "data"
     assert cfg.sock_path == tmp_config_dir.parent / "data" / "_sock" / "worker.sock"
+
+
+def test_secrets_loads(tmp_config_dir: Path) -> None:
+    (tmp_config_dir / "secrets.toml").write_text(
+        '[telegram]\nbot_token = "TESTBOT:TOKEN"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_bot_token == "TESTBOT:TOKEN"
+
+
+def test_secrets_missing_raises(tmp_path: Path) -> None:
+    # Build a config dir that has projects.toml but NOT secrets.toml.
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.test-project]\n'
+        'slug = "test-project"\n'
+        'display_name = "Test Project"\n'
+        'repo_path = "/tmp/test-repo"\n'
+        'deploy_branch = "agent_team/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = "https://example.com"\n'
+        'staging_url = "https://staging.example.com"\n'
+        'dev_url = "https://dev.example.com"\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+    )
+    with pytest.raises(FileNotFoundError, match="secrets.toml"):
+        Config.load(cfg_dir)

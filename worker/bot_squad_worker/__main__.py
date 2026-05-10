@@ -16,6 +16,7 @@ from pathlib import Path
 
 import uvicorn
 
+from bot_squad_worker.actions import set_config
 from bot_squad_worker.config import Config
 from bot_squad_worker.scheduler import build_scheduler
 from bot_squad_worker.server import build_app
@@ -41,6 +42,7 @@ def main() -> int:
     log = logging.getLogger("bot-squad-worker")
 
     cfg = Config.load(Path(args.config))
+    set_config(cfg)
     log.info("loaded config: %d project(s)", len(cfg.projects))
 
     cfg.sock_path.parent.mkdir(parents=True, exist_ok=True)

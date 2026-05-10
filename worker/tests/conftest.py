@@ -18,7 +18,7 @@ def tmp_data_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def tmp_config_dir(tmp_path: Path) -> Path:
-    """Provide a config dir with a minimal projects.toml."""
+    """Provide a config dir with a minimal projects.toml and secrets.toml."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "projects.toml").write_text(
@@ -34,5 +34,10 @@ def tmp_config_dir(tmp_path: Path) -> Path:
         'deploy_targets = ["staging"]\n'
         'tg_chat = "0"\n'
         'created_at = 2026-05-10\n'
+    )
+    (cfg / "secrets.toml").write_text(
+        '[telegram]\n'
+        'bot_token = "TESTBOT:TOKEN"\n'
+        'auth_age_max = 86400\n'
     )
     return cfg

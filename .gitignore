@@ -9,6 +9,7 @@ data/_worker/*
 # Secrets
 .env
 config/auth.toml
+config/secrets.toml
 
 # Python
 __pycache__/

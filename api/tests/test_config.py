@@ -12,7 +12,6 @@ def test_api_config_loads_projects(tmp_bot_squad: Path) -> None:
 
 def test_auth_config_loads(tmp_bot_squad: Path) -> None:
     auth = AuthConfig.load(tmp_bot_squad / "config")
-    assert auth.bot_token == "TESTBOT:TOKEN"
     assert 12345 in auth.allowed_ids
     assert auth.session_ttl_seconds == 7 * 24 * 3600
 

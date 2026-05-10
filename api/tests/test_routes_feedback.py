@@ -21,7 +21,7 @@ def _logged_in(tmp_bot_squad: Path, monkeypatch):
     return c
 
 
-def test_feedback_lists(tmp_bot_squad: Path, monkeypatch):
+def test_feedback_lists(tmp_bot_squad: Path, monkeypatch, fake_worker_tg):
     fb = tmp_bot_squad / "data" / "test-project" / "feedback"
     (fb / "F-2026-04-15-id520.md").write_text("# Feedback\n\nText\n")
     with _logged_in(tmp_bot_squad, monkeypatch) as c:

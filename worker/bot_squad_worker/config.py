@@ -1,4 +1,4 @@
-"""Config loader — parses bot-squad config/projects.toml."""
+"""Config loader — parses bot-squad config/projects.toml + config/secrets.toml."""
 from __future__ import annotations
 
 import tomllib
@@ -39,6 +39,8 @@ class Project:
 class Config:
     config_dir: Path
     projects: dict[str, Project] = field(default_factory=dict)
+    tg_bot_token: str = ""
+    tg_auth_age_max: int = 86400
 
     @property
     def data_dir(self) -> Path:
@@ -60,9 +62,18 @@ class Config:
         projects_toml = config_dir / "projects.toml"
         if not projects_toml.exists():
             raise FileNotFoundError(f"projects.toml not found: {projects_toml}")
+        secrets_toml = config_dir / "secrets.toml"
+        if not secrets_toml.exists():
+            raise FileNotFoundError(f"secrets.toml not found: {secrets_toml}")
         raw = tomllib.loads(projects_toml.read_text())
         projects = {
             slug: Project.from_toml(p)
             for slug, p in raw.get("projects", {}).items()
         }
-        return cls(config_dir=config_dir, projects=projects)
+        sec = tomllib.loads(secrets_toml.read_text())
+        return cls(
+            config_dir=config_dir,
+            projects=projects,
+            tg_bot_token=sec.get("telegram", {}).get("bot_token", ""),
+            tg_auth_age_max=int(sec.get("telegram", {}).get("auth_age_max", 86400)),
+        )

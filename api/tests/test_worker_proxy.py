@@ -1,52 +1,18 @@
-import asyncio
+"""Tests for the API→worker proxy route (/api/worker/*)."""
 import hashlib
 import hmac
-import threading
 import time
 from pathlib import Path
 
-import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.main import build_app
 
 
-@pytest.fixture
-def fake_worker(tmp_bot_squad: Path):
-    """Start a fake worker in a background thread (not the test event loop)."""
-    import uvicorn
-
-    sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
-    sock.parent.mkdir(parents=True, exist_ok=True)
-    fake = FastAPI()
-
-    @fake.post("/actions/noop")
-    def noop(params: dict | None = None) -> dict:
-        return {"ok": True, "ts": 99}
-
-    config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
-    server = uvicorn.Server(config)
-
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-
-    # Wait for socket to bind.
-    for _ in range(50):
-        if sock.exists():
-            break
-        time.sleep(0.05)
-
-    yield sock
-
-    server.should_exit = True
-    thread.join(timeout=5)
-
-
-async def test_worker_noop_proxy(tmp_bot_squad: Path, monkeypatch, fake_worker):
+async def test_worker_noop_proxy(tmp_bot_squad: Path, monkeypatch, fake_worker_tg):
     monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
     monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
-    monkeypatch.setenv("WORKER_SOCK", str(fake_worker))
+    monkeypatch.setenv("WORKER_SOCK", str(fake_worker_tg))
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("COOKIE_SECURE", "0")
     app = build_app()

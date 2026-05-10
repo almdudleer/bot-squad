@@ -71,10 +71,8 @@ class ApiConfig:
 
 @dataclass(frozen=True)
 class AuthConfig:
-    bot_token: str
     allowed_ids: tuple[int, ...]
     session_ttl_seconds: int
-    auth_age_max: int
 
     @staticmethod
     def _parse_ttl(s: str) -> int:
@@ -90,8 +88,6 @@ class AuthConfig:
         raw = tomllib.loads((config_dir / "auth.toml").read_text())
         tg = raw["telegram_login"]
         return cls(
-            bot_token=tg["bot_token"],
             allowed_ids=tuple(int(i) for i in tg["allowed_ids"]),
             session_ttl_seconds=cls._parse_ttl(tg["session_ttl"]),
-            auth_age_max=int(tg.get("auth_age_max", 86400)),
         )

@@ -21,7 +21,7 @@ def _logged_in(tmp_bot_squad: Path, monkeypatch):
     return c
 
 
-def test_vision_lists_files_and_initiatives(tmp_bot_squad: Path, monkeypatch):
+def test_vision_lists_files_and_initiatives(tmp_bot_squad: Path, monkeypatch, fake_worker_tg):
     vision = tmp_bot_squad / "data" / "test-project" / "vision"
     (vision / "north-star.md").write_text("# North star\n\nAim true.\n")
     (vision / "strategy.md").write_text("# Strategy\n\nBet on X.\n")

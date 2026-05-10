@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# bot-squad CLI — project management.
+#
+# Usage:
+#   bot-squad project init <slug> --repo <path> [--master master] [--deploy-branch agent_team/dev]
+#
+set -euo pipefail
+
+BOT_SQUAD="${BOT_SQUAD:-/home/www/bot-squad}"
+
+cmd_project_init() {
+    local slug="" repo="" master="master" deploy_branch="agent_team/dev"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            --master) master="$2"; shift 2 ;;
+            --deploy-branch) deploy_branch="$2"; shift 2 ;;
+            -h|--help) sed -n '4,9p' "$0"; exit 0 ;;
+            *)
+                if [ -z "$slug" ]; then slug="$1"; shift
+                else echo "unexpected arg: $1" >&2; exit 2
+                fi
+                ;;
+        esac
+    done
+
+    [ -n "$slug" ] || { echo "missing <slug>" >&2; exit 2; }
+    [ -n "$repo" ] || { echo "missing --repo <path>" >&2; exit 2; }
+    [ -d "$repo" ] || { echo "repo not found: $repo" >&2; exit 2; }
+
+    local data="$BOT_SQUAD/data/$slug"
+    mkdir -p "$data"/{backlog,vision/initiatives,feedback,sessions,runs}
+    chgrp -R www "$data"
+    find "$data" -type d -exec chmod 2775 {} +
+
+    if [ ! -f "$data/AGENT_INSTRUCTIONS.md" ]; then
+        cat > "$data/AGENT_INSTRUCTIONS.md" <<EOF
+# $slug — agent contract
+
+(Long-form recipes, gotchas, paths. AGENTS.md in the repo holds the
+always-on summary; this file is the once-at-startup expansion.)
+
+EOF
+    fi
+
+    # Append project entry to projects.toml if not present.
+    if ! grep -q "^\[projects\.$slug\]" "$BOT_SQUAD/config/projects.toml"; then
+        cat >> "$BOT_SQUAD/config/projects.toml" <<EOF
+
+[projects.$slug]
+slug          = "$slug"
+display_name  = "$slug"
+repo_path     = "$repo"
+deploy_branch = "$deploy_branch"
+master_branch = "$master"
+prod_url      = ""
+staging_url   = ""
+dev_url       = ""
+deploy_targets = []
+tg_chat       = "0"
+created_at    = $(date -u +%Y-%m-%d)
+EOF
+    fi
+
+    # Drop in-repo files.
+    if [ ! -e "$repo/.claude/settings.json" ]; then
+        mkdir -p "$repo/.claude"
+        cat > "$repo/.claude/settings.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$BOT_SQUAD/scripts/hooks/session_start.sh" }
+        ]
+      }
+    ]
+  }
+}
+EOF
+    fi
+
+    if [ ! -e "$repo/ops/bot-squad" ]; then
+        mkdir -p "$repo/ops"
+        ln -sf "$data" "$repo/ops/bot-squad"
+    fi
+
+    # Patch .gitignore (idempotent).
+    touch "$repo/.gitignore"
+    if ! grep -q "^!.claude/settings.json$" "$repo/.gitignore"; then
+        cat >> "$repo/.gitignore" <<'EOF'
+
+# bot-squad: whitelist committed Claude settings; ignore symlink to data dir.
+!.claude/settings.json
+ops/bot-squad
+EOF
+    fi
+
+    cat <<EOF
+Project '$slug' initialized.
+  data:   $data
+  repo:   $repo
+  symlink: $repo/ops/bot-squad -> $data
+
+Next steps (in $repo):
+  1. Fill in vision: $data/vision/{north-star,strategy,tactical}.md
+  2. Write a slim AGENTS.md (see plan §6.1)
+  3. Review changes:   git -C $repo status
+  4. Stage and commit: git -C $repo add AGENTS.md .claude/ .gitignore && git commit -m "ops: register with bot-squad"
+EOF
+}
+
+case "${1:-}" in
+    project)
+        shift
+        case "${1:-}" in
+            init) shift; cmd_project_init "$@" ;;
+            *) echo "usage: bot-squad project init <slug> --repo <path> ..." >&2; exit 2 ;;
+        esac
+        ;;
+    -h|--help|"") sed -n '4,9p' "$0"; exit 0 ;;
+    *) echo "unknown command: $1" >&2; exit 2 ;;
+esac

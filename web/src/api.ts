@@ -35,6 +35,9 @@ export type Task = {
   status: "open" | "totest" | "reopened" | "closed";
   body: string;
   path: string;
+  created?: string;
+  updated?: string;
+  from?: string;
 };
 
 export type VisionFile = { name: string; content: string };
@@ -53,4 +56,20 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => call("/api/auth/logout", { method: "POST" }),
+  createTask: (slug: string, t: Partial<Task>) =>
+    call<Task>(`/api/projects/${slug}/backlog`, { method: "POST", body: JSON.stringify(t) }),
+  patchTask: (slug: string, id: string, t: Partial<Task>) =>
+    call<Task>(`/api/projects/${slug}/backlog/${id}`, { method: "PATCH", body: JSON.stringify(t) }),
+  deleteTask: (slug: string, id: string) =>
+    call(`/api/projects/${slug}/backlog/${id}`, { method: "DELETE" }),
+  addComment: (slug: string, id: string, body: string) =>
+    call<Task>(`/api/projects/${slug}/backlog/${id}/comments`, { method: "POST", body: JSON.stringify({ body }) }),
+  putVision: (slug: string, name: string, content: string) =>
+    call(`/api/projects/${slug}/vision/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
+  newInitiative: (slug: string, name: string, content: string) =>
+    call(`/api/projects/${slug}/vision`, { method: "POST", body: JSON.stringify({ kind: "initiative", name, content }) }),
+  putFeedback: (slug: string, name: string, content: string) =>
+    call(`/api/projects/${slug}/feedback/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
+  promoteFeedback: (slug: string, name: string, title?: string, body?: string) =>
+    call<{ task_id: string }>(`/api/projects/${slug}/feedback/${name}/promote`, { method: "POST", body: JSON.stringify({ title, body }) }),
 };

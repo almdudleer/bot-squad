@@ -1,0 +1,27 @@
+[Unit]
+Description=bot-squad worker (APScheduler + Unix-socket action API)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/www/bot-squad
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_LEVEL=info
+ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
+Restart=on-failure
+RestartSec=10s
+
+# Hardening (defense-in-depth — worker still has docker/git/tmux/claude access
+# for spec #3 actions, but we lock down what we can).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/www/bot-squad/data /home/almdudleer
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

@@ -69,7 +69,7 @@ def main() -> int:
         try:
             gid = grp.getgrnam("www").gr_gid
             os.chown(cfg.sock_path, -1, gid)
-        except (KeyError, PermissionError):
+        except (KeyError, PermissionError, OSError):
             log.warning("could not chgrp socket to www; falling back to current group")
         cfg.sock_path.chmod(0o660)
         log.info("socket perms tightened to 0660 (group www)")

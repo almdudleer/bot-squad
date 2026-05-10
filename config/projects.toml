@@ -1,0 +1,15 @@
+# bot-squad project registry. Add a new project via:
+#   scripts/cli/bot-squad project init <slug> --repo <path>
+
+[projects.signal-tracker]
+slug          = "signal-tracker"
+display_name  = "Signal Tracker"
+repo_path     = "/home/almdudleer/signal_tracker_mgmt"
+deploy_branch = "agent_team/dev"
+master_branch = "master"
+prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
+staging_url   = "https://signal-staging.dev.uzinvestapi.com"
+dev_url       = "https://signal-dev.dev.uzinvestapi.com"
+deploy_targets = ["staging", "dev"]
+tg_chat       = "404580642"
+created_at    = 2026-05-10

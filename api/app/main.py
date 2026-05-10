@@ -37,6 +37,11 @@ def build_app() -> FastAPI:
 
     from app.routes_backlog import router as backlog_router
     app.include_router(backlog_router, prefix="/api")
+
+    from app.routes_vision import router as vision_router
+    from app.routes_feedback import router as feedback_router
+    app.include_router(vision_router, prefix="/api")
+    app.include_router(feedback_router, prefix="/api")
     return app
 
 

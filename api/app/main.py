@@ -42,6 +42,19 @@ def build_app() -> FastAPI:
     from app.routes_feedback import router as feedback_router
     app.include_router(vision_router, prefix="/api")
     app.include_router(feedback_router, prefix="/api")
+
+    from app.routes_auth import require_auth
+    from app.worker_client import WorkerClient, WorkerError
+    from fastapi import Depends, HTTPException
+
+    @app.post("/api/worker/noop")
+    async def worker_noop(_user: dict = Depends(require_auth)) -> dict:
+        client = WorkerClient(app.state.sock_path)
+        try:
+            return await client.call_action("noop", {})
+        except WorkerError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
     return app
 
 

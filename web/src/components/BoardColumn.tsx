@@ -1,6 +1,14 @@
 import { Task } from "../api";
+import { TaskCard, MenuAction } from "./TaskCard";
 
-export function BoardColumn({ title, tasks }: { title: string; tasks: Task[] }) {
+interface BoardColumnProps {
+  title: string;
+  tasks: Task[];
+  slug: string;
+  onMenuAction: (task: Task, action: MenuAction) => void;
+}
+
+export function BoardColumn({ title, tasks, slug, onMenuAction }: BoardColumnProps) {
   return (
     <div className="col-md-3">
       <h6 className="text-muted text-uppercase small mb-2">
@@ -8,12 +16,7 @@ export function BoardColumn({ title, tasks }: { title: string; tasks: Task[] }) 
       </h6>
       {tasks.length === 0 && <p className="small text-muted">empty</p>}
       {tasks.map((t) => (
-        <div key={t.id} className="card mb-2">
-          <div className="card-body p-2">
-            <div className="small text-muted">{t.id}</div>
-            <div className="fw-medium">{t.title}</div>
-          </div>
-        </div>
+        <TaskCard key={t.id} task={t} slug={slug} onMenuAction={onMenuAction} />
       ))}
     </div>
   );

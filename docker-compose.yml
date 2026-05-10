@@ -1,0 +1,33 @@
+services:
+  bot-squad-api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: bot-squad-api:latest
+    container_name: bot-squad-api
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file: .env
+    environment:
+      - CONFIG_DIR=/config
+      - DATA_DIR=/data
+      - WORKER_SOCK=/data/_sock/worker.sock
+      - JWT_SECRET=${JWT_SECRET}
+      - COOKIE_SECURE=1
+      - BUILD_AT_IMPORT=1
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data:rw
+    networks:
+      - avo_backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=avo_backend"
+      - "traefik.http.routers.bot-squad.rule=Host(`bot-squad.${DOMAIN}`)"
+      - "traefik.http.routers.bot-squad.entrypoints=websecure"
+      - "traefik.http.routers.bot-squad.tls.certresolver=le"
+      - "traefik.http.services.bot-squad.loadbalancer.server.port=8000"
+
+networks:
+  avo_backend:
+    external: true

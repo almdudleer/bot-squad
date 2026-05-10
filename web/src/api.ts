@@ -47,7 +47,10 @@ export const api = {
   backlog: (slug: string) => call<Task[]>(`/api/projects/${slug}/backlog`),
   vision: (slug: string) => call<VisionFile[]>(`/api/projects/${slug}/vision`),
   feedback: (slug: string) => call<FeedbackFile[]>(`/api/projects/${slug}/feedback`),
-  loginTg: (payload: Record<string, unknown>) =>
-    call("/api/auth/tg", { method: "POST", body: JSON.stringify(payload) }),
+  login: (username: string, password: string) =>
+    call("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
   logout: () => call("/api/auth/logout", { method: "POST" }),
 };

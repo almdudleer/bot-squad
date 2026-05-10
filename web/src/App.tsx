@@ -4,6 +4,7 @@ import { Picker } from "./pages/Picker";
 import { Project } from "./pages/Project";
 import { Vision } from "./pages/Vision";
 import { Feedback } from "./pages/Feedback";
+import { TaskDetail } from "./pages/TaskDetail";
 
 export function App() {
   return (
@@ -12,6 +13,7 @@ export function App() {
         <Route path="/login" element={<Login />} />
         <Route path="/" element={<Picker />} />
         <Route path="/p/:slug" element={<Project />} />
+        <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
         <Route path="/p/:slug/vision" element={<Vision />} />
         <Route path="/p/:slug/feedback" element={<Feedback />} />
         <Route path="*" element={<Navigate to="/" replace />} />

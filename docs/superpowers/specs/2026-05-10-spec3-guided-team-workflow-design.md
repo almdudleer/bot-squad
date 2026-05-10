@@ -43,15 +43,20 @@ Spec #1's two-process split holds: `bot-squad-api` (Docker, traefik) for FS read
    git, docker, tmux, claude, TG bot
 ```
 
-Worker actions for spec #3 v1 (typed allowlist):
+Worker actions for spec #3 v1 (typed allowlist — kept minimal; agents continue to use bash/git directly for everything else):
 
-| Action | Caller | What it does |
+| Action | Caller | Why it's an action and not bash |
 |---|---|---|
 | `noop` | smoke | proof-of-life (already in v1) |
-| `deploy` | `ops/bot-squad/deploy` shim | drops a request file for `deploy_monitor` to pick up; sync return = `{queued: true, queue_id}` |
-| `git_status` | UI (later); also debug | runs `git status --porcelain` in the project repo, returns clean/dirty + first 5 dirty paths |
-| `tg_notify` | hooks, scheduler, debug | sends a Telegram message via watchbot, prefixed with SID |
-| `kick_stuck_now` | debug | manually fires what `kick_stuck` runs daily |
+| `deploy` | `ops/bot-squad-bin/deploy` shim | needs to write to bot-squad's per-project queue, which lives outside the project repo |
+| `tg_notify` | hooks, scheduler | worker holds `bot_token` (split out of `auth.toml`); agents and the API container don't have it |
+| `kick_stuck_now` | debug | mirrors the daily summary on demand for stakeholder use |
+
+What's intentionally NOT an action (over-engineering avoided):
+
+- `git_status` — agents can run `git status` themselves; `deploy_monitor` calls `subprocess.run(['git', 'status'])` directly, doesn't need to round-trip through the worker.
+- `squash` — agents can run two git commands themselves; no wrapper helper needed.
+- `tmux_rename_pane` — same; tmux is in agent's hands.
 
 Time-driven jobs (in `worker/bot_squad_worker/jobs.py`):
 
@@ -85,14 +90,19 @@ Hard rules embedded in AGENTS.md:
 
 ### 3.2 Squash policy
 
-The user's directive: "agents should regularly squash commits that they made." Implementation:
+Stakeholder's directive: "agents should regularly squash commits that they made." Kept as **policy in AGENTS.md, no wrapper helper** — agents already speak git, no hoops to jump through.
 
-- A helper at `ops/bot-squad/squash`, dropped by `bot-squad project init` into the project repo (gitignored — symlinked to `/home/www/bot-squad/scripts/cli/squash.sh`).
-- Usage: `ops/bot-squad/squash "<single-line message>"`
-- Behavior: `git reset --soft $(git merge-base HEAD master)` then `git commit -m "<message>"` (with the standard Co-Authored-By trailer auto-appended). Effectively collapses every commit on `agent_team/dev` since it diverged from master into one.
-- Safety: refuses to run if working tree is dirty (uncommitted changes), if HEAD is on master, or if the merge-base equals HEAD (nothing to squash).
-- When agents call it: AGENTS.md tells them to squash *before requesting a deploy* and *before handing off* to the user. Routine working commits stay un-squashed during a working session.
-- The policy is not enforced in the worker — it's social. If an agent skips squash and pushes 30 commits up before deploy, the deploy still works; the deploy recipe doesn't care about commit shape.
+AGENTS.md `## Branching & commits` includes the recipe inline:
+
+```
+Squash before requesting a deploy or handing off to the stakeholder:
+  BASE=$(git merge-base HEAD master)
+  git reset --soft "$BASE" && git commit -m "<single-line message>"
+```
+
+Plus the safety rules: don't squash on master/staging; don't squash with a dirty tree; don't squash if `merge-base == HEAD`.
+
+Routine working commits stay un-squashed during a session. The policy isn't enforced in the worker — the deploy recipe doesn't care about commit shape.
 
 ### 3.3 Branch creation
 
@@ -294,31 +304,24 @@ What does NOT ping:
 - Backlog edits
 - Anything more than one message in 60s with the same payload
 
-## 8. tmux pane-naming convention
+## 8. tmux SID derivation (and why pane naming is optional)
 
-You drive tmux interactively. Convention:
+You drive tmux interactively. In practice, lots of windows end up named just `claude` (default from auto-spawn) and never get renamed. So the SID can't rely on window name being meaningful — it has to disambiguate even when names collide.
 
-- One tmux session per machine (typically session `0` or named after the machine)
-- One window per active "feature" or "task slot"
-- Window name = short feature handle (kebab-case): `tg-deeplink`, `recheck-cost`, `playwright-fixes`
-- Windows can have multiple panes if you want sub-agents visible
+**SID format**: `S-<user>-<window>-p<pane_id>`
 
-SID derivation (already implemented in v1 hook): `S-<user>-<window>`. A pane at window `tg-deeplink` running as `almdudleer` gets SID `S-almdudleer-tg-deeplink`.
+- `<user>` — `id -un`, sanitized to `[A-Za-z0-9_]`
+- `<window>` — `tmux display-message -p '#W'`, sanitized; defaults to `claude` or whatever
+- `<pane_id>` — `tmux display-message -p '#{pane_id}'` minus the leading `%` (e.g., `%5` → `5`). Unique across the entire tmux server, so two windows both named `claude` produce different SIDs (`S-almdudleer-claude-p5` vs `S-almdudleer-claude-p6`).
 
-Per-project flow:
+When agents care: TG pings prefix with the SID. Stakeholder reads `[S-almdudleer-tg-deeplink-p5] needs your input` and either:
 
-- Before starting a session, you `tmux rename-window <feature>` (or new-window with that name). Optional but recommended; without it you get the default window number which still works but is less informative in TG.
-- Spawn `claude` in that pane. SessionStart hook reads the window name → injects the SID into AGENT_INSTRUCTIONS at the top so the session knows its own identity.
-- TG pings prefix with the SID; you scan and know "the `tg-deeplink` session needs me."
+- Recognizes the window name (renamed it themselves) and goes there, OR
+- Looks up `tmux list-panes -a -F '#{pane_id} #W #{pane_current_path}'` to find the pane.
 
-Spec #3 adds a small CLI helper `bot-squad pane <feature>` that does:
+**Renaming is purely cosmetic**: helps the stakeholder skim TG messages but isn't load-bearing. No CLI helper for it — `tmux rename-window <feature>` is two words.
 
-```bash
-tmux rename-window "$1"
-echo "renamed window to '$1'; SID = S-$(id -un)-$1"
-```
-
-Mostly cosmetic — just a tab-completable shortcut.
+`hook_my_sid.sh` (called by the Stop hook and the `deploy` shim) computes the SID FRESH each call using `tmux display-message -t $TMUX_PANE` — never reads a stale `.current` file, so it stays correct as the user renames panes.
 
 ## 9. Hooks
 
@@ -413,14 +416,16 @@ Migration: move `bot_token` line from `auth.toml` to `secrets.toml`, restart bot
 
 ## 12. CLI additions
 
-`scripts/cli/bot-squad` grows:
+`scripts/cli/bot-squad` grows two subcommands:
 
-- `bot-squad project init <slug> ... [--create-deploy-branch] [--scaffold-recipes]`
-- `bot-squad squash "<message>"` — runs in CWD; works only on agent_team/dev
-- `bot-squad pane <feature>` — `tmux rename-window <feature>`
-- `bot-squad render-agents-md <slug>` — re-renders the project's AGENTS.md from template + vision layers (spec #1's static AGENTS.md was a one-shot; this is the helper for ad-hoc re-renders pending the spec #Z auto-render)
+- `bot-squad project init <slug> ... [--create-deploy-branch] [--scaffold-recipes]` — extends v1's project init with branch creation and recipe scaffolding flags.
+- `bot-squad render-agents-md <slug>` — re-renders the project's AGENTS.md from template + vision layers. Spec #1's static AGENTS.md was a one-shot; this is the manual re-render pending spec #Z's auto-render.
 
-Each is a thin wrapper over a Python or bash script under `scripts/cli/`.
+Things explicitly NOT added (per the "no hoops for agents" principle):
+
+- No `squash` wrapper — agents run `git reset --soft $(git merge-base HEAD master) && git commit -m "..."` themselves. Documented in AGENTS.md.
+- No `pane` wrapper — `tmux rename-window <feature>` is two words and the SID still disambiguates duplicate names via pane-id.
+- No `git_status` wrapper — `git status` is one word.
 
 ## 13. Risks & mitigations
 
@@ -450,19 +455,20 @@ Each is a thin wrapper over a Python or bash script under `scripts/cli/`.
 
 ## 15. Implementation order
 
-1. `agent_team/dev` branch creation (`bot-squad project init --create-deploy-branch`); idempotent
-2. Per-project recipes scaffolding (`--scaffold-recipes` flag drops `data/<slug>/deploy/{staging,dev}.sh.example`); for signal-tracker write the real `staging.sh`
-3. `actions.py` — add `deploy`, `git_status`, `tg_notify`, `kick_stuck_now` with tests
-4. `jobs.py` — add `deploy_monitor`, `kick_stuck`, `oauth_refresh` with tests (mock the recipe via tmpdir for `deploy_monitor`)
-5. `scheduler.py` — register the new jobs
-6. `scripts/cli/deploy.sh` shim and per-project symlink dropping (project init)
-7. `scripts/cli/squash.sh` + `bot-squad squash`
-8. `scripts/cli/pane.sh` + `bot-squad pane`
-9. `scripts/hooks/{user_prompt_submit,stop}.sh`
-10. Update `bot-squad project init` to drop the new `.claude/settings.json` template
-11. Tighten `secrets.toml` split (move bot_token out of `auth.toml`); update API + worker config loaders
-12. AGENTS.md re-render with the new branching/deploy sections; `bot-squad render-agents-md` helper
-13. End-to-end smoke test: agent commits → squashes → `ops/bot-squad/deploy staging "smoke"` → tree-clean → recipe runs → staging URL reflects new build → TG ping received
+1. Tighten `secrets.toml` split (move bot_token out of `auth.toml`); update API + worker config loaders + docker-compose mounts
+2. Worker `tg.py` — outbound TG client with debounce + SID prefix
+3. `actions.py` — add `tg_notify`, `kick_stuck_now` (no `git_status`, no `squash` wrapper)
+4. Worker `deploy.py` — queue + per-project recipe runner (uses `subprocess` for `git status` directly; no action needed)
+5. `actions.py` — add `deploy` action
+6. `jobs.py` — add `deploy_monitor`, `kick_stuck`, `oauth_refresh` (with tests)
+7. `scheduler.py` — register the new jobs
+8. `scripts/cli/deploy.sh` shim
+9. `scripts/cli/bot-squad project init` — drop the deploy shim symlink as `ops/bot-squad-bin/deploy`; drop new hook config
+10. `scripts/hooks/{hook_my_sid,user_prompt_submit,stop}.sh`
+11. `scripts/cli/render_agents_md.py` + `bot-squad render-agents-md` subcommand
+12. `agent_team/dev` branch creation in signal-tracker; signal-tracker `staging.sh` and `dev.sh` recipes
+13. AGENTS.md re-rendered with the real branching/deploy sections (and the inline squash recipe)
+14. End-to-end smoke: agent commits → manual squash → `ops/bot-squad-bin/deploy staging "smoke"` → tree-clean → recipe runs → staging URL reflects new build → TG ping received
 
 Each step gets tasks in the implementation plan with explicit acceptance criteria.
 

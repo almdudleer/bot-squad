@@ -25,8 +25,12 @@ def build_app() -> FastAPI:
     app.state.sock_path = sock_path
     app.state.heartbeat_path = data_dir / "_worker" / "heartbeat"
     app.state.jwt_secret = jwt_secret
+    app.state.cookie_secure = os.environ.get("COOKIE_SECURE", "1") == "1"
 
     app.include_router(health_router, prefix="/api")
+
+    from app.routes_auth import router as auth_router
+    app.include_router(auth_router, prefix="/api")
     return app
 
 

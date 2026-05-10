@@ -31,6 +31,9 @@ def build_app() -> FastAPI:
 
     from app.routes_auth import router as auth_router
     app.include_router(auth_router, prefix="/api")
+
+    from app.routes_projects import router as projects_router
+    app.include_router(projects_router, prefix="/api")
     return app
 
 

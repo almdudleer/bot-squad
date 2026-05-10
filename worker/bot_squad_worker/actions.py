@@ -7,6 +7,7 @@ actions on this allowlist with their declared parameter shapes.
 
 v1 ships `noop` (proof-of-life) and `tg_verify_login` (HMAC verification
 proxied from the API — the bot token lives only in the worker post spec #3).
+Spec #3 adds `tg_notify`.
 """
 from __future__ import annotations
 
@@ -37,6 +38,23 @@ def _get_config() -> Any:
     if _CONFIG is None:
         raise ActionError("worker config not initialised")
     return _CONFIG
+
+
+# ---------------------------------------------------------------------------
+# TgClient singleton — created lazily on first use.
+# Tests replace _TG or monkeypatch _get_tg_client directly.
+# ---------------------------------------------------------------------------
+
+_TG: Any = None  # TgClient | None
+
+
+def _get_tg_client(cfg: Any) -> Any:
+    """Return the module-level TgClient, creating it on first call."""
+    global _TG
+    if _TG is None:
+        from bot_squad_worker.tg import TgClient
+        _TG = TgClient(cfg)
+    return _TG
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +92,63 @@ def _action_tg_verify_login(params: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+_TG_NOTIFY_ALLOWED = {"slug", "chat_id", "message", "sid", "user"}
+
+
+def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
+    """Send a Telegram message, with optional SID prefix and debounce.
+
+    Params (all optional except ``message``):
+        message  : str  — required; the text to send
+        chat_id  : str  — explicit chat; takes precedence over slug
+        slug     : str  — project slug; resolved to tg_chat in projects.toml
+        sid      : str  — SID prefix component  (e.g. "S-almdudleer-claude-p5")
+        user     : str  — user prefix component
+
+    If neither ``chat_id`` nor ``slug`` is given, falls back to the first
+    project's tg_chat (there is usually only one project).  Unknown slug
+    raises ActionError.
+
+    Returns {ok: true, sent: <bool>}.
+    """
+    extra = set(params) - _TG_NOTIFY_ALLOWED
+    if extra:
+        raise ActionError(f"tg_notify got unexpected params: {sorted(extra)}")
+    if "message" not in params:
+        raise ActionError("tg_notify missing required param: message")
+
+    cfg = _get_config()
+
+    # --- resolve chat_id ---
+    chat_id: str | None = params.get("chat_id") or None
+    if not chat_id:
+        slug: str = params.get("slug") or ""
+        if slug:
+            project = cfg.projects.get(slug)
+            if project is None:
+                raise ActionError(f"tg_notify: unknown project slug {slug!r}")
+            chat_id = project.tg_chat
+        else:
+            # Fallback: first registered project's chat (single-project setups)
+            if cfg.projects:
+                chat_id = next(iter(cfg.projects.values())).tg_chat
+            else:
+                raise ActionError("tg_notify: no chat_id, no slug, and no projects configured")
+
+    tg = _get_tg_client(cfg)
+    sent = tg.send(
+        chat_id=chat_id,
+        text=params["message"],
+        sid=params.get("sid", ""),
+        user=params.get("user", ""),
+    )
+    return {"ok": True, "sent": sent}
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
+    "tg_notify": _action_tg_notify,
 }
 
 

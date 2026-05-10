@@ -35,6 +35,8 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         id="kick_stuck",
         replace_existing=True,
     )
+    # oauth_refresh: v1 placeholder — checks claude binary reachable.
+    # Full token-rotation port from cctv-backend deferred to a later spec.
     sched.add_job(
         oauth_refresh,
         "interval",

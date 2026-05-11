@@ -8,7 +8,14 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from bot_squad_worker.config import Config
-from bot_squad_worker.jobs import deploy_monitor, heartbeat, kick_stuck, oauth_refresh, tg_listener_tick
+from bot_squad_worker.jobs import (
+    autonomous_tick,
+    deploy_monitor,
+    heartbeat,
+    kick_stuck,
+    oauth_refresh,
+    tg_listener_tick,
+)
 
 if TYPE_CHECKING:
     pass
@@ -87,6 +94,15 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=30,
         args=[cfg],
         id="tg_listener",
+        replace_existing=True,
+    )
+    # autonomous_tick: run one orchestrator step per project (spec #8).
+    sched.add_job(
+        autonomous_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="autonomous_tick",
         replace_existing=True,
     )
 

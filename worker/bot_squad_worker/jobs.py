@@ -158,6 +158,21 @@ def tg_listener_tick(cfg: Config) -> None:
         log.exception("tg_listener_tick error")
 
 
+def autonomous_tick(cfg: Config) -> None:
+    """Run one orchestrator tick for every project that has autonomous mode enabled.
+
+    Scheduled every 60 seconds by APScheduler. Per-project exceptions are
+    caught and logged so one bad project doesn't kill the whole sweep.
+    """
+    from bot_squad_worker import autonomous as _auto
+
+    for slug in cfg.projects:
+        try:
+            _auto.tick(cfg, slug)
+        except Exception:
+            log.exception("autonomous_tick: unhandled error for project %s", slug)
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

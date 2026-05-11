@@ -202,12 +202,109 @@ def _action_kick_stuck_now(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "ran": True}
 
 
+# ---------------------------------------------------------------------------
+# Session management actions (spec #5)
+# ---------------------------------------------------------------------------
+
+_LIST_SESSIONS_REQUIRED = {"slug"}
+_LIST_SESSIONS_ALLOWED = _LIST_SESSIONS_REQUIRED
+
+
+def _action_list_sessions(params: dict[str, Any]) -> dict[str, Any]:
+    """List all Claude sessions for a project (active + paused).
+
+    Required params: slug
+    Returns: [{sid, status, window, cwd, started_at, last_prompt_at, claude_uuid, linked_tasks}]
+    """
+    extra = set(params) - _LIST_SESSIONS_ALLOWED
+    if extra:
+        raise ActionError(f"list_sessions got unexpected params: {sorted(extra)}")
+    missing = _LIST_SESSIONS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"list_sessions missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.list_sessions(cfg, params["slug"])
+
+
+_PAUSE_SESSION_REQUIRED = {"slug", "sid"}
+_PAUSE_SESSION_ALLOWED = _PAUSE_SESSION_REQUIRED
+
+
+def _action_pause_session(params: dict[str, Any]) -> dict[str, Any]:
+    """Pause a running Claude session.
+
+    Required params: slug, sid
+    Returns: {ok: true, paused: true}
+    """
+    extra = set(params) - _PAUSE_SESSION_ALLOWED
+    if extra:
+        raise ActionError(f"pause_session got unexpected params: {sorted(extra)}")
+    missing = _PAUSE_SESSION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"pause_session missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.pause(cfg, params["slug"], params["sid"])
+
+
+_RESUME_SESSION_REQUIRED = {"slug", "sid"}
+_RESUME_SESSION_ALLOWED = _RESUME_SESSION_REQUIRED
+
+
+def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
+    """Resume a paused Claude session.
+
+    Required params: slug, sid
+    Returns: {ok: true, sid: <new_sid>}
+    """
+    extra = set(params) - _RESUME_SESSION_ALLOWED
+    if extra:
+        raise ActionError(f"resume_session got unexpected params: {sorted(extra)}")
+    missing = _RESUME_SESSION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"resume_session missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.resume(cfg, params["slug"], params["sid"])
+
+
+_SPAWN_SESSION_REQUIRED = {"slug", "window"}
+_SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {"initial_prompt"}
+
+
+def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
+    """Spawn a new Claude session in the project's repo.
+
+    Required params: slug, window
+    Optional params: initial_prompt
+    Returns: {ok: true, sid: <new_sid>}
+    """
+    extra = set(params) - _SPAWN_SESSION_ALLOWED
+    if extra:
+        raise ActionError(f"spawn_session got unexpected params: {sorted(extra)}")
+    missing = _SPAWN_SESSION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"spawn_session missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.spawn(cfg, params["slug"], params["window"], params.get("initial_prompt"))
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
     "tg_notify": _action_tg_notify,
     "deploy": _action_deploy,
     "kick_stuck_now": _action_kick_stuck_now,
+    "list_sessions": _action_list_sessions,
+    "pause_session": _action_pause_session,
+    "resume_session": _action_resume_session,
+    "spawn_session": _action_spawn_session,
 }
 
 

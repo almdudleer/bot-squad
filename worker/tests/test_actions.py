@@ -41,8 +41,10 @@ def test_unknown_action_raises():
 
 def test_registry_lists_only_allowed_actions():
     # Closed allowlist — spec #3 phase 3 adds deploy + kick_stuck_now.
+    # spec #5 adds list_sessions, pause_session, resume_session, spawn_session.
     assert set(ACTION_REGISTRY.keys()) == {
-        "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now"
+        "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now",
+        "list_sessions", "pause_session", "resume_session", "spawn_session",
     }
 
 
@@ -332,3 +334,149 @@ def test_kick_stuck_now_rejects_params(tmp_config_dir, monkeypatch):
 
     with pytest.raises(ActionError, match="takes no params"):
         A.dispatch("kick_stuck_now", {"extra": "bad"})
+
+
+# ---------------------------------------------------------------------------
+# Session actions tests (spec #5)
+# ---------------------------------------------------------------------------
+
+
+def _make_sessions_cfg(tmp_path: Path, monkeypatch):
+    """Create a minimal config with test-project and inject it into actions."""
+    import types
+    import bot_squad_worker.actions as A
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.test-project]\n'
+        f'slug = "test-project"\n'
+        f'display_name = "Test Project"\n'
+        f'repo_path = "{repo}"\n'
+        f'deploy_branch = "agent_team/dev"\n'
+        f'master_branch = "master"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "0"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    data_dir = tmp_path / "data"
+    (data_dir / "test-project" / "sessions").mkdir(parents=True)
+    (data_dir / "test-project" / "backlog").mkdir(parents=True)
+
+    cfg = Config.load(cfg_dir)
+    patched = types.SimpleNamespace(
+        projects=cfg.projects,
+        data_dir=data_dir,
+        tg_bot_token=cfg.tg_bot_token,
+    )
+    monkeypatch.setattr(A, "_get_config", lambda: patched)
+    return patched, repo
+
+
+def test_list_sessions_action_dispatches(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "_run", lambda args, **kw: __import__("subprocess").CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    result = A.dispatch("list_sessions", {"slug": "test-project"})
+    assert isinstance(result, list)
+
+
+def test_list_sessions_action_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("list_sessions", {"slug": "test-project", "evil": "extra"})
+
+
+def test_list_sessions_action_requires_slug(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("list_sessions", {})
+
+
+def test_list_sessions_action_rejects_unknown_slug(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "_run", lambda args, **kw: __import__("subprocess").CompletedProcess(args, 0, "", ""))
+
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("list_sessions", {"slug": "no-such-project"})
+
+
+def test_pause_session_action_rejects_missing_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("pause_session", {"slug": "test-project"})  # missing sid
+
+
+def test_pause_session_action_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("pause_session", {"slug": "test-project", "sid": "S-x-p1", "evil": "x"})
+
+
+def test_resume_session_action_rejects_missing_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("resume_session", {"slug": "test-project"})  # missing sid
+
+
+def test_spawn_session_action_accepts_optional_prompt(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+
+    call_counts = {"list": 0}
+
+    def fake_run(args, **kw):
+        import subprocess as sp
+        if "list-panes" in args:
+            call_counts["list"] += 1
+            if call_counts["list"] > 1:
+                return sp.CompletedProcess(args, 0, f"%9|testwin|1111|{repo}|claude\n", "")
+            return sp.CompletedProcess(args, 0, "", "")
+        return sp.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = A.dispatch("spawn_session", {
+        "slug": "test-project",
+        "window": "testwin",
+        "initial_prompt": "hello from test",
+    })
+    assert result["ok"] is True
+    assert "sid" in result
+
+
+def test_spawn_session_action_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("spawn_session", {"slug": "test-project", "window": "w", "evil": "x"})

@@ -225,7 +225,8 @@ def _action_list_sessions(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     from bot_squad_worker import sessions as _sessions
-    return _sessions.list_sessions(cfg, params["slug"])
+    # Wrap in a dict so the FastAPI response (typed `-> dict`) validates.
+    return {"sessions": _sessions.list_sessions(cfg, params["slug"])}
 
 
 _PAUSE_SESSION_REQUIRED = {"slug", "sid"}

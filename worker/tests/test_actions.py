@@ -389,7 +389,9 @@ def test_list_sessions_action_dispatches(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
 
     result = A.dispatch("list_sessions", {"slug": "test-project"})
-    assert isinstance(result, list)
+    assert isinstance(result, dict)
+    assert "sessions" in result
+    assert isinstance(result["sessions"], list)
 
 
 def test_list_sessions_action_rejects_extra_params(tmp_path, monkeypatch):

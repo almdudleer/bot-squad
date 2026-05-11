@@ -43,11 +43,13 @@ def build_app() -> FastAPI:
     from app.routes_sessions import router as sessions_router
     from app.routes_runs import router as runs_router
     from app.routes_messages import router as messages_router
+    from app.routes_scheduler import router as scheduler_router
     app.include_router(vision_router, prefix="/api")
     app.include_router(feedback_router, prefix="/api")
     app.include_router(sessions_router, prefix="/api")
     app.include_router(runs_router, prefix="/api")
     app.include_router(messages_router, prefix="/api")
+    app.include_router(scheduler_router, prefix="/api")
 
     from app.routes_auth import require_auth
     from app.worker_client import WorkerClient, WorkerError

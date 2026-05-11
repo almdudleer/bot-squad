@@ -29,14 +29,40 @@ router = APIRouter(
 )
 
 
+def _get_claude_projects_dir() -> Path:
+    """Return the path to ~/.claude/projects.
+
+    Checks CLAUDE_PROJECTS_DIR env var first (useful in Docker); falls back to
+    the running user's home directory.
+    """
+    env_override = os.environ.get("CLAUDE_PROJECTS_DIR")
+    if env_override:
+        return Path(env_override)
+    return Path(os.path.expanduser("~")) / ".claude" / "projects"
+
+
+def _encode_repo_path(repo_path: Path) -> str:
+    """Encode a repo path to Claude's project directory naming convention.
+
+    Claude stores sessions under ~/.claude/projects/<encoded-cwd>/.
+    The encoding replaces every '/' and '_' with '-'.  The leading '-'
+    (from the leading '/') is kept as-is — do NOT strip it.
+
+    Example: /home/almdudleer/signal_tracker_mgmt
+          →  -home-almdudleer-signal-tracker-mgmt
+    """
+    s = str(repo_path)
+    return s.replace("/", "-").replace("_", "-")
+
+
 def _resolve_jsonl(repo_path: Path, claude_uuid: str) -> Path | None:
     """Resolve the .jsonl path for a given repo + claude UUID.
 
     Returns None if the path does not exist.
     """
-    user_home = Path(os.path.expanduser("~"))
-    encoded = str(repo_path).replace("/", "-").lstrip("-")
-    jsonl_path = user_home / ".claude" / "projects" / encoded / f"{claude_uuid}.jsonl"
+    projects_dir = _get_claude_projects_dir()
+    encoded = _encode_repo_path(repo_path)
+    jsonl_path = projects_dir / encoded / f"{claude_uuid}.jsonl"
     return jsonl_path if jsonl_path.exists() else None
 
 

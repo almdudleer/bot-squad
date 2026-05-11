@@ -14,6 +14,7 @@ from bot_squad_worker.jobs import (
     heartbeat,
     kick_stuck,
     oauth_refresh,
+    tg_listener_tick,
 )
 
 
@@ -317,3 +318,40 @@ def test_oauth_refresh_failure_pings_tg(
     assert len(fake_tg.calls) == 1
     assert "FAILED" in fake_tg.calls[0]["text"] or "failed" in fake_tg.calls[0]["text"].lower()
     assert "test failure" in fake_tg.calls[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# tg_listener_tick tests (spec #7)
+# ---------------------------------------------------------------------------
+
+
+def test_tg_listener_tick_calls_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tg_listener_tick(cfg) delegates to tg_listener.tick and does not raise."""
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    tick_calls: list[Any] = []
+
+    import bot_squad_worker.tg_listener as TGL
+    monkeypatch.setattr(TGL, "tick", lambda c: tick_calls.append(c) or {"ok": True, "polled": 0, "handled": 0, "max_update_id": 0})
+
+    tg_listener_tick(cfg)
+
+    assert len(tick_calls) == 1
+    assert tick_calls[0] is cfg
+
+
+def test_tg_listener_tick_swallows_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tg_listener_tick must not let exceptions propagate to APScheduler."""
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    import bot_squad_worker.tg_listener as TGL
+    monkeypatch.setattr(TGL, "tick", lambda c: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    # Should not raise
+    tg_listener_tick(cfg)

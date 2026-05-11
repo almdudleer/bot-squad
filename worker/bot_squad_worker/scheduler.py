@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from bot_squad_worker.config import Config
-from bot_squad_worker.jobs import deploy_monitor, heartbeat, kick_stuck, oauth_refresh
+from bot_squad_worker.jobs import deploy_monitor, heartbeat, kick_stuck, oauth_refresh, tg_listener_tick
 
 if TYPE_CHECKING:
     pass
@@ -78,6 +78,15 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         hours=6,
         args=[cfg],
         id="oauth_refresh",
+        replace_existing=True,
+    )
+    # tg_listener: poll Telegram for replies and route them into sessions (spec #7).
+    sched.add_job(
+        tg_listener_tick,
+        "interval",
+        seconds=30,
+        args=[cfg],
+        id="tg_listener",
         replace_existing=True,
     )
 

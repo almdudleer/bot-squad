@@ -136,6 +136,12 @@ export function Sessions() {
         </button>
       </div>
 
+      {/* TG reply hint (spec #7) */}
+      <div className="alert alert-info py-2 small mb-3">
+        💬 Tip: reply to a Telegram <code>[SID] needs your input</code> notification —
+        your reply lands in that session. Or use <code>/sessions</code>, <code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
+      </div>
+
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
       {actionError && (

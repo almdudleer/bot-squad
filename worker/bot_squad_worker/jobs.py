@@ -145,6 +145,19 @@ def _kick_stuck_project(
     tg.send(chat_id=chat_id, text=msg, sid="kick_stuck")  # type: ignore[attr-defined]
 
 
+def tg_listener_tick(cfg: Config) -> None:
+    """Poll Telegram for incoming replies and route them into sessions.
+
+    Scheduled every 30s by APScheduler. Errors are caught and logged so
+    one bad update cycle never kills the scheduler.
+    """
+    from bot_squad_worker import tg_listener
+    try:
+        tg_listener.tick(cfg)
+    except Exception:
+        log.exception("tg_listener_tick error")
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

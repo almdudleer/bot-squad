@@ -38,7 +38,6 @@ export function Feedback() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
-  /** Extract the first H1 line from markdown content as a fallback title */
   function extractTitle(content: string, fallbackName: string): string {
     const match = content.match(/^#\s+(.+)$/m);
     return match ? match[1].trim() : fallbackName.replace(/\.md$/, "").replace(/[-_]/g, " ");
@@ -95,26 +94,50 @@ export function Feedback() {
   }
 
   return (
-    <div className="container py-4">
-      <nav className="mb-3">
+    <div className="container py-4" style={{ maxWidth: "860px" }}>
+      <nav className="mc-breadcrumb">
         <Link to={`/p/${slug}`}>← Board</Link>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Feedback</span>
       </nav>
-      <h2>Feedback — {slug}</h2>
+
+      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1.5rem" }}>
+        Feedback
+        <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
+      </h2>
+
       {error && <div className="alert alert-danger">{error}</div>}
-      {files === null && !error && <p>Loading…</p>}
+      {files === null && !error && <div className="mc-loading">Loading</div>}
+
       {files?.map((f) => (
         <section key={f.name} className="mb-4">
-          <div className="d-flex justify-content-between align-items-center mb-1">
-            <h5 className="text-muted small mb-0">{f.name}</h5>
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <div
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.72rem",
+                color: "var(--mc-text-dim)",
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+              }}
+            >
+              {f.name}
+            </div>
             <div className="d-flex gap-2">
               {editing?.name !== f.name && (
-                <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => startEdit(f)}>
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  style={{ fontSize: "0.72rem" }}
+                  onClick={() => startEdit(f)}
+                >
                   Edit
                 </button>
               )}
               <button
                 type="button"
-                className="btn btn-sm btn-outline-primary"
+                className="btn btn-outline-primary btn-sm"
+                style={{ fontSize: "0.72rem" }}
                 onClick={() => openPromote(f)}
               >
                 Promote to task
@@ -141,9 +164,7 @@ export function Feedback() {
               </div>
             </>
           ) : (
-            <pre className="bg-light p-3 small" style={{ whiteSpace: "pre-wrap" }}>
-              {f.content}
-            </pre>
+            <pre className="mc-pre">{f.content}</pre>
           )}
         </section>
       ))}

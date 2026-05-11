@@ -2,10 +2,6 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, RunRow } from "../api";
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
-
 export function RunLog() {
   const { slug = "", id = "" } = useParams();
   const [log, setLog] = useState<string | null>(null);
@@ -15,13 +11,11 @@ export function RunLog() {
   const [isFull, setIsFull] = useState(false);
 
   useEffect(() => {
-    // Load run metadata (from runs list, filter by id)
     api.runs(slug, 500).then((rows) => {
       const found = rows.find((r) => r.id === id) ?? null;
       setRun(found);
     }).catch(() => {/* best-effort */});
 
-    // Load log content
     api.runLog(slug, id)
       .then((text) => setLog(text))
       .catch((e: unknown) => setError(String(e)));
@@ -40,7 +34,7 @@ export function RunLog() {
     }
   }
 
-  const duration = (() => {
+  const dur = (() => {
     if (!run?.started_at || !run?.ended_at) return null;
     const s = Date.parse(run.started_at);
     const e = Date.parse(run.ended_at);
@@ -51,39 +45,51 @@ export function RunLog() {
     return `${Math.floor(diff / 60)}m ${diff % 60}s`;
   })();
 
+  const statusCls = !run ? "" :
+    run.status === "ok" ? "mc-badge-ok" :
+    run.status === "fail" ? "mc-badge-danger" :
+    run.status === "processing" ? "mc-badge-warn" :
+    "mc-badge-dim";
+
+  const targetCls = !run ? "" :
+    run.target === "staging" ? "mc-badge-info" :
+    run.target === "prod" ? "mc-badge-danger" :
+    "mc-badge-dim";
+
   return (
     <div className="container-fluid py-4">
       {/* Breadcrumb */}
-      <nav className="mb-3 small">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
-        <Link to={`/p/${slug}`}>Backlog</Link>
-        <span className="mx-2 text-muted">|</span>
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
+        <Link to={`/p/${slug}`}>{slug}</Link>
+        <span className="mc-bc-sep">/</span>
         <Link to={`/p/${slug}/runs`}>Runs</Link>
-        <span className="mx-2 text-muted">|</span>
-        <code style={{ fontSize: "0.8rem" }}>{id.slice(0, 8)}</code>
+        <span className="mc-bc-sep">/</span>
+        <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-mid)" }}>
+          {id.slice(0, 8)}
+        </code>
       </nav>
 
       {/* Header */}
-      <div className="d-flex flex-wrap gap-3 align-items-center mb-3">
-        <h2 className="mb-0" style={{ fontFamily: "monospace", fontSize: "1.1rem" }}>
+      <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
+        <code
+          style={{
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.82rem",
+            color: "var(--mc-text-mid)",
+          }}
+        >
           {id}
-        </h2>
+        </code>
         {run && (
           <>
-            <span className={`badge ${
-              run.target === "staging" ? "bg-info text-dark"
-              : run.target === "prod" ? "bg-danger"
-              : "bg-light text-dark border"
-            }`}>{run.target}</span>
-            <span className={`badge ${
-              run.status === "ok" ? "bg-success"
-              : run.status === "fail" ? "bg-danger"
-              : run.status === "processing" ? "bg-warning text-dark"
-              : "bg-secondary"
-            }`}>{run.status}</span>
-            {duration && (
-              <span className="text-muted small">Duration: {duration}</span>
+            <span className={`mc-badge ${targetCls}`}>{run.target}</span>
+            <span className={`mc-badge ${statusCls}`}>{run.status}</span>
+            {dur && (
+              <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
+                {dur}
+              </span>
             )}
           </>
         )}
@@ -94,15 +100,18 @@ export function RunLog() {
 
       {/* Log not loaded yet */}
       {log === null && !error && (
-        <p className="text-muted">Loading log…</p>
+        <div className="mc-loading">Loading log</div>
       )}
 
       {/* Log content */}
       {log !== null && (
         <>
           {!isFull && log.length >= 2 * 1024 * 1024 - 100 && (
-            <div className="alert alert-warning d-flex justify-content-between align-items-center py-2 px-3 mb-2" style={{ fontSize: "0.85rem" }}>
-              <span>Log is truncated to 2 MB.</span>
+            <div
+              className="alert alert-warning d-flex justify-content-between align-items-center py-2 px-3 mb-2"
+              style={{ fontSize: "0.82rem" }}
+            >
+              <span>Log truncated to 2 MB.</span>
               <button
                 type="button"
                 className="btn btn-sm btn-outline-warning ms-3"
@@ -113,16 +122,7 @@ export function RunLog() {
               </button>
             </div>
           )}
-          <pre
-            className="bg-dark text-light rounded p-3"
-            style={{
-              fontSize: "0.8rem",
-              maxHeight: "80vh",
-              overflowY: "auto",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-all",
-            }}
-          >{log || "(empty log)"}</pre>
+          <pre className="mc-log">{log || "(empty log)"}</pre>
         </>
       )}
     </div>

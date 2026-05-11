@@ -11,23 +11,32 @@ import { RunLog } from "./pages/RunLog";
 import { Messages } from "./pages/Messages";
 import { Scheduler } from "./pages/Scheduler";
 import { Autonomous } from "./pages/Autonomous";
+import { Help } from "./pages/Help";
+import { Shell } from "./components/Shell";
 
 export function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Public routes — no shell header */}
         <Route path="/login" element={<Login />} />
-        <Route path="/" element={<Picker />} />
-        <Route path="/p/:slug" element={<Project />} />
-        <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
-        <Route path="/p/:slug/vision" element={<Vision />} />
-        <Route path="/p/:slug/feedback" element={<Feedback />} />
-        <Route path="/p/:slug/sessions" element={<Sessions />} />
-        <Route path="/p/:slug/runs" element={<Runs />} />
-        <Route path="/p/:slug/runs/:id" element={<RunLog />} />
-        <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />
-        <Route path="/p/:slug/autonomous" element={<Autonomous />} />
-        <Route path="/scheduler" element={<Scheduler />} />
+        <Route path="/help" element={<Help />} />
+
+        {/* Authenticated routes — wrapped in Shell (sticky header) */}
+        <Route element={<Shell />}>
+          <Route path="/" element={<Picker />} />
+          <Route path="/p/:slug" element={<Project />} />
+          <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
+          <Route path="/p/:slug/vision" element={<Vision />} />
+          <Route path="/p/:slug/feedback" element={<Feedback />} />
+          <Route path="/p/:slug/sessions" element={<Sessions />} />
+          <Route path="/p/:slug/runs" element={<Runs />} />
+          <Route path="/p/:slug/runs/:id" element={<RunLog />} />
+          <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />
+          <Route path="/p/:slug/autonomous" element={<Autonomous />} />
+          <Route path="/scheduler" element={<Scheduler />} />
+        </Route>
+
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>

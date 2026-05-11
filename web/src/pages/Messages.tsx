@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, MessageRecord } from "../api";
 
 // ---------------------------------------------------------------------------
-// Tool use card — collapsed by default
+// Tool use card
 // ---------------------------------------------------------------------------
 
 function ToolUseCard({
@@ -20,18 +20,40 @@ function ToolUseCard({
     <div className="mb-1">
       <button
         type="button"
-        className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1"
-        style={{ fontSize: "0.75rem" }}
+        style={{
+          background: "var(--mc-surface)",
+          border: "1px solid var(--mc-border-mid)",
+          borderRadius: "2px",
+          padding: "2px 8px",
+          fontSize: "0.72rem",
+          fontFamily: "var(--mc-mono)",
+          color: "var(--mc-text-dim)",
+          cursor: "pointer",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "0.35rem",
+        }}
         onClick={() => setOpen((v) => !v)}
       >
-        <span style={{ fontFamily: "monospace" }}>{name}</span>
-        <span className="text-muted" style={{ fontSize: "0.65rem" }}>({tuId.slice(0, 8)})</span>
+        <span>{name}</span>
+        <span style={{ opacity: 0.5, fontSize: "0.65rem" }}>({tuId.slice(0, 8)})</span>
         <span>{open ? "▾" : "▸"}</span>
       </button>
       {open && (
         <pre
-          className="bg-light border rounded p-2 mt-1 mb-0"
-          style={{ fontSize: "0.72rem", maxHeight: "12rem", overflowY: "auto" }}
+          style={{
+            background: "var(--mc-surface-raised)",
+            border: "1px solid var(--mc-border)",
+            borderRadius: "2px",
+            padding: "0.5rem 0.75rem",
+            fontSize: "0.7rem",
+            fontFamily: "var(--mc-mono)",
+            maxHeight: "12rem",
+            overflowY: "auto",
+            marginTop: "0.25rem",
+            marginBottom: 0,
+            color: "var(--mc-text-mid)",
+          }}
         >
           {JSON.stringify(input, null, 2)}
         </pre>
@@ -41,7 +63,7 @@ function ToolUseCard({
 }
 
 // ---------------------------------------------------------------------------
-// Tool result card — collapsed by default
+// Tool result card
 // ---------------------------------------------------------------------------
 
 function ToolResultCard({ output, toolUseId }: { output: string; toolUseId: string }) {
@@ -50,18 +72,40 @@ function ToolResultCard({ output, toolUseId }: { output: string; toolUseId: stri
     <div className="mb-1">
       <button
         type="button"
-        className="btn btn-outline-info btn-sm d-flex align-items-center gap-1"
-        style={{ fontSize: "0.75rem" }}
+        style={{
+          background: "var(--mc-surface)",
+          border: "1px solid var(--mc-accent-dim)",
+          borderRadius: "2px",
+          padding: "2px 8px",
+          fontSize: "0.72rem",
+          fontFamily: "var(--mc-mono)",
+          color: "var(--mc-accent-dim)",
+          cursor: "pointer",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "0.35rem",
+        }}
         onClick={() => setOpen((v) => !v)}
       >
         <span>tool result</span>
-        <span className="text-muted" style={{ fontSize: "0.65rem" }}>({toolUseId.slice(0, 8)})</span>
+        <span style={{ opacity: 0.6, fontSize: "0.65rem" }}>({toolUseId.slice(0, 8)})</span>
         <span>{open ? "▾" : "▸"}</span>
       </button>
       {open && (
         <pre
-          className="bg-light border rounded p-2 mt-1 mb-0"
-          style={{ fontSize: "0.72rem", maxHeight: "16rem", overflowY: "auto" }}
+          style={{
+            background: "var(--mc-surface-raised)",
+            border: "1px solid var(--mc-border)",
+            borderRadius: "2px",
+            padding: "0.5rem 0.75rem",
+            fontSize: "0.7rem",
+            fontFamily: "var(--mc-mono)",
+            maxHeight: "16rem",
+            overflowY: "auto",
+            marginTop: "0.25rem",
+            marginBottom: 0,
+            color: "var(--mc-text-mid)",
+          }}
         >
           {output || "(empty)"}
         </pre>
@@ -71,7 +115,7 @@ function ToolResultCard({ output, toolUseId }: { output: string; toolUseId: stri
 }
 
 // ---------------------------------------------------------------------------
-// Single message bubble
+// Message bubble
 // ---------------------------------------------------------------------------
 
 function MessageBubble({ msg }: { msg: MessageRecord }) {
@@ -79,7 +123,9 @@ function MessageBubble({ msg }: { msg: MessageRecord }) {
   const isAssistant = msg.role === "assistant";
   const isTool = msg.role === "tool";
 
-  const ts = msg.ts ? new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const ts = msg.ts
+    ? new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
 
   if (isTool) {
     return (
@@ -89,25 +135,20 @@ function MessageBubble({ msg }: { msg: MessageRecord }) {
             output={msg.tool_result?.output ?? msg.text}
             toolUseId={msg.tool_result?.tool_use_id ?? ""}
           />
-          {ts && <div className="text-muted" style={{ fontSize: "0.65rem" }}>{ts}</div>}
+          {ts && (
+            <div style={{ fontFamily: "var(--mc-mono)", fontSize: "0.62rem", color: "var(--mc-text-dim)", marginTop: "0.2rem" }}>
+              {ts}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
   return (
-    <div
-      className={`d-flex mb-3 ${isUser ? "justify-content-end" : "justify-content-start"}`}
-    >
+    <div className={`d-flex mb-3 ${isUser ? "justify-content-end" : "justify-content-start"}`}>
       <div style={{ maxWidth: "80%" }}>
-        <div
-          className={`rounded-3 px-3 py-2 ${
-            isUser
-              ? "bg-primary text-white"
-              : "bg-light border"
-          }`}
-          style={{ fontSize: "0.875rem", lineHeight: "1.5" }}
-        >
+        <div className={isUser ? "mc-msg-user" : "mc-msg-assistant"}>
           {/* Tool uses (assistant) */}
           {isAssistant && msg.tool_uses && msg.tool_uses.length > 0 && (
             <div className="mb-2">
@@ -124,15 +165,16 @@ function MessageBubble({ msg }: { msg: MessageRecord }) {
             </div>
           )}
 
-          {/* Empty assistant message (just tool use) */}
+          {/* Empty assistant message */}
           {isAssistant && !msg.text?.trim() && (!msg.tool_uses || msg.tool_uses.length === 0) && (
-            <span className="text-muted fst-italic" style={{ fontSize: "0.8rem" }}>(no text)</span>
+            <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic", fontSize: "0.78rem" }}>
+              (no text)
+            </span>
           )}
         </div>
         {ts && (
           <div
-            className={`mt-1 text-muted ${isUser ? "text-end" : ""}`}
-            style={{ fontSize: "0.65rem" }}
+            className={`mc-msg-role mt-1 ${isUser ? "text-end" : ""}`}
           >
             {msg.role} · {ts}
           </div>
@@ -162,7 +204,6 @@ export function Messages() {
         setMessages(rows);
         setHasMore(rows.length >= limit);
         setError(null);
-        // Auto-scroll to bottom on first load
         setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
       })
       .catch((e: unknown) => setError(String(e)));
@@ -189,27 +230,26 @@ export function Messages() {
   return (
     <div className="container py-4">
       {/* Breadcrumb */}
-      <nav className="mb-3 small">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
-        <Link to={`/p/${slug}`}>Backlog</Link>
-        <span className="mx-2 text-muted">|</span>
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
+        <Link to={`/p/${slug}`}>{slug}</Link>
+        <span className="mc-bc-sep">/</span>
         <Link to={`/p/${slug}/sessions`}>Sessions</Link>
-        <span className="mx-2 text-muted">|</span>
-        Messages
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Messages</span>
       </nav>
 
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
-        <h2 className="mb-0" style={{ fontSize: "1.2rem" }}>
-          Session transcript
-          <code
-            className="ms-2 text-muted fw-normal"
-            style={{ fontSize: "0.8rem" }}
-          >
+        <div>
+          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.15rem" }}>
+            Session transcript
+          </div>
+          <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
             {claude_uuid}
           </code>
-        </h2>
+        </div>
         <button
           type="button"
           className="btn btn-outline-secondary btn-sm"
@@ -224,7 +264,7 @@ export function Messages() {
         <div className="alert alert-danger">
           {error}
           {error.includes("session log not found") && (
-            <div className="mt-1 small text-muted">
+            <div className="mt-1" style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
               The session log file may not exist yet or may belong to a different user.
             </div>
           )}
@@ -233,14 +273,15 @@ export function Messages() {
 
       {/* Loading */}
       {messages === null && !error && (
-        <p className="text-muted">Loading transcript…</p>
+        <div className="mc-loading">Loading transcript</div>
       )}
 
       {/* Empty state */}
       {messages !== null && messages.length === 0 && (
-        <div className="text-center py-5">
-          <p className="text-muted fs-5">No messages in this session yet.</p>
-          <p className="text-muted small">Messages appear here once the Claude session exchanges data.</p>
+        <div className="mc-empty">
+          <div className="mc-empty-icon">◯</div>
+          <div>No messages in this session yet.</div>
+          <div style={{ fontSize: "0.75rem", marginTop: "0.3rem" }}>Messages appear once the Claude session exchanges data.</div>
         </div>
       )}
 

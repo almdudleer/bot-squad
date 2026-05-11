@@ -34,87 +34,146 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
 
   return (
     <div
-      className="card mb-2 task-card"
-      style={{ cursor: "pointer" }}
+      className="mc-task-card"
       onClick={() => navigate(`/p/${slug}/t/${task.id}`)}
     >
-      <div className="card-body p-2 position-relative">
-        <div className="d-flex justify-content-between align-items-start">
-          <div className="small text-muted">{task.id}</div>
-          <div data-no-nav onClick={(e) => e.stopPropagation()} className="position-relative">
-            <button
-              type="button"
-              className="btn btn-sm btn-link text-muted p-0 lh-1"
-              style={{ fontSize: "1.2rem" }}
-              onClick={() => setMenuOpen((v) => !v)}
-              onBlur={() => setTimeout(() => setMenuOpen(false), 150)}
+      <div className="d-flex justify-content-between align-items-start">
+        <div className="mc-task-id">{task.id}</div>
+        <div
+          data-no-nav
+          onClick={(e) => e.stopPropagation()}
+          style={{ position: "relative" }}
+        >
+          <button
+            type="button"
+            style={{
+              background: "none",
+              border: "none",
+              padding: "0 0.1rem",
+              cursor: "pointer",
+              color: "var(--mc-text-dim)",
+              fontSize: "1rem",
+              lineHeight: 1,
+            }}
+            onClick={() => setMenuOpen((v) => !v)}
+            onBlur={() => setTimeout(() => setMenuOpen(false), 150)}
+          >
+            ⋯
+          </button>
+          {menuOpen && (
+            <div
+              style={{
+                position: "absolute",
+                right: 0,
+                top: "100%",
+                zIndex: 1050,
+                minWidth: "160px",
+                background: "var(--mc-surface-raised)",
+                border: "1px solid var(--mc-border-mid)",
+                borderRadius: "3px",
+                boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+              }}
             >
-              ⋯
-            </button>
-            {menuOpen && (
               <div
-                className="card border shadow-sm position-absolute end-0"
-                style={{ zIndex: 1050, minWidth: "160px", top: "100%" }}
+                style={{
+                  fontSize: "0.65rem",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.07em",
+                  color: "var(--mc-text-dim)",
+                  padding: "0.4rem 0.625rem",
+                  borderBottom: "1px solid var(--mc-border)",
+                }}
               >
-                <div className="card-body p-1">
-                  <div className="small text-muted px-2 py-1">Change status</div>
-                  {STATUS_OPTIONS.filter((s) => s.value !== task.status).map((s) => (
-                    <button
-                      key={s.value}
-                      type="button"
-                      className="btn btn-sm btn-light w-100 text-start px-2 py-1"
-                      onMouseDown={() => {
-                        setMenuOpen(false);
-                        onMenuAction(task, { kind: "status", status: s.value });
-                      }}
-                    >
-                      → {s.label}
-                    </button>
-                  ))}
-                  <hr className="my-1" />
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-light w-100 text-start px-2 py-1"
-                    onMouseDown={() => {
-                      setMenuOpen(false);
-                      onMenuAction(task, { kind: "editBody" });
-                    }}
-                  >
-                    Edit body
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-light w-100 text-start px-2 py-1"
-                    onMouseDown={() => {
-                      setMenuOpen(false);
-                      onMenuAction(task, { kind: "addComment" });
-                    }}
-                  >
-                    Add comment
-                  </button>
-                  <hr className="my-1" />
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-danger w-100 text-start px-2 py-1"
-                    onMouseDown={() => {
-                      setMenuOpen(false);
-                      onMenuAction(task, { kind: "delete" });
-                    }}
-                  >
-                    Delete
-                  </button>
-                </div>
+                Change status
               </div>
-            )}
-          </div>
-        </div>
-        <div className="fw-medium mt-1">{task.title}</div>
-        <div className="d-flex gap-2 mt-1 align-items-center">
-          {updated && <span className="small text-muted">{updated}</span>}
-          {commentCount > 0 && (
-            <span className="badge bg-secondary rounded-pill small">{commentCount}</span>
+              {STATUS_OPTIONS.filter((s) => s.value !== task.status).map((s) => (
+                <button
+                  key={s.value}
+                  type="button"
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    background: "none",
+                    border: "none",
+                    padding: "0.3rem 0.625rem",
+                    fontSize: "0.78rem",
+                    color: "var(--mc-text-mid)",
+                    cursor: "pointer",
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = "var(--mc-text)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = "var(--mc-text-mid)")}
+                  onMouseDown={() => {
+                    setMenuOpen(false);
+                    onMenuAction(task, { kind: "status", status: s.value });
+                  }}
+                >
+                  → {s.label}
+                </button>
+              ))}
+              <div style={{ borderTop: "1px solid var(--mc-border)", margin: "0.2rem 0" }} />
+              {(["editBody", "addComment"] as const).map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    background: "none",
+                    border: "none",
+                    padding: "0.3rem 0.625rem",
+                    fontSize: "0.78rem",
+                    color: "var(--mc-text-mid)",
+                    cursor: "pointer",
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = "var(--mc-text)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = "var(--mc-text-mid)")}
+                  onMouseDown={() => { setMenuOpen(false); onMenuAction(task, { kind }); }}
+                >
+                  {kind === "editBody" ? "Edit body" : "Add comment"}
+                </button>
+              ))}
+              <div style={{ borderTop: "1px solid var(--mc-border)", margin: "0.2rem 0" }} />
+              <button
+                type="button"
+                style={{
+                  display: "block",
+                  width: "100%",
+                  textAlign: "left",
+                  background: "none",
+                  border: "none",
+                  padding: "0.3rem 0.625rem",
+                  fontSize: "0.78rem",
+                  color: "var(--mc-accent-danger)",
+                  cursor: "pointer",
+                }}
+                onMouseDown={() => { setMenuOpen(false); onMenuAction(task, { kind: "delete" }); }}
+              >
+                Delete
+              </button>
+            </div>
           )}
         </div>
+      </div>
+      <div className="mc-task-title">{task.title}</div>
+      <div className="mc-task-meta">
+        {updated && <span>{updated}</span>}
+        {commentCount > 0 && (
+          <span
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.65rem",
+              color: "var(--mc-text-dim)",
+              background: "var(--mc-surface-raised)",
+              border: "1px solid var(--mc-border)",
+              borderRadius: "2px",
+              padding: "0 4px",
+            }}
+          >
+            {commentCount} comments
+          </span>
+        )}
       </div>
     </div>
   );

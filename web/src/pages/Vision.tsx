@@ -76,24 +76,51 @@ export function Vision() {
   }
 
   return (
-    <div className="container py-4">
-      <nav className="mb-3">
+    <div className="container py-4" style={{ maxWidth: "860px" }}>
+      <nav className="mc-breadcrumb">
         <Link to={`/p/${slug}`}>← Board</Link>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Vision</span>
       </nav>
-      <div className="d-flex justify-content-between align-items-center mb-3">
-        <h2>Vision — {slug}</h2>
-        <button type="button" className="btn btn-sm btn-primary" onClick={() => { setShowNew(true); setNewError(null); }}>
+
+      <div className="d-flex justify-content-between align-items-center mb-4">
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
+          Vision
+          <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
+        </h2>
+        <button
+          type="button"
+          className="btn btn-primary btn-sm"
+          onClick={() => { setShowNew(true); setNewError(null); }}
+        >
           + New initiative
         </button>
       </div>
+
       {error && <div className="alert alert-danger">{error}</div>}
-      {files === null && !error && <p>Loading…</p>}
+      {files === null && !error && <div className="mc-loading">Loading</div>}
+
       {files?.map((f) => (
         <section key={f.name} className="mb-4">
-          <div className="d-flex justify-content-between align-items-center mb-1">
-            <h5 className="text-muted small mb-0">{f.name}</h5>
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <div
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.72rem",
+                color: "var(--mc-text-dim)",
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+              }}
+            >
+              {f.name}
+            </div>
             {editing?.name !== f.name && (
-              <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => startEdit(f)}>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                style={{ fontSize: "0.72rem" }}
+                onClick={() => startEdit(f)}
+              >
                 Edit
               </button>
             )}
@@ -118,9 +145,7 @@ export function Vision() {
               </div>
             </>
           ) : (
-            <pre className="bg-light p-3 small" style={{ whiteSpace: "pre-wrap" }}>
-              {f.content}
-            </pre>
+            <pre className="mc-pre">{f.content}</pre>
           )}
         </section>
       ))}

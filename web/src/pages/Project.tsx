@@ -145,30 +145,35 @@ export function Project() {
 
   return (
     <div className="container py-4">
-      <nav className="mb-3">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">{slug}</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/vision`}>Vision</Link>
-        <span className="mx-2 text-muted">|</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/feedback`}>Feedback</Link>
-        <span className="mx-2 text-muted">|</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/sessions`}>Sessions</Link>
-        <span className="mx-2 text-muted">|</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/runs`}>Runs</Link>
-        <span className="mx-2 text-muted">|</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/autonomous`}>Autonomous</Link>
-        <span className="mx-2 text-muted">|</span>
+        <span className="mc-bc-sep">·</span>
         <Link to="/scheduler">Scheduler</Link>
       </nav>
-      <div className="d-flex justify-content-between align-items-center">
-        <h2>{slug}</h2>
+
+      <div className="d-flex justify-content-between align-items-center mb-3">
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Backlog</h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>
           + New task
         </button>
       </div>
+
       {error && <div className="alert alert-danger mt-2">{error}</div>}
-      {tasks === null && !error && <p>Loading…</p>}
-      <div className="row g-3 mt-3">
+      {tasks === null && !error && <div className="mc-loading">Loading</div>}
+
+      <div className="row g-3 mt-1">
         {COLUMNS.map((c) => (
           <BoardColumn
             key={c}

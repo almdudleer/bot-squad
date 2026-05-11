@@ -9,7 +9,6 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "closed", label: "Closed" },
 ];
 
-/** Split body into "above comments" and "comment blocks" */
 function parseComments(body: string): { preamble: string; comments: { heading: string; text: string }[] } {
   const commentsIdx = body.indexOf("\n## Comments");
   if (commentsIdx === -1) {
@@ -17,17 +16,13 @@ function parseComments(body: string): { preamble: string; comments: { heading: s
   }
   const preamble = body.slice(0, commentsIdx).trim();
   const commentsSection = body.slice(commentsIdx + 1);
-
-  // Split by ### headings
   const parts = commentsSection.split(/\n(?=### )/);
-  // first part is "## Comments" header itself — skip
   const commentBlocks = parts.slice(1).map((block) => {
     const nl = block.indexOf("\n");
     return nl === -1
       ? { heading: block.trim(), text: "" }
       : { heading: block.slice(0, nl).replace(/^### /, ""), text: block.slice(nl + 1).trim() };
   });
-
   return { preamble, comments: commentBlocks };
 }
 
@@ -39,19 +34,15 @@ export function TaskDetail() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  // title edit
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleValue, setTitleValue] = useState("");
   const titleRef = useRef<HTMLInputElement>(null);
 
-  // status
   const [statusValue, setStatusValue] = useState<Task["status"]>("open");
 
-  // body edit
   const [editingBody, setEditingBody] = useState(false);
   const [bodyValue, setBodyValue] = useState("");
 
-  // comment
   const [commentText, setCommentText] = useState("");
   const [commentError, setCommentError] = useState<string | null>(null);
   const [commentSaving, setCommentSaving] = useState(false);
@@ -155,7 +146,9 @@ export function TaskDetail() {
   if (error) {
     return (
       <div className="container py-4">
-        <nav className="mb-3"><Link to={`/p/${slug}`}>← Board</Link></nav>
+        <nav className="mc-breadcrumb">
+          <Link to={`/p/${slug}`}>← Board</Link>
+        </nav>
         <div className="alert alert-danger">{error}</div>
       </div>
     );
@@ -164,8 +157,10 @@ export function TaskDetail() {
   if (!task) {
     return (
       <div className="container py-4">
-        <nav className="mb-3"><Link to={`/p/${slug}`}>← Board</Link></nav>
-        <p>Loading…</p>
+        <nav className="mc-breadcrumb">
+          <Link to={`/p/${slug}`}>← Board</Link>
+        </nav>
+        <div className="mc-loading">Loading</div>
       </div>
     );
   }
@@ -174,8 +169,12 @@ export function TaskDetail() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "800px" }}>
-      <nav className="mb-3">
+      <nav className="mc-breadcrumb">
         <Link to={`/p/${slug}`}>← Board</Link>
+        <span className="mc-bc-sep">/</span>
+        <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+          {task.id}
+        </code>
       </nav>
 
       {actionError && <div className="alert alert-danger">{actionError}</div>}
@@ -183,21 +182,29 @@ export function TaskDetail() {
       {/* Title + status row */}
       <div className="d-flex align-items-start gap-3 mb-3">
         <div className="flex-grow-1">
-          <div className="text-muted small mb-1">{task.id}</div>
           {editingTitle ? (
             <input
               ref={titleRef}
-              className="form-control fw-semibold fs-4"
+              className="form-control fw-semibold"
+              style={{ fontSize: "1.05rem" }}
               value={titleValue}
               onChange={(e) => setTitleValue(e.target.value)}
               onBlur={saveTitle}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveTitle(); } if (e.key === "Escape") { setEditingTitle(false); setTitleValue(task.title); } }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); saveTitle(); }
+                if (e.key === "Escape") { setEditingTitle(false); setTitleValue(task.title); }
+              }}
               disabled={saving}
             />
           ) : (
             <h4
-              className="mb-0"
-              style={{ cursor: "text" }}
+              style={{
+                cursor: "text",
+                marginBottom: 0,
+                fontSize: "1.05rem",
+                fontWeight: 600,
+                color: "var(--mc-text)",
+              }}
               title="Click to edit title"
               onClick={() => setEditingTitle(true)}
             >
@@ -221,10 +228,15 @@ export function TaskDetail() {
 
       {/* Body */}
       <div className="mb-4">
-        <div className="d-flex justify-content-between align-items-center mb-1">
-          <span className="text-muted small fw-semibold text-uppercase">Body</span>
+        <div className="d-flex justify-content-between align-items-center mb-2">
+          <div className="mc-section-title" style={{ margin: 0 }}>Body</div>
           {!editingBody && (
-            <button type="button" className="btn btn-sm btn-outline-secondary" onClick={() => { setBodyValue(task.body); setEditingBody(true); }}>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              style={{ fontSize: "0.72rem" }}
+              onClick={() => { setBodyValue(task.body); setEditingBody(true); }}
+            >
               Edit
             </button>
           )}
@@ -242,26 +254,61 @@ export function TaskDetail() {
               <button type="button" className="btn btn-primary btn-sm" onClick={saveBody} disabled={saving}>
                 {saving ? "Saving…" : "Save"}
               </button>
-              <button type="button" className="btn btn-secondary btn-sm" onClick={() => { setEditingBody(false); setBodyValue(task.body); }}>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => { setEditingBody(false); setBodyValue(task.body); }}
+              >
                 Cancel
               </button>
             </div>
           </>
         ) : (
-          <pre className="bg-light p-3 small" style={{ whiteSpace: "pre-wrap" }}>
-            {preamble || <span className="text-muted">(no body)</span>}
+          <pre className="mc-pre">
+            {preamble || <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic" }}>(no body)</span>}
           </pre>
         )}
       </div>
 
       {/* Comments */}
       <div className="mb-4">
-        <h6 className="text-muted text-uppercase small">Comments ({comments.length})</h6>
-        {comments.length === 0 && <p className="small text-muted">No comments yet.</p>}
+        <div className="mc-section-title">Comments ({comments.length})</div>
+        {comments.length === 0 && (
+          <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>No comments yet.</p>
+        )}
         {comments.map((c, i) => (
-          <div key={i} className="border rounded p-3 mb-2 bg-white">
-            <div className="small text-muted fw-semibold mb-1">{c.heading}</div>
-            <pre className="mb-0 small" style={{ whiteSpace: "pre-wrap" }}>{c.text}</pre>
+          <div
+            key={i}
+            style={{
+              background: "var(--mc-surface-raised)",
+              border: "1px solid var(--mc-border)",
+              borderLeft: "2px solid var(--mc-border-mid)",
+              borderRadius: "3px",
+              padding: "0.625rem 0.75rem",
+              marginBottom: "0.5rem",
+            }}
+          >
+            <div
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.7rem",
+                color: "var(--mc-text-dim)",
+                marginBottom: "0.3rem",
+              }}
+            >
+              {c.heading}
+            </div>
+            <pre
+              style={{
+                margin: 0,
+                fontSize: "0.8rem",
+                whiteSpace: "pre-wrap",
+                color: "var(--mc-text-mid)",
+                fontFamily: "var(--mc-sans)",
+              }}
+            >
+              {c.text}
+            </pre>
           </div>
         ))}
 
@@ -287,7 +334,10 @@ export function TaskDetail() {
       </div>
 
       {/* Actions */}
-      <div className="d-flex gap-2 align-items-center border-top pt-3">
+      <div
+        className="d-flex gap-2 align-items-center"
+        style={{ borderTop: "1px solid var(--mc-border)", paddingTop: "1rem" }}
+      >
         <button type="button" className="btn btn-sm btn-outline-danger" onClick={deleteTask}>
           Delete task
         </button>
@@ -296,9 +346,18 @@ export function TaskDetail() {
             View source feedback ({task.from})
           </Link>
         )}
-        <span className="text-muted small ms-auto">
-          {task.updated ? `Updated ${new Date(task.updated).toLocaleString()}` : ""}
-        </span>
+        {task.updated && (
+          <span
+            style={{
+              marginLeft: "auto",
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.7rem",
+              color: "var(--mc-text-dim)",
+            }}
+          >
+            updated {new Date(task.updated).toLocaleString()}
+          </span>
+        )}
       </div>
     </div>
   );

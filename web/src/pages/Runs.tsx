@@ -28,24 +28,25 @@ function duration(start: string | null, end: string | null): string {
   return `${Math.floor(diff / 60)}m ${diff % 60}s`;
 }
 
-type StatusBadgeProps = { status: RunRow["status"] };
-function StatusBadge({ status }: StatusBadgeProps) {
-  const map: Record<RunRow["status"], [string, string]> = {
-    ok:         ["bg-success",   "ok"],
-    fail:       ["bg-danger",    "fail"],
-    processing: ["bg-warning text-dark", "processing"],
-    queued:     ["bg-secondary", "queued"],
+function StatusBadge({ status }: { status: RunRow["status"] }) {
+  const map: Record<RunRow["status"], string> = {
+    ok:         "mc-badge-ok",
+    fail:       "mc-badge-danger",
+    processing: "mc-badge-warn",
+    queued:     "mc-badge-dim",
   };
-  const [cls, label] = map[status] ?? ["bg-secondary", status];
-  return <span className={`badge ${cls}`}>{label}</span>;
+  return (
+    <span className={`mc-badge ${map[status] ?? "mc-badge-dim"}`}>
+      {status}
+    </span>
+  );
 }
 
-type TargetBadgeProps = { target: string };
-function TargetBadge({ target }: TargetBadgeProps) {
-  const cls = target === "staging" ? "bg-info text-dark"
-            : target === "prod"    ? "bg-danger"
-            : "bg-light text-dark border";
-  return <span className={`badge ${cls}`}>{target}</span>;
+function TargetBadge({ target }: { target: string }) {
+  const cls = target === "staging" ? "mc-badge-info"
+            : target === "prod"    ? "mc-badge-danger"
+            : "mc-badge-dim";
+  return <span className={`mc-badge ${cls}`}>{target}</span>;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,30 +82,24 @@ export function Runs() {
   return (
     <div className="container py-4">
       {/* Breadcrumb */}
-      <nav className="mb-3 small">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
-        <Link to={`/p/${slug}`}>Backlog</Link>
-        <span className="mx-2 text-muted">|</span>
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
+        <Link to={`/p/${slug}`}>{slug}</Link>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Runs</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/sessions`}>Sessions</Link>
-        <span className="mx-2 text-muted">|</span>
-        <strong>Runs</strong>
       </nav>
 
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
-        <h2 className="mb-0">
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
           Deploy runs
-          <span className="text-muted fw-normal fs-5 ms-2">/ {slug}</span>
+          <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
-        <span className="text-muted small" style={{ fontStyle: "italic" }}>
-          <span
-            className="spinner-border spinner-border-sm me-1 text-secondary"
-            role="status"
-            aria-hidden="true"
-            style={{ width: "0.7rem", height: "0.7rem", borderWidth: "0.1em" }}
-          />
-          Auto-refreshing every 15s
+        <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+          auto-refresh 15s
         </span>
       </div>
 
@@ -113,16 +108,17 @@ export function Runs() {
 
       {/* Loading */}
       {runs === null && !error && (
-        <p className="text-muted">Loading runs…</p>
+        <div className="mc-loading">Loading runs</div>
       )}
 
       {/* Empty state */}
       {runs !== null && runs.length === 0 && (
-        <div className="text-center py-5">
-          <p className="text-muted fs-5 mb-2">No deploy runs yet.</p>
-          <p className="text-muted small">
-            Runs appear here once a deploy is queued via a session.
-          </p>
+        <div className="mc-empty">
+          <div className="mc-empty-icon">▢</div>
+          <div>No deploy runs yet.</div>
+          <div style={{ fontSize: "0.75rem", marginTop: "0.4rem", color: "var(--mc-text-dim)" }}>
+            Queue a deploy via <code>ops/bot-squad-bin/deploy &lt;target&gt; "&lt;reason&gt;"</code>
+          </div>
         </div>
       )}
 
@@ -131,16 +127,16 @@ export function Runs() {
         <>
           <div className="table-responsive">
             <table className="table table-hover table-sm align-middle">
-              <thead className="table-light">
+              <thead>
                 <tr>
-                  <th style={{ width: "9rem" }}>ID</th>
+                  <th style={{ width: "6rem" }}>ID</th>
                   <th>Target</th>
                   <th>Status</th>
                   <th>Reason</th>
-                  <th className="text-muted small">Requested by</th>
-                  <th className="text-muted small">Queued</th>
-                  <th className="text-muted small">Started</th>
-                  <th className="text-muted small">Duration</th>
+                  <th>Requested by</th>
+                  <th>Queued</th>
+                  <th>Started</th>
+                  <th>Duration</th>
                   <th></th>
                 </tr>
               </thead>
@@ -148,7 +144,7 @@ export function Runs() {
                 {runs.map((r) => (
                   <tr key={r.id}>
                     <td>
-                      <code className="text-body" style={{ fontSize: "0.8rem" }}>
+                      <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-mid)" }}>
                         {r.id.slice(0, 8)}
                       </code>
                     </td>
@@ -156,24 +152,32 @@ export function Runs() {
                     <td><StatusBadge status={r.status} /></td>
                     <td
                       className="text-truncate"
-                      style={{ maxWidth: "18rem" }}
+                      style={{ maxWidth: "18rem", fontSize: "0.83rem" }}
                       title={r.reason}
                     >
-                      {r.reason || <span className="text-muted">—</span>}
+                      {r.reason || <span style={{ color: "var(--mc-text-dim)" }}>—</span>}
                     </td>
-                    <td className="text-muted small">
-                      <code style={{ fontSize: "0.75rem" }}>{r.requested_by || "—"}</code>
+                    <td>
+                      <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+                        {r.requested_by || "—"}
+                      </code>
                     </td>
-                    <td className="text-muted small">{relTime(r.queued_at)}</td>
-                    <td className="text-muted small">{relTime(r.started_at)}</td>
-                    <td className="text-muted small">{duration(r.started_at, r.ended_at)}</td>
+                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
+                      {relTime(r.queued_at)}
+                    </td>
+                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
+                      {relTime(r.started_at)}
+                    </td>
+                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
+                      {duration(r.started_at, r.ended_at)}
+                    </td>
                     <td>
                       <Link
                         to={`/p/${slug}/runs/${r.id}`}
-                        className="btn btn-outline-secondary btn-sm"
-                        style={{ fontSize: "0.75rem" }}
+                        className="mc-badge mc-badge-dim"
+                        style={{ textDecoration: "none" }}
                       >
-                        Log
+                        log
                       </Link>
                     </td>
                   </tr>

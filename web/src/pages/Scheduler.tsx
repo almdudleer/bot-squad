@@ -73,27 +73,21 @@ export function Scheduler() {
 
   return (
     <div className="container py-4">
-      {/* Breadcrumb / nav */}
-      <nav className="mb-3 small">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
-        <strong>Scheduler</strong>
+      {/* Breadcrumb */}
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Scheduler</span>
       </nav>
 
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-4">
-        <h2 className="mb-0">Scheduler dashboard</h2>
-        <span className="text-muted small" style={{ fontStyle: "italic" }}>
-          <span
-            className="spinner-border spinner-border-sm me-1 text-secondary"
-            role="status"
-            aria-hidden="true"
-            style={{ width: "0.7rem", height: "0.7rem", borderWidth: "0.1em" }}
-          />
-          Auto-refreshing every 30s
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Scheduler</h2>
+        <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+          auto-refresh 30s
           {lastRefresh && (
-            <span className="ms-2 text-muted">
-              · last at {lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+            <span style={{ marginLeft: "0.5rem" }}>
+              · {lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
             </span>
           )}
         </span>
@@ -104,24 +98,24 @@ export function Scheduler() {
 
       {/* Loading */}
       {state === null && !error && (
-        <p className="text-muted">Loading scheduler state…</p>
+        <div className="mc-loading">Loading scheduler state</div>
       )}
 
       {state !== null && (
         <>
-          {/* Worker status cards */}
+          {/* Status cards */}
           <div className="row g-3 mb-4">
             <div className="col-sm-6 col-md-4">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Worker uptime</h6>
-                  <p className="card-text fs-4 fw-semibold mb-0">
+                  <div className="card-subtitle mb-2">Worker uptime</div>
+                  <div className="card-text fs-4 fw-semibold">
                     {uptimeStr(state.worker_started_at)}
-                  </p>
+                  </div>
                   {state.worker_started_at && (
-                    <small className="text-muted">
+                    <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
                       started {relTime(state.worker_started_at)}
-                    </small>
+                    </div>
                   )}
                 </div>
               </div>
@@ -130,18 +124,16 @@ export function Scheduler() {
             <div className="col-sm-6 col-md-4">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Last heartbeat</h6>
-                  <p className="card-text fs-4 fw-semibold mb-0">
-                    {heartbeatAge !== null
-                      ? `${Math.floor(heartbeatAge)}s ago`
-                      : "—"}
-                  </p>
-                  <span
-                    className={`badge ${heartbeatOk ? "bg-success" : "bg-danger"}`}
-                    style={{ fontSize: "0.7rem" }}
-                  >
-                    {heartbeatOk ? "healthy" : "stale"}
-                  </span>
+                  <div className="card-subtitle mb-2">Last heartbeat</div>
+                  <div className="card-text fs-4 fw-semibold">
+                    {heartbeatAge !== null ? `${Math.floor(heartbeatAge)}s ago` : "—"}
+                  </div>
+                  <div style={{ marginTop: "0.3rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+                    <span className={heartbeatOk ? "mc-dot mc-dot-active" : "mc-dot mc-dot-error"} />
+                    <span className={`mc-badge ${heartbeatOk ? "mc-badge-ok" : "mc-badge-danger"}`}>
+                      {heartbeatOk ? "healthy" : "stale"}
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -149,23 +141,26 @@ export function Scheduler() {
             <div className="col-sm-6 col-md-4">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Jobs registered</h6>
-                  <p className="card-text fs-4 fw-semibold mb-0">
+                  <div className="card-subtitle mb-2">Jobs registered</div>
+                  <div className="card-text fs-4 fw-semibold">
                     {state.jobs.length}
-                  </p>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
 
           {/* Jobs table */}
-          <h5 className="mb-3">Scheduled jobs</h5>
+          <div className="mc-section-title mb-2">Scheduled jobs</div>
           {state.jobs.length === 0 ? (
-            <p className="text-muted">No jobs scheduled.</p>
+            <div className="mc-empty">
+              <div className="mc-empty-icon">◯</div>
+              <div>No jobs scheduled.</div>
+            </div>
           ) : (
             <div className="table-responsive">
               <table className="table table-hover table-sm align-middle">
-                <thead className="table-light">
+                <thead>
                   <tr>
                     <th>Job ID</th>
                     <th>Trigger</th>
@@ -176,19 +171,26 @@ export function Scheduler() {
                   {state.jobs.map((job) => (
                     <tr key={job.id}>
                       <td>
-                        <code style={{ fontSize: "0.85rem" }}>{job.id}</code>
+                        <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-mid)" }}>
+                          {job.id}
+                        </code>
                       </td>
                       <td>
-                        <span className="text-muted" style={{ fontSize: "0.85rem", fontFamily: "monospace" }}>
+                        <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
                           {job.trigger}
                         </span>
                       </td>
-                      <td className="text-muted" style={{ fontSize: "0.85rem" }}>
+                      <td>
                         {job.next_run ? (
-                          <span title={job.next_run}>
+                          <span
+                            title={job.next_run}
+                            style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}
+                          >
                             {futureTime(job.next_run)}
                           </span>
-                        ) : "—"}
+                        ) : (
+                          <span style={{ color: "var(--mc-text-dim)" }}>—</span>
+                        )}
                       </td>
                     </tr>
                   ))}

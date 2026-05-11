@@ -19,16 +19,23 @@ function relTime(iso: string | null | undefined): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function statusBadge(status: string) {
-  const classes: Record<string, string> = {
-    idle: "bg-secondary",
-    working: "bg-primary",
-    reviewing: "bg-info text-dark",
-    sleeping: "bg-warning text-dark",
+function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, string> = {
+    idle:      "mc-badge-dim",
+    working:   "mc-badge-active",
+    reviewing: "mc-badge-info",
+    sleeping:  "mc-badge-warn",
+  };
+  const dotMap: Record<string, string> = {
+    idle:      "mc-dot-idle",
+    working:   "mc-dot-active",
+    reviewing: "mc-dot-active",
+    sleeping:  "mc-dot-warn",
   };
   return (
-    <span className={`badge ${classes[status] ?? "bg-secondary"} ms-2`} style={{ fontSize: "0.8rem" }}>
-      {status}
+    <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
+      <span className={`mc-dot ${dotMap[status] ?? "mc-dot-idle"}`} />
+      <span className={`mc-badge ${map[status] ?? "mc-badge-dim"}`}>{status}</span>
     </span>
   );
 }
@@ -45,10 +52,8 @@ export function Autonomous() {
   const [saving, setSaving] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
-  // Enable-confirmation modal
   const [showEnableModal, setShowEnableModal] = useState(false);
 
-  // Settings form
   const [sleepStart, setSleepStart] = useState<number>(22);
   const [sleepEnd, setSleepEnd] = useState<number>(8);
   const [settingsDirty, setSettingsDirty] = useState(false);
@@ -58,7 +63,6 @@ export function Autonomous() {
       .autonomousStatus(slug)
       .then((s) => {
         setState(s);
-        // Only sync form values on first load or when not dirty
         if (!settingsDirty) {
           setSleepStart(s.sleep_start_hour);
           setSleepEnd(s.sleep_end_hour);
@@ -107,10 +111,8 @@ export function Autonomous() {
     setActionError(null);
     try {
       if (state?.enabled) {
-        // Re-enable with new sleep hours to update them
         await api.autonomousEnable(slug, sleepStart, sleepEnd);
       } else {
-        // Just update via enable (won't start the orchestrator if already disabled — we re-disable)
         await api.autonomousEnable(slug, sleepStart, sleepEnd);
         await api.autonomousDisable(slug);
       }
@@ -128,31 +130,25 @@ export function Autonomous() {
   return (
     <div className="container py-4">
       {/* Breadcrumb */}
-      <nav className="mb-3 small">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
         <Link to={`/p/${slug}`}>{slug}</Link>
-        <span className="mx-2 text-muted">|</span>
-        <strong>Autonomous</strong>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Autonomous</span>
       </nav>
 
       {/* Page header */}
       <div className="d-flex justify-content-between align-items-center mb-4">
-        <div className="d-flex align-items-center gap-2">
-          <h2 className="mb-0">Autonomous orchestrator</h2>
-          {state && statusBadge(state.status)}
+        <div className="d-flex align-items-center gap-3">
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Autonomous orchestrator</h2>
+          {state && <StatusBadge status={state.status} />}
         </div>
         <div className="d-flex align-items-center gap-2">
-          <span className="text-muted small">
-            <span
-              className="spinner-border spinner-border-sm me-1 text-secondary"
-              role="status"
-              aria-hidden="true"
-              style={{ width: "0.7rem", height: "0.7rem", borderWidth: "0.1em" }}
-            />
-            Auto-refresh 15s
+          <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+            auto-refresh 15s
             {lastRefresh && (
-              <span className="ms-2">
+              <span style={{ marginLeft: "0.4rem" }}>
                 · {lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
               </span>
             )}
@@ -182,33 +178,40 @@ export function Autonomous() {
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
       {actionError && (
-        <div className="alert alert-warning alert-dismissible">
-          {actionError}
-          <button type="button" className="btn-close" onClick={() => setActionError(null)} />
+        <div className="alert alert-warning d-flex justify-content-between align-items-center">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            className="btn-close"
+            style={{ filter: "invert(1) opacity(0.5)" }}
+            onClick={() => setActionError(null)}
+          />
         </div>
       )}
 
       {/* Loading */}
-      {state === null && !error && <p className="text-muted">Loading…</p>}
+      {state === null && !error && <div className="mc-loading">Loading</div>}
 
       {state !== null && (
         <>
           {/* Working banner */}
           {state.status === "working" && state.current_task_id && (
             <div className="alert alert-primary d-flex align-items-center gap-2 mb-4">
-              <span className="spinner-border spinner-border-sm" role="status" aria-hidden="true" />
+              <span className="mc-dot mc-dot-active" />
               <span>
                 Working on{" "}
-                <Link to={`/p/${slug}/t/${state.current_task_id}`} className="fw-semibold">
+                <Link to={`/p/${slug}/t/${state.current_task_id}`} style={{ fontWeight: 600 }}>
                   {state.current_task_id}
                 </Link>
                 {state.current_pane_id && (
-                  <span className="ms-2 text-muted" style={{ fontFamily: "monospace", fontSize: "0.85rem" }}>
+                  <span
+                    style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-accent-dim)", marginLeft: "0.5rem" }}
+                  >
                     · pane {state.current_pane_id}
                   </span>
                 )}
                 {state.current_started_at && (
-                  <span className="ms-2 text-muted" style={{ fontSize: "0.85rem" }}>
+                  <span style={{ fontSize: "0.78rem", color: "var(--mc-accent-dim)", marginLeft: "0.5rem" }}>
                     · started {relTime(state.current_started_at)}
                   </span>
                 )}
@@ -216,15 +219,15 @@ export function Autonomous() {
             </div>
           )}
 
-          {/* Status card */}
+          {/* Status cards */}
           <div className="row g-3 mb-4">
             <div className="col-sm-6 col-md-3">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Status</h6>
-                  <p className="card-text fs-5 fw-semibold mb-0 text-capitalize">
+                  <div className="card-subtitle mb-2">Status</div>
+                  <div style={{ fontFamily: "var(--mc-mono)", fontSize: "1rem", fontWeight: 600, textTransform: "capitalize" }}>
                     {state.status}
-                  </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -232,16 +235,16 @@ export function Autonomous() {
             <div className="col-sm-6 col-md-3">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Current task</h6>
-                  <p className="card-text fs-5 fw-semibold mb-0">
+                  <div className="card-subtitle mb-2">Current task</div>
+                  <div style={{ fontFamily: "var(--mc-mono)", fontSize: "1rem", fontWeight: 600 }}>
                     {state.current_task_id ? (
-                      <Link to={`/p/${slug}/t/${state.current_task_id}`}>
+                      <Link to={`/p/${slug}/t/${state.current_task_id}`} style={{ color: "var(--mc-accent)" }}>
                         {state.current_task_id}
                       </Link>
                     ) : (
-                      <span className="text-muted">—</span>
+                      <span style={{ color: "var(--mc-text-dim)" }}>—</span>
                     )}
-                  </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -249,10 +252,10 @@ export function Autonomous() {
             <div className="col-sm-6 col-md-3">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Last tick</h6>
-                  <p className="card-text fs-5 fw-semibold mb-0">
+                  <div className="card-subtitle mb-2">Last tick</div>
+                  <div style={{ fontFamily: "var(--mc-mono)", fontSize: "1rem", fontWeight: 600 }}>
                     {relTime(state.last_tick_at)}
-                  </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -260,12 +263,13 @@ export function Autonomous() {
             <div className="col-sm-6 col-md-3">
               <div className="card h-100">
                 <div className="card-body">
-                  <h6 className="card-subtitle text-muted mb-1">Enabled</h6>
-                  <p className="card-text fs-5 fw-semibold mb-0">
-                    <span className={`badge ${isEnabled ? "bg-success" : "bg-secondary"}`}>
-                      {isEnabled ? "Yes" : "No"}
+                  <div className="card-subtitle mb-2">Enabled</div>
+                  <div style={{ marginTop: "0.3rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+                    <span className={`mc-dot ${isEnabled ? "mc-dot-active" : "mc-dot-idle"}`} />
+                    <span className={`mc-badge ${isEnabled ? "mc-badge-ok" : "mc-badge-dim"}`}>
+                      {isEnabled ? "yes" : "no"}
                     </span>
-                  </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -273,16 +277,14 @@ export function Autonomous() {
 
           {/* Settings card */}
           <div className="card mb-4">
-            <div className="card-header fw-semibold">Sleep window settings</div>
+            <div className="card-header">Sleep window settings</div>
             <div className="card-body">
-              <p className="text-muted small mb-3">
+              <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)", marginBottom: "1rem" }}>
                 No new tasks are spawned during the sleep window. In-flight tasks complete normally.
               </p>
               <div className="row g-3 align-items-end">
                 <div className="col-auto">
-                  <label className="form-label small fw-semibold mb-1">
-                    Sleep start (UTC hour)
-                  </label>
+                  <label className="form-label">Sleep start (UTC hour)</label>
                   <input
                     type="number"
                     className="form-control form-control-sm"
@@ -290,16 +292,11 @@ export function Autonomous() {
                     max={23}
                     value={sleepStart}
                     style={{ width: "80px" }}
-                    onChange={(e) => {
-                      setSleepStart(Number(e.target.value));
-                      setSettingsDirty(true);
-                    }}
+                    onChange={(e) => { setSleepStart(Number(e.target.value)); setSettingsDirty(true); }}
                   />
                 </div>
                 <div className="col-auto">
-                  <label className="form-label small fw-semibold mb-1">
-                    Sleep end (UTC hour)
-                  </label>
+                  <label className="form-label">Sleep end (UTC hour)</label>
                   <input
                     type="number"
                     className="form-control form-control-sm"
@@ -307,10 +304,7 @@ export function Autonomous() {
                     max={23}
                     value={sleepEnd}
                     style={{ width: "80px" }}
-                    onChange={(e) => {
-                      setSleepEnd(Number(e.target.value));
-                      setSettingsDirty(true);
-                    }}
+                    onChange={(e) => { setSleepEnd(Number(e.target.value)); setSettingsDirty(true); }}
                   />
                 </div>
                 <div className="col-auto">
@@ -323,9 +317,9 @@ export function Autonomous() {
                   </button>
                 </div>
                 <div className="col-auto">
-                  <small className="text-muted">
-                    Currently: {state.sleep_start_hour}:00 – {state.sleep_end_hour}:00 UTC
-                  </small>
+                  <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
+                    {state.sleep_start_hour}:00 – {state.sleep_end_hour}:00 UTC
+                  </span>
                 </div>
               </div>
             </div>
@@ -333,34 +327,34 @@ export function Autonomous() {
 
           {/* Tick log */}
           <div className="card">
-            <div className="card-header fw-semibold d-flex justify-content-between align-items-center">
+            <div
+              className="card-header d-flex justify-content-between align-items-center"
+              style={{ textTransform: "none", letterSpacing: 0, fontSize: "0.78rem" }}
+            >
               <span>Recent tick log</span>
-              <small className="text-muted fw-normal">last {state.tick_log.length} entries</small>
+              <span style={{ color: "var(--mc-text-dim)", fontSize: "0.7rem" }}>
+                last {state.tick_log.length} entries
+              </span>
             </div>
             <div className="card-body p-0">
               {state.tick_log.length === 0 ? (
-                <p className="text-muted p-3 mb-0">No ticks recorded yet.</p>
+                <div className="mc-empty" style={{ padding: "1.5rem" }}>
+                  <div>No ticks recorded yet.</div>
+                </div>
               ) : (
-                <div
-                  style={{
-                    fontFamily: "monospace",
-                    fontSize: "0.8rem",
-                    maxHeight: "360px",
-                    overflowY: "auto",
-                  }}
-                >
+                <div className="mc-tick-log">
                   {[...state.tick_log].reverse().map((entry, i) => (
-                    <div
-                      key={i}
-                      className="px-3 py-1 border-bottom"
-                      style={{ lineHeight: "1.6" }}
-                    >
-                      <span className="text-muted me-2">
-                        {entry.ts ? new Date(entry.ts).toLocaleTimeString([], {
-                          hour: "2-digit", minute: "2-digit", second: "2-digit",
-                        }) : "—"}
+                    <div key={i} className="mc-tick-entry">
+                      <span className="mc-tick-ts">
+                        {entry.ts
+                          ? new Date(entry.ts).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              second: "2-digit",
+                            })
+                          : "—"}
                       </span>
-                      <span>{entry.msg}</span>
+                      <span className="mc-tick-msg">{entry.msg}</span>
                     </div>
                   ))}
                 </div>
@@ -398,12 +392,12 @@ export function Autonomous() {
         <div className="alert alert-warning mb-3">
           <strong>Agents will work autonomously.</strong>
         </div>
-        <p>
+        <p style={{ fontSize: "0.85rem", color: "var(--mc-text-mid)" }}>
           When enabled, the orchestrator will automatically pick open backlog tasks, spawn
           claude sessions to implement them, and run DOD reviews — all without your
           involvement. In-flight tasks cannot be stopped mid-flight.
         </p>
-        <p className="mb-0">
+        <p style={{ fontSize: "0.85rem", color: "var(--mc-text-mid)", marginBottom: 0 }}>
           The orchestrator will respect the configured sleep window ({sleepStart}:00 –{" "}
           {sleepEnd}:00 UTC).
         </p>

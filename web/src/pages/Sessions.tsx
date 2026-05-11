@@ -109,47 +109,48 @@ export function Sessions() {
   return (
     <div className="container py-4">
       {/* Breadcrumb nav */}
-      <nav className="mb-3">
-        <Link to="/">← Projects</Link>
-        <span className="mx-2 text-muted">|</span>
-        <Link to={`/p/${slug}`}>Backlog</Link>
-        <span className="mx-2 text-muted">|</span>
-        <Link to={`/p/${slug}/vision`}>Vision</Link>
-        <span className="mx-2 text-muted">|</span>
-        <Link to={`/p/${slug}/feedback`}>Feedback</Link>
-        <span className="mx-2 text-muted">|</span>
-        <strong>Sessions</strong>
-        <span className="mx-2 text-muted">|</span>
+      <nav className="mc-breadcrumb">
+        <Link to="/">Projects</Link>
+        <span className="mc-bc-sep">/</span>
+        <Link to={`/p/${slug}`}>{slug}</Link>
+        <span className="mc-bc-sep">/</span>
+        <span className="mc-bc-current">Sessions</span>
+        <span className="mc-bc-sep">·</span>
         <Link to={`/p/${slug}/runs`}>Runs</Link>
-        <span className="mx-2 text-muted">|</span>
+        <span className="mc-bc-sep">·</span>
+        <Link to={`/p/${slug}/vision`}>Vision</Link>
+        <span className="mc-bc-sep">·</span>
+        <Link to={`/p/${slug}/feedback`}>Feedback</Link>
+        <span className="mc-bc-sep">·</span>
         <Link to="/scheduler">Scheduler</Link>
       </nav>
 
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
-        <h2 className="mb-0">
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
           Sessions
-          <span className="text-muted fw-normal fs-5 ms-2">/ {slug}</span>
+          <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={openModal}>
           + New session
         </button>
       </div>
 
-      {/* TG reply hint (spec #7) */}
-      <div className="alert alert-info py-2 small mb-3">
-        💬 Tip: reply to a Telegram <code>[SID] needs your input</code> notification —
-        your reply lands in that session. Or use <code>/sessions</code>, <code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
+      {/* TG reply hint */}
+      <div className="alert alert-info py-2 mb-3" style={{ fontSize: "0.78rem" }}>
+        Reply to a Telegram <code>[SID] needs your input</code> notification — your reply lands
+        in that session. Or use <code>/sessions</code>, <code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
       </div>
 
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
       {actionError && (
-        <div className="alert alert-warning alert-dismissible">
-          {actionError}
+        <div className="alert alert-warning d-flex justify-content-between align-items-center">
+          <span>{actionError}</span>
           <button
             type="button"
             className="btn-close"
+            style={{ filter: "invert(1) opacity(0.5)" }}
             onClick={() => setActionError(null)}
           />
         </div>
@@ -157,16 +158,19 @@ export function Sessions() {
 
       {/* Loading */}
       {sessions === null && !error && (
-        <p className="text-muted">Loading sessions…</p>
+        <div className="mc-loading">Loading sessions</div>
       )}
 
       {/* Empty state */}
       {sessions !== null && sessions.length === 0 && (
-        <div className="text-center py-5">
-          <p className="text-muted mb-3">
-            No active or paused sessions for <strong>{slug}</strong>.
-          </p>
-          <button type="button" className="btn btn-outline-primary" onClick={openModal}>
+        <div className="mc-empty">
+          <div className="mc-empty-icon">◯</div>
+          <div>No sessions for <strong>{slug}</strong></div>
+          <button
+            type="button"
+            className="btn btn-outline-primary btn-sm mt-3"
+            onClick={openModal}
+          >
             + New session
           </button>
         </div>
@@ -176,7 +180,7 @@ export function Sessions() {
       {sessions !== null && sessions.length > 0 && (
         <div className="table-responsive">
           <table className="table table-hover align-middle">
-            <thead className="table-light">
+            <thead>
               <tr>
                 <th>SID</th>
                 <th>Window</th>
@@ -191,53 +195,52 @@ export function Sessions() {
             <tbody>
               {sessions.map((s) => (
                 <tr key={s.sid}>
-                  {/* SID — monospace; links to messages if claude_uuid available */}
+                  {/* SID */}
                   <td>
                     {s.claude_uuid ? (
                       <Link
                         to={`/p/${slug}/sessions/${encodeURIComponent(s.claude_uuid)}/messages`}
-                        className="text-body"
-                        style={{ fontSize: "0.8rem", fontFamily: "monospace" }}
+                        style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-accent)" }}
                       >
                         {s.sid}
                       </Link>
                     ) : (
-                      <code className="text-body" style={{ fontSize: "0.8rem" }}>
+                      <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-mid)" }}>
                         {s.sid}
                       </code>
                     )}
                   </td>
 
                   {/* Window */}
-                  <td>{s.window}</td>
+                  <td style={{ fontSize: "0.83rem" }}>{s.window}</td>
 
-                  {/* CWD — truncated */}
+                  {/* CWD */}
                   <td>
                     <span
                       title={s.cwd}
-                      className="text-muted"
-                      style={{ fontSize: "0.85rem", fontFamily: "monospace" }}
+                      style={{ fontSize: "0.78rem", fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}
                     >
                       {truncateCwd(s.cwd)}
                     </span>
                   </td>
 
-                  {/* Status badge */}
+                  {/* Status */}
                   <td>
-                    {s.status === "active" ? (
-                      <span className="badge bg-success">active</span>
-                    ) : (
-                      <span className="badge bg-secondary">paused</span>
-                    )}
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
+                      <span className={s.status === "active" ? "mc-dot mc-dot-active" : "mc-dot mc-dot-idle"} />
+                      <span className={s.status === "active" ? "mc-badge mc-badge-ok" : "mc-badge mc-badge-dim"}>
+                        {s.status}
+                      </span>
+                    </span>
                   </td>
 
                   {/* Started */}
-                  <td className="text-muted" style={{ fontSize: "0.85rem" }}>
+                  <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
                     {relativeTime(s.started_at)}
                   </td>
 
                   {/* Last activity */}
-                  <td className="text-muted" style={{ fontSize: "0.85rem" }}>
+                  <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
                     {relativeTime(s.last_prompt_at)}
                   </td>
 
@@ -248,8 +251,8 @@ export function Sessions() {
                         <Link
                           key={tid}
                           to={`/p/${slug}/t/${tid}`}
-                          className="badge bg-light text-primary border border-primary text-decoration-none"
-                          style={{ fontSize: "0.75rem" }}
+                          className="mc-badge mc-badge-info"
+                          style={{ textDecoration: "none" }}
                         >
                           {tid}
                         </Link>
@@ -263,6 +266,7 @@ export function Sessions() {
                       <button
                         type="button"
                         className="btn btn-outline-warning btn-sm"
+                        style={{ fontSize: "0.72rem" }}
                         onClick={() => handlePause(s.sid)}
                       >
                         Pause
@@ -271,6 +275,7 @@ export function Sessions() {
                       <button
                         type="button"
                         className="btn btn-outline-success btn-sm"
+                        style={{ fontSize: "0.72rem" }}
                         onClick={() => handleResume(s.sid)}
                       >
                         Resume
@@ -291,30 +296,19 @@ export function Sessions() {
         onClose={() => setModalOpen(false)}
         footer={
           <>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setModalOpen(false)}
-            >
+            <button type="button" className="btn btn-secondary" onClick={() => setModalOpen(false)}>
               Cancel
             </button>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={handleSpawn}
-              disabled={spawning}
-            >
+            <button type="button" className="btn btn-primary" onClick={handleSpawn} disabled={spawning}>
               {spawning ? "Spawning…" : "Spawn"}
             </button>
           </>
         }
       >
-        {modalError && (
-          <div className="alert alert-danger">{modalError}</div>
-        )}
+        {modalError && <div className="alert alert-danger">{modalError}</div>}
         <div className="mb-3">
           <label className="form-label">
-            Window name <span className="text-danger">*</span>
+            Window name <span style={{ color: "var(--mc-accent-danger)" }}>*</span>
           </label>
           <input
             className="form-control"
@@ -327,7 +321,7 @@ export function Sessions() {
         <div className="mb-3">
           <label className="form-label">
             Initial prompt{" "}
-            <span className="text-muted fw-normal">(optional)</span>
+            <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
           </label>
           <textarea
             className="form-control"

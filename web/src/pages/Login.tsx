@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, Link } from "react-router-dom";
 import { api } from "../api";
 
 export function Login() {
@@ -24,37 +24,56 @@ export function Login() {
   }
 
   return (
-    <div className="container py-5">
-      <div className="row justify-content-center">
-        <div className="col-md-5">
-          <h1 className="mb-4">bot-squad</h1>
-          <form onSubmit={submit}>
-            <div className="mb-3">
-              <label className="form-label">Username</label>
-              <input
-                type="text"
-                className="form-control"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoFocus
-                required
-              />
+    <div className="mc-login-page">
+      <div className="mc-login-box">
+        <div className="mc-login-wordmark">BOT-SQUAD</div>
+        <div className="mc-login-subtitle">mission control — sign in to continue</div>
+
+        <form onSubmit={submit}>
+          <div className="mb-3">
+            <label className="form-label">Username</label>
+            <input
+              type="text"
+              className="form-control"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              autoFocus
+              required
+              autoComplete="username"
+            />
+          </div>
+          <div className="mb-3">
+            <label className="form-label">Password</label>
+            <input
+              type="password"
+              className="form-control"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              autoComplete="current-password"
+            />
+          </div>
+          {error && (
+            <div className="alert alert-danger mb-3" style={{ fontSize: "0.8rem" }}>
+              {error}
             </div>
-            <div className="mb-3">
-              <label className="form-label">Password</label>
-              <input
-                type="password"
-                className="form-control"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-              />
-            </div>
-            {error && <div className="alert alert-danger">{error}</div>}
-            <button className="btn btn-primary w-100" disabled={busy}>
-              {busy ? "Signing in…" : "Sign in"}
-            </button>
-          </form>
+          )}
+          <button
+            className="btn btn-primary w-100"
+            disabled={busy}
+            style={{ marginTop: "0.25rem" }}
+          >
+            {busy ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+
+        <div style={{ marginTop: "1.25rem", textAlign: "center" }}>
+          <Link
+            to="/help"
+            style={{ fontSize: "0.75rem", color: "var(--mc-text-dim)" }}
+          >
+            Usage manual
+          </Link>
         </div>
       </div>
     </div>

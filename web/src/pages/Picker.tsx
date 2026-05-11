@@ -11,23 +11,30 @@ export function Picker() {
   }, []);
 
   return (
-    <div className="container py-4">
-      <header className="d-flex justify-content-between align-items-center mb-4">
-        <h1 className="m-0">bot-squad</h1>
-        <button className="btn btn-outline-secondary btn-sm" onClick={() => api.logout().then(() => location.assign("/login"))}>
-          Sign out
-        </button>
-      </header>
+    <div className="container py-4" style={{ maxWidth: "900px" }}>
+      <div className="d-flex align-items-center gap-2 mb-4">
+        <div className="mc-section-title" style={{ margin: 0 }}>Projects</div>
+      </div>
+
       {error && <div className="alert alert-danger">{error}</div>}
-      {projects === null && !error && <p>Loading…</p>}
+
+      {projects === null && !error && (
+        <div className="mc-loading">Loading</div>
+      )}
+
+      {projects !== null && projects.length === 0 && (
+        <div className="mc-empty">
+          <div className="mc-empty-icon">◯</div>
+          <div>No projects configured.</div>
+        </div>
+      )}
+
       <div className="row g-3">
         {projects?.map((p) => (
           <div className="col-md-4" key={p.slug}>
-            <Link to={`/p/${p.slug}`} className="card text-decoration-none">
-              <div className="card-body">
-                <h5 className="card-title">{p.display_name}</h5>
-                <small className="text-muted">{p.slug}</small>
-              </div>
+            <Link to={`/p/${p.slug}`} className="mc-project-card">
+              <div className="mc-project-name">{p.display_name}</div>
+              <div className="mc-project-slug">{p.slug}</div>
             </Link>
           </div>
         ))}

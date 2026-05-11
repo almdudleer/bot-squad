@@ -86,6 +86,26 @@ export type SchedulerState = {
   last_heartbeat_age_seconds: number | null;
 };
 
+export type TickLogEntry = {
+  ts: string;
+  msg: string;
+};
+
+export type AutonomousState = {
+  ok: boolean;
+  slug: string;
+  enabled: boolean;
+  status: "idle" | "working" | "reviewing" | "sleeping";
+  current_task_id: string | null;
+  current_pane_id: string | null;
+  current_started_at: string | null;
+  last_tick_at: string | null;
+  sleep_start_hour: number;
+  sleep_end_hour: number;
+  fail_counts: Record<string, number>;
+  tick_log: TickLogEntry[];
+};
+
 export const api = {
   health: () => call("/api/health"),
   projects: () => call<Project[]>("/api/projects"),
@@ -147,4 +167,18 @@ export const api = {
       `/api/projects/${slug}/sessions/${encodeURIComponent(claudeUuid)}/messages?limit=${limit}&offset=${offset}${full ? "&full=1" : ""}`
     ),
   scheduler: () => call<SchedulerState>("/api/scheduler"),
+  autonomousStatus: (slug: string) =>
+    call<AutonomousState>(`/api/projects/${slug}/autonomous`),
+  autonomousEnable: (slug: string, sleepStartHour?: number, sleepEndHour?: number) =>
+    call(`/api/projects/${slug}/autonomous/enable`, {
+      method: "POST",
+      body: JSON.stringify({
+        sleep_start_hour: sleepStartHour,
+        sleep_end_hour: sleepEndHour,
+      }),
+    }),
+  autonomousDisable: (slug: string) =>
+    call(`/api/projects/${slug}/autonomous/disable`, { method: "POST" }),
+  autonomousLog: (slug: string) =>
+    call<TickLogEntry[]>(`/api/projects/${slug}/autonomous/log`),
 };

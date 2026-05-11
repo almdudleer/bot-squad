@@ -10,6 +10,7 @@ import { Runs } from "./pages/Runs";
 import { RunLog } from "./pages/RunLog";
 import { Messages } from "./pages/Messages";
 import { Scheduler } from "./pages/Scheduler";
+import { Autonomous } from "./pages/Autonomous";
 
 export function App() {
   return (
@@ -25,6 +26,7 @@ export function App() {
         <Route path="/p/:slug/runs" element={<Runs />} />
         <Route path="/p/:slug/runs/:id" element={<RunLog />} />
         <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />
+        <Route path="/p/:slug/autonomous" element={<Autonomous />} />
         <Route path="/scheduler" element={<Scheduler />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

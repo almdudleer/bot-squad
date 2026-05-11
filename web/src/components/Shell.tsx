@@ -2,18 +2,43 @@ import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
 
+const PINNED_PROJECT_KEY = "bot-squad:last-project";
+
 /**
  * Shell — left sidebar navigation present on every authenticated page.
  * 240 px sticky sidebar: wordmark + worker LED, project info, nav links, system links, footer.
+ *
+ * The currently-selected project is pinned in localStorage so the [PROJECT]
+ * section keeps showing when you navigate to global routes like /scheduler or /help.
  */
 export function Shell() {
-  const { slug } = useParams<{ slug?: string }>();
+  const { slug: urlSlug } = useParams<{ slug?: string }>();
   const location = useLocation();
   const [workerAlive, setWorkerAlive] = useState<boolean | null>(null);
   const [username, setUsername] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [pinnedSlug, setPinnedSlug] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(PINNED_PROJECT_KEY);
+    } catch {
+      return null;
+    }
+  });
 
-  // Determine if we are on a project-level route
+  // Keep pinned project in sync when the URL has a slug
+  useEffect(() => {
+    if (urlSlug && urlSlug !== pinnedSlug) {
+      setPinnedSlug(urlSlug);
+      try {
+        localStorage.setItem(PINNED_PROJECT_KEY, urlSlug);
+      } catch {
+        /* ignore quota / disabled */
+      }
+    }
+  }, [urlSlug, pinnedSlug]);
+
+  // Display slug: URL takes precedence; otherwise the pinned slug
+  const slug = urlSlug ?? pinnedSlug;
   const hasProject = Boolean(slug);
 
   // Poll worker health every 30 s
@@ -47,7 +72,24 @@ export function Shell() {
   }, [location.pathname]);
 
   function handleSignOut() {
-    api.logout().then(() => (window.location.href = "/login")).catch(() => (window.location.href = "/login"));
+    try {
+      localStorage.removeItem(PINNED_PROJECT_KEY);
+    } catch {
+      /* ignore */
+    }
+    api
+      .logout()
+      .then(() => (window.location.href = "/login"))
+      .catch(() => (window.location.href = "/login"));
+  }
+
+  function handleSwitchProject() {
+    try {
+      localStorage.removeItem(PINNED_PROJECT_KEY);
+    } catch {
+      /* ignore */
+    }
+    setPinnedSlug(null);
   }
 
   const dotCls =
@@ -97,18 +139,21 @@ export function Shell() {
           </div>
         </div>
 
-        {/* Project section — only when inside a project */}
+        {/* Project section — shows pinned project even on global routes */}
         {hasProject && (
           <>
             <div className="mc-sidebar-section">Project</div>
             <div className="mc-sidebar-project">
               <div className="mc-sidebar-project-name">{slug}</div>
-              <Link to="/" className="mc-sidebar-project-link">
+              <Link
+                to="/"
+                className="mc-sidebar-project-link"
+                onClick={handleSwitchProject}
+              >
                 ← switch project
               </Link>
             </div>
 
-            <div className="mc-sidebar-section">Nav</div>
             <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
@@ -182,10 +227,13 @@ export function Shell() {
             </NavLink>
           </li>
           <li>
-            <a href="/help" target="_blank" rel="noopener noreferrer">
+            <NavLink
+              to="/help"
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+            >
               <span className="mc-nav-diamond">◇</span>
               HELP
-            </a>
+            </NavLink>
           </li>
         </ul>
 

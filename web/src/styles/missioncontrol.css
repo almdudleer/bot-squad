@@ -216,12 +216,12 @@ h1, h2, h3, h4, h5, h6 {
   align-items: center;
   gap: 0.5rem;
   width: 100%;
-  padding: 0.45rem 1rem;
+  padding: 0.5rem 1rem;
   font-family: var(--mc-mono);
-  font-size: 0.75rem;
+  font-size: 0.78rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--mc-text-dim);
+  color: var(--mc-text);                /* readable, not greyed */
   text-decoration: none;
   background: none;
   border: none;
@@ -233,7 +233,7 @@ h1, h2, h3, h4, h5, h6 {
 .mc-sidebar-nav a:hover,
 .mc-sidebar-nav button:hover {
   background-color: var(--mc-surface);
-  color: var(--mc-text);
+  color: var(--mc-cyan-bright);
   text-decoration: none;
   border-left-color: var(--mc-border-strong);
 }

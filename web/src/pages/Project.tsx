@@ -166,6 +166,11 @@ export function Project() {
           + New task
         </button>
       </div>
+      <div className="mc-page-help">
+        Open work for this project across four statuses. <strong>Drag</strong> a card
+        to change status, <strong>click</strong> a card for full detail, or <strong>⋯</strong>
+        for the quick menu (status / edit body / comment / delete).
+      </div>
 
       {error && <div className="alert alert-danger mt-2">{error}</div>}
       {tasks === null && !error && <div className="mc-loading">Loading</div>}

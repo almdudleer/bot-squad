@@ -1,5 +1,4 @@
 import { useEffect, useState, useCallback } from "react";
-import { Link } from "react-router-dom";
 import { api, SchedulerState } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -73,15 +72,8 @@ export function Scheduler() {
 
   return (
     <div className="container py-4">
-      {/* Breadcrumb */}
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Scheduler</span>
-      </nav>
-
       {/* Header */}
-      <div className="d-flex justify-content-between align-items-center mb-4">
+      <div className="d-flex justify-content-between align-items-center mb-1">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Scheduler</h2>
         <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
           auto-refresh 30s
@@ -91,6 +83,12 @@ export function Scheduler() {
             </span>
           )}
         </span>
+      </div>
+
+      <div className="mc-page-help">
+        Time-driven jobs the worker runs (heartbeat, deploy_monitor,
+        kick_stuck, oauth_refresh, tg_listener, autonomous_tick).
+        Shows worker uptime, last heartbeat, and each job&apos;s next fire time.
       </div>
 
       {/* Error */}

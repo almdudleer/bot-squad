@@ -816,6 +816,26 @@ pre.bg-light {
   padding: 0.6rem 0.5rem;
   letter-spacing: 0.05em;
 }
+
+/* Per-page help one-liner — sits under each page title to explain what
+   the page is for. Subtle but always visible. */
+.mc-page-help {
+  font-family: var(--mc-sans);
+  font-size: 0.78rem;
+  color: var(--mc-text-dim);
+  margin: -0.5rem 0 1rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--mc-amber);
+  line-height: 1.5;
+  max-width: 70ch;
+}
+.mc-page-help code {
+  font-family: var(--mc-mono);
+  font-size: 0.92em;
+  color: var(--mc-cyan-bright);
+  background: none;
+  padding: 0;
+}
 .mc-task-id {
   font-family: var(--mc-mono);
   font-size: 0.68rem;

@@ -130,7 +130,7 @@ export function Autonomous() {
   return (
     <div className="container py-4">
       {/* Page header */}
-      <div className="d-flex justify-content-between align-items-center mb-4">
+      <div className="d-flex justify-content-between align-items-center mb-1">
         <div className="d-flex align-items-center gap-3">
           <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Autonomous orchestrator</h2>
           {state && <StatusBadge status={state.status} />}
@@ -164,6 +164,12 @@ export function Autonomous() {
             )
           )}
         </div>
+      </div>
+      <div className="mc-page-help">
+        One-task-at-a-time orchestrator. When enabled, picks the next open backlog task,
+        spawns a Claude pane to work it, reviews against Definition-of-Done, marks
+        <code> closed</code> or reopens with feedback. Honors a sleep window
+        (default 22:00–08:00 UTC). Defaults to <strong>disabled</strong>.
       </div>
 
       {/* Errors */}

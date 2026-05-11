@@ -95,10 +95,15 @@ export function Feedback() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "860px" }}>
-      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1.5rem" }}>
+      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
         Feedback
         <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
       </h2>
+      <div className="mc-page-help">
+        Raw user feedback collected outside any backlog process. Use <strong>Promote
+        to task</strong> to lift an item into the board with a <code>from:</code> link back.
+        Edit text in place; the file lives at <code>data/&lt;slug&gt;/feedback/</code>.
+      </div>
 
       {error && <div className="alert alert-danger">{error}</div>}
       {files === null && !error && <div className="mc-loading">Loading</div>}

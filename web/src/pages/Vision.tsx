@@ -24,8 +24,27 @@ export function Vision() {
   const [newError, setNewError] = useState<string | null>(null);
   const [newSaving, setNewSaving] = useState(false);
 
+  // Order from least- to most-frequently-changing.
+  // constitution → north-star → strategy → tactical → initiatives/*
+  function sortVisionFiles(list: VisionFile[]): VisionFile[] {
+    const rank = (name: string): number => {
+      if (name === "constitution.md") return 0;
+      if (name === "north-star.md") return 1;
+      if (name === "strategy.md") return 2;
+      if (name === "tactical.md") return 3;
+      if (name.startsWith("initiatives/")) return 4;
+      return 5;
+    };
+    return [...list].sort((a, b) => {
+      const ra = rank(a.name);
+      const rb = rank(b.name);
+      if (ra !== rb) return ra - rb;
+      return a.name.localeCompare(b.name);
+    });
+  }
+
   function reload() {
-    api.vision(slug).then(setFiles).catch((e) => setError(String(e)));
+    api.vision(slug).then((list) => setFiles(sortVisionFiles(list))).catch((e) => setError(String(e)));
   }
 
   useEffect(() => {
@@ -89,6 +108,14 @@ export function Vision() {
         >
           + New initiative
         </button>
+      </div>
+
+      <div className="mc-page-help">
+        Layered product north star ordered from rarely- to often-changing:
+        <code> constitution</code> (stakeholder-only) → <code> north-star</code> →
+        <code> strategy</code> (per cycle) → <code> tactical</code> (per sprint) →
+        <code> initiatives/*</code>. Click Edit to revise; AGENTS.md surfaces these to
+        every agent on every turn.
       </div>
 
       {error && <div className="alert alert-danger">{error}</div>}

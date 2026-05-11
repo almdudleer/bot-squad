@@ -219,6 +219,17 @@ export function Shell() {
         <ul className="mc-sidebar-nav">
           <li>
             <NavLink
+              to="/"
+              end
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+              onClick={handleSwitchProject}
+            >
+              <span className="mc-nav-diamond">◇</span>
+              ALL PROJECTS
+            </NavLink>
+          </li>
+          <li>
+            <NavLink
               to="/scheduler"
               className={({ isActive }) => (isActive ? "active" : undefined)}
             >

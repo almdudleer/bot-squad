@@ -43,6 +43,17 @@ export type Task = {
 export type VisionFile = { name: string; content: string };
 export type FeedbackFile = { name: string; content: string };
 
+export type SessionRow = {
+  sid: string;
+  status: "active" | "paused";
+  window: string;
+  cwd: string;
+  started_at?: string | null;
+  last_prompt_at?: string | number | null;
+  claude_uuid?: string | null;
+  linked_tasks: string[];
+};
+
 export const api = {
   health: () => call("/api/health"),
   projects: () => call<Project[]>("/api/projects"),
@@ -72,4 +83,15 @@ export const api = {
     call(`/api/projects/${slug}/feedback/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   promoteFeedback: (slug: string, name: string, title?: string, body?: string) =>
     call<{ task_id: string }>(`/api/projects/${slug}/feedback/${name}/promote`, { method: "POST", body: JSON.stringify({ title, body }) }),
+  sessions: (slug: string) =>
+    call<SessionRow[]>(`/api/projects/${slug}/sessions`),
+  pauseSession: (slug: string, sid: string) =>
+    call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`, { method: "POST" }),
+  resumeSession: (slug: string, sid: string) =>
+    call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/resume`, { method: "POST" }),
+  spawnSession: (slug: string, window: string, initial_prompt?: string) =>
+    call(`/api/projects/${slug}/sessions`, {
+      method: "POST",
+      body: JSON.stringify({ window, initial_prompt }),
+    }),
 };

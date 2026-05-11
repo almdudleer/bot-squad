@@ -779,13 +779,42 @@ pre.bg-light {
   border-radius: 4px;
   padding: 0.6rem 0.75rem;
   margin-bottom: 0.4rem;
-  cursor: pointer;
-  transition: border-left-color 0.12s, background-color 0.12s;
+  cursor: grab;
+  transition: border-left-color 0.12s, background-color 0.12s, opacity 0.12s, transform 0.12s;
   box-shadow: inset 0 1px 0 var(--mc-border-strong);
+  user-select: none;       /* drag is the primary gesture */
 }
 .mc-task-card:hover {
   background-color: var(--mc-surface-raised);
   border-left-color: var(--mc-cyan);
+}
+.mc-task-card:active {
+  cursor: grabbing;
+}
+.mc-task-card.dragging {
+  opacity: 0.35;
+  transform: scale(0.98);
+  cursor: grabbing;
+}
+
+/* Board column drag-over highlight */
+.mc-board-col {
+  border-radius: 4px;
+  transition: background-color 0.12s, outline-color 0.12s;
+  outline: 1px dashed transparent;
+  outline-offset: -4px;
+  padding-top: 0.25rem;
+}
+.mc-board-col.drag-over {
+  background-color: rgba(34, 211, 238, 0.06);
+  outline-color: var(--mc-cyan);
+}
+.mc-empty-col {
+  font-family: var(--mc-mono);
+  font-size: 0.72rem;
+  color: var(--mc-text-faint);
+  padding: 0.6rem 0.5rem;
+  letter-spacing: 0.05em;
 }
 .mc-task-id {
   font-family: var(--mc-mono);

@@ -114,6 +114,21 @@ export function Project() {
     }
   }
 
+  async function handleMove(taskId: string, fromStatus: Task["status"], toStatus: Task["status"]) {
+    if (fromStatus === toStatus) return;
+    // Optimistic update so the card moves immediately
+    setTasks((prev) =>
+      prev ? prev.map((t) => (t.id === taskId ? { ...t, status: toStatus } : t)) : prev,
+    );
+    try {
+      await api.patchTask(slug, taskId, { status: toStatus });
+      reload();
+    } catch (e) {
+      setError(String(e));
+      reload();   // revert to server truth
+    }
+  }
+
   async function handleMenuAction(task: Task, action: MenuAction) {
     if (action.kind === "status") {
       try {
@@ -160,9 +175,11 @@ export function Project() {
           <BoardColumn
             key={c}
             title={COLUMN_LABELS[c]}
+            status={c}
             tasks={grouped[c]}
             slug={slug}
             onMenuAction={handleMenuAction}
+            onMove={handleMove}
           />
         ))}
       </div>

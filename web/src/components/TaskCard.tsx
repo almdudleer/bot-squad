@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task } from "../api";
 import { relativeTime } from "../utils/relativeTime";
+import { DRAG_MIME } from "./BoardColumn";
 
 export type MenuAction =
   | { kind: "status"; status: Task["status"] }
@@ -29,13 +30,39 @@ function countComments(body: string): number {
 export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragSuppressClickRef = useRef(false);
   const commentCount = countComments(task.body);
   const updated = relativeTime(task.updated);
 
+  function handleDragStart(e: React.DragEvent<HTMLDivElement>) {
+    e.dataTransfer.setData(
+      DRAG_MIME,
+      JSON.stringify({ id: task.id, fromStatus: task.status }),
+    );
+    e.dataTransfer.effectAllowed = "move";
+    setIsDragging(true);
+    dragSuppressClickRef.current = true;
+  }
+
+  function handleDragEnd() {
+    setIsDragging(false);
+    // Clear the suppress flag on the next tick so the click from the same gesture is ignored
+    setTimeout(() => { dragSuppressClickRef.current = false; }, 50);
+  }
+
+  function handleCardClick() {
+    if (dragSuppressClickRef.current) return;   // ignore click that's part of a drag
+    navigate(`/p/${slug}/t/${task.id}`);
+  }
+
   return (
     <div
-      className="mc-task-card"
-      onClick={() => navigate(`/p/${slug}/t/${task.id}`)}
+      className={`mc-task-card${isDragging ? " dragging" : ""}`}
+      draggable
+      onDragStart={handleDragStart}
+      onDragEnd={handleDragEnd}
+      onClick={handleCardClick}
     >
       <div className="d-flex justify-content-between align-items-start">
         <div className="mc-task-id">{task.id}</div>

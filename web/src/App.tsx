@@ -18,13 +18,13 @@ export function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Public routes — no shell header */}
+        {/* Login is the only route fully outside the sidebar shell */}
         <Route path="/login" element={<Login />} />
-        <Route path="/help" element={<Help />} />
 
-        {/* Authenticated routes — wrapped in Shell (sticky header) */}
+        {/* Everything else inside the Shell sidebar layout */}
         <Route element={<Shell />}>
           <Route path="/" element={<Picker />} />
+          <Route path="/help" element={<Help />} />
           <Route path="/p/:slug" element={<Project />} />
           <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
           <Route path="/p/:slug/vision" element={<Vision />} />

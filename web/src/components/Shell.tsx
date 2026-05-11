@@ -8,8 +8,13 @@ const PINNED_PROJECT_KEY = "bot-squad:last-project";
  * Shell — left sidebar navigation present on every authenticated page.
  * 240 px sticky sidebar: wordmark + worker LED, project info, nav links, system links, footer.
  *
- * The currently-selected project is pinned in localStorage so the [PROJECT]
- * section keeps showing when you navigate to global routes like /scheduler or /help.
+ * Project pinning contract (one pin or none, exactly one way each):
+ *   • PIN     — visiting any /p/:slug/* URL pins that slug. The only practical
+ *               way to trigger this is by clicking a project in the picker.
+ *   • UNPIN   — the "← switch project" link in the [PROJECT] block. That's it.
+ *               (Sign-out also clears the pin for hygiene.)
+ *   • The pin survives navigating to /, /scheduler, /help, etc. — the
+ *               [PROJECT] block stays so per-project links remain one click away.
  */
 export function Shell() {
   const { slug: urlSlug } = useParams<{ slug?: string }>();
@@ -83,7 +88,8 @@ export function Shell() {
       .catch(() => (window.location.href = "/login"));
   }
 
-  function handleSwitchProject() {
+  // The ONLY way to unpin (other than sign-out).
+  function unpinProject() {
     try {
       localStorage.removeItem(PINNED_PROJECT_KEY);
     } catch {
@@ -148,7 +154,7 @@ export function Shell() {
               <Link
                 to="/"
                 className="mc-sidebar-project-link"
-                onClick={handleSwitchProject}
+                onClick={unpinProject}
               >
                 ← switch project
               </Link>
@@ -222,7 +228,6 @@ export function Shell() {
               to="/"
               end
               className={({ isActive }) => (isActive ? "active" : undefined)}
-              onClick={handleSwitchProject}
             >
               <span className="mc-nav-diamond">◇</span>
               ALL PROJECTS

@@ -377,6 +377,101 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "pane_id": pane.pane_id, "lines_sent": lines_sent}
 
 
+# ---------------------------------------------------------------------------
+# Autonomous orchestrator actions (spec #8)
+# ---------------------------------------------------------------------------
+
+_AUTO_STATUS_ALLOWED = {"slug"}
+
+
+def _action_autonomous_status(params: dict[str, Any]) -> dict[str, Any]:
+    """Return the current autonomous orchestrator state for a project.
+
+    Required params: slug
+    Returns: {enabled, status, current_task_id, current_pane_id, last_tick_at,
+              sleep_start_hour, sleep_end_hour, tick_log (last 5)}
+    """
+    extra = set(params) - _AUTO_STATUS_ALLOWED
+    if extra:
+        raise ActionError(f"autonomous_status got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("autonomous_status missing required param: slug")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autonomous_status: unknown project slug {slug!r}")
+
+    from bot_squad_worker import autonomous as _auto
+    state = _auto.load_state(cfg, slug)
+    from dataclasses import asdict
+    d = asdict(state)
+    # Return last 5 tick log entries in status (full log via log endpoint)
+    d["tick_log"] = state.tick_log[-5:]
+    return {"ok": True, **d}
+
+
+_AUTO_ENABLE_ALLOWED = {"slug", "sleep_start_hour", "sleep_end_hour"}
+
+
+def _action_autonomous_enable(params: dict[str, Any]) -> dict[str, Any]:
+    """Enable the autonomous orchestrator for a project.
+
+    Required params: slug
+    Optional params: sleep_start_hour (int, default 22), sleep_end_hour (int, default 8)
+    Returns: {ok: true, slug, enabled: true}
+    """
+    extra = set(params) - _AUTO_ENABLE_ALLOWED
+    if extra:
+        raise ActionError(f"autonomous_enable got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("autonomous_enable missing required param: slug")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autonomous_enable: unknown project slug {slug!r}")
+
+    from bot_squad_worker import autonomous as _auto
+    state = _auto.load_state(cfg, slug)
+    state.enabled = True
+    if "sleep_start_hour" in params:
+        state.sleep_start_hour = int(params["sleep_start_hour"])
+    if "sleep_end_hour" in params:
+        state.sleep_end_hour = int(params["sleep_end_hour"])
+    _auto.save_state(cfg, state)
+    return {"ok": True, "slug": slug, "enabled": True}
+
+
+_AUTO_DISABLE_ALLOWED = {"slug"}
+
+
+def _action_autonomous_disable(params: dict[str, Any]) -> dict[str, Any]:
+    """Disable the autonomous orchestrator for a project.
+
+    Required params: slug
+    Returns: {ok: true, slug, enabled: false}
+
+    In-flight tasks complete normally; the orchestrator won't start new ones.
+    """
+    extra = set(params) - _AUTO_DISABLE_ALLOWED
+    if extra:
+        raise ActionError(f"autonomous_disable got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("autonomous_disable missing required param: slug")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autonomous_disable: unknown project slug {slug!r}")
+
+    from bot_squad_worker import autonomous as _auto
+    state = _auto.load_state(cfg, slug)
+    state.enabled = False
+    _auto.save_state(cfg, state)
+    return {"ok": True, "slug": slug, "enabled": False}
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
@@ -389,6 +484,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "spawn_session": _action_spawn_session,
     "scheduler_state": _action_scheduler_state,
     "inject_input": _action_inject_input,
+    "autonomous_status": _action_autonomous_status,
+    "autonomous_enable": _action_autonomous_enable,
+    "autonomous_disable": _action_autonomous_disable,
 }
 
 

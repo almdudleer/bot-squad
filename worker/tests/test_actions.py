@@ -44,10 +44,12 @@ def test_registry_lists_only_allowed_actions():
     # spec #5 adds list_sessions, pause_session, resume_session, spawn_session.
     # spec #6 adds scheduler_state.
     # spec #7 adds inject_input.
+    # spec #8 adds autonomous_status, autonomous_enable, autonomous_disable.
     assert set(ACTION_REGISTRY.keys()) == {
         "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now",
         "list_sessions", "pause_session", "resume_session", "spawn_session",
         "scheduler_state", "inject_input",
+        "autonomous_status", "autonomous_enable", "autonomous_disable",
     }
 
 
@@ -709,3 +711,154 @@ def test_inject_input_missing_params(tmp_path, monkeypatch):
 
     with pytest.raises(ActionError, match="missing required"):
         A.dispatch("inject_input", {"sid": "S-x-y-p1"})
+
+
+# ---------------------------------------------------------------------------
+# autonomous_status / autonomous_enable / autonomous_disable tests (spec #8)
+# ---------------------------------------------------------------------------
+
+
+def _make_auto_cfg(tmp_path: Path, monkeypatch):
+    """Create config + data dirs for autonomous action tests."""
+    import types
+    import bot_squad_worker.actions as A
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data_dir = tmp_path / "data"
+    (data_dir / "test-project" / "backlog").mkdir(parents=True)
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.test-project]\n'
+        f'slug = "test-project"\n'
+        f'display_name = "Test Project"\n'
+        f'repo_path = "{repo}"\n'
+        f'deploy_branch = "agent_team/dev"\n'
+        f'master_branch = "master"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "0"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    patched = types.SimpleNamespace(
+        projects=cfg.projects,
+        data_dir=data_dir,
+        tg_bot_token="",
+    )
+    monkeypatch.setattr(A, "_get_config", lambda: patched)
+    return patched
+
+
+def test_autonomous_status_returns_disabled_by_default(tmp_path, monkeypatch):
+    """autonomous_status for a new project returns enabled=False."""
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    result = A.dispatch("autonomous_status", {"slug": "test-project"})
+    assert result["ok"] is True
+    assert result["enabled"] is False
+    assert result["status"] == "idle"
+
+
+def test_autonomous_status_unknown_slug_raises(tmp_path, monkeypatch):
+    """autonomous_status with unknown slug raises ActionError."""
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("autonomous_status", {"slug": "no-such-project"})
+
+
+def test_autonomous_status_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("autonomous_status", {"slug": "test-project", "evil": "x"})
+
+
+def test_autonomous_enable_sets_enabled_true(tmp_path, monkeypatch):
+    """autonomous_enable persists enabled=True."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import autonomous as _auto
+
+    cfg = _make_auto_cfg(tmp_path, monkeypatch)
+    result = A.dispatch("autonomous_enable", {"slug": "test-project"})
+    assert result["ok"] is True
+    assert result["enabled"] is True
+
+    state = _auto.load_state(cfg, "test-project")
+    assert state.enabled is True
+
+
+def test_autonomous_enable_accepts_sleep_hours(tmp_path, monkeypatch):
+    """autonomous_enable accepts optional sleep_start_hour / sleep_end_hour."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import autonomous as _auto
+
+    cfg = _make_auto_cfg(tmp_path, monkeypatch)
+    A.dispatch("autonomous_enable", {
+        "slug": "test-project",
+        "sleep_start_hour": 23,
+        "sleep_end_hour": 7,
+    })
+    state = _auto.load_state(cfg, "test-project")
+    assert state.sleep_start_hour == 23
+    assert state.sleep_end_hour == 7
+
+
+def test_autonomous_enable_unknown_slug_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("autonomous_enable", {"slug": "no-such-project"})
+
+
+def test_autonomous_enable_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("autonomous_enable", {"slug": "test-project", "evil": "x"})
+
+
+def test_autonomous_disable_sets_enabled_false(tmp_path, monkeypatch):
+    """autonomous_disable persists enabled=False even if previously enabled."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import autonomous as _auto
+
+    cfg = _make_auto_cfg(tmp_path, monkeypatch)
+    # Enable first
+    A.dispatch("autonomous_enable", {"slug": "test-project"})
+    state = _auto.load_state(cfg, "test-project")
+    assert state.enabled is True
+
+    # Now disable
+    result = A.dispatch("autonomous_disable", {"slug": "test-project"})
+    assert result["ok"] is True
+    assert result["enabled"] is False
+
+    state2 = _auto.load_state(cfg, "test-project")
+    assert state2.enabled is False
+
+
+def test_autonomous_disable_unknown_slug_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("autonomous_disable", {"slug": "no-such-project"})
+
+
+def test_autonomous_disable_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_auto_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("autonomous_disable", {"slug": "test-project", "evil": "x"})

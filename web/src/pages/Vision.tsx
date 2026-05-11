@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api, VisionFile } from "../api";
 import { Modal } from "../components/Modal";
 
@@ -77,12 +77,6 @@ export function Vision() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "860px" }}>
-      <nav className="mc-breadcrumb">
-        <Link to={`/p/${slug}`}>← Board</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Vision</span>
-      </nav>
-
       <div className="d-flex justify-content-between align-items-center mb-4">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
           Vision

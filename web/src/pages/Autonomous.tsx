@@ -129,15 +129,6 @@ export function Autonomous() {
 
   return (
     <div className="container py-4">
-      {/* Breadcrumb */}
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}`}>{slug}</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Autonomous</span>
-      </nav>
-
       {/* Page header */}
       <div className="d-flex justify-content-between align-items-center mb-4">
         <div className="d-flex align-items-center gap-3">

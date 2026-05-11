@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { Link, useParams } from "react-router-dom";
+// Link kept for session SID links and task links inside the table
 import { api, SessionRow } from "../api";
 import { Modal } from "../components/Modal";
 
@@ -108,23 +109,6 @@ export function Sessions() {
 
   return (
     <div className="container py-4">
-      {/* Breadcrumb nav */}
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}`}>{slug}</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Sessions</span>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/runs`}>Runs</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/vision`}>Vision</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/feedback`}>Feedback</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to="/scheduler">Scheduler</Link>
-      </nav>
-
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>

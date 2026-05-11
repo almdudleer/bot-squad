@@ -1,15 +1,20 @@
 import { useEffect, useState } from "react";
-import { Link, Outlet, useParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
 
 /**
- * Shell — sticky top header bar present on every authenticated page.
- * Renders: BOT-SQUAD wordmark + worker status dot | project name | user + sign-out + help
+ * Shell — left sidebar navigation present on every authenticated page.
+ * 240 px sticky sidebar: wordmark + worker LED, project info, nav links, system links, footer.
  */
 export function Shell() {
   const { slug } = useParams<{ slug?: string }>();
+  const location = useLocation();
   const [workerAlive, setWorkerAlive] = useState<boolean | null>(null);
   const [username, setUsername] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Determine if we are on a project-level route
+  const hasProject = Boolean(slug);
 
   // Poll worker health every 30 s
   useEffect(() => {
@@ -21,7 +26,6 @@ export function Shell() {
           if (cancelled) return;
           const alive = !!(h as Record<string, unknown>)?.ok;
           setWorkerAlive(alive);
-          // Extract username if returned
           const u = (h as Record<string, unknown>)?.username;
           if (typeof u === "string") setUsername(u);
         })
@@ -37,56 +41,173 @@ export function Shell() {
     };
   }, []);
 
+  // Close sidebar on route change (mobile)
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [location.pathname]);
+
   function handleSignOut() {
     api.logout().then(() => (window.location.href = "/login")).catch(() => (window.location.href = "/login"));
   }
 
   const dotCls =
-    workerAlive === null ? "mc-dot mc-dot-idle" : workerAlive ? "mc-dot mc-dot-active" : "mc-dot mc-dot-error";
+    workerAlive === null
+      ? "mc-dot mc-dot-idle"
+      : workerAlive
+      ? "mc-dot mc-dot-active"
+      : "mc-dot mc-dot-error";
+
+  const workerLabel =
+    workerAlive === null ? "UNKNOWN" : workerAlive ? "OPERATIONAL" : "WORKER OFFLINE";
+
+  const workerLabelColor =
+    workerAlive === null
+      ? "var(--mc-text-faint)"
+      : workerAlive
+      ? "var(--mc-green)"
+      : "var(--mc-red)";
 
   return (
-    <>
-      <header className="mc-shell-header">
-        {/* Wordmark */}
-        <Link to="/" className="mc-wordmark">
-          <span className={dotCls} title={workerAlive === null ? "unknown" : workerAlive ? "worker alive" : "worker offline"} />
-          BOT-SQUAD
-        </Link>
+    <div className="mc-layout">
+      {/* Mobile toggle */}
+      <button
+        type="button"
+        className="mc-sidebar-toggle"
+        onClick={() => setSidebarOpen((v) => !v)}
+        aria-label="Toggle navigation"
+      >
+        ☰
+      </button>
 
-        {/* Project name (center) */}
-        <div className="mc-shell-project">
-          {slug && (
-            <>
-              <span style={{ color: "var(--mc-border-mid)", marginRight: "0.35rem" }}>/</span>
-              <span>{slug}</span>
-            </>
-          )}
+      {/* Overlay for mobile */}
+      <div
+        className={`mc-sidebar-overlay${sidebarOpen ? " open" : ""}`}
+        onClick={() => setSidebarOpen(false)}
+      />
+
+      {/* ── Sidebar ─────────────────────────────────────────── */}
+      <nav className={`mc-sidebar${sidebarOpen ? " open" : ""}`}>
+
+        {/* Header strip */}
+        <div className="mc-sidebar-header">
+          <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
+          <div className="mc-worker-status">
+            <span className={dotCls} />
+            <span style={{ color: workerLabelColor }}>{workerLabel}</span>
+          </div>
         </div>
 
-        {/* Right side */}
-        <div className="mc-shell-right">
-          {username && <span className="mc-shell-username">{username}</span>}
-          <Link to="/help">help</Link>
-          <span className="mc-shell-sep">·</span>
+        {/* Project section — only when inside a project */}
+        {hasProject && (
+          <>
+            <div className="mc-sidebar-section">Project</div>
+            <div className="mc-sidebar-project">
+              <div className="mc-sidebar-project-name">{slug}</div>
+              <Link to="/" className="mc-sidebar-project-link">
+                ← switch project
+              </Link>
+            </div>
+
+            <div className="mc-sidebar-section">Nav</div>
+            <ul className="mc-sidebar-nav">
+              <li>
+                <NavLink
+                  to={`/p/${slug}`}
+                  end
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  BOARD
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/vision`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  VISION
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/feedback`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  FEEDBACK
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/sessions`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  SESSIONS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/runs`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  RUNS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/autonomous`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  AUTONOMOUS
+                </NavLink>
+              </li>
+            </ul>
+          </>
+        )}
+
+        {/* System section */}
+        <div className="mc-sidebar-section">System</div>
+        <ul className="mc-sidebar-nav">
+          <li>
+            <NavLink
+              to="/scheduler"
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+            >
+              <span className="mc-nav-diamond">◇</span>
+              SCHEDULER
+            </NavLink>
+          </li>
+          <li>
+            <a href="/help" target="_blank" rel="noopener noreferrer">
+              <span className="mc-nav-diamond">◇</span>
+              HELP
+            </a>
+          </li>
+        </ul>
+
+        {/* Footer */}
+        <div className="mc-sidebar-footer">
+          {username && (
+            <div className="mc-sidebar-user">{username} @ bot-squad</div>
+          )}
           <button
             type="button"
+            className="mc-sidebar-signout"
             onClick={handleSignOut}
-            style={{
-              background: "none",
-              border: "none",
-              padding: 0,
-              cursor: "pointer",
-              color: "var(--mc-text-dim)",
-              fontSize: "0.78rem",
-              fontFamily: "var(--mc-sans)",
-            }}
           >
-            sign out
+            Sign out
           </button>
         </div>
-      </header>
+      </nav>
 
-      <Outlet />
-    </>
+      {/* ── Main content ──────────────────────────────────── */}
+      <main className="mc-main">
+        <Outlet />
+      </main>
+    </div>
   );
 }

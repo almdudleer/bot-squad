@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api, RunRow } from "../api";
 
 export function RunLog() {
@@ -58,19 +58,6 @@ export function RunLog() {
 
   return (
     <div className="container-fluid py-4">
-      {/* Breadcrumb */}
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}`}>{slug}</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}/runs`}>Runs</Link>
-        <span className="mc-bc-sep">/</span>
-        <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-mid)" }}>
-          {id.slice(0, 8)}
-        </code>
-      </nav>
-
       {/* Header */}
       <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
         <code

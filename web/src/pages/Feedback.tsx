@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api, FeedbackFile } from "../api";
 import { Modal } from "../components/Modal";
 
@@ -95,12 +95,6 @@ export function Feedback() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "860px" }}>
-      <nav className="mc-breadcrumb">
-        <Link to={`/p/${slug}`}>← Board</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Feedback</span>
-      </nav>
-
       <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1.5rem" }}>
         Feedback
         <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>

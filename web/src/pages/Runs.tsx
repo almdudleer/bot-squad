@@ -81,17 +81,6 @@ export function Runs() {
 
   return (
     <div className="container py-4">
-      {/* Breadcrumb */}
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}`}>{slug}</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Runs</span>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/sessions`}>Sessions</Link>
-      </nav>
-
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>

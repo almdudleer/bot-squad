@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api, Task } from "../api";
 import { BoardColumn } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
@@ -145,24 +145,6 @@ export function Project() {
 
   return (
     <div className="container py-4">
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">{slug}</span>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/vision`}>Vision</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/feedback`}>Feedback</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/sessions`}>Sessions</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/runs`}>Runs</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to={`/p/${slug}/autonomous`}>Autonomous</Link>
-        <span className="mc-bc-sep">·</span>
-        <Link to="/scheduler">Scheduler</Link>
-      </nav>
-
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Backlog</h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>

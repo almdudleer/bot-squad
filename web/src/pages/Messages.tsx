@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api, MessageRecord } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -229,17 +229,6 @@ export function Messages() {
 
   return (
     <div className="container py-4">
-      {/* Breadcrumb */}
-      <nav className="mc-breadcrumb">
-        <Link to="/">Projects</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}`}>{slug}</Link>
-        <span className="mc-bc-sep">/</span>
-        <Link to={`/p/${slug}/sessions`}>Sessions</Link>
-        <span className="mc-bc-sep">/</span>
-        <span className="mc-bc-current">Messages</span>
-      </nav>
-
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
         <div>

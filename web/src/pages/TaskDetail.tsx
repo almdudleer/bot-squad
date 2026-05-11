@@ -146,9 +146,6 @@ export function TaskDetail() {
   if (error) {
     return (
       <div className="container py-4">
-        <nav className="mc-breadcrumb">
-          <Link to={`/p/${slug}`}>← Board</Link>
-        </nav>
         <div className="alert alert-danger">{error}</div>
       </div>
     );
@@ -157,9 +154,6 @@ export function TaskDetail() {
   if (!task) {
     return (
       <div className="container py-4">
-        <nav className="mc-breadcrumb">
-          <Link to={`/p/${slug}`}>← Board</Link>
-        </nav>
         <div className="mc-loading">Loading</div>
       </div>
     );
@@ -169,14 +163,6 @@ export function TaskDetail() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "800px" }}>
-      <nav className="mc-breadcrumb">
-        <Link to={`/p/${slug}`}>← Board</Link>
-        <span className="mc-bc-sep">/</span>
-        <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
-          {task.id}
-        </code>
-      </nav>
-
       {actionError && <div className="alert alert-danger">{actionError}</div>}
 
       {/* Title + status row */}

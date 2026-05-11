@@ -16,7 +16,7 @@ from pathlib import Path
 
 import uvicorn
 
-from bot_squad_worker.actions import set_config
+from bot_squad_worker.actions import set_config, set_scheduler
 from bot_squad_worker.config import Config
 from bot_squad_worker.scheduler import build_scheduler
 from bot_squad_worker.server import build_app
@@ -51,6 +51,7 @@ def main() -> int:
 
     sched = build_scheduler(cfg)
     sched.start()
+    set_scheduler(sched)
     log.info("scheduler started")
 
     app = build_app()

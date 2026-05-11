@@ -41,6 +41,20 @@ def _get_config() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Scheduler singleton — injected at startup by __main__.py via set_scheduler().
+# Tests can monkeypatch _SCHED with a stub BackgroundScheduler.
+# ---------------------------------------------------------------------------
+
+_SCHED: Any = None  # BackgroundScheduler | None
+
+
+def set_scheduler(sched: Any) -> None:
+    """Called once at startup after the scheduler is created."""
+    global _SCHED
+    _SCHED = sched
+
+
+# ---------------------------------------------------------------------------
 # TgClient singleton — created lazily on first use.
 # Tests replace _TG or monkeypatch _get_tg_client directly.
 # ---------------------------------------------------------------------------
@@ -296,6 +310,26 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.spawn(cfg, params["slug"], params["window"], params.get("initial_prompt"))
 
 
+# ---------------------------------------------------------------------------
+# Scheduler state action (spec #6)
+# ---------------------------------------------------------------------------
+
+def _action_scheduler_state(params: dict[str, Any]) -> dict[str, Any]:
+    """Return current APScheduler state (jobs, uptime, heartbeat age).
+
+    Takes no params. Returns {jobs, worker_started_at, last_heartbeat_age_seconds}.
+    """
+    if params:
+        raise ActionError(f"scheduler_state takes no params, got: {sorted(params)}")
+
+    cfg = _get_config()
+    if _SCHED is None:
+        raise ActionError("scheduler not initialised")
+
+    from bot_squad_worker.scheduler import state_for_api
+    return state_for_api(_SCHED, cfg)
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
@@ -306,6 +340,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "pause_session": _action_pause_session,
     "resume_session": _action_resume_session,
     "spawn_session": _action_spawn_session,
+    "scheduler_state": _action_scheduler_state,
 }
 
 

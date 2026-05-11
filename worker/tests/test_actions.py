@@ -42,9 +42,11 @@ def test_unknown_action_raises():
 def test_registry_lists_only_allowed_actions():
     # Closed allowlist — spec #3 phase 3 adds deploy + kick_stuck_now.
     # spec #5 adds list_sessions, pause_session, resume_session, spawn_session.
+    # spec #6 adds scheduler_state.
     assert set(ACTION_REGISTRY.keys()) == {
         "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now",
         "list_sessions", "pause_session", "resume_session", "spawn_session",
+        "scheduler_state",
     }
 
 
@@ -482,3 +484,95 @@ def test_spawn_session_action_rejects_extra_params(tmp_path, monkeypatch):
     _make_sessions_cfg(tmp_path, monkeypatch)
     with pytest.raises(ActionError, match="unexpected params"):
         A.dispatch("spawn_session", {"slug": "test-project", "window": "w", "evil": "x"})
+
+
+# ---------------------------------------------------------------------------
+# scheduler_state action tests (spec #6)
+# ---------------------------------------------------------------------------
+
+
+class _FakeJob:
+    """Minimal stub for an APScheduler job."""
+
+    def __init__(self, jid: str, next_run=None, trigger_str="interval[60s]") -> None:
+        self.id = jid
+        self.next_run_time = next_run
+        self._trigger_str = trigger_str
+
+    @property
+    def trigger(self):
+        class _T:
+            def __str__(self_inner):
+                return self._trigger_str
+        return _T()
+
+
+class _FakeSched:
+    def __init__(self, jobs=None) -> None:
+        self._jobs = jobs or []
+
+    def get_jobs(self):
+        return self._jobs
+
+
+def _make_scheduler_cfg(tmp_path: Path, monkeypatch):
+    """Create config + heartbeat file + inject fake scheduler."""
+    import types
+    import bot_squad_worker.actions as A
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.tp]\nslug = "tp"\ndisplay_name = "TP"\n'
+        'repo_path = "/tmp/tp"\ndeploy_branch = "dev"\nmaster_branch = "master"\n'
+        'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+        'deploy_targets = ["staging"]\ntg_chat = "0"\ncreated_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+
+    data_dir = tmp_path / "data"
+    worker_dir = data_dir / "_worker"
+    worker_dir.mkdir(parents=True)
+    hb_path = worker_dir / "heartbeat"
+    hb_path.write_text("ok")
+
+    cfg = Config.load(cfg_dir)
+    patched = types.SimpleNamespace(
+        projects=cfg.projects,
+        data_dir=data_dir,
+        heartbeat_path=hb_path,
+        tg_bot_token="",
+    )
+    monkeypatch.setattr(A, "_get_config", lambda: patched)
+    return patched
+
+
+def test_scheduler_state_returns_expected_shape(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from datetime import datetime, timezone
+
+    cfg = _make_scheduler_cfg(tmp_path, monkeypatch)
+
+    fake_sched = _FakeSched(jobs=[
+        _FakeJob("heartbeat", datetime(2026, 5, 11, 12, 0, 0, tzinfo=timezone.utc)),
+        _FakeJob("deploy_monitor", None),
+    ])
+    monkeypatch.setattr(A, "_SCHED", fake_sched)
+
+    result = A.dispatch("scheduler_state", {})
+    assert "jobs" in result
+    assert "worker_started_at" in result
+    assert "last_heartbeat_age_seconds" in result
+    assert len(result["jobs"]) == 2
+    assert result["jobs"][0]["id"] == "heartbeat"
+    assert result["jobs"][0]["next_run"] is not None
+    assert result["jobs"][1]["next_run"] is None
+
+
+def test_scheduler_state_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_scheduler_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(A, "_SCHED", _FakeSched())
+    with pytest.raises(ActionError, match="takes no params"):
+        A.dispatch("scheduler_state", {"evil": "x"})

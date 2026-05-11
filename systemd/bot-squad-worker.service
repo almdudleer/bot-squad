@@ -16,7 +16,11 @@ RestartSec=10s
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/home/www/bot-squad/data /home/almdudleer
-PrivateTmp=yes
+# PrivateTmp INTENTIONALLY DISABLED — the worker needs to see the user's
+# tmux server at /tmp/tmux-1000/default to discover and control Claude
+# sessions (spec #5 list_sessions/pause/resume/spawn). Re-enabling will
+# silently break session discovery.
+# PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

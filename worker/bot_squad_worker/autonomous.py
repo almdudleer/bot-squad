@@ -297,7 +297,7 @@ def spawn_worker(cfg: Any, slug: str, task: dict) -> str:
         "## What to do\n\n"
         "1. Read AGENTS.md if you haven't already.\n"
         "2. Implement the task within the constraints. NEVER push, NEVER merge, NEVER amend.\n"
-        "3. Commit on agent_team/dev.\n"
+        "3. Commit on bot_squad/dev.\n"
         "4. Run tests; fix until green.\n"
         "5. Request a deploy: ops/bot-squad-bin/deploy staging \"<reason tied to task ID>\"\n"
         f"6. Update the task status to `totest` (task ID: {task_id}).\n"

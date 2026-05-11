@@ -194,7 +194,7 @@ files repeatedly, the right answer probably belongs here.
 
 ## Branching & commits
 
-- Working branch: `agent_team/dev`. Branch off master, never push, never merge,
+- Working branch: `bot_squad/dev`. Branch off master, never push, never merge,
   never amend.
 - Commit prefix: `[backend]`, `[web]`, `[ops]`, `[docs]`. Imperative summary,
   ≤70 chars. Co-Authored-By auto-added.
@@ -211,7 +211,7 @@ files repeatedly, the right answer probably belongs here.
 - TG-pings on success/failure.
 - You don't manage the loop. Commit, squash, request, walk away.
 
-Manual prod release: stakeholder reviews staging → merges agent_team/dev (or
+Manual prod release: stakeholder reviews staging → merges bot_squad/dev (or
 staging) into master → builds the prod container → deploys. Agents never
 deploy prod.
 

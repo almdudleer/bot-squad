@@ -5,7 +5,7 @@
 slug          = "signal-tracker"
 display_name  = "Signal Tracker"
 repo_path     = "/home/almdudleer/signal_tracker_mgmt"
-deploy_branch = "agent_team/dev"
+deploy_branch = "bot_squad/dev"
 master_branch = "master"
 prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
 staging_url   = "https://signal-staging.dev.uzinvestapi.com"

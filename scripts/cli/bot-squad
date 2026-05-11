@@ -2,14 +2,14 @@
 # bot-squad CLI — project management.
 #
 # Usage:
-#   bot-squad project init <slug> --repo <path> [--master master] [--deploy-branch agent_team/dev]
+#   bot-squad project init <slug> --repo <path> [--master master] [--deploy-branch bot_squad/dev]
 #
 set -euo pipefail
 
 BOT_SQUAD="${BOT_SQUAD:-/home/www/bot-squad}"
 
 cmd_project_init() {
-    local slug="" repo="" master="master" deploy_branch="agent_team/dev"
+    local slug="" repo="" master="master" deploy_branch="bot_squad/dev"
     local create_deploy_branch="true" scaffold_recipes="true"
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -160,7 +160,7 @@ EOF
     fi
     [ "$gitignore_updated" = "true" ] && echo "Updated: $repo/.gitignore"
 
-    # Create agent_team/dev branch if missing.
+    # Create bot_squad/dev branch if missing.
     if [ "$create_deploy_branch" = "true" ]; then
         if ! git -C "$repo" rev-parse --verify "$deploy_branch" >/dev/null 2>&1; then
             git -C "$repo" checkout -b "$deploy_branch" "$master"

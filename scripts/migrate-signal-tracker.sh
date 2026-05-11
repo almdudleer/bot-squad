@@ -135,7 +135,7 @@ Repo: this directory. Vision/backlog/feedback: \`ops/bot-squad/\`
 
 ## Branching & commits
 
-- Working branch: \`agent_team/dev\` (created in spec #3; until then, master).
+- Working branch: \`bot_squad/dev\` (created in spec #3; until then, master).
 - Commit prefix: \`[backend]\`, \`[web]\`, \`[ops]\`, \`[docs]\`.
 - Imperative summary, ≤70 chars. Co-Authored-By trailer is auto-added.
 - One commit per discrete change.

@@ -26,7 +26,7 @@ def tmp_bot_squad(tmp_path: Path) -> Path:
         'slug = "test-project"\n'
         'display_name = "Test Project"\n'
         'repo_path = "/tmp/test-repo"\n'
-        'deploy_branch = "agent_team/dev"\n'
+        'deploy_branch = "bot_squad/dev"\n'
         'master_branch = "master"\n'
         'prod_url = "https://example.com"\n'
         'staging_url = "https://staging.example.com"\n'

@@ -97,7 +97,7 @@ export function Feedback() {
   return (
     <div className="container py-4" style={{ maxWidth: "860px" }}>
       <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-        Feedback
+        User feedback
         <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
       </h2>
       <PageHelp>

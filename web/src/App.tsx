@@ -11,6 +11,7 @@ import { RunLog } from "./pages/RunLog";
 import { Messages } from "./pages/Messages";
 import { Scheduler } from "./pages/Scheduler";
 import { Autonomous } from "./pages/Autonomous";
+import { Workflow } from "./pages/Workflow";
 import { Help } from "./pages/Help";
 import { Shell } from "./components/Shell";
 
@@ -28,6 +29,7 @@ export function App() {
           <Route path="/p/:slug" element={<Project />} />
           <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
           <Route path="/p/:slug/vision" element={<Vision />} />
+          <Route path="/p/:slug/workflow" element={<Workflow />} />
           <Route path="/p/:slug/feedback" element={<Feedback />} />
           <Route path="/p/:slug/sessions" element={<Sessions />} />
           <Route path="/p/:slug/runs" element={<Runs />} />

@@ -163,6 +163,23 @@ export function TaskDetail() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "800px" }}>
+      {/* Back link */}
+      <div className="mb-2">
+        <Link
+          to={`/p/${slug}`}
+          style={{
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.72rem",
+            color: "var(--mc-text-dim)",
+            textTransform: "uppercase",
+            letterSpacing: "0.06em",
+            textDecoration: "none",
+          }}
+        >
+          ← back to board
+        </Link>
+      </div>
+
       {actionError && <div className="alert alert-danger">{actionError}</div>}
 
       {/* Title + status row */}

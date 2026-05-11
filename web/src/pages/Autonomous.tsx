@@ -133,7 +133,7 @@ export function Autonomous() {
       {/* Page header */}
       <div className="d-flex justify-content-between align-items-center mb-1">
         <div className="d-flex align-items-center gap-3">
-          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Autonomous orchestrator</h2>
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Autonomous team</h2>
           {state && <StatusBadge status={state.status} />}
         </div>
         <div className="d-flex align-items-center gap-2">

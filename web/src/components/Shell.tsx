@@ -161,6 +161,7 @@ export function Shell() {
             </div>
 
             <ul className="mc-sidebar-nav">
+              {/* Management — planning content */}
               <li>
                 <NavLink
                   to={`/p/${slug}`}
@@ -177,7 +178,7 @@ export function Shell() {
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
                   <span className="mc-nav-diamond">◆</span>
-                  VISION
+                  ROADMAP
                 </NavLink>
               </li>
               <li>
@@ -186,16 +187,32 @@ export function Shell() {
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
                   <span className="mc-nav-diamond">◆</span>
-                  FEEDBACK
+                  USER FEEDBACK
                 </NavLink>
               </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/workflow`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◆</span>
+                  WORKFLOW
+                </NavLink>
+              </li>
+            </ul>
+
+            {/* Separator between management (above) and execution (below) */}
+            <div className="mc-sidebar-divider" aria-hidden="true" />
+
+            <ul className="mc-sidebar-nav">
+              {/* Execution — running things */}
               <li>
                 <NavLink
                   to={`/p/${slug}/sessions`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
-                  SESSIONS
+                  <span className="mc-nav-diamond">▸</span>
+                  AGENT SESSIONS
                 </NavLink>
               </li>
               <li>
@@ -203,8 +220,8 @@ export function Shell() {
                   to={`/p/${slug}/runs`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
-                  RUNS
+                  <span className="mc-nav-diamond">▸</span>
+                  DEPLOYMENT QUEUE
                 </NavLink>
               </li>
               <li>
@@ -212,8 +229,8 @@ export function Shell() {
                   to={`/p/${slug}/autonomous`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
-                  AUTONOMOUS
+                  <span className="mc-nav-diamond">▸</span>
+                  AUTONOMOUS TEAM
                 </NavLink>
               </li>
             </ul>

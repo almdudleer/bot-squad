@@ -45,7 +45,14 @@ export function Vision() {
   }
 
   function reload() {
-    api.vision(slug).then((list) => setFiles(sortVisionFiles(list))).catch((e) => setError(String(e)));
+    api
+      .vision(slug)
+      .then((list) => {
+        // Constitution lives in the WORKFLOW tab — filter it out here.
+        const filtered = list.filter((f) => f.name !== "constitution.md");
+        setFiles(sortVisionFiles(filtered));
+      })
+      .catch((e) => setError(String(e)));
   }
 
   useEffect(() => {
@@ -99,7 +106,7 @@ export function Vision() {
     <div className="container py-4" style={{ maxWidth: "860px" }}>
       <div className="d-flex justify-content-between align-items-center mb-4">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
-          Vision
+          Roadmap
           <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
         <button
@@ -112,11 +119,12 @@ export function Vision() {
       </div>
 
       <PageHelp>
-        Layered product north star ordered from rarely- to often-changing:
-        <code> constitution</code> (stakeholder-only) → <code> north-star</code> →
-        <code> strategy</code> (per cycle) → <code> tactical</code> (per sprint) →
-        <code> initiatives/*</code>. Click Edit to revise; AGENTS.md surfaces these to
-        every agent on every turn.
+        Layered product roadmap, ordered from rarely- to often-changing:
+        <code> north-star</code> (mission) → <code> strategy</code> (per cycle)
+        → <code> tactical</code> (per sprint) → <code> initiatives/*</code>
+        (active strategic bets). Click Edit to revise; AGENTS.md surfaces these
+        to every agent on every turn. The project&apos;s constitution lives in
+        the <strong>Workflow</strong> tab.
       </PageHelp>
 
       {error && <div className="alert alert-danger">{error}</div>}

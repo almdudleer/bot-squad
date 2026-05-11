@@ -85,7 +85,7 @@ export function Runs() {
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
-          Deploy runs
+          Deployment queue
           <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
         <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>

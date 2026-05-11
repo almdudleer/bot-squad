@@ -53,13 +53,13 @@ export function Help() {
           A sticky header bar is visible on every authenticated page. It shows:
         </p>
         <ul>
-          <li><strong>BOT-SQUAD</strong> wordmark (top-left) — clicking returns to the project picker. The small LED dot beside it shows whether the background worker process is alive (green) or offline (red).</li>
-          <li><strong>Project name</strong> (centre) — shown when you are inside a project.</li>
-          <li><strong>help · sign out</strong> (top-right).</li>
+          <li><strong>BOT·SQUAD wordmark</strong> (top of sidebar) — returns to the project picker. The LED dot beside it shows worker liveness (green = operational, red = offline).</li>
+          <li><strong>[PROJECT] section</strong> — shown when you are inside a project. Lists the per-project pages (BOARD, VISION, FEEDBACK, SESSIONS, RUNS, AUTONOMOUS). The selected project stays pinned even if you click a [SYSTEM] item.</li>
+          <li><strong>[SYSTEM] section</strong> — always visible. ALL PROJECTS returns to the picker; SCHEDULER shows worker jobs; HELP is this page.</li>
+          <li><strong>Footer</strong> — your username + Sign out.</li>
         </ul>
         <p>
-          Within a project, use the breadcrumb navigation below the header to jump between
-          sections: Board, Vision, Feedback, Sessions, Runs, and Autonomous.
+          The active page has an amber left-border in the sidebar so it&apos;s easy to see where you are.
         </p>
       </section>
 

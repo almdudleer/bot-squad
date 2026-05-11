@@ -51,6 +51,9 @@ def build_app() -> FastAPI:
     app.include_router(messages_router, prefix="/api")
     app.include_router(scheduler_router, prefix="/api")
 
+    from app.routes_autonomous import router as autonomous_router
+    app.include_router(autonomous_router, prefix="/api")
+
     from app.routes_auth import require_auth
     from app.worker_client import WorkerClient, WorkerError
     from fastapi import Depends, HTTPException

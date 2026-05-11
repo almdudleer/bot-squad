@@ -6,6 +6,10 @@ import { Vision } from "./pages/Vision";
 import { Feedback } from "./pages/Feedback";
 import { Sessions } from "./pages/Sessions";
 import { TaskDetail } from "./pages/TaskDetail";
+import { Runs } from "./pages/Runs";
+import { RunLog } from "./pages/RunLog";
+import { Messages } from "./pages/Messages";
+import { Scheduler } from "./pages/Scheduler";
 
 export function App() {
   return (
@@ -18,6 +22,10 @@ export function App() {
         <Route path="/p/:slug/vision" element={<Vision />} />
         <Route path="/p/:slug/feedback" element={<Feedback />} />
         <Route path="/p/:slug/sessions" element={<Sessions />} />
+        <Route path="/p/:slug/runs" element={<Runs />} />
+        <Route path="/p/:slug/runs/:id" element={<RunLog />} />
+        <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />
+        <Route path="/scheduler" element={<Scheduler />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>

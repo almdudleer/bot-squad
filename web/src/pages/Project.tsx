@@ -153,6 +153,10 @@ export function Project() {
         <Link to={`/p/${slug}/feedback`}>Feedback</Link>
         <span className="mx-2 text-muted">|</span>
         <Link to={`/p/${slug}/sessions`}>Sessions</Link>
+        <span className="mx-2 text-muted">|</span>
+        <Link to={`/p/${slug}/runs`}>Runs</Link>
+        <span className="mx-2 text-muted">|</span>
+        <Link to="/scheduler">Scheduler</Link>
       </nav>
       <div className="d-flex justify-content-between align-items-center">
         <h2>{slug}</h2>

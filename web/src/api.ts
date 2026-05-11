@@ -54,6 +54,38 @@ export type SessionRow = {
   linked_tasks: string[];
 };
 
+export type RunRow = {
+  id: string;
+  target: string;
+  status: "queued" | "processing" | "ok" | "fail";
+  rc: number | null;
+  reason: string;
+  requested_by: string;
+  queued_at: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+};
+
+export type MessageRecord = {
+  role: "user" | "assistant" | "tool" | "system";
+  ts: string;
+  text: string;
+  tool_uses?: Array<{ id: string; name: string; input: Record<string, unknown> }>;
+  tool_result?: { tool_use_id: string; output: string };
+};
+
+export type SchedulerJob = {
+  id: string;
+  next_run: string | null;
+  trigger: string;
+};
+
+export type SchedulerState = {
+  jobs: SchedulerJob[];
+  worker_started_at: string | null;
+  last_heartbeat_age_seconds: number | null;
+};
+
 export const api = {
   health: () => call("/api/health"),
   projects: () => call<Project[]>("/api/projects"),
@@ -94,4 +126,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ window, initial_prompt }),
     }),
+  runs: (slug: string, limit = 50, offset = 0) =>
+    call<RunRow[]>(`/api/projects/${slug}/runs?limit=${limit}&offset=${offset}`),
+  runLog: (slug: string, id: string, full = false) =>
+    fetch(`/api/projects/${slug}/runs/${encodeURIComponent(id)}/log${full ? "?full=1" : ""}`, {
+      credentials: "include",
+    }).then(async (res) => {
+      if (res.status === 401) { window.location.href = "/login"; throw new Error("not authenticated"); }
+      if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+      return res.text();
+    }),
+  sessionMessages: (
+    slug: string,
+    claudeUuid: string,
+    limit = 200,
+    offset = 0,
+    full = false,
+  ) =>
+    call<MessageRecord[]>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(claudeUuid)}/messages?limit=${limit}&offset=${offset}${full ? "&full=1" : ""}`
+    ),
+  scheduler: () => call<SchedulerState>("/api/scheduler"),
 };

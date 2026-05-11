@@ -119,6 +119,10 @@ export function Sessions() {
         <Link to={`/p/${slug}/feedback`}>Feedback</Link>
         <span className="mx-2 text-muted">|</span>
         <strong>Sessions</strong>
+        <span className="mx-2 text-muted">|</span>
+        <Link to={`/p/${slug}/runs`}>Runs</Link>
+        <span className="mx-2 text-muted">|</span>
+        <Link to="/scheduler">Scheduler</Link>
       </nav>
 
       {/* Header */}
@@ -181,11 +185,21 @@ export function Sessions() {
             <tbody>
               {sessions.map((s) => (
                 <tr key={s.sid}>
-                  {/* SID — monospace */}
+                  {/* SID — monospace; links to messages if claude_uuid available */}
                   <td>
-                    <code className="text-body" style={{ fontSize: "0.8rem" }}>
-                      {s.sid}
-                    </code>
+                    {s.claude_uuid ? (
+                      <Link
+                        to={`/p/${slug}/sessions/${encodeURIComponent(s.claude_uuid)}/messages`}
+                        className="text-body"
+                        style={{ fontSize: "0.8rem", fontFamily: "monospace" }}
+                      >
+                        {s.sid}
+                      </Link>
+                    ) : (
+                      <code className="text-body" style={{ fontSize: "0.8rem" }}>
+                        {s.sid}
+                      </code>
+                    )}
                   </td>
 
                   {/* Window */}

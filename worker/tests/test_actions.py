@@ -43,10 +43,11 @@ def test_registry_lists_only_allowed_actions():
     # Closed allowlist — spec #3 phase 3 adds deploy + kick_stuck_now.
     # spec #5 adds list_sessions, pause_session, resume_session, spawn_session.
     # spec #6 adds scheduler_state.
+    # spec #7 adds inject_input.
     assert set(ACTION_REGISTRY.keys()) == {
         "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now",
         "list_sessions", "pause_session", "resume_session", "spawn_session",
-        "scheduler_state",
+        "scheduler_state", "inject_input",
     }
 
 
@@ -576,3 +577,135 @@ def test_scheduler_state_rejects_extra_params(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "_SCHED", _FakeSched())
     with pytest.raises(ActionError, match="takes no params"):
         A.dispatch("scheduler_state", {"evil": "x"})
+
+
+# ---------------------------------------------------------------------------
+# inject_input action tests (spec #7)
+# ---------------------------------------------------------------------------
+
+
+def _make_inject_cfg(tmp_path: Path, monkeypatch):
+    """Create config + inject it into actions module."""
+    import types
+    import bot_squad_worker.actions as A
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.test-project]\n'
+        f'slug = "test-project"\n'
+        f'display_name = "Test Project"\n'
+        f'repo_path = "{repo}"\n'
+        f'deploy_branch = "agent_team/dev"\n'
+        f'master_branch = "master"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "0"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    return cfg
+
+
+def test_inject_input_happy_path(tmp_path, monkeypatch):
+    """Happy path: pane found, subprocess called once per line."""
+    import subprocess
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.sessions import PaneInfo
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+
+    # Mock list_panes to return a matching pane
+    # SID: S-testuser-specwin-p5 → compute_sid("testuser", "specwin", "%5")
+    fake_pane = PaneInfo(pane_id="%5", window="specwin", pid="1234", cwd="/tmp", command="claude")
+    monkeypatch.setattr(S, "list_panes", lambda: [fake_pane])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+
+    run_calls = []
+
+    def fake_run(args, check=False):
+        run_calls.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = A.dispatch("inject_input", {"sid": "S-testuser-specwin-p5", "text": "hello"})
+    assert result["ok"] is True
+    assert result["pane_id"] == "%5"
+    assert result["lines_sent"] == 1
+    assert any("send-keys" in str(c) for c in run_calls)
+
+
+def test_inject_input_multiline(tmp_path, monkeypatch):
+    """Multi-line text sends one send-keys per line."""
+    import subprocess
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.sessions import PaneInfo
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+
+    fake_pane = PaneInfo(pane_id="%7", window="win", pid="1111", cwd="/tmp", command="bash")
+    monkeypatch.setattr(S, "list_panes", lambda: [fake_pane])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+
+    run_calls = []
+    monkeypatch.setattr("subprocess.run", lambda args, check=False: run_calls.append(args) or subprocess.CompletedProcess(args, 0))
+
+    result = A.dispatch("inject_input", {"sid": "S-testuser-win-p7", "text": "line1\nline2\nline3"})
+    assert result["lines_sent"] == 3
+    # 3 send-keys calls
+    assert len(run_calls) == 3
+
+
+def test_inject_input_unknown_sid(tmp_path, monkeypatch):
+    """Unknown SID raises ActionError."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+
+    with pytest.raises(ActionError, match="no live pane"):
+        A.dispatch("inject_input", {"sid": "S-testuser-nosuchwin-p99", "text": "hello"})
+
+
+def test_inject_input_empty_text(tmp_path, monkeypatch):
+    """Empty text raises ActionError."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+
+    with pytest.raises(ActionError, match="empty text"):
+        A.dispatch("inject_input", {"sid": "S-testuser-win-p1", "text": "   "})
+
+
+def test_inject_input_extra_params(tmp_path, monkeypatch):
+    """Extra params raise ActionError."""
+    import bot_squad_worker.actions as A
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("inject_input", {"sid": "S-x-y-p1", "text": "hi", "evil": "x"})
+
+
+def test_inject_input_missing_params(tmp_path, monkeypatch):
+    """Missing required params raise ActionError."""
+    import bot_squad_worker.actions as A
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("inject_input", {"sid": "S-x-y-p1"})

@@ -330,6 +330,53 @@ def _action_scheduler_state(params: dict[str, Any]) -> dict[str, Any]:
     return state_for_api(_SCHED, cfg)
 
 
+# ---------------------------------------------------------------------------
+# inject_input action (spec #7)
+# ---------------------------------------------------------------------------
+
+_INJECT_INPUT_REQUIRED = {"sid", "text"}
+_INJECT_INPUT_ALLOWED = _INJECT_INPUT_REQUIRED
+
+
+def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
+    """Send text to the tmux pane for a SID (one Enter per line).
+
+    Required params: sid, text
+    Returns: {ok: true, pane_id, lines_sent: int}
+    """
+    extra = set(params) - _INJECT_INPUT_ALLOWED
+    if extra:
+        raise ActionError(f"inject_input got unexpected params: {sorted(extra)}")
+    missing = _INJECT_INPUT_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"inject_input missing required params: {sorted(missing)}")
+
+    sid = params["sid"]
+    text = params["text"]
+    if not text.strip():
+        raise ActionError("inject_input: empty text")
+
+    from bot_squad_worker import sessions as S
+    panes = S.list_panes()
+    user = S._get_current_user()
+    pane = next(
+        (p for p in panes if S.compute_sid(user, p.window, p.pane_id) == sid),
+        None,
+    )
+    if pane is None:
+        raise ActionError(f"inject_input: no live pane for sid {sid!r}")
+
+    import subprocess
+    lines_sent = 0
+    for line in text.split("\n"):
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane.pane_id, "--", line, "Enter"],
+            check=False,
+        )
+        lines_sent += 1
+    return {"ok": True, "pane_id": pane.pane_id, "lines_sent": lines_sent}
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
@@ -341,6 +388,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "resume_session": _action_resume_session,
     "spawn_session": _action_spawn_session,
     "scheduler_state": _action_scheduler_state,
+    "inject_input": _action_inject_input,
 }
 
 

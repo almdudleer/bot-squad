@@ -817,17 +817,53 @@ pre.bg-light {
   letter-spacing: 0.05em;
 }
 
-/* Per-page help one-liner — sits under each page title to explain what
-   the page is for. Subtle but always visible. */
+/* Per-page help — collapsible block that explains what the page does.
+   The wrap holds a toggle button by default; when expanded, a panel
+   appears below it. */
+.mc-page-help-wrap {
+  margin: 0.25rem 0 1rem;
+}
+.mc-page-help-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: none;
+  border: 1px solid var(--mc-border);
+  color: var(--mc-text-dim);
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: lowercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: color 0.1s, border-color 0.1s, background-color 0.1s;
+}
+.mc-page-help-toggle:hover {
+  color: var(--mc-cyan-bright);
+  border-color: var(--mc-cyan);
+  background-color: rgba(34, 211, 238, 0.05);
+}
+.mc-page-help-toggle[aria-expanded="true"] {
+  color: var(--mc-amber-bright);
+  border-color: var(--mc-amber);
+}
+.mc-page-help-icon {
+  color: var(--mc-amber);
+  font-weight: 700;
+}
 .mc-page-help {
   font-family: var(--mc-sans);
-  font-size: 0.78rem;
-  color: var(--mc-text-dim);
-  margin: -0.5rem 0 1rem;
-  padding-left: 0.6rem;
+  font-size: 0.82rem;
+  color: var(--mc-text);
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background-color: var(--mc-surface);
+  border: 1px solid var(--mc-border);
   border-left: 2px solid var(--mc-amber);
-  line-height: 1.5;
-  max-width: 70ch;
+  line-height: 1.55;
+  max-width: 80ch;
+  border-radius: 3px;
 }
 .mc-page-help code {
   font-family: var(--mc-mono);
@@ -835,6 +871,10 @@ pre.bg-light {
   color: var(--mc-cyan-bright);
   background: none;
   padding: 0;
+}
+.mc-page-help strong {
+  color: var(--mc-text);
+  font-weight: 600;
 }
 .mc-task-id {
   font-family: var(--mc-mono);

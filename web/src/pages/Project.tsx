@@ -5,6 +5,7 @@ import { BoardColumn } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
 import { MenuAction } from "../components/TaskCard";
 
+import { PageHelp } from "../components/PageHelp";
 const COLUMNS = ["open", "totest", "reopened", "closed"] as const;
 const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
   open: "Open",
@@ -166,11 +167,11 @@ export function Project() {
           + New task
         </button>
       </div>
-      <div className="mc-page-help">
+      <PageHelp>
         Open work for this project across four statuses. <strong>Drag</strong> a card
         to change status, <strong>click</strong> a card for full detail, or <strong>⋯</strong>
         for the quick menu (status / edit body / comment / delete).
-      </div>
+      </PageHelp>
 
       {error && <div className="alert alert-danger mt-2">{error}</div>}
       {tasks === null && !error && <div className="mc-loading">Loading</div>}

@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { PageHelp } from "../components/PageHelp";
 import { Link, useParams } from "react-router-dom";
 import { api, RunRow } from "../api";
 
@@ -91,12 +92,12 @@ export function Runs() {
           auto-refresh 15s
         </span>
       </div>
-      <div className="mc-page-help">
+      <PageHelp>
         Deploy history for this project. Agents queue a deploy with
         <code> ops/bot-squad-bin/deploy &lt;target&gt; &quot;&lt;reason&gt;&quot;</code>;
         the worker&apos;s <code>deploy_monitor</code> fires it when the repo tree is clean.
         Click any row for the full stdout/stderr.
-      </div>
+      </PageHelp>
 
       {/* Error */}
       {error && <div className="alert alert-danger">{error}</div>}

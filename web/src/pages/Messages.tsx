@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { PageHelp } from "../components/PageHelp";
 import { useParams } from "react-router-dom";
 import { api, MessageRecord } from "../api";
 
@@ -247,11 +248,11 @@ export function Messages() {
           ↓ Jump to bottom
         </button>
       </div>
-      <div className="mc-page-help">
+      <PageHelp>
         Full conversation transcript of a Claude session: user messages right-aligned,
         assistant left-aligned, tool uses and results collapsible. Sourced from
         <code> ~/.claude/projects/&lt;encoded-cwd&gt;/&lt;uuid&gt;.jsonl</code>.
-      </div>
+      </PageHelp>
 
       {/* Error */}
       {error && (

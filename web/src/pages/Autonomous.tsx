@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, AutonomousState } from "../api";
 import { Modal } from "../components/Modal";
 
+import { PageHelp } from "../components/PageHelp";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -165,12 +166,12 @@ export function Autonomous() {
           )}
         </div>
       </div>
-      <div className="mc-page-help">
+      <PageHelp>
         One-task-at-a-time orchestrator. When enabled, picks the next open backlog task,
         spawns a Claude pane to work it, reviews against Definition-of-Done, marks
         <code> closed</code> or reopens with feedback. Honors a sleep window
         (default 22:00–08:00 UTC). Defaults to <strong>disabled</strong>.
-      </div>
+      </PageHelp>
 
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}

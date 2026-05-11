@@ -4,6 +4,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, SessionRow } from "../api";
 import { Modal } from "../components/Modal";
 
+import { PageHelp } from "../components/PageHelp";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -119,12 +120,12 @@ export function Sessions() {
           + New session
         </button>
       </div>
-      <div className="mc-page-help">
+      <PageHelp>
         Active and paused Claude tmux sessions whose CWD is this project&apos;s repo.
         <strong> Pause</strong> kills the pane after saving the session UUID;
         <strong> Resume</strong> spawns a new pane with <code>claude --resume &lt;uuid&gt;</code>;
         <strong> + New session</strong> opens a fresh pane in the repo.
-      </div>
+      </PageHelp>
 
       {/* TG reply hint */}
       <div className="alert alert-info py-2 mb-3" style={{ fontSize: "0.78rem" }}>

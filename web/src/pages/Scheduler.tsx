@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { PageHelp } from "../components/PageHelp";
 import { api, SchedulerState } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -85,11 +86,11 @@ export function Scheduler() {
         </span>
       </div>
 
-      <div className="mc-page-help">
+      <PageHelp>
         Time-driven jobs the worker runs (heartbeat, deploy_monitor,
         kick_stuck, oauth_refresh, tg_listener, autonomous_tick).
         Shows worker uptime, last heartbeat, and each job&apos;s next fire time.
-      </div>
+      </PageHelp>
 
       {/* Error */}
       {error && <div className="alert alert-danger">{error}</div>}

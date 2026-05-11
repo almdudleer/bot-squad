@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 import { api, VisionFile } from "../api";
 import { Modal } from "../components/Modal";
 
+import { PageHelp } from "../components/PageHelp";
 interface EditState {
   name: string;
   draft: string;
@@ -110,13 +111,13 @@ export function Vision() {
         </button>
       </div>
 
-      <div className="mc-page-help">
+      <PageHelp>
         Layered product north star ordered from rarely- to often-changing:
         <code> constitution</code> (stakeholder-only) → <code> north-star</code> →
         <code> strategy</code> (per cycle) → <code> tactical</code> (per sprint) →
         <code> initiatives/*</code>. Click Edit to revise; AGENTS.md surfaces these to
         every agent on every turn.
-      </div>
+      </PageHelp>
 
       {error && <div className="alert alert-danger">{error}</div>}
       {files === null && !error && <div className="mc-loading">Loading</div>}

@@ -1,4 +1,4 @@
-"""Tests for worker jobs (heartbeat, deploy_monitor, kick_stuck, oauth_refresh)."""
+"""Tests for worker jobs (heartbeat, deploy_monitor, oauth_refresh)."""
 from __future__ import annotations
 
 import subprocess
@@ -12,7 +12,6 @@ from bot_squad_worker.config import Config, Project
 from bot_squad_worker.jobs import (
     deploy_monitor,
     heartbeat,
-    kick_stuck,
     oauth_refresh,
     tg_listener_tick,
 )
@@ -205,74 +204,6 @@ def test_deploy_monitor_dirty_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         if "SUCCESS" in c["text"] or "FAILED" in c["text"]
     ]
     assert success_or_fail == []
-
-
-# ---------------------------------------------------------------------------
-# kick_stuck tests
-# ---------------------------------------------------------------------------
-
-
-def test_kick_stuck_no_issues_no_ping(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Clean project with no queued deploys → no TG ping."""
-    proj = _make_project_with_repo(tmp_path)
-    cfg = _make_config_with_project(tmp_path, proj)
-
-    fake_tg = _FakeTgClient()
-    from bot_squad_worker import actions as A
-    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
-
-    kick_stuck(cfg)
-
-    assert fake_tg.calls == []
-
-
-def test_kick_stuck_queued_and_dirty_sends_one_message(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Queued deploy + dirty tree → exactly one consolidated TG message."""
-    proj = _make_project_with_repo(tmp_path)
-    cfg = _make_config_with_project(tmp_path, proj)
-
-    from bot_squad_worker import deploy as _deploy
-    _deploy.enqueue(cfg, proj.slug, "staging", "stuck test", "pytest")
-
-    # Make tree dirty
-    (proj.repo_path / "dirty.txt").write_text("uncommitted")
-
-    fake_tg = _FakeTgClient()
-    from bot_squad_worker import actions as A
-    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
-
-    kick_stuck(cfg)
-
-    assert len(fake_tg.calls) == 1
-    msg = fake_tg.calls[0]["text"]
-    assert "queued" in msg.lower() or "📋" in msg
-    assert "dirty" in msg.lower() or "⚠️" in msg
-
-
-def test_kick_stuck_recent_failures_ping(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Recent .fail file in processed dir → TG ping mentioning failure."""
-    proj = _make_project_with_repo(tmp_path)
-    cfg = _make_config_with_project(tmp_path, proj)
-
-    # Manually drop a .fail file
-    processed_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processed"
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    (processed_dir / "fake.fail.7").write_text("{}")
-
-    fake_tg = _FakeTgClient()
-    from bot_squad_worker import actions as A
-    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
-
-    kick_stuck(cfg)
-
-    assert len(fake_tg.calls) == 1
-    assert "fail" in fake_tg.calls[0]["text"].lower() or "💥" in fake_tg.calls[0]["text"]
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -29,6 +30,12 @@ router = APIRouter(
 )
 
 
+# Claude session UUIDs are stored as lower-case hex with dashes (length 36).
+# Tighten the shape to a UUIDv4-ish pattern to prevent path traversal via
+# the URL parameter.
+_UUID_RE = re.compile(r"^[a-f0-9-]{36}$")
+
+
 def _get_claude_projects_dir() -> Path:
     """Return the path to ~/.claude/projects.
 
@@ -41,29 +48,28 @@ def _get_claude_projects_dir() -> Path:
     return Path(os.path.expanduser("~")) / ".claude" / "projects"
 
 
-def _encode_repo_path(repo_path: Path) -> str:
-    """Encode a repo path to Claude's project directory naming convention.
+def _resolve_jsonl(claude_uuid: str) -> Path | None:
+    """Resolve a .jsonl path by UUID, globbing across every project subdir.
 
-    Claude stores sessions under ~/.claude/projects/<encoded-cwd>/.
-    The encoding replaces every '/' and '_' with '-'.  The leading '-'
-    (from the leading '/') is kept as-is — do NOT strip it.
+    Claude stores sessions under ``~/.claude/projects/<encoded-cwd>/`` where
+    the encoding depends on the actual realpath / cwd Claude was launched
+    in — symlinked repo roots, worktrees and worker spawns each land in
+    their own encoded dir. The UUID is globally unique so we just glob.
 
-    Example: /home/almdudleer/signal_tracker_mgmt
-          →  -home-almdudleer-signal-tracker-mgmt
-    """
-    s = str(repo_path)
-    return s.replace("/", "-").replace("_", "-")
-
-
-def _resolve_jsonl(repo_path: Path, claude_uuid: str) -> Path | None:
-    """Resolve the .jsonl path for a given repo + claude UUID.
-
-    Returns None if the path does not exist.
+    Returns the first matching path (sorted by mtime, newest first) or
+    None when nothing matches. The auth layer is the real gate; project
+    scoping was always best-effort anyway.
     """
     projects_dir = _get_claude_projects_dir()
-    encoded = _encode_repo_path(repo_path)
-    jsonl_path = projects_dir / encoded / f"{claude_uuid}.jsonl"
-    return jsonl_path if jsonl_path.exists() else None
+    if not projects_dir.exists():
+        return None
+    matches = list(projects_dir.glob(f"*/{claude_uuid}.jsonl"))
+    if not matches:
+        return None
+    # Newest first — duplicate UUIDs across encoded dirs would be a Claude
+    # bug, but if they exist prefer the freshest log.
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
 
 
 @router.get("/{claude_uuid}/messages")
@@ -89,7 +95,10 @@ async def get_session_messages(
     if project is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
 
-    jsonl_path = _resolve_jsonl(project.repo_path, claude_uuid)
+    if not _UUID_RE.match(claude_uuid):
+        raise HTTPException(status_code=400, detail="invalid claude_uuid format")
+
+    jsonl_path = _resolve_jsonl(claude_uuid)
     if jsonl_path is None:
         raise HTTPException(
             status_code=404,

@@ -457,6 +457,11 @@ a.active .mc-nav-diamond {
 }
 .table-hover > tbody > tr:hover > td {
   background-color: rgba(34, 211, 238, 0.06);
+  /* Bootstrap 5.3 sets --bs-table-hover-color to the emphasis colour
+     (near-black) on hover, which turns plain <td> text invisible against
+     the dark hover background. Force the cell text back to mc-text so
+     columns without explicit inline colour (e.g. Window) stay readable. */
+  color: var(--mc-text);
 }
 /* Numbers right-aligned in tables */
 .table td.text-end, .table th.text-end { text-align: right !important; }

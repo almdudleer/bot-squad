@@ -37,6 +37,8 @@ class TgClient:
         self._token: str = cfg.tg_bot_token
         self._debounce_dir: Path = cfg.data_dir / "_worker" / "tg_debounce"
         self._cooldown: int = cooldown_sec
+        self._quiet_start_utc: int = getattr(cfg, "tg_quiet_hours_start_utc", 17)
+        self._quiet_end_utc: int = getattr(cfg, "tg_quiet_hours_end_utc", 5)
 
     # ------------------------------------------------------------------
     # Public API
@@ -49,14 +51,23 @@ class TgClient:
         text: str,
         sid: str = "",
         user: str = "",
+        urgent: bool = False,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
         Returns True if the message was sent, False if suppressed (empty
-        token or debounce).  Raises on network/API errors.
+        token, debounce, or quiet hours).  Raises on network/API errors.
+
+        ``urgent=True`` bypasses quiet hours (use for hard failures the
+        stakeholder explicitly asked to be paged on; not for routine
+        "needs your input" pings).
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
+            return False
+
+        if not urgent and _in_quiet_hours(self._quiet_start_utc, self._quiet_end_utc):
+            log.info("tg.send: dropped (quiet hours — user is asleep)")
             return False
 
         full_text = _prefix(text, sid=sid, user=user)
@@ -117,3 +128,27 @@ def _prefix(text: str, *, sid: str, user: str) -> str:
     if sid:
         return f"[{sid}] {text}"
     return text
+
+
+# Quiet hours: never ping the user when they're asleep. Stakeholder is in
+# UTC+5 (Tashkent). Default 17:00–05:00 UTC ≈ 22:00–10:00 local — wide enough
+# to cover both early bedtime and late wake-up. Admin can override via
+# system_settings.toml. Urgent=True bypasses.
+
+
+def _in_quiet_hours(start_utc: int = 17, end_utc: int = 5) -> bool:
+    """True if the current UTC hour falls in the stakeholder's sleep window.
+
+    Disabled when env var ``BOT_SQUAD_DISABLE_QUIET_HOURS`` is set — used by
+    the test suite, which exercises send paths without time-dependent
+    skips.
+    """
+    import os
+    if os.environ.get("BOT_SQUAD_DISABLE_QUIET_HOURS"):
+        return False
+    from datetime import datetime, timezone
+    h = datetime.now(timezone.utc).hour
+    if start_utc < end_utc:
+        return start_utc <= h < end_utc
+    # Wraps midnight: e.g. 17 -> 5 means 17..23 or 0..4
+    return h >= start_utc or h < end_utc

@@ -17,6 +17,8 @@ from app.markdown_writer import (
     write_task,
 )
 from app.routes_auth import require_auth
+from app.task_body import compose_body, parse_body
+from app.worker_client import WorkerClient, WorkerError
 
 log = logging.getLogger(__name__)
 router = APIRouter(
@@ -25,7 +27,7 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
-_VALID_STATUSES = {"open", "totest", "reopened", "closed"}
+_VALID_STATUSES = {"open", "in_progress", "totest", "reopened", "closed"}
 _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 
 
@@ -49,22 +51,116 @@ def _validate_task_id(task_id: str) -> None:
         raise HTTPException(status_code=400, detail=f"invalid task id format: {task_id!r}")
 
 
+def _enrich_with_sections(task: dict) -> dict:
+    """Attach parsed body sections to a task dict (in-place + return)."""
+    body = task.get("body", "") or ""
+    sections = parse_body(body)
+    task["verbatim"] = sections["verbatim"]
+    task["context"] = sections["context"]
+    task["progress"] = sections["progress"]
+    return task
+
+
+def _session_map_by_task(sessions_dir: Path) -> dict[str, dict]:
+    """Scan sessions/*.md → {task_id: {sid, status}}. Active beats paused.
+
+    Phase 9: a dev session may also carry `extra_task_ids: [T-..., T-...]`
+    (bracketed list). Every entry in {primary} ∪ extras gets the same
+    session row. (Constraint: a task can only be in one session's
+    primary-or-extras set; the worker enforces this at bind time.)
+    """
+    if not sessions_dir.exists():
+        return {}
+    out: dict[str, dict] = {}
+    for f in sorted(sessions_dir.glob("*.md")):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        if not text.startswith("---"):
+            continue
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            continue
+        meta: dict[str, str] = {}
+        for line in parts[1].strip().splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                meta[k.strip()] = v.strip()
+        sid = meta.get("sid") or f.stem
+        status = meta.get("status", "unknown")
+        task_ids: list[str] = []
+        primary = meta.get("task_id", "")
+        if primary and primary != "~":
+            task_ids.append(primary)
+        extras_raw = meta.get("extra_task_ids", "")
+        if extras_raw.startswith("[") and extras_raw.endswith("]"):
+            inner = extras_raw[1:-1].strip()
+            if inner:
+                for t in (x.strip() for x in inner.split(",")):
+                    if t and t != "~":
+                        task_ids.append(t)
+        for tid in task_ids:
+            existing = out.get(tid)
+            if existing and existing["status"] == "active" and status != "active":
+                continue
+            out[tid] = {"sid": sid, "status": status}
+    return out
+
+
 @router.get("")
 def list_backlog(slug: str, request: Request) -> list[dict]:
     cfg = request.app.state.api_config
     proj = cfg.project(slug)
     if proj is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
-    backlog_dir = cfg.project_data_dir(slug) / "backlog"
+    project_data = cfg.project_data_dir(slug)
+    backlog_dir = project_data / "backlog"
     if not backlog_dir.exists():
         return []
-    tasks = []
+    session_map = _session_map_by_task(project_data / "sessions")
+    tasks: list[dict] = []
     for f in sorted(backlog_dir.glob("*.md")):
         try:
-            tasks.append(parse_task(f))
+            t = parse_task(f)
         except ParseError as e:
             log.warning("backlog parse error %s: %s", f, e)
+            continue
+        sess = session_map.get(t.get("id", ""))
+        if sess:
+            t["session"] = sess
+        _enrich_with_sections(t)
+        tasks.append(t)
     return tasks
+
+
+def _validate_priority(value: object) -> int:
+    """Coerce + validate priority for write paths. Raises 400 if not a non-negative int."""
+    # Reject bools explicitly — Python treats `True` as 1 numerically.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(status_code=400, detail="priority must be a non-negative integer")
+    if value < 0:
+        raise HTTPException(status_code=400, detail="priority must be a non-negative integer")
+    return value
+
+
+def _default_open_priority(backlog_dir: Path) -> int:
+    """Default priority for a new task: max(open priorities) + 100, else 0."""
+    max_open: int | None = None
+    if not backlog_dir.exists():
+        return 0
+    for f in backlog_dir.glob("T-*.md"):
+        try:
+            t = parse_task(f)
+        except ParseError:
+            continue
+        if t.get("status") != "open":
+            continue
+        prio = t.get("priority")
+        if isinstance(prio, int) and not isinstance(prio, bool):
+            if max_open is None or prio > max_open:
+                max_open = prio
+    return 0 if max_open is None else max_open + 100
 
 
 @router.post("")
@@ -80,10 +176,23 @@ def create_task(
     status = payload.get("status", "open")
     if status not in _VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"invalid status: {status!r}")
-    body = payload.get("body") or ""
+    # Phase 7: prefer `verbatim_request` (composed into canonical body).
+    # Fall back to legacy `body` (stored as-is — caller knows the convention).
+    verbatim_request = payload.get("verbatim_request")
+    if verbatim_request is not None:
+        body = compose_body(verbatim_request, "", "")
+    else:
+        body = payload.get("body") or ""
 
     backlog_dir = _backlog_dir(request, slug)
     backlog_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase 8: priority. If the caller specified one, validate. Else compute
+    # default from existing open tasks so new ones land at the bottom.
+    if "priority" in payload and payload["priority"] is not None:
+        priority = _validate_priority(payload["priority"])
+    else:
+        priority = _default_open_priority(backlog_dir)
 
     lock_path = backlog_dir / ".lock"
     with open(lock_path, "w") as lock_f:
@@ -99,12 +208,13 @@ def create_task(
             "id": task_id,
             "title": title,
             "status": status,
+            "priority": priority,
             "created": now,
             "updated": now,
         }
         write_task(path, fm, body)
 
-    return parse_task(path)
+    return _enrich_with_sections(parse_task(path))
 
 
 @router.patch("/{task_id}")
@@ -132,7 +242,32 @@ def patch_task(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return parse_task(path)
+    return _enrich_with_sections(parse_task(path))
+
+
+@router.patch("/{task_id}/priority")
+def patch_task_priority(
+    slug: str,
+    task_id: str,
+    request: Request,
+    payload: dict,
+    user: dict = Depends(require_auth),
+) -> dict:
+    """Set a task's priority (int sort key for Kanban ordering)."""
+    _validate_task_id(task_id)
+    if "priority" not in payload:
+        raise HTTPException(status_code=400, detail="priority required")
+    priority = _validate_priority(payload["priority"])
+
+    backlog_dir = _backlog_dir(request, slug)
+    path = _find_task_file(backlog_dir, task_id)
+
+    try:
+        merge_task_update(path, {"priority": priority})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return _enrich_with_sections(parse_task(path))
 
 
 @router.delete("/{task_id}")
@@ -173,4 +308,39 @@ def add_comment(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return parse_task(path)
+    return _enrich_with_sections(parse_task(path))
+
+
+@router.post("/{task_id}/progress")
+async def add_progress(
+    slug: str,
+    task_id: str,
+    request: Request,
+    payload: dict,
+    user: dict = Depends(require_auth),
+) -> dict:
+    """Append a short progress note. Proxies to worker action `task_progress_add`."""
+    _validate_task_id(task_id)
+    sid = (payload.get("sid") or "").strip()
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text must not be empty")
+    if not sid:
+        raise HTTPException(status_code=400, detail="sid must not be empty")
+
+    backlog_dir = _backlog_dir(request, slug)
+    # Pre-flight: 404 cleanly if the task does not exist (worker would also 4xx
+    # but the API contract maps it to 502 otherwise).
+    _find_task_file(backlog_dir, task_id)
+
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action("task_progress_add", {
+            "slug": slug,
+            "task_id": task_id,
+            "sid": sid,
+            "text": text,
+        })
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result

@@ -88,7 +88,7 @@ export function Scheduler() {
 
       <PageHelp>
         Time-driven jobs the worker runs (heartbeat, deploy_monitor,
-        kick_stuck, oauth_refresh, tg_listener, autonomous_tick).
+        oauth_refresh, tg_listener).
         Shows worker uptime, last heartbeat, and each job&apos;s next fire time.
       </PageHelp>
 

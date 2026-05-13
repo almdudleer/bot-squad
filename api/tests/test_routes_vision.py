@@ -44,6 +44,29 @@ def test_vision_lists_files_and_initiatives(tmp_bot_squad: Path, monkeypatch):
     assert "initiatives/v0.6.md" in names
 
 
+def test_vision_surfaces_agent_instructions(tmp_bot_squad: Path, monkeypatch):
+    project_data = tmp_bot_squad / "data" / "test-project"
+    (project_data / "AGENT_INSTRUCTIONS.md").write_text("# Hooked at startup\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    assert r.status_code == 200
+    by_name = {x["name"]: x for x in r.json()}
+    assert "AGENT_INSTRUCTIONS.md" in by_name
+    assert by_name["AGENT_INSTRUCTIONS.md"]["content"] == "# Hooked at startup\n"
+
+
+def test_put_agent_instructions_routes_to_project_root(tmp_bot_squad: Path, monkeypatch):
+    project_data = tmp_bot_squad / "data" / "test-project"
+    (project_data / "AGENT_INSTRUCTIONS.md").write_text("# Old\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.put(
+            "/api/projects/test-project/vision/AGENT_INSTRUCTIONS.md",
+            json={"content": "# New\n"},
+        )
+    assert r.status_code == 200
+    assert (project_data / "AGENT_INSTRUCTIONS.md").read_text() == "# New\n"
+
+
 # ---------------------------------------------------------------------------
 # PUT /api/projects/{slug}/vision/{name}
 # ---------------------------------------------------------------------------

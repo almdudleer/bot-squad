@@ -17,10 +17,14 @@ services:
       - BUILD_AT_IMPORT=1
       - CLAUDE_PROJECTS_DIR=/home/almdudleer/.claude/projects
     volumes:
-      - ./config/projects.toml:/config/projects.toml:ro
-      - ./config/auth.toml:/config/auth.toml:ro
+      - ./config:/config:rw
       - ./data:/data:rw
       - /home/almdudleer/.claude/projects:/home/almdudleer/.claude/projects:ro
+      # Project repo paths — needed for AGENTS.md read/write through the API.
+      # signal-tracker/dev is a symlink → signal_tracker_mgmt; mount both so
+      # the symlink resolves inside the container.
+      - /home/almdudleer/signal_tracker:/home/almdudleer/signal_tracker:ro
+      - /home/almdudleer/signal_tracker_mgmt:/home/almdudleer/signal_tracker_mgmt:rw
     networks:
       - avo_backend
     labels:

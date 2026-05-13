@@ -193,6 +193,9 @@ def test_list_sessions_active_pane(tmp_path, monkeypatch):
     assert rows[0]["status"] == "active"
     assert rows[0]["sid"] == "S-testuser-mywin-p2"
     assert rows[0]["window"] == "mywin"
+    # Phase 6: initiative key is always present (empty string when unset).
+    assert "initiative" in rows[0]
+    assert rows[0]["initiative"] == ""
 
 
 def test_list_sessions_filters_non_claude_panes(tmp_path, monkeypatch):
@@ -268,8 +271,84 @@ def test_list_sessions_includes_paused(tmp_path, monkeypatch):
 
     rows = list_sessions(cfg, "test-project")
     assert len(rows) == 1
-    assert rows[0]["status"] == "paused"
+    # Paused md with no live pane is surfaced as "suspended" (resurrectable).
+    assert rows[0]["status"] == "suspended"
     assert rows[0]["sid"] == "S-testuser-mywin-p5"
+    # Phase 6: initiative key is always present (empty string when md omits it).
+    assert "initiative" in rows[0]
+    assert rows[0]["initiative"] == ""
+
+
+def test_list_sessions_active_pane_with_initiative(tmp_path, monkeypatch):
+    """Active pane with an initiative recorded in its md surfaces it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # Pre-write a session md with an initiative field (mimics the hook).
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = sessions_dir / "S-testuser-mywin-p2.md"
+    _write_session_metadata(meta_path, {
+        "sid": "S-testuser-mywin-p2",
+        "status": "active",
+        "window": "mywin",
+        "cwd": str(repo),
+        "claude_uuid": "some-uuid",
+        "task_id": "~",
+        "initiative": "v0.7-news-subscriptions.md",
+        "started_at": "2026-05-12T10:00:00Z",
+    })
+
+    fake_pane_output = f"%2|mywin|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["initiative"] == "v0.7-news-subscriptions.md"
+
+
+def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
+    """Suspended-md path surfaces initiative from frontmatter."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = sessions_dir / "S-testuser-mywin-p7.md"
+    _write_session_metadata(meta_path, {
+        "sid": "S-testuser-mywin-p7",
+        "status": "suspended",
+        "window": "mywin",
+        "cwd": str(repo),
+        "claude_uuid": "another-uuid",
+        "initiative": "foo.md",
+        "linked_tasks": [],
+    })
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["initiative"] == "foo.md"
 
 
 def test_list_sessions_unknown_slug(tmp_path, monkeypatch):
@@ -287,10 +366,10 @@ def test_list_sessions_unknown_slug(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# pause
+# pause (Ctrl-C only; pane stays open)
 # ---------------------------------------------------------------------------
 
-def test_pause_writes_metadata_and_sends_keys(tmp_path, monkeypatch):
+def test_pause_sends_ctrl_c_and_marks_paused(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     cfg = _make_cfg(tmp_path, repo)
@@ -300,36 +379,29 @@ def test_pause_writes_metadata_and_sends_keys(tmp_path, monkeypatch):
     def fake_run(args, **kwargs):
         calls.append(args)
         if "list-panes" in args:
-            # First call (initial pane lookup): return the pane.
-            # Subsequent calls (wait-loop polling): return empty to simulate pane died.
-            list_panes_calls = sum(1 for c in calls if "list-panes" in c)
-            if list_panes_calls <= 1:
-                return subprocess.CompletedProcess(args, 0, f"%2|mywin|1234|{repo}|claude\n", "")
-            return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 0, f"%2|mywin|1234|{repo}|claude\n", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
     import bot_squad_worker.sessions as S
     monkeypatch.setattr(S, "_run", fake_run)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
-    monkeypatch.setattr(S.time, "sleep", lambda x: None)
 
     result = pause(cfg, "test-project", "S-testuser-mywin-p2")
 
     assert result == {"ok": True, "paused": True}
 
-    # Metadata file must exist
     sessions_dir = cfg.data_dir / "test-project" / "sessions"
     meta_file = sessions_dir / "S-testuser-mywin-p2.md"
     assert meta_file.exists()
     meta = _read_session_metadata(meta_file)
     assert meta["status"] == "paused"
 
-    # send-keys calls: C-c and /exit
+    # Only Ctrl-C — no /exit, no kill-pane.
     send_key_calls = [c for c in calls if "send-keys" in c]
-    assert len(send_key_calls) == 2
+    assert len(send_key_calls) == 1
     assert "C-c" in send_key_calls[0]
-    assert "/exit" in send_key_calls[1]
+    assert not any("kill-pane" in c for c in calls)
 
 
 def test_pause_unknown_sid_raises(tmp_path, monkeypatch):
@@ -350,6 +422,91 @@ def test_pause_unknown_sid_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ActionError, match="no active pane"):
         pause(cfg, "test-project", "S-testuser-nowin-p99")
+
+
+# ---------------------------------------------------------------------------
+# suspend (close pane, preserve registry for resurrect)
+# ---------------------------------------------------------------------------
+
+def test_suspend_closes_pane_and_marks_suspended(tmp_path, monkeypatch):
+    from bot_squad_worker.sessions import suspend
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "list-panes" in args:
+            list_panes_calls = sum(1 for c in calls if "list-panes" in c)
+            if list_panes_calls <= 1:
+                return subprocess.CompletedProcess(args, 0, f"%2|mywin|1234|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = suspend(cfg, "test-project", "S-testuser-mywin-p2")
+
+    assert result == {"ok": True, "suspended": True}
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    meta_file = sessions_dir / "S-testuser-mywin-p2.md"
+    assert meta_file.exists()
+    meta = _read_session_metadata(meta_file)
+    assert meta["status"] == "suspended"
+
+    send_key_calls = [c for c in calls if "send-keys" in c]
+    assert any("C-c" in c for c in send_key_calls)
+    assert any("/exit" in c for c in send_key_calls)
+
+
+def test_suspend_no_live_pane_just_normalises_md(tmp_path, monkeypatch):
+    """Suspending a zombie (no live pane) preserves md and marks suspended."""
+    from bot_squad_worker.sessions import suspend
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = sessions_dir / "S-testuser-zombie-p7.md"
+    _write_session_metadata(meta_path, {
+        "sid": "S-testuser-zombie-p7",
+        "status": "active",
+        "window": "zombie",
+        "cwd": str(repo),
+        "claude_uuid": "zombie-uuid",
+        "task_id": "~",
+        "started_at": "2026-05-10T12:00:00Z",
+        "linked_tasks": [],
+    })
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    result = suspend(cfg, "test-project", "S-testuser-zombie-p7")
+    assert result["ok"] is True
+    assert result["suspended"] is True
+    assert result["already_gone"] is True
+
+    meta = _read_session_metadata(meta_path)
+    assert meta["status"] == "suspended"
+    assert meta["claude_uuid"] == "zombie-uuid"
 
 
 # ---------------------------------------------------------------------------

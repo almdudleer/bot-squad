@@ -13,7 +13,7 @@ import yaml
 from app.markdown_parser import parse_task
 
 # Keys allowed in merge_task_update `updates` dict
-_ALLOWED_UPDATE_KEYS = frozenset({"title", "status", "body"})
+_ALLOWED_UPDATE_KEYS = frozenset({"title", "status", "body", "priority"})
 
 _TASK_ID_RE = re.compile(r"^T-(\d{4})-")
 
@@ -24,7 +24,10 @@ def _now_utc_iso() -> str:
 
 def write_task(path: Path, frontmatter: dict, body: str) -> None:
     """Write a task file atomically — .tmp then os.rename."""
-    fm_str = yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False)
+    # Drop None values so missing keys (notably `priority`) don't serialize
+    # as `key: null` — keeps frontmatter clean and parser semantics symmetric.
+    fm_clean = {k: v for k, v in frontmatter.items() if v is not None}
+    fm_str = yaml.safe_dump(fm_clean, allow_unicode=True, sort_keys=False)
     content = f"---\n{fm_str}---\n\n{body}"
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(content, encoding="utf-8")

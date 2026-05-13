@@ -138,7 +138,7 @@ export function Runs() {
               </thead>
               <tbody>
                 {runs.map((r) => (
-                  <tr key={r.id}>
+                  <tr key={r.id} style={r.status === "ok" ? { opacity: 0.55 } : undefined}>
                     <td>
                       <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-mid)" }}>
                         {r.id.slice(0, 8)}

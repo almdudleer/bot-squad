@@ -11,6 +11,9 @@ data/_worker/*
 config/auth.toml
 config/secrets.toml
 
+# Runtime system settings (managed by admin UI, not source)
+config/system_settings.toml
+
 # Python
 __pycache__/
 *.pyc

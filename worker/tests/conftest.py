@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+# Quiet-hours dropping is time-dependent; tests should always exercise the
+# send path regardless of wall-clock.
+os.environ.setdefault("BOT_SQUAD_DISABLE_QUIET_HOURS", "1")
+
 
 @pytest.fixture
 def tmp_data_dir(tmp_path: Path) -> Path:

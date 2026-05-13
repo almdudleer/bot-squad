@@ -25,7 +25,7 @@ router = APIRouter(
 @router.get("")
 async def get_scheduler_state(request: Request) -> dict:
     """Return current APScheduler state from the worker."""
-    client = WorkerClient(request.app.state.sock_path)
+    client = request.app.state.worker_router.coordinator()
     try:
         return await client.call_action("scheduler_state", {})
     except WorkerError as e:

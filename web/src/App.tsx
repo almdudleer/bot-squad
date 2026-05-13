@@ -13,6 +13,8 @@ import { Scheduler } from "./pages/Scheduler";
 import { Autonomous } from "./pages/Autonomous";
 import { Workflow } from "./pages/Workflow";
 import { Help } from "./pages/Help";
+import { Users } from "./pages/Users";
+import { SystemSettings } from "./pages/SystemSettings";
 import { Shell } from "./components/Shell";
 
 export function App() {
@@ -37,6 +39,8 @@ export function App() {
           <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />
           <Route path="/p/:slug/autonomous" element={<Autonomous />} />
           <Route path="/scheduler" element={<Scheduler />} />
+          <Route path="/users" element={<Users />} />
+          <Route path="/system-settings" element={<SystemSettings />} />
         </Route>
 
         <Route path="*" element={<Navigate to="/" replace />} />

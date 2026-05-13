@@ -70,9 +70,25 @@ class ApiConfig:
 
 
 @dataclass(frozen=True)
+class UserMeta:
+    """Per-user metadata loaded from auth.toml [user_meta.<username>]."""
+    linux_user: str
+    is_admin: bool = False
+
+
+@dataclass(frozen=True)
 class AuthConfig:
     users: dict[str, str]                 # username -> bcrypt hash
+    user_meta: dict[str, UserMeta]        # username -> metadata
     session_ttl_seconds: int
+
+    def meta_for(self, username: str) -> UserMeta:
+        """Return metadata for username; defaults if not configured."""
+        m = self.user_meta.get(username)
+        if m is not None:
+            return m
+        # Default: linux_user mirrors the UI username, no admin.
+        return UserMeta(linux_user=username, is_admin=False)
 
     @staticmethod
     def _parse_ttl(s: str) -> int:
@@ -87,5 +103,16 @@ class AuthConfig:
     def load(cls, config_dir: Path) -> "AuthConfig":
         raw = tomllib.loads((config_dir / "auth.toml").read_text())
         users = dict(raw.get("users", {}))
+        meta_raw = raw.get("user_meta", {}) or {}
+        user_meta: dict[str, UserMeta] = {}
+        for name, m in meta_raw.items():
+            user_meta[name] = UserMeta(
+                linux_user=str(m.get("linux_user", name)),
+                is_admin=bool(m.get("is_admin", False)),
+            )
         ttl_str = raw.get("session", {}).get("ttl", "7d")
-        return cls(users=users, session_ttl_seconds=cls._parse_ttl(ttl_str))
+        return cls(
+            users=users,
+            user_meta=user_meta,
+            session_ttl_seconds=cls._parse_ttl(ttl_str),
+        )

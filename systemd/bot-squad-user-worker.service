@@ -1,0 +1,60 @@
+# bot-squad per-user worker (Phase 2 multi-user, tmux ops only).
+#
+# One copy per non-coordinator Linux user (e.g. edem, dima). Runs in
+# `systemd --user` for that user. Binds a Unix socket at
+# /home/www/bot-squad/data/_sock/user-<USER>.sock and handles only
+# tmux-tagged worker actions (list_sessions / pause / suspend / resume
+# / spawn / inject_input). Coordinator actions (deploy, tg_notify,
+# peer_send, autonomous_*, scheduler_state, task_progress_add) are
+# refused with ActionError in this mode.
+#
+# Install per user:
+#   sudo usermod -a -G www <USER>
+#   sudo install -m 0644 -o <USER> -g <USER> \
+#       /home/www/bot-squad/systemd/bot-squad-user-worker.service \
+#       /home/<USER>/.config/systemd/user/
+#   sudo loginctl enable-linger <USER>
+#   sudo -u <USER> XDG_RUNTIME_DIR=/run/user/$(id -u <USER>) \
+#       systemctl --user daemon-reload
+#   sudo -u <USER> XDG_RUNTIME_DIR=/run/user/$(id -u <USER>) \
+#       systemctl --user enable --now bot-squad-user-worker.service
+#
+# Then add the UI user mapping to /home/www/bot-squad/config/auth.toml:
+#   [user_meta.<ui_name>]
+#   linux_user = "<USER>"
+#   is_admin = false
+#
+# Verify:
+#   ls -l /home/www/bot-squad/data/_sock/user-<USER>.sock  (group www, 0660)
+#   curl --unix-socket .../user-<USER>.sock http://w/health
+
+[Unit]
+Description=bot-squad per-user worker (tmux ops)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/www/bot-squad
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_LEVEL=info
+Environment=BOT_SQUAD_MODE=user-worker
+ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
+Restart=on-failure
+RestartSec=10s
+
+# Hardening — same posture as the coordinator unit but without the
+# heartbeat / deploy writes. The user-worker still needs tmux + claude
+# in the user's HOME.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/www/bot-squad/data
+# PrivateTmp INTENTIONALLY DISABLED — the worker needs to see the
+# user's tmux server at /tmp/tmux-<uid>/default to control panes.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

@@ -26,7 +26,7 @@ router = APIRouter(
 
 
 def _worker(request: Request) -> WorkerClient:
-    return WorkerClient(request.app.state.sock_path)
+    return request.app.state.worker_router.coordinator()
 
 
 def _check_project(request: Request, slug: str) -> None:

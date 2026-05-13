@@ -21,6 +21,8 @@ export function Shell() {
   const location = useLocation();
   const [workerAlive, setWorkerAlive] = useState<boolean | null>(null);
   const [username, setUsername] = useState<string | null>(null);
+  const [linuxUser, setLinuxUser] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [pinnedSlug, setPinnedSlug] = useState<string | null>(() => {
     try {
@@ -68,6 +70,26 @@ export function Shell() {
     return () => {
       cancelled = true;
       clearInterval(id);
+    };
+  }, []);
+
+  // Identify the logged-in user once on mount so the footer can show
+  // who is acting on which Linux user's tmux.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .me()
+      .then((m) => {
+        if (cancelled) return;
+        setUsername(m.username);
+        setLinuxUser(m.linux_user);
+        setIsAdmin(Boolean(m.is_admin));
+      })
+      .catch(() => {
+        /* anonymous — login redirect handled elsewhere */
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -224,15 +246,8 @@ export function Shell() {
                   DEPLOYMENT QUEUE
                 </NavLink>
               </li>
-              <li>
-                <NavLink
-                  to={`/p/${slug}/autonomous`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  <span className="mc-nav-diamond">▸</span>
-                  AUTONOMOUS TEAM
-                </NavLink>
-              </li>
+              {/* AUTONOMOUS TEAM — link hidden 2026-05-12, autonomous work frozen.
+                  Route still exists; restore this <li> when re-enabling. */}
             </ul>
           </>
         )}
@@ -268,12 +283,38 @@ export function Shell() {
               HELP
             </NavLink>
           </li>
+          {isAdmin && (
+            <>
+              <li>
+                <NavLink
+                  to="/users"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◇</span>
+                  USERS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to="/system-settings"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◇</span>
+                  SETTINGS
+                </NavLink>
+              </li>
+            </>
+          )}
         </ul>
 
         {/* Footer */}
         <div className="mc-sidebar-footer">
           {username && (
-            <div className="mc-sidebar-user">{username} @ bot-squad</div>
+            <div className="mc-sidebar-user">
+              {username}
+              {linuxUser && linuxUser !== username ? ` (${linuxUser})` : ""}
+              {" "}@ bot-squad
+            </div>
           )}
           <button
             type="button"

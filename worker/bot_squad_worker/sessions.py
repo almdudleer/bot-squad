@@ -9,6 +9,7 @@ Session ID (SID) format: ``S-<user>-<window>-p<pane_id_no_pct>``
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -176,6 +177,26 @@ def _get_current_user() -> str:
     return getpass.getuser()
 
 
+def _ensure_project_tmux_session(slug: str, cwd: str) -> None:
+    """Ensure a long-lived tmux session named after the project exists.
+
+    Per the active-context-manager model: one tmux session per project,
+    panes/windows live inside it. Survives across spawn/resume cycles.
+    Caller must guarantee the session is created before any new-window.
+    """
+    has = _run(["tmux", "has-session", "-t", slug])
+    if has.returncode == 0:
+        return
+    # Create detached; -n _init parks a placeholder window we never use for
+    # claude. claude windows are added via tmux new-window -t <slug>:.
+    _run([
+        "tmux", "new-session", "-d",
+        "-s", slug,
+        "-c", cwd,
+        "-n", "_init",
+    ])
+
+
 # ---------------------------------------------------------------------------
 # Session manager actions
 # ---------------------------------------------------------------------------
@@ -192,6 +213,12 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         raise ActionError(f"list_sessions: unknown project slug {slug!r}")
 
     repo_path = Path(project.repo_path)
+    # Dereference symlinks so symlinked dev clones (e.g. signal_tracker/dev
+    # → signal_tracker_mgmt) match panes whose cwd is the real target.
+    try:
+        repo_real = repo_path.resolve()
+    except OSError:
+        repo_real = repo_path
     data_dir = cfg.data_dir
     user = _get_current_user()
     user_home = _get_user_home()
@@ -205,14 +232,29 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
     except Exception:
         panes = []
 
+    import re as _re_cmd
+    _claude_version_re = _re_cmd.compile(r"^\d+\.\d+\.\d+$")
     for pane in panes:
         pane_cwd = Path(pane.cwd) if pane.cwd else None
-        if pane.command != "claude":
+        # Accept top-level "claude" plus the version-named binaries Claude Code
+        # uses for agent-teams subagents, e.g. "2.1.139" — these are spawned
+        # from ~/.local/share/claude/versions/<ver> and tmux reports the basename.
+        if pane.command != "claude" and not _claude_version_re.match(pane.command):
             continue
         if pane_cwd is None:
             continue
         try:
-            if not (pane_cwd == repo_path or pane_cwd.is_relative_to(repo_path)):
+            pane_real = pane_cwd.resolve()
+        except OSError:
+            pane_real = pane_cwd
+        try:
+            match = (
+                pane_cwd == repo_path
+                or pane_cwd.is_relative_to(repo_path)
+                or pane_real == repo_real
+                or pane_real.is_relative_to(repo_real)
+            )
+            if not match:
                 continue
         except (ValueError, TypeError):
             continue
@@ -232,58 +274,135 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             except OSError:
                 pass
 
-        # Check if there's an existing metadata file with started_at
+        # Check if there's an existing metadata file with started_at + task_id
         session_file = _session_file(data_dir, slug, sid)
         started_at = None
+        task_id: str | None = None
+        initiative: str = ""
+        # Default to "active" for live panes; if the md frontmatter says
+        # paused (Ctrl-C'd but pane left open) reflect that — otherwise
+        # the UI shows every live pane as active even when the user paused it.
+        live_status = "active"
         if session_file.exists():
             existing = _read_session_metadata(session_file)
             if existing:
                 started_at = existing.get("started_at")
+                tid = existing.get("task_id")
+                if tid and tid != "~":
+                    task_id = tid
+                init_val = existing.get("initiative")
+                if init_val and init_val != "~":
+                    initiative = init_val
+                md_status = existing.get("status", "")
+                if md_status == "paused":
+                    live_status = "paused"
+
+        # Phase 9: extras for multi-binding. Empty list when unset.
+        extra_task_ids: list[str] = []
+        extra_initiatives: list[str] = []
+        paused_at_meta: Any = None
+        archived_flag = False
+        if session_file.exists():
+            existing = _read_session_metadata(session_file)
+            if existing:
+                etids = existing.get("extra_task_ids")
+                if isinstance(etids, list):
+                    extra_task_ids = [t for t in etids if t and t != "~"]
+                einits = existing.get("extra_initiatives")
+                if isinstance(einits, list):
+                    extra_initiatives = [i for i in einits if i and i != "~"]
+                paused_at_meta = existing.get("paused_at")
+                archived_flag = str(existing.get("archived", "")).lower() == "true"
 
         rows.append({
             "sid": sid,
-            "status": "active",
+            "status": live_status,
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
             "last_prompt_at": last_prompt_at,
             "claude_uuid": claude_uuid,
+            "task_id": task_id,
+            "initiative": initiative,
             "linked_tasks": linked_tasks,
+            "extra_task_ids": extra_task_ids,
+            "extra_initiatives": extra_initiatives,
+            "paused_at": paused_at_meta,
+            "suspended_at": None,
+            "archived": archived_flag,
         })
 
-    # --- Paused sessions from metadata files ---
+    # --- Non-active sessions from metadata files ---
+    # Surface: explicitly paused/suspended sessions AND zombies (md says
+    # "active" but the pane is gone — e.g. user closed the tmux window).
+    # Anything with no live pane and a claude_uuid is resurrectable.
     sessions_dir = data_dir / slug / "sessions"
     if sessions_dir.exists():
         for meta_file in sorted(sessions_dir.glob("*.md")):
             meta = _read_session_metadata(meta_file)
             if meta is None:
                 continue
-            if meta.get("status") != "paused":
-                continue
             sid = meta.get("sid", meta_file.stem)
             if sid in active_sids:
-                continue  # already listed as active
+                continue  # listed as active above
+            status = meta.get("status", "")
+            # Display status: keep "paused" only if pane is still alive;
+            # otherwise anything with no pane is "suspended" (resurrectable).
+            display_status = "suspended"
+            if status == "paused":
+                # Pane is gone (we already filtered out alive SIDs) — treat as suspended.
+                display_status = "suspended"
+            elif status == "suspended":
+                display_status = "suspended"
+            elif status == "active":
+                # Zombie: registry says active but pane is gone.
+                display_status = "suspended"
+            else:
+                # Unknown status — surface as suspended so user can resurrect.
+                display_status = "suspended"
+            md_task_id = meta.get("task_id")
+            if md_task_id == "~":
+                md_task_id = None
+            md_initiative = meta.get("initiative")
+            if not md_initiative or md_initiative == "~":
+                md_initiative = ""
+            md_extra_tids = meta.get("extra_task_ids") or []
+            if not isinstance(md_extra_tids, list):
+                md_extra_tids = []
+            md_extra_tids = [t for t in md_extra_tids if t and t != "~"]
+            md_extra_inits = meta.get("extra_initiatives") or []
+            if not isinstance(md_extra_inits, list):
+                md_extra_inits = []
+            md_extra_inits = [i for i in md_extra_inits if i and i != "~"]
+            md_archived = str(meta.get("archived", "")).lower() == "true"
             rows.append({
                 "sid": sid,
-                "status": "paused",
+                "status": display_status,
                 "window": meta.get("window", ""),
                 "cwd": meta.get("cwd", ""),
                 "started_at": meta.get("started_at"),
-                "last_prompt_at": meta.get("paused_at"),
+                "last_prompt_at": meta.get("suspended_at") or meta.get("paused_at"),
                 "claude_uuid": meta.get("claude_uuid"),
+                "task_id": md_task_id,
+                "initiative": md_initiative,
                 "linked_tasks": meta.get("linked_tasks") or [],
+                "extra_task_ids": md_extra_tids,
+                "extra_initiatives": md_extra_inits,
+                "paused_at": meta.get("paused_at"),
+                "suspended_at": meta.get("suspended_at"),
+                "archived": md_archived,
             })
 
     return rows
 
 
 def pause(cfg: Any, slug: str, sid: str) -> dict:
-    """Pause a running Claude session.
+    """Pause a running Claude session — INTERRUPT ONLY.
 
-    1. Find the pane for this SID.
-    2. Write metadata file.
-    3. Send Ctrl-C then /exit then Enter.
-    4. Wait up to 10s for pane to disappear; force-kill if not.
+    Sends Ctrl-C to the pane so Claude stops whatever it's doing and returns
+    to its prompt. The pane stays open; the user can type into it directly,
+    or click Resume in the UI to re-mark status active. To FREE RESOURCES,
+    use suspend() instead.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -291,10 +410,8 @@ def pause(cfg: Any, slug: str, sid: str) -> dict:
         raise ActionError(f"pause: unknown project slug {slug!r}")
 
     user = _get_current_user()
-    user_home = _get_user_home()
     data_dir = cfg.data_dir
 
-    # Find the pane matching this SID
     panes = list_panes()
     target_pane: PaneInfo | None = None
     for pane in panes:
@@ -306,52 +423,98 @@ def pause(cfg: Any, slug: str, sid: str) -> dict:
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"pause: no active pane found for SID {sid!r}")
 
-    claude_uuid = discover_claude_uuid(target_pane.cwd, user_home)
+    # Update registry status; preserve everything else.
+    meta_file = _session_file(data_dir, slug, sid)
+    existing = _read_session_metadata(meta_file) or {}
+    existing["status"] = "paused"
+    existing["paused_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _write_session_metadata(meta_file, existing)
+
+    # Just the interrupt — no /exit, no kill-pane.
+    _run(["tmux", "send-keys", "-t", target_pane.pane_id, "C-c", ""])
+    return {"ok": True, "paused": True}
+
+
+def suspend(cfg: Any, slug: str, sid: str) -> dict:
+    """Suspend a Claude session — close the pane to free resources.
+
+    The registry md is preserved (with claude_uuid). Use resume() to
+    resurrect: a new tmux window is spawned with ``claude --resume <uuid>``.
+    """
+    project = cfg.projects.get(slug)
+    if project is None:
+        from bot_squad_worker.actions import ActionError
+        raise ActionError(f"suspend: unknown project slug {slug!r}")
+
+    user = _get_current_user()
+    user_home = _get_user_home()
+    data_dir = cfg.data_dir
+
+    panes = list_panes()
+    target_pane: PaneInfo | None = None
+    for pane in panes:
+        if compute_sid(user, pane.window, pane.pane_id) == sid:
+            target_pane = pane
+            break
+
+    meta_file = _session_file(data_dir, slug, sid)
+    existing = _read_session_metadata(meta_file) or {}
+
+    # If no live pane, treat as already suspended — just normalise the md.
+    if target_pane is None:
+        existing["status"] = "suspended"
+        existing.setdefault("started_at", "~")
+        existing.setdefault("task_id", "~")
+        existing.setdefault("claude_uuid", existing.get("claude_uuid", "~"))
+        _write_session_metadata(meta_file, existing)
+        return {"ok": True, "suspended": True, "already_gone": True}
+
+    claude_uuid = existing.get("claude_uuid")
+    if not claude_uuid or claude_uuid == "~":
+        claude_uuid = discover_claude_uuid(target_pane.cwd, user_home)
+    started_at = existing.get("started_at") or "~"
+    task_id = existing.get("task_id") or "~"
     linked_tasks = _scan_linked_tasks(data_dir, slug, sid, claude_uuid)
 
-    # Write metadata before sending kill signal (so state is recoverable)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     meta: dict = {
         "sid": sid,
-        "status": "paused",
+        "status": "suspended",
         "window": target_pane.window,
         "cwd": target_pane.cwd,
         "claude_uuid": claude_uuid if claude_uuid else "~",
-        "started_at": "~",
-        "paused_at": now,
+        "task_id": task_id,
+        "started_at": started_at,
+        "suspended_at": now,
         "linked_tasks": linked_tasks,
     }
-    meta_file = _session_file(data_dir, slug, sid)
     _write_session_metadata(meta_file, meta)
 
-    # Graceful exit: Ctrl-C, then /exit Enter
+    # Graceful exit then force-kill if needed.
     _run(["tmux", "send-keys", "-t", target_pane.pane_id, "C-c", ""])
     time.sleep(0.3)
     _run(["tmux", "send-keys", "-t", target_pane.pane_id, "/exit", "Enter"])
 
-    # Wait up to 10s for pane to disappear
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        panes_now = list_panes()
-        ids_now = {p.pane_id for p in panes_now}
+        ids_now = {p.pane_id for p in list_panes()}
         if target_pane.pane_id not in ids_now:
             break
         time.sleep(0.5)
     else:
-        # Force-kill
         _run(["tmux", "kill-pane", "-t", target_pane.pane_id])
 
-    return {"ok": True, "paused": True}
+    return {"ok": True, "suspended": True}
 
 
 def resume(cfg: Any, slug: str, sid: str) -> dict:
-    """Resume a paused Claude session.
+    """Resume a Claude session — handles paused, suspended, and zombie cases.
 
-    1. Read metadata file.
-    2. Check no live pane already has the same claude_uuid.
-    3. spawn new-window with claude --resume <uuid>.
-    4. Discover new pane, compute new SID.
-    5. Rename metadata file, update status.
+    - status=paused with live pane → just clear paused status; user types in tmux.
+    - status=paused with no live pane → resurrect (window was closed externally).
+    - status=suspended → resurrect (new window + ``claude --resume <uuid>``).
+    - status=active with no live pane (zombie) → resurrect.
+    - status=active with live pane → error (use pause/suspend first).
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -366,44 +529,57 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     if meta is None:
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"resume: no metadata found for SID {sid!r}")
-    if meta.get("status") != "paused":
-        from bot_squad_worker.actions import ActionError
-        raise ActionError(f"resume: session {sid!r} is not paused (status={meta.get('status')!r})")
 
     cwd = meta.get("cwd", str(project.repo_path))
     window = meta.get("window", "claude")
     claude_uuid = meta.get("claude_uuid")
+    status = meta.get("status", "")
 
-    # Guard: no live pane with the same UUID
-    if claude_uuid and claude_uuid != "~":
-        existing_panes = list_panes()
-        for pane in existing_panes:
-            if pane.command == "claude":
-                existing_uuid = _get_user_home()
-                # Check if any live pane is in the same cwd with same uuid
-                # (we can't introspect the UUID from the pane directly,
-                #  so we check if any live pane matches the exact cwd)
-                if pane.cwd == cwd:
-                    from bot_squad_worker.actions import ActionError
-                    raise ActionError(
-                        f"resume: a live claude session already exists in {cwd!r}. "
-                        f"Pause or kill it first."
-                    )
+    # Is the original pane still alive?
+    panes_now = list_panes()
+    live_pane = None
+    for pane in panes_now:
+        if compute_sid(user, pane.window, pane.pane_id) == sid:
+            live_pane = pane
+            break
+
+    if live_pane is not None:
+        if status == "paused":
+            # Just clear paused: user types in the tmux pane to continue.
+            meta["status"] = "active"
+            meta.pop("paused_at", None)
+            _write_session_metadata(meta_file, meta)
+            return {"ok": True, "sid": sid, "in_place": True}
+        from bot_squad_worker.actions import ActionError
+        raise ActionError(
+            f"resume: session {sid!r} has a live pane and is not paused — "
+            f"nothing to do. Pause or suspend it first if you meant to restart."
+        )
+
+    # One tmux session per project — create lazily, never killed.
+    _ensure_project_tmux_session(slug, cwd)
 
     # Snapshot existing pane IDs
     pre_panes = {p.pane_id for p in list_panes()}
 
-    # Spawn new window
+    # Spawn new window inside the project's tmux session. Use bash -lc so
+    # the user's profile is sourced — claude lives in ~/.local/bin which is
+    # NOT on the systemd-default PATH the worker inherits.
+    # --dangerously-skip-permissions: agent-team sessions cannot pause and
+    # ask the human at night; settings.json permissions.allow doesn't cover
+    # writes to .claude/ which are needed for the task_id marker. The
+    # stakeholder has explicitly opted into this risk class.
     if claude_uuid and claude_uuid != "~":
-        cmd = f"claude --resume {claude_uuid}"
+        cmd = f"claude --dangerously-skip-permissions --resume {claude_uuid}"
     else:
-        cmd = "claude"
+        cmd = "claude --dangerously-skip-permissions"
 
     result = _run([
         "tmux", "new-window", "-d",
+        "-t", f"{slug}:",
         "-n", window,
         "-c", cwd,
-        cmd,
+        "bash", "-lc", cmd,
     ])
     if result.returncode != 0:
         from bot_squad_worker.actions import ActionError
@@ -438,11 +614,27 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     return {"ok": True, "sid": new_sid}
 
 
-def spawn(cfg: Any, slug: str, window: str, initial_prompt: str | None = None) -> dict:
+def spawn(
+    cfg: Any,
+    slug: str,
+    window: str,
+    initial_prompt: str | None = None,
+    task_id: str | None = None,
+    initiative: str | None = None,
+) -> dict:
     """Spawn a new Claude session in the project's repo.
 
     Opens a new tmux window, starts claude (no resume), and optionally
     sends an initial_prompt after a short delay.
+
+    If task_id is provided, writes ``.claude/task_id`` in the project's
+    repo *before* spawning so the SessionStart hook links the new session
+    to that backlog task automatically.
+
+    If initiative is provided (a filename under vision/initiatives/), the
+    SessionStart hook is told via the BOT_SQUAD_INITIATIVE env var to use
+    that file instead of the project's global active_initiative. Lets the
+    stakeholder spawn multiple TLs on different initiatives in parallel.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -452,14 +644,38 @@ def spawn(cfg: Any, slug: str, window: str, initial_prompt: str | None = None) -
     cwd = str(project.repo_path)
     user = _get_current_user()
 
+    # Drop the task_id marker so SessionStart picks it up.
+    if task_id:
+        marker_dir = project.repo_path / ".claude"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / "task_id").write_text(task_id.strip())
+
+    # One tmux session per project — create lazily, never killed.
+    _ensure_project_tmux_session(slug, cwd)
+
     # Snapshot existing pane IDs
     pre_panes = {p.pane_id for p in list_panes()}
 
+    # bash -lc so claude (in ~/.local/bin) is on PATH — the worker's
+    # systemd env does not include the user's local bin directory.
+    # --dangerously-skip-permissions: see resume() rationale above.
+    # BOT_SQUAD_INITIATIVE: per-session initiative override (Phase 4).
+    if initiative:
+        # Basic safety: only basename, must end .md, no slashes/..
+        clean = initiative.strip()
+        if "/" in clean or ".." in clean or not clean.endswith(".md"):
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(f"spawn: invalid initiative name {initiative!r}")
+        shell_cmd = f"BOT_SQUAD_INITIATIVE={shlex.quote(clean)} claude --dangerously-skip-permissions"
+    else:
+        shell_cmd = "claude --dangerously-skip-permissions"
+
     result = _run([
         "tmux", "new-window", "-d",
+        "-t", f"{slug}:",
         "-n", window,
         "-c", cwd,
-        "claude",
+        "bash", "-lc", shell_cmd,
     ])
     if result.returncode != 0:
         from bot_squad_worker.actions import ActionError
@@ -478,9 +694,341 @@ def spawn(cfg: Any, slug: str, window: str, initial_prompt: str | None = None) -
     new_pane = max(new_panes, key=lambda p: int(p.pane_id.lstrip("%")) if p.pane_id.lstrip("%").isdigit() else 0)
     new_sid = compute_sid(user, new_pane.window, new_pane.pane_id)
 
-    # Send initial prompt if provided
+    # Send initial prompt if provided. Two-phase: text first, brief pause,
+    # then a *separate* Enter. tmux wraps long text as a bracketed-paste
+    # escape sequence; an Enter inside the paste isn't a submit, so the
+    # standalone Enter that follows the wrap-end is what submits the prompt
+    # to claude's input box.
     if initial_prompt:
         time.sleep(2)
-        _run(["tmux", "send-keys", "-t", new_pane.pane_id, initial_prompt, "Enter"])
+        _run(["tmux", "send-keys", "-t", new_pane.pane_id, initial_prompt])
+        time.sleep(0.4)
+        _run(["tmux", "send-keys", "-t", new_pane.pane_id, "Enter"])
 
     return {"ok": True, "sid": new_sid}
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: multi-binding helpers
+# ---------------------------------------------------------------------------
+
+def _full_task_set(meta: dict) -> set[str]:
+    """Return {primary, *extras} of task IDs for a session md frontmatter."""
+    out: set[str] = set()
+    tid = meta.get("task_id")
+    if tid and tid != "~":
+        out.add(tid)
+    extras = meta.get("extra_task_ids") or []
+    if isinstance(extras, list):
+        for t in extras:
+            if t and t != "~":
+                out.add(t)
+    return out
+
+
+def _full_initiative_set(meta: dict) -> set[str]:
+    """Return {primary, *extras} of initiative basenames for a session md."""
+    out: set[str] = set()
+    init = meta.get("initiative")
+    if init and init != "~":
+        out.add(init)
+    extras = meta.get("extra_initiatives") or []
+    if isinstance(extras, list):
+        for i in extras:
+            if i and i != "~":
+                out.add(i)
+    return out
+
+
+def _find_owner(
+    data_dir: Path,
+    slug: str,
+    *,
+    task_id: str | None = None,
+    initiative: str | None = None,
+) -> str | None:
+    """Scan all session mds; return SID of the session that already holds the
+    given task_id or initiative (primary or extras). None if free.
+    """
+    sess_dir = data_dir / slug / "sessions"
+    if not sess_dir.exists():
+        return None
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        sid = meta.get("sid", md.stem)
+        if task_id and task_id in _full_task_set(meta):
+            return sid
+        if initiative and initiative in _full_initiative_set(meta):
+            return sid
+    return None
+
+
+def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
+    """Append task_id to a dev session's extra_task_ids.
+
+    Validates: session exists, session is a dev (has primary task_id), task
+    file exists, task isn't already bound elsewhere. Sends a peer notification.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"bind_task: unknown project slug {slug!r}")
+
+    data_dir = cfg.data_dir
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"bind_task: no session metadata for SID {sid!r}")
+
+    primary = meta.get("task_id")
+    if not primary or primary == "~":
+        raise ActionError(f"bind_task: session {sid!r} is not a dev session (no primary task_id)")
+
+    backlog_dir = data_dir / slug / "backlog"
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        raise ActionError(f"bind_task: task not found: {task_id}")
+
+    if task_id == primary or task_id in (meta.get("extra_task_ids") or []):
+        # Already bound to this session — idempotent success.
+        extras = [t for t in (meta.get("extra_task_ids") or []) if t and t != "~"]
+        return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras, "already_bound": True}
+
+    owner = _find_owner(data_dir, slug, task_id=task_id)
+    if owner is not None and owner != sid:
+        raise ActionError(f"bind_task: task {task_id} already bound to {owner}")
+
+    extras = list(meta.get("extra_task_ids") or [])
+    extras = [t for t in extras if t and t != "~"]
+    extras.append(task_id)
+    meta["extra_task_ids"] = extras
+    _write_session_metadata(meta_file, meta)
+
+    # Read the task title for a friendlier message.
+    title = ""
+    try:
+        task_meta = _read_session_metadata(matches[0])
+        if task_meta:
+            title = str(task_meta.get("title") or "").strip()
+    except Exception:
+        pass
+
+    text = (
+        f"[BIND_TASK from stakeholder] Also work on {task_id}"
+        + (f": {title}" if title else "")
+        + f". Read data/{slug}/backlog/{matches[0].name} for scope."
+    )
+    try:
+        from bot_squad_worker import intersession as _is
+        _is.send(cfg, slug, "stakeholder", sid, text)
+    except Exception:
+        # Peer notify is best-effort; the binding itself is the source of truth.
+        pass
+
+    return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras}
+
+
+def archive_session(cfg: Any, slug: str, sid: str) -> dict:
+    """Mark a session as archived in its frontmatter.
+
+    Rules:
+      - session must exist
+      - session must be in 'suspended' state (no live pane). Active or
+        paused sessions can't be archived — suspend first.
+
+    Idempotent: archiving an already-archived session returns ok=True.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"archive_session: unknown project slug {slug!r}")
+
+    data_dir = cfg.data_dir
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"archive_session: no metadata for SID {sid!r}")
+
+    # The session must have no live pane. Check tmux directly so we can't
+    # rely on a stale md status flag.
+    user = _get_current_user()
+    for pane in list_panes():
+        if compute_sid(user, pane.window, pane.pane_id) == sid:
+            raise ActionError(
+                f"archive_session: {sid!r} still has a live pane — suspend first"
+            )
+
+    status = meta.get("status", "")
+    if status not in ("suspended", "paused", "active"):
+        # paused/active here mean stale md flags (we already verified no
+        # live pane), so allow the archive — normalise to suspended first.
+        pass
+
+    meta["status"] = "suspended"
+    meta["archived"] = "true"
+    _write_session_metadata(meta_file, meta)
+    return {"ok": True, "sid": sid, "archived": True}
+
+
+def unarchive_session(cfg: Any, slug: str, sid: str) -> dict:
+    """Clear the archived flag on a session md."""
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"unarchive_session: unknown project slug {slug!r}")
+
+    data_dir = cfg.data_dir
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"unarchive_session: no metadata for SID {sid!r}")
+
+    if "archived" in meta:
+        meta.pop("archived", None)
+    _write_session_metadata(meta_file, meta)
+    return {"ok": True, "sid": sid, "archived": False}
+
+
+def bind_initiative(cfg: Any, slug: str, sid: str, initiative: str) -> dict:
+    """Append initiative basename to a TL session's extra_initiatives.
+
+    Validates: session exists, session is a TL (no primary task_id),
+    initiative file exists, initiative isn't already bound elsewhere.
+    Sends a peer notification.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"bind_initiative: unknown project slug {slug!r}")
+
+    # Safety: basename-only, must end .md, no traversal.
+    clean = (initiative or "").strip()
+    if not clean or "/" in clean or ".." in clean or not clean.endswith(".md"):
+        raise ActionError(f"bind_initiative: invalid initiative name {initiative!r}")
+
+    data_dir = cfg.data_dir
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"bind_initiative: no session metadata for SID {sid!r}")
+
+    primary_task = meta.get("task_id")
+    if primary_task and primary_task != "~":
+        raise ActionError(f"bind_initiative: session {sid!r} is a dev session, not a teamlead")
+
+    init_path = data_dir / slug / "vision" / "initiatives" / clean
+    if not init_path.exists():
+        raise ActionError(f"bind_initiative: initiative not found: {clean}")
+
+    primary_init = meta.get("initiative")
+    if clean == primary_init or clean in (meta.get("extra_initiatives") or []):
+        extras = [i for i in (meta.get("extra_initiatives") or []) if i and i != "~"]
+        return {"ok": True, "sid": sid, "initiative": clean, "extras": extras, "already_bound": True}
+
+    owner = _find_owner(data_dir, slug, initiative=clean)
+    if owner is not None and owner != sid:
+        raise ActionError(f"bind_initiative: initiative {clean} already bound to {owner}")
+
+    extras = list(meta.get("extra_initiatives") or [])
+    extras = [i for i in extras if i and i != "~"]
+    extras.append(clean)
+    meta["extra_initiatives"] = extras
+    _write_session_metadata(meta_file, meta)
+
+    text = (
+        f"[BIND_INITIATIVE from stakeholder] Also coordinate {clean}. "
+        f"Read data/{slug}/vision/initiatives/{clean} for context."
+    )
+    try:
+        from bot_squad_worker import intersession as _is
+        _is.send(cfg, slug, "stakeholder", sid, text)
+    except Exception:
+        pass
+
+    return {"ok": True, "sid": sid, "initiative": clean, "extras": extras}
+
+
+def unbind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
+    """Remove a task binding from a dev session.
+
+    If `task_id` matches the session's primary task_id, the call fails —
+    the primary is the session's identity. Removes from extra_task_ids
+    otherwise. Idempotent if the task isn't bound.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"unbind_task: unknown project slug {slug!r}")
+
+    data_dir = cfg.data_dir
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"unbind_task: no session metadata for SID {sid!r}")
+
+    primary = meta.get("task_id")
+    if primary == task_id:
+        raise ActionError(
+            f"unbind_task: {task_id} is the primary task of {sid!r}; "
+            "cannot unbind the session's identity"
+        )
+
+    extras = list(meta.get("extra_task_ids") or [])
+    extras = [t for t in extras if t and t != "~"]
+    if task_id not in extras:
+        return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras, "changed": False}
+    extras = [t for t in extras if t != task_id]
+    meta["extra_task_ids"] = extras
+    _write_session_metadata(meta_file, meta)
+    return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras, "changed": True}
+
+
+def unbind_initiative(cfg: Any, slug: str, sid: str, initiative: str) -> dict:
+    """Remove an initiative from a TL session's bindings.
+
+    If the initiative matches the primary `initiative` field, that field is
+    cleared (leaving extras intact). Otherwise the value is filtered out of
+    `extra_initiatives`. Returns the resulting extras list.
+
+    Idempotent: unbinding a not-present initiative returns ok=True.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"unbind_initiative: unknown project slug {slug!r}")
+
+    clean = (initiative or "").strip()
+    if not clean or "/" in clean or ".." in clean:
+        raise ActionError(f"unbind_initiative: invalid initiative name {initiative!r}")
+
+    data_dir = cfg.data_dir
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"unbind_initiative: no session metadata for SID {sid!r}")
+
+    primary_init = meta.get("initiative")
+    extras = list(meta.get("extra_initiatives") or [])
+    extras = [i for i in extras if i and i != "~"]
+
+    changed = False
+    if primary_init == clean:
+        meta["initiative"] = "~"
+        changed = True
+    if clean in extras:
+        extras = [i for i in extras if i != clean]
+        meta["extra_initiatives"] = extras
+        changed = True
+
+    if changed:
+        _write_session_metadata(meta_file, meta)
+
+    return {"ok": True, "sid": sid, "initiative": clean, "extras": extras, "changed": changed}

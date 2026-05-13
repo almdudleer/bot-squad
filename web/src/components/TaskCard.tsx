@@ -18,6 +18,7 @@ interface TaskCardProps {
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "open", label: "Open" },
+  { value: "in_progress", label: "In progress" },
   { value: "totest", label: "To Test" },
   { value: "reopened", label: "Reopened" },
   { value: "closed", label: "Closed" },
@@ -201,6 +202,36 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
             {commentCount} comments
           </span>
         )}
+        {task.session && (
+          <span
+            data-no-nav
+            title={`${task.session.status} session ${task.session.sid} — click to view`}
+            onClick={(e) => {
+              e.stopPropagation();
+              navigate(`/p/${slug}/sessions`);
+            }}
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.65rem",
+              color:
+                task.session.status === "active"
+                  ? "var(--mc-accent-success, #4ade80)"
+                  : "var(--mc-text-dim)",
+              background: "var(--mc-surface-raised)",
+              border: "1px solid",
+              borderColor:
+                task.session.status === "active"
+                  ? "var(--mc-accent-success, #4ade80)"
+                  : "var(--mc-border)",
+              borderRadius: "2px",
+              padding: "0 4px",
+              cursor: "pointer",
+            }}
+          >
+            {task.session.status === "active" ? "● running" : "◌ paused"}
+          </span>
+        )}
+{/* Assign-session affordance lives on the task detail page, not the card. */}
       </div>
     </div>
   );

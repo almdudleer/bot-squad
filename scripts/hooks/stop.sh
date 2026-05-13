@@ -27,7 +27,9 @@ now=$(date +%s)
 age=$((now - mtime))
 [ "$age" -gt 60 ] || exit 0
 
-# Resolve slug from CWD against projects.toml.
+# Resolve slug from CWD against projects.toml. Matches both clones (dev +
+# master) and dereferences symlinks so layouts like signal_tracker/dev →
+# signal_tracker_mgmt work either way.
 slug=$(python3 - <<'PY'
 import os, sys, tomllib
 cfg_path = os.environ.get("BOT_SQUAD", "/home/www/bot-squad") + "/config/projects.toml"
@@ -36,9 +38,19 @@ try:
 except Exception:
     sys.exit(0)
 cwd = os.getcwd()
+real_cwd = os.path.realpath(cwd)
+def _match(target):
+    if not target:
+        return False
+    real_t = os.path.realpath(target)
+    return (
+        cwd == target
+        or cwd.startswith(target.rstrip("/") + "/")
+        or real_cwd == real_t
+        or real_cwd.startswith(real_t.rstrip("/") + "/")
+    )
 for slug, p in cfg.get("projects", {}).items():
-    repo = p.get("repo_path", "")
-    if repo and (cwd == repo or cwd.startswith(repo.rstrip("/") + "/")):
+    if _match(p.get("repo_path", "")) or _match(p.get("repo_master", "")):
         print(slug)
         sys.exit(0)
 sys.exit(0)

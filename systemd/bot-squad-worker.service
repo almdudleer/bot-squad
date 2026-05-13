@@ -7,6 +7,10 @@ Type=simple
 WorkingDirectory=/home/www/bot-squad
 Environment=PYTHONUNBUFFERED=1
 Environment=LOG_LEVEL=info
+# Phase 2 multi-user: coordinator mode = scheduler + all actions + tmux ops
+# for this user. Per-user workers (other Linux users) use the separate
+# bot-squad-user-worker.service template.
+Environment=BOT_SQUAD_MODE=coordinator
 ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
 Restart=on-failure
 RestartSec=10s

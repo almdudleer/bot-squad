@@ -48,11 +48,11 @@ def test_get_messages_success(tmp_bot_squad: Path, monkeypatch):
 
     monkeypatch.setattr(
         RM, "_resolve_jsonl",
-        lambda repo_path, uuid: FIXTURES / "sample_session.jsonl",
+        lambda uuid: FIXTURES / "sample_session.jsonl",
     )
 
     with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
-        r = client.get("/api/projects/test-project/sessions/test-uuid-0001/messages")
+        r = client.get("/api/projects/test-project/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages")
     assert r.status_code == 200
     data = r.json()
     assert isinstance(data, list)
@@ -68,11 +68,11 @@ def test_get_messages_returns_expected_fields(tmp_bot_squad: Path, monkeypatch):
 
     monkeypatch.setattr(
         RM, "_resolve_jsonl",
-        lambda repo_path, uuid: FIXTURES / "sample_session.jsonl",
+        lambda uuid: FIXTURES / "sample_session.jsonl",
     )
 
     with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
-        r = client.get("/api/projects/test-project/sessions/test-uuid-0001/messages")
+        r = client.get("/api/projects/test-project/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages")
     assert r.status_code == 200
     for msg in r.json():
         assert "role" in msg
@@ -86,11 +86,11 @@ def test_get_messages_not_found_404(tmp_bot_squad: Path, monkeypatch):
 
     monkeypatch.setattr(
         RM, "_resolve_jsonl",
-        lambda repo_path, uuid: None,
+        lambda uuid: None,
     )
 
     with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
-        r = client.get("/api/projects/test-project/sessions/nonexistent-uuid/messages")
+        r = client.get("/api/projects/test-project/sessions/11111111-2222-3333-4444-555555555555/messages")
     assert r.status_code == 404
     assert "session log not found" in r.json()["detail"]
 
@@ -101,11 +101,11 @@ def test_get_messages_requires_auth(tmp_bot_squad: Path, monkeypatch):
 
     monkeypatch.setattr(
         RM, "_resolve_jsonl",
-        lambda repo_path, uuid: FIXTURES / "sample_session.jsonl",
+        lambda uuid: FIXTURES / "sample_session.jsonl",
     )
 
     with _anon_client(tmp_bot_squad, monkeypatch) as client:
-        r = client.get("/api/projects/test-project/sessions/test-uuid-0001/messages")
+        r = client.get("/api/projects/test-project/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages")
     assert r.status_code == 401
 
 
@@ -122,11 +122,11 @@ def test_get_messages_limit(tmp_bot_squad: Path, monkeypatch):
 
     monkeypatch.setattr(
         RM, "_resolve_jsonl",
-        lambda repo_path, uuid: FIXTURES / "sample_session.jsonl",
+        lambda uuid: FIXTURES / "sample_session.jsonl",
     )
 
     with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
-        r = client.get("/api/projects/test-project/sessions/test-uuid-0001/messages?limit=1")
+        r = client.get("/api/projects/test-project/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages?limit=1")
     assert r.status_code == 200
     assert len(r.json()) <= 1
 
@@ -137,12 +137,12 @@ def test_get_messages_offset(tmp_bot_squad: Path, monkeypatch):
 
     monkeypatch.setattr(
         RM, "_resolve_jsonl",
-        lambda repo_path, uuid: FIXTURES / "sample_session.jsonl",
+        lambda uuid: FIXTURES / "sample_session.jsonl",
     )
 
     with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
-        r0 = client.get("/api/projects/test-project/sessions/test-uuid-0001/messages")
-        r2 = client.get("/api/projects/test-project/sessions/test-uuid-0001/messages?offset=2")
+        r0 = client.get("/api/projects/test-project/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages")
+        r2 = client.get("/api/projects/test-project/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages?offset=2")
     assert r0.status_code == 200
     assert r2.status_code == 200
     assert len(r2.json()) < len(r0.json())

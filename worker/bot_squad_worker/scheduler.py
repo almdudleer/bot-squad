@@ -9,10 +9,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from bot_squad_worker.config import Config
 from bot_squad_worker.jobs import (
-    autonomous_tick,
     deploy_monitor,
     heartbeat,
-    kick_stuck,
     oauth_refresh,
     tg_listener_tick,
 )
@@ -68,15 +66,6 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         id="deploy_monitor",
         replace_existing=True,
     )
-    sched.add_job(
-        kick_stuck,
-        "cron",
-        hour=11,
-        minute=59,
-        args=[cfg],
-        id="kick_stuck",
-        replace_existing=True,
-    )
     # oauth_refresh: v1 placeholder — checks claude binary reachable.
     # Full token-rotation port from cctv-backend deferred to a later spec.
     sched.add_job(
@@ -96,14 +85,8 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         id="tg_listener",
         replace_existing=True,
     )
-    # autonomous_tick: run one orchestrator step per project (spec #8).
-    sched.add_job(
-        autonomous_tick,
-        "interval",
-        seconds=60,
-        args=[cfg],
-        id="autonomous_tick",
-        replace_existing=True,
-    )
+    # autonomous_tick: DISABLED 2026-05-12 — autonomous work is frozen pending
+    # the new operating model. The autonomous module + actions remain on disk
+    # but no background tick fires. Re-enable here when the model is ready.
 
     return sched

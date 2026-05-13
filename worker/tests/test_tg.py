@@ -135,3 +135,65 @@ def test_message_no_prefix_when_no_sid(tmp_path: Path) -> None:
     client.send(chat_id="123", text="plain text")
     call_kwargs = mock_post.call_args
     assert call_kwargs.kwargs["text"] == "plain text"
+
+
+# ---------------------------------------------------------------------------
+# Quiet hours config — defaults to 17→5 UTC, override via system_settings.toml
+# ---------------------------------------------------------------------------
+
+
+def test_config_loads_default_quiet_hours(tmp_config_dir: Path) -> None:
+    from bot_squad_worker.config import Config
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_quiet_hours_start_utc == 17
+    assert cfg.tg_quiet_hours_end_utc == 5
+
+
+def test_config_loads_quiet_hours_from_system_settings(tmp_config_dir: Path) -> None:
+    from bot_squad_worker.config import Config
+    (tmp_config_dir / "system_settings.toml").write_text(
+        "[tg]\n"
+        "quiet_hours_start_utc = 22\n"
+        "quiet_hours_end_utc = 6\n"
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_quiet_hours_start_utc == 22
+    assert cfg.tg_quiet_hours_end_utc == 6
+
+
+def test_in_quiet_hours_respects_args(monkeypatch) -> None:
+    """_in_quiet_hours uses its start/end args, computed against current UTC.
+
+    The worker conftest sets BOT_SQUAD_DISABLE_QUIET_HOURS so the helper
+    returns False unconditionally; pop the override for this test only.
+    """
+    from bot_squad_worker import tg as tg_module
+    monkeypatch.delenv("BOT_SQUAD_DISABLE_QUIET_HOURS", raising=False)
+
+    from datetime import datetime as dt, timezone as tz
+    h = dt.now(tz.utc).hour
+
+    # Window guaranteed NOT to include h:
+    far_start = (h + 6) % 24
+    far_end = (h + 7) % 24
+    if far_start < far_end:
+        assert tg_module._in_quiet_hours(far_start, far_end) is False
+
+    # Window guaranteed TO include h:
+    near_start = (h - 1) % 24
+    near_end = (h + 2) % 24
+    if near_start < near_end:
+        assert tg_module._in_quiet_hours(near_start, near_end) is True
+
+
+def test_tg_client_picks_up_configured_quiet_hours(tmp_path: Path) -> None:
+    """TgClient stores quiet hours from cfg."""
+    class _Cfg:
+        tg_bot_token = "t"
+        data_dir = tmp_path
+        tg_quiet_hours_start_utc = 22
+        tg_quiet_hours_end_utc = 6
+
+    client = TgClient(_Cfg())
+    assert client._quiet_start_utc == 22
+    assert client._quiet_end_utc == 6

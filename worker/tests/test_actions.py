@@ -40,16 +40,25 @@ def test_unknown_action_raises():
 
 
 def test_registry_lists_only_allowed_actions():
-    # Closed allowlist — spec #3 phase 3 adds deploy + kick_stuck_now.
+    # Closed allowlist — spec #3 phase 3 adds deploy.
     # spec #5 adds list_sessions, pause_session, resume_session, spawn_session.
     # spec #6 adds scheduler_state.
     # spec #7 adds inject_input.
     # spec #8 adds autonomous_status, autonomous_enable, autonomous_disable.
+    # Phase 1 message bus adds peer_send, peer_inbox_read, peer_inbox_wait.
     assert set(ACTION_REGISTRY.keys()) == {
-        "noop", "tg_verify_login", "tg_notify", "deploy", "kick_stuck_now",
-        "list_sessions", "pause_session", "resume_session", "spawn_session",
+        "noop", "tg_verify_login", "tg_notify", "deploy",
+        "list_sessions", "pause_session", "suspend_session", "resume_session",
+        "spawn_session",
         "scheduler_state", "inject_input",
         "autonomous_status", "autonomous_enable", "autonomous_disable",
+        "peer_send", "peer_inbox_read", "peer_inbox_wait",
+        "task_progress_add",
+        # Phase 9: bind multi-task-per-dev / multi-initiative-per-TL.
+        "bind_task", "bind_initiative",
+        # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
+        "unbind_task", "unbind_initiative",
+        "archive_session", "unarchive_session",
     }
 
 
@@ -110,8 +119,8 @@ class _FakeTgClient:
         self.calls: list[dict] = []
         self._suppress = False  # when True, send() returns False (debounce sim)
 
-    def send(self, *, chat_id, text, sid="", user="") -> bool:
-        self.calls.append({"chat_id": chat_id, "text": text, "sid": sid, "user": user})
+    def send(self, *, chat_id, text, sid="", user="", urgent=False) -> bool:
+        self.calls.append({"chat_id": chat_id, "text": text, "sid": sid, "user": user, "urgent": urgent})
         return not self._suppress
 
 
@@ -310,35 +319,6 @@ def test_deploy_action_requires_all_params(tmp_path, monkeypatch):
 
     with pytest.raises(ActionError, match="missing required"):
         A.dispatch("deploy", {"slug": "deploy-test", "target": "staging"})
-
-
-# ---------------------------------------------------------------------------
-# kick_stuck_now action tests
-# ---------------------------------------------------------------------------
-
-
-def test_kick_stuck_now_returns_ok(tmp_config_dir, monkeypatch):
-    """kick_stuck_now with no params runs and returns {ok: True, ran: True}."""
-    import bot_squad_worker.actions as A
-    from bot_squad_worker import jobs as J
-
-    cfg = Config.load(tmp_config_dir)
-    monkeypatch.setattr(A, "_get_config", lambda: cfg)
-    # Patch kick_stuck so it doesn't actually try to send TG messages
-    monkeypatch.setattr(J, "kick_stuck", lambda _cfg: None)
-
-    out = A.dispatch("kick_stuck_now", {})
-    assert out == {"ok": True, "ran": True}
-
-
-def test_kick_stuck_now_rejects_params(tmp_config_dir, monkeypatch):
-    import bot_squad_worker.actions as A
-
-    cfg = Config.load(tmp_config_dir)
-    monkeypatch.setattr(A, "_get_config", lambda: cfg)
-
-    with pytest.raises(ActionError, match="takes no params"):
-        A.dispatch("kick_stuck_now", {"extra": "bad"})
 
 
 # ---------------------------------------------------------------------------
@@ -862,3 +842,160 @@ def test_autonomous_disable_rejects_extra_params(tmp_path, monkeypatch):
     _make_auto_cfg(tmp_path, monkeypatch)
     with pytest.raises(ActionError, match="unexpected params"):
         A.dispatch("autonomous_disable", {"slug": "test-project", "evil": "x"})
+
+
+# ---------------------------------------------------------------------------
+# task_progress_add action tests (Phase 7)
+# ---------------------------------------------------------------------------
+
+
+def _make_task_progress_cfg(tmp_path: Path, monkeypatch):
+    """Config + a single test task md, with config injected into actions."""
+    import types
+    import bot_squad_worker.actions as A
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.test-project]\n'
+        f'slug = "test-project"\n'
+        f'display_name = "Test Project"\n'
+        f'repo_path = "{repo}"\n'
+        f'deploy_branch = "bot_squad/dev"\n'
+        f'master_branch = "master"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "0"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    data_dir = tmp_path / "data"
+    backlog = data_dir / "test-project" / "backlog"
+    backlog.mkdir(parents=True)
+
+    cfg = Config.load(cfg_dir)
+    patched = types.SimpleNamespace(
+        projects=cfg.projects,
+        data_dir=data_dir,
+        tg_bot_token="",
+    )
+    monkeypatch.setattr(A, "_get_config", lambda: patched)
+    return patched, backlog
+
+
+def test_task_progress_add_appends_line(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    task_path = backlog / "T-0001-foo.md"
+    task_path.write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
+        "## Verbatim request\n\nI want X.\n"
+    )
+    out = A.dispatch("task_progress_add", {
+        "slug": "test-project",
+        "task_id": "T-0001",
+        "sid": "S-test-p1",
+        "text": "shipped the thing",
+    })
+    assert out["ok"] is True
+    assert out["task_id"] == "T-0001"
+    assert "S-test-p1" in out["line_appended"]
+    assert "shipped the thing" in out["line_appended"]
+
+    content = task_path.read_text()
+    assert "## Verbatim request" in content
+    assert "I want X." in content
+    assert "## Progress" in content
+    assert "S-test-p1 · shipped the thing" in content
+
+
+def test_task_progress_add_unknown_task_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_task_progress_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="task not found"):
+        A.dispatch("task_progress_add", {
+            "slug": "test-project",
+            "task_id": "T-9999",
+            "sid": "S-x",
+            "text": "x",
+        })
+
+
+def test_task_progress_add_unknown_slug_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_task_progress_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("task_progress_add", {
+            "slug": "no-such",
+            "task_id": "T-0001",
+            "sid": "S-x",
+            "text": "x",
+        })
+
+
+def test_task_progress_add_empty_text_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+    with pytest.raises(ActionError, match="empty text"):
+        A.dispatch("task_progress_add", {
+            "slug": "test-project",
+            "task_id": "T-0001",
+            "sid": "S-x",
+            "text": "   ",
+        })
+
+
+def test_task_progress_add_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_task_progress_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("task_progress_add", {
+            "slug": "test-project", "task_id": "T-0001",
+            "sid": "S-x", "text": "x", "evil": "x",
+        })
+
+
+def test_task_progress_add_missing_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_task_progress_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("task_progress_add", {"slug": "test-project", "task_id": "T-0001"})
+
+
+def test_task_progress_add_preserves_verbatim_section(tmp_path, monkeypatch):
+    """The verbatim section must not be altered when appending progress."""
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    task_path = backlog / "T-0001-foo.md"
+    task_path.write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
+        "## Verbatim request\n\nDO NOT REWRITE.\n\n"
+        "## Context\n\nctx text\n"
+    )
+    A.dispatch("task_progress_add", {
+        "slug": "test-project", "task_id": "T-0001",
+        "sid": "S-x", "text": "first",
+    })
+    A.dispatch("task_progress_add", {
+        "slug": "test-project", "task_id": "T-0001",
+        "sid": "S-y", "text": "second",
+    })
+    content = task_path.read_text()
+    assert "DO NOT REWRITE." in content
+    assert "ctx text" in content
+    assert content.count("S-x · first") == 1
+    assert content.count("S-y · second") == 1

@@ -20,7 +20,6 @@ _SAMPLE_SCHEDULER_STATE = {
     "jobs": [
         {"id": "heartbeat", "next_run": "2026-05-11T12:01:00+00:00", "trigger": "interval[60s]"},
         {"id": "deploy_monitor", "next_run": "2026-05-11T12:01:00+00:00", "trigger": "interval[60s]"},
-        {"id": "kick_stuck", "next_run": "2026-05-11T11:59:00+00:00", "trigger": "cron[11:59 UTC]"},
         {"id": "oauth_refresh", "next_run": "2026-05-11T18:00:00+00:00", "trigger": "interval[6h]"},
     ],
     "worker_started_at": "2026-05-11T10:00:00+00:00",
@@ -90,7 +89,7 @@ def test_get_scheduler_state_success(tmp_bot_squad: Path, monkeypatch, fake_work
     assert r.status_code == 200
     data = r.json()
     assert "jobs" in data
-    assert len(data["jobs"]) == 4
+    assert len(data["jobs"]) == 3
     assert "worker_started_at" in data
     assert "last_heartbeat_age_seconds" in data
 

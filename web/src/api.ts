@@ -32,26 +32,51 @@ export type ProjectDetail = Project & {
 export type Task = {
   id: string;
   title: string;
-  status: "open" | "totest" | "reopened" | "closed";
+  status: "open" | "in_progress" | "totest" | "reopened" | "closed";
   body: string;
+  // Phase 7: parsed body sections — verbatim is the stakeholder's exact words.
+  verbatim?: string;
+  context?: string;
+  progress?: string;
+  // Phase 8: int sort key for Kanban ordering. null = unset (sorts last).
+  priority?: number | null;
   path: string;
   created?: string;
   updated?: string;
   from?: string;
+  session?: { sid: string; status: "active" | "paused" | string };
 };
 
-export type VisionFile = { name: string; content: string };
+export type CreateTaskBody = {
+  title: string;
+  status?: Task["status"];
+  // Either pass `verbatim_request` (preferred — composed into canonical body)
+  // or `body` (raw, stored as-is for callers that know the convention).
+  verbatim_request?: string;
+  body?: string;
+};
+
+export type VisionFile = { name: string; content: string; active?: boolean; finished?: boolean };
 export type FeedbackFile = { name: string; content: string };
 
 export type SessionRow = {
   sid: string;
-  status: "active" | "paused";
+  status: "active" | "paused" | "suspended";
   window: string;
   cwd: string;
   started_at?: string | null;
   last_prompt_at?: string | number | null;
   claude_uuid?: string | null;
+  task_id?: string | null;
+  initiative?: string | null;
   linked_tasks: string[];
+  // Phase 9: multi-binding. A dev may carry extra tasks; a TL extra
+  // initiatives. Both are empty lists by default.
+  extra_task_ids?: string[];
+  extra_initiatives?: string[];
+  paused_at?: string | null;
+  suspended_at?: string | null;
+  archived?: boolean;
 };
 
 export type RunRow = {
@@ -106,10 +131,55 @@ export type AutonomousState = {
   tick_log: TickLogEntry[];
 };
 
+export type Me = {
+  username: string;
+  linux_user: string;
+  is_admin: boolean;
+};
+
+export type UserRow = {
+  username: string;
+  linux_user: string;
+  is_admin: boolean;
+};
+
+export type SystemSettings = {
+  tg: {
+    bot_token_set: boolean;
+    quiet_hours_start_utc: number;
+    quiet_hours_end_utc: number;
+  };
+  session: { ttl: string };
+  admin: { coordinator_user: string };
+};
+
+export type PutSystemSettingsBody = {
+  tg?: {
+    bot_token?: string;
+    quiet_hours_start_utc?: number;
+    quiet_hours_end_utc?: number;
+  };
+  session?: { ttl?: string };
+  admin?: { coordinator_user?: string };
+};
+
+export type PutSystemSettingsResult = SystemSettings & {
+  ok: boolean;
+  restart_required: boolean;
+};
+
 export const api = {
   health: () => call("/api/health"),
+  me: () => call<Me>("/api/auth/me"),
   projects: () => call<Project[]>("/api/projects"),
   project: (slug: string) => call<ProjectDetail>(`/api/projects/${slug}`),
+  repoAgentsMd: (slug: string) =>
+    call<{ content: string }>(`/api/projects/${slug}/repo-agents-md`),
+  putRepoAgentsMd: (slug: string, content: string) =>
+    call(`/api/projects/${slug}/repo-agents-md`, {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }),
   backlog: (slug: string) => call<Task[]>(`/api/projects/${slug}/backlog`),
   vision: (slug: string) => call<VisionFile[]>(`/api/projects/${slug}/vision`),
   feedback: (slug: string) => call<FeedbackFile[]>(`/api/projects/${slug}/feedback`),
@@ -119,18 +189,38 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => call("/api/auth/logout", { method: "POST" }),
-  createTask: (slug: string, t: Partial<Task>) =>
+  createTask: (slug: string, t: CreateTaskBody) =>
     call<Task>(`/api/projects/${slug}/backlog`, { method: "POST", body: JSON.stringify(t) }),
   patchTask: (slug: string, id: string, t: Partial<Task>) =>
     call<Task>(`/api/projects/${slug}/backlog/${id}`, { method: "PATCH", body: JSON.stringify(t) }),
+  patchTaskPriority: (slug: string, id: string, priority: number) =>
+    call<Task>(`/api/projects/${slug}/backlog/${id}/priority`, {
+      method: "PATCH",
+      body: JSON.stringify({ priority }),
+    }),
   deleteTask: (slug: string, id: string) =>
     call(`/api/projects/${slug}/backlog/${id}`, { method: "DELETE" }),
   addComment: (slug: string, id: string, body: string) =>
     call<Task>(`/api/projects/${slug}/backlog/${id}/comments`, { method: "POST", body: JSON.stringify({ body }) }),
+  addProgress: (slug: string, id: string, sid: string, text: string) =>
+    call<{ ok: boolean; task_id: string; line_appended: string }>(
+      `/api/projects/${slug}/backlog/${id}/progress`,
+      { method: "POST", body: JSON.stringify({ sid, text }) },
+    ),
   putVision: (slug: string, name: string, content: string) =>
     call(`/api/projects/${slug}/vision/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   newInitiative: (slug: string, name: string, content: string) =>
     call(`/api/projects/${slug}/vision`, { method: "POST", body: JSON.stringify({ kind: "initiative", name, content }) }),
+  setActiveInitiative: (slug: string, name: string) =>
+    call(`/api/projects/${slug}/vision/active_initiative`, { method: "PUT", body: JSON.stringify({ name }) }),
+  activateInitiative: (slug: string, name: string) =>
+    call(`/api/projects/${slug}/vision/active_initiatives/${encodeURIComponent(name)}`, { method: "POST" }),
+  deactivateInitiative: (slug: string, name: string) =>
+    call(`/api/projects/${slug}/vision/active_initiatives/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  markInitiativeFinished: (slug: string, name: string) =>
+    call(`/api/projects/${slug}/vision/finished_initiatives/${encodeURIComponent(name)}`, { method: "POST" }),
+  reopenInitiative: (slug: string, name: string) =>
+    call(`/api/projects/${slug}/vision/finished_initiatives/${encodeURIComponent(name)}`, { method: "DELETE" }),
   putFeedback: (slug: string, name: string, content: string) =>
     call(`/api/projects/${slug}/feedback/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   promoteFeedback: (slug: string, name: string, title?: string, body?: string) =>
@@ -139,13 +229,53 @@ export const api = {
     call<SessionRow[]>(`/api/projects/${slug}/sessions`),
   pauseSession: (slug: string, sid: string) =>
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`, { method: "POST" }),
+  suspendSession: (slug: string, sid: string) =>
+    call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/suspend`, { method: "POST" }),
   resumeSession: (slug: string, sid: string) =>
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/resume`, { method: "POST" }),
-  spawnSession: (slug: string, window: string, initial_prompt?: string) =>
+  spawnSession: (slug: string, window: string, initial_prompt?: string, task_id?: string, initiative?: string) =>
     call(`/api/projects/${slug}/sessions`, {
       method: "POST",
-      body: JSON.stringify({ window, initial_prompt }),
+      body: JSON.stringify({ window, initial_prompt, task_id, initiative }),
     }),
+  devSpawnRequest: (slug: string, tl_sid: string, task_id: string | undefined, instructions: string) =>
+    call<{ ok: boolean; delivered_to: string[] }>(
+      `/api/projects/${slug}/dev-spawn-request`,
+      {
+        method: "POST",
+        body: JSON.stringify({ tl_sid, task_id, instructions }),
+      },
+    ),
+  bindTask: (slug: string, sid: string, task_id: string) =>
+    call<{ ok: boolean; sid: string; task_id: string; extras: string[] }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/bind/task`,
+      { method: "POST", body: JSON.stringify({ task_id }) },
+    ),
+  unbindTask: (slug: string, sid: string, task_id: string) =>
+    call<{ ok: boolean; sid: string; task_id: string; extras: string[]; changed: boolean }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/unbind/task`,
+      { method: "POST", body: JSON.stringify({ task_id }) },
+    ),
+  bindInitiative: (slug: string, sid: string, initiative: string) =>
+    call<{ ok: boolean; sid: string; initiative: string; extras: string[] }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/bind/initiative`,
+      { method: "POST", body: JSON.stringify({ initiative }) },
+    ),
+  unbindInitiative: (slug: string, sid: string, initiative: string) =>
+    call<{ ok: boolean; sid: string; initiative: string; extras: string[]; changed: boolean }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/unbind/initiative`,
+      { method: "POST", body: JSON.stringify({ initiative }) },
+    ),
+  archiveSession: (slug: string, sid: string) =>
+    call<{ ok: boolean; sid: string; archived: boolean }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/archive`,
+      { method: "POST" },
+    ),
+  unarchiveSession: (slug: string, sid: string) =>
+    call<{ ok: boolean; sid: string; archived: boolean }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/unarchive`,
+      { method: "POST" },
+    ),
   runs: (slug: string, limit = 50, offset = 0) =>
     call<RunRow[]>(`/api/projects/${slug}/runs?limit=${limit}&offset=${offset}`),
   runLog: (slug: string, id: string, full = false) =>
@@ -181,4 +311,56 @@ export const api = {
     call(`/api/projects/${slug}/autonomous/disable`, { method: "POST" }),
   autonomousLog: (slug: string) =>
     call<TickLogEntry[]>(`/api/projects/${slug}/autonomous/log`),
+  peerSend: (slug: string, fromSid: string, to: string, text: string) =>
+    call<{ ok: boolean; delivered_to: string[] }>(
+      `/api/projects/${slug}/peer/send`,
+      {
+        method: "POST",
+        body: JSON.stringify({ from_sid: fromSid, to, text }),
+      },
+    ),
+  peerInboxRead: (slug: string, sid: string) =>
+    call<{ ok: boolean; messages: string[]; count: number }>(
+      `/api/projects/${slug}/peer/${encodeURIComponent(sid)}/read`,
+      { method: "POST" },
+    ),
+  peerInboxWait: (slug: string, sid: string, timeoutSec: number) =>
+    call<{ ok: boolean; ready: boolean; elapsed_sec: number }>(
+      `/api/projects/${slug}/peer/${encodeURIComponent(sid)}/wait`,
+      { method: "POST", body: JSON.stringify({ timeout: timeoutSec }) },
+    ),
+  listUsers: () => call<UserRow[]>("/api/users"),
+  createUser: (
+    username: string,
+    password: string,
+    linux_user?: string,
+    is_admin?: boolean,
+  ) =>
+    call<UserRow>("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ username, password, linux_user, is_admin }),
+    }),
+  patchUser: (
+    username: string,
+    body: { linux_user?: string; is_admin?: boolean },
+  ) =>
+    call<UserRow>(`/api/users/${encodeURIComponent(username)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  resetUserPassword: (username: string, password: string) =>
+    call<{ ok: boolean }>(
+      `/api/users/${encodeURIComponent(username)}/password`,
+      { method: "PUT", body: JSON.stringify({ password }) },
+    ),
+  deleteUser: (username: string) =>
+    call<{ ok: boolean }>(`/api/users/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+    }),
+  getSystemSettings: () => call<SystemSettings>("/api/system-settings"),
+  putSystemSettings: (body: PutSystemSettingsBody) =>
+    call<PutSystemSettingsResult>("/api/system-settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
 };

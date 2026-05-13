@@ -12,17 +12,40 @@ set -uo pipefail
 BOT_SQUAD="${BOT_SQUAD:-/home/www/bot-squad}"
 CFG="$BOT_SQUAD/config/projects.toml"
 
-# Resolve current project by matching CWD against repo_path entries.
+# Claude Code passes hook event JSON on stdin: {session_id, transcript_path,
+# cwd, hook_event_name}. We capture session_id so the registry uses the real
+# Claude UUID instead of guessing via jsonl mtime (which races when multiple
+# panes share a cwd — exactly the agent-teams case).
+HOOK_INPUT="$(cat 2>/dev/null || echo '{}')"
+CLAUDE_SID="$(printf '%s' "$HOOK_INPUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("session_id","") or "")
+except Exception: print("")' 2>/dev/null || echo "")"
+
+# Resolve current project by matching CWD against any of the project's
+# clones (repo_path = dev clone, repo_master = master clone). Compares both
+# the literal path and the resolved (readlink) path so symlinked layouts
+# work in both directions.
 slug=$(python3 - "$CFG" "$PWD" <<'PY'
-import sys, tomllib
+import os, sys, tomllib
 cfg_path, cwd = sys.argv[1], sys.argv[2]
+real_cwd = os.path.realpath(cwd)
 with open(cfg_path, "rb") as f:
     cfg = tomllib.load(f)
+def _match(candidate, target):
+    if not target:
+        return False
+    real_target = os.path.realpath(target)
+    return (
+        candidate == target
+        or candidate.startswith(target.rstrip("/") + "/")
+        or real_cwd == real_target
+        or real_cwd.startswith(real_target.rstrip("/") + "/")
+    )
 for slug, p in cfg.get("projects", {}).items():
-    repo = p.get("repo_path", "")
-    if cwd == repo or cwd.startswith(repo.rstrip("/") + "/"):
-        print(slug)
-        break
+    for key in ("repo_path", "repo_master"):
+        if _match(cwd, p.get(key, "")):
+            print(slug)
+            sys.exit(0)
 PY
 )
 
@@ -33,43 +56,360 @@ fi
 
 DATA="$BOT_SQUAD/data/$slug"
 
+# --- Registry write -------------------------------------------------------
+# Compute SID from tmux context (skip if not in tmux). Write/update the
+# session md so the registry has the real claude_session_id from start time.
+sid="$("$BOT_SQUAD/scripts/hooks/hook_my_sid.sh" 2>/dev/null || echo "")"
+
+# Resolve task_id once in bash so both the md write and the (later)
+# break-pane window name can use it. Convention: .claude/task_id file in
+# cwd takes precedence; else a window name shaped like T-NNNN-* counts.
+task_id=""
+src_window=""
+[ -n "$sid" ] && src_window="$(printf '%s' "$sid" | sed -E 's/^S-[^-]+-(.*)-p[0-9]+$/\1/')"
+if [ -f "$PWD/.claude/task_id" ]; then
+    task_id="$(tr -d '[:space:]' < "$PWD/.claude/task_id" 2>/dev/null || echo "")"
+fi
+if [ -z "$task_id" ] && [ "${src_window#T-}" != "$src_window" ]; then
+    # window starts with T-; extract T-NNNN if NNNN is digits
+    num="$(printf '%s' "$src_window" | sed -E 's/^T-([0-9]+).*$/\1/')"
+    [ -n "$num" ] && [ "$num" != "$src_window" ] && task_id="T-$num"
+fi
+
+if [ -n "$sid" ] && [ -n "$CLAUDE_SID" ]; then
+    mkdir -p "$DATA/sessions"
+    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" python3 - <<'PY' 2>/dev/null || true
+import os, time
+from pathlib import Path
+
+sid        = os.environ["SID"]
+slug       = os.environ["SLUG"]
+csid       = os.environ["CLAUDE_SID"]
+data       = Path(os.environ["DATA"])
+cwd        = os.environ["CWD"]
+task_id    = os.environ.get("TASK_ID") or ""
+initiative = os.environ.get("INITIATIVE") or ""
+window     = sid.rsplit("-p", 1)[0].split("-", 2)[-1] if "-p" in sid else ""
+now        = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+md_path    = data / "sessions" / f"{sid}.md"
+
+# Preserve existing started_at + task_id + initiative + extras (existing wins if non-empty).
+existing = {}
+if md_path.exists():
+    text = md_path.read_text()
+    if text.startswith("---"):
+        try:
+            fm = text.split("---", 2)[1]
+            for line in fm.strip().splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    existing[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+if not task_id:
+    task_id = existing.get("task_id") or ""
+if task_id == "~":
+    task_id = ""
+
+if not initiative:
+    initiative = existing.get("initiative") or ""
+if initiative == "~":
+    initiative = ""
+
+started_at = existing.get("started_at") or "~"
+if started_at == "~" or not started_at:
+    started_at = now
+
+# Phase 9: extras managed by bind_task / bind_initiative actions, not the
+# spawn. Preserve them verbatim across re-runs of this hook (resume, etc.).
+extra_task_ids   = existing.get("extra_task_ids")   or "[]"
+extra_initiatives = existing.get("extra_initiatives") or "[]"
+
+md_path.write_text(
+    "---\n"
+    f"sid: {sid}\n"
+    f"status: active\n"
+    f"window: {window}\n"
+    f"cwd: {cwd}\n"
+    f"claude_uuid: {csid}\n"
+    f"task_id: {task_id or '~'}\n"
+    f"initiative: {initiative or '~'}\n"
+    f"extra_task_ids: {extra_task_ids}\n"
+    f"extra_initiatives: {extra_initiatives}\n"
+    f"started_at: {started_at}\n"
+    "---\n"
+)
+PY
+fi
+
+# --- Break-pane into its own window (async, post-init) --------------------
+# Claude's agent-teams feature lands teammates as split panes inside the
+# lead's window. We want each teammate in its own named window so SIDs are
+# stable, list_panes shows distinct windows, and humans can tab between
+# teammates. Doing this synchronously races with Claude's startup send-keys
+# init — backgrounding with a sleep avoids that. Only acts on panes with
+# siblings; one-pane windows (e.g. the lead spawned via tmux new-window)
+# are already correct, no-op.
+#
+# Bug #4/#6: the md is written above with the PRE-break-pane window name
+# (the lead's window), so after break-pane the md filename's SID no longer
+# matches the live pane's actual SID. Fix: after break-pane succeeds,
+# recompute the SID from the new window name, write a NEW md at the new
+# path with all fields preserved, then delete the old md.
+if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
+    new_win_name="${task_id:-}"
+    if [ -z "$new_win_name" ]; then
+        # Try to extract an --agent-name from a claude process attached to
+        # this pane. claude's pane subprocesses share the tmux pane PID;
+        # walk /proc to find a `claude ... --agent-name X` command line.
+        pane_pid="$(tmux display-message -p -t "$TMUX_PANE" -F '#{pane_pid}' 2>/dev/null || echo "")"
+        agent_name=""
+        if [ -n "$pane_pid" ]; then
+            agent_name="$(PANE_PID="$pane_pid" python3 - <<'PY' 2>/dev/null
+import os, pathlib, re
+target = int(os.environ["PANE_PID"])
+
+def children(pid):
+    out = []
+    for p in pathlib.Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            st = (p / "status").read_text()
+        except Exception:
+            continue
+        m = re.search(r"^PPid:\s+(\d+)", st, re.M)
+        if m and int(m.group(1)) == pid:
+            out.append(int(p.name))
+    return out
+
+# BFS descendants of the pane's shell looking for `claude` with --agent-name.
+seen, queue = set(), [target]
+while queue:
+    pid = queue.pop(0)
+    if pid in seen:
+        continue
+    seen.add(pid)
+    try:
+        cmd = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except Exception:
+        cmd = ""
+    parts = cmd.split("\x00")
+    if any("claude" in p for p in parts):
+        for i, tok in enumerate(parts):
+            if tok == "--agent-name" and i + 1 < len(parts):
+                name = parts[i + 1].strip()
+                # sanitize for tmux window name
+                name = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+                if name:
+                    print(name)
+                    raise SystemExit
+    queue.extend(children(pid))
+PY
+)"
+        fi
+        if [ -n "$agent_name" ]; then
+            new_win_name="$agent_name"
+        else
+            # Last-resort fallback: short Claude UUID prefixed with team-
+            # (not claude-) to signal "agent-teams teammate".
+            short="$(printf '%s' "$CLAUDE_SID" | cut -c1-8)"
+            new_win_name="team-${short:-anon}"
+        fi
+    fi
+    pane="$TMUX_PANE"
+    name="$new_win_name"
+    target_session="$slug"
+    user="$(whoami 2>/dev/null || id -un 2>/dev/null || echo u)"
+    old_sid="$sid"
+    data_dir="$DATA"
+    # setsid + nohup detaches from claude's process group so the wait
+    # survives the hook return. tmux flags: -s is the SOURCE pane to break,
+    # -t is the DESTINATION (new window goes into the project's tmux
+    # session, never the user's attached session).
+    #
+    # After break-pane: compute new SID from the post-rename window and
+    # migrate the md (write new path first, then unlink old — atomic from
+    # a reader's perspective: at no point is there zero md).
+    setsid -f bash -c "
+        sleep 4
+        win=\$(tmux display-message -p -t '$pane' -F '#{window_id}' 2>/dev/null) || exit 0
+        cnt=\$(tmux list-panes -t \"\$win\" 2>/dev/null | wc -l)
+        if [ \"\$cnt\" -gt 1 ]; then
+            if tmux break-pane -s '$pane' -t '$target_session:' -n '$name' 2>/dev/null; then
+                # Migrate the md: read old, rewrite at new SID path, delete old.
+                OLD_SID='$old_sid' USER_NAME='$user' PANE='$pane' DATA='$data_dir' python3 - <<'PY' 2>/dev/null || true
+import os, re
+from pathlib import Path
+import subprocess
+
+old_sid = os.environ['OLD_SID']
+user    = os.environ['USER_NAME']
+pane    = os.environ['PANE']
+data    = Path(os.environ['DATA'])
+
+# Re-query tmux for the post-break-pane window name + pane id.
+def tmux_q(fmt):
+    r = subprocess.run(['tmux', 'display-message', '-p', '-t', pane, '-F', fmt],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ''
+
+new_window = tmux_q('#W')
+pane_raw   = tmux_q('#{pane_id}')
+if not new_window or not pane_raw:
+    raise SystemExit
+new_window = re.sub(r'[^A-Za-z0-9_-]', '_', new_window)
+pane_no_pct = pane_raw.lstrip('%')
+new_sid = f'S-{user}-{new_window}-p{pane_no_pct}'
+
+if new_sid == old_sid:
+    # break-pane succeeded but window/pane look identical — no-op.
+    raise SystemExit
+
+old_md = data / 'sessions' / f'{old_sid}.md'
+new_md = data / 'sessions' / f'{new_sid}.md'
+if not old_md.exists():
+    raise SystemExit
+
+text = old_md.read_text()
+# Rewrite sid: and window: lines; keep everything else verbatim.
+def sub_field(t, key, value):
+    pat = re.compile(rf'^{re.escape(key)}:.*$', re.M)
+    if pat.search(t):
+        return pat.sub(f'{key}: {value}', t, count=1)
+    return t
+
+text = sub_field(text, 'sid', new_sid)
+text = sub_field(text, 'window', new_window)
+
+# Atomic-ish: write new first, then unlink old. If they're the same path
+# (defensive: can't happen given the new_sid==old_sid early-exit above)
+# do nothing destructive.
+new_md.parent.mkdir(parents=True, exist_ok=True)
+new_md.write_text(text)
+if old_md.resolve() != new_md.resolve():
+    try:
+        old_md.unlink()
+    except FileNotFoundError:
+        pass
+PY
+            fi
+        fi
+    " </dev/null >/dev/null 2>&1 || true
+fi
+
 print_section() {
     echo
     echo "=== $1 ==="
 }
 
-# 1. AGENT_INSTRUCTIONS.md
-if [ -f "$DATA/AGENT_INSTRUCTIONS.md" ]; then
-    print_section "AGENT_INSTRUCTIONS"
-    cat "$DATA/AGENT_INSTRUCTIONS.md"
+# Resolve role early so per-role sections below can branch on it.
+# "dev" matches vision/roles/dev.md (workers get a task_id, TLs don't).
+ROLE="teamlead"
+[ -n "$task_id" ] && ROLE="dev"
+
+# 1. Product description (small, anchors orientation). The big stuff —
+# AGENT_INSTRUCTIONS.md and the full active-initiative spec — is pointed
+# at, not pasted, so the per-session-start context stays lean. Agents
+# read those once on their first action.
+if [ -f "$DATA/vision/product.md" ]; then
+    print_section "PRODUCT"
+    cat "$DATA/vision/product.md"
 fi
 
-# 2. Vision layers
-if [ -f "$DATA/vision/north-star.md" ]; then
-    print_section "VISION: NORTH STAR"
-    awk '/^# /{p=1} p; /^$/ && p>=1 && NR>1 {p++} p>=3 {exit}' "$DATA/vision/north-star.md"
+active_init=""
+if [ -n "${BOT_SQUAD_INITIATIVE:-}" ]; then
+    # Per-session binding: this TL was spawned with a specific initiative.
+    # A project may have many active initiatives at once; each TL is bound
+    # to exactly one of them (or none, for ad-hoc sessions).
+    active_init="$BOT_SQUAD_INITIATIVE"
 fi
-for layer in strategy tactical; do
-    f="$DATA/vision/$layer.md"
-    if [ -f "$f" ]; then
-        print_section "VISION: $(echo $layer | tr a-z A-Z)"
-        cat "$f"
-    fi
-done
 
-# 3. Open task headlines (max 30 lines)
-if [ -d "$DATA/backlog" ]; then
+print_section "READ ONCE ON YOUR FIRST ACTION"
+echo "These files are heavy — fetched on demand, not piped in every turn."
+echo
+echo "- AGENT_INSTRUCTIONS.md  : $DATA/AGENT_INSTRUCTIONS.md"
+echo "  (project-specific recipes, gotchas, paths)"
+if [ -n "$active_init" ] && [ -f "$DATA/vision/initiatives/$active_init" ]; then
+    echo "- Your initiative        : $DATA/vision/initiatives/$active_init"
+    echo "  (your bound scope — required reading on day one)"
+fi
+echo "- Constitution           : $DATA/vision/constitution.md"
+echo "  (governance, hard rules — consult when in doubt)"
+
+# Phase 9: surface extra bindings (multi-task devs, multi-initiative TLs).
+# Read the live session md (rewritten above) to pull the current extras list.
+if [ -n "$sid" ] && [ -f "$DATA/sessions/$sid.md" ]; then
+    SID="$sid" SLUG="$slug" DATA="$DATA" ROLE="$ROLE" python3 - <<'PY' 2>/dev/null || true
+import os
+from pathlib import Path
+
+sid  = os.environ["SID"]
+data = Path(os.environ["DATA"])
+role = os.environ.get("ROLE", "")
+md   = data / "sessions" / f"{sid}.md"
+if not md.exists():
+    raise SystemExit
+
+text = md.read_text()
+if not text.startswith("---"):
+    raise SystemExit
+fm = text.split("---", 2)[1]
+meta = {}
+for line in fm.strip().splitlines():
+    if ":" in line:
+        k, _, v = line.partition(":")
+        meta[k.strip()] = v.strip()
+
+def parse_list(v):
+    v = (v or "").strip()
+    if not (v.startswith("[") and v.endswith("]")):
+        return []
+    inner = v[1:-1].strip()
+    if not inner:
+        return []
+    return [x.strip() for x in inner.split(",") if x.strip() and x.strip() != "~"]
+
+extras_t = parse_list(meta.get("extra_task_ids", ""))
+extras_i = parse_list(meta.get("extra_initiatives", ""))
+primary_t = meta.get("task_id", "")
+primary_i = meta.get("initiative", "")
+if primary_t == "~":
+    primary_t = ""
+if primary_i == "~":
+    primary_i = ""
+
+# Devs: show task bindings if there are extras to surface.
+if role == "dev" and extras_t:
+    parts = [f"{primary_t} (primary)" if primary_t else "(no primary)"]
+    parts.extend(extras_t)
+    print()
+    print(f"Your bound tasks: {', '.join(parts)} — read each task md.")
+
+# TLs: same for initiatives.
+if role == "teamlead" and extras_i:
+    parts = [f"{primary_i} (primary)" if primary_i else "(no primary)"]
+    parts.extend(extras_i)
+    print()
+    print(f"Your bound initiatives: {', '.join(parts)} — coordinate all of them.")
+PY
+fi
+
+# 3. Open task headlines (TL only — devs are focused on their single task,
+# the backlog is noise + a scope-expansion temptation for them).
+if [ "$ROLE" = "teamlead" ] && [ -d "$DATA/backlog" ]; then
     print_section "OPEN BACKLOG"
     python3 - "$DATA/backlog" <<'PY'
-import os, re, sys
+import math, os, re, sys
 try:
     import yaml
 except ImportError:
     print("(open backlog scan unavailable: pyyaml not installed)")
     sys.exit(0)
 backlog = sys.argv[1]
-shown = 0
-for fn in sorted(os.listdir(backlog)):
+tasks = []
+for fn in os.listdir(backlog):
     if not fn.endswith(".md"): continue
     p = os.path.join(backlog, fn)
     with open(p) as f: t = f.read()
@@ -78,7 +418,23 @@ for fn in sorted(os.listdir(backlog)):
     try:
         meta = yaml.safe_load(m.group(1)) or {}
     except yaml.YAMLError: continue
-    if meta.get("status") not in ("open", "reopened"): continue
+    if meta.get("status") not in ("open", "in_progress", "reopened"): continue
+    raw = meta.get("priority")
+    if isinstance(raw, bool):
+        prio = None
+    elif isinstance(raw, int):
+        prio = raw
+    elif isinstance(raw, str):
+        try: prio = int(raw.strip())
+        except (ValueError, TypeError): prio = None
+    else:
+        prio = None
+    # Missing → +inf so they sort last. Secondary sort by filename for stability.
+    sort_key = (prio if prio is not None else math.inf, fn)
+    tasks.append((sort_key, meta))
+tasks.sort(key=lambda x: x[0])
+shown = 0
+for _, meta in tasks:
     print(f"- [{meta.get('id','?')}] {meta.get('title','?')}")
     shown += 1
     if shown >= 30:
@@ -96,6 +452,102 @@ if [ -d "$DATA/sessions" ]; then
             grep -q 'status: active' "$f" 2>/dev/null && echo "- $(basename "$f" .md)"
         done
     fi
+fi
+
+# 5. Message bus — give every session the recipe for cross-session messaging
+# via the worker socket. TLs are expected to keep a peer_inbox_wait armed
+# in the background; devs use it as a backup channel (their primary is the
+# native agent-teams chat).
+if [ -n "$sid" ]; then
+    print_section "MESSAGE BUS"
+    cat <<BUS_EOF
+Cross-session messaging via bot-squad worker actions (no raw nc):
+
+  # Send to a peer SID, or to a role keyword (teamlead / dev / all):
+  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
+    -X POST -H 'Content-Type: application/json' \\
+    -d '{"slug":"$slug","from_sid":"$sid","to":"<target>","text":"hello"}' \\
+    http://w/actions/peer_send
+
+  # Drain new messages:
+  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
+    -X POST -H 'Content-Type: application/json' \\
+    -d '{"slug":"$slug","sid":"$sid"}' \\
+    http://w/actions/peer_inbox_read
+
+  # Long-poll: block until new mail or timeout, then re-arm.
+  # Run with run_in_background:true so Claude Code wakes you between turns.
+  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
+    -X POST -H 'Content-Type: application/json' \\
+    -d '{"slug":"$slug","sid":"$sid","timeout":1800}' \\
+    http://w/actions/peer_inbox_wait
+
+Your SID is: $sid
+BUS_EOF
+fi
+
+# 6. Team protocol — sourced from data/<slug>/vision/team_protocol.md so the
+# stakeholder can edit it from the Workflow UI. Hardcoded fallback if the
+# file is missing.
+print_section "BOT-SQUAD TEAM PROTOCOL"
+if [ -f "$DATA/vision/team_protocol.md" ]; then
+    cat "$DATA/vision/team_protocol.md"
+else
+cat <<'PROTO'
+You are running inside bot-squad — the active-context manager for this
+project. Permissions in .claude/settings.json are auto-allowed
+(--dangerously-skip-permissions is on). Just act; don't ask before tools.
+
+- One session per task.
+- Branching: bot_squad/dev in the dev clone; stakeholder owns merges to master.
+- Tests first. Run them yourself before saying you're done.
+- Out-of-scope items go to data/<slug>/backlog/T-NNNN-<slug>.md (status: open).
+- Coordinate with peers via Claude Code's native agent-teams chat.
+- DO NOT invoke the superpowers `brainstorming` skill. Choose, justify in
+  one sentence, build.
+- Ping stakeholder via tg_notify; urgent:true for hard outages only.
+- Do not kill peer sessions on your own — ping the stakeholder.
+PROTO
+fi
+
+role_file="$DATA/vision/roles/$ROLE.md"
+if [ -f "$role_file" ]; then
+    echo
+    echo "## Your role: $(echo "$ROLE" | tr a-z A-Z)"
+    echo
+    cat "$role_file"
+elif [ "$ROLE" = "teamlead" ]; then
+cat <<'TL_PROTO'
+
+## Your role: TEAMLEAD
+
+You were not spawned with a task_id — you are the team-lead session.
+
+- Anchor on the **ACTIVE INITIATIVE** section above (if present).
+- When the stakeholder hands you work: split it into specific, named
+  subtasks. For each, spawn a worker session via Claude's agent-teams
+  feature ("form a team with one teammate for <feature>"). bot-squad's
+  SessionStart hook will break each teammate pane into its own tmux
+  window named for the feature.
+- **Do not kill worker sessions on your own.** If a worker is
+  misbehaving, TG the stakeholder and propose what to do.
+- Approve permission relays from workers with "allow during this session".
+TL_PROTO
+else
+cat <<WORKER_PROTO
+
+## Your role: DEV WORKER
+
+You own one task: \`$task_id\`. Read its md under
+\`data/$slug/backlog/$task_id-*.md\` for scope + DoD.
+
+- Build, test, commit on \`bot_squad/dev\`.
+- When DoD is green: set the task md's \`status\` to \`totest\`, commit
+  with a one-line message describing what shipped, and signal READY in
+  the agent-teams chat.
+- If blocked: ping the teamlead via agent-teams chat first; only TG the
+  stakeholder if there's no TL or you've been stuck > 1h.
+WORKER_PROTO
 fi
 
 exit 0

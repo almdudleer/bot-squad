@@ -75,4 +75,68 @@ def test_me_with_cookie(tmp_bot_squad: Path, monkeypatch) -> None:
         client.post("/api/auth/login", json={"username": "testuser", "password": "test"})
         r = client.get("/api/auth/me")
     assert r.status_code == 200
-    assert r.json()["username"] == "testuser"
+    body = r.json()
+    assert body["username"] == "testuser"
+    # Phase 2: /me must expose linux_user + is_admin. The test fixture
+    # configures testuser → linux_user=almdudleer, is_admin=true so the
+    # rest of the suite can use either-user SIDs without ownership 403s.
+    assert body["linux_user"] == "almdudleer"
+    assert body["is_admin"] is True
+
+
+def test_me_defaults_when_no_user_meta(tmp_bot_squad: Path, monkeypatch) -> None:
+    """When auth.toml has NO [user_meta.<name>], defaults: linux_user==name, admin=false."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[session]\nttl = "7d"\n'
+    )
+    app = build_app()
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "testuser", "password": "test"})
+        r = client.get("/api/auth/me")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linux_user"] == "testuser"
+    assert body["is_admin"] is False
+
+
+def test_require_admin_rejects_non_admin(tmp_bot_squad: Path, monkeypatch) -> None:
+    """require_admin returns 403 for authenticated but non-admin users."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'plain = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.plain]\n'
+        'linux_user = "plain"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    app = build_app()
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "plain", "password": "test"})
+        r = client.get("/api/users")
+    assert r.status_code == 403
+
+
+def test_me_returns_user_meta_when_present(tmp_bot_squad: Path, monkeypatch) -> None:
+    """When auth.toml has [user_meta.<name>], /me reflects those values."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    # Overwrite auth.toml to include a meta block.
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "someoneelse"\n'
+        'is_admin = true\n'
+        '[session]\nttl = "7d"\n'
+    )
+    app = build_app()
+    with TestClient(app) as client:
+        client.post("/api/auth/login", json={"username": "testuser", "password": "test"})
+        r = client.get("/api/auth/me")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["linux_user"] == "someoneelse"
+    assert body["is_admin"] is True

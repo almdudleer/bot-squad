@@ -39,6 +39,12 @@ def tmp_bot_squad(tmp_path: Path) -> Path:
         '[users]\n'
         # bcrypt hash of "test" (rounds=12)
         'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        # Phase 2 multi-user: default test user is admin so tests can use
+        # any linux-user SID without tripping the ownership gate. Tests that
+        # care about non-admin behaviour rewrite auth.toml themselves.
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = true\n'
         '[session]\nttl = "7d"\n'
     )
     return tmp_path

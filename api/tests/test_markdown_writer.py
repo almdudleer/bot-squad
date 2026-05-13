@@ -104,6 +104,40 @@ def test_merge_task_update_fills_created_from_mtime(tmp_path: Path):
     assert "updated" in new_fm
 
 
+def test_write_task_priority_round_trips_as_int(tmp_path: Path):
+    """Phase 8 — `priority` round-trips cleanly as an int (no quotes)."""
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0050-prio.md"
+    fm = {"id": "T-0050", "title": "P", "status": "open", "priority": 250}
+    write_task(p, fm, "body\n")
+    task = parse_task(p)
+    assert task["priority"] == 250
+    assert isinstance(task["priority"], int)
+    raw = p.read_text()
+    assert "priority: 250" in raw
+
+
+def test_write_task_skips_none_priority(tmp_path: Path):
+    """None priority must not serialize as `priority: null`."""
+    p = tmp_path / "T-0051-noprio.md"
+    fm = {"id": "T-0051", "title": "P", "status": "open", "priority": None}
+    write_task(p, fm, "body\n")
+    raw = p.read_text()
+    assert "priority" not in raw
+
+
+def test_merge_task_update_priority_round_trip(tmp_path: Path):
+    """Phase 8 — merge_task_update accepts priority and persists it."""
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0052-mp.md"
+    write_task(p, {"id": "T-0052", "title": "X", "status": "open"}, "body\n")
+    merge_task_update(p, {"priority": 300})
+    task = parse_task(p)
+    assert task["priority"] == 300
+
+
 # ---------------------------------------------------------------------------
 # append_comment
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Auth routes — username/password login, logout, me."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.auth import AuthError, issue_jwt, verify_jwt, verify_password
 
@@ -43,6 +43,18 @@ def logout(response: Response) -> dict:
     return {"ok": True}
 
 
+def _enrich(claims: dict, request: Request) -> dict:
+    """Attach linux_user + is_admin from auth_config.user_meta to the JWT claims."""
+    username = claims.get("username", "")
+    cfg = request.app.state.auth_config
+    meta = cfg.meta_for(username)
+    return {
+        "username": username,
+        "linux_user": meta.linux_user,
+        "is_admin": meta.is_admin,
+    }
+
+
 @router.get("/me")
 def me(request: Request) -> dict:
     token = request.cookies.get(COOKIE_NAME)
@@ -52,15 +64,26 @@ def me(request: Request) -> dict:
         claims = verify_jwt(token, request.app.state.jwt_secret)
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
-    return {"username": claims.get("username", "")}
+    return _enrich(claims, request)
 
 
 def require_auth(request: Request) -> dict:
-    """Dependency for routes that require an authenticated session."""
+    """Dependency for routes that require an authenticated session.
+
+    Returns enriched user dict: {username, linux_user, is_admin}.
+    """
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         raise HTTPException(status_code=401, detail="not authenticated")
     try:
-        return verify_jwt(token, request.app.state.jwt_secret)
+        claims = verify_jwt(token, request.app.state.jwt_secret)
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
+    return _enrich(claims, request)
+
+
+def require_admin(user: dict = Depends(require_auth)) -> dict:
+    """Dependency layered on require_auth: 403 unless user is_admin."""
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    return user

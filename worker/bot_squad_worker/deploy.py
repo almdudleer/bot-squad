@@ -163,15 +163,20 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         return None
 
     project = cfg.projects[slug]
-    if not _is_clean(project.repo_path):
-        log.info("deploy.run_next: %s tree is dirty — skipping", slug)
-        return None
 
     # Pop oldest
     queue_file = queued[0]
     payload = json.loads(queue_file.read_text())
     queue_id = payload["queue_id"]
     target = payload["target"]
+
+    # Pick the clone for this target: prod → master clone (separate dir so
+    # dev work continues uninterrupted); everything else → dev clone.
+    repo = project.repo_for_target(target)
+    if not _is_clean(repo):
+        log.info("deploy.run_next: %s %s tree is dirty — skipping (%s)", slug, target, repo)
+        # Put the queue file back so we retry next tick
+        return None
 
     # Move to processing/
     processing_dir = _processing_dir(cfg, slug)
@@ -192,12 +197,13 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         log_path.write_text(f"recipe not found: {recipe}\n")
         return DeployResult(ok=False, returncode=99, queue_id=queue_id, log_path=log_path)
 
-    # Run recipe
-    log.info("deploy.run_next: running %s (recipe: %s)", queue_id, recipe)
+    # Run recipe with cwd matching the target clone (dev clone for staging,
+    # master clone for prod). Recipes assume their cwd is the right tree.
+    log.info("deploy.run_next: running %s (recipe: %s, cwd: %s)", queue_id, recipe, repo)
     with log_path.open("w") as lf:
         proc = subprocess.run(
             ["bash", str(recipe)],
-            cwd=str(project.repo_path),
+            cwd=str(repo),
             stdout=lf,
             stderr=subprocess.STDOUT,
             timeout=600,

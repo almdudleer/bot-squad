@@ -26,8 +26,24 @@ def parse_task(path: Path) -> dict:
     if not isinstance(meta, dict):
         raise ParseError(f"frontmatter is not a mapping in {path}")
     body = m.group(2).lstrip("\n")
-    return {
+    # `priority` is an int sort key for Kanban ordering. Coerce loose values
+    # (str ints, floats) → int; anything else (missing, non-numeric) → None.
+    raw_priority = meta.get("priority")
+    if isinstance(raw_priority, bool):
+        priority = None
+    elif isinstance(raw_priority, int):
+        priority = raw_priority
+    elif isinstance(raw_priority, str):
+        try:
+            priority = int(raw_priority.strip())
+        except (ValueError, TypeError):
+            priority = None
+    else:
+        priority = None
+    out = {
         **meta,
         "body": body,
         "path": str(path),
     }
+    out["priority"] = priority
+    return out

@@ -27,6 +27,19 @@ def build_app() -> FastAPI:
     app.state.jwt_secret = jwt_secret
     app.state.cookie_secure = os.environ.get("COOKIE_SECURE", "1") == "1"
 
+    # Phase 2 multi-user: build the WorkerRouter once so request handlers
+    # don't have to re-parse config on every call.
+    from app.worker_client import WorkerRouter
+    coordinator_user = os.environ.get("BOT_SQUAD_COORDINATOR_USER", "almdudleer")
+    known_users = {
+        meta.linux_user for meta in app.state.auth_config.user_meta.values()
+    }
+    app.state.worker_router = WorkerRouter(
+        coordinator_sock=sock_path,
+        coordinator_user=coordinator_user,
+        known_users=known_users,
+    )
+
     app.include_router(health_router, prefix="/api")
 
     from app.routes_auth import router as auth_router
@@ -40,13 +53,14 @@ def build_app() -> FastAPI:
 
     from app.routes_vision import router as vision_router
     from app.routes_feedback import router as feedback_router
-    from app.routes_sessions import router as sessions_router
+    from app.routes_sessions import router as sessions_router, dev_spawn_router
     from app.routes_runs import router as runs_router
     from app.routes_messages import router as messages_router
     from app.routes_scheduler import router as scheduler_router
     app.include_router(vision_router, prefix="/api")
     app.include_router(feedback_router, prefix="/api")
     app.include_router(sessions_router, prefix="/api")
+    app.include_router(dev_spawn_router, prefix="/api")
     app.include_router(runs_router, prefix="/api")
     app.include_router(messages_router, prefix="/api")
     app.include_router(scheduler_router, prefix="/api")
@@ -54,13 +68,21 @@ def build_app() -> FastAPI:
     from app.routes_autonomous import router as autonomous_router
     app.include_router(autonomous_router, prefix="/api")
 
+    from app.routes_intersession import router as intersession_router
+    app.include_router(intersession_router, prefix="/api")
+
+    from app.routes_users import router as users_router
+    from app.routes_settings import router as settings_router
+    app.include_router(users_router, prefix="/api")
+    app.include_router(settings_router, prefix="/api")
+
     from app.routes_auth import require_auth
-    from app.worker_client import WorkerClient, WorkerError
+    from app.worker_client import WorkerError
     from fastapi import Depends, HTTPException
 
     @app.post("/api/worker/noop")
     async def worker_noop(_user: dict = Depends(require_auth)) -> dict:
-        client = WorkerClient(app.state.sock_path)
+        client = app.state.worker_router.coordinator()
         try:
             return await client.call_action("noop", {})
         except WorkerError as e:

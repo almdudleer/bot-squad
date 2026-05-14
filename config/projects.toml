@@ -23,6 +23,9 @@ created_at    = 2026-05-10
 [projects.bot-squad]
 slug          = "bot-squad"
 display_name  = "Bot Squad"
+# Workspace dir: parent of dev/master, where the operator lives. The
+# hook resolves the slug for any session run at or under this path.
+repo_workspace = "/home/almdudleer/bot-squad"
 # Dev clone: editing surface for bot-squad's own code. Branch bot_squad/dev.
 repo_path     = "/home/almdudleer/bot-squad/dev"
 # Master clone: separate from the installation. Merges land here before

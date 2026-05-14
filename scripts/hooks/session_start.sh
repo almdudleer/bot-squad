@@ -42,7 +42,7 @@ def _match(candidate, target):
         or real_cwd.startswith(real_target.rstrip("/") + "/")
     )
 for slug, p in cfg.get("projects", {}).items():
-    for key in ("repo_path", "repo_master"):
+    for key in ("repo_path", "repo_master", "repo_workspace"):
         if _match(cwd, p.get(key, "")):
             print(slug)
             sys.exit(0)

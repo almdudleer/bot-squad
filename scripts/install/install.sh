@@ -89,8 +89,9 @@ post_checkpoint_event() {
     --arg cp "$cp" --arg status "$status" \
     --arg host "$(hostname -f 2>/dev/null || hostname)" \
     '{checkpoint: $cp, status: $status, hostname: $host, ts: (now | todate)}') || return 0
-  # Endpoint owned by T-0024 — final path may change; currently treated
-  # as best-effort. Body: { checkpoint, status, hostname, ts }.
+  # Endpoint locked in vision/architecture/mothership-seam.md; treated
+  # as best-effort because UI display, not install correctness, depends
+  # on it. Body: { checkpoint, status, hostname, ts }.
   curl -fsS --max-time 5 -X POST \
     -H "$auth_header" -H 'Content-Type: application/json' \
     -d "$payload" \

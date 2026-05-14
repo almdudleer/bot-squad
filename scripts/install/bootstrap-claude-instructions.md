@@ -134,6 +134,11 @@ found", the mothership's templating broke; ping the bot-squad team.
 - HTTP 5xx / connection refused → mothership unreachable. Check
   `BOTSQUAD_MOTHERSHIP_URL` and the user's outbound network.
 - HTTP 404 → URL is wrong; confirm the substituted mothership URL.
+- HTTP 410 **after a prior crash before bearer write** → install token
+  was burned but `~/.bot-squad/server.token` was never written (no
+  `mothership_handshake` line in the state file, no token file on disk).
+  Recovery is the same as a normal 410: re-issue the install link from
+  the mothership UI and re-copy this brief with fresh placeholders.
 
 ### `docker_compose_up`
 - "network avo_backend not found" → the host doesn't have the

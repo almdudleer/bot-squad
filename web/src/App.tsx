@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Login } from "./pages/Login";
 import { Picker } from "./pages/Picker";
@@ -16,6 +17,14 @@ import { Help } from "./pages/Help";
 import { Users } from "./pages/Users";
 import { SystemSettings } from "./pages/SystemSettings";
 import { Shell } from "./components/Shell";
+
+// Mothership centralization layer — vision/architecture/mothership-seam.md.
+// Vite inlines VITE_MOTHERSHIP at build time, so the dynamic import resolves
+// to a literal `null` on single-install builds and the chunk is tree-shaken.
+const MOTHERSHIP_ENABLED = import.meta.env.VITE_MOTHERSHIP === "1";
+const MothershipRoutes = MOTHERSHIP_ENABLED
+  ? lazy(() => import("./mothership/routes"))
+  : null;
 
 export function App() {
   return (
@@ -41,6 +50,16 @@ export function App() {
           <Route path="/scheduler" element={<Scheduler />} />
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />
+          {MothershipRoutes && (
+            <Route
+              path="/m/*"
+              element={
+                <Suspense fallback={<div className="mc-loading">Loading mothership…</div>}>
+                  <MothershipRoutes />
+                </Suspense>
+              }
+            />
+          )}
         </Route>
 
         <Route path="*" element={<Navigate to="/" replace />} />

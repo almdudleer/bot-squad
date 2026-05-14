@@ -76,6 +76,13 @@ def build_app() -> FastAPI:
     app.include_router(users_router, prefix="/api")
     app.include_router(settings_router, prefix="/api")
 
+    # Centralization-layer routes — mounted only on bot-squad.org installs.
+    # Single-install servers run with MOTHERSHIP unset (or "0") and never
+    # expose /api/m/*. Detach build = MOTHERSHIP=0 (or delete the module).
+    if os.environ.get("MOTHERSHIP", "0") == "1":
+        from app.routes_mothership import router as mothership_router
+        app.include_router(mothership_router, prefix="/api/m")
+
     from app.routes_auth import require_auth
     from app.worker_client import WorkerError
     from fastapi import Depends, HTTPException

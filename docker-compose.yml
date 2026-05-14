@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
+      args:
+        VITE_MOTHERSHIP: ${MOTHERSHIP:-0}
     image: bot-squad-api:latest
     container_name: bot-squad-api
     restart: unless-stopped
@@ -16,6 +18,7 @@ services:
       - COOKIE_SECURE=1
       - BUILD_AT_IMPORT=1
       - CLAUDE_PROJECTS_DIR=/home/almdudleer/.claude/projects
+      - MOTHERSHIP=${MOTHERSHIP:-0}
     volumes:
       - ./config:/config:rw
       - ./data:/data:rw
@@ -30,10 +33,19 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=avo_backend"
+      # Primary host: the single-install playground.
       - "traefik.http.routers.bot-squad.rule=Host(`bot-squad.${DOMAIN}`)"
       - "traefik.http.routers.bot-squad.entrypoints=websecure"
       - "traefik.http.routers.bot-squad.tls.certresolver=le"
       - "traefik.http.services.bot-squad.loadbalancer.server.port=8000"
+      # Mothership staging host (T-0033): served by the same container
+      # when MOTHERSHIP=1 in .env. Both hosts hit the same backend; the
+      # FE mothership chunks are gated by build flag, not host header.
+      # Detach later by removing this router + setting MOTHERSHIP=0.
+      - "traefik.http.routers.bot-squad-mothership.rule=Host(`my.bot-squad.org`)"
+      - "traefik.http.routers.bot-squad-mothership.entrypoints=websecure"
+      - "traefik.http.routers.bot-squad-mothership.tls.certresolver=le"
+      - "traefik.http.routers.bot-squad-mothership.service=bot-squad"
 
 networks:
   avo_backend:

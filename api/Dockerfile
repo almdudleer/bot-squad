@@ -1,6 +1,8 @@
 # Multi-stage: build web, then assemble api with web/dist as static.
 
 FROM node:20-alpine AS web-builder
+ARG VITE_MOTHERSHIP=0
+ENV VITE_MOTHERSHIP=${VITE_MOTHERSHIP}
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci

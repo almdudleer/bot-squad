@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, MeProfile } from "../api";
+import { Coachmark } from "../onboarding";
 
 type TestState =
   | { kind: "idle" }
@@ -66,6 +67,24 @@ export function Profile() {
 
       {profile && (
         <>
+          {/* §9.5 — passive spotlight. Fires once the user lands on /me from
+              the §9.x chain, points at the chat-id input, and is dismissed by
+              ESC / backdrop / "Got it". Framework handles seen_steps. */}
+          <Coachmark
+            stepId="srv.9_5.tg_binding"
+            title="Bind your Telegram chat ID"
+            anchorSelector='[data-onboarding-anchor="tg-chat-id"]'
+            placement="bottom"
+            body={
+              <>
+                Help user to bind his telegram chat id, ping him with a test
+                message. While this server is attached to bot-squad.org, all
+                Telegram traffic routes through <code>@bot_squad_bot</code> —
+                you don't need to bring your own bot.
+              </>
+            }
+          />
+
           <section className="mb-4">
             <div style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
               {profile.username}
@@ -95,6 +114,7 @@ export function Profile() {
                 value={chatId}
                 onChange={(e) => setChatId(e.target.value)}
                 placeholder="e.g. 404580642"
+                data-onboarding-anchor="tg-chat-id"
                 style={{
                   fontFamily: "var(--mc-mono)",
                   width: "16rem",

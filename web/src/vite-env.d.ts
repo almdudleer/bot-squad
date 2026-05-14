@@ -1,0 +1,16 @@
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  /**
+   * "1" on the bot-squad.org mothership build — mounts the centralization
+   * layer (/m/* routes, cross-server picker swap). Unset or "0" on a
+   * single-install build. Vite inlines this at build time, so the guarded
+   * dynamic imports are tree-shaken when off. Frozen by
+   * vision/architecture/mothership-seam.md.
+   */
+  readonly VITE_MOTHERSHIP?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}

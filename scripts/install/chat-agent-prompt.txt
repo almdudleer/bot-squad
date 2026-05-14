@@ -1,0 +1,85 @@
+I need help installing "bot-squad" on a Linux server. I have access to
+a chat with you (one message at a time) and an SSH terminal to the
+server. I can run commands and paste outputs back to you. Please act as
+my pair: tell me what to do one step at a time, ask me to paste the
+output of each command, and help me diagnose any errors.
+
+Context you need:
+
+- bot-squad is a server-side context-manager for Claude Code sessions.
+  Installing it provisions a directory at /home/www/bot-squad, the
+  bot-squad-worker systemd service, a docker-compose stack
+  (API + UI + worker), and a tmux session for the "operator".
+- The install is driven by a single shell script that is idempotent:
+  re-running after a partial failure resumes at the first incomplete
+  checkpoint; re-running on a complete install is a no-op.
+- A "mothership" service at __MOTHERSHIP_URL__ issued me a single-use
+  install link tied to my account. It expires in 24 hours.
+- I am NOT a sysadmin. Explain anything non-obvious before asking me to
+  run it. Never have me run `rm -rf` or `sudo rm -rf` without telling
+  me what it will delete and why.
+
+The first step is:
+
+```bash
+curl -fsSL "__MOTHERSHIP_URL__/i/__INSTALL_TOKEN__/install.sh" -o ~/install.sh
+chmod +x ~/install.sh
+bash ~/install.sh
+```
+
+That single invocation runs the entire installer. If it succeeds, the
+last lines printed will be a green banner with a `tmux a -t
+bot-squad-operator` command — that's the success signal; I'll paste
+the banner so you know.
+
+If it fails, the last ~10 lines will contain a structured block like:
+
+```
+============================================================
+INSTALL FAILED at checkpoint: <name>
+------------------------------------------------------------
+What happened:
+  <cause>
+What to do:
+  <remediation>
+...
+============================================================
+```
+
+I will paste the block to you in full. Your job is to translate it
+into a step-by-step recovery plan for me, walk me through any extra
+commands the script suggested, and then tell me to re-run
+`bash ~/install.sh`. **Do not** edit the script. **Do not** delete
+`~/.bot-squad/install.state`. **Do not** ask me to `sudo rm -rf
+/home/www/bot-squad` unless I explicitly ask why and you've explained
+the risk.
+
+Common failure causes you should recognize without me explaining:
+
+- `require_sudo`: my user can't sudo. Help me check /etc/sudoers or
+  ask an admin.
+- `apt_update` / `install_*`: usually network or a corporate proxy.
+  Help me set http_proxy/https_proxy env vars and the apt proxy file.
+- `install_claude_code`: EACCES on global npm — help me reconfigure
+  the npm prefix to ~/.npm-global.
+- `require_docker`: docker engine or compose plugin missing — walk me
+  through installing it from https://docs.docker.com/engine/install
+  /ubuntu/, then adding my user to the `docker` group.
+- `clone_repo`: install token expired (24 hours). Tell me to re-issue
+  the install link from the mothership UI and re-copy this prompt with
+  fresh values, then resume.
+- `mothership_handshake` HTTP 410: same — token expired.
+- `docker_compose_up` "network avo_backend not found": tell me to run
+  `docker network create avo_backend` and re-run.
+
+When the install is done, walk me through this hand-off:
+
+1. From a **separate** SSH session to the same host, run
+   `tmux a -t bot-squad-operator`. That attaches me to the bot-squad
+   operator — the long-lived Claude session that manages this server.
+2. Send the operator a message ("hi") so it knows I've arrived.
+3. Close the SSH session I used for the install (your job here is
+   done).
+
+Ready when you are — please start by telling me to run the curl + bash
+command above, and ask me to paste the result.

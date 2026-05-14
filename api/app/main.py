@@ -76,6 +76,23 @@ def build_app() -> FastAPI:
     app.include_router(users_router, prefix="/api")
     app.include_router(settings_router, prefix="/api")
 
+    # Centralization-layer routes — mounted only on bot-squad.org installs.
+    # Single-install servers run with MOTHERSHIP unset (or "0") and never
+    # expose /api/m/* or /i/*. Detach build = MOTHERSHIP=0 (or delete the module).
+    # Three routers because the install flow has three distinct auth surfaces;
+    # see routes_mothership.py for the rationale.
+    if os.environ.get("MOTHERSHIP", "0") == "1":
+        from app.routes_mothership import (
+            router as mothership_router,
+            installer_router as mothership_installer_router,
+            bundle_router as mothership_bundle_router,
+        )
+        app.include_router(mothership_router, prefix="/api/m")
+        app.include_router(mothership_installer_router, prefix="/api/m")
+        # Bundle GETs sit at root: /i/<token>/install.sh + instructions.md.
+        # They must register BEFORE the SPA catch-all below.
+        app.include_router(mothership_bundle_router)
+
     from app.routes_auth import require_auth
     from app.worker_client import WorkerError
     from fastapi import Depends, HTTPException

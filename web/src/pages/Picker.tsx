@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, Project } from "../api";
+import { Coachmark } from "../onboarding";
 
 export function Picker() {
   const [projects, setProjects] = useState<Project[] | null>(null);
@@ -12,6 +13,13 @@ export function Picker() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "900px" }}>
+      {/* Framework smoke. Real §9.1–9.6 copy lands in T-0014..T-0022. */}
+      <Coachmark
+        stepId="srv.intro"
+        title="Welcome to your server"
+        body="A quick tour of the picker and the surrounding views. Skip if you've seen it."
+      />
+
       <div className="d-flex align-items-center gap-2 mb-4">
         <div className="mc-section-title" style={{ margin: 0 }}>Projects</div>
       </div>

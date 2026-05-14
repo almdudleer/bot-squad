@@ -1268,3 +1268,22 @@ hr { border-color: var(--mc-border); opacity: 1; }
   }
   .mc-help-page { padding: 1.25rem 1rem 3rem; }
 }
+
+/* Coachmark — T-0012 onboarding framework. Minimal surface; spotlight beats
+   T-0014..T-0022 supply their own content but reuse this chrome. */
+.bs-coachmark-root {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  pointer-events: none;
+}
+.bs-coachmark-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+}
+.bs-coachmark-card {
+  pointer-events: auto;
+  max-width: 360px;
+}

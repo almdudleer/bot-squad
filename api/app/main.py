@@ -73,8 +73,10 @@ def build_app() -> FastAPI:
 
     from app.routes_users import router as users_router
     from app.routes_settings import router as settings_router
+    from app.routes_me import router as me_router
     app.include_router(users_router, prefix="/api")
     app.include_router(settings_router, prefix="/api")
+    app.include_router(me_router, prefix="/api")
 
     # Centralization-layer routes — mounted only on bot-squad.org installs.
     # Single-install servers run with MOTHERSHIP unset (or "0") and never

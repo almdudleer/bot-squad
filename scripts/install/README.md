@@ -1,21 +1,24 @@
 # scripts/install/
 
 Source artifacts for the bot-squad installer. The mothership serves
-these files at tokened URLs after a small substitution pass.
+`install.sh` and `bootstrap-claude-instructions.md` at tokened URLs after
+a small substitution pass; `chat-agent-prompt.txt` is rendered inline by
+the FE wizard (T-0031) — not served from a tokened URL.
 
 ## Files
 
-| File                                  | Served at                          | Purpose                                              |
-|---------------------------------------|------------------------------------|------------------------------------------------------|
-| `install.sh`                          | `/i/<token>/install.sh`            | Idempotent installer. The only artifact that runs.   |
-| `bootstrap-claude-instructions.md`    | `/i/<token>/instructions.md`       | Brief for a Claude Code session (tool-using).        |
-| `chat-agent-prompt.txt`               | `/i/<token>/prompt.txt`            | Prompt for a generic chat AI (copy-paste-loop user). |
+| File                                  | Served at                                                | Purpose                                              |
+|---------------------------------------|----------------------------------------------------------|------------------------------------------------------|
+| `install.sh`                          | `/i/<token>/install.sh`                                  | Idempotent installer. The only artifact that runs.   |
+| `bootstrap-claude-instructions.md`    | `/i/<token>/instructions.md`                             | Brief for a Claude Code session (tool-using).        |
+| `chat-agent-prompt.txt`               | _(rendered inline by FE wizard T-0031, not a tokened URL)_ | Prompt for a generic chat AI (copy-paste-loop user). |
 
 ## Placeholders the mothership substitutes
 
-The four substitution targets in `install.sh` and the two in the two md/txt
-artifacts. The mothership rewrites these as literal text at serve time —
-no templating engine, no escapes; they appear once each per file:
+Four substitution targets in `install.sh`, four in
+`bootstrap-claude-instructions.md`, and two in `chat-agent-prompt.txt`.
+Substitution uses literal `str.replace()` (no templating engine, no
+escapes), so each placeholder is rewritten everywhere it appears:
 
 - `__INSTALL_TOKEN__` — opaque `bsq_install_<32B b64url>`, single-burn at `/api/m/installer/connect` (24h TTL)
 - `__MOTHERSHIP_URL__` — the mothership root URL the install talks back to

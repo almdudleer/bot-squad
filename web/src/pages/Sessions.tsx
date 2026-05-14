@@ -777,7 +777,7 @@ export function Sessions() {
                 <th>SID</th>
                 <th>Window</th>
                 <th>Role</th>
-                <th>Bound</th>
+                <th>Target</th>
                 <th>Status</th>
                 <th>Started</th>
                 <th>Last activity</th>
@@ -821,7 +821,7 @@ export function Sessions() {
                   <th>SID</th>
                   <th>Window</th>
                   <th>Role</th>
-                  <th>Bound</th>
+                  <th>Target</th>
                   <th>Started</th>
                   <th>Last activity</th>
                   <th></th>

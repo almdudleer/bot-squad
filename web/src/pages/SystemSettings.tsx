@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, SystemSettings as Settings } from "../api";
 import { Modal } from "../components/Modal";
+import { Coachmark } from "../onboarding";
 
 const TTL_RE = /^\d+[smhd]$/;
 
@@ -91,6 +92,26 @@ export function SystemSettings() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "720px" }}>
+      {/* §9.2 — admin-only spotlight pointing at the Detach affordance.
+          Fires only once an admin lands on /system-settings, so it doesn't
+          compete with §9.1 on the Picker. Non-admins never render it, so the
+          step is never marked seen for them and never gates onboarding. */}
+      {isAdmin && (
+        <Coachmark
+          stepId="srv.9_2.detach_admin"
+          title="You can detach this server"
+          anchorSelector='[data-onboarding-anchor="detach-toggle"]'
+          placement="top"
+          body={
+            <>
+              Now that you own a bot-squad installation, you can detach from
+              bot-squad.org at any time and run standalone from this server's
+              own address. See the advantages before you do.
+            </>
+          }
+        />
+      )}
+
       <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1rem" }}>
         System settings
       </h2>

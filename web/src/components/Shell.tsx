@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
+import { ProjectSwitcher } from "./ProjectSwitcher";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
 
@@ -11,8 +12,8 @@ const PINNED_PROJECT_KEY = "bot-squad:last-project";
  * Project pinning contract (one pin or none, exactly one way each):
  *   • PIN     — visiting any /p/:slug/* URL pins that slug. The only practical
  *               way to trigger this is by clicking a project in the picker.
- *   • UNPIN   — the "← switch project" link in the [PROJECT] block. That's it.
- *               (Sign-out also clears the pin for hygiene.)
+ *   • UNPIN   — the "← all projects" row inside the ProjectSwitcher dropdown
+ *               (the only un-pin affordance other than sign-out).
  *   • The pin survives navigating to /, /scheduler, /help, etc. — the
  *               [PROJECT] block stays so per-project links remain one click away.
  */
@@ -168,18 +169,12 @@ export function Shell() {
         </div>
 
         {/* Project section — shows pinned project even on global routes */}
-        {hasProject && (
+        {hasProject && slug && (
           <>
             <div className="mc-sidebar-section">Project</div>
             <div className="mc-sidebar-project">
               <div className="mc-sidebar-project-name">{slug}</div>
-              <Link
-                to="/"
-                className="mc-sidebar-project-link"
-                onClick={unpinProject}
-              >
-                ← switch project
-              </Link>
+              <ProjectSwitcher slug={slug} onUnpin={unpinProject} />
             </div>
 
             <ul className="mc-sidebar-nav">

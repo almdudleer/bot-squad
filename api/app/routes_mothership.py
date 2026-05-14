@@ -33,6 +33,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
@@ -348,4 +349,126 @@ def install_instructions(request: Request, token: str) -> PlainTextResponse:
 # install-token contract surface and stay imported even if a future
 # refactor of this file stops using them directly.
 _ = (INSTALL_PREFIX, SERVER_PREFIX, hash_token)
+
+
+# ---- per-server proxy (T-0023) ---------------------------------------------
+# The mothership FE renders per-project pages by talking to the *target
+# server's* API. ``/api/m/servers/{id}/api/{rest:path}`` forwards each call
+# to ``<server.base_url>/api/<rest>`` using the bearer-sidecar plaintext
+# (the ``server_bearer`` plaintext that ``/connect`` minted and stored at
+# ``DATA_DIR/_mothership/bearers/<id>``). See "Per-server backend client
+# (T-0023)" in ``mothership-seam.md`` — proxy variant.
+
+
+def _proxy_client(base_url: str) -> httpx.AsyncClient:
+    """httpx.AsyncClient factory the proxy route uses. Lives at module scope
+    so tests can monkeypatch it to point at an ``httpx.MockTransport``
+    instead of opening a real socket to ``base_url``."""
+    return httpx.AsyncClient(
+        base_url=base_url,
+        timeout=httpx.Timeout(30.0, connect=5.0),
+    )
+
+
+@router.get("/servers/{server_id}/projects")
+def list_server_projects(server_id: str, request: Request) -> list[dict]:
+    """Return the registry's cached project list for ``server_id``.
+
+    Cheap, no upstream call. T-0025's all-projects page polls this for
+    every attached server in parallel — partial-failure isolation is
+    handled FE-side via the fanOut envelope contract.
+    """
+    server = _store(request).get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    return server.projects_cache
+
+
+@router.post("/servers/{server_id}/projects/refresh")
+async def refresh_server_projects(server_id: str, request: Request) -> list[dict]:
+    """Force-refresh the projects cache by hitting upstream ``/api/projects``.
+
+    On upstream failure (502), the existing cache is preserved — a
+    transient outage shouldn't blank the last-known-good state. The
+    eventual ``last_seen`` ping channel will refresh asynchronously; this
+    endpoint is the manual handle the UI's "refresh" button hits.
+    """
+    store = _store(request)
+    server = store.get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    bearer = store.read_server_bearer(server_id)
+    if not bearer:
+        raise HTTPException(
+            status_code=503,
+            detail="server bearer not available (server not connected)",
+        )
+    async with _proxy_client(server.base_url) as client:
+        try:
+            upstream = await client.get(
+                "/api/projects",
+                headers={"Authorization": f"Bearer {bearer}"},
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"upstream unreachable: {e}")
+    if upstream.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"upstream returned {upstream.status_code}",
+        )
+    try:
+        listing = upstream.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"upstream returned non-JSON: {e}")
+    if not isinstance(listing, list):
+        raise HTTPException(status_code=502, detail="upstream /api/projects must return a list")
+    persisted = store.update_projects_cache(server_id, listing)
+    if persisted is None:
+        # Race: server was removed between the get_server check and the
+        # cache update. Treat as 404 — the FE will re-fetch the server list.
+        raise HTTPException(status_code=404, detail="server not found")
+    return persisted
+
+
+_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+
+@router.api_route("/servers/{server_id}/api/{rest:path}", methods=_PROXY_METHODS)
+async def server_api_proxy(server_id: str, rest: str, request: Request) -> Response:
+    store = _store(request)
+    server = store.get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    bearer = store.read_server_bearer(server_id)
+    if not bearer:
+        raise HTTPException(
+            status_code=503,
+            detail="server bearer not available (server not connected)",
+        )
+    upstream_path = f"/api/{rest}"
+    # Forward the request body verbatim. The FE / single-install API only
+    # ever uses JSON bodies, but we don't decode here — pass-through keeps
+    # the proxy method-agnostic and avoids round-trip encoding bugs.
+    body = await request.body()
+    headers: dict[str, str] = {"Authorization": f"Bearer {bearer}"}
+    ctype = request.headers.get("content-type")
+    if ctype:
+        headers["Content-Type"] = ctype
+    async with _proxy_client(server.base_url) as client:
+        try:
+            upstream = await client.request(
+                request.method,
+                upstream_path,
+                content=body or None,
+                headers=headers,
+                params=request.query_params,
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"upstream unreachable: {e}")
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+
 

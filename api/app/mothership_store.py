@@ -290,6 +290,39 @@ class MothershipStore:
         except FileNotFoundError:
             pass
 
+    # ---- projects cache (T-0023) --------------------------------------------
+
+    def update_projects_cache(
+        self, server_id: str, projects: list[dict]
+    ) -> list[dict] | None:
+        """Replace the cached project list for ``server_id``.
+
+        ``projects`` is the raw upstream response (each item has ``slug`` +
+        ``display_name``; status is not yet on the single-install API — see
+        T-0016). We normalise to the schema fixed in ``mothership-seam.md``
+        and default ``status`` to ``"idle"`` until the status-sync stream
+        lands.
+
+        Returns the persisted list, or ``None`` if no such server.
+        """
+        normalised = [
+            {
+                "slug": p.get("slug", ""),
+                "display_name": p.get("display_name", p.get("slug", "")),
+                "status": p.get("status", "idle"),
+            }
+            for p in projects
+            if p.get("slug")
+        ]
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id == server_id:
+                    servers[i] = replace(s, projects_cache=normalised)
+                    self.write(servers)
+                    return normalised
+        return None
+
     def touch_last_seen(self, server_id: str) -> None:
         """Stamp ``last_seen_at`` on the registry entry."""
         now = _utc_now_iso()

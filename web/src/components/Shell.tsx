@@ -254,6 +254,7 @@ export function Shell() {
             <NavLink
               to="/"
               end
+              data-onboarding-anchor="all-projects-nav"
               className={({ isActive }) => (isActive ? "active" : undefined)}
             >
               <span className="mc-nav-diamond">◇</span>

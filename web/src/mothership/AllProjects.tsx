@@ -7,6 +7,8 @@ import {
   type FanOutResult,
   type ServerProject,
 } from "./api";
+import { Coachmark } from "../onboarding";
+import { STEP_9_3_BULLETS, STEP_9_3_TITLE } from "../onboarding/copy";
 
 /**
  * Cross-server all-projects view (T-0025). Mounted at /m on the mothership
@@ -94,6 +96,23 @@ export function AllProjects() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "1100px" }}>
+      {/* §9.3 spotlight — single coachmark, three bullets. Auto-gated to
+          mothership builds by virtue of living in this module (App.tsx
+          lazy-imports it only when VITE_MOTHERSHIP === "1"). */}
+      <Coachmark
+        stepId="srv.9_3.cross_server"
+        title={STEP_9_3_TITLE}
+        anchorSelector='[data-onboarding-anchor="all-projects-nav"]'
+        placement="right"
+        body={
+          <ul className="mb-0 ps-3">
+            {STEP_9_3_BULLETS.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        }
+      />
+
       <div className="d-flex align-items-center justify-content-between gap-2 mb-4">
         <div className="mc-section-title" style={{ margin: 0 }}>
           All projects

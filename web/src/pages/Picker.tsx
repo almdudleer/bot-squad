@@ -146,6 +146,23 @@ export function Picker() {
         }
       />
 
+      {/* §9.6 — closing beat. Anchors on the admin-only "+ New project"
+          button (mounted below). `final` flips the dismiss to write
+          __skip_all__ so any future-added §9.x beat doesn't re-trigger the
+          tour for users who already finished it. The spotlight just points;
+          clicking it does NOT open the modal — the user clicks the button
+          themselves (per T-0022 DoD note). */}
+      {isAdmin && (
+        <Coachmark
+          stepId="srv.9_6.project_create"
+          title="Create your first project"
+          anchorSelector='[data-onboarding-anchor="create-project"]'
+          placement="bottom"
+          final
+          body={<>Create your first project here.</>}
+        />
+      )}
+
       {/* §9.4 — discovery spotlight on the first non-self project. Only
           mounts when alien-detection found one (see useEffect above); on a
           sole-creator or empty installation this is silent. The CTA points

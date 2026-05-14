@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
-import { api, Task } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { api, Task, VisionFile } from "../api";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
-import { MenuAction } from "../components/TaskCard";
+import { MenuAction, TaskCard } from "../components/TaskCard";
 
 import { PageHelp } from "../components/PageHelp";
 const COLUMNS = ["open", "in_progress", "totest", "reopened", "closed"] as const;
@@ -16,11 +16,68 @@ const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
 };
 
 type ModalKind = "create" | "editBody" | "addComment" | null;
+type GroupBy = "none" | "initiative";
+type ViewMode = "board" | "list";
+
+// T-0039: sentinel for the "no initiative" lane. Real initiatives are
+// vision/initiatives/<basename>.md so this prefix can't collide.
+const UNATTACHED = "__unattached__";
+
+type InitiativeStatus = "active" | "draft" | "done";
+
+type InitiativeMeta = {
+  // basename (e.g. "multi-server-installation-process.md"). `UNATTACHED`
+  // for the synthetic lane.
+  key: string;
+  title: string;       // human label (basename minus .md)
+  status: InitiativeStatus;
+};
+
+function initiativeBasename(visionName: string): string {
+  // VisionFile.name is "initiatives/<basename>.md"
+  return visionName.replace(/^initiatives\//, "");
+}
+
+function statusFromVision(v: VisionFile): InitiativeStatus {
+  if (v.finished) return "done";
+  if (v.active) return "active";
+  return "draft";
+}
+
+function STATUS_PILL_COLOR(s: InitiativeStatus): { color: string; bg: string; border: string } {
+  switch (s) {
+    case "active":
+      return {
+        color: "var(--mc-accent-success, #4ade80)",
+        bg: "rgba(74, 222, 128, 0.08)",
+        border: "var(--mc-accent-success, #4ade80)",
+      };
+    case "done":
+      return {
+        color: "var(--mc-text-dim)",
+        bg: "var(--mc-surface-raised)",
+        border: "var(--mc-border)",
+      };
+    default:
+      return {
+        color: "var(--mc-amber, #fbbf24)",
+        bg: "rgba(251, 191, 36, 0.08)",
+        border: "var(--mc-amber, #fbbf24)",
+      };
+  }
+}
 
 export function Project() {
   const { slug = "" } = useParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
+  const [vision, setVision] = useState<VisionFile[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  // T-0039: view controls. Defaults reproduce the pre-T-0039 board exactly.
+  const [groupBy, setGroupBy] = useState<GroupBy>("none");
+  const [viewMode, setViewMode] = useState<ViewMode>("board");
+  // Filter is a single initiative basename, UNATTACHED, or "" for all.
+  const [filterInit, setFilterInit] = useState<string>("");
 
   // modal state
   const [modalKind, setModalKind] = useState<ModalKind>(null);
@@ -46,11 +103,83 @@ export function Project() {
 
   useEffect(() => {
     reload();
+    api.vision(slug).then(setVision).catch(() => setVision([]));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
+  // ---- Initiative meta + lane build ----
+  // Build the canonical lane list: every initiative file (active+draft+done)
+  // gets a lane, plus an Unattached lane at the end. Empty lanes still
+  // render (forces backlog hygiene — "we have nothing on update-delivery
+  // yet" is visible, not an inference from absence).
+  const initiativeMeta = useMemo<InitiativeMeta[]>(() => {
+    const list = vision
+      .filter((v) => v.name.startsWith("initiatives/") && !v.name.endsWith("/_TEMPLATE.md"))
+      .map((v) => {
+        const key = initiativeBasename(v.name);
+        return {
+          key,
+          title: key.replace(/\.md$/, ""),
+          status: statusFromVision(v),
+        };
+      });
+    // Active first, draft second, done last — keeps the eye on live work.
+    list.sort((a, b) => {
+      const rank = { active: 0, draft: 1, done: 2 } as const;
+      if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+      return a.title.localeCompare(b.title);
+    });
+    return list;
+  }, [vision]);
+
+  // Tasks keyed by initiative basename (or UNATTACHED).
+  const tasksByInit = useMemo<Record<string, Task[]>>(() => {
+    const out: Record<string, Task[]> = { [UNATTACHED]: [] };
+    for (const m of initiativeMeta) out[m.key] = [];
+    for (const t of tasks ?? []) {
+      const init = (t.initiative ?? "").trim();
+      if (init && out[init] !== undefined) {
+        out[init].push(t);
+      } else if (init) {
+        // Task tagged with an initiative basename we don't have a vision
+        // file for — bucket it under that basename so the orphan stays
+        // visible. Synthesize a lane on render.
+        (out[init] ||= []).push(t);
+      } else {
+        out[UNATTACHED].push(t);
+      }
+    }
+    return out;
+  }, [tasks, initiativeMeta]);
+
+  // Final lane list (after applying the filter). Always include the lane
+  // matching the active filter even if empty; otherwise show all.
+  const visibleLanes = useMemo<InitiativeMeta[]>(() => {
+    const synthesized: InitiativeMeta[] = [];
+    const known = new Set(initiativeMeta.map((m) => m.key));
+    for (const key of Object.keys(tasksByInit)) {
+      if (key === UNATTACHED || known.has(key)) continue;
+      synthesized.push({ key, title: `${key.replace(/\.md$/, "")} (orphan)`, status: "draft" });
+    }
+    const all: InitiativeMeta[] = [
+      ...initiativeMeta,
+      ...synthesized,
+      { key: UNATTACHED, title: "Unattached", status: "draft" },
+    ];
+    if (!filterInit) return all;
+    return all.filter((m) => m.key === filterInit);
+  }, [initiativeMeta, tasksByInit, filterInit]);
+
+  // Ungrouped — current 5-column behavior.
   const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
-  for (const t of tasks ?? []) {
+  const ungroupedTasks = filterInit
+    ? (tasks ?? []).filter((t) => {
+        const init = (t.initiative ?? "").trim();
+        if (filterInit === UNATTACHED) return !init;
+        return init === filterInit;
+      })
+    : (tasks ?? []);
+  for (const t of ungroupedTasks) {
     if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
       grouped[t.status].push(t);
     }
@@ -265,20 +394,90 @@ export function Project() {
       {error && <div className="alert alert-danger mt-2">{error}</div>}
       {tasks === null && !error && <div className="mc-loading">Loading</div>}
 
-      <div className="row g-3 mt-1">
-        {COLUMNS.map((c) => (
-          <BoardColumn
-            key={c}
-            title={COLUMN_LABELS[c]}
-            status={c}
-            tasks={grouped[c]}
+      {/* T-0039: view-control bar. Defaults to none + board for backwards
+          compatibility with the pre-T-0039 board. */}
+      <div
+        className="d-flex flex-wrap align-items-center gap-2 mb-2"
+        style={{ fontSize: "0.75rem" }}
+      >
+        <SegmentedToggle
+          label="Group by"
+          value={groupBy}
+          onChange={(v) => setGroupBy(v as GroupBy)}
+          options={[
+            { value: "none", label: "none" },
+            { value: "initiative", label: "initiative" },
+          ]}
+        />
+        <SegmentedToggle
+          label="View"
+          value={viewMode}
+          onChange={(v) => setViewMode(v as ViewMode)}
+          options={[
+            { value: "board", label: "board" },
+            { value: "list", label: "list" },
+          ]}
+        />
+        <div className="d-flex align-items-center gap-2 ms-auto">
+          <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
+            filter:
+          </span>
+          <select
+            className="form-select form-select-sm"
+            style={{ width: "auto", minWidth: "12rem", fontSize: "0.75rem" }}
+            value={filterInit}
+            onChange={(e) => setFilterInit(e.target.value)}
+          >
+            <option value="">all initiatives</option>
+            {initiativeMeta.map((m) => (
+              <option key={m.key} value={m.key}>
+                {m.title} · {m.status}
+              </option>
+            ))}
+            <option value={UNATTACHED}>(unattached)</option>
+          </select>
+        </div>
+      </div>
+
+      {groupBy === "none" ? (
+        viewMode === "board" ? (
+          <div className="row g-3 mt-1">
+            {COLUMNS.map((c) => (
+              <BoardColumn
+                key={c}
+                title={COLUMN_LABELS[c]}
+                status={c}
+                tasks={grouped[c]}
+                slug={slug}
+                onMenuAction={handleMenuAction}
+                onMove={handleMove}
+                onReorder={handleReorder}
+              />
+            ))}
+          </div>
+        ) : (
+          <ListBoard
+            tasks={ungroupedTasks}
             slug={slug}
             onMenuAction={handleMenuAction}
-            onMove={handleMove}
-            onReorder={handleReorder}
           />
-        ))}
-      </div>
+        )
+      ) : (
+        <div className="mt-1">
+          {visibleLanes.map((lane) => (
+            <InitiativeLane
+              key={lane.key}
+              meta={lane}
+              tasks={tasksByInit[lane.key] ?? []}
+              slug={slug}
+              viewMode={viewMode}
+              onMenuAction={handleMenuAction}
+              onMove={handleMove}
+              onReorder={handleReorder}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Create task modal */}
       <Modal
@@ -388,6 +587,228 @@ export function Project() {
           autoFocus
         />
       </Modal>
+    </div>
+  );
+}
+
+// ===========================================================================
+// T-0039 helpers
+// ===========================================================================
+
+interface SegmentedToggleProps {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+}
+
+function SegmentedToggle({ label, value, onChange, options }: SegmentedToggleProps) {
+  return (
+    <div className="d-flex align-items-center gap-2">
+      <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
+        {label}:
+      </span>
+      <div className="btn-group btn-group-sm" role="group">
+        {options.map((o) => (
+          <button
+            key={o.value}
+            type="button"
+            className={`btn ${
+              value === o.value ? "btn-secondary" : "btn-outline-secondary"
+            }`}
+            style={{ fontSize: "0.72rem", padding: "0.15rem 0.55rem" }}
+            onClick={() => onChange(o.value)}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface InitiativeLaneProps {
+  meta: InitiativeMeta;
+  tasks: Task[];
+  slug: string;
+  viewMode: ViewMode;
+  onMenuAction: (task: Task, action: MenuAction) => void;
+  onMove: (taskId: string, from: Task["status"], to: Task["status"]) => void;
+  onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
+}
+
+function InitiativeLane({
+  meta,
+  tasks,
+  slug,
+  viewMode,
+  onMenuAction,
+  onMove,
+  onReorder,
+}: InitiativeLaneProps) {
+  const navigate = useNavigate();
+  const counts = COLUMNS.reduce<Record<string, number>>(
+    (acc, c) => ({ ...acc, [c]: 0 }),
+    {},
+  );
+  for (const t of tasks) {
+    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) counts[t.status]++;
+  }
+  const pill = STATUS_PILL_COLOR(meta.status);
+
+  const grouped = COLUMNS.reduce<Record<string, Task[]>>(
+    (acc, c) => ({ ...acc, [c]: [] }),
+    {},
+  );
+  for (const t of tasks) {
+    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
+      grouped[t.status].push(t);
+    }
+  }
+
+  const isUnattached = meta.key === UNATTACHED;
+  const titleClickable = !isUnattached;
+
+  return (
+    <div
+      style={{
+        marginBottom: "1.25rem",
+        borderTop: "1px solid var(--mc-border)",
+        paddingTop: "0.75rem",
+      }}
+    >
+      <div
+        className="d-flex align-items-center gap-2 mb-2 flex-wrap"
+        style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}
+      >
+        <span
+          onClick={() => {
+            if (titleClickable) navigate(`/p/${slug}/vision`);
+          }}
+          style={{
+            fontWeight: 700,
+            color: titleClickable ? "var(--mc-text)" : "var(--mc-text-dim)",
+            cursor: titleClickable ? "pointer" : "default",
+            fontSize: "0.85rem",
+            letterSpacing: "0.03em",
+          }}
+          title={titleClickable ? "Open initiative spec" : "Tasks without an initiative"}
+        >
+          {meta.title}
+        </span>
+        {!isUnattached && (
+          <span
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.62rem",
+              color: pill.color,
+              background: pill.bg,
+              border: `1px solid ${pill.border}`,
+              borderRadius: "2px",
+              padding: "0 5px",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+            }}
+          >
+            {meta.status}
+          </span>
+        )}
+        <span
+          style={{
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.65rem",
+            color: "var(--mc-text-dim)",
+            marginLeft: "0.5rem",
+          }}
+          title="open / in-progress / to-test / reopened / closed"
+        >
+          {COLUMNS.map((c) => `${counts[c]}`).join(" / ")}
+        </span>
+        <span
+          style={{
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.6rem",
+            color: "var(--mc-text-faint)",
+            marginLeft: "0.5rem",
+          }}
+        >
+          ({tasks.length} total)
+        </span>
+      </div>
+      {viewMode === "board" ? (
+        <div className="row g-3">
+          {COLUMNS.map((c) => (
+            <BoardColumn
+              key={c}
+              title={COLUMN_LABELS[c]}
+              status={c}
+              tasks={grouped[c]}
+              slug={slug}
+              onMenuAction={onMenuAction}
+              onMove={onMove}
+              onReorder={onReorder}
+            />
+          ))}
+        </div>
+      ) : (
+        <ListBoard
+          tasks={tasks}
+          slug={slug}
+          onMenuAction={onMenuAction}
+        />
+      )}
+    </div>
+  );
+}
+
+interface ListBoardProps {
+  tasks: Task[];
+  slug: string;
+  onMenuAction: (task: Task, action: MenuAction) => void;
+}
+
+/**
+ * Compact list view: one section per status, tasks rendered as cards but
+ * stacked into a single column. DnD reordering is omitted to keep the
+ * list lean — use the board view when reordering matters.
+ */
+function ListBoard({ tasks, slug, onMenuAction }: ListBoardProps) {
+  const grouped = COLUMNS.reduce<Record<string, Task[]>>(
+    (acc, c) => ({ ...acc, [c]: [] }),
+    {},
+  );
+  for (const t of tasks) {
+    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
+      grouped[t.status].push(t);
+    }
+  }
+  return (
+    <div className="mt-1">
+      {COLUMNS.map((c) => {
+        const sorted = sortByPriority(grouped[c]);
+        return (
+          <div key={c} className="mb-3">
+            <div className="mc-board-col-header" style={{ marginBottom: "0.35rem" }}>
+              <span>{COLUMN_LABELS[c]}</span>
+              <span className="mc-board-count">{sorted.length}</span>
+            </div>
+            {sorted.length === 0 ? (
+              <div className="mc-empty-col">▢ empty</div>
+            ) : (
+              <div>
+                {sorted.map((t) => (
+                  <TaskCard
+                    key={t.id}
+                    task={t}
+                    slug={slug}
+                    onMenuAction={onMenuAction}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

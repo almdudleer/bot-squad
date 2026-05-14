@@ -3,6 +3,22 @@ import { Link } from "react-router-dom";
 import { api, Project } from "../api";
 import { Coachmark } from "../onboarding";
 
+// Mirror T-0025's statusBadgeClass so single-server and cross-server views
+// paint the same colours from the same enum. Unknown strings fall back to
+// the dim pill rather than going invisible — same forward-compat policy.
+function statusBadgeClass(status: string): string {
+  switch (status) {
+    case "working":
+      return "mc-badge mc-badge-active";
+    case "needs-input":
+      return "mc-badge mc-badge-warn";
+    case "idle":
+      return "mc-badge mc-badge-dim";
+    default:
+      return "mc-badge mc-badge-dim";
+  }
+}
+
 export function Picker() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -42,7 +58,25 @@ export function Picker() {
           <div className="col-md-4" key={p.slug}>
             <Link to={`/p/${p.slug}`} className="mc-project-card">
               <div className="mc-project-name">{p.display_name}</div>
-              <div className="mc-project-slug">{p.slug}</div>
+              <div
+                className="mc-project-slug"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: "0.5rem",
+                }}
+              >
+                <span>{p.slug}</span>
+                {p.status && (
+                  <span
+                    className={statusBadgeClass(p.status)}
+                    title={p.status_since ? `since ${p.status_since}` : undefined}
+                  >
+                    {p.status}
+                  </span>
+                )}
+              </div>
             </Link>
           </div>
         ))}

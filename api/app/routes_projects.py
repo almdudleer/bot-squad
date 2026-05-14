@@ -1,24 +1,78 @@
 """Project list/detail routes."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.quick_status import aggregate_project_status
 from app.routes_auth import require_auth
+from app.worker_client import WorkerClient, WorkerError, WorkerRouter
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["projects"], dependencies=[Depends(require_auth)])
 
 _MAX_CONTENT_BYTES = 200 * 1024  # 200 KB
 
 
+async def _project_sessions(
+    wrouter: WorkerRouter, slug: str
+) -> list[dict]:
+    """Fan out list_sessions across every user worker; merge by sid.
+
+    Mirrors routes_sessions.list_sessions but inlined here so /api/projects
+    can derive quick-status without an extra round trip from the FE. Dead
+    workers degrade to an empty contribution (status = idle) rather than
+    502'ing the whole project list — same partial-failure shape T-0025 uses.
+    """
+    async def _one(client: WorkerClient, who: str) -> list[dict]:
+        try:
+            result = await client.call_action(
+                "list_sessions", {"slug": slug}, timeout=5.0,
+            )
+            return result.get("sessions", [])
+        except WorkerError as e:
+            log.warning("quick_status list_sessions for %s/%s failed: %s", slug, who, e)
+            return []
+        except Exception as e:
+            log.warning("quick_status list_sessions for %s/%s crashed: %s", slug, who, e)
+            return []
+
+    pairs = wrouter.all_user_workers()
+    results = await asyncio.gather(*[_one(c, u) for (u, c) in pairs])
+    merged: dict[str, dict] = {}
+    for batch in results:
+        for row in batch:
+            sid = row.get("sid")
+            if sid and sid not in merged:
+                merged[sid] = row
+    return list(merged.values())
+
+
 @router.get("")
-def list_projects(request: Request) -> list[dict]:
+async def list_projects(request: Request) -> list[dict]:
     cfg = request.app.state.api_config
-    return [
-        {"slug": p.slug, "display_name": p.display_name}
-        for p in cfg.projects.values()
-    ]
+    wrouter: WorkerRouter = request.app.state.worker_router
+
+    slugs = list(cfg.projects.keys())
+    sessions_per_project = await asyncio.gather(
+        *[_project_sessions(wrouter, s) for s in slugs]
+    )
+
+    out: list[dict] = []
+    for slug, rows in zip(slugs, sessions_per_project):
+        p = cfg.projects[slug]
+        status_info = aggregate_project_status(rows)
+        out.append({
+            "slug": p.slug,
+            "display_name": p.display_name,
+            "status": status_info["status"],
+            "status_since": status_info["status_since"],
+        })
+    return out
 
 
 @router.get("/{slug}")

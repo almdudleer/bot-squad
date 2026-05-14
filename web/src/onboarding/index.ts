@@ -4,3 +4,5 @@ export { useOnboardingStep } from "./useOnboardingStep";
 export type { OnboardingStep } from "./useOnboardingStep";
 export type { OnboardingStepId } from "./stepIds";
 export { skipAll, markSeen, hasSeen, loadOnboarding, useOnboardingState } from "./client";
+export { Typewriter } from "./Typewriter";
+export type { TypewriterProps } from "./Typewriter";

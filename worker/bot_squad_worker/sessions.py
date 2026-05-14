@@ -9,6 +9,7 @@ Session ID (SID) format: ``S-<user>-<window>-p<pane_id_no_pct>``
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -614,6 +615,51 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     return {"ok": True, "sid": new_sid}
 
 
+def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative: str) -> bool:
+    """T-0038: stamp `initiative: <basename>` into the task md's frontmatter
+    if no `initiative:` field is present.
+
+    Existing-wins: if the task already has an initiative (even a different
+    one), the file is left alone — the operator's manual classification is
+    authoritative.
+
+    Returns True iff the file was modified.
+    """
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        return False
+    path = matches[0]
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    m = re.match(r"\A---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+    if not m:
+        return False
+    fm_block = m.group(1)
+    body = m.group(2)
+    fm_lines = fm_block.splitlines()
+    for ln in fm_lines:
+        if ln.lstrip().startswith("initiative:"):
+            return False  # already set — don't clobber
+    # Insert after the `status:` line for stable ordering; if no status line,
+    # append at the end of frontmatter.
+    insert_at = len(fm_lines)
+    for i, ln in enumerate(fm_lines):
+        if ln.lstrip().startswith("status:"):
+            insert_at = i + 1
+            break
+    fm_lines.insert(insert_at, f"initiative: {initiative}")
+    new_fm = "\n".join(fm_lines)
+    content = f"---\n{new_fm}\n---\n{body}"
+    if not body.startswith("\n"):
+        content = f"---\n{new_fm}\n---\n\n{body}"
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.rename(tmp, path)
+    return True
+
+
 def spawn(
     cfg: Any,
     slug: str,
@@ -649,6 +695,22 @@ def spawn(
         marker_dir = project.repo_path / ".claude"
         marker_dir.mkdir(parents=True, exist_ok=True)
         (marker_dir / "task_id").write_text(task_id.strip())
+
+    # T-0038: when both a task and an initiative are known at spawn time,
+    # stamp the initiative onto the task md so it's queryable without grep
+    # (board group-by, filter, etc.). Existing initiative wins — operator
+    # classification is authoritative.
+    if task_id and initiative:
+        try:
+            _write_task_initiative_if_absent(
+                cfg.data_dir / slug / "backlog",
+                task_id.strip(),
+                initiative.strip(),
+            )
+        except OSError:
+            # Best-effort: the spawn itself is the source of truth; the task
+            # md stamp is a convenience for the UI.
+            pass
 
     # One tmux session per project — create lazily, never killed.
     _ensure_project_tmux_session(slug, cwd)
@@ -806,6 +868,16 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     extras.append(task_id)
     meta["extra_task_ids"] = extras
     _write_session_metadata(meta_file, meta)
+
+    # T-0038: if the dev's session carries an initiative, propagate it to
+    # the newly-bound task md (existing-wins). Lets multi-binding keep the
+    # task-to-initiative graph consistent without operator intervention.
+    sess_init = meta.get("initiative")
+    if sess_init and sess_init != "~":
+        try:
+            _write_task_initiative_if_absent(backlog_dir, task_id, sess_init)
+        except OSError:
+            pass
 
     # Read the task title for a friendlier message.
     title = ""

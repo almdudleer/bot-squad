@@ -123,6 +123,73 @@ def test_bind_task_appends_to_extras(tmp_path):
     assert meta["extra_task_ids"] == ["T-0002"]
 
 
+def test_bind_task_propagates_session_initiative_to_task_md(tmp_path):
+    """T-0038: bind_task stamps the dev's initiative onto the bound task md
+    if absent. Existing-wins."""
+    cfg = _make_cfg(tmp_path)
+    sess_md = cfg.data_dir / "test-project" / "sessions" / "S-u-w-p1.md"
+    _write_session_metadata(sess_md, {
+        "sid": "S-u-w-p1",
+        "status": "active",
+        "window": "dev1",
+        "cwd": "/tmp",
+        "claude_uuid": "uuid-1",
+        "task_id": "T-0001",
+        "initiative": "multi-server-installation-process.md",
+        "started_at": "2026-05-12T00:00:00Z",
+    })
+    _make_task(cfg, "T-0001")
+    _make_task(cfg, "T-0002")
+
+    bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
+
+    task_md = cfg.data_dir / "test-project" / "backlog" / "T-0002-foo.md"
+    txt = task_md.read_text()
+    assert "initiative: multi-server-installation-process.md" in txt
+
+
+def test_bind_task_does_not_clobber_existing_task_initiative(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    sess_md = cfg.data_dir / "test-project" / "sessions" / "S-u-w-p1.md"
+    _write_session_metadata(sess_md, {
+        "sid": "S-u-w-p1",
+        "status": "active",
+        "window": "dev1",
+        "cwd": "/tmp",
+        "claude_uuid": "uuid-1",
+        "task_id": "T-0001",
+        "initiative": "alpha.md",
+        "started_at": "2026-05-12T00:00:00Z",
+    })
+    _make_task(cfg, "T-0001")
+    # The bound task already has an initiative set; bind must not overwrite.
+    task_md = cfg.data_dir / "test-project" / "backlog" / "T-0002-foo.md"
+    task_md.write_text(
+        "---\nid: T-0002\ntitle: Some Task\nstatus: open\n"
+        "initiative: beta.md\n---\n\nbody\n"
+    )
+
+    bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
+
+    txt = task_md.read_text()
+    assert "initiative: beta.md" in txt
+    assert "initiative: alpha.md" not in txt
+
+
+def test_bind_task_no_session_initiative_leaves_task_md_alone(tmp_path):
+    """When the dev session has no initiative, no stamping happens."""
+    cfg = _make_cfg(tmp_path)
+    _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")  # initiative: ~
+    _make_task(cfg, "T-0001")
+    _make_task(cfg, "T-0002")
+
+    bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
+
+    task_md = cfg.data_dir / "test-project" / "backlog" / "T-0002-foo.md"
+    txt = task_md.read_text()
+    assert "initiative:" not in txt
+
+
 def test_bind_task_sends_peer_notification(tmp_path):
     cfg = _make_cfg(tmp_path)
     _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")

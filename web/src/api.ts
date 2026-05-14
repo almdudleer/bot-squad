@@ -45,6 +45,11 @@ export type Task = {
   progress?: string;
   // Phase 8: int sort key for Kanban ordering. null = unset (sorts last).
   priority?: number | null;
+  // T-0038: first-class linkage. `initiative` is a basename under
+  // vision/initiatives/. Missing/null = unattached.
+  initiative?: string | null;
+  parent_task?: string | null;
+  blocked_by?: string[] | null;
   path: string;
   created?: string;
   updated?: string;

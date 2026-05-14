@@ -1287,3 +1287,15 @@ hr { border-color: var(--mc-border); opacity: 1; }
   pointer-events: auto;
   max-width: 360px;
 }
+.bs-typewriter-caret {
+  display: inline-block;
+  margin-left: 1px;
+  animation: bs-typewriter-blink 0.7s steps(1) infinite;
+  color: var(--mc-amber, #d99933);
+}
+@keyframes bs-typewriter-blink {
+  50% { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .bs-typewriter-caret { animation: none; }
+}

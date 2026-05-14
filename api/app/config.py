@@ -69,11 +69,19 @@ class ApiConfig:
         return cls(config_dir=config_dir, projects=projects)
 
 
+# Sentinel written by POST /api/me/onboarding/skip. Treated by the frontend
+# as "user has seen every step", including ones that don't exist yet — so new
+# spotlight beats (T-0014..T-0022) light up dark for users who already skipped
+# without an API churn.
+ONBOARDING_SKIP_ALL = "__skip_all__"
+
+
 @dataclass(frozen=True)
 class UserMeta:
     """Per-user metadata loaded from auth.toml [user_meta.<username>]."""
     linux_user: str
     is_admin: bool = False
+    seen_steps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,9 +114,13 @@ class AuthConfig:
         meta_raw = raw.get("user_meta", {}) or {}
         user_meta: dict[str, UserMeta] = {}
         for name, m in meta_raw.items():
+            raw_steps = m.get("seen_steps", [])
+            if not isinstance(raw_steps, list):
+                raw_steps = []
             user_meta[name] = UserMeta(
                 linux_user=str(m.get("linux_user", name)),
                 is_admin=bool(m.get("is_admin", False)),
+                seen_steps=tuple(str(s) for s in raw_steps),
             )
         ttl_str = raw.get("session", {}).get("ttl", "7d")
         return cls(

@@ -31,6 +31,12 @@ def _serialize_auth_toml(users: dict[str, str], user_meta: dict, session_ttl: st
         out.append(f"[user_meta.{name}]")
         out.append(f'linux_user = "{_toml_escape(meta.linux_user)}"')
         out.append(f"is_admin = {'true' if meta.is_admin else 'false'}")
+        # Only emit seen_steps when non-empty so existing auth.toml files
+        # without onboarding state stay byte-identical on roundtrip.
+        steps = getattr(meta, "seen_steps", ()) or ()
+        if steps:
+            items = ", ".join(f'"{_toml_escape(s)}"' for s in steps)
+            out.append(f"seen_steps = [{items}]")
         out.append("")
     out.append("[session]")
     out.append(f'ttl = "{_toml_escape(session_ttl)}"')
@@ -136,7 +142,11 @@ def patch_user(username: str, request: Request, payload: dict) -> dict:
         new_is_admin = bool(payload["is_admin"])
 
     new_meta = dict(cfg.user_meta)
-    new_meta[username] = UserMeta(linux_user=new_linux_user, is_admin=new_is_admin)
+    new_meta[username] = UserMeta(
+        linux_user=new_linux_user,
+        is_admin=new_is_admin,
+        seen_steps=current.seen_steps,
+    )
 
     # Last-admin protection: refuse to demote the only remaining admin.
     if current.is_admin and not new_is_admin:

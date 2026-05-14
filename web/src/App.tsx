@@ -19,11 +19,20 @@ import { SystemSettings } from "./pages/SystemSettings";
 import { Shell } from "./components/Shell";
 
 // Mothership centralization layer — vision/architecture/mothership-seam.md.
-// Vite inlines VITE_MOTHERSHIP at build time, so the dynamic import resolves
-// to a literal `null` on single-install builds and the chunk is tree-shaken.
+// Vite inlines VITE_MOTHERSHIP at build time, so the dynamic imports resolve
+// to literal `null` on single-install builds and the chunks are tree-shaken.
 const MOTHERSHIP_ENABLED = import.meta.env.VITE_MOTHERSHIP === "1";
 const MothershipRoutes = MOTHERSHIP_ENABLED
   ? lazy(() => import("./mothership/routes"))
+  : null;
+// T-0025: on the mothership build, `/` renders the cross-server view in
+// place of the local `Picker`. Single-install builds are unaffected.
+const MothershipHome = MOTHERSHIP_ENABLED
+  ? lazy(() =>
+      import("./mothership/AllProjects").then((m) => ({
+        default: m.AllProjects,
+      })),
+    )
   : null;
 
 export function App() {
@@ -35,7 +44,20 @@ export function App() {
 
         {/* Everything else inside the Shell sidebar layout */}
         <Route element={<Shell />}>
-          <Route path="/" element={<Picker />} />
+          <Route
+            path="/"
+            element={
+              MothershipHome ? (
+                <Suspense
+                  fallback={<div className="mc-loading">Loading mothership…</div>}
+                >
+                  <MothershipHome />
+                </Suspense>
+              ) : (
+                <Picker />
+              )
+            }
+          />
           <Route path="/help" element={<Help />} />
           <Route path="/p/:slug" element={<Project />} />
           <Route path="/p/:slug/t/:id" element={<TaskDetail />} />

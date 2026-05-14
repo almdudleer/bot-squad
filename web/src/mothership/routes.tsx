@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Routes, Route, Link, useNavigate, useParams } from "react-router-dom";
 import { mothershipApi, type Checkpoint, type NewServer } from "./api";
+import { AllProjects } from "./AllProjects";
 
 /**
  * Mothership centralization-layer routes. Mounted under /m/* in App.tsx
@@ -284,6 +285,7 @@ function NotFound() {
 export default function MothershipRoutes() {
   return (
     <Routes>
+      <Route index element={<AllProjects />} />
       <Route path="servers/add" element={<AddServer />} />
       <Route path="servers/:id" element={<ServerProgress />} />
       <Route path="*" element={<NotFound />} />

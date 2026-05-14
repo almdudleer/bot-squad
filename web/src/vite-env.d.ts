@@ -14,3 +14,11 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+// `?raw` imports for plain-text assets (e.g. the chat-agent install prompt
+// the mothership wizard renders inline). Vite ships the loader; this
+// declaration just teaches TS that the suffixed path resolves to a string.
+declare module "*.txt?raw" {
+  const content: string;
+  export default content;
+}

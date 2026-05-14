@@ -7,6 +7,10 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
+# Mothership add-server wizard ?raw-imports the canonical chat-agent
+# install prompt from scripts/install/. Sibling path to /web so the
+# `../scripts/...` resolution from vite/Rollup matches local dev.
+COPY scripts/install /scripts/install
 RUN npm run build
 
 FROM python:3.12-slim AS api

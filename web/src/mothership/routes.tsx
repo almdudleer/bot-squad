@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { Routes, Route, Link, useNavigate, useParams } from "react-router-dom";
-import { mothershipApi, type Checkpoint, type NewServer } from "./api";
+import { Routes, Route, Link, useParams } from "react-router-dom";
+import { type Checkpoint } from "./api";
 import { AllProjects } from "./AllProjects";
+import { AddServerWizard } from "./AddServerWizard";
 
 /**
  * Mothership centralization-layer routes. Mounted under /m/* in App.tsx
@@ -9,16 +10,13 @@ import { AllProjects } from "./AllProjects";
  * literal at build time, so this module is tree-shaken from the single-
  * install bundle).
  *
- * What lives here (T-0024 scope):
- *   /m/servers/add     — minimal create-server form (POST /api/m/servers)
- *   /m/servers/:id     — install-checkpoint progress view (SSE)
- *
- * The full add-server wizard (the §3.0-3.3 Q-and-A flow that generates
- * the copyable install prompts for each pathway) is T-0031 — it consumes
- * the same /api/m/servers + SSE endpoints but wraps them in a richer UI.
- *
- * T-0025 will land /m (cross-server all-projects view) + T-0023 will land
- * apiFor(serverId) for talking to attached servers.
+ * What lives here:
+ *   /m                 — cross-server all-projects view (T-0025).
+ *   /m/servers/add     — the §3.0–§3.3 Q&A wizard (T-0031), which mints
+ *                        an install token via POST /api/m/servers and
+ *                        auto-transitions to /m/servers/:id on the first
+ *                        SSE checkpoint.
+ *   /m/servers/:id     — install-checkpoint progress view (T-0024).
  *
  * Contract: vision/architecture/mothership-seam.md.
  */
@@ -50,141 +48,6 @@ function coalesce(events: Checkpoint[]): Checkpoint[] {
     byName.set(ev.checkpoint, ev);
   }
   return Array.from(byName.values());
-}
-
-function AddServer() {
-  const navigate = useNavigate();
-  const [displayName, setDisplayName] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [minted, setMinted] = useState<NewServer | null>(null);
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSubmitting(true);
-    setError(null);
-    try {
-      const out = await mothershipApi.createServer(displayName.trim(), baseUrl.trim());
-      setMinted(out);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  if (minted) {
-    const oneLiner = `curl -fsSL "${minted.install_url}" | bash`;
-    return (
-      <div className="container py-4" style={{ maxWidth: 720 }}>
-        <div className="mc-section-title">Mothership · install link issued</div>
-        <p style={{ color: "var(--mc-text-dim)", fontSize: "0.85rem" }}>
-          Run the one-liner below on the target server. The wizard moves to
-          the next step automatically as soon as the installer makes its
-          first call back to the mothership.
-        </p>
-        <pre className="mc-code-block" style={{
-          padding: "0.75rem 1rem",
-          background: "var(--mc-surface)",
-          border: "1px solid var(--mc-border)",
-          borderRadius: 4,
-          overflowX: "auto",
-          fontSize: 12,
-          margin: "0.75rem 0",
-        }}>
-          {oneLiner}
-        </pre>
-        <p style={{ color: "var(--mc-text-dim)", fontSize: "0.78rem" }}>
-          Token expires {minted.expires_at ?? "in 24 hours"}. The bundle GETs
-          are idempotent — re-running the installer reuses the same token
-          until it expires or the install completes.
-        </p>
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "1rem" }}>
-          <Link
-            to={`/m/servers/${minted.id}`}
-            className="mc-badge mc-badge-info"
-            style={{ textDecoration: "none", padding: "6px 14px" }}
-          >
-            watch install progress →
-          </Link>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="container py-4" style={{ maxWidth: 560 }}>
-      <div className="mc-section-title">Mothership · add server</div>
-      <form onSubmit={onSubmit} style={{ display: "grid", gap: "0.75rem", marginTop: "1rem" }}>
-        <label style={{ display: "grid", gap: 4, fontSize: 12, letterSpacing: "0.05em" }}>
-          <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase" }}>display name</span>
-          <input
-            required
-            autoFocus
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            placeholder="e.g. mothership-staging"
-            style={{
-              padding: "6px 10px",
-              background: "var(--mc-surface)",
-              border: "1px solid var(--mc-border)",
-              color: "var(--mc-text)",
-              fontFamily: "var(--mc-mono)",
-              fontSize: 13,
-              borderRadius: 3,
-            }}
-          />
-        </label>
-        <label style={{ display: "grid", gap: 4, fontSize: 12, letterSpacing: "0.05em" }}>
-          <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase" }}>base url</span>
-          <input
-            required
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="https://bot-squad.example.com"
-            style={{
-              padding: "6px 10px",
-              background: "var(--mc-surface)",
-              border: "1px solid var(--mc-border)",
-              color: "var(--mc-text)",
-              fontFamily: "var(--mc-mono)",
-              fontSize: 13,
-              borderRadius: 3,
-            }}
-          />
-        </label>
-        {error && (
-          <div className="mc-badge mc-badge-danger" style={{ alignSelf: "start" }}>
-            {error}
-          </div>
-        )}
-        <div style={{ display: "flex", gap: "0.5rem" }}>
-          <button
-            type="submit"
-            disabled={submitting}
-            className="mc-badge mc-badge-info"
-            style={{
-              padding: "8px 18px",
-              cursor: submitting ? "wait" : "pointer",
-              background: "transparent",
-              fontSize: 12,
-            }}
-          >
-            {submitting ? "issuing…" : "issue install link"}
-          </button>
-          <button
-            type="button"
-            onClick={() => navigate("/m")}
-            className="mc-badge mc-badge-dim"
-            style={{ padding: "8px 18px", cursor: "pointer", background: "transparent", fontSize: 12 }}
-          >
-            cancel
-          </button>
-        </div>
-      </form>
-    </div>
-  );
 }
 
 function ServerProgress() {
@@ -286,7 +149,7 @@ export default function MothershipRoutes() {
   return (
     <Routes>
       <Route index element={<AllProjects />} />
-      <Route path="servers/add" element={<AddServer />} />
+      <Route path="servers/add" element={<AddServerWizard />} />
       <Route path="servers/:id" element={<ServerProgress />} />
       <Route path="*" element={<NotFound />} />
     </Routes>

@@ -276,6 +276,15 @@ export function Shell() {
           </li>
           <li>
             <NavLink
+              to="/me"
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+            >
+              <span className="mc-nav-diamond">◇</span>
+              MY PROFILE
+            </NavLink>
+          </li>
+          <li>
+            <NavLink
               to="/help"
               className={({ isActive }) => (isActive ? "active" : undefined)}
             >

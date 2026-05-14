@@ -37,6 +37,11 @@ def _serialize_auth_toml(users: dict[str, str], user_meta: dict, session_ttl: st
         if steps:
             items = ", ".join(f'"{_toml_escape(s)}"' for s in steps)
             out.append(f"seen_steps = [{items}]")
+        # Only emit tg_chat_id when bound — keeps unbound users byte-identical
+        # on roundtrip (same shape as seen_steps above).
+        tg_chat_id = getattr(meta, "tg_chat_id", "") or ""
+        if tg_chat_id:
+            out.append(f'tg_chat_id = "{_toml_escape(tg_chat_id)}"')
         out.append("")
     out.append("[session]")
     out.append(f'ttl = "{_toml_escape(session_ttl)}"')
@@ -146,6 +151,7 @@ def patch_user(username: str, request: Request, payload: dict) -> dict:
         linux_user=new_linux_user,
         is_admin=new_is_admin,
         seen_steps=current.seen_steps,
+        tg_chat_id=current.tg_chat_id,
     )
 
     # Last-admin protection: refuse to demote the only remaining admin.

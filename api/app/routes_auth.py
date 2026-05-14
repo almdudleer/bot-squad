@@ -44,7 +44,7 @@ def logout(response: Response) -> dict:
 
 
 def _enrich(claims: dict, request: Request) -> dict:
-    """Attach linux_user + is_admin from auth_config.user_meta to the JWT claims."""
+    """Attach linux_user + is_admin (+ tg_chat_id) from auth_config.user_meta to the JWT claims."""
     username = claims.get("username", "")
     cfg = request.app.state.auth_config
     meta = cfg.meta_for(username)
@@ -52,6 +52,7 @@ def _enrich(claims: dict, request: Request) -> dict:
         "username": username,
         "linux_user": meta.linux_user,
         "is_admin": meta.is_admin,
+        "tg_chat_id": meta.tg_chat_id,
     }
 
 

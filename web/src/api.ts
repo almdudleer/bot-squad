@@ -19,6 +19,11 @@ async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
 export type Project = {
   slug: string;
   display_name: string;
+  // T-0016 quick-status. Canonical enum locked with T-0025: any unknown
+  // string is tolerated for forward-compat but won't be painted as a
+  // coloured pill. See vision/multi-server/quick-status.md.
+  status?: "working" | "needs-input" | "idle" | string;
+  status_since?: string | null;
 };
 
 export type ProjectDetail = Project & {
@@ -135,6 +140,14 @@ export type Me = {
   username: string;
   linux_user: string;
   is_admin: boolean;
+  tg_chat_id?: string | null;
+};
+
+export type MeProfile = {
+  username: string;
+  linux_user: string;
+  is_admin: boolean;
+  tg_chat_id: string | null;
 };
 
 export type UserRow = {
@@ -362,5 +375,15 @@ export const api = {
     call<PutSystemSettingsResult>("/api/system-settings", {
       method: "PUT",
       body: JSON.stringify(body),
+    }),
+  getMyProfile: () => call<MeProfile>("/api/me"),
+  putMyTgChatId: (tg_chat_id: string) =>
+    call<MeProfile>("/api/me/tg-chat-id", {
+      method: "PUT",
+      body: JSON.stringify({ tg_chat_id }),
+    }),
+  testMyTgChatId: () =>
+    call<{ ok: boolean; sent: boolean }>("/api/me/tg-chat-id/test", {
+      method: "POST",
     }),
 };

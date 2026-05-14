@@ -16,6 +16,7 @@ import { Workflow } from "./pages/Workflow";
 import { Help } from "./pages/Help";
 import { Users } from "./pages/Users";
 import { SystemSettings } from "./pages/SystemSettings";
+import { Profile } from "./pages/Profile";
 import { Shell } from "./components/Shell";
 
 // Mothership centralization layer — vision/architecture/mothership-seam.md.
@@ -72,6 +73,7 @@ export function App() {
           <Route path="/scheduler" element={<Scheduler />} />
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />
+          <Route path="/me" element={<Profile />} />
           {MothershipRoutes && (
             <Route
               path="/m/*"

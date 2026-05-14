@@ -283,6 +283,18 @@ export function Shell() {
               HELP
             </NavLink>
           </li>
+          {/* Mothership-only — vision/architecture/mothership-seam.md sidebar nav. */}
+          {import.meta.env.VITE_MOTHERSHIP === "1" && (
+            <li>
+              <NavLink
+                to="/m/servers/add"
+                className={({ isActive }) => (isActive ? "active" : undefined)}
+              >
+                <span className="mc-nav-diamond">◇</span>
+                SERVERS
+              </NavLink>
+            </li>
+          )}
           {isAdmin && (
             <>
               <li>

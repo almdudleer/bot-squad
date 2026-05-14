@@ -82,6 +82,9 @@ class UserMeta:
     linux_user: str
     is_admin: bool = False
     seen_steps: tuple[str, ...] = ()
+    # Telegram chat id bound to this user (per T-0019). Empty means unbound.
+    # Disambiguated from the per-project `tg_chat` with the `_id` suffix.
+    tg_chat_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,7 @@ class AuthConfig:
                 linux_user=str(m.get("linux_user", name)),
                 is_admin=bool(m.get("is_admin", False)),
                 seen_steps=tuple(str(s) for s in raw_steps),
+                tg_chat_id=str(m.get("tg_chat_id", "")),
             )
         ttl_str = raw.get("session", {}).get("ttl", "7d")
         return cls(

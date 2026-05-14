@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import tomllib
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.config import ApiConfig
 from app.quick_status import aggregate_project_status
-from app.routes_auth import require_auth
+from app.routes_auth import require_admin, require_auth
 from app.worker_client import WorkerClient, WorkerError, WorkerRouter
 
 log = logging.getLogger(__name__)
@@ -16,6 +20,8 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/projects", tags=["projects"], dependencies=[Depends(require_auth)])
 
 _MAX_CONTENT_BYTES = 200 * 1024  # 200 KB
+
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 async def _project_sessions(
@@ -73,6 +79,109 @@ async def list_projects(request: Request) -> list[dict]:
             "status_since": status_info["status_since"],
         })
     return out
+
+
+def _toml_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _serialize_projects_toml(projects_raw: dict[str, dict]) -> str:
+    """Hand-rolled writer for projects.toml.
+
+    Mirrors _serialize_auth_toml in routes_users.py: strict, key-ordered,
+    no third-party dep. Each project block emits the full Project schema
+    (loader requires every key) — missing fields default to "" / [].
+    """
+    out: list[str] = []
+    out.append("# bot-squad project registry. Managed by /api/projects.")
+    out.append("")
+    for slug in sorted(projects_raw):
+        p = projects_raw[slug]
+        out.append(f"[projects.{slug}]")
+        for key in (
+            "slug", "display_name", "repo_path",
+            "deploy_branch", "master_branch",
+            "prod_url", "staging_url", "dev_url",
+        ):
+            out.append(f'{key} = "{_toml_escape(str(p.get(key, "")))}"')
+        targets = p.get("deploy_targets") or []
+        items = ", ".join(f'"{_toml_escape(str(t))}"' for t in targets)
+        out.append(f"deploy_targets = [{items}]")
+        out.append(f'tg_chat = "{_toml_escape(str(p.get("tg_chat", "")))}"')
+        out.append("")
+    return "\n".join(out)
+
+
+def _read_projects_toml(config_dir: Path) -> dict[str, dict]:
+    raw = tomllib.loads((config_dir / "projects.toml").read_text())
+    return dict(raw.get("projects", {}))
+
+
+@router.post("", status_code=201)
+def create_project(
+    request: Request,
+    payload: dict,
+    _admin: dict = Depends(require_admin),
+) -> dict:
+    cfg: ApiConfig = request.app.state.api_config
+    slug = (payload.get("slug") or "").strip()
+    display_name = (payload.get("display_name") or "").strip()
+    repo_path = (payload.get("repo_path") or "").strip()
+
+    if not slug:
+        raise HTTPException(status_code=400, detail="slug required")
+    if not _SLUG_RE.match(slug):
+        raise HTTPException(
+            status_code=400,
+            detail="slug must match ^[a-z][a-z0-9_-]*$",
+        )
+    if not display_name:
+        raise HTTPException(status_code=400, detail="display_name required")
+    if slug in cfg.projects:
+        raise HTTPException(status_code=400, detail=f"project already exists: {slug}")
+
+    # Re-read on-disk so a hand-edited projects.toml isn't clobbered. The
+    # in-memory cfg.projects is loaded once at app start; any out-of-band edit
+    # would be lost if we serialized cfg.projects directly.
+    config_dir = cfg.config_dir
+    new_raw = _read_projects_toml(config_dir)
+    if slug in new_raw:
+        raise HTTPException(status_code=400, detail=f"project already exists: {slug}")
+    new_raw[slug] = {
+        "slug": slug,
+        "display_name": display_name,
+        "repo_path": repo_path,
+        "deploy_branch": "",
+        "master_branch": "",
+        "prod_url": "",
+        "staging_url": "",
+        "dev_url": "",
+        "deploy_targets": [],
+        "tg_chat": "",
+    }
+
+    text = _serialize_projects_toml(new_raw)
+    path = config_dir / "projects.toml"
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(text)
+    os.rename(tmp, path)
+
+    data_dir = cfg.project_data_dir(slug)
+    for sub in ("backlog", "vision", "feedback", "sessions"):
+        (data_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # Hot-reload the API's view; the worker still reads projects.toml on
+    # startup, so peer/session routing for this slug requires a worker
+    # restart. TODO: a worker `reload_projects` action — separate ticket,
+    # out of scope for the minimal create affordance.
+    request.app.state.api_config = ApiConfig.load(config_dir)
+
+    return {
+        "slug": slug,
+        "display_name": display_name,
+        "status": "idle",
+        "status_since": None,
+    }
 
 
 @router.get("/{slug}")

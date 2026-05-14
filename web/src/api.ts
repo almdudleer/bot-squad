@@ -190,6 +190,11 @@ export const api = {
   health: () => call("/api/health"),
   me: () => call<Me>("/api/auth/me"),
   projects: () => call<Project[]>("/api/projects"),
+  createProject: (slug: string, display_name: string, repo_path?: string) =>
+    call<Project>("/api/projects", {
+      method: "POST",
+      body: JSON.stringify({ slug, display_name, repo_path }),
+    }),
   project: (slug: string) => call<ProjectDetail>(`/api/projects/${slug}`),
   repoAgentsMd: (slug: string) =>
     call<{ content: string }>(`/api/projects/${slug}/repo-agents-md`),

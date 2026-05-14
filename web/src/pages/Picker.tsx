@@ -1,7 +1,26 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, Project } from "../api";
+import { Modal } from "../components/Modal";
 import { Coachmark, Typewriter, useOnboardingStep } from "../onboarding";
+
+// Auto-derive a slug from a display name on the fly so users only have to
+// type one of the two. Lowercase, replace runs of non-alnum with '-', strip
+// leading non-letter chars to satisfy the server's ^[a-z][a-z0-9_-]*$.
+function deriveSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[^a-z]+/, "")
+    .replace(/-+$/g, "");
+}
+
+interface NewProjectState {
+  display_name: string;
+  slug: string;
+  slug_touched: boolean;
+  repo_path: string;
+}
 
 // Mirror T-0025's statusBadgeClass so single-server and cross-server views
 // paint the same colours from the same enum. Unknown strings fall back to
@@ -22,6 +41,10 @@ function statusBadgeClass(status: string): string {
 export function Picker() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  const [creating, setCreating] = useState<NewProjectState | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [createSaving, setCreateSaving] = useState(false);
 
   // T-0018 / §9.4: the slug of the first project on the picker that hosts a
   // session NOT prefixed with the current user's `S-<linux_user>-…` SID.
@@ -30,9 +53,37 @@ export function Picker() {
   const [alienSlug, setAlienSlug] = useState<string | null>(null);
   const existingStep = useOnboardingStep("srv.9_4.existing_projects");
 
-  useEffect(() => {
+  function reload() {
     api.projects().then(setProjects).catch((e) => setError(String(e)));
+  }
+
+  useEffect(() => {
+    reload();
+    api.me().then((m) => setIsAdmin(Boolean(m.is_admin))).catch(() => {});
   }, []);
+
+  async function submitCreate() {
+    if (!creating) return;
+    if (!creating.display_name.trim() || !creating.slug.trim()) {
+      setCreateError("display name and slug required");
+      return;
+    }
+    setCreateSaving(true);
+    setCreateError(null);
+    try {
+      await api.createProject(
+        creating.slug.trim(),
+        creating.display_name.trim(),
+        creating.repo_path.trim() || undefined,
+      );
+      setCreating(null);
+      reload();
+    } catch (e) {
+      setCreateError(String(e));
+    } finally {
+      setCreateSaving(false);
+    }
+  }
 
   // Alien-detection scan: only runs while §9.4 is still pending (gated on
   // existingStep.visible) so dismissing the coachmark also stops the
@@ -117,8 +168,26 @@ export function Picker() {
         />
       )}
 
-      <div className="d-flex align-items-center gap-2 mb-4">
+      <div className="d-flex align-items-center justify-content-between mb-4">
         <div className="mc-section-title" style={{ margin: 0 }}>Projects</div>
+        {isAdmin && (
+          <button
+            type="button"
+            className="btn btn-outline-primary btn-sm"
+            style={{ fontSize: "0.72rem" }}
+            data-onboarding-anchor="create-project"
+            onClick={() =>
+              setCreating({
+                display_name: "",
+                slug: "",
+                slug_touched: false,
+                repo_path: "",
+              })
+            }
+          >
+            + New project
+          </button>
+        )}
       </div>
 
       {error && <div className="alert alert-danger">{error}</div>}
@@ -166,6 +235,72 @@ export function Picker() {
           </div>
         ))}
       </div>
+
+      <Modal
+        open={creating !== null}
+        title="New project"
+        onClose={() => setCreating(null)}
+        footer={
+          <>
+            <button type="button" className="btn btn-secondary" onClick={() => setCreating(null)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={submitCreate}
+              disabled={createSaving}
+            >
+              {createSaving ? "Creating…" : "Create"}
+            </button>
+          </>
+        }
+      >
+        {createError && <div className="alert alert-danger">{createError}</div>}
+        <div className="mb-3">
+          <label className="form-label">Display name *</label>
+          <input
+            className="form-control"
+            value={creating?.display_name ?? ""}
+            onChange={(e) => {
+              if (!creating) return;
+              const display_name = e.target.value;
+              setCreating({
+                ...creating,
+                display_name,
+                slug: creating.slug_touched
+                  ? creating.slug
+                  : deriveSlug(display_name),
+              });
+            }}
+            autoFocus
+          />
+        </div>
+        <div className="mb-3">
+          <label className="form-label">Slug *</label>
+          <input
+            className="form-control"
+            style={{ fontFamily: "var(--mc-mono)" }}
+            value={creating?.slug ?? ""}
+            onChange={(e) =>
+              creating && setCreating({ ...creating, slug: e.target.value, slug_touched: true })
+            }
+            placeholder="lowercase, letters/digits/-/_"
+          />
+        </div>
+        <div className="mb-3">
+          <label className="form-label">Repo path</label>
+          <input
+            className="form-control"
+            style={{ fontFamily: "var(--mc-mono)" }}
+            value={creating?.repo_path ?? ""}
+            onChange={(e) =>
+              creating && setCreating({ ...creating, repo_path: e.target.value })
+            }
+            placeholder="optional — fill in projects.toml later"
+          />
+        </div>
+      </Modal>
     </div>
   );
 }

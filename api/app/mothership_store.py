@@ -27,20 +27,39 @@ Schema (frozen by ``vision/architecture/mothership-seam.md``)::
       ]
     }
 
-This module ships the read path + write helper only. T-0024 grows it with
-``register_server`` / ``consume_install_token`` / ``set_server_bearer``;
-T-0023 grows it with ``update_projects_cache``. Detach build: delete this
-file alongside ``routes_mothership.py``.
+T-0024 adds the install-token + connect lifecycle helpers + a per-server
+checkpoint log under ``DATA_DIR/_mothership/checkpoints/<server_id>.jsonl``.
+T-0023 will grow this with ``update_projects_cache``.
+
+Detach build: delete this file alongside ``routes_mothership.py``.
 """
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+import secrets
+import threading
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from app.install_tokens import (
+    hash_token,
+    mint_install_token,
+    mint_server_bearer,
+)
 
 
 SCHEMA_VERSION = 1
+INSTALL_TOKEN_TTL_SECONDS = 24 * 3600
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_utc(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
 @dataclass(frozen=True)
@@ -65,9 +84,23 @@ class AttachedServer:
 
 
 class MothershipStore:
+    """File-backed registry with a process-wide mutation lock.
+
+    Reads are lockless — the JSON file is rewritten atomically via rename
+    so a concurrent reader either sees the old snapshot or the new one,
+    never a partial write. Mutating helpers (``register_server``,
+    ``consume_install_token``, ``set_server_bearer``) acquire a class-level
+    threading lock so multiple HTTP requests in the same process can't
+    interleave their read-modify-write windows.
+    """
+
+    _lock = threading.Lock()
+
     def __init__(self, root: Path) -> None:
         self.root = root
         self.servers_path = root / "servers.json"
+
+    # ---- raw read / write ----------------------------------------------------
 
     def _read(self) -> dict:
         if not self.servers_path.exists():
@@ -89,3 +122,220 @@ class MothershipStore:
             encoding="utf-8",
         )
         os.rename(tmp, self.servers_path)
+
+    # ---- lookups -------------------------------------------------------------
+
+    def get_server(self, server_id: str) -> AttachedServer | None:
+        for s in self.list_servers():
+            if s.id == server_id:
+                return s
+        return None
+
+    def server_by_install_token(self, token: str) -> AttachedServer | None:
+        """Hash + TTL check on the install_token, no burn.
+
+        Returns ``None`` for unknown OR expired tokens — callers should
+        not distinguish the two over the wire (always 410 Gone) so the
+        installer's structured "what + how" message is identical in
+        both cases.
+        """
+        h = hash_token(token)
+        for s in self.list_servers():
+            if s.install_token_hash != h:
+                continue
+            if not s.install_token_expires_at:
+                return None
+            if datetime.now(timezone.utc) > _parse_utc(s.install_token_expires_at):
+                return None
+            return s
+        return None
+
+    def server_by_bearer(self, bearer: str) -> AttachedServer | None:
+        h = hash_token(bearer)
+        for s in self.list_servers():
+            if s.server_bearer_hash == h:
+                return s
+        return None
+
+    # ---- mutations -----------------------------------------------------------
+
+    def register_server(
+        self,
+        *,
+        display_name: str,
+        base_url: str,
+        owner_user: str,
+        ttl_seconds: int = INSTALL_TOKEN_TTL_SECONDS,
+    ) -> tuple[AttachedServer, str]:
+        """Create a pending server entry, mint a fresh install_token.
+
+        Returns ``(entry, plaintext_install_token)``. The plaintext is the
+        ONLY copy that ever exits the API process — it's embedded in the
+        install URL we hand back to the UI, and the registry only ever
+        stores its SHA-256.
+        """
+        token = mint_install_token()
+        token_hash = hash_token(token)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+        entry = AttachedServer(
+            id=f"srv_{secrets.token_hex(12)}",
+            display_name=display_name,
+            base_url=base_url,
+            owner_user=owner_user,
+            created_at=_utc_now_iso(),
+            install_state="pending",
+            install_token_hash=token_hash,
+            install_token_expires_at=expires.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        )
+        with self._lock:
+            servers = self.list_servers()
+            servers.append(entry)
+            self.write(servers)
+        return entry, token
+
+    def consume_install_token(
+        self,
+        token: str,
+        server_meta: dict | None = None,  # noqa: ARG002 — reserved for later
+    ) -> tuple[AttachedServer, str] | None:
+        """Validate + burn the install_token, mint a server_bearer.
+
+        Returns ``(updated_entry, plaintext_server_bearer)`` on success or
+        ``None`` if the token is unknown, expired, or already burned
+        (all map to 410 Gone at the HTTP layer — see the bearer rotation
+        section in ``mothership-seam.md``).
+        """
+        h = hash_token(token)
+        bearer = mint_server_bearer()
+        bearer_hash = hash_token(bearer)
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.install_token_hash != h:
+                    continue
+                if not s.install_token_expires_at:
+                    return None
+                if now > _parse_utc(s.install_token_expires_at):
+                    return None
+                updated = replace(
+                    s,
+                    install_state="connected",
+                    install_token_hash=None,
+                    install_token_expires_at=None,
+                    server_bearer_hash=bearer_hash,
+                    last_seen_at=_utc_now_iso(),
+                )
+                servers[i] = updated
+                self.write(servers)
+                # T-0023 proxy contract: persist the plaintext to the
+                # bearer sidecar inside the same lock so the registry row
+                # and the on-disk plaintext never disagree. If the sidecar
+                # write raises, the install_token is already burned —
+                # documented as a v1 limitation in mothership-seam.md.
+                self.store_server_bearer(updated.id, bearer)
+                return updated, bearer
+        return None
+
+    def set_server_bearer(self, server_id: str, bearer_hash: str | None) -> None:
+        """Replace the server_bearer_hash (or clear it on revoke)."""
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id == server_id:
+                    servers[i] = replace(s, server_bearer_hash=bearer_hash)
+                    self.write(servers)
+                    return
+
+    # ---- bearer sidecar (T-0023 contract) -----------------------------------
+    # The registry stores only the SHA-256 of the server_bearer. The T-0023
+    # per-server proxy needs the plaintext to forward as a bearer to the
+    # target server. We keep it in a sidecar file mode 0600 next to the
+    # registry — never in the JSON itself, so a registry leak via logging
+    # or an audit dump still doesn't disclose the active bearers.
+
+    def _bearers_dir(self) -> Path:
+        return self.root / "bearers"
+
+    def _bearer_path(self, server_id: str) -> Path:
+        return self._bearers_dir() / server_id
+
+    def store_server_bearer(self, server_id: str, bearer: str) -> None:
+        d = self._bearers_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = self._bearer_path(server_id)
+        tmp = path.with_suffix(".tmp")
+        # Owner-only mode 0600. We chmod the tempfile before rename so the
+        # final file inherits the restrictive mode on inode reuse.
+        with os.fdopen(
+            os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(bearer)
+        os.chmod(tmp, 0o600)
+        os.rename(tmp, path)
+
+    def read_server_bearer(self, server_id: str) -> str | None:
+        path = self._bearer_path(server_id)
+        if not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8").strip() or None
+
+    def forget_server_bearer(self, server_id: str) -> None:
+        path = self._bearer_path(server_id)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def touch_last_seen(self, server_id: str) -> None:
+        """Stamp ``last_seen_at`` on the registry entry."""
+        now = _utc_now_iso()
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id == server_id:
+                    servers[i] = replace(s, last_seen_at=now)
+                    self.write(servers)
+                    return
+
+    # ---- checkpoint log ------------------------------------------------------
+
+    def _checkpoints_dir(self) -> Path:
+        return self.root / "checkpoints"
+
+    def append_checkpoint(self, server_id: str, event: dict) -> dict:
+        """Append a checkpoint event to the per-server JSONL log.
+
+        The event is stamped with a server-side ``received_at`` so the SSE
+        consumer has a trustworthy ordering signal — installer ``ts`` is
+        advisory because the installer's clock can drift.
+        """
+        stamped = {**event, "received_at": _utc_now_iso()}
+        log_dir = self._checkpoints_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / f"{server_id}.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(stamped) + "\n")
+        return stamped
+
+    def read_checkpoints(self, server_id: str) -> list[dict]:
+        path = self._checkpoints_dir() / f"{server_id}.jsonl"
+        if not path.exists():
+            return []
+        out: list[dict] = []
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # A partial line from a torn write would be the worst
+                    # case here, and we'd rather show the user the events
+                    # we can parse than 500 the SSE handshake.
+                    continue
+        return out

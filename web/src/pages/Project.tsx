@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
-import { api, Task, VisionFile } from "../api";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { api, SessionRow, Task, VisionFile } from "../api";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
+import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 
@@ -71,6 +72,7 @@ export function Project() {
   const { slug = "" } = useParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [vision, setVision] = useState<VisionFile[]>([]);
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   // T-0039: view controls. Defaults reproduce the pre-T-0039 board exactly.
@@ -104,6 +106,10 @@ export function Project() {
   useEffect(() => {
     reload();
     api.vision(slug).then(setVision).catch(() => setVision([]));
+    api
+      .sessions(slug)
+      .then((rows) => setSessions(rows.filter((s) => !s.archived)))
+      .catch(() => setSessions([]));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
@@ -379,6 +385,39 @@ export function Project() {
 
   return (
     <div className="container py-4">
+      {/* T-0006: active-sessions strip — quick way to copy the tmux attach for
+          any live session on this project without bouncing through the
+          Sessions page. Hidden when no live sessions exist. */}
+      {sessions.length > 0 && (
+        <div
+          className="mb-3 d-flex flex-wrap align-items-center gap-3"
+          style={{
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.74rem",
+            padding: "0.5rem 0.75rem",
+            background: "var(--mc-surface-deep)",
+            border: "1px solid var(--mc-border)",
+            borderRadius: 3,
+          }}
+        >
+          <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Active sessions
+          </span>
+          {sessions.map((s) => (
+            <span key={s.sid} style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}>
+              <Link
+                to={`/p/${slug}/sessions`}
+                style={{ color: "var(--mc-accent)", textDecoration: "none" }}
+                title={s.sid}
+              >
+                {s.window}
+              </Link>
+              <CopyableTmuxAttach session={s.sid} window={s.window} />
+            </span>
+          ))}
+        </div>
+      )}
+
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Backlog</h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>

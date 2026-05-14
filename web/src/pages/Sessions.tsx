@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
 import { api, SessionRow, Task, VisionFile } from "../api";
+import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 
 import { PageHelp } from "../components/PageHelp";
@@ -79,6 +80,12 @@ export function Sessions() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [modalInfo, setModalInfo] = useState<string | null>(null);
   const [spawning, setSpawning] = useState(false);
+
+  // T-0006: post-spawn toast surfacing the copyable tmux attach for the
+  // session that just appeared. Computed by diffing the SID set before and
+  // after the spawn call so we don't need a return-value contract change on
+  // api.spawnSession.
+  const [spawnNotice, setSpawnNotice] = useState<{ sid: string; window: string } | null>(null);
 
   // Send-message modal (cross-session bus)
   const [sendOpen, setSendOpen] = useState(false);
@@ -450,6 +457,11 @@ export function Sessions() {
           {/* Window */}
           <td style={{ fontSize: "0.83rem" }}>{s.window}</td>
 
+          {/* Attach (T-0006) */}
+          <td onClick={(e) => e.stopPropagation()}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          </td>
+
           {/* Role */}
           <td>
             {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
@@ -573,7 +585,7 @@ export function Sessions() {
             </div>
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 10)}
+        {isOpen && renderDetailRow(s, 11)}
       </Fragment>
     );
   }
@@ -608,6 +620,9 @@ export function Sessions() {
             </code>
           </td>
           <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
+          <td onClick={(e) => e.stopPropagation()}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          </td>
           <td>
             {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
               (s.linked_tasks ?? []).length > 0) ? (
@@ -644,7 +659,7 @@ export function Sessions() {
             </div>
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 8)}
+        {isOpen && renderDetailRow(s, 9)}
       </Fragment>
     );
   }
@@ -657,6 +672,7 @@ export function Sessions() {
     setSpawning(true);
     setModalError(null);
     try {
+      const before = new Set((sessions ?? []).map((s) => s.sid));
       await api.spawnSession(
         slug,
         newWindow.trim(),
@@ -664,8 +680,22 @@ export function Sessions() {
         undefined,
         newInitiative || undefined,
       );
+      // T-0006: reload inline so we can diff old/new SIDs and surface the
+      // attach command for the freshly spawned session.
+      try {
+        const after = await api.sessions(slug);
+        setSessions(after);
+        setError(null);
+        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
+        if (fresh) {
+          setSpawnNotice({ sid: fresh.sid, window: fresh.window });
+        }
+      } catch {
+        // Best-effort: if the post-spawn fetch fails, fall back to the
+        // regular poll loop.
+        load();
+      }
       setModalOpen(false);
-      load();
     } catch (e: unknown) {
       setModalError(String(e));
     } finally {
@@ -733,6 +763,32 @@ export function Sessions() {
         </div>
       </PageHelp>
 
+      {/* T-0006: post-spawn toast. Dismisses on click of the close button,
+          stays sticky until then so the user has time to copy the command. */}
+      {spawnNotice && (
+        <div
+          className="alert alert-success d-flex justify-content-between align-items-center flex-wrap gap-2"
+          role="status"
+        >
+          <span style={{ fontSize: "0.85rem" }}>
+            Spawned <code style={{ fontFamily: "var(--mc-mono)" }}>{spawnNotice.window}</code>.
+            Attach with:{" "}
+            <CopyableTmuxAttach
+              session={spawnNotice.sid}
+              window={spawnNotice.window}
+              size="md"
+            />
+          </span>
+          <button
+            type="button"
+            className="btn-close"
+            aria-label="Dismiss"
+            style={{ filter: "invert(1) opacity(0.5)" }}
+            onClick={() => setSpawnNotice(null)}
+          />
+        </div>
+      )}
+
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
       {actionError && (
@@ -776,6 +832,7 @@ export function Sessions() {
                 <th style={{ width: "1.5rem" }}></th>
                 <th>SID</th>
                 <th>Window</th>
+                <th>Attach</th>
                 <th>Role</th>
                 <th>Target</th>
                 <th>Status</th>
@@ -820,6 +877,7 @@ export function Sessions() {
                   <th style={{ width: "1.5rem" }}></th>
                   <th>SID</th>
                   <th>Window</th>
+                  <th>Attach</th>
                   <th>Role</th>
                   <th>Target</th>
                   <th>Started</th>

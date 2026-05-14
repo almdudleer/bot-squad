@@ -179,6 +179,25 @@ export function Help() {
           message — your text is routed into that session automatically. No need to open the web
           UI just to answer a question.
         </div>
+
+        <h3 id="tmux-cheatsheet">Tmux cheatsheet</h3>
+        <p>
+          Sessions run inside <code>tmux</code> on the server. Connect over SSH and use these
+          commands to move around. All shortcuts assume the default prefix <code>Ctrl-b</code>
+          (press the prefix, release, then press the next key).
+        </p>
+        <ul>
+          <li><code>tmux ls</code> — list sessions on this host.</li>
+          <li><code>tmux a -t &lt;name&gt;</code> — attach to a session by name.</li>
+          <li><code>Ctrl-b d</code> — detach from the current session (leaves it running).</li>
+          <li><code>Ctrl-b w</code> — interactive window/session picker.</li>
+          <li><code>Ctrl-b n</code> / <code>Ctrl-b p</code> — next / previous window.</li>
+          <li><code>Ctrl-b &lt;0-9&gt;</code> — switch directly to window N.</li>
+          <li><code>Ctrl-b c</code> — open a new window.</li>
+          <li><code>Ctrl-b %</code> / <code>Ctrl-b &quot;</code> — split pane vertically / horizontally.</li>
+          <li><code>Ctrl-b [</code> — enter scroll-back / copy mode (arrow keys + PageUp; press <code>q</code> to exit).</li>
+          <li><code>Ctrl-b &amp;</code> — kill the current window (asks for confirmation).</li>
+        </ul>
       </section>
 
       {/* ------------------------------------------------------------------ */}

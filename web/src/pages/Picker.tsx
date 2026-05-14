@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, Project } from "../api";
-import { Coachmark } from "../onboarding";
+import { Coachmark, Typewriter } from "../onboarding";
 
 // Mirror T-0025's statusBadgeClass so single-server and cross-server views
 // paint the same colours from the same enum. Unknown strings fall back to
@@ -29,11 +29,25 @@ export function Picker() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "900px" }}>
-      {/* Framework smoke. Real §9.1–9.6 copy lands in T-0014..T-0022. */}
+      {/* §9.1 — first onboarding beat for a fresh server-view visit. Anchors
+          on the sidebar HELP link via the data-onboarding-anchor convention
+          (see Shell.tsx); future §9.2..9.6 beats reuse the same attribute. */}
       <Coachmark
-        stepId="srv.intro"
-        title="Welcome to your server"
-        body="A quick tour of the picker and the surrounding views. Skip if you've seen it."
+        stepId="srv.9_1.help_spotlight"
+        title="Need a hand?"
+        anchorSelector='[data-onboarding-anchor="help-nav"]'
+        placement="right"
+        body={
+          <Typewriter
+            text="You can always see the tmux cheatsheet here."
+            trailing={
+              <>
+                {" "}
+                <Link to="/help#tmux-cheatsheet">Open it →</Link>
+              </>
+            }
+          />
+        }
       />
 
       <div className="d-flex align-items-center gap-2 mb-4">

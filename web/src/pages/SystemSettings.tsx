@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, SystemSettings as Settings } from "../api";
+import { Modal } from "../components/Modal";
 
 const TTL_RE = /^\d+[smhd]$/;
 
@@ -8,6 +9,8 @@ export function SystemSettings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  const [detachOpen, setDetachOpen] = useState(false);
 
   const [botToken, setBotToken] = useState<string>("");
   const [showToken, setShowToken] = useState(false);
@@ -32,6 +35,12 @@ export function SystemSettings() {
 
   useEffect(() => {
     load();
+    api
+      .me()
+      .then((m) => setIsAdmin(Boolean(m.is_admin)))
+      .catch(() => {
+        /* anonymous / load error — leave isAdmin false so Danger zone stays hidden */
+      });
   }, []);
 
   function validate(): string | null {
@@ -199,8 +208,80 @@ export function SystemSettings() {
           >
             {saving ? "Saving…" : "Save"}
           </button>
+
+          {isAdmin && (
+            <section className="mt-5 pt-4 border-top" id="detach-affordance">
+              <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem", color: "var(--mc-red-bright)" }}>
+                Danger zone
+              </h3>
+              <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.75rem" }}>
+                Detach this server from bot-squad.org. Your installation will keep working as a
+                standalone server-only frontend; the centralization layer will be unmounted.
+              </p>
+              <button
+                type="button"
+                className="btn btn-outline-danger btn-sm"
+                data-onboarding-anchor="detach-toggle"
+                onClick={() => setDetachOpen(true)}
+              >
+                Detach from bot-squad.org…
+              </button>
+            </section>
+          )}
         </>
       )}
+
+      <Modal
+        open={detachOpen}
+        title="Detach this server from bot-squad.org?"
+        onClose={() => setDetachOpen(false)}
+        footer={
+          <>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setDetachOpen(false)}
+            >
+              Keep centralized
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-danger"
+              onClick={() => {
+                setDetachOpen(false);
+                setNotice("Detach is not yet available — see vision/initiatives/detach-sequence.md.");
+              }}
+            >
+              Detach anyway
+            </button>
+          </>
+        }
+      >
+        <p style={{ marginBottom: "0.75rem" }}>
+          Before you detach, here's what you'd give up by leaving bot-squad.org:
+        </p>
+        <ul style={{ paddingLeft: "1.1rem", marginBottom: "0.75rem" }}>
+          <li>
+            <strong>Cross-server projects view</strong> — the <code>/m</code> all-projects window
+            that shows every project on every attached server, split by server.
+          </li>
+          <li>
+            <strong>Preferences sync</strong> across all your servers (deferred but designed-in).
+          </li>
+          <li>
+            <strong>Quick project switcher</strong> — the cross-server drop-down for jumping
+            between projects without going back to the picker.
+          </li>
+          <li>
+            <strong>Free <code>@bot_squad_bot</code> Telegram routing</strong> — without it, every
+            user on this server would need to bring their own bot token.
+          </li>
+        </ul>
+        <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: 0 }}>
+          Detach is not yet implemented; this dialog is here so you know what the choice will
+          cost when it ships.
+        </p>
+      </Modal>
     </div>
   );
 }

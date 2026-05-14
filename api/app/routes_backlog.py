@@ -30,6 +30,13 @@ router = APIRouter(
 _VALID_STATUSES = {"open", "in_progress", "totest", "reopened", "closed"}
 _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 
+# T-0038: optional linkage fields settable via PATCH alongside title/status.
+_LINKAGE_PATCH_KEYS = frozenset({"initiative", "parent_task", "blocked_by"})
+
+# Permissive — basename of a vision/initiatives/<name> .md file. Empty string
+# allowed (callers must pass null to clear, not empty).
+_INITIATIVE_BASENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.md$")
+
 
 def _backlog_dir(request: Request, slug: str) -> Path:
     cfg = request.app.state.api_config
@@ -232,10 +239,30 @@ def patch_task(
     if "title" in payload and not (payload.get("title") or "").strip():
         raise HTTPException(status_code=400, detail="title must not be empty")
 
+    # T-0038: validate linkage fields if provided. `null` clears the field
+    # (write_task drops None entries). String must look like a vision/
+    # initiatives basename; parent_task must be T-NNNN; blocked_by must be a
+    # list of T-NNNN.
+    if "initiative" in payload and payload["initiative"] is not None:
+        v = payload["initiative"]
+        if not isinstance(v, str) or not _INITIATIVE_BASENAME_RE.match(v):
+            raise HTTPException(status_code=400, detail=f"invalid initiative basename: {v!r}")
+    if "parent_task" in payload and payload["parent_task"] is not None:
+        v = payload["parent_task"]
+        if not isinstance(v, str) or not _TASK_ID_RE.match(v):
+            raise HTTPException(status_code=400, detail=f"invalid parent_task id: {v!r}")
+    if "blocked_by" in payload and payload["blocked_by"] is not None:
+        v = payload["blocked_by"]
+        if not isinstance(v, list) or not all(
+            isinstance(x, str) and _TASK_ID_RE.match(x) for x in v
+        ):
+            raise HTTPException(status_code=400, detail="blocked_by must be a list of T-NNNN ids")
+
     backlog_dir = _backlog_dir(request, slug)
     path = _find_task_file(backlog_dir, task_id)
 
-    updates = {k: v for k, v in payload.items() if k in ("title", "status")}
+    allowed = {"title", "status"} | _LINKAGE_PATCH_KEYS
+    updates = {k: v for k, v in payload.items() if k in allowed}
     body = payload.get("body")
     try:
         merge_task_update(path, updates, body=body)

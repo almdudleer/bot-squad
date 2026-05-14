@@ -540,6 +540,70 @@ def test_spawn_creates_new_window(tmp_path, monkeypatch):
     assert result["sid"] == "S-testuser-spec5-smoke-p7"
 
 
+def test_spawn_with_task_and_initiative_stamps_task_md(tmp_path, monkeypatch):
+    """T-0038: spawn(task_id=..., initiative=...) writes the initiative
+    into the task md frontmatter when absent."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0007-foo.md"
+    task_md.write_text(
+        "---\nid: T-0007\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w",
+          task_id="T-0007", initiative="multi-server-installation-process.md")
+
+    txt = task_md.read_text()
+    assert "initiative: multi-server-installation-process.md" in txt
+
+
+def test_spawn_does_not_clobber_existing_initiative(tmp_path, monkeypatch):
+    """T-0038: existing-wins. If the task already has an initiative, don't
+    overwrite it on spawn."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0008-foo.md"
+    task_md.write_text(
+        "---\nid: T-0008\ntitle: Foo\nstatus: open\n"
+        "initiative: original.md\n---\n\nbody\n"
+    )
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%3|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w",
+          task_id="T-0008", initiative="different.md")
+
+    txt = task_md.read_text()
+    assert "initiative: original.md" in txt
+    assert "initiative: different.md" not in txt
+
+
 def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

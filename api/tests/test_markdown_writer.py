@@ -139,6 +139,45 @@ def test_merge_task_update_priority_round_trip(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# T-0038 — initiative / parent_task / blocked_by are merge-updatable
+# ---------------------------------------------------------------------------
+
+def test_merge_task_update_accepts_initiative(tmp_path: Path):
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0060-init.md"
+    write_task(p, {"id": "T-0060", "title": "X", "status": "open"}, "body\n")
+    merge_task_update(p, {"initiative": "multi-server-installation-process.md"})
+    task = parse_task(p)
+    assert task["initiative"] == "multi-server-installation-process.md"
+
+
+def test_merge_task_update_accepts_parent_and_blocked_by(tmp_path: Path):
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0061-links.md"
+    write_task(p, {"id": "T-0061", "title": "X", "status": "open"}, "body\n")
+    merge_task_update(p, {"parent_task": "T-0007", "blocked_by": ["T-0001"]})
+    task = parse_task(p)
+    assert task["parent_task"] == "T-0007"
+    assert task["blocked_by"] == ["T-0001"]
+
+
+def test_merge_task_update_clears_initiative_with_none(tmp_path: Path):
+    """Setting initiative=None drops the field from frontmatter."""
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0062-clr.md"
+    write_task(p, {
+        "id": "T-0062", "title": "X", "status": "open",
+        "initiative": "foo.md",
+    }, "body\n")
+    merge_task_update(p, {"initiative": None})
+    task = parse_task(p)
+    assert task.get("initiative") is None
+
+
+# ---------------------------------------------------------------------------
 # append_comment
 # ---------------------------------------------------------------------------
 

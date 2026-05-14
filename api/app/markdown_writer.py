@@ -12,8 +12,13 @@ import yaml
 
 from app.markdown_parser import parse_task
 
-# Keys allowed in merge_task_update `updates` dict
-_ALLOWED_UPDATE_KEYS = frozenset({"title", "status", "body", "priority"})
+# Keys allowed in merge_task_update `updates` dict.
+# T-0038 adds first-class linkage fields: `initiative` (basename under
+# vision/initiatives/), `parent_task` (T-NNNN), `blocked_by` (list of T-NNNN).
+_ALLOWED_UPDATE_KEYS = frozenset({
+    "title", "status", "body", "priority",
+    "initiative", "parent_task", "blocked_by",
+})
 
 _TASK_ID_RE = re.compile(r"^T-(\d{4})-")
 

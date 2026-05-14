@@ -176,6 +176,94 @@ def test_patch_task_invalid_id_format(tmp_bot_squad: Path, monkeypatch):
     assert r.status_code == 400
 
 
+# ---------------------------------------------------------------------------
+# T-0038: PATCH linkage fields (initiative / parent_task / blocked_by)
+# ---------------------------------------------------------------------------
+
+def test_patch_task_sets_initiative(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"initiative": "multi-server-installation-process.md"},
+        )
+    assert r.status_code == 200
+    assert r.json()["initiative"] == "multi-server-installation-process.md"
+
+
+def test_patch_task_clears_initiative_with_null(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n"
+        "initiative: foo.md\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"initiative": None},
+        )
+    assert r.status_code == 200
+    assert r.json().get("initiative") is None
+
+
+def test_patch_task_rejects_bad_initiative_basename(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"initiative": "../etc/passwd"},
+        )
+    assert r.status_code == 400
+
+
+def test_patch_task_sets_parent_and_blocked_by(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0010-foo.md").write_text(
+        "---\nid: T-0010\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0010",
+            json={"parent_task": "T-0007", "blocked_by": ["T-0001", "T-0002"]},
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["parent_task"] == "T-0007"
+    assert body["blocked_by"] == ["T-0001", "T-0002"]
+
+
+def test_patch_task_rejects_malformed_blocked_by(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0010-foo.md").write_text(
+        "---\nid: T-0010\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0010",
+            json={"blocked_by": ["nope"]},
+        )
+    assert r.status_code == 400
+
+
+def test_backlog_returns_initiative_field(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n"
+        "initiative: alpha.md\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog")
+    assert r.status_code == 200
+    [task] = r.json()
+    assert task["initiative"] == "alpha.md"
+
+
 def test_patch_task_invalid_status(tmp_bot_squad: Path, monkeypatch):
     backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
     (backlog / "T-0001-foo.md").write_text(

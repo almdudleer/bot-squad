@@ -68,3 +68,36 @@ def test_parse_task_priority_garbage_is_none(tmp_path: Path) -> None:
     )
     parsed = parse_task(f)
     assert parsed["priority"] is None
+
+
+# ---------------------------------------------------------------------------
+# T-0038: initiative / parent_task / blocked_by pass-through
+# ---------------------------------------------------------------------------
+
+def test_parse_task_initiative_field(tmp_path: Path) -> None:
+    f = tmp_path / "T-0060-init.md"
+    f.write_text(
+        "---\nid: T-0060\ntitle: I\nstatus: open\n"
+        "initiative: multi-server-installation-process.md\n---\n\nbody\n"
+    )
+    parsed = parse_task(f)
+    assert parsed["initiative"] == "multi-server-installation-process.md"
+
+
+def test_parse_task_initiative_missing(tmp_path: Path) -> None:
+    f = tmp_path / "T-0061-noinit.md"
+    f.write_text("---\nid: T-0061\ntitle: I\nstatus: open\n---\n\nbody\n")
+    parsed = parse_task(f)
+    assert parsed.get("initiative") is None
+
+
+def test_parse_task_parent_and_blocked_by(tmp_path: Path) -> None:
+    f = tmp_path / "T-0062-links.md"
+    f.write_text(
+        "---\nid: T-0062\ntitle: L\nstatus: open\n"
+        "parent_task: T-0007\n"
+        "blocked_by: [T-0001, T-0002]\n---\n\nbody\n"
+    )
+    parsed = parse_task(f)
+    assert parsed["parent_task"] == "T-0007"
+    assert parsed["blocked_by"] == ["T-0001", "T-0002"]

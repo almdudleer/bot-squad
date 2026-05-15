@@ -289,9 +289,12 @@ function ServerSectionBody({
   }
   return (
     <div className="row g-2">
-      {result.data.map((p) => (
-        <div className="col-md-4" key={p.slug}>
-          <div className="mc-project-card" style={{ cursor: "default" }}>
+      {result.data.map((p) => {
+        const card = (
+          <div
+            className="mc-project-card"
+            style={{ cursor: server.is_self ? "pointer" : "default" }}
+          >
             <div className="mc-project-name">{p.display_name}</div>
             <div
               className="mc-project-slug"
@@ -306,8 +309,22 @@ function ServerSectionBody({
               <span className={statusBadgeClass(p.status)}>{p.status}</span>
             </div>
           </div>
-        </div>
-      ))}
+        );
+        return (
+          <div className="col-md-4" key={p.slug}>
+            {server.is_self ? (
+              <Link
+                to={`/p/${encodeURIComponent(p.slug)}`}
+                style={{ textDecoration: "none", color: "inherit" }}
+              >
+                {card}
+              </Link>
+            ) : (
+              card
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

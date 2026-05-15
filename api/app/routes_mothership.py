@@ -371,16 +371,22 @@ def _proxy_client(base_url: str) -> httpx.AsyncClient:
 
 
 @router.get("/servers/{server_id}/projects")
-def list_server_projects(server_id: str, request: Request) -> list[dict]:
-    """Return the registry's cached project list for ``server_id``.
+async def list_server_projects(server_id: str, request: Request) -> list[dict]:
+    """Return the project list for ``server_id``.
 
-    Cheap, no upstream call. T-0025's all-projects page polls this for
-    every attached server in parallel — partial-failure isolation is
-    handled FE-side via the fanOut envelope contract.
+    For peer (attached) servers: returns the registry's cached list (cheap,
+    no upstream call; refresh hits ``POST /projects/refresh``).
+    For ``is_self`` servers: fans IN to the local ``/api/projects`` handler
+    so the mothership shows its own projects without needing a bearer or
+    proxy hop. T-0049's planned wiring; landed inline mid-T-0055 because
+    the empty self list was confusing on the unified view.
     """
     server = _store(request).get_server(server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
+    if server.is_self:
+        from .routes_projects import list_projects as _list_local_projects
+        return await _list_local_projects(request)
     return server.projects_cache
 
 

@@ -33,6 +33,19 @@ BOTSQUAD_SKIP_MOTHERSHIP="${BOTSQUAD_SKIP_MOTHERSHIP:-0}"
 # Non-interactive mode (CI / smoke): refuse to prompt; fail with a clear
 # checkpoint instead so claude can be told what env to set on rerun.
 BOTSQUAD_NONINTERACTIVE="${BOTSQUAD_NONINTERACTIVE:-0}"
+# HTTP/HTTPS proxy URL. Three-way semantics:
+#   - unset       → interactive prompt at the proxy_url checkpoint
+#   - empty ""    → skip the prompt, no proxy is configured
+#   - non-empty   → use this URL (validated, then written to all sinks)
+# Override target paths if needed (tests redirect these):
+#   BOTSQUAD_PROXY_APT_CONF    — apt-conf sink (default /etc/apt/apt.conf.d/01proxy)
+#   BOTSQUAD_CLAUDE_SETTINGS   — claude settings sink (default ~/.claude/settings.json)
+#   BOTSQUAD_PROXY_PROBE_CMD   — validation command; default is curl --proxy <url> npmjs
+#                                (the command receives the URL as $1; non-zero exit = fail,
+#                                stderr is shown to the user as the failure reason)
+BOTSQUAD_PROXY_APT_CONF="${BOTSQUAD_PROXY_APT_CONF:-/etc/apt/apt.conf.d/01proxy}"
+BOTSQUAD_CLAUDE_SETTINGS="${BOTSQUAD_CLAUDE_SETTINGS:-${HOME}/.claude/settings.json}"
+BOTSQUAD_PROXY_PROBE_CMD="${BOTSQUAD_PROXY_PROBE_CMD:-}"
 
 STATE_FILE="${BOTSQUAD_STATE_DIR}/install.state"
 ENV_FILE="${BOTSQUAD_INSTALL_DIR}/.env"
@@ -183,11 +196,168 @@ step_require_sudo() {
     "Make sure your user is in /etc/sudoers (or the 'sudo' group), then re-run."
 }
 
+# --- proxy_url checkpoint helpers --------------------------------------------
+#
+# Three sinks for an accepted proxy URL:
+#   1. script env  — export http_proxy/https_proxy so subsequent apt/curl/npm
+#                    invocations inherit it (this checkpoint runs before
+#                    apt_update on purpose)
+#   2. claude settings — ~/.claude/settings.json under .env.http_proxy /
+#                        .env.https_proxy (the same {env: {...}} convention
+#                        claude-code reads other vars from, e.g.
+#                        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)
+#   3. apt conf    — /etc/apt/apt.conf.d/01proxy with Acquire::http::Proxy +
+#                    Acquire::https::Proxy (needs sudo, chmod 0644)
+#
+# Each sink writer is idempotent: re-running with the same URL is a no-op;
+# changing the URL rewrites the sink.
+
+# Run the validation probe for a candidate URL.
+# Returns 0 on success; on failure prints a human-readable reason to stderr.
+proxy_probe() {
+  local url="$1"
+  if [[ -n "$BOTSQUAD_PROXY_PROBE_CMD" ]]; then
+    # Test/override hook: receives the URL as $1.
+    bash -c "$BOTSQUAD_PROXY_PROBE_CMD \"\$1\"" _ "$url"
+    return $?
+  fi
+  # Default probe: curl through the proxy to the npm registry.
+  # -sS keeps it quiet but surfaces errors; --max-time 5 bounds the wait;
+  # -o /dev/null discards the body; -w '%{http_code}' is consulted via the
+  # exit code (curl returns non-zero on connection failure regardless).
+  local err
+  err="$(curl -sS --proxy "$url" --max-time 5 -o /dev/null \
+    -w '%{http_code}' https://registry.npmjs.org/ 2>&1)" || {
+    printf '%s\n' "$err" >&2
+    return 1
+  }
+  # curl exited 0 → connection succeeded; check HTTP status.
+  case "$err" in
+    2*|3*) return 0 ;;
+    *)
+      printf 'proxy returned HTTP status %s from registry.npmjs.org\n' "$err" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Write the proxy URL into ~/.claude/settings.json under .env.http_proxy and
+# .env.https_proxy. Creates the file if missing.
+proxy_write_claude_settings() {
+  local url="$1" cfg="$BOTSQUAD_CLAUDE_SETTINGS"
+  mkdir -p "$(dirname "$cfg")"
+  if [[ ! -f "$cfg" ]]; then
+    printf '%s\n' '{}' > "$cfg"
+  fi
+  local tmp; tmp="$(mktemp)"
+  jq --arg url "$url" \
+    '.env = ((.env // {}) + {http_proxy: $url, https_proxy: $url})' \
+    "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+# Remove the proxy keys from ~/.claude/settings.json (used when re-running
+# with a now-empty BOTSQUAD_PROXY_URL — but we only call this for transparency
+# in tests; the main flow doesn't undo, it just no-ops on empty).
+proxy_clear_claude_settings() {
+  local cfg="$BOTSQUAD_CLAUDE_SETTINGS"
+  [[ -f "$cfg" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  jq 'if .env then .env |= (del(.http_proxy) | del(.https_proxy))
+        | (if (.env | length) == 0 then del(.env) else . end)
+      else . end' \
+    "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+# Write the apt conf snippet. Uses sudo unless the target path is already
+# writable by the current user (the test suite redirects to a temp dir).
+proxy_write_apt_conf() {
+  local url="$1" path="$BOTSQUAD_PROXY_APT_CONF"
+  local body
+  body="$(printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$url" "$url")"
+  # Idempotent: if the file already has the exact body, do nothing.
+  if [[ -f "$path" ]] && [[ "$(cat "$path" 2>/dev/null)" = "$body" ]]; then
+    return 0
+  fi
+  local parent; parent="$(dirname "$path")"
+  if [[ -w "$parent" ]] || { [[ -f "$path" ]] && [[ -w "$path" ]]; }; then
+    printf '%s' "$body" > "$path"
+    chmod 0644 "$path"
+  else
+    printf '%s' "$body" | sudo tee "$path" >/dev/null
+    sudo chmod 0644 "$path"
+  fi
+}
+
+step_proxy_url() {
+  # Decide the URL: explicit env (set, possibly empty) wins; otherwise prompt.
+  local url
+  if [[ "${BOTSQUAD_PROXY_URL+set}" = "set" ]]; then
+    url="$BOTSQUAD_PROXY_URL"
+    if [[ -z "$url" ]]; then
+      log "BOTSQUAD_PROXY_URL is empty → no proxy configured (skipping)"
+      return 0
+    fi
+    # Pre-set URL still gets validated; failure is fatal (no re-prompt in
+    # non-interactive mode).
+    if ! proxy_probe "$url" 2>/tmp/proxy_probe_err.$$; then
+      local reason; reason="$(cat /tmp/proxy_probe_err.$$ 2>/dev/null || true)"
+      rm -f /tmp/proxy_probe_err.$$
+      die_struct proxy_url \
+        "Proxy URL '$url' failed validation: ${reason:-unknown error}" \
+        "Re-run with a working BOTSQUAD_PROXY_URL=... (or BOTSQUAD_PROXY_URL='' to skip)."
+    fi
+    rm -f /tmp/proxy_probe_err.$$
+  else
+    if [[ "$BOTSQUAD_NONINTERACTIVE" = "1" ]]; then
+      log "BOTSQUAD_PROXY_URL unset + non-interactive → skipping proxy checkpoint"
+      log "(set BOTSQUAD_PROXY_URL=http://... or BOTSQUAD_PROXY_URL='' to silence this)"
+      return 0
+    fi
+    # Ask first whether a proxy is needed at all.
+    local answer
+    read -r -p "[bot-squad] Do you need an HTTP/HTTPS proxy for apt/npm/curl? [y/N]: " answer </dev/tty || answer=""
+    case "$answer" in
+      y|Y|yes|YES) : ;;
+      *) log "no proxy configured"; return 0 ;;
+    esac
+    while :; do
+      read -r -p "[bot-squad] Proxy URL (e.g. http://proxy.corp:3128): " url </dev/tty || url=""
+      if [[ -z "$url" ]]; then
+        warn "empty URL — re-enter, or Ctrl-C to abort"
+        continue
+      fi
+      log "validating proxy by curl-ing https://registry.npmjs.org/ through it (5s timeout)..."
+      if proxy_probe "$url" 2>/tmp/proxy_probe_err.$$; then
+        rm -f /tmp/proxy_probe_err.$$
+        break
+      fi
+      local reason; reason="$(cat /tmp/proxy_probe_err.$$ 2>/dev/null || true)"
+      rm -f /tmp/proxy_probe_err.$$
+      warn "proxy validation failed: ${reason:-unknown error}"
+      warn "re-enter the URL (or Ctrl-C to abort)"
+    done
+  fi
+
+  # Write all three sinks.
+  export http_proxy="$url"
+  export https_proxy="$url"
+  export HTTP_PROXY="$url"
+  export HTTPS_PROXY="$url"
+  proxy_write_claude_settings "$url" || die_struct proxy_url \
+    "Failed to write proxy URL into $BOTSQUAD_CLAUDE_SETTINGS." \
+    "Check the file's permissions; ensure jq is installed."
+  proxy_write_apt_conf "$url" || die_struct proxy_url \
+    "Failed to write $BOTSQUAD_PROXY_APT_CONF." \
+    "Check sudo permissions on $(dirname "$BOTSQUAD_PROXY_APT_CONF")."
+  log "proxy configured: $url → env + claude settings + apt conf"
+}
+
 step_apt_update() {
   sudo apt-get update -y >/dev/null || die_struct apt_update \
     "apt-get update failed." \
     "Check network connectivity and APT sources (/etc/apt/sources.list*).
-If you're behind a proxy, configure /etc/apt/apt.conf.d/01proxy first."
+If you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=http://... (or
+just run interactively) — the proxy_url checkpoint will wire it through."
 }
 
 step_install_base_pkgs() {
@@ -217,7 +387,8 @@ step_install_nodejs() {
   if ! curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
     die_struct install_nodejs "Failed to fetch the NodeSource setup script." \
       "Check network (curl https://deb.nodesource.com). If you're on a corporate
-network, set HTTPS_PROXY before re-running. Then re-run the installer."
+network, re-run with BOTSQUAD_PROXY_URL=http://... (the proxy_url checkpoint
+will configure apt/curl/npm), then re-run the installer."
   fi
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >/dev/null \
     || die_struct install_nodejs "apt-get install nodejs failed." \
@@ -234,7 +405,7 @@ step_install_claude_code() {
   sudo npm install -g @anthropic-ai/claude-code
 If you see EACCES, your global node prefix may need fixing
 (npm config set prefix ~/.npm-global). If you see network errors,
-configure HTTPS_PROXY and retry."
+re-run with BOTSQUAD_PROXY_URL=http://... and retry."
   fi
   command -v claude >/dev/null 2>&1 || die_struct install_claude_code \
     "npm install reported success but 'claude' is still not on PATH." \
@@ -501,8 +672,11 @@ When you're attached and have spoken to the operator, you can
 exit the bootstrap claude session that drove this install —
 that one's job is done.
 
-UI:       http://bot-squad.\$DOMAIN  (or however your reverse
-          proxy routes to the bot-squad-api container)
+UI:       http://bot-squad.\$DOMAIN/welcome  (or however your
+          reverse proxy routes to the bot-squad-api container)
+          — lands on the "you're all set" handoff screen with a
+          copyable tmux-attach command; click Next to enter the
+          server view.
 Worker:   sudo systemctl status bot-squad-worker
 State:    $STATE_FILE
 ============================================================
@@ -513,6 +687,7 @@ EOF
 STEPS=(
   require_linux
   require_sudo
+  proxy_url
   apt_update
   install_base_pkgs
   install_tmux

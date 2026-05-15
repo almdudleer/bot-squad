@@ -74,11 +74,13 @@ User isn't in sudoers, or the sudo prompt was answered wrong. Run
 isn't in `/etc/sudoers` at all, they need to add themselves from a root
 shell (or have an admin do it).
 
-### `apt_update` / `install_*` package failures
+### `pkg_index_update` / `install_*` package failures
 Most often network or a corporate proxy. The installer has a dedicated
-`proxy_url` checkpoint that runs **before** `apt_update`; if the user
-hit `apt_update` failures, the proxy checkpoint was either skipped
-(interactive answer was "no") or the URL was never tried.
+`proxy_url` checkpoint that runs **before** `pkg_index_update` (the
+cross-distro renamed-from-`apt_update` step that refreshes apt/dnf/pacman
+indexes); if the user hit `pkg_index_update` failures, the proxy
+checkpoint was either skipped (interactive answer was "no") or the URL
+was never tried.
 
 Ask the user whether they're behind a proxy. If yes, either:
 

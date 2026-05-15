@@ -17,6 +17,28 @@
 
 set -Eeuo pipefail
 
+# ---- Cross-distro package abstraction (T-0030) ------------------------------
+# Source pkg.sh so the install_* steps can use pkg_install/pkg_update/pkg_have
+# instead of raw apt-get. Search order:
+#   1. $BOTSQUAD_PKG_SH if set (tests + advanced overrides)
+#   2. <dirname of this script>/pkg.sh
+#   3. <CWD>/pkg.sh (for `bash install.sh` from the repo)
+# detect_distro errors loudly if none of the candidates loads the helper,
+# so this stays a soft load (no early exit on missing file).
+__BS_INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo .)"
+for __bs_pkg_candidate in \
+    "${BOTSQUAD_PKG_SH:-}" \
+    "$__BS_INSTALL_DIR/pkg.sh" \
+    "$PWD/pkg.sh" \
+    "./pkg.sh"; do
+  if [[ -n "$__bs_pkg_candidate" ]] && [[ -r "$__bs_pkg_candidate" ]]; then
+    # shellcheck source=./pkg.sh
+    . "$__bs_pkg_candidate"
+    break
+  fi
+done
+unset __bs_pkg_candidate
+
 # ---- Mothership substitution targets (replaced at serve-time) ----------------
 BOTSQUAD_INSTALL_TOKEN="${BOTSQUAD_INSTALL_TOKEN:-__INSTALL_TOKEN__}"
 BOTSQUAD_MOTHERSHIP_URL="${BOTSQUAD_MOTHERSHIP_URL:-__MOTHERSHIP_URL__}"
@@ -28,6 +50,10 @@ BOTSQUAD_INSTALL_DIR="${BOTSQUAD_INSTALL_DIR:-/home/www/bot-squad}"
 BOTSQUAD_GROUP="${BOTSQUAD_GROUP:-www}"
 BOTSQUAD_STATE_DIR="${BOTSQUAD_STATE_DIR:-${HOME}/.bot-squad}"
 BOTSQUAD_OPERATOR_SESSION="${BOTSQUAD_OPERATOR_SESSION:-bot-squad-operator}"
+# Cross-distro support (T-0030). When unset, detect_distro infers the
+# family from /etc/os-release; when set, the explicit value wins and
+# is persisted to the state file. Valid families: debian, fedora, arch.
+BOTSQUAD_DISTRO_FAMILY="${BOTSQUAD_DISTRO_FAMILY:-}"
 # Skip the mothership /connect handshake — for offline smoke only.
 BOTSQUAD_SKIP_MOTHERSHIP="${BOTSQUAD_SKIP_MOTHERSHIP:-0}"
 # Non-interactive mode (CI / smoke): refuse to prompt; fail with a clear
@@ -105,6 +131,10 @@ BOTSQUAD_DOCKER_NETWORK_PROBE_CMD="${BOTSQUAD_DOCKER_NETWORK_PROBE_CMD:-}"
 BOTSQUAD_FRESH_HOST_OVERRIDE="${BOTSQUAD_FRESH_HOST_OVERRIDE:-}"
 
 STATE_FILE="${BOTSQUAD_STATE_DIR}/install.state"
+# Side-car file holding the detected distro family + ID so a re-run on
+# a different distro errors loudly instead of silently shelling out to
+# the wrong package manager (T-0030).
+DISTRO_STATE_FILE="${BOTSQUAD_STATE_DIR}/install.distro"
 ENV_FILE="${BOTSQUAD_INSTALL_DIR}/.env"
 FRESH_HOST_OVERRIDE_DEFAULT="${BOTSQUAD_INSTALL_DIR}/docker-compose.fresh-host.yml"
 
@@ -230,16 +260,63 @@ prompt_value() {
 
 # ---- Checkpoints ------------------------------------------------------------
 
-step_require_linux() {
+step_detect_distro() {
   case "$(uname -s)" in
     Linux) : ;;
-    *) die_struct require_linux "OS is $(uname -s); bot-squad install only supports Linux." \
-         "Run on an Ubuntu/Debian host." ;;
+    *) die_struct detect_distro "OS is $(uname -s); bot-squad install only supports Linux." \
+         "Run on a supported Linux host (Debian/Ubuntu, Fedora/RHEL, or Arch)." ;;
   esac
-  if ! command -v apt-get >/dev/null 2>&1; then
-    die_struct require_linux "apt-get not found; only Debian/Ubuntu are supported by this v1 installer." \
-      "Install on Ubuntu 22.04+ or Debian 12+. Cross-distro support is tracked separately."
+  # Resolve family + ID via pkg.sh's detector. An empty result means the
+  # host's /etc/os-release didn't match any family we have a package
+  # map for. We bail loudly with a pointer at BOTSQUAD_DISTRO_FAMILY so
+  # the user can force a guess on a close-enough derivative.
+  if ! declare -F detect_distro_family >/dev/null 2>&1; then
+    die_struct detect_distro \
+      "pkg.sh helper not loaded (detect_distro_family unavailable)." \
+      "The installer bundle is incomplete. Re-fetch install.sh + pkg.sh
+from the mothership (or, if running from the repo, ensure scripts/install/pkg.sh
+exists next to install.sh)."
   fi
+  local family id=""
+  family="$(detect_distro_family)"
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    id="$( . /etc/os-release && printf '%s' "${ID:-}" )"
+  fi
+  if [[ -z "$family" ]]; then
+    die_struct detect_distro \
+      "Could not detect a supported distro family from /etc/os-release (ID='${id:-?}')." \
+      "Supported families: debian (Ubuntu 22.04+/Debian 12+), fedora
+(Fedora 40+/RHEL 9+), arch (rolling). If your host is a derivative we
+don't recognize, re-run with BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch
+to force a family. Alpine and NixOS are explicitly out of scope (see
+backlog T-0055 / T-0056)."
+  fi
+  export BOTSQUAD_DISTRO_FAMILY="$family"
+  # Mismatch guard: if a previous run recorded a different family on
+  # this state dir, the user almost certainly mounted the wrong state
+  # dir (or migrated the host); refuse and explain.
+  if [[ -r "$DISTRO_STATE_FILE" ]]; then
+    local prev_family
+    prev_family="$( . "$DISTRO_STATE_FILE" 2>/dev/null && printf '%s' "${BOTSQUAD_DISTRO_FAMILY:-}" )" || prev_family=""
+    if [[ -n "$prev_family" ]] && [[ "$prev_family" != "$family" ]]; then
+      die_struct detect_distro \
+        "Detected distro family '$family' but state file at $DISTRO_STATE_FILE
+records a previous run as '$prev_family'. The installer's state dir is
+not transferable across families — package-manager assumptions baked
+into earlier checkpoints would now be wrong." \
+        "Use a fresh state dir for this host (BOTSQUAD_STATE_DIR=...),
+or rm -rf $BOTSQUAD_STATE_DIR if you really intend to re-bootstrap on
+the same host with a different family."
+    fi
+  fi
+  # Persist for subsequent runs.
+  umask 022
+  cat > "$DISTRO_STATE_FILE" <<EOF
+BOTSQUAD_DISTRO_FAMILY=$family
+BOTSQUAD_DISTRO_ID=$id
+EOF
+  log "distro family: $family (ID=$id)"
 }
 
 step_require_sudo() {
@@ -249,7 +326,7 @@ step_require_sudo() {
     die_struct require_sudo "This step needs sudo but no cached credential is available and NONINTERACTIVE=1." \
       "Run 'sudo -v' interactively once, then re-run the installer."
   fi
-  log "you'll be prompted for your sudo password (needed for apt + group setup)"
+  log "you'll be prompted for your sudo password (needed for package install + group setup)"
   sudo -v || die_struct require_sudo "sudo authentication failed." \
     "Make sure your user is in /etc/sudoers (or the 'sudo' group), then re-run."
 }
@@ -259,7 +336,7 @@ step_require_sudo() {
 # Three sinks for an accepted proxy URL:
 #   1. script env  — export http_proxy/https_proxy so subsequent apt/curl/npm
 #                    invocations inherit it (this checkpoint runs before
-#                    apt_update on purpose)
+#                    pkg_index_update on purpose)
 #   2. claude settings — ~/.claude/settings.json under .env.http_proxy /
 #                        .env.https_proxy (the same {env: {...}} convention
 #                        claude-code reads other vars from, e.g.
@@ -410,28 +487,39 @@ step_proxy_url() {
   log "proxy configured: $url → env + claude settings + apt conf"
 }
 
-step_apt_update() {
-  sudo apt-get update -y >/dev/null || die_struct apt_update \
-    "apt-get update failed." \
-    "Check network connectivity and APT sources (/etc/apt/sources.list*).
-If you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=http://... (or
-just run interactively) — the proxy_url checkpoint will wire it through."
+step_pkg_index_update() {
+  # Replaces the v1 apt_update checkpoint. Dispatches via pkg_update()
+  # to the family-appropriate refresh (apt-get update / dnf makecache
+  # / pacman -Sy). Keeping it as its own checkpoint preserves the
+  # "before proxy is wired" → "after proxy is wired" ordering that
+  # the proxy_url checkpoint relies on for its first index pull.
+  pkg_update || die_struct pkg_index_update \
+    "Package index refresh failed (family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+    "Check network connectivity and your package-manager sources
+(/etc/apt/sources.list*, /etc/yum.repos.d/, or /etc/pacman.conf as
+applicable). If you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=
+http://... — the proxy_url checkpoint will wire it through."
 }
 
 step_install_base_pkgs() {
   # curl + git + ca-certificates + jq (for parsing mothership responses).
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl ca-certificates git jq >/dev/null || die_struct install_base_pkgs \
-      "apt-get install of base packages (curl/git/jq/ca-certificates) failed." \
-      "Inspect the apt-get output above. The most common cause is a held
-package or a stale apt cache — try 'sudo apt-get update && sudo apt-get -f install'."
+  # Resolved per-family by pkg_install.
+  pkg_install curl ca-certificates git jq || die_struct install_base_pkgs \
+      "Install of base packages (curl/git/jq/ca-certificates) failed
+(family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+      "Inspect the package-manager output above. The most common cause is
+a held package or a stale index — re-run the pkg_index_update checkpoint
+manually (e.g. 'sudo apt-get update && sudo apt-get -f install' on
+Debian/Ubuntu)."
 }
 
 step_install_tmux() {
-  if command -v tmux >/dev/null 2>&1; then return 0; fi
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tmux >/dev/null \
-    || die_struct install_tmux "Could not install tmux via apt-get." \
-       "Try 'sudo apt-get install tmux' manually to see the exact error."
+  if pkg_have tmux; then return 0; fi
+  pkg_install tmux || die_struct install_tmux \
+    "Could not install tmux via the system package manager
+(family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+    "Try installing tmux manually (e.g. 'sudo apt-get install tmux',
+'sudo dnf install tmux', or 'sudo pacman -S tmux') to see the exact error."
 }
 
 step_install_nodejs() {
@@ -441,16 +529,44 @@ step_install_nodejs() {
     # claude-code needs node >= 18; be lenient on minor.
     if [[ -n "$v" ]] && [[ "${v%%.*}" -ge 18 ]]; then return 0; fi
   fi
-  # Ship NodeSource 20.x — minimum claude-code-compatible LTS.
-  if ! curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
-    die_struct install_nodejs "Failed to fetch the NodeSource setup script." \
-      "Check network (curl https://deb.nodesource.com). If you're on a corporate
+  # NodeSource is the source-of-truth for current Node on Debian/Fedora;
+  # Arch's `nodejs` package tracks current well enough on its own.
+  case "${BOTSQUAD_DISTRO_FAMILY:-}" in
+    debian)
+      if ! curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
+        die_struct install_nodejs "Failed to fetch the NodeSource setup script (deb)." \
+          "Check network (curl https://deb.nodesource.com). If you're on a corporate
 network, re-run with BOTSQUAD_PROXY_URL=http://... (the proxy_url checkpoint
 will configure apt/curl/npm), then re-run the installer."
-  fi
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >/dev/null \
-    || die_struct install_nodejs "apt-get install nodejs failed." \
-       "Run 'sudo apt-get install nodejs' to see the exact apt error."
+      fi
+      pkg_install nodejs \
+        || die_struct install_nodejs "apt-get install nodejs failed." \
+           "Run 'sudo apt-get install nodejs' to see the exact apt error."
+      ;;
+    fedora)
+      # NodeSource RPM repo (same source-of-truth as Debian, different URL).
+      if ! curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
+        die_struct install_nodejs "Failed to fetch the NodeSource setup script (rpm)." \
+          "Check network (curl https://rpm.nodesource.com). If you're on a corporate
+network, re-run with BOTSQUAD_PROXY_URL=http://... and retry."
+      fi
+      pkg_install nodejs \
+        || die_struct install_nodejs "dnf install nodejs failed." \
+           "Run 'sudo dnf install nodejs' to see the exact dnf error."
+      ;;
+    arch)
+      # Arch core/extra ships current node + npm; no third-party repo.
+      pkg_install nodejs \
+        || die_struct install_nodejs "pacman -S nodejs npm failed." \
+           "Run 'sudo pacman -S nodejs npm' to see the exact pacman error."
+      ;;
+    *)
+      die_struct install_nodejs \
+        "Unknown distro family '${BOTSQUAD_DISTRO_FAMILY:-?}'; cannot install nodejs." \
+        "Re-run after the detect_distro checkpoint succeeds, or set
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch explicitly."
+      ;;
+  esac
 }
 
 step_install_claude_code() {
@@ -587,10 +703,40 @@ docker_run_install_cmd() {
     bash -c "$BOTSQUAD_DOCKER_INSTALL_CMD"
     return $?
   fi
-  sudo apt-get update -y >/dev/null || return 1
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin >/dev/null
+  case "${BOTSQUAD_DISTRO_FAMILY:-debian}" in
+    debian)
+      sudo apt-get update -y >/dev/null || return 1
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin >/dev/null
+      ;;
+    fedora)
+      # Docker's Fedora repo: written via dnf config-manager from the
+      # upstream .repo file (no manual GPG key step — the .repo entry
+      # carries the gpgkey URL, and dnf imports it on first install).
+      sudo dnf -y install dnf-plugins-core >/dev/null || return 1
+      # `dnf config-manager --add-repo <url>` is idempotent (writes the
+      # same .repo each time).
+      sudo dnf config-manager --add-repo \
+        https://download.docker.com/linux/fedora/docker-ce.repo >/dev/null || return 1
+      sudo dnf -y install \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin >/dev/null || return 1
+      # On Fedora the docker daemon isn't started by the install, unlike
+      # apt on Debian/Ubuntu. Enable + start so the post-install probe
+      # has a socket to talk to.
+      sudo systemctl enable --now docker >/dev/null 2>&1 || return 1
+      ;;
+    arch)
+      # Arch ships docker + docker compose plugin in core/extra; no
+      # third-party repo or GPG dance.
+      sudo pacman -S --noconfirm --needed docker docker-compose >/dev/null || return 1
+      sudo systemctl enable --now docker >/dev/null 2>&1 || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 docker_run_usermod_cmd() {
@@ -609,17 +755,35 @@ step_install_docker() {
     return 0
   fi
 
-  docker_install_gpg_key "$BOTSQUAD_DOCKER_GPG_KEYRING" \
-    || die_struct install_docker \
-      "Could not install Docker's GPG key to $BOTSQUAD_DOCKER_GPG_KEYRING." \
-      "Check network connectivity to download.docker.com and that
+  # The signed-by GPG keyring + apt sources.list snippet are Debian-family
+  # specific. Fedora uses dnf config-manager --add-repo (handled inside
+  # docker_run_install_cmd); Arch ships docker in core/extra (no
+  # third-party repo). Default to the debian path so legacy tests that
+  # never set BOTSQUAD_DISTRO_FAMILY keep working as before.
+  case "${BOTSQUAD_DISTRO_FAMILY:-debian}" in
+    debian)
+      docker_install_gpg_key "$BOTSQUAD_DOCKER_GPG_KEYRING" \
+        || die_struct install_docker \
+          "Could not install Docker's GPG key to $BOTSQUAD_DOCKER_GPG_KEYRING." \
+          "Check network connectivity to download.docker.com and that
 $(dirname "$BOTSQUAD_DOCKER_GPG_KEYRING") is writable (with sudo). If
 you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=http://..."
 
-  docker_write_apt_list "$BOTSQUAD_DOCKER_APT_LIST" "$BOTSQUAD_DOCKER_GPG_KEYRING" \
-    || die_struct install_docker \
-      "Could not write $BOTSQUAD_DOCKER_APT_LIST." \
-      "Check sudo permissions on $(dirname "$BOTSQUAD_DOCKER_APT_LIST")."
+      docker_write_apt_list "$BOTSQUAD_DOCKER_APT_LIST" "$BOTSQUAD_DOCKER_GPG_KEYRING" \
+        || die_struct install_docker \
+          "Could not write $BOTSQUAD_DOCKER_APT_LIST." \
+          "Check sudo permissions on $(dirname "$BOTSQUAD_DOCKER_APT_LIST")."
+      ;;
+    fedora|arch)
+      log "docker: using ${BOTSQUAD_DISTRO_FAMILY} package source (no apt keyring/list)"
+      ;;
+    *)
+      die_struct install_docker \
+        "Cannot install Docker on family '${BOTSQUAD_DISTRO_FAMILY:-?}'." \
+        "Re-run after the detect_distro checkpoint succeeds, or set
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch explicitly."
+      ;;
+  esac
 
   docker_run_install_cmd \
     || die_struct install_docker \
@@ -937,13 +1101,17 @@ step_python_venv() {
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip >/dev/null \
-      || die_struct python_venv "apt-get install python3 failed." \
-         "Run 'sudo apt-get install python3 python3-venv python3-pip' manually."
+    pkg_install python3 python3-venv python3-pip \
+      || die_struct python_venv "Install of python3+venv+pip failed (family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+         "Run the install manually for your distro (e.g.
+'sudo apt-get install python3 python3-venv python3-pip' on Debian/Ubuntu,
+'sudo dnf install python3 python3-pip' on Fedora,
+'sudo pacman -S python python-pip' on Arch)."
   fi
   python3 -m venv "$venv" || die_struct python_venv \
     "python3 -m venv failed for $venv." \
-    "Make sure python3-venv is installed (sudo apt-get install python3-venv)."
+    "On Debian/Ubuntu the venv module is a separate package
+(sudo apt-get install python3-venv). On Fedora/Arch it ships with python3."
   "$venv/bin/pip" install --upgrade pip >/dev/null
   "$venv/bin/pip" install -e "$BOTSQUAD_INSTALL_DIR/worker" >/dev/null \
     || die_struct python_venv "pip install -e worker failed." \
@@ -1060,10 +1228,10 @@ EOF
 
 # ---- Step order -------------------------------------------------------------
 STEPS=(
-  require_linux
+  detect_distro
   require_sudo
   proxy_url
-  apt_update
+  pkg_index_update
   install_base_pkgs
   install_tmux
   install_nodejs

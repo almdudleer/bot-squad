@@ -6,8 +6,22 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from urllib.parse import urlparse
+
 from app.config import ApiConfig, AuthConfig
 from app.routes_health import router as health_router
+
+
+def _hostname_from_url(url: str) -> str:
+    """Best-effort FQDN extraction for the mothership self-register label.
+
+    Returns ``""`` if the URL is unparseable so the caller can fall back to
+    its hard-coded default.
+    """
+    try:
+        return urlparse(url).hostname or ""
+    except ValueError:
+        return ""
 
 
 def build_app() -> FastAPI:
@@ -97,6 +111,37 @@ def build_app() -> FastAPI:
         # Bundle GETs sit at root: /i/<token>/install.sh + instructions.md.
         # They must register BEFORE the SPA catch-all below.
         app.include_router(mothership_bundle_router)
+
+        # T-0055: self-register this mothership in its own registry on boot so
+        # the unified all-projects view at `/` has a row for "this server"
+        # without waiting for an admin to manually add it. Idempotent — dedup
+        # by base_url; subsequent boots no-op.
+        #
+        # MOTHERSHIP_BASE_URL is the canonical config knob (already used by
+        # routes_mothership._mothership_base_url for install-bundle URLs).
+        # If unset, fall back to the staging hostname per T-0055 brief; a
+        # follow-up ticket should make this configurable cleanly.
+        from app.mothership_store import MothershipStore
+
+        self_url = os.environ.get(
+            "MOTHERSHIP_BASE_URL", "https://staging.bot-squad.org"
+        )
+        self_name = os.environ.get("MOTHERSHIP_SELF_NAME") or _hostname_from_url(
+            self_url
+        ) or "this server"
+        try:
+            MothershipStore(data_dir / "_mothership").register_self_if_missing(
+                base_url=self_url,
+                display_name=self_name,
+            )
+        except OSError:
+            # A read-only DATA_DIR shouldn't crash app boot; log-and-continue.
+            # The detach build never enters this branch (MOTHERSHIP=0).
+            import logging
+            logging.getLogger(__name__).warning(
+                "mothership self-register failed (continuing without it)",
+                exc_info=True,
+            )
 
     from app.routes_auth import require_auth
     from app.worker_client import WorkerError

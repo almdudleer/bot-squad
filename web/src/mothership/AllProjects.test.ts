@@ -10,6 +10,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   buildSections,
+  serverHeaderLabel,
   statusBadgeClass,
   type ServerSection,
 } from "./AllProjects";
@@ -18,6 +19,7 @@ import type { AttachedServer, FanOutResult, ServerProject } from "./api";
 function srv(
   id: string,
   install_state: AttachedServer["install_state"] = "ready",
+  extra: Partial<AttachedServer> = {},
 ): AttachedServer {
   return {
     id,
@@ -29,6 +31,7 @@ function srv(
     install_token_expires_at: null,
     last_seen_at: null,
     projects_cache: [],
+    ...extra,
   };
 }
 
@@ -113,5 +116,42 @@ describe("statusBadgeClass", () => {
 
   test("unknown status falls back to dim (forward-compatible with future T-0016 amendments)", () => {
     expect(statusBadgeClass("future-state")).toBe("mc-badge mc-badge-dim");
+  });
+});
+
+describe("serverHeaderLabel (T-0055)", () => {
+  test("peer server has no 'this server' suffix", () => {
+    const label = serverHeaderLabel(srv("peer"));
+    expect(label.suffix).toBeNull();
+    expect(label.name).toBe("peer");
+    expect(label.url).toBe("https://peer.example.com");
+  });
+
+  test("self entry gets the 'this server' suffix marker", () => {
+    const label = serverHeaderLabel(srv("home", "ready", { is_self: true }));
+    expect(label.suffix).toBe("this server");
+    expect(label.name).toBe("home");
+  });
+
+  test("is_self=false is treated identically to omitted is_self (boundary check)", () => {
+    expect(serverHeaderLabel(srv("a", "ready", { is_self: false })).suffix).toBeNull();
+  });
+});
+
+describe("buildSections honours is_self transparently", () => {
+  test("the self entry sits in the same ordering as peers and renders 'live' when ready", () => {
+    const sections = buildSections(
+      [
+        srv("self", "ready", { is_self: true }),
+        srv("peer"),
+      ],
+      [
+        { serverId: "self", ok: true, data: [] },
+        { serverId: "peer", ok: true, data: [] },
+      ],
+    );
+    expect(sections[0].server.is_self).toBe(true);
+    expect(sections[0].kind).toBe("live");
+    expect(sections[1].server.is_self).toBeFalsy();
   });
 });

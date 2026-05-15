@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { Routes, Route, Link, useParams } from "react-router-dom";
+import { Routes, Route, Link, Navigate, useParams } from "react-router-dom";
 import { mothershipApi, type AttachedServer, type Checkpoint } from "./api";
-import { AllProjects } from "./AllProjects";
 import { AddServerWizard } from "./AddServerWizard";
 
 /**
@@ -38,7 +37,9 @@ export function welcomeUrlFor(baseUrl: string): string {
  * install bundle).
  *
  * What lives here:
- *   /m                 — cross-server all-projects view (T-0025).
+ *   /m                 — redirect to `/` (unified all-projects view at the
+ *                        root, T-0055). Kept as a 301-style stub so any
+ *                        stray internal bookmarks pre-T-0055 still resolve.
  *   /m/servers/add     — the §3.0–§3.3 Q&A wizard (T-0031), which mints
  *                        an install token via POST /api/m/servers and
  *                        auto-transitions to /m/servers/:id on the first
@@ -210,7 +211,11 @@ function NotFound() {
 export default function MothershipRoutes() {
   return (
     <Routes>
-      <Route index element={<AllProjects />} />
+      {/* T-0055: /m is no longer the all-projects view — the unified `/`
+          owns that. Redirect for backwards-compat with any internal
+          bookmarks; the wizard + install-progress sub-routes still live
+          here because the install flow URLs are quoted in scripts/docs. */}
+      <Route index element={<Navigate to="/" replace />} />
       <Route path="servers/add" element={<AddServerWizard />} />
       <Route path="servers/:id" element={<ServerProgress />} />
       <Route path="*" element={<NotFound />} />

@@ -39,7 +39,7 @@ import json
 import os
 import secrets
 import threading
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -75,6 +75,12 @@ class AttachedServer:
     server_bearer_hash: str | None = None
     last_seen_at: str | None = None
     projects_cache: list[dict] = field(default_factory=list)
+    # T-0055: marks the mothership's own entry in its own registry, so the
+    # unified all-projects view can render it with a "this server" affordance
+    # distinct from attached peers. Defaults to False so existing registry
+    # rows on disk (no key) deserialise unchanged via the ``**s`` splat in
+    # ``list_servers``; we tolerate the missing key in ``_read`` below.
+    is_self: bool = False
 
     def to_public(self) -> dict:
         d = asdict(self)
@@ -109,7 +115,15 @@ class MothershipStore:
             return json.load(f)
 
     def list_servers(self) -> list[AttachedServer]:
-        return [AttachedServer(**s) for s in self._read().get("servers", [])]
+        # Use a known-field allowlist so a future schema field added on disk
+        # by a newer process doesn't 500 this reader on rollback. Unknown
+        # keys are dropped; missing keys (e.g. ``is_self`` on pre-T-0055 rows)
+        # take the dataclass default.
+        known = {f.name for f in fields(AttachedServer)}
+        return [
+            AttachedServer(**{k: v for k, v in s.items() if k in known})
+            for s in self._read().get("servers", [])
+        ]
 
     def write(self, servers: list[AttachedServer]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -193,6 +207,56 @@ class MothershipStore:
             servers.append(entry)
             self.write(servers)
         return entry, token
+
+    def register_self_if_missing(
+        self,
+        *,
+        base_url: str,
+        display_name: str,
+        owner_user: str = "system",
+    ) -> AttachedServer | None:
+        """Self-register the mothership server in its own registry (T-0055).
+
+        Idempotent: dedup by ``base_url`` (after rstrip("/")). If an entry
+        already exists for this URL, no-op and return the existing entry
+        with the ``is_self`` flag re-asserted (so a manually-added row gets
+        promoted to "this server" on next boot rather than living as a
+        zombie peer that proxies to itself).
+
+        The self entry skips the install_token lifecycle entirely:
+        ``install_state`` lands as ``ready``, ``install_token_hash`` /
+        ``server_bearer_hash`` stay None. The cross-server FE proxy at
+        ``/api/m/servers/{id}/api/*`` will refuse to forward without a
+        bearer; that's deliberate — T-0049 will wire local projects in
+        without the proxy hop.
+        """
+        canonical = base_url.rstrip("/")
+        if not canonical:
+            return None
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.base_url.rstrip("/") == canonical:
+                    # Already present. Make sure the flag is True so the UI
+                    # marks it correctly even if it was registered via the
+                    # normal POST /servers path before this code shipped.
+                    if not s.is_self:
+                        servers[i] = replace(s, is_self=True)
+                        self.write(servers)
+                        return servers[i]
+                    return s
+            entry = AttachedServer(
+                id=f"srv_{secrets.token_hex(12)}",
+                display_name=display_name,
+                base_url=canonical,
+                owner_user=owner_user,
+                created_at=_utc_now_iso(),
+                install_state="ready",
+                is_self=True,
+            )
+            servers.append(entry)
+            self.write(servers)
+            return entry
 
     def consume_install_token(
         self,

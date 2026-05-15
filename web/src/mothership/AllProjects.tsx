@@ -65,6 +65,27 @@ export function statusBadgeClass(status: ServerStatus): string {
   }
 }
 
+/**
+ * Label fragments for the per-server section header (T-0055).
+ *
+ * The self entry (the mothership's own registry row) gets a "(this server)"
+ * suffix so an operator with both their mothership and one attached peer can
+ * tell which is which at a glance. The display_name + base_url are
+ * untouched. Pure-function so the renderer stays trivial and we have a
+ * unit-test seam without React.
+ */
+export function serverHeaderLabel(server: AttachedServer): {
+  name: string;
+  url: string;
+  suffix: string | null;
+} {
+  return {
+    name: server.display_name,
+    url: server.base_url,
+    suffix: server.is_self ? "this server" : null,
+  };
+}
+
 export function AllProjects() {
   const [sections, setSections] = useState<ServerSection[] | null>(null);
   const [topError, setTopError] = useState<string | null>(null);
@@ -161,8 +182,10 @@ export function AllProjects() {
 
 function ServerSectionView({ section }: { section: ServerSection }) {
   const { server, kind, result } = section;
+  const label = serverHeaderLabel(server);
   return (
     <section
+      data-testid={server.is_self ? "server-self" : "server-peer"}
       style={{
         border: "1px solid var(--mc-border)",
         borderRadius: 4,
@@ -188,12 +211,18 @@ function ServerSectionView({ section }: { section: ServerSection }) {
             flexWrap: "wrap",
           }}
         >
-          <strong style={{ fontFamily: "var(--mc-mono)" }}>
-            {server.display_name}
-          </strong>
+          <strong style={{ fontFamily: "var(--mc-mono)" }}>{label.name}</strong>
           <span style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
-            {server.base_url}
+            {label.url}
           </span>
+          {label.suffix && (
+            <span
+              className="mc-badge mc-badge-info"
+              title="The mothership server itself"
+            >
+              {label.suffix}
+            </span>
+          )}
         </div>
         <ServerHeaderBadge section={section} />
       </header>

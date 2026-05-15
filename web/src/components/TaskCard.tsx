@@ -8,6 +8,7 @@ export type MenuAction =
   | { kind: "status"; status: Task["status"] }
   | { kind: "editBody" }
   | { kind: "addComment" }
+  | { kind: "setInitiative" }
   | { kind: "delete" };
 
 interface TaskCardProps {
@@ -140,7 +141,7 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
                 </button>
               ))}
               <div style={{ borderTop: "1px solid var(--mc-border)", margin: "0.2rem 0" }} />
-              {(["editBody", "addComment"] as const).map((kind) => (
+              {(["editBody", "addComment", "setInitiative"] as const).map((kind) => (
                 <button
                   key={kind}
                   type="button"
@@ -159,7 +160,11 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
                   onMouseLeave={(e) => (e.currentTarget.style.color = "var(--mc-text-mid)")}
                   onMouseDown={() => { setMenuOpen(false); onMenuAction(task, { kind }); }}
                 >
-                  {kind === "editBody" ? "Edit body" : "Add comment"}
+                  {kind === "editBody"
+                    ? "Edit body"
+                    : kind === "addComment"
+                      ? "Add comment"
+                      : "Set initiative…"}
                 </button>
               ))}
               <div style={{ borderTop: "1px solid var(--mc-border)", margin: "0.2rem 0" }} />

@@ -16,7 +16,7 @@ const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
   closed: "Closed",
 };
 
-type ModalKind = "create" | "editBody" | "addComment" | null;
+type ModalKind = "create" | "editBody" | "addComment" | "setInitiative" | null;
 type GroupBy = "none" | "initiative";
 type ViewMode = "board" | "list";
 
@@ -95,6 +95,9 @@ export function Project() {
 
   // comment form
   const [commentText, setCommentText] = useState("");
+
+  // set-initiative form. "" = unattached.
+  const [initiativeChoice, setInitiativeChoice] = useState<string>("");
 
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
@@ -372,6 +375,11 @@ export function Project() {
       setCommentText("");
       setModalError(null);
       setModalKind("addComment");
+    } else if (action.kind === "setInitiative") {
+      setActiveTask(task);
+      setInitiativeChoice((task.initiative ?? "").trim());
+      setModalError(null);
+      setModalKind("setInitiative");
     } else if (action.kind === "delete") {
       if (!confirm(`Delete task ${task.id}: "${task.title}"?`)) return;
       try {
@@ -380,6 +388,23 @@ export function Project() {
       } catch (e) {
         setError(String(e));
       }
+    }
+  }
+
+  async function handleSetInitiative() {
+    if (!activeTask) return;
+    setSaving(true);
+    setModalError(null);
+    try {
+      await api.patchTask(slug, activeTask.id, {
+        initiative: initiativeChoice ? initiativeChoice : null,
+      });
+      closeModal();
+      reload();
+    } catch (e) {
+      setModalError(String(e));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -625,6 +650,45 @@ export function Project() {
           onChange={(e) => setCommentText(e.target.value)}
           autoFocus
         />
+      </Modal>
+
+      {/* Set initiative modal — T-0038 follow-up. Quick assign from the
+          three-dots menu. The TaskDetail page has the same control inline. */}
+      <Modal
+        open={modalKind === "setInitiative"}
+        title={`Set initiative — ${activeTask?.id ?? ""}`}
+        onClose={closeModal}
+        footer={
+          <>
+            <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
+            <button type="button" className="btn btn-primary" onClick={handleSetInitiative} disabled={saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </>
+        }
+      >
+        {modalError && <div className="alert alert-danger">{modalError}</div>}
+        <select
+          className="form-select"
+          value={initiativeChoice}
+          onChange={(e) => setInitiativeChoice(e.target.value)}
+          autoFocus
+        >
+          <option value="">— unattached —</option>
+          {/* If the current binding isn't in the vision list (orphan: file
+              deleted), surface it so saving is still a deliberate act. */}
+          {activeTask?.initiative &&
+            !initiativeMeta.some((m) => m.key === activeTask.initiative) && (
+              <option value={activeTask.initiative}>
+                {activeTask.initiative} (orphan)
+              </option>
+            )}
+          {initiativeMeta.map((m) => (
+            <option key={m.key} value={m.key}>
+              {m.title} · {m.status}
+            </option>
+          ))}
+        </select>
       </Modal>
     </div>
   );

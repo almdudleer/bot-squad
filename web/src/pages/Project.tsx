@@ -6,14 +6,18 @@ import { Modal } from "../components/Modal";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 
 import { PageHelp } from "../components/PageHelp";
-const COLUMNS = ["open", "in_progress", "totest", "reopened", "closed"] as const;
+const COLUMNS = ["planned", "open", "in_progress", "totest", "reopened", "closed"] as const;
 const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
+  planned: "Planned",
   open: "Open",
   in_progress: "In progress",
   totest: "To Test",
   reopened: "Reopened",
   closed: "Closed",
 };
+// T-0058: the two "rail" columns — render as a thin drop-strip by default,
+// expand on click. Only one is expanded at a time (other auto-collapses).
+const RAIL_STATUSES: ReadonlySet<typeof COLUMNS[number]> = new Set(["planned", "closed"]);
 
 type ModalKind = "create" | "editBody" | "addComment" | "setInitiative" | null;
 type GroupBy = "none" | "initiative";
@@ -104,6 +108,14 @@ export function Project() {
   }, [collapsedStorageKey, collapsedLanes]);
   function toggleLane(key: string) {
     setCollapsedLanes((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
+  // T-0058: which rail (planned|closed) is currently expanded. null = both
+  // collapsed to thin strips. Shared across the ungrouped board AND every
+  // initiative lane, so toggling one place toggles them all (consistent UX).
+  const [expandedRail, setExpandedRail] = useState<typeof COLUMNS[number] | null>(null);
+  function toggleRail(status: typeof COLUMNS[number]) {
+    setExpandedRail((prev) => (prev === status ? null : status));
   }
 
   // modal state
@@ -503,7 +515,7 @@ export function Project() {
 
       {groupBy === "none" ? (
         viewMode === "board" ? (
-          <div className="row g-3 mt-1">
+          <div className="mc-board-row mt-1">
             {COLUMNS.map((c) => (
               <BoardColumn
                 key={c}
@@ -514,6 +526,12 @@ export function Project() {
                 onMenuAction={handleMenuAction}
                 onMove={handleMove}
                 onReorder={handleReorder}
+                railMode={
+                  RAIL_STATUSES.has(c)
+                    ? (expandedRail === c ? "expanded" : "collapsed")
+                    : null
+                }
+                onToggleRail={RAIL_STATUSES.has(c) ? () => toggleRail(c) : undefined}
               />
             ))}
           </div>
@@ -538,6 +556,8 @@ export function Project() {
               onMenuAction={handleMenuAction}
               onMove={handleMove}
               onReorder={handleReorder}
+              expandedRail={expandedRail}
+              onToggleRail={toggleRail}
             />
           ))}
         </div>
@@ -594,6 +614,7 @@ export function Project() {
             value={newStatus}
             onChange={(e) => setNewStatus(e.target.value as Task["status"])}
           >
+            <option value="planned">Planned</option>
             <option value="open">Open</option>
             <option value="in_progress">In progress</option>
             <option value="totest">To Test</option>
@@ -740,6 +761,9 @@ interface InitiativeLaneProps {
   onMenuAction: (task: Task, action: MenuAction) => void;
   onMove: (taskId: string, from: Task["status"], to: Task["status"]) => void;
   onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
+  // T-0058: rail expansion is shared across lanes — the parent owns the state.
+  expandedRail: typeof COLUMNS[number] | null;
+  onToggleRail: (status: typeof COLUMNS[number]) => void;
 }
 
 function InitiativeLane({
@@ -752,6 +776,8 @@ function InitiativeLane({
   onMenuAction,
   onMove,
   onReorder,
+  expandedRail,
+  onToggleRail,
 }: InitiativeLaneProps) {
   const navigate = useNavigate();
   const counts = COLUMNS.reduce<Record<string, number>>(
@@ -847,7 +873,7 @@ function InitiativeLane({
             color: "var(--mc-text-dim)",
             marginLeft: "0.5rem",
           }}
-          title="open / in-progress / to-test / reopened / closed"
+          title="planned / open / in-progress / to-test / reopened / closed"
         >
           {COLUMNS.map((c) => `${counts[c]}`).join(" / ")}
         </span>
@@ -863,7 +889,7 @@ function InitiativeLane({
         </span>
       </div>
       {!collapsed && (viewMode === "board" ? (
-        <div className="row g-3">
+        <div className="mc-board-row">
           {COLUMNS.map((c) => (
             <BoardColumn
               key={c}
@@ -874,6 +900,12 @@ function InitiativeLane({
               onMenuAction={onMenuAction}
               onMove={onMove}
               onReorder={onReorder}
+              railMode={
+                RAIL_STATUSES.has(c)
+                  ? (expandedRail === c ? "expanded" : "collapsed")
+                  : null
+              }
+              onToggleRail={RAIL_STATUSES.has(c) ? () => onToggleRail(c) : undefined}
             />
           ))}
         </div>

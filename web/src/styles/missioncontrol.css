@@ -947,6 +947,85 @@ pre.bg-light {
   letter-spacing: 0.05em;
 }
 
+/* T-0058: board row replaces Bootstrap `row g-3` so the planned/closed
+   rails can collapse to thin drop-strips while the other columns share
+   the remaining width on a single line. */
+.mc-board-row {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 1rem;
+  align-items: stretch;
+  overflow-x: auto;
+}
+.mc-board-row > .mc-board-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.mc-board-row > .mc-board-col.mc-board-rail-collapsed {
+  flex: 0 0 2.25rem;
+  min-width: 2.25rem;
+  max-width: 2.25rem;
+  padding: 0;
+  cursor: pointer;
+  border: 1px solid var(--mc-border);
+  background-color: var(--mc-surface);
+  transition: background-color 0.12s, border-color 0.12s;
+}
+.mc-board-row > .mc-board-col.mc-board-rail-collapsed:hover,
+.mc-board-row > .mc-board-col.mc-board-rail-collapsed:focus-visible {
+  background-color: var(--mc-surface-raised);
+  border-color: var(--mc-cyan);
+  outline: none;
+}
+.mc-board-rail-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  height: 100%;
+  min-height: 6rem;
+  padding: 0.6rem 0;
+  gap: 0.5rem;
+  font-family: var(--mc-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--mc-amber);
+  font-weight: 700;
+  pointer-events: none;     /* clicks bubble to the column */
+}
+.mc-board-rail-chevron {
+  font-size: 0.85rem;
+  color: var(--mc-text-dim);
+  line-height: 1;
+}
+.mc-board-rail-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  white-space: nowrap;
+  letter-spacing: 0.18em;
+}
+.mc-board-rail-count {
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  background: var(--mc-surface-raised);
+  border: 1px solid var(--mc-border-strong);
+  border-radius: 2px;
+  padding: 1px 5px;
+  font-weight: 700;
+}
+.mc-board-col.mc-board-rail-expanded .mc-board-col-header {
+  color: var(--mc-cyan);
+  border-bottom-color: var(--mc-cyan);
+}
+.mc-board-rail-chevron-inline {
+  font-size: 0.85rem;
+  color: var(--mc-text-dim);
+  line-height: 1;
+  margin-right: 0.1rem;
+}
+
 /* Per-page help — collapsible block that explains what the page does.
    The wrap holds a toggle button by default; when expanded, a panel
    appears below it. */

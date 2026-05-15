@@ -27,7 +27,7 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
-_VALID_STATUSES = {"open", "in_progress", "totest", "reopened", "closed"}
+_VALID_STATUSES = {"planned", "open", "in_progress", "totest", "reopened", "closed"}
 _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 
 # T-0038: optional linkage fields settable via PATCH alongside title/status.

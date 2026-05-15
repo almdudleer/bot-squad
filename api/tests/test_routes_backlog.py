@@ -103,6 +103,32 @@ def test_create_task_invalid_status_rejected(tmp_bot_squad: Path, monkeypatch):
     assert r.status_code == 400
 
 
+def test_create_and_patch_planned_status(tmp_bot_squad: Path, monkeypatch):
+    # T-0058: planned is a first-class status; round-trip create → patch → patch.
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/backlog",
+            json={"title": "Backlogged", "status": "planned"},
+        )
+        assert r.status_code == 200
+        tid = r.json()["id"]
+        assert r.json()["status"] == "planned"
+
+        r = client.patch(
+            f"/api/projects/test-project/backlog/{tid}",
+            json={"status": "open"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "open"
+
+        r = client.patch(
+            f"/api/projects/test-project/backlog/{tid}",
+            json={"status": "planned"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "planned"
+
+
 def test_create_task_requires_auth(tmp_bot_squad: Path, monkeypatch):
     with _anon_client(tmp_bot_squad, monkeypatch) as client:
         r = client.post(

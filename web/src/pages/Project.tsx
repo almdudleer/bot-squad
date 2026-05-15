@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, SessionRow, Task, VisionFile } from "../api";
+import { useNavigate, useParams } from "react-router-dom";
+import { api, Task, VisionFile } from "../api";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
-import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 
@@ -76,7 +75,6 @@ export function Project() {
   const { slug = "" } = useParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [vision, setVision] = useState<VisionFile[]>([]);
-  const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   // T-0039: view controls. Defaults reproduce the pre-T-0039 board exactly.
@@ -136,10 +134,6 @@ export function Project() {
   useEffect(() => {
     reload();
     api.vision(slug).then(setVision).catch(() => setVision([]));
-    api
-      .sessions(slug)
-      .then((rows) => setSessions(rows.filter((s) => !s.archived)))
-      .catch(() => setSessions([]));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
@@ -168,16 +162,6 @@ export function Project() {
     return list;
   }, [vision]);
 
-  // T-0038 stakeholder follow-up #1: tickets with an active dev session
-  // belong on the Sessions surface, not the kanban backlog. Strip them
-  // here so every downstream view (board, swimlanes, list) hides them
-  // consistently. Paused / suspended sessions don't count — that work
-  // has stalled and the board is the right place to plan to resume it.
-  const boardTasks = useMemo<Task[]>(() => {
-    return (tasks ?? []).filter((t) => t.session?.status !== "active");
-  }, [tasks]);
-  const hiddenActiveCount = (tasks?.length ?? 0) - boardTasks.length;
-
   // Set of initiative basenames currently in vision/active_initiatives.
   const activeInitiativeKeys = useMemo<Set<string>>(() => {
     return new Set(initiativeMeta.filter((m) => m.status === "active").map((m) => m.key));
@@ -196,7 +180,7 @@ export function Project() {
   const tasksByInit = useMemo<Record<string, Task[]>>(() => {
     const out: Record<string, Task[]> = { [UNATTACHED]: [] };
     for (const m of initiativeMeta) out[m.key] = [];
-    for (const t of boardTasks) {
+    for (const t of tasks ?? []) {
       const init = (t.initiative ?? "").trim();
       if (init && out[init] !== undefined) {
         out[init].push(t);
@@ -210,7 +194,7 @@ export function Project() {
       }
     }
     return out;
-  }, [boardTasks, initiativeMeta]);
+  }, [tasks, initiativeMeta]);
 
   // Final lane list (after applying the filter). Always include the lane
   // matching the active filter even if empty; otherwise show all.
@@ -233,7 +217,7 @@ export function Project() {
 
   // Ungrouped — current 5-column behavior.
   const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
-  const ungroupedTasks = boardTasks.filter(passesFilter);
+  const ungroupedTasks = (tasks ?? []).filter(passesFilter);
   for (const t of ungroupedTasks) {
     if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
       grouped[t.status].push(t);
@@ -456,39 +440,6 @@ export function Project() {
 
   return (
     <div className="container py-4">
-      {/* T-0006: active-sessions strip — quick way to copy the tmux attach for
-          any live session on this project without bouncing through the
-          Sessions page. Hidden when no live sessions exist. */}
-      {sessions.length > 0 && (
-        <div
-          className="mb-3 d-flex flex-wrap align-items-center gap-3"
-          style={{
-            fontFamily: "var(--mc-mono)",
-            fontSize: "0.74rem",
-            padding: "0.5rem 0.75rem",
-            background: "var(--mc-surface-deep)",
-            border: "1px solid var(--mc-border)",
-            borderRadius: 3,
-          }}
-        >
-          <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-            Active sessions
-          </span>
-          {sessions.map((s) => (
-            <span key={s.sid} style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}>
-              <Link
-                to={`/p/${slug}/sessions`}
-                style={{ color: "var(--mc-accent)", textDecoration: "none" }}
-                title={s.sid}
-              >
-                {s.window}
-              </Link>
-              <CopyableTmuxAttach session={s.sid} window={s.window} />
-            </span>
-          ))}
-        </div>
-      )}
-
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Backlog</h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>
@@ -549,29 +500,6 @@ export function Project() {
           </select>
         </div>
       </div>
-
-      {/* Hidden-count indicator. The board strips tickets with a live dev
-          session — show the count so they're not invisible. Click goes to
-          the Sessions page where that work belongs. */}
-      {hiddenActiveCount > 0 && (
-        <div
-          className="d-flex align-items-center gap-2 mb-2"
-          style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem" }}
-        >
-          <span style={{ color: "var(--mc-text-dim)" }}>
-            {hiddenActiveCount} ticket{hiddenActiveCount === 1 ? "" : "s"} in active sessions —
-          </span>
-          <Link
-            to={`/p/${slug}/sessions`}
-            style={{
-              color: "var(--mc-accent-success, #4ade80)",
-              textDecoration: "none",
-            }}
-          >
-            view on Sessions →
-          </Link>
-        </div>
-      )}
 
       {groupBy === "none" ? (
         viewMode === "board" ? (

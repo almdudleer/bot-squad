@@ -81,6 +81,29 @@ export function Project() {
   // Filter is a single initiative basename, UNATTACHED, or "" for all.
   const [filterInit, setFilterInit] = useState<string>("");
 
+  // Per-lane collapsed state. Key = initiative basename or UNATTACHED.
+  // Persisted to localStorage per project so a folded set of "done"
+  // initiatives stays folded across reloads.
+  const collapsedStorageKey = `bs.collapsedLanes.${slug}`;
+  const [collapsedLanes, setCollapsedLanes] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem(collapsedStorageKey);
+      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(collapsedStorageKey, JSON.stringify(collapsedLanes));
+    } catch {
+      /* quota exceeded, private mode, etc. — silent. */
+    }
+  }, [collapsedStorageKey, collapsedLanes]);
+  function toggleLane(key: string) {
+    setCollapsedLanes((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
   // modal state
   const [modalKind, setModalKind] = useState<ModalKind>(null);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
@@ -535,6 +558,8 @@ export function Project() {
               tasks={tasksByInit[lane.key] ?? []}
               slug={slug}
               viewMode={viewMode}
+              collapsed={Boolean(collapsedLanes[lane.key])}
+              onToggleCollapsed={() => toggleLane(lane.key)}
               onMenuAction={handleMenuAction}
               onMove={handleMove}
               onReorder={handleReorder}
@@ -735,6 +760,8 @@ interface InitiativeLaneProps {
   tasks: Task[];
   slug: string;
   viewMode: ViewMode;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
   onMenuAction: (task: Task, action: MenuAction) => void;
   onMove: (taskId: string, from: Task["status"], to: Task["status"]) => void;
   onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
@@ -745,6 +772,8 @@ function InitiativeLane({
   tasks,
   slug,
   viewMode,
+  collapsed,
+  onToggleCollapsed,
   onMenuAction,
   onMove,
   onReorder,
@@ -784,6 +813,26 @@ function InitiativeLane({
         className="d-flex align-items-center gap-2 mb-2 flex-wrap"
         style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}
       >
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? `Expand ${meta.title}` : `Collapse ${meta.title}`}
+          title={collapsed ? "Expand lane" : "Collapse lane"}
+          style={{
+            background: "none",
+            border: "none",
+            color: "var(--mc-text-dim)",
+            cursor: "pointer",
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.8rem",
+            padding: "0 0.15rem",
+            lineHeight: 1,
+            width: "1.1rem",
+          }}
+        >
+          {collapsed ? "▸" : "▾"}
+        </button>
         <span
           onClick={() => {
             if (titleClickable) navigate(`/p/${slug}/vision`);
@@ -838,7 +887,7 @@ function InitiativeLane({
           ({tasks.length} total)
         </span>
       </div>
-      {viewMode === "board" ? (
+      {!collapsed && (viewMode === "board" ? (
         <div className="row g-3">
           {COLUMNS.map((c) => (
             <BoardColumn
@@ -859,7 +908,7 @@ function InitiativeLane({
           slug={slug}
           onMenuAction={onMenuAction}
         />
-      )}
+      ))}
     </div>
   );
 }

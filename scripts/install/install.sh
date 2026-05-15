@@ -77,9 +77,36 @@ BOTSQUAD_DOCKER_GPG_FETCH_CMD="${BOTSQUAD_DOCKER_GPG_FETCH_CMD:-}"
 BOTSQUAD_DOCKER_INSTALL_CMD="${BOTSQUAD_DOCKER_INSTALL_CMD:-}"
 BOTSQUAD_DOCKER_USERMOD_CMD="${BOTSQUAD_DOCKER_USERMOD_CMD:-}"
 BOTSQUAD_DOCKER_CHECK_CMD="${BOTSQUAD_DOCKER_CHECK_CMD:-docker compose version}"
+# install_reverse_proxy checkpoint seams (T-0029). The default shape is the
+# HTTP-only fallback (shape 2 in T-0029); the bundled-traefik shape was
+# rejected — see vision/multi-server/reverse-proxy-decision.md.
+#   BOTSQUAD_REVERSE_PROXY_MODE — auto|shared|fresh (default auto)
+#                                  auto  → detect via the network probe below
+#                                  shared → assume an external traefik is in
+#                                           front (no-op; existing compose
+#                                           labels are used as-is)
+#                                  fresh  → force the fresh-host override
+#                                           regardless of probe result
+#   BOTSQUAD_HTTP_PORT          — host port to publish for the fresh-host
+#                                  shape (default 8000)
+#   BOTSQUAD_REVERSE_PROXY_NETWORK — name of the external traefik network
+#                                    that the bundled compose file expects
+#                                    (default avo_backend)
+#   BOTSQUAD_DOCKER_NETWORK_PROBE_CMD — "shared reverse proxy is present"
+#                                       probe. Receives the network name as
+#                                       $1; non-zero exit = absent. Default is
+#                                       `docker network inspect <name>`.
+#   BOTSQUAD_FRESH_HOST_OVERRIDE — override compose-file path (default
+#                                   $BOTSQUAD_INSTALL_DIR/docker-compose.fresh-host.yml)
+BOTSQUAD_REVERSE_PROXY_MODE="${BOTSQUAD_REVERSE_PROXY_MODE:-auto}"
+BOTSQUAD_HTTP_PORT="${BOTSQUAD_HTTP_PORT:-8000}"
+BOTSQUAD_REVERSE_PROXY_NETWORK="${BOTSQUAD_REVERSE_PROXY_NETWORK:-avo_backend}"
+BOTSQUAD_DOCKER_NETWORK_PROBE_CMD="${BOTSQUAD_DOCKER_NETWORK_PROBE_CMD:-}"
+BOTSQUAD_FRESH_HOST_OVERRIDE="${BOTSQUAD_FRESH_HOST_OVERRIDE:-}"
 
 STATE_FILE="${BOTSQUAD_STATE_DIR}/install.state"
 ENV_FILE="${BOTSQUAD_INSTALL_DIR}/.env"
+FRESH_HOST_OVERRIDE_DEFAULT="${BOTSQUAD_INSTALL_DIR}/docker-compose.fresh-host.yml"
 
 # ---- Plumbing ---------------------------------------------------------------
 log()  { printf '\033[36m[bot-squad]\033[0m %s\n' "$*" >&2; }
@@ -638,6 +665,131 @@ see the underlying error."
   fi
 }
 
+# --- install_reverse_proxy checkpoint helpers (T-0029) -----------------------
+#
+# Two shapes, distinguished by whether a shared reverse proxy is already in
+# front of this docker daemon:
+#
+#   shared (no-op): the host already runs a reverse proxy (e.g. traefik on
+#     the `avo_backend` external network — the bot-squad-api compose service
+#     has matching `traefik.http.routers.bot-squad.rule=Host(...)` labels).
+#     The detection sentinel is `docker network inspect avo_backend` (or
+#     whatever name BOTSQUAD_REVERSE_PROXY_NETWORK is set to). When the
+#     probe returns 0, this checkpoint is a no-op — the existing labels
+#     do the work. This is the path the bot-squad mothership server itself
+#     takes and MUST stay no-op for it.
+#
+#   fresh: the host has no reverse proxy. We write a docker-compose override
+#     (BOTSQUAD_FRESH_HOST_OVERRIDE, default docker-compose.fresh-host.yml)
+#     that (a) redefines `avo_backend` as a stack-local network so compose
+#     creates it, and (b) publishes bot-squad-api:8000 on the host at
+#     BOTSQUAD_HTTP_PORT (default 8000). step_docker_compose_up picks the
+#     override file up automatically when it's present.
+#
+# TLS bootstrap is deliberately deferred: shape 2 only serves HTTP on the
+# published port; users layer their own caddy / nginx / traefik in front
+# (the gitea/plausible/forgejo playbook).
+#
+# Rationale: vision/multi-server/reverse-proxy-decision.md
+
+reverse_proxy_override_path() {
+  if [[ -n "$BOTSQUAD_FRESH_HOST_OVERRIDE" ]]; then
+    printf '%s' "$BOTSQUAD_FRESH_HOST_OVERRIDE"
+  else
+    printf '%s' "${BOTSQUAD_INSTALL_DIR}/docker-compose.fresh-host.yml"
+  fi
+}
+
+# Return 0 if the shared reverse-proxy network is present (i.e. somebody
+# else is already running a reverse proxy on this docker daemon), non-zero
+# otherwise. Honors the BOTSQUAD_DOCKER_NETWORK_PROBE_CMD test seam: when
+# set, the command is invoked with the network name as $1.
+reverse_proxy_shared_present() {
+  local network="$BOTSQUAD_REVERSE_PROXY_NETWORK"
+  if [[ -n "$BOTSQUAD_DOCKER_NETWORK_PROBE_CMD" ]]; then
+    bash -c "$BOTSQUAD_DOCKER_NETWORK_PROBE_CMD \"\$1\"" _ "$network" >/dev/null 2>&1
+    return $?
+  fi
+  # Default probe: `docker network inspect <name>` returns 0 iff the
+  # network exists on the local daemon. Silent on both branches.
+  command -v docker >/dev/null 2>&1 || return 1
+  docker network inspect "$network" >/dev/null 2>&1
+}
+
+# Write the fresh-host docker-compose override. Idempotent: if the file
+# already has the exact body, leave its mtime alone.
+reverse_proxy_write_override() {
+  local path="$1" port="$2" network="$3"
+  local body
+  # The override targets the bot-squad-api service from the parent
+  # compose. We redefine `avo_backend` as stack-local (external: false)
+  # so compose creates it, and add a ports: block to publish the API.
+  # Comments explain the intent for anyone who opens the file later.
+  body="$(cat <<EOF
+# Generated by bot-squad installer (T-0029, install_reverse_proxy step).
+# Layered on top of docker-compose.yml when this host has no shared
+# reverse proxy (no '${network}' external network). Publishes the API
+# on a host port so the user can curl/browse it directly, or layer
+# their own caddy/nginx/traefik in front. To remove (e.g. you set up a
+# shared traefik later), just delete this file and re-run the installer.
+services:
+  bot-squad-api:
+    ports:
+      - "${port}:8000"
+
+networks:
+  ${network}:
+    external: false
+EOF
+)"
+  if [[ -f "$path" ]] && [[ "$(cat "$path" 2>/dev/null)" = "$body" ]]; then
+    return 0
+  fi
+  local parent; parent="$(dirname "$path")"
+  if [[ ! -d "$parent" ]]; then
+    mkdir -p "$parent" 2>/dev/null || sudo mkdir -p "$parent" || return 1
+  fi
+  if [[ -w "$parent" ]] || { [[ -f "$path" ]] && [[ -w "$path" ]]; }; then
+    printf '%s\n' "$body" > "$path"
+    chmod 0644 "$path"
+  else
+    printf '%s\n' "$body" | sudo tee "$path" >/dev/null
+    sudo chmod 0644 "$path"
+  fi
+}
+
+step_install_reverse_proxy() {
+  local override; override="$(reverse_proxy_override_path)"
+  case "$BOTSQUAD_REVERSE_PROXY_MODE" in
+    shared)
+      log "reverse-proxy mode forced to shared → no-op (existing traefik labels apply)"
+      return 0
+      ;;
+    fresh)
+      log "reverse-proxy mode forced to fresh → writing override $override"
+      ;;
+    auto|"")
+      if reverse_proxy_shared_present; then
+        log "shared reverse proxy detected (network '$BOTSQUAD_REVERSE_PROXY_NETWORK' exists) → no-op"
+        return 0
+      fi
+      log "no shared reverse proxy detected → writing fresh-host override $override"
+      ;;
+    *)
+      die_struct install_reverse_proxy \
+        "Unknown BOTSQUAD_REVERSE_PROXY_MODE='$BOTSQUAD_REVERSE_PROXY_MODE'." \
+        "Set BOTSQUAD_REVERSE_PROXY_MODE to one of: auto, shared, fresh."
+      ;;
+  esac
+  reverse_proxy_write_override "$override" \
+      "$BOTSQUAD_HTTP_PORT" "$BOTSQUAD_REVERSE_PROXY_NETWORK" \
+    || die_struct install_reverse_proxy \
+      "Could not write fresh-host compose override at $override." \
+      "Check permissions on $(dirname "$override"). If you're behind a
+read-only mount, set BOTSQUAD_FRESH_HOST_OVERRIDE to a writable path."
+  log "fresh-host override ready: bot-squad-api → host:${BOTSQUAD_HTTP_PORT}"
+}
+
 step_botsquad_group() {
   if getent group "$BOTSQUAD_GROUP" >/dev/null 2>&1; then
     log "group $BOTSQUAD_GROUP already exists"
@@ -816,13 +968,24 @@ step_systemd_unit() {
 }
 
 step_docker_compose_up() {
-  ( cd "$BOTSQUAD_INSTALL_DIR" && docker compose up -d --build ) \
+  # T-0029: if the fresh-host override exists (written by
+  # install_reverse_proxy on hosts with no shared traefik), layer it on
+  # top of the base compose file via -f. On hosts with a shared traefik,
+  # the override is absent and `docker compose up` uses just the base.
+  local override; override="$(reverse_proxy_override_path)"
+  local -a compose_args=(compose -f docker-compose.yml)
+  if [[ -f "$override" ]]; then
+    compose_args+=(-f "$override")
+    log "docker compose: layering fresh-host override $override"
+  fi
+  compose_args+=(up -d --build)
+  ( cd "$BOTSQUAD_INSTALL_DIR" && docker "${compose_args[@]}" ) \
     || die_struct docker_compose_up "docker compose up failed." \
        "Run 'cd $BOTSQUAD_INSTALL_DIR && docker compose up -d --build'
 manually to see the build error. If it complains about a missing
-external network 'avo_backend', that prerequisite isn't bundled in v1 —
-create it with 'docker network create avo_backend' (or whatever your
-reverse-proxy network is) and re-run."
+external network 'avo_backend', the install_reverse_proxy checkpoint
+should have written $override — re-run the installer (it'll resume at
+install_reverse_proxy)."
 }
 
 step_agent_teams_flag() {
@@ -913,6 +1076,7 @@ STEPS=(
   mothership_handshake
   python_venv
   systemd_unit
+  install_reverse_proxy
   docker_compose_up
   agent_teams_flag
   spawn_operator

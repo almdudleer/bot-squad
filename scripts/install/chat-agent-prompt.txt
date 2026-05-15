@@ -78,11 +78,14 @@ Common failure causes you should recognize without me explaining:
 
 When the install is done, walk me through this hand-off:
 
-1. From a **separate** SSH session to the same host, run
+1. Open the UI at `/welcome` (the URL the success banner prints).
+   That's the "you're all set" handoff screen with a copyable
+   `tmux a -t …` command and a Next button into the server view.
+2. From a **separate** SSH session to the same host, run
    `tmux a -t bot-squad-operator`. That attaches me to the bot-squad
    operator — the long-lived Claude session that manages this server.
-2. Send the operator a message ("hi") so it knows I've arrived.
-3. Close the SSH session I used for the install (your job here is
+3. Send the operator a message ("hi") so it knows I've arrived.
+4. Close the SSH session I used for the install (your job here is
    done).
 
 Ready when you are — please start by telling me to run the curl + bash

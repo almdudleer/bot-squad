@@ -46,6 +46,37 @@ BOTSQUAD_NONINTERACTIVE="${BOTSQUAD_NONINTERACTIVE:-0}"
 BOTSQUAD_PROXY_APT_CONF="${BOTSQUAD_PROXY_APT_CONF:-/etc/apt/apt.conf.d/01proxy}"
 BOTSQUAD_CLAUDE_SETTINGS="${BOTSQUAD_CLAUDE_SETTINGS:-${HOME}/.claude/settings.json}"
 BOTSQUAD_PROXY_PROBE_CMD="${BOTSQUAD_PROXY_PROBE_CMD:-}"
+# install_docker checkpoint seams. Override target paths if needed (tests
+# redirect these into a temp dir):
+#   BOTSQUAD_DOCKER_GPG_KEYRING — keyring sink (default
+#                                  /etc/apt/keyrings/docker.asc)
+#   BOTSQUAD_DOCKER_APT_LIST    — sources.list.d snippet (default
+#                                  /etc/apt/sources.list.d/docker.list)
+#   BOTSQUAD_DOCKER_CODENAME    — override apt repo codename (default: detect
+#                                  via /etc/os-release VERSION_CODENAME)
+#   BOTSQUAD_DOCKER_ARCH        — override apt repo arch (default: dpkg --print-architecture)
+#   BOTSQUAD_DOCKER_DISTRO      — override apt repo distro (ubuntu|debian; default
+#                                  via /etc/os-release ID, fallback ubuntu)
+#   BOTSQUAD_DOCKER_GPG_FETCH_CMD — command that writes the GPG key; receives
+#                                    the destination path as $1. Default is
+#                                    sudo curl from download.docker.com.
+#   BOTSQUAD_DOCKER_INSTALL_CMD — command that installs the docker apt packages.
+#                                  Default is `sudo apt-get update && sudo
+#                                  apt-get install -y docker-ce ...`.
+#   BOTSQUAD_DOCKER_USERMOD_CMD — command that adds $1 to the docker group.
+#                                  Default is `sudo usermod -aG docker $1`.
+#   BOTSQUAD_DOCKER_CHECK_CMD   — "compose works" probe (default
+#                                  `docker compose version`). Idempotency
+#                                  keys on the exit code of this command.
+BOTSQUAD_DOCKER_GPG_KEYRING="${BOTSQUAD_DOCKER_GPG_KEYRING:-/etc/apt/keyrings/docker.asc}"
+BOTSQUAD_DOCKER_APT_LIST="${BOTSQUAD_DOCKER_APT_LIST:-/etc/apt/sources.list.d/docker.list}"
+BOTSQUAD_DOCKER_CODENAME="${BOTSQUAD_DOCKER_CODENAME:-}"
+BOTSQUAD_DOCKER_ARCH="${BOTSQUAD_DOCKER_ARCH:-}"
+BOTSQUAD_DOCKER_DISTRO="${BOTSQUAD_DOCKER_DISTRO:-}"
+BOTSQUAD_DOCKER_GPG_FETCH_CMD="${BOTSQUAD_DOCKER_GPG_FETCH_CMD:-}"
+BOTSQUAD_DOCKER_INSTALL_CMD="${BOTSQUAD_DOCKER_INSTALL_CMD:-}"
+BOTSQUAD_DOCKER_USERMOD_CMD="${BOTSQUAD_DOCKER_USERMOD_CMD:-}"
+BOTSQUAD_DOCKER_CHECK_CMD="${BOTSQUAD_DOCKER_CHECK_CMD:-docker compose version}"
 
 STATE_FILE="${BOTSQUAD_STATE_DIR}/install.state"
 ENV_FILE="${BOTSQUAD_INSTALL_DIR}/.env"
@@ -412,18 +443,199 @@ re-run with BOTSQUAD_PROXY_URL=http://... and retry."
     "Add npm's global bin dir to your PATH (npm bin -g) and re-run."
 }
 
-step_require_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+# --- install_docker checkpoint helpers ---------------------------------------
+#
+# Bootstrap Docker engine + compose plugin via Docker's official apt repo,
+# using the signed-by gpg-key pattern (not pipe-curl-to-sudo-bash) per
+# https://docs.docker.com/engine/install/ubuntu/.
+#
+# Idempotency is keyed on "compose works" (BOTSQUAD_DOCKER_CHECK_CMD), not
+# "we ran apt": if `docker compose version` already returns 0, the entire
+# checkpoint is a no-op. This keeps the checkpoint stable across docker
+# minor-version bumps and across hosts where docker was installed by some
+# other means.
+#
+# Every step that touches sudo / apt / network is funnelled through a
+# BOTSQUAD_DOCKER_*_CMD env-var seam so the test suite can stub them.
+
+docker_compose_works() {
+  bash -c "$BOTSQUAD_DOCKER_CHECK_CMD" >/dev/null 2>&1
+}
+
+docker_detect_codename() {
+  if [[ -n "$BOTSQUAD_DOCKER_CODENAME" ]]; then
+    printf '%s' "$BOTSQUAD_DOCKER_CODENAME"; return
+  fi
+  local codename=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    codename="$( . /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}" )"
+  fi
+  if [[ -z "$codename" ]] && command -v lsb_release >/dev/null 2>&1; then
+    codename="$(lsb_release -cs 2>/dev/null || true)"
+  fi
+  printf '%s' "$codename"
+}
+
+docker_detect_distro() {
+  if [[ -n "$BOTSQUAD_DOCKER_DISTRO" ]]; then
+    printf '%s' "$BOTSQUAD_DOCKER_DISTRO"; return
+  fi
+  if [[ -r /etc/os-release ]]; then
+    ( . /etc/os-release && printf '%s' "${ID:-ubuntu}" )
+  else
+    printf '%s' ubuntu
+  fi
+}
+
+docker_detect_arch() {
+  if [[ -n "$BOTSQUAD_DOCKER_ARCH" ]]; then
+    printf '%s' "$BOTSQUAD_DOCKER_ARCH"; return
+  fi
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --print-architecture 2>/dev/null || printf '%s' amd64
+  else
+    printf '%s' amd64
+  fi
+}
+
+# Install Docker's official GPG key at $1 using the signed-by pattern.
+# Returns non-zero on any failure (network / sudo / write).
+docker_install_gpg_key() {
+  local keyring="$1" parent
+  parent="$(dirname "$keyring")"
+  if [[ -n "$BOTSQUAD_DOCKER_GPG_FETCH_CMD" ]]; then
+    mkdir -p "$parent" || return 1
+    bash -c "$BOTSQUAD_DOCKER_GPG_FETCH_CMD \"\$1\"" _ "$keyring"
+    return $?
+  fi
+  local distro; distro="$(docker_detect_distro)"
+  if [[ -w "$parent" ]] || { [[ -f "$keyring" ]] && [[ -w "$keyring" ]]; }; then
+    mkdir -p "$parent" || return 1
+    curl -fsSL "https://download.docker.com/linux/${distro}/gpg" \
+      -o "$keyring" || return 1
+    chmod 0644 "$keyring" || return 1
+  else
+    sudo install -m 0755 -d "$parent" || return 1
+    sudo curl -fsSL "https://download.docker.com/linux/${distro}/gpg" \
+      -o "$keyring" || return 1
+    sudo chmod 0644 "$keyring" || return 1
+  fi
+}
+
+# Write the apt sources.list.d snippet for Docker's repo. Idempotent: if the
+# file already has the exact body we'd write, leave its mtime alone.
+docker_write_apt_list() {
+  local list="$1" keyring="$2" distro codename arch
+  distro="$(docker_detect_distro)"
+  codename="$(docker_detect_codename)"
+  arch="$(docker_detect_arch)"
+  if [[ -z "$codename" ]]; then
+    die_struct install_docker \
+      "Could not detect distro codename for Docker's apt repo." \
+      "Make sure /etc/os-release defines VERSION_CODENAME (or UBUNTU_CODENAME),
+or install lsb-release. Cross-distro support is tracked under T-0030; for
+now, override with BOTSQUAD_DOCKER_CODENAME=<codename>."
+  fi
+  local body
+  body="$(printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' \
+    "$arch" "$keyring" "$distro" "$codename")"
+  if [[ -f "$list" ]] && [[ "$(cat "$list" 2>/dev/null)" = "$body" ]]; then
     return 0
   fi
-  die_struct require_docker \
-    "Docker engine + compose plugin not detected. This v1 installer assumes
-docker is already configured for the current user." \
-    "Install docker engine + compose plugin per
-https://docs.docker.com/engine/install/ubuntu/ — then add your user to the
-'docker' group (sudo usermod -aG docker \$USER), log out + back in, and
-re-run the installer. (Bootstrap-from-zero docker install is a follow-on
-task.)"
+  local parent; parent="$(dirname "$list")"
+  if [[ -w "$parent" ]] || { [[ -f "$list" ]] && [[ -w "$list" ]]; }; then
+    mkdir -p "$parent" || return 1
+    printf '%s' "$body" > "$list"
+    chmod 0644 "$list"
+  else
+    sudo install -m 0755 -d "$parent" || return 1
+    printf '%s' "$body" | sudo tee "$list" >/dev/null
+    sudo chmod 0644 "$list"
+  fi
+}
+
+docker_run_install_cmd() {
+  if [[ -n "$BOTSQUAD_DOCKER_INSTALL_CMD" ]]; then
+    bash -c "$BOTSQUAD_DOCKER_INSTALL_CMD"
+    return $?
+  fi
+  sudo apt-get update -y >/dev/null || return 1
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin >/dev/null
+}
+
+docker_run_usermod_cmd() {
+  local user="$1"
+  if [[ -n "$BOTSQUAD_DOCKER_USERMOD_CMD" ]]; then
+    bash -c "$BOTSQUAD_DOCKER_USERMOD_CMD \"\$1\"" _ "$user"
+    return $?
+  fi
+  sudo usermod -aG docker "$user"
+}
+
+step_install_docker() {
+  # Idempotency is keyed on "compose works", not "we ran apt".
+  if docker_compose_works; then
+    log "docker compose already works (skipping)"
+    return 0
+  fi
+
+  docker_install_gpg_key "$BOTSQUAD_DOCKER_GPG_KEYRING" \
+    || die_struct install_docker \
+      "Could not install Docker's GPG key to $BOTSQUAD_DOCKER_GPG_KEYRING." \
+      "Check network connectivity to download.docker.com and that
+$(dirname "$BOTSQUAD_DOCKER_GPG_KEYRING") is writable (with sudo). If
+you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=http://..."
+
+  docker_write_apt_list "$BOTSQUAD_DOCKER_APT_LIST" "$BOTSQUAD_DOCKER_GPG_KEYRING" \
+    || die_struct install_docker \
+      "Could not write $BOTSQUAD_DOCKER_APT_LIST." \
+      "Check sudo permissions on $(dirname "$BOTSQUAD_DOCKER_APT_LIST")."
+
+  docker_run_install_cmd \
+    || die_struct install_docker \
+      "apt-get install of docker-ce + plugins failed." \
+      "Inspect the apt-get output above. Common causes: stale apt cache
+(try 'sudo apt-get update'); held packages; or transient network. If
+your distro codename isn't in Docker's upstream list, T-0030 tracks
+cross-distro support."
+
+  local user; user="$(id -un)"
+  docker_run_usermod_cmd "$user" \
+    || die_struct install_docker \
+      "Could not add $user to the 'docker' group." \
+      "Run 'sudo usermod -aG docker $user' manually to see the error."
+
+  # Final probe: did install + group membership actually take effect for
+  # this shell? Two failure modes are distinguished:
+  #   (a) binaries missing — apt didn't really install (rare; would
+  #       normally have been caught above).
+  #   (b) binaries present but the current shell can't reach the docker
+  #       socket — the user was just added to the 'docker' group, but
+  #       Unix group membership is fixed at session start (login), so this
+  #       shell inherited the pre-usermod group set. Re-running the
+  #       installer in a new login (or after `newgrp docker`) will see
+  #       `docker compose version` succeed and skip the whole checkpoint.
+  if ! docker_compose_works; then
+    if command -v docker >/dev/null 2>&1; then
+      die_struct install_docker \
+        "Docker is installed, but this shell can't talk to it yet.
+Reason: you were just added to the 'docker' group, and Unix group
+membership is fixed at session start — this shell inherited the
+pre-usermod group set. This is NOT a script bug." \
+        "Log out and back in (or, in this shell, run 'newgrp docker'),
+then re-run the installer. The install_docker checkpoint will be a
+no-op once 'docker compose version' returns 0 in the new shell."
+    fi
+    die_struct install_docker \
+      "apt reported success but 'docker compose version' still fails and
+'docker' isn't on PATH." \
+      "Re-run 'sudo apt-get install -y docker-ce docker-ce-cli
+containerd.io docker-buildx-plugin docker-compose-plugin' manually to
+see the underlying error."
+  fi
 }
 
 step_botsquad_group() {
@@ -693,7 +905,7 @@ STEPS=(
   install_tmux
   install_nodejs
   install_claude_code
-  require_docker
+  install_docker
   botsquad_group
   install_dir
   clone_repo

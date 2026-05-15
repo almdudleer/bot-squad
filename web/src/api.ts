@@ -396,4 +396,8 @@ export const api = {
     call<{ ok: boolean; sent: boolean }>("/api/me/tg-chat-id/test", {
       method: "POST",
     }),
+  /** T-0013: resolve the operator tmux session name for the post-install
+   * /welcome screen. Server-side constant (env var on the install). */
+  welcomeOperator: () =>
+    call<{ session: string }>("/api/welcome/operator"),
 };

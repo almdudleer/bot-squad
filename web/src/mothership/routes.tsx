@@ -1,8 +1,35 @@
 import { useEffect, useMemo, useState } from "react";
 import { Routes, Route, Link, useParams } from "react-router-dom";
-import { type Checkpoint } from "./api";
+import { mothershipApi, type AttachedServer, type Checkpoint } from "./api";
 import { AllProjects } from "./AllProjects";
 import { AddServerWizard } from "./AddServerWizard";
+
+/**
+ * T-0013: Chapter I §8 specifies that the mothership add-server flow
+ * should land the user on the target server's `/welcome` screen once the
+ * installer reports success, instead of leaving them parked on
+ * `/m/servers/:id`. The installer's terminal checkpoint is `print_attach`
+ * (see scripts/install/install.sh:STEPS) — that's the trigger.
+ *
+ * Pure helpers so they're unit-testable without a DOM.
+ */
+export function isInstallComplete(events: Checkpoint[]): boolean {
+  // Last-write-wins per checkpoint, mirrors `coalesce` below. We look for
+  // print_attach=done; the bash installer only emits this once every
+  // upstream step has succeeded.
+  let final: Checkpoint["status"] | null = null;
+  for (const ev of events) {
+    if (ev.checkpoint === "print_attach") final = ev.status;
+  }
+  return final === "done";
+}
+
+export function welcomeUrlFor(baseUrl: string): string {
+  // Strip a single trailing slash so we don't emit `//welcome`. The
+  // base_url is validated server-side at server-mint time (T-0024 schema),
+  // so we don't re-validate here.
+  return `${baseUrl.replace(/\/$/, "")}/welcome`;
+}
 
 /**
  * Mothership centralization-layer routes. Mounted under /m/* in App.tsx
@@ -55,6 +82,8 @@ function ServerProgress() {
   const [events, setEvents] = useState<Checkpoint[]>([]);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const [server, setServer] = useState<AttachedServer | null>(null);
+  const [handedOff, setHandedOff] = useState(false);
 
   useEffect(() => {
     if (!id) return;
@@ -81,6 +110,39 @@ function ServerProgress() {
     };
     return () => es.close();
   }, [id]);
+
+  // T-0013: fetch the registry entry once so we know the target base_url
+  // for the post-install /welcome handoff. The registry is small and the
+  // call is cheap; we don't need a per-server detail endpoint.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    mothershipApi
+      .listServers()
+      .then((all) => {
+        if (cancelled) return;
+        const match = all.find((s) => s.id === id);
+        if (match) setServer(match);
+      })
+      .catch(() => {
+        // Non-fatal: the user can still navigate manually. The progress
+        // view degrades gracefully without the registry entry.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // T-0013: when print_attach=done lands, hand off to the target's
+  // /welcome screen (cross-origin to the install_state-ready server). Guard
+  // with `handedOff` so a flaky SSE replay can't bounce the user twice.
+  useEffect(() => {
+    if (handedOff) return;
+    if (!server) return;
+    if (!isInstallComplete(events)) return;
+    setHandedOff(true);
+    globalThis.window?.location?.replace(welcomeUrlFor(server.base_url));
+  }, [events, server, handedOff]);
 
   const rows = useMemo(() => coalesce(events), [events]);
 

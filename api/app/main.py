@@ -78,6 +78,9 @@ def build_app() -> FastAPI:
     app.include_router(settings_router, prefix="/api")
     app.include_router(me_router, prefix="/api")
 
+    from app.routes_welcome import router as welcome_router
+    app.include_router(welcome_router, prefix="/api")
+
     # Centralization-layer routes — mounted only on bot-squad.org installs.
     # Single-install servers run with MOTHERSHIP unset (or "0") and never
     # expose /api/m/* or /i/*. Detach build = MOTHERSHIP=0 (or delete the module).

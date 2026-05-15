@@ -192,6 +192,32 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
       <div className="mc-task-title">{task.title}</div>
       <div className="mc-task-meta">
         {updated && <span>{updated}</span>}
+        {/* T-0038 stakeholder follow-up #3: surface the bound initiative on
+            every card. Click-through goes to the roadmap. Active/draft/done
+            tag lives on the swimlane header, not here — keep card noise
+            low. */}
+        {task.initiative && task.initiative !== "~" && (
+          <span
+            data-no-nav
+            title={`Initiative: ${task.initiative}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              navigate(`/p/${slug}/vision#${encodeURIComponent(task.initiative!)}`);
+            }}
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.65rem",
+              color: "var(--mc-text-mid)",
+              background: "var(--mc-surface-raised)",
+              border: "1px solid var(--mc-border)",
+              borderRadius: "2px",
+              padding: "0 4px",
+              cursor: "pointer",
+            }}
+          >
+            ▸ {task.initiative.replace(/\.md$/, "")}
+          </span>
+        )}
         {commentCount > 0 && (
           <span
             style={{

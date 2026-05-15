@@ -23,6 +23,10 @@ type ViewMode = "board" | "list";
 // T-0039: sentinel for the "no initiative" lane. Real initiatives are
 // vision/initiatives/<basename>.md so this prefix can't collide.
 const UNATTACHED = "__unattached__";
+// T-0038 stakeholder follow-up #2: synthetic filter value that means
+// "only tickets whose initiative is currently in vision/active_initiatives".
+// Same collision-proof prefix as UNATTACHED.
+const ACTIVE_ONLY = "__active__";
 
 type InitiativeStatus = "active" | "draft" | "done";
 
@@ -164,11 +168,35 @@ export function Project() {
     return list;
   }, [vision]);
 
+  // T-0038 stakeholder follow-up #1: tickets with an active dev session
+  // belong on the Sessions surface, not the kanban backlog. Strip them
+  // here so every downstream view (board, swimlanes, list) hides them
+  // consistently. Paused / suspended sessions don't count — that work
+  // has stalled and the board is the right place to plan to resume it.
+  const boardTasks = useMemo<Task[]>(() => {
+    return (tasks ?? []).filter((t) => t.session?.status !== "active");
+  }, [tasks]);
+  const hiddenActiveCount = (tasks?.length ?? 0) - boardTasks.length;
+
+  // Set of initiative basenames currently in vision/active_initiatives.
+  const activeInitiativeKeys = useMemo<Set<string>>(() => {
+    return new Set(initiativeMeta.filter((m) => m.status === "active").map((m) => m.key));
+  }, [initiativeMeta]);
+
+  // Single source of truth for "does this task pass the current filter".
+  function passesFilter(t: Task): boolean {
+    if (!filterInit) return true;
+    const init = (t.initiative ?? "").trim();
+    if (filterInit === UNATTACHED) return !init;
+    if (filterInit === ACTIVE_ONLY) return Boolean(init) && activeInitiativeKeys.has(init);
+    return init === filterInit;
+  }
+
   // Tasks keyed by initiative basename (or UNATTACHED).
   const tasksByInit = useMemo<Record<string, Task[]>>(() => {
     const out: Record<string, Task[]> = { [UNATTACHED]: [] };
     for (const m of initiativeMeta) out[m.key] = [];
-    for (const t of tasks ?? []) {
+    for (const t of boardTasks) {
       const init = (t.initiative ?? "").trim();
       if (init && out[init] !== undefined) {
         out[init].push(t);
@@ -182,7 +210,7 @@ export function Project() {
       }
     }
     return out;
-  }, [tasks, initiativeMeta]);
+  }, [boardTasks, initiativeMeta]);
 
   // Final lane list (after applying the filter). Always include the lane
   // matching the active filter even if empty; otherwise show all.
@@ -199,18 +227,13 @@ export function Project() {
       { key: UNATTACHED, title: "Unattached", status: "draft" },
     ];
     if (!filterInit) return all;
+    if (filterInit === ACTIVE_ONLY) return all.filter((m) => activeInitiativeKeys.has(m.key));
     return all.filter((m) => m.key === filterInit);
-  }, [initiativeMeta, tasksByInit, filterInit]);
+  }, [initiativeMeta, tasksByInit, filterInit, activeInitiativeKeys]);
 
   // Ungrouped — current 5-column behavior.
   const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
-  const ungroupedTasks = filterInit
-    ? (tasks ?? []).filter((t) => {
-        const init = (t.initiative ?? "").trim();
-        if (filterInit === UNATTACHED) return !init;
-        return init === filterInit;
-      })
-    : (tasks ?? []);
+  const ungroupedTasks = boardTasks.filter(passesFilter);
   for (const t of ungroupedTasks) {
     if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
       grouped[t.status].push(t);
@@ -516,6 +539,7 @@ export function Project() {
             onChange={(e) => setFilterInit(e.target.value)}
           >
             <option value="">all initiatives</option>
+            <option value={ACTIVE_ONLY}>(active initiatives)</option>
             {initiativeMeta.map((m) => (
               <option key={m.key} value={m.key}>
                 {m.title} · {m.status}
@@ -525,6 +549,29 @@ export function Project() {
           </select>
         </div>
       </div>
+
+      {/* Hidden-count indicator. The board strips tickets with a live dev
+          session — show the count so they're not invisible. Click goes to
+          the Sessions page where that work belongs. */}
+      {hiddenActiveCount > 0 && (
+        <div
+          className="d-flex align-items-center gap-2 mb-2"
+          style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem" }}
+        >
+          <span style={{ color: "var(--mc-text-dim)" }}>
+            {hiddenActiveCount} ticket{hiddenActiveCount === 1 ? "" : "s"} in active sessions —
+          </span>
+          <Link
+            to={`/p/${slug}/sessions`}
+            style={{
+              color: "var(--mc-accent-success, #4ade80)",
+              textDecoration: "none",
+            }}
+          >
+            view on Sessions →
+          </Link>
+        </div>
+      )}
 
       {groupBy === "none" ? (
         viewMode === "board" ? (

@@ -25,6 +25,8 @@ venv/
 # Node
 node_modules/
 web/dist/
+# TypeScript incremental compile cache — regenerated every build
+web/tsconfig.tsbuildinfo
 
 # Editor
 .vscode/

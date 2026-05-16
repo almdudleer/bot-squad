@@ -58,15 +58,10 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Mothership detection — T-0086 ships the canonical helper.
+# Mothership detection — canonical helper from T-0086.
 # ---------------------------------------------------------------------------
 
-try:  # pragma: no cover — import-time branch, exercised by integration env.
-    from bot_squad_worker.install_role import is_mothership  # type: ignore[import]
-except ImportError:  # pragma: no cover — stub until T-0086 lands.
-    def is_mothership(slug: str = "bot-squad") -> bool:  # type: ignore[no-redef]
-        """TODO(T-0086): replace this stub with bot_squad_worker.install_role.is_mothership."""
-        return False
+from bot_squad_worker.install_role import is_mothership
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, SessionRow, Task } from "../api";
+import { api, SessionRow, Task, VisionFile } from "../api";
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "open", label: "Open" },
@@ -35,6 +35,10 @@ export function TaskDetail() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [activeDevs, setActiveDevs] = useState<SessionRow[]>([]);
+  // T-0038 follow-up: surface initiative binding here. We load every
+  // initiative file (active+draft+done) so the operator can bind a task
+  // to e.g. a draft initiative without first activating it.
+  const [initiatives, setInitiatives] = useState<VisionFile[]>([]);
 
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleValue, setTitleValue] = useState("");
@@ -80,6 +84,52 @@ export function TaskDetail() {
         }));
       })
       .catch(() => setActiveDevs([]));
+    api.vision(slug)
+      .then((files) =>
+        setInitiatives(
+          files.filter(
+            (f) =>
+              f.name.startsWith("initiatives/") && !f.name.endsWith("/_TEMPLATE.md"),
+          ),
+        ),
+      )
+      .catch(() => setInitiatives([]));
+  }
+
+  // Build the option list once per `initiatives` change. Sort active first,
+  // draft second, done last — matches the swimlane order on the board.
+  const initiativeOptions = useMemo(() => {
+    const list = initiatives.map((f) => ({
+      basename: f.name.replace(/^initiatives\//, ""),
+      active: Boolean(f.active),
+      finished: Boolean(f.finished),
+    }));
+    const rank = (i: { active: boolean; finished: boolean }) =>
+      i.finished ? 2 : i.active ? 0 : 1;
+    list.sort((a, b) => {
+      const ra = rank(a);
+      const rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      return a.basename.localeCompare(b.basename);
+    });
+    return list;
+  }, [initiatives]);
+
+  async function saveInitiative(value: string | null) {
+    if (!task) return;
+    setSaving(true);
+    setActionError(null);
+    try {
+      // value="" from the select means "unattached" — send null to clear.
+      await api.patchTask(slug, id, {
+        initiative: value && value.length > 0 ? value : null,
+      });
+      loadTask();
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function bindToDev(sid: string) {
@@ -313,6 +363,49 @@ export function TaskDetail() {
           {STATUS_OPTIONS.map((s) => (
             <option key={s.value} value={s.value}>{s.label}</option>
           ))}
+        </select>
+      </div>
+
+      {/* T-0038: initiative binding. The board's group-by/filter is useless
+          without a way to actually assign initiatives — this select is the
+          primary surface for that. */}
+      <div className="mb-2 d-flex align-items-center gap-2" style={{ fontSize: "0.78rem" }}>
+        <label
+          htmlFor="task-initiative"
+          style={{
+            color: "var(--mc-text-dim)",
+            fontFamily: "var(--mc-mono)",
+            minWidth: "5.5rem",
+            margin: 0,
+          }}
+        >
+          initiative:
+        </label>
+        <select
+          id="task-initiative"
+          className="form-select form-select-sm"
+          style={{ width: "auto", minWidth: "16rem", maxWidth: "30rem" }}
+          value={task.initiative ?? ""}
+          onChange={(e) => saveInitiative(e.target.value || null)}
+          disabled={saving}
+        >
+          <option value="">— unattached —</option>
+          {/* Surface the current binding even if not in the loaded list
+              (orphan: file deleted but reference lingers). */}
+          {task.initiative &&
+            !initiativeOptions.some((i) => i.basename === task.initiative) && (
+              <option value={task.initiative}>
+                {task.initiative} (orphan)
+              </option>
+            )}
+          {initiativeOptions.map((i) => {
+            const tag = i.finished ? "done" : i.active ? "active" : "draft";
+            return (
+              <option key={i.basename} value={i.basename}>
+                {i.basename.replace(/\.md$/, "")} · {tag}
+              </option>
+            );
+          })}
         </select>
       </div>
 

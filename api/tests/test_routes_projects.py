@@ -233,3 +233,93 @@ def test_repo_agents_md_requires_auth(tmp_bot_squad: Path, monkeypatch):
     with _client(tmp_bot_squad, monkeypatch) as client:
         r = client.get("/api/projects/test-project/repo-agents-md")
     assert r.status_code == 401
+
+
+# T-0021 — POST /api/projects: minimal create affordance.
+
+def test_create_project_round_trip(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={"slug": "new-proj", "display_name": "New Proj"},
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body == {
+            "slug": "new-proj",
+            "display_name": "New Proj",
+            "status": "idle",
+            "status_since": None,
+        }
+
+        listing = client.get("/api/projects").json()
+        slugs = {p["slug"] for p in listing}
+        assert {"test-project", "new-proj"} <= slugs
+
+        detail = client.get("/api/projects/new-proj").json()
+        assert detail["slug"] == "new-proj"
+        assert detail["counts"] == {
+            "backlog": 0, "vision": 0, "feedback": 0, "sessions": 0,
+        }
+
+    # Data dirs were actually created.
+    for sub in ("backlog", "vision", "feedback", "sessions"):
+        assert (tmp_bot_squad / "data" / "new-proj" / sub).is_dir()
+
+
+def test_create_project_collision_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={"slug": "test-project", "display_name": "dup"},
+        )
+    assert r.status_code == 400
+    assert "already exists" in r.json()["detail"]
+
+
+def test_create_project_invalid_slug_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        for bad in ("Bad", "1leading", "has space", "has.dot", ""):
+            r = client.post(
+                "/api/projects",
+                json={"slug": bad, "display_name": "X"},
+            )
+            assert r.status_code == 400, f"slug {bad!r} should 400, got {r.status_code}"
+
+
+def test_create_project_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects",
+            json={"slug": "p", "display_name": "P"},
+        )
+    assert r.status_code == 401
+
+
+def test_create_project_requires_admin(tmp_bot_squad: Path, monkeypatch):
+    # Demote testuser so the admin gate fires (default fixture is admin).
+    auth_path = tmp_bot_squad / "config" / "auth.toml"
+    auth_path.write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={"slug": "p", "display_name": "P"},
+        )
+    assert r.status_code == 403

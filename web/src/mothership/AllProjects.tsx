@@ -7,6 +7,8 @@ import {
   type FanOutResult,
   type ServerProject,
 } from "./api";
+import { Coachmark } from "../onboarding";
+import { STEP_9_3_BULLETS, STEP_9_3_TITLE } from "../onboarding/copy";
 
 /**
  * Cross-server all-projects view (T-0025). Mounted at /m on the mothership
@@ -63,6 +65,27 @@ export function statusBadgeClass(status: ServerStatus): string {
   }
 }
 
+/**
+ * Label fragments for the per-server section header (T-0055).
+ *
+ * The self entry (the mothership's own registry row) gets a "(this server)"
+ * suffix so an operator with both their mothership and one attached peer can
+ * tell which is which at a glance. The display_name + base_url are
+ * untouched. Pure-function so the renderer stays trivial and we have a
+ * unit-test seam without React.
+ */
+export function serverHeaderLabel(server: AttachedServer): {
+  name: string;
+  url: string;
+  suffix: string | null;
+} {
+  return {
+    name: server.display_name,
+    url: server.base_url,
+    suffix: server.is_self ? "this server" : null,
+  };
+}
+
 export function AllProjects() {
   const [sections, setSections] = useState<ServerSection[] | null>(null);
   const [topError, setTopError] = useState<string | null>(null);
@@ -94,6 +117,23 @@ export function AllProjects() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "1100px" }}>
+      {/* §9.3 spotlight — single coachmark, three bullets. Auto-gated to
+          mothership builds by virtue of living in this module (App.tsx
+          lazy-imports it only when VITE_MOTHERSHIP === "1"). */}
+      <Coachmark
+        stepId="srv.9_3.cross_server"
+        title={STEP_9_3_TITLE}
+        anchorSelector='[data-onboarding-anchor="all-projects-nav"]'
+        placement="right"
+        body={
+          <ul className="mb-0 ps-3">
+            {STEP_9_3_BULLETS.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        }
+      />
+
       <div className="d-flex align-items-center justify-content-between gap-2 mb-4">
         <div className="mc-section-title" style={{ margin: 0 }}>
           All projects
@@ -142,8 +182,10 @@ export function AllProjects() {
 
 function ServerSectionView({ section }: { section: ServerSection }) {
   const { server, kind, result } = section;
+  const label = serverHeaderLabel(server);
   return (
     <section
+      data-testid={server.is_self ? "server-self" : "server-peer"}
       style={{
         border: "1px solid var(--mc-border)",
         borderRadius: 4,
@@ -169,12 +211,18 @@ function ServerSectionView({ section }: { section: ServerSection }) {
             flexWrap: "wrap",
           }}
         >
-          <strong style={{ fontFamily: "var(--mc-mono)" }}>
-            {server.display_name}
-          </strong>
+          <strong style={{ fontFamily: "var(--mc-mono)" }}>{label.name}</strong>
           <span style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
-            {server.base_url}
+            {label.url}
           </span>
+          {label.suffix && (
+            <span
+              className="mc-badge mc-badge-info"
+              title="The mothership server itself"
+            >
+              {label.suffix}
+            </span>
+          )}
         </div>
         <ServerHeaderBadge section={section} />
       </header>
@@ -241,9 +289,12 @@ function ServerSectionBody({
   }
   return (
     <div className="row g-2">
-      {result.data.map((p) => (
-        <div className="col-md-4" key={p.slug}>
-          <div className="mc-project-card" style={{ cursor: "default" }}>
+      {result.data.map((p) => {
+        const card = (
+          <div
+            className="mc-project-card"
+            style={{ cursor: server.is_self ? "pointer" : "default" }}
+          >
             <div className="mc-project-name">{p.display_name}</div>
             <div
               className="mc-project-slug"
@@ -258,8 +309,22 @@ function ServerSectionBody({
               <span className={statusBadgeClass(p.status)}>{p.status}</span>
             </div>
           </div>
-        </div>
-      ))}
+        );
+        return (
+          <div className="col-md-4" key={p.slug}>
+            {server.is_self ? (
+              <Link
+                to={`/p/${encodeURIComponent(p.slug)}`}
+                style={{ textDecoration: "none", color: "inherit" }}
+              >
+                {card}
+              </Link>
+            ) : (
+              card
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

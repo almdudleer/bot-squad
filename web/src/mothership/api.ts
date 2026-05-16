@@ -3,7 +3,7 @@
  *
  *   `mothershipApi` — calls the centralization layer itself (server
  *      registry, cached project list). These live at `/api/m/*` on
- *      bot-squad.org.
+ *      botsquad.dev.
  *
  *   `apiFor(serverId)` — calls a *target* server's single-install API
  *      via the proxy at `/api/m/servers/{id}/api/{rest}`. Every method
@@ -50,6 +50,14 @@ export type AttachedServer = {
   install_token_expires_at: string | null;
   last_seen_at: string | null;
   projects_cache: ServerProject[];
+  /**
+   * T-0055: ``true`` on the mothership's own self-registered entry. Lets
+   * the unified all-projects view at ``/`` mark "this server" distinctly
+   * from attached peers. Server-side default is ``false``; the wire
+   * projection always includes the key (registry rows pre-T-0055 still
+   * deserialise via the dataclass default).
+   */
+  is_self?: boolean;
 };
 
 /** Envelope returned for each server in a `fanOut` call. */

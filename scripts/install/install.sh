@@ -17,6 +17,28 @@
 
 set -Eeuo pipefail
 
+# ---- Cross-distro package abstraction (T-0030) ------------------------------
+# Source pkg.sh so the install_* steps can use pkg_install/pkg_update/pkg_have
+# instead of raw apt-get. Search order:
+#   1. $BOTSQUAD_PKG_SH if set (tests + advanced overrides)
+#   2. <dirname of this script>/pkg.sh
+#   3. <CWD>/pkg.sh (for `bash install.sh` from the repo)
+# detect_distro errors loudly if none of the candidates loads the helper,
+# so this stays a soft load (no early exit on missing file).
+__BS_INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo .)"
+for __bs_pkg_candidate in \
+    "${BOTSQUAD_PKG_SH:-}" \
+    "$__BS_INSTALL_DIR/pkg.sh" \
+    "$PWD/pkg.sh" \
+    "./pkg.sh"; do
+  if [[ -n "$__bs_pkg_candidate" ]] && [[ -r "$__bs_pkg_candidate" ]]; then
+    # shellcheck source=./pkg.sh
+    . "$__bs_pkg_candidate"
+    break
+  fi
+done
+unset __bs_pkg_candidate
+
 # ---- Mothership substitution targets (replaced at serve-time) ----------------
 BOTSQUAD_INSTALL_TOKEN="${BOTSQUAD_INSTALL_TOKEN:-__INSTALL_TOKEN__}"
 BOTSQUAD_MOTHERSHIP_URL="${BOTSQUAD_MOTHERSHIP_URL:-__MOTHERSHIP_URL__}"
@@ -28,14 +50,93 @@ BOTSQUAD_INSTALL_DIR="${BOTSQUAD_INSTALL_DIR:-/home/www/bot-squad}"
 BOTSQUAD_GROUP="${BOTSQUAD_GROUP:-www}"
 BOTSQUAD_STATE_DIR="${BOTSQUAD_STATE_DIR:-${HOME}/.bot-squad}"
 BOTSQUAD_OPERATOR_SESSION="${BOTSQUAD_OPERATOR_SESSION:-bot-squad-operator}"
+# Cross-distro support (T-0030). When unset, detect_distro infers the
+# family from /etc/os-release; when set, the explicit value wins and
+# is persisted to the state file. Valid families: debian, fedora, arch.
+BOTSQUAD_DISTRO_FAMILY="${BOTSQUAD_DISTRO_FAMILY:-}"
 # Skip the mothership /connect handshake — for offline smoke only.
 BOTSQUAD_SKIP_MOTHERSHIP="${BOTSQUAD_SKIP_MOTHERSHIP:-0}"
 # Non-interactive mode (CI / smoke): refuse to prompt; fail with a clear
 # checkpoint instead so claude can be told what env to set on rerun.
 BOTSQUAD_NONINTERACTIVE="${BOTSQUAD_NONINTERACTIVE:-0}"
+# HTTP/HTTPS proxy URL. Three-way semantics:
+#   - unset       → interactive prompt at the proxy_url checkpoint
+#   - empty ""    → skip the prompt, no proxy is configured
+#   - non-empty   → use this URL (validated, then written to all sinks)
+# Override target paths if needed (tests redirect these):
+#   BOTSQUAD_PROXY_APT_CONF    — apt-conf sink (default /etc/apt/apt.conf.d/01proxy)
+#   BOTSQUAD_CLAUDE_SETTINGS   — claude settings sink (default ~/.claude/settings.json)
+#   BOTSQUAD_PROXY_PROBE_CMD   — validation command; default is curl --proxy <url> npmjs
+#                                (the command receives the URL as $1; non-zero exit = fail,
+#                                stderr is shown to the user as the failure reason)
+BOTSQUAD_PROXY_APT_CONF="${BOTSQUAD_PROXY_APT_CONF:-/etc/apt/apt.conf.d/01proxy}"
+BOTSQUAD_CLAUDE_SETTINGS="${BOTSQUAD_CLAUDE_SETTINGS:-${HOME}/.claude/settings.json}"
+BOTSQUAD_PROXY_PROBE_CMD="${BOTSQUAD_PROXY_PROBE_CMD:-}"
+# install_docker checkpoint seams. Override target paths if needed (tests
+# redirect these into a temp dir):
+#   BOTSQUAD_DOCKER_GPG_KEYRING — keyring sink (default
+#                                  /etc/apt/keyrings/docker.asc)
+#   BOTSQUAD_DOCKER_APT_LIST    — sources.list.d snippet (default
+#                                  /etc/apt/sources.list.d/docker.list)
+#   BOTSQUAD_DOCKER_CODENAME    — override apt repo codename (default: detect
+#                                  via /etc/os-release VERSION_CODENAME)
+#   BOTSQUAD_DOCKER_ARCH        — override apt repo arch (default: dpkg --print-architecture)
+#   BOTSQUAD_DOCKER_DISTRO      — override apt repo distro (ubuntu|debian; default
+#                                  via /etc/os-release ID, fallback ubuntu)
+#   BOTSQUAD_DOCKER_GPG_FETCH_CMD — command that writes the GPG key; receives
+#                                    the destination path as $1. Default is
+#                                    sudo curl from download.docker.com.
+#   BOTSQUAD_DOCKER_INSTALL_CMD — command that installs the docker apt packages.
+#                                  Default is `sudo apt-get update && sudo
+#                                  apt-get install -y docker-ce ...`.
+#   BOTSQUAD_DOCKER_USERMOD_CMD — command that adds $1 to the docker group.
+#                                  Default is `sudo usermod -aG docker $1`.
+#   BOTSQUAD_DOCKER_CHECK_CMD   — "compose works" probe (default
+#                                  `docker compose version`). Idempotency
+#                                  keys on the exit code of this command.
+BOTSQUAD_DOCKER_GPG_KEYRING="${BOTSQUAD_DOCKER_GPG_KEYRING:-/etc/apt/keyrings/docker.asc}"
+BOTSQUAD_DOCKER_APT_LIST="${BOTSQUAD_DOCKER_APT_LIST:-/etc/apt/sources.list.d/docker.list}"
+BOTSQUAD_DOCKER_CODENAME="${BOTSQUAD_DOCKER_CODENAME:-}"
+BOTSQUAD_DOCKER_ARCH="${BOTSQUAD_DOCKER_ARCH:-}"
+BOTSQUAD_DOCKER_DISTRO="${BOTSQUAD_DOCKER_DISTRO:-}"
+BOTSQUAD_DOCKER_GPG_FETCH_CMD="${BOTSQUAD_DOCKER_GPG_FETCH_CMD:-}"
+BOTSQUAD_DOCKER_INSTALL_CMD="${BOTSQUAD_DOCKER_INSTALL_CMD:-}"
+BOTSQUAD_DOCKER_USERMOD_CMD="${BOTSQUAD_DOCKER_USERMOD_CMD:-}"
+BOTSQUAD_DOCKER_CHECK_CMD="${BOTSQUAD_DOCKER_CHECK_CMD:-docker compose version}"
+# install_reverse_proxy checkpoint seams (T-0029). The default shape is the
+# HTTP-only fallback (shape 2 in T-0029); the bundled-traefik shape was
+# rejected — see vision/multi-server/reverse-proxy-decision.md.
+#   BOTSQUAD_REVERSE_PROXY_MODE — auto|shared|fresh (default auto)
+#                                  auto  → detect via the network probe below
+#                                  shared → assume an external traefik is in
+#                                           front (no-op; existing compose
+#                                           labels are used as-is)
+#                                  fresh  → force the fresh-host override
+#                                           regardless of probe result
+#   BOTSQUAD_HTTP_PORT          — host port to publish for the fresh-host
+#                                  shape (default 8000)
+#   BOTSQUAD_REVERSE_PROXY_NETWORK — name of the external traefik network
+#                                    that the bundled compose file expects
+#                                    (default avo_backend)
+#   BOTSQUAD_DOCKER_NETWORK_PROBE_CMD — "shared reverse proxy is present"
+#                                       probe. Receives the network name as
+#                                       $1; non-zero exit = absent. Default is
+#                                       `docker network inspect <name>`.
+#   BOTSQUAD_FRESH_HOST_OVERRIDE — override compose-file path (default
+#                                   $BOTSQUAD_INSTALL_DIR/docker-compose.fresh-host.yml)
+BOTSQUAD_REVERSE_PROXY_MODE="${BOTSQUAD_REVERSE_PROXY_MODE:-auto}"
+BOTSQUAD_HTTP_PORT="${BOTSQUAD_HTTP_PORT:-8000}"
+BOTSQUAD_REVERSE_PROXY_NETWORK="${BOTSQUAD_REVERSE_PROXY_NETWORK:-avo_backend}"
+BOTSQUAD_DOCKER_NETWORK_PROBE_CMD="${BOTSQUAD_DOCKER_NETWORK_PROBE_CMD:-}"
+BOTSQUAD_FRESH_HOST_OVERRIDE="${BOTSQUAD_FRESH_HOST_OVERRIDE:-}"
 
 STATE_FILE="${BOTSQUAD_STATE_DIR}/install.state"
+# Side-car file holding the detected distro family + ID so a re-run on
+# a different distro errors loudly instead of silently shelling out to
+# the wrong package manager (T-0030).
+DISTRO_STATE_FILE="${BOTSQUAD_STATE_DIR}/install.distro"
 ENV_FILE="${BOTSQUAD_INSTALL_DIR}/.env"
+FRESH_HOST_OVERRIDE_DEFAULT="${BOTSQUAD_INSTALL_DIR}/docker-compose.fresh-host.yml"
 
 # ---- Plumbing ---------------------------------------------------------------
 log()  { printf '\033[36m[bot-squad]\033[0m %s\n' "$*" >&2; }
@@ -159,16 +260,63 @@ prompt_value() {
 
 # ---- Checkpoints ------------------------------------------------------------
 
-step_require_linux() {
+step_detect_distro() {
   case "$(uname -s)" in
     Linux) : ;;
-    *) die_struct require_linux "OS is $(uname -s); bot-squad install only supports Linux." \
-         "Run on an Ubuntu/Debian host." ;;
+    *) die_struct detect_distro "OS is $(uname -s); bot-squad install only supports Linux." \
+         "Run on a supported Linux host (Debian/Ubuntu, Fedora/RHEL, or Arch)." ;;
   esac
-  if ! command -v apt-get >/dev/null 2>&1; then
-    die_struct require_linux "apt-get not found; only Debian/Ubuntu are supported by this v1 installer." \
-      "Install on Ubuntu 22.04+ or Debian 12+. Cross-distro support is tracked separately."
+  # Resolve family + ID via pkg.sh's detector. An empty result means the
+  # host's /etc/os-release didn't match any family we have a package
+  # map for. We bail loudly with a pointer at BOTSQUAD_DISTRO_FAMILY so
+  # the user can force a guess on a close-enough derivative.
+  if ! declare -F detect_distro_family >/dev/null 2>&1; then
+    die_struct detect_distro \
+      "pkg.sh helper not loaded (detect_distro_family unavailable)." \
+      "The installer bundle is incomplete. Re-fetch install.sh + pkg.sh
+from the mothership (or, if running from the repo, ensure scripts/install/pkg.sh
+exists next to install.sh)."
   fi
+  local family id=""
+  family="$(detect_distro_family)"
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    id="$( . /etc/os-release && printf '%s' "${ID:-}" )"
+  fi
+  if [[ -z "$family" ]]; then
+    die_struct detect_distro \
+      "Could not detect a supported distro family from /etc/os-release (ID='${id:-?}')." \
+      "Supported families: debian (Ubuntu 22.04+/Debian 12+), fedora
+(Fedora 40+/RHEL 9+), arch (rolling). If your host is a derivative we
+don't recognize, re-run with BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch
+to force a family. Alpine and NixOS are explicitly out of scope (see
+backlog T-0055 / T-0056)."
+  fi
+  export BOTSQUAD_DISTRO_FAMILY="$family"
+  # Mismatch guard: if a previous run recorded a different family on
+  # this state dir, the user almost certainly mounted the wrong state
+  # dir (or migrated the host); refuse and explain.
+  if [[ -r "$DISTRO_STATE_FILE" ]]; then
+    local prev_family
+    prev_family="$( . "$DISTRO_STATE_FILE" 2>/dev/null && printf '%s' "${BOTSQUAD_DISTRO_FAMILY:-}" )" || prev_family=""
+    if [[ -n "$prev_family" ]] && [[ "$prev_family" != "$family" ]]; then
+      die_struct detect_distro \
+        "Detected distro family '$family' but state file at $DISTRO_STATE_FILE
+records a previous run as '$prev_family'. The installer's state dir is
+not transferable across families — package-manager assumptions baked
+into earlier checkpoints would now be wrong." \
+        "Use a fresh state dir for this host (BOTSQUAD_STATE_DIR=...),
+or rm -rf $BOTSQUAD_STATE_DIR if you really intend to re-bootstrap on
+the same host with a different family."
+    fi
+  fi
+  # Persist for subsequent runs.
+  umask 022
+  cat > "$DISTRO_STATE_FILE" <<EOF
+BOTSQUAD_DISTRO_FAMILY=$family
+BOTSQUAD_DISTRO_ID=$id
+EOF
+  log "distro family: $family (ID=$id)"
 }
 
 step_require_sudo() {
@@ -178,32 +326,200 @@ step_require_sudo() {
     die_struct require_sudo "This step needs sudo but no cached credential is available and NONINTERACTIVE=1." \
       "Run 'sudo -v' interactively once, then re-run the installer."
   fi
-  log "you'll be prompted for your sudo password (needed for apt + group setup)"
+  log "you'll be prompted for your sudo password (needed for package install + group setup)"
   sudo -v || die_struct require_sudo "sudo authentication failed." \
     "Make sure your user is in /etc/sudoers (or the 'sudo' group), then re-run."
 }
 
-step_apt_update() {
-  sudo apt-get update -y >/dev/null || die_struct apt_update \
-    "apt-get update failed." \
-    "Check network connectivity and APT sources (/etc/apt/sources.list*).
-If you're behind a proxy, configure /etc/apt/apt.conf.d/01proxy first."
+# --- proxy_url checkpoint helpers --------------------------------------------
+#
+# Three sinks for an accepted proxy URL:
+#   1. script env  — export http_proxy/https_proxy so subsequent apt/curl/npm
+#                    invocations inherit it (this checkpoint runs before
+#                    pkg_index_update on purpose)
+#   2. claude settings — ~/.claude/settings.json under .env.http_proxy /
+#                        .env.https_proxy (the same {env: {...}} convention
+#                        claude-code reads other vars from, e.g.
+#                        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)
+#   3. apt conf    — /etc/apt/apt.conf.d/01proxy with Acquire::http::Proxy +
+#                    Acquire::https::Proxy (needs sudo, chmod 0644)
+#
+# Each sink writer is idempotent: re-running with the same URL is a no-op;
+# changing the URL rewrites the sink.
+
+# Run the validation probe for a candidate URL.
+# Returns 0 on success; on failure prints a human-readable reason to stderr.
+proxy_probe() {
+  local url="$1"
+  if [[ -n "$BOTSQUAD_PROXY_PROBE_CMD" ]]; then
+    # Test/override hook: receives the URL as $1.
+    bash -c "$BOTSQUAD_PROXY_PROBE_CMD \"\$1\"" _ "$url"
+    return $?
+  fi
+  # Default probe: curl through the proxy to the npm registry.
+  # -sS keeps it quiet but surfaces errors; --max-time 5 bounds the wait;
+  # -o /dev/null discards the body; -w '%{http_code}' is consulted via the
+  # exit code (curl returns non-zero on connection failure regardless).
+  local err
+  err="$(curl -sS --proxy "$url" --max-time 5 -o /dev/null \
+    -w '%{http_code}' https://registry.npmjs.org/ 2>&1)" || {
+    printf '%s\n' "$err" >&2
+    return 1
+  }
+  # curl exited 0 → connection succeeded; check HTTP status.
+  case "$err" in
+    2*|3*) return 0 ;;
+    *)
+      printf 'proxy returned HTTP status %s from registry.npmjs.org\n' "$err" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Write the proxy URL into ~/.claude/settings.json under .env.http_proxy and
+# .env.https_proxy. Creates the file if missing.
+proxy_write_claude_settings() {
+  local url="$1" cfg="$BOTSQUAD_CLAUDE_SETTINGS"
+  mkdir -p "$(dirname "$cfg")"
+  if [[ ! -f "$cfg" ]]; then
+    printf '%s\n' '{}' > "$cfg"
+  fi
+  local tmp; tmp="$(mktemp)"
+  jq --arg url "$url" \
+    '.env = ((.env // {}) + {http_proxy: $url, https_proxy: $url})' \
+    "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+# Remove the proxy keys from ~/.claude/settings.json (used when re-running
+# with a now-empty BOTSQUAD_PROXY_URL — but we only call this for transparency
+# in tests; the main flow doesn't undo, it just no-ops on empty).
+proxy_clear_claude_settings() {
+  local cfg="$BOTSQUAD_CLAUDE_SETTINGS"
+  [[ -f "$cfg" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  jq 'if .env then .env |= (del(.http_proxy) | del(.https_proxy))
+        | (if (.env | length) == 0 then del(.env) else . end)
+      else . end' \
+    "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+# Write the apt conf snippet. Uses sudo unless the target path is already
+# writable by the current user (the test suite redirects to a temp dir).
+proxy_write_apt_conf() {
+  local url="$1" path="$BOTSQUAD_PROXY_APT_CONF"
+  local body
+  body="$(printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$url" "$url")"
+  # Idempotent: if the file already has the exact body, do nothing.
+  if [[ -f "$path" ]] && [[ "$(cat "$path" 2>/dev/null)" = "$body" ]]; then
+    return 0
+  fi
+  local parent; parent="$(dirname "$path")"
+  if [[ -w "$parent" ]] || { [[ -f "$path" ]] && [[ -w "$path" ]]; }; then
+    printf '%s' "$body" > "$path"
+    chmod 0644 "$path"
+  else
+    printf '%s' "$body" | sudo tee "$path" >/dev/null
+    sudo chmod 0644 "$path"
+  fi
+}
+
+step_proxy_url() {
+  # Decide the URL: explicit env (set, possibly empty) wins; otherwise prompt.
+  local url
+  if [[ "${BOTSQUAD_PROXY_URL+set}" = "set" ]]; then
+    url="$BOTSQUAD_PROXY_URL"
+    if [[ -z "$url" ]]; then
+      log "BOTSQUAD_PROXY_URL is empty → no proxy configured (skipping)"
+      return 0
+    fi
+    # Pre-set URL still gets validated; failure is fatal (no re-prompt in
+    # non-interactive mode).
+    if ! proxy_probe "$url" 2>/tmp/proxy_probe_err.$$; then
+      local reason; reason="$(cat /tmp/proxy_probe_err.$$ 2>/dev/null || true)"
+      rm -f /tmp/proxy_probe_err.$$
+      die_struct proxy_url \
+        "Proxy URL '$url' failed validation: ${reason:-unknown error}" \
+        "Re-run with a working BOTSQUAD_PROXY_URL=... (or BOTSQUAD_PROXY_URL='' to skip)."
+    fi
+    rm -f /tmp/proxy_probe_err.$$
+  else
+    if [[ "$BOTSQUAD_NONINTERACTIVE" = "1" ]]; then
+      log "BOTSQUAD_PROXY_URL unset + non-interactive → skipping proxy checkpoint"
+      log "(set BOTSQUAD_PROXY_URL=http://... or BOTSQUAD_PROXY_URL='' to silence this)"
+      return 0
+    fi
+    # Ask first whether a proxy is needed at all.
+    local answer
+    read -r -p "[bot-squad] Do you need an HTTP/HTTPS proxy for apt/npm/curl? [y/N]: " answer </dev/tty || answer=""
+    case "$answer" in
+      y|Y|yes|YES) : ;;
+      *) log "no proxy configured"; return 0 ;;
+    esac
+    while :; do
+      read -r -p "[bot-squad] Proxy URL (e.g. http://proxy.corp:3128): " url </dev/tty || url=""
+      if [[ -z "$url" ]]; then
+        warn "empty URL — re-enter, or Ctrl-C to abort"
+        continue
+      fi
+      log "validating proxy by curl-ing https://registry.npmjs.org/ through it (5s timeout)..."
+      if proxy_probe "$url" 2>/tmp/proxy_probe_err.$$; then
+        rm -f /tmp/proxy_probe_err.$$
+        break
+      fi
+      local reason; reason="$(cat /tmp/proxy_probe_err.$$ 2>/dev/null || true)"
+      rm -f /tmp/proxy_probe_err.$$
+      warn "proxy validation failed: ${reason:-unknown error}"
+      warn "re-enter the URL (or Ctrl-C to abort)"
+    done
+  fi
+
+  # Write all three sinks.
+  export http_proxy="$url"
+  export https_proxy="$url"
+  export HTTP_PROXY="$url"
+  export HTTPS_PROXY="$url"
+  proxy_write_claude_settings "$url" || die_struct proxy_url \
+    "Failed to write proxy URL into $BOTSQUAD_CLAUDE_SETTINGS." \
+    "Check the file's permissions; ensure jq is installed."
+  proxy_write_apt_conf "$url" || die_struct proxy_url \
+    "Failed to write $BOTSQUAD_PROXY_APT_CONF." \
+    "Check sudo permissions on $(dirname "$BOTSQUAD_PROXY_APT_CONF")."
+  log "proxy configured: $url → env + claude settings + apt conf"
+}
+
+step_pkg_index_update() {
+  # Replaces the v1 apt_update checkpoint. Dispatches via pkg_update()
+  # to the family-appropriate refresh (apt-get update / dnf makecache
+  # / pacman -Sy). Keeping it as its own checkpoint preserves the
+  # "before proxy is wired" → "after proxy is wired" ordering that
+  # the proxy_url checkpoint relies on for its first index pull.
+  pkg_update || die_struct pkg_index_update \
+    "Package index refresh failed (family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+    "Check network connectivity and your package-manager sources
+(/etc/apt/sources.list*, /etc/yum.repos.d/, or /etc/pacman.conf as
+applicable). If you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=
+http://... — the proxy_url checkpoint will wire it through."
 }
 
 step_install_base_pkgs() {
   # curl + git + ca-certificates + jq (for parsing mothership responses).
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl ca-certificates git jq >/dev/null || die_struct install_base_pkgs \
-      "apt-get install of base packages (curl/git/jq/ca-certificates) failed." \
-      "Inspect the apt-get output above. The most common cause is a held
-package or a stale apt cache — try 'sudo apt-get update && sudo apt-get -f install'."
+  # Resolved per-family by pkg_install.
+  pkg_install curl ca-certificates git jq || die_struct install_base_pkgs \
+      "Install of base packages (curl/git/jq/ca-certificates) failed
+(family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+      "Inspect the package-manager output above. The most common cause is
+a held package or a stale index — re-run the pkg_index_update checkpoint
+manually (e.g. 'sudo apt-get update && sudo apt-get -f install' on
+Debian/Ubuntu)."
 }
 
 step_install_tmux() {
-  if command -v tmux >/dev/null 2>&1; then return 0; fi
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tmux >/dev/null \
-    || die_struct install_tmux "Could not install tmux via apt-get." \
-       "Try 'sudo apt-get install tmux' manually to see the exact error."
+  if pkg_have tmux; then return 0; fi
+  pkg_install tmux || die_struct install_tmux \
+    "Could not install tmux via the system package manager
+(family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+    "Try installing tmux manually (e.g. 'sudo apt-get install tmux',
+'sudo dnf install tmux', or 'sudo pacman -S tmux') to see the exact error."
 }
 
 step_install_nodejs() {
@@ -213,15 +529,44 @@ step_install_nodejs() {
     # claude-code needs node >= 18; be lenient on minor.
     if [[ -n "$v" ]] && [[ "${v%%.*}" -ge 18 ]]; then return 0; fi
   fi
-  # Ship NodeSource 20.x — minimum claude-code-compatible LTS.
-  if ! curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
-    die_struct install_nodejs "Failed to fetch the NodeSource setup script." \
-      "Check network (curl https://deb.nodesource.com). If you're on a corporate
-network, set HTTPS_PROXY before re-running. Then re-run the installer."
-  fi
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >/dev/null \
-    || die_struct install_nodejs "apt-get install nodejs failed." \
-       "Run 'sudo apt-get install nodejs' to see the exact apt error."
+  # NodeSource is the source-of-truth for current Node on Debian/Fedora;
+  # Arch's `nodejs` package tracks current well enough on its own.
+  case "${BOTSQUAD_DISTRO_FAMILY:-}" in
+    debian)
+      if ! curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
+        die_struct install_nodejs "Failed to fetch the NodeSource setup script (deb)." \
+          "Check network (curl https://deb.nodesource.com). If you're on a corporate
+network, re-run with BOTSQUAD_PROXY_URL=http://... (the proxy_url checkpoint
+will configure apt/curl/npm), then re-run the installer."
+      fi
+      pkg_install nodejs \
+        || die_struct install_nodejs "apt-get install nodejs failed." \
+           "Run 'sudo apt-get install nodejs' to see the exact apt error."
+      ;;
+    fedora)
+      # NodeSource RPM repo (same source-of-truth as Debian, different URL).
+      if ! curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1; then
+        die_struct install_nodejs "Failed to fetch the NodeSource setup script (rpm)." \
+          "Check network (curl https://rpm.nodesource.com). If you're on a corporate
+network, re-run with BOTSQUAD_PROXY_URL=http://... and retry."
+      fi
+      pkg_install nodejs \
+        || die_struct install_nodejs "dnf install nodejs failed." \
+           "Run 'sudo dnf install nodejs' to see the exact dnf error."
+      ;;
+    arch)
+      # Arch core/extra ships current node + npm; no third-party repo.
+      pkg_install nodejs \
+        || die_struct install_nodejs "pacman -S nodejs npm failed." \
+           "Run 'sudo pacman -S nodejs npm' to see the exact pacman error."
+      ;;
+    *)
+      die_struct install_nodejs \
+        "Unknown distro family '${BOTSQUAD_DISTRO_FAMILY:-?}'; cannot install nodejs." \
+        "Re-run after the detect_distro checkpoint succeeds, or set
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch explicitly."
+      ;;
+  esac
 }
 
 step_install_claude_code() {
@@ -234,25 +579,379 @@ step_install_claude_code() {
   sudo npm install -g @anthropic-ai/claude-code
 If you see EACCES, your global node prefix may need fixing
 (npm config set prefix ~/.npm-global). If you see network errors,
-configure HTTPS_PROXY and retry."
+re-run with BOTSQUAD_PROXY_URL=http://... and retry."
   fi
   command -v claude >/dev/null 2>&1 || die_struct install_claude_code \
     "npm install reported success but 'claude' is still not on PATH." \
     "Add npm's global bin dir to your PATH (npm bin -g) and re-run."
 }
 
-step_require_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+# --- install_docker checkpoint helpers ---------------------------------------
+#
+# Bootstrap Docker engine + compose plugin via Docker's official apt repo,
+# using the signed-by gpg-key pattern (not pipe-curl-to-sudo-bash) per
+# https://docs.docker.com/engine/install/ubuntu/.
+#
+# Idempotency is keyed on "compose works" (BOTSQUAD_DOCKER_CHECK_CMD), not
+# "we ran apt": if `docker compose version` already returns 0, the entire
+# checkpoint is a no-op. This keeps the checkpoint stable across docker
+# minor-version bumps and across hosts where docker was installed by some
+# other means.
+#
+# Every step that touches sudo / apt / network is funnelled through a
+# BOTSQUAD_DOCKER_*_CMD env-var seam so the test suite can stub them.
+
+docker_compose_works() {
+  bash -c "$BOTSQUAD_DOCKER_CHECK_CMD" >/dev/null 2>&1
+}
+
+docker_detect_codename() {
+  if [[ -n "$BOTSQUAD_DOCKER_CODENAME" ]]; then
+    printf '%s' "$BOTSQUAD_DOCKER_CODENAME"; return
+  fi
+  local codename=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    codename="$( . /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}" )"
+  fi
+  if [[ -z "$codename" ]] && command -v lsb_release >/dev/null 2>&1; then
+    codename="$(lsb_release -cs 2>/dev/null || true)"
+  fi
+  printf '%s' "$codename"
+}
+
+docker_detect_distro() {
+  if [[ -n "$BOTSQUAD_DOCKER_DISTRO" ]]; then
+    printf '%s' "$BOTSQUAD_DOCKER_DISTRO"; return
+  fi
+  if [[ -r /etc/os-release ]]; then
+    ( . /etc/os-release && printf '%s' "${ID:-ubuntu}" )
+  else
+    printf '%s' ubuntu
+  fi
+}
+
+docker_detect_arch() {
+  if [[ -n "$BOTSQUAD_DOCKER_ARCH" ]]; then
+    printf '%s' "$BOTSQUAD_DOCKER_ARCH"; return
+  fi
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --print-architecture 2>/dev/null || printf '%s' amd64
+  else
+    printf '%s' amd64
+  fi
+}
+
+# Install Docker's official GPG key at $1 using the signed-by pattern.
+# Returns non-zero on any failure (network / sudo / write).
+docker_install_gpg_key() {
+  local keyring="$1" parent
+  parent="$(dirname "$keyring")"
+  if [[ -n "$BOTSQUAD_DOCKER_GPG_FETCH_CMD" ]]; then
+    mkdir -p "$parent" || return 1
+    bash -c "$BOTSQUAD_DOCKER_GPG_FETCH_CMD \"\$1\"" _ "$keyring"
+    return $?
+  fi
+  local distro; distro="$(docker_detect_distro)"
+  if [[ -w "$parent" ]] || { [[ -f "$keyring" ]] && [[ -w "$keyring" ]]; }; then
+    mkdir -p "$parent" || return 1
+    curl -fsSL "https://download.docker.com/linux/${distro}/gpg" \
+      -o "$keyring" || return 1
+    chmod 0644 "$keyring" || return 1
+  else
+    sudo install -m 0755 -d "$parent" || return 1
+    sudo curl -fsSL "https://download.docker.com/linux/${distro}/gpg" \
+      -o "$keyring" || return 1
+    sudo chmod 0644 "$keyring" || return 1
+  fi
+}
+
+# Write the apt sources.list.d snippet for Docker's repo. Idempotent: if the
+# file already has the exact body we'd write, leave its mtime alone.
+docker_write_apt_list() {
+  local list="$1" keyring="$2" distro codename arch
+  distro="$(docker_detect_distro)"
+  codename="$(docker_detect_codename)"
+  arch="$(docker_detect_arch)"
+  if [[ -z "$codename" ]]; then
+    die_struct install_docker \
+      "Could not detect distro codename for Docker's apt repo." \
+      "Make sure /etc/os-release defines VERSION_CODENAME (or UBUNTU_CODENAME),
+or install lsb-release. Cross-distro support is tracked under T-0030; for
+now, override with BOTSQUAD_DOCKER_CODENAME=<codename>."
+  fi
+  local body
+  body="$(printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' \
+    "$arch" "$keyring" "$distro" "$codename")"
+  if [[ -f "$list" ]] && [[ "$(cat "$list" 2>/dev/null)" = "$body" ]]; then
     return 0
   fi
-  die_struct require_docker \
-    "Docker engine + compose plugin not detected. This v1 installer assumes
-docker is already configured for the current user." \
-    "Install docker engine + compose plugin per
-https://docs.docker.com/engine/install/ubuntu/ — then add your user to the
-'docker' group (sudo usermod -aG docker \$USER), log out + back in, and
-re-run the installer. (Bootstrap-from-zero docker install is a follow-on
-task.)"
+  local parent; parent="$(dirname "$list")"
+  if [[ -w "$parent" ]] || { [[ -f "$list" ]] && [[ -w "$list" ]]; }; then
+    mkdir -p "$parent" || return 1
+    printf '%s' "$body" > "$list"
+    chmod 0644 "$list"
+  else
+    sudo install -m 0755 -d "$parent" || return 1
+    printf '%s' "$body" | sudo tee "$list" >/dev/null
+    sudo chmod 0644 "$list"
+  fi
+}
+
+docker_run_install_cmd() {
+  if [[ -n "$BOTSQUAD_DOCKER_INSTALL_CMD" ]]; then
+    bash -c "$BOTSQUAD_DOCKER_INSTALL_CMD"
+    return $?
+  fi
+  case "${BOTSQUAD_DISTRO_FAMILY:-debian}" in
+    debian)
+      sudo apt-get update -y >/dev/null || return 1
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin >/dev/null
+      ;;
+    fedora)
+      # Docker's Fedora repo: written via dnf config-manager from the
+      # upstream .repo file (no manual GPG key step — the .repo entry
+      # carries the gpgkey URL, and dnf imports it on first install).
+      sudo dnf -y install dnf-plugins-core >/dev/null || return 1
+      # `dnf config-manager --add-repo <url>` is idempotent (writes the
+      # same .repo each time).
+      sudo dnf config-manager --add-repo \
+        https://download.docker.com/linux/fedora/docker-ce.repo >/dev/null || return 1
+      sudo dnf -y install \
+        docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin >/dev/null || return 1
+      # On Fedora the docker daemon isn't started by the install, unlike
+      # apt on Debian/Ubuntu. Enable + start so the post-install probe
+      # has a socket to talk to.
+      sudo systemctl enable --now docker >/dev/null 2>&1 || return 1
+      ;;
+    arch)
+      # Arch ships docker + docker compose plugin in core/extra; no
+      # third-party repo or GPG dance.
+      sudo pacman -S --noconfirm --needed docker docker-compose >/dev/null || return 1
+      sudo systemctl enable --now docker >/dev/null 2>&1 || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+docker_run_usermod_cmd() {
+  local user="$1"
+  if [[ -n "$BOTSQUAD_DOCKER_USERMOD_CMD" ]]; then
+    bash -c "$BOTSQUAD_DOCKER_USERMOD_CMD \"\$1\"" _ "$user"
+    return $?
+  fi
+  sudo usermod -aG docker "$user"
+}
+
+step_install_docker() {
+  # Idempotency is keyed on "compose works", not "we ran apt".
+  if docker_compose_works; then
+    log "docker compose already works (skipping)"
+    return 0
+  fi
+
+  # The signed-by GPG keyring + apt sources.list snippet are Debian-family
+  # specific. Fedora uses dnf config-manager --add-repo (handled inside
+  # docker_run_install_cmd); Arch ships docker in core/extra (no
+  # third-party repo). Default to the debian path so legacy tests that
+  # never set BOTSQUAD_DISTRO_FAMILY keep working as before.
+  case "${BOTSQUAD_DISTRO_FAMILY:-debian}" in
+    debian)
+      docker_install_gpg_key "$BOTSQUAD_DOCKER_GPG_KEYRING" \
+        || die_struct install_docker \
+          "Could not install Docker's GPG key to $BOTSQUAD_DOCKER_GPG_KEYRING." \
+          "Check network connectivity to download.docker.com and that
+$(dirname "$BOTSQUAD_DOCKER_GPG_KEYRING") is writable (with sudo). If
+you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=http://..."
+
+      docker_write_apt_list "$BOTSQUAD_DOCKER_APT_LIST" "$BOTSQUAD_DOCKER_GPG_KEYRING" \
+        || die_struct install_docker \
+          "Could not write $BOTSQUAD_DOCKER_APT_LIST." \
+          "Check sudo permissions on $(dirname "$BOTSQUAD_DOCKER_APT_LIST")."
+      ;;
+    fedora|arch)
+      log "docker: using ${BOTSQUAD_DISTRO_FAMILY} package source (no apt keyring/list)"
+      ;;
+    *)
+      die_struct install_docker \
+        "Cannot install Docker on family '${BOTSQUAD_DISTRO_FAMILY:-?}'." \
+        "Re-run after the detect_distro checkpoint succeeds, or set
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch explicitly."
+      ;;
+  esac
+
+  docker_run_install_cmd \
+    || die_struct install_docker \
+      "apt-get install of docker-ce + plugins failed." \
+      "Inspect the apt-get output above. Common causes: stale apt cache
+(try 'sudo apt-get update'); held packages; or transient network. If
+your distro codename isn't in Docker's upstream list, T-0030 tracks
+cross-distro support."
+
+  local user; user="$(id -un)"
+  docker_run_usermod_cmd "$user" \
+    || die_struct install_docker \
+      "Could not add $user to the 'docker' group." \
+      "Run 'sudo usermod -aG docker $user' manually to see the error."
+
+  # Final probe: did install + group membership actually take effect for
+  # this shell? Two failure modes are distinguished:
+  #   (a) binaries missing — apt didn't really install (rare; would
+  #       normally have been caught above).
+  #   (b) binaries present but the current shell can't reach the docker
+  #       socket — the user was just added to the 'docker' group, but
+  #       Unix group membership is fixed at session start (login), so this
+  #       shell inherited the pre-usermod group set. Re-running the
+  #       installer in a new login (or after `newgrp docker`) will see
+  #       `docker compose version` succeed and skip the whole checkpoint.
+  if ! docker_compose_works; then
+    if command -v docker >/dev/null 2>&1; then
+      die_struct install_docker \
+        "Docker is installed, but this shell can't talk to it yet.
+Reason: you were just added to the 'docker' group, and Unix group
+membership is fixed at session start — this shell inherited the
+pre-usermod group set. This is NOT a script bug." \
+        "Log out and back in (or, in this shell, run 'newgrp docker'),
+then re-run the installer. The install_docker checkpoint will be a
+no-op once 'docker compose version' returns 0 in the new shell."
+    fi
+    die_struct install_docker \
+      "apt reported success but 'docker compose version' still fails and
+'docker' isn't on PATH." \
+      "Re-run 'sudo apt-get install -y docker-ce docker-ce-cli
+containerd.io docker-buildx-plugin docker-compose-plugin' manually to
+see the underlying error."
+  fi
+}
+
+# --- install_reverse_proxy checkpoint helpers (T-0029) -----------------------
+#
+# Two shapes, distinguished by whether a shared reverse proxy is already in
+# front of this docker daemon:
+#
+#   shared (no-op): the host already runs a reverse proxy (e.g. traefik on
+#     the `avo_backend` external network — the bot-squad-api compose service
+#     has matching `traefik.http.routers.bot-squad.rule=Host(...)` labels).
+#     The detection sentinel is `docker network inspect avo_backend` (or
+#     whatever name BOTSQUAD_REVERSE_PROXY_NETWORK is set to). When the
+#     probe returns 0, this checkpoint is a no-op — the existing labels
+#     do the work. This is the path the bot-squad mothership server itself
+#     takes and MUST stay no-op for it.
+#
+#   fresh: the host has no reverse proxy. We write a docker-compose override
+#     (BOTSQUAD_FRESH_HOST_OVERRIDE, default docker-compose.fresh-host.yml)
+#     that (a) redefines `avo_backend` as a stack-local network so compose
+#     creates it, and (b) publishes bot-squad-api:8000 on the host at
+#     BOTSQUAD_HTTP_PORT (default 8000). step_docker_compose_up picks the
+#     override file up automatically when it's present.
+#
+# TLS bootstrap is deliberately deferred: shape 2 only serves HTTP on the
+# published port; users layer their own caddy / nginx / traefik in front
+# (the gitea/plausible/forgejo playbook).
+#
+# Rationale: vision/multi-server/reverse-proxy-decision.md
+
+reverse_proxy_override_path() {
+  if [[ -n "$BOTSQUAD_FRESH_HOST_OVERRIDE" ]]; then
+    printf '%s' "$BOTSQUAD_FRESH_HOST_OVERRIDE"
+  else
+    printf '%s' "${BOTSQUAD_INSTALL_DIR}/docker-compose.fresh-host.yml"
+  fi
+}
+
+# Return 0 if the shared reverse-proxy network is present (i.e. somebody
+# else is already running a reverse proxy on this docker daemon), non-zero
+# otherwise. Honors the BOTSQUAD_DOCKER_NETWORK_PROBE_CMD test seam: when
+# set, the command is invoked with the network name as $1.
+reverse_proxy_shared_present() {
+  local network="$BOTSQUAD_REVERSE_PROXY_NETWORK"
+  if [[ -n "$BOTSQUAD_DOCKER_NETWORK_PROBE_CMD" ]]; then
+    bash -c "$BOTSQUAD_DOCKER_NETWORK_PROBE_CMD \"\$1\"" _ "$network" >/dev/null 2>&1
+    return $?
+  fi
+  # Default probe: `docker network inspect <name>` returns 0 iff the
+  # network exists on the local daemon. Silent on both branches.
+  command -v docker >/dev/null 2>&1 || return 1
+  docker network inspect "$network" >/dev/null 2>&1
+}
+
+# Write the fresh-host docker-compose override. Idempotent: if the file
+# already has the exact body, leave its mtime alone.
+reverse_proxy_write_override() {
+  local path="$1" port="$2" network="$3"
+  local body
+  # The override targets the bot-squad-api service from the parent
+  # compose. We redefine `avo_backend` as stack-local (external: false)
+  # so compose creates it, and add a ports: block to publish the API.
+  # Comments explain the intent for anyone who opens the file later.
+  body="$(cat <<EOF
+# Generated by bot-squad installer (T-0029, install_reverse_proxy step).
+# Layered on top of docker-compose.yml when this host has no shared
+# reverse proxy (no '${network}' external network). Publishes the API
+# on a host port so the user can curl/browse it directly, or layer
+# their own caddy/nginx/traefik in front. To remove (e.g. you set up a
+# shared traefik later), just delete this file and re-run the installer.
+services:
+  bot-squad-api:
+    ports:
+      - "${port}:8000"
+
+networks:
+  ${network}:
+    external: false
+EOF
+)"
+  if [[ -f "$path" ]] && [[ "$(cat "$path" 2>/dev/null)" = "$body" ]]; then
+    return 0
+  fi
+  local parent; parent="$(dirname "$path")"
+  if [[ ! -d "$parent" ]]; then
+    mkdir -p "$parent" 2>/dev/null || sudo mkdir -p "$parent" || return 1
+  fi
+  if [[ -w "$parent" ]] || { [[ -f "$path" ]] && [[ -w "$path" ]]; }; then
+    printf '%s\n' "$body" > "$path"
+    chmod 0644 "$path"
+  else
+    printf '%s\n' "$body" | sudo tee "$path" >/dev/null
+    sudo chmod 0644 "$path"
+  fi
+}
+
+step_install_reverse_proxy() {
+  local override; override="$(reverse_proxy_override_path)"
+  case "$BOTSQUAD_REVERSE_PROXY_MODE" in
+    shared)
+      log "reverse-proxy mode forced to shared → no-op (existing traefik labels apply)"
+      return 0
+      ;;
+    fresh)
+      log "reverse-proxy mode forced to fresh → writing override $override"
+      ;;
+    auto|"")
+      if reverse_proxy_shared_present; then
+        log "shared reverse proxy detected (network '$BOTSQUAD_REVERSE_PROXY_NETWORK' exists) → no-op"
+        return 0
+      fi
+      log "no shared reverse proxy detected → writing fresh-host override $override"
+      ;;
+    *)
+      die_struct install_reverse_proxy \
+        "Unknown BOTSQUAD_REVERSE_PROXY_MODE='$BOTSQUAD_REVERSE_PROXY_MODE'." \
+        "Set BOTSQUAD_REVERSE_PROXY_MODE to one of: auto, shared, fresh."
+      ;;
+  esac
+  reverse_proxy_write_override "$override" \
+      "$BOTSQUAD_HTTP_PORT" "$BOTSQUAD_REVERSE_PROXY_NETWORK" \
+    || die_struct install_reverse_proxy \
+      "Could not write fresh-host compose override at $override." \
+      "Check permissions on $(dirname "$override"). If you're behind a
+read-only mount, set BOTSQUAD_FRESH_HOST_OVERRIDE to a writable path."
+  log "fresh-host override ready: bot-squad-api → host:${BOTSQUAD_HTTP_PORT}"
 }
 
 step_botsquad_group() {
@@ -402,13 +1101,17 @@ step_python_venv() {
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip >/dev/null \
-      || die_struct python_venv "apt-get install python3 failed." \
-         "Run 'sudo apt-get install python3 python3-venv python3-pip' manually."
+    pkg_install python3 python3-venv python3-pip \
+      || die_struct python_venv "Install of python3+venv+pip failed (family=${BOTSQUAD_DISTRO_FAMILY:-?})." \
+         "Run the install manually for your distro (e.g.
+'sudo apt-get install python3 python3-venv python3-pip' on Debian/Ubuntu,
+'sudo dnf install python3 python3-pip' on Fedora,
+'sudo pacman -S python python-pip' on Arch)."
   fi
   python3 -m venv "$venv" || die_struct python_venv \
     "python3 -m venv failed for $venv." \
-    "Make sure python3-venv is installed (sudo apt-get install python3-venv)."
+    "On Debian/Ubuntu the venv module is a separate package
+(sudo apt-get install python3-venv). On Fedora/Arch it ships with python3."
   "$venv/bin/pip" install --upgrade pip >/dev/null
   "$venv/bin/pip" install -e "$BOTSQUAD_INSTALL_DIR/worker" >/dev/null \
     || die_struct python_venv "pip install -e worker failed." \
@@ -433,13 +1136,24 @@ step_systemd_unit() {
 }
 
 step_docker_compose_up() {
-  ( cd "$BOTSQUAD_INSTALL_DIR" && docker compose up -d --build ) \
+  # T-0029: if the fresh-host override exists (written by
+  # install_reverse_proxy on hosts with no shared traefik), layer it on
+  # top of the base compose file via -f. On hosts with a shared traefik,
+  # the override is absent and `docker compose up` uses just the base.
+  local override; override="$(reverse_proxy_override_path)"
+  local -a compose_args=(compose -f docker-compose.yml)
+  if [[ -f "$override" ]]; then
+    compose_args+=(-f "$override")
+    log "docker compose: layering fresh-host override $override"
+  fi
+  compose_args+=(up -d --build)
+  ( cd "$BOTSQUAD_INSTALL_DIR" && docker "${compose_args[@]}" ) \
     || die_struct docker_compose_up "docker compose up failed." \
        "Run 'cd $BOTSQUAD_INSTALL_DIR && docker compose up -d --build'
 manually to see the build error. If it complains about a missing
-external network 'avo_backend', that prerequisite isn't bundled in v1 —
-create it with 'docker network create avo_backend' (or whatever your
-reverse-proxy network is) and re-run."
+external network 'avo_backend', the install_reverse_proxy checkpoint
+should have written $override — re-run the installer (it'll resume at
+install_reverse_proxy)."
 }
 
 step_agent_teams_flag() {
@@ -501,8 +1215,11 @@ When you're attached and have spoken to the operator, you can
 exit the bootstrap claude session that drove this install —
 that one's job is done.
 
-UI:       http://bot-squad.\$DOMAIN  (or however your reverse
-          proxy routes to the bot-squad-api container)
+UI:       http://bot-squad.\$DOMAIN/welcome  (or however your
+          reverse proxy routes to the bot-squad-api container)
+          — lands on the "you're all set" handoff screen with a
+          copyable tmux-attach command; click Next to enter the
+          server view.
 Worker:   sudo systemctl status bot-squad-worker
 State:    $STATE_FILE
 ============================================================
@@ -511,14 +1228,15 @@ EOF
 
 # ---- Step order -------------------------------------------------------------
 STEPS=(
-  require_linux
+  detect_distro
   require_sudo
-  apt_update
+  proxy_url
+  pkg_index_update
   install_base_pkgs
   install_tmux
   install_nodejs
   install_claude_code
-  require_docker
+  install_docker
   botsquad_group
   install_dir
   clone_repo
@@ -526,6 +1244,7 @@ STEPS=(
   mothership_handshake
   python_venv
   systemd_unit
+  install_reverse_proxy
   docker_compose_up
   agent_teams_flag
   spawn_operator

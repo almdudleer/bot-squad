@@ -14,6 +14,7 @@ import { Scheduler } from "./pages/Scheduler";
 import { Autonomous } from "./pages/Autonomous";
 import { Workflow } from "./pages/Workflow";
 import { Help } from "./pages/Help";
+import { Welcome } from "./pages/Welcome";
 import { Users } from "./pages/Users";
 import { SystemSettings } from "./pages/SystemSettings";
 import { Profile } from "./pages/Profile";
@@ -60,6 +61,7 @@ export function App() {
             }
           />
           <Route path="/help" element={<Help />} />
+          <Route path="/welcome" element={<Welcome />} />
           <Route path="/p/:slug" element={<Project />} />
           <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
           <Route path="/p/:slug/vision" element={<Vision />} />

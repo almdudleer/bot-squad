@@ -201,6 +201,111 @@ h1, h2, h3, h4, h5, h6 {
   text-decoration: none;
 }
 
+/* ---- Sidebar: project switcher (T-0008) ------------------ */
+.mc-switcher {
+  position: relative;
+}
+.mc-switcher-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.mc-switcher-trigger:hover {
+  color: var(--mc-cyan);
+}
+.mc-switcher-caret {
+  font-size: 0.7rem;
+  line-height: 1;
+}
+.mc-switcher-panel {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 0;
+  z-index: 50;
+  min-width: 220px;
+  max-width: 280px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  padding: 0.25rem 0;
+}
+.mc-switcher-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mc-switcher-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.45rem 0.75rem;
+  background: none;
+  border: none;
+  font-family: var(--mc-mono);
+  font-size: 0.75rem;
+  color: var(--mc-text);
+  text-align: left;
+  cursor: pointer;
+}
+.mc-switcher-row:hover {
+  background: var(--mc-bg-alt, rgba(255, 255, 255, 0.04));
+  color: var(--mc-cyan);
+}
+.mc-switcher-row-current {
+  color: var(--mc-cyan);
+}
+.mc-switcher-row-current::before {
+  content: "▸ ";
+}
+.mc-switcher-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.mc-switcher-empty {
+  padding: 0.5rem 0.75rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  color: var(--mc-text-dim);
+}
+.mc-switcher-error {
+  color: var(--mc-red);
+}
+.mc-switcher-allprojects {
+  display: block;
+  width: 100%;
+  padding: 0.45rem 0.75rem;
+  margin-top: 0.25rem;
+  border-top: 1px solid var(--mc-border);
+  background: none;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  letter-spacing: 0.04em;
+  text-align: left;
+  cursor: pointer;
+}
+.mc-switcher-allprojects:hover {
+  color: var(--mc-cyan);
+}
+
 /* ---- Sidebar: nav items ---------------------------------- */
 .mc-sidebar-nav {
   list-style: none;
@@ -840,6 +945,85 @@ pre.bg-light {
   color: var(--mc-text-faint);
   padding: 0.6rem 0.5rem;
   letter-spacing: 0.05em;
+}
+
+/* T-0058: board row replaces Bootstrap `row g-3` so the planned/closed
+   rails can collapse to thin drop-strips while the other columns share
+   the remaining width on a single line. */
+.mc-board-row {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 1rem;
+  align-items: stretch;
+  overflow-x: auto;
+}
+.mc-board-row > .mc-board-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.mc-board-row > .mc-board-col.mc-board-rail-collapsed {
+  flex: 0 0 2.25rem;
+  min-width: 2.25rem;
+  max-width: 2.25rem;
+  padding: 0;
+  cursor: pointer;
+  border: 1px solid var(--mc-border);
+  background-color: var(--mc-surface);
+  transition: background-color 0.12s, border-color 0.12s;
+}
+.mc-board-row > .mc-board-col.mc-board-rail-collapsed:hover,
+.mc-board-row > .mc-board-col.mc-board-rail-collapsed:focus-visible {
+  background-color: var(--mc-surface-raised);
+  border-color: var(--mc-cyan);
+  outline: none;
+}
+.mc-board-rail-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  height: 100%;
+  min-height: 6rem;
+  padding: 0.6rem 0;
+  gap: 0.5rem;
+  font-family: var(--mc-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--mc-amber);
+  font-weight: 700;
+  pointer-events: none;     /* clicks bubble to the column */
+}
+.mc-board-rail-chevron {
+  font-size: 0.85rem;
+  color: var(--mc-text-dim);
+  line-height: 1;
+}
+.mc-board-rail-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  white-space: nowrap;
+  letter-spacing: 0.18em;
+}
+.mc-board-rail-count {
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  background: var(--mc-surface-raised);
+  border: 1px solid var(--mc-border-strong);
+  border-radius: 2px;
+  padding: 1px 5px;
+  font-weight: 700;
+}
+.mc-board-col.mc-board-rail-expanded .mc-board-col-header {
+  color: var(--mc-cyan);
+  border-bottom-color: var(--mc-cyan);
+}
+.mc-board-rail-chevron-inline {
+  font-size: 0.85rem;
+  color: var(--mc-text-dim);
+  line-height: 1;
+  margin-right: 0.1rem;
 }
 
 /* Per-page help — collapsible block that explains what the page does.

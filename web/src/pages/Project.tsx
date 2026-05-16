@@ -6,22 +6,30 @@ import { Modal } from "../components/Modal";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 
 import { PageHelp } from "../components/PageHelp";
-const COLUMNS = ["open", "in_progress", "totest", "reopened", "closed"] as const;
+const COLUMNS = ["planned", "open", "in_progress", "totest", "reopened", "closed"] as const;
 const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
+  planned: "Planned",
   open: "Open",
   in_progress: "In progress",
   totest: "To Test",
   reopened: "Reopened",
   closed: "Closed",
 };
+// T-0058: the two "rail" columns — render as a thin drop-strip by default,
+// expand on click. Only one is expanded at a time (other auto-collapses).
+const RAIL_STATUSES: ReadonlySet<typeof COLUMNS[number]> = new Set(["planned", "closed"]);
 
-type ModalKind = "create" | "editBody" | "addComment" | null;
+type ModalKind = "create" | "editBody" | "addComment" | "setInitiative" | null;
 type GroupBy = "none" | "initiative";
 type ViewMode = "board" | "list";
 
 // T-0039: sentinel for the "no initiative" lane. Real initiatives are
 // vision/initiatives/<basename>.md so this prefix can't collide.
 const UNATTACHED = "__unattached__";
+// T-0038 stakeholder follow-up #2: synthetic filter value that means
+// "only tickets whose initiative is currently in vision/active_initiatives".
+// Same collision-proof prefix as UNATTACHED.
+const ACTIVE_ONLY = "__active__";
 
 type InitiativeStatus = "active" | "draft" | "done";
 
@@ -79,6 +87,37 @@ export function Project() {
   // Filter is a single initiative basename, UNATTACHED, or "" for all.
   const [filterInit, setFilterInit] = useState<string>("");
 
+  // Per-lane collapsed state. Key = initiative basename or UNATTACHED.
+  // Persisted to localStorage per project so a folded set of "done"
+  // initiatives stays folded across reloads.
+  const collapsedStorageKey = `bs.collapsedLanes.${slug}`;
+  const [collapsedLanes, setCollapsedLanes] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem(collapsedStorageKey);
+      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(collapsedStorageKey, JSON.stringify(collapsedLanes));
+    } catch {
+      /* quota exceeded, private mode, etc. — silent. */
+    }
+  }, [collapsedStorageKey, collapsedLanes]);
+  function toggleLane(key: string) {
+    setCollapsedLanes((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
+  // T-0058: which rail (planned|closed) is currently expanded. null = both
+  // collapsed to thin strips. Shared across the ungrouped board AND every
+  // initiative lane, so toggling one place toggles them all (consistent UX).
+  const [expandedRail, setExpandedRail] = useState<typeof COLUMNS[number] | null>(null);
+  function toggleRail(status: typeof COLUMNS[number]) {
+    setExpandedRail((prev) => (prev === status ? null : status));
+  }
+
   // modal state
   const [modalKind, setModalKind] = useState<ModalKind>(null);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
@@ -93,6 +132,9 @@ export function Project() {
 
   // comment form
   const [commentText, setCommentText] = useState("");
+
+  // set-initiative form. "" = unattached.
+  const [initiativeChoice, setInitiativeChoice] = useState<string>("");
 
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
@@ -132,6 +174,20 @@ export function Project() {
     return list;
   }, [vision]);
 
+  // Set of initiative basenames currently in vision/active_initiatives.
+  const activeInitiativeKeys = useMemo<Set<string>>(() => {
+    return new Set(initiativeMeta.filter((m) => m.status === "active").map((m) => m.key));
+  }, [initiativeMeta]);
+
+  // Single source of truth for "does this task pass the current filter".
+  function passesFilter(t: Task): boolean {
+    if (!filterInit) return true;
+    const init = (t.initiative ?? "").trim();
+    if (filterInit === UNATTACHED) return !init;
+    if (filterInit === ACTIVE_ONLY) return Boolean(init) && activeInitiativeKeys.has(init);
+    return init === filterInit;
+  }
+
   // Tasks keyed by initiative basename (or UNATTACHED).
   const tasksByInit = useMemo<Record<string, Task[]>>(() => {
     const out: Record<string, Task[]> = { [UNATTACHED]: [] };
@@ -167,18 +223,13 @@ export function Project() {
       { key: UNATTACHED, title: "Unattached", status: "draft" },
     ];
     if (!filterInit) return all;
+    if (filterInit === ACTIVE_ONLY) return all.filter((m) => activeInitiativeKeys.has(m.key));
     return all.filter((m) => m.key === filterInit);
-  }, [initiativeMeta, tasksByInit, filterInit]);
+  }, [initiativeMeta, tasksByInit, filterInit, activeInitiativeKeys]);
 
   // Ungrouped — current 5-column behavior.
   const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
-  const ungroupedTasks = filterInit
-    ? (tasks ?? []).filter((t) => {
-        const init = (t.initiative ?? "").trim();
-        if (filterInit === UNATTACHED) return !init;
-        return init === filterInit;
-      })
-    : (tasks ?? []);
+  const ungroupedTasks = (tasks ?? []).filter(passesFilter);
   for (const t of ungroupedTasks) {
     if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
       grouped[t.status].push(t);
@@ -366,6 +417,11 @@ export function Project() {
       setCommentText("");
       setModalError(null);
       setModalKind("addComment");
+    } else if (action.kind === "setInitiative") {
+      setActiveTask(task);
+      setInitiativeChoice((task.initiative ?? "").trim());
+      setModalError(null);
+      setModalKind("setInitiative");
     } else if (action.kind === "delete") {
       if (!confirm(`Delete task ${task.id}: "${task.title}"?`)) return;
       try {
@@ -374,6 +430,23 @@ export function Project() {
       } catch (e) {
         setError(String(e));
       }
+    }
+  }
+
+  async function handleSetInitiative() {
+    if (!activeTask) return;
+    setSaving(true);
+    setModalError(null);
+    try {
+      await api.patchTask(slug, activeTask.id, {
+        initiative: initiativeChoice ? initiativeChoice : null,
+      });
+      closeModal();
+      reload();
+    } catch (e) {
+      setModalError(String(e));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -429,6 +502,7 @@ export function Project() {
             onChange={(e) => setFilterInit(e.target.value)}
           >
             <option value="">all initiatives</option>
+            <option value={ACTIVE_ONLY}>(active initiatives)</option>
             {initiativeMeta.map((m) => (
               <option key={m.key} value={m.key}>
                 {m.title} · {m.status}
@@ -441,7 +515,7 @@ export function Project() {
 
       {groupBy === "none" ? (
         viewMode === "board" ? (
-          <div className="row g-3 mt-1">
+          <div className="mc-board-row mt-1">
             {COLUMNS.map((c) => (
               <BoardColumn
                 key={c}
@@ -452,6 +526,12 @@ export function Project() {
                 onMenuAction={handleMenuAction}
                 onMove={handleMove}
                 onReorder={handleReorder}
+                railMode={
+                  RAIL_STATUSES.has(c)
+                    ? (expandedRail === c ? "expanded" : "collapsed")
+                    : null
+                }
+                onToggleRail={RAIL_STATUSES.has(c) ? () => toggleRail(c) : undefined}
               />
             ))}
           </div>
@@ -471,9 +551,13 @@ export function Project() {
               tasks={tasksByInit[lane.key] ?? []}
               slug={slug}
               viewMode={viewMode}
+              collapsed={Boolean(collapsedLanes[lane.key])}
+              onToggleCollapsed={() => toggleLane(lane.key)}
               onMenuAction={handleMenuAction}
               onMove={handleMove}
               onReorder={handleReorder}
+              expandedRail={expandedRail}
+              onToggleRail={toggleRail}
             />
           ))}
         </div>
@@ -530,6 +614,7 @@ export function Project() {
             value={newStatus}
             onChange={(e) => setNewStatus(e.target.value as Task["status"])}
           >
+            <option value="planned">Planned</option>
             <option value="open">Open</option>
             <option value="in_progress">In progress</option>
             <option value="totest">To Test</option>
@@ -587,6 +672,45 @@ export function Project() {
           autoFocus
         />
       </Modal>
+
+      {/* Set initiative modal — T-0038 follow-up. Quick assign from the
+          three-dots menu. The TaskDetail page has the same control inline. */}
+      <Modal
+        open={modalKind === "setInitiative"}
+        title={`Set initiative — ${activeTask?.id ?? ""}`}
+        onClose={closeModal}
+        footer={
+          <>
+            <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
+            <button type="button" className="btn btn-primary" onClick={handleSetInitiative} disabled={saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </>
+        }
+      >
+        {modalError && <div className="alert alert-danger">{modalError}</div>}
+        <select
+          className="form-select"
+          value={initiativeChoice}
+          onChange={(e) => setInitiativeChoice(e.target.value)}
+          autoFocus
+        >
+          <option value="">— unattached —</option>
+          {/* If the current binding isn't in the vision list (orphan: file
+              deleted), surface it so saving is still a deliberate act. */}
+          {activeTask?.initiative &&
+            !initiativeMeta.some((m) => m.key === activeTask.initiative) && (
+              <option value={activeTask.initiative}>
+                {activeTask.initiative} (orphan)
+              </option>
+            )}
+          {initiativeMeta.map((m) => (
+            <option key={m.key} value={m.key}>
+              {m.title} · {m.status}
+            </option>
+          ))}
+        </select>
+      </Modal>
     </div>
   );
 }
@@ -632,9 +756,14 @@ interface InitiativeLaneProps {
   tasks: Task[];
   slug: string;
   viewMode: ViewMode;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
   onMenuAction: (task: Task, action: MenuAction) => void;
   onMove: (taskId: string, from: Task["status"], to: Task["status"]) => void;
   onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
+  // T-0058: rail expansion is shared across lanes — the parent owns the state.
+  expandedRail: typeof COLUMNS[number] | null;
+  onToggleRail: (status: typeof COLUMNS[number]) => void;
 }
 
 function InitiativeLane({
@@ -642,9 +771,13 @@ function InitiativeLane({
   tasks,
   slug,
   viewMode,
+  collapsed,
+  onToggleCollapsed,
   onMenuAction,
   onMove,
   onReorder,
+  expandedRail,
+  onToggleRail,
 }: InitiativeLaneProps) {
   const navigate = useNavigate();
   const counts = COLUMNS.reduce<Record<string, number>>(
@@ -681,6 +814,26 @@ function InitiativeLane({
         className="d-flex align-items-center gap-2 mb-2 flex-wrap"
         style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}
       >
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? `Expand ${meta.title}` : `Collapse ${meta.title}`}
+          title={collapsed ? "Expand lane" : "Collapse lane"}
+          style={{
+            background: "none",
+            border: "none",
+            color: "var(--mc-text-dim)",
+            cursor: "pointer",
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.8rem",
+            padding: "0 0.15rem",
+            lineHeight: 1,
+            width: "1.1rem",
+          }}
+        >
+          {collapsed ? "▸" : "▾"}
+        </button>
         <span
           onClick={() => {
             if (titleClickable) navigate(`/p/${slug}/vision`);
@@ -720,7 +873,7 @@ function InitiativeLane({
             color: "var(--mc-text-dim)",
             marginLeft: "0.5rem",
           }}
-          title="open / in-progress / to-test / reopened / closed"
+          title="planned / open / in-progress / to-test / reopened / closed"
         >
           {COLUMNS.map((c) => `${counts[c]}`).join(" / ")}
         </span>
@@ -735,8 +888,8 @@ function InitiativeLane({
           ({tasks.length} total)
         </span>
       </div>
-      {viewMode === "board" ? (
-        <div className="row g-3">
+      {!collapsed && (viewMode === "board" ? (
+        <div className="mc-board-row">
           {COLUMNS.map((c) => (
             <BoardColumn
               key={c}
@@ -747,6 +900,12 @@ function InitiativeLane({
               onMenuAction={onMenuAction}
               onMove={onMove}
               onReorder={onReorder}
+              railMode={
+                RAIL_STATUSES.has(c)
+                  ? (expandedRail === c ? "expanded" : "collapsed")
+                  : null
+              }
+              onToggleRail={RAIL_STATUSES.has(c) ? () => onToggleRail(c) : undefined}
             />
           ))}
         </div>
@@ -756,7 +915,7 @@ function InitiativeLane({
           slug={slug}
           onMenuAction={onMenuAction}
         />
-      )}
+      ))}
     </div>
   );
 }

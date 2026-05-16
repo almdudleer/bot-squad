@@ -1,7 +1,8 @@
-import { useEffect, useState, useCallback, Fragment } from "react";
+import { useEffect, useMemo, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
 import { api, SessionRow, Task, VisionFile } from "../api";
+import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 
 import { PageHelp } from "../components/PageHelp";
@@ -80,6 +81,12 @@ export function Sessions() {
   const [modalInfo, setModalInfo] = useState<string | null>(null);
   const [spawning, setSpawning] = useState(false);
 
+  // T-0006: post-spawn toast surfacing the copyable tmux attach for the
+  // session that just appeared. Computed by diffing the SID set before and
+  // after the spawn call so we don't need a return-value contract change on
+  // api.spawnSession.
+  const [spawnNotice, setSpawnNotice] = useState<{ sid: string; window: string } | null>(null);
+
   // Send-message modal (cross-session bus)
   const [sendOpen, setSendOpen] = useState(false);
   const [sendTarget, setSendTarget] = useState<string>("");
@@ -93,6 +100,35 @@ export function Sessions() {
   // section toggle.
   const [expandedSids, setExpandedSids] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
+
+  // T-0039 follow-up: group sessions by initiative on this page too.
+  // Default = none (preserves the pre-group view).
+  type SessGroupBy = "none" | "initiative";
+  const SESS_UNATTACHED = "__unattached__";
+  const [groupBy, setGroupBy] = useState<SessGroupBy>("none");
+  const [filterInit, setFilterInit] = useState<string>(""); // "" = all
+  // Initiatives for grouping (separate from modal's `initiatives` so the
+  // grouping view doesn't depend on the modal being opened).
+  const [groupingInitiatives, setGroupingInitiatives] = useState<VisionFile[]>([]);
+  const collapsedSessLanesKey = `bs.collapsedSessionLanes.${slug}`;
+  const [collapsedSessLanes, setCollapsedSessLanes] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem(collapsedSessLanesKey);
+      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(collapsedSessLanesKey, JSON.stringify(collapsedSessLanes));
+    } catch {
+      /* silent */
+    }
+  }, [collapsedSessLanesKey, collapsedSessLanes]);
+  function toggleSessLane(key: string) {
+    setCollapsedSessLanes((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
 
   function toggleRow(sid: string) {
     setExpandedSids((prev) => {
@@ -131,6 +167,21 @@ export function Sessions() {
     const id = setInterval(load, 10_000);
     return () => clearInterval(id);
   }, [load]);
+
+  // Initiative list for grouping/filter. Loaded once per slug; cheap to
+  // refetch occasionally but we don't need real-time refreshes here.
+  useEffect(() => {
+    api
+      .vision(slug)
+      .then((files) =>
+        setGroupingInitiatives(
+          files.filter(
+            (f) => f.name.startsWith("initiatives/") && !f.name.endsWith("/_TEMPLATE.md"),
+          ),
+        ),
+      )
+      .catch(() => setGroupingInitiatives([]));
+  }, [slug]);
 
   async function handlePause(sid: string) {
     setActionError(null);
@@ -450,6 +501,11 @@ export function Sessions() {
           {/* Window */}
           <td style={{ fontSize: "0.83rem" }}>{s.window}</td>
 
+          {/* Attach (T-0006) */}
+          <td onClick={(e) => e.stopPropagation()}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          </td>
+
           {/* Role */}
           <td>
             {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
@@ -573,7 +629,7 @@ export function Sessions() {
             </div>
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 10)}
+        {isOpen && renderDetailRow(s, 11)}
       </Fragment>
     );
   }
@@ -608,6 +664,9 @@ export function Sessions() {
             </code>
           </td>
           <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
+          <td onClick={(e) => e.stopPropagation()}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          </td>
           <td>
             {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
               (s.linked_tasks ?? []).length > 0) ? (
@@ -644,7 +703,7 @@ export function Sessions() {
             </div>
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 8)}
+        {isOpen && renderDetailRow(s, 9)}
       </Fragment>
     );
   }
@@ -657,6 +716,7 @@ export function Sessions() {
     setSpawning(true);
     setModalError(null);
     try {
+      const before = new Set((sessions ?? []).map((s) => s.sid));
       await api.spawnSession(
         slug,
         newWindow.trim(),
@@ -664,8 +724,22 @@ export function Sessions() {
         undefined,
         newInitiative || undefined,
       );
+      // T-0006: reload inline so we can diff old/new SIDs and surface the
+      // attach command for the freshly spawned session.
+      try {
+        const after = await api.sessions(slug);
+        setSessions(after);
+        setError(null);
+        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
+        if (fresh) {
+          setSpawnNotice({ sid: fresh.sid, window: fresh.window });
+        }
+      } catch {
+        // Best-effort: if the post-spawn fetch fails, fall back to the
+        // regular poll loop.
+        load();
+      }
       setModalOpen(false);
-      load();
     } catch (e: unknown) {
       setModalError(String(e));
     } finally {
@@ -705,6 +779,193 @@ export function Sessions() {
     }
   }
 
+  // ---- Initiative grouping for the sessions table ----
+  type SessInitMeta = {
+    key: string;
+    title: string;
+    status: "active" | "draft" | "done";
+  };
+  const sessInitiativeMeta = useMemo<SessInitMeta[]>(() => {
+    const list = groupingInitiatives.map((f) => {
+      const key = f.name.replace(/^initiatives\//, "");
+      const status: SessInitMeta["status"] = f.finished
+        ? "done"
+        : f.active
+          ? "active"
+          : "draft";
+      return { key, title: key.replace(/\.md$/, ""), status };
+    });
+    const rank = { active: 0, draft: 1, done: 2 } as const;
+    list.sort((a, b) => {
+      if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+      return a.title.localeCompare(b.title);
+    });
+    return list;
+  }, [groupingInitiatives]);
+
+  function sessionLaneKey(s: SessionRow): string {
+    const primary = (s.initiative ?? "").trim();
+    if (primary && primary !== "~") return primary;
+    const extras = (s.extra_initiatives ?? []).filter((i) => i && i !== "~");
+    if (extras.length > 0) return extras[0];
+    return SESS_UNATTACHED;
+  }
+
+  // Returns sessions filtered by the current filterInit. When filterInit
+  // is empty, returns the input unchanged.
+  function applySessFilter(rows: SessionRow[]): SessionRow[] {
+    if (!filterInit) return rows;
+    return rows.filter((s) => sessionLaneKey(s) === filterInit);
+  }
+
+  // Group: lane key → sessions in that lane.
+  function groupSessionsByLane(rows: SessionRow[]): Record<string, SessionRow[]> {
+    const out: Record<string, SessionRow[]> = { [SESS_UNATTACHED]: [] };
+    for (const m of sessInitiativeMeta) out[m.key] = [];
+    for (const s of rows) {
+      const k = sessionLaneKey(s);
+      (out[k] ||= []).push(s);
+    }
+    return out;
+  }
+
+  // Final visible lane list under current filter. Surface orphan lanes
+  // (sessions referencing an initiative file we don't have loaded yet).
+  function buildVisibleLanes(rows: SessionRow[]): SessInitMeta[] {
+    const grouped = groupSessionsByLane(rows);
+    const known = new Set(sessInitiativeMeta.map((m) => m.key));
+    const synthesized: SessInitMeta[] = [];
+    for (const key of Object.keys(grouped)) {
+      if (key === SESS_UNATTACHED || known.has(key)) continue;
+      synthesized.push({
+        key,
+        title: `${key.replace(/\.md$/, "")} (orphan)`,
+        status: "draft",
+      });
+    }
+    const all: SessInitMeta[] = [
+      ...sessInitiativeMeta,
+      ...synthesized,
+      { key: SESS_UNATTACHED, title: "Unattached", status: "draft" },
+    ];
+    if (!filterInit) return all;
+    return all.filter((m) => m.key === filterInit);
+  }
+
+  function sessLanePillStyle(status: SessInitMeta["status"]) {
+    if (status === "active") {
+      return {
+        color: "var(--mc-accent-success, #4ade80)",
+        bg: "rgba(74, 222, 128, 0.08)",
+        border: "var(--mc-accent-success, #4ade80)",
+      };
+    }
+    if (status === "done") {
+      return {
+        color: "var(--mc-text-dim)",
+        bg: "var(--mc-surface-raised)",
+        border: "var(--mc-border)",
+      };
+    }
+    return {
+      color: "var(--mc-amber, #fbbf24)",
+      bg: "rgba(251, 191, 36, 0.08)",
+      border: "var(--mc-amber, #fbbf24)",
+    };
+  }
+
+  // Renders a colspan'd lane-header row inside an existing table. The
+  // header is the only piece visible when the lane is collapsed.
+  function renderLaneHeaderRow(
+    meta: SessInitMeta,
+    rowCount: number,
+    colSpan: number,
+  ) {
+    const pill = sessLanePillStyle(meta.status);
+    const collapsed = Boolean(collapsedSessLanes[meta.key]);
+    const isUnattached = meta.key === SESS_UNATTACHED;
+    return (
+      <tr
+        key={`lane-${meta.key}`}
+        style={{
+          background: "var(--mc-surface-deep)",
+          borderTop: "1px solid var(--mc-border)",
+        }}
+      >
+        <td
+          colSpan={colSpan}
+          style={{
+            padding: "0.45rem 0.75rem",
+            fontFamily: "var(--mc-mono)",
+            fontSize: "0.78rem",
+          }}
+        >
+          <div className="d-flex align-items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              onClick={() => toggleSessLane(meta.key)}
+              aria-expanded={!collapsed}
+              aria-label={
+                collapsed ? `Expand ${meta.title}` : `Collapse ${meta.title}`
+              }
+              title={collapsed ? "Expand lane" : "Collapse lane"}
+              style={{
+                background: "none",
+                border: "none",
+                color: "var(--mc-text-dim)",
+                cursor: "pointer",
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.8rem",
+                padding: "0 0.15rem",
+                lineHeight: 1,
+                width: "1.1rem",
+              }}
+            >
+              {collapsed ? "▸" : "▾"}
+            </button>
+            <span
+              style={{
+                fontWeight: 700,
+                color: isUnattached ? "var(--mc-text-dim)" : "var(--mc-text)",
+                fontSize: "0.85rem",
+                letterSpacing: "0.03em",
+              }}
+            >
+              {meta.title}
+            </span>
+            {!isUnattached && (
+              <span
+                style={{
+                  fontFamily: "var(--mc-mono)",
+                  fontSize: "0.62rem",
+                  color: pill.color,
+                  background: pill.bg,
+                  border: `1px solid ${pill.border}`,
+                  borderRadius: "2px",
+                  padding: "0 5px",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                }}
+              >
+                {meta.status}
+              </span>
+            )}
+            <span
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.65rem",
+                color: "var(--mc-text-dim)",
+                marginLeft: "0.5rem",
+              }}
+            >
+              {rowCount} session{rowCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
   return (
     <div className="container py-4">
       {/* Header */}
@@ -732,6 +993,32 @@ export function Sessions() {
           {" "}<code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
         </div>
       </PageHelp>
+
+      {/* T-0006: post-spawn toast. Dismisses on click of the close button,
+          stays sticky until then so the user has time to copy the command. */}
+      {spawnNotice && (
+        <div
+          className="alert alert-success d-flex justify-content-between align-items-center flex-wrap gap-2"
+          role="status"
+        >
+          <span style={{ fontSize: "0.85rem" }}>
+            Spawned <code style={{ fontFamily: "var(--mc-mono)" }}>{spawnNotice.window}</code>.
+            Attach with:{" "}
+            <CopyableTmuxAttach
+              session={spawnNotice.sid}
+              window={spawnNotice.window}
+              size="md"
+            />
+          </span>
+          <button
+            type="button"
+            className="btn-close"
+            aria-label="Dismiss"
+            style={{ filter: "invert(1) opacity(0.5)" }}
+            onClick={() => setSpawnNotice(null)}
+          />
+        </div>
+      )}
 
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
@@ -767,6 +1054,50 @@ export function Sessions() {
         </div>
       )}
 
+      {/* Group / filter toolbar */}
+      {sessions !== null && sessions.length > 0 && (
+        <div
+          className="d-flex flex-wrap align-items-center gap-2 mb-2"
+          style={{ fontSize: "0.75rem" }}
+        >
+          <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
+            group by:
+          </span>
+          <div className="btn-group btn-group-sm" role="group">
+            {(["none", "initiative"] as const).map((v) => (
+              <button
+                key={v}
+                type="button"
+                className={`btn ${groupBy === v ? "btn-secondary" : "btn-outline-secondary"}`}
+                style={{ fontSize: "0.72rem", padding: "0.15rem 0.55rem" }}
+                onClick={() => setGroupBy(v)}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
+          <div className="d-flex align-items-center gap-2 ms-auto">
+            <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
+              filter:
+            </span>
+            <select
+              className="form-select form-select-sm"
+              style={{ width: "auto", minWidth: "12rem", fontSize: "0.75rem" }}
+              value={filterInit}
+              onChange={(e) => setFilterInit(e.target.value)}
+            >
+              <option value="">all initiatives</option>
+              {sessInitiativeMeta.map((m) => (
+                <option key={m.key} value={m.key}>
+                  {m.title} · {m.status}
+                </option>
+              ))}
+              <option value={SESS_UNATTACHED}>(unattached)</option>
+            </select>
+          </div>
+        </div>
+      )}
+
       {/* Session table */}
       {sessions !== null && sessions.length > 0 && (
         <div className="table-responsive">
@@ -776,6 +1107,7 @@ export function Sessions() {
                 <th style={{ width: "1.5rem" }}></th>
                 <th>SID</th>
                 <th>Window</th>
+                <th>Attach</th>
                 <th>Role</th>
                 <th>Target</th>
                 <th>Status</th>
@@ -786,7 +1118,19 @@ export function Sessions() {
               </tr>
             </thead>
             <tbody>
-              {visibleSessions.map((s) => renderSessionRow(s))}
+              {groupBy === "none"
+                ? applySessFilter(visibleSessions).map((s) => renderSessionRow(s))
+                : buildVisibleLanes(visibleSessions).flatMap((lane) => {
+                    const laneRows = groupSessionsByLane(visibleSessions)[lane.key] ?? [];
+                    const collapsed = Boolean(collapsedSessLanes[lane.key]);
+                    const nodes: React.ReactNode[] = [
+                      renderLaneHeaderRow(lane, laneRows.length, 11),
+                    ];
+                    if (!collapsed) {
+                      for (const s of laneRows) nodes.push(renderSessionRow(s));
+                    }
+                    return nodes;
+                  })}
             </tbody>
           </table>
         </div>
@@ -820,6 +1164,7 @@ export function Sessions() {
                   <th style={{ width: "1.5rem" }}></th>
                   <th>SID</th>
                   <th>Window</th>
+                  <th>Attach</th>
                   <th>Role</th>
                   <th>Target</th>
                   <th>Started</th>
@@ -828,7 +1173,22 @@ export function Sessions() {
                 </tr>
               </thead>
               <tbody>
-                {archivedSessions.map((s) => renderArchivedRow(s))}
+                {groupBy === "none"
+                  ? applySessFilter(archivedSessions).map((s) => renderArchivedRow(s))
+                  : buildVisibleLanes(archivedSessions).flatMap((lane) => {
+                      const laneRows = groupSessionsByLane(archivedSessions)[lane.key] ?? [];
+                      const collapsed = Boolean(collapsedSessLanes[lane.key]);
+                      // Skip empty lanes here — archived view is already
+                      // off-by-default so noise-suppression matters more.
+                      if (laneRows.length === 0) return [];
+                      const nodes: React.ReactNode[] = [
+                        renderLaneHeaderRow(lane, laneRows.length, 9),
+                      ];
+                      if (!collapsed) {
+                        for (const s of laneRows) nodes.push(renderArchivedRow(s));
+                      }
+                      return nodes;
+                    })}
               </tbody>
             </table>
           </div>

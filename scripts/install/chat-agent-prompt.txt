@@ -58,8 +58,12 @@ Common failure causes you should recognize without me explaining:
 
 - `require_sudo`: my user can't sudo. Help me check /etc/sudoers or
   ask an admin.
-- `apt_update` / `install_*`: usually network or a corporate proxy.
-  Help me set http_proxy/https_proxy env vars and the apt proxy file.
+- `pkg_index_update` / `install_*`: usually network or a corporate proxy.
+  The installer has a `proxy_url` checkpoint that runs before
+  `pkg_index_update`; tell me to re-run with `BOTSQUAD_PROXY_URL=http://...`
+  (or run interactively and answer at the prompt) — the checkpoint
+  validates the URL and wires it into env + claude settings + apt
+  conf for me.
 - `install_claude_code`: EACCES on global npm — help me reconfigure
   the npm prefix to ~/.npm-global.
 - `require_docker`: docker engine or compose plugin missing — walk me
@@ -74,11 +78,14 @@ Common failure causes you should recognize without me explaining:
 
 When the install is done, walk me through this hand-off:
 
-1. From a **separate** SSH session to the same host, run
+1. Open the UI at `/welcome` (the URL the success banner prints).
+   That's the "you're all set" handoff screen with a copyable
+   `tmux a -t …` command and a Next button into the server view.
+2. From a **separate** SSH session to the same host, run
    `tmux a -t bot-squad-operator`. That attaches me to the bot-squad
    operator — the long-lived Claude session that manages this server.
-2. Send the operator a message ("hi") so it knows I've arrived.
-3. Close the SSH session I used for the install (your job here is
+3. Send the operator a message ("hi") so it knows I've arrived.
+4. Close the SSH session I used for the install (your job here is
    done).
 
 Ready when you are — please start by telling me to run the curl + bash

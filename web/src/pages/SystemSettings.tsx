@@ -105,7 +105,7 @@ export function SystemSettings() {
           body={
             <>
               Now that you own a bot-squad installation, you can detach from
-              bot-squad.org at any time and run standalone from this server's
+              botsquad.dev at any time and run standalone from this server's
               own address. See the advantages before you do.
             </>
           }
@@ -236,7 +236,7 @@ export function SystemSettings() {
                 Danger zone
               </h3>
               <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.75rem" }}>
-                Detach this server from bot-squad.org. Your installation will keep working as a
+                Detach this server from botsquad.dev. Your installation will keep working as a
                 standalone server-only frontend; the centralization layer will be unmounted.
               </p>
               <button
@@ -245,7 +245,7 @@ export function SystemSettings() {
                 data-onboarding-anchor="detach-toggle"
                 onClick={() => setDetachOpen(true)}
               >
-                Detach from bot-squad.org…
+                Detach from botsquad.dev…
               </button>
             </section>
           )}
@@ -254,7 +254,7 @@ export function SystemSettings() {
 
       <Modal
         open={detachOpen}
-        title="Detach this server from bot-squad.org?"
+        title="Detach this server from botsquad.dev?"
         onClose={() => setDetachOpen(false)}
         footer={
           <>
@@ -279,7 +279,7 @@ export function SystemSettings() {
         }
       >
         <p style={{ marginBottom: "0.75rem" }}>
-          Before you detach, here's what you'd give up by leaving bot-squad.org:
+          Before you detach, here's what you'd give up by leaving botsquad.dev:
         </p>
         <ul style={{ paddingLeft: "1.1rem", marginBottom: "0.75rem" }}>
           <li>

@@ -74,21 +74,27 @@ User isn't in sudoers, or the sudo prompt was answered wrong. Run
 isn't in `/etc/sudoers` at all, they need to add themselves from a root
 shell (or have an admin do it).
 
-### `apt_update` / `install_*` package failures
-Most often network or a corporate proxy. Ask the user whether they're
-behind a proxy. If yes:
+### `pkg_index_update` / `install_*` package failures
+Most often network or a corporate proxy. The installer has a dedicated
+`proxy_url` checkpoint that runs **before** `pkg_index_update` (the
+cross-distro renamed-from-`apt_update` step that refreshes apt/dnf/pacman
+indexes); if the user hit `pkg_index_update` failures, the proxy
+checkpoint was either skipped (interactive answer was "no") or the URL
+was never tried.
 
-```bash
-sudo tee /etc/apt/apt.conf.d/01proxy <<'EOF'
-Acquire::http::Proxy "http://<proxy-host>:<port>";
-Acquire::https::Proxy "http://<proxy-host>:<port>";
-EOF
-export http_proxy=http://<proxy-host>:<port>
-export https_proxy=http://<proxy-host>:<port>
-```
+Ask the user whether they're behind a proxy. If yes, either:
 
-Then re-run. (HTTP/HTTPS proxy as a first-class installer flag is a
-follow-on task; for now, env exports cover it.)
+- re-run interactively and answer "y" + paste the URL at the
+  `proxy_url` checkpoint prompt, **or**
+- set `BOTSQUAD_PROXY_URL=http://<proxy-host>:<port>` and re-run:
+  `BOTSQUAD_PROXY_URL=http://<proxy-host>:<port> bash ~/install.sh`
+
+The checkpoint validates the URL by curl-ing the npm registry through
+it (5s timeout) and writes the URL into three sinks: the script's own
+environment, `~/.claude/settings.json` (`.env.http_proxy` /
+`.env.https_proxy`), and `/etc/apt/apt.conf.d/01proxy`. Set
+`BOTSQUAD_PROXY_URL=''` (empty string) to explicitly skip the prompt
+on subsequent re-runs.
 
 ### `install_claude_code`
 `npm install -g` with EACCES → the user's npm global prefix points
@@ -167,8 +173,13 @@ done. Do these in order:
    — `spawn_operator` is idempotent and the failure is recoverable.
 
 2. Tell the user, in plain language:
-   > The install is done. From a *separate* ssh session to this host,
-   > run `tmux a -t bot-squad-operator`. That attaches you to the
+   > The install is done. Open the UI at `/welcome` (the URL the
+   > `print_attach` block above prints) — that's the "you're all set"
+   > handoff screen with a one-click copyable `tmux a -t …` command
+   > and a Next button into the server view.
+   >
+   > Then, from a *separate* ssh session to this host, run
+   > `tmux a -t bot-squad-operator`. That attaches you to the
    > bot-squad operator — the long-lived session that manages projects
    > and other sessions on this server.
    >

@@ -694,3 +694,185 @@ def test_resume_unknown_sid_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ActionError, match="no metadata found"):
         resume(cfg, "test-project", "S-testuser-nowin-p0")
+
+
+# ---------------------------------------------------------------------------
+# T-0080: owner field plumbing
+# ---------------------------------------------------------------------------
+
+def test_spawn_passes_owner_env_to_shell(tmp_path, monkeypatch):
+    """spawn(owner=X) bakes BOT_SQUAD_OWNER=X into the bash -lc shell cmd
+    so the SessionStart hook can stamp owner into the SessionMd."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    captured_shell_cmd: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            # bash -lc <cmd> — capture the cmd string.
+            try:
+                i = args.index("-lc")
+                captured_shell_cmd.append(args[i + 1])
+            except (ValueError, IndexError):
+                pass
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%4|w|123|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", owner="aqice")
+
+    assert captured_shell_cmd, "expected at least one new-window call"
+    assert "BOT_SQUAD_OWNER=aqice" in captured_shell_cmd[0]
+
+
+def test_spawn_rejects_invalid_owner(tmp_path, monkeypatch):
+    """Owner must be alnum/_./-; reject shell-meaningful chars."""
+    from bot_squad_worker.actions import ActionError
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+    # Stub out tmux: ensure-session probe + list-panes. Validation fires
+    # before tmux new-window, so we only need _run to return ok for the
+    # ensure-session path.
+    monkeypatch.setattr(S, "_run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    with pytest.raises(ActionError, match="invalid owner"):
+        spawn(cfg, "test-project", "w", owner="bob; rm -rf /")
+
+
+def test_spawn_without_owner_omits_env_var(tmp_path, monkeypatch):
+    """Legacy callers (no owner kwarg) must not get an empty BOT_SQUAD_OWNER=."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    captured: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            try:
+                i = args.index("-lc")
+                captured.append(args[i + 1])
+            except (ValueError, IndexError):
+                pass
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%5|w|123|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w")
+    assert captured
+    assert "BOT_SQUAD_OWNER" not in captured[0]
+
+
+def test_list_sessions_emits_owner_from_md(tmp_path, monkeypatch):
+    """list_sessions surfaces SessionMd `owner:` for both active + suspended."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Suspended (md-only) row with owner stamped.
+    _write_session_metadata(sessions_dir / "S-u-sus-p1.md", {
+        "sid": "S-u-sus-p1",
+        "status": "suspended",
+        "window": "sus",
+        "cwd": str(repo),
+        "claude_uuid": "abc",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:00:00Z",
+        "suspended_at": "2026-05-16T11:00:00Z",
+        "owner": "aqice",
+    })
+    # Active row — its md exists too, owner stamped.
+    _write_session_metadata(sessions_dir / "S-u-act-p2.md", {
+        "sid": "S-u-act-p2",
+        "status": "active",
+        "window": "act",
+        "cwd": str(repo),
+        "claude_uuid": "def",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:30:00Z",
+        "owner": "alexey",
+    })
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            # Only the "active" row has a live pane.
+            return subprocess.CompletedProcess(
+                args, 0, f"%2|act|111|{repo}|claude\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows}
+    assert by_sid["S-u-act-p2"]["owner"] == "alexey"
+    assert by_sid["S-u-sus-p1"]["owner"] == "aqice"
+
+
+def test_suspend_preserves_owner_field(tmp_path, monkeypatch):
+    """suspend() rewrites the md but must keep owner stamped."""
+    from bot_squad_worker.sessions import suspend
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-u-w-p3.md", {
+        "sid": "S-u-w-p3",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-1",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:00:00Z",
+        "owner": "aqice",
+    })
+
+    pane_calls = [0]
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            pane_calls[0] += 1
+            # First call: pane live. After kill: gone.
+            if pane_calls[0] == 1:
+                return subprocess.CompletedProcess(args, 0, f"%3|w|11|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    suspend(cfg, "test-project", "S-u-w-p3")
+    meta = _read_session_metadata(sessions_dir / "S-u-w-p3.md")
+    assert meta["owner"] == "aqice"

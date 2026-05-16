@@ -27,7 +27,7 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
-_VALID_STATUSES = {"open", "in_progress", "totest", "reopened", "closed"}
+_VALID_STATUSES = {"planned", "open", "in_progress", "totest", "reopened", "closed"}
 _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 
 # T-0038: optional linkage fields settable via PATCH alongside title/status.
@@ -218,6 +218,12 @@ def create_task(
             "priority": priority,
             "created": now,
             "updated": now,
+            # T-0080: stamp the creator's UI username so per-user task
+            # scoping (deferred for v0.9) has the data it needs without a
+            # backfill. Legacy tasks lack this field; they default to
+            # admin-only when filtering eventually lands. None gets
+            # dropped by write_task — only emit owner: if known.
+            "owner": user.get("username") or None,
         }
         write_task(path, fm, body)
 

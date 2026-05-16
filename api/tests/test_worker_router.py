@@ -15,18 +15,35 @@ def test_for_user_returns_coordinator_client_for_coordinator(tmp_path: Path):
     assert c.sock_path == sock
 
 
-def test_for_user_returns_user_sock_for_non_coordinator(tmp_path: Path):
+def test_for_user_returns_user_sock_when_socket_exists(tmp_path: Path):
+    """When the per-user worker socket file exists, for_user routes to it."""
+    sock = tmp_path / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True)
+    edem_sock = sock.parent / "user-edem.sock"
+    edem_sock.touch()
+    r = WorkerRouter(coordinator_sock=sock, coordinator_user="almdudleer",
+                     known_users={"edem"})
+    c = r.for_user("edem")
+    assert c.sock_path == edem_sock
+
+
+def test_for_user_falls_back_to_coordinator_when_socket_missing(tmp_path: Path):
+    """T-0080: missing per-user socket falls back to coordinator so second-
+    user spawn / pause / resume actions still succeed in single-tenant
+    installs where no per-user worker is running."""
     sock = tmp_path / "_sock" / "worker.sock"
     sock.parent.mkdir(parents=True)
     r = WorkerRouter(coordinator_sock=sock, coordinator_user="almdudleer",
                      known_users={"edem"})
     c = r.for_user("edem")
-    assert c.sock_path == sock.parent / "user-edem.sock"
+    assert c.sock_path == sock
 
 
 def test_for_sid_routes_via_linux_user(tmp_path: Path):
     sock = tmp_path / "_sock" / "worker.sock"
     sock.parent.mkdir(parents=True)
+    edem_sock = sock.parent / "user-edem.sock"
+    edem_sock.touch()
     r = WorkerRouter(coordinator_sock=sock, coordinator_user="almdudleer",
                      known_users={"edem"})
 
@@ -34,7 +51,17 @@ def test_for_sid_routes_via_linux_user(tmp_path: Path):
     assert c1.sock_path == sock
 
     c2 = r.for_sid("S-edem-feature-p3")
-    assert c2.sock_path == sock.parent / "user-edem.sock"
+    assert c2.sock_path == edem_sock
+
+
+def test_for_sid_falls_back_to_coordinator_when_user_sock_missing(tmp_path: Path):
+    """T-0080: SID for a user without a worker socket falls back to coordinator."""
+    sock = tmp_path / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True)
+    r = WorkerRouter(coordinator_sock=sock, coordinator_user="almdudleer",
+                     known_users={"edem"})
+    c = r.for_sid("S-edem-feature-p3")
+    assert c.sock_path == sock
 
 
 def test_for_sid_falls_back_to_coordinator_for_unknown_format(tmp_path: Path):

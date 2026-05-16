@@ -46,10 +46,64 @@ def _check_project(request: Request, slug: str) -> None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
 
 
-def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter) -> None:
-    """Non-admins can only act on SIDs owned by their own linux_user."""
+def _data_dir(request: Request) -> Path:
+    return request.app.state.api_config.data_dir
+
+
+def _read_session_owner(data_dir: Path, slug: str, sid: str) -> str | None:
+    """Read the SessionMd `owner:` field. Returns None if no md or no field.
+
+    T-0080: owner is the UI username (JWT username claim) stamped at spawn
+    time. Legacy sessions written before T-0080 have no owner field; we
+    treat them as admin-only (callers handle the None case).
+    """
+    md = data_dir / slug / "sessions" / f"{sid}.md"
+    if not md.exists():
+        return None
+    try:
+        text = md.read_text()
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    for line in parts[1].strip().splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        if k.strip() == "owner":
+            v = v.strip()
+            if not v or v == "~":
+                return None
+            return v
+    return None
+
+
+def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter,
+                         data_dir: Path | None = None, slug: str | None = None) -> None:
+    """Non-admins can only act on SIDs they own.
+
+    T-0080: ownership precedence is (1) SessionMd `owner` field equals the
+    caller's UI username, otherwise (2) SID's linux_user prefix equals the
+    caller's linux_user (legacy fallback for sessions spawned before owner
+    stamping landed). Admins bypass both checks.
+    """
     if user.get("is_admin"):
         return
+    # (1) SessionMd owner field — authoritative when set.
+    if data_dir is not None and slug:
+        md_owner = _read_session_owner(data_dir, slug, sid)
+        if md_owner is not None:
+            if md_owner == user.get("username"):
+                return
+            raise HTTPException(
+                status_code=403,
+                detail=f"session {sid!r} is owned by {md_owner!r}; "
+                       f"you are {user.get('username')!r}",
+            )
+    # (2) Legacy SID-prefix check.
     sid_user = router.user_for_sid(sid)
     if sid_user is None:
         return  # legacy SID format — let the worker decide
@@ -66,12 +120,20 @@ def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter) -> None:
 # ---------------------------------------------------------------------------
 
 @router.get("")
-async def list_sessions(slug: str, request: Request) -> list[dict]:
+async def list_sessions(
+    slug: str, request: Request,
+    user: dict = Depends(require_auth),
+) -> list[dict]:
     """List all Claude sessions (active + paused) for a project.
 
     Fans out across every configured user worker. Each call is bounded
     by a 5 s timeout so a dead/slow user worker can't block the whole list.
     Results are deduped by sid.
+
+    T-0080: non-admin callers see only sessions whose SessionMd `owner`
+    field equals their UI username. Sessions written before owner stamping
+    landed have no owner — they are treated as admin-only so they don't
+    leak to a second user. Admins still see every row.
     """
     _check_project(request, slug)
     wrouter = _router(request)
@@ -97,7 +159,14 @@ async def list_sessions(slug: str, request: Request) -> list[dict]:
             sid = row.get("sid")
             if sid and sid not in merged:
                 merged[sid] = row
-    return list(merged.values())
+
+    rows = list(merged.values())
+    if user.get("is_admin"):
+        return rows
+    # Non-admin: drop rows whose owner doesn't match. Missing owner
+    # (legacy session) = admin-only. The worker emits "" for missing.
+    me = user.get("username") or ""
+    return [r for r in rows if (r.get("owner") or "") == me]
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +181,7 @@ async def pause_session(
     """Pause a running Claude session — interrupt only (Ctrl-C)."""
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.for_sid(sid)
     try:
         return await client.call_action("pause_session", {"slug": slug, "sid": sid})
@@ -135,7 +204,7 @@ async def suspend_session(
     """
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.for_sid(sid)
     try:
         return await client.call_action("suspend_session", {"slug": slug, "sid": sid})
@@ -159,7 +228,7 @@ async def resume_session(
     """
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.for_sid(sid)
     try:
         return await client.call_action("resume_session", {"slug": slug, "sid": sid})
@@ -195,7 +264,15 @@ async def spawn_session(
 
     wrouter = _router(request)
     client = wrouter.for_user(user["linux_user"])
-    params: dict = {"slug": slug, "window": body.window}
+    # T-0080: always stamp the caller's UI username onto the spawned
+    # session md so per-user listing filters scope correctly even when
+    # multiple UI users share a linux_user (e.g. when WorkerRouter falls
+    # back to the coordinator socket for a user without their own worker).
+    params: dict = {
+        "slug": slug,
+        "window": body.window,
+        "owner": user["username"],
+    }
     if body.initial_prompt:
         params["initial_prompt"] = body.initial_prompt
     if body.task_id:
@@ -234,7 +311,7 @@ async def bind_task(
     """
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     # Binding state lives on the coordinator (the session md is canonical there).
     client = wrouter.coordinator()
     try:
@@ -257,7 +334,7 @@ async def bind_initiative(
     """
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.coordinator()
     try:
         return await client.call_action("bind_initiative", {
@@ -275,7 +352,7 @@ async def unbind_task(
     """Remove a task from a dev session's extras (cannot remove the primary)."""
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.coordinator()
     try:
         return await client.call_action("unbind_task", {
@@ -297,7 +374,7 @@ async def unbind_initiative(
     """
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.coordinator()
     try:
         return await client.call_action("unbind_initiative", {
@@ -323,7 +400,7 @@ async def archive_session(
     """
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.coordinator()
     try:
         return await client.call_action("archive_session", {"slug": slug, "sid": sid})
@@ -339,7 +416,7 @@ async def unarchive_session(
     """Clear the archived flag on a session md."""
     _check_project(request, slug)
     wrouter = _router(request)
-    _check_sid_ownership(sid, user, wrouter)
+    _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
     client = wrouter.coordinator()
     try:
         return await client.call_action("unarchive_session", {"slug": slug, "sid": sid})

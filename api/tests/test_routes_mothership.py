@@ -75,12 +75,95 @@ def test_mothership_off_means_no_routes(tmp_bot_squad: Path, monkeypatch):
 
 
 def test_mothership_on_mounts_servers_empty(tmp_bot_squad: Path, monkeypatch):
-    """Mothership build — router mounted, empty registry returns []."""
+    """Mothership build — router mounted, only the self-register entry present.
+
+    T-0055 self-registers ``MOTHERSHIP_BASE_URL`` on boot, so a fresh registry
+    is no longer empty. Confirm the one row is the self entry with
+    ``is_self=True``, and no token surface leaks.
+    """
     with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
         _login(client)
         r = client.get("/api/m/servers")
     assert r.status_code == 200
-    assert r.json() == []
+    listing = r.json()
+    assert len(listing) == 1
+    self_entry = listing[0]
+    assert self_entry["is_self"] is True
+    assert self_entry["base_url"] == "https://mothership.test"
+    assert self_entry["install_state"] == "ready"
+    # Token surface stays stripped on the public projection.
+    assert "install_token_hash" not in self_entry
+    assert "server_bearer_hash" not in self_entry
+
+
+def test_self_register_is_idempotent_across_reboots(tmp_bot_squad: Path, monkeypatch):
+    """Booting the app twice against the same DATA_DIR yields one self entry,
+    not two. Dedup is by ``base_url`` (trailing-slash insensitive)."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True):
+        pass
+    # Second boot — same DATA_DIR via the same monkeypatched env. We re-enter
+    # the context manager to trigger another build_app() pass.
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        r = client.get("/api/m/servers")
+    listing = r.json()
+    assert len(listing) == 1
+    assert listing[0]["is_self"] is True
+
+    # Direct store check — the on-disk row was not duplicated.
+    store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    servers = store.list_servers()
+    assert len(servers) == 1
+    assert servers[0].is_self is True
+    assert servers[0].base_url == "https://mothership.test"
+
+
+def test_self_register_promotes_existing_row_to_is_self(tmp_bot_squad: Path, monkeypatch):
+    """If the registry already has a row whose base_url matches the
+    mothership's own URL (e.g. an admin added it manually before T-0055
+    shipped), boot should flip its ``is_self`` flag instead of duplicating.
+    """
+    # Seed the store before app boot.
+    monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://mothership.test")
+    store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    store.register_server(
+        display_name="manual-add",
+        base_url="https://mothership.test",
+        owner_user="testuser",
+    )
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        listing = client.get("/api/m/servers").json()
+    assert len(listing) == 1
+    assert listing[0]["is_self"] is True
+    assert listing[0]["base_url"] == "https://mothership.test"
+
+
+def test_self_register_falls_back_when_base_url_unset(tmp_bot_squad: Path, monkeypatch):
+    """If ``MOTHERSHIP_BASE_URL`` is unset, the self-register uses the
+    documented fallback so a misconfigured deploy still surfaces SOME entry
+    in the unified view. Follow-up ticket should make this strict."""
+    # Re-prep the env without MOTHERSHIP_BASE_URL.
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv(
+        "WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock")
+    )
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    monkeypatch.setenv("WEB_DIST", str(tmp_bot_squad / "nonexistent-web-dist"))
+    monkeypatch.setenv("MOTHERSHIP", "1")
+    monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
+    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    from app.main import build_app
+
+    build_app()
+    store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    servers = store.list_servers()
+    assert len(servers) == 1
+    assert servers[0].is_self is True
+    assert servers[0].base_url == "https://staging.botsquad.dev"
 
 
 def test_mothership_on_requires_auth(tmp_bot_squad: Path, monkeypatch):
@@ -111,10 +194,10 @@ def test_post_servers_mints_install_token(tmp_bot_squad: Path, monkeypatch):
 
         # Subsequent GET /api/m/servers MUST NOT leak the plaintext token or
         # the hash — only the public projection of the registry entry.
+        # The listing also contains the T-0055 self-register row; pick out the
+        # row we just minted by id.
         listing = client.get("/api/m/servers").json()
-        assert len(listing) == 1
-        srv = listing[0]
-        assert srv["id"] == body["id"]
+        srv = next(s for s in listing if s["id"] == body["id"])
         assert srv["install_state"] == "pending"
         assert "install_token" not in srv
         assert "install_token_hash" not in srv

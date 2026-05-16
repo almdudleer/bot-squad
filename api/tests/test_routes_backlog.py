@@ -103,6 +103,32 @@ def test_create_task_invalid_status_rejected(tmp_bot_squad: Path, monkeypatch):
     assert r.status_code == 400
 
 
+def test_create_and_patch_planned_status(tmp_bot_squad: Path, monkeypatch):
+    # T-0058: planned is a first-class status; round-trip create → patch → patch.
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/backlog",
+            json={"title": "Backlogged", "status": "planned"},
+        )
+        assert r.status_code == 200
+        tid = r.json()["id"]
+        assert r.json()["status"] == "planned"
+
+        r = client.patch(
+            f"/api/projects/test-project/backlog/{tid}",
+            json={"status": "open"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "open"
+
+        r = client.patch(
+            f"/api/projects/test-project/backlog/{tid}",
+            json={"status": "planned"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "planned"
+
+
 def test_create_task_requires_auth(tmp_bot_squad: Path, monkeypatch):
     with _anon_client(tmp_bot_squad, monkeypatch) as client:
         r = client.post(
@@ -711,3 +737,24 @@ def test_session_map_by_task_active_beats_paused_for_extras(tmp_bot_squad: Path)
     out = _session_map_by_task(sessions)
     assert out["T-0002"]["sid"] == "S-u-w-p1"
     assert out["T-0002"]["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# T-0080: owner stamping on create
+# ---------------------------------------------------------------------------
+
+def test_create_task_stamps_owner_from_username(tmp_bot_squad: Path, monkeypatch):
+    """POST /backlog stamps `owner: <username>` so per-user task scoping
+    (deferred) has the data without a backfill."""
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/backlog",
+            json={"title": "owned task"},
+        )
+    assert r.status_code == 200
+    tid = r.json()["id"]
+    md = tmp_bot_squad / "data" / "test-project" / "backlog"
+    matches = list(md.glob(f"{tid}-*.md"))
+    assert matches, "task md not created"
+    text = matches[0].read_text()
+    assert "owner: testuser" in text

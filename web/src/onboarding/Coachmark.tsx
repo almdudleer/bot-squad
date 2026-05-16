@@ -13,6 +13,10 @@ export type CoachmarkProps = {
   // for srv.intro and any beat that doesn't have a single DOM target).
   anchorSelector?: string;
   placement?: Placement;
+  // When true, dismissing this beat writes the skip-all sentinel instead of
+  // just marking this step seen. Use on the LAST beat in the §9 chain so a
+  // returning user does not re-trigger any future spotlight added later.
+  final?: boolean;
 };
 
 const CARD_WIDTH = 320;
@@ -47,9 +51,14 @@ export function Coachmark({
   body,
   anchorSelector,
   placement = "bottom",
+  final = false,
 }: CoachmarkProps) {
   const step = useOnboardingStep(stepId);
   const [anchor, setAnchor] = useState<Rect | null>(null);
+  // Terminal beat: every dismiss path writes the skip-all sentinel so any
+  // future-added beat doesn't re-trigger the tour. Non-terminal beats just
+  // mark this step seen.
+  const dismiss = final ? step.skipAll : step.dismiss;
 
   useLayoutEffect(() => {
     if (!step.visible || !anchorSelector) return;
@@ -70,11 +79,11 @@ export function Coachmark({
   useEffect(() => {
     if (!step.visible) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") step.dismiss();
+      if (e.key === "Escape") dismiss();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [step.visible, step.dismiss]);
+  }, [step.visible, dismiss]);
 
   if (!step.visible) return null;
 
@@ -94,23 +103,27 @@ export function Coachmark({
 
   return (
     <div className="bs-coachmark-root" role="dialog" aria-label={title}>
-      <div className="bs-coachmark-backdrop" onClick={step.dismiss} />
+      <div className="bs-coachmark-backdrop" onClick={dismiss} />
       <div className="bs-coachmark-card card shadow" style={cardStyle}>
         <div className="card-body">
           <div className="card-title fw-semibold mb-2">{title}</div>
           <div className="card-text small mb-3">{body}</div>
           <div className="d-flex justify-content-between align-items-center">
-            <button
-              type="button"
-              className="btn btn-link btn-sm p-0"
-              onClick={step.skipAll}
-            >
-              Skip onboarding
-            </button>
+            {final ? (
+              <span />
+            ) : (
+              <button
+                type="button"
+                className="btn btn-link btn-sm p-0"
+                onClick={step.skipAll}
+              >
+                Skip onboarding
+              </button>
+            )}
             <button
               type="button"
               className="btn btn-primary btn-sm"
-              onClick={step.dismiss}
+              onClick={dismiss}
             >
               Got it
             </button>

@@ -324,7 +324,7 @@ def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _SPAWN_SESSION_REQUIRED = {"slug", "window"}
-_SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {"initial_prompt", "task_id", "initiative"}
+_SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {"initial_prompt", "task_id", "initiative", "owner"}
 
 
 def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
@@ -350,6 +350,7 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         params.get("initial_prompt"),
         task_id=params.get("task_id"),
         initiative=params.get("initiative"),
+        owner=params.get("owner"),
     )
 
 

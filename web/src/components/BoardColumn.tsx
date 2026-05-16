@@ -10,6 +10,11 @@ interface BoardColumnProps {
   onMenuAction: (task: Task, action: MenuAction) => void;
   onMove: (taskId: string, fromStatus: Task["status"], toStatus: Task["status"]) => void;
   onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
+  // T-0058: rail mode. `null`/undefined = normal column. "collapsed" = thin
+  // vertical drop-strip with a rotated label. "expanded" = normal width but
+  // clickable header to collapse back. Toggled via onToggleRail.
+  railMode?: "collapsed" | "expanded" | null;
+  onToggleRail?: () => void;
 }
 
 const DRAG_MIME = "application/x-bot-squad-task";
@@ -37,12 +42,15 @@ export function BoardColumn({
   onMenuAction,
   onMove,
   onReorder,
+  railMode = null,
+  onToggleRail,
 }: BoardColumnProps) {
   const [isOver, setIsOver] = useState(false);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   const sorted = sortByPriority(tasks);
+  const isCollapsed = railMode === "collapsed";
 
   function parsePayload(e: React.DragEvent<HTMLDivElement>): { id: string; fromStatus: Task["status"] } | null {
     const payload = e.dataTransfer.getData(DRAG_MIME);
@@ -99,14 +107,52 @@ export function BoardColumn({
   const showIndicatorAt = (idx: number): boolean =>
     isOver && dropIndex === idx;
 
+  // ---- Collapsed rail: thin vertical strip, drop target only ----
+  if (isCollapsed) {
+    return (
+      <div
+        className={`mc-board-col mc-board-rail mc-board-rail-collapsed${isOver ? " drag-over" : ""}`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        onClick={onToggleRail}
+        role="button"
+        tabIndex={0}
+        aria-label={`Expand ${title} column (${tasks.length} cards)`}
+        title={`Expand ${title}`}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggleRail?.();
+          }
+        }}
+      >
+        <div className="mc-board-rail-inner">
+          <span className="mc-board-rail-chevron" aria-hidden>▸</span>
+          <span className="mc-board-rail-label">{title}</span>
+          <span className="mc-board-rail-count">{tasks.length}</span>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- Normal / expanded rail: full column render ----
   return (
     <div
-      className={`col-md-3 mc-board-col${isOver ? " drag-over" : ""}`}
+      className={`mc-board-col${railMode === "expanded" ? " mc-board-rail-expanded" : ""}${isOver ? " drag-over" : ""}`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <div className="mc-board-col-header">
+      <div
+        className="mc-board-col-header"
+        onClick={railMode === "expanded" ? onToggleRail : undefined}
+        style={railMode === "expanded" ? { cursor: "pointer" } : undefined}
+        title={railMode === "expanded" ? `Collapse ${title}` : undefined}
+      >
+        {railMode === "expanded" && (
+          <span className="mc-board-rail-chevron-inline" aria-hidden>▾</span>
+        )}
         <span>{title}</span>
         <span className="mc-board-count">{tasks.length}</span>
       </div>

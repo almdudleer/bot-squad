@@ -78,7 +78,7 @@ fi
 
 if [ -n "$sid" ] && [ -n "$CLAUDE_SID" ]; then
     mkdir -p "$DATA/sessions"
-    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" python3 - <<'PY' 2>/dev/null || true
+    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" python3 - <<'PY' 2>/dev/null || true
 import os, time
 from pathlib import Path
 
@@ -89,11 +89,15 @@ data       = Path(os.environ["DATA"])
 cwd        = os.environ["CWD"]
 task_id    = os.environ.get("TASK_ID") or ""
 initiative = os.environ.get("INITIATIVE") or ""
+owner      = os.environ.get("OWNER") or ""
 window     = sid.rsplit("-p", 1)[0].split("-", 2)[-1] if "-p" in sid else ""
 now        = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 md_path    = data / "sessions" / f"{sid}.md"
 
-# Preserve existing started_at + task_id + initiative + extras (existing wins if non-empty).
+# Preserve existing started_at + task_id + initiative + extras + owner
+# (existing wins if non-empty). T-0080: owner is the UI username stamp
+# passed in via BOT_SQUAD_OWNER at spawn time; preserve once stamped so
+# resumes / break-pane SID rotations don't lose attribution.
 existing = {}
 if md_path.exists():
     text = md_path.read_text()
@@ -117,6 +121,11 @@ if not initiative:
 if initiative == "~":
     initiative = ""
 
+if not owner:
+    owner = existing.get("owner") or ""
+if owner == "~":
+    owner = ""
+
 started_at = existing.get("started_at") or "~"
 if started_at == "~" or not started_at:
     started_at = now
@@ -138,6 +147,7 @@ md_path.write_text(
     f"extra_task_ids: {extra_task_ids}\n"
     f"extra_initiatives: {extra_initiatives}\n"
     f"started_at: {started_at}\n"
+    f"owner: {owner or '~'}\n"
     "---\n"
 )
 PY

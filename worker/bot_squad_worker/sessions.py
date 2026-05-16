@@ -303,6 +303,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         extra_initiatives: list[str] = []
         paused_at_meta: Any = None
         archived_flag = False
+        owner_meta: str = ""  # T-0080 — UI-username owner stamp; "" = legacy
         if session_file.exists():
             existing = _read_session_metadata(session_file)
             if existing:
@@ -314,6 +315,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                     extra_initiatives = [i for i in einits if i and i != "~"]
                 paused_at_meta = existing.get("paused_at")
                 archived_flag = str(existing.get("archived", "")).lower() == "true"
+                own_val = existing.get("owner")
+                if own_val and own_val != "~":
+                    owner_meta = str(own_val)
 
         rows.append({
             "sid": sid,
@@ -331,6 +335,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "paused_at": paused_at_meta,
             "suspended_at": None,
             "archived": archived_flag,
+            "owner": owner_meta,
         })
 
     # --- Non-active sessions from metadata files ---
@@ -376,6 +381,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 md_extra_inits = []
             md_extra_inits = [i for i in md_extra_inits if i and i != "~"]
             md_archived = str(meta.get("archived", "")).lower() == "true"
+            md_owner_val = meta.get("owner")
+            md_owner = str(md_owner_val) if (md_owner_val and md_owner_val != "~") else ""
             rows.append({
                 "sid": sid,
                 "status": display_status,
@@ -392,6 +399,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "paused_at": meta.get("paused_at"),
                 "suspended_at": meta.get("suspended_at"),
                 "archived": md_archived,
+                "owner": md_owner,
             })
 
     return rows
@@ -478,6 +486,9 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
     linked_tasks = _scan_linked_tasks(data_dir, slug, sid, claude_uuid)
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # T-0080: preserve owner field across suspend/resume so per-user
+    # listing filters keep working after a session is suspended.
+    owner_val = existing.get("owner") or "~"
     meta: dict = {
         "sid": sid,
         "status": "suspended",
@@ -488,6 +499,7 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         "started_at": started_at,
         "suspended_at": now,
         "linked_tasks": linked_tasks,
+        "owner": owner_val,
     }
     _write_session_metadata(meta_file, meta)
 
@@ -667,6 +679,7 @@ def spawn(
     initial_prompt: str | None = None,
     task_id: str | None = None,
     initiative: str | None = None,
+    owner: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -681,6 +694,11 @@ def spawn(
     SessionStart hook is told via the BOT_SQUAD_INITIATIVE env var to use
     that file instead of the project's global active_initiative. Lets the
     stakeholder spawn multiple TLs on different initiatives in parallel.
+
+    If owner is provided (T-0080), the spawned session md gets stamped
+    with ``owner: <username>`` so per-user listing filters can scope
+    results without relying on the SID linux_user prefix. The owner is
+    the UI username from the JWT claims, not the linux_user.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -722,15 +740,27 @@ def spawn(
     # systemd env does not include the user's local bin directory.
     # --dangerously-skip-permissions: see resume() rationale above.
     # BOT_SQUAD_INITIATIVE: per-session initiative override (Phase 4).
+    # BOT_SQUAD_OWNER (T-0080): per-session owner stamp picked up by the
+    # SessionStart hook and written into the SessionMd frontmatter.
+    env_prefix_parts: list[str] = []
     if initiative:
         # Basic safety: only basename, must end .md, no slashes/..
         clean = initiative.strip()
         if "/" in clean or ".." in clean or not clean.endswith(".md"):
             from bot_squad_worker.actions import ActionError
             raise ActionError(f"spawn: invalid initiative name {initiative!r}")
-        shell_cmd = f"BOT_SQUAD_INITIATIVE={shlex.quote(clean)} claude --dangerously-skip-permissions"
-    else:
-        shell_cmd = "claude --dangerously-skip-permissions"
+        env_prefix_parts.append(f"BOT_SQUAD_INITIATIVE={shlex.quote(clean)}")
+    if owner:
+        # Username sanity: alnum + _.- only. The username is API-provided
+        # (JWT claim) but we still defence-in-depth-validate before shoving
+        # it into a shell env-var assignment.
+        owner_clean = owner.strip()
+        if not owner_clean or not re.match(r"^[A-Za-z0-9_.-]+$", owner_clean):
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(f"spawn: invalid owner {owner!r}")
+        env_prefix_parts.append(f"BOT_SQUAD_OWNER={shlex.quote(owner_clean)}")
+    env_prefix = (" ".join(env_prefix_parts) + " ") if env_prefix_parts else ""
+    shell_cmd = f"{env_prefix}claude --dangerously-skip-permissions"
 
     result = _run([
         "tmux", "new-window", "-d",

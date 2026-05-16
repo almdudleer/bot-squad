@@ -408,14 +408,17 @@ def test_pause_non_admin_other_user_sid_403(
 def test_pause_admin_other_user_sid_ok(
     tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
 ):
-    """Admin can act on any user's SID."""
+    """Admin can act on any user's SID.
+
+    T-0080: WorkerRouter.for_user now falls back to the coordinator
+    socket when a per-user socket is missing, so this call succeeds via
+    the coordinator's fake worker (proving the ownership gate let us
+    through without 403'ing).
+    """
     _set_auth_with_meta(tmp_bot_squad, is_admin=True, linux_user="tu")
     with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
-        # Sub-worker socket for edem doesn't exist; we expect a 502 from the
-        # call attempt, NOT a 403 — which proves the ownership gate let us
-        # through.
         r = client.post("/api/projects/test-project/sessions/S-edem-foo-p2/pause")
-    assert r.status_code == 502
+    assert r.status_code == 200
 
 
 def test_list_sessions_fans_out_and_merges(
@@ -643,3 +646,232 @@ def test_spawn_routes_to_callers_linux_user(
         s2.should_exit = True
         t1.join(timeout=5)
         t2.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# T-0080: owner field stamping + per-user list filtering
+# ---------------------------------------------------------------------------
+
+
+def _write_session_md_full(tmp_bot_squad: Path, sid: str, *, owner: str = "",
+                           status: str = "active") -> None:
+    """Drop an owner-stamped session md for the list-filter tests."""
+    p = tmp_bot_squad / "data" / "test-project" / "sessions" / f"{sid}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    parts = [
+        "---",
+        f"sid: {sid}",
+        f"status: {status}",
+        "window: w",
+        "cwd: /tmp/test-repo",
+        "claude_uuid: ~",
+        "task_id: ~",
+    ]
+    if owner:
+        parts.append(f"owner: {owner}")
+    parts.extend(["---", ""])
+    p.write_text("\n".join(parts))
+
+
+def test_spawn_forwards_owner_to_worker(tmp_bot_squad: Path, monkeypatch):
+    """Spawning stamps the caller's UI username as `owner` in worker params."""
+    import threading
+    import time as _time
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    coord_sock = sock_dir / "worker.sock"
+
+    captured: list[dict] = []
+    app = FastAPI()
+
+    @app.post("/actions/spawn_session")
+    def spawn(params: dict | None = None) -> dict:
+        captured.append(params or {})
+        return {"ok": True, "sid": "S-x-y-p1"}
+
+    cfg = uvicorn.Config(app, uds=str(coord_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if coord_sock.exists():
+            break
+        _time.sleep(0.05)
+
+    try:
+        with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
+            r = client.post(
+                "/api/projects/test-project/sessions",
+                json={"window": "feature-x"},
+            )
+        assert r.status_code == 200, r.text
+        assert captured, "worker spawn_session was not called"
+        assert captured[0].get("owner") == "testuser"
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
+def test_list_sessions_non_admin_drops_other_owners(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """Non-admin user sees only sessions whose `owner` equals their username."""
+    import threading
+    import time as _time
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    coord_sock = sock_dir / "worker.sock"
+
+    rows = [
+        {"sid": "S-x-a-p1", "status": "active", "window": "a", "cwd": "/",
+         "owner": "alexey",  "linked_tasks": []},
+        {"sid": "S-x-b-p2", "status": "active", "window": "b", "cwd": "/",
+         "owner": "testuser", "linked_tasks": []},
+        {"sid": "S-x-c-p3", "status": "suspended", "window": "c", "cwd": "/",
+         "owner": "", "linked_tasks": []},  # legacy / unstamped
+    ]
+    app = FastAPI()
+
+    @app.post("/actions/list_sessions")
+    def ls(params: dict | None = None) -> dict:
+        return {"sessions": rows}
+
+    cfg = uvicorn.Config(app, uds=str(coord_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if coord_sock.exists():
+            break
+        _time.sleep(0.05)
+
+    try:
+        # Mark testuser as non-admin so the filter applies.
+        _set_auth_with_meta(tmp_bot_squad, is_admin=False, linux_user="tu")
+        with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
+            r = client.get("/api/projects/test-project/sessions")
+        assert r.status_code == 200
+        sids = sorted(row["sid"] for row in r.json())
+        # Only the row stamped owner=testuser survives — the other-owner
+        # row and the legacy unstamped row are both filtered out.
+        assert sids == ["S-x-b-p2"]
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
+def test_list_sessions_admin_sees_all_owners(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """Admin sees every row, regardless of owner stamp."""
+    import threading
+    import time as _time
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    coord_sock = sock_dir / "worker.sock"
+
+    rows = [
+        {"sid": "S-x-a-p1", "status": "active", "window": "a", "cwd": "/",
+         "owner": "alexey",  "linked_tasks": []},
+        {"sid": "S-x-b-p2", "status": "active", "window": "b", "cwd": "/",
+         "owner": "aqice", "linked_tasks": []},
+        {"sid": "S-x-c-p3", "status": "suspended", "window": "c", "cwd": "/",
+         "owner": "", "linked_tasks": []},
+    ]
+    app = FastAPI()
+
+    @app.post("/actions/list_sessions")
+    def ls(params: dict | None = None) -> dict:
+        return {"sessions": rows}
+
+    cfg = uvicorn.Config(app, uds=str(coord_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if coord_sock.exists():
+            break
+        _time.sleep(0.05)
+
+    try:
+        # testuser is admin by default in tmp_bot_squad fixture.
+        with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
+            r = client.get("/api/projects/test-project/sessions")
+        assert r.status_code == 200
+        sids = sorted(row["sid"] for row in r.json())
+        assert sids == ["S-x-a-p1", "S-x-b-p2", "S-x-c-p3"]
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
+def test_pause_owner_field_wins_over_sid_prefix(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """SessionMd owner stamp is authoritative; SID linux_user prefix is fallback.
+
+    T-0080 scenario: aqice (linux_user=aqice) spawned a session via the
+    coordinator (so the SID says S-almdudleer-...). The md is stamped
+    owner=aqice. aqice can pause it; alexey-as-non-admin cannot.
+    """
+    sid = "S-almdudleer-feature-p99"
+    _write_session_md_full(tmp_bot_squad, sid, owner="aqice")
+
+    # aqice (non-admin) acts on the owner-stamped SID — should pass the
+    # ownership check (because owner==aqice matches the username claim).
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'aqice = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.aqice]\n'
+        'linux_user = "aqice"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(fake_worker_sessions))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    client = TestClient(build_app())
+    client.post("/api/auth/login", json={"username": "aqice", "password": "test"})
+    r = client.post(f"/api/projects/test-project/sessions/{sid}/pause")
+    assert r.status_code == 200
+
+
+def test_pause_other_user_owner_blocked(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """Non-admin gets 403 when SessionMd owner is someone else."""
+    sid = "S-almdudleer-feature-p98"
+    _write_session_md_full(tmp_bot_squad, sid, owner="alexey")
+
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'aqice = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.aqice]\n'
+        'linux_user = "aqice"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(fake_worker_sessions))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    client = TestClient(build_app())
+    client.post("/api/auth/login", json={"username": "aqice", "password": "test"})
+    r = client.post(f"/api/projects/test-project/sessions/{sid}/pause")
+    assert r.status_code == 403
+    assert "owned by" in r.json()["detail"]

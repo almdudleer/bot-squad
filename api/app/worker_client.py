@@ -6,10 +6,13 @@ Coordinator (single host) handles non-tmux actions; per-user workers
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterable
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 
 class WorkerError(Exception):
@@ -83,9 +86,25 @@ class WorkerRouter:
         return WorkerClient(self._coordinator_sock)
 
     def for_user(self, linux_user: str) -> WorkerClient:
+        """Return the client for a user worker; fall back to coordinator.
+
+        T-0080: when a non-coordinator user has no per-user worker socket
+        installed, fall back to the coordinator socket so spawn / pause /
+        resume actions still succeed. Physical tmux ops happen on the
+        coordinator's linux user; the SessionMd owner field (not the SID
+        prefix) is the source of truth for which UI user owns the
+        session. Real per-user-tmux isolation remains deferred.
+        """
         if linux_user == self.coordinator_user:
             return WorkerClient(self._coordinator_sock)
-        return WorkerClient(_user_sock(self._sock_dir, linux_user))
+        user_sock = _user_sock(self._sock_dir, linux_user)
+        if not user_sock.exists():
+            log.warning(
+                "WorkerRouter.for_user(%r): %s missing, falling back to coordinator",
+                linux_user, user_sock,
+            )
+            return WorkerClient(self._coordinator_sock)
+        return WorkerClient(user_sock)
 
     def for_sid(self, sid: str) -> WorkerClient:
         """Resolve via SID format S-<linux_user>-<rest>. Falls back to coordinator."""
@@ -103,5 +122,18 @@ class WorkerRouter:
         return None
 
     def all_user_workers(self) -> list[tuple[str, WorkerClient]]:
-        """Return (linux_user, client) for every known user (coordinator + meta)."""
-        return [(u, self.for_user(u)) for u in self.users]
+        """Return (linux_user, client) for every known user (coordinator + meta).
+
+        Used by list_sessions fan-out. Unlike for_user(), this does NOT
+        fall back to coordinator for missing user sockets — we want each
+        declared user to be queried at their expected socket so missing
+        sockets fail fast (and get swallowed by the fan-out warning) rather
+        than re-hitting coordinator N times and double-counting sessions.
+        """
+        out: list[tuple[str, WorkerClient]] = []
+        for u in self.users:
+            if u == self.coordinator_user:
+                out.append((u, WorkerClient(self._coordinator_sock)))
+            else:
+                out.append((u, WorkerClient(_user_sock(self._sock_dir, u))))
+        return out

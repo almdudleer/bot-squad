@@ -87,6 +87,9 @@ export type SessionRow = {
   paused_at?: string | null;
   suspended_at?: string | null;
   archived?: boolean;
+  // T-0080: UI username that spawned the session. Empty for legacy
+  // pre-T-0080 sessions; backend filters non-admins to only their own.
+  owner?: string;
 };
 
 export type RunRow = {

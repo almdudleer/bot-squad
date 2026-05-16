@@ -163,7 +163,7 @@ def test_self_register_falls_back_when_base_url_unset(tmp_bot_squad: Path, monke
     servers = store.list_servers()
     assert len(servers) == 1
     assert servers[0].is_self is True
-    assert servers[0].base_url == "https://staging.bot-squad.org"
+    assert servers[0].base_url == "https://staging.botsquad.dev"
 
 
 def test_mothership_on_requires_auth(tmp_bot_squad: Path, monkeypatch):

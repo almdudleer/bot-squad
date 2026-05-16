@@ -124,7 +124,7 @@ def build_app() -> FastAPI:
         from app.mothership_store import MothershipStore
 
         self_url = os.environ.get(
-            "MOTHERSHIP_BASE_URL", "https://staging.bot-squad.org"
+            "MOTHERSHIP_BASE_URL", "https://staging.botsquad.dev"
         )
         self_name = os.environ.get("MOTHERSHIP_SELF_NAME") or _hostname_from_url(
             self_url

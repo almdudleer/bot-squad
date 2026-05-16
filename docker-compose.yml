@@ -42,7 +42,7 @@ services:
       # when MOTHERSHIP=1 in .env. Both hosts hit the same backend; the
       # FE mothership chunks are gated by build flag, not host header.
       # Detach later by removing this router + setting MOTHERSHIP=0.
-      - "traefik.http.routers.bot-squad-mothership.rule=Host(`staging.bot-squad.org`)"
+      - "traefik.http.routers.bot-squad-mothership.rule=Host(`staging.botsquad.dev`) || Host(`botsquad.dev`)"
       - "traefik.http.routers.bot-squad-mothership.entrypoints=websecure"
       - "traefik.http.routers.bot-squad-mothership.tls.certresolver=le"
       - "traefik.http.routers.bot-squad-mothership.service=bot-squad"

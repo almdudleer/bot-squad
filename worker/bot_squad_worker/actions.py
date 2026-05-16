@@ -806,6 +806,80 @@ def _action_unarchive_session(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.unarchive_session(cfg, params["slug"], params["sid"])
 
 
+# ---------------------------------------------------------------------------
+# Autoupdate operator handoff actions (T-0085)
+# ---------------------------------------------------------------------------
+
+_AUTOUPDATE_RETRY_REQUIRED = {"slug"}
+_AUTOUPDATE_RETRY_ALLOWED = _AUTOUPDATE_RETRY_REQUIRED
+
+
+def _action_autoupdate_retry(params: dict[str, Any]) -> dict[str, Any]:
+    """Re-enqueue the most-recent failed apply job.
+
+    Required params: slug
+    Returns: {ok, requeued: bool, version?: str, queue_file?: str, reason?: str}
+
+    Idempotent — when the failed-queue is empty, returns
+    ``{ok: true, requeued: false}`` without raising. The ``slug`` param is
+    accepted (and validated) for consistency with peer actions even though
+    the failed-queue is install-scoped, not project-scoped.
+    """
+    extra = set(params) - _AUTOUPDATE_RETRY_ALLOWED
+    if extra:
+        raise ActionError(f"autoupdate_retry got unexpected params: {sorted(extra)}")
+    missing = _AUTOUPDATE_RETRY_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"autoupdate_retry missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autoupdate_retry: unknown project slug {slug!r}")
+
+    from bot_squad_worker import autoupdate_apply as _apply
+    try:
+        return _apply.retry_last_failed(cfg)
+    except Exception as e:
+        raise ActionError(f"autoupdate_retry: {e}") from e
+
+
+_AUTOUPDATE_FORCE_REQUIRED = {"slug", "version"}
+_AUTOUPDATE_FORCE_ALLOWED = _AUTOUPDATE_FORCE_REQUIRED
+
+
+def _action_autoupdate_force(params: dict[str, Any]) -> dict[str, Any]:
+    """Force-apply a specific release version (skips poller's newer-than gate).
+
+    Required params: slug, version
+    Returns: {ok: true, version, queue_file}
+
+    The manifest entry is fetched from the mothership's
+    ``/api/releases/<version>`` endpoint and enqueued for the drain loop.
+    Apply itself runs out-of-band on the next tick.
+    """
+    extra = set(params) - _AUTOUPDATE_FORCE_ALLOWED
+    if extra:
+        raise ActionError(f"autoupdate_force got unexpected params: {sorted(extra)}")
+    missing = _AUTOUPDATE_FORCE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"autoupdate_force missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    version = params["version"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autoupdate_force: unknown project slug {slug!r}")
+    if not isinstance(version, str) or not version.strip():
+        raise ActionError("autoupdate_force: empty version")
+
+    from bot_squad_worker import autoupdate_apply as _apply
+    try:
+        return _apply.force_apply(cfg, version)
+    except Exception as e:
+        raise ActionError(f"autoupdate_force: {e}") from e
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
@@ -831,6 +905,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
     "unarchive_session": _action_unarchive_session,
+    # T-0085: autoupdate operator handoff levers.
+    "autoupdate_retry": _action_autoupdate_retry,
+    "autoupdate_force": _action_autoupdate_force,
 }
 
 
@@ -864,6 +941,9 @@ ACTION_MODES: dict[str, str] = {
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",
     "unarchive_session": "coordinator_only",
+    # T-0085: autoupdate handoff is install-scoped (coordinator).
+    "autoupdate_retry": "coordinator_only",
+    "autoupdate_force": "coordinator_only",
 }
 
 

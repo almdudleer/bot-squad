@@ -59,6 +59,8 @@ def test_registry_lists_only_allowed_actions():
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
         "unbind_task", "unbind_initiative",
         "archive_session", "unarchive_session",
+        # T-0085: operator handoff levers for autoupdate failures.
+        "autoupdate_retry", "autoupdate_force",
     }
 
 

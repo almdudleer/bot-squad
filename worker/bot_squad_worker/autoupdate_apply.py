@@ -358,17 +358,47 @@ def _tail(s: str, n: int = 20) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _install_identifier(cfg: Any) -> str:
+    """Best-effort label for this install in operator handoff messages.
+
+    Preference order:
+      1. ``cfg.projects["bot-squad"].prod_url`` (the canonical self-URL — same
+         lookup the smoke-test uses).
+      2. ``BOT_SQUAD_SELF_URL`` env override.
+      3. literal "unknown-install" — never raise; the alert must always go out.
+    """
+    projects = getattr(cfg, "projects", None) or {}
+    proj = projects.get("bot-squad") if hasattr(projects, "get") else None
+    if proj is not None:
+        url = getattr(proj, "prod_url", None)
+        if url:
+            return str(url).rstrip("/")
+    env = os.environ.get("BOT_SQUAD_SELF_URL")
+    if env:
+        return env.rstrip("/")
+    return "unknown-install"
+
+
+def _retry_command() -> str:
+    """Operator-runnable command string for the retry path. Surfaced in the
+    alert payload + the tg message body."""
+    return "bot-squad-cli autoupdate retry"
+
+
+def _force_command(version: str) -> str:
+    return f"bot-squad-cli autoupdate force {version}"
+
+
 def _write_alert(cfg: Any, *, version: str, step: str, log_tail: str) -> None:
     """Write a structured failure banner for T-0089's UI banner + T-0085's
-    operator handoff. Schema is intentionally minimal — T-0085 may extend it."""
+    operator handoff."""
     payload = {
         "version": version,
         "step": step,
         "log_tail": log_tail,
         "occurred_at": _now_iso(),
-        # T-0085 will fill these in with real operator commands.
-        "retry_command": "bot-squad-cli autoupdate retry",
-        "force_command": f"bot-squad-cli autoupdate force {version}",
+        "retry_command": _retry_command(),
+        "force_command": _force_command(version),
     }
     p = alert_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -384,21 +414,92 @@ def _clear_alert(cfg: Any) -> None:
             log.warning("autoupdate_apply: could not clear alert %s", p)
 
 
-def _notify_failure(cfg: Any, *, version: str, step: str, log_tail: str) -> None:
-    """Operator handoff seam.
+def _format_failure_message(
+    *,
+    install_id: str,
+    version: str,
+    step: str,
+    log_tail: str,
+) -> str:
+    """Build the tg body for a failed apply.
 
-    T-0085 owns the body (tg_notify to the consumer operator chat with the
-    structured failure message). This stub exists so T-0084's failure paths
-    have somewhere to call right now, and T-0085's wire-up is a single-edit
-    diff. Do NOT inline tg_notify here — keep the seam clean.
+    Format is intentionally plain-text (TG client doesn't pass a parse_mode)
+    and bounded — log tail is already capped to ~20 lines upstream, but we
+    trim the final body to ~3000 chars to stay well below TG's 4096 limit.
     """
-    # TODO(T-0085): tg_notify(cfg, ...) with install-id, version, step, log_tail,
-    # and the autoupdate_retry / autoupdate_force command strings.
-    log.warning(
-        "autoupdate_apply: failure pending operator handoff "
-        "(version=%s step=%s); see %s",
-        version, step, alert_path(cfg),
+    body = (
+        "🚨 bot-squad autoupdate FAILED\n"
+        f"install:  {install_id}\n"
+        f"version:  {version}\n"
+        f"step:     {step}\n"
+        "\n"
+        "log tail:\n"
+        f"{log_tail}\n"
+        "\n"
+        "recovery — run on the consumer host:\n"
+        f"  {_retry_command()}    # re-attempt the same failed version\n"
+        f"  {_force_command(version)}  # force-apply a specific version"
     )
+    if len(body) > 3000:
+        body = body[:2997] + "..."
+    return body
+
+
+def _notify_failure(cfg: Any, *, version: str, step: str, log_tail: str) -> None:
+    """Operator handoff: send a structured TG message to the consumer's
+    operator chat on every apply failure.
+
+    Errors here are swallowed (logged at WARNING) — the alert.json banner
+    is already on disk by the time we get called, so the operator can still
+    recover even if TG is unreachable / misconfigured.
+    """
+    install_id = _install_identifier(cfg)
+    text = _format_failure_message(
+        install_id=install_id,
+        version=version,
+        step=step,
+        log_tail=log_tail,
+    )
+
+    chat_id = _operator_chat_id(cfg)
+    if not chat_id:
+        log.warning(
+            "autoupdate_apply._notify_failure: no operator chat configured "
+            "(missing projects['bot-squad'].tg_chat); banner-only handoff"
+        )
+        return
+
+    try:
+        from bot_squad_worker.tg import TgClient
+        TgClient(cfg).send(
+            chat_id=chat_id,
+            text=text,
+            sid="",
+            user="",
+            urgent=True,  # apply failure bypasses quiet hours per spec
+        )
+    except Exception:
+        log.exception(
+            "autoupdate_apply._notify_failure: tg send failed for "
+            "version=%s step=%s — banner at %s remains the recovery surface",
+            version, step, alert_path(cfg),
+        )
+
+
+def _operator_chat_id(cfg: Any) -> Optional[str]:
+    """Resolve the operator chat for autoupdate alerts.
+
+    Uses the ``bot-squad`` project's ``tg_chat`` (each install has its own
+    bot-squad entry in projects.toml pointing at its operator). Returns
+    None when projects config is unavailable — caller treats that as
+    banner-only handoff.
+    """
+    projects = getattr(cfg, "projects", None) or {}
+    proj = projects.get("bot-squad") if hasattr(projects, "get") else None
+    if proj is None:
+        return None
+    chat = getattr(proj, "tg_chat", None)
+    return str(chat) if chat else None
 
 
 # ---------------------------------------------------------------------------
@@ -613,3 +714,110 @@ def tick(cfg: Any) -> None:
         drain_one(cfg)
     except Exception:
         log.exception("autoupdate_apply.tick: unhandled error")
+
+
+# ---------------------------------------------------------------------------
+# Operator handoff levers (T-0085): retry + force
+# ---------------------------------------------------------------------------
+
+
+def _newest_failed(cfg: Any) -> Optional[Path]:
+    """Most-recently-parked file in the failed-queue (highest mtime)."""
+    fdir = failed_queue_dir(cfg)
+    if not fdir.exists():
+        return None
+    files = [p for p in fdir.iterdir() if p.is_file() and p.suffix == ".json"]
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def retry_last_failed(cfg: Any) -> dict:
+    """Move the most-recent failed manifest entry back into the live queue.
+
+    Idempotent: no-op (``{"ok": True, "requeued": False}``) when the
+    failed-queue is empty. On success returns the version it requeued so
+    the operator gets confirmation in the action response.
+    """
+    src = _newest_failed(cfg)
+    if src is None:
+        return {"ok": True, "requeued": False, "reason": "failed-queue empty"}
+
+    # Best-effort: peek at the file to surface the version in the response.
+    version: str = "?"
+    try:
+        version = json.loads(src.read_text()).get("version", "?")
+    except (OSError, json.JSONDecodeError):
+        # Bad file — let the drain loop park it again rather than blocking
+        # the retry; the operator at least gets the move acknowledged.
+        log.warning("autoupdate_apply.retry: unreadable failed entry %s", src)
+
+    qdir = queue_dir(cfg)
+    qdir.mkdir(parents=True, exist_ok=True)
+    dest = qdir / src.name
+    try:
+        src.replace(dest)
+    except OSError as e:
+        raise RuntimeError(f"could not requeue {src.name}: {e}") from e
+
+    log.info("autoupdate_apply.retry: requeued %s (version=%s)", src.name, version)
+    return {"ok": True, "requeued": True, "version": version, "queue_file": dest.name}
+
+
+def _fetch_release_entry(version: str) -> Optional[dict]:
+    """GET ``<mothership>/api/releases/<version>`` and return the manifest entry.
+
+    Returns ``None`` when:
+      * ``BOT_SQUAD_MOTHERSHIP_URL`` is unset (no mothership configured), or
+      * the upstream returns a non-2xx / non-dict body, or
+      * a transport/timeout error occurs.
+
+    No retry — operator-driven action; let the operator re-run if the
+    upstream is briefly unreachable.
+    """
+    base = _poller.mothership_url()
+    if not base:
+        return None
+    url = f"{base.rstrip('/')}/api/releases/{version}"
+    try:
+        resp = httpx.get(url, timeout=10.0)
+        resp.raise_for_status()
+        entry = resp.json()
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as e:
+        log.warning("autoupdate_apply.force: fetch failed for %s: %s", url, e)
+        return None
+    if not isinstance(entry, dict):
+        log.warning("autoupdate_apply.force: bad body from %s: %r", url, type(entry))
+        return None
+    return entry
+
+
+def force_apply(cfg: Any, version: str) -> dict:
+    """Enqueue an apply job for ``version``, bypassing the poller's newer-than
+    gate. Used to roll forward past a known-bad release once a fix is shipped.
+
+    The manifest entry is fetched from the mothership's
+    ``/api/releases/<version>`` endpoint (T-0082). On fetch failure we
+    surface an error so the operator sees the problem immediately rather
+    than the apply pipeline later choking on a bad entry.
+    """
+    if not isinstance(version, str) or not version:
+        raise RuntimeError("force_apply: empty version")
+
+    entry = _fetch_release_entry(version)
+    if entry is None:
+        raise RuntimeError(
+            f"force_apply: could not fetch manifest for {version} "
+            "(check BOT_SQUAD_MOTHERSHIP_URL and that the version exists)"
+        )
+
+    # Sanity: mothership returned a different version than asked for.
+    got = entry.get("version")
+    if got and got != version:
+        raise RuntimeError(
+            f"force_apply: mothership returned version={got!r} for request {version!r}"
+        )
+
+    path = _poller._enqueue_apply(cfg, entry)
+    log.info("autoupdate_apply.force: enqueued %s as %s", version, path.name)
+    return {"ok": True, "version": version, "queue_file": path.name}

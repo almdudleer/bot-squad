@@ -96,6 +96,22 @@ def autoupdate_tick(cfg: Config) -> None:
         log.exception("autoupdate_tick error")
 
 
+def autoupdate_apply_tick(cfg: Config) -> None:
+    """Drain the apply queue produced by the poller (T-0084).
+
+    Scheduled at a shorter cadence than the poll tick so a freshly-enqueued
+    release starts applying within ~1 minute. The apply itself can take
+    many minutes (download + build + smoke); APScheduler ``max_instances=1``
+    on the registered job keeps overlapping ticks from starting a second
+    apply mid-flight. No-op on the mothership itself (T-0086).
+    """
+    from bot_squad_worker import autoupdate_apply as _apply
+    try:
+        _apply.tick(cfg)
+    except Exception:
+        log.exception("autoupdate_apply_tick error")
+
+
 def autonomous_tick(cfg: Config) -> None:
     """Run one orchestrator tick for every project that has autonomous mode enabled.
 

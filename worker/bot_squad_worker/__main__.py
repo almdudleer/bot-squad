@@ -23,6 +23,7 @@ import uvicorn
 
 from bot_squad_worker.actions import set_config, set_mode, set_scheduler
 from bot_squad_worker.config import Config
+from bot_squad_worker.install_role import is_mothership, warn_if_misconfigured
 from bot_squad_worker.scheduler import build_scheduler
 from bot_squad_worker.server import build_app
 
@@ -60,6 +61,14 @@ def main() -> int:
     cfg = Config.load(Path(args.config))
     set_config(cfg)
     log.info("loaded config: %d project(s)", len(cfg.projects))
+
+    # T-0086 integration check: warn early if mothership flag and prod
+    # deploy_targets disagree for bot-squad itself.
+    log.info(
+        "install_role: is_mothership(bot-squad)=%s",
+        is_mothership(slug="bot-squad", config_dir=cfg.config_dir),
+    )
+    warn_if_misconfigured(cfg.config_dir, slug="bot-squad", log=log)
 
     if mode == "coordinator":
         sock_path = cfg.sock_path

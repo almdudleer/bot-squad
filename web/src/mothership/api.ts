@@ -3,7 +3,7 @@
  *
  *   `mothershipApi` — calls the centralization layer itself (server
  *      registry, cached project list). These live at `/api/m/*` on
- *      bot-squad.org.
+ *      botsquad.dev.
  *
  *   `apiFor(serverId)` — calls a *target* server's single-install API
  *      via the proxy at `/api/m/servers/{id}/api/{rest}`. Every method

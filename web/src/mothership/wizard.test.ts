@@ -81,22 +81,22 @@ describe("visibleSections", () => {
 describe("buildClaudePromptOnTarget", () => {
   test("embeds the instructions URL with token", () => {
     const out = buildClaudePromptOnTarget({
-      mothershipBase: "https://staging.bot-squad.org",
+      mothershipBase: "https://staging.botsquad.dev",
       token: "bsq_install_TOKEN",
     });
     expect(out).toContain(
-      "https://staging.bot-squad.org/i/bsq_install_TOKEN/instructions.md",
+      "https://staging.botsquad.dev/i/bsq_install_TOKEN/instructions.md",
     );
     expect(out).toContain("single-use install token");
   });
 
   test("strips a trailing slash from mothershipBase before joining", () => {
     const out = buildClaudePromptOnTarget({
-      mothershipBase: "https://staging.bot-squad.org/",
+      mothershipBase: "https://staging.botsquad.dev/",
       token: "bsq_install_T",
     });
     expect(out).toContain(
-      "https://staging.bot-squad.org/i/bsq_install_T/instructions.md",
+      "https://staging.botsquad.dev/i/bsq_install_T/instructions.md",
     );
     // Sanity: no doubled slash.
     expect(out).not.toContain("//i/");
@@ -106,19 +106,19 @@ describe("buildClaudePromptOnTarget", () => {
 describe("buildClaudePromptViaSsh", () => {
   test("embeds ssh target + instructions URL", () => {
     const out = buildClaudePromptViaSsh({
-      mothershipBase: "https://staging.bot-squad.org",
+      mothershipBase: "https://staging.botsquad.dev",
       token: "bsq_install_T",
       sshTarget: "alice@host.example.com",
     });
     expect(out).toContain("ssh into alice@host.example.com");
     expect(out).toContain(
-      "https://staging.bot-squad.org/i/bsq_install_T/instructions.md",
+      "https://staging.botsquad.dev/i/bsq_install_T/instructions.md",
     );
   });
 
   test("empty ssh target renders a <user@host> placeholder so the copy-pasta still reads", () => {
     const out = buildClaudePromptViaSsh({
-      mothershipBase: "https://staging.bot-squad.org",
+      mothershipBase: "https://staging.botsquad.dev",
       token: "bsq_install_T",
       sshTarget: "   ",
     });
@@ -143,13 +143,13 @@ describe("renderChatAgentPrompt", () => {
     ].join("\n");
     const out = renderChatAgentPrompt({
       template,
-      mothershipBase: "https://staging.bot-squad.org",
+      mothershipBase: "https://staging.botsquad.dev",
       token: "bsq_install_ABC",
     });
     expect(out).toBe(
       [
-        "A mothership at https://staging.bot-squad.org issued me a token.",
-        "Run: curl https://staging.bot-squad.org/i/bsq_install_ABC/install.sh",
+        "A mothership at https://staging.botsquad.dev issued me a token.",
+        "Run: curl https://staging.botsquad.dev/i/bsq_install_ABC/install.sh",
         "Token: bsq_install_ABC",
       ].join("\n"),
     );

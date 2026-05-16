@@ -78,7 +78,7 @@ export function Profile() {
             body={
               <>
                 Help user to bind his telegram chat id, ping him with a test
-                message. While this server is attached to bot-squad.org, all
+                message. While this server is attached to botsquad.dev, all
                 Telegram traffic routes through <code>@bot_squad_bot</code> —
                 you don't need to bring your own bot.
               </>

@@ -9,7 +9,7 @@ This module ships THREE routers because the install flow has three
 distinct auth surfaces:
 
 - ``router`` — cookie auth (session). Mounted at ``/api/m``. The
-  logged-in bot-squad.org user creates servers, lists them, watches a
+  logged-in botsquad.dev user creates servers, lists them, watches a
   server's install progress over SSE.
 - ``installer_router`` — bearer auth via the install_token (pre-/connect)
   or the server_bearer (post-/connect). Mounted at ``/api/m``. Called by

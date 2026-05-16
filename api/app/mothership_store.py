@@ -13,7 +13,7 @@ Schema (frozen by ``vision/architecture/mothership-seam.md``)::
           "id": "srv_<ulid>",
           "display_name": "...",
           "base_url": "https://...",
-          "owner_user": "<bot-squad.org username>",
+          "owner_user": "<botsquad.dev username>",
           "created_at": "<ISO-8601 UTC>",
           "install_state": "pending|connected|ready|failed",
           "install_token_hash": "<sha256 hex, null after /connect>",

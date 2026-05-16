@@ -81,6 +81,21 @@ def tg_listener_tick(cfg: Config) -> None:
         log.exception("tg_listener_tick error")
 
 
+def autoupdate_tick(cfg: Config) -> None:
+    """Poll the mothership release feed and queue apply jobs when newer.
+
+    Scheduled at ``BOT_SQUAD_AUTOUPDATE_INTERVAL_SECONDS`` (default 900s)
+    by APScheduler. Errors are caught and logged so one bad poll cycle
+    never kills the scheduler. See ``bot_squad_worker.autoupdate`` for
+    the full contract (T-0083). No-op on the mothership itself (T-0086).
+    """
+    from bot_squad_worker import autoupdate as _autoupdate
+    try:
+        _autoupdate.tick(cfg)
+    except Exception:
+        log.exception("autoupdate_tick error")
+
+
 def autonomous_tick(cfg: Config) -> None:
     """Run one orchestrator tick for every project that has autonomous mode enabled.
 

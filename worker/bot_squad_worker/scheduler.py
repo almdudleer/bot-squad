@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from bot_squad_worker.config import Config
+from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.jobs import (
+    autoupdate_tick,
     deploy_monitor,
     heartbeat,
     oauth_refresh,
@@ -88,5 +90,17 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
     # autonomous_tick: DISABLED 2026-05-12 — autonomous work is frozen pending
     # the new operating model. The autonomous module + actions remain on disk
     # but no background tick fires. Re-enable here when the model is ready.
+
+    # autoupdate_tick: poll mothership release feed (T-0083). No-op on the
+    # mothership itself (self-exclusion via T-0086). Cadence is configurable
+    # via BOT_SQUAD_AUTOUPDATE_INTERVAL_SECONDS (default 900s = 15min).
+    sched.add_job(
+        autoupdate_tick,
+        "interval",
+        seconds=_autoupdate.interval_seconds(),
+        args=[cfg],
+        id="autoupdate",
+        replace_existing=True,
+    )
 
     return sched

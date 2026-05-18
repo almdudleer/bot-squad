@@ -178,7 +178,7 @@ def test_deploy_monitor_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def test_deploy_monitor_dirty_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Dirty tree → queue file stays, no TG pings for start/success/fail."""
+    """Dirty tree → queue file stays, ZERO TG pings (no spam at monitor cadence)."""
     proj = _make_project_with_repo(tmp_path)
     cfg = _make_config_with_project(tmp_path, proj)
     _make_recipe(cfg, proj.slug, "staging", rc=0)
@@ -197,13 +197,104 @@ def test_deploy_monitor_dirty_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     # Queue still has the file
     assert len(_deploy.list_queued(cfg, proj.slug)) == 1
-    # No success/fail pings — but "starting" ping was sent before run_next returned None
-    # Per plan note 4: "🚚 starting" ping happens, then dirty-skip means no success/fail
-    success_or_fail = [
-        c for c in fake_tg.calls
-        if "SUCCESS" in c["text"] or "FAILED" in c["text"]
-    ]
-    assert success_or_fail == []
+    # No "starting" ping either — that's the fix. Previously the start
+    # ping was sent before the cleanliness check, producing 60s-cadence
+    # spam with no success/fail follow-up. Now the per-target cleanliness
+    # check gates ALL user-visible pings.
+    assert fake_tg.calls == []
+
+
+def test_deploy_monitor_collapses_same_target_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5 queued deploys for the same target → 1 actual deploy + 1 start/finish TG pair."""
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+    _make_recipe(cfg, proj.slug, "staging", rc=0)
+
+    from bot_squad_worker import deploy as _deploy
+    # Need distinct millisecond timestamps so queue files sort
+    for i in range(5):
+        _deploy.enqueue(cfg, proj.slug, "staging", f"reason-{i}", "pytest")
+        time.sleep(0.005)
+
+    assert len(_deploy.list_queued(cfg, proj.slug)) == 5
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    deploy_monitor(cfg)
+
+    # All 5 queue files should be consumed in a single run.
+    assert _deploy.list_queued(cfg, proj.slug) == []
+    # Exactly one start ping + one success ping, and the success ping
+    # mentions the collapsed count.
+    starts = [c for c in fake_tg.calls if "starting" in c["text"]]
+    succs  = [c for c in fake_tg.calls if "SUCCESS"  in c["text"]]
+    assert len(starts) == 1
+    assert len(succs)  == 1
+    assert "5 queued requests collapsed" in succs[0]["text"]
+
+
+def test_deploy_monitor_collapses_only_same_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """staging + prod queued together → only same-target trailing entries collapse."""
+    proj = _make_project_with_repo(tmp_path)
+    # Re-make project allowing two targets so we can enqueue both.
+    proj = Project(
+        slug=proj.slug,
+        display_name=proj.display_name,
+        repo_path=proj.repo_path,
+        deploy_branch=proj.deploy_branch,
+        master_branch=proj.master_branch,
+        prod_url="",
+        staging_url="",
+        dev_url="",
+        deploy_targets=("staging", "prod"),
+        tg_chat=proj.tg_chat,
+    )
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.{proj.slug}]\n'
+        f'slug = "{proj.slug}"\n'
+        f'display_name = "{proj.display_name}"\n'
+        f'repo_path = "{proj.repo_path}"\n'
+        f'deploy_branch = "{proj.deploy_branch}"\n'
+        f'master_branch = "{proj.master_branch}"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging", "prod"]\n'
+        f'tg_chat = "{proj.tg_chat}"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    _make_recipe(cfg, proj.slug, "staging", rc=0)
+    _make_recipe(cfg, proj.slug, "prod", rc=0)
+
+    from bot_squad_worker import deploy as _deploy
+    _deploy.enqueue(cfg, proj.slug, "staging", "s1", "pytest"); time.sleep(0.005)
+    _deploy.enqueue(cfg, proj.slug, "staging", "s2", "pytest"); time.sleep(0.005)
+    _deploy.enqueue(cfg, proj.slug, "prod",    "p1", "pytest"); time.sleep(0.005)
+    _deploy.enqueue(cfg, proj.slug, "staging", "s3", "pytest")
+
+    assert len(_deploy.list_queued(cfg, proj.slug)) == 4
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    deploy_monitor(cfg)
+
+    # First tick: oldest is staging → collapses s1+s2+s3 (the trailing
+    # staging entries, even past the prod one in between). prod job stays.
+    remaining = _deploy.list_queued(cfg, proj.slug)
+    assert len(remaining) == 1
+    assert "p1" in remaining[0].read_text()
 
 
 # ---------------------------------------------------------------------------

@@ -97,6 +97,47 @@ def _runs_dir(cfg: "Config", slug: str) -> Path:
     return cfg.data_dir / slug / "_jobs" / "deploy" / "runs"
 
 
+def _pause_marker(cfg: "Config", slug: str) -> Path:
+    """Presence-of-file gate: when this exists, deploy_monitor skips the queue."""
+    return cfg.data_dir / slug / "_jobs" / "deploy" / "PAUSED.json"
+
+
+def is_paused(cfg: "Config", slug: str) -> dict | None:
+    """Return the pause metadata dict if the slug's deploys are paused, else None."""
+    marker = _pause_marker(cfg, slug)
+    if not marker.exists():
+        return None
+    try:
+        return json.loads(marker.read_text())
+    except Exception:
+        # Malformed marker file still counts as paused — fail-closed.
+        return {"reason": "(unparseable PAUSED.json)", "paused_by": "?", "paused_at": 0.0}
+
+
+def pause(cfg: "Config", slug: str, reason: str, requested_by: str) -> dict:
+    """Create the pause marker. Returns the metadata that was written."""
+    marker = _pause_marker(cfg, slug)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "reason": reason or "(no reason given)",
+        "paused_by": requested_by,
+        "paused_at": time.time(),
+    }
+    marker.write_text(json.dumps(meta, indent=2))
+    log.info("deploy.pause: %s paused by %s — %s", slug, requested_by, meta["reason"])
+    return meta
+
+
+def resume(cfg: "Config", slug: str) -> bool:
+    """Remove the pause marker. Returns True if it was present (i.e. actually resumed)."""
+    marker = _pause_marker(cfg, slug)
+    if not marker.exists():
+        return False
+    marker.unlink()
+    log.info("deploy.resume: %s resumed", slug)
+    return True
+
+
 def _recipe_path(cfg: "Config", slug: str, target: str) -> Path:
     return cfg.data_dir / slug / "deploy" / f"{target}.sh"
 

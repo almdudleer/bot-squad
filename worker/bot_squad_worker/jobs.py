@@ -49,6 +49,13 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     if not queued:
         return
 
+    # Pause gate (T-0094) — checked before everything else. When the
+    # PAUSED.json marker exists, defer silently. The TG ping at pause
+    # time already told the operator; no per-tick reminder spam.
+    if _deploy.is_paused(cfg, slug) is not None:
+        log.info("deploy_monitor: %s deferred — PAUSED", slug)
+        return
+
     # Peek at the oldest queued job's target so we can run the per-target
     # cleanliness check before any user-visible TG ping. (run_next() will
     # re-read the file anyway; this peek doesn't move anything.)

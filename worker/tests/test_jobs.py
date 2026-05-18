@@ -237,6 +237,110 @@ def test_deploy_monitor_collapses_same_target_queue(
     assert "5 queued requests collapsed" in succs[0]["text"]
 
 
+def test_deploy_monitor_paused_skips_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PAUSED.json present → zero TG calls, queue preserved (same shape as dirty-tree)."""
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+    _make_recipe(cfg, proj.slug, "staging", rc=0)
+
+    from bot_squad_worker import deploy as _deploy
+    _deploy.enqueue(cfg, proj.slug, "staging", "before pause", "pytest")
+    _deploy.pause(cfg, proj.slug, "manual hold", "pytest")
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    deploy_monitor(cfg)
+
+    assert len(_deploy.list_queued(cfg, proj.slug)) == 1  # queue preserved
+    assert fake_tg.calls == []                            # no pings at all
+
+    # Resume → next tick runs.
+    assert _deploy.resume(cfg, proj.slug) is True
+    deploy_monitor(cfg)
+    assert _deploy.list_queued(cfg, proj.slug) == []      # ran
+    starts  = [c for c in fake_tg.calls if "starting" in c["text"]]
+    success = [c for c in fake_tg.calls if "SUCCESS"  in c["text"]]
+    assert len(starts) == 1
+    assert len(success) == 1
+
+
+def test_deploy_pause_resume_idempotent(tmp_path: Path) -> None:
+    """pause() is idempotent; resume() returns False when nothing to remove."""
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+    from bot_squad_worker import deploy as _deploy
+
+    assert _deploy.is_paused(cfg, proj.slug) is None
+    assert _deploy.resume(cfg, proj.slug) is False  # nothing to resume
+
+    meta = _deploy.pause(cfg, proj.slug, "first", "pytest")
+    assert meta["reason"] == "first"
+    assert _deploy.is_paused(cfg, proj.slug) is not None
+
+    # Re-pause overwrites reason but stays paused
+    meta2 = _deploy.pause(cfg, proj.slug, "second", "pytest")
+    assert meta2["reason"] == "second"
+
+    assert _deploy.resume(cfg, proj.slug) is True
+    assert _deploy.is_paused(cfg, proj.slug) is None
+
+
+def test_deploy_pause_is_per_slug(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pausing slug A must not affect slug B."""
+    proj_a = _make_project_with_repo(tmp_path / "a", slug="a")
+    proj_b = _make_project_with_repo(tmp_path / "b", slug="b")
+
+    # Build a cfg with both projects
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.{proj_a.slug}]\n'
+        f'slug = "{proj_a.slug}"\n'
+        f'display_name = "A"\n'
+        f'repo_path = "{proj_a.repo_path}"\n'
+        f'deploy_branch = "{proj_a.deploy_branch}"\n'
+        f'master_branch = "{proj_a.master_branch}"\n'
+        f'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "TEST_CHAT_A"\n'
+        f'created_at = 2026-05-10\n'
+        f'\n'
+        f'[projects.{proj_b.slug}]\n'
+        f'slug = "{proj_b.slug}"\n'
+        f'display_name = "B"\n'
+        f'repo_path = "{proj_b.repo_path}"\n'
+        f'deploy_branch = "{proj_b.deploy_branch}"\n'
+        f'master_branch = "{proj_b.master_branch}"\n'
+        f'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "TEST_CHAT_B"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    _make_recipe(cfg, "a", "staging", rc=0)
+    _make_recipe(cfg, "b", "staging", rc=0)
+
+    from bot_squad_worker import deploy as _deploy
+    _deploy.enqueue(cfg, "a", "staging", "a1", "pytest")
+    _deploy.enqueue(cfg, "b", "staging", "b1", "pytest")
+    _deploy.pause(cfg, "a", "hold a only", "pytest")
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    deploy_monitor(cfg)
+
+    # A is paused, queue preserved. B ran and drained.
+    assert len(_deploy.list_queued(cfg, "a")) == 1
+    assert _deploy.list_queued(cfg, "b") == []
+
+
 def test_deploy_monitor_collapses_only_same_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

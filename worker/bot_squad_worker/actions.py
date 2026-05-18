@@ -229,6 +229,88 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "queue_id": queue_id, "queued_at": _time.time()}
 
 
+_PAUSE_DEPLOYS_REQUIRED = {"slug", "reason", "requested_by"}
+_PAUSE_DEPLOYS_ALLOWED = _PAUSE_DEPLOYS_REQUIRED
+
+
+def _action_pause_deploys(params: dict[str, Any]) -> dict[str, Any]:
+    """Pause the deploy queue for a project until resume_deploys is called.
+
+    Required params: slug, reason, requested_by
+    Returns: {ok: true, paused: <meta dict>, was_already_paused: bool}
+
+    A PAUSED.json marker is written to data/<slug>/_jobs/deploy/. The
+    deploy_monitor checks for it on every tick and silently defers when
+    present — no TG spam during the pause. One TG ping is sent at pause
+    time (and one at resume time) so the operator knows the state flipped.
+    """
+    extra = set(params) - _PAUSE_DEPLOYS_ALLOWED
+    if extra:
+        raise ActionError(f"pause_deploys got unexpected params: {sorted(extra)}")
+    missing = _PAUSE_DEPLOYS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"pause_deploys missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"pause_deploys: unknown project slug {slug!r}")
+
+    from bot_squad_worker import deploy as _deploy
+    was_paused = _deploy.is_paused(cfg, slug) is not None
+    meta = _deploy.pause(cfg, slug, params["reason"], params["requested_by"])
+
+    if not was_paused:
+        tg = _get_tg_client(cfg)
+        tg.send(
+            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            text=f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
+            sid="deploy_monitor",
+        )
+
+    return {"ok": True, "paused": meta, "was_already_paused": was_paused}
+
+
+_RESUME_DEPLOYS_REQUIRED = {"slug"}
+_RESUME_DEPLOYS_ALLOWED = _RESUME_DEPLOYS_REQUIRED | {"requested_by"}
+
+
+def _action_resume_deploys(params: dict[str, Any]) -> dict[str, Any]:
+    """Resume a paused deploy queue. No-op (idempotent) if not paused.
+
+    Required params: slug
+    Optional params: requested_by (for TG attribution)
+    Returns: {ok: true, was_paused: bool}
+    """
+    extra = set(params) - _RESUME_DEPLOYS_ALLOWED
+    if extra:
+        raise ActionError(f"resume_deploys got unexpected params: {sorted(extra)}")
+    missing = _RESUME_DEPLOYS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"resume_deploys missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"resume_deploys: unknown project slug {slug!r}")
+
+    from bot_squad_worker import deploy as _deploy
+    was_paused = _deploy.resume(cfg, slug)
+
+    if was_paused:
+        who = params.get("requested_by") or "?"
+        tg = _get_tg_client(cfg)
+        tg.send(
+            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            text=f"🟢 deploys resumed for {slug} (by {who})",
+            sid="deploy_monitor",
+        )
+
+    return {"ok": True, "was_paused": was_paused}
+
+
 # ---------------------------------------------------------------------------
 # Session management actions (spec #5)
 # ---------------------------------------------------------------------------
@@ -811,6 +893,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "tg_verify_login": _action_tg_verify_login,
     "tg_notify": _action_tg_notify,
     "deploy": _action_deploy,
+    "pause_deploys": _action_pause_deploys,
+    "resume_deploys": _action_resume_deploys,
     "list_sessions": _action_list_sessions,
     "pause_session": _action_pause_session,
     "suspend_session": _action_suspend_session,
@@ -844,6 +928,8 @@ ACTION_MODES: dict[str, str] = {
     "tg_verify_login": "coordinator_only",
     "tg_notify": "coordinator_only",
     "deploy": "coordinator_only",
+    "pause_deploys": "coordinator_only",
+    "resume_deploys": "coordinator_only",
     "list_sessions": "tmux_only",
     "pause_session": "tmux_only",
     "suspend_session": "tmux_only",

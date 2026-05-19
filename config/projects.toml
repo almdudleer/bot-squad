@@ -6,11 +6,16 @@ slug          = "signal-tracker"
 display_name  = "Signal Tracker"
 # Dev clone: where agents work. On the deploy_branch (bot_squad/dev), pushes
 # to staging on every deploy queue.
-repo_path     = "/home/almdudleer/signal_tracker/dev"
+# 2026-05-19: physical path now `signal-tracker/dev` (hyphen, matches slug).
+# Was a symlink at `signal_tracker/dev → signal_tracker_mgmt` which kept
+# confusing path resolution. Migration moved the real clone here and
+# removed the symlink. See data/bot-squad/feedback/F-0001 for the
+# shared-tree pain history that motivated this.
+repo_path     = "/home/almdudleer/signal-tracker/dev"
 # Master clone: separate working tree on master branch for prod deploys,
 # hotfixes, and rollbacks. The dev clone is never touched for these so the
 # agent team can keep working uninterrupted.
-repo_master   = "/home/almdudleer/signal_tracker/master"
+repo_master   = "/home/almdudleer/signal-tracker/master"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
 prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
@@ -19,3 +24,34 @@ dev_url       = "https://signal-dev.dev.uzinvestapi.com"
 deploy_targets = ["staging", "prod"]
 tg_chat       = "404580642"
 created_at    = 2026-05-10
+
+[projects.bot-squad]
+slug          = "bot-squad"
+display_name  = "Bot Squad"
+# Workspace dir: parent of dev/master, where the operator lives. The
+# hook resolves the slug for any session run at or under this path.
+repo_workspace = "/home/almdudleer/bot-squad"
+# Dev clone: editing surface for bot-squad's own code. Branch bot_squad/dev.
+repo_path     = "/home/almdudleer/bot-squad/dev"
+# Master clone: separate from the installation. Merges land here before
+# deploy. The running installation at /home/www/bot-squad is a deploy
+# TARGET, not part of the project tree.
+repo_master   = "/home/almdudleer/bot-squad/master"
+deploy_branch = "bot_squad/dev"
+master_branch = "master"
+prod_url      = "https://botsquad.dev"
+# Convention (update-delivery.md): "staging" deploys to THIS server only
+# (the mothership); "prod" produces a release artifact downloadable by
+# OTHER attached servers. The prod target + artifact pipeline is not
+# wired yet — Chapter II of multi-server initiative. Until it lands,
+# bot-squad only ships "staging" from this server.
+staging_url   = "https://staging.botsquad.dev"
+dev_url       = "https://bot-squad.dev.uzinvestapi.com"
+deploy_targets = ["staging"]
+# Mothership: this install produces bot-squad releases that other attached
+# servers consume. The flag is the SSOT for is_mothership() — the consumer
+# poller (T-0083) and apply (T-0084) short-circuit when this is true so the
+# mothership never tries to consume its own releases. See T-0086.
+mothership    = true
+tg_chat       = "404580642"
+created_at    = 2026-05-14

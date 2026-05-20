@@ -130,10 +130,20 @@ async def list_sessions(
     by a 5 s timeout so a dead/slow user worker can't block the whole list.
     Results are deduped by sid.
 
-    T-0080: non-admin callers see only sessions whose SessionMd `owner`
-    field equals their UI username. Sessions written before owner stamping
-    landed have no owner — they are treated as admin-only so they don't
-    leak to a second user. Admins still see every row.
+    T-0080 owner gate: non-admin callers see only sessions whose SessionMd
+    `owner` field equals their UI username. Sessions written before owner
+    stamping landed have no owner — they are treated as admin-only so they
+    don't leak to a second user. Admins still see every row.
+
+    T-0080 activity status: each row also carries a worker-derived
+    ``activity`` enum (``running|idle|paused|suspended``) and an
+    ``activity_at`` epoch float. Frontends display labels off ``activity``,
+    not the raw md ``status``, so a zombie session with ``status: active``
+    surfaces as ``activity: suspended`` and a live-but-quiet pane surfaces
+    as ``idle`` rather than ``running``. The derivation lives in the
+    worker (``_pane_activity_at`` / ``_derive_activity`` in
+    ``worker/bot_squad_worker/sessions.py``); this endpoint is a
+    pass-through.
     """
     _check_project(request, slug)
     wrouter = _router(request)

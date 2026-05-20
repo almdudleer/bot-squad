@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 import uuid
@@ -68,6 +69,12 @@ class DeployResult:
     returncode: int
     queue_id: str
     log_path: Path | None
+    # Same-(slug,target) queue entries collapsed into this single run, including
+    # the leading one. Always >= 1 on success/failure. Lets the caller report
+    # "5 queued requests collapsed into one deploy" instead of pretending the
+    # other 4 happened separately.
+    collapsed_count: int = 1
+    collapsed_reasons: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +96,47 @@ def _processed_dir(cfg: "Config", slug: str) -> Path:
 
 def _runs_dir(cfg: "Config", slug: str) -> Path:
     return cfg.data_dir / slug / "_jobs" / "deploy" / "runs"
+
+
+def _pause_marker(cfg: "Config", slug: str) -> Path:
+    """Presence-of-file gate: when this exists, deploy_monitor skips the queue."""
+    return cfg.data_dir / slug / "_jobs" / "deploy" / "PAUSED.json"
+
+
+def is_paused(cfg: "Config", slug: str) -> dict | None:
+    """Return the pause metadata dict if the slug's deploys are paused, else None."""
+    marker = _pause_marker(cfg, slug)
+    if not marker.exists():
+        return None
+    try:
+        return json.loads(marker.read_text())
+    except Exception:
+        # Malformed marker file still counts as paused — fail-closed.
+        return {"reason": "(unparseable PAUSED.json)", "paused_by": "?", "paused_at": 0.0}
+
+
+def pause(cfg: "Config", slug: str, reason: str, requested_by: str) -> dict:
+    """Create the pause marker. Returns the metadata that was written."""
+    marker = _pause_marker(cfg, slug)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "reason": reason or "(no reason given)",
+        "paused_by": requested_by,
+        "paused_at": time.time(),
+    }
+    marker.write_text(json.dumps(meta, indent=2))
+    log.info("deploy.pause: %s paused by %s — %s", slug, requested_by, meta["reason"])
+    return meta
+
+
+def resume(cfg: "Config", slug: str) -> bool:
+    """Remove the pause marker. Returns True if it was present (i.e. actually resumed)."""
+    marker = _pause_marker(cfg, slug)
+    if not marker.exists():
+        return False
+    marker.unlink()
+    log.info("deploy.resume: %s resumed", slug)
+    return True
 
 
 def _recipe_path(cfg: "Config", slug: str, target: str) -> Path:
@@ -149,6 +197,16 @@ def list_queued(cfg: "Config", slug: str) -> list[Path]:
     return sorted(queue_dir.glob("*.json"))
 
 
+def is_clean_for_target(cfg: "Config", slug: str, target: str) -> bool:
+    """Public cleanliness check for the clone associated with this target.
+
+    Lets callers (e.g. the deploy_monitor in jobs.py) gate user-facing
+    notifications without re-implementing the check or popping a queue file.
+    """
+    project = cfg.projects[slug]
+    return _is_clean(project.repo_for_target(target))
+
+
 def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     """Run the next queued deploy for ``slug``.
 
@@ -156,7 +214,13 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     - the queue is empty, or
     - the git working tree is dirty (after ignoring quiescence patterns).
 
-    Returns a DeployResult on either success or failure.
+    On success/failure, returns a DeployResult. Same-(slug,target) queue
+    entries trailing the oldest are collapsed into this single run: there's
+    no reason to redeploy identical code five times because five sessions
+    each queued the same target. All collapsed queue files land in
+    `processed/` with the same outcome suffix (.ok or .fail.<rc>), and
+    `DeployResult.collapsed_count` / `.collapsed_reasons` carry the count
+    + reason list for the caller's user-facing message.
     """
     queued = list_queued(cfg, slug)
     if not queued:
@@ -178,11 +242,36 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         # Put the queue file back so we retry next tick
         return None
 
-    # Move to processing/
+    # Collapse same-target trailing entries — they would deploy the same
+    # code anyway (each recipe does `git checkout <branch> && git merge`
+    # against current HEAD). Keep the oldest as the "primary" we report.
+    collapsed_files: list[Path] = []
+    collapsed_reasons: list[str] = [payload.get("reason", "") or ""]
+    for f in queued[1:]:
+        try:
+            p = json.loads(f.read_text())
+        except Exception:
+            continue
+        if p.get("target") != target:
+            continue
+        collapsed_files.append(f)
+        collapsed_reasons.append(p.get("reason", "") or "")
+    if collapsed_files:
+        log.info(
+            "deploy.run_next: %s/%s collapsing %d trailing queue entries into %s",
+            slug, target, len(collapsed_files), queue_id,
+        )
+
+    # Move all collapsed queue files to processing/ atomically.
     processing_dir = _processing_dir(cfg, slug)
     processing_dir.mkdir(parents=True, exist_ok=True)
     processing_file = processing_dir / queue_file.name
     queue_file.rename(processing_file)
+    collapsed_processing: list[Path] = []
+    for f in collapsed_files:
+        dest = processing_dir / f.name
+        f.rename(dest)
+        collapsed_processing.append(dest)
 
     # Prepare log file
     runs_dir = _runs_dir(cfg, slug)
@@ -194,26 +283,52 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     if not recipe.exists():
         log.warning("deploy.run_next: recipe missing: %s", recipe)
         _finish(cfg, slug, processing_file, queue_id, rc=99)
+        for pf in collapsed_processing:
+            _finish(cfg, slug, pf, _queue_id_of(pf), rc=99)
         log_path.write_text(f"recipe not found: {recipe}\n")
-        return DeployResult(ok=False, returncode=99, queue_id=queue_id, log_path=log_path)
+        return DeployResult(
+            ok=False, returncode=99, queue_id=queue_id, log_path=log_path,
+            collapsed_count=1 + len(collapsed_processing),
+            collapsed_reasons=tuple(collapsed_reasons),
+        )
 
     # Run recipe with cwd matching the target clone (dev clone for staging,
     # master clone for prod). Recipes assume their cwd is the right tree.
-    log.info("deploy.run_next: running %s (recipe: %s, cwd: %s)", queue_id, recipe, repo)
+    # Timeout: signal-tracker's image build (vite + npm install + COPY backend)
+    # has crept past the original 600s ceiling — fresh-cache builds now take
+    # ~17 min, blowing the timeout right after `Built` and before the
+    # docker-compose-up swap could finish. 1800s (30 min) gives headroom
+    # without masking truly hung recipes. Override with $BOT_SQUAD_DEPLOY_TIMEOUT.
+    timeout_s = int(os.environ.get("BOT_SQUAD_DEPLOY_TIMEOUT", "1800"))
+    log.info("deploy.run_next: running %s (recipe: %s, cwd: %s, timeout=%ds)", queue_id, recipe, repo, timeout_s)
     with log_path.open("w") as lf:
         proc = subprocess.run(
             ["bash", str(recipe)],
             cwd=str(repo),
             stdout=lf,
             stderr=subprocess.STDOUT,
-            timeout=600,
+            timeout=timeout_s,
         )
 
     rc = proc.returncode
     _finish(cfg, slug, processing_file, queue_id, rc=rc)
+    for pf in collapsed_processing:
+        _finish(cfg, slug, pf, _queue_id_of(pf), rc=rc)
     ok = rc == 0
-    log.info("deploy.run_next: %s/%s finished rc=%d", slug, target, rc)
-    return DeployResult(ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path)
+    log.info("deploy.run_next: %s/%s finished rc=%d (collapsed=%d)", slug, target, rc, 1 + len(collapsed_processing))
+    return DeployResult(
+        ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
+        collapsed_count=1 + len(collapsed_processing),
+        collapsed_reasons=tuple(collapsed_reasons),
+    )
+
+
+def _queue_id_of(processing_file: Path) -> str:
+    """Recover the queue_id from a processing file's name (<ts>-<uuid>.json)."""
+    stem = processing_file.stem  # "<ts_ms>-<uuid>"
+    # Everything after the first dash is the uuid
+    _, _, qid = stem.partition("-")
+    return qid
 
 
 # ---------------------------------------------------------------------------

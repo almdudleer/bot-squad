@@ -6,11 +6,18 @@ slug          = "signal-tracker"
 display_name  = "Signal Tracker"
 # Dev clone: where agents work. On the deploy_branch (bot_squad/dev), pushes
 # to staging on every deploy queue.
-repo_path     = "/home/almdudleer/signal_tracker/dev"
+# 2026-05-19: physical path is `watchrobot/dev` (matches the public brand).
+# Two consecutive migrations same day, both no-symlink: first from
+# `signal_tracker/dev → signal_tracker_mgmt` (symlink) to a real
+# `signal-tracker/dev` dir, then renamed to `watchrobot`. Slug stays
+# `signal-tracker` (containers, DB, code untouched — only the home dir
+# carries the brand name). See data/bot-squad/feedback/F-0001 for the
+# shared-tree pain history that motivated dropping the symlink.
+repo_path     = "/home/almdudleer/watchrobot/dev"
 # Master clone: separate working tree on master branch for prod deploys,
 # hotfixes, and rollbacks. The dev clone is never touched for these so the
 # agent team can keep working uninterrupted.
-repo_master   = "/home/almdudleer/signal_tracker/master"
+repo_master   = "/home/almdudleer/watchrobot/master"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
 prod_url      = "https://signal-tracker.dev.uzinvestapi.com"

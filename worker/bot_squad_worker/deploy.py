@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 import uuid
@@ -293,14 +294,20 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
 
     # Run recipe with cwd matching the target clone (dev clone for staging,
     # master clone for prod). Recipes assume their cwd is the right tree.
-    log.info("deploy.run_next: running %s (recipe: %s, cwd: %s)", queue_id, recipe, repo)
+    # Timeout: signal-tracker's image build (vite + npm install + COPY backend)
+    # has crept past the original 600s ceiling — fresh-cache builds now take
+    # ~17 min, blowing the timeout right after `Built` and before the
+    # docker-compose-up swap could finish. 1800s (30 min) gives headroom
+    # without masking truly hung recipes. Override with $BOT_SQUAD_DEPLOY_TIMEOUT.
+    timeout_s = int(os.environ.get("BOT_SQUAD_DEPLOY_TIMEOUT", "1800"))
+    log.info("deploy.run_next: running %s (recipe: %s, cwd: %s, timeout=%ds)", queue_id, recipe, repo, timeout_s)
     with log_path.open("w") as lf:
         proc = subprocess.run(
             ["bash", str(recipe)],
             cwd=str(repo),
             stdout=lf,
             stderr=subprocess.STDOUT,
-            timeout=600,
+            timeout=timeout_s,
         )
 
     rc = proc.returncode

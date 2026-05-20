@@ -1,6 +1,7 @@
 """Tests for worker.sessions — session list/pause/resume/spawn."""
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -349,6 +350,157 @@ def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
     rows = list_sessions(cfg, "test-project")
     assert len(rows) == 1
     assert rows[0]["initiative"] == "foo.md"
+
+
+# ---------------------------------------------------------------------------
+# T-0080: activity-derived "running" vs "idle" — jsonl-mtime probe
+# ---------------------------------------------------------------------------
+
+def _setup_activity_probe(tmp_path, monkeypatch):
+    """Boilerplate: a live claude pane in `tmp_path/repo` + its jsonl file.
+
+    Returns (cfg, jsonl_path) so the test can mutate the jsonl mtime to
+    drive the running/idle derivation.
+    """
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # Encode cwd to the path claude uses under ~/.claude/projects/.
+    encoded = str(repo).replace("/", "-").lstrip("-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    uuid = "fff00000-0000-0000-0000-000000000fff"
+    jsonl = proj_dir / f"{uuid}.jsonl"
+    jsonl.write_text("{}")
+
+    fake_pane_output = f"%9|mywin|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    return cfg, jsonl
+
+
+def test_pane_activity_at_returns_jsonl_mtime(tmp_path):
+    from bot_squad_worker.sessions import _pane_activity_at
+    encoded = "tmp-repo"
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    jsonl = proj_dir / "abc.jsonl"
+    jsonl.write_text("{}")
+    expected = jsonl.stat().st_mtime
+    got = _pane_activity_at("/tmp/repo", "abc", str(tmp_path))
+    assert got == expected
+
+
+def test_pane_activity_at_none_when_no_uuid(tmp_path):
+    from bot_squad_worker.sessions import _pane_activity_at
+    assert _pane_activity_at("/tmp/repo", None, str(tmp_path)) is None
+
+
+def test_pane_activity_at_none_when_jsonl_missing(tmp_path):
+    from bot_squad_worker.sessions import _pane_activity_at
+    assert _pane_activity_at("/tmp/repo", "nope", str(tmp_path)) is None
+
+
+def test_derive_activity_running_when_fresh():
+    from bot_squad_worker.sessions import _derive_activity
+    now = 1000.0
+    assert _derive_activity("active", now - 5.0, now) == "running"
+
+
+def test_derive_activity_idle_when_stale():
+    from bot_squad_worker.sessions import _derive_activity
+    now = 1000.0
+    assert _derive_activity("active", now - 60.0, now) == "idle"
+
+
+def test_derive_activity_idle_when_no_signal():
+    from bot_squad_worker.sessions import _derive_activity
+    assert _derive_activity("active", None, 1000.0) == "idle"
+
+
+def test_derive_activity_paused_overrides_activity():
+    from bot_squad_worker.sessions import _derive_activity
+    # Even if jsonl is fresh, an explicit md=paused (Ctrl-C) wins so the
+    # UI still offers Resume rather than confusing the operator.
+    assert _derive_activity("paused", 1000.0 - 1.0, 1000.0) == "paused"
+
+
+def test_list_sessions_running_when_jsonl_fresh(tmp_path, monkeypatch):
+    """Fresh jsonl mtime → activity='running' on the returned row."""
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    # touch — already fresh from the write above; just be explicit.
+    now = time.time()
+    os.utime(jsonl, (now, now))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "running"
+    assert rows[0]["status"] == "active"  # back-compat raw status preserved
+    assert rows[0]["activity_at"] is not None
+
+
+def test_list_sessions_idle_when_jsonl_stale(tmp_path, monkeypatch):
+    """jsonl mtime older than RUNNING_THRESHOLD_SEC → activity='idle'.
+
+    DoD reproducer: synth a session whose jsonl mtime is >30s old → API
+    returns idle. Touch the jsonl → next poll flips to running.
+    """
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    stale = time.time() - (S.RUNNING_THRESHOLD_SEC + 5.0)
+    os.utime(jsonl, (stale, stale))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "idle"
+    assert rows[0]["status"] == "active"
+
+    # Touch the jsonl → next poll should flip to running.
+    now = time.time()
+    os.utime(jsonl, (now, now))
+    rows2 = list_sessions(cfg, "test-project")
+    assert rows2[0]["activity"] == "running"
+
+
+def test_list_sessions_suspended_md_has_activity_suspended(tmp_path, monkeypatch):
+    """No live pane → activity is `suspended` regardless of md status."""
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = sessions_dir / "S-testuser-mywin-p7.md"
+    _write_session_metadata(meta_path, {
+        "sid": "S-testuser-mywin-p7",
+        "status": "active",   # zombie md — pane is gone
+        "window": "mywin",
+        "cwd": str(repo),
+        "claude_uuid": "ghost-uuid",
+    })
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "suspended"
+    assert rows[0]["activity_at"] is None
 
 
 def test_list_sessions_unknown_slug(tmp_path, monkeypatch):

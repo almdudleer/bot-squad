@@ -19,6 +19,18 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# T-0080 — activity-derived "running" vs "idle" threshold.
+#
+# A live claude pane bumps the mtime of its own jsonl transcript every time
+# Claude writes (every assistant turn, every tool call). 30s is generous
+# enough that a short tool pause does not flip the label, and short enough
+# that an idle agent registers as `idle` on the next poll. Centralised here
+# so the threshold lives in exactly one place; do not duplicate.
+# ---------------------------------------------------------------------------
+RUNNING_THRESHOLD_SEC = 30.0
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -93,6 +105,63 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     # Latest by mtime → that's the active session
     latest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
     return latest.stem  # filename without .jsonl = UUID
+
+
+def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> float | None:
+    """T-0080: return the per-pane activity timestamp (epoch seconds) or None.
+
+    Reads the mtime of the pane's own jsonl transcript file
+    (``~/.claude/projects/<encoded_cwd>/<uuid>.jsonl``). Claude appends to
+    that file on every assistant turn / tool call, so a fresh mtime means
+    the pane is actively writing.
+
+    Per-pane granularity comes from claude_uuid — each pane has its own
+    UUID and its own jsonl. We intentionally do NOT consult
+    ``<cwd>/.claude/last_user_prompt_ts`` here: that file lives at cwd
+    level and is bumped by every claude pane sharing the repo, so it
+    can't distinguish per-pane activity in the common bot-squad setup
+    where multiple panes share a single repo cwd.
+
+    Returns None when claude_uuid is unknown or the jsonl is missing
+    (e.g. brand-new pane whose first write hasn't happened yet) — the
+    caller treats this as "no recent activity".
+    """
+    if not claude_uuid:
+        return None
+    encoded = cwd.replace("/", "-").lstrip("-")
+    jsonl_path = Path(user_home) / ".claude" / "projects" / encoded / f"{claude_uuid}.jsonl"
+    try:
+        return jsonl_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _derive_activity(
+    live_status: str,
+    activity_at: float | None,
+    now: float,
+    *,
+    threshold_sec: float = RUNNING_THRESHOLD_SEC,
+) -> str:
+    """T-0080: map (live md status, activity_at, now) → canonical activity enum.
+
+    Enum: ``running | idle | paused | suspended``. ``suspended`` is set by
+    the caller for the no-live-pane path; this helper only handles the
+    live-pane derivation.
+
+    - ``paused`` (md says Ctrl-C'd) stays ``paused`` — distinct from idle
+      so the UI can offer Resume.
+    - Live pane + recent jsonl mtime (< threshold_sec) → ``running``.
+    - Live pane + stale or missing mtime → ``idle``.
+
+    Activity-derived: never trusts a self-reported `status: active` in the
+    md when the jsonl tells a different story.
+    """
+    if live_status == "paused":
+        return "paused"
+    if activity_at is not None and (now - activity_at) < threshold_sec:
+        return "running"
+    return "idle"
 
 
 def _get_user_home() -> str:
@@ -319,9 +388,19 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 if own_val and own_val != "~":
                     owner_meta = str(own_val)
 
+        # T-0080: activity-derived status. The existing `status` (md/zombie)
+        # is preserved for back-compat callers and action-button routing;
+        # `activity` is the canonical label-display enum derived from the
+        # jsonl mtime probe. Two fields — not a replacement — per the
+        # binding-audit "don't replace existing status logic, extend it".
+        activity_at = _pane_activity_at(pane.cwd, claude_uuid, user_home)
+        activity = _derive_activity(live_status, activity_at, time.time())
+
         rows.append({
             "sid": sid,
             "status": live_status,
+            "activity": activity,
+            "activity_at": activity_at,
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
@@ -386,6 +465,10 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             rows.append({
                 "sid": sid,
                 "status": display_status,
+                # T-0080: no live pane → activity is unambiguously suspended,
+                # regardless of what the md frontmatter claims.
+                "activity": "suspended",
+                "activity_at": None,
                 "window": meta.get("window", ""),
                 "cwd": meta.get("cwd", ""),
                 "started_at": meta.get("started_at"),

@@ -4,30 +4,33 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
+import { sessionActivity, sessionLabel } from "../utils/sessionStatus";
 
 import { PageHelp } from "../components/PageHelp";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Render a status badge consistent with the new vocabulary:
-//   active     — live pane, not paused        → green LED + ok badge
-//   paused/idle — live pane, user pressed pause → grey LED + dim badge ("idle")
-//   suspended  — pane gone, resurrectable     → faint dot + dim badge
-function StatusBadge({ status }: { status: string }) {
-  if (status === "active") {
+// T-0080: render a badge keyed off the canonical `activity` enum
+// (worker-derived from jsonl mtime). `running` is the only "green LED"
+// state — a live-but-quiet pane is `idle`, never `running`. Same
+// vocabulary is used by TaskCard / TaskDetail so card and detail no
+// longer disagree on the label.
+function StatusBadge({ row }: { row: SessionRow }) {
+  const a = sessionActivity(row);
+  if (a === "running") {
     return (
       <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
         <span className="mc-dot mc-dot-active" />
-        <span className="mc-badge mc-badge-ok">active</span>
+        <span className="mc-badge mc-badge-ok">{sessionLabel(a)}</span>
       </span>
     );
   }
-  if (status === "paused" || status === "idle") {
+  if (a === "idle" || a === "paused") {
     return (
       <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
         <span className="mc-dot mc-dot-idle" />
-        <span className="mc-badge mc-badge-dim">idle</span>
+        <span className="mc-badge mc-badge-dim">{sessionLabel(a)}</span>
       </span>
     );
   }
@@ -35,7 +38,7 @@ function StatusBadge({ status }: { status: string }) {
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", opacity: 0.7 }}>
       <span className="mc-dot mc-dot-idle" />
-      <span className="mc-badge mc-badge-dim">suspended</span>
+      <span className="mc-badge mc-badge-dim">{sessionLabel(a)}</span>
     </span>
   );
 }
@@ -521,7 +524,7 @@ export function Sessions() {
 
           {/* Status */}
           <td>
-            <StatusBadge status={s.status} />
+            <StatusBadge row={s} />
           </td>
 
           {/* Started */}

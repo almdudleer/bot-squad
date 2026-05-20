@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
+import {
+  isRunning,
+  sessionActivity,
+  sessionGlyph,
+  sessionLabel,
+} from "../utils/sessionStatus";
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "open", label: "Open" },
@@ -35,6 +41,11 @@ export function TaskDetail() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [activeDevs, setActiveDevs] = useState<SessionRow[]>([]);
+  // T-0080: keep every session row keyed by sid so we can look up the
+  // worker-derived activity for the bound dev session below. The
+  // /backlog endpoint that drove `task.session` doesn't enrich with
+  // the activity probe, so we join client-side from /sessions.
+  const [sessionsBySid, setSessionsBySid] = useState<Record<string, SessionRow>>({});
   // T-0038 follow-up: surface initiative binding here. We load every
   // initiative file (active+draft+done) so the operator can bind a task
   // to e.g. a draft initiative without first activating it.
@@ -74,7 +85,9 @@ export function TaskDetail() {
       })
       .catch((e) => setError(String(e)));
     // Phase 9: surface active devs so the user can bind this task to an
-    // already-running dev (multi-binding). Silent on error.
+    // already-running dev (multi-binding). Silent on error. T-0080:
+    // also stash every row by sid for activity lookup against the
+    // bound session pill below.
     api.sessions(slug)
       .then((rows) => {
         setActiveDevs(rows.filter((s) => {
@@ -82,8 +95,14 @@ export function TaskDetail() {
           const tid = (s.task_id ?? "").trim();
           return Boolean(tid) && tid !== "~";
         }));
+        const map: Record<string, SessionRow> = {};
+        for (const r of rows) map[r.sid] = r;
+        setSessionsBySid(map);
       })
-      .catch(() => setActiveDevs([]));
+      .catch(() => {
+        setActiveDevs([]);
+        setSessionsBySid({});
+      });
     api.vision(slug)
       .then((files) =>
         setInitiatives(
@@ -450,10 +469,17 @@ export function TaskDetail() {
           </option>
           <option value="__new__">+ Create new dev session…</option>
           {/* Surface the current binding even if it's not in activeDevs
-              (e.g. paused/suspended) so the select reflects reality. */}
+              (e.g. paused/suspended) so the select reflects reality.
+              T-0080: label via the canonical activity formatter so this
+              dropdown row reads the same vocabulary as the rest of the
+              page. */}
           {task.session && !activeDevs.some((d) => d.sid === task.session!.sid) && (
             <option value={task.session.sid}>
-              {task.session.sid} ({task.session.status})
+              {task.session.sid} (
+              {sessionLabel(
+                sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
+              )}
+              )
             </option>
           )}
           {activeDevs.map((d) => (
@@ -474,21 +500,29 @@ export function TaskDetail() {
             Unassign
           </button>
         )}
-        {task.session && (
-          <span
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontSize: "0.7rem",
-              color:
-                task.session.status === "active"
+        {task.session && (() => {
+          // T-0080: prefer the worker-derived activity (from /sessions
+          // join via sessionsBySid) over the raw md status. Falls back
+          // to the status-derived mapping in sessionActivity() when
+          // the session isn't in the live list (e.g. suspended).
+          const live = sessionsBySid[task.session.sid];
+          const act = sessionActivity(live ?? task.session);
+          const green = isRunning(act);
+          return (
+            <span
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.7rem",
+                color: green
                   ? "var(--mc-accent-success, #4ade80)"
                   : "var(--mc-text-dim)",
-            }}
-            title={`session status: ${task.session.status}`}
-          >
-            {task.session.status === "active" ? "●" : "◌"} {task.session.status}
-          </span>
-        )}
+              }}
+              title={`session status: ${act}`}
+            >
+              {sessionGlyph(act)} {sessionLabel(act)}
+            </span>
+          );
+        })()}
       </div>
 
       {/* Verbatim request — source-of-truth section */}

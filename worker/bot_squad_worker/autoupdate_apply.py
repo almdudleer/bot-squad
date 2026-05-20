@@ -85,6 +85,31 @@ SMOKE_BACKOFF_SECONDS = (5, 10, 20, 30)  # ≤65s total wall time
 SMOKE_REQUEST_TIMEOUT_SECONDS = 10.0
 
 
+def _extra_rsync_excludes() -> tuple[str, ...]:
+    """Per-install rsync exclude patterns for the apply pipeline.
+
+    Read once per call from ``BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES`` (comma-
+    separated). Lets a consumer install preserve site-local customizations
+    that aren't in the upstream tarball — typically ``docker-compose.yml``
+    overrides, ``.env`` files, or sidecar service definitions. The base
+    ``data/`` exclusion is always applied separately and isn't configurable.
+
+    Default: empty (canonical consumer behavior — full sync from upstream).
+    """
+    raw = os.environ.get("BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES", "")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return tuple(parts)
+
+
+def _sync_excludes() -> tuple[str, ...]:
+    """Full exclude tuple for the install-tree sync step.
+
+    Always includes ``data/`` (mutable user state — explicit in T-0084 spec).
+    Appends ``_extra_rsync_excludes()`` for per-install customizations.
+    """
+    return ("data/", *_extra_rsync_excludes())
+
+
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
@@ -251,7 +276,7 @@ def _snapshot(cfg: Any, prev_version: str) -> Path:
     snap = snapshot_path(cfg, prev_version)
     if snap.exists():
         shutil.rmtree(snap)
-    _rsync(install_root(cfg), snap, delete=True, exclude=("data/",))
+    _rsync(install_root(cfg), snap, delete=True, exclude=_sync_excludes())
     return snap
 
 
@@ -260,7 +285,7 @@ def _restore(cfg: Any, snap: Path) -> None:
     is preserved (rsync ignores it via --exclude=data/)."""
     if not snap.exists():
         raise RuntimeError(f"snapshot missing during restore: {snap}")
-    _rsync(snap, install_root(cfg), delete=True, exclude=("data/",))
+    _rsync(snap, install_root(cfg), delete=True, exclude=_sync_excludes())
 
 
 def _extract(tarball: Path, dest: Path) -> None:
@@ -515,7 +540,7 @@ def apply(cfg: Any, entry: dict) -> ApplyResult:
     The poller's ``autoupdate.json`` is updated either way (last_apply_at,
     last_apply_outcome, installed_version on success).
     """
-    if is_mothership():
+    if is_mothership(config_dir=getattr(cfg, "config_dir", None)):
         log.debug("autoupdate_apply: mothership self-exclusion — apply is a no-op")
         return ApplyResult(ok=True, version=entry.get("version", "?"), skipped=True)
 
@@ -575,7 +600,7 @@ def apply(cfg: Any, entry: dict) -> ApplyResult:
         # ---- 4. extract + sync into install
         try:
             _extract(tarball, extracted)
-            _rsync(extracted, install_root(cfg), delete=True, exclude=("data/",))
+            _rsync(extracted, install_root(cfg), delete=True, exclude=_sync_excludes())
         except Exception as e:
             _safe_restore(cfg, snap, version)
             return _finish_failure(cfg, version, "extract", f"{type(e).__name__}: {e}")
@@ -663,7 +688,7 @@ def drain_one(cfg: Any) -> Optional[ApplyResult]:
     """Process at most ONE queue file. Returns None if the queue is empty,
     if the operator has paused autoupdate (T-0089), or if this is the
     mothership."""
-    if is_mothership():
+    if is_mothership(config_dir=getattr(cfg, "config_dir", None)):
         return None
 
     # T-0089: honor the operator pause flag. Queued jobs sit untouched

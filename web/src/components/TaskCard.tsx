@@ -21,6 +21,10 @@ interface TaskCardProps {
   task: Task;
   slug: string;
   onMenuAction: (task: Task, action: MenuAction) => void;
+  // T-0096: when the board is already filtered to a single initiative or
+  // grouped by initiative, the chip is redundant noise. Parent decides;
+  // the card does not infer.
+  hideInitiative?: boolean;
 }
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
@@ -35,7 +39,7 @@ function countComments(body: string): number {
   return (body.match(/^### /gm) ?? []).length;
 }
 
-export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
+export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: TaskCardProps) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -201,8 +205,9 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
         {/* T-0038 stakeholder follow-up #3: surface the bound initiative on
             every card. Click-through goes to the roadmap. Active/draft/done
             tag lives on the swimlane header, not here — keep card noise
-            low. */}
-        {task.initiative && task.initiative !== "~" && (
+            low. T-0096: parent may suppress when the board view already
+            disambiguates initiative (single-init filter or group-by). */}
+        {!hideInitiative && task.initiative && task.initiative !== "~" && (
           <span
             data-no-nav
             title={`Initiative: ${task.initiative}`}
@@ -253,7 +258,8 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
               title={`${act} session ${task.session.sid} — click to view`}
               onClick={(e) => {
                 e.stopPropagation();
-                navigate(`/p/${slug}/sessions`);
+                // T-0099: deep-link to the bound session's row.
+                navigate(`/p/${slug}/sessions?sid=${encodeURIComponent(task.session!.sid)}`);
               }}
               style={{
                 fontFamily: "var(--mc-mono)",

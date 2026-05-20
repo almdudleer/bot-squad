@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
@@ -89,10 +89,35 @@ export function Project() {
   const [error, setError] = useState<string | null>(null);
 
   // T-0039: view controls. Defaults reproduce the pre-T-0039 board exactly.
-  const [groupBy, setGroupBy] = useState<GroupBy>("none");
-  const [viewMode, setViewMode] = useState<ViewMode>("board");
-  // Filter is a single initiative basename, UNATTACHED, or "" for all.
-  const [filterInit, setFilterInit] = useState<string>("");
+  // T-0097: persisted in URL query params (`group`, `view`, `init`) so
+  // refresh / deep-link / open-in-new-tab all reproduce the same view.
+  // URL is the source of truth — no useState, no sync drift. Default
+  // values are omitted from the URL to keep deep-links clean.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const groupBy: GroupBy =
+    searchParams.get("group") === "initiative" ? "initiative" : "none";
+  const viewMode: ViewMode =
+    searchParams.get("view") === "list" ? "list" : "board";
+  // Filter is a single initiative basename, UNATTACHED, ACTIVE_ONLY, or "" for all.
+  const filterInit: string = searchParams.get("init") ?? "";
+
+  // Toggle a single param, dropping it when the value matches the default
+  // (keeps the URL minimal). `replace: true` so back-button doesn't ladder
+  // through every selector flip.
+  function updateParam(key: string, value: string, defaultValue: string) {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value === defaultValue) next.delete(key);
+        else next.set(key, value);
+        return next;
+      },
+      { replace: true },
+    );
+  }
+  const setGroupBy = (v: GroupBy) => updateParam("group", v, "none");
+  const setViewMode = (v: ViewMode) => updateParam("view", v, "board");
+  const setFilterInit = (v: string) => updateParam("init", v, "");
 
   // Per-lane collapsed state. Key = initiative basename or UNATTACHED.
   // Persisted to localStorage per project so a folded set of "done"
@@ -281,6 +306,15 @@ export function Project() {
       grouped[t.status].push(t);
     }
   }
+
+  // T-0096: the card chip is redundant whenever the board view already
+  // disambiguates initiative. That's true when grouping by initiative
+  // (each lane = one initiative) OR when filtering to a specific
+  // initiative basename / UNATTACHED (every visible card shares the
+  // same binding). ACTIVE_ONLY still mixes initiatives — keep the chip.
+  const hideInitiativeChip =
+    groupBy === "initiative" ||
+    (filterInit !== "" && filterInit !== ACTIVE_ONLY);
 
   function openCreate() {
     setNewTitle("");
@@ -578,6 +612,7 @@ export function Project() {
                     : null
                 }
                 onToggleRail={RAIL_STATUSES.has(c) ? () => toggleRail(c) : undefined}
+                hideInitiative={hideInitiativeChip}
               />
             ))}
           </div>
@@ -586,6 +621,7 @@ export function Project() {
             tasks={ungroupedTasks}
             slug={slug}
             onMenuAction={handleMenuAction}
+            hideInitiative={hideInitiativeChip}
           />
         )
       ) : (
@@ -952,6 +988,7 @@ function InitiativeLane({
                   : null
               }
               onToggleRail={RAIL_STATUSES.has(c) ? () => onToggleRail(c) : undefined}
+              hideInitiative
             />
           ))}
         </div>
@@ -960,6 +997,7 @@ function InitiativeLane({
           tasks={tasks}
           slug={slug}
           onMenuAction={onMenuAction}
+          hideInitiative
         />
       ))}
     </div>
@@ -970,6 +1008,8 @@ interface ListBoardProps {
   tasks: Task[];
   slug: string;
   onMenuAction: (task: Task, action: MenuAction) => void;
+  // T-0096: forwarded to every TaskCard rendered by the list.
+  hideInitiative?: boolean;
 }
 
 /**
@@ -977,7 +1017,7 @@ interface ListBoardProps {
  * stacked into a single column. DnD reordering is omitted to keep the
  * list lean — use the board view when reordering matters.
  */
-function ListBoard({ tasks, slug, onMenuAction }: ListBoardProps) {
+function ListBoard({ tasks, slug, onMenuAction, hideInitiative = false }: ListBoardProps) {
   const grouped = COLUMNS.reduce<Record<string, Task[]>>(
     (acc, c) => ({ ...acc, [c]: [] }),
     {},
@@ -1007,6 +1047,7 @@ function ListBoard({ tasks, slug, onMenuAction }: ListBoardProps) {
                     task={t}
                     slug={slug}
                     onMenuAction={onMenuAction}
+                    hideInitiative={hideInitiative}
                   />
                 ))}
               </div>

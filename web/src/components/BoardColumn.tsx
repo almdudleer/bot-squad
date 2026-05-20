@@ -15,6 +15,8 @@ interface BoardColumnProps {
   // clickable header to collapse back. Toggled via onToggleRail.
   railMode?: "collapsed" | "expanded" | null;
   onToggleRail?: () => void;
+  // T-0096: forwarded to every TaskCard rendered by this column.
+  hideInitiative?: boolean;
 }
 
 const DRAG_MIME = "application/x-bot-squad-task";
@@ -44,6 +46,7 @@ export function BoardColumn({
   onReorder,
   railMode = null,
   onToggleRail,
+  hideInitiative = false,
 }: BoardColumnProps) {
   const [isOver, setIsOver] = useState(false);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
@@ -165,7 +168,7 @@ export function BoardColumn({
           ref={(el) => { cardRefs.current[i] = el; }}
         >
           {showIndicatorAt(i) && <DropIndicator />}
-          <TaskCard task={t} slug={slug} onMenuAction={onMenuAction} />
+          <TaskCard task={t} slug={slug} onMenuAction={onMenuAction} hideInitiative={hideInitiative} />
         </div>
       ))}
       {showIndicatorAt(sorted.length) && <DropIndicator />}

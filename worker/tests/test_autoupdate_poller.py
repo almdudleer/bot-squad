@@ -46,6 +46,7 @@ def _isolate_env(monkeypatch):
         "BOT_SQUAD_MOTHERSHIP_URL",
         "BOTSQUAD_MOTHERSHIP_URL",
         "BOT_SQUAD_AUTOUPDATE_INTERVAL_SECONDS",
+        "BOT_SQUAD_INSTALL_ID",
     ):
         monkeypatch.delenv(key, raising=False)
     # Default to consumer; tests opt in to mothership mode.
@@ -353,3 +354,209 @@ def test_tick_bad_entry_does_not_enqueue(tmp_path, monkeypatch):
     assert queued == []
     state = autoupdate.load_state(cfg)
     assert state["installed_version"] is None
+
+
+# ---------------------------------------------------------------------------
+# install_id resolution (T-0088)
+# ---------------------------------------------------------------------------
+
+def test_install_id_env_takes_precedence(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    # File present AND env set — env wins.
+    autoupdate.install_id_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    autoupdate.install_id_path(cfg).write_text("srv_from_file\n")
+    monkeypatch.setenv("BOT_SQUAD_INSTALL_ID", "srv_from_env")
+    assert autoupdate.install_id(cfg) == "srv_from_env"
+
+
+def test_install_id_reads_from_file_when_env_unset(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    autoupdate.install_id_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    autoupdate.install_id_path(cfg).write_text("srv_from_file\n")
+    assert autoupdate.install_id(cfg) == "srv_from_file"
+
+
+def test_install_id_missing_everywhere_returns_none(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert autoupdate.install_id(cfg) is None
+
+
+def test_install_id_empty_file_returns_none(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    autoupdate.install_id_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    autoupdate.install_id_path(cfg).write_text("   \n")
+    assert autoupdate.install_id(cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# Telemetry POST (T-0088)
+# ---------------------------------------------------------------------------
+
+def _capture_post(monkeypatch, *, status_code: int = 204):
+    """Replace httpx.post with a capture stub; returns the calls list."""
+    calls: list[dict] = []
+
+    def fake_post(url, json, timeout):  # noqa: A002 — match httpx signature
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return httpx.Response(status_code, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    return calls
+
+
+def _seed_install_id(cfg, value: str = "srv_test_consumer") -> None:
+    autoupdate.install_id_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    autoupdate.install_id_path(cfg).write_text(value + "\n")
+
+
+def test_post_telemetry_sends_full_snapshot(monkeypatch):
+    calls = _capture_post(monkeypatch, status_code=204)
+    state = {
+        "installed_version": "v2026.05.16.2",
+        "last_check_at": "2026-05-16T17:00:00+00:00",
+        "last_apply_at": "2026-05-16T16:30:00+00:00",
+        "last_apply_outcome": "success",
+        "current_git_sha": "abc123",
+    }
+    ok = autoupdate._post_telemetry("https://mothership.example/", "srv_x", state)
+    assert ok is True
+    assert len(calls) == 1
+    sent = calls[0]
+    assert sent["url"] == "https://mothership.example/api/releases/_telemetry"
+    assert sent["json"]["install_id"] == "srv_x"
+    for k, v in state.items():
+        assert sent["json"][k] == v
+
+
+def test_post_telemetry_drops_unknown_state_keys(monkeypatch):
+    """Only spec'd fields ride along — a future debug-only key in
+    autoupdate.json must not leak over the wire."""
+    calls = _capture_post(monkeypatch)
+    state = {
+        "installed_version": "v2026.05.16.2",
+        "last_check_at": "2026-05-16T17:00:00+00:00",
+        "last_apply_at": None,
+        "last_apply_outcome": "never",
+        "current_git_sha": None,
+        "secret_debug_field": "should-not-leak",
+    }
+    autoupdate._post_telemetry("https://mothership.example", "srv_x", state)
+    assert "secret_debug_field" not in calls[0]["json"]
+
+
+def test_post_telemetry_returns_false_on_403(monkeypatch):
+    _capture_post(monkeypatch, status_code=403)
+    ok = autoupdate._post_telemetry(
+        "https://mothership.example", "srv_unknown", {}
+    )
+    assert ok is False
+
+
+def test_post_telemetry_returns_false_on_500(monkeypatch):
+    _capture_post(monkeypatch, status_code=500)
+    ok = autoupdate._post_telemetry("https://mothership.example", "srv_x", {})
+    assert ok is False
+
+
+def test_post_telemetry_returns_false_on_transport_error(monkeypatch):
+    def boom(url, json, timeout):  # noqa: ARG001, A002
+        raise httpx.ConnectError("nope", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", boom)
+    ok = autoupdate._post_telemetry("https://mothership.example", "srv_x", {})
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# tick() — telemetry piggy-back (T-0088)
+# ---------------------------------------------------------------------------
+
+def test_tick_piggybacks_telemetry_post_after_fetch(tmp_path, monkeypatch):
+    """Happy path: tick fetches latest, then POSTs telemetry with the
+    freshly-stamped state."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mothership.example")
+    _seed_install_id(cfg, "srv_consumer_one")
+    _install_fake_fetch(monkeypatch, _entry(version="v2026.05.16.5", git_sha="sha5"))
+    calls = _capture_post(monkeypatch)
+
+    autoupdate.tick(cfg)
+
+    assert len(calls) == 1
+    sent = calls[0]["json"]
+    assert sent["install_id"] == "srv_consumer_one"
+    # First-run-stamped bumps installed_version BEFORE the telemetry POST
+    # reloads state, so the mothership sees the post-handle snapshot.
+    assert sent["installed_version"] == "v2026.05.16.5"
+    assert sent["current_git_sha"] == "sha5"
+
+
+def test_tick_skips_telemetry_when_install_id_missing(tmp_path, monkeypatch):
+    """No install.id + no env → telemetry POST is silently skipped (the
+    tick itself still updates state via _handle_latest)."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mothership.example")
+    _install_fake_fetch(monkeypatch, _entry())
+    calls = _capture_post(monkeypatch)
+
+    autoupdate.tick(cfg)
+
+    assert calls == []  # never posted
+    # but state was still stamped — tick wasn't blocked.
+    assert autoupdate.load_state(cfg)["installed_version"] is not None
+
+
+def test_tick_posts_telemetry_even_when_fetch_fails(tmp_path, monkeypatch):
+    """Mothership read failure must NOT suppress the write-side ping —
+    that's how the operator UI's "last seen" clock keeps moving while
+    the read path is flaky."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mothership.example")
+    _seed_install_id(cfg, "srv_consumer_one")
+    # Pre-stamp some state so the POST has interesting content.
+    autoupdate.save_state(cfg, {
+        "installed_version": "v2026.05.16.1",
+        "last_check_at": None,
+        "last_apply_at": None,
+        "last_apply_outcome": "never",
+        "current_git_sha": "old",
+    })
+    _install_fake_fetch(monkeypatch, None)  # fetch fails
+    calls = _capture_post(monkeypatch)
+
+    autoupdate.tick(cfg)
+
+    assert len(calls) == 1
+    assert calls[0]["json"]["install_id"] == "srv_consumer_one"
+    assert calls[0]["json"]["installed_version"] == "v2026.05.16.1"
+    # last_check_at was stamped pre-fetch and the POST reads fresh state.
+    assert calls[0]["json"]["last_check_at"] is not None
+
+
+def test_tick_telemetry_post_failure_does_not_break_tick(tmp_path, monkeypatch):
+    """A 403 from the mothership is logged but does not raise — the tick
+    completes normally and the next tick will retry."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mothership.example")
+    _seed_install_id(cfg, "srv_unknown")
+    _install_fake_fetch(monkeypatch, _entry())
+    _capture_post(monkeypatch, status_code=403)
+
+    # Must not raise.
+    autoupdate.tick(cfg)
+
+    # State was still updated by _handle_latest's first-run path.
+    assert autoupdate.load_state(cfg)["installed_version"] is not None
+
+
+def test_tick_mothership_skips_telemetry_too(tmp_path, monkeypatch):
+    """Mothership self-exclusion short-circuits before telemetry POST."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mothership.example")
+    monkeypatch.setattr(autoupdate, "is_mothership", lambda *a, **kw: True)
+    _seed_install_id(cfg, "srv_does_not_matter")
+    calls = _capture_post(monkeypatch)
+
+    autoupdate.tick(cfg)
+
+    assert calls == []

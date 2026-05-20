@@ -41,6 +41,19 @@ Mothership self-exclusion
 The poller short-circuits to a no-op on the mothership itself. T-0086
 will normally prevent the tick from being scheduled at all, but this is
 belt-and-suspenders — the producer of releases must never consume them.
+
+Telemetry piggy-back (T-0088)
+-----------------------------
+
+Each tick also POSTs the local autoupdate.json state to
+``<mothership>/api/releases/_telemetry`` so the mothership UI (T-0087)
+can render an installs grid showing every consumer's current version +
+last apply outcome. The POST is best-effort — a failure (transport,
+4xx, 5xx) never blocks the rest of the tick, and we send a fresher
+snapshot on the next cycle. The consumer's ``install_id`` is read from
+``BOT_SQUAD_INSTALL_ID`` if set, else from
+``<data_dir>/_worker/install.id`` which the installer script writes
+after the mothership ``/connect`` handshake.
 """
 from __future__ import annotations
 
@@ -71,6 +84,8 @@ from bot_squad_worker.install_role import is_mothership
 DEFAULT_INTERVAL_SECONDS = 900  # 15 minutes (overridable via env)
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 LATEST_PATH = "/api/releases/latest"
+TELEMETRY_PATH = "/api/releases/_telemetry"
+INSTALL_ID_FILE = "install.id"
 
 
 def interval_seconds() -> int:
@@ -111,6 +126,43 @@ def mothership_url() -> Optional[str]:
 
 def state_path(cfg: Any) -> Path:
     return cfg.data_dir / "_worker" / "autoupdate.json"
+
+
+def install_id_path(cfg: Any) -> Path:
+    """Path of the persisted Chapter-I install_id (``srv_<hex>``).
+
+    Written by ``scripts/install/install.sh`` after the mothership ``/connect``
+    handshake mints a ``server_id`` (T-0024 — alongside the existing
+    ``$BOTSQUAD_STATE_DIR/server.token``). Living under ``data/_worker/``
+    keeps it next to ``autoupdate.json`` so the worker can read it without
+    needing to know the installer user's ``$HOME``.
+    """
+    return cfg.data_dir / "_worker" / INSTALL_ID_FILE
+
+
+def install_id(cfg: Any) -> Optional[str]:
+    """Resolve this consumer's mothership-issued install_id.
+
+    Preference order:
+      1. ``BOT_SQUAD_INSTALL_ID`` env var (override for tests + ad-hoc fixes).
+      2. ``<data_dir>/_worker/install.id`` (written at install time).
+      3. ``None`` — caller treats telemetry POST as a no-op (logs once at
+         debug; tick still runs).
+    """
+    env = os.environ.get("BOT_SQUAD_INSTALL_ID")
+    if env:
+        v = env.strip()
+        if v:
+            return v
+    p = install_id_path(cfg)
+    if not p.is_file():
+        return None
+    try:
+        v = p.read_text().strip()
+    except OSError as e:
+        log.warning("autoupdate: could not read install.id at %s: %s", p, e)
+        return None
+    return v or None
 
 
 def queue_dir(cfg: Any) -> Path:
@@ -222,6 +274,64 @@ def _fetch_latest(base_url: str, *, timeout: float = DEFAULT_HTTP_TIMEOUT_SECOND
 
 
 # ---------------------------------------------------------------------------
+# Telemetry POST (T-0088)
+# ---------------------------------------------------------------------------
+
+# Fields the mothership expects (mirrored from
+# ``api/app/routes_releases.py:_TELEMETRY_FIELDS``). We send the local
+# autoupdate.json state verbatim minus anything not on this list, so we
+# never accidentally leak a future debug-only state key over the wire.
+_TELEMETRY_FIELDS = (
+    "installed_version",
+    "last_check_at",
+    "last_apply_at",
+    "last_apply_outcome",
+    "current_git_sha",
+)
+
+
+def _post_telemetry(
+    base_url: str,
+    iid: str,
+    state: dict,
+    *,
+    timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+) -> bool:
+    """Best-effort POST of telemetry state to the mothership.
+
+    Returns True on 2xx, False on anything else (incl. transport errors,
+    timeouts, 4xx, 5xx). Telemetry is advisory — a failed POST never
+    blocks the rest of the tick, and we deliberately do NOT retry: the
+    next tick (15 min by default) will resend a fresher snapshot anyway.
+
+    Logs 403 at WARNING because that means the consumer's ``install.id``
+    no longer matches a registry row — typically the mothership re-issued
+    the install, or this consumer was removed. The operator needs to know.
+    """
+    url = f"{base_url.rstrip('/')}{TELEMETRY_PATH}"
+    body = {"install_id": iid, **{k: state.get(k) for k in _TELEMETRY_FIELDS}}
+    try:
+        resp = httpx.post(url, json=body, timeout=timeout)
+    except (httpx.TransportError, httpx.TimeoutException) as e:
+        log.info("autoupdate: telemetry POST transport error for %s: %s", url, e)
+        return False
+    if resp.status_code == 403:
+        log.warning(
+            "autoupdate: telemetry POST rejected (403) — install_id %r not in "
+            "mothership registry (re-install or removed?)",
+            iid,
+        )
+        return False
+    if resp.status_code >= 400:
+        log.info(
+            "autoupdate: telemetry POST returned HTTP %d for %s",
+            resp.status_code, url,
+        )
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Apply-job queue
 # ---------------------------------------------------------------------------
 
@@ -311,11 +421,26 @@ def tick(cfg: Any) -> None:
     save_state(cfg, state)
 
     entry = _fetch_latest(base_url)
-    if entry is None:
-        # last_check_at is already stamped; nothing else to do.
-        return
+    if entry is not None:
+        try:
+            _handle_latest(cfg, entry)
+        except Exception:
+            log.exception("autoupdate: _handle_latest raised on entry=%r", entry)
 
+    # T-0088: piggy-back telemetry on every tick (even when the manifest
+    # fetch failed) so the operator UI's "last seen" clock keeps moving
+    # while the mothership is intermittently unreachable in EITHER direction.
+    # We re-load state here so the snapshot includes any updates _handle_latest
+    # just wrote (e.g. first_run_stamped bumping installed_version). Failure
+    # is silent at the tick level — _post_telemetry already logs.
+    iid = install_id(cfg)
+    if not iid:
+        log.debug(
+            "autoupdate: no install.id (and BOT_SQUAD_INSTALL_ID unset) — "
+            "skipping telemetry POST"
+        )
+        return
     try:
-        _handle_latest(cfg, entry)
+        _post_telemetry(base_url, iid, load_state(cfg))
     except Exception:
-        log.exception("autoupdate: _handle_latest raised on entry=%r", entry)
+        log.exception("autoupdate: telemetry POST raised unexpectedly")

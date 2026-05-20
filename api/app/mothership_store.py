@@ -81,6 +81,14 @@ class AttachedServer:
     # rows on disk (no key) deserialise unchanged via the ``**s`` splat in
     # ``list_servers``; we tolerate the missing key in ``_read`` below.
     is_self: bool = False
+    # T-0088: latest release-telemetry snapshot reported by the consumer's
+    # autoupdate poller. None until the first ``POST /api/releases/_telemetry``
+    # lands for this server. Shape (free-form dict, validated at the route
+    # layer): ``{installed_version, last_check_at, last_apply_at,
+    # last_apply_outcome, current_git_sha}``. We store the dict verbatim so
+    # the GET handler can fan it back out as-is without a second migration
+    # if the consumer ever adds a field.
+    release: dict | None = None
 
     def to_public(self) -> dict:
         d = asdict(self)
@@ -385,6 +393,38 @@ class MothershipStore:
                     servers[i] = replace(s, projects_cache=normalised)
                     self.write(servers)
                     return normalised
+        return None
+
+    # ---- release telemetry (T-0088) -----------------------------------------
+
+    # Allowlist mirrors the spec'd POST body (minus ``install_id``, which is
+    # the key, not part of the payload). Anything else the consumer ships is
+    # dropped here so we never leak unexpected fields back through the GET.
+    _RELEASE_FIELDS = (
+        "installed_version",
+        "last_check_at",
+        "last_apply_at",
+        "last_apply_outcome",
+        "current_git_sha",
+    )
+
+    def set_release_telemetry(
+        self, server_id: str, telemetry: dict
+    ) -> AttachedServer | None:
+        """Replace the ``release`` snapshot for ``server_id``.
+
+        Persists only the allowlisted keys; values are stored verbatim (the
+        route layer is responsible for sane type-checking of the payload).
+        Returns the updated entry, or ``None`` if no such server.
+        """
+        normalised = {k: telemetry.get(k) for k in self._RELEASE_FIELDS}
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id == server_id:
+                    servers[i] = replace(s, release=normalised)
+                    self.write(servers)
+                    return servers[i]
         return None
 
     def touch_last_seen(self, server_id: str) -> None:

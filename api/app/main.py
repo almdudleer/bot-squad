@@ -95,6 +95,19 @@ def build_app() -> FastAPI:
     from app.routes_welcome import router as welcome_router
     app.include_router(welcome_router, prefix="/api")
 
+    # T-0082: public release-feed endpoints. Mounted on every install
+    # (not gated behind MOTHERSHIP) — detached single-installs simply
+    # have an empty `data/bot-squad/releases/` so all three endpoints
+    # return 404. The mothership populates the manifest via prod.sh.
+    from app.routes_releases import router as releases_router
+    app.include_router(releases_router, prefix="/api")
+
+    # T-0089: consumer-side autoupdate status/pause/check_now. Mounted on
+    # every install but each route 404s when MOTHERSHIP=1 (the producer
+    # never consumes its own releases, so there's no state to surface).
+    from app.routes_autoupdate import router as autoupdate_router
+    app.include_router(autoupdate_router, prefix="/api")
+
     # Centralization-layer routes — mounted only on botsquad.dev installs.
     # Single-install servers run with MOTHERSHIP unset (or "0") and never
     # expose /api/m/* or /i/*. Detach build = MOTHERSHIP=0 (or delete the module).

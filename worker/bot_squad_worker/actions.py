@@ -229,6 +229,88 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "queue_id": queue_id, "queued_at": _time.time()}
 
 
+_PAUSE_DEPLOYS_REQUIRED = {"slug", "reason", "requested_by"}
+_PAUSE_DEPLOYS_ALLOWED = _PAUSE_DEPLOYS_REQUIRED
+
+
+def _action_pause_deploys(params: dict[str, Any]) -> dict[str, Any]:
+    """Pause the deploy queue for a project until resume_deploys is called.
+
+    Required params: slug, reason, requested_by
+    Returns: {ok: true, paused: <meta dict>, was_already_paused: bool}
+
+    A PAUSED.json marker is written to data/<slug>/_jobs/deploy/. The
+    deploy_monitor checks for it on every tick and silently defers when
+    present — no TG spam during the pause. One TG ping is sent at pause
+    time (and one at resume time) so the operator knows the state flipped.
+    """
+    extra = set(params) - _PAUSE_DEPLOYS_ALLOWED
+    if extra:
+        raise ActionError(f"pause_deploys got unexpected params: {sorted(extra)}")
+    missing = _PAUSE_DEPLOYS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"pause_deploys missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"pause_deploys: unknown project slug {slug!r}")
+
+    from bot_squad_worker import deploy as _deploy
+    was_paused = _deploy.is_paused(cfg, slug) is not None
+    meta = _deploy.pause(cfg, slug, params["reason"], params["requested_by"])
+
+    if not was_paused:
+        tg = _get_tg_client(cfg)
+        tg.send(
+            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            text=f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
+            sid="deploy_monitor",
+        )
+
+    return {"ok": True, "paused": meta, "was_already_paused": was_paused}
+
+
+_RESUME_DEPLOYS_REQUIRED = {"slug"}
+_RESUME_DEPLOYS_ALLOWED = _RESUME_DEPLOYS_REQUIRED | {"requested_by"}
+
+
+def _action_resume_deploys(params: dict[str, Any]) -> dict[str, Any]:
+    """Resume a paused deploy queue. No-op (idempotent) if not paused.
+
+    Required params: slug
+    Optional params: requested_by (for TG attribution)
+    Returns: {ok: true, was_paused: bool}
+    """
+    extra = set(params) - _RESUME_DEPLOYS_ALLOWED
+    if extra:
+        raise ActionError(f"resume_deploys got unexpected params: {sorted(extra)}")
+    missing = _RESUME_DEPLOYS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"resume_deploys missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"resume_deploys: unknown project slug {slug!r}")
+
+    from bot_squad_worker import deploy as _deploy
+    was_paused = _deploy.resume(cfg, slug)
+
+    if was_paused:
+        who = params.get("requested_by") or "?"
+        tg = _get_tg_client(cfg)
+        tg.send(
+            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            text=f"🟢 deploys resumed for {slug} (by {who})",
+            sid="deploy_monitor",
+        )
+
+    return {"ok": True, "was_paused": was_paused}
+
+
 # ---------------------------------------------------------------------------
 # Session management actions (spec #5)
 # ---------------------------------------------------------------------------
@@ -806,11 +888,128 @@ def _action_unarchive_session(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.unarchive_session(cfg, params["slug"], params["sid"])
 
 
+# ---------------------------------------------------------------------------
+# Autoupdate operator handoff actions (T-0085)
+# ---------------------------------------------------------------------------
+
+_AUTOUPDATE_RETRY_REQUIRED = {"slug"}
+_AUTOUPDATE_RETRY_ALLOWED = _AUTOUPDATE_RETRY_REQUIRED
+
+
+def _action_autoupdate_retry(params: dict[str, Any]) -> dict[str, Any]:
+    """Re-enqueue the most-recent failed apply job.
+
+    Required params: slug
+    Returns: {ok, requeued: bool, version?: str, queue_file?: str, reason?: str}
+
+    Idempotent — when the failed-queue is empty, returns
+    ``{ok: true, requeued: false}`` without raising. The ``slug`` param is
+    accepted (and validated) for consistency with peer actions even though
+    the failed-queue is install-scoped, not project-scoped.
+    """
+    extra = set(params) - _AUTOUPDATE_RETRY_ALLOWED
+    if extra:
+        raise ActionError(f"autoupdate_retry got unexpected params: {sorted(extra)}")
+    missing = _AUTOUPDATE_RETRY_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"autoupdate_retry missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autoupdate_retry: unknown project slug {slug!r}")
+
+    from bot_squad_worker import autoupdate_apply as _apply
+    try:
+        return _apply.retry_last_failed(cfg)
+    except Exception as e:
+        raise ActionError(f"autoupdate_retry: {e}") from e
+
+
+def _action_autoupdate_check_now(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0089: trigger the poller tick out-of-cadence.
+
+    Takes no params. Returns {ok, scheduled: bool, next_run?: str}.
+    Reschedules the registered ``autoupdate`` APScheduler job to fire on
+    the next loop pass (typically <1s). Non-blocking — the actual poll
+    happens on the scheduler thread; the API caller can refresh
+    ``/autoupdate/status`` a moment later to see the updated
+    ``last_check_at``.
+
+    If the scheduler isn't initialised (tests, or worker not in coordinator
+    mode), the action falls back to running ``autoupdate.tick`` inline so
+    operators still get the documented "force a fresh check" behaviour.
+    """
+    if params:
+        raise ActionError(f"autoupdate_check_now takes no params, got: {sorted(params)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import autoupdate as _au
+
+    if _SCHED is None:
+        # No scheduler around (e.g. tests, single-shot scripts) — fall back to
+        # inline tick so the action still has its documented effect.
+        try:
+            _au.tick(cfg)
+        except Exception as e:  # noqa: BLE001 — operator-facing, surface message
+            raise ActionError(f"autoupdate_check_now: tick failed: {e}") from e
+        return {"ok": True, "scheduled": False, "ran_inline": True}
+
+    from datetime import datetime, timezone
+    try:
+        job = _SCHED.modify_job(
+            "autoupdate", next_run_time=datetime.now(timezone.utc)
+        )
+    except Exception as e:  # JobLookupError, scheduler not running, etc.
+        raise ActionError(f"autoupdate_check_now: could not reschedule: {e}") from e
+
+    next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+    return {"ok": True, "scheduled": True, "next_run": next_run}
+
+
+_AUTOUPDATE_FORCE_REQUIRED = {"slug", "version"}
+_AUTOUPDATE_FORCE_ALLOWED = _AUTOUPDATE_FORCE_REQUIRED
+
+
+def _action_autoupdate_force(params: dict[str, Any]) -> dict[str, Any]:
+    """Force-apply a specific release version (skips poller's newer-than gate).
+
+    Required params: slug, version
+    Returns: {ok: true, version, queue_file}
+
+    The manifest entry is fetched from the mothership's
+    ``/api/releases/<version>`` endpoint and enqueued for the drain loop.
+    Apply itself runs out-of-band on the next tick.
+    """
+    extra = set(params) - _AUTOUPDATE_FORCE_ALLOWED
+    if extra:
+        raise ActionError(f"autoupdate_force got unexpected params: {sorted(extra)}")
+    missing = _AUTOUPDATE_FORCE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"autoupdate_force missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    version = params["version"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"autoupdate_force: unknown project slug {slug!r}")
+    if not isinstance(version, str) or not version.strip():
+        raise ActionError("autoupdate_force: empty version")
+
+    from bot_squad_worker import autoupdate_apply as _apply
+    try:
+        return _apply.force_apply(cfg, version)
+    except Exception as e:
+        raise ActionError(f"autoupdate_force: {e}") from e
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
     "tg_notify": _action_tg_notify,
     "deploy": _action_deploy,
+    "pause_deploys": _action_pause_deploys,
+    "resume_deploys": _action_resume_deploys,
     "list_sessions": _action_list_sessions,
     "pause_session": _action_pause_session,
     "suspend_session": _action_suspend_session,
@@ -831,6 +1030,11 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
     "unarchive_session": _action_unarchive_session,
+    # T-0085: autoupdate operator handoff levers.
+    "autoupdate_retry": _action_autoupdate_retry,
+    "autoupdate_force": _action_autoupdate_force,
+    # T-0089: trigger an out-of-cadence poller tick from the consumer UI.
+    "autoupdate_check_now": _action_autoupdate_check_now,
 }
 
 
@@ -844,6 +1048,8 @@ ACTION_MODES: dict[str, str] = {
     "tg_verify_login": "coordinator_only",
     "tg_notify": "coordinator_only",
     "deploy": "coordinator_only",
+    "pause_deploys": "coordinator_only",
+    "resume_deploys": "coordinator_only",
     "list_sessions": "tmux_only",
     "pause_session": "tmux_only",
     "suspend_session": "tmux_only",
@@ -864,6 +1070,11 @@ ACTION_MODES: dict[str, str] = {
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",
     "unarchive_session": "coordinator_only",
+    # T-0085: autoupdate handoff is install-scoped (coordinator).
+    "autoupdate_retry": "coordinator_only",
+    "autoupdate_force": "coordinator_only",
+    # T-0089: scheduler-coupled (modifies the autoupdate job's next_run).
+    "autoupdate_check_now": "coordinator_only",
 }
 
 

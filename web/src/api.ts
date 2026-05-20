@@ -189,6 +189,33 @@ export type PutSystemSettingsResult = SystemSettings & {
   restart_required: boolean;
 };
 
+// T-0089 — consumer-side autoupdate status surface for the header pill.
+// On the mothership build (`VITE_MOTHERSHIP === "1"`) the server returns 404
+// for every route; the caller (AutoupdatePill) tree-shakes itself away there.
+export type AutoupdateAlert = {
+  version: string;
+  step: string;
+  log_tail: string;
+  occurred_at: string;
+  retry_command: string;
+  force_command: string;
+};
+
+export type AutoupdateStatus = {
+  installed_version: string | null;
+  last_check_at: string | null;
+  next_check_at: string | null;
+  last_apply_at: string | null;
+  // Free-form so a future ``failed:<step>`` outcome doesn't break TS.
+  last_apply_outcome: string;
+  current_git_sha: string | null;
+  paused: boolean;
+  alert: AutoupdateAlert | null;
+  pending_apply_version: string | null;
+  mothership_url: string | null;
+  poll_interval_seconds: number;
+};
+
 export const api = {
   health: () => call("/api/health"),
   me: () => call<Me>("/api/auth/me"),
@@ -403,4 +430,20 @@ export const api = {
    * /welcome screen. Server-side constant (env var on the install). */
   welcomeOperator: () =>
     call<{ session: string }>("/api/welcome/operator"),
+
+  // T-0089 — consumer-side autoupdate status + operator levers. All three
+  // 404 on the mothership build; the AutoupdatePill component is also
+  // tree-shaken there via VITE_MOTHERSHIP, so these methods are only
+  // exercised on consumer installs.
+  autoupdateStatus: () => call<AutoupdateStatus>("/api/autoupdate/status"),
+  autoupdatePause: (paused: boolean) =>
+    call<{ ok: boolean; paused: boolean }>("/api/autoupdate/pause", {
+      method: "POST",
+      body: JSON.stringify({ paused }),
+    }),
+  autoupdateCheckNow: () =>
+    call<{ ok: boolean; scheduled?: boolean; next_run?: string; ran_inline?: boolean }>(
+      "/api/autoupdate/check_now",
+      { method: "POST" },
+    ),
 };

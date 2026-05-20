@@ -214,6 +214,73 @@ def _count(path) -> int:
     return sum(1 for _ in path.glob("*.md"))
 
 
+@router.post("/{slug}/deploy", status_code=202)
+async def queue_deploy(
+    slug: str, request: Request, payload: dict, user: dict = Depends(require_auth)
+) -> dict:
+    """Queue a deploy job via the worker's ``deploy`` action.
+
+    Body: ``{"target": "prod"|"staging", "reason": "<text>"}``. The
+    ``slug`` is taken from the path; ``requested_by`` is filled from
+    the auth context so the worker's audit envelope matches what CLI
+    callers emit (``ops/bot-squad-bin/deploy`` sets ``requested_by`` to
+    the linux user).
+
+    T-0087: the mothership UI's "Cut a release" button uses this with
+    ``target=prod, reason="cut release"``. Until now the API never
+    exposed the deploy queue — all queueing came from the CLI helper.
+    Mirroring it here lets the UI run the same single-action pattern
+    without growing a separate worker action.
+
+    Returns the worker's envelope verbatim
+    (``{ok: true, queue_id, queued_at}``) so the FE can poll
+    ``GET /api/projects/{slug}/runs`` for the matching ``queue_id`` and
+    pivot off ``status``.
+    """
+    cfg: ApiConfig = request.app.state.api_config
+    proj = cfg.project(slug)
+    if proj is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="json object required")
+    target = (payload.get("target") or "").strip()
+    reason = (payload.get("reason") or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="target required")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason required")
+
+    # ``deploy_targets`` is the project's allow-list (e.g. ["staging"]
+    # for non-mothership projects, ["staging", "prod"] for bot-squad).
+    # Worker re-validates, but a 400 here gives the operator a faster
+    # signal than a generic worker error.
+    if target not in (proj.deploy_targets or []):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown target {target!r} for project {slug!r}",
+        )
+
+    requested_by = (
+        user.get("username") if isinstance(user, dict) else None
+    ) or "api"
+
+    client = request.app.state.worker_router.coordinator()
+    try:
+        return await client.call_action(
+            "deploy",
+            {
+                "slug": slug,
+                "target": target,
+                "reason": reason,
+                "requested_by": requested_by,
+            },
+            timeout=10.0,
+        )
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.get("/{slug}/repo-agents-md")
 def get_repo_agents_md(slug: str, request: Request) -> dict:
     cfg = request.app.state.api_config

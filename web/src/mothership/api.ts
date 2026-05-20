@@ -87,6 +87,52 @@ export type Checkpoint = {
 };
 
 // ---------------------------------------------------------------------------
+// Release-feed surface (T-0087)
+// ---------------------------------------------------------------------------
+
+/** One manifest entry produced by prod.sh (T-0081), enriched server-side
+ *  with `tarball_url` for direct download. Mirrors the shape returned by
+ *  /api/releases/latest and /api/releases/_all. */
+export type ReleaseEntry = {
+  version: string;
+  git_sha: string;
+  created_at: string;
+  tarball_path: string;
+  tarball_url: string;
+  sha256: string;
+  notes: string;
+};
+
+/** Per-install telemetry row from /api/releases/_telemetry (T-0088).
+ *  `installed_version` is null until the consumer's autoupdate poller has
+ *  reported once. */
+export type ReleaseTelemetryRow = {
+  install_id: string;
+  install_name: string;
+  installed_version: string | null;
+  last_check_at: string | null;
+  last_apply_at: string | null;
+  last_apply_outcome: string | null;
+  current_git_sha: string | null;
+};
+
+/** Envelope from /api/releases/_notes_draft on success. The version is
+ *  computed by the API mirroring prod.sh's vYYYY.MM.DD.N counter. */
+export type NotesDraftResult = {
+  ok: boolean;
+  version: string;
+  path: string;
+};
+
+/** Envelope from /api/projects/{slug}/deploy on success. Matches the
+ *  worker's `deploy` action envelope verbatim. */
+export type DeployResult = {
+  ok: boolean;
+  queue_id: string;
+  queued_at: number;
+};
+
+// ---------------------------------------------------------------------------
 // Low-level call helper
 // ---------------------------------------------------------------------------
 
@@ -132,6 +178,43 @@ export const mothershipApi = {
       `/api/m/servers/${encodeURIComponent(serverId)}/projects/refresh`,
       { method: "POST" },
     ),
+};
+
+// ---------------------------------------------------------------------------
+// Release-feed client (T-0087)
+// ---------------------------------------------------------------------------
+//
+// All four endpoints are mounted on the release-feed router; the two
+// underscore-prefixed mothership ones (`_all`, `_notes_draft`) are gated
+// server-side by MOTHERSHIP=1 + cookie auth. The detached single-install
+// build's UI never imports this module (lazy-loaded under VITE_MOTHERSHIP),
+// so reaching them from there would be a routing bug.
+
+export const releasesApi = {
+  /** Full release history newest-first. Returns an empty array if the
+   *  manifest hasn't been cut yet (vs. 404 — the UI distinguishes
+   *  "no releases" from "endpoint missing"). */
+  all: () => call<ReleaseEntry[]>("/api/releases/_all"),
+
+  /** Per-install version + apply-outcome snapshot for the installs grid. */
+  telemetry: () => call<ReleaseTelemetryRow[]>("/api/releases/_telemetry"),
+
+  /** Stage release notes for the next prod.sh cut. The server writes the
+   *  notes to `data/bot-squad/releases/<v>.md` where <v> is the next
+   *  vYYYY.MM.DD.N computed identically to prod.sh step 2. */
+  saveNotesDraft: (notes: string) =>
+    call<NotesDraftResult>("/api/releases/_notes_draft", {
+      method: "POST",
+      body: JSON.stringify({ notes }),
+    }),
+
+  /** Queue a deploy job for `bot-squad` on the mothership. The worker's
+   *  prod.sh recipe (T-0081) consumes the staged notes file on cut. */
+  cutDeploy: (reason: string) =>
+    call<DeployResult>("/api/projects/bot-squad/deploy", {
+      method: "POST",
+      body: JSON.stringify({ target: "prod", reason }),
+    }),
 };
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,14 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
+import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
+
+// T-0089: the autoupdate pill is consumer-side only — Vite inlines this
+// constant so the mothership bundle tree-shakes the component import away.
+const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
 
 /**
  * Shell — left sidebar navigation present on every authenticated page.
@@ -166,6 +171,9 @@ export function Shell() {
             <span className={dotCls} />
             <span style={{ color: workerLabelColor }}>{workerLabel}</span>
           </div>
+          {/* T-0089: consumer-only autoupdate status pill. Skipped on the
+              mothership build so we don't poll a 404 endpoint forever. */}
+          {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}
         </div>
 
         {/* Project section — shows pinned project even on global routes */}
@@ -289,6 +297,22 @@ export function Shell() {
               HELP
             </NavLink>
           </li>
+          {/* T-0087: mothership-only Releases tab. Vite inlines the
+              VITE_MOTHERSHIP literal so this entire <li> is tree-shaken
+              from detached single-install bundles — same posture as the
+              AutoupdatePill gate above and the /m/* route below. */}
+          {IS_MOTHERSHIP_BUILD && (
+            <li>
+              <NavLink
+                to="/m/releases"
+                data-onboarding-anchor="releases-nav"
+                className={({ isActive }) => (isActive ? "active" : undefined)}
+              >
+                <span className="mc-nav-diamond">◇</span>
+                RELEASES
+              </NavLink>
+            </li>
+          )}
           {/* T-0055: SERVERS nav removed — the unified all-projects view at
               "/" hosts the +Add server affordance inline on mothership builds. */}
           {isAdmin && (

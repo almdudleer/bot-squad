@@ -4,6 +4,7 @@ v1 ships only the heartbeat. Spec #3 adds deploy_monitor, oauth_refresh.
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 
 from bot_squad_worker.config import Config
@@ -33,7 +34,14 @@ def deploy_monitor(cfg: Config) -> None:
 
 
 def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
-    """Pop and run one deploy for ``slug``, sending TG pings."""
+    """Pop and run one deploy for ``slug``, sending TG pings.
+
+    The "🚚 starting" ping is gated on the per-target tree being clean —
+    without that gate, the monitor pings at 60s cadence forever when a
+    dirty tree blocks the queue, and the operator gets spam with no
+    success/fail follow-up (root cause of the deploy_monitor spam reported
+    2026-05-18). Dirty-deferred state is logged, not pinged.
+    """
     from bot_squad_worker import deploy as _deploy
     from bot_squad_worker.actions import _get_tg_client
 
@@ -41,29 +49,60 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     if not queued:
         return
 
+    # Pause gate (T-0094) — checked before everything else. When the
+    # PAUSED.json marker exists, defer silently. The TG ping at pause
+    # time already told the operator; no per-tick reminder spam.
+    if _deploy.is_paused(cfg, slug) is not None:
+        log.info("deploy_monitor: %s deferred — PAUSED", slug)
+        return
+
+    # Peek at the oldest queued job's target so we can run the per-target
+    # cleanliness check before any user-visible TG ping. (run_next() will
+    # re-read the file anyway; this peek doesn't move anything.)
+    try:
+        peek = _json.loads(queued[0].read_text())
+        target = peek.get("target")
+    except Exception:
+        log.exception("deploy_monitor: %s could not read queue head %s", slug, queued[0])
+        return
+    if not target:
+        log.warning("deploy_monitor: %s queue head %s has no target", slug, queued[0])
+        return
+
+    if not _deploy.is_clean_for_target(cfg, slug, target):
+        # Tree is dirty — defer silently. No ping yet; we'll pick it up
+        # again next tick once a peer commits or stashes their WIP.
+        log.info("deploy_monitor: %s/%s deferred — tree dirty", slug, target)
+        return
+
     tg = _get_tg_client(cfg)
     chat_id = project.tg_chat  # type: ignore[attr-defined]
     sid = "deploy_monitor"
 
-    # Ping at queue time
-    tg.send(chat_id=chat_id, text=f"🚚 starting deploy for {slug}", sid=sid)
+    # Tree is clean — ping at start and at finish.
+    tg.send(chat_id=chat_id, text=f"🚚 starting deploy for {slug}/{target}", sid=sid)
 
     result = _deploy.run_next(cfg, slug)
     if result is None:
-        # Tree was dirty — don't ping (not an error, just deferred)
-        log.info("deploy_monitor: %s deploy deferred (dirty tree)", slug)
+        # Race: tree went dirty between peek and run_next, or queue emptied.
+        log.info("deploy_monitor: %s deferred between peek and run_next", slug)
         return
 
+    suffix = (
+        f" ({result.collapsed_count} queued requests collapsed)"
+        if result.collapsed_count > 1
+        else ""
+    )
     if result.ok:
         tg.send(
             chat_id=chat_id,
-            text=f"✅ deploy {slug} SUCCESS (rc={result.returncode})",
+            text=f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){suffix}",
             sid=sid,
         )
     else:
         tg.send(
             chat_id=chat_id,
-            text=f"❌ deploy {slug} FAILED rc={result.returncode}",
+            text=f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}",
             sid=sid,
         )
 
@@ -79,6 +118,37 @@ def tg_listener_tick(cfg: Config) -> None:
         tg_listener.tick(cfg)
     except Exception:
         log.exception("tg_listener_tick error")
+
+
+def autoupdate_tick(cfg: Config) -> None:
+    """Poll the mothership release feed and queue apply jobs when newer.
+
+    Scheduled at ``BOT_SQUAD_AUTOUPDATE_INTERVAL_SECONDS`` (default 900s)
+    by APScheduler. Errors are caught and logged so one bad poll cycle
+    never kills the scheduler. See ``bot_squad_worker.autoupdate`` for
+    the full contract (T-0083). No-op on the mothership itself (T-0086).
+    """
+    from bot_squad_worker import autoupdate as _autoupdate
+    try:
+        _autoupdate.tick(cfg)
+    except Exception:
+        log.exception("autoupdate_tick error")
+
+
+def autoupdate_apply_tick(cfg: Config) -> None:
+    """Drain the apply queue produced by the poller (T-0084).
+
+    Scheduled at a shorter cadence than the poll tick so a freshly-enqueued
+    release starts applying within ~1 minute. The apply itself can take
+    many minutes (download + build + smoke); APScheduler ``max_instances=1``
+    on the registered job keeps overlapping ticks from starting a second
+    apply mid-flight. No-op on the mothership itself (T-0086).
+    """
+    from bot_squad_worker import autoupdate_apply as _apply
+    try:
+        _apply.tick(cfg)
+    except Exception:
+        log.exception("autoupdate_apply_tick error")
 
 
 def autonomous_tick(cfg: Config) -> None:

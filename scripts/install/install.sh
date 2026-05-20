@@ -1058,8 +1058,14 @@ from the mothership. To smoke locally, re-run with
 BOTSQUAD_SKIP_MOTHERSHIP=1. Otherwise re-fetch your install command from
 the mothership UI."
   fi
-  local resp http_code body bearer bearer_file
+  local resp http_code body bearer bearer_file server_id install_id_file
   bearer_file="${BOTSQUAD_STATE_DIR}/server.token"
+  # T-0088: persist the mothership-issued server_id so the worker's
+  # autoupdate poller can stamp it on every telemetry POST. Lives under
+  # the bot-squad install's data dir (not $BOTSQUAD_STATE_DIR, which is
+  # $HOME-scoped) so the systemd worker — which may run as a different
+  # user — can read it without crossing user-home boundaries.
+  install_id_file="${BOTSQUAD_INSTALL_DIR}/data/_worker/install.id"
   # Body shape per mothership-seam.md: { token, server_meta }.
   local payload
   payload=$(jq -n \
@@ -1083,15 +1089,28 @@ unreachable; check network/DNS and retry. If 404: confirm
 BOTSQUAD_MOTHERSHIP_URL is correct."
   fi
   bearer="$(jq -r '.server_bearer' "$resp")"
+  server_id="$(jq -r '.server_id' "$resp")"
   rm -f "$resp"
   if [[ -z "$bearer" || "$bearer" = "null" ]]; then
     die_struct mothership_handshake \
       "Mothership /connect returned 200 but no server_bearer in the body." \
       "This is a mothership bug; ping the bot-squad team."
   fi
+  if [[ -z "$server_id" || "$server_id" = "null" ]]; then
+    die_struct mothership_handshake \
+      "Mothership /connect returned 200 but no server_id in the body." \
+      "This is a mothership bug; ping the bot-squad team."
+  fi
   umask 077
   printf '%s\n' "$bearer" > "$bearer_file"
   log "server bearer stored at $bearer_file"
+  # install.id is world-readable inside the install tree (mode 0644);
+  # it's just a server identifier, not a credential, and the worker may
+  # run as a different user than the installer.
+  umask 022
+  mkdir -p "$(dirname "$install_id_file")"
+  printf '%s\n' "$server_id" > "$install_id_file"
+  log "install id stored at $install_id_file"
 }
 
 step_python_venv() {

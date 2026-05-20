@@ -6,11 +6,18 @@ slug          = "signal-tracker"
 display_name  = "Signal Tracker"
 # Dev clone: where agents work. On the deploy_branch (bot_squad/dev), pushes
 # to staging on every deploy queue.
-repo_path     = "/home/almdudleer/signal_tracker/dev"
+# 2026-05-19: physical path is `watchrobot/dev` (matches the public brand).
+# Two consecutive migrations same day, both no-symlink: first from
+# `signal_tracker/dev → signal_tracker_mgmt` (symlink) to a real
+# `signal-tracker/dev` dir, then renamed to `watchrobot`. Slug stays
+# `signal-tracker` (containers, DB, code untouched — only the home dir
+# carries the brand name). See data/bot-squad/feedback/F-0001 for the
+# shared-tree pain history that motivated dropping the symlink.
+repo_path     = "/home/almdudleer/watchrobot/dev"
 # Master clone: separate working tree on master branch for prod deploys,
 # hotfixes, and rollbacks. The dev clone is never touched for these so the
 # agent team can keep working uninterrupted.
-repo_master   = "/home/almdudleer/signal_tracker/master"
+repo_master   = "/home/almdudleer/watchrobot/master"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
 prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
@@ -34,12 +41,23 @@ repo_path     = "/home/almdudleer/bot-squad/dev"
 repo_master   = "/home/almdudleer/bot-squad/master"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
-prod_url      = "https://bot-squad.dev.uzinvestapi.com"
-# No separate staging URL — bot-squad is internal infra; "prod" = the
-# installation. Staging deploys land in a future preview-install when
-# we have more servers.
-staging_url   = "https://bot-squad.dev.uzinvestapi.com"
+prod_url      = "https://botsquad.dev"
+# Convention (update-delivery.md): "staging" deploys to THIS server only
+# (the mothership); "prod" produces a release artifact downloadable by
+# OTHER attached servers. The prod target + artifact pipeline is not
+# wired yet — Chapter II of multi-server initiative. Until it lands,
+# bot-squad only ships "staging" from this server.
+staging_url   = "https://staging.botsquad.dev"
 dev_url       = "https://bot-squad.dev.uzinvestapi.com"
-deploy_targets = ["prod"]
+# "staging" redeploys THIS install; "prod" (mothership-only, T-0081) cuts
+# a versioned release tarball + manifest entry for attached servers to
+# pull via the release-feed API (T-0082). Refuses to run unless
+# `mothership = true` below.
+deploy_targets = ["staging", "prod"]
+# Mothership: this install produces bot-squad releases that other attached
+# servers consume. The flag is the SSOT for is_mothership() — the consumer
+# poller (T-0083) and apply (T-0084) short-circuit when this is true so the
+# mothership never tries to consume its own releases. See T-0086.
+mothership    = true
 tg_chat       = "404580642"
 created_at    = 2026-05-14

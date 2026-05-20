@@ -297,6 +297,22 @@ export function Shell() {
               HELP
             </NavLink>
           </li>
+          {/* T-0087: mothership-only Releases tab. Vite inlines the
+              VITE_MOTHERSHIP literal so this entire <li> is tree-shaken
+              from detached single-install bundles — same posture as the
+              AutoupdatePill gate above and the /m/* route below. */}
+          {IS_MOTHERSHIP_BUILD && (
+            <li>
+              <NavLink
+                to="/m/releases"
+                data-onboarding-anchor="releases-nav"
+                className={({ isActive }) => (isActive ? "active" : undefined)}
+              >
+                <span className="mc-nav-diamond">◇</span>
+                RELEASES
+              </NavLink>
+            </li>
+          )}
           {/* T-0055: SERVERS nav removed — the unified all-projects view at
               "/" hosts the +Add server affordance inline on mothership builds. */}
           {isAdmin && (

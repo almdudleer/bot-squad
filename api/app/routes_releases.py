@@ -1,9 +1,11 @@
-"""Public release-feed endpoints (T-0082) + consumer telemetry (T-0088).
+"""Public release-feed endpoints (T-0082) + consumer telemetry (T-0088)
++ mothership UI helpers (T-0087).
 
 Exposes the release manifest produced by T-0081's ``prod.sh`` so attached
 servers (T-0083 consumer poller) can pull the latest tarball, plus a
 telemetry surface for those same consumers to report installed_version
-back to the mothership.
+back to the mothership, plus a couple of mothership-only endpoints that
+back the T-0087 UI (the full manifest list + a release-notes draft writer).
 
 Public release-feed (T-0082) — all three are PUBLIC in v0 (no auth header).
 HTTPS-only is enforced upstream by traefik:
@@ -25,20 +27,30 @@ Consumer telemetry (T-0088):
   the full per-install snapshot list joined with the registry's
   ``display_name`` so the UI can label rows without a second round-trip.
 
+Mothership UI surface (T-0087):
+
+- ``GET /api/releases/_all`` — full manifest list (same per-entry shape
+  as ``/latest`` but every entry, newest-first). Cookie-authed +
+  mothership-only — the detached-install /latest feed is public, but
+  the operator-facing roll-up is gated like the rest of /api/m/*.
+- ``POST /api/releases/_notes_draft`` ``{notes: str}`` — write the
+  release-notes body to ``data/bot-squad/releases/<next-version>.md``
+  using the same vYYYY.MM.DD.N counter ``prod.sh`` derives. The deploy
+  worker then picks the file up on cut (T-0081 step 5). Mothership-only.
+
 The manifest path is fixed: ``<data_dir>/bot-squad/releases/index.json``
 (matches what ``prod.sh`` writes; T-0081 spec is the SSOT for the entry
 schema). On-disk entries carry ``tarball_path``; the API adds a
 ``tarball_url`` computed against the incoming request's base URL so it
 works on staging.botsquad.dev and any detached-server URL without a
 config change.
-
-T-0087 (UI) extends this router with additional endpoints — keep this
-module focused on the public feed + telemetry surface.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -48,6 +60,19 @@ from app.mothership_store import MothershipStore
 from app.routes_auth import require_auth
 
 router = APIRouter(prefix="/releases", tags=["releases"])
+
+
+def _refuse_unless_mothership() -> None:
+    """Raise 404 unless this install is the mothership.
+
+    Mirrors the gate on ``GET /_telemetry`` so the T-0087 UI endpoints
+    behave identically on detached single-installs: the route stays
+    mounted (the router itself is always wired in ``main.py``) but
+    every operator-facing surface returns 404, identical to "not built
+    with that feature".
+    """
+    if os.environ.get("MOTHERSHIP", "0") != "1":
+        raise HTTPException(status_code=404, detail="not available")
 
 
 def _releases_dir(request: Request) -> Path:
@@ -224,6 +249,155 @@ def get_telemetry(
             }
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Mothership UI surface (T-0087)
+# ---------------------------------------------------------------------------
+#
+# Both endpoints sit between the telemetry GET (also underscore-prefixed
+# so it dodges the ``/{version}`` catch-all) and the final ``/{version}``
+# fallback. They MUST stay above ``/{version}`` for the same reason as
+# the other underscore routes.
+
+
+@router.get("/_all")
+def get_all(
+    request: Request, _user: dict = Depends(require_auth)
+) -> list[dict]:
+    """Full manifest list for the T-0087 release-history table.
+
+    Returns every entry from ``index.json``'s ``releases`` array with
+    ``tarball_url`` filled in (same per-entry shape as ``/latest``),
+    newest-first. The manifest is the canonical history (T-0081 spec);
+    the manifest writer appends, so an order-by-creation_at sort is
+    equivalent to "reverse the file order" without re-parsing
+    timestamps.
+
+    Mothership-only: detached single-installs don't run prod.sh and
+    don't have a manifest at all, so this 404s twice over (gate + empty
+    file). Auth + 404 match the GET /_telemetry posture so a single
+    ``Suspense`` boundary on the UI side handles both.
+    """
+    _refuse_unless_mothership()
+    releases_dir = _releases_dir(request)
+    index = releases_dir / "index.json"
+    if not index.is_file():
+        # Empty list (not 404) — the UI table renders an empty-state
+        # banner instead of an error envelope. Saves a happy-path branch
+        # on the FE for fresh mothership installs before the first cut.
+        return []
+    try:
+        manifest = json.loads(index.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=500, detail=f"manifest unreadable: {e}")
+    entries = manifest.get("releases") or []
+    # Newest-first. prod.sh appends, so the on-disk array is oldest-first
+    # — reverse here rather than baking the order into the FE.
+    return [_with_tarball_url(e, request) for e in reversed(entries)]
+
+
+# Filename schema mirrors prod.sh step 5: ``<RELEASES_DIR>/<version>.md``.
+# Validating the computed version against this regex is belt-and-braces —
+# the inputs are all internal (UTC date + manifest counter) but the file
+# write is the one surface we don't want a malformed pattern reaching.
+_VERSION_RE = re.compile(r"^v\d{4}\.\d{2}\.\d{2}\.\d+$")
+
+
+def _next_version_for_today(releases_dir: Path) -> str:
+    """Compute the same vYYYY.MM.DD.N tag prod.sh would compute next.
+
+    Mirror of the inline ``python3 -`` block in
+    ``data/bot-squad/deploy/prod.sh`` (step 2). Re-deriving it here lets
+    the operator pre-stage notes BEFORE the deploy worker runs — when
+    prod.sh executes it picks the same file up via the ``NOTES_FILE``
+    branch.
+
+    Edge case: if the operator drafts at 23:59 UTC and the deploy runs
+    at 00:01 UTC, the file lands under "today" and prod.sh's "tomorrow"
+    file lookup finds nothing. Spec explicitly accepts this — the
+    operator just types the notes again, or the cut button is the same
+    HTTP roundtrip + queue so the window is sub-second in practice.
+    """
+    date_tag = datetime.now(timezone.utc).strftime("%Y.%m.%d")
+    prefix = f"v{date_tag}."
+    n = 0
+    index = releases_dir / "index.json"
+    if index.is_file():
+        try:
+            data = json.loads(index.read_text())
+        except (OSError, json.JSONDecodeError):
+            # If the manifest is unreadable, prod.sh would crash before
+            # cutting — we still want the draft to be writeable so the
+            # operator can stage notes for the post-fix re-run. Fall
+            # through with n=0 (counter starts at 1).
+            data = {}
+        for entry in data.get("releases", []) or []:
+            v = entry.get("version", "")
+            if not v.startswith(prefix):
+                continue
+            try:
+                n = max(n, int(v[len(prefix):]))
+            except ValueError:
+                # Malformed entry in the manifest — skip, don't crash.
+                continue
+    return f"v{date_tag}.{n + 1}"
+
+
+@router.post("/_notes_draft", status_code=200)
+def post_notes_draft(
+    request: Request, payload: dict, _user: dict = Depends(require_auth)
+) -> dict:
+    """Stage release notes for the next cut.
+
+    Body: ``{"notes": "<markdown>"}``. Writes ``<releases_dir>/<v>.md``
+    where ``<v>`` is the next vYYYY.MM.DD.N — computed identically to
+    prod.sh step 2 so the running deploy picks the file up via the
+    ``NOTES_FILE`` lookup in step 5.
+
+    Returns ``{ok: true, version: "<v>", path: "<rel-path>"}`` so the
+    UI can echo the staged version back to the operator without a
+    second round-trip.
+
+    Idempotent: re-POSTing replaces the staged file (same name) so the
+    operator can iterate on copy before hitting "cut". The same-day
+    counter only advances after prod.sh actually cuts (which appends to
+    the manifest), so re-drafting before cut keeps the same target.
+
+    Mothership-only — see ``/_all`` for the same rationale.
+    """
+    _refuse_unless_mothership()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="json object required")
+    notes = payload.get("notes")
+    if not isinstance(notes, str):
+        raise HTTPException(status_code=400, detail="notes must be a string")
+    # Whitespace-only notes are almost certainly an accidental submit;
+    # 400 is friendlier than silently writing an empty file that prod.sh
+    # would gladly embed as a blank notes body.
+    if not notes.strip():
+        raise HTTPException(status_code=400, detail="notes must not be empty")
+
+    releases_dir = _releases_dir(request)
+    releases_dir.mkdir(parents=True, exist_ok=True)
+    version = _next_version_for_today(releases_dir)
+    if not _VERSION_RE.match(version):
+        # Defence-in-depth: every input is internal, but if a future
+        # change to the computation breaks the format we'd rather 500
+        # here than write a malformed path.
+        raise HTTPException(
+            status_code=500, detail=f"computed bad version: {version!r}"
+        )
+    rel_path = f"data/bot-squad/releases/{version}.md"
+    notes_path = releases_dir / f"{version}.md"
+    # Atomic-ish write — same .tmp + replace dance the rest of the
+    # codebase uses for config edits. prod.sh's notes lookup is a plain
+    # ``[ -f ]`` so a half-written file would be picked up if the API
+    # crashed mid-write without this.
+    tmp = notes_path.with_suffix(".md.tmp")
+    tmp.write_text(notes)
+    os.replace(tmp, notes_path)
+    return {"ok": True, "version": version, "path": rel_path}
 
 
 # Catch-all version lookup — MUST stay last because ``/{version}`` swallows

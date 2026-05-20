@@ -179,6 +179,125 @@ def test_get_repo_agents_md_missing_404(tmp_bot_squad: Path, monkeypatch):
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# T-0087 — POST /projects/{slug}/deploy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_worker_deploy(tmp_bot_squad: Path):
+    """Minimal fake worker that records deploy calls and returns the same
+    envelope the real worker returns."""
+    sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+
+    calls: list[dict] = []
+    fake = FastAPI()
+
+    @fake.post("/actions/deploy")
+    def deploy(params: dict | None = None) -> dict:
+        calls.append(params or {})
+        return {"ok": True, "queue_id": "abc-123", "queued_at": 1234567890.0}
+
+    config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if sock.exists():
+            break
+        time.sleep(0.05)
+
+    yield sock, calls
+
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_deploy_queue_happy_path(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_deploy
+):
+    """Happy path: POST queues a deploy via the worker action and returns
+    the worker envelope verbatim."""
+    _, calls = fake_worker_deploy
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects/test-project/deploy",
+            json={"target": "staging", "reason": "smoke test"},
+        )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body == {
+        "ok": True,
+        "queue_id": "abc-123",
+        "queued_at": 1234567890.0,
+    }
+    # Worker received the slug from the path + the auth context's username.
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload["slug"] == "test-project"
+    assert payload["target"] == "staging"
+    assert payload["reason"] == "smoke test"
+    assert payload["requested_by"] == "testuser"
+
+
+def test_deploy_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/deploy",
+            json={"target": "staging", "reason": "x"},
+        )
+    assert r.status_code == 401
+
+
+def test_deploy_unknown_slug_404(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_deploy
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects/nope/deploy",
+            json={"target": "staging", "reason": "x"},
+        )
+    assert r.status_code == 404
+
+
+def test_deploy_missing_fields_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_deploy
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        missing_target = client.post(
+            "/api/projects/test-project/deploy",
+            json={"reason": "x"},
+        )
+        missing_reason = client.post(
+            "/api/projects/test-project/deploy",
+            json={"target": "staging"},
+        )
+    assert missing_target.status_code == 400
+    assert missing_reason.status_code == 400
+
+
+def test_deploy_unknown_target_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_deploy
+):
+    """The conftest's test-project lists only ``staging`` in
+    deploy_targets, so a request for ``prod`` is a clean 400 before we
+    bother the worker."""
+    _, calls = fake_worker_deploy
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects/test-project/deploy",
+            json={"target": "prod", "reason": "x"},
+        )
+    assert r.status_code == 400
+    # Worker should not have been called.
+    assert calls == []
+
+
 def test_get_repo_agents_md_unknown_project_404(tmp_bot_squad: Path, monkeypatch):
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)

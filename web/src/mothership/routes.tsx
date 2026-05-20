@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Routes, Route, Link, Navigate, useParams } from "react-router-dom";
 import { mothershipApi, type AttachedServer, type Checkpoint } from "./api";
 import { AddServerWizard } from "./AddServerWizard";
+import { Releases } from "./Releases";
 
 /**
  * T-0013: Chapter I §8 specifies that the mothership add-server flow
@@ -218,6 +219,10 @@ export default function MothershipRoutes() {
       <Route index element={<Navigate to="/" replace />} />
       <Route path="servers/add" element={<AddServerWizard />} />
       <Route path="servers/:id" element={<ServerProgress />} />
+      {/* T-0087: mothership-only releases tab. Route lives here so the
+          whole module + its chunk gets tree-shaken from detached builds
+          via the same VITE_MOTHERSHIP gate in App.tsx. */}
+      <Route path="releases" element={<Releases />} />
       <Route path="*" element={<NotFound />} />
     </Routes>
   );

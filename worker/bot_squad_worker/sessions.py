@@ -707,7 +707,99 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     if new_sid != sid and meta_file.exists():
         meta_file.unlink()
 
+    # T-0105: SID rotation — append the rotated SID to every task this
+    # session was bound to (primary + extras). The pre-rotation SID is
+    # already in history (from spawn / bind_task); now both old and new
+    # remain for forensics. Idempotent if for some reason new_sid == sid.
+    rotated_task_ids: list[str] = []
+    primary_task = meta.get("task_id")
+    if primary_task and primary_task != "~":
+        rotated_task_ids.append(primary_task)
+    extras_raw = meta.get("extra_task_ids") or []
+    if isinstance(extras_raw, list):
+        rotated_task_ids.extend(t for t in extras_raw if t and t != "~")
+    if rotated_task_ids:
+        backlog_dir = data_dir / slug / "backlog"
+        for tid in rotated_task_ids:
+            try:
+                _append_task_session_history(backlog_dir, tid, new_sid)
+            except OSError:
+                pass
+
     return {"ok": True, "sid": new_sid}
+
+
+def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> bool:
+    """T-0105: append `sid` to the task md's `session_history:` frontmatter
+    list. Append-only, idempotent (de-duped — if `sid` is already in the
+    list, no-op) and atomic (tmp + rename).
+
+    Inline-list format: ``session_history: [SID, SID, ...]`` — chosen so
+    the line-based worker readers (sessions/intersession/autonomous) can
+    pick it up. Block-yaml-format lists written by the api PATCH path
+    would be invisible here (same hazard as the existing `blocked_by`
+    field — audit Bug #4); inline format is the worker's source of truth.
+
+    Creates the field if absent, inserted after ``status:`` for stable
+    ordering. Returns True iff the file was modified.
+
+    Best-effort: returns False on any I/O or parse failure — the binding
+    write itself is the source of truth, the task-md stamp is a forensic
+    convenience.
+    """
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        return False
+    path = matches[0]
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    m = re.match(r"\A---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+    if not m:
+        return False
+    fm_block = m.group(1)
+    body = m.group(2)
+    fm_lines = fm_block.splitlines()
+
+    history_idx = -1
+    existing: list[str] = []
+    for i, ln in enumerate(fm_lines):
+        stripped = ln.lstrip()
+        if stripped.startswith("session_history:"):
+            history_idx = i
+            _, _, val = stripped.partition(":")
+            val = val.strip()
+            if val.startswith("[") and val.endswith("]"):
+                inner = val[1:-1].strip()
+                if inner:
+                    existing = [x.strip() for x in inner.split(",") if x.strip() and x.strip() != "~"]
+            break
+
+    if sid in existing:
+        return False  # idempotent — de-dup, preserve order
+
+    new_list = existing + [sid]
+    new_line = f"session_history: [{', '.join(new_list)}]"
+
+    if history_idx >= 0:
+        fm_lines[history_idx] = new_line
+    else:
+        insert_at = len(fm_lines)
+        for i, ln in enumerate(fm_lines):
+            if ln.lstrip().startswith("status:"):
+                insert_at = i + 1
+                break
+        fm_lines.insert(insert_at, new_line)
+
+    new_fm = "\n".join(fm_lines)
+    content = f"---\n{new_fm}\n---\n{body}"
+    if not body.startswith("\n"):
+        content = f"---\n{new_fm}\n---\n\n{body}"
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.rename(tmp, path)
+    return True
 
 
 def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative: str) -> bool:
@@ -869,6 +961,19 @@ def spawn(
     new_pane = max(new_panes, key=lambda p: int(p.pane_id.lstrip("%")) if p.pane_id.lstrip("%").isdigit() else 0)
     new_sid = compute_sid(user, new_pane.window, new_pane.pane_id)
 
+    # T-0105: stamp the freshly-spawned SID into the task md's
+    # session_history list so the task carries forensics for *every*
+    # session that worked on it, not just the current binding. Best-effort.
+    if task_id:
+        try:
+            _append_task_session_history(
+                cfg.data_dir / slug / "backlog",
+                task_id.strip(),
+                new_sid,
+            )
+        except OSError:
+            pass
+
     # Send initial prompt if provided. Two-phase: text first, brief pause,
     # then a *separate* Enter. tmux wraps long text as a bracketed-paste
     # escape sequence; an Enter inside the paste isn't a submit, so the
@@ -981,6 +1086,13 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     extras.append(task_id)
     meta["extra_task_ids"] = extras
     _write_session_metadata(meta_file, meta)
+
+    # T-0105: stamp the binding SID into the new task's session_history.
+    # Best-effort; the SessionMd write above is the source of truth.
+    try:
+        _append_task_session_history(backlog_dir, task_id, sid)
+    except OSError:
+        pass
 
     # T-0038: if the dev's session carries an initiative, propagate it to
     # the newly-bound task md (existing-wins). Lets multi-binding keep the

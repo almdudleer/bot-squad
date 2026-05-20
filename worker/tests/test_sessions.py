@@ -1028,3 +1028,246 @@ def test_suspend_preserves_owner_field(tmp_path, monkeypatch):
     suspend(cfg, "test-project", "S-u-w-p3")
     meta = _read_session_metadata(sessions_dir / "S-u-w-p3.md")
     assert meta["owner"] == "aqice"
+
+
+# ---------------------------------------------------------------------------
+# T-0105: session_history append on bind / rotate
+# ---------------------------------------------------------------------------
+
+def _read_task_session_history(task_md: Path) -> list[str]:
+    """Parse the inline `session_history:` line out of a task md."""
+    text = task_md.read_text()
+    import re as _re
+    m = _re.search(r"^session_history:\s*\[(.*?)\]\s*$", text, _re.M)
+    if not m:
+        return []
+    inner = m.group(1).strip()
+    if not inner:
+        return []
+    return [x.strip() for x in inner.split(",") if x.strip()]
+
+
+def test_session_history_first_bind_via_spawn(tmp_path, monkeypatch):
+    """spawn(task_id=X) stamps the new SID into X's session_history."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0090-hist.md"
+    task_md.write_text("---\nid: T-0090\ntitle: H\nstatus: open\n---\n\nbody\n")
+
+    def fake_run(args, **kw):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", task_id="T-0090")
+    hist = _read_task_session_history(task_md)
+    assert hist == ["S-alice-w-p2"]
+
+
+def test_session_history_dedup_on_repeated_spawn(tmp_path, monkeypatch):
+    """If somehow the same SID stamps twice, the helper de-dupes."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0091-dup.md"
+    task_md.write_text(
+        "---\nid: T-0091\ntitle: D\nstatus: open\n"
+        "session_history: [S-alice-w-p2]\n---\n\nbody\n"
+    )
+
+    def fake_run(args, **kw):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", task_id="T-0091")
+    hist = _read_task_session_history(task_md)
+    assert hist == ["S-alice-w-p2"]  # no duplicate
+
+
+def test_session_history_appended_on_bind_task(tmp_path, monkeypatch):
+    """bind_task() stamps the binding SID into the extras-task's history."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    primary_md = backlog / "T-0092-primary.md"
+    extra_md = backlog / "T-0093-extra.md"
+    primary_md.write_text("---\nid: T-0092\ntitle: P\nstatus: open\n---\n\nbody\n")
+    extra_md.write_text("---\nid: T-0093\ntitle: E\nstatus: open\n---\n\nbody\n")
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "u-1",
+        "task_id": "T-0092",
+        "initiative": "~",
+    })
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    from bot_squad_worker.sessions import bind_task
+    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0093")
+
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+
+def test_session_history_rotates_on_resume(tmp_path, monkeypatch):
+    """resume() rotation appends the new SID; old SID stays for forensics."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0094-rot.md"
+    task_md.write_text(
+        "---\nid: T-0094\ntitle: R\nstatus: open\n"
+        "session_history: [S-alice-w-p2]\n---\n\nbody\n"
+    )
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2",
+        "status": "suspended",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "u-1",
+        "task_id": "T-0094",
+    })
+
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        if "list-panes" in args:
+            n = sum(1 for c in calls if "list-panes" in c)
+            if n <= 1:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            # new pane after resume
+            return subprocess.CompletedProcess(args, 0, f"%9|w|999|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = resume(cfg, "test-project", "S-alice-w-p2")
+    new_sid = result["sid"]
+    hist = _read_task_session_history(task_md)
+    # Both old and new SIDs present; old first, new last.
+    assert hist[0] == "S-alice-w-p2"
+    assert hist[-1] == new_sid
+    assert len(hist) == 2
+
+
+def test_session_history_unbind_rebind_no_dup(tmp_path, monkeypatch):
+    """Unbinding + rebinding the same SID keeps history as [sid] — no dup,
+    no reorder. (per T-0105 DoD)"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    primary_md = backlog / "T-0095-prim.md"
+    extra_md = backlog / "T-0096-ext.md"
+    primary_md.write_text("---\nid: T-0095\ntitle: P\nstatus: open\n---\n\nbody\n")
+    extra_md.write_text("---\nid: T-0096\ntitle: E\nstatus: open\n---\n\nbody\n")
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "u-1",
+        "task_id": "T-0095",
+        "initiative": "~",
+    })
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    from bot_squad_worker.sessions import bind_task, unbind_task
+    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+    # Unbind does NOT touch session_history (it's append-only/forensic).
+    unbind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+    # Re-bind same SID — still no dup.
+    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+
+# ---------------------------------------------------------------------------
+# T-0103: break-pane uses TL pane's tmux session, not hardcoded $slug
+# ---------------------------------------------------------------------------
+
+def test_session_start_hook_uses_tl_pane_tmux_session_for_break_pane():
+    """Regression guard: scripts/hooks/session_start.sh resolves
+    target_session via `tmux display-message -p -t "$TMUX_PANE" '#S'`
+    rather than hardcoding $slug. Teammates land in their TL's tmux
+    session (e.g. bot-squad-multi_server), not always the project main
+    session. (T-0103)
+
+    Skipped when the hook isn't reachable from the test cwd (e.g. when
+    only the worker/ dir is mounted into the test container — the host
+    workflow runs this from the repo root and exercises it fully).
+    """
+    import pathlib as _pl
+    here = _pl.Path(__file__).resolve()
+    hook = None
+    for ancestor in here.parents:
+        cand = ancestor / "scripts" / "hooks" / "session_start.sh"
+        if cand.is_file():
+            hook = cand
+            break
+    if hook is None:
+        pytest.skip("session_start.sh not reachable from test cwd "
+                    "(repo root not mounted)")
+    text = hook.read_text()
+    # The primary resolution must query tmux for the TL pane's session
+    # (the fallback `target_session="$slug"` inside the empty-check `if`
+    # is fine — that only fires when the tmux query returned nothing).
+    assert 'target_session="$(tmux display-message' in text, \
+        "T-0103 regression: break-pane target reverted to hardcoded $slug"
+    assert "'#S'" in text, \
+        "T-0103: target_session must come from `tmux display-message ... #S`"

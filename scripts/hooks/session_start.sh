@@ -230,7 +230,17 @@ PY
     fi
     pane="$TMUX_PANE"
     name="$new_win_name"
-    target_session="$slug"
+    # T-0103: target the TL pane's *own* tmux session, not the project
+    # slug. Agent-teams teammates spawn as sub-panes inside the lead's
+    # window; the lead may live in <slug>-<initiative> (e.g.
+    # bot-squad-multi_server). Hardcoding $slug as the destination would
+    # send the teammate window into the main project session beside the
+    # operator instead of next to its TL. Fall back to slug if the tmux
+    # query fails for any reason.
+    target_session="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || echo "$slug")"
+    if [ -z "$target_session" ]; then
+        target_session="$slug"
+    fi
     user="$(whoami 2>/dev/null || id -un 2>/dev/null || echo u)"
     old_sid="$sid"
     data_dir="$DATA"
@@ -303,6 +313,81 @@ if old_md.resolve() != new_md.resolve():
         old_md.unlink()
     except FileNotFoundError:
         pass
+
+# T-0105: SID rotation — append new_sid to session_history of every
+# task this session was bound to (primary + extras). The common
+# agent-teams case has no task_id at break-pane time (lead binds the
+# teammate AFTER break-pane completes), so this is a defensive no-op
+# for vanilla teammate spawns. Covers the rare case where a dev
+# session already bound to T-NNNN gets broken-pane'd.
+task_ids: list[str] = []
+m_task = re.search(r'^task_id:\s*(.*)$', text, re.M)
+if m_task:
+    tid = m_task.group(1).strip()
+    if tid and tid != '~':
+        task_ids.append(tid)
+m_extras = re.search(r'^extra_task_ids:\s*\[([^\]]*)\]\s*$', text, re.M)
+if m_extras:
+    for raw in m_extras.group(1).split(','):
+        tid = raw.strip()
+        if tid and tid != '~':
+            task_ids.append(tid)
+
+if task_ids:
+    backlog = data / 'backlog'
+    for tid in task_ids:
+        cands = sorted(backlog.glob(tid + '-*.md'))
+        if not cands:
+            continue
+        tpath = cands[0]
+        try:
+            ttext = tpath.read_text()
+        except OSError:
+            continue
+        tm = re.match(r'\A---\n(.*?)\n---\n(.*)', ttext, re.DOTALL)
+        if not tm:
+            continue
+        fm_lines = tm.group(1).splitlines()
+        tbody = tm.group(2)
+        h_idx, existing = -1, []
+        for i, ln in enumerate(fm_lines):
+            stripped = ln.lstrip()
+            if stripped.startswith('session_history:'):
+                h_idx = i
+                _, _, vv = stripped.partition(':')
+                vv = vv.strip()
+                if vv.startswith('[') and vv.endswith(']'):
+                    inner = vv[1:-1].strip()
+                    if inner:
+                        existing = [x.strip() for x in inner.split(',') if x.strip() and x.strip() != '~']
+                break
+        if new_sid in existing:
+            continue  # idempotent
+        new_list = existing + [new_sid]
+        joined = ', '.join(new_list)
+        new_line = 'session_history: [' + joined + ']'
+        if h_idx >= 0:
+            fm_lines[h_idx] = new_line
+        else:
+            insert_at = len(fm_lines)
+            for i, ln in enumerate(fm_lines):
+                if ln.lstrip().startswith('status:'):
+                    insert_at = i + 1
+                    break
+            fm_lines.insert(insert_at, new_line)
+        new_fm = '\n'.join(fm_lines)
+        content = '---\n' + new_fm + '\n---\n' + tbody
+        if not tbody.startswith('\n'):
+            content = '---\n' + new_fm + '\n---\n\n' + tbody
+        tmp = tpath.parent / (tpath.name + '.tmp')
+        try:
+            tmp.write_text(content, encoding='utf-8')
+            os.rename(tmp, tpath)
+        except OSError:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 PY
             fi
         fi

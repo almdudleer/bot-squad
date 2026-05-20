@@ -15,9 +15,14 @@ from app.markdown_parser import parse_task
 # Keys allowed in merge_task_update `updates` dict.
 # T-0038 adds first-class linkage fields: `initiative` (basename under
 # vision/initiatives/), `parent_task` (T-NNNN), `blocked_by` (list of T-NNNN).
+# T-0105 adds `session_history` (append-only list of SIDs that worked on
+# this task, oldest first). Worker writes the field inline-format
+# (`[sid1, sid2]`) via sessions.py; the api PATCH path lets us backfill
+# block-format via the yaml-dump writer when needed.
 _ALLOWED_UPDATE_KEYS = frozenset({
     "title", "status", "body", "priority",
     "initiative", "parent_task", "blocked_by",
+    "session_history",
 })
 
 _TASK_ID_RE = re.compile(r"^T-(\d{4})-")

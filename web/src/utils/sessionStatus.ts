@@ -1,4 +1,4 @@
-// T-0080 — shared session-status formatter.
+// T-0104 — shared session-status formatter.
 //
 // One canonical enum used by every UI surface that shows a session
 // state: `running | idle | paused | suspended`. The Sessions board

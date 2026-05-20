@@ -57,7 +57,7 @@ export type Task = {
   session?: {
     sid: string;
     status: "active" | "paused" | string;
-    // T-0080: activity-derived enum. /backlog doesn't populate this
+    // T-0104: activity-derived enum. /backlog doesn't populate this
     // (the worker activity probe lives behind /sessions); FE pages may
     // enrich it client-side by joining with the sessions list. When
     // present it's the canonical display label; when absent the FE
@@ -82,12 +82,12 @@ export type SessionRow = {
   sid: string;
   // Raw md/zombie-reclassified status. Kept for back-compat and for
   // action-button routing (Pause/Resume/Resurrect read this). Display
-  // labels go through `activity` (T-0080) instead.
+  // labels go through `activity` (T-0104) instead.
   status: "active" | "paused" | "suspended";
-  // T-0080: worker-derived activity enum (jsonl mtime probe). Authoritative
+  // T-0104: worker-derived activity enum (jsonl mtime probe). Authoritative
   // for UI labels: a zombie `status: active` surfaces here as `suspended`,
   // and a live-but-quiet pane surfaces as `idle` rather than `running`.
-  // Optional so a pre-T-0080 worker doesn't break the type contract; the
+  // Optional so a pre-T-0104 worker doesn't break the type contract; the
   // UI falls back via `utils/sessionStatus.sessionActivity`.
   activity?: "running" | "idle" | "paused" | "suspended";
   activity_at?: number | null;

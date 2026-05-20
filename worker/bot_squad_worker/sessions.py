@@ -19,7 +19,7 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# T-0080 — activity-derived "running" vs "idle" threshold.
+# T-0104 — activity-derived "running" vs "idle" threshold.
 #
 # A live claude pane bumps the mtime of its own jsonl transcript every time
 # Claude writes (every assistant turn, every tool call). 30s is generous
@@ -108,7 +108,7 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
 
 
 def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> float | None:
-    """T-0080: return the per-pane activity timestamp (epoch seconds) or None.
+    """T-0104: return the per-pane activity timestamp (epoch seconds) or None.
 
     Reads the mtime of the pane's own jsonl transcript file
     (``~/.claude/projects/<encoded_cwd>/<uuid>.jsonl``). Claude appends to
@@ -143,7 +143,7 @@ def _derive_activity(
     *,
     threshold_sec: float = RUNNING_THRESHOLD_SEC,
 ) -> str:
-    """T-0080: map (live md status, activity_at, now) → canonical activity enum.
+    """T-0104: map (live md status, activity_at, now) → canonical activity enum.
 
     Enum: ``running | idle | paused | suspended``. ``suspended`` is set by
     the caller for the no-live-pane path; this helper only handles the
@@ -388,7 +388,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 if own_val and own_val != "~":
                     owner_meta = str(own_val)
 
-        # T-0080: activity-derived status. The existing `status` (md/zombie)
+        # T-0104: activity-derived status. The existing `status` (md/zombie)
         # is preserved for back-compat callers and action-button routing;
         # `activity` is the canonical label-display enum derived from the
         # jsonl mtime probe. Two fields — not a replacement — per the
@@ -465,7 +465,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             rows.append({
                 "sid": sid,
                 "status": display_status,
-                # T-0080: no live pane → activity is unambiguously suspended,
+                # T-0104: no live pane → activity is unambiguously suspended,
                 # regardless of what the md frontmatter claims.
                 "activity": "suspended",
                 "activity_at": None,

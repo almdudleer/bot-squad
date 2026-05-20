@@ -11,7 +11,7 @@ import { PageHelp } from "../components/PageHelp";
 // Helpers
 // ---------------------------------------------------------------------------
 
-// T-0080: render a badge keyed off the canonical `activity` enum
+// T-0104: render a badge keyed off the canonical `activity` enum
 // (worker-derived from jsonl mtime). `running` is the only "green LED"
 // state — a live-but-quiet pane is `idle`, never `running`. Same
 // vocabulary is used by TaskCard / TaskDetail so card and detail no

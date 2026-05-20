@@ -41,7 +41,7 @@ export function TaskDetail() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [activeDevs, setActiveDevs] = useState<SessionRow[]>([]);
-  // T-0080: keep every session row keyed by sid so we can look up the
+  // T-0104: keep every session row keyed by sid so we can look up the
   // worker-derived activity for the bound dev session below. The
   // /backlog endpoint that drove `task.session` doesn't enrich with
   // the activity probe, so we join client-side from /sessions.
@@ -85,7 +85,7 @@ export function TaskDetail() {
       })
       .catch((e) => setError(String(e)));
     // Phase 9: surface active devs so the user can bind this task to an
-    // already-running dev (multi-binding). Silent on error. T-0080:
+    // already-running dev (multi-binding). Silent on error. T-0104:
     // also stash every row by sid for activity lookup against the
     // bound session pill below.
     api.sessions(slug)
@@ -470,7 +470,7 @@ export function TaskDetail() {
           <option value="__new__">+ Create new dev session…</option>
           {/* Surface the current binding even if it's not in activeDevs
               (e.g. paused/suspended) so the select reflects reality.
-              T-0080: label via the canonical activity formatter so this
+              T-0104: label via the canonical activity formatter so this
               dropdown row reads the same vocabulary as the rest of the
               page. */}
           {task.session && !activeDevs.some((d) => d.sid === task.session!.sid) && (
@@ -501,7 +501,7 @@ export function TaskDetail() {
           </button>
         )}
         {task.session && (() => {
-          // T-0080: prefer the worker-derived activity (from /sessions
+          // T-0104: prefer the worker-derived activity (from /sessions
           // join via sessionsBySid) over the raw md status. Falls back
           // to the status-derived mapping in sessionActivity() when
           // the session isn't in the live list (e.g. suspended).

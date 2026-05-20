@@ -353,7 +353,7 @@ def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# T-0080: activity-derived "running" vs "idle" — jsonl-mtime probe
+# T-0104: activity-derived "running" vs "idle" — jsonl-mtime probe
 # ---------------------------------------------------------------------------
 
 def _setup_activity_probe(tmp_path, monkeypatch):

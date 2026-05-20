@@ -80,7 +80,7 @@ export function Project() {
   const { slug = "" } = useParams();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [vision, setVision] = useState<VisionFile[]>([]);
-  // T-0080: per-sid session map for client-side activity enrichment.
+  // T-0104: per-sid session map for client-side activity enrichment.
   // /backlog's task.session doesn't run the worker activity probe, so
   // we join with /sessions here and stamp `task.session.activity` on
   // each card. Empty map = the fetch hasn't landed yet (or failed
@@ -150,7 +150,7 @@ export function Project() {
     api.backlog(slug).then(setTasks).catch((e) => setError(String(e)));
   };
 
-  // T-0080: refresh the sessions map so card pills track the
+  // T-0104: refresh the sessions map so card pills track the
   // worker-derived `running`/`idle` flip in near-real-time. Poll
   // matches the Sessions page cadence (10s) so a typed prompt lights
   // up the card within one poll window.
@@ -176,7 +176,7 @@ export function Project() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
-  // T-0080: enrich task.session.activity by joining with the sessions
+  // T-0104: enrich task.session.activity by joining with the sessions
   // map. We do NOT mutate the original task; useMemo builds a new
   // array so React picks up the activity flip on the next poll.
   const enrichedTasks = useMemo<Task[] | null>(() => {
@@ -232,7 +232,7 @@ export function Project() {
   }
 
   // Tasks keyed by initiative basename (or UNATTACHED).
-  // T-0080: read from enrichedTasks (with activity stamped) so cards
+  // T-0104: read from enrichedTasks (with activity stamped) so cards
   // display the canonical session label.
   const tasksByInit = useMemo<Record<string, Task[]>>(() => {
     const out: Record<string, Task[]> = { [UNATTACHED]: [] };
@@ -272,7 +272,7 @@ export function Project() {
     return all.filter((m) => m.key === filterInit);
   }, [initiativeMeta, tasksByInit, filterInit, activeInitiativeKeys]);
 
-  // Ungrouped — current 5-column behavior. T-0080: enrichedTasks
+  // Ungrouped — current 5-column behavior. T-0104: enrichedTasks
   // so the activity-flip propagates without a board reload.
   const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
   const ungroupedTasks = (enrichedTasks ?? []).filter(passesFilter);

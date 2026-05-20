@@ -240,7 +240,7 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
           </span>
         )}
         {task.session && (() => {
-          // T-0080: unify the card label with the detail page and the
+          // T-0104: unify the card label with the detail page and the
           // Sessions board via the shared formatter. Prefers the
           // worker-derived `activity` field when present (the project
           // page enriches task.session.activity by joining /sessions);

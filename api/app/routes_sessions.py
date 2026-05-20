@@ -135,7 +135,7 @@ async def list_sessions(
     stamping landed have no owner — they are treated as admin-only so they
     don't leak to a second user. Admins still see every row.
 
-    T-0080 activity status: each row also carries a worker-derived
+    T-0104 activity status: each row also carries a worker-derived
     ``activity`` enum (``running|idle|paused|suspended``) and an
     ``activity_at`` epoch float. Frontends display labels off ``activity``,
     not the raw md ``status``, so a zombie session with ``status: active``

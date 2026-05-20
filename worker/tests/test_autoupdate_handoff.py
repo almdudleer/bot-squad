@@ -544,3 +544,100 @@ def test_apply_failure_into_retry_into_drain(install_ctx, monkeypatch):
     result2 = apply_mod.drain_one(cfg)
     assert result2 is not None and result2.ok is False
     assert (apply_mod.failed_queue_dir(cfg) / "deadbeef.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# autoupdate_check_now action (T-0089)
+# ---------------------------------------------------------------------------
+
+
+def test_autoupdate_check_now_falls_back_to_inline_tick(install_ctx, monkeypatch):
+    """No scheduler injected: the action runs autoupdate.tick inline so the
+    operator's "force a check" lever still does something useful."""
+    cfg = install_ctx["cfg"]
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    # Make sure no scheduler is registered for this test (autouse fixture
+    # doesn't set one).
+    A.set_scheduler(None)
+
+    calls = {"n": 0}
+    def fake_tick(_cfg):
+        calls["n"] += 1
+    monkeypatch.setattr(poller, "tick", fake_tick)
+
+    out = dispatch("autoupdate_check_now", {})
+    assert out == {"ok": True, "scheduled": False, "ran_inline": True}
+    assert calls["n"] == 1
+
+
+def test_autoupdate_check_now_reschedules_when_scheduler_present(
+    install_ctx, monkeypatch
+):
+    """With a scheduler injected the action modifies the autoupdate job's
+    next_run_time and returns the new value. No inline tick runs."""
+    cfg = install_ctx["cfg"]
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    # Tripwire: inline tick must NOT run when the scheduler path is taken.
+    def fake_tick(_cfg):
+        pytest.fail("tick must not run inline when scheduler is present")
+    monkeypatch.setattr(poller, "tick", fake_tick)
+
+    from datetime import datetime, timezone
+    seen: dict = {}
+
+    class FakeJob:
+        def __init__(self, t):
+            self.next_run_time = t
+
+    class FakeSched:
+        def modify_job(self, job_id, *, next_run_time):
+            seen["id"] = job_id
+            seen["nrt"] = next_run_time
+            return FakeJob(next_run_time)
+
+    A.set_scheduler(FakeSched())
+    try:
+        out = dispatch("autoupdate_check_now", {})
+    finally:
+        A.set_scheduler(None)
+
+    assert out["ok"] is True
+    assert out["scheduled"] is True
+    assert out["next_run"] is not None
+    assert seen["id"] == "autoupdate"
+    # next_run_time was set to ~now (UTC). Allow a generous skew window.
+    now = datetime.now(timezone.utc)
+    assert abs((now - seen["nrt"]).total_seconds()) < 5
+
+
+def test_autoupdate_check_now_rejects_params(install_ctx, monkeypatch):
+    cfg = install_ctx["cfg"]
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    A.set_scheduler(None)
+    with pytest.raises(ActionError, match="no params"):
+        dispatch("autoupdate_check_now", {"slug": "bot-squad"})
+
+
+def test_autoupdate_check_now_surfaces_scheduler_errors(install_ctx, monkeypatch):
+    """A JobLookupError / scheduler-not-running becomes an ActionError so
+    the API gets a usable 502 instead of a stack trace."""
+    cfg = install_ctx["cfg"]
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    class ExplodingSched:
+        def modify_job(self, *a, **kw):
+            raise RuntimeError("scheduler not running")
+
+    A.set_scheduler(ExplodingSched())
+    try:
+        with pytest.raises(ActionError, match="could not reschedule"):
+            dispatch("autoupdate_check_now", {})
+    finally:
+        A.set_scheduler(None)
+
+
+def test_autoupdate_check_now_registered_as_coordinator_only(install_ctx):
+    """Mode tag wiring: the action must be coordinator-only, not tmux_only."""
+    assert "autoupdate_check_now" in ACTION_REGISTRY
+    assert ACTION_MODES["autoupdate_check_now"] == "coordinator_only"

@@ -844,6 +844,47 @@ def _action_autoupdate_retry(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"autoupdate_retry: {e}") from e
 
 
+def _action_autoupdate_check_now(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0089: trigger the poller tick out-of-cadence.
+
+    Takes no params. Returns {ok, scheduled: bool, next_run?: str}.
+    Reschedules the registered ``autoupdate`` APScheduler job to fire on
+    the next loop pass (typically <1s). Non-blocking — the actual poll
+    happens on the scheduler thread; the API caller can refresh
+    ``/autoupdate/status`` a moment later to see the updated
+    ``last_check_at``.
+
+    If the scheduler isn't initialised (tests, or worker not in coordinator
+    mode), the action falls back to running ``autoupdate.tick`` inline so
+    operators still get the documented "force a fresh check" behaviour.
+    """
+    if params:
+        raise ActionError(f"autoupdate_check_now takes no params, got: {sorted(params)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import autoupdate as _au
+
+    if _SCHED is None:
+        # No scheduler around (e.g. tests, single-shot scripts) — fall back to
+        # inline tick so the action still has its documented effect.
+        try:
+            _au.tick(cfg)
+        except Exception as e:  # noqa: BLE001 — operator-facing, surface message
+            raise ActionError(f"autoupdate_check_now: tick failed: {e}") from e
+        return {"ok": True, "scheduled": False, "ran_inline": True}
+
+    from datetime import datetime, timezone
+    try:
+        job = _SCHED.modify_job(
+            "autoupdate", next_run_time=datetime.now(timezone.utc)
+        )
+    except Exception as e:  # JobLookupError, scheduler not running, etc.
+        raise ActionError(f"autoupdate_check_now: could not reschedule: {e}") from e
+
+    next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+    return {"ok": True, "scheduled": True, "next_run": next_run}
+
+
 _AUTOUPDATE_FORCE_REQUIRED = {"slug", "version"}
 _AUTOUPDATE_FORCE_ALLOWED = _AUTOUPDATE_FORCE_REQUIRED
 
@@ -908,6 +949,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0085: autoupdate operator handoff levers.
     "autoupdate_retry": _action_autoupdate_retry,
     "autoupdate_force": _action_autoupdate_force,
+    # T-0089: trigger an out-of-cadence poller tick from the consumer UI.
+    "autoupdate_check_now": _action_autoupdate_check_now,
 }
 
 
@@ -944,6 +987,8 @@ ACTION_MODES: dict[str, str] = {
     # T-0085: autoupdate handoff is install-scoped (coordinator).
     "autoupdate_retry": "coordinator_only",
     "autoupdate_force": "coordinator_only",
+    # T-0089: scheduler-coupled (modifies the autoupdate job's next_run).
+    "autoupdate_check_now": "coordinator_only",
 }
 
 

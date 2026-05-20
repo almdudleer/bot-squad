@@ -1,9 +1,14 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
+import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
+
+// T-0089: the autoupdate pill is consumer-side only — Vite inlines this
+// constant so the mothership bundle tree-shakes the component import away.
+const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
 
 /**
  * Shell — left sidebar navigation present on every authenticated page.
@@ -166,6 +171,9 @@ export function Shell() {
             <span className={dotCls} />
             <span style={{ color: workerLabelColor }}>{workerLabel}</span>
           </div>
+          {/* T-0089: consumer-only autoupdate status pill. Skipped on the
+              mothership build so we don't poll a 404 endpoint forever. */}
+          {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}
         </div>
 
         {/* Project section — shows pinned project even on global routes */}

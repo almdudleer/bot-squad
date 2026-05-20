@@ -61,6 +61,8 @@ def test_registry_lists_only_allowed_actions():
         "archive_session", "unarchive_session",
         # T-0085: operator handoff levers for autoupdate failures.
         "autoupdate_retry", "autoupdate_force",
+        # T-0089: trigger an out-of-cadence poller tick from the consumer UI.
+        "autoupdate_check_now",
     }
 
 

@@ -357,6 +357,87 @@ def test_tick_bad_entry_does_not_enqueue(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Pause flag (T-0089)
+# ---------------------------------------------------------------------------
+
+
+def test_is_paused_reflects_flag_presence(tmp_path):
+    """is_paused is presence-only — contents of the flag file don't matter."""
+    cfg = _make_cfg(tmp_path)
+    assert autoupdate.is_paused(cfg) is False
+    flag = autoupdate.paused_flag_path(cfg)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("")  # empty is fine
+    assert autoupdate.is_paused(cfg) is True
+    flag.unlink()
+    assert autoupdate.is_paused(cfg) is False
+
+
+def test_tick_newer_version_does_not_enqueue_when_paused(tmp_path, monkeypatch):
+    """T-0089: with the pause flag set, a newer manifest entry is logged
+    but NOT enqueued. last_check_at still advances so the UI's liveness
+    clock keeps moving."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mothership.example")
+    autoupdate.save_state(cfg, {
+        "installed_version": "v2026.05.16.1",
+        "last_check_at": None,
+        "last_apply_at": None,
+        "last_apply_outcome": "never",
+        "current_git_sha": "old",
+    })
+    # Pause before the tick.
+    flag = autoupdate.paused_flag_path(cfg)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("")
+    _install_fake_fetch(monkeypatch, _entry(version="v2026.05.16.2"))
+
+    autoupdate.tick(cfg)
+
+    # No enqueue.
+    qdir = autoupdate.queue_dir(cfg)
+    assert not qdir.exists() or list(qdir.glob("*.json")) == []
+    # Last-check-at still advanced.
+    state = autoupdate.load_state(cfg)
+    assert state["last_check_at"] is not None
+    # installed_version unchanged.
+    assert state["installed_version"] == "v2026.05.16.1"
+
+
+def test_handle_latest_returns_paused_marker_when_paused(tmp_path, monkeypatch):
+    """The internal status string is "paused" — useful for log analysis
+    and any future test that wants to assert the codepath was taken
+    rather than just observing absence."""
+    cfg = _make_cfg(tmp_path)
+    autoupdate.save_state(cfg, {
+        "installed_version": "v2026.05.16.1",
+        "last_check_at": None,
+        "last_apply_at": None,
+        "last_apply_outcome": "never",
+        "current_git_sha": "old",
+    })
+    flag = autoupdate.paused_flag_path(cfg)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("")
+    result = autoupdate._handle_latest(cfg, _entry(version="v2026.05.16.2"))
+    assert result == "paused"
+
+
+def test_first_run_still_stamps_when_paused(tmp_path):
+    """First-run stamping is bookkeeping, not an apply — should run even
+    when paused. Otherwise a paused fresh install would never learn what
+    version it's on, breaking the UI pill's default state."""
+    cfg = _make_cfg(tmp_path)
+    # No prior state.
+    flag = autoupdate.paused_flag_path(cfg)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("")
+    result = autoupdate._handle_latest(cfg, _entry(version="v2026.05.16.2"))
+    assert result == "first_run_stamped"
+    assert autoupdate.load_state(cfg)["installed_version"] == "v2026.05.16.2"
+
+
+# ---------------------------------------------------------------------------
 # install_id resolution (T-0088)
 # ---------------------------------------------------------------------------
 

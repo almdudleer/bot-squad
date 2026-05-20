@@ -86,6 +86,10 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 LATEST_PATH = "/api/releases/latest"
 TELEMETRY_PATH = "/api/releases/_telemetry"
 INSTALL_ID_FILE = "install.id"
+# T-0089: operator pause flag honored by both the poller (skip enqueue)
+# and the apply drainer (skip drain). last_check_at still advances so the
+# UI's "checked Nm ago" liveness clock stays accurate while paused.
+PAUSED_FLAG_FILE = "autoupdate_paused.flag"
 
 
 def interval_seconds() -> int:
@@ -167,6 +171,21 @@ def install_id(cfg: Any) -> Optional[str]:
 
 def queue_dir(cfg: Any) -> Path:
     return cfg.data_dir / "_worker" / "autoupdate_queue"
+
+
+def paused_flag_path(cfg: Any) -> Path:
+    """Path of the operator pause flag (T-0089).
+
+    Presence of the file = paused; absence = active. We use a flag file
+    rather than a JSON field so the API can toggle it atomically without
+    racing the poller's autoupdate.json writer.
+    """
+    return cfg.data_dir / "_worker" / PAUSED_FLAG_FILE
+
+
+def is_paused(cfg: Any) -> bool:
+    """T-0089: True iff the operator has paused autoupdate on this consumer."""
+    return paused_flag_path(cfg).exists()
 
 
 def _now_iso() -> str:
@@ -355,6 +374,7 @@ def _handle_latest(cfg: Any, entry: dict) -> str:
 
     * ``"first_run_stamped"`` — no prior state; stamped manifest as installed.
     * ``"enqueued"`` — newer version detected; apply job written.
+    * ``"paused"`` — newer version available but operator paused enqueue (T-0089).
     * ``"up_to_date"`` — manifest version matches installed.
     * ``"older"``     — manifest version is older than installed (no-op).
     * ``"bad_entry"`` — manifest entry missing required fields (no-op).
@@ -370,6 +390,8 @@ def _handle_latest(cfg: Any, entry: dict) -> str:
     if not installed:
         # First run: we don't know what's actually installed, but the spec
         # says assume aligned with the current latest — do NOT apply.
+        # First-run stamping is a bookkeeping op, not an apply, so we still
+        # do it even when paused (T-0089).
         state["installed_version"] = version
         state["current_git_sha"] = entry.get("git_sha") or state.get("current_git_sha")
         save_state(cfg, state)
@@ -377,6 +399,14 @@ def _handle_latest(cfg: Any, entry: dict) -> str:
         return "first_run_stamped"
 
     if is_newer(version, installed):
+        # T-0089: skip enqueue while operator paused; last_check_at still
+        # advances upstream in tick() so the UI's liveness clock keeps moving.
+        if is_paused(cfg):
+            log.info(
+                "autoupdate: newer version %s available but PAUSED (T-0089) — not enqueuing",
+                version,
+            )
+            return "paused"
         path = _enqueue_apply(cfg, entry)
         log.info(
             "autoupdate: newer version available (%s > %s); enqueued %s",

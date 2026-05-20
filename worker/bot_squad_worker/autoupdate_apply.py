@@ -660,9 +660,16 @@ def _next_queued(cfg: Any) -> Optional[Path]:
 
 
 def drain_one(cfg: Any) -> Optional[ApplyResult]:
-    """Process at most ONE queue file. Returns None if the queue is empty
-    (or this is the mothership)."""
+    """Process at most ONE queue file. Returns None if the queue is empty,
+    if the operator has paused autoupdate (T-0089), or if this is the
+    mothership."""
     if is_mothership():
+        return None
+
+    # T-0089: honor the operator pause flag. Queued jobs sit untouched
+    # until the flag is cleared; unpause + drain on the next tick.
+    if _poller.is_paused(cfg):
+        log.debug("autoupdate_apply: PAUSED (T-0089) — drain is a no-op")
         return None
 
     qfile = _next_queued(cfg)

@@ -1,7 +1,12 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  ATTACHMENT_SIDEBAR_ITEMS,
+  SELF_SERVER_ID,
+  SERVER_PICKER_STORAGE_KEY,
+  attachmentSidebarItems,
   isSuperAdminFromMe,
+  readAttachmentServerId,
   resolveInitialPickedServer,
   sidebarSectionVisibility,
   visibleSidebarSections,
@@ -163,6 +168,59 @@ describe("isSuperAdminFromMe (T-0062 with T-0066 fallback)", () => {
   test("null / undefined me → false (anonymous can't be super-admin)", () => {
     expect(isSuperAdminFromMe(null)).toBe(false);
     expect(isSuperAdminFromMe(undefined)).toBe(false);
+  });
+});
+
+describe("attachmentSidebarItems (T-0061 — locked contract)", () => {
+  test("returns the three items from the nav-restructure spec, in order", () => {
+    const items = attachmentSidebarItems();
+    expect(items.map((i) => i.key)).toEqual([
+      "tg-binding",
+      "my-sessions",
+      "my-worker",
+    ]);
+    expect(items.map((i) => i.label)).toEqual([
+      "TG BINDING",
+      "MY SESSIONS",
+      "WORKER CONTROLS",
+    ]);
+  });
+
+  test("routes to /attachment/* paths so detach + mothership share the same shell", () => {
+    // Both builds render the same body — the spec calls out that ATTACHMENT
+    // is identical on detach AND mothership (only SERVER changes shape).
+    for (const item of attachmentSidebarItems()) {
+      expect(item.to.startsWith("/attachment/")).toBe(true);
+    }
+  });
+
+  test("ATTACHMENT_SIDEBAR_ITEMS is the exported constant (stable reference)", () => {
+    // Some callers may want to import the constant directly (e.g. tests
+    // pinning the spec) — verify the helper returns it untouched so we
+    // don't accidentally diverge the two surfaces.
+    expect(attachmentSidebarItems()).toBe(ATTACHMENT_SIDEBAR_ITEMS);
+  });
+});
+
+describe("readAttachmentServerId (T-0061)", () => {
+  function fakeStorage(value: string | null): Pick<Storage, "getItem"> {
+    return { getItem: (k) => (k === SERVER_PICKER_STORAGE_KEY ? value : null) };
+  }
+
+  test("returns the SELF sentinel when no picker selection is stored", () => {
+    expect(readAttachmentServerId(fakeStorage(null))).toBe(SELF_SERVER_ID);
+  });
+
+  test("returns the SELF sentinel for an empty stored value", () => {
+    expect(readAttachmentServerId(fakeStorage(""))).toBe(SELF_SERVER_ID);
+  });
+
+  test("returns the stored picker selection when present", () => {
+    expect(readAttachmentServerId(fakeStorage("srv_abc123"))).toBe("srv_abc123");
+  });
+
+  test("returns the SELF sentinel when no storage exists at all (node env)", () => {
+    expect(readAttachmentServerId(null)).toBe(SELF_SERVER_ID);
   });
 });
 

@@ -3,7 +3,11 @@ import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom"
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
-import { isSuperAdminFromMe, workerStatusPaint } from "./sidebarHelpers";
+import {
+  attachmentSidebarItems,
+  isSuperAdminFromMe,
+  workerStatusPaint,
+} from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
@@ -379,12 +383,13 @@ export function Shell() {
           )}
         </ul>
 
-        {/* ATTACHMENT — per-user-per-server (T-0061 placeholder + T-0063).
-            Scoped to the currently-picked SERVER (T-0060). Bundle C fills
-            the TG-binding / my-sessions / worker-controls rows. The
-            operational-status pill lives in the section chrome (top row
-            of the body) — it's per-worker, per-user-per-server, so this
-            scope is its true home. */}
+        {/* ATTACHMENT — per-user-per-server (T-0061 + T-0063). Scoped to
+            the currently-picked SERVER (T-0060) via SERVER_PICKER_STORAGE_KEY
+            which each child page reads (Shell stays presentation-only). The
+            operational-status pill lives as the section's chrome row (it
+            belongs to this scope per T-0063); the nav rows below come from
+            ``attachmentSidebarItems()`` so the locked-spec order has a
+            single source of truth shared with vitest. */}
         <div className="mc-sidebar-section">ATTACHMENT</div>
         <ul className="mc-sidebar-nav" aria-live="polite">
           <li
@@ -394,10 +399,18 @@ export function Shell() {
             <span className={workerPaint.dotClass} />
             <span style={{ color: workerPaint.color }}>{workerPaint.label}</span>
           </li>
-          <li className="mc-sidebar-attachment-placeholder">
-            <span className="mc-nav-diamond">·</span>
-            loading…
-          </li>
+          {attachmentSidebarItems().map((item) => (
+            <li key={item.key}>
+              <NavLink
+                to={item.to}
+                data-onboarding-anchor={item.onboardingAnchor}
+                className={({ isActive }) => (isActive ? "active" : undefined)}
+              >
+                <span className="mc-nav-diamond">◇</span>
+                {item.label}
+              </NavLink>
+            </li>
+          ))}
         </ul>
 
         {/* MOTHERSHIP — super-admin only on mothership builds (T-0062).

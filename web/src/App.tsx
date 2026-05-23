@@ -18,6 +18,9 @@ import { Welcome } from "./pages/Welcome";
 import { Users } from "./pages/Users";
 import { SystemSettings } from "./pages/SystemSettings";
 import { Profile } from "./pages/Profile";
+import { AttachmentTgBinding } from "./pages/AttachmentTgBinding";
+import { AttachmentSessions } from "./pages/AttachmentSessions";
+import { AttachmentWorker } from "./pages/AttachmentWorker";
 import { Shell } from "./components/Shell";
 
 // Mothership centralization layer — vision/architecture/mothership-seam.md.
@@ -76,6 +79,11 @@ export function App() {
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />
           <Route path="/me" element={<Profile />} />
+          {/* T-0061: ATTACHMENT-scoped (per-user-per-server) pages. Sidebar
+              entries in components/sidebarHelpers.ts ATTACHMENT_SIDEBAR_ITEMS. */}
+          <Route path="/attachment/tg-binding" element={<AttachmentTgBinding />} />
+          <Route path="/attachment/sessions" element={<AttachmentSessions />} />
+          <Route path="/attachment/worker" element={<AttachmentWorker />} />
           {MothershipRoutes && (
             <Route
               path="/m/*"

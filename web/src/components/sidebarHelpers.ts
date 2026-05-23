@@ -121,6 +121,76 @@ export function workerStatusPaint(alive: WorkerAlive): WorkerStatusPaint {
  *  but the cookie session already isolates browsers. */
 export const SERVER_PICKER_STORAGE_KEY = "srv.picker.server_id";
 
+/**
+ * T-0061 — sentinel passed to ``/api/me/attachment/<server_id>/...`` when
+ * no picker selection is known. The backend resolves it to this install's
+ * own server-id (or falls through to UserMeta on detach builds with no
+ * mothership registry), so this value is safe to send regardless of build.
+ */
+export const SELF_SERVER_ID = "self";
+
+/**
+ * Resolve the server-id ATTACHMENT-scoped API calls should target. Reads
+ * the same localStorage key the picker writes (T-0060) so the picker's
+ * choice flows transparently to non-Shell pages. ``null``/empty/missing
+ * → ``"self"`` sentinel which the backend resolves server-side.
+ *
+ * The ``storage`` arg is injectable so node-env tests (vitest, no jsdom)
+ * can pass a stub without crashing on a missing ``localStorage`` global.
+ */
+type StorageLike = Pick<Storage, "getItem">;
+
+export function readAttachmentServerId(storage?: StorageLike | null): string {
+  const s =
+    storage ?? (typeof localStorage !== "undefined" ? localStorage : null);
+  if (s === null) return SELF_SERVER_ID;
+  try {
+    const v = s.getItem(SERVER_PICKER_STORAGE_KEY);
+    if (v && v.length > 0) return v;
+  } catch {
+    /* ignore quota / disabled */
+  }
+  return SELF_SERVER_ID;
+}
+
+/** T-0061 — ATTACHMENT section nav items, in render order. */
+export type AttachmentSidebarItem = {
+  key: string;
+  label: string;
+  to: string;
+  /** Optional data-onboarding-anchor for §9.x spotlight beats. */
+  onboardingAnchor?: string;
+};
+
+/**
+ * Locked contract from ``vision/multi-server/nav-restructure.md``: TG
+ * binding, my sessions, worker controls — in that order, identical on
+ * mothership and detach builds. The operational-status pill is rendered
+ * separately by Shell.tsx as section chrome (T-0063), not as a nav item.
+ */
+export const ATTACHMENT_SIDEBAR_ITEMS: AttachmentSidebarItem[] = [
+  {
+    key: "tg-binding",
+    label: "TG BINDING",
+    to: "/attachment/tg-binding",
+    onboardingAnchor: "attachment-tg-binding",
+  },
+  {
+    key: "my-sessions",
+    label: "MY SESSIONS",
+    to: "/attachment/sessions",
+  },
+  {
+    key: "my-worker",
+    label: "WORKER CONTROLS",
+    to: "/attachment/worker",
+  },
+];
+
+export function attachmentSidebarItems(): AttachmentSidebarItem[] {
+  return ATTACHMENT_SIDEBAR_ITEMS;
+}
+
 export type PickerCandidate = {
   /** Server id in the mothership registry. */
   id: string;

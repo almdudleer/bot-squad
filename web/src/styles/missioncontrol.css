@@ -1737,6 +1737,20 @@ tr.mc-row-flash > td {
   list-style: none;
 }
 
+/* T-0063: operational-status pill moved out of the top header into the
+   ATTACHMENT chrome. It's per-worker per-user-per-server, which is
+   exactly this section's scope. */
+.mc-sidebar-attachment-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem 0.5rem;
+  list-style: none;
+  font-family: var(--mc-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+}
+
 /* ---- Sidebar: SERVER picker (T-0060) --------------------- */
 /* Section header carries the picker inline — the surrounding
    `.mc-sidebar-section` adds the "[ ]" brackets via pseudo-elements,

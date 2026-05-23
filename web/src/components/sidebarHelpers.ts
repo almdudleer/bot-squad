@@ -77,6 +77,45 @@ export function visibleSidebarSections(flags: SidebarFlags): SidebarSectionKey[]
   return ordered.filter((k) => v[k]);
 }
 
+/**
+ * T-0063 — operational-status pill. Pulled out of inline JSX so the
+ * three-way ternary (unknown / alive / offline) is unit-testable. The
+ * pill itself moves out of the Shell top header into the ATTACHMENT
+ * section chrome per the contract.
+ */
+export type WorkerAlive = boolean | null;
+
+export type WorkerStatusPaint = {
+  /** Status class for the dot: idle (unknown), active (alive), error (down). */
+  dotClass: string;
+  /** Short label rendered next to the dot. */
+  label: string;
+  /** Foreground colour token for the label text. */
+  color: string;
+};
+
+export function workerStatusPaint(alive: WorkerAlive): WorkerStatusPaint {
+  if (alive === null) {
+    return {
+      dotClass: "mc-dot mc-dot-idle",
+      label: "UNKNOWN",
+      color: "var(--mc-text-faint)",
+    };
+  }
+  if (alive) {
+    return {
+      dotClass: "mc-dot mc-dot-active",
+      label: "OPERATIONAL",
+      color: "var(--mc-green)",
+    };
+  }
+  return {
+    dotClass: "mc-dot mc-dot-error",
+    label: "WORKER OFFLINE",
+    color: "var(--mc-red)",
+  };
+}
+
 /** T-0060 — localStorage key for the server picker selection. Scoped per
  *  installation; in a multi-user context the key would also be per-user,
  *  but the cookie session already isolates browsers. */

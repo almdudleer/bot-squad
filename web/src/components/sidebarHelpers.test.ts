@@ -5,6 +5,7 @@ import {
   resolveInitialPickedServer,
   sidebarSectionVisibility,
   visibleSidebarSections,
+  workerStatusPaint,
   type PickerCandidate,
   type SidebarFlags,
 } from "./sidebarHelpers";
@@ -82,6 +83,28 @@ describe("visibleSidebarSections", () => {
     expect(visibleSidebarSections(flags({ isMothershipBuild: true }))).toContain(
       "attachment",
     );
+  });
+});
+
+describe("workerStatusPaint (T-0063 — pill moved to ATTACHMENT)", () => {
+  test("alive === null → idle/UNKNOWN", () => {
+    const p = workerStatusPaint(null);
+    expect(p.dotClass).toBe("mc-dot mc-dot-idle");
+    expect(p.label).toBe("UNKNOWN");
+  });
+
+  test("alive === true → active/OPERATIONAL", () => {
+    const p = workerStatusPaint(true);
+    expect(p.dotClass).toBe("mc-dot mc-dot-active");
+    expect(p.label).toBe("OPERATIONAL");
+    expect(p.color).toBe("var(--mc-green)");
+  });
+
+  test("alive === false → error/WORKER OFFLINE", () => {
+    const p = workerStatusPaint(false);
+    expect(p.dotClass).toBe("mc-dot mc-dot-error");
+    expect(p.label).toBe("WORKER OFFLINE");
+    expect(p.color).toBe("var(--mc-red)");
   });
 });
 

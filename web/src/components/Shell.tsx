@@ -3,7 +3,7 @@ import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom"
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
-import { isSuperAdminFromMe } from "./sidebarHelpers";
+import { isSuperAdminFromMe, workerStatusPaint } from "./sidebarHelpers";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
 
@@ -147,22 +147,9 @@ export function Shell() {
     setPinnedSlug(null);
   }
 
-  const dotCls =
-    workerAlive === null
-      ? "mc-dot mc-dot-idle"
-      : workerAlive
-      ? "mc-dot mc-dot-active"
-      : "mc-dot mc-dot-error";
-
-  const workerLabel =
-    workerAlive === null ? "UNKNOWN" : workerAlive ? "OPERATIONAL" : "WORKER OFFLINE";
-
-  const workerLabelColor =
-    workerAlive === null
-      ? "var(--mc-text-faint)"
-      : workerAlive
-      ? "var(--mc-green)"
-      : "var(--mc-red)";
+  // T-0063: pill moved out of the top header into the ATTACHMENT chrome.
+  // Inline ternary collapsed into workerStatusPaint() for unit-testability.
+  const workerPaint = workerStatusPaint(workerAlive);
 
   return (
     <div className="mc-layout">
@@ -185,13 +172,12 @@ export function Shell() {
       {/* ── Sidebar ─────────────────────────────────────────── */}
       <nav className={`mc-sidebar${sidebarOpen ? " open" : ""}`}>
 
-        {/* Header strip */}
+        {/* Header strip. T-0063 evacuated the per-worker operational-status
+            pill out of here (it was misscoped: per-user-per-server, not
+            global). It lives under ATTACHMENT now. T-0064 will reuse the
+            freed space for a cross-server GLOBAL busy indicator. */}
         <div className="mc-sidebar-header">
           <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
-          <div className="mc-worker-status">
-            <span className={dotCls} />
-            <span style={{ color: workerLabelColor }}>{workerLabel}</span>
-          </div>
           {/* T-0089: consumer-only autoupdate status pill. Skipped on the
               mothership build so we don't poll a 404 endpoint forever. */}
           {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}
@@ -386,15 +372,21 @@ export function Shell() {
           )}
         </ul>
 
-        {/* ATTACHMENT — per-user-per-server (T-0061 placeholder).
+        {/* ATTACHMENT — per-user-per-server (T-0061 placeholder + T-0063).
             Scoped to the currently-picked SERVER (T-0060). Bundle C fills
-            the rows (operational status row lands here via T-0063 next;
-            TG-binding migration + my-sessions + worker controls are
-            owned by the downstream `attachment-tg` dev). We render the
-            section header + a loading-stub body so the structural shape
-            is in place and T-0063 has a host. */}
+            the TG-binding / my-sessions / worker-controls rows. The
+            operational-status pill lives in the section chrome (top row
+            of the body) — it's per-worker, per-user-per-server, so this
+            scope is its true home. */}
         <div className="mc-sidebar-section">ATTACHMENT</div>
         <ul className="mc-sidebar-nav" aria-live="polite">
+          <li
+            className="mc-sidebar-attachment-status"
+            data-onboarding-anchor="operational-status"
+          >
+            <span className={workerPaint.dotClass} />
+            <span style={{ color: workerPaint.color }}>{workerPaint.label}</span>
+          </li>
           <li className="mc-sidebar-attachment-placeholder">
             <span className="mc-nav-diamond">·</span>
             loading…

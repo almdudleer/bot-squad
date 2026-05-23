@@ -9,6 +9,48 @@ interface EditState {
   draft: string;
 }
 
+// T-0100: pure helper mirroring worker `_find_owner` (sessions.py). Used by
+// the roadmap to decide which TL sessions are bound to which initiatives.
+//
+// Rules (must match _find_owner / _full_initiative_set in the worker):
+//   - A TL is any session with no primary task_id (or task_id == "~").
+//   - A TL is bound to initiative X iff X appears in primary `initiative`
+//     OR in `extra_initiatives` (Phase 9 multi-binding).
+//   - Status is NOT a filter: a paused/suspended TL still owns its bindings
+//     (otherwise the roadmap claims "no TL" while the worker still routes
+//     peer_send to it and blocks re-binding).
+//   - Archived sessions ARE filtered: archived means "gone for real" — the
+//     binding chip would be stale and misleading.
+//
+// Returns { tlsByInitiative, candidateTls } where candidateTls is the flat
+// list of TLs (any status, unarchived) used to populate the bind dropdown.
+export function computeTlBindings(sessions: SessionRow[]): {
+  tlsByInitiative: Map<string, SessionRow[]>;
+  candidateTls: SessionRow[];
+} {
+  const tlsByInitiative = new Map<string, SessionRow[]>();
+  const candidateTls: SessionRow[] = [];
+  for (const s of sessions) {
+    if (s.archived) continue;
+    const tid = (s.task_id ?? "").trim();
+    if (tid && tid !== "~") continue;
+    candidateTls.push(s);
+    const bound: string[] = [];
+    const init = (s.initiative ?? "").trim();
+    if (init && init !== "~") bound.push(init);
+    for (const e of s.extra_initiatives ?? []) {
+      const cleaned = (e ?? "").trim();
+      if (cleaned && cleaned !== "~") bound.push(cleaned);
+    }
+    for (const b of bound) {
+      const list = tlsByInitiative.get(b) ?? [];
+      list.push(s);
+      tlsByInitiative.set(b, list);
+    }
+  }
+  return { tlsByInitiative, candidateTls };
+}
+
 export function Vision() {
   const { slug = "" } = useParams();
   const navigate = useNavigate();
@@ -165,30 +207,13 @@ export function Vision() {
     .filter((f) => !f.active && !f.finished)
     .filter((f) => !f.name.endsWith("/_TEMPLATE.md"));
 
-  // For each initiative basename, the list of bound active TL sessions.
-  // A TL is a session with no task_id and status === "active". A TL is
-  // bound to initiative X iff X is in {primary} ∪ extra_initiatives.
-  // Phase 9: multi-binding — extras are usually empty but a TL can hold many.
-  const tlsByInitiative = new Map<string, SessionRow[]>();
-  const activeTls: SessionRow[] = [];
-  for (const s of sessions) {
-    if (s.status !== "active") continue;
-    const tid = (s.task_id ?? "").trim();
-    if (tid && tid !== "~") continue;   // dev session, not a TL
-    activeTls.push(s);
-    const bound: string[] = [];
-    const init = (s.initiative ?? "").trim();
-    if (init && init !== "~") bound.push(init);
-    for (const e of s.extra_initiatives ?? []) {
-      const cleaned = e.trim();
-      if (cleaned && cleaned !== "~") bound.push(cleaned);
-    }
-    for (const b of bound) {
-      const list = tlsByInitiative.get(b) ?? [];
-      list.push(s);
-      tlsByInitiative.set(b, list);
-    }
-  }
+  // T-0100: mirror the worker's `_find_owner` resolver so the roadmap's
+  // notion of "who is the TL for initiative X" matches what `peer_send
+  // to=teamlead` and `bind_initiative` would resolve to. The worker does
+  // NOT filter by status — a paused/suspended TL still owns its bindings
+  // (resurrect-able). The previous status==="active" filter caused the
+  // "no TL" bug for any TL that wasn't currently running.
+  const { tlsByInitiative, candidateTls: activeTls } = computeTlBindings(sessions);
 
   async function bindInitiativeTo(sid: string, base: string) {
     try {

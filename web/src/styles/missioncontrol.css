@@ -1573,3 +1573,18 @@ hr { border-color: var(--mc-border); opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   .bs-typewriter-caret { animation: none; }
 }
+
+/* T-0099: row flash on deep-link arrival. Apply via className on the
+   target <tr>; the animation fades to transparent so removing the class
+   afterwards is purely a cleanup step. */
+@keyframes mc-row-flash {
+  0%   { background-color: rgba(34, 211, 238, 0.32); }
+  60%  { background-color: rgba(34, 211, 238, 0.18); }
+  100% { background-color: transparent; }
+}
+tr.mc-row-flash > td {
+  animation: mc-row-flash 2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  tr.mc-row-flash > td { animation: none; background-color: rgba(34, 211, 238, 0.18); }
+}

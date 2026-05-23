@@ -306,7 +306,12 @@ export function Vision() {
             title={`bound TL: ${s.sid}`}
           >
             <span
-              onClick={(e) => { e.stopPropagation(); navigate(`/p/${slug}/sessions`); }}
+              onClick={(e) => {
+                e.stopPropagation();
+                // T-0099: deep-link to the bound TL row so /sessions
+                // scrolls + highlights it instead of opening cold.
+                navigate(`/p/${slug}/sessions?sid=${encodeURIComponent(s.sid)}`);
+              }}
               style={{ cursor: "pointer" }}
             >
               ● {s.window}

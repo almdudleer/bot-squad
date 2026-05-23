@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback, Fragment } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
 import { api, SessionRow, Task, VisionFile } from "../api";
@@ -103,6 +103,13 @@ export function Sessions() {
   // section toggle.
   const [expandedSids, setExpandedSids] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
+
+  // T-0099: deep-link target — when the URL carries ?sid=S-..., scroll
+  // that row into view, expand its detail row, and flash a transient
+  // highlight that fades after 2s. `flashedSidRef` guards against the
+  // 10s poll re-firing the flash on every refresh.
+  const [flashSid, setFlashSid] = useState<string | null>(null);
+  const flashedSidRef = useRef<string | null>(null);
 
   // T-0039 follow-up: group sessions by initiative on this page too.
   // Default = none (preserves the pre-group view).
@@ -307,6 +314,70 @@ export function Sessions() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
+  // T-0099: deep-link to a specific session. The URL carries ?sid=S-...;
+  // once sessions are loaded we make sure the row will render (clear any
+  // active filter, open the archived <details> if needed, expand the
+  // containing lane in grouped mode), expand the row's detail panel,
+  // scroll it into view, and flash a transient highlight. The
+  // `flashedSidRef` guard keeps the 10s poll from re-firing the flash.
+  const targetSid = searchParams.get("sid");
+  useEffect(() => {
+    if (!targetSid) return;
+    if (sessions === null) return;
+    if (flashedSidRef.current === targetSid) return;
+    const found = sessions.find((s) => s.sid === targetSid);
+    if (!found) return;
+
+    flashedSidRef.current = targetSid;
+
+    // Drop any filter that would hide the row.
+    setFilterInit("");
+    if (found.archived) setShowArchived(true);
+    if (groupBy === "initiative") {
+      const primary = (found.initiative ?? "").trim();
+      const extras = (found.extra_initiatives ?? []).filter((i) => i && i !== "~");
+      const laneKey =
+        primary && primary !== "~"
+          ? primary
+          : extras.length > 0
+            ? extras[0]
+            : SESS_UNATTACHED;
+      setCollapsedSessLanes((prev) =>
+        prev[laneKey] ? { ...prev, [laneKey]: false } : prev,
+      );
+    }
+
+    // Expand the row's detail panel so the deep-link is informative.
+    setExpandedSids((prev) => {
+      if (prev.has(targetSid)) return prev;
+      const next = new Set(prev);
+      next.add(targetSid);
+      return next;
+    });
+
+    // Wait two animation frames so the section toggles + expansions
+    // are committed to the DOM before we measure + scroll.
+    let timeoutId: number | undefined;
+    const rafId = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`sess-row-${targetSid}`);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+        setFlashSid(targetSid);
+        timeoutId = globalThis.window?.setTimeout(() => {
+          setFlashSid((cur) => (cur === targetSid ? null : cur));
+        }, 2200);
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (timeoutId !== undefined) globalThis.window?.clearTimeout(timeoutId);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetSid, sessions]);
+
   // Active TLs are sessions with no task_id and status === "active".
   const activeTeamleads: SessionRow[] = (sessions ?? []).filter(
     (s) =>
@@ -467,9 +538,12 @@ export function Sessions() {
   function renderSessionRow(s: SessionRow) {
     const isOpen = expandedSids.has(s.sid);
     const isSuspended = s.status === "suspended";
+    const isFlashing = flashSid === s.sid;
     return (
       <Fragment key={s.sid}>
         <tr
+          id={`sess-row-${s.sid}`}
+          className={isFlashing ? "mc-row-flash" : undefined}
           style={{ cursor: "pointer" }}
           onClick={() => toggleRow(s.sid)}
         >
@@ -502,11 +576,22 @@ export function Sessions() {
           </td>
 
           {/* Window */}
-          <td style={{ fontSize: "0.83rem" }}>{s.window}</td>
+          <td
+            style={{
+              fontSize: "0.83rem",
+              maxWidth: "14rem",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={s.window}
+          >
+            {s.window}
+          </td>
 
-          {/* Attach (T-0006) */}
-          <td onClick={(e) => e.stopPropagation()}>
-            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          {/* Attach (T-0006 / collapsed to icon button per T-0098) */}
+          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
           </td>
 
           {/* Role */}
@@ -639,9 +724,12 @@ export function Sessions() {
 
   function renderArchivedRow(s: SessionRow) {
     const isOpen = expandedSids.has(s.sid);
+    const isFlashing = flashSid === s.sid;
     return (
       <Fragment key={s.sid}>
         <tr
+          id={`sess-row-${s.sid}`}
+          className={isFlashing ? "mc-row-flash" : undefined}
           style={{ cursor: "pointer" }}
           onClick={() => toggleRow(s.sid)}
         >
@@ -667,8 +755,8 @@ export function Sessions() {
             </code>
           </td>
           <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
-          <td onClick={(e) => e.stopPropagation()}>
-            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
           </td>
           <td>
             {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||

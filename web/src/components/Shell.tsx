@@ -4,6 +4,7 @@ import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import { isSuperAdminFromMe, workerStatusPaint } from "./sidebarHelpers";
+import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
 
@@ -173,11 +174,14 @@ export function Shell() {
       <nav className={`mc-sidebar${sidebarOpen ? " open" : ""}`}>
 
         {/* Header strip. T-0063 evacuated the per-worker operational-status
-            pill out of here (it was misscoped: per-user-per-server, not
-            global). It lives under ATTACHMENT now. T-0064 will reuse the
-            freed space for a cross-server GLOBAL busy indicator. */}
+            pill (it was misscoped — per-user-per-server, now under
+            ATTACHMENT). The freed space hosts the new cross-server GLOBAL
+            busy indicator (T-0064): one dot for "is any task in-flight
+            RIGHT NOW for any of my projects on any server"; hover for the
+            list with project + server badges. */}
         <div className="mc-sidebar-header">
           <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
+          <GlobalBusyIndicator myUsername={username} />
           {/* T-0089: consumer-only autoupdate status pill. Skipped on the
               mothership build so we don't poll a 404 endpoint forever. */}
           {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}

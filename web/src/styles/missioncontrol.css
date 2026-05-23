@@ -1724,6 +1724,87 @@ tr.mc-row-flash > td {
   padding: 0.15rem 0.45rem;
 }
 
+/* ---- Top-header: GLOBAL busy indicator (T-0064) ---------- */
+/* One dot in the sidebar header strip lights up when ANY task is
+   in flight for the current user across all attached servers.
+   Hover/tap reveals the per-task list. Visible to every logged-in
+   user — not super-admin gated. */
+.mc-global-busy {
+  position: relative;
+  display: inline-flex;
+}
+.mc-global-busy-trigger {
+  background: transparent;
+  border: none;
+  padding: 0.15rem 0.35rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  cursor: pointer;
+  color: var(--mc-text-faint);
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+}
+.mc-global-busy-on .mc-global-busy-trigger {
+  color: var(--mc-amber);
+}
+.mc-global-busy-dot {
+  font-size: 0.7rem;
+  line-height: 1;
+}
+.mc-global-busy-count {
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.mc-global-busy-panel {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  margin-top: 0.25rem;
+  min-width: 18rem;
+  max-width: 28rem;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  border-radius: 3px;
+  padding: 0.5rem;
+}
+.mc-global-busy-empty {
+  padding: 0.25rem 0.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  color: var(--mc-text-dim);
+}
+.mc-global-busy-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mc-global-busy-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+}
+.mc-global-busy-task {
+  color: var(--mc-text);
+  letter-spacing: 0.05em;
+}
+.mc-global-busy-sid {
+  color: var(--mc-text-dim);
+  font-size: 0.62rem;
+}
+.mc-global-busy-warn {
+  margin-top: 0.4rem;
+  padding: 0.25rem 0.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  border-top: 1px solid var(--mc-border);
+}
+
 /* ---- Sidebar: ATTACHMENT placeholder (T-0061 placeholder) -- */
 /* Shell renders an "[ ATTACHMENT ]" header + a loading row so the
    downstream Bundle C dev has a host to slot the real rows into

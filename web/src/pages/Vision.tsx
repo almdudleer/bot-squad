@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, SessionRow, VisionFile } from "../api";
 import { Modal } from "../components/Modal";
-
 import { PageHelp } from "../components/PageHelp";
+import { Select, type SelectOption } from "../components/Select";
+
 interface EditState {
   name: string;
   draft: string;
@@ -267,23 +268,38 @@ export function Vision() {
     return <pre className="mc-pre">{f.content}</pre>;
   }
 
-  function renderTlBindings(base: string) {
+  function renderTlBindings(base: string, fileName: string) {
     const tls = tlsByInitiative.get(base) ?? [];
     if (tls.length === 0) {
+      // T-0101: single Select replaces the old 3-element no-TL header
+      // (no-TL chip + Start teamlead button + native "or bind" select).
+      // Candidates are non-archived TLs (any status) so paused/suspended
+      // TLs can still be re-bound to an initiative without resuming.
+      const options: SelectOption[] = [
+        ...activeTls.map((tl) => ({
+          value: tl.sid,
+          label: tl.window || tl.sid,
+          hint: tl.status !== "active" ? tl.status : undefined,
+        })),
+        {
+          action: true,
+          key: "__start__",
+          label: "+ Start new TL…",
+          onSelect: () => startTeamleadFor(fileName),
+        },
+      ];
       return (
-        <span
-          style={{
-            fontFamily: "var(--mc-mono)",
-            fontSize: "0.65rem",
-            color: "var(--mc-text-dim)",
-            background: "var(--mc-surface-raised)",
-            border: "1px dashed var(--mc-border)",
-            borderRadius: "2px",
-            padding: "0 4px",
+        <Select
+          value=""
+          options={options}
+          onChange={(sid) => {
+            if (sid) bindInitiativeTo(sid, base);
           }}
-        >
-          no TL
-        </span>
+          placeholder="no TL"
+          title="Bind this initiative to an existing TL, or start a new one"
+          ariaLabel={`bind teamlead for ${base}`}
+          style={{ minWidth: "10rem", maxWidth: "16rem", fontSize: "0.72rem" }}
+        />
       );
     }
     return (
@@ -362,7 +378,6 @@ export function Vision() {
         {opts.items.map((f) => {
           const isOpen = !!expanded[f.name];
           const base = f.name.replace(/^initiatives\//, "");
-          const covered = (tlsByInitiative.get(base) ?? []).length > 0;
           return (
             <div
               key={f.name}
@@ -380,38 +395,7 @@ export function Vision() {
                   {isOpen ? "▾" : "▸"} {f.name}
                 </button>
                 <div className="d-flex gap-2 align-items-center flex-wrap">
-                  {opts.kind === "active" && renderTlBindings(base)}
-                  {opts.kind === "active" && !covered && (
-                    <>
-                      <button
-                        type="button"
-                        className="btn btn-outline-success btn-sm"
-                        style={{ fontSize: "0.72rem" }}
-                        title="Spawn a teamlead session bound to this initiative"
-                        onClick={() => startTeamleadFor(f.name)}
-                      >
-                        Start teamlead
-                      </button>
-                      {activeTls.length > 0 && (
-                        <select
-                          className="form-select form-select-sm"
-                          style={{ fontSize: "0.7rem", width: "auto", maxWidth: "160px" }}
-                          defaultValue=""
-                          title="Bind this initiative to an existing teamlead session"
-                          onChange={(e) => {
-                            const sid = e.target.value;
-                            e.target.selectedIndex = 0;
-                            if (sid) bindInitiativeTo(sid, base);
-                          }}
-                        >
-                          <option value="" disabled>or bind ▾</option>
-                          {activeTls.map((tl) => (
-                            <option key={tl.sid} value={tl.sid}>{tl.window || tl.sid}</option>
-                          ))}
-                        </select>
-                      )}
-                    </>
-                  )}
+                  {opts.kind === "active" && renderTlBindings(base, f.name)}
                   {opts.kind === "active" && (
                     <>
                       <button

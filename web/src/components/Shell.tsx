@@ -303,23 +303,26 @@ export function Shell() {
           </>
         )}
 
-        {/* SERVER — installation-level scope (T-0060). On mothership builds
-            the section header carries a picker dropdown; on detach there's
-            only one server so the label is just "SERVER". Items under SERVER
-            are per-server: projects + sessions + admin-gated users/settings.
-            Scheduler lives here too (it's the server's scheduler).
-            Releases stays mothership-only (T-0087). */}
-        <div className="mc-sidebar-section mc-sidebar-section-row">
-          <span>SERVER</span>
-          {ServerPicker && (
+        {/* SERVER — installation-level scope (T-0060 + T-0065). On
+            mothership the header carries a ▾ picker; on detach there's
+            only one server so we render a plain "[ SERVER ]" header
+            (matches today's SYSTEM look). The picker ternary is a
+            literal-known constant (IS_MOTHERSHIP_BUILD ? lazy : null),
+            so Vite folds the false branch + tree-shakes the Suspense
+            wrapper out of the detach bundle. */}
+        {ServerPicker ? (
+          <div className="mc-sidebar-section mc-sidebar-section-row">
+            <span>SERVER</span>
             <Suspense fallback={<span className="mc-srv-picker-loading">▾ …</span>}>
               <ServerPicker
                 currentServerId={null}
                 onChange={setPickedServerId}
               />
             </Suspense>
-          )}
-        </div>
+          </div>
+        ) : (
+          <div className="mc-sidebar-section">SERVER</div>
+        )}
         <ul className="mc-sidebar-nav" data-picked-server-id={pickedServerId ?? ""}>
           <li>
             <NavLink

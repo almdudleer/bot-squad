@@ -62,6 +62,42 @@ describe("sidebarSectionVisibility", () => {
   });
 });
 
+describe("T-0065 — detach build shape (VITE_MOTHERSHIP=0)", () => {
+  // Locked contract: detach build looks like today's SYSTEM sidebar
+  // plus the new GLOBAL header. GLOBAL + SERVER (no picker) +
+  // ATTACHMENT visible, MOTHERSHIP gone. Test by pretending we ran
+  // with the env literal flipped — the gating logic lives in pure
+  // helpers so we don't need import.meta.env mocking infra.
+  test("non-admin user on detach: 3 sections, no picker, no MOTHERSHIP", () => {
+    const f = flags({ isMothershipBuild: false });
+    const v = sidebarSectionVisibility(f);
+    expect(v.global).toBe(true);
+    expect(v.server).toBe(true);
+    expect(v.attachment).toBe(true);
+    expect(v.mothership).toBe(false);
+    expect(v.serverPicker).toBe(false);
+    expect(visibleSidebarSections(f)).toEqual(["global", "server", "attachment"]);
+  });
+
+  test("super-admin on detach still hides MOTHERSHIP (build flag wins)", () => {
+    // The MOTHERSHIP module is tree-shaken out of the detach bundle
+    // entirely — a logged-in super-admin on a detach install must NOT
+    // see a section that has no implementation.
+    const v = sidebarSectionVisibility(
+      flags({ isMothershipBuild: false, isSuperAdmin: true }),
+    );
+    expect(v.mothership).toBe(false);
+  });
+
+  test("admin on detach still sees SERVER admin items (auth.toml is per-server)", () => {
+    const v = sidebarSectionVisibility(
+      flags({ isMothershipBuild: false, isServerAdmin: true }),
+    );
+    expect(v.serverAdminItems).toBe(true);
+    expect(v.serverPicker).toBe(false);
+  });
+});
+
 describe("visibleSidebarSections", () => {
   test("detach build, anon: GLOBAL > SERVER > ATTACHMENT (no MOTHERSHIP)", () => {
     expect(visibleSidebarSections(flags())).toEqual([

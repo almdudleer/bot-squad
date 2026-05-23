@@ -26,6 +26,17 @@ import {
 const POLL_INTERVAL_MS = 8000;
 const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
 
+// T-0065: hoist the mothership dynamic import to a module-top conditional
+// so Rollup's tree-shaker can prove the import is unreachable on detach
+// (mirrors App.tsx's MothershipRoutes pattern). An inline ternary inside
+// poll() left the chunk in the detach bundle.
+const fetchMothershipFanOut = IS_MOTHERSHIP_BUILD
+  ? () =>
+      import("../mothership/globalBusyMothership").then((m) =>
+        m.fanOutInFlight(),
+      )
+  : null;
+
 async function fetchLocalInFlight(): Promise<FanResult[]> {
   const projects = await api.projects() as Project[];
   const perProject = await Promise.all(
@@ -60,8 +71,8 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
     let cancelled = false;
     async function poll() {
       try {
-        const fanResults = IS_MOTHERSHIP_BUILD
-          ? await (await import("../mothership/globalBusyMothership")).fanOutInFlight()
+        const fanResults = fetchMothershipFanOut
+          ? await fetchMothershipFanOut()
           : await fetchLocalInFlight();
         if (cancelled) return;
         setState(aggregateIndicator(fanResults, myUsername));

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, SessionRow, Task, VisionFile } from "../api";
+import type { SessionRow, Task, VisionFile } from "../api";
+import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
 import { Select, type SelectOption } from "../components/Select";
@@ -79,6 +80,7 @@ function STATUS_PILL_COLOR(s: InitiativeStatus): { color: string; bg: string; bo
 
 export function Project() {
   const { slug = "" } = useParams();
+  const api = useApiClient();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [vision, setVision] = useState<VisionFile[]>([]);
   // T-0104: per-sid session map for client-side activity enrichment.

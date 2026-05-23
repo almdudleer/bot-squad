@@ -10,6 +10,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   buildSections,
+  projectCardLinkFor,
   serverHeaderLabel,
   statusBadgeClass,
   type ServerSection,
@@ -153,5 +154,29 @@ describe("buildSections honours is_self transparently", () => {
     expect(sections[0].server.is_self).toBe(true);
     expect(sections[0].kind).toBe("live");
     expect(sections[1].server.is_self).toBeFalsy();
+  });
+});
+
+// T-0068: peer-server cards used to be plain divs ("non-clickable"). The
+// project-card link helper now returns a real route for them, while the
+// self entry keeps the legacy short URL — `projectCardLinkFor` is the
+// only place that decision lives.
+describe("projectCardLinkFor (T-0068)", () => {
+  test("self entry keeps the short /p/<slug> URL", () => {
+    const link = projectCardLinkFor({ id: "srv_self", is_self: true }, "alpha");
+    expect(link).toBe("/p/alpha");
+  });
+
+  test("peer entry routes through /m/servers/<id>/p/<slug>", () => {
+    const link = projectCardLinkFor({ id: "srv_peer", is_self: false }, "alpha");
+    expect(link).toBe("/m/servers/srv_peer/p/alpha");
+  });
+
+  test("URL-encodes server id and slug so weird IDs don't break routing", () => {
+    const link = projectCardLinkFor(
+      { id: "srv/with spaces", is_self: false },
+      "name with spaces",
+    );
+    expect(link).toBe("/m/servers/srv%2Fwith%20spaces/p/name%20with%20spaces");
   });
 });

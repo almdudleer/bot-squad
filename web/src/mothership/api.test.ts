@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { apiFor, fanOut, mothershipApi } from "./api";
+import { apiFor, fanOut, mothershipApi, ProxyError } from "./api";
 
 type FetchSpy = ReturnType<typeof vi.fn>;
 
@@ -112,6 +112,141 @@ describe("apiFor(serverId).projects", () => {
       "/api/m/servers/srv_proxy/api/projects",
       expect.any(Object),
     );
+  });
+});
+
+// T-0068: every per-project method on apiFor must hit
+// /api/m/servers/<id>/api/<upstream-path> with the same body/method as the
+// global singleton would emit. Sampled across read, mutate, and action
+// surfaces; if a future method drifts from its singleton twin, this test
+// pair (proxy URL + singleton URL below) will catch the divergence.
+describe("apiFor(serverId) — per-project surface (T-0068)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("backlog: GETs /api/m/servers/<id>/api/projects/<slug>/backlog", async () => {
+    const spy = mockFetchSequence([{ json: async () => [] }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await apiFor("srv_a").backlog("alpha");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_a/api/projects/alpha/backlog",
+      expect.any(Object),
+    );
+  });
+
+  test("sessions: GETs /api/m/servers/<id>/api/projects/<slug>/sessions", async () => {
+    const spy = mockFetchSequence([{ json: async () => [] }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await apiFor("srv_b").sessions("beta");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_b/api/projects/beta/sessions",
+      expect.any(Object),
+    );
+  });
+
+  test("createTask: POSTs to the proxy with the JSON body verbatim", async () => {
+    const spy = mockFetchSequence([{ json: async () => ({ id: "T-1" }) }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await apiFor("srv_c").createTask("gamma", {
+      title: "x",
+      verbatim_request: "y",
+      status: "open",
+    });
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_c/api/projects/gamma/backlog",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          title: "x",
+          verbatim_request: "y",
+          status: "open",
+        }),
+      }),
+    );
+  });
+
+  test("peerSend: POSTs with `from_sid`-shaped body (T-0068 verifies bus surface)", async () => {
+    const spy = mockFetchSequence([
+      { json: async () => ({ ok: true, delivered_to: [] }) },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await apiFor("srv_d").peerSend("delta", "S-from", "S-to", "hello");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_d/api/projects/delta/peer/send",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ from_sid: "S-from", to: "S-to", text: "hello" }),
+      }),
+    );
+  });
+
+  test("pauseSession: POSTs and URL-encodes the sid", async () => {
+    const spy = mockFetchSequence([{ json: async () => ({ ok: true }) }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await apiFor("srv_e").pauseSession("eps", "S/odd sid");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_e/api/projects/eps/sessions/S%2Fodd%20sid/pause",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
+// T-0068: the proxy hop can return three auth-relevant statuses that the
+// wrapper component needs to render distinct UI for. 503 = mothership has
+// no bearer for this peer; 401/403 = peer rejected our bearer. Anything
+// else flows through as a plain Error so the calling page can surface its
+// own message.
+describe("apiFor(serverId) — proxy auth error classification (T-0068)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("503 from the proxy → ProxyError(not_connected)", async () => {
+    globalThis.fetch = mockFetchSequence([
+      { ok: false, status: 503, text: async () => "bearer missing" },
+    ]) as unknown as typeof fetch;
+
+    await expect(apiFor("srv").backlog("p")).rejects.toMatchObject({
+      kind: "not_connected",
+      status: 503,
+    });
+  });
+
+  test("401 from upstream → ProxyError(access_denied) (does NOT redirect)", async () => {
+    globalThis.fetch = mockFetchSequence([
+      { ok: false, status: 401, text: async () => "denied" },
+    ]) as unknown as typeof fetch;
+
+    // Sanity: the call must reject — a global `call()` would assign
+    // window.location.href on a 401 (and throw); proxyCall must not.
+    await expect(apiFor("srv").backlog("p")).rejects.toBeInstanceOf(
+      ProxyError,
+    );
+  });
+
+  test("403 from upstream → ProxyError(access_denied)", async () => {
+    globalThis.fetch = mockFetchSequence([
+      { ok: false, status: 403, text: async () => "forbidden" },
+    ]) as unknown as typeof fetch;
+
+    await expect(apiFor("srv").backlog("p")).rejects.toMatchObject({
+      kind: "access_denied",
+      status: 403,
+    });
+  });
+
+  test("500 from upstream → plain Error (not ProxyError)", async () => {
+    globalThis.fetch = mockFetchSequence([
+      { ok: false, status: 500, text: async () => "boom" },
+    ]) as unknown as typeof fetch;
+
+    const err = await apiFor("srv")
+      .backlog("p")
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ProxyError);
   });
 });
 

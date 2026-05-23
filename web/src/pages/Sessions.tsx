@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
-import { api, SessionRow, Task, VisionFile } from "../api";
+import type { SessionRow, Task, VisionFile } from "../api";
+import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { Select } from "../components/Select";
@@ -64,6 +65,7 @@ function relativeTime(raw: string | number | null | undefined): string {
 
 export function Sessions() {
   const { slug = "" } = useParams();
+  const api = useApiClient();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);

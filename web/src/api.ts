@@ -466,3 +466,28 @@ export const api = {
       { method: "POST" },
     ),
 };
+
+// T-0068: per-project methods exposed via context so per-project pages can be
+// rendered against either the global single-install singleton OR the
+// mothership's `apiFor(server_id)` proxy without touching the page code. The
+// list is exactly what Project.tsx + Sessions.tsx consume today; expand it
+// when new per-project pages are migrated.
+export type ProjectApi = Pick<
+  typeof api,
+  | "backlog"
+  | "vision"
+  | "sessions"
+  | "createTask"
+  | "patchTask"
+  | "patchTaskPriority"
+  | "deleteTask"
+  | "addComment"
+  | "pauseSession"
+  | "suspendSession"
+  | "resumeSession"
+  | "archiveSession"
+  | "unarchiveSession"
+  | "spawnSession"
+  | "devSpawnRequest"
+  | "peerSend"
+>;

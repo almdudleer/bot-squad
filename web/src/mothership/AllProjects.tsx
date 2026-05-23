@@ -69,6 +69,18 @@ export function buildSections(
   });
 }
 
+// T-0068: pure helper so the AllProjects card-link routing decision is
+// testable without a DOM. Self-server keeps the short `/p/:slug` URL (so
+// bookmarks from the single-install era still work); peer servers route
+// through the cross-server view at `/m/servers/:id/p/:slug`.
+export function projectCardLinkFor(
+  server: Pick<AttachedServer, "id" | "is_self">,
+  slug: string,
+): string {
+  if (server.is_self) return `/p/${encodeURIComponent(slug)}`;
+  return `/m/servers/${encodeURIComponent(server.id)}/p/${encodeURIComponent(slug)}`;
+}
+
 export function statusBadgeClass(status: ServerStatus): string {
   switch (status) {
     case "working":
@@ -459,10 +471,7 @@ function ServerSectionBody({
     <div className="row g-2">
       {result.data.map((p) => {
         const card = (
-          <div
-            className="mc-project-card"
-            style={{ cursor: server.is_self ? "pointer" : "default" }}
-          >
+          <div className="mc-project-card" style={{ cursor: "pointer" }}>
             <div className="mc-project-name">{p.display_name}</div>
             <div
               className="mc-project-slug"
@@ -478,18 +487,18 @@ function ServerSectionBody({
             </div>
           </div>
         );
+        // T-0068: peer-server cards now link to the cross-server board
+        // route. The self-server keeps its short `/p/:slug` URL so
+        // bookmarks/deep-links from the single-install era still resolve.
+        const to = projectCardLinkFor(server, p.slug);
         return (
           <div className="col-md-4" key={p.slug}>
-            {server.is_self ? (
-              <Link
-                to={`/p/${encodeURIComponent(p.slug)}`}
-                style={{ textDecoration: "none", color: "inherit" }}
-              >
-                {card}
-              </Link>
-            ) : (
-              card
-            )}
+            <Link
+              to={to}
+              style={{ textDecoration: "none", color: "inherit" }}
+            >
+              {card}
+            </Link>
           </div>
         );
       })}

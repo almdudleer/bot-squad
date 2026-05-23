@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
@@ -9,6 +9,17 @@ const PINNED_PROJECT_KEY = "bot-squad:last-project";
 // T-0089: the autoupdate pill is consumer-side only — Vite inlines this
 // constant so the mothership bundle tree-shakes the component import away.
 const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
+
+// T-0060: server picker is mothership-only. Lazy + literal-gated so the
+// detach bundle never imports the chunk (same pattern as App.tsx's
+// MothershipRoutes — Vite resolves the conditional to `null` at build).
+const ServerPicker = IS_MOTHERSHIP_BUILD
+  ? lazy(() =>
+      import("../mothership/ServerPicker").then((m) => ({
+        default: m.ServerPicker,
+      })),
+    )
+  : null;
 
 /**
  * Shell — left sidebar navigation present on every authenticated page.
@@ -30,6 +41,10 @@ export function Shell() {
   const [linuxUser, setLinuxUser] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // T-0060: which server the SERVER section + (later) ATTACHMENT scope
+  // belongs to. Only meaningful on mothership; on detach the single
+  // installation is implicit and the picker isn't rendered.
+  const [pickedServerId, setPickedServerId] = useState<string | null>(null);
   const [pinnedSlug, setPinnedSlug] = useState<string | null>(() => {
     try {
       return localStorage.getItem(PINNED_PROJECT_KEY);
@@ -292,12 +307,24 @@ export function Shell() {
           </>
         )}
 
-        {/* System section — T-0059 moved ALL PROJECTS, MY PROFILE, HELP up
-            into the new GLOBAL section. T-0060 will rename this header to
-            SERVER and wire the picker; for now it carries scheduler +
-            mothership-only releases + admin-gated USERS/SETTINGS. */}
-        <div className="mc-sidebar-section">System</div>
-        <ul className="mc-sidebar-nav">
+        {/* SERVER — installation-level scope (T-0060). On mothership builds
+            the section header carries a picker dropdown; on detach there's
+            only one server so the label is just "SERVER". Items under SERVER
+            are per-server: projects + sessions + admin-gated users/settings.
+            Scheduler lives here too (it's the server's scheduler).
+            Releases stays mothership-only (T-0087). */}
+        <div className="mc-sidebar-section mc-sidebar-section-row">
+          <span>SERVER</span>
+          {ServerPicker && (
+            <Suspense fallback={<span className="mc-srv-picker-loading">▾ …</span>}>
+              <ServerPicker
+                currentServerId={null}
+                onChange={setPickedServerId}
+              />
+            </Suspense>
+          )}
+        </div>
+        <ul className="mc-sidebar-nav" data-picked-server-id={pickedServerId ?? ""}>
           <li>
             <NavLink
               to="/scheduler"
@@ -324,7 +351,11 @@ export function Shell() {
             </li>
           )}
           {/* T-0055: SERVERS nav removed — the unified all-projects view at
-              "/" hosts the +Add server affordance inline on mothership builds. */}
+              "/" hosts the +Add server affordance inline on mothership builds.
+              T-0060: SERVER>users + SERVER>settings are server-local
+              (auth.toml on the picked server). Until cross-server admin
+              endpoints land (T-0068 plumbing), they route to the existing
+              single-install /users + /system-settings on the local server. */}
           {isAdmin && (
             <>
               <li>

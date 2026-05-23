@@ -1,7 +1,9 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  resolveInitialPickedServer,
   sidebarSectionVisibility,
+  type PickerCandidate,
   type SidebarFlags,
 } from "./sidebarHelpers";
 
@@ -54,5 +56,45 @@ describe("sidebarSectionVisibility", () => {
     );
     expect(v.mothership).toBe(false);
     expect(v.serverAdminItems).toBe(true);
+  });
+});
+
+describe("resolveInitialPickedServer", () => {
+  function attached(...ids: string[]): PickerCandidate[] {
+    return ids.map((id, i) => ({ id, isSelf: i === 0 }));
+  }
+
+  test("respects a valid stored selection", () => {
+    expect(resolveInitialPickedServer("b", null, attached("a", "b", "c"))).toBe("b");
+  });
+
+  test("drops a stale stored selection (server no longer attached)", () => {
+    // If a server is detached after the user picked it, we don't want to
+    // silently load against a missing id — fall through to current/self.
+    expect(resolveInitialPickedServer("gone", null, attached("a", "b"))).toBe("a");
+  });
+
+  test("uses currentId when no stored selection", () => {
+    expect(resolveInitialPickedServer(null, "c", attached("a", "b", "c"))).toBe("c");
+  });
+
+  test("ignores currentId that isn't in attached set", () => {
+    expect(resolveInitialPickedServer(null, "unknown", attached("a", "b"))).toBe("a");
+  });
+
+  test("prefers the self server when no other signal", () => {
+    expect(resolveInitialPickedServer(null, null, attached("self", "peer"))).toBe(
+      "self",
+    );
+  });
+
+  test("falls back to first attached when no self entry exists", () => {
+    const ids: PickerCandidate[] = [{ id: "a" }, { id: "b" }];
+    expect(resolveInitialPickedServer(null, null, ids)).toBe("a");
+  });
+
+  test("returns null when nothing is attached", () => {
+    expect(resolveInitialPickedServer(null, null, [])).toBeNull();
+    expect(resolveInitialPickedServer("anything", "anything", [])).toBeNull();
   });
 });

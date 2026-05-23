@@ -1723,3 +1723,80 @@ tr.mc-row-flash > td {
   font-size: 0.75rem;
   padding: 0.15rem 0.45rem;
 }
+
+/* ---- Sidebar: SERVER picker (T-0060) --------------------- */
+/* Section header carries the picker inline — the surrounding
+   `.mc-sidebar-section` adds the "[ ]" brackets via pseudo-elements,
+   so this wraps "SERVER ▾ <picker>" inside them per the contract. */
+.mc-sidebar-section-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.mc-srv-picker {
+  position: relative;
+  display: inline-flex;
+}
+.mc-srv-picker-trigger {
+  background: transparent;
+  border: none;
+  color: var(--mc-text);
+  font-family: var(--mc-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 0;
+}
+.mc-srv-picker-trigger:hover {
+  color: var(--mc-amber);
+}
+.mc-srv-picker-loading {
+  font-family: var(--mc-mono);
+  font-size: 0.62rem;
+  color: var(--mc-text-faint);
+}
+.mc-srv-picker-panel {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  min-width: 12rem;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  border-radius: 3px;
+  margin-top: 0.25rem;
+}
+.mc-srv-picker-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.mc-srv-picker-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--mc-text);
+  padding: 0.4rem 0.65rem;
+  font-family: var(--mc-mono);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.mc-srv-picker-row:hover {
+  background: var(--mc-surface-hover, rgba(255, 200, 0, 0.08));
+}
+.mc-srv-picker-row-current {
+  color: var(--mc-amber);
+}
+.mc-srv-picker-row-current::before {
+  content: "▸ ";
+}
+.mc-srv-picker-empty {
+  padding: 0.5rem 0.65rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  color: var(--mc-text-dim);
+}

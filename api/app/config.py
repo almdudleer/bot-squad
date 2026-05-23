@@ -85,6 +85,12 @@ class UserMeta:
     # Telegram chat id bound to this user (per T-0019). Empty means unbound.
     # Disambiguated from the per-project `tg_chat` with the `_id` suffix.
     tg_chat_id: str = ""
+    # T-0066: GlobalUser uuid this ServerUser is bound to via the
+    # worker-attachment flow. Empty/None means legacy local-only user
+    # (login still works against the local password_hash). When set, the
+    # mothership owns the canonical credentials and per-server state
+    # (tg_chat_id, seen_steps) is mirrored into an Attachment record.
+    attached_to_global_user: str = ""
 
 
 @dataclass(frozen=True)
@@ -125,6 +131,7 @@ class AuthConfig:
                 is_admin=bool(m.get("is_admin", False)),
                 seen_steps=tuple(str(s) for s in raw_steps),
                 tg_chat_id=str(m.get("tg_chat_id", "")),
+                attached_to_global_user=str(m.get("attached_to_global_user", "")),
             )
         ttl_str = raw.get("session", {}).get("ttl", "7d")
         return cls(

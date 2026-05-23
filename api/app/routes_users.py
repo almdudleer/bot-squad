@@ -42,6 +42,13 @@ def _serialize_auth_toml(users: dict[str, str], user_meta: dict, session_ttl: st
         tg_chat_id = getattr(meta, "tg_chat_id", "") or ""
         if tg_chat_id:
             out.append(f'tg_chat_id = "{_toml_escape(tg_chat_id)}"')
+        # T-0066: only emit attached_to_global_user when set. Unmigrated
+        # rows omit the key entirely so the legacy login path (which
+        # checks for a missing/empty value to fall back to local password)
+        # stays a single read.
+        attached = getattr(meta, "attached_to_global_user", "") or ""
+        if attached:
+            out.append(f'attached_to_global_user = "{_toml_escape(attached)}"')
         out.append("")
     out.append("[session]")
     out.append(f'ttl = "{_toml_escape(session_ttl)}"')
@@ -152,6 +159,7 @@ def patch_user(username: str, request: Request, payload: dict) -> dict:
         is_admin=new_is_admin,
         seen_steps=current.seen_steps,
         tg_chat_id=current.tg_chat_id,
+        attached_to_global_user=current.attached_to_global_user,
     )
 
     # Last-admin protection: refuse to demote the only remaining admin.

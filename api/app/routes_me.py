@@ -82,6 +82,8 @@ def mark_step_seen(request: Request, payload: dict, user: dict = Depends(require
         linux_user=meta.linux_user,
         is_admin=meta.is_admin,
         seen_steps=meta.seen_steps + (step,),
+        tg_chat_id=meta.tg_chat_id,
+        attached_to_global_user=meta.attached_to_global_user,
     )
     _write_user_meta(request, username, new_meta)
     return _state_payload(new_meta)
@@ -100,6 +102,7 @@ def skip_onboarding(request: Request, user: dict = Depends(require_auth)) -> dic
         is_admin=meta.is_admin,
         seen_steps=meta.seen_steps + (ONBOARDING_SKIP_ALL,),
         tg_chat_id=meta.tg_chat_id,
+        attached_to_global_user=meta.attached_to_global_user,
     )
     _write_user_meta(request, username, new_meta)
     return _state_payload(new_meta)
@@ -149,6 +152,7 @@ def put_tg_chat_id(request: Request, payload: dict, user: dict = Depends(require
         is_admin=meta.is_admin,
         seen_steps=meta.seen_steps,
         tg_chat_id=new_id,
+        attached_to_global_user=meta.attached_to_global_user,
     )
     _write_user_meta(request, username, new_meta)
     return _profile_payload(username, new_meta)

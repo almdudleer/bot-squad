@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
+import { Select, type SelectOption } from "../components/Select";
 import {
   isRunning,
   sessionActivity,
@@ -371,18 +372,15 @@ export function TaskDetail() {
         >
           status:
         </label>
-        <select
+        <Select
           id="task-status"
-          className="form-select form-select-sm"
-          style={{ width: "auto", minWidth: "10rem" }}
           value={statusValue}
-          onChange={(e) => saveStatus(e.target.value as Task["status"])}
+          onChange={(v) => saveStatus(v as Task["status"])}
           disabled={saving}
-        >
-          {STATUS_OPTIONS.map((s) => (
-            <option key={s.value} value={s.value}>{s.label}</option>
-          ))}
-        </select>
+          style={{ minWidth: "10rem" }}
+          ariaLabel="task status"
+          options={STATUS_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
+        />
       </div>
 
       {/* T-0038: initiative binding. The board's group-by/filter is useless
@@ -400,32 +398,36 @@ export function TaskDetail() {
         >
           initiative:
         </label>
-        <select
-          id="task-initiative"
-          className="form-select form-select-sm"
-          style={{ width: "auto", minWidth: "16rem", maxWidth: "30rem" }}
-          value={task.initiative ?? ""}
-          onChange={(e) => saveInitiative(e.target.value || null)}
-          disabled={saving}
-        >
-          <option value="">— unattached —</option>
-          {/* Surface the current binding even if not in the loaded list
-              (orphan: file deleted but reference lingers). */}
-          {task.initiative &&
-            !initiativeOptions.some((i) => i.basename === task.initiative) && (
-              <option value={task.initiative}>
-                {task.initiative} (orphan)
-              </option>
-            )}
-          {initiativeOptions.map((i) => {
-            const tag = i.finished ? "done" : i.active ? "active" : "draft";
-            return (
-              <option key={i.basename} value={i.basename}>
-                {i.basename.replace(/\.md$/, "")} · {tag}
-              </option>
-            );
-          })}
-        </select>
+        {(() => {
+          const orphan: SelectOption | null =
+            task.initiative &&
+            !initiativeOptions.some((i) => i.basename === task.initiative)
+              ? { value: task.initiative, label: `${task.initiative} (orphan)` }
+              : null;
+          const options: SelectOption[] = [
+            { value: "", label: "— unattached —" },
+            ...(orphan ? [orphan] : []),
+            ...initiativeOptions.map((i) => {
+              const tag = i.finished ? "done" : i.active ? "active" : "draft";
+              return {
+                value: i.basename,
+                label: i.basename.replace(/\.md$/, ""),
+                hint: tag,
+              };
+            }),
+          ];
+          return (
+            <Select
+              id="task-initiative"
+              value={task.initiative ?? ""}
+              onChange={(v) => saveInitiative(v || null)}
+              disabled={saving}
+              style={{ minWidth: "16rem", maxWidth: "30rem" }}
+              ariaLabel="initiative binding"
+              options={options}
+            />
+          );
+        })()}
       </div>
 
       {/* Unified dev-session select: one control replaces the three older
@@ -444,50 +446,49 @@ export function TaskDetail() {
         >
           dev session:
         </label>
-        <select
-          id="task-session"
-          className="form-select form-select-sm"
-          style={{ width: "auto", minWidth: "16rem", maxWidth: "30rem" }}
-          value={task.session ? task.session.sid : ""}
-          onChange={(e) => {
-            const value = e.target.value;
-            if (value === "__new__") {
-              // Re-select the current binding so the dropdown stays sane
-              // if the user navigates back without spawning.
-              navigate(
-                `/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`,
-              );
-              return;
-            }
-            if (!value) return;
-            bindToDev(value);
-          }}
-          disabled={saving}
-        >
-          <option value="" disabled>
-            — none —
-          </option>
-          <option value="__new__">+ Create new dev session…</option>
-          {/* Surface the current binding even if it's not in activeDevs
-              (e.g. paused/suspended) so the select reflects reality.
-              T-0104: label via the canonical activity formatter so this
-              dropdown row reads the same vocabulary as the rest of the
-              page. */}
-          {task.session && !activeDevs.some((d) => d.sid === task.session!.sid) && (
-            <option value={task.session.sid}>
-              {task.session.sid} (
-              {sessionLabel(
-                sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
-              )}
-              )
-            </option>
-          )}
-          {activeDevs.map((d) => (
-            <option key={d.sid} value={d.sid}>
-              {d.window || d.sid} ({d.sid})
-            </option>
-          ))}
-        </select>
+        {(() => {
+          // Surface the current binding even if it's not in activeDevs
+          // (paused/suspended) so the select reflects reality. T-0104:
+          // label via the canonical activity formatter so this row reads
+          // the same vocabulary as the rest of the page.
+          const orphanSession: SelectOption | null =
+            task.session && !activeDevs.some((d) => d.sid === task.session!.sid)
+              ? {
+                  value: task.session.sid,
+                  label: `${task.session.sid} (${sessionLabel(
+                    sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
+                  )})`,
+                }
+              : null;
+          const options: SelectOption[] = [
+            { value: "", label: "— none —", disabled: true },
+            ...(orphanSession ? [orphanSession] : []),
+            ...activeDevs.map((d) => ({
+              value: d.sid,
+              label: `${d.window || d.sid} (${d.sid})`,
+            })),
+            {
+              action: true,
+              key: "__new__",
+              label: "+ Create new dev session…",
+              onSelect: () =>
+                navigate(`/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`),
+            },
+          ];
+          return (
+            <Select
+              id="task-session"
+              value={task.session ? task.session.sid : ""}
+              onChange={(v) => {
+                if (v) bindToDev(v);
+              }}
+              disabled={saving}
+              style={{ minWidth: "16rem", maxWidth: "30rem" }}
+              ariaLabel="dev session binding"
+              options={options}
+            />
+          );
+        })()}
         {task.session && (
           <button
             type="button"

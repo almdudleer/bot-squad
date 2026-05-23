@@ -4,6 +4,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
+import { Select } from "../components/Select";
 import { sessionActivity, sessionLabel } from "../utils/sessionStatus";
 
 import { PageHelp } from "../components/PageHelp";
@@ -1171,20 +1172,21 @@ export function Sessions() {
             <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
               filter:
             </span>
-            <select
-              className="form-select form-select-sm"
-              style={{ width: "auto", minWidth: "12rem", fontSize: "0.75rem" }}
+            <Select
               value={filterInit}
-              onChange={(e) => setFilterInit(e.target.value)}
-            >
-              <option value="">all initiatives</option>
-              {sessInitiativeMeta.map((m) => (
-                <option key={m.key} value={m.key}>
-                  {m.title} · {m.status}
-                </option>
-              ))}
-              <option value={SESS_UNATTACHED}>(unattached)</option>
-            </select>
+              onChange={setFilterInit}
+              style={{ minWidth: "12rem", fontSize: "0.75rem" }}
+              ariaLabel="filter by initiative"
+              options={[
+                { value: "", label: "all initiatives" },
+                ...sessInitiativeMeta.map((m) => ({
+                  value: m.key,
+                  label: m.title,
+                  hint: m.status,
+                })),
+                { value: SESS_UNATTACHED, label: "(unattached)" },
+              ]}
+            />
           </div>
         </div>
       )}
@@ -1352,21 +1354,23 @@ export function Sessions() {
                   (optional — overrides the project default for this session)
                 </span>
               </label>
-              <select
-                className="form-select"
+              <Select
                 value={newInitiative}
-                onChange={(e) => setNewInitiative(e.target.value)}
-              >
-                <option value="">— Use project default —</option>
-                {initiatives.map((f) => {
-                  const base = f.name.replace(/^initiatives\//, "");
-                  return (
-                    <option key={f.name} value={base}>
-                      {base}{f.active ? " (currently active)" : ""}
-                    </option>
-                  );
-                })}
-              </select>
+                onChange={setNewInitiative}
+                style={{ width: "100%" }}
+                ariaLabel="initiative for new teamlead"
+                options={[
+                  { value: "", label: "— Use project default —" },
+                  ...initiatives.map((f) => {
+                    const base = f.name.replace(/^initiatives\//, "");
+                    return {
+                      value: base,
+                      label: base,
+                      hint: f.active ? "active" : undefined,
+                    };
+                  }),
+                ]}
+              />
             </div>
             <div className="mb-3">
               <label className="form-label">
@@ -1421,18 +1425,17 @@ export function Sessions() {
                   <label className="form-label">
                     Target teamlead <span style={{ color: "var(--mc-accent-danger)" }}>*</span>
                   </label>
-                  <select
-                    className="form-select"
+                  <Select
                     value={newTlSid}
-                    onChange={(e) => setNewTlSid(e.target.value)}
-                  >
-                    <option value="">— Pick a teamlead —</option>
-                    {activeTeamleads.map((tl) => (
-                      <option key={tl.sid} value={tl.sid}>
-                        {tl.window} ({tl.sid})
-                      </option>
-                    ))}
-                  </select>
+                    onChange={setNewTlSid}
+                    placeholder="— Pick a teamlead —"
+                    style={{ width: "100%" }}
+                    ariaLabel="target teamlead"
+                    options={activeTeamleads.map((tl) => ({
+                      value: tl.sid,
+                      label: `${tl.window} (${tl.sid})`,
+                    }))}
+                  />
                 </div>
                 <div className="mb-3">
                   <label className="form-label">
@@ -1441,16 +1444,19 @@ export function Sessions() {
                       (optional)
                     </span>
                   </label>
-                  <select
-                    className="form-select"
+                  <Select
                     value={newTaskId}
-                    onChange={(e) => setNewTaskId(e.target.value)}
-                  >
-                    <option value="">— None (let TL find or create one) —</option>
-                    {backlog.map((t) => (
-                      <option key={t.id} value={t.id}>{t.id} · {t.title}</option>
-                    ))}
-                  </select>
+                    onChange={setNewTaskId}
+                    style={{ width: "100%" }}
+                    ariaLabel="backlog task"
+                    options={[
+                      { value: "", label: "— None (let TL find or create one) —" },
+                      ...backlog.map((t) => ({
+                        value: t.id,
+                        label: `${t.id} · ${t.title}`,
+                      })),
+                    ]}
+                  />
                 </div>
                 <div className="mb-3">
                   <label className="form-label">

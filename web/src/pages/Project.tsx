@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
+import { Select, type SelectOption } from "../components/Select";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 import { sessionActivity } from "../utils/sessionStatus";
 
@@ -575,21 +576,22 @@ export function Project() {
           <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
             filter:
           </span>
-          <select
-            className="form-select form-select-sm"
-            style={{ width: "auto", minWidth: "12rem", fontSize: "0.75rem" }}
+          <Select
             value={filterInit}
-            onChange={(e) => setFilterInit(e.target.value)}
-          >
-            <option value="">all initiatives</option>
-            <option value={ACTIVE_ONLY}>(active initiatives)</option>
-            {initiativeMeta.map((m) => (
-              <option key={m.key} value={m.key}>
-                {m.title} · {m.status}
-              </option>
-            ))}
-            <option value={UNATTACHED}>(unattached)</option>
-          </select>
+            onChange={setFilterInit}
+            style={{ minWidth: "12rem", fontSize: "0.75rem" }}
+            ariaLabel="filter by initiative"
+            options={[
+              { value: "", label: "all initiatives" },
+              { value: ACTIVE_ONLY, label: "(active initiatives)" },
+              ...initiativeMeta.map((m) => ({
+                value: m.key,
+                label: m.title,
+                hint: m.status,
+              })),
+              { value: UNATTACHED, label: "(unattached)" },
+            ]}
+          />
         </div>
       </div>
 
@@ -691,18 +693,13 @@ export function Project() {
         </div>
         <div className="mb-3">
           <label className="form-label">Status</label>
-          <select
-            className="form-select"
+          <Select
             value={newStatus}
-            onChange={(e) => setNewStatus(e.target.value as Task["status"])}
-          >
-            <option value="planned">Planned</option>
-            <option value="open">Open</option>
-            <option value="in_progress">In progress</option>
-            <option value="totest">To Test</option>
-            <option value="reopened">Reopened</option>
-            <option value="closed">Closed</option>
-          </select>
+            onChange={(v) => setNewStatus(v as Task["status"])}
+            style={{ width: "100%" }}
+            ariaLabel="task status"
+            options={COLUMNS.map((c) => ({ value: c, label: COLUMN_LABELS[c] }))}
+          />
         </div>
       </Modal>
 
@@ -771,27 +768,34 @@ export function Project() {
         }
       >
         {modalError && <div className="alert alert-danger">{modalError}</div>}
-        <select
-          className="form-select"
-          value={initiativeChoice}
-          onChange={(e) => setInitiativeChoice(e.target.value)}
-          autoFocus
-        >
-          <option value="">— unattached —</option>
-          {/* If the current binding isn't in the vision list (orphan: file
-              deleted), surface it so saving is still a deliberate act. */}
-          {activeTask?.initiative &&
-            !initiativeMeta.some((m) => m.key === activeTask.initiative) && (
-              <option value={activeTask.initiative}>
-                {activeTask.initiative} (orphan)
-              </option>
-            )}
-          {initiativeMeta.map((m) => (
-            <option key={m.key} value={m.key}>
-              {m.title} · {m.status}
-            </option>
-          ))}
-        </select>
+        {(() => {
+          // Orphan-aware option list: surface the current binding even if
+          // the vision file was deleted, so saving is a deliberate act.
+          const orphanOpt: SelectOption | null =
+            activeTask?.initiative &&
+            !initiativeMeta.some((m) => m.key === activeTask.initiative)
+              ? { value: activeTask.initiative, label: `${activeTask.initiative} (orphan)` }
+              : null;
+          const options: SelectOption[] = [
+            { value: "", label: "— unattached —" },
+            ...(orphanOpt ? [orphanOpt] : []),
+            ...initiativeMeta.map((m) => ({
+              value: m.key,
+              label: m.title,
+              hint: m.status,
+            })),
+          ];
+          return (
+            <Select
+              value={initiativeChoice}
+              onChange={setInitiativeChoice}
+              autoFocus
+              style={{ width: "100%" }}
+              ariaLabel="initiative"
+              options={options}
+            />
+          );
+        })()}
       </Modal>
     </div>
   );

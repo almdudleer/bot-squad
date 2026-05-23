@@ -45,6 +45,20 @@ export function sidebarSectionVisibility(flags: SidebarFlags): SidebarVisibility
   };
 }
 
+/**
+ * Section headers in render order, per the locked diagram in
+ * `vision/multi-server/nav-restructure.md`. Returns only sections that are
+ * visible under the given flags — callers iterate to drive both Shell.tsx
+ * markup AND tests that pin the contract order.
+ */
+export type SidebarSectionKey = "global" | "server" | "attachment" | "mothership";
+
+export function visibleSidebarSections(flags: SidebarFlags): SidebarSectionKey[] {
+  const v = sidebarSectionVisibility(flags);
+  const ordered: SidebarSectionKey[] = ["global", "server", "attachment", "mothership"];
+  return ordered.filter((k) => v[k]);
+}
+
 /** T-0060 — localStorage key for the server picker selection. Scoped per
  *  installation; in a multi-user context the key would also be per-user,
  *  but the cookie session already isolates browsers. */

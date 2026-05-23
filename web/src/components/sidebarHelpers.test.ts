@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
   resolveInitialPickedServer,
   sidebarSectionVisibility,
+  visibleSidebarSections,
   type PickerCandidate,
   type SidebarFlags,
 } from "./sidebarHelpers";
@@ -56,6 +57,30 @@ describe("sidebarSectionVisibility", () => {
     );
     expect(v.mothership).toBe(false);
     expect(v.serverAdminItems).toBe(true);
+  });
+});
+
+describe("visibleSidebarSections", () => {
+  test("detach build, anon: GLOBAL > SERVER > ATTACHMENT (no MOTHERSHIP)", () => {
+    expect(visibleSidebarSections(flags())).toEqual([
+      "global",
+      "server",
+      "attachment",
+    ]);
+  });
+
+  test("mothership build + super-admin: all four sections in contract order", () => {
+    expect(
+      visibleSidebarSections(flags({ isMothershipBuild: true, isSuperAdmin: true })),
+    ).toEqual(["global", "server", "attachment", "mothership"]);
+  });
+
+  test("ATTACHMENT placeholder is always present (T-0061 contract: every attached user has it)", () => {
+    // The body is filled by Bundle C; the header is unconditional.
+    expect(visibleSidebarSections(flags())).toContain("attachment");
+    expect(visibleSidebarSections(flags({ isMothershipBuild: true }))).toContain(
+      "attachment",
+    );
   });
 });
 

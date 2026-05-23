@@ -1724,6 +1724,19 @@ tr.mc-row-flash > td {
   padding: 0.15rem 0.45rem;
 }
 
+/* ---- Sidebar: ATTACHMENT placeholder (T-0061 placeholder) -- */
+/* Shell renders an "[ ATTACHMENT ]" header + a loading row so the
+   downstream Bundle C dev has a host to slot the real rows into
+   without needing a second pass on Shell.tsx. */
+.mc-sidebar-attachment-placeholder {
+  padding: 0.4rem 1rem;
+  color: var(--mc-text-faint);
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  font-style: italic;
+  list-style: none;
+}
+
 /* ---- Sidebar: SERVER picker (T-0060) --------------------- */
 /* Section header carries the picker inline — the surrounding
    `.mc-sidebar-section` adds the "[ ]" brackets via pseudo-elements,

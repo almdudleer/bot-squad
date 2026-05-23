@@ -380,6 +380,21 @@ export function Shell() {
           )}
         </ul>
 
+        {/* ATTACHMENT — per-user-per-server (T-0061 placeholder).
+            Scoped to the currently-picked SERVER (T-0060). Bundle C fills
+            the rows (operational status row lands here via T-0063 next;
+            TG-binding migration + my-sessions + worker controls are
+            owned by the downstream `attachment-tg` dev). We render the
+            section header + a loading-stub body so the structural shape
+            is in place and T-0063 has a host. */}
+        <div className="mc-sidebar-section">ATTACHMENT</div>
+        <ul className="mc-sidebar-nav" aria-live="polite">
+          <li className="mc-sidebar-attachment-placeholder">
+            <span className="mc-nav-diamond">·</span>
+            loading…
+          </li>
+        </ul>
+
         {/* Footer */}
         <div className="mc-sidebar-footer">
           {username && (

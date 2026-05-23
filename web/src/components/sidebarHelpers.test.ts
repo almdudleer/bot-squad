@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  isSuperAdminFromMe,
   resolveInitialPickedServer,
   sidebarSectionVisibility,
   visibleSidebarSections,
@@ -81,6 +82,28 @@ describe("visibleSidebarSections", () => {
     expect(visibleSidebarSections(flags({ isMothershipBuild: true }))).toContain(
       "attachment",
     );
+  });
+});
+
+describe("isSuperAdminFromMe (T-0062 with T-0066 fallback)", () => {
+  test("explicit is_super_admin=true wins regardless of is_admin", () => {
+    expect(isSuperAdminFromMe({ is_super_admin: true, is_admin: false })).toBe(true);
+  });
+
+  test("explicit is_super_admin=false wins regardless of is_admin", () => {
+    // Once T-0066 ships, a server-local admin who isn't the mothership owner
+    // returns false here — they should NOT see the MOTHERSHIP section.
+    expect(isSuperAdminFromMe({ is_super_admin: false, is_admin: true })).toBe(false);
+  });
+
+  test("falls back to is_admin when is_super_admin is absent (pre-T-0066)", () => {
+    expect(isSuperAdminFromMe({ is_admin: true })).toBe(true);
+    expect(isSuperAdminFromMe({ is_admin: false })).toBe(false);
+  });
+
+  test("null / undefined me → false (anonymous can't be super-admin)", () => {
+    expect(isSuperAdminFromMe(null)).toBe(false);
+    expect(isSuperAdminFromMe(undefined)).toBe(false);
   });
 });
 

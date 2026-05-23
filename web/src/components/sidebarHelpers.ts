@@ -53,6 +53,24 @@ export function sidebarSectionVisibility(flags: SidebarFlags): SidebarVisibility
  */
 export type SidebarSectionKey = "global" | "server" | "attachment" | "mothership";
 
+/**
+ * T-0062 — read the super-admin flag from /api/me, falling back to the
+ * legacy `is_admin` field until T-0066's users-model split ships the
+ * canonical `is_super_admin` boolean. Until then a server-local admin
+ * who is ALSO the install owner (the alexey case) is treated as the
+ * super-admin. Once T-0066 lands this becomes a pure lookup of
+ * `me.is_super_admin`. TODO(T-0066): drop the fallback.
+ */
+export type MeLike = {
+  is_admin?: boolean;
+  is_super_admin?: boolean;
+};
+export function isSuperAdminFromMe(me: MeLike | null | undefined): boolean {
+  if (!me) return false;
+  if (typeof me.is_super_admin === "boolean") return me.is_super_admin;
+  return Boolean(me.is_admin);
+}
+
 export function visibleSidebarSections(flags: SidebarFlags): SidebarSectionKey[] {
   const v = sidebarSectionVisibility(flags);
   const ordered: SidebarSectionKey[] = ["global", "server", "attachment", "mothership"];

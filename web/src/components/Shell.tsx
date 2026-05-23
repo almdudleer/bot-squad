@@ -3,6 +3,7 @@ import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom"
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
+import { isSuperAdminFromMe } from "./sidebarHelpers";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
 
@@ -40,6 +41,10 @@ export function Shell() {
   const [username, setUsername] = useState<string | null>(null);
   const [linuxUser, setLinuxUser] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  // T-0062: super-admin gates the MOTHERSHIP section. Read from /api/me;
+  // pre-T-0066 the field doesn't exist server-side so isSuperAdminFromMe
+  // falls back to is_admin. Drop the fallback once users-model-split lands.
+  const [isSuperAdmin, setIsSuperAdmin] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   // T-0060: which server the SERVER section + (later) ATTACHMENT scope
   // belongs to. Only meaningful on mothership; on detach the single
@@ -105,6 +110,7 @@ export function Shell() {
         setUsername(m.username);
         setLinuxUser(m.linux_user);
         setIsAdmin(Boolean(m.is_admin));
+        setIsSuperAdmin(isSuperAdminFromMe(m));
       })
       .catch(() => {
         /* anonymous — login redirect handled elsewhere */
@@ -394,6 +400,51 @@ export function Shell() {
             loading…
           </li>
         </ul>
+
+        {/* MOTHERSHIP — super-admin only on mothership builds (T-0062).
+            VITE_MOTHERSHIP=0 builds tree-shake the whole block out via the
+            literal gate. On detach, the contract says MOTHERSHIP "GONE
+            entirely" — that's what this conditional + the import gate above
+            achieve together. The /m/users page + /api/m/users + the install-
+            tokens sub-table are deferred (BE owned by Bundle B's users-model
+            split; the mothership route table is owned by Bundle E this
+            sprint). For now /m/users falls through to the wildcard NotFound
+            until those land; /m/servers/add reaches the existing wizard. */}
+        {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
+          <>
+            <div className="mc-sidebar-section">MOTHERSHIP</div>
+            <ul className="mc-sidebar-nav">
+              <li>
+                <NavLink
+                  to="/m/users"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◇</span>
+                  ALL USERS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to="/"
+                  end
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◇</span>
+                  ATTACHED SERVERS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to="/m/servers/add"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  <span className="mc-nav-diamond">◇</span>
+                  + ADD SERVER
+                </NavLink>
+              </li>
+            </ul>
+          </>
+        )}
 
         {/* Footer */}
         <div className="mc-sidebar-footer">

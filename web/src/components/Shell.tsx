@@ -176,6 +176,43 @@ export function Shell() {
           {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}
         </div>
 
+        {/* GLOBAL — per-user cross-server (T-0059). Audience: every logged-in
+            user, regardless of which server they're attached to. See
+            vision/multi-server/nav-restructure.md for the locked scope. */}
+        <div className="mc-sidebar-section">GLOBAL</div>
+        <ul className="mc-sidebar-nav">
+          <li>
+            <NavLink
+              to="/"
+              end
+              data-onboarding-anchor="all-projects-nav"
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+            >
+              <span className="mc-nav-diamond">◇</span>
+              ALL PROJECTS
+            </NavLink>
+          </li>
+          <li>
+            <NavLink
+              to="/me"
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+            >
+              <span className="mc-nav-diamond">◇</span>
+              MY PROFILE
+            </NavLink>
+          </li>
+          <li>
+            <NavLink
+              to="/help"
+              data-onboarding-anchor="help-nav"
+              className={({ isActive }) => (isActive ? "active" : undefined)}
+            >
+              <span className="mc-nav-diamond">◇</span>
+              HELP
+            </NavLink>
+          </li>
+        </ul>
+
         {/* Project section — shows pinned project even on global routes */}
         {hasProject && slug && (
           <>
@@ -255,20 +292,12 @@ export function Shell() {
           </>
         )}
 
-        {/* System section */}
+        {/* System section — T-0059 moved ALL PROJECTS, MY PROFILE, HELP up
+            into the new GLOBAL section. T-0060 will rename this header to
+            SERVER and wire the picker; for now it carries scheduler +
+            mothership-only releases + admin-gated USERS/SETTINGS. */}
         <div className="mc-sidebar-section">System</div>
         <ul className="mc-sidebar-nav">
-          <li>
-            <NavLink
-              to="/"
-              end
-              data-onboarding-anchor="all-projects-nav"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              <span className="mc-nav-diamond">◇</span>
-              ALL PROJECTS
-            </NavLink>
-          </li>
           <li>
             <NavLink
               to="/scheduler"
@@ -276,25 +305,6 @@ export function Shell() {
             >
               <span className="mc-nav-diamond">◇</span>
               SCHEDULER
-            </NavLink>
-          </li>
-          <li>
-            <NavLink
-              to="/me"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              <span className="mc-nav-diamond">◇</span>
-              MY PROFILE
-            </NavLink>
-          </li>
-          <li>
-            <NavLink
-              to="/help"
-              data-onboarding-anchor="help-nav"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              <span className="mc-nav-diamond">◇</span>
-              HELP
             </NavLink>
           </li>
           {/* T-0087: mothership-only Releases tab. Vite inlines the

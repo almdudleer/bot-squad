@@ -58,9 +58,18 @@ export function Profile() {
 
   return (
     <div className="container py-4" style={{ maxWidth: "640px" }}>
-      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1rem" }}>
+      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
         My profile
       </h2>
+      <p
+        style={{
+          fontSize: "0.75rem",
+          color: "var(--mc-text-dim)",
+          marginBottom: "1rem",
+        }}
+      >
+        These settings apply across all bot-squad servers you're attached to.
+      </p>
 
       {error && <div className="alert alert-danger">{error}</div>}
       {profile === null && !error && <div className="mc-loading">Loading</div>}

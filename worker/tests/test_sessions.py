@@ -398,6 +398,107 @@ def test_list_sessions_recovers_started_at_after_window_rename(tmp_path, monkeyp
     assert rows[0]["owner"] == "alexey"
 
 
+def test_list_sessions_per_pane_uuid_under_shared_cwd(tmp_path, monkeypatch):
+    """T-0120: panes sharing a cwd each surface their OWN md.
+
+    On staging the 3 active bot-squad TLs (ui_polish-TL-p11,
+    multi_server-TL-p9, update_delivery-TL-p13) all share
+    /home/almdudleer/bot-squad-mgmt. discover_claude_uuid returns the
+    cwd's mtime-latest jsonl — the SAME uuid for all three — so the
+    T-0118 uuid-keyed fallback in _find_session_md attributed ONE
+    pane's started_at + task_id + initiative to ALL of them.
+
+    Fix: _pane_claude_uuid_from_proc walks each pane's /proc descendants
+    for the live claude process's open jsonl fd — pane-specific. Test
+    asserts each post-rename SID resolves to ITS OWN md, not a neighbor's.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-rename mds carry distinct claude_uuids; post-rename SIDs (computed
+    # from the live tmux window names) miss the SID-keyed lookup, so the
+    # fallback path has to disambiguate using the per-pane uuid.
+    _write_session_metadata(sessions_dir / "S-testuser-teamlead-p11.md", {
+        "sid": "S-testuser-teamlead-p11", "status": "active", "window": "teamlead",
+        "cwd": str(repo), "claude_uuid": "uuid-ui-polish",
+        "task_id": "T-0120", "initiative": "ui-polish.md",
+        "started_at": "2026-05-15T10:00:00Z", "owner": "alexey",
+    })
+    _write_session_metadata(sessions_dir / "S-testuser-multi_server-p9.md", {
+        "sid": "S-testuser-multi_server-p9", "status": "active", "window": "multi_server",
+        "cwd": str(repo), "claude_uuid": "uuid-multi-server",
+        "task_id": "T-0119", "initiative": "multi-server.md",
+        "started_at": "2026-05-15T11:00:00Z", "owner": "alexey",
+    })
+    _write_session_metadata(sessions_dir / "S-testuser-teamlead-p13.md", {
+        "sid": "S-testuser-teamlead-p13", "status": "active", "window": "teamlead",
+        "cwd": str(repo), "claude_uuid": "uuid-update-delivery",
+        "task_id": "T-0117", "initiative": "update-delivery.md",
+        "started_at": "2026-05-15T12:00:00Z", "owner": "alexey",
+    })
+
+    # discover_claude_uuid will collapse onto whatever was written last —
+    # populate the encoded project dir so it returns a real value (proving
+    # the test is exercising the disambiguation path, not a None-fallback).
+    encoded = str(repo).replace("/", "-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    for stem in ("uuid-ui-polish", "uuid-multi-server", "uuid-update-delivery"):
+        (proj_dir / f"{stem}.jsonl").write_text("{}")
+
+    # 3 panes, shared cwd, distinct pids and post-rename window names.
+    fake_panes = (
+        f"%11|ui_polish-TL|3001|{repo}|claude\n"
+        f"%9|multi_server-TL|3002|{repo}|claude\n"
+        f"%13|update_delivery-TL|3003|{repo}|claude\n"
+    )
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_panes, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    pid_to_uuid = {
+        "3001": "uuid-ui-polish",
+        "3002": "uuid-multi-server",
+        "3003": "uuid-update-delivery",
+    }
+
+    def fake_proc(pid, user_home):
+        return pid_to_uuid.get(pid)
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", fake_proc)
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows if r["status"] == "active"}
+
+    # Each post-rename SID resolves to its OWN pre-rename md.
+    assert by_sid["S-testuser-ui_polish-TL-p11"]["started_at"] == "2026-05-15T10:00:00Z"
+    assert by_sid["S-testuser-ui_polish-TL-p11"]["task_id"] == "T-0120"
+    assert by_sid["S-testuser-ui_polish-TL-p11"]["initiative"] == "ui-polish.md"
+
+    assert by_sid["S-testuser-multi_server-TL-p9"]["started_at"] == "2026-05-15T11:00:00Z"
+    assert by_sid["S-testuser-multi_server-TL-p9"]["task_id"] == "T-0119"
+    assert by_sid["S-testuser-multi_server-TL-p9"]["initiative"] == "multi-server.md"
+
+    assert by_sid["S-testuser-update_delivery-TL-p13"]["started_at"] == "2026-05-15T12:00:00Z"
+    assert by_sid["S-testuser-update_delivery-TL-p13"]["task_id"] == "T-0117"
+    assert by_sid["S-testuser-update_delivery-TL-p13"]["initiative"] == "update-delivery.md"
+
+    # Sanity: no two active rows bleed the same started_at — the failure mode
+    # this test exists to prevent.
+    starts = [r["started_at"] for r in by_sid.values()]
+    assert len(set(starts)) == 3, f"active TLs must have distinct started_at, got {starts}"
+
+
 def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
     """Suspended-md path surfaces initiative from frontmatter."""
     repo = tmp_path / "repo"

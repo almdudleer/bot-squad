@@ -110,6 +110,60 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     return latest.stem  # filename without .jsonl = UUID
 
 
+def _pane_claude_uuid_from_proc(pane_pid: str, user_home: str) -> str | None:
+    """T-0120: return the AUTHORITATIVE claude_uuid for a tmux pane via /proc.
+
+    Walks /proc descendants of ``pane_pid`` for an open .jsonl file under
+    ``~/.claude/projects/``. Returns the filename stem (uuid) of the first
+    matching open fd. None if no claude descendant is found or the walk fails.
+
+    Disambiguates panes that share a cwd: ``discover_claude_uuid()`` returns
+    the cwd's mtime-latest jsonl — the SAME uuid for every pane in the cwd —
+    so the uuid-keyed md fallback would map every such pane to one md.
+    Reading each pane's claude process directly gives a per-pane uuid.
+    Pattern mirrors the descendant walk in scripts/hooks/session_start.sh.
+    """
+    try:
+        target = int(pane_pid)
+    except (ValueError, TypeError):
+        return None
+    children: dict[int, list[int]] = {}
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                st = (entry / "status").read_text()
+            except OSError:
+                continue
+            m = re.search(r"^PPid:\s+(\d+)", st, re.M)
+            if m:
+                children.setdefault(int(m.group(1)), []).append(int(entry.name))
+    except OSError:
+        return None
+    proj_prefix = str(Path(user_home) / ".claude" / "projects") + "/"
+    queue: list[int] = [target]
+    seen: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        fd_dir = Path(f"/proc/{pid}/fd")
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    link = os.readlink(str(fd))
+                except OSError:
+                    continue
+                if link.startswith(proj_prefix) and link.endswith(".jsonl"):
+                    return Path(link).stem
+        except OSError:
+            pass
+        queue.extend(children.get(pid, []))
+    return None
+
+
 def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> float | None:
     """T-0104: return the per-pane activity timestamp (epoch seconds) or None.
 
@@ -361,7 +415,18 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         sid = compute_sid(user, pane.window, pane.pane_id)
         active_sids.add(sid)
 
-        claude_uuid = discover_claude_uuid(pane.cwd, user_home)
+        # T-0120: prefer the pane's /proc-walked uuid over the cwd-mtime
+        # guess. discover_claude_uuid returns the same value for every pane
+        # sharing a cwd, so the uuid fallback in _find_session_md would map
+        # multiple panes to one md (3 active TLs in /home/almdudleer/bot-squad-mgmt
+        # all attributed to the same started_at + initiative on staging).
+        # /proc walk reads the uuid the live claude process has open — that's
+        # per-pane. discover_claude_uuid stays as the fallback when the walk
+        # finds nothing (e.g. claude not yet exec'd in a brand-new pane).
+        claude_uuid = (
+            _pane_claude_uuid_from_proc(pane.pid, user_home)
+            or discover_claude_uuid(pane.cwd, user_home)
+        )
         linked_tasks = _scan_linked_tasks(data_dir, slug, sid, claude_uuid)
 
         # Check for last_prompt_at via .claude/last_user_prompt_ts mtime

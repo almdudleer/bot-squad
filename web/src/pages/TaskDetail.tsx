@@ -692,6 +692,76 @@ export function TaskDetail() {
         </div>
       </div>
 
+      {/* Session history — T-0106. Frontmatter `session_history` is an
+          append-only ordered list of SIDs that have ever bound this task
+          (spawn / bind_task / resume). Render chronologically; each row
+          links to the Sessions page deep-linked to that SID, and shows the
+          session's `started_at` (joined from the live sessions list) as a
+          first-touch proxy. */}
+      <div className="mb-4">
+        <div className="mc-section-title">
+          Session history ({(task.session_history ?? []).length})
+        </div>
+        {(task.session_history ?? []).length === 0 ? (
+          <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
+            No sessions have touched this task yet.
+          </p>
+        ) : (
+          <div>
+            {(task.session_history ?? []).map((sid, i) => {
+              const row = sessionsBySid[sid];
+              const startedAt = row?.started_at;
+              return (
+                <div
+                  key={`${sid}-${i}`}
+                  style={{
+                    background: "var(--mc-surface-raised)",
+                    border: "1px solid var(--mc-border)",
+                    borderRadius: "3px",
+                    padding: "0.4rem 0.625rem",
+                    marginBottom: "0.35rem",
+                    fontSize: "0.78rem",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.75rem",
+                  }}
+                >
+                  <Link
+                    to={`/p/${slug}/sessions?sid=${encodeURIComponent(sid)}`}
+                    style={{
+                      fontFamily: "var(--mc-mono)",
+                      fontSize: "0.78rem",
+                      color: "var(--mc-accent)",
+                      textDecoration: "none",
+                    }}
+                    title="Open this session on the Sessions page"
+                  >
+                    {sid}
+                  </Link>
+                  <span
+                    style={{
+                      fontFamily: "var(--mc-mono)",
+                      fontSize: "0.7rem",
+                      color: "var(--mc-text-dim)",
+                      marginLeft: "auto",
+                    }}
+                    title={
+                      startedAt
+                        ? `Session started_at: ${startedAt}`
+                        : "Session not in the current registry (suspended/archived/legacy)"
+                    }
+                  >
+                    {startedAt
+                      ? new Date(startedAt).toLocaleString()
+                      : "—"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {/* Actions */}
       <div
         className="d-flex gap-2 align-items-center"

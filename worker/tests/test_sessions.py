@@ -686,6 +686,49 @@ def test_list_sessions_suspended_md_has_activity_suspended(tmp_path, monkeypatch
     assert rows[0]["activity_at"] is None
 
 
+def test_peer_heartbeat_at_returns_mtime(tmp_path):
+    from bot_squad_worker.sessions import _peer_heartbeat_at
+    hb = tmp_path / "test-project" / "_chat" / "heartbeat-S-x-y-p1"
+    hb.parent.mkdir(parents=True)
+    hb.write_text("")
+    expected = hb.stat().st_mtime
+    got = _peer_heartbeat_at(tmp_path, "test-project", "S-x-y-p1")
+    assert got == expected
+
+
+def test_peer_heartbeat_at_none_when_missing(tmp_path):
+    from bot_squad_worker.sessions import _peer_heartbeat_at
+    assert _peer_heartbeat_at(tmp_path, "test-project", "S-nope-w-p0") is None
+
+
+def test_list_sessions_heartbeat_keeps_long_idle_pane_fresh(tmp_path, monkeypatch):
+    """T-0037: armed peer_inbox_wait counts as activity even if jsonl is stale.
+
+    Reproducer: TL with a stale jsonl (last claude turn 5 minutes ago) but
+    a fresh heartbeat-<sid> (inbox_wait re-armed seconds ago). Without the
+    heartbeat fold, activity_at == old jsonl mtime → 'idle' label + a
+    misleading "5m ago" in the Last activity column. With the fold,
+    activity_at == fresh heartbeat → 'running' + a truthful "seconds ago".
+    """
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    now = time.time()
+    stale = now - 300.0
+    os.utime(jsonl, (stale, stale))
+    # Heartbeat written by intersession.inbox_wait/read.
+    hb = cfg.data_dir / "test-project" / "_chat" / "heartbeat-S-testuser-mywin-p9"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text("")
+    os.utime(hb, (now, now))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "running"
+    assert rows[0]["activity_at"] is not None
+    # Heartbeat (now) wins over jsonl (5 min ago).
+    assert abs(rows[0]["activity_at"] - now) < 1.0
+
+
 def test_list_sessions_unknown_slug(tmp_path, monkeypatch):
     from bot_squad_worker.actions import ActionError
     cfg = _make_cfg(tmp_path)

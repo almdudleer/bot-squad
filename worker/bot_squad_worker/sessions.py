@@ -210,6 +210,23 @@ def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> floa
         return None
 
 
+def _peer_heartbeat_at(data_dir: Path, slug: str, sid: str) -> float | None:
+    """T-0037: return mtime of the peer-bus heartbeat file for this SID, or None.
+
+    intersession.inbox_read / inbox_wait touch ``data/<slug>/_chat/heartbeat-<sid>``
+    each time they run (wait re-touches every ``_HEARTBEAT_INTERVAL`` seconds
+    while armed). A long-idle TL whose only activity is an armed inbox_wait
+    has a stale jsonl mtime but a fresh heartbeat — folding the heartbeat into
+    ``activity_at`` keeps the "Last activity" column truthful for those
+    sessions instead of showing "5h ago" for a session that's polling now.
+    """
+    hb = data_dir / slug / "_chat" / f"heartbeat-{sid}"
+    try:
+        return hb.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _derive_activity(
     live_status: str,
     activity_at: float | None,
@@ -509,7 +526,12 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # `activity` is the canonical label-display enum derived from the
         # jsonl mtime probe. Two fields — not a replacement — per the
         # binding-audit "don't replace existing status logic, extend it".
-        activity_at = _pane_activity_at(pane.cwd, claude_uuid, user_home)
+        jsonl_at = _pane_activity_at(pane.cwd, claude_uuid, user_home)
+        heartbeat_at = _peer_heartbeat_at(data_dir, slug, sid)
+        # Fold jsonl mtime and peer-bus heartbeat into a single timestamp.
+        # max() with None: pick whichever is non-None, or the larger when both.
+        candidates = [t for t in (jsonl_at, heartbeat_at) if t is not None]
+        activity_at = max(candidates) if candidates else None
         activity = _derive_activity(live_status, activity_at, time.time())
 
         rows.append({

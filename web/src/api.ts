@@ -50,6 +50,10 @@ export type Task = {
   initiative?: string | null;
   parent_task?: string | null;
   blocked_by?: string[] | null;
+  // T-0105 + T-0106: append-only list of SIDs that worked on this task,
+  // oldest first. Worker stamps on spawn/bind/resume; rendered as a panel
+  // on TaskDetail. May be undefined for legacy tasks created before T-0105.
+  session_history?: string[];
   path: string;
   created?: string;
   updated?: string;

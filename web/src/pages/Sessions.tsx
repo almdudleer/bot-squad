@@ -59,6 +59,23 @@ function relativeTime(raw: string | number | null | undefined): string {
   return `${Math.floor(diffHr / 24)}d ago`;
 }
 
+// T-0037: "Last activity" must be per-pane. Prefer the worker-derived
+// `activity_at` (jsonl mtime + peer-bus heartbeat — distinct per claude_uuid)
+// over `last_prompt_at`, which sources from `.claude/last_user_prompt_ts`
+// shared across every pane in the repo and so reads the same for every row.
+// For suspended rows the worker leaves activity_at null and stuffs
+// suspended_at/paused_at into last_prompt_at; fall through to that.
+function sessionLastActivity(s: SessionRow): string {
+  if (s.activity_at != null) return relativeTime(s.activity_at);
+  if (s.last_prompt_at != null) return relativeTime(s.last_prompt_at);
+  return "never";
+}
+
+const LAST_ACTIVITY_TOOLTIP =
+  "Most recent per-pane activity: claude turn or tool call (jsonl mtime) " +
+  "plus peer_inbox_read/wait heartbeat. 'never' = pane hasn't written yet. " +
+  "Suspended rows show the suspend/pause timestamp.";
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -620,9 +637,12 @@ export function Sessions() {
             {relativeTime(s.started_at)}
           </td>
 
-          {/* Last activity */}
-          <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
-            {relativeTime(s.last_prompt_at)}
+          {/* Last activity (T-0037: per-pane) */}
+          <td
+            style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}
+            title={LAST_ACTIVITY_TOOLTIP}
+          >
+            {sessionLastActivity(s)}
           </td>
 
           {/* Linked tasks */}
@@ -773,8 +793,11 @@ export function Sessions() {
           <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
             {relativeTime(s.started_at)}
           </td>
-          <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
-            {relativeTime(s.last_prompt_at)}
+          <td
+            style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}
+            title={LAST_ACTIVITY_TOOLTIP}
+          >
+            {sessionLastActivity(s)}
           </td>
           <td onClick={(e) => e.stopPropagation()}>
             <div className="d-flex gap-1 flex-wrap">
@@ -1207,7 +1230,7 @@ export function Sessions() {
                 <th>Target</th>
                 <th>Status</th>
                 <th>Started</th>
-                <th>Last activity</th>
+                <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
                 <th>Tasks</th>
                 <th></th>
               </tr>
@@ -1263,7 +1286,7 @@ export function Sessions() {
                   <th>Role</th>
                   <th>Target</th>
                   <th>Started</th>
-                  <th>Last activity</th>
+                  <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
                   <th></th>
                 </tr>
               </thead>

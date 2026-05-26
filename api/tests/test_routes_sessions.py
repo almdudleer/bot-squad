@@ -20,6 +20,9 @@ from app.main import build_app
 _SAMPLE_SESSION = {
     "sid": "S-almdudleer-spec5-p2",
     "status": "active",
+    # T-0104: activity-derived enum; worker emits this alongside raw status.
+    "activity": "running",
+    "activity_at": 1_700_000_000.0,
     "window": "spec5",
     "cwd": "/home/almdudleer/signal_tracker_mgmt",
     "started_at": None,
@@ -133,6 +136,9 @@ def test_list_sessions_success(tmp_bot_squad: Path, monkeypatch, fake_worker_ses
     assert len(data) == 1
     assert data[0]["sid"] == "S-almdudleer-spec5-p2"
     assert data[0]["status"] == "active"
+    # T-0104: derived activity field passes through unchanged.
+    assert data[0]["activity"] == "running"
+    assert data[0]["activity_at"] == 1_700_000_000.0
 
 
 def test_list_sessions_requires_auth(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):

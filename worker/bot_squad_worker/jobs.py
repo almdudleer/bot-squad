@@ -79,8 +79,19 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     chat_id = project.tg_chat  # type: ignore[attr-defined]
     sid = "deploy_monitor"
 
-    # Tree is clean — ping at start and at finish.
-    tg.send(chat_id=chat_id, text=f"🚚 starting deploy for {slug}/{target}", sid=sid)
+    # Tree is clean — ping at start and at finish. TG outages must not
+    # block the deploy itself: api.telegram.org went unreachable from this
+    # host once (IPv6 default with no route) and the uncaught network error
+    # propagated out of deploy_monitor, leaving queued recipes wedged in
+    # the queue dir indefinitely. Swallow + log; the deploy queue is the
+    # source of truth, the TG ping is best-effort observability.
+    def _tg_safe(text: str) -> None:
+        try:
+            tg.send(chat_id=chat_id, text=text, sid=sid)
+        except Exception:
+            log.exception("deploy_monitor: tg.send failed (non-fatal): %s", text)
+
+    _tg_safe(f"🚚 starting deploy for {slug}/{target}")
 
     result = _deploy.run_next(cfg, slug)
     if result is None:
@@ -94,17 +105,9 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
         else ""
     )
     if result.ok:
-        tg.send(
-            chat_id=chat_id,
-            text=f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){suffix}",
-            sid=sid,
-        )
+        _tg_safe(f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){suffix}")
     else:
-        tg.send(
-            chat_id=chat_id,
-            text=f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}",
-            sid=sid,
-        )
+        _tg_safe(f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}")
 
 
 def tg_listener_tick(cfg: Config) -> None:

@@ -32,4 +32,10 @@ ENV CONFIG_DIR=/config \
     COOKIE_SECURE=1
 
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --proxy-headers + --forwarded-allow-ips '*' so Starlette honors traefik's
+# X-Forwarded-Proto: in particular, `request.url_for(...)` in routes_releases
+# was emitting http:// scheme even on https traffic, breaking the consumer's
+# tarball download (T-0090 dogfood finding). Trust ALL forwarders because
+# traefik is the only ingress in front of this container and the container
+# port isn't exposed externally.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

@@ -1,6 +1,7 @@
 """Tests for worker.sessions — session list/pause/resume/spawn."""
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -80,7 +81,7 @@ def test_compute_sid_no_pct():
 
 
 def test_discover_claude_uuid_returns_stem(tmp_path):
-    proj_dir = tmp_path / ".claude" / "projects" / "home-alice-myrepo"
+    proj_dir = tmp_path / ".claude" / "projects" / "-home-alice-myrepo"
     proj_dir.mkdir(parents=True)
     uuid_file = proj_dir / "abc123-0000-0000-0000-000000000000.jsonl"
     uuid_file.write_text("{}")
@@ -94,14 +95,14 @@ def test_discover_claude_uuid_no_dir(tmp_path):
 
 
 def test_discover_claude_uuid_no_jsonl(tmp_path):
-    proj_dir = tmp_path / ".claude" / "projects" / "home-alice-myrepo"
+    proj_dir = tmp_path / ".claude" / "projects" / "-home-alice-myrepo"
     proj_dir.mkdir(parents=True)
     result = discover_claude_uuid("/home/alice/myrepo", str(tmp_path))
     assert result is None
 
 
 def test_discover_claude_uuid_returns_latest(tmp_path):
-    proj_dir = tmp_path / ".claude" / "projects" / "tmp-repo"
+    proj_dir = tmp_path / ".claude" / "projects" / "-tmp-repo"
     proj_dir.mkdir(parents=True)
     old = proj_dir / "old-uuid.jsonl"
     new = proj_dir / "new-uuid.jsonl"
@@ -110,6 +111,31 @@ def test_discover_claude_uuid_returns_latest(tmp_path):
     new.write_text("{}")
     result = discover_claude_uuid("/tmp/repo", str(tmp_path))
     assert result == "new-uuid"
+
+
+def test_discover_claude_uuid_round_trip_real_encoding(tmp_path):
+    """T-0118 regression: Claude's path-encoding keeps the leading dash.
+
+    Set up a project dir using the EXACT encoding Claude uses on real disk
+    (verified against /home/almdudleer/.claude/projects/ which contains
+    entries like `-home-almdudleer-bot-squad-mgmt`). Then assert that
+    discover_claude_uuid locates a jsonl whose stem matches. If a future
+    change re-introduces lstrip('-') or any other leading-dash mutation,
+    proj_dir will be looked up at the wrong path and this test fails.
+    """
+    cwd = "/home/almdudleer/bot-squad-mgmt"
+    # Real encoding — the leading slash becomes a leading dash and stays.
+    encoded = "-home-almdudleer-bot-squad-mgmt"
+    assert cwd.replace("/", "-") == encoded, (
+        "round-trip premise broke: replace('/', '-') must yield the "
+        "leading-dash form Claude writes to disk"
+    )
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    uuid_stem = "deadbeef-1234-5678-9abc-def012345678"
+    (proj_dir / f"{uuid_stem}.jsonl").write_text("{}")
+    result = discover_claude_uuid(cwd, str(tmp_path))
+    assert result == uuid_stem
 
 
 def test_read_write_session_metadata_roundtrip(tmp_path):
@@ -317,6 +343,61 @@ def test_list_sessions_active_pane_with_initiative(tmp_path, monkeypatch):
     assert rows[0]["initiative"] == "v0.7-news-subscriptions.md"
 
 
+def test_list_sessions_recovers_started_at_after_window_rename(tmp_path, monkeypatch):
+    """T-0118: live pane whose tmux window was renamed still surfaces
+    started_at / task_id from the pre-rename md via claude_uuid fallback.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # Pre-rename md file lives at the OLD SID (window was 'teamlead' when
+    # the session started) — file holds the rename-invariant claude_uuid
+    # plus started_at, task_id, owner.
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-teamlead-p11.md", {
+        "sid": "S-testuser-teamlead-p11",
+        "status": "active",
+        "window": "teamlead",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-after-rename",
+        "task_id": "T-0100",
+        "started_at": "2026-05-23T15:37:12Z",
+        "owner": "alexey",
+    })
+
+    # Live pane reports the NEW window name — same pane_id, same uuid,
+    # so the SID-keyed lookup misses but the uuid fallback should hit.
+    # Encoding mirrors claude's on-disk layout — leading slash → leading dash.
+    encoded = str(repo).replace("/", "-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "uuid-after-rename.jsonl").write_text("{}")
+
+    fake_pane_output = f"%11|ui_polish-TL|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    # Exactly one row — the suspended-md loop must NOT also emit the
+    # pre-rename SID as a separate suspended session.
+    assert len(rows) == 1
+    assert rows[0]["sid"] == "S-testuser-ui_polish-TL-p11"
+    assert rows[0]["status"] == "active"
+    assert rows[0]["started_at"] == "2026-05-23T15:37:12Z"
+    assert rows[0]["task_id"] == "T-0100"
+    assert rows[0]["owner"] == "alexey"
+
+
 def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
     """Suspended-md path surfaces initiative from frontmatter."""
     repo = tmp_path / "repo"
@@ -349,6 +430,159 @@ def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
     rows = list_sessions(cfg, "test-project")
     assert len(rows) == 1
     assert rows[0]["initiative"] == "foo.md"
+
+
+# ---------------------------------------------------------------------------
+# T-0104: activity-derived "running" vs "idle" — jsonl-mtime probe
+# ---------------------------------------------------------------------------
+
+def _setup_activity_probe(tmp_path, monkeypatch):
+    """Boilerplate: a live claude pane in `tmp_path/repo` + its jsonl file.
+
+    Returns (cfg, jsonl_path) so the test can mutate the jsonl mtime to
+    drive the running/idle derivation.
+    """
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # Encode cwd to the path claude uses under ~/.claude/projects/.
+    # T-0118: claude keeps the leading dash; do NOT lstrip.
+    encoded = str(repo).replace("/", "-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    uuid = "fff00000-0000-0000-0000-000000000fff"
+    jsonl = proj_dir / f"{uuid}.jsonl"
+    jsonl.write_text("{}")
+
+    fake_pane_output = f"%9|mywin|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    return cfg, jsonl
+
+
+def test_pane_activity_at_returns_jsonl_mtime(tmp_path):
+    from bot_squad_worker.sessions import _pane_activity_at
+    # Real claude encoding keeps the leading dash (T-0118).
+    encoded = "-tmp-repo"
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    jsonl = proj_dir / "abc.jsonl"
+    jsonl.write_text("{}")
+    expected = jsonl.stat().st_mtime
+    got = _pane_activity_at("/tmp/repo", "abc", str(tmp_path))
+    assert got == expected
+
+
+def test_pane_activity_at_none_when_no_uuid(tmp_path):
+    from bot_squad_worker.sessions import _pane_activity_at
+    assert _pane_activity_at("/tmp/repo", None, str(tmp_path)) is None
+
+
+def test_pane_activity_at_none_when_jsonl_missing(tmp_path):
+    from bot_squad_worker.sessions import _pane_activity_at
+    assert _pane_activity_at("/tmp/repo", "nope", str(tmp_path)) is None
+
+
+def test_derive_activity_running_when_fresh():
+    from bot_squad_worker.sessions import _derive_activity
+    now = 1000.0
+    assert _derive_activity("active", now - 5.0, now) == "running"
+
+
+def test_derive_activity_idle_when_stale():
+    from bot_squad_worker.sessions import _derive_activity
+    now = 1000.0
+    assert _derive_activity("active", now - 60.0, now) == "idle"
+
+
+def test_derive_activity_idle_when_no_signal():
+    from bot_squad_worker.sessions import _derive_activity
+    assert _derive_activity("active", None, 1000.0) == "idle"
+
+
+def test_derive_activity_paused_overrides_activity():
+    from bot_squad_worker.sessions import _derive_activity
+    # Even if jsonl is fresh, an explicit md=paused (Ctrl-C) wins so the
+    # UI still offers Resume rather than confusing the operator.
+    assert _derive_activity("paused", 1000.0 - 1.0, 1000.0) == "paused"
+
+
+def test_list_sessions_running_when_jsonl_fresh(tmp_path, monkeypatch):
+    """Fresh jsonl mtime → activity='running' on the returned row."""
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    # touch — already fresh from the write above; just be explicit.
+    now = time.time()
+    os.utime(jsonl, (now, now))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "running"
+    assert rows[0]["status"] == "active"  # back-compat raw status preserved
+    assert rows[0]["activity_at"] is not None
+
+
+def test_list_sessions_idle_when_jsonl_stale(tmp_path, monkeypatch):
+    """jsonl mtime older than RUNNING_THRESHOLD_SEC → activity='idle'.
+
+    DoD reproducer: synth a session whose jsonl mtime is >30s old → API
+    returns idle. Touch the jsonl → next poll flips to running.
+    """
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    stale = time.time() - (S.RUNNING_THRESHOLD_SEC + 5.0)
+    os.utime(jsonl, (stale, stale))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "idle"
+    assert rows[0]["status"] == "active"
+
+    # Touch the jsonl → next poll should flip to running.
+    now = time.time()
+    os.utime(jsonl, (now, now))
+    rows2 = list_sessions(cfg, "test-project")
+    assert rows2[0]["activity"] == "running"
+
+
+def test_list_sessions_suspended_md_has_activity_suspended(tmp_path, monkeypatch):
+    """No live pane → activity is `suspended` regardless of md status."""
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = sessions_dir / "S-testuser-mywin-p7.md"
+    _write_session_metadata(meta_path, {
+        "sid": "S-testuser-mywin-p7",
+        "status": "active",   # zombie md — pane is gone
+        "window": "mywin",
+        "cwd": str(repo),
+        "claude_uuid": "ghost-uuid",
+    })
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["activity"] == "suspended"
+    assert rows[0]["activity_at"] is None
 
 
 def test_list_sessions_unknown_slug(tmp_path, monkeypatch):
@@ -876,3 +1110,246 @@ def test_suspend_preserves_owner_field(tmp_path, monkeypatch):
     suspend(cfg, "test-project", "S-u-w-p3")
     meta = _read_session_metadata(sessions_dir / "S-u-w-p3.md")
     assert meta["owner"] == "aqice"
+
+
+# ---------------------------------------------------------------------------
+# T-0105: session_history append on bind / rotate
+# ---------------------------------------------------------------------------
+
+def _read_task_session_history(task_md: Path) -> list[str]:
+    """Parse the inline `session_history:` line out of a task md."""
+    text = task_md.read_text()
+    import re as _re
+    m = _re.search(r"^session_history:\s*\[(.*?)\]\s*$", text, _re.M)
+    if not m:
+        return []
+    inner = m.group(1).strip()
+    if not inner:
+        return []
+    return [x.strip() for x in inner.split(",") if x.strip()]
+
+
+def test_session_history_first_bind_via_spawn(tmp_path, monkeypatch):
+    """spawn(task_id=X) stamps the new SID into X's session_history."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0090-hist.md"
+    task_md.write_text("---\nid: T-0090\ntitle: H\nstatus: open\n---\n\nbody\n")
+
+    def fake_run(args, **kw):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", task_id="T-0090")
+    hist = _read_task_session_history(task_md)
+    assert hist == ["S-alice-w-p2"]
+
+
+def test_session_history_dedup_on_repeated_spawn(tmp_path, monkeypatch):
+    """If somehow the same SID stamps twice, the helper de-dupes."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0091-dup.md"
+    task_md.write_text(
+        "---\nid: T-0091\ntitle: D\nstatus: open\n"
+        "session_history: [S-alice-w-p2]\n---\n\nbody\n"
+    )
+
+    def fake_run(args, **kw):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", task_id="T-0091")
+    hist = _read_task_session_history(task_md)
+    assert hist == ["S-alice-w-p2"]  # no duplicate
+
+
+def test_session_history_appended_on_bind_task(tmp_path, monkeypatch):
+    """bind_task() stamps the binding SID into the extras-task's history."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    primary_md = backlog / "T-0092-primary.md"
+    extra_md = backlog / "T-0093-extra.md"
+    primary_md.write_text("---\nid: T-0092\ntitle: P\nstatus: open\n---\n\nbody\n")
+    extra_md.write_text("---\nid: T-0093\ntitle: E\nstatus: open\n---\n\nbody\n")
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "u-1",
+        "task_id": "T-0092",
+        "initiative": "~",
+    })
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    from bot_squad_worker.sessions import bind_task
+    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0093")
+
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+
+def test_session_history_rotates_on_resume(tmp_path, monkeypatch):
+    """resume() rotation appends the new SID; old SID stays for forensics."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0094-rot.md"
+    task_md.write_text(
+        "---\nid: T-0094\ntitle: R\nstatus: open\n"
+        "session_history: [S-alice-w-p2]\n---\n\nbody\n"
+    )
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2",
+        "status": "suspended",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "u-1",
+        "task_id": "T-0094",
+    })
+
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        if "list-panes" in args:
+            n = sum(1 for c in calls if "list-panes" in c)
+            if n <= 1:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            # new pane after resume
+            return subprocess.CompletedProcess(args, 0, f"%9|w|999|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = resume(cfg, "test-project", "S-alice-w-p2")
+    new_sid = result["sid"]
+    hist = _read_task_session_history(task_md)
+    # Both old and new SIDs present; old first, new last.
+    assert hist[0] == "S-alice-w-p2"
+    assert hist[-1] == new_sid
+    assert len(hist) == 2
+
+
+def test_session_history_unbind_rebind_no_dup(tmp_path, monkeypatch):
+    """Unbinding + rebinding the same SID keeps history as [sid] — no dup,
+    no reorder. (per T-0105 DoD)"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    primary_md = backlog / "T-0095-prim.md"
+    extra_md = backlog / "T-0096-ext.md"
+    primary_md.write_text("---\nid: T-0095\ntitle: P\nstatus: open\n---\n\nbody\n")
+    extra_md.write_text("---\nid: T-0096\ntitle: E\nstatus: open\n---\n\nbody\n")
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "u-1",
+        "task_id": "T-0095",
+        "initiative": "~",
+    })
+
+    def fake_run(args, **kw):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    from bot_squad_worker.sessions import bind_task, unbind_task
+    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+    # Unbind does NOT touch session_history (it's append-only/forensic).
+    unbind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+    # Re-bind same SID — still no dup.
+    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
+    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+
+# ---------------------------------------------------------------------------
+# T-0103: break-pane uses TL pane's tmux session, not hardcoded $slug
+# ---------------------------------------------------------------------------
+
+def test_session_start_hook_uses_tl_pane_tmux_session_for_break_pane():
+    """Regression guard: scripts/hooks/session_start.sh resolves
+    target_session via `tmux display-message -p -t "$TMUX_PANE" '#S'`
+    rather than hardcoding $slug. Teammates land in their TL's tmux
+    session (e.g. bot-squad-multi_server), not always the project main
+    session. (T-0103)
+
+    Skipped when the hook isn't reachable from the test cwd (e.g. when
+    only the worker/ dir is mounted into the test container — the host
+    workflow runs this from the repo root and exercises it fully).
+    """
+    import pathlib as _pl
+    here = _pl.Path(__file__).resolve()
+    hook = None
+    for ancestor in here.parents:
+        cand = ancestor / "scripts" / "hooks" / "session_start.sh"
+        if cand.is_file():
+            hook = cand
+            break
+    if hook is None:
+        pytest.skip("session_start.sh not reachable from test cwd "
+                    "(repo root not mounted)")
+    text = hook.read_text()
+    # The primary resolution must query tmux for the TL pane's session
+    # (the fallback `target_session="$slug"` inside the empty-check `if`
+    # is fine — that only fires when the tmux query returned nothing).
+    assert 'target_session="$(tmux display-message' in text, \
+        "T-0103 regression: break-pane target reverted to hardcoded $slug"
+    assert "'#S'" in text, \
+        "T-0103: target_session must come from `tmux display-message ... #S`"

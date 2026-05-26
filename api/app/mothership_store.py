@@ -243,16 +243,36 @@ class MothershipStore:
             return None
         with self._lock:
             servers = self.list_servers()
+            # Pass 1: at-most-one is_self invariant. Domain renames change
+            # MOTHERSHIP_BASE_URL between deploys; the old register code
+            # deduped only by base_url, so a rename created a SECOND
+            # is_self row instead of migrating. Find any existing self
+            # entry first and migrate it to the new URL.
+            self_idx = next(
+                (i for i, s in enumerate(servers) if s.is_self), None
+            )
+            if self_idx is not None:
+                existing = servers[self_idx]
+                if (
+                    existing.base_url.rstrip("/") == canonical
+                    and existing.display_name == display_name
+                ):
+                    return existing
+                servers[self_idx] = replace(
+                    existing,
+                    base_url=canonical,
+                    display_name=display_name,
+                )
+                self.write(servers)
+                return servers[self_idx]
+            # Pass 2: no self entry yet. If a row with this base_url
+            # already exists (e.g. manually POSTed), promote it.
             for i, s in enumerate(servers):
                 if s.base_url.rstrip("/") == canonical:
-                    # Already present. Make sure the flag is True so the UI
-                    # marks it correctly even if it was registered via the
-                    # normal POST /servers path before this code shipped.
-                    if not s.is_self:
-                        servers[i] = replace(s, is_self=True)
-                        self.write(servers)
-                        return servers[i]
-                    return s
+                    servers[i] = replace(s, is_self=True)
+                    self.write(servers)
+                    return servers[i]
+            # Pass 3: create fresh.
             entry = AttachedServer(
                 id=f"srv_{secrets.token_hex(12)}",
                 display_name=display_name,

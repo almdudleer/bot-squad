@@ -23,7 +23,14 @@
  * `VITE_MOTHERSHIP !== "1"`, so Vite tree-shakes the lazy chunk and the
  * single-install bundle emits zero mothership code.
  */
-import type { Project } from "../api";
+import type {
+  CreateTaskBody,
+  Project,
+  ProjectApi,
+  SessionRow,
+  Task,
+  VisionFile,
+} from "../api";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -234,7 +241,57 @@ function proxyUrl(serverId: string, apiPath: string): string {
   )}`;
 }
 
-export type ServerApi = {
+// T-0068: typed error so the cross-server route's wrapper can render
+// "Connect this server first" vs. "Access denied" without scraping a string.
+// Kinds map onto distinct mothership-proxy + upstream auth outcomes:
+//   - not_connected: the mothership has no bearer for this peer (503 from
+//     the proxy's bearer lookup; peer install hasn't burned its
+//     install_token yet).
+//   - access_denied: the peer rejected the bearer (401/403 upstream).
+// "Other" upstream errors (502/5xx/etc.) flow through as a plain Error so
+// the page can surface them via its existing error state.
+export type ProxyErrorKind = "not_connected" | "access_denied";
+
+export class ProxyError extends Error {
+  kind: ProxyErrorKind;
+  status: number;
+  constructor(kind: ProxyErrorKind, status: number) {
+    super(kind);
+    this.kind = kind;
+    this.status = status;
+    this.name = "ProxyError";
+  }
+}
+
+/**
+ * Per-server `call()` variant. The shared `call` in this module redirects
+ * to /login on any 401 — appropriate for mothership-direct endpoints but
+ * wrong for the proxy, where 401 means "the *peer* rejected our bearer"
+ * (the mothership session is fine; you wouldn't want a peer-side bearer
+ * rotation to log you out of the mothership UI). We classify auth-relevant
+ * statuses and rethrow other errors verbatim.
+ */
+async function proxyCall<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+  if (res.status === 503) {
+    // The mothership-side proxy raises 503 with detail "server bearer not
+    // available (server not connected)" — see routes_mothership.py.
+    throw new ProxyError("not_connected", 503);
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new ProxyError("access_denied", res.status);
+  }
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${await res.text()}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export type ServerApi = ProjectApi & {
   /** Generic escape hatch: takes the *upstream* single-install path
    *  (e.g. "/api/projects/foo/backlog") and routes it through the
    *  proxy. Use this for surface that hasn't been added as a named
@@ -249,10 +306,86 @@ export function apiFor(serverId: string): ServerApi {
   // promise rejection — callers always await this, never inspect the
   // sync result.
   const fwd = async <T>(path: string, init?: RequestInit): Promise<T> =>
-    call<T>(proxyUrl(serverId, path), init);
+    proxyCall<T>(proxyUrl(serverId, path), init);
   return {
     call: fwd,
     projects: () => fwd<Project[]>("/api/projects"),
+
+    // T-0068: full per-project surface (mirrors `api` 1:1 for the methods
+    // Project.tsx + Sessions.tsx call). Every method's path matches the
+    // singleton in `web/src/api.ts` — keep them in sync when adding new
+    // upstream endpoints.
+    backlog: (slug) => fwd<Task[]>(`/api/projects/${slug}/backlog`),
+    vision: (slug) => fwd<VisionFile[]>(`/api/projects/${slug}/vision`),
+    sessions: (slug) => fwd<SessionRow[]>(`/api/projects/${slug}/sessions`),
+    createTask: (slug, t: CreateTaskBody) =>
+      fwd<Task>(`/api/projects/${slug}/backlog`, {
+        method: "POST",
+        body: JSON.stringify(t),
+      }),
+    patchTask: (slug, id, t) =>
+      fwd<Task>(`/api/projects/${slug}/backlog/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(t),
+      }),
+    patchTaskPriority: (slug, id, priority) =>
+      fwd<Task>(`/api/projects/${slug}/backlog/${id}/priority`, {
+        method: "PATCH",
+        body: JSON.stringify({ priority }),
+      }),
+    deleteTask: (slug, id) =>
+      fwd(`/api/projects/${slug}/backlog/${id}`, { method: "DELETE" }),
+    addComment: (slug, id, body) =>
+      fwd<Task>(`/api/projects/${slug}/backlog/${id}/comments`, {
+        method: "POST",
+        body: JSON.stringify({ body }),
+      }),
+    pauseSession: (slug, sid) =>
+      fwd(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`,
+        { method: "POST" },
+      ),
+    suspendSession: (slug, sid) =>
+      fwd(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/suspend`,
+        { method: "POST" },
+      ),
+    resumeSession: (slug, sid) =>
+      fwd(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/resume`,
+        { method: "POST" },
+      ),
+    archiveSession: (slug, sid) =>
+      fwd<{ ok: boolean; sid: string; archived: boolean }>(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/archive`,
+        { method: "POST" },
+      ),
+    unarchiveSession: (slug, sid) =>
+      fwd<{ ok: boolean; sid: string; archived: boolean }>(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/unarchive`,
+        { method: "POST" },
+      ),
+    spawnSession: (slug, window, initial_prompt, task_id, initiative) =>
+      fwd(`/api/projects/${slug}/sessions`, {
+        method: "POST",
+        body: JSON.stringify({ window, initial_prompt, task_id, initiative }),
+      }),
+    devSpawnRequest: (slug, tl_sid, task_id, instructions) =>
+      fwd<{ ok: boolean; delivered_to: string[] }>(
+        `/api/projects/${slug}/dev-spawn-request`,
+        {
+          method: "POST",
+          body: JSON.stringify({ tl_sid, task_id, instructions }),
+        },
+      ),
+    peerSend: (slug, fromSid, to, text) =>
+      fwd<{ ok: boolean; delivered_to: string[] }>(
+        `/api/projects/${slug}/peer/send`,
+        {
+          method: "POST",
+          body: JSON.stringify({ from_sid: fromSid, to, text }),
+        },
+      ),
   };
 }
 

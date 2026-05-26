@@ -1154,6 +1154,47 @@ step_systemd_unit() {
 -u bot-squad-worker.service -n 50' to see why."
 }
 
+step_per_user_worker_unit() {
+  # T-0067: drop the per-user systemd-user unit into /etc/systemd/user/ so
+  # any attached non-coordinator Linux user can `systemctl --user enable
+  # --now bot-squad-user-worker.service` themselves (one-shot via
+  # scripts/install/enable-per-user-worker.sh) without a fresh sudo cycle
+  # to land the unit file. The coordinator (this install owner) keeps the
+  # system-level bot-squad-worker.service from step_systemd_unit — they
+  # are NOT mutually exclusive.
+  #
+  # No `systemctl daemon-reload` here: /etc/systemd/user/ is read by each
+  # user's own systemctl --user; the user's enable script does its own
+  # daemon-reload when it runs. A system-level reload would not propagate.
+  local src="$BOTSQUAD_INSTALL_DIR/systemd/bot-squad-user-worker.service"
+  # BOTSQUAD_USER_UNIT_DEST seam: tests redirect this into a temp dir.
+  local dest="${BOTSQUAD_USER_UNIT_DEST:-/etc/systemd/user/bot-squad-user-worker.service}"
+  [[ -f "$src" ]] || die_struct per_user_worker_unit \
+    "Source unit file missing: $src" \
+    "The repo clone may be incomplete or out of date. Try
+'cd $BOTSQUAD_INSTALL_DIR && git status' and re-pull if needed."
+  local dest_dir; dest_dir="$(dirname "$dest")"
+  # Idempotency: if the dest exists and is byte-identical, no-op.
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+    log "per-user systemd-user unit already up to date at $dest"
+    return 0
+  fi
+  if [[ -w "$dest_dir" ]] || { [[ -f "$dest" ]] && [[ -w "$dest" ]]; }; then
+    mkdir -p "$dest_dir" || true
+    install -m 0644 "$src" "$dest" || die_struct per_user_worker_unit \
+      "Could not install $dest." \
+      "Run 'install -m 0644 $src $dest' manually to see the error."
+  else
+    sudo install -d -m 0755 "$dest_dir" || die_struct per_user_worker_unit \
+      "Could not create $dest_dir." \
+      "Run 'sudo mkdir -p $dest_dir' manually to see the error."
+    sudo install -m 0644 "$src" "$dest" || die_struct per_user_worker_unit \
+      "Could not install $dest." \
+      "Run 'sudo install -m 0644 $src $dest' manually to see the error."
+  fi
+  log "per-user systemd-user unit installed at $dest"
+}
+
 step_docker_compose_up() {
   # T-0029: if the fresh-host override exists (written by
   # install_reverse_proxy on hosts with no shared traefik), layer it on
@@ -1263,6 +1304,7 @@ STEPS=(
   mothership_handshake
   python_venv
   systemd_unit
+  per_user_worker_unit
   install_reverse_proxy
   docker_compose_up
   agent_teams_flag

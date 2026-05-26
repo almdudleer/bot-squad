@@ -2,6 +2,12 @@ import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task } from "../api";
 import { relativeTime } from "../utils/relativeTime";
+import {
+  isRunning,
+  sessionActivity,
+  sessionGlyph,
+  sessionLabel,
+} from "../utils/sessionStatus";
 import { DRAG_MIME } from "./BoardColumn";
 
 export type MenuAction =
@@ -15,6 +21,10 @@ interface TaskCardProps {
   task: Task;
   slug: string;
   onMenuAction: (task: Task, action: MenuAction) => void;
+  // T-0096: when the board is already filtered to a single initiative or
+  // grouped by initiative, the chip is redundant noise. Parent decides;
+  // the card does not infer.
+  hideInitiative?: boolean;
 }
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
@@ -29,7 +39,7 @@ function countComments(body: string): number {
   return (body.match(/^### /gm) ?? []).length;
 }
 
-export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
+export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: TaskCardProps) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -195,8 +205,9 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
         {/* T-0038 stakeholder follow-up #3: surface the bound initiative on
             every card. Click-through goes to the roadmap. Active/draft/done
             tag lives on the swimlane header, not here — keep card noise
-            low. */}
-        {task.initiative && task.initiative !== "~" && (
+            low. T-0096: parent may suppress when the board view already
+            disambiguates initiative (single-init filter or group-by). */}
+        {!hideInitiative && task.initiative && task.initiative !== "~" && (
           <span
             data-no-nav
             title={`Initiative: ${task.initiative}`}
@@ -233,35 +244,43 @@ export function TaskCard({ task, slug, onMenuAction }: TaskCardProps) {
             {commentCount} comments
           </span>
         )}
-        {task.session && (
-          <span
-            data-no-nav
-            title={`${task.session.status} session ${task.session.sid} — click to view`}
-            onClick={(e) => {
-              e.stopPropagation();
-              navigate(`/p/${slug}/sessions`);
-            }}
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontSize: "0.65rem",
-              color:
-                task.session.status === "active"
+        {task.session && (() => {
+          // T-0104: unify the card label with the detail page and the
+          // Sessions board via the shared formatter. Prefers the
+          // worker-derived `activity` field when present (the project
+          // page enriches task.session.activity by joining /sessions);
+          // falls back to mapping the raw md `status` otherwise.
+          const act = sessionActivity(task.session);
+          const green = isRunning(act);
+          return (
+            <span
+              data-no-nav
+              title={`${act} session ${task.session.sid} — click to view`}
+              onClick={(e) => {
+                e.stopPropagation();
+                // T-0099: deep-link to the bound session's row.
+                navigate(`/p/${slug}/sessions?sid=${encodeURIComponent(task.session!.sid)}`);
+              }}
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.65rem",
+                color: green
                   ? "var(--mc-accent-success, #4ade80)"
                   : "var(--mc-text-dim)",
-              background: "var(--mc-surface-raised)",
-              border: "1px solid",
-              borderColor:
-                task.session.status === "active"
+                background: "var(--mc-surface-raised)",
+                border: "1px solid",
+                borderColor: green
                   ? "var(--mc-accent-success, #4ade80)"
                   : "var(--mc-border)",
-              borderRadius: "2px",
-              padding: "0 4px",
-              cursor: "pointer",
-            }}
-          >
-            {task.session.status === "active" ? "● running" : "◌ paused"}
-          </span>
-        )}
+                borderRadius: "2px",
+                padding: "0 4px",
+                cursor: "pointer",
+              }}
+            >
+              {sessionGlyph(act)} {sessionLabel(act)}
+            </span>
+          );
+        })()}
 {/* Assign-session affordance lives on the task detail page, not the card. */}
       </div>
     </div>

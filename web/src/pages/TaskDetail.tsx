@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, SessionRow, Task, VisionFile } from "../api";
+import { Select, type SelectOption } from "../components/Select";
+import {
+  isRunning,
+  sessionActivity,
+  sessionGlyph,
+  sessionLabel,
+} from "../utils/sessionStatus";
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "open", label: "Open" },
@@ -35,6 +42,11 @@ export function TaskDetail() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [activeDevs, setActiveDevs] = useState<SessionRow[]>([]);
+  // T-0104: keep every session row keyed by sid so we can look up the
+  // worker-derived activity for the bound dev session below. The
+  // /backlog endpoint that drove `task.session` doesn't enrich with
+  // the activity probe, so we join client-side from /sessions.
+  const [sessionsBySid, setSessionsBySid] = useState<Record<string, SessionRow>>({});
   // T-0038 follow-up: surface initiative binding here. We load every
   // initiative file (active+draft+done) so the operator can bind a task
   // to e.g. a draft initiative without first activating it.
@@ -74,7 +86,9 @@ export function TaskDetail() {
       })
       .catch((e) => setError(String(e)));
     // Phase 9: surface active devs so the user can bind this task to an
-    // already-running dev (multi-binding). Silent on error.
+    // already-running dev (multi-binding). Silent on error. T-0104:
+    // also stash every row by sid for activity lookup against the
+    // bound session pill below.
     api.sessions(slug)
       .then((rows) => {
         setActiveDevs(rows.filter((s) => {
@@ -82,8 +96,14 @@ export function TaskDetail() {
           const tid = (s.task_id ?? "").trim();
           return Boolean(tid) && tid !== "~";
         }));
+        const map: Record<string, SessionRow> = {};
+        for (const r of rows) map[r.sid] = r;
+        setSessionsBySid(map);
       })
-      .catch(() => setActiveDevs([]));
+      .catch(() => {
+        setActiveDevs([]);
+        setSessionsBySid({});
+      });
     api.vision(slug)
       .then((files) =>
         setInitiatives(
@@ -352,18 +372,15 @@ export function TaskDetail() {
         >
           status:
         </label>
-        <select
+        <Select
           id="task-status"
-          className="form-select form-select-sm"
-          style={{ width: "auto", minWidth: "10rem" }}
           value={statusValue}
-          onChange={(e) => saveStatus(e.target.value as Task["status"])}
+          onChange={(v) => saveStatus(v as Task["status"])}
           disabled={saving}
-        >
-          {STATUS_OPTIONS.map((s) => (
-            <option key={s.value} value={s.value}>{s.label}</option>
-          ))}
-        </select>
+          style={{ minWidth: "10rem" }}
+          ariaLabel="task status"
+          options={STATUS_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
+        />
       </div>
 
       {/* T-0038: initiative binding. The board's group-by/filter is useless
@@ -381,32 +398,36 @@ export function TaskDetail() {
         >
           initiative:
         </label>
-        <select
-          id="task-initiative"
-          className="form-select form-select-sm"
-          style={{ width: "auto", minWidth: "16rem", maxWidth: "30rem" }}
-          value={task.initiative ?? ""}
-          onChange={(e) => saveInitiative(e.target.value || null)}
-          disabled={saving}
-        >
-          <option value="">— unattached —</option>
-          {/* Surface the current binding even if not in the loaded list
-              (orphan: file deleted but reference lingers). */}
-          {task.initiative &&
-            !initiativeOptions.some((i) => i.basename === task.initiative) && (
-              <option value={task.initiative}>
-                {task.initiative} (orphan)
-              </option>
-            )}
-          {initiativeOptions.map((i) => {
-            const tag = i.finished ? "done" : i.active ? "active" : "draft";
-            return (
-              <option key={i.basename} value={i.basename}>
-                {i.basename.replace(/\.md$/, "")} · {tag}
-              </option>
-            );
-          })}
-        </select>
+        {(() => {
+          const orphan: SelectOption | null =
+            task.initiative &&
+            !initiativeOptions.some((i) => i.basename === task.initiative)
+              ? { value: task.initiative, label: `${task.initiative} (orphan)` }
+              : null;
+          const options: SelectOption[] = [
+            { value: "", label: "— unattached —" },
+            ...(orphan ? [orphan] : []),
+            ...initiativeOptions.map((i) => {
+              const tag = i.finished ? "done" : i.active ? "active" : "draft";
+              return {
+                value: i.basename,
+                label: i.basename.replace(/\.md$/, ""),
+                hint: tag,
+              };
+            }),
+          ];
+          return (
+            <Select
+              id="task-initiative"
+              value={task.initiative ?? ""}
+              onChange={(v) => saveInitiative(v || null)}
+              disabled={saving}
+              style={{ minWidth: "16rem", maxWidth: "30rem" }}
+              ariaLabel="initiative binding"
+              options={options}
+            />
+          );
+        })()}
       </div>
 
       {/* Unified dev-session select: one control replaces the three older
@@ -425,43 +446,49 @@ export function TaskDetail() {
         >
           dev session:
         </label>
-        <select
-          id="task-session"
-          className="form-select form-select-sm"
-          style={{ width: "auto", minWidth: "16rem", maxWidth: "30rem" }}
-          value={task.session ? task.session.sid : ""}
-          onChange={(e) => {
-            const value = e.target.value;
-            if (value === "__new__") {
-              // Re-select the current binding so the dropdown stays sane
-              // if the user navigates back without spawning.
-              navigate(
-                `/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`,
-              );
-              return;
-            }
-            if (!value) return;
-            bindToDev(value);
-          }}
-          disabled={saving}
-        >
-          <option value="" disabled>
-            — none —
-          </option>
-          <option value="__new__">+ Create new dev session…</option>
-          {/* Surface the current binding even if it's not in activeDevs
-              (e.g. paused/suspended) so the select reflects reality. */}
-          {task.session && !activeDevs.some((d) => d.sid === task.session!.sid) && (
-            <option value={task.session.sid}>
-              {task.session.sid} ({task.session.status})
-            </option>
-          )}
-          {activeDevs.map((d) => (
-            <option key={d.sid} value={d.sid}>
-              {d.window || d.sid} ({d.sid})
-            </option>
-          ))}
-        </select>
+        {(() => {
+          // Surface the current binding even if it's not in activeDevs
+          // (paused/suspended) so the select reflects reality. T-0104:
+          // label via the canonical activity formatter so this row reads
+          // the same vocabulary as the rest of the page.
+          const orphanSession: SelectOption | null =
+            task.session && !activeDevs.some((d) => d.sid === task.session!.sid)
+              ? {
+                  value: task.session.sid,
+                  label: `${task.session.sid} (${sessionLabel(
+                    sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
+                  )})`,
+                }
+              : null;
+          const options: SelectOption[] = [
+            { value: "", label: "— none —", disabled: true },
+            ...(orphanSession ? [orphanSession] : []),
+            ...activeDevs.map((d) => ({
+              value: d.sid,
+              label: `${d.window || d.sid} (${d.sid})`,
+            })),
+            {
+              action: true,
+              key: "__new__",
+              label: "+ Create new dev session…",
+              onSelect: () =>
+                navigate(`/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`),
+            },
+          ];
+          return (
+            <Select
+              id="task-session"
+              value={task.session ? task.session.sid : ""}
+              onChange={(v) => {
+                if (v) bindToDev(v);
+              }}
+              disabled={saving}
+              style={{ minWidth: "16rem", maxWidth: "30rem" }}
+              ariaLabel="dev session binding"
+              options={options}
+            />
+          );
+        })()}
         {task.session && (
           <button
             type="button"
@@ -474,21 +501,29 @@ export function TaskDetail() {
             Unassign
           </button>
         )}
-        {task.session && (
-          <span
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontSize: "0.7rem",
-              color:
-                task.session.status === "active"
+        {task.session && (() => {
+          // T-0104: prefer the worker-derived activity (from /sessions
+          // join via sessionsBySid) over the raw md status. Falls back
+          // to the status-derived mapping in sessionActivity() when
+          // the session isn't in the live list (e.g. suspended).
+          const live = sessionsBySid[task.session.sid];
+          const act = sessionActivity(live ?? task.session);
+          const green = isRunning(act);
+          return (
+            <span
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.7rem",
+                color: green
                   ? "var(--mc-accent-success, #4ade80)"
                   : "var(--mc-text-dim)",
-            }}
-            title={`session status: ${task.session.status}`}
-          >
-            {task.session.status === "active" ? "●" : "◌"} {task.session.status}
-          </span>
-        )}
+              }}
+              title={`session status: ${act}`}
+            >
+              {sessionGlyph(act)} {sessionLabel(act)}
+            </span>
+          );
+        })()}
       </div>
 
       {/* Verbatim request — source-of-truth section */}

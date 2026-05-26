@@ -19,6 +19,18 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# T-0104 — activity-derived "running" vs "idle" threshold.
+#
+# A live claude pane bumps the mtime of its own jsonl transcript every time
+# Claude writes (every assistant turn, every tool call). 30s is generous
+# enough that a short tool pause does not flip the label, and short enough
+# that an idle agent registers as `idle` on the next poll. Centralised here
+# so the threshold lives in exactly one place; do not duplicate.
+# ---------------------------------------------------------------------------
+RUNNING_THRESHOLD_SEC = 30.0
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -80,10 +92,13 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     """Return the UUID (filename stem) of the most recent .jsonl for this cwd.
 
     Encodes cwd using the standard claude path-encoding:
-      ``cwd.replace('/', '-').lstrip('-')``
+      ``cwd.replace('/', '-')``
+    Claude keeps the leading dash (e.g. ``/home/alice/repo`` →
+    ``-home-alice-repo``); stripping it produces a path that doesn't exist
+    on disk and causes this function to always return None for real cwds.
     Returns None if no project dir or no .jsonl files exist.
     """
-    encoded = cwd.replace("/", "-").lstrip("-")
+    encoded = cwd.replace("/", "-")
     proj_dir = Path(user_home) / ".claude" / "projects" / encoded
     if not proj_dir.exists():
         return None
@@ -95,6 +110,64 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     return latest.stem  # filename without .jsonl = UUID
 
 
+def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> float | None:
+    """T-0104: return the per-pane activity timestamp (epoch seconds) or None.
+
+    Reads the mtime of the pane's own jsonl transcript file
+    (``~/.claude/projects/<encoded_cwd>/<uuid>.jsonl``). Claude appends to
+    that file on every assistant turn / tool call, so a fresh mtime means
+    the pane is actively writing.
+
+    Per-pane granularity comes from claude_uuid — each pane has its own
+    UUID and its own jsonl. We intentionally do NOT consult
+    ``<cwd>/.claude/last_user_prompt_ts`` here: that file lives at cwd
+    level and is bumped by every claude pane sharing the repo, so it
+    can't distinguish per-pane activity in the common bot-squad setup
+    where multiple panes share a single repo cwd.
+
+    Returns None when claude_uuid is unknown or the jsonl is missing
+    (e.g. brand-new pane whose first write hasn't happened yet) — the
+    caller treats this as "no recent activity".
+    """
+    if not claude_uuid:
+        return None
+    # T-0118: claude keeps the leading dash on the encoded cwd. Don't strip it.
+    encoded = cwd.replace("/", "-")
+    jsonl_path = Path(user_home) / ".claude" / "projects" / encoded / f"{claude_uuid}.jsonl"
+    try:
+        return jsonl_path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _derive_activity(
+    live_status: str,
+    activity_at: float | None,
+    now: float,
+    *,
+    threshold_sec: float = RUNNING_THRESHOLD_SEC,
+) -> str:
+    """T-0104: map (live md status, activity_at, now) → canonical activity enum.
+
+    Enum: ``running | idle | paused | suspended``. ``suspended`` is set by
+    the caller for the no-live-pane path; this helper only handles the
+    live-pane derivation.
+
+    - ``paused`` (md says Ctrl-C'd) stays ``paused`` — distinct from idle
+      so the UI can offer Resume.
+    - Live pane + recent jsonl mtime (< threshold_sec) → ``running``.
+    - Live pane + stale or missing mtime → ``idle``.
+
+    Activity-derived: never trusts a self-reported `status: active` in the
+    md when the jsonl tells a different story.
+    """
+    if live_status == "paused":
+        return "paused"
+    if activity_at is not None and (now - activity_at) < threshold_sec:
+        return "running"
+    return "idle"
+
+
 def _get_user_home() -> str:
     """Return the home directory for the current user."""
     return str(Path.home())
@@ -102,6 +175,31 @@ def _get_user_home() -> str:
 
 def _session_file(data_dir: Path, slug: str, sid: str) -> Path:
     return data_dir / slug / "sessions" / f"{sid}.md"
+
+
+def _find_session_md(sessions_dir: Path, sid: str, claude_uuid: str | None) -> Path | None:
+    """Resolve a session md by SID, falling back to a claude_uuid scan.
+
+    A tmux window rename leaves the metadata file at the pre-rename SID
+    (e.g. ``S-alice-teamlead-p10.md``) while the live pane has computed a
+    fresh SID (e.g. ``S-alice-newname-p10.md``). The SID-keyed lookup
+    misses, so as a last resort scan the sessions dir for a file whose
+    ``claude_uuid:`` field matches the live pane's uuid — the uuid is
+    rename-invariant since it identifies the claude transcript, not the
+    tmux address.
+    """
+    direct = sessions_dir / f"{sid}.md"
+    if direct.exists():
+        return direct
+    if not claude_uuid or not sessions_dir.exists():
+        return None
+    for md in sessions_dir.glob("*.md"):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        if meta.get("claude_uuid") == claude_uuid:
+            return md
+    return None
 
 
 def _write_session_metadata(path: Path, meta: dict) -> None:
@@ -275,8 +373,14 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             except OSError:
                 pass
 
-        # Check if there's an existing metadata file with started_at + task_id
-        session_file = _session_file(data_dir, slug, sid)
+        # Resolve the session md — SID first, then claude_uuid fallback.
+        # T-0118: a tmux window rename moves the live pane's computed SID
+        # away from the on-disk md filename; the uuid-keyed fallback
+        # recovers started_at / task_id / etc. for renamed-window panes.
+        sessions_dir_path = data_dir / slug / "sessions"
+        session_md_path = _find_session_md(sessions_dir_path, sid, claude_uuid)
+        existing = _read_session_metadata(session_md_path) if session_md_path else None
+
         started_at = None
         task_id: str | None = None
         initiative: str = ""
@@ -284,44 +388,54 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # paused (Ctrl-C'd but pane left open) reflect that — otherwise
         # the UI shows every live pane as active even when the user paused it.
         live_status = "active"
-        if session_file.exists():
-            existing = _read_session_metadata(session_file)
-            if existing:
-                started_at = existing.get("started_at")
-                tid = existing.get("task_id")
-                if tid and tid != "~":
-                    task_id = tid
-                init_val = existing.get("initiative")
-                if init_val and init_val != "~":
-                    initiative = init_val
-                md_status = existing.get("status", "")
-                if md_status == "paused":
-                    live_status = "paused"
-
         # Phase 9: extras for multi-binding. Empty list when unset.
         extra_task_ids: list[str] = []
         extra_initiatives: list[str] = []
         paused_at_meta: Any = None
         archived_flag = False
         owner_meta: str = ""  # T-0080 — UI-username owner stamp; "" = legacy
-        if session_file.exists():
-            existing = _read_session_metadata(session_file)
-            if existing:
-                etids = existing.get("extra_task_ids")
-                if isinstance(etids, list):
-                    extra_task_ids = [t for t in etids if t and t != "~"]
-                einits = existing.get("extra_initiatives")
-                if isinstance(einits, list):
-                    extra_initiatives = [i for i in einits if i and i != "~"]
-                paused_at_meta = existing.get("paused_at")
-                archived_flag = str(existing.get("archived", "")).lower() == "true"
-                own_val = existing.get("owner")
-                if own_val and own_val != "~":
-                    owner_meta = str(own_val)
+        if existing:
+            started_at = existing.get("started_at")
+            tid = existing.get("task_id")
+            if tid and tid != "~":
+                task_id = tid
+            init_val = existing.get("initiative")
+            if init_val and init_val != "~":
+                initiative = init_val
+            md_status = existing.get("status", "")
+            if md_status == "paused":
+                live_status = "paused"
+            etids = existing.get("extra_task_ids")
+            if isinstance(etids, list):
+                extra_task_ids = [t for t in etids if t and t != "~"]
+            einits = existing.get("extra_initiatives")
+            if isinstance(einits, list):
+                extra_initiatives = [i for i in einits if i and i != "~"]
+            paused_at_meta = existing.get("paused_at")
+            archived_flag = str(existing.get("archived", "")).lower() == "true"
+            own_val = existing.get("owner")
+            if own_val and own_val != "~":
+                owner_meta = str(own_val)
+            # If the md was resolved via uuid fallback (stale SID after a
+            # window rename), mark the stored SID as active too so the
+            # suspended-md loop below doesn't double-emit the same session.
+            stored_sid = existing.get("sid")
+            if stored_sid and stored_sid != sid:
+                active_sids.add(stored_sid)
+
+        # T-0104: activity-derived status. The existing `status` (md/zombie)
+        # is preserved for back-compat callers and action-button routing;
+        # `activity` is the canonical label-display enum derived from the
+        # jsonl mtime probe. Two fields — not a replacement — per the
+        # binding-audit "don't replace existing status logic, extend it".
+        activity_at = _pane_activity_at(pane.cwd, claude_uuid, user_home)
+        activity = _derive_activity(live_status, activity_at, time.time())
 
         rows.append({
             "sid": sid,
             "status": live_status,
+            "activity": activity,
+            "activity_at": activity_at,
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
@@ -386,6 +500,10 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             rows.append({
                 "sid": sid,
                 "status": display_status,
+                # T-0104: no live pane → activity is unambiguously suspended,
+                # regardless of what the md frontmatter claims.
+                "activity": "suspended",
+                "activity_at": None,
                 "window": meta.get("window", ""),
                 "cwd": meta.get("cwd", ""),
                 "started_at": meta.get("started_at"),
@@ -624,7 +742,99 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     if new_sid != sid and meta_file.exists():
         meta_file.unlink()
 
+    # T-0105: SID rotation — append the rotated SID to every task this
+    # session was bound to (primary + extras). The pre-rotation SID is
+    # already in history (from spawn / bind_task); now both old and new
+    # remain for forensics. Idempotent if for some reason new_sid == sid.
+    rotated_task_ids: list[str] = []
+    primary_task = meta.get("task_id")
+    if primary_task and primary_task != "~":
+        rotated_task_ids.append(primary_task)
+    extras_raw = meta.get("extra_task_ids") or []
+    if isinstance(extras_raw, list):
+        rotated_task_ids.extend(t for t in extras_raw if t and t != "~")
+    if rotated_task_ids:
+        backlog_dir = data_dir / slug / "backlog"
+        for tid in rotated_task_ids:
+            try:
+                _append_task_session_history(backlog_dir, tid, new_sid)
+            except OSError:
+                pass
+
     return {"ok": True, "sid": new_sid}
+
+
+def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> bool:
+    """T-0105: append `sid` to the task md's `session_history:` frontmatter
+    list. Append-only, idempotent (de-duped — if `sid` is already in the
+    list, no-op) and atomic (tmp + rename).
+
+    Inline-list format: ``session_history: [SID, SID, ...]`` — chosen so
+    the line-based worker readers (sessions/intersession/autonomous) can
+    pick it up. Block-yaml-format lists written by the api PATCH path
+    would be invisible here (same hazard as the existing `blocked_by`
+    field — audit Bug #4); inline format is the worker's source of truth.
+
+    Creates the field if absent, inserted after ``status:`` for stable
+    ordering. Returns True iff the file was modified.
+
+    Best-effort: returns False on any I/O or parse failure — the binding
+    write itself is the source of truth, the task-md stamp is a forensic
+    convenience.
+    """
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        return False
+    path = matches[0]
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    m = re.match(r"\A---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+    if not m:
+        return False
+    fm_block = m.group(1)
+    body = m.group(2)
+    fm_lines = fm_block.splitlines()
+
+    history_idx = -1
+    existing: list[str] = []
+    for i, ln in enumerate(fm_lines):
+        stripped = ln.lstrip()
+        if stripped.startswith("session_history:"):
+            history_idx = i
+            _, _, val = stripped.partition(":")
+            val = val.strip()
+            if val.startswith("[") and val.endswith("]"):
+                inner = val[1:-1].strip()
+                if inner:
+                    existing = [x.strip() for x in inner.split(",") if x.strip() and x.strip() != "~"]
+            break
+
+    if sid in existing:
+        return False  # idempotent — de-dup, preserve order
+
+    new_list = existing + [sid]
+    new_line = f"session_history: [{', '.join(new_list)}]"
+
+    if history_idx >= 0:
+        fm_lines[history_idx] = new_line
+    else:
+        insert_at = len(fm_lines)
+        for i, ln in enumerate(fm_lines):
+            if ln.lstrip().startswith("status:"):
+                insert_at = i + 1
+                break
+        fm_lines.insert(insert_at, new_line)
+
+    new_fm = "\n".join(fm_lines)
+    content = f"---\n{new_fm}\n---\n{body}"
+    if not body.startswith("\n"):
+        content = f"---\n{new_fm}\n---\n\n{body}"
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.rename(tmp, path)
+    return True
 
 
 def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative: str) -> bool:
@@ -786,6 +996,19 @@ def spawn(
     new_pane = max(new_panes, key=lambda p: int(p.pane_id.lstrip("%")) if p.pane_id.lstrip("%").isdigit() else 0)
     new_sid = compute_sid(user, new_pane.window, new_pane.pane_id)
 
+    # T-0105: stamp the freshly-spawned SID into the task md's
+    # session_history list so the task carries forensics for *every*
+    # session that worked on it, not just the current binding. Best-effort.
+    if task_id:
+        try:
+            _append_task_session_history(
+                cfg.data_dir / slug / "backlog",
+                task_id.strip(),
+                new_sid,
+            )
+        except OSError:
+            pass
+
     # Send initial prompt if provided. Two-phase: text first, brief pause,
     # then a *separate* Enter. tmux wraps long text as a bracketed-paste
     # escape sequence; an Enter inside the paste isn't a submit, so the
@@ -898,6 +1121,13 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     extras.append(task_id)
     meta["extra_task_ids"] = extras
     _write_session_metadata(meta_file, meta)
+
+    # T-0105: stamp the binding SID into the new task's session_history.
+    # Best-effort; the SessionMd write above is the source of truth.
+    try:
+        _append_task_session_history(backlog_dir, task_id, sid)
+    except OSError:
+        pass
 
     # T-0038: if the dev's session carries an initiative, propagate it to
     # the newly-bound task md (existing-wins). Lets multi-binding keep the

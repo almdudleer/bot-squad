@@ -178,6 +178,24 @@ def test_merge_task_update_clears_initiative_with_none(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# T-0105 — session_history is allowed through merge_task_update
+# ---------------------------------------------------------------------------
+
+def test_merge_task_update_accepts_session_history(tmp_path: Path):
+    """T-0105: the api PATCH path can backfill session_history.
+    Worker writes inline; api may write block-yaml — both are valid YAML."""
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0063-hist.md"
+    write_task(p, {"id": "T-0063", "title": "X", "status": "open"}, "body\n")
+    merge_task_update(p, {
+        "session_history": ["S-alice-w-p2", "S-alice-w-p9"],
+    })
+    task = parse_task(p)
+    assert task["session_history"] == ["S-alice-w-p2", "S-alice-w-p9"]
+
+
+# ---------------------------------------------------------------------------
 # append_comment
 # ---------------------------------------------------------------------------
 

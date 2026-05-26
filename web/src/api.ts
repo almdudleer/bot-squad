@@ -54,7 +54,16 @@ export type Task = {
   created?: string;
   updated?: string;
   from?: string;
-  session?: { sid: string; status: "active" | "paused" | string };
+  session?: {
+    sid: string;
+    status: "active" | "paused" | string;
+    // T-0104: activity-derived enum. /backlog doesn't populate this
+    // (the worker activity probe lives behind /sessions); FE pages may
+    // enrich it client-side by joining with the sessions list. When
+    // present it's the canonical display label; when absent the FE
+    // falls back to mapping the raw `status` (see utils/sessionStatus).
+    activity?: "running" | "idle" | "paused" | "suspended";
+  };
 };
 
 export type CreateTaskBody = {
@@ -71,7 +80,17 @@ export type FeedbackFile = { name: string; content: string };
 
 export type SessionRow = {
   sid: string;
+  // Raw md/zombie-reclassified status. Kept for back-compat and for
+  // action-button routing (Pause/Resume/Resurrect read this). Display
+  // labels go through `activity` (T-0104) instead.
   status: "active" | "paused" | "suspended";
+  // T-0104: worker-derived activity enum (jsonl mtime probe). Authoritative
+  // for UI labels: a zombie `status: active` surfaces here as `suspended`,
+  // and a live-but-quiet pane surfaces as `idle` rather than `running`.
+  // Optional so a pre-T-0104 worker doesn't break the type contract; the
+  // UI falls back via `utils/sessionStatus.sessionActivity`.
+  activity?: "running" | "idle" | "paused" | "suspended";
+  activity_at?: number | null;
   window: string;
   cwd: string;
   started_at?: string | null;
@@ -447,3 +466,28 @@ export const api = {
       { method: "POST" },
     ),
 };
+
+// T-0068: per-project methods exposed via context so per-project pages can be
+// rendered against either the global single-install singleton OR the
+// mothership's `apiFor(server_id)` proxy without touching the page code. The
+// list is exactly what Project.tsx + Sessions.tsx consume today; expand it
+// when new per-project pages are migrated.
+export type ProjectApi = Pick<
+  typeof api,
+  | "backlog"
+  | "vision"
+  | "sessions"
+  | "createTask"
+  | "patchTask"
+  | "patchTaskPriority"
+  | "deleteTask"
+  | "addComment"
+  | "pauseSession"
+  | "suspendSession"
+  | "resumeSession"
+  | "archiveSession"
+  | "unarchiveSession"
+  | "spawnSession"
+  | "devSpawnRequest"
+  | "peerSend"
+>;

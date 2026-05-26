@@ -8,23 +8,25 @@
 # peer_send, autonomous_*, scheduler_state, task_progress_add) are
 # refused with ActionError in this mode.
 #
-# Install per user:
-#   sudo usermod -a -G www <USER>
-#   sudo install -m 0644 -o <USER> -g <USER> \
-#       /home/www/bot-squad/systemd/bot-squad-user-worker.service \
-#       /home/<USER>/.config/systemd/user/
-#   sudo loginctl enable-linger <USER>
-#   sudo -u <USER> XDG_RUNTIME_DIR=/run/user/$(id -u <USER>) \
-#       systemctl --user daemon-reload
-#   sudo -u <USER> XDG_RUNTIME_DIR=/run/user/$(id -u <USER>) \
-#       systemctl --user enable --now bot-squad-user-worker.service
+# T-0067: this unit is installed SYSTEM-WIDE by the installer's
+# step_per_user_worker_unit (drops it into /etc/systemd/user/) so a
+# fresh attached user does NOT need a separate sudo cycle to discover
+# it. Per-user enablement is a one-shot the user themselves runs on
+# first login:
+#
+#   bash /home/www/bot-squad/scripts/install/enable-per-user-worker.sh
+#
+# The script does:
+#   sudo loginctl enable-linger <USER>          # survives logout
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now bot-squad-user-worker.service
 #
 # Then add the UI user mapping to /home/www/bot-squad/config/auth.toml:
 #   [user_meta.<ui_name>]
 #   linux_user = "<USER>"
 #   is_admin = false
 #
-# Verify:
+# Verify (from any account with read on /home/www/bot-squad/data/_sock):
 #   ls -l /home/www/bot-squad/data/_sock/user-<USER>.sock  (group www, 0660)
 #   curl --unix-socket .../user-<USER>.sock http://w/health
 

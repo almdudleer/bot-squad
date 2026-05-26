@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
-import { api, Task, VisionFile } from "../api";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import type { SessionRow, Task, VisionFile } from "../api";
+import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { Modal } from "../components/Modal";
+import { Select, type SelectOption } from "../components/Select";
 import { MenuAction, TaskCard } from "../components/TaskCard";
+import { sessionActivity } from "../utils/sessionStatus";
 
 import { PageHelp } from "../components/PageHelp";
 const COLUMNS = ["planned", "open", "in_progress", "totest", "reopened", "closed"] as const;
@@ -77,15 +80,47 @@ function STATUS_PILL_COLOR(s: InitiativeStatus): { color: string; bg: string; bo
 
 export function Project() {
   const { slug = "" } = useParams();
+  const api = useApiClient();
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [vision, setVision] = useState<VisionFile[]>([]);
+  // T-0104: per-sid session map for client-side activity enrichment.
+  // /backlog's task.session doesn't run the worker activity probe, so
+  // we join with /sessions here and stamp `task.session.activity` on
+  // each card. Empty map = the fetch hasn't landed yet (or failed
+  // silently); TaskCard falls back to mapping the raw md status.
+  const [sessionsBySid, setSessionsBySid] = useState<Record<string, SessionRow>>({});
   const [error, setError] = useState<string | null>(null);
 
   // T-0039: view controls. Defaults reproduce the pre-T-0039 board exactly.
-  const [groupBy, setGroupBy] = useState<GroupBy>("none");
-  const [viewMode, setViewMode] = useState<ViewMode>("board");
-  // Filter is a single initiative basename, UNATTACHED, or "" for all.
-  const [filterInit, setFilterInit] = useState<string>("");
+  // T-0097: persisted in URL query params (`group`, `view`, `init`) so
+  // refresh / deep-link / open-in-new-tab all reproduce the same view.
+  // URL is the source of truth — no useState, no sync drift. Default
+  // values are omitted from the URL to keep deep-links clean.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const groupBy: GroupBy =
+    searchParams.get("group") === "initiative" ? "initiative" : "none";
+  const viewMode: ViewMode =
+    searchParams.get("view") === "list" ? "list" : "board";
+  // Filter is a single initiative basename, UNATTACHED, ACTIVE_ONLY, or "" for all.
+  const filterInit: string = searchParams.get("init") ?? "";
+
+  // Toggle a single param, dropping it when the value matches the default
+  // (keeps the URL minimal). `replace: true` so back-button doesn't ladder
+  // through every selector flip.
+  function updateParam(key: string, value: string, defaultValue: string) {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value === defaultValue) next.delete(key);
+        else next.set(key, value);
+        return next;
+      },
+      { replace: true },
+    );
+  }
+  const setGroupBy = (v: GroupBy) => updateParam("group", v, "none");
+  const setViewMode = (v: ViewMode) => updateParam("view", v, "board");
+  const setFilterInit = (v: string) => updateParam("init", v, "");
 
   // Per-lane collapsed state. Key = initiative basename or UNATTACHED.
   // Persisted to localStorage per project so a folded set of "done"
@@ -143,11 +178,47 @@ export function Project() {
     api.backlog(slug).then(setTasks).catch((e) => setError(String(e)));
   };
 
+  // T-0104: refresh the sessions map so card pills track the
+  // worker-derived `running`/`idle` flip in near-real-time. Poll
+  // matches the Sessions page cadence (10s) so a typed prompt lights
+  // up the card within one poll window.
+  const reloadSessions = () => {
+    api
+      .sessions(slug)
+      .then((rows) => {
+        const map: Record<string, SessionRow> = {};
+        for (const r of rows) map[r.sid] = r;
+        setSessionsBySid(map);
+      })
+      .catch(() => {
+        /* silent — TaskCard handles missing rows via its fallback. */
+      });
+  };
+
   useEffect(() => {
     reload();
     api.vision(slug).then(setVision).catch(() => setVision([]));
+    reloadSessions();
+    const id = setInterval(reloadSessions, 10_000);
+    return () => clearInterval(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
+
+  // T-0104: enrich task.session.activity by joining with the sessions
+  // map. We do NOT mutate the original task; useMemo builds a new
+  // array so React picks up the activity flip on the next poll.
+  const enrichedTasks = useMemo<Task[] | null>(() => {
+    if (tasks === null) return null;
+    return tasks.map((t) => {
+      if (!t.session) return t;
+      const live = sessionsBySid[t.session.sid];
+      if (!live) return t;
+      return {
+        ...t,
+        session: { ...t.session, activity: sessionActivity(live) },
+      };
+    });
+  }, [tasks, sessionsBySid]);
 
   // ---- Initiative meta + lane build ----
   // Build the canonical lane list: every initiative file (active+draft+done)
@@ -189,10 +260,12 @@ export function Project() {
   }
 
   // Tasks keyed by initiative basename (or UNATTACHED).
+  // T-0104: read from enrichedTasks (with activity stamped) so cards
+  // display the canonical session label.
   const tasksByInit = useMemo<Record<string, Task[]>>(() => {
     const out: Record<string, Task[]> = { [UNATTACHED]: [] };
     for (const m of initiativeMeta) out[m.key] = [];
-    for (const t of tasks ?? []) {
+    for (const t of enrichedTasks ?? []) {
       const init = (t.initiative ?? "").trim();
       if (init && out[init] !== undefined) {
         out[init].push(t);
@@ -206,7 +279,7 @@ export function Project() {
       }
     }
     return out;
-  }, [tasks, initiativeMeta]);
+  }, [enrichedTasks, initiativeMeta]);
 
   // Final lane list (after applying the filter). Always include the lane
   // matching the active filter even if empty; otherwise show all.
@@ -227,14 +300,24 @@ export function Project() {
     return all.filter((m) => m.key === filterInit);
   }, [initiativeMeta, tasksByInit, filterInit, activeInitiativeKeys]);
 
-  // Ungrouped — current 5-column behavior.
+  // Ungrouped — current 5-column behavior. T-0104: enrichedTasks
+  // so the activity-flip propagates without a board reload.
   const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
-  const ungroupedTasks = (tasks ?? []).filter(passesFilter);
+  const ungroupedTasks = (enrichedTasks ?? []).filter(passesFilter);
   for (const t of ungroupedTasks) {
     if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
       grouped[t.status].push(t);
     }
   }
+
+  // T-0096: the card chip is redundant whenever the board view already
+  // disambiguates initiative. That's true when grouping by initiative
+  // (each lane = one initiative) OR when filtering to a specific
+  // initiative basename / UNATTACHED (every visible card shares the
+  // same binding). ACTIVE_ONLY still mixes initiatives — keep the chip.
+  const hideInitiativeChip =
+    groupBy === "initiative" ||
+    (filterInit !== "" && filterInit !== ACTIVE_ONLY);
 
   function openCreate() {
     setNewTitle("");
@@ -495,21 +578,22 @@ export function Project() {
           <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
             filter:
           </span>
-          <select
-            className="form-select form-select-sm"
-            style={{ width: "auto", minWidth: "12rem", fontSize: "0.75rem" }}
+          <Select
             value={filterInit}
-            onChange={(e) => setFilterInit(e.target.value)}
-          >
-            <option value="">all initiatives</option>
-            <option value={ACTIVE_ONLY}>(active initiatives)</option>
-            {initiativeMeta.map((m) => (
-              <option key={m.key} value={m.key}>
-                {m.title} · {m.status}
-              </option>
-            ))}
-            <option value={UNATTACHED}>(unattached)</option>
-          </select>
+            onChange={setFilterInit}
+            style={{ minWidth: "12rem", fontSize: "0.75rem" }}
+            ariaLabel="filter by initiative"
+            options={[
+              { value: "", label: "all initiatives" },
+              { value: ACTIVE_ONLY, label: "(active initiatives)" },
+              ...initiativeMeta.map((m) => ({
+                value: m.key,
+                label: m.title,
+                hint: m.status,
+              })),
+              { value: UNATTACHED, label: "(unattached)" },
+            ]}
+          />
         </div>
       </div>
 
@@ -532,6 +616,7 @@ export function Project() {
                     : null
                 }
                 onToggleRail={RAIL_STATUSES.has(c) ? () => toggleRail(c) : undefined}
+                hideInitiative={hideInitiativeChip}
               />
             ))}
           </div>
@@ -540,6 +625,7 @@ export function Project() {
             tasks={ungroupedTasks}
             slug={slug}
             onMenuAction={handleMenuAction}
+            hideInitiative={hideInitiativeChip}
           />
         )
       ) : (
@@ -609,18 +695,13 @@ export function Project() {
         </div>
         <div className="mb-3">
           <label className="form-label">Status</label>
-          <select
-            className="form-select"
+          <Select
             value={newStatus}
-            onChange={(e) => setNewStatus(e.target.value as Task["status"])}
-          >
-            <option value="planned">Planned</option>
-            <option value="open">Open</option>
-            <option value="in_progress">In progress</option>
-            <option value="totest">To Test</option>
-            <option value="reopened">Reopened</option>
-            <option value="closed">Closed</option>
-          </select>
+            onChange={(v) => setNewStatus(v as Task["status"])}
+            style={{ width: "100%" }}
+            ariaLabel="task status"
+            options={COLUMNS.map((c) => ({ value: c, label: COLUMN_LABELS[c] }))}
+          />
         </div>
       </Modal>
 
@@ -689,27 +770,34 @@ export function Project() {
         }
       >
         {modalError && <div className="alert alert-danger">{modalError}</div>}
-        <select
-          className="form-select"
-          value={initiativeChoice}
-          onChange={(e) => setInitiativeChoice(e.target.value)}
-          autoFocus
-        >
-          <option value="">— unattached —</option>
-          {/* If the current binding isn't in the vision list (orphan: file
-              deleted), surface it so saving is still a deliberate act. */}
-          {activeTask?.initiative &&
-            !initiativeMeta.some((m) => m.key === activeTask.initiative) && (
-              <option value={activeTask.initiative}>
-                {activeTask.initiative} (orphan)
-              </option>
-            )}
-          {initiativeMeta.map((m) => (
-            <option key={m.key} value={m.key}>
-              {m.title} · {m.status}
-            </option>
-          ))}
-        </select>
+        {(() => {
+          // Orphan-aware option list: surface the current binding even if
+          // the vision file was deleted, so saving is a deliberate act.
+          const orphanOpt: SelectOption | null =
+            activeTask?.initiative &&
+            !initiativeMeta.some((m) => m.key === activeTask.initiative)
+              ? { value: activeTask.initiative, label: `${activeTask.initiative} (orphan)` }
+              : null;
+          const options: SelectOption[] = [
+            { value: "", label: "— unattached —" },
+            ...(orphanOpt ? [orphanOpt] : []),
+            ...initiativeMeta.map((m) => ({
+              value: m.key,
+              label: m.title,
+              hint: m.status,
+            })),
+          ];
+          return (
+            <Select
+              value={initiativeChoice}
+              onChange={setInitiativeChoice}
+              autoFocus
+              style={{ width: "100%" }}
+              ariaLabel="initiative"
+              options={options}
+            />
+          );
+        })()}
       </Modal>
     </div>
   );
@@ -906,6 +994,7 @@ function InitiativeLane({
                   : null
               }
               onToggleRail={RAIL_STATUSES.has(c) ? () => onToggleRail(c) : undefined}
+              hideInitiative
             />
           ))}
         </div>
@@ -914,6 +1003,7 @@ function InitiativeLane({
           tasks={tasks}
           slug={slug}
           onMenuAction={onMenuAction}
+          hideInitiative
         />
       ))}
     </div>
@@ -924,6 +1014,8 @@ interface ListBoardProps {
   tasks: Task[];
   slug: string;
   onMenuAction: (task: Task, action: MenuAction) => void;
+  // T-0096: forwarded to every TaskCard rendered by the list.
+  hideInitiative?: boolean;
 }
 
 /**
@@ -931,7 +1023,7 @@ interface ListBoardProps {
  * stacked into a single column. DnD reordering is omitted to keep the
  * list lean — use the board view when reordering matters.
  */
-function ListBoard({ tasks, slug, onMenuAction }: ListBoardProps) {
+function ListBoard({ tasks, slug, onMenuAction, hideInitiative = false }: ListBoardProps) {
   const grouped = COLUMNS.reduce<Record<string, Task[]>>(
     (acc, c) => ({ ...acc, [c]: [] }),
     {},
@@ -961,6 +1053,7 @@ function ListBoard({ tasks, slug, onMenuAction }: ListBoardProps) {
                     task={t}
                     slug={slug}
                     onMenuAction={onMenuAction}
+                    hideInitiative={hideInitiative}
                   />
                 ))}
               </div>

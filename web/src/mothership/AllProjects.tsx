@@ -7,8 +7,25 @@ import {
   type FanOutResult,
   type ServerProject,
 } from "./api";
+import { api } from "../api";
+import { Modal } from "../components/Modal";
 import { Coachmark } from "../onboarding";
 import { STEP_9_3_BULLETS, STEP_9_3_TITLE } from "../onboarding/copy";
+
+function deriveSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[^a-z]+/, "")
+    .replace(/-+$/g, "");
+}
+
+interface NewProjectState {
+  display_name: string;
+  slug: string;
+  slug_touched: boolean;
+  repo_path: string;
+}
 
 /**
  * Cross-server all-projects view (T-0025). Mounted at /m on the mothership
@@ -52,6 +69,18 @@ export function buildSections(
   });
 }
 
+// T-0068: pure helper so the AllProjects card-link routing decision is
+// testable without a DOM. Self-server keeps the short `/p/:slug` URL (so
+// bookmarks from the single-install era still work); peer servers route
+// through the cross-server view at `/m/servers/:id/p/:slug`.
+export function projectCardLinkFor(
+  server: Pick<AttachedServer, "id" | "is_self">,
+  slug: string,
+): string {
+  if (server.is_self) return `/p/${encodeURIComponent(slug)}`;
+  return `/m/servers/${encodeURIComponent(server.id)}/p/${encodeURIComponent(slug)}`;
+}
+
 export function statusBadgeClass(status: ServerStatus): string {
   switch (status) {
     case "working":
@@ -79,9 +108,20 @@ export function serverHeaderLabel(server: AttachedServer): {
   url: string;
   suffix: string | null;
 } {
+  // Auto-self-registered entries set display_name to the hostname, so
+  // display_name + base_url duplicate each other in the card. Drop the
+  // URL line when it adds no information.
+  let host = "";
+  try {
+    host = new URL(server.base_url).hostname;
+  } catch {
+    host = "";
+  }
+  const redundant =
+    server.display_name === host || server.display_name === server.base_url;
   return {
     name: server.display_name,
-    url: server.base_url,
+    url: redundant ? "" : server.base_url,
     suffix: server.is_self ? "this server" : null,
   };
 }
@@ -89,6 +129,29 @@ export function serverHeaderLabel(server: AttachedServer): {
 export function AllProjects() {
   const [sections, setSections] = useState<ServerSection[] | null>(null);
   const [topError, setTopError] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [creating, setCreating] = useState<NewProjectState | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [createSaving, setCreateSaving] = useState(false);
+
+  function reload() {
+    setTopError(null);
+    setSections(null);
+    (async () => {
+      try {
+        const servers = await mothershipApi.listServers();
+        const readyIds = servers
+          .filter((s) => s.install_state === "ready")
+          .map((s) => s.id);
+        const fanResults = await fanOut(readyIds, (id) =>
+          mothershipApi.projectsFor(id),
+        );
+        setSections(buildSections(servers, fanResults));
+      } catch (e) {
+        setTopError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -110,10 +173,34 @@ export function AllProjects() {
         setTopError(e instanceof Error ? e.message : String(e));
       }
     })();
+    api.me().then((m) => setIsAdmin(Boolean(m.is_admin))).catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
+
+  async function submitCreate() {
+    if (!creating) return;
+    if (!creating.display_name.trim() || !creating.slug.trim()) {
+      setCreateError("display name and slug required");
+      return;
+    }
+    setCreateSaving(true);
+    setCreateError(null);
+    try {
+      await api.createProject(
+        creating.slug.trim(),
+        creating.display_name.trim(),
+        creating.repo_path.trim() || undefined,
+      );
+      setCreating(null);
+      reload();
+    } catch (e) {
+      setCreateError(String(e));
+    } finally {
+      setCreateSaving(false);
+    }
+  }
 
   return (
     <div className="container py-4" style={{ maxWidth: "1100px" }}>
@@ -138,13 +225,33 @@ export function AllProjects() {
         <div className="mc-section-title" style={{ margin: 0 }}>
           All projects
         </div>
-        <Link
-          to="/m/servers/add"
-          className="mc-badge mc-badge-info"
-          style={{ textDecoration: "none", padding: "6px 14px" }}
-        >
-          + Add server
-        </Link>
+        <div className="d-flex align-items-center gap-2">
+          {isAdmin && (
+            <button
+              type="button"
+              className="btn btn-outline-primary btn-sm"
+              style={{ fontSize: "0.72rem" }}
+              data-onboarding-anchor="create-project"
+              onClick={() =>
+                setCreating({
+                  display_name: "",
+                  slug: "",
+                  slug_touched: false,
+                  repo_path: "",
+                })
+              }
+            >
+              + New project
+            </button>
+          )}
+          <Link
+            to="/m/servers/add"
+            className="mc-badge mc-badge-info"
+            style={{ textDecoration: "none", padding: "6px 14px" }}
+          >
+            + Add server
+          </Link>
+        </div>
       </div>
 
       {topError && <div className="alert alert-danger">{topError}</div>}
@@ -176,6 +283,77 @@ export function AllProjects() {
           ))}
         </div>
       )}
+
+      <Modal
+        open={creating !== null}
+        title="New project (this server)"
+        onClose={() => setCreating(null)}
+        footer={
+          <>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setCreating(null)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={submitCreate}
+              disabled={createSaving}
+            >
+              {createSaving ? "Creating…" : "Create"}
+            </button>
+          </>
+        }
+      >
+        {createError && <div className="alert alert-danger">{createError}</div>}
+        <div className="mb-3">
+          <label className="form-label">Display name *</label>
+          <input
+            className="form-control"
+            value={creating?.display_name ?? ""}
+            onChange={(e) => {
+              if (!creating) return;
+              const display_name = e.target.value;
+              setCreating({
+                ...creating,
+                display_name,
+                slug: creating.slug_touched
+                  ? creating.slug
+                  : deriveSlug(display_name),
+              });
+            }}
+            autoFocus
+          />
+        </div>
+        <div className="mb-3">
+          <label className="form-label">Slug *</label>
+          <input
+            className="form-control"
+            style={{ fontFamily: "var(--mc-mono)" }}
+            value={creating?.slug ?? ""}
+            onChange={(e) =>
+              creating &&
+              setCreating({ ...creating, slug: e.target.value, slug_touched: true })
+            }
+            placeholder="lowercase, letters/digits/-/_"
+          />
+        </div>
+        <div className="mb-3">
+          <label className="form-label">Repo path</label>
+          <input
+            className="form-control"
+            style={{ fontFamily: "var(--mc-mono)" }}
+            value={creating?.repo_path ?? ""}
+            onChange={(e) =>
+              creating && setCreating({ ...creating, repo_path: e.target.value })
+            }
+            placeholder="optional — fill in projects.toml later"
+          />
+        </div>
+      </Modal>
     </div>
   );
 }
@@ -212,9 +390,11 @@ function ServerSectionView({ section }: { section: ServerSection }) {
           }}
         >
           <strong style={{ fontFamily: "var(--mc-mono)" }}>{label.name}</strong>
-          <span style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
-            {label.url}
-          </span>
+          {label.url && (
+            <span style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
+              {label.url}
+            </span>
+          )}
           {label.suffix && (
             <span
               className="mc-badge mc-badge-info"
@@ -291,10 +471,7 @@ function ServerSectionBody({
     <div className="row g-2">
       {result.data.map((p) => {
         const card = (
-          <div
-            className="mc-project-card"
-            style={{ cursor: server.is_self ? "pointer" : "default" }}
-          >
+          <div className="mc-project-card" style={{ cursor: "pointer" }}>
             <div className="mc-project-name">{p.display_name}</div>
             <div
               className="mc-project-slug"
@@ -310,18 +487,18 @@ function ServerSectionBody({
             </div>
           </div>
         );
+        // T-0068: peer-server cards now link to the cross-server board
+        // route. The self-server keeps its short `/p/:slug` URL so
+        // bookmarks/deep-links from the single-install era still resolve.
+        const to = projectCardLinkFor(server, p.slug);
         return (
           <div className="col-md-4" key={p.slug}>
-            {server.is_self ? (
-              <Link
-                to={`/p/${encodeURIComponent(p.slug)}`}
-                style={{ textDecoration: "none", color: "inherit" }}
-              >
-                {card}
-              </Link>
-            ) : (
-              card
-            )}
+            <Link
+              to={to}
+              style={{ textDecoration: "none", color: "inherit" }}
+            >
+              {card}
+            </Link>
           </div>
         );
       })}

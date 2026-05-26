@@ -35,3 +35,9 @@ web/tsconfig.tsbuildinfo
 
 # Initial credentials file (for stakeholder reference)
 INITIAL_LOGIN.txt
+
+# Playwright dev-dep installed at repo root for staging UI verification
+# (operator-authorized 2026-05-26 per T-0117). node_modules/ already ignored
+# above. These two land in the repo root, not in web/.
+/package.json
+/package-lock.json

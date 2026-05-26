@@ -380,3 +380,273 @@ def test_test_ping_surfaces_worker_error(
         r = client.post("/api/me/tg-chat-id/test")
     assert r.status_code == 502
     assert "telegram 403" in r.json()["detail"]
+
+
+# ── T-0061: per-attachment tg-chat-id ─────────────────────────────────────
+
+
+def _attach_testuser(tmp: Path, *, tg_chat_id: str = "") -> tuple[str, str]:
+    """Mint a GlobalUser + Attachment for testuser; rewrite auth.toml.
+
+    Returns ``(global_user_id, server_id)``. Used to put the fixture user
+    into the migrated state without going through /api/auth/attach (which
+    requires a global password) — these tests want to assert the route
+    plumbing on top of an already-attached row.
+    """
+    from app.mothership_users_store import MothershipUsersStore
+    from app.mothership_store import MothershipStore
+
+    mship = MothershipStore(tmp / "data" / "_mothership")
+    mship.register_self_if_missing(
+        base_url="https://this.test", display_name="this.test"
+    )
+    server_id = next(s.id for s in mship.list_servers() if s.is_self)
+
+    store = MothershipUsersStore(tmp / "data" / "_mothership")
+    gu, _ = store.upsert_user_by_username(
+        username="testuser",
+        password_hash="$2b$12$placeholder",
+    )
+    store.upsert_attachment(
+        global_user_id=gu.id,
+        server_id=server_id,
+        server_username="testuser",
+        tg_chat_id=tg_chat_id,
+    )
+    # Rewrite auth.toml so testuser carries attached_to_global_user — the
+    # new endpoints branch on this field.
+    auth_path = tmp / "config" / "auth.toml"
+    text = auth_path.read_text()
+    text = text.replace(
+        "is_admin = true\n",
+        f'is_admin = true\nattached_to_global_user = "{gu.id}"\n',
+        1,
+    )
+    auth_path.write_text(text)
+    return gu.id, server_id
+
+
+def test_get_attachment_tg_chat_id_reads_from_attachment_store(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Migrated user → GET returns Attachment.tg_chat_id, not UserMeta's."""
+    _, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="11122233")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.get(f"/api/me/attachment/{server_id}/tg-chat-id")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["server_id"] == server_id
+    assert body["tg_chat_id"] == "11122233"
+
+
+def test_get_attachment_tg_chat_id_self_sentinel(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """``server_id="self"`` resolves to this install's is_self id."""
+    _, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="99")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.get("/api/me/attachment/self/tg-chat-id")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["server_id"] == server_id
+    assert body["tg_chat_id"] == "99"
+
+
+def test_put_attachment_tg_chat_id_writes_to_store(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """PUT updates the Attachment file, not auth.toml's UserMeta."""
+    from app.mothership_users_store import MothershipUsersStore
+
+    gu_id, server_id = _attach_testuser(tmp_bot_squad)
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            f"/api/me/attachment/{server_id}/tg-chat-id",
+            json={"tg_chat_id": "555444"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["tg_chat_id"] == "555444"
+
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    attachment = store.get_attachment(gu_id, server_id)
+    assert attachment is not None
+    assert attachment.tg_chat_id == "555444"
+    # auth.toml's UserMeta.tg_chat_id is left untouched (migrated branch
+    # writes to the store, not back into auth.toml).
+    raw = tomllib.loads((tmp_bot_squad / "config" / "auth.toml").read_text())
+    assert "tg_chat_id" not in raw["user_meta"]["testuser"]
+
+
+def test_put_attachment_tg_chat_id_preserves_seen_steps(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """A TG write must not blow away the Attachment's seen_steps tuple."""
+    from app.mothership_users_store import MothershipUsersStore
+
+    gu_id, server_id = _attach_testuser(tmp_bot_squad)
+    # Seed seen_steps on the existing attachment row.
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    store.upsert_attachment(
+        global_user_id=gu_id,
+        server_id=server_id,
+        server_username="testuser",
+        seen_steps=("srv.intro", "srv.9_5.tg_binding"),
+    )
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put(
+            f"/api/me/attachment/{server_id}/tg-chat-id",
+            json={"tg_chat_id": "7"},
+        )
+    after = store.get_attachment(gu_id, server_id)
+    assert after is not None
+    assert after.seen_steps == ("srv.intro", "srv.9_5.tg_binding")
+    assert after.tg_chat_id == "7"
+
+
+def test_put_attachment_tg_chat_id_rejects_non_numeric(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    _, server_id = _attach_testuser(tmp_bot_squad)
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            f"/api/me/attachment/{server_id}/tg-chat-id",
+            json={"tg_chat_id": "abc"},
+        )
+    assert r.status_code == 400
+
+
+def test_attachment_unmigrated_user_falls_back_to_user_meta(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """No attached_to_global_user → endpoint reads UserMeta.tg_chat_id.
+
+    Back-compat for the window between rollout of these endpoints and the
+    one-shot ``users_split.py`` migration.
+    """
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "123456"})
+        r = client.get("/api/me/attachment/self/tg-chat-id")
+    assert r.status_code == 200
+    assert r.json()["tg_chat_id"] == "123456"
+
+
+def test_attachment_unmigrated_user_put_writes_user_meta(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """PUT on unmigrated user still works — writes to UserMeta (legacy)."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            "/api/me/attachment/self/tg-chat-id", json={"tg_chat_id": "789"}
+        )
+        assert r.status_code == 200
+        assert r.json()["tg_chat_id"] == "789"
+        # Legacy GET sees the same value.
+        legacy = client.get("/api/me").json()
+    assert legacy["tg_chat_id"] == "789"
+
+    raw = tomllib.loads((tmp_bot_squad / "config" / "auth.toml").read_text())
+    assert raw["user_meta"]["testuser"]["tg_chat_id"] == "789"
+
+
+def test_list_attachments_migrated(tmp_bot_squad: Path, monkeypatch) -> None:
+    """GET /api/me/attachments returns one row per Attachment."""
+    _, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="42")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.get("/api/me/attachments")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["global_user_id"]  # truthy
+    assert len(body["attachments"]) == 1
+    row = body["attachments"][0]
+    assert row["server_id"] == server_id
+    assert row["tg_chat_id"] == "42"
+    assert row["legacy_unmigrated"] is False
+
+
+def test_list_attachments_unmigrated(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Un-migrated user → synthetic single-row from UserMeta."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "888"})
+        r = client.get("/api/me/attachments")
+    body = r.json()
+    assert body["global_user_id"] is None
+    assert len(body["attachments"]) == 1
+    row = body["attachments"][0]
+    assert row["server_username"] == "testuser"
+    assert row["tg_chat_id"] == "888"
+    assert row["legacy_unmigrated"] is True
+
+
+def test_attachment_test_ping_uses_attachment_chat_id(
+    tmp_bot_squad: Path, monkeypatch, fake_tg_worker: _FakeTgWorker
+) -> None:
+    """test ping reads chat_id from Attachment, not UserMeta."""
+    _, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="77777")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.post(f"/api/me/attachment/{server_id}/tg-chat-id/test")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+    assert fake_tg_worker.calls[-1]["chat_id"] == "77777"
+    assert fake_tg_worker.calls[-1]["user"] == "testuser"
+
+
+def test_attachment_test_ping_400_when_unbound(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    _, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.post(f"/api/me/attachment/{server_id}/tg-chat-id/test")
+    assert r.status_code == 400
+    assert "no tg_chat_id bound" in r.json()["detail"]
+
+
+def test_legacy_tg_chat_id_endpoints_still_work_post_t0061(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Legacy /api/me/tg-chat-id keeps working for un-migrated users.
+
+    Sanity check that adding the per-attachment surface didn't accidentally
+    short-circuit the existing endpoints — un-migrated rows are the steady
+    state until ``users_split.py`` runs on every install.
+    """
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put("/api/me/tg-chat-id", json={"tg_chat_id": "42"})
+        assert r.status_code == 200
+        me = client.get("/api/me").json()
+    assert me["tg_chat_id"] == "42"

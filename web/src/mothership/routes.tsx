@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Routes, Route, Link, Navigate, useParams } from "react-router-dom";
 import { mothershipApi, type AttachedServer, type Checkpoint } from "./api";
 import { AddServerWizard } from "./AddServerWizard";
+import { MothershipProject } from "./MothershipProject";
 import { Releases } from "./Releases";
 
 /**
@@ -219,6 +220,13 @@ export default function MothershipRoutes() {
       <Route index element={<Navigate to="/" replace />} />
       <Route path="servers/add" element={<AddServerWizard />} />
       <Route path="servers/:id" element={<ServerProgress />} />
+      {/* T-0068: cross-server per-project view. AllProjects' peer-server
+          cards link here so a click on a peer project pulls the same
+          board UI but against the peer's API via the mothership proxy. */}
+      <Route
+        path="servers/:server_id/p/:slug"
+        element={<MothershipProject />}
+      />
       {/* T-0087: mothership-only releases tab. Route lives here so the
           whole module + its chunk gets tree-shaken from detached builds
           via the same VITE_MOTHERSHIP gate in App.tsx. */}

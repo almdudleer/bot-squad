@@ -44,7 +44,9 @@ from app.install_tokens import (
     is_install_token,
     is_server_bearer,
 )
+from app.auth import verify_password
 from app.mothership_store import MothershipStore
+from app.mothership_users_store import MothershipUsersStore
 from app.routes_auth import require_auth
 
 
@@ -60,6 +62,25 @@ bundle_router = APIRouter(tags=["mothership-bundle"])
 def _store(request: Request) -> MothershipStore:
     cfg = request.app.state.api_config
     return MothershipStore(cfg.data_dir / "_mothership")
+
+
+def _users_store(request: Request) -> MothershipUsersStore:
+    cfg = request.app.state.api_config
+    return MothershipUsersStore(cfg.data_dir / "_mothership")
+
+
+def _require_super_admin(user: dict = Depends(require_auth)) -> dict:
+    """Super-admin gate for the MOTHERSHIP routes that aren't bearer-auth.
+
+    Until GlobalUser-backed sessions land (follow-up), every server-local
+    admin on the mothership build is the super-admin — same derivation as
+    routes_auth._is_super_admin. Routes that touch the GlobalUser registry
+    use this instead of the looser ``require_auth`` because non-admin
+    users (no MOTHERSHIP scope) MUST get 403, not see anyone's else profile.
+    """
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="super-admin only")
+    return user
 
 
 def _mothership_base_url(request: Request) -> str:
@@ -121,6 +142,63 @@ def _broadcast(server_id: str, event: dict) -> None:
 @router.get("/servers")
 def list_servers(request: Request) -> list[dict]:
     return [s.to_public() for s in _store(request).list_servers()]
+
+
+# ---- T-0066: GlobalUser registry (super-admin cookie auth) ------------------
+
+
+@router.get("/users", dependencies=[Depends(_require_super_admin)])
+def list_global_users(request: Request) -> list[dict]:
+    """Return the GlobalUser registry, password hashes stripped.
+
+    Consumed by Bundle A's MOTHERSHIP > all-users page. The list reflects
+    only users that have been minted into the mothership registry — server-
+    local ServerUsers that haven't gone through ``/api/auth/attach`` (or the
+    one-shot migration) are NOT visible here. That's intentional: this
+    surface is the cross-server identity directory, not a union of every
+    local auth.toml.
+    """
+    return [u.to_public() for u in _users_store(request).list_users()]
+
+
+# ---- T-0066: /users/verify — server-bearer auth (consumed by /api/auth/attach)
+
+
+@installer_router.post("/users/verify")
+def verify_global_user(request: Request, payload: dict) -> dict:
+    """Validate global creds on behalf of an attached server.
+
+    Bearer-auth via the SERVER bearer (post-/connect) only. Pre-/connect
+    install tokens are explicitly rejected — token-stage installers have
+    no business validating user creds and rejecting here keeps the
+    rotation invariant clean. Returns the GlobalUser public projection on
+    success, 401 on bad creds, 404 on unknown username.
+    """
+    server_id, kind = _authenticate_installer(request)
+    if kind != "server_bearer":
+        raise HTTPException(
+            status_code=403,
+            detail="server_bearer required (install_token rejected for /users/verify)",
+        )
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+    store = _users_store(request)
+    user = store.user_by_username(username)
+    if user is None:
+        # 404 distinguishes "no such global user" from "bad password" so
+        # the calling server can surface a precise error to the attaching
+        # user instead of a generic 401.
+        raise HTTPException(status_code=404, detail="unknown global user")
+    if not verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="bad global credentials")
+    # Touch last_seen on the (user × server) attachment if one already
+    # exists; the attach side will upsert if this is the first claim.
+    # Silent no-op when no attachment yet — verify is a precursor to the
+    # writeback step on the server side, not the writeback itself.
+    store.touch_last_seen(user.id, server_id)
+    return user.to_public()
 
 
 @router.post("/servers")

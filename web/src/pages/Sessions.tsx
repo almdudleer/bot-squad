@@ -1,33 +1,38 @@
-import { useEffect, useMemo, useState, useCallback, Fragment } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
-import { api, SessionRow, Task, VisionFile } from "../api";
+import type { SessionRow, Task, VisionFile } from "../api";
+import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
+import { Select } from "../components/Select";
+import { sessionActivity, sessionLabel } from "../utils/sessionStatus";
 
 import { PageHelp } from "../components/PageHelp";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Render a status badge consistent with the new vocabulary:
-//   active     — live pane, not paused        → green LED + ok badge
-//   paused/idle — live pane, user pressed pause → grey LED + dim badge ("idle")
-//   suspended  — pane gone, resurrectable     → faint dot + dim badge
-function StatusBadge({ status }: { status: string }) {
-  if (status === "active") {
+// T-0104: render a badge keyed off the canonical `activity` enum
+// (worker-derived from jsonl mtime). `running` is the only "green LED"
+// state — a live-but-quiet pane is `idle`, never `running`. Same
+// vocabulary is used by TaskCard / TaskDetail so card and detail no
+// longer disagree on the label.
+function StatusBadge({ row }: { row: SessionRow }) {
+  const a = sessionActivity(row);
+  if (a === "running") {
     return (
       <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
         <span className="mc-dot mc-dot-active" />
-        <span className="mc-badge mc-badge-ok">active</span>
+        <span className="mc-badge mc-badge-ok">{sessionLabel(a)}</span>
       </span>
     );
   }
-  if (status === "paused" || status === "idle") {
+  if (a === "idle" || a === "paused") {
     return (
       <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem" }}>
         <span className="mc-dot mc-dot-idle" />
-        <span className="mc-badge mc-badge-dim">idle</span>
+        <span className="mc-badge mc-badge-dim">{sessionLabel(a)}</span>
       </span>
     );
   }
@@ -35,7 +40,7 @@ function StatusBadge({ status }: { status: string }) {
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", opacity: 0.7 }}>
       <span className="mc-dot mc-dot-idle" />
-      <span className="mc-badge mc-badge-dim">suspended</span>
+      <span className="mc-badge mc-badge-dim">{sessionLabel(a)}</span>
     </span>
   );
 }
@@ -60,6 +65,7 @@ function relativeTime(raw: string | number | null | undefined): string {
 
 export function Sessions() {
   const { slug = "" } = useParams();
+  const api = useApiClient();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);
@@ -100,6 +106,13 @@ export function Sessions() {
   // section toggle.
   const [expandedSids, setExpandedSids] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
+
+  // T-0099: deep-link target — when the URL carries ?sid=S-..., scroll
+  // that row into view, expand its detail row, and flash a transient
+  // highlight that fades after 2s. `flashedSidRef` guards against the
+  // 10s poll re-firing the flash on every refresh.
+  const [flashSid, setFlashSid] = useState<string | null>(null);
+  const flashedSidRef = useRef<string | null>(null);
 
   // T-0039 follow-up: group sessions by initiative on this page too.
   // Default = none (preserves the pre-group view).
@@ -304,6 +317,70 @@ export function Sessions() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
+  // T-0099: deep-link to a specific session. The URL carries ?sid=S-...;
+  // once sessions are loaded we make sure the row will render (clear any
+  // active filter, open the archived <details> if needed, expand the
+  // containing lane in grouped mode), expand the row's detail panel,
+  // scroll it into view, and flash a transient highlight. The
+  // `flashedSidRef` guard keeps the 10s poll from re-firing the flash.
+  const targetSid = searchParams.get("sid");
+  useEffect(() => {
+    if (!targetSid) return;
+    if (sessions === null) return;
+    if (flashedSidRef.current === targetSid) return;
+    const found = sessions.find((s) => s.sid === targetSid);
+    if (!found) return;
+
+    flashedSidRef.current = targetSid;
+
+    // Drop any filter that would hide the row.
+    setFilterInit("");
+    if (found.archived) setShowArchived(true);
+    if (groupBy === "initiative") {
+      const primary = (found.initiative ?? "").trim();
+      const extras = (found.extra_initiatives ?? []).filter((i) => i && i !== "~");
+      const laneKey =
+        primary && primary !== "~"
+          ? primary
+          : extras.length > 0
+            ? extras[0]
+            : SESS_UNATTACHED;
+      setCollapsedSessLanes((prev) =>
+        prev[laneKey] ? { ...prev, [laneKey]: false } : prev,
+      );
+    }
+
+    // Expand the row's detail panel so the deep-link is informative.
+    setExpandedSids((prev) => {
+      if (prev.has(targetSid)) return prev;
+      const next = new Set(prev);
+      next.add(targetSid);
+      return next;
+    });
+
+    // Wait two animation frames so the section toggles + expansions
+    // are committed to the DOM before we measure + scroll.
+    let timeoutId: number | undefined;
+    const rafId = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`sess-row-${targetSid}`);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+        setFlashSid(targetSid);
+        timeoutId = globalThis.window?.setTimeout(() => {
+          setFlashSid((cur) => (cur === targetSid ? null : cur));
+        }, 2200);
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (timeoutId !== undefined) globalThis.window?.clearTimeout(timeoutId);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetSid, sessions]);
+
   // Active TLs are sessions with no task_id and status === "active".
   const activeTeamleads: SessionRow[] = (sessions ?? []).filter(
     (s) =>
@@ -464,9 +541,12 @@ export function Sessions() {
   function renderSessionRow(s: SessionRow) {
     const isOpen = expandedSids.has(s.sid);
     const isSuspended = s.status === "suspended";
+    const isFlashing = flashSid === s.sid;
     return (
       <Fragment key={s.sid}>
         <tr
+          id={`sess-row-${s.sid}`}
+          className={isFlashing ? "mc-row-flash" : undefined}
           style={{ cursor: "pointer" }}
           onClick={() => toggleRow(s.sid)}
         >
@@ -499,11 +579,22 @@ export function Sessions() {
           </td>
 
           {/* Window */}
-          <td style={{ fontSize: "0.83rem" }}>{s.window}</td>
+          <td
+            style={{
+              fontSize: "0.83rem",
+              maxWidth: "14rem",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={s.window}
+          >
+            {s.window}
+          </td>
 
-          {/* Attach (T-0006) */}
-          <td onClick={(e) => e.stopPropagation()}>
-            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          {/* Attach (T-0006 / collapsed to icon button per T-0098) */}
+          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
           </td>
 
           {/* Role */}
@@ -521,7 +612,7 @@ export function Sessions() {
 
           {/* Status */}
           <td>
-            <StatusBadge status={s.status} />
+            <StatusBadge row={s} />
           </td>
 
           {/* Started */}
@@ -636,9 +727,12 @@ export function Sessions() {
 
   function renderArchivedRow(s: SessionRow) {
     const isOpen = expandedSids.has(s.sid);
+    const isFlashing = flashSid === s.sid;
     return (
       <Fragment key={s.sid}>
         <tr
+          id={`sess-row-${s.sid}`}
+          className={isFlashing ? "mc-row-flash" : undefined}
           style={{ cursor: "pointer" }}
           onClick={() => toggleRow(s.sid)}
         >
@@ -664,8 +758,8 @@ export function Sessions() {
             </code>
           </td>
           <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
-          <td onClick={(e) => e.stopPropagation()}>
-            <CopyableTmuxAttach session={s.sid} window={s.window} />
+          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
+            <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
           </td>
           <td>
             {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
@@ -1080,20 +1174,21 @@ export function Sessions() {
             <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
               filter:
             </span>
-            <select
-              className="form-select form-select-sm"
-              style={{ width: "auto", minWidth: "12rem", fontSize: "0.75rem" }}
+            <Select
               value={filterInit}
-              onChange={(e) => setFilterInit(e.target.value)}
-            >
-              <option value="">all initiatives</option>
-              {sessInitiativeMeta.map((m) => (
-                <option key={m.key} value={m.key}>
-                  {m.title} · {m.status}
-                </option>
-              ))}
-              <option value={SESS_UNATTACHED}>(unattached)</option>
-            </select>
+              onChange={setFilterInit}
+              style={{ minWidth: "12rem", fontSize: "0.75rem" }}
+              ariaLabel="filter by initiative"
+              options={[
+                { value: "", label: "all initiatives" },
+                ...sessInitiativeMeta.map((m) => ({
+                  value: m.key,
+                  label: m.title,
+                  hint: m.status,
+                })),
+                { value: SESS_UNATTACHED, label: "(unattached)" },
+              ]}
+            />
           </div>
         </div>
       )}
@@ -1261,21 +1356,23 @@ export function Sessions() {
                   (optional — overrides the project default for this session)
                 </span>
               </label>
-              <select
-                className="form-select"
+              <Select
                 value={newInitiative}
-                onChange={(e) => setNewInitiative(e.target.value)}
-              >
-                <option value="">— Use project default —</option>
-                {initiatives.map((f) => {
-                  const base = f.name.replace(/^initiatives\//, "");
-                  return (
-                    <option key={f.name} value={base}>
-                      {base}{f.active ? " (currently active)" : ""}
-                    </option>
-                  );
-                })}
-              </select>
+                onChange={setNewInitiative}
+                style={{ width: "100%" }}
+                ariaLabel="initiative for new teamlead"
+                options={[
+                  { value: "", label: "— Use project default —" },
+                  ...initiatives.map((f) => {
+                    const base = f.name.replace(/^initiatives\//, "");
+                    return {
+                      value: base,
+                      label: base,
+                      hint: f.active ? "active" : undefined,
+                    };
+                  }),
+                ]}
+              />
             </div>
             <div className="mb-3">
               <label className="form-label">
@@ -1330,18 +1427,17 @@ export function Sessions() {
                   <label className="form-label">
                     Target teamlead <span style={{ color: "var(--mc-accent-danger)" }}>*</span>
                   </label>
-                  <select
-                    className="form-select"
+                  <Select
                     value={newTlSid}
-                    onChange={(e) => setNewTlSid(e.target.value)}
-                  >
-                    <option value="">— Pick a teamlead —</option>
-                    {activeTeamleads.map((tl) => (
-                      <option key={tl.sid} value={tl.sid}>
-                        {tl.window} ({tl.sid})
-                      </option>
-                    ))}
-                  </select>
+                    onChange={setNewTlSid}
+                    placeholder="— Pick a teamlead —"
+                    style={{ width: "100%" }}
+                    ariaLabel="target teamlead"
+                    options={activeTeamleads.map((tl) => ({
+                      value: tl.sid,
+                      label: `${tl.window} (${tl.sid})`,
+                    }))}
+                  />
                 </div>
                 <div className="mb-3">
                   <label className="form-label">
@@ -1350,16 +1446,19 @@ export function Sessions() {
                       (optional)
                     </span>
                   </label>
-                  <select
-                    className="form-select"
+                  <Select
                     value={newTaskId}
-                    onChange={(e) => setNewTaskId(e.target.value)}
-                  >
-                    <option value="">— None (let TL find or create one) —</option>
-                    {backlog.map((t) => (
-                      <option key={t.id} value={t.id}>{t.id} · {t.title}</option>
-                    ))}
-                  </select>
+                    onChange={setNewTaskId}
+                    style={{ width: "100%" }}
+                    ariaLabel="backlog task"
+                    options={[
+                      { value: "", label: "— None (let TL find or create one) —" },
+                      ...backlog.map((t) => ({
+                        value: t.id,
+                        label: `${t.id} · ${t.title}`,
+                      })),
+                    ]}
+                  />
                 </div>
                 <div className="mb-3">
                   <label className="form-label">

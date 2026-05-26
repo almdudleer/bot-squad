@@ -434,8 +434,11 @@ def tick(cfg: Any) -> None:
     from "poller dead".
     """
     # Belt-and-suspenders mothership exclusion (T-0086 should also prevent
-    # scheduling this tick at all).
-    if is_mothership():
+    # scheduling this tick at all). Pass cfg.config_dir so the check reads
+    # THIS install's projects.toml, not the hardcoded /home/www/bot-squad
+    # fallback — the latter mis-flagged sibling/dogfood installs as
+    # mothership and silently no-op'd their pollers.
+    if is_mothership(config_dir=getattr(cfg, "config_dir", None)):
         log.debug("autoupdate: mothership self-exclusion — tick is a no-op")
         return
 

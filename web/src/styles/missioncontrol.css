@@ -1573,3 +1573,338 @@ hr { border-color: var(--mc-border); opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   .bs-typewriter-caret { animation: none; }
 }
+
+/* T-0099: row flash on deep-link arrival. Apply via className on the
+   target <tr>; the animation fades to transparent so removing the class
+   afterwards is purely a cleanup step. */
+@keyframes mc-row-flash {
+  0%   { background-color: rgba(34, 211, 238, 0.32); }
+  60%  { background-color: rgba(34, 211, 238, 0.18); }
+  100% { background-color: transparent; }
+}
+tr.mc-row-flash > td {
+  animation: mc-row-flash 2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  tr.mc-row-flash > td { animation: none; background-color: rgba(34, 211, 238, 0.18); }
+}
+
+/* ---- Shared Select (T-0102) -----------------------------------------
+   Replaces every native <select> in the app. Looks roughly like the
+   bootstrap form-select-sm callers it stands in for, so the migration
+   is visually unobtrusive. The panel is the mc-switcher pattern.
+   --------------------------------------------------------------------- */
+.mc-select {
+  position: relative;
+  display: inline-block;
+}
+.mc-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  min-width: 8rem;
+  width: 100%;
+  padding: 0.2rem 0.55rem;
+  font-family: var(--mc-mono);
+  font-size: 0.78rem;
+  color: var(--mc-text);
+  background: var(--mc-surface-raised);
+  border: 1px solid var(--mc-border);
+  border-radius: 2px;
+  cursor: pointer;
+  text-align: left;
+}
+.mc-select-trigger:hover:not(:disabled) {
+  border-color: var(--mc-cyan);
+}
+.mc-select-trigger:focus-visible {
+  outline: 2px solid var(--mc-cyan);
+  outline-offset: -1px;
+}
+.mc-select-trigger[aria-expanded="true"] {
+  border-color: var(--mc-cyan);
+}
+.mc-select-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.mc-select-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-select-placeholder {
+  color: var(--mc-text-dim);
+}
+.mc-select-caret {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--mc-text-dim);
+}
+.mc-select-panel {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  left: 0;
+  z-index: 60;
+  min-width: 100%;
+  max-width: 22rem;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  padding: 0.2rem 0;
+  font-family: var(--mc-mono);
+}
+.mc-select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.35rem 0.7rem;
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 0.78rem;
+  color: var(--mc-text);
+  text-align: left;
+  cursor: pointer;
+}
+.mc-select-option:disabled,
+.mc-select-option[aria-disabled="true"] {
+  color: var(--mc-text-dim);
+  cursor: not-allowed;
+}
+.mc-select-option-highlight:not(:disabled) {
+  background: var(--mc-bg-alt, rgba(255, 255, 255, 0.06));
+  color: var(--mc-cyan);
+}
+.mc-select-option-selected:not(.mc-select-option-action) {
+  color: var(--mc-cyan);
+}
+.mc-select-option-selected:not(.mc-select-option-action)::before {
+  content: "▸ ";
+}
+.mc-select-option-action {
+  color: var(--mc-accent, var(--mc-cyan));
+  font-style: italic;
+}
+.mc-select-option-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-select-option-hint {
+  flex: 0 0 auto;
+  color: var(--mc-text-dim);
+  font-size: 0.7rem;
+}
+.mc-select-divider {
+  height: 1px;
+  margin: 0.2rem 0;
+  background: var(--mc-border);
+}
+.mc-select-empty {
+  padding: 0.5rem 0.7rem;
+  font-family: var(--mc-mono);
+  font-size: 0.74rem;
+  color: var(--mc-text-dim);
+}
+/* Width variants — usable as className overrides for callers that want
+   the explicit form-select-sm widths without recomputing inline. */
+.mc-select-sm .mc-select-trigger {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.45rem;
+}
+
+/* ---- Top-header: GLOBAL busy indicator (T-0064) ---------- */
+/* One dot in the sidebar header strip lights up when ANY task is
+   in flight for the current user across all attached servers.
+   Hover/tap reveals the per-task list. Visible to every logged-in
+   user — not super-admin gated. */
+.mc-global-busy {
+  position: relative;
+  display: inline-flex;
+}
+.mc-global-busy-trigger {
+  background: transparent;
+  border: none;
+  padding: 0.15rem 0.35rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  cursor: pointer;
+  color: var(--mc-text-faint);
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+}
+.mc-global-busy-on .mc-global-busy-trigger {
+  color: var(--mc-amber);
+}
+.mc-global-busy-dot {
+  font-size: 0.7rem;
+  line-height: 1;
+}
+.mc-global-busy-count {
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.mc-global-busy-panel {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  margin-top: 0.25rem;
+  min-width: 18rem;
+  max-width: 28rem;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  border-radius: 3px;
+  padding: 0.5rem;
+}
+.mc-global-busy-empty {
+  padding: 0.25rem 0.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  color: var(--mc-text-dim);
+}
+.mc-global-busy-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mc-global-busy-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+}
+.mc-global-busy-task {
+  color: var(--mc-text);
+  letter-spacing: 0.05em;
+}
+.mc-global-busy-sid {
+  color: var(--mc-text-dim);
+  font-size: 0.62rem;
+}
+.mc-global-busy-warn {
+  margin-top: 0.4rem;
+  padding: 0.25rem 0.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  border-top: 1px solid var(--mc-border);
+}
+
+/* ---- Sidebar: ATTACHMENT placeholder (T-0061 placeholder) -- */
+/* Shell renders an "[ ATTACHMENT ]" header + a loading row so the
+   downstream Bundle C dev has a host to slot the real rows into
+   without needing a second pass on Shell.tsx. */
+.mc-sidebar-attachment-placeholder {
+  padding: 0.4rem 1rem;
+  color: var(--mc-text-faint);
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  font-style: italic;
+  list-style: none;
+}
+
+/* T-0063: operational-status pill moved out of the top header into the
+   ATTACHMENT chrome. It's per-worker per-user-per-server, which is
+   exactly this section's scope. */
+.mc-sidebar-attachment-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem 0.5rem;
+  list-style: none;
+  font-family: var(--mc-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+}
+
+/* ---- Sidebar: SERVER picker (T-0060) --------------------- */
+/* Section header carries the picker inline — the surrounding
+   `.mc-sidebar-section` adds the "[ ]" brackets via pseudo-elements,
+   so this wraps "SERVER ▾ <picker>" inside them per the contract. */
+.mc-sidebar-section-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.mc-srv-picker {
+  position: relative;
+  display: inline-flex;
+}
+.mc-srv-picker-trigger {
+  background: transparent;
+  border: none;
+  color: var(--mc-text);
+  font-family: var(--mc-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 0;
+}
+.mc-srv-picker-trigger:hover {
+  color: var(--mc-amber);
+}
+.mc-srv-picker-loading {
+  font-family: var(--mc-mono);
+  font-size: 0.62rem;
+  color: var(--mc-text-faint);
+}
+.mc-srv-picker-panel {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  min-width: 12rem;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  border-radius: 3px;
+  margin-top: 0.25rem;
+}
+.mc-srv-picker-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.mc-srv-picker-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--mc-text);
+  padding: 0.4rem 0.65rem;
+  font-family: var(--mc-mono);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.mc-srv-picker-row:hover {
+  background: var(--mc-surface-hover, rgba(255, 200, 0, 0.08));
+}
+.mc-srv-picker-row-current {
+  color: var(--mc-amber);
+}
+.mc-srv-picker-row-current::before {
+  content: "▸ ";
+}
+.mc-srv-picker-empty {
+  padding: 0.5rem 0.65rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  color: var(--mc-text-dim);
+}

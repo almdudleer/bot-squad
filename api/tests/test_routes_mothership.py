@@ -118,6 +118,47 @@ def test_self_register_is_idempotent_across_reboots(tmp_bot_squad: Path, monkeyp
     assert servers[0].base_url == "https://mothership.test"
 
 
+def test_self_register_migrates_on_host_rename(tmp_bot_squad: Path, monkeypatch):
+    """T-0109 — boot the mothership at URL_OLD, then re-boot at URL_NEW. The
+    is_self row's base_url must MIGRATE in place (one row, new URL), not
+    leave a stale zombie behind. Real-world driver: the .org→.dev domain
+    flip (T-0033) shipped before this migration logic landed and left a
+    duplicate srv_1a3a44462eee… row in production.
+
+    Bypasses ``_client()`` because that helper hardcodes MOTHERSHIP_BASE_URL;
+    this test needs the URL to change between the two boots.
+    """
+    # Common env (same DATA_DIR across both boots — that's how we exercise
+    # the persistence + migration path).
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    monkeypatch.setenv("BOTSQUAD_CLONE_URL", "https://example.com/bot-squad.git")
+    monkeypatch.setenv("BOTSQUAD_REPO_REF", "master")
+    monkeypatch.setenv("WEB_DIST", str(tmp_bot_squad / "nonexistent-web-dist"))
+    monkeypatch.setenv("MOTHERSHIP", "1")
+
+    # First boot: register self at the old host.
+    monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://mothership.test")
+    build_app()
+
+    # Second boot: same DATA_DIR, different host.
+    monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://renamed.test")
+    build_app()
+
+    store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    servers = store.list_servers()
+    assert len(servers) == 1, \
+        f"host rename should migrate the is_self row, not duplicate; got {len(servers)} rows: {[s.base_url for s in servers]}"
+    assert servers[0].is_self is True
+    assert servers[0].base_url == "https://renamed.test", \
+        f"old URL must be GC'd from disk after rename; got {servers[0].base_url}"
+
+
 def test_self_register_promotes_existing_row_to_is_self(tmp_bot_squad: Path, monkeypatch):
     """If the registry already has a row whose base_url matches the
     mothership's own URL (e.g. an admin added it manually before T-0055

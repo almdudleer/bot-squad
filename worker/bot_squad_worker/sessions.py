@@ -110,19 +110,36 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     return latest.stem  # filename without .jsonl = UUID
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
 def _pane_claude_uuid_from_proc(pane_pid: str, user_home: str) -> str | None:
     """T-0120: return the AUTHORITATIVE claude_uuid for a tmux pane via /proc.
 
-    Walks /proc descendants of ``pane_pid`` for an open .jsonl file under
-    ``~/.claude/projects/``. Returns the filename stem (uuid) of the first
-    matching open fd. None if no claude descendant is found or the walk fails.
+    Walks /proc descendants of ``pane_pid`` for a ``claude`` process whose
+    cmdline carries ``--resume <uuid>`` or ``--session-id <uuid>`` — that's
+    the uuid the live session is writing to. Returns None if no matching
+    descendant is found (e.g. fresh spawn whose cmdline is just ``claude
+    --dangerously-skip-permissions``; that case is left for the
+    discover_claude_uuid fallback). user_home is reserved for future use
+    (e.g. a fd-based probe) and kept in the signature for parity with
+    discover_claude_uuid.
 
     Disambiguates panes that share a cwd: ``discover_claude_uuid()`` returns
     the cwd's mtime-latest jsonl — the SAME uuid for every pane in the cwd —
     so the uuid-keyed md fallback would map every such pane to one md.
     Reading each pane's claude process directly gives a per-pane uuid.
     Pattern mirrors the descendant walk in scripts/hooks/session_start.sh.
+
+    Why cmdline and not /proc/<pid>/fd: claude does NOT keep its transcript
+    .jsonl open as a long-lived fd — it opens, appends, closes per write —
+    so an fd scan races with each turn boundary. The cmdline is stable for
+    the lifetime of the claude process.
     """
+    del user_home  # reserved; see docstring
     try:
         target = int(pane_pid)
     except (ValueError, TypeError):
@@ -141,7 +158,6 @@ def _pane_claude_uuid_from_proc(pane_pid: str, user_home: str) -> str | None:
                 children.setdefault(int(m.group(1)), []).append(int(entry.name))
     except OSError:
         return None
-    proj_prefix = str(Path(user_home) / ".claude" / "projects") + "/"
     queue: list[int] = [target]
     seen: set[int] = set()
     while queue:
@@ -149,17 +165,17 @@ def _pane_claude_uuid_from_proc(pane_pid: str, user_home: str) -> str | None:
         if pid in seen:
             continue
         seen.add(pid)
-        fd_dir = Path(f"/proc/{pid}/fd")
         try:
-            for fd in fd_dir.iterdir():
-                try:
-                    link = os.readlink(str(fd))
-                except OSError:
-                    continue
-                if link.startswith(proj_prefix) and link.endswith(".jsonl"):
-                    return Path(link).stem
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
         except OSError:
-            pass
+            cmd = ""
+        parts = cmd.split("\x00")
+        if parts and any(p.endswith("claude") or p == "claude" for p in parts[:1]):
+            for i, tok in enumerate(parts):
+                if tok in ("--resume", "--session-id") and i + 1 < len(parts):
+                    candidate = parts[i + 1].strip()
+                    if _UUID_RE.match(candidate):
+                        return candidate
         queue.extend(children.get(pid, []))
     return None
 

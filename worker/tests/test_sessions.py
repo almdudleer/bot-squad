@@ -81,7 +81,7 @@ def test_compute_sid_no_pct():
 
 
 def test_discover_claude_uuid_returns_stem(tmp_path):
-    proj_dir = tmp_path / ".claude" / "projects" / "home-alice-myrepo"
+    proj_dir = tmp_path / ".claude" / "projects" / "-home-alice-myrepo"
     proj_dir.mkdir(parents=True)
     uuid_file = proj_dir / "abc123-0000-0000-0000-000000000000.jsonl"
     uuid_file.write_text("{}")
@@ -95,14 +95,14 @@ def test_discover_claude_uuid_no_dir(tmp_path):
 
 
 def test_discover_claude_uuid_no_jsonl(tmp_path):
-    proj_dir = tmp_path / ".claude" / "projects" / "home-alice-myrepo"
+    proj_dir = tmp_path / ".claude" / "projects" / "-home-alice-myrepo"
     proj_dir.mkdir(parents=True)
     result = discover_claude_uuid("/home/alice/myrepo", str(tmp_path))
     assert result is None
 
 
 def test_discover_claude_uuid_returns_latest(tmp_path):
-    proj_dir = tmp_path / ".claude" / "projects" / "tmp-repo"
+    proj_dir = tmp_path / ".claude" / "projects" / "-tmp-repo"
     proj_dir.mkdir(parents=True)
     old = proj_dir / "old-uuid.jsonl"
     new = proj_dir / "new-uuid.jsonl"
@@ -111,6 +111,31 @@ def test_discover_claude_uuid_returns_latest(tmp_path):
     new.write_text("{}")
     result = discover_claude_uuid("/tmp/repo", str(tmp_path))
     assert result == "new-uuid"
+
+
+def test_discover_claude_uuid_round_trip_real_encoding(tmp_path):
+    """T-0118 regression: Claude's path-encoding keeps the leading dash.
+
+    Set up a project dir using the EXACT encoding Claude uses on real disk
+    (verified against /home/almdudleer/.claude/projects/ which contains
+    entries like `-home-almdudleer-bot-squad-mgmt`). Then assert that
+    discover_claude_uuid locates a jsonl whose stem matches. If a future
+    change re-introduces lstrip('-') or any other leading-dash mutation,
+    proj_dir will be looked up at the wrong path and this test fails.
+    """
+    cwd = "/home/almdudleer/bot-squad-mgmt"
+    # Real encoding — the leading slash becomes a leading dash and stays.
+    encoded = "-home-almdudleer-bot-squad-mgmt"
+    assert cwd.replace("/", "-") == encoded, (
+        "round-trip premise broke: replace('/', '-') must yield the "
+        "leading-dash form Claude writes to disk"
+    )
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    uuid_stem = "deadbeef-1234-5678-9abc-def012345678"
+    (proj_dir / f"{uuid_stem}.jsonl").write_text("{}")
+    result = discover_claude_uuid(cwd, str(tmp_path))
+    assert result == uuid_stem
 
 
 def test_read_write_session_metadata_roundtrip(tmp_path):
@@ -344,7 +369,8 @@ def test_list_sessions_recovers_started_at_after_window_rename(tmp_path, monkeyp
 
     # Live pane reports the NEW window name — same pane_id, same uuid,
     # so the SID-keyed lookup misses but the uuid fallback should hit.
-    encoded = str(repo).replace("/", "-").lstrip("-")
+    # Encoding mirrors claude's on-disk layout — leading slash → leading dash.
+    encoded = str(repo).replace("/", "-")
     proj_dir = tmp_path / ".claude" / "projects" / encoded
     proj_dir.mkdir(parents=True)
     (proj_dir / "uuid-after-rename.jsonl").write_text("{}")
@@ -422,7 +448,8 @@ def _setup_activity_probe(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path, repo)
 
     # Encode cwd to the path claude uses under ~/.claude/projects/.
-    encoded = str(repo).replace("/", "-").lstrip("-")
+    # T-0118: claude keeps the leading dash; do NOT lstrip.
+    encoded = str(repo).replace("/", "-")
     proj_dir = tmp_path / ".claude" / "projects" / encoded
     proj_dir.mkdir(parents=True)
     uuid = "fff00000-0000-0000-0000-000000000fff"
@@ -444,7 +471,8 @@ def _setup_activity_probe(tmp_path, monkeypatch):
 
 def test_pane_activity_at_returns_jsonl_mtime(tmp_path):
     from bot_squad_worker.sessions import _pane_activity_at
-    encoded = "tmp-repo"
+    # Real claude encoding keeps the leading dash (T-0118).
+    encoded = "-tmp-repo"
     proj_dir = tmp_path / ".claude" / "projects" / encoded
     proj_dir.mkdir(parents=True)
     jsonl = proj_dir / "abc.jsonl"

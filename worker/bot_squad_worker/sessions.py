@@ -92,10 +92,13 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     """Return the UUID (filename stem) of the most recent .jsonl for this cwd.
 
     Encodes cwd using the standard claude path-encoding:
-      ``cwd.replace('/', '-').lstrip('-')``
+      ``cwd.replace('/', '-')``
+    Claude keeps the leading dash (e.g. ``/home/alice/repo`` →
+    ``-home-alice-repo``); stripping it produces a path that doesn't exist
+    on disk and causes this function to always return None for real cwds.
     Returns None if no project dir or no .jsonl files exist.
     """
-    encoded = cwd.replace("/", "-").lstrip("-")
+    encoded = cwd.replace("/", "-")
     proj_dir = Path(user_home) / ".claude" / "projects" / encoded
     if not proj_dir.exists():
         return None
@@ -128,7 +131,8 @@ def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> floa
     """
     if not claude_uuid:
         return None
-    encoded = cwd.replace("/", "-").lstrip("-")
+    # T-0118: claude keeps the leading dash on the encoded cwd. Don't strip it.
+    encoded = cwd.replace("/", "-")
     jsonl_path = Path(user_home) / ".claude" / "projects" / encoded / f"{claude_uuid}.jsonl"
     try:
         return jsonl_path.stat().st_mtime

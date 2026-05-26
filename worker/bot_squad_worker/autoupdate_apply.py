@@ -83,6 +83,10 @@ DOCKER_BUILD_TIMEOUT_SECONDS = 1800  # 30min cap on docker compose up --build
 SMOKE_PATH = "/api/health"
 SMOKE_BACKOFF_SECONDS = (5, 10, 20, 30)  # ≤65s total wall time
 SMOKE_REQUEST_TIMEOUT_SECONDS = 10.0
+# T-0107 — delay before the detached worker-restart fires, in seconds. Gives
+# the apply caller time to write final state + return; also lets the calling
+# tick complete cleanly before systemd SIGTERMs the worker.
+WORKER_RESTART_DELAY_SECONDS = 5
 
 
 def _extra_rsync_excludes() -> tuple[str, ...]:
@@ -108,6 +112,54 @@ def _sync_excludes() -> tuple[str, ...]:
     Appends ``_extra_rsync_excludes()`` for per-install customizations.
     """
     return ("data/", *_extra_rsync_excludes())
+
+
+def _schedule_worker_restart(delay_sec: int = WORKER_RESTART_DELAY_SECONDS) -> None:
+    """Schedule a detached worker restart after a successful apply (T-0107).
+
+    The apply rewrites the worker's own code on disk; the running process is
+    still serving the old in-memory bytecode. We can't synchronously
+    ``systemctl restart`` from inside the worker — that SIGTERMs the very
+    process running this call. So fork a detached child that sleeps a few
+    seconds (long enough for the caller to record success state and return)
+    and then invokes the restart command. systemd respawns the worker,
+    which then runs the new code.
+
+    Override the command via ``BOT_SQUAD_AUTOUPDATE_RESTART_CMD``. Set it to
+    ``off`` / ``none`` / ``skip`` / empty string to disable (useful for
+    tests, dogfood runs, or environments where the worker isn't under
+    systemd-user).
+    """
+    cmd = os.environ.get(
+        "BOT_SQUAD_AUTOUPDATE_RESTART_CMD",
+        "systemctl --user restart bot-squad-worker",
+    )
+    if not cmd or cmd.strip().lower() in {"off", "none", "skip"}:
+        log.info(
+            "autoupdate_apply: worker restart disabled (BOT_SQUAD_AUTOUPDATE_RESTART_CMD=%r)",
+            cmd,
+        )
+        return
+    try:
+        # start_new_session detaches from the worker's process group so
+        # systemd's eventual SIGTERM on the worker doesn't take the
+        # restart child down with it. nohup belt-and-suspenders.
+        full = f"sleep {int(delay_sec)} && {cmd}"
+        subprocess.Popen(
+            ["nohup", "sh", "-c", full],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log.info(
+            "autoupdate_apply: scheduled detached worker restart in %ds (%s)",
+            delay_sec, cmd,
+        )
+    except Exception:
+        log.exception(
+            "autoupdate_apply: failed to schedule worker restart (cmd=%r)", cmd,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +688,12 @@ def apply(cfg: Any, entry: dict) -> ApplyResult:
 
         log.info("autoupdate_apply: success — installed_version=%s (prev=%s)",
                  version, prev_version)
+
+        # T-0107 — schedule the worker self-restart so the running process
+        # picks up the new code. Fires AFTER state is persisted and we
+        # return, so the caller (drain_one / the tick) finishes cleanly.
+        _schedule_worker_restart()
+
         return ApplyResult(ok=True, version=version)
 
     finally:

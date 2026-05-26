@@ -37,8 +37,13 @@ def _isolate_env(monkeypatch):
         "BOTSQUAD_MOTHERSHIP_URL",
         "BOT_SQUAD_SELF_URL",
         "BOT_SQUAD_INSTALL_ROOT",
+        "BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES",
     ):
         monkeypatch.delenv(key, raising=False)
+    # T-0107 — disable worker-restart scheduling by default so the apply
+    # happy-path tests don't actually fork systemctl. Tests that exercise
+    # the restart helper itself flip this explicitly.
+    monkeypatch.setenv("BOT_SQUAD_AUTOUPDATE_RESTART_CMD", "off")
     # Default to consumer (not mothership); individual tests can flip.
     monkeypatch.setattr(apply_mod, "is_mothership", lambda *a, **kw: False)
     monkeypatch.setattr(poller, "is_mothership", lambda *a, **kw: False)
@@ -228,6 +233,141 @@ def test_snapshot_restore_round_trip_preserves_data(install_ctx):
 
 
 # ---------------------------------------------------------------------------
+# BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES (T-0112 — coverage for the env-driven
+# extra-excludes path proven by the T-0090 dogfood)
+# ---------------------------------------------------------------------------
+
+
+def test_extra_excludes_empty_by_default(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES", raising=False)
+    assert apply_mod._extra_rsync_excludes() == ()
+
+
+def test_extra_excludes_parses_comma_separated(monkeypatch):
+    monkeypatch.setenv(
+        "BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES",
+        "docker-compose.yml,.env,config/",
+    )
+    assert apply_mod._extra_rsync_excludes() == (
+        "docker-compose.yml",
+        ".env",
+        "config/",
+    )
+
+
+def test_extra_excludes_strips_whitespace_and_drops_blanks(monkeypatch):
+    monkeypatch.setenv(
+        "BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES",
+        " docker-compose.yml , , .env ",
+    )
+    assert apply_mod._extra_rsync_excludes() == ("docker-compose.yml", ".env")
+
+
+def test_sync_excludes_always_prefixes_data_dir(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES", raising=False)
+    assert apply_mod._sync_excludes() == ("data/",)
+
+
+def test_sync_excludes_appends_extras_after_data(monkeypatch):
+    monkeypatch.setenv(
+        "BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES",
+        "docker-compose.yml,.env",
+    )
+    assert apply_mod._sync_excludes() == ("data/", "docker-compose.yml", ".env")
+
+
+def test_extra_excludes_preserves_site_local_file_through_restore(install_ctx, monkeypatch):
+    """End-to-end: a file matching EXTRA_EXCLUDES survives a snapshot+restore cycle
+    even when the snapshot doesn't contain it. Proves the exclude pattern reaches
+    the rsync invocation (both --exclude prevents copying it INTO the snapshot AND
+    prevents --delete from wiping it on restore)."""
+    cfg = install_ctx["cfg"]
+    install = install_ctx["install"]
+
+    # Site-local file the consumer wants preserved across apply.
+    site_local = install / "docker-compose.yml"
+    site_local.write_text("# SITE-LOCAL override — must survive apply\n")
+
+    monkeypatch.setenv("BOT_SQUAD_AUTOUPDATE_EXTRA_EXCLUDES", "docker-compose.yml")
+
+    # Snapshot the install (docker-compose.yml excluded from snapshot).
+    snap = apply_mod._snapshot(cfg, "v2026.05.16.1")
+    try:
+        assert not (snap / "docker-compose.yml").exists(), \
+            "docker-compose.yml should NOT be in the snapshot when EXTRA_EXCLUDES lists it"
+
+        # Mutate the live install to simulate a bad apply that touched the file.
+        site_local.write_text("# CORRUPTED by bad apply\n")
+
+        # Restore from snapshot — without the exclude, --delete would wipe
+        # docker-compose.yml (it's not in the snapshot); WITH the exclude,
+        # rsync leaves the live copy untouched.
+        apply_mod._restore(cfg, snap)
+
+        assert site_local.exists(), "site-local file was wiped despite EXTRA_EXCLUDES"
+        assert site_local.read_text() == "# CORRUPTED by bad apply\n", \
+            "site-local file content was overwritten despite EXTRA_EXCLUDES"
+    finally:
+        if snap.exists():
+            import shutil
+            shutil.rmtree(snap)
+
+
+# ---------------------------------------------------------------------------
+# Worker self-restart on successful apply (T-0107)
+# ---------------------------------------------------------------------------
+
+
+def _capture_popen(monkeypatch) -> list[tuple[list[str], dict]]:
+    """Replace subprocess.Popen with a no-op that records its invocations."""
+    calls: list[tuple[list[str], dict]] = []
+    def fake_popen(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        # Return a fake handle with the minimal surface Popen callers touch.
+        return types.SimpleNamespace(pid=12345, wait=lambda: 0)
+    monkeypatch.setattr(apply_mod.subprocess, "Popen", fake_popen)
+    return calls
+
+
+def test_schedule_worker_restart_default_command(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_AUTOUPDATE_RESTART_CMD", "")  # cleared below
+    monkeypatch.delenv("BOT_SQUAD_AUTOUPDATE_RESTART_CMD", raising=False)
+    calls = _capture_popen(monkeypatch)
+    apply_mod._schedule_worker_restart(delay_sec=2)
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv[:3] == ["nohup", "sh", "-c"]
+    assert argv[3] == "sleep 2 && systemctl --user restart bot-squad-worker"
+    assert kwargs.get("start_new_session") is True
+
+
+def test_schedule_worker_restart_env_override(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_AUTOUPDATE_RESTART_CMD", "echo restart-hook")
+    calls = _capture_popen(monkeypatch)
+    apply_mod._schedule_worker_restart(delay_sec=3)
+    assert len(calls) == 1
+    argv, _ = calls[0]
+    assert argv[3] == "sleep 3 && echo restart-hook"
+
+
+@pytest.mark.parametrize("value", ["off", "none", "skip", "", "  off  ", "OFF"])
+def test_schedule_worker_restart_disabled_values_skip(monkeypatch, value):
+    monkeypatch.setenv("BOT_SQUAD_AUTOUPDATE_RESTART_CMD", value)
+    calls = _capture_popen(monkeypatch)
+    apply_mod._schedule_worker_restart()
+    assert calls == [], f"value={value!r} should suppress the restart, but Popen was called"
+
+
+def test_schedule_worker_restart_swallows_subprocess_errors(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_AUTOUPDATE_RESTART_CMD", "systemctl --user restart bot-squad-worker")
+    def boom(*a, **kw):
+        raise OSError("nohup not on PATH")
+    monkeypatch.setattr(apply_mod.subprocess, "Popen", boom)
+    # Must not propagate — a missing restart shouldn't fail the apply.
+    apply_mod._schedule_worker_restart()
+
+
+# ---------------------------------------------------------------------------
 # Apply happy path
 # ---------------------------------------------------------------------------
 
@@ -270,6 +410,35 @@ def test_apply_happy_path_updates_install_and_stamps_state(install_ctx, monkeypa
 
     # No alert on success:
     assert not apply_mod.alert_path(cfg).exists()
+
+
+def test_apply_happy_path_schedules_worker_restart(install_ctx, monkeypatch):
+    """T-0107 — apply success must call _schedule_worker_restart so the
+    running worker picks up the new install tree without manual intervention.
+    """
+    cfg = install_ctx["cfg"]
+    _pre_stamp(cfg, "v2026.05.16.1")
+
+    tar_bytes = _make_tarball("v2026.05.16.2")
+    sha = hashlib.sha256(tar_bytes).hexdigest()
+    entry = _make_entry("v2026.05.16.2", sha)
+
+    _install_fake_download(monkeypatch, tar_bytes)
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+
+    # Spy on the helper directly — replacing subprocess.Popen would also
+    # neuter the rsync/extract subprocess calls inside apply.
+    restart_calls: list[int] = []
+    monkeypatch.setattr(
+        apply_mod, "_schedule_worker_restart",
+        lambda *a, **kw: restart_calls.append(1),
+    )
+
+    result = apply_mod.apply(cfg, entry)
+
+    assert result.ok is True
+    assert restart_calls == [1], "apply success must schedule exactly one worker restart"
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +598,15 @@ def test_smoke_failure_rolls_back_and_brings_prior_containers_back(install_ctx, 
         lambda cfg: no_build_calls.append(1) or "ok",
     )
 
+    # T-0107 — also assert failure path does NOT schedule a restart.
+    # (Restarting after a failure would respawn the worker into the
+    # restored-snapshot tree, which is the prior version — pointless churn.)
+    restart_calls: list[int] = []
+    monkeypatch.setattr(
+        apply_mod, "_schedule_worker_restart",
+        lambda *a, **kw: restart_calls.append(1),
+    )
+
     result = apply_mod.apply(cfg, entry)
 
     assert result.ok is False
@@ -437,6 +615,7 @@ def test_smoke_failure_rolls_back_and_brings_prior_containers_back(install_ctx, 
     assert len(no_build_calls) == 1
     state = poller.load_state(cfg)
     assert state["last_apply_outcome"] == "failed:smoke"
+    assert restart_calls == [], "apply failure must NOT schedule a worker restart"
 
 
 # ---------------------------------------------------------------------------

@@ -173,6 +173,31 @@ def _session_file(data_dir: Path, slug: str, sid: str) -> Path:
     return data_dir / slug / "sessions" / f"{sid}.md"
 
 
+def _find_session_md(sessions_dir: Path, sid: str, claude_uuid: str | None) -> Path | None:
+    """Resolve a session md by SID, falling back to a claude_uuid scan.
+
+    A tmux window rename leaves the metadata file at the pre-rename SID
+    (e.g. ``S-alice-teamlead-p10.md``) while the live pane has computed a
+    fresh SID (e.g. ``S-alice-newname-p10.md``). The SID-keyed lookup
+    misses, so as a last resort scan the sessions dir for a file whose
+    ``claude_uuid:`` field matches the live pane's uuid — the uuid is
+    rename-invariant since it identifies the claude transcript, not the
+    tmux address.
+    """
+    direct = sessions_dir / f"{sid}.md"
+    if direct.exists():
+        return direct
+    if not claude_uuid or not sessions_dir.exists():
+        return None
+    for md in sessions_dir.glob("*.md"):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        if meta.get("claude_uuid") == claude_uuid:
+            return md
+    return None
+
+
 def _write_session_metadata(path: Path, meta: dict) -> None:
     """Write a session metadata file with YAML frontmatter."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,8 +369,14 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             except OSError:
                 pass
 
-        # Check if there's an existing metadata file with started_at + task_id
-        session_file = _session_file(data_dir, slug, sid)
+        # Resolve the session md — SID first, then claude_uuid fallback.
+        # T-0118: a tmux window rename moves the live pane's computed SID
+        # away from the on-disk md filename; the uuid-keyed fallback
+        # recovers started_at / task_id / etc. for renamed-window panes.
+        sessions_dir_path = data_dir / slug / "sessions"
+        session_md_path = _find_session_md(sessions_dir_path, sid, claude_uuid)
+        existing = _read_session_metadata(session_md_path) if session_md_path else None
+
         started_at = None
         task_id: str | None = None
         initiative: str = ""
@@ -353,40 +384,40 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # paused (Ctrl-C'd but pane left open) reflect that — otherwise
         # the UI shows every live pane as active even when the user paused it.
         live_status = "active"
-        if session_file.exists():
-            existing = _read_session_metadata(session_file)
-            if existing:
-                started_at = existing.get("started_at")
-                tid = existing.get("task_id")
-                if tid and tid != "~":
-                    task_id = tid
-                init_val = existing.get("initiative")
-                if init_val and init_val != "~":
-                    initiative = init_val
-                md_status = existing.get("status", "")
-                if md_status == "paused":
-                    live_status = "paused"
-
         # Phase 9: extras for multi-binding. Empty list when unset.
         extra_task_ids: list[str] = []
         extra_initiatives: list[str] = []
         paused_at_meta: Any = None
         archived_flag = False
         owner_meta: str = ""  # T-0080 — UI-username owner stamp; "" = legacy
-        if session_file.exists():
-            existing = _read_session_metadata(session_file)
-            if existing:
-                etids = existing.get("extra_task_ids")
-                if isinstance(etids, list):
-                    extra_task_ids = [t for t in etids if t and t != "~"]
-                einits = existing.get("extra_initiatives")
-                if isinstance(einits, list):
-                    extra_initiatives = [i for i in einits if i and i != "~"]
-                paused_at_meta = existing.get("paused_at")
-                archived_flag = str(existing.get("archived", "")).lower() == "true"
-                own_val = existing.get("owner")
-                if own_val and own_val != "~":
-                    owner_meta = str(own_val)
+        if existing:
+            started_at = existing.get("started_at")
+            tid = existing.get("task_id")
+            if tid and tid != "~":
+                task_id = tid
+            init_val = existing.get("initiative")
+            if init_val and init_val != "~":
+                initiative = init_val
+            md_status = existing.get("status", "")
+            if md_status == "paused":
+                live_status = "paused"
+            etids = existing.get("extra_task_ids")
+            if isinstance(etids, list):
+                extra_task_ids = [t for t in etids if t and t != "~"]
+            einits = existing.get("extra_initiatives")
+            if isinstance(einits, list):
+                extra_initiatives = [i for i in einits if i and i != "~"]
+            paused_at_meta = existing.get("paused_at")
+            archived_flag = str(existing.get("archived", "")).lower() == "true"
+            own_val = existing.get("owner")
+            if own_val and own_val != "~":
+                owner_meta = str(own_val)
+            # If the md was resolved via uuid fallback (stale SID after a
+            # window rename), mark the stored SID as active too so the
+            # suspended-md loop below doesn't double-emit the same session.
+            stored_sid = existing.get("sid")
+            if stored_sid and stored_sid != sid:
+                active_sids.add(stored_sid)
 
         # T-0104: activity-derived status. The existing `status` (md/zombie)
         # is preserved for back-compat callers and action-button routing;

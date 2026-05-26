@@ -318,6 +318,60 @@ def test_list_sessions_active_pane_with_initiative(tmp_path, monkeypatch):
     assert rows[0]["initiative"] == "v0.7-news-subscriptions.md"
 
 
+def test_list_sessions_recovers_started_at_after_window_rename(tmp_path, monkeypatch):
+    """T-0118: live pane whose tmux window was renamed still surfaces
+    started_at / task_id from the pre-rename md via claude_uuid fallback.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # Pre-rename md file lives at the OLD SID (window was 'teamlead' when
+    # the session started) — file holds the rename-invariant claude_uuid
+    # plus started_at, task_id, owner.
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-teamlead-p11.md", {
+        "sid": "S-testuser-teamlead-p11",
+        "status": "active",
+        "window": "teamlead",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-after-rename",
+        "task_id": "T-0100",
+        "started_at": "2026-05-23T15:37:12Z",
+        "owner": "alexey",
+    })
+
+    # Live pane reports the NEW window name — same pane_id, same uuid,
+    # so the SID-keyed lookup misses but the uuid fallback should hit.
+    encoded = str(repo).replace("/", "-").lstrip("-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "uuid-after-rename.jsonl").write_text("{}")
+
+    fake_pane_output = f"%11|ui_polish-TL|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    # Exactly one row — the suspended-md loop must NOT also emit the
+    # pre-rename SID as a separate suspended session.
+    assert len(rows) == 1
+    assert rows[0]["sid"] == "S-testuser-ui_polish-TL-p11"
+    assert rows[0]["status"] == "active"
+    assert rows[0]["started_at"] == "2026-05-23T15:37:12Z"
+    assert rows[0]["task_id"] == "T-0100"
+    assert rows[0]["owner"] == "alexey"
+
+
 def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
     """Suspended-md path surfaces initiative from frontmatter."""
     repo = tmp_path / "repo"

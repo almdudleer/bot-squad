@@ -674,3 +674,283 @@ def test_sse_requires_auth(tmp_bot_squad: Path, monkeypatch):
     with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
         r = client.get("/api/m/servers/srv_anything/checkpoints")
     assert r.status_code == 401
+
+
+# ---- invite-join flow (T-0026) ---------------------------------------------
+
+
+from app.install_tokens import INVITE_PREFIX  # noqa: E402 — section-local
+
+
+def _mint_server(client) -> tuple[str, str]:
+    """Helper: log in, mint a server, return (server_id, install_token)."""
+    _login(client)
+    body = client.post(
+        "/api/m/servers",
+        json={"display_name": "S", "base_url": "https://s.example.com"},
+    ).json()
+    return body["id"], body["install_token"]
+
+
+def test_invite_mint_round_trip(tmp_bot_squad: Path, monkeypatch):
+    """POST /api/m/servers/{id}/invites returns a plaintext invite token
+    exactly once, with the correct prefix + role + target_username.
+
+    Roundtrip: store the server, mint an invite, look up the server again
+    and confirm (a) the registry has the SHA-256 hash but NOT the plaintext,
+    (b) the public projection strips the hash entirely.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _install_token = _mint_server(client)
+        r = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "edem", "role": "non-admin"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        token = body["invite_token"]
+        assert token.startswith(INVITE_PREFIX)
+        assert body["server_id"] == sid
+        assert body["target_username"] == "edem"
+        assert body["role"] == "non-admin"
+        assert body["expires_at"] is not None
+        # Install URL embeds the invite token — same /i/<token>/install.sh
+        # shape so install.sh can prefix-detect at run-time.
+        assert token in body["install_url"]
+        assert token in body["instructions_url"]
+
+        # Listing must NOT leak invite plaintext OR hash.
+        listing = client.get("/api/m/servers").json()
+        srv = next(s for s in listing if s["id"] == sid)
+        assert "invites" in srv
+        assert len(srv["invites"]) == 1
+        inv = srv["invites"][0]
+        assert inv["target_username"] == "edem"
+        assert inv["role"] == "non-admin"
+        assert "hash" not in inv  # public projection strips it
+
+        # On-disk hash is the SHA-256 of the plaintext.
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        on_disk = store.get_server(sid)
+        assert on_disk is not None
+        assert len(on_disk.invites) == 1
+        assert on_disk.invites[0]["hash"] == hash_token(token)
+
+
+def test_invite_mint_admin_role(tmp_bot_squad: Path, monkeypatch):
+    """role='admin' is accepted and round-trips. installer/join must echo it
+    back so the installer can decide whether to add the user to the
+    bot-squad group."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        r = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "operator", "role": "admin"},
+        )
+        assert r.status_code == 200
+        token = r.json()["invite_token"]
+        client.cookies.clear()
+        join = client.post("/api/m/installer/join", json={"token": token})
+        assert join.status_code == 200, join.text
+        assert join.json() == {
+            "server_id": sid,
+            "target_username": "operator",
+            "role": "admin",
+        }
+
+
+def test_invite_mint_rejects_bad_role(tmp_bot_squad: Path, monkeypatch):
+    """Only 'admin' / 'non-admin' are valid. Anything else → 400."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        r = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "x", "role": "root"},
+        )
+    assert r.status_code == 400
+
+
+def test_invite_mint_unknown_server_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        r = client.post(
+            "/api/m/servers/srv_does_not_exist/invites",
+            json={"target_username": "x", "role": "admin"},
+        )
+    assert r.status_code == 404
+
+
+def test_installer_join_burns_invite(tmp_bot_squad: Path, monkeypatch):
+    """POST /api/m/installer/join validates + burns the invite token,
+    returns (server_id, target_username, role). Second attempt → 410.
+
+    Burn semantics match the install-token contract: single-use. The
+    invite plaintext leaves the user's tmpfs after one redemption.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        mint = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "edem", "role": "non-admin"},
+        ).json()
+        token = mint["invite_token"]
+        client.cookies.clear()  # installer has no session cookie
+
+        first = client.post("/api/m/installer/join", json={"token": token})
+        assert first.status_code == 200, first.text
+        assert first.json() == {
+            "server_id": sid,
+            "target_username": "edem",
+            "role": "non-admin",
+        }
+
+        # Burned — registry no longer carries the invite at all.
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        on_disk = store.get_server(sid)
+        assert on_disk is not None
+        assert on_disk.invites == []
+
+        second = client.post("/api/m/installer/join", json={"token": token})
+    assert second.status_code == 410
+
+
+def test_installer_join_unknown_token_410(tmp_bot_squad: Path, monkeypatch):
+    """Bogus invite token → 410 (matches the install-token unhappy-path)."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        r = client.post(
+            "/api/m/installer/join",
+            json={"token": "bsq_invite_definitelyNotReal"},
+        )
+    assert r.status_code == 410
+
+
+def test_installer_join_expired_invite_410(tmp_bot_squad: Path, monkeypatch):
+    """Expired invite → 410. Backdates expires_at directly on disk."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        token = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "edem", "role": "non-admin"},
+        ).json()["invite_token"]
+
+        # Backdate the invite's expiry directly via the store.
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        servers = store.list_servers()
+        idx = next(i for i, s in enumerate(servers) if s.id == sid)
+        old = servers[idx]
+        stale_invites = [
+            {**inv, "expires_at": (datetime.now(timezone.utc) - timedelta(hours=1))
+                .isoformat().replace("+00:00", "Z")}
+            for inv in old.invites
+        ]
+        servers[idx] = type(old)(
+            **{**old.__dict__, "invites": stale_invites},
+        )
+        store.write(servers)
+        client.cookies.clear()
+        r = client.post("/api/m/installer/join", json={"token": token})
+    assert r.status_code == 410
+
+
+# ---- install-token vs invite-token NON-INTERCHANGEABILITY -------------------
+# Locks the DoD bullet: the two token kinds MUST NOT cross-validate. A
+# leaked install_token cannot redeem an invite, and a leaked invite_token
+# cannot redeem a /connect handshake (which would mint a server bearer
+# the invitee was never supposed to hold).
+
+
+def test_install_token_rejected_on_installer_join(tmp_bot_squad: Path, monkeypatch):
+    """Install token presented to /installer/join → 400 'invite token
+    required'. The 400 (vs 410) distinguishes "wrong KIND" from "wrong
+    OR expired token" so audit logs can flag prefix mismatches as
+    potential leakage attempts rather than benign TTL expiries.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _sid, install_token = _mint_server(client)
+        client.cookies.clear()
+        r = client.post("/api/m/installer/join", json={"token": install_token})
+    assert r.status_code == 400
+    assert "invite token" in r.json()["detail"].lower()
+
+
+def test_invite_token_rejected_on_installer_connect(tmp_bot_squad: Path, monkeypatch):
+    """Invite token presented to /installer/connect → 400 'install token
+    required'. Even though both burn-points are POST + bearer-shaped,
+    /connect is the install-side handshake (mints a server_bearer) and
+    invitees are not supposed to hold a server_bearer.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        invite_token = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "edem", "role": "non-admin"},
+        ).json()["invite_token"]
+        client.cookies.clear()
+        r = client.post(
+            "/api/m/installer/connect",
+            json={"token": invite_token, "server_meta": {"hostname": "h"}},
+        )
+    assert r.status_code == 400
+
+
+def test_invite_token_rejected_as_checkpoint_bearer(tmp_bot_squad: Path, monkeypatch):
+    """Invite token CAN'T be used as the checkpoint bearer. The bearer
+    surface (Authorization: Bearer ...) is for install_token or
+    server_bearer only; an invite is for /installer/join exclusively."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        invite_token = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "edem", "role": "non-admin"},
+        ).json()["invite_token"]
+        client.cookies.clear()
+        r = client.post(
+            "/api/m/installer/checkpoint",
+            headers={"Authorization": f"Bearer {invite_token}"},
+            json={"checkpoint": "x", "status": "begin"},
+        )
+    assert r.status_code == 401
+
+
+def test_invite_token_bundle_get_serves_install_sh(tmp_bot_squad: Path, monkeypatch):
+    """The bundle /i/<token>/install.sh path accepts BOTH install AND
+    invite tokens — install.sh self-detects the prefix at runtime. Without
+    this, an invitee's curl|bash would 410 before install.sh ever sees
+    its first argument.
+
+    Validates the symmetry but keeps the burn-point single: re-fetching
+    the bundle does not consume the invite.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        invite_token = client.post(
+            f"/api/m/servers/{sid}/invites",
+            json={"target_username": "edem", "role": "non-admin"},
+        ).json()["invite_token"]
+        client.cookies.clear()
+
+        r = client.get(f"/i/{invite_token}/install.sh")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("text/x-shellscript")
+        # The invite token is substituted into the same BOTSQUAD_INSTALL_TOKEN
+        # slot — install.sh detects the bsq_invite_ prefix and branches.
+        assert f'BOTSQUAD_INSTALL_TOKEN:-{invite_token}' in r.text
+
+        # No burn — re-fetch is byte-identical and the invite is still live.
+        r2 = client.get(f"/i/{invite_token}/install.sh")
+        assert r2.status_code == 200
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        on_disk = store.get_server(sid)
+        assert on_disk is not None
+        assert len(on_disk.invites) == 1  # still there, not burned
+
+
+def test_invite_mint_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    """Cookie-auth gate on the invite-mint surface — only logged-in
+    botsquad.dev users can issue invites."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        r = client.post(
+            "/api/m/servers/srv_x/invites",
+            json={"target_username": "edem", "role": "admin"},
+        )
+    assert r.status_code == 401

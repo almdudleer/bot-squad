@@ -1286,8 +1286,205 @@ State:    $STATE_FILE
 EOF
 }
 
+# ---- Invite-mode checkpoints (T-0026) ---------------------------------------
+# When BOTSQUAD_INSTALL_TOKEN carries an invite prefix (bsq_invite_*), the
+# script runs the join-existing-install chain instead of fresh-install. The
+# steps below are siblings of the fresh-install ones but DO NOT create the
+# install dir, the www group, the systemd UNIT install, or run docker
+# compose — that's the existing coordinator's territory.
+
+step_mothership_join() {
+  # Sibling of step_mothership_handshake but for invite tokens. Calls
+  # POST /api/m/installer/join with the invite plaintext, gets back the
+  # target_username + role the mothership recorded at mint time, then
+  # refuses if the Linux user running install.sh isn't the target.
+  if [[ "$BOTSQUAD_SKIP_MOTHERSHIP" = "1" ]]; then
+    die_struct mothership_join \
+      "BOTSQUAD_SKIP_MOTHERSHIP=1 is incompatible with invite-mode install." \
+      "Invite-mode requires the mothership to authoritatively name the target
+Linux user + role — there is no offline override. Unset
+BOTSQUAD_SKIP_MOTHERSHIP and re-run."
+  fi
+  if [[ "$BOTSQUAD_INSTALL_TOKEN" = "__INSTALL_TOKEN__" ]] || [[ "$BOTSQUAD_MOTHERSHIP_URL" = "__MOTHERSHIP_URL__" ]]; then
+    die_struct mothership_join \
+      "Invite token / mothership URL were not substituted." \
+      "Invite-mode install must be invoked from the mothership-served
+install.sh (curl https://<mothership>/i/<invite>/install.sh). Re-fetch the
+install URL from the invite link."
+  fi
+  local resp http_code body target_username role server_id state_file
+  state_file="${BOTSQUAD_STATE_DIR}/invite.target"
+  local payload
+  payload=$(jq -n \
+    --arg token "$BOTSQUAD_INSTALL_TOKEN" \
+    '{token: $token}')
+  resp="$(mktemp)"
+  http_code="$(curl -sS -o "$resp" -w '%{http_code}' \
+    -X POST "${BOTSQUAD_MOTHERSHIP_URL}/api/m/installer/join" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" || echo 000)"
+  if [[ "$http_code" != "200" ]]; then
+    body="$(cat "$resp")"; rm -f "$resp"
+    die_struct mothership_join \
+      "Mothership /installer/join returned HTTP $http_code: $body" \
+      "If 410 Gone: invite token expired (24h TTL) or already used; ask
+the inviter to issue a new link. If 400: the token doesn't look like an
+invite — make sure you're using the invite URL, not a fresh-install URL.
+If 5xx: check network/DNS and retry."
+  fi
+  target_username="$(jq -r '.target_username' "$resp")"
+  role="$(jq -r '.role' "$resp")"
+  server_id="$(jq -r '.server_id' "$resp")"
+  rm -f "$resp"
+  if [[ -z "$target_username" || "$target_username" = "null" ]]; then
+    die_struct mothership_join \
+      "Mothership /installer/join returned 200 but no target_username." \
+      "This is a mothership bug; ping the bot-squad team."
+  fi
+  if [[ "$role" != "admin" && "$role" != "non-admin" ]]; then
+    die_struct mothership_join \
+      "Mothership returned unrecognized role '$role'." \
+      "Expected 'admin' or 'non-admin'. Ping the bot-squad team."
+  fi
+  local current_user; current_user="$(id -un)"
+  if [[ "$current_user" != "$target_username" ]]; then
+    die_struct mothership_join \
+      "Invite is for Linux user '$target_username' but install.sh is
+running as '$current_user'." \
+      "Switch to the target user (su - $target_username) on this host and
+re-run the same install command. Invites are bound to a specific Linux
+username at mint time and cannot be transferred."
+  fi
+  # Persist for downstream steps. Mode 0644 — the values are not secret,
+  # the invite plaintext is already burned at this point.
+  umask 022
+  cat > "$state_file" <<EOF
+BOTSQUAD_INVITE_ROLE=$role
+BOTSQUAD_INVITE_TARGET_USERNAME=$target_username
+BOTSQUAD_INVITE_SERVER_ID=$server_id
+EOF
+  export BOTSQUAD_INVITE_ROLE="$role"
+  export BOTSQUAD_INVITE_TARGET_USERNAME="$target_username"
+  export BOTSQUAD_INVITE_SERVER_ID="$server_id"
+  log "joining server $server_id as $target_username (role: $role)"
+}
+
+step_user_groups_join() {
+  # Two group memberships, gated by invite role:
+  #   - 'www' (BOTSQUAD_SHARED_GROUP, default "www") — EVERY invited user
+  #     needs this for read access to the per-user socket dir at
+  #     $BOTSQUAD_INSTALL_DIR/data/_sock. Per docs/multi-user-setup.md
+  #     step 1, this is unconditional for any non-coordinator user.
+  #   - 'bot-squad' (BOTSQUAD_ADMIN_GROUP, default "bot-squad") — admin
+  #     role only, per the T-0026 DoD: "Admin gets added to bot-squad
+  #     group; non-admin doesn't (usermod -aG bot-squad only for admin)."
+  #     If the group is absent on this host (older fresh-install layout
+  #     doesn't create it), we warn but DON'T fail — the invite-mode
+  #     install shouldn't refuse over a missing group it didn't create.
+  local user shared_group admin_group
+  user="$(id -un)"
+  shared_group="${BOTSQUAD_SHARED_GROUP:-www}"
+  admin_group="${BOTSQUAD_ADMIN_GROUP:-bot-squad}"
+  if ! getent group "$shared_group" >/dev/null 2>&1; then
+    die_struct user_groups_join \
+      "Group '$shared_group' does not exist on this host." \
+      "The existing bot-squad install creates this group on a fresh
+host. Either the host wasn't installed via the bot-squad installer, or
+the group was removed. Ask the existing install's admin to (re)create
+it: 'sudo groupadd $shared_group'."
+  fi
+  if id -nG "$user" | tr ' ' '\n' | grep -qxF "$shared_group"; then
+    log "user $user already in '$shared_group' group"
+  else
+    sudo usermod -aG "$shared_group" "$user" || die_struct user_groups_join \
+      "Could not add user $user to group '$shared_group'." \
+      "Run 'sudo usermod -aG $shared_group $user' manually to see the error."
+    warn "added $user to '$shared_group' group — log out and back in (or run
+'newgrp $shared_group') for the membership to take effect in this shell."
+  fi
+  if [[ "${BOTSQUAD_INVITE_ROLE:-}" = "admin" ]]; then
+    if ! getent group "$admin_group" >/dev/null 2>&1; then
+      warn "admin group '$admin_group' is absent on this host — skipping
+admin group membership. The install admin can create it later
+('sudo groupadd $admin_group && sudo usermod -aG $admin_group $user')."
+    elif id -nG "$user" | tr ' ' '\n' | grep -qxF "$admin_group"; then
+      log "user $user already in '$admin_group' group (admin)"
+    else
+      sudo usermod -aG "$admin_group" "$user" || die_struct user_groups_join \
+        "Could not add user $user to admin group '$admin_group'." \
+        "Run 'sudo usermod -aG $admin_group $user' manually."
+      warn "added $user to '$admin_group' (admin) — re-log for it to apply."
+    fi
+  else
+    log "non-admin invite — skipping '$admin_group' group membership"
+  fi
+  # loginctl enable-linger so the user-worker survives logout (per
+  # docs/multi-user-setup.md step 1). Idempotent.
+  if command -v loginctl >/dev/null 2>&1; then
+    if [[ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" != "yes" ]]; then
+      sudo loginctl enable-linger "$user" || warn "loginctl enable-linger $user failed; the user-worker won't survive logout"
+    else
+      log "linger already enabled for $user"
+    fi
+  fi
+}
+
+step_per_user_worker_enable() {
+  # Call the existing enable-per-user-worker.sh helper. Skipped if the
+  # system-wide unit isn't dropped yet — the user's coordinator must
+  # have run the fresh-install path first.
+  local helper="${BOTSQUAD_INSTALL_DIR}/scripts/install/enable-per-user-worker.sh"
+  if [[ ! -x "$helper" ]] && [[ ! -f "$helper" ]]; then
+    die_struct per_user_worker_enable \
+      "Expected helper $helper missing." \
+      "The install at $BOTSQUAD_INSTALL_DIR may be out of date or
+incomplete. Ask the existing install's admin to verify the bot-squad
+checkout includes scripts/install/enable-per-user-worker.sh."
+  fi
+  # Honor a test-override so the shell test can substitute a stub.
+  local cmd="${BOTSQUAD_PER_USER_ENABLE_CMD:-bash \"$helper\"}"
+  bash -c "$cmd" || die_struct per_user_worker_enable \
+    "Per-user worker enablement failed." \
+    "Re-run '$helper' manually to see the underlying error. Common
+causes: systemd-user not running for this account, or the system-wide
+unit /etc/systemd/user/bot-squad-user-worker.service hasn't been
+installed yet — ask the install admin to re-run the host installer."
+}
+
+step_print_join_attach() {
+  cat <<EOF
+
+============================================================
+You're joined to bot-squad as $(id -un) (${BOTSQUAD_INVITE_ROLE:-?}).
+------------------------------------------------------------
+Your per-user worker is running. From any ssh session on this
+host, you can now spawn sessions in the UI and they'll land in
+YOUR tmux server.
+
+UI:       ask the install admin for the bot-squad URL; sign in
+          with the credentials they minted for you.
+Worker:   systemctl --user status bot-squad-user-worker
+Install:  $BOTSQUAD_INSTALL_DIR  (shared with other users)
+State:    $STATE_FILE
+
+If this shell can't reach the bot-squad data dir, log out and
+back in — you were just added to the 'www' group and Unix
+group membership is fixed at session start.
+============================================================
+EOF
+}
+
 # ---- Step order -------------------------------------------------------------
-STEPS=(
+# Two chains, dispatched by the prefix of $BOTSQUAD_INSTALL_TOKEN:
+#   - INSTALL_STEPS: fresh install on a never-installed host. Owns the
+#     install dir, creates the www group, drops systemd units, runs
+#     docker compose up.
+#   - INVITE_STEPS  (T-0026): the host ALREADY runs bot-squad; an
+#     additional Linux user is joining via a per-user worker. NO group
+#     create, NO install-dir create, NO systemd UNIT install at
+#     install-level, NO docker compose up. The existing coordinator
+#     keeps the install; this script just provisions the invitee.
+INSTALL_STEPS=(
   detect_distro
   require_sudo
   proxy_url
@@ -1311,10 +1508,39 @@ STEPS=(
   spawn_operator
   print_attach
 )
+INVITE_STEPS=(
+  detect_distro
+  require_sudo
+  proxy_url
+  pkg_index_update
+  install_base_pkgs
+  install_tmux
+  install_nodejs
+  install_claude_code
+  mothership_join
+  user_groups_join
+  per_user_worker_enable
+  agent_teams_flag
+  print_join_attach
+)
+# STEPS is selected at runtime in main(). Default to INSTALL_STEPS so a
+# sourced-without-main test (smoke_engine.sh) sees the historical array.
+STEPS=("${INSTALL_STEPS[@]}")
 
 main() {
   ensure_state_dir
-  log "bot-squad installer starting (state file: $STATE_FILE)"
+  # Prefix-detect on the token to pick the chain. The exact prefix string
+  # matches install_tokens.py:INVITE_PREFIX. We do this BEFORE
+  # checkpoint resolution so the state file is consistent across reruns:
+  # a partial fresh-install state dir + a later invite-token rerun would
+  # otherwise silently skip half the steps.
+  if [[ "$BOTSQUAD_INSTALL_TOKEN" == bsq_invite_* ]]; then
+    STEPS=("${INVITE_STEPS[@]}")
+    log "bot-squad installer starting in INVITE mode (state file: $STATE_FILE)"
+  else
+    STEPS=("${INSTALL_STEPS[@]}")
+    log "bot-squad installer starting (state file: $STATE_FILE)"
+  fi
   for step in "${STEPS[@]}"; do
     run_checkpoint "$step"
   done

@@ -39,9 +39,11 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.install_tokens import (
     INSTALL_PREFIX,
+    INVITE_PREFIX,
     SERVER_PREFIX,
     hash_token,
     is_install_token,
+    is_invite_token,
     is_server_bearer,
 )
 from app.auth import verify_password
@@ -229,6 +231,71 @@ def create_server(
     }
 
 
+@router.post("/servers/{server_id}/invites")
+def create_invite(
+    request: Request,
+    server_id: str,
+    payload: dict,
+    user: dict = Depends(require_auth),
+) -> dict:
+    """Mint an invite token tied to an existing server + target Linux user.
+
+    T-0026 Chapter I §3.0 invite-join flow. The plaintext is returned exactly
+    once in this response body; only the SHA-256 lives in the registry.
+    Target user runs the same ``curl … | bash`` surface but with an invite
+    token in the URL — install.sh prefix-detects and runs the no-group,
+    no-compose, user-scoped STEPS chain.
+
+    Role is the install-time choice between admin (added to ``bot-squad``
+    group on join) and non-admin (no group membership). Cannot be changed
+    after the invite is minted; revocation is "let it expire" — single-use
+    + 24h TTL bounds the blast radius if the link leaks.
+    """
+    store = _store(request)
+    if store.get_server(server_id) is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    target_username = (payload.get("target_username") or "").strip()
+    role = (payload.get("role") or "").strip()
+    if not target_username:
+        raise HTTPException(status_code=400, detail="target_username is required")
+    if role not in ("admin", "non-admin"):
+        raise HTTPException(
+            status_code=400, detail="role must be 'admin' or 'non-admin'"
+        )
+    result = store.register_invite(
+        server_id=server_id,
+        target_username=target_username,
+        role=role,
+        created_by=user["username"],
+    )
+    # ``register_invite`` returns ``None`` only on a missing server, which we
+    # already filtered above — but keep the guard to surface a sane error if
+    # a future caller races a server delete.
+    if result is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    server, token = result
+    base = _mothership_base_url(request)
+    # The invite URL reuses the same /i/<token>/install.sh path — the same
+    # install.sh substitutes the token, prefix-detects at runtime, and runs
+    # the invite-mode STEPS chain instead of the fresh-install one.
+    install_url = f"{base}/i/{token}/install.sh"
+    # Pull the just-minted invite back out so we can return its expires_at
+    # (the only data the FE needs that isn't already in the request body).
+    minted = next(
+        (inv for inv in server.invites if inv["hash"] == hash_token(token)),
+        None,
+    )
+    return {
+        "server_id": server_id,
+        "invite_token": token,
+        "install_url": install_url,
+        "instructions_url": f"{base}/i/{token}/instructions.md",
+        "target_username": target_username,
+        "role": role,
+        "expires_at": minted["expires_at"] if minted else None,
+    }
+
+
 @router.get("/servers/{server_id}/checkpoints")
 async def checkpoints_stream(server_id: str, request: Request) -> StreamingResponse:
     """SSE: replay the persisted log, then forward live events.
@@ -351,6 +418,39 @@ def installer_connect(request: Request, payload: dict) -> dict:
     }
 
 
+@installer_router.post("/installer/join")
+def installer_join(request: Request, payload: dict) -> dict:
+    """Burn an invite token; return server_id + target user + role.
+
+    T-0026 invite-join handshake. Sibling of ``/installer/connect`` but the
+    server already exists — there's no new registry row, no install_state
+    transition, no server_bearer mint. The installer's invite-mode STEPS
+    chain calls this once to learn the target_username + role it must
+    enforce locally (admin → add to ``bot-squad`` group; non-admin → skip).
+
+    The invite is burned on success. 410 covers all the unhappy paths
+    (unknown / expired / already burned) so the installer's structured
+    "what + how" message keys off it verbatim — same recipe as the
+    install-token 410 from ``/connect``.
+    """
+    token = (payload.get("token") or "").strip()
+    # Reject the wrong token KIND with a precise 400 — keeps the
+    # install-token-vs-invite-token non-interchangeability invariant
+    # auditable without leaking which token a stale plaintext was. Any
+    # opaque non-invite string falls through to the same 400.
+    if not token or not is_invite_token(token):
+        raise HTTPException(status_code=400, detail="invite token required")
+    result = _store(request).consume_invite_token(token)
+    if result is None:
+        raise HTTPException(status_code=410, detail="invite token gone")
+    server, invite = result
+    return {
+        "server_id": server.id,
+        "target_username": invite["target_username"],
+        "role": invite["role"],
+    }
+
+
 @installer_router.post("/installer/checkpoint")
 def installer_checkpoint(
     request: Request,
@@ -378,10 +478,24 @@ def installer_checkpoint(
 
 
 def _validate_bundle_token(request: Request, token: str) -> None:
-    if not is_install_token(token):
-        raise HTTPException(status_code=410, detail="install token gone")
-    if _store(request).server_by_install_token(token) is None:
-        raise HTTPException(status_code=410, detail="install token gone")
+    """Accept either an install token (fresh install) OR an invite token
+    (T-0026 join-existing-install) for the no-auth bundle GETs. install.sh
+    detects the prefix at runtime and runs the appropriate STEPS chain.
+
+    Bundle GETs never burn — re-fetch is idempotent so installer reruns
+    after a failure can keep pulling the same script. The burn happens at
+    ``/installer/connect`` (install) or ``/installer/join`` (invite).
+    """
+    store = _store(request)
+    if is_install_token(token):
+        if store.server_by_install_token(token) is None:
+            raise HTTPException(status_code=410, detail="install token gone")
+        return
+    if is_invite_token(token):
+        if store.server_by_invite_token(token) is None:
+            raise HTTPException(status_code=410, detail="install token gone")
+        return
+    raise HTTPException(status_code=410, detail="install token gone")
 
 
 def _substitute_bundle(text: str, *, token: str, mothership_base: str) -> str:
@@ -426,7 +540,7 @@ def install_instructions(request: Request, token: str) -> PlainTextResponse:
 # Touch unused imports to silence linters — these are part of the
 # install-token contract surface and stay imported even if a future
 # refactor of this file stops using them directly.
-_ = (INSTALL_PREFIX, SERVER_PREFIX, hash_token)
+_ = (INSTALL_PREFIX, SERVER_PREFIX, INVITE_PREFIX, hash_token)
 
 
 # ---- per-server proxy (T-0023) ---------------------------------------------

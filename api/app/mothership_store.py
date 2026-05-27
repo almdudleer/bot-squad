@@ -46,12 +46,18 @@ from pathlib import Path
 from app.install_tokens import (
     hash_token,
     mint_install_token,
+    mint_invite_token,
     mint_server_bearer,
 )
 
 
 SCHEMA_VERSION = 1
 INSTALL_TOKEN_TTL_SECONDS = 24 * 3600
+# Invite tokens (T-0026) share the install-token shape but are per-user, not
+# per-server. Same 24h TTL — same blast radius if the link leaks; the user
+# who needs to use it is presumed reachable within that window. Single-use
+# (burned on /installer/join) regardless.
+INVITE_TOKEN_TTL_SECONDS = 24 * 3600
 
 
 def _utc_now_iso() -> str:
@@ -89,11 +95,24 @@ class AttachedServer:
     # the GET handler can fan it back out as-is without a second migration
     # if the consumer ever adds a field.
     release: dict | None = None
+    # T-0026: outstanding invite tokens for additional Linux users to join
+    # this server. Each invite is single-use (burned on /installer/join) and
+    # TTL'd. Plaintexts NEVER land here — only SHA-256 hashes.
+    # Shape: list of dicts {hash, expires_at, target_username, role,
+    # created_by, created_at}; role ∈ {"admin","non-admin"}.
+    invites: list[dict] = field(default_factory=list)
 
     def to_public(self) -> dict:
         d = asdict(self)
         d.pop("install_token_hash", None)
         d.pop("server_bearer_hash", None)
+        # Invite hashes are credentials too — strip them from the public
+        # projection. We surface only the non-secret fields so the wizard
+        # can render a "this server's outstanding invites" list.
+        d["invites"] = [
+            {k: v for k, v in inv.items() if k != "hash"}
+            for inv in d.get("invites", [])
+        ]
         return d
 
 
@@ -328,6 +347,102 @@ class MothershipStore:
                 # documented as a v1 limitation in mothership-seam.md.
                 self.store_server_bearer(updated.id, bearer)
                 return updated, bearer
+        return None
+
+    # ---- invites (T-0026) ----------------------------------------------------
+    # Invites attach a TTL'd, single-use token to a (server, target_username,
+    # role) triple. The installer's invite-mode branch trades the plaintext
+    # at /installer/join for the target_username + role it needs to drive the
+    # user-scoped install. Stored under the server's ``invites`` list (not as
+    # a parallel registry) so a server delete sweeps its invites with it.
+
+    def register_invite(
+        self,
+        *,
+        server_id: str,
+        target_username: str,
+        role: str,
+        created_by: str,
+        ttl_seconds: int = INVITE_TOKEN_TTL_SECONDS,
+    ) -> tuple[AttachedServer, str] | None:
+        """Mint a fresh invite token tied to ``server_id``.
+
+        Returns ``(updated_entry, plaintext_invite_token)`` on success or
+        ``None`` if no such server. The plaintext is the ONLY copy that
+        ever exits the API process — only its SHA-256 lands on disk.
+        """
+        if role not in ("admin", "non-admin"):
+            raise ValueError(f"invite role must be 'admin' or 'non-admin', got {role!r}")
+        token = mint_invite_token()
+        token_hash = hash_token(token)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+        invite = {
+            "hash": token_hash,
+            "expires_at": expires.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "target_username": target_username,
+            "role": role,
+            "created_by": created_by,
+            "created_at": _utc_now_iso(),
+        }
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id == server_id:
+                    servers[i] = replace(s, invites=[*s.invites, invite])
+                    self.write(servers)
+                    return servers[i], token
+        return None
+
+    def server_by_invite_token(
+        self, token: str
+    ) -> tuple[AttachedServer, dict] | None:
+        """Hash + TTL check on an invite token, no burn.
+
+        Returns ``(server, invite_dict)`` for an unburned, unexpired invite or
+        ``None`` for unknown/expired/burned tokens (uniform 410 at the route
+        layer — keeps the installer's "what + how" recipe identical to the
+        install-token 410 case).
+        """
+        h = hash_token(token)
+        now = datetime.now(timezone.utc)
+        for s in self.list_servers():
+            for inv in s.invites:
+                if inv.get("hash") != h:
+                    continue
+                expires_at = inv.get("expires_at")
+                if not expires_at:
+                    return None
+                if now > _parse_utc(expires_at):
+                    return None
+                return s, inv
+        return None
+
+    def consume_invite_token(self, token: str) -> tuple[AttachedServer, dict] | None:
+        """Validate + burn an invite token.
+
+        Returns ``(server, burned_invite_dict)`` on success or ``None`` if the
+        token is unknown, expired, or already burned (all map to 410 Gone at
+        the HTTP layer, matching the install-token contract).
+        """
+        h = hash_token(token)
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                for j, inv in enumerate(s.invites):
+                    if inv.get("hash") != h:
+                        continue
+                    expires_at = inv.get("expires_at")
+                    if not expires_at:
+                        return None
+                    if now > _parse_utc(expires_at):
+                        return None
+                    burned = {**inv, "burned_at": _utc_now_iso()}
+                    new_invites = [*s.invites[:j], *s.invites[j + 1 :]]
+                    servers[i] = replace(s, invites=new_invites)
+                    self.write(servers)
+                    return servers[i], burned
         return None
 
     def set_server_bearer(self, server_id: str, bearer_hash: str | None) -> None:

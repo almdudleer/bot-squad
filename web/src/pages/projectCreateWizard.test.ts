@@ -81,13 +81,32 @@ describe("validateWizard", () => {
     expect(errs.some((e) => e.includes("master repo path must be an absolute path"))).toBe(true);
   });
 
-  test("mode=attach_destructive always errors (not implemented)", () => {
+  test("mode=attach_destructive requires mother + existing_path + confirm flag (T-0122)", () => {
     const s = stateForMode("attach_destructive");
+    // Empty: missing mother + existing_path + confirm
+    let errs = validateWizard(s);
+    expect(errs).toContain("mother dir required");
+    expect(errs).toContain("existing repo path required");
+    expect(errs.some((e) => e.includes("confirm the destructive move"))).toBe(true);
+
     s.mother_dir = "/m";
     s.existing_path = "/e";
+    // Still missing the confirm checkbox.
+    errs = validateWizard(s);
+    expect(errs.some((e) => e.includes("confirm the destructive move"))).toBe(true);
+
+    s.confirm_destructive_move = true;
+    expect(validateWizard(s)).toEqual([]);
+  });
+
+  test("mode=attach_destructive: paths must be absolute", () => {
+    const s = stateForMode("attach_destructive");
+    s.mother_dir = "relative";
+    s.existing_path = "also-relative";
     s.confirm_destructive_move = true;
     const errs = validateWizard(s);
-    expect(errs.some((e) => e.includes("not implemented"))).toBe(true);
+    expect(errs.some((e) => e.includes("mother dir must be an absolute path"))).toBe(true);
+    expect(errs.some((e) => e.includes("existing repo path must be an absolute path"))).toBe(true);
   });
 });
 
@@ -179,10 +198,8 @@ describe("modeOptions", () => {
       "attach_destructive",
     ]);
     expect(opts.find((o) => o.key === "paths_as_they_are")?.recommended).toBe(true);
-    // attach_destructive disabled with a reason — UI renders it greyed
-    // out so the user can see the option exists but is not available.
+    // T-0122 shipped Mode 2 — attach_destructive is no longer disabled.
     const destr = opts.find((o) => o.key === "attach_destructive");
-    expect(destr?.disabled).toBe(true);
-    expect(destr?.disabled_reason).toMatch(/follow-up|not yet/i);
+    expect(destr?.disabled).toBeFalsy();
   });
 });

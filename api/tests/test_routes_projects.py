@@ -722,28 +722,149 @@ def test_create_project_unknown_mode_400(
     assert "unknown mode" in r.json()["detail"]
 
 
-def test_create_project_destructive_mode_501(
+def test_create_project_attach_destructive_round_trip(
     tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
 ):
-    """Mode 2 is peeled to a follow-up; until it lands the API must
-    answer 501 so the FE can render a 'come back later' state instead
-    of silently falling through to a minimal-create."""
+    """T-0122: happy path with confirm flag set → 201, the existing repo
+    is renamed under <mother>/dev, master is freshly cloned from it,
+    ops symlinks on both clones, registry picks up repo_master/workspace."""
+    elsewhere = tmp_bot_squad / "elsewhere"
+    existing = elsewhere / "myproj-src"
+    _seed_git_repo(existing)
+    mother = tmp_bot_squad / "home" / "myproj"
+
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         r = client.post(
             "/api/projects",
             json={
-                "slug": "dst",
-                "display_name": "Dst",
+                "slug": "myproj",
+                "display_name": "My Proj",
                 "mode": "attach_destructive",
-                "mother_dir": "/tmp/dst",
-                "existing_path": "/tmp/dst-src",
+                "mother_dir": str(mother),
+                "existing_path": str(existing),
                 "existing_becomes": "dev",
                 "confirm_destructive_move": True,
             },
         )
-    assert r.status_code == 501
-    assert "not implemented" in r.json()["detail"]
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["slug"] == "myproj"
+    assert body["scaffold"]["ops_linked"] == [
+        str(mother / "dev" / "ops"),
+        str(mother / "master" / "ops"),
+    ]
+
+    # Destructive move actually happened.
+    assert not existing.exists()
+    assert (mother / "dev" / ".git").exists()
+    assert (mother / "master" / ".git").exists()
+
+    cfg_raw = tomllib.loads((mother / ".bot-squad.toml").read_text())
+    assert cfg_raw["repo_path"] == str(mother / "dev")
+    assert cfg_raw["repo_master"] == str(mother / "master")
+
+    pt = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert f'repo_path = "{mother / "dev"}"' in pt
+    assert f'repo_master = "{mother / "master"}"' in pt
+
+
+def test_create_project_attach_destructive_existing_becomes_master(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    """Symmetric branch: existing_becomes=master cuts a fresh dev."""
+    existing = tmp_bot_squad / "elsewhere" / "myproj-src"
+    _seed_git_repo(existing)
+    mother = tmp_bot_squad / "home" / "myproj2"
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "myproj2",
+                "display_name": "My Proj 2",
+                "mode": "attach_destructive",
+                "mother_dir": str(mother),
+                "existing_path": str(existing),
+                "existing_becomes": "master",
+                "confirm_destructive_move": True,
+            },
+        )
+    assert r.status_code == 201, r.text
+    assert not existing.exists()
+    assert (mother / "master" / ".git").exists()
+    assert (mother / "dev" / ".git").exists()
+    # dev was cloned from master → remote points at the now-mother/master.
+    import subprocess as _sp
+    remotes = _sp.run(
+        ["git", "-C", str(mother / "dev"), "remote", "-v"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(mother / "master") in remotes
+
+
+def test_create_project_attach_destructive_missing_confirm_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    """Without confirm_destructive_move=true the API must refuse with a
+    400 whose detail carries the literal rollback the caller would run if
+    they mis-fired — and the existing repo must be untouched."""
+    existing = tmp_bot_squad / "elsewhere" / "miss-src"
+    _seed_git_repo(existing)
+    mother = tmp_bot_squad / "home" / "miss"
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "miss",
+                "display_name": "Miss",
+                "mode": "attach_destructive",
+                "mother_dir": str(mother),
+                "existing_path": str(existing),
+                "existing_becomes": "dev",
+                # confirm_destructive_move omitted on purpose
+            },
+        )
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "confirm_destructive_move" in detail
+    # Rollback message echoes the literal mv command.
+    assert f"mv {mother / 'dev'} {existing}" in detail
+    # Nothing on disk should have moved.
+    assert existing.is_dir()
+    assert not mother.exists()
+    # And projects.toml did NOT pick up a phantom entry.
+    pt = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert "[projects.miss]" not in pt
+
+
+def test_create_project_attach_destructive_bad_existing_becomes_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    existing = tmp_bot_squad / "elsewhere" / "bad-src"
+    _seed_git_repo(existing)
+    mother = tmp_bot_squad / "home" / "bad"
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "bad",
+                "display_name": "Bad",
+                "mode": "attach_destructive",
+                "mother_dir": str(mother),
+                "existing_path": str(existing),
+                "existing_becomes": "trunk",
+                "confirm_destructive_move": True,
+            },
+        )
+    assert r.status_code == 400
+    assert "existing_becomes" in r.json()["detail"]
+    assert existing.is_dir()
 
 
 def test_create_project_paths_as_they_are_missing_field_400(

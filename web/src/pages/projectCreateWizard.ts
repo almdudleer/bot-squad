@@ -23,7 +23,7 @@ export interface ProjectCreateState {
   repo_path: string;
   repo_master: string;
 
-  // mode=attach_destructive (UI gated; backend 501 today)
+  // mode=attach_destructive (T-0122)
   existing_path: string;
   existing_becomes: "dev" | "master";
   confirm_destructive_move: boolean;
@@ -69,13 +69,6 @@ export function validateWizard(state: ProjectCreateState): string[] {
     return errs;
   }
 
-  if (state.mode === "attach_destructive") {
-    errs.push(
-      "destructive move is not implemented yet — see the T-0051 follow-up",
-    );
-    return errs;
-  }
-
   if (!state.mother_dir.trim()) errs.push("mother dir required");
   else if (!state.mother_dir.trim().startsWith("/"))
     errs.push("mother dir must be an absolute path");
@@ -87,6 +80,16 @@ export function validateWizard(state: ProjectCreateState): string[] {
     if (!state.repo_master.trim()) errs.push("master repo path required");
     else if (!state.repo_master.trim().startsWith("/"))
       errs.push("master repo path must be an absolute path");
+  } else if (state.mode === "attach_destructive") {
+    if (!state.existing_path.trim()) errs.push("existing repo path required");
+    else if (!state.existing_path.trim().startsWith("/"))
+      errs.push("existing repo path must be an absolute path");
+    // T-0122: the confirmation checkbox is the only thing standing
+    // between the user and an os.rename of their working repo, so the
+    // validator enforces it too — defence in depth alongside the FE
+    // Create-button gate.
+    if (!state.confirm_destructive_move)
+      errs.push("you must confirm the destructive move before creating");
   }
   // new_from_scratch: git_remote is optional (blank = git init locally).
 
@@ -150,9 +153,7 @@ export function modeOptions(): ModeOption[] {
     {
       key: "attach_destructive",
       label: "Attach existing, move into structure",
-      hint: "Rename your existing repo into <mother>/dev or <mother>/master. Destructive — peeled to follow-up.",
-      disabled: true,
-      disabled_reason: "Not yet implemented (T-0051 follow-up).",
+      hint: "Rename your existing repo into <mother>/dev or <mother>/master. Destructive — atomic os.rename, requires explicit confirmation.",
     },
   ];
 }

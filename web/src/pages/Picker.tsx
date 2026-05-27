@@ -308,7 +308,12 @@ export function Picker() {
                 type="button"
                 className="btn btn-primary"
                 onClick={submitCreate}
-                disabled={createSaving || (creating?.mode === "attach_destructive")}
+                disabled={
+                  createSaving ||
+                  (creating?.mode === "attach_destructive" &&
+                    !creating?.confirm_destructive_move)
+                }
+                data-testid="project-create-submit"
               >
                 {createSaving ? "Creating…" : "Create"}
               </button>
@@ -533,12 +538,92 @@ export function Picker() {
         )}
 
         {creating?.mode === "attach_destructive" && (
-          <div className="alert alert-warning" style={{ fontSize: "0.78rem" }}>
-            The destructive-move flow is not implemented yet. It will rename
-            your existing repo into the mother dir; see the T-0051 follow-up
-            ticket. For now use <strong>paths-as-they-are</strong> to attach
-            without moving the repo.
-          </div>
+          <>
+            <div className="mb-3">
+              <label className="form-label">Mother dir *</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.mother_dir}
+                onChange={(e) => setCreating({ ...creating, mother_dir: e.target.value })}
+                placeholder={`/home/<user>/${creating.slug || "<slug>"}`}
+              />
+            </div>
+            <div className="mb-3">
+              <label className="form-label">Existing repo path *</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.existing_path}
+                onChange={(e) => setCreating({ ...creating, existing_path: e.target.value })}
+                placeholder="/path/to/your/existing/repo"
+              />
+            </div>
+            <div className="mb-3">
+              <label className="form-label">Existing repo becomes *</label>
+              {(["dev", "master"] as const).map((side) => {
+                const id = `proj-destr-becomes-${side}`;
+                return (
+                  <div className="form-check" key={side}>
+                    <input
+                      className="form-check-input"
+                      type="radio"
+                      id={id}
+                      name="proj-destr-becomes"
+                      checked={creating.existing_becomes === side}
+                      onChange={() =>
+                        setCreating({ ...creating, existing_becomes: side })
+                      }
+                    />
+                    <label className="form-check-label" htmlFor={id}>
+                      <code>{side}</code>{" "}
+                      <span className="text-muted" style={{ fontSize: "0.72rem" }}>
+                        — your repo becomes <code>{side}</code>, the other side
+                        is freshly cloned from it
+                      </span>
+                    </label>
+                  </div>
+                );
+              })}
+            </div>
+            <div
+              className="alert alert-warning"
+              style={{ fontSize: "0.82rem" }}
+              data-testid="project-create-destructive-confirm"
+            >
+              <div style={{ marginBottom: "0.5rem" }}>
+                <strong>DESTRUCTIVE:</strong> this will rename your repo from{" "}
+                <code>{creating.existing_path || "<existing>"}</code> to{" "}
+                <code>
+                  {(creating.mother_dir || "<mother>") + "/" + creating.existing_becomes}
+                </code>
+                . Rollback:{" "}
+                <code>
+                  mv{" "}
+                  {(creating.mother_dir || "<mother>") + "/" + creating.existing_becomes}{" "}
+                  {creating.existing_path || "<existing>"}
+                </code>
+              </div>
+              <div className="form-check">
+                <input
+                  className="form-check-input"
+                  type="checkbox"
+                  id="proj-destr-confirm"
+                  checked={creating.confirm_destructive_move}
+                  onChange={(e) =>
+                    setCreating({
+                      ...creating,
+                      confirm_destructive_move: e.target.checked,
+                    })
+                  }
+                  data-testid="project-create-destructive-checkbox"
+                />
+                <label className="form-check-label" htmlFor="proj-destr-confirm">
+                  I understand, proceed
+                </label>
+              </div>
+            </div>
+          </>
         )}
         </>
         )}

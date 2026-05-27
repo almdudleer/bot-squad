@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.config import ApiConfig
 from app.project_scaffold import (
     ScaffoldError,
+    scaffold_attach_destructive,
     scaffold_new_from_scratch,
     scaffold_paths_as_they_are,
 )
@@ -132,9 +133,6 @@ def _read_projects_toml(config_dir: Path) -> dict[str, dict]:
 _VALID_MODES = (
     "new_from_scratch",
     "paths_as_they_are",
-    # T-0051 ships modes 1 + 3. Mode 2 (attach_destructive) is peeled to
-    # a follow-up ticket; surface a clear 501 if a caller asks for it now
-    # so the FE knows the wizard's mode-2 branch is server-side gated.
     "attach_destructive",
 )
 
@@ -235,17 +233,46 @@ async def create_project(
         # caller takes responsibility for the on-disk layout.
         pass
     elif mode == "attach_destructive":
-        # Mode 2 — peeled to follow-up ticket. The FE should disable the
-        # mode-2 sub-form on the wizard; this server-side 501 is the
-        # defence in depth for anyone calling the API directly.
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "mode 'attach_destructive' is not implemented yet; see "
-                "the T-0051 follow-up ticket for the destructive-rename "
-                "flow. Use 'paths_as_they_are' to attach in place."
-            ),
-        )
+        mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
+        existing = _require_abs_path("existing_path", (payload.get("existing_path") or "").strip())
+        existing_becomes = (payload.get("existing_becomes") or "").strip()
+        if existing_becomes not in ("dev", "master"):
+            raise HTTPException(
+                status_code=400,
+                detail="existing_becomes must be 'dev' or 'master'",
+            )
+        # T-0122: the destructive move is the only operation in the
+        # wizard that mutates the user's existing repo. The confirm flag
+        # is a defence-in-depth gate against API callers that didn't go
+        # through the FE checkbox — the 400 carries the literal rollback
+        # so a mis-fire is recoverable from the error response alone.
+        if not payload.get("confirm_destructive_move"):
+            renamed = mother_dir / existing_becomes
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "confirm_destructive_move must be true to proceed with "
+                    f"the destructive rename of {existing} into {renamed}. "
+                    f"Rollback if you mis-fire: mv {renamed} {existing}"
+                ),
+            )
+        try:
+            result = scaffold_attach_destructive(
+                slug=slug,
+                mother_dir=mother_dir,
+                existing=existing,
+                existing_becomes=existing_becomes,
+                install_data_dir=cfg.data_dir,
+            )
+        except ScaffoldError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        repo_path_str = str(result.repo_path)
+        repo_master_str = str(result.repo_master)
+        repo_workspace_str = str(result.repo_workspace)
+        scaffold_summary = {
+            "ops_linked": [str(p) for p in result.ops_linked],
+            "ops_skipped": [str(p) for p in result.ops_skipped],
+        }
     elif mode == "paths_as_they_are":
         mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
         repo_path = _require_abs_path("repo_path", repo_path_str)

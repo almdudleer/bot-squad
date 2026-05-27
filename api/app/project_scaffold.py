@@ -18,6 +18,7 @@ themselves only if `<clone>/ops` does not already exist.
 """
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
@@ -237,6 +238,101 @@ def scaffold_new_from_scratch(
         toml_text = render_per_project_toml(slug, dev, master, mother_dir)
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)
     except Exception:
+        shutil.rmtree(mother_dir, ignore_errors=True)
+        raise
+
+    return ScaffoldResult(
+        repo_path=dev,
+        repo_master=master,
+        repo_workspace=mother_dir,
+        ops_linked=tuple(ops_linked),
+        ops_skipped=tuple(ops_skipped),
+    )
+
+
+def scaffold_attach_destructive(
+    *,
+    slug: str,
+    mother_dir: Path,
+    existing: Path,
+    existing_becomes: str,
+    install_data_dir: Path,
+) -> ScaffoldResult:
+    """Mode 2 — destructive attach-move (T-0122).
+
+    Pre-conditions: mother_dir does NOT exist; existing IS a directory;
+    existing_becomes is "dev" or "master".
+
+    Steps:
+      1. Create mother_dir.
+      2. ``os.rename(existing, mother_dir/<existing_becomes>)`` — atomic.
+         Cross-filesystem moves (EXDEV) are refused with a clear pointer at
+         Mode 3 (paths_as_they_are) as the alternative, rather than falling
+         back to copy+delete (Mode 2 only makes sense as a true atomic move).
+      3. ``git clone <renamed> <mother>/<other>`` for whichever side wasn't
+         the renamed one — same wire shape as Mode 1's master-from-dev cut.
+      4. Plant ops symlinks on both clones.
+      5. Write ``<mother>/.bot-squad.toml``.
+
+    On failure after the rename we attempt a best-effort ``os.rename`` back
+    to ``existing`` so the user's repo isn't stranded inside a half-built
+    mother dir. The whole mother dir is then ``rmtree``d so a retry starts
+    clean (same boundary contract as Mode 1).
+    """
+    if existing_becomes not in ("dev", "master"):
+        raise ScaffoldError(
+            f"existing_becomes must be 'dev' or 'master'; got {existing_becomes!r}"
+        )
+    if mother_dir.exists():
+        raise ScaffoldError(f"mother dir already exists: {mother_dir}")
+    if not existing.exists():
+        raise ScaffoldError(f"existing path does not exist: {existing}")
+    if not existing.is_dir():
+        raise ScaffoldError(f"existing path is not a directory: {existing}")
+
+    renamed = mother_dir / existing_becomes
+    other_name = "master" if existing_becomes == "dev" else "dev"
+
+    mother_dir.mkdir(parents=True)
+    rename_done = False
+    try:
+        try:
+            os.rename(existing, renamed)
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.EXDEV:
+                raise ScaffoldError(
+                    f"cannot move {existing} to {renamed}: cross-filesystem "
+                    "rename is not supported by Mode 2 (atomic move requires "
+                    "same device). Use Mode 3 ('paths_as_they_are') to attach "
+                    "the existing clone in place instead."
+                ) from e
+            raise ScaffoldError(
+                f"could not rename {existing} -> {renamed}: {e}"
+            ) from e
+        rename_done = True
+
+        _run_git(mother_dir, "clone", "--quiet", str(renamed), other_name)
+
+        dev = mother_dir / "dev"
+        master = mother_dir / "master"
+        ops_linked: list[Path] = []
+        ops_skipped: list[Path] = []
+        for clone in (dev, master):
+            linked, _note = _link_ops(clone, install_data_dir, slug)
+            (ops_linked if linked else ops_skipped).append(clone / "ops")
+
+        toml_text = render_per_project_toml(slug, dev, master, mother_dir)
+        _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)
+    except Exception:
+        if rename_done:
+            try:
+                if renamed.exists() and not existing.exists():
+                    os.rename(renamed, existing)
+            except OSError:
+                # Best-effort: if even the rollback fails the user can
+                # still recover by hand from the rollback message the API
+                # echoed before the destructive move was attempted.
+                pass
         shutil.rmtree(mother_dir, ignore_errors=True)
         raise
 

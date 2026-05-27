@@ -196,17 +196,65 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 // Centralization-layer surface
 // ---------------------------------------------------------------------------
 
+// T-0133: in-flight dedup + short-TTL cache for `/api/m/servers`. The
+// detail page mounts multiple components that each fetch the registry
+// (ServerPicker, ServerProgress, GlobalBusyIndicator's mothership
+// fan-out, AllProjects); without coalescing, a single page-load fires
+// 3–4 identical requests in the first second and `networkidle` never
+// settles. The cache is tiny (the public registry projection is small)
+// and the TTL is short enough that an admin who just added a server in
+// another tab sees it on the next mount. `createServer` and the per-
+// page reload helpers invalidate the cache explicitly so a UI-driven
+// mutation is reflected immediately. Module-level state is fine —
+// React's component tree is single-rooted per build.
+const SERVERS_CACHE_TTL_MS = 5_000;
+let _serversCache: { at: number; data: AttachedServer[] } | null = null;
+let _serversInFlight: Promise<AttachedServer[]> | null = null;
+
+export function invalidateServersCache(): void {
+  _serversCache = null;
+  _serversInFlight = null;
+}
+
+async function listServersDeduped(): Promise<AttachedServer[]> {
+  const now = Date.now();
+  if (_serversCache && now - _serversCache.at < SERVERS_CACHE_TTL_MS) {
+    return _serversCache.data;
+  }
+  if (_serversInFlight) return _serversInFlight;
+  _serversInFlight = (async () => {
+    try {
+      const data = await call<AttachedServer[]>("/api/m/servers");
+      _serversCache = { at: Date.now(), data };
+      return data;
+    } finally {
+      _serversInFlight = null;
+    }
+  })();
+  return _serversInFlight;
+}
+
 export const mothershipApi = {
-  listServers: () => call<AttachedServer[]>("/api/m/servers"),
+  /** Cached + in-flight-deduped registry list. Multiple components on
+   *  the same page see a single underlying fetch; the TTL is short
+   *  (5s) so an external mutation is picked up on the next mount.
+   *  `createServer` and `invalidateServersCache` clear the cache
+   *  explicitly when the FE knows the registry changed. */
+  listServers: () => listServersDeduped(),
 
   /** Mint a pending server entry + an install_token (24h TTL). The
    *  install_token plaintext is returned ONLY here — subsequent
-   *  `listServers()` calls strip token hashes from the public projection. */
-  createServer: (display_name: string, base_url: string) =>
-    call<NewServer>("/api/m/servers", {
+   *  `listServers()` calls strip token hashes from the public projection.
+   *  T-0133: invalidate the cache so the AllProjects / ServerPicker
+   *  reload after a mint sees the new row immediately. */
+  createServer: async (display_name: string, base_url: string) => {
+    const out = await call<NewServer>("/api/m/servers", {
       method: "POST",
       body: JSON.stringify({ display_name, base_url }),
-    }),
+    });
+    invalidateServersCache();
+    return out;
+  },
 
   /** T-0125: mint an invite token for an additional Linux user to join an
    *  existing install. The plaintext `invite_token` is returned ONCE in

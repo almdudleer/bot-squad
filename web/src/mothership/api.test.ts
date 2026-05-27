@@ -7,7 +7,13 @@
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { apiFor, fanOut, mothershipApi, ProxyError } from "./api";
+import {
+  apiFor,
+  fanOut,
+  invalidateServersCache,
+  mothershipApi,
+  ProxyError,
+} from "./api";
 
 type FetchSpy = ReturnType<typeof vi.fn>;
 
@@ -31,6 +37,7 @@ function mockFetchSequence(responses: Array<Partial<Response> | Error>): FetchSp
 
 describe("mothershipApi.listServers", () => {
   beforeEach(() => {
+    invalidateServersCache();
     globalThis.fetch = mockFetchSequence([
       {
         json: async () => [
@@ -39,7 +46,10 @@ describe("mothershipApi.listServers", () => {
       },
     ]) as unknown as typeof fetch;
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    invalidateServersCache();
+  });
 
   test("GETs /api/m/servers and returns the array", async () => {
     const out = await mothershipApi.listServers();
@@ -50,6 +60,103 @@ describe("mothershipApi.listServers", () => {
       "/api/m/servers",
       expect.objectContaining({ credentials: "include" }),
     );
+  });
+});
+
+// T-0133: server-detail mounts fire multiple concurrent listServers()
+// across siblings (ServerPicker, ServerProgress, mothership fan-out).
+// Without dedup, networkidle never settles. The shared cache must
+// coalesce concurrent calls AND serve a short-TTL cached copy so a
+// quick re-mount during navigation doesn't re-fetch.
+describe("mothershipApi.listServers — T-0133 dedup + cache", () => {
+  beforeEach(() => invalidateServersCache());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    invalidateServersCache();
+  });
+
+  test("concurrent callers share a single fetch", async () => {
+    const spy = mockFetchSequence([
+      {
+        json: async () => [
+          { id: "srv_a", display_name: "A", install_state: "ready" },
+        ],
+      },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    // 4 concurrent callers (the worst-case server-detail page-load
+    // shape). After awaiting all, fetch must have run exactly once.
+    const [a, b, c, d] = await Promise.all([
+      mothershipApi.listServers(),
+      mothershipApi.listServers(),
+      mothershipApi.listServers(),
+      mothershipApi.listServers(),
+    ]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(a).toBe(b);
+    expect(b).toBe(c);
+    expect(c).toBe(d);
+  });
+
+  test("subsequent callers within TTL hit the cache, no new fetch", async () => {
+    const spy = mockFetchSequence([
+      { json: async () => [{ id: "srv_a", install_state: "ready" }] },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await mothershipApi.listServers();
+    // Second call: same data, fetch NOT re-invoked.
+    await mothershipApi.listServers();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  test("createServer invalidates the cache so the next list re-fetches", async () => {
+    // First fetch populates the cache.
+    const fetchSpy = mockFetchSequence([
+      { json: async () => [{ id: "srv_a", install_state: "ready" }] },
+      // POST /api/m/servers
+      {
+        json: async () => ({
+          id: "srv_b",
+          install_token: "tok",
+          install_url: "u",
+          instructions_url: "i",
+          expires_at: null,
+        }),
+      },
+      // listServers after invalidation: returns both rows.
+      {
+        json: async () => [
+          { id: "srv_a", install_state: "ready" },
+          { id: "srv_b", install_state: "pending" },
+        ],
+      },
+    ]);
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const before = await mothershipApi.listServers();
+    expect(before).toHaveLength(1);
+
+    await mothershipApi.createServer("B", "https://b.example.com");
+
+    const after = await mothershipApi.listServers();
+    expect(after).toHaveLength(2);
+    // Three fetches total: initial list, createServer POST, re-list.
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  test("invalidateServersCache forces the next list to re-fetch", async () => {
+    const spy = mockFetchSequence([
+      { json: async () => [{ id: "srv_a", install_state: "ready" }] },
+      { json: async () => [{ id: "srv_a", install_state: "ready" }] },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await mothershipApi.listServers();
+    invalidateServersCache();
+    await mothershipApi.listServers();
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -28,16 +28,38 @@ from app.install_tokens import (
 from app.mothership_store import MothershipStore
 
 
+def _seed_install_bundle(tmp_bot_squad: Path) -> Path:
+    """Write a minimal install bundle inside ``tmp_bot_squad`` carrying the
+    four placeholder lines the substitution + assertions rely on. Self-
+    contained so tests don't depend on the repo layout being reachable from
+    ``__file__`` (the docker test runner mounts only ``api/`` at ``/app``,
+    so the real ``scripts/install`` isn't visible inside the container).
+    """
+    bundle = tmp_bot_squad / "install-bundle"
+    bundle.mkdir(exist_ok=True)
+    (bundle / "install.sh").write_text(
+        '#!/usr/bin/env bash\n'
+        'BOTSQUAD_INSTALL_TOKEN="${BOTSQUAD_INSTALL_TOKEN:-__INSTALL_TOKEN__}"\n'
+        'BOTSQUAD_MOTHERSHIP_URL="${BOTSQUAD_MOTHERSHIP_URL:-__MOTHERSHIP_URL__}"\n'
+        'BOTSQUAD_CLONE_URL="${BOTSQUAD_CLONE_URL:-__CLONE_URL__}"\n'
+        'BOTSQUAD_REPO_REF="${BOTSQUAD_REPO_REF:-__REPO_REF__}"\n',
+        encoding="utf-8",
+    )
+    (bundle / "bootstrap-claude-instructions.md").write_text(
+        '- Install token: `__INSTALL_TOKEN__`\n'
+        '- Mothership URL: `__MOTHERSHIP_URL__`\n',
+        encoding="utf-8",
+    )
+    return bundle
+
+
 def _client(tmp_bot_squad: Path, monkeypatch, *, mothership: bool):
     monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
     monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
     monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("COOKIE_SECURE", "0")
-    # Bundle dir: point at the repo's scripts/install so the substituted
-    # install.sh + instructions.md actually contain the placeholder lines.
-    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
-    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(_seed_install_bundle(tmp_bot_squad)))
     monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://mothership.test")
     monkeypatch.setenv("BOTSQUAD_CLONE_URL", "https://example.com/bot-squad.git")
     monkeypatch.setenv("BOTSQUAD_REPO_REF", "master")
@@ -135,8 +157,7 @@ def test_self_register_migrates_on_host_rename(tmp_bot_squad: Path, monkeypatch)
     monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("COOKIE_SECURE", "0")
-    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
-    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(_seed_install_bundle(tmp_bot_squad)))
     monkeypatch.setenv("BOTSQUAD_CLONE_URL", "https://example.com/bot-squad.git")
     monkeypatch.setenv("BOTSQUAD_REPO_REF", "master")
     monkeypatch.setenv("WEB_DIST", str(tmp_bot_squad / "nonexistent-web-dist"))
@@ -195,8 +216,7 @@ def test_self_register_falls_back_when_base_url_unset(tmp_bot_squad: Path, monke
     monkeypatch.setenv("WEB_DIST", str(tmp_bot_squad / "nonexistent-web-dist"))
     monkeypatch.setenv("MOTHERSHIP", "1")
     monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
-    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
-    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(_seed_install_bundle(tmp_bot_squad)))
     from app.main import build_app
 
     build_app()
@@ -532,8 +552,7 @@ async def test_sse_replays_persisted_checkpoints(tmp_bot_squad: Path, monkeypatc
     monkeypatch.setenv("COOKIE_SECURE", "0")
     monkeypatch.setenv("WEB_DIST", str(tmp_bot_squad / "nonexistent-web-dist"))
     monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://mothership.test")
-    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
-    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(_seed_install_bundle(tmp_bot_squad)))
     monkeypatch.setenv("MOTHERSHIP", "1")
 
     app = build_app()
@@ -613,8 +632,7 @@ async def test_sse_forwards_live_events_after_replay(tmp_bot_squad: Path, monkey
     monkeypatch.setenv("COOKIE_SECURE", "0")
     monkeypatch.setenv("WEB_DIST", str(tmp_bot_squad / "nonexistent-web-dist"))
     monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://mothership.test")
-    repo_bundle = Path(__file__).resolve().parents[2] / "scripts" / "install"
-    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(repo_bundle))
+    monkeypatch.setenv("INSTALL_BUNDLE_DIR", str(_seed_install_bundle(tmp_bot_squad)))
     monkeypatch.setenv("MOTHERSHIP", "1")
 
     app = build_app()

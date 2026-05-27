@@ -682,6 +682,103 @@ def test_derive_activity_paused_overrides_activity():
     assert _derive_activity("paused", 1000.0 - 1.0, 1000.0) == "paused"
 
 
+# ---------------------------------------------------------------------------
+# T-0046: active-at-prompt detection (pane idle >= IDLE_AT_PROMPT_SECONDS)
+# ---------------------------------------------------------------------------
+
+def test_is_active_at_prompt_true_when_idle_past_threshold():
+    from bot_squad_worker.sessions import _is_active_at_prompt
+    now = 1000.0
+    # 90s idle > 60s default — flag as at-prompt.
+    assert _is_active_at_prompt("active", now - 90.0, now, threshold_sec=60.0) is True
+
+
+def test_is_active_at_prompt_false_when_recent_write():
+    from bot_squad_worker.sessions import _is_active_at_prompt
+    now = 1000.0
+    # 5s idle < 60s — still crunching.
+    assert _is_active_at_prompt("active", now - 5.0, now, threshold_sec=60.0) is False
+
+
+def test_is_active_at_prompt_false_when_paused():
+    from bot_squad_worker.sessions import _is_active_at_prompt
+    # Paused is its own needs-input case — caller handles separately.
+    assert _is_active_at_prompt("paused", 0.0, 1000.0, threshold_sec=60.0) is False
+
+
+def test_is_active_at_prompt_false_when_activity_unknown():
+    from bot_squad_worker.sessions import _is_active_at_prompt
+    # No write timestamp → can't measure idle time → conservative False.
+    assert _is_active_at_prompt("active", None, 1000.0, threshold_sec=60.0) is False
+
+
+def test_is_active_at_prompt_uses_env_default(monkeypatch):
+    """Threshold is configurable via BOT_SQUAD_IDLE_AT_PROMPT_SECONDS."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "IDLE_AT_PROMPT_SECONDS", 5.0)
+    now = 1000.0
+    # 10s idle > 5s overridden threshold.
+    assert S._is_active_at_prompt("active", now - 10.0, now) is True
+    # 2s idle < 5s.
+    assert S._is_active_at_prompt("active", now - 2.0, now) is False
+
+
+def test_list_sessions_flags_active_at_prompt_after_threshold(tmp_path, monkeypatch):
+    """jsonl mtime older than IDLE_AT_PROMPT_SECONDS → active_at_prompt=True."""
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "IDLE_AT_PROMPT_SECONDS", 60.0)
+    stale = time.time() - 120.0  # 2 minutes idle
+    os.utime(jsonl, (stale, stale))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "active"  # raw status preserved
+    assert rows[0]["active_at_prompt"] is True
+
+
+def test_list_sessions_not_at_prompt_when_recent_activity(tmp_path, monkeypatch):
+    """Fresh jsonl mtime → active_at_prompt=False (still crunching)."""
+    from bot_squad_worker import sessions as S
+    cfg, jsonl = _setup_activity_probe(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "IDLE_AT_PROMPT_SECONDS", 60.0)
+    now = time.time()
+    os.utime(jsonl, (now, now))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["active_at_prompt"] is False
+
+
+def test_list_sessions_suspended_row_has_active_at_prompt_false(tmp_path, monkeypatch):
+    """Suspended rows always carry active_at_prompt=False."""
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-w-p1.md", {
+        "sid": "S-testuser-w-p1",
+        "status": "suspended",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "abc",
+    })
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["active_at_prompt"] is False
+
+
 def test_list_sessions_running_when_jsonl_fresh(tmp_path, monkeypatch):
     """Fresh jsonl mtime → activity='running' on the returned row."""
     from bot_squad_worker import sessions as S

@@ -98,3 +98,56 @@ def test_paused_takes_priority_over_suspended():
         _row("paused",    paused_at="2026-05-14T08:00:00Z"),
     ]
     assert aggregate_project_status(rows)["status"] == "needs-input"
+
+
+# ---------------------------------------------------------------------------
+# T-0046: active-at-prompt rolls active sessions into needs-input.
+# ---------------------------------------------------------------------------
+
+def test_active_at_prompt_alone_yields_needs_input():
+    """An active session that's been quiet past the worker's threshold —
+    worker flagged active_at_prompt=True — flips the project to needs-input."""
+    rows = [_row("active", started_at="2026-05-14T09:00:00Z", active_at_prompt=True)]
+    out = aggregate_project_status(rows)
+    assert out["status"] == "needs-input"
+    assert out["status_since"] == "2026-05-14T09:00:00Z"
+
+
+def test_active_not_at_prompt_is_working():
+    """Plain active (worker didn't flag at-prompt) remains working."""
+    rows = [_row("active", started_at="2026-05-14T09:00:00Z", active_at_prompt=False)]
+    out = aggregate_project_status(rows)
+    assert out["status"] == "working"
+    assert out["status_since"] == "2026-05-14T09:00:00Z"
+
+
+def test_mixed_active_at_prompt_and_crunching_is_working():
+    """If ANY active session is crunching, project is working — the
+    quiet one doesn't downgrade the pill."""
+    rows = [
+        _row("active", started_at="2026-05-14T09:00:00Z", active_at_prompt=True,  sid="a"),
+        _row("active", started_at="2026-05-14T10:00:00Z", active_at_prompt=False, sid="b"),
+    ]
+    out = aggregate_project_status(rows)
+    assert out["status"] == "working"
+    # status_since reflects the crunching row, not the at-prompt one.
+    assert out["status_since"] == "2026-05-14T10:00:00Z"
+
+
+def test_active_at_prompt_plus_paused_uses_max_timestamp():
+    """needs-input status_since folds paused_at + at-prompt started_at."""
+    rows = [
+        _row("active", started_at="2026-05-14T15:00:00Z", active_at_prompt=True, sid="a"),
+        _row("paused", paused_at="2026-05-14T11:00:00Z", sid="b"),
+    ]
+    out = aggregate_project_status(rows)
+    assert out["status"] == "needs-input"
+    # max across paused_at and at-prompt started_at.
+    assert out["status_since"] == "2026-05-14T15:00:00Z"
+
+
+def test_missing_active_at_prompt_key_treated_as_false():
+    """Legacy row shape without active_at_prompt key still works as 'crunching'."""
+    rows = [_row("active", started_at="2026-05-14T09:00:00Z")]  # no active_at_prompt
+    out = aggregate_project_status(rows)
+    assert out["status"] == "working"

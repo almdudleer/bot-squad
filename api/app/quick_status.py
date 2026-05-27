@@ -3,8 +3,12 @@
 The canonical contract — see vision/multi-server/quick-status.md — derives a
 single string per project from its session rows:
 
-    working      = at least one session with status 'active'
-    needs-input  = no active, at least one 'paused' (Ctrl-C'd pane awaits human)
+    working      = at least one `active` session genuinely crunching
+                   (active AND NOT active_at_prompt)
+    needs-input  = no working, at least one `paused` (Ctrl-C'd) OR
+                   `active_at_prompt` (active pane idle past the
+                   IDLE_AT_PROMPT_SECONDS threshold — Claude finished
+                   its turn, human hasn't replied) — T-0046
     idle         = otherwise (only suspended, or zero sessions)
 
 T-0025's mothership cache and T-0008's picker dropdown both consume this
@@ -49,17 +53,34 @@ def aggregate_project_status(rows: list[dict]) -> dict:
     Returns: {"status": "working|needs-input|idle", "status_since": ISO|None}
     """
     actives = [r for r in rows if r.get("status") == "active"]
-    if actives:
+    # T-0046: split `active` into genuinely-crunching vs at-prompt-idle. Only
+    # the crunching subset counts as "working"; the idle-at-prompt rows roll
+    # into needs-input alongside paused sessions.
+    workings = [r for r in actives if not r.get("active_at_prompt")]
+    if workings:
         return {
             "status": "working",
-            "status_since": _max_ts(actives, "started_at"),
+            "status_since": _max_ts(workings, "started_at"),
         }
 
     pauseds = [r for r in rows if r.get("status") == "paused"]
-    if pauseds:
+    at_prompts = [r for r in actives if r.get("active_at_prompt")]
+    if pauseds or at_prompts:
+        # `paused_at` is the canonical needs-input timestamp; at-prompt rows
+        # don't carry a dedicated "idle-since" ISO so fall back to their
+        # `started_at`. _max_ts skips missing/non-string values.
+        candidates: list[str] = []
+        for r in pauseds:
+            v = r.get("paused_at")
+            if v and isinstance(v, str):
+                candidates.append(v)
+        for r in at_prompts:
+            v = r.get("started_at")
+            if v and isinstance(v, str):
+                candidates.append(v)
         return {
             "status": "needs-input",
-            "status_since": _max_ts(pauseds, "paused_at"),
+            "status_since": max(candidates) if candidates else None,
         }
 
     # Only suspended sessions left, or zero sessions at all — both render

@@ -31,6 +31,18 @@ RUNNING_THRESHOLD_SEC = 30.0
 
 
 # ---------------------------------------------------------------------------
+# T-0046 — "active-at-prompt" threshold (separate from the running/idle one).
+#
+# An `active` pane whose jsonl has been quiet for this many seconds is
+# treated as awaiting human input by the quick-status aggregator. Distinct
+# from RUNNING_THRESHOLD_SEC: a multi-step tool chain can quietly run for
+# 30-50s between assistant writes and we don't want every such pause to
+# flip the project pill to needs-input. 60s is the conservative default.
+# ---------------------------------------------------------------------------
+IDLE_AT_PROMPT_SECONDS = float(os.environ.get("BOT_SQUAD_IDLE_AT_PROMPT_SECONDS") or 60)
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -228,6 +240,35 @@ def _peer_heartbeat_at(data_dir: Path, slug: str, sid: str) -> float | None:
         return hb.stat().st_mtime
     except OSError:
         return None
+
+
+def _is_active_at_prompt(
+    live_status: str,
+    activity_at: float | None,
+    now: float,
+    *,
+    threshold_sec: float | None = None,
+) -> bool:
+    """T-0046: True iff a live `active` pane has been idle long enough that
+    the human is the bottleneck (Claude finished its turn, awaiting input).
+
+    Coarse — pure pane-mtime check, no composer-text probe. Threshold lives
+    above RUNNING_THRESHOLD_SEC so normal tool-chain pauses (30-50s between
+    assistant writes) don't get mistaken for "needs-input"; only persistent
+    quiet on an active pane does. ``paused`` is handled separately by the
+    aggregator (Ctrl-C is its own needs-input case).
+
+    Conservative on missing data: ``activity_at is None`` returns False —
+    we can't measure idle time without a write timestamp; the next poll
+    will re-evaluate once a jsonl appears.
+    """
+    if live_status != "active":
+        return False
+    if activity_at is None:
+        return False
+    if threshold_sec is None:
+        threshold_sec = IDLE_AT_PROMPT_SECONDS
+    return (now - activity_at) >= threshold_sec
 
 
 def _derive_activity(
@@ -547,13 +588,20 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # max() with None: pick whichever is non-None, or the larger when both.
         candidates = [t for t in (jsonl_at, heartbeat_at) if t is not None]
         activity_at = max(candidates) if candidates else None
-        activity = _derive_activity(live_status, activity_at, time.time())
+        now_ts = time.time()
+        activity = _derive_activity(live_status, activity_at, now_ts)
+        # T-0046: an `active` pane whose jsonl has been quiet for
+        # IDLE_AT_PROMPT_SECONDS is reclassified as needs-input by the
+        # quick-status aggregator. The raw `status` stays "active" so
+        # action-button routing (pause/suspend) is unaffected.
+        active_at_prompt = _is_active_at_prompt(live_status, activity_at, now_ts)
 
         rows.append({
             "sid": sid,
             "status": live_status,
             "activity": activity,
             "activity_at": activity_at,
+            "active_at_prompt": active_at_prompt,
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
@@ -622,6 +670,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 # regardless of what the md frontmatter claims.
                 "activity": "suspended",
                 "activity_at": None,
+                "active_at_prompt": False,
                 "window": meta.get("window", ""),
                 "cwd": meta.get("cwd", ""),
                 "started_at": meta.get("started_at"),

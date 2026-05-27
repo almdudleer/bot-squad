@@ -534,6 +534,10 @@ def test_spawn_session_action_accepts_optional_prompt(tmp_path, monkeypatch):
             if call_counts["list"] > 1:
                 return sp.CompletedProcess(args, 0, f"%9|testwin|1111|{repo}|claude\n", "")
             return sp.CompletedProcess(args, 0, "", "")
+        if "capture-pane" in args:
+            # T-0126: spawn() polls capture-pane for the ❯ composer rune
+            # before send-keys; emit it so the readiness check passes.
+            return sp.CompletedProcess(args, 0, "❯ \n", "")
         return sp.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(S, "_run", fake_run)

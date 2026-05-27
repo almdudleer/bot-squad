@@ -1049,6 +1049,39 @@ def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative
     return True
 
 
+# T-0126: composer-ready poll. The `❯` rune is rendered by Claude Code's
+# TUI inside the input box and never appears in the bash prompt that runs
+# before claude takes over the pane, so its presence is a reliable signal
+# that the composer accepts keystrokes. Total budget = 15s; interval 0.3s
+# keeps the polling pressure on tmux well under one request per claude
+# render frame on a loaded host.
+_COMPOSER_READY_TIMEOUT_SEC = 15.0
+_COMPOSER_READY_POLL_INTERVAL_SEC = 0.3
+
+
+def _wait_for_claude_composer_ready(pane_id: str) -> bool:
+    """Poll ``tmux capture-pane`` until Claude's composer prompt rune appears.
+
+    Returns True as soon as ``❯`` shows up in the pane buffer, or False if
+    the budget elapses with no marker. Used by ``spawn()`` to avoid the
+    initial_prompt-drop regression (T-0126): send-keys against a pane that
+    is still in bash / claude-init swallows the text or the Enter.
+
+    Reads ``_COMPOSER_READY_TIMEOUT_SEC`` / ``_COMPOSER_READY_POLL_INTERVAL_SEC``
+    at call time (not def time) so tests can monkeypatch the module-level
+    constants to bound runtime.
+    """
+    timeout_sec = _COMPOSER_READY_TIMEOUT_SEC
+    interval_sec = _COMPOSER_READY_POLL_INTERVAL_SEC
+    iterations = max(1, int(timeout_sec / interval_sec))
+    for _ in range(iterations):
+        cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p"])
+        if cap.returncode == 0 and "❯" in cap.stdout:
+            return True
+        time.sleep(interval_sec)
+    return False
+
+
 def spawn(
     cfg: Any,
     slug: str,
@@ -1181,8 +1214,20 @@ def spawn(
     # escape sequence; an Enter inside the paste isn't a submit, so the
     # standalone Enter that follows the wrap-end is what submits the prompt
     # to claude's input box.
+    #
+    # T-0126: a fixed sleep before send-keys lost the prompt on a loaded
+    # host (Claude's TUI startup can exceed several seconds). Poll for the
+    # composer prompt marker `❯` via capture-pane and only then type. If
+    # the marker never appears within the budget, raise — the spawned pane
+    # is still alive, so the caller can recover via inject_input.
     if initial_prompt:
-        time.sleep(2)
+        if not _wait_for_claude_composer_ready(new_pane.pane_id):
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(
+                f"spawn: claude composer never showed ❯ for sid {new_sid} within "
+                f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
+                "(pane is up; recover via inject_input)"
+            )
         _run(["tmux", "send-keys", "-t", new_pane.pane_id, initial_prompt])
         time.sleep(0.4)
         _run(["tmux", "send-keys", "-t", new_pane.pane_id, "Enter"])

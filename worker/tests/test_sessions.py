@@ -1156,6 +1156,9 @@ def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
         if "send-keys" in args:
             key_calls.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
+        if "capture-pane" in args:
+            # Composer-ready marker is present from the first poll.
+            return subprocess.CompletedProcess(args, 0, "❯ \n", "")
         if "new-window" in args:
             new_window_called[0] = True
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -1176,6 +1179,98 @@ def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
 
     assert any("hello world" in str(c) for c in key_calls), \
         f"expected hello world send-keys; got: {key_calls}"
+
+
+def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkeypatch):
+    """T-0126: spawn() must poll capture-pane for the `❯` composer rune
+    BEFORE typing initial_prompt; otherwise send-keys lands on the bash
+    prompt or mid-claude-init and the text/Enter is dropped."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    call_log: list[str] = []  # ordered tags: "capture-not-ready", "capture-ready", "send-text", "send-enter"
+    capture_calls = [0]
+
+    def fake_run(args, **kwargs):
+        if "capture-pane" in args:
+            capture_calls[0] += 1
+            # Composer is not ready for the first two polls (still bash /
+            # claude bootstrapping), then `❯` appears.
+            if capture_calls[0] < 3:
+                call_log.append("capture-not-ready")
+                return subprocess.CompletedProcess(args, 0, "bash-5.2$\n", "")
+            call_log.append("capture-ready")
+            return subprocess.CompletedProcess(args, 0, "❯ \n", "")
+        if "send-keys" in args:
+            # Distinguish the prompt text from the trailing Enter.
+            if args[-1] == "Enter":
+                call_log.append("send-enter")
+            else:
+                call_log.append("send-text")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%11|w|1234|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = spawn(cfg, "test-project", "w", initial_prompt="go")
+    assert result["ok"] is True
+
+    # send-keys for the prompt text + Enter must come strictly AFTER the
+    # first ready capture, and the not-ready captures must come first.
+    ready_idx = call_log.index("capture-ready")
+    text_idx = call_log.index("send-text")
+    enter_idx = call_log.index("send-enter")
+    assert ready_idx < text_idx < enter_idx, f"unexpected order: {call_log}"
+    # And spawn() must actually have polled — at least one not-ready capture.
+    assert "capture-not-ready" in call_log, f"never polled before ready: {call_log}"
+
+
+def test_spawn_raises_when_composer_never_ready(tmp_path, monkeypatch):
+    """T-0126: if capture-pane never shows the composer rune within the
+    timeout budget, spawn() must raise so the caller knows the prompt
+    didn't land — rather than silently typing into a dead/hung pane."""
+    from bot_squad_worker.actions import ActionError
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    send_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        if "capture-pane" in args:
+            # Composer never renders the ❯ rune (claude crash, hang, etc.).
+            return subprocess.CompletedProcess(args, 0, "still booting...\n", "")
+        if "send-keys" in args:
+            send_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%12|w|5678|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    # Shrink the budget so the test bounds runtime even if time.sleep was
+    # not stubbed in some future refactor.
+    monkeypatch.setattr(S, "_COMPOSER_READY_TIMEOUT_SEC", 0.6)
+    monkeypatch.setattr(S, "_COMPOSER_READY_POLL_INTERVAL_SEC", 0.1)
+
+    with pytest.raises(ActionError, match="composer never showed"):
+        spawn(cfg, "test-project", "w", initial_prompt="go")
+
+    # No send-keys should have been issued — we must not type into a pane
+    # that never indicated readiness.
+    assert not send_calls, f"expected zero send-keys; got: {send_calls}"
 
 
 # ---------------------------------------------------------------------------

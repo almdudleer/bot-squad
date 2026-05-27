@@ -30,6 +30,37 @@ class ScaffoldError(Exception):
     """Pre-condition or step failure during project scaffolding."""
 
 
+# T-0123 — canonical role mds bundled with the API image. Same pattern
+# as T-0051's project-create-modes.md (`api/app/resources/...`); qa.md
+# is excluded until T-0124 lands a canonical version.
+_RESOURCES_DIR = Path(__file__).parent / "resources"
+_VISION_ROLE_FILENAMES = (
+    "operator.md",
+    "teamlead.md",
+    "dev.md",
+    "prod-teamlead.md",
+)
+
+
+def _seed_vision_roles(install_data_dir: Path, slug: str) -> None:
+    """Copy bundled role mds into ``<install_data_dir>/<slug>/vision/roles/``.
+
+    T-0053's onboarding spotlight reads role definitions from the vision
+    endpoint; freshly-created projects had an empty vision/ until this
+    hook landed (the FE worked around it with condensed blurbs in
+    ``web/src/onboarding/copy.ts``). A missing source md raises
+    ScaffoldError so a packaging regression surfaces at create time, not
+    at first `GET /api/projects/<slug>/vision`."""
+    roles_src = _RESOURCES_DIR / "roles"
+    roles_dst = install_data_dir / slug / "vision" / "roles"
+    roles_dst.mkdir(parents=True, exist_ok=True)
+    for name in _VISION_ROLE_FILENAMES:
+        src = roles_src / name
+        if not src.exists():
+            raise ScaffoldError(f"bundled role md missing from API image: {src}")
+        shutil.copyfile(src, roles_dst / name)
+
+
 @dataclass(frozen=True)
 class ScaffoldResult:
     """What the scaffold actually created, surfaced back to the API for
@@ -156,11 +187,16 @@ def scaffold_paths_as_they_are(
             slug, repo_path, repo_master, mother_dir
         )
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)
+
+        _seed_vision_roles(install_data_dir, slug)
     except Exception:
         # Best-effort rollback: remove anything we touched in mother_dir.
         # We deliberately do NOT unlink ops symlinks on the user's
         # existing clones — leaving them planted is harmless and avoids a
-        # second failure during cleanup.
+        # second failure during cleanup. Seeded vision/roles/ files under
+        # `install_data_dir/<slug>/` are likewise left in place, matching
+        # the ops-symlink policy (the per-slug data dir is owned by the
+        # install, not by the scaffolder).
         shutil.rmtree(mother_dir, ignore_errors=True)
         raise
 
@@ -237,6 +273,8 @@ def scaffold_new_from_scratch(
 
         toml_text = render_per_project_toml(slug, dev, master, mother_dir)
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)
+
+        _seed_vision_roles(install_data_dir, slug)
     except Exception:
         shutil.rmtree(mother_dir, ignore_errors=True)
         raise

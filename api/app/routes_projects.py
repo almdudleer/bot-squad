@@ -11,6 +11,11 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import ApiConfig
+from app.project_scaffold import (
+    ScaffoldError,
+    scaffold_new_from_scratch,
+    scaffold_paths_as_they_are,
+)
 from app.quick_status import aggregate_project_status
 from app.routes_auth import require_admin, require_auth
 from app.worker_client import WorkerClient, WorkerError, WorkerRouter
@@ -91,6 +96,9 @@ def _serialize_projects_toml(projects_raw: dict[str, dict]) -> str:
     Mirrors _serialize_auth_toml in routes_users.py: strict, key-ordered,
     no third-party dep. Each project block emits the full Project schema
     (loader requires every key) — missing fields default to "" / [].
+    Optional T-0051 fields (`repo_master`, `repo_workspace`) are emitted
+    only when present so projects created via the T-0021 minimal flow
+    don't pick up spurious empty keys.
     """
     out: list[str] = []
     out.append("# bot-squad project registry. Managed by /api/projects.")
@@ -104,6 +112,10 @@ def _serialize_projects_toml(projects_raw: dict[str, dict]) -> str:
             "prod_url", "staging_url", "dev_url",
         ):
             out.append(f'{key} = "{_toml_escape(str(p.get(key, "")))}"')
+        for opt_key in ("repo_master", "repo_workspace"):
+            v = p.get(opt_key)
+            if v:
+                out.append(f'{opt_key} = "{_toml_escape(str(v))}"')
         targets = p.get("deploy_targets") or []
         items = ", ".join(f'"{_toml_escape(str(t))}"' for t in targets)
         out.append(f"deploy_targets = [{items}]")
@@ -117,6 +129,31 @@ def _read_projects_toml(config_dir: Path) -> dict[str, dict]:
     return dict(raw.get("projects", {}))
 
 
+_VALID_MODES = (
+    "new_from_scratch",
+    "paths_as_they_are",
+    # T-0051 ships modes 1 + 3. Mode 2 (attach_destructive) is peeled to
+    # a follow-up ticket; surface a clear 501 if a caller asks for it now
+    # so the FE knows the wizard's mode-2 branch is server-side gated.
+    "attach_destructive",
+)
+
+
+def _require_abs_path(payload_key: str, raw: str) -> Path:
+    """Reject relative paths / empty paths at the API boundary. Scaffold
+    helpers expect absolute paths so they can build symlink targets
+    deterministically."""
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"{payload_key} required")
+    p = Path(raw)
+    if not p.is_absolute():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{payload_key} must be an absolute path",
+        )
+    return p
+
+
 @router.post("", status_code=201)
 async def create_project(
     request: Request,
@@ -126,7 +163,7 @@ async def create_project(
     cfg: ApiConfig = request.app.state.api_config
     slug = (payload.get("slug") or "").strip()
     display_name = (payload.get("display_name") or "").strip()
-    repo_path = (payload.get("repo_path") or "").strip()
+    mode = (payload.get("mode") or "").strip() or None
 
     if not slug:
         raise HTTPException(status_code=400, detail="slug required")
@@ -139,6 +176,11 @@ async def create_project(
         raise HTTPException(status_code=400, detail="display_name required")
     if slug in cfg.projects:
         raise HTTPException(status_code=400, detail=f"project already exists: {slug}")
+    if mode is not None and mode not in _VALID_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown mode {mode!r}; expected one of {_VALID_MODES}",
+        )
 
     # Re-read on-disk so a hand-edited projects.toml isn't clobbered. The
     # in-memory cfg.projects is loaded once at app start; any out-of-band edit
@@ -147,10 +189,82 @@ async def create_project(
     new_raw = _read_projects_toml(config_dir)
     if slug in new_raw:
         raise HTTPException(status_code=400, detail=f"project already exists: {slug}")
+
+    # T-0051: per-project data dirs must exist BEFORE scaffold so the
+    # ops symlinks it plants into the clones have a real target. The
+    # minimal back-compat (mode=None) path also benefits — the worker's
+    # reload nudge expects the data dir present.
+    data_dir = cfg.project_data_dir(slug)
+    for sub in ("backlog", "vision", "feedback", "sessions"):
+        (data_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # Defaults — minimal/back-compat path overwrites only repo_path.
+    repo_path_str = (payload.get("repo_path") or "").strip()
+    repo_master_str = ""
+    repo_workspace_str = ""
+    scaffold_summary: dict | None = None
+
+    if mode is None:
+        # T-0021 back-compat: registry entry only, no scaffolding. The
+        # caller takes responsibility for the on-disk layout.
+        pass
+    elif mode == "attach_destructive":
+        # Mode 2 — peeled to follow-up ticket. The FE should disable the
+        # mode-2 sub-form on the wizard; this server-side 501 is the
+        # defence in depth for anyone calling the API directly.
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "mode 'attach_destructive' is not implemented yet; see "
+                "the T-0051 follow-up ticket for the destructive-rename "
+                "flow. Use 'paths_as_they_are' to attach in place."
+            ),
+        )
+    elif mode == "paths_as_they_are":
+        mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
+        repo_path = _require_abs_path("repo_path", repo_path_str)
+        repo_master = _require_abs_path("repo_master", (payload.get("repo_master") or "").strip())
+        try:
+            result = scaffold_paths_as_they_are(
+                slug=slug,
+                mother_dir=mother_dir,
+                repo_path=repo_path,
+                repo_master=repo_master,
+                install_data_dir=cfg.data_dir,
+            )
+        except ScaffoldError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        repo_path_str = str(result.repo_path)
+        repo_master_str = str(result.repo_master)
+        repo_workspace_str = str(result.repo_workspace)
+        scaffold_summary = {
+            "ops_linked": [str(p) for p in result.ops_linked],
+            "ops_skipped": [str(p) for p in result.ops_skipped],
+        }
+    elif mode == "new_from_scratch":
+        mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
+        git_remote = (payload.get("git_remote") or "").strip() or None
+        try:
+            result = scaffold_new_from_scratch(
+                slug=slug,
+                mother_dir=mother_dir,
+                git_remote=git_remote,
+                install_data_dir=cfg.data_dir,
+            )
+        except ScaffoldError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        repo_path_str = str(result.repo_path)
+        repo_master_str = str(result.repo_master)
+        repo_workspace_str = str(result.repo_workspace)
+        scaffold_summary = {
+            "ops_linked": [str(p) for p in result.ops_linked],
+            "ops_skipped": [str(p) for p in result.ops_skipped],
+        }
+
     new_raw[slug] = {
         "slug": slug,
         "display_name": display_name,
-        "repo_path": repo_path,
+        "repo_path": repo_path_str,
         "deploy_branch": "",
         "master_branch": "",
         "prod_url": "",
@@ -158,6 +272,8 @@ async def create_project(
         "dev_url": "",
         "deploy_targets": [],
         "tg_chat": "",
+        "repo_master": repo_master_str,
+        "repo_workspace": repo_workspace_str,
     }
 
     text = _serialize_projects_toml(new_raw)
@@ -165,10 +281,6 @@ async def create_project(
     tmp = path.with_suffix(".toml.tmp")
     tmp.write_text(text)
     os.rename(tmp, path)
-
-    data_dir = cfg.project_data_dir(slug)
-    for sub in ("backlog", "vision", "feedback", "sessions"):
-        (data_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # Hot-reload the API's view, then nudge the worker so its in-memory
     # project list picks up the new slug without a restart (T-0054). On-disk
@@ -191,7 +303,32 @@ async def create_project(
         "display_name": display_name,
         "status": "idle",
         "status_since": None,
+        "scaffold": scaffold_summary,
     }
+
+
+# T-0051 — single source of truth for the three-mode wizard text.
+# Vendored canonical copy lives at
+# ``api/app/resources/project-create-modes.md`` (the dir name avoids
+# the repo-wide ``data/`` gitignore for runtime state). It is consumed
+# by:
+#   - the FE wizard's rationale-expander (via this endpoint)
+#   - the per-user bot-squad-manager session, which has the same text
+#     mirrored into AGENT_INSTRUCTIONS.md by
+#     scripts/cli/sync_project_create_modes.py
+# Anything else that wants the text should fetch it here so drift is
+# impossible by construction. The route is registered BEFORE the
+# catch-all ``/{slug}`` so `_` (which doesn't match the slug regex
+# anyway) routes here.
+@router.get("/_/create-modes")
+def get_create_modes() -> dict:
+    md_path = Path(__file__).parent / "resources" / "project-create-modes.md"
+    if not md_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="project-create-modes.md missing from API bundle",
+        )
+    return {"content": md_path.read_text(encoding="utf-8")}
 
 
 @router.get("/{slug}")

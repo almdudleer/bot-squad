@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,18 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.main import build_app
+
+
+def _seed_git_repo(repo: Path) -> None:
+    """Plant a minimal local git repo for Mode-3 attach tests."""
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@e.x"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "--quiet", "-m", "seed"],
+        cwd=repo, check=True,
+    )
 
 
 def _client(tmp_bot_squad: Path, monkeypatch):
@@ -367,11 +381,14 @@ def test_create_project_round_trip(
         )
         assert r.status_code == 201, r.text
         body = r.json()
+        # T-0051 added an optional `scaffold` summary field that is None
+        # on the back-compat minimal-create (no mode passed).
         assert body == {
             "slug": "new-proj",
             "display_name": "New Proj",
             "status": "idle",
             "status_since": None,
+            "scaffold": None,
         }
 
         listing = client.get("/api/projects").json()
@@ -558,6 +575,224 @@ def test_create_project_returns_201_even_if_worker_unreachable(
     assert (tmp_bot_squad / "data" / "lonely" / "backlog").is_dir()
     projects_toml = (tmp_bot_squad / "config" / "projects.toml").read_text()
     assert "[projects.lonely]" in projects_toml
+
+
+# ---------------------------------------------------------------------------
+# T-0051 — POST /api/projects with `mode` for deep-flow scaffolding +
+#          GET /api/projects/_/create-modes for the wizard rationale.
+# ---------------------------------------------------------------------------
+
+
+def test_create_modes_endpoint_returns_md(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.get("/api/projects/_/create-modes")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "content" in body
+    text = body["content"]
+    # All three modes named; the rationale block is present. Doubles as
+    # a smoke test that the canonical file shipped with the API bundle.
+    assert "New from scratch" in text
+    assert "paths-as-they-are" in text.lower()
+    assert "destructive" in text.lower()
+    assert "Why does bot-squad require this structure?" in text
+
+
+def test_create_project_paths_as_they_are_round_trip(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    elsewhere = tmp_bot_squad / "elsewhere"
+    existing_dev = elsewhere / "myproj-dev"
+    existing_master = elsewhere / "myproj-master"
+    _seed_git_repo(existing_dev)
+    _seed_git_repo(existing_master)
+    mother = tmp_bot_squad / "home" / "myproj"
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "myproj",
+                "display_name": "My Proj",
+                "mode": "paths_as_they_are",
+                "mother_dir": str(mother),
+                "repo_path": str(existing_dev),
+                "repo_master": str(existing_master),
+            },
+        )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["slug"] == "myproj"
+    assert body["scaffold"]["ops_linked"] == [
+        str(existing_dev / "ops"),
+        str(existing_master / "ops"),
+    ]
+    assert body["scaffold"]["ops_skipped"] == []
+
+    # On-disk state: mother + .bot-squad.toml + ops symlinks all there.
+    assert mother.is_dir()
+    cfg_raw = tomllib.loads((mother / ".bot-squad.toml").read_text())
+    assert cfg_raw["repo_path"] == str(existing_dev)
+    assert cfg_raw["repo_master"] == str(existing_master)
+    assert cfg_raw["repo_workspace"] == str(mother)
+    for clone in (existing_dev, existing_master):
+        link = clone / "ops"
+        assert link.is_symlink()
+        # Resolves to the install's per-slug data dir.
+        assert link.resolve() == (tmp_bot_squad / "data" / "myproj").resolve()
+
+    # The registry write picked up repo_master + repo_workspace too.
+    pt = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert f'repo_master = "{existing_master}"' in pt
+    assert f'repo_workspace = "{mother}"' in pt
+
+
+def test_create_project_new_from_scratch_round_trip(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    mother = tmp_bot_squad / "home" / "fresh"
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "fresh",
+                "display_name": "Fresh",
+                "mode": "new_from_scratch",
+                "mother_dir": str(mother),
+            },
+        )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["slug"] == "fresh"
+    # Both clones got fresh ops symlinks (no prior ops/ on either).
+    assert (mother / "dev" / "ops").is_symlink()
+    assert (mother / "master" / "ops").is_symlink()
+    # And both are real git checkouts.
+    assert (mother / "dev" / ".git").exists()
+    assert (mother / "master" / ".git").exists()
+
+    cfg_raw = tomllib.loads((mother / ".bot-squad.toml").read_text())
+    assert cfg_raw["repo_path"] == str(mother / "dev")
+    assert cfg_raw["repo_master"] == str(mother / "master")
+
+    pt = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert f'repo_path = "{mother / "dev"}"' in pt
+    assert f'repo_master = "{mother / "master"}"' in pt
+
+
+def test_create_project_unknown_mode_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "bad",
+                "display_name": "Bad",
+                "mode": "not_a_mode",
+            },
+        )
+    assert r.status_code == 400
+    assert "unknown mode" in r.json()["detail"]
+
+
+def test_create_project_destructive_mode_501(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    """Mode 2 is peeled to a follow-up; until it lands the API must
+    answer 501 so the FE can render a 'come back later' state instead
+    of silently falling through to a minimal-create."""
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "dst",
+                "display_name": "Dst",
+                "mode": "attach_destructive",
+                "mother_dir": "/tmp/dst",
+                "existing_path": "/tmp/dst-src",
+                "existing_becomes": "dev",
+                "confirm_destructive_move": True,
+            },
+        )
+    assert r.status_code == 501
+    assert "not implemented" in r.json()["detail"]
+
+
+def test_create_project_paths_as_they_are_missing_field_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "miss",
+                "display_name": "Miss",
+                "mode": "paths_as_they_are",
+                "mother_dir": "/tmp/miss",
+                "repo_path": "/tmp/miss-dev",
+                # repo_master missing
+            },
+        )
+    assert r.status_code == 400
+    assert "repo_master" in r.json()["detail"]
+
+
+def test_create_project_paths_as_they_are_relative_path_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "rel",
+                "display_name": "Rel",
+                "mode": "paths_as_they_are",
+                "mother_dir": "relative/path",
+                "repo_path": "/tmp/x",
+                "repo_master": "/tmp/y",
+            },
+        )
+    assert r.status_code == 400
+    assert "absolute" in r.json()["detail"]
+
+
+def test_create_project_paths_as_they_are_repo_missing_400(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    """If a repo path doesn't exist on disk, the scaffold pre-check
+    bubbles a ScaffoldError up as a 400 — and no half-built state
+    (mother dir, projects.toml entry) is left behind."""
+    mother = tmp_bot_squad / "home" / "ghost"
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "ghost",
+                "display_name": "Ghost",
+                "mode": "paths_as_they_are",
+                "mother_dir": str(mother),
+                "repo_path": str(tmp_bot_squad / "no-dev"),
+                "repo_master": str(tmp_bot_squad / "no-master"),
+            },
+        )
+    assert r.status_code == 400, r.text
+    assert "does not exist" in r.json()["detail"]
+    assert not mother.exists()
+    # And projects.toml did NOT pick up a phantom entry.
+    pt = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert "[projects.ghost]" not in pt
 
 
 def test_create_project_requires_admin(tmp_bot_squad: Path, monkeypatch):

@@ -15,8 +15,15 @@ RUN npm run build
 
 FROM python:3.12-slim AS api
 WORKDIR /app
+# `git` is needed by app/project_scaffold.py (T-0051) for the
+# `new_from_scratch` project-create mode — it runs `git init` /
+# `git clone` to seed the dev and master clones. The
+# `paths_as_they_are` mode doesn't need git, but we keep it always
+# present so a host with no git on PATH can't degrade the wizard
+# silently.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY api/pyproject.toml ./

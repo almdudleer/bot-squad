@@ -19,9 +19,17 @@ class Project:
     dev_url: str
     deploy_targets: tuple[str, ...]
     tg_chat: str
+    # T-0051: per-project layout — repo_master is the prod-side clone,
+    # repo_workspace is the mother dir that owns both clones (or none of
+    # them, in Mode 3 paths-as-they-are). Optional for back-compat: the
+    # minimal projects.toml shipped by T-0021 only has repo_path.
+    repo_master: Path | None = None
+    repo_workspace: Path | None = None
 
     @classmethod
     def from_toml(cls, raw: dict) -> "Project":
+        rm = raw.get("repo_master")
+        rw = raw.get("repo_workspace")
         return cls(
             slug=raw["slug"],
             display_name=raw["display_name"],
@@ -33,6 +41,8 @@ class Project:
             dev_url=raw["dev_url"],
             deploy_targets=tuple(raw["deploy_targets"]),
             tg_chat=str(raw["tg_chat"]),
+            repo_master=Path(rm) if rm else None,
+            repo_workspace=Path(rw) if rw else None,
         )
 
 

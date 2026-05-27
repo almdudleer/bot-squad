@@ -46,6 +46,13 @@ def fake_worker_with_sessions(tmp_bot_squad: Path, request):
 
     Use via indirect parametrization or override `sessions` in the closure.
     Defaults to an empty list — i.e. status='idle', status_since=None.
+
+    Also serves the actions the create-project path now invokes after
+    scaffold (``reload_projects`` and T-0052's ``spawn_session``), with
+    canned ok responses so existing scaffold round-trip tests don't have
+    to wire a second fake. Tests that care about the spawn payload
+    inspect the ``spawn_session`` calls list yielded alongside the sock
+    (use the ``fake_worker_with_spawn`` fixture for the recorded form).
     """
     sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
     sock.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +64,14 @@ def fake_worker_with_sessions(tmp_bot_squad: Path, request):
     @fake.post("/actions/list_sessions")
     def list_sessions(params: dict | None = None) -> dict:
         return {"sessions": sessions}
+
+    @fake.post("/actions/reload_projects")
+    def reload_projects(params: dict | None = None) -> dict:
+        return {"ok": True}
+
+    @fake.post("/actions/spawn_session")
+    def spawn_session(params: dict | None = None) -> dict:
+        return {"ok": True, "sid": "S-almdudleer-operator-p99"}
 
     config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
     server = uvicorn.Server(config)
@@ -382,13 +397,17 @@ def test_create_project_round_trip(
         assert r.status_code == 201, r.text
         body = r.json()
         # T-0051 added an optional `scaffold` summary field that is None
-        # on the back-compat minimal-create (no mode passed).
+        # on the back-compat minimal-create (no mode passed). T-0052 added
+        # `operator_sid`/`spawn_error` — both None on the minimal path
+        # because there's no scaffolded repo for an operator to live in.
         assert body == {
             "slug": "new-proj",
             "display_name": "New Proj",
             "status": "idle",
             "status_since": None,
             "scaffold": None,
+            "operator_sid": None,
+            "spawn_error": None,
         }
 
         listing = client.get("/api/projects").json()
@@ -813,3 +832,186 @@ def test_create_project_requires_admin(tmp_bot_squad: Path, monkeypatch):
             json={"slug": "p", "display_name": "P"},
         )
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# T-0052 — POST /api/projects spawns a per-project operator session right
+# after a successful scaffold and returns the operator's SID (or a
+# `spawn_error` on worker failure — the project itself is still 201).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_worker_recording_spawn(tmp_bot_squad: Path, request):
+    """Worker fake that records spawn_session params and returns either an
+    ok envelope or a 500, controlled by indirect parametrization.
+
+    Param shape: ``{"sid": "S-…", "raise": False}`` for happy-path,
+    ``{"raise": True}`` for the error-path test. Reload + list_sessions
+    are stubbed so the create flow doesn't 502 before reaching the spawn.
+    """
+    sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+
+    cfg = getattr(request, "param", None) or {}
+    sid = cfg.get("sid", "S-almdudleer-operator-p42")
+    should_raise = cfg.get("raise", False)
+
+    spawn_calls: list[dict] = []
+
+    fake = FastAPI()
+
+    @fake.post("/actions/list_sessions")
+    def list_sessions(params: dict | None = None) -> dict:
+        return {"sessions": []}
+
+    @fake.post("/actions/reload_projects")
+    def reload_projects(params: dict | None = None) -> dict:
+        return {"ok": True}
+
+    from fastapi import HTTPException as _HTTPException
+
+    @fake.post("/actions/spawn_session")
+    def spawn_session(params: dict | None = None) -> dict:
+        spawn_calls.append(params or {})
+        if should_raise:
+            raise _HTTPException(status_code=500, detail="tmux: no server running")
+        return {"ok": True, "sid": sid}
+
+    config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if sock.exists():
+            break
+        time.sleep(0.05)
+
+    yield sock, spawn_calls
+
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "fake_worker_recording_spawn",
+    [{"sid": "S-almdudleer-operator-p77", "raise": False}],
+    indirect=True,
+)
+def test_create_project_spawns_operator_happy_path(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_recording_spawn,
+):
+    """Scaffolded create → worker spawn_session fires with slug + window
+    'operator' + the operator role-doc as initial_prompt; response carries
+    the returned SID."""
+    _, spawn_calls = fake_worker_recording_spawn
+    mother = tmp_bot_squad / "home" / "newp"
+
+    # Plant the install's operator role doc so the brief is the
+    # canonical-content branch (not the placeholder). Mirrors the live
+    # install at /home/www/bot-squad/data/bot-squad/vision/roles/operator.md.
+    role_md = tmp_bot_squad / "data" / "bot-squad" / "vision" / "roles" / "operator.md"
+    role_md.parent.mkdir(parents=True, exist_ok=True)
+    role_md.write_text("# Role: Project Operator\n\nYou are the operator.\n")
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "newp",
+                "display_name": "New P",
+                "mode": "new_from_scratch",
+                "mother_dir": str(mother),
+            },
+        )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["slug"] == "newp"
+    assert body["operator_sid"] == "S-almdudleer-operator-p77"
+    assert body["spawn_error"] is None
+
+    # Spawn was called exactly once, with the expected wiring.
+    assert len(spawn_calls) == 1
+    p = spawn_calls[0]
+    assert p["slug"] == "newp"
+    assert p["window"] == "operator"
+    # Operator brief includes the per-project framing + the role-doc body.
+    assert "operator" in p["initial_prompt"].lower()
+    assert "newp" in p["initial_prompt"]
+    assert "You are the operator." in p["initial_prompt"]
+    # No task_id — operator is long-lived, not task-bound.
+    assert "task_id" not in p
+    # The caller's UI username gets stamped on the spawned session md.
+    assert p.get("owner") == "testuser"
+
+
+@pytest.mark.parametrize(
+    "fake_worker_recording_spawn",
+    [{"raise": True}],
+    indirect=True,
+)
+def test_create_project_spawn_error_still_returns_201(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_recording_spawn,
+):
+    """Worker spawn failure must NOT roll back the project (it's already
+    on disk and registered) — the response is still 201, but carries a
+    populated ``spawn_error`` and a null ``operator_sid`` so the FE can
+    surface a manual-spawn nudge."""
+    _, spawn_calls = fake_worker_recording_spawn
+    mother = tmp_bot_squad / "home" / "halfp"
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "halfp",
+                "display_name": "Half P",
+                "mode": "new_from_scratch",
+                "mother_dir": str(mother),
+            },
+        )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["slug"] == "halfp"
+    assert body["operator_sid"] is None
+    assert body["spawn_error"]  # non-empty
+    assert "tmux: no server running" in body["spawn_error"]
+
+    # The project is fully scaffolded + registered despite the spawn fail.
+    assert (mother / "dev" / ".git").exists()
+    pt = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert "[projects.halfp]" in pt
+
+    # And the worker WAS asked to spawn (so we know we're testing the
+    # error-translation path, not a silently-skipped spawn).
+    assert len(spawn_calls) == 1
+
+
+def test_create_project_operator_brief_falls_back_to_placeholder(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_with_sessions: Path,
+):
+    """When the install's bot-squad operator role-doc is absent (fresh
+    install), the spawn brief is the minimal placeholder rather than a
+    failure — the follow-on to write the role doc is a separate ticket."""
+    # fake_worker_with_sessions exposes spawn_session but doesn't record
+    # params. Send through the create and just check it 201s with a sid
+    # — the placeholder branch is exercised because no role doc exists
+    # under tmp/data/bot-squad/vision/roles/operator.md.
+    mother = tmp_bot_squad / "home" / "minp"
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post(
+            "/api/projects",
+            json={
+                "slug": "minp",
+                "display_name": "Min P",
+                "mode": "new_from_scratch",
+                "mother_dir": str(mother),
+            },
+        )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["operator_sid"] == "S-almdudleer-operator-p99"
+    assert body["spawn_error"] is None

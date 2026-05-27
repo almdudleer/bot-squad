@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, Project } from "../api";
+import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { Coachmark, Typewriter, useOnboardingStep } from "../onboarding";
 import {
@@ -12,6 +13,15 @@ import {
   type ProjectCreateMode,
   type ProjectCreateState,
 } from "./projectCreateWizard";
+
+// T-0052: post-create success surface. The wizard switches from the
+// edit pane to this once the API has scaffolded the project + spawned
+// (or attempted to spawn) the per-project operator session.
+type ProjectCreateResult = {
+  slug: string;
+  operator_sid: string | null;
+  spawn_error: string | null;
+};
 
 // Mirror T-0025's statusBadgeClass so single-server and cross-server views
 // paint the same colours from the same enum. Unknown strings fall back to
@@ -36,6 +46,9 @@ export function Picker() {
   const [creating, setCreating] = useState<ProjectCreateState | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSaving, setCreateSaving] = useState(false);
+  // T-0052: when set, the modal flips to the success view (operator attach
+  // command + spawn-error nudge if any) instead of the create form.
+  const [createResult, setCreateResult] = useState<ProjectCreateResult | null>(null);
   // Rationale expander state — fetched on first open of the modal,
   // cached for the page lifetime. The SSOT lives at
   // api/app/data/project-create-modes.md (T-0051) so the UI text
@@ -70,14 +83,31 @@ export function Picker() {
     setCreateSaving(true);
     setCreateError(null);
     try {
-      await api.createProject(payloadFromWizard(creating));
-      setCreating(null);
-      reload();
+      const resp = await api.createProject(payloadFromWizard(creating));
+      // Minimal-create (mode=null) doesn't spawn — close immediately as
+      // before. Deep-flow scaffolds get the success step.
+      if (creating.mode === null) {
+        setCreating(null);
+        reload();
+      } else {
+        setCreateResult({
+          slug: resp.slug,
+          operator_sid: resp.operator_sid ?? null,
+          spawn_error: resp.spawn_error ?? null,
+        });
+        reload();
+      }
     } catch (e) {
       setCreateError(String(e));
     } finally {
       setCreateSaving(false);
     }
+  }
+
+  function closeWizard() {
+    setCreating(null);
+    setCreateResult(null);
+    setCreateError(null);
   }
 
   function openRationale() {
@@ -252,24 +282,87 @@ export function Picker() {
 
       <Modal
         open={creating !== null}
-        title="New project"
-        onClose={() => setCreating(null)}
+        title={createResult ? "Project created" : "New project"}
+        onClose={closeWizard}
         footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={() => setCreating(null)}>
-              Cancel
-            </button>
+          createResult ? (
             <button
               type="button"
               className="btn btn-primary"
-              onClick={submitCreate}
-              disabled={createSaving || (creating?.mode === "attach_destructive")}
+              onClick={closeWizard}
+              data-testid="project-create-done"
             >
-              {createSaving ? "Creating…" : "Create"}
+              Done
             </button>
-          </>
+          ) : (
+            <>
+              <button type="button" className="btn btn-secondary" onClick={closeWizard}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={submitCreate}
+                disabled={createSaving || (creating?.mode === "attach_destructive")}
+              >
+                {createSaving ? "Creating…" : "Create"}
+              </button>
+            </>
+          )
         }
       >
+        {createResult ? (
+          <div data-testid="project-create-success">
+            <p style={{ fontSize: "0.9rem", marginBottom: "0.75rem" }}>
+              Project <code>{createResult.slug}</code> is created.
+            </p>
+            {createResult.operator_sid ? (
+              <>
+                <p style={{ fontSize: "0.85rem", marginBottom: "0.5rem" }}>
+                  A per-project <strong>operator</strong> session is spawned
+                  in the project's tmux session. This is your day-to-day
+                  chat surface for the project — attach and start talking:
+                </p>
+                <div style={{ marginBottom: "0.75rem" }}>
+                  <CopyableTmuxAttach
+                    session={createResult.slug}
+                    window="operator"
+                    size="md"
+                  />
+                </div>
+                <p className="text-muted" style={{ fontSize: "0.72rem", margin: 0 }}>
+                  Operator SID:{" "}
+                  <code style={{ fontFamily: "var(--mc-mono)" }}>
+                    {createResult.operator_sid}
+                  </code>
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="alert alert-warning" style={{ fontSize: "0.82rem" }}>
+                  The project is created, but the operator session could
+                  not be spawned automatically.
+                  {createResult.spawn_error && (
+                    <>
+                      {" "}
+                      <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}>
+                        {createResult.spawn_error}
+                      </span>
+                    </>
+                  )}
+                </div>
+                <p style={{ fontSize: "0.82rem", marginBottom: 0 }}>
+                  You can spawn it by hand from the project page's{" "}
+                  <Link to={`/p/${createResult.slug}/sessions`}>
+                    sessions tab
+                  </Link>{" "}
+                  (window name: <code>operator</code>).
+                </p>
+              </>
+            )}
+          </div>
+        ) : (
+        <>
         {createError && <div className="alert alert-danger">{createError}</div>}
         <div className="mb-3">
           <label className="form-label">Display name *</label>
@@ -441,6 +534,8 @@ export function Picker() {
             ticket. For now use <strong>paths-as-they-are</strong> to attach
             without moving the repo.
           </div>
+        )}
+        </>
         )}
       </Modal>
     </div>

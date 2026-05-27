@@ -154,11 +154,37 @@ def _require_abs_path(payload_key: str, raw: str) -> Path:
     return p
 
 
+_OPERATOR_PLACEHOLDER = (
+    "You are the bot-squad project-operator for {slug}. The stakeholder "
+    "will brief you when the role doc is written."
+)
+
+
+def _load_operator_brief(cfg: ApiConfig, slug: str) -> str:
+    """Build the initial_prompt for a freshly-spawned operator session.
+
+    Reads the canonical operator role md from the install's `bot-squad`
+    project data dir (where the dev repo's vision tree gets symlinked to
+    on each install) and prepends the per-project framing. Falls back to
+    a minimal placeholder when the role doc is absent so a fresh install
+    without the bot-squad project still ships a usable brief — the
+    follow-on to actually write `vision/roles/operator.md` is T-0052's
+    sibling DoD bullet (file at brief time if missing)."""
+    role_md = cfg.data_dir / "bot-squad" / "vision" / "roles" / "operator.md"
+    if role_md.exists():
+        body = role_md.read_text(encoding="utf-8")
+        return (
+            f'You are the bot-squad project-operator for "{slug}". '
+            f"Your role doc follows.\n\n{body}"
+        )
+    return _OPERATOR_PLACEHOLDER.format(slug=slug)
+
+
 @router.post("", status_code=201)
 async def create_project(
     request: Request,
     payload: dict,
-    _admin: dict = Depends(require_admin),
+    admin: dict = Depends(require_admin),
 ) -> dict:
     cfg: ApiConfig = request.app.state.api_config
     slug = (payload.get("slug") or "").strip()
@@ -298,12 +324,42 @@ async def create_project(
     except WorkerError as e:
         log.warning("create_project %s: worker reload_projects failed: %s", slug, e)
 
+    # T-0052: spawn the per-project operator session right after scaffold.
+    # Only fires for deep-flow scaffolded creates — the minimal back-compat
+    # path (mode=None) leaves the on-disk layout to the caller, so there's
+    # no project repo for an operator to live in. Failures don't roll back
+    # the project (already on disk and registered); the API returns 201
+    # with a `spawn_error` so the FE can show a manual-spawn nudge.
+    operator_sid: str | None = None
+    spawn_error: str | None = None
+    if scaffold_summary is not None:
+        cfg_after = request.app.state.api_config
+        operator_brief = _load_operator_brief(cfg_after, slug)
+        spawn_client = request.app.state.worker_router.for_user(admin["linux_user"])
+        spawn_params: dict = {
+            "slug": slug,
+            "window": "operator",
+            "initial_prompt": operator_brief,
+        }
+        if admin.get("username"):
+            spawn_params["owner"] = admin["username"]
+        try:
+            spawn_result = await spawn_client.call_action(
+                "spawn_session", spawn_params, timeout=10.0,
+            )
+            operator_sid = spawn_result.get("sid")
+        except WorkerError as e:
+            log.warning("create_project %s: operator spawn_session failed: %s", slug, e)
+            spawn_error = str(e)
+
     return {
         "slug": slug,
         "display_name": display_name,
         "status": "idle",
         "status_since": None,
         "scaffold": scaffold_summary,
+        "operator_sid": operator_sid,
+        "spawn_error": spawn_error,
     }
 
 

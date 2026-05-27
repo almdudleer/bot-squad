@@ -247,8 +247,18 @@ export const api = {
   // pages/projectCreateWizard.ts::payloadFromWizard) so the API
   // helper accepts the body verbatim. Back-compat: the minimal
   // T-0021 form just sends {slug, display_name, repo_path?}.
+  // T-0052: the deep-flow create also spawns a per-project operator
+  // session and returns its SID (or a `spawn_error` if the worker spawn
+  // failed — the project itself is still created). The wizard's success
+  // step uses these to surface the attach command via CopyableTmuxAttach.
   createProject: (body: Record<string, unknown>) =>
-    call<Project & { scaffold?: { ops_linked: string[]; ops_skipped: string[] } | null }>(
+    call<
+      Project & {
+        scaffold?: { ops_linked: string[]; ops_skipped: string[] } | null;
+        operator_sid?: string | null;
+        spawn_error?: string | null;
+      }
+    >(
       "/api/projects",
       { method: "POST", body: JSON.stringify(body) },
     ),

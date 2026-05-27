@@ -18,9 +18,7 @@ export const STEP_9_3_BULLETS: ReadonlyArray<string> = [
 // Role blurbs are condensed from `vision/roles/*.md` in the install. They
 // live here because vision/roles/ is per-project data (not in the
 // codebase tree), and a freshly-created project's vision/roles/ is empty
-// — there's nothing for ?raw to import. Source-of-truth pointers below;
-// follow-on tickets track seeding the per-project vision/roles/ on
-// scaffold + adding the missing qa.md.
+// — there's nothing for ?raw to import. Source-of-truth pointers below.
 export type RoleBlurb = {
   key: string;
   label: string;
@@ -68,11 +66,11 @@ export const PROJECT_ROLE_BLURBS: ReadonlyArray<RoleBlurb> = [
   {
     key: "qa",
     label: "QA",
-    source: "vision/roles/qa.md (not yet defined — see follow-on)",
+    source: "vision/roles/qa.md",
     blurb:
-      "Verifies totest tickets and closes them or flips back to reopened. " +
-      "Role doc still to be written — follow-on ticket tracks the canonical " +
-      "definition.",
+      "Verifies totest tickets against their DoD and reports back to the TL " +
+      "— VERIFIED to close, or REOPEN with a follow-on ticket. Files " +
+      "regressions, does not write the fix.",
   },
 ];
 

@@ -1,12 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import type { SessionRow, Task, VisionFile } from "../api";
 import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
+import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { Select, type SelectOption } from "../components/Select";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 import { sessionActivity } from "../utils/sessionStatus";
+import { Coachmark, hasSeen, useOnboardingState } from "../onboarding";
+import {
+  PROJECT_ROLE_BLURBS,
+  STEP_13_1_TITLE,
+  STEP_13_2_TITLE,
+  STEP_13_3_TITLE,
+  STEP_13_4_TITLE,
+} from "../onboarding/copy";
 
 import { PageHelp } from "../components/PageHelp";
 const COLUMNS = ["planned", "open", "in_progress", "totest", "reopened", "closed"] as const;
@@ -535,6 +544,7 @@ export function Project() {
 
   return (
     <div className="container py-4">
+      <ProjectOnboarding slug={slug} sessions={Object.values(sessionsBySid)} />
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Backlog</h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>
@@ -564,6 +574,7 @@ export function Project() {
             { value: "none", label: "none" },
             { value: "initiative", label: "initiative" },
           ]}
+          onboardingAnchor="board-group-by"
         />
         <SegmentedToggle
           label="View"
@@ -812,15 +823,29 @@ interface SegmentedToggleProps {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  // T-0053: optional data-onboarding-anchor on the inner btn-group so a
+  // coachmark can anchor on the toggle itself (not the label) — the toggle
+  // is what the user clicks, so the spotlight rect should hug the buttons.
+  onboardingAnchor?: string;
 }
 
-function SegmentedToggle({ label, value, onChange, options }: SegmentedToggleProps) {
+function SegmentedToggle({
+  label,
+  value,
+  onChange,
+  options,
+  onboardingAnchor,
+}: SegmentedToggleProps) {
   return (
     <div className="d-flex align-items-center gap-2">
       <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
         {label}:
       </span>
-      <div className="btn-group btn-group-sm" role="group">
+      <div
+        className="btn-group btn-group-sm"
+        role="group"
+        data-onboarding-anchor={onboardingAnchor}
+      >
         {options.map((o) => (
           <button
             key={o.value}
@@ -1062,5 +1087,154 @@ function ListBoard({ tasks, slug, onMenuAction, hideInitiative = false }: ListBo
         );
       })}
     </div>
+  );
+}
+
+// ===========================================================================
+// T-0053 — project-section onboarding (Chapter I §12, 4 beats)
+// ===========================================================================
+
+interface ProjectOnboardingProps {
+  slug: string;
+  // Live sessions from the Project page's poll. Used to surface the
+  // per-project operator session (window=operator) for beat 3. Empty
+  // array on a cold mount — the coachmark renders a fallback in that
+  // case (sessions tab pointer) instead of waiting.
+  sessions: SessionRow[];
+}
+
+function ProjectOnboarding({ slug, sessions }: ProjectOnboardingProps) {
+  // Subscribe to onboarding state so the gate re-renders when seen_steps
+  // loads (without this, hasSeen runs once against the empty default and
+  // every beat stays dark).
+  const state = useOnboardingState();
+
+  // Gate: only fire for users who've created at least one project. The
+  // marker is written by Picker on a successful createProject. Until it's
+  // set, the proj.* tour stays dark — the server-view §9.x chain handles
+  // a user who hasn't yet created.
+  if (!state.loaded) return null;
+  if (!hasSeen("proj.has_created_any")) return null;
+
+  // Find the operator session (window=operator) for beat 3. There can be
+  // only one live operator per project (the scaffold spawns it on create);
+  // if it was suspended / never spawned, we fall back to a sessions-tab
+  // pointer inside the coachmark body.
+  const operator = sessions.find(
+    (s) => s.window === "operator" && !s.archived,
+  );
+
+  // Sequence the beats — beat N is gated on the previous beat being seen
+  // so the user walks through them in order instead of getting four
+  // stacked backdrops at once. Skip-all collapses the whole chain via
+  // the framework's `skipped` flag, which hasSeen already honours.
+  const beat1Seen = hasSeen("proj.13_1.roles");
+  const beat2Seen = hasSeen("proj.13_2.tasks_vs_initiatives");
+  const beat3Seen = hasSeen("proj.13_3.operator_attach");
+
+  return (
+    <>
+      <Coachmark
+        stepId="proj.13_1.roles"
+        title={STEP_13_1_TITLE}
+        body={
+          <div>
+            <div style={{ marginBottom: "0.5rem" }}>
+              Four roles drive a bot-squad project. You only chat with the
+              first one directly — the rest are spawned and coordinated by
+              the operator and TLs:
+            </div>
+            <ul style={{ paddingLeft: "1.1rem", margin: 0 }}>
+              {PROJECT_ROLE_BLURBS.map((r) => (
+                <li key={r.key} style={{ marginBottom: "0.35rem" }}>
+                  <strong>{r.label}.</strong> {r.blurb}
+                </li>
+              ))}
+            </ul>
+          </div>
+        }
+      />
+
+      {beat1Seen && (
+      <Coachmark
+        stepId="proj.13_2.tasks_vs_initiatives"
+        title={STEP_13_2_TITLE}
+        anchorSelector='[data-onboarding-anchor="board-group-by"]'
+        placement="bottom"
+        body={
+          <>
+            Two units of work live on this board:{" "}
+            <strong>tickets</strong> (single shippable changes, prefixed{" "}
+            <code>T-NNNN</code>) and <strong>initiatives</strong>{" "}
+            (multi-week scopes that contain many tickets). Flip{" "}
+            <em>Group by → initiative</em> to see how tickets fan out across
+            initiatives, or filter to a single initiative to focus on one
+            scope at a time.
+          </>
+        }
+      />
+      )}
+
+      {beat2Seen && (
+      <Coachmark
+        stepId="proj.13_3.operator_attach"
+        title={STEP_13_3_TITLE}
+        anchorSelector='[data-onboarding-anchor="sessions-nav"]'
+        placement="right"
+        body={
+          operator ? (
+            <>
+              <div style={{ marginBottom: "0.5rem" }}>
+                Your project operator is running. Attach in a terminal and
+                start talking — "what's the state of X", "let's start work
+                on Y", whatever you've got:
+              </div>
+              <CopyableTmuxAttach
+                session={slug}
+                window="operator"
+                size="md"
+              />
+              <div
+                style={{
+                  marginTop: "0.4rem",
+                  fontSize: "0.7rem",
+                  color: "var(--mc-text-dim)",
+                }}
+              >
+                Operator SID:{" "}
+                <code style={{ fontFamily: "var(--mc-mono)" }}>
+                  {operator.sid}
+                </code>
+              </div>
+            </>
+          ) : (
+            <>
+              No operator session is currently running for this project. Open
+              the{" "}
+              <Link to={`/p/${slug}/sessions`}>sessions tab</Link> and spawn
+              one (window name: <code>operator</code>) — that's your
+              day-to-day chat surface for this project.
+            </>
+          )
+        }
+      />
+      )}
+
+      {beat3Seen && (
+      <Coachmark
+        stepId="proj.13_4.close"
+        title={STEP_13_4_TITLE}
+        final
+        body={
+          <>
+            That's the whole tour. From here, hop into the operator's tmux
+            pane and hand it the first real task — it'll spawn TLs and dev
+            workers as needed. You can always re-find the operator on the{" "}
+            <Link to={`/p/${slug}/sessions`}>sessions tab</Link>.
+          </>
+        }
+      />
+      )}
+    </>
   );
 }

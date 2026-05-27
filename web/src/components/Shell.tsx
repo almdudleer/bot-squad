@@ -286,6 +286,7 @@ export function Shell() {
               <li>
                 <NavLink
                   to={`/p/${slug}/sessions`}
+                  data-onboarding-anchor="sessions-nav"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
                   <span className="mc-nav-diamond">▸</span>

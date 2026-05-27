@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api, Project } from "../api";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
-import { Coachmark, Typewriter, useOnboardingStep } from "../onboarding";
+import { Coachmark, Typewriter, markSeen, useOnboardingStep } from "../onboarding";
 import {
   deriveSlug,
   emptyWizardState,
@@ -84,6 +84,11 @@ export function Picker() {
     setCreateError(null);
     try {
       const resp = await api.createProject(payloadFromWizard(creating));
+      // T-0053: mark the user as past the first-project threshold so the
+      // proj.13_* tour can fire on their next /p/<slug> visit. Both create
+      // shapes (minimal and deep-flow) count — a user who created via the
+      // minimal path is still a project-author.
+      void markSeen("proj.has_created_any");
       // Minimal-create (mode=null) doesn't spawn — close immediately as
       // before. Deep-flow scaffolds get the success step.
       if (creating.mode === null) {

@@ -213,6 +213,31 @@ export function Sessions() {
       .catch(() => setGroupingInitiatives([]));
   }, [slug]);
 
+  // T-0040: task→initiative map for the dev-under-TL tree heuristic.
+  // Backlog is also loaded inside openModal but cached here for the always-on
+  // tree render. A 30s refresh is enough — task↔initiative bindings change
+  // far less often than session activity.
+  const [taskBacklog, setTaskBacklog] = useState<Task[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => {
+      api.backlog(slug)
+        .then((rows) => { if (alive) setTaskBacklog(rows); })
+        .catch(() => { if (alive) setTaskBacklog([]); });
+    };
+    refresh();
+    const id = setInterval(refresh, 30_000);
+    return () => { alive = false; clearInterval(id); };
+  }, [slug]);
+  const taskInitiative = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const t of taskBacklog) {
+      const init = (t.initiative ?? "").trim();
+      if (init) m.set(t.id, init);
+    }
+    return m;
+  }, [taskBacklog]);
+
   async function handlePause(sid: string) {
     setActionError(null);
     try {
@@ -555,7 +580,7 @@ export function Sessions() {
     );
   }
 
-  function renderSessionRow(s: SessionRow) {
+  function renderSessionRow(s: SessionRow, level = 0) {
     const isOpen = expandedSids.has(s.sid);
     const isSuspended = s.status === "suspended";
     const isFlashing = flashSid === s.sid;
@@ -567,20 +592,35 @@ export function Sessions() {
           style={{ cursor: "pointer" }}
           onClick={() => toggleRow(s.sid)}
         >
-          {/* Expand chevron */}
+          {/* Expand chevron (T-0040: paddingLeft scales with tree depth) */}
           <td
             style={{
               fontFamily: "var(--mc-mono)",
               fontSize: "0.75rem",
               color: "var(--mc-text-dim)",
-              width: "1.5rem",
+              width: `${1.5 + level * 1.25}rem`,
+              paddingLeft: `${0.5 + level * 1.25}rem`,
+              whiteSpace: "nowrap",
             }}
           >
             {isOpen ? "▾" : "▸"}
           </td>
 
-          {/* SID */}
+          {/* SID — prefix with a faint tree branch glyph when nested */}
           <td onClick={(e) => e.stopPropagation()}>
+            {level > 0 && (
+              <span
+                aria-hidden
+                style={{
+                  color: "var(--mc-text-dim)",
+                  fontFamily: "var(--mc-mono)",
+                  marginRight: "0.3rem",
+                  fontSize: "0.78rem",
+                }}
+              >
+                └
+              </span>
+            )}
             {s.claude_uuid ? (
               <Link
                 to={`/p/${slug}/sessions/${encodeURIComponent(s.claude_uuid)}/messages`}
@@ -928,6 +968,55 @@ export function Sessions() {
     return SESS_UNATTACHED;
   }
 
+  // T-0040 lean: rendering-only tree. Devs are visually indented under
+  // their TL via the heuristic: dev.task_id → task.initiative → TL session
+  // bound to that initiative (primary or extra). Operator/TL/orphan devs
+  // sit at root. The worker still doesn't persist parent_sid (see follow-up
+  // ticket) so this is best-effort; an orphan dev means we couldn't trace
+  // a TL — not an error.
+  function isDevRow(s: SessionRow): boolean {
+    return !!(s.task_id && s.task_id !== "" && s.task_id !== "~");
+  }
+  function buildSessionTree(
+    rows: SessionRow[],
+  ): { row: SessionRow; level: number }[] {
+    const tlByInitiative = new Map<string, SessionRow>();
+    for (const s of rows) {
+      if (isDevRow(s)) continue;
+      const inits = [(s.initiative ?? "").trim(), ...(s.extra_initiatives ?? [])]
+        .filter((i) => i && i !== "~");
+      for (const init of inits) {
+        if (!tlByInitiative.has(init)) tlByInitiative.set(init, s);
+      }
+    }
+    const devsByTl = new Map<string, SessionRow[]>();
+    const orphanDevs: SessionRow[] = [];
+    for (const s of rows) {
+      if (!isDevRow(s)) continue;
+      const init = taskInitiative.get(s.task_id!) ?? "";
+      const tl = init ? tlByInitiative.get(init) : undefined;
+      if (tl && tl.sid !== s.sid) {
+        const list = devsByTl.get(tl.sid) ?? [];
+        list.push(s);
+        devsByTl.set(tl.sid, list);
+      } else {
+        orphanDevs.push(s);
+      }
+    }
+    const out: { row: SessionRow; level: number }[] = [];
+    for (const s of rows) {
+      if (isDevRow(s)) continue;
+      out.push({ row: s, level: 0 });
+      for (const dev of devsByTl.get(s.sid) ?? []) {
+        out.push({ row: dev, level: 1 });
+      }
+    }
+    for (const orphan of orphanDevs) {
+      out.push({ row: orphan, level: 0 });
+    }
+    return out;
+  }
+
   // Returns sessions filtered by the current filterInit. When filterInit
   // is empty, returns the input unchanged.
   function applySessFilter(rows: SessionRow[]): SessionRow[] {
@@ -1237,7 +1326,9 @@ export function Sessions() {
             </thead>
             <tbody>
               {groupBy === "none"
-                ? applySessFilter(visibleSessions).map((s) => renderSessionRow(s))
+                ? buildSessionTree(applySessFilter(visibleSessions)).map(
+                    ({ row, level }) => renderSessionRow(row, level),
+                  )
                 : buildVisibleLanes(visibleSessions).flatMap((lane) => {
                     const laneRows = groupSessionsByLane(visibleSessions)[lane.key] ?? [];
                     const collapsed = Boolean(collapsedSessLanes[lane.key]);
@@ -1245,7 +1336,12 @@ export function Sessions() {
                       renderLaneHeaderRow(lane, laneRows.length, 11),
                     ];
                     if (!collapsed) {
-                      for (const s of laneRows) nodes.push(renderSessionRow(s));
+                      // Within each initiative lane the tree is also useful — TL at
+                      // top, devs indented under it. Orphans (no TL bound to the
+                      // lane initiative) render at root within the lane.
+                      for (const { row, level } of buildSessionTree(laneRows)) {
+                        nodes.push(renderSessionRow(row, level));
+                      }
                     }
                     return nodes;
                   })}

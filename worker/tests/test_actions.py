@@ -217,6 +217,88 @@ def test_tg_notify_sid_and_user_forwarded(tmp_config_dir, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# peer_send tg-mirror tests (T-0035 lean Option B)
+# ---------------------------------------------------------------------------
+
+
+def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monkeypatch):
+    """peer_send addressed to S-<user>-ui-p0 fires tg.send for the user's bound chat."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[users]\n'
+        'alexey = "hash"\n'
+        '\n'
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "404580642"\n'
+    )
+    (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+
+    out = A.dispatch("peer_send", {
+        "slug": "test-project",
+        "from_sid": "S-almdudleer-operator-p23",
+        "to": "S-alexey-ui-p0",
+        "text": "ack — got your ping",
+    })
+    assert out["ok"] is True
+    assert out["delivered_to"] == ["S-alexey-ui-p0"]
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["chat_id"] == "404580642"
+    assert call["text"] == "ack — got your ping"
+    assert call["sid"] == "S-almdudleer-operator-p23"
+    assert call["user"] == "alexey"
+
+
+def test_peer_send_skips_tg_mirror_when_user_has_no_chat_id(tmp_path, tmp_config_dir, monkeypatch):
+    """User present in user_meta but with no tg_chat_id → no TG call."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[users]\n'
+        'aqice = "hash"\n'
+        '\n'
+        '[user_meta.aqice]\n'
+        'linux_user = "aqice"\n'
+    )
+    (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+
+    out = A.dispatch("peer_send", {
+        "slug": "test-project",
+        "from_sid": "S-x-p1",
+        "to": "S-aqice-ui-p0",
+        "text": "hi",
+    })
+    assert out["ok"] is True
+    assert fake.calls == []
+
+
+def test_peer_send_no_mirror_for_non_ui_sid(tmp_path, tmp_config_dir, monkeypatch):
+    """A dev/TL/operator SID should never trigger the TG mirror."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "404580642"\n'
+    )
+    (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+
+    out = A.dispatch("peer_send", {
+        "slug": "test-project",
+        "from_sid": "S-alexey-ui-p0",
+        "to": "S-almdudleer-operator-p23",
+        "text": "hi",
+    })
+    assert out["ok"] is True
+    assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
 # deploy action tests
 # ---------------------------------------------------------------------------
 

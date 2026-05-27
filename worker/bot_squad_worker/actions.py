@@ -15,10 +15,15 @@ tmux_only, or both. The dispatcher checks the running worker's mode
 """
 from __future__ import annotations
 
+import logging
 import os
+import re
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Callable
+
+log = logging.getLogger(__name__)
 
 
 class ActionError(Exception):
@@ -615,12 +620,43 @@ def _action_autonomous_disable(params: dict[str, Any]) -> dict[str, Any]:
 _PEER_SEND_REQUIRED = {"slug", "from_sid", "to", "text"}
 _PEER_SEND_ALLOWED = _PEER_SEND_REQUIRED
 
+# T-0035 (lean Option B): peer_send replies to a UI-shaped SID are mirrored
+# to that user's bound Telegram chat so a stakeholder browsing the UI still
+# sees responses while the in-UI chat panel is a follow-up.
+# Format: S-<username>-ui-p<N> (Sessions.tsx::handleSend builds this).
+_UI_SID_RE = re.compile(r"^S-([A-Za-z0-9_-]+)-ui-p\d+$")
+
+
+def _parse_ui_sid_username(sid: str) -> str | None:
+    """Return the username if ``sid`` looks like a UI-originated SID, else None."""
+    m = _UI_SID_RE.match(sid)
+    return m.group(1) if m else None
+
+
+def _lookup_user_tg_chat_id(cfg: Any, username: str) -> str:
+    """Load auth.toml and return user_meta[<username>].tg_chat_id (or "" if unset/missing)."""
+    auth_path = Path(cfg.config_dir) / "auth.toml"
+    if not auth_path.exists():
+        return ""
+    try:
+        raw = tomllib.loads(auth_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        log.warning("peer_send tg-mirror: failed to read auth.toml: %s", e)
+        return ""
+    meta = raw.get("user_meta", {}).get(username, {}) or {}
+    return str(meta.get("tg_chat_id", "") or "")
+
 
 def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     """Append a message to recipient inbox(es).
 
     Required params: slug, from_sid, to, text
     Returns: {ok: true, delivered_to: [sid, ...]}
+
+    T-0035: any delivered SID matching ``S-<user>-ui-p<N>`` also fires a
+    ``tg.send`` to that user's bound ``tg_chat_id`` (from
+    ``config/auth.toml [user_meta.<user>]``). Mirror failures are logged
+    but never break the bus write — delivered_to still reflects the inbox.
     """
     extra = set(params) - _PEER_SEND_ALLOWED
     if extra:
@@ -631,7 +667,33 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     from bot_squad_worker import intersession as _is
-    return _is.send(cfg, params["slug"], params["from_sid"], params["to"], params["text"])
+    result = _is.send(cfg, params["slug"], params["from_sid"], params["to"], params["text"])
+
+    for recipient_sid in result.get("delivered_to", []):
+        username = _parse_ui_sid_username(recipient_sid)
+        if not username:
+            continue
+        chat_id = _lookup_user_tg_chat_id(cfg, username)
+        if not chat_id:
+            log.debug(
+                "peer_send tg-mirror: user %r has no tg_chat_id bound — skipping",
+                username,
+            )
+            continue
+        try:
+            _get_tg_client(cfg).send(
+                chat_id=chat_id,
+                text=params["text"],
+                sid=params["from_sid"],
+                user=username,
+            )
+        except Exception:  # noqa: BLE001 — never let TG hiccups corrupt the bus reply
+            log.exception(
+                "peer_send tg-mirror: tg.send failed for user=%s recipient=%s",
+                username, recipient_sid,
+            )
+
+    return result
 
 
 _PEER_INBOX_READ_REQUIRED = {"slug", "sid"}

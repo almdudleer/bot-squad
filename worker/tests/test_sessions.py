@@ -140,12 +140,12 @@ def test_discover_claude_uuid_round_trip_real_encoding(tmp_path):
 
 def test_read_write_session_metadata_roundtrip(tmp_path):
     path = tmp_path / "S-test.md"
-    meta = {"sid": "S-x", "status": "paused", "linked_tasks": ["T-0001"], "cwd": "/tmp"}
+    meta = {"sid": "S-x", "status": "paused", "extra_task_ids": ["T-0001"], "cwd": "/tmp"}
     _write_session_metadata(path, meta)
     result = _read_session_metadata(path)
     assert result["sid"] == "S-x"
     assert result["status"] == "paused"
-    assert result["linked_tasks"] == ["T-0001"]
+    assert result["extra_task_ids"] == ["T-0001"]
 
 
 def test_read_session_metadata_missing_file(tmp_path):
@@ -155,9 +155,9 @@ def test_read_session_metadata_missing_file(tmp_path):
 
 def test_read_session_metadata_empty_list(tmp_path):
     path = tmp_path / "S-test.md"
-    _write_session_metadata(path, {"linked_tasks": []})
+    _write_session_metadata(path, {"extra_task_ids": []})
     result = _read_session_metadata(path)
-    assert result["linked_tasks"] == []
+    assert result["extra_task_ids"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +347,6 @@ def test_list_sessions_includes_paused(tmp_path, monkeypatch):
         "cwd": str(repo),
         "claude_uuid": "some-uuid",
         "paused_at": "2026-05-10T12:00:00Z",
-        "linked_tasks": [],
     })
 
     def fake_run(args, **kwargs):
@@ -580,7 +579,6 @@ def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
         "cwd": str(repo),
         "claude_uuid": "another-uuid",
         "initiative": "foo.md",
-        "linked_tasks": [],
     })
 
     def fake_run(args, **kwargs):
@@ -1026,7 +1024,6 @@ def test_suspend_no_live_pane_just_normalises_md(tmp_path, monkeypatch):
         "claude_uuid": "zombie-uuid",
         "task_id": "~",
         "started_at": "2026-05-10T12:00:00Z",
-        "linked_tasks": [],
     })
 
     def fake_run(args, **kwargs):
@@ -1078,6 +1075,156 @@ def test_spawn_creates_new_window(tmp_path, monkeypatch):
     result = spawn(cfg, "test-project", "spec5-smoke")
     assert result["ok"] is True
     assert result["sid"] == "S-testuser-spec5-smoke-p7"
+
+
+def test_tmux_session_name_no_initiative_returns_slug():
+    """T-0001: without an initiative, panes live in the main `<slug>` session."""
+    from bot_squad_worker.sessions import _tmux_session_name
+    assert _tmux_session_name("bot-squad", None) == "bot-squad"
+    assert _tmux_session_name("bot-squad", "") == "bot-squad"
+
+
+def test_tmux_session_name_with_initiative_appends_stem():
+    """T-0001: with an initiative, route into sibling `<slug>-<stem>` session."""
+    from bot_squad_worker.sessions import _tmux_session_name
+    assert _tmux_session_name(
+        "bot-squad", "multi-server-installation-process.md"
+    ) == "bot-squad-multi-server-installation-process"
+    # Stem strips the .md extension only — multi-dot names keep the rest.
+    assert _tmux_session_name("p", "a.b.md") == "p-a.b"
+
+
+def test_spawn_with_initiative_targets_sibling_tmux_session(tmp_path, monkeypatch):
+    """T-0001: spawn(initiative=...) issues tmux new-window into
+    `<slug>-<initiative-stem>:`, not the main `<slug>:` session.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    new_window_targets: list[str] = []
+    has_session_targets: list[str] = []
+    new_session_targets: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            i = args.index("-t")
+            new_window_targets.append(args[i + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "has-session" in args:
+            i = args.index("-t")
+            has_session_targets.append(args[i + 1])
+            return subprocess.CompletedProcess(args, 1, "", "")  # not present
+        if "new-session" in args:
+            i = args.index("-s")
+            new_session_targets.append(args[i + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%4|tl-init|9|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "tl-init",
+          initiative="multi-server-installation-process.md")
+
+    sibling = "test-project-multi-server-installation-process"
+    assert new_window_targets == [f"{sibling}:"], \
+        f"expected sibling session target, got {new_window_targets!r}"
+    assert sibling in has_session_targets, \
+        f"expected has-session probe on sibling, got {has_session_targets!r}"
+    assert new_session_targets == [sibling], \
+        f"expected new-session for sibling, got {new_session_targets!r}"
+
+
+def test_spawn_without_initiative_uses_main_project_session(tmp_path, monkeypatch):
+    """T-0001: no initiative → legacy behaviour, panes go to `<slug>:`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    new_window_targets: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            i = args.index("-t")
+            new_window_targets.append(args[i + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "has-session" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")  # already exists
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%5|w|9|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w")
+    assert new_window_targets == ["test-project:"], \
+        f"expected main project session, got {new_window_targets!r}"
+
+
+def test_resume_routes_into_initiative_sibling_session(tmp_path, monkeypatch):
+    """T-0001: resume() reads initiative from session md and resurrects into
+    the same `<slug>-<initiative-stem>` session the spawn put it in.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    md = sessions_dir / "S-u-tl-init-p11.md"
+    _write_session_metadata(md, {
+        "sid": "S-u-tl-init-p11",
+        "status": "suspended",
+        "window": "tl-init",
+        "cwd": str(repo),
+        "claude_uuid": "abc-123",
+        "task_id": "~",
+        "initiative": "multi-server-installation-process.md",
+        "started_at": "2026-05-20T00:00:00Z",
+        "suspended_at": "2026-05-20T01:00:00Z",
+    })
+
+    new_window_targets: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            i = args.index("-t")
+            new_window_targets.append(args[i + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "has-session" in args:
+            return subprocess.CompletedProcess(args, 1, "", "")  # not present
+        if "new-session" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            # No live pane for the old SID before resume; after new-window,
+            # one fresh pane on the same window name.
+            if any("new-window" in c for c in []):
+                return subprocess.CompletedProcess(args, 0, "", "")
+            # The check happens twice: pre and post; the post should show the
+            # spawned pane. We return it unconditionally — the test only cares
+            # about the new-window target.
+            return subprocess.CompletedProcess(args, 0, f"%9|tl-init|22|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-u-tl-init-p11")
+    assert new_window_targets == [
+        "test-project-multi-server-installation-process:"
+    ], f"expected sibling session, got {new_window_targets!r}"
 
 
 def test_spawn_with_task_and_initiative_stamps_task_md(tmp_path, monkeypatch):
@@ -1291,7 +1438,6 @@ def test_resume_resumes_paused_session(tmp_path, monkeypatch):
         "cwd": str(repo),
         "claude_uuid": "fake-uuid-1234",
         "paused_at": "2026-05-10T12:00:00Z",
-        "linked_tasks": [],
     })
 
     pane_list_calls = []

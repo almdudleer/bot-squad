@@ -407,21 +407,48 @@ def _get_current_user() -> str:
     return getpass.getuser()
 
 
-def _ensure_project_tmux_session(slug: str, cwd: str) -> None:
-    """Ensure a long-lived tmux session named after the project exists.
+def _tmux_session_name(slug: str, initiative: str | None) -> str:
+    """T-0001: per-initiative tmux session routing.
+
+    Without an initiative, panes live in the project's main session named
+    after ``slug`` — the operator and TL-less devs share that pane real
+    estate. With an initiative, the spawned TL (and any devs spawned with
+    the same initiative arg) land in a sibling session named
+    ``<slug>-<initiative-stem>`` so the stakeholder can attach to one
+    initiative team without the operator pane competing for the screen,
+    and so initiatives don't accumulate windows in the main session.
+
+    ``initiative`` is the basename of a file under ``vision/initiatives/``
+    (e.g. ``multi-server-installation-process.md``); the stem (``Path.stem``)
+    is what gets appended. Empty / None → main session.
+    """
+    if not initiative:
+        return slug
+    stem = Path(initiative).stem
+    if not stem:
+        return slug
+    return f"{slug}-{stem}"
+
+
+def _ensure_project_tmux_session(slug: str, cwd: str, initiative: str | None = None) -> None:
+    """Ensure a long-lived tmux session for this slug (or slug+initiative) exists.
 
     Per the active-context-manager model: one tmux session per project,
     panes/windows live inside it. Survives across spawn/resume cycles.
     Caller must guarantee the session is created before any new-window.
+
+    T-0001: when ``initiative`` is set, ensure (and reuse) a sibling session
+    named ``<slug>-<initiative-stem>`` instead of the main project session.
     """
-    has = _run(["tmux", "has-session", "-t", slug])
+    target = _tmux_session_name(slug, initiative)
+    has = _run(["tmux", "has-session", "-t", target])
     if has.returncode == 0:
         return
     # Create detached; -n _init parks a placeholder window we never use for
-    # claude. claude windows are added via tmux new-window -t <slug>:.
+    # claude. claude windows are added via tmux new-window -t <target>:.
     _run([
         "tmux", "new-session", "-d",
-        "-s", slug,
+        "-s", target,
         "-c", cwd,
         "-n", "_init",
     ])
@@ -832,6 +859,12 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     window = meta.get("window", "claude")
     claude_uuid = meta.get("claude_uuid")
     status = meta.get("status", "")
+    # T-0001: resurrect into the same tmux session the spawn put us in.
+    # A TL spawned with an initiative lives in `<slug>-<initiative-stem>`;
+    # without that routing, resume would dump it back into the main
+    # project session next to the operator pane.
+    init_meta = meta.get("initiative")
+    resume_initiative = init_meta if (init_meta and init_meta != "~") else None
 
     # Is the original pane still alive?
     panes_now = list_panes()
@@ -854,8 +887,10 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
             f"nothing to do. Pause or suspend it first if you meant to restart."
         )
 
-    # One tmux session per project — create lazily, never killed.
-    _ensure_project_tmux_session(slug, cwd)
+    # T-0001: resurrect into the same tmux session the spawn put us in
+    # (main `<slug>` or sibling `<slug>-<initiative-stem>`).
+    target_session = _tmux_session_name(slug, resume_initiative)
+    _ensure_project_tmux_session(slug, cwd, resume_initiative)
 
     # Snapshot existing pane IDs
     pre_panes = {p.pane_id for p in list_panes()}
@@ -874,7 +909,7 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
 
     result = _run([
         "tmux", "new-window", "-d",
-        "-t", f"{slug}:",
+        "-t", f"{target_session}:",
         "-n", window,
         "-c", cwd,
         "bash", "-lc", cmd,
@@ -1105,6 +1140,13 @@ def spawn(
     that file instead of the project's global active_initiative. Lets the
     stakeholder spawn multiple TLs on different initiatives in parallel.
 
+    T-0001: when ``initiative`` is set, the new tmux window is routed into
+    a sibling session named ``<slug>-<initiative-stem>`` instead of the
+    main ``<slug>`` session (which hosts the operator pane). Devs spawned
+    with the same initiative arg join that same sibling session — keeping
+    initiative-team traffic separated per-team and the operator pane
+    uncluttered. ``initiative=None`` keeps the legacy behaviour.
+
     If owner is provided (T-0080), the spawned session md gets stamped
     with ``owner: <username>`` so per-user listing filters can scope
     results without relying on the SID linux_user prefix. The owner is
@@ -1140,8 +1182,13 @@ def spawn(
             # md stamp is a convenience for the UI.
             pass
 
-    # One tmux session per project — create lazily, never killed.
-    _ensure_project_tmux_session(slug, cwd)
+    # T-0001: initiative-keyed tmux session routing — TL spawns with an
+    # initiative arg land in a sibling `<slug>-<initiative-stem>` session,
+    # not the main `<slug>` session shared with the operator. Devs spawned
+    # with the same initiative arg join that sibling session, keeping the
+    # operator pane uncluttered.
+    target_session = _tmux_session_name(slug, initiative)
+    _ensure_project_tmux_session(slug, cwd, initiative)
 
     # Snapshot existing pane IDs
     pre_panes = {p.pane_id for p in list_panes()}
@@ -1174,7 +1221,7 @@ def spawn(
 
     result = _run([
         "tmux", "new-window", "-d",
-        "-t", f"{slug}:",
+        "-t", f"{target_session}:",
         "-n", window,
         "-c", cwd,
         "bash", "-lc", shell_cmd,

@@ -82,6 +82,25 @@ export type NewServer = {
   expires_at: string | null;
 };
 
+/** Invite role at mint time. The BE accepts the literal strings
+ *  `"admin"` and `"non-admin"` only; anything else is rejected with a
+ *  400. Mirrors the role check in `routes_mothership.create_invite`. */
+export type InviteRole = "admin" | "non-admin";
+
+/** One-shot response from `POST /api/m/servers/{srv_id}/invites` — the
+ *  plaintext `invite_token` is returned ONCE here and never again (only
+ *  the SHA-256 is persisted). T-0026 minted the endpoint; the FE
+ *  surfacing is T-0125. */
+export type MintedInvite = {
+  server_id: string;
+  invite_token: string;
+  install_url: string;
+  instructions_url: string;
+  target_username: string;
+  role: InviteRole;
+  expires_at: string | null;
+};
+
 /** Checkpoint event over the per-server SSE channel (and as persisted in
  *  the JSONL log). The server stamps `received_at`; the installer's `ts`
  *  is advisory. */
@@ -174,6 +193,24 @@ export const mothershipApi = {
       method: "POST",
       body: JSON.stringify({ display_name, base_url }),
     }),
+
+  /** T-0125: mint an invite token for an additional Linux user to join an
+   *  existing install. The plaintext `invite_token` is returned ONCE in
+   *  this response body — the registry only stores the SHA-256. Caller
+   *  must surface the URL/expiry to the inviter immediately; there is no
+   *  recovery path if the response is dropped. */
+  createInvite: (
+    serverId: string,
+    target_username: string,
+    role: InviteRole,
+  ) =>
+    call<MintedInvite>(
+      `/api/m/servers/${encodeURIComponent(serverId)}/invites`,
+      {
+        method: "POST",
+        body: JSON.stringify({ target_username, role }),
+      },
+    ),
 
   projectsFor: (serverId: string) =>
     call<ServerProject[]>(

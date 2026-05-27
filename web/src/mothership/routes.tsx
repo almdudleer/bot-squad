@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { Routes, Route, Link, Navigate, useParams } from "react-router-dom";
-import { mothershipApi, type AttachedServer, type Checkpoint } from "./api";
+import {
+  mothershipApi,
+  type AttachedServer,
+  type Checkpoint,
+  type InviteRole,
+  type MintedInvite,
+} from "./api";
 import { AddServerWizard } from "./AddServerWizard";
 import { MothershipProject } from "./MothershipProject";
 import { Releases } from "./Releases";
+import { api } from "../api";
+import { isSuperAdminFromMe } from "../components/sidebarHelpers";
 
 /**
  * T-0013: Chapter I §8 specifies that the mothership add-server flow
@@ -191,6 +199,247 @@ function ServerProgress() {
           ))}
         </ul>
       )}
+
+      {id && <InviteUserPanel serverId={id} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// T-0125: per-server "invite a user" surface. Mounts inside ServerProgress
+// so the inviter can mint + watch the same checkpoint stream they're
+// already on. Super-admin gate: the mothership router itself is gated on
+// VITE_MOTHERSHIP, but the create_invite endpoint is auth'd (not super-
+// admin gated server-side as of T-0026), so we double-up the gate on the
+// FE by checking /api/me. `isSuperAdminFromMe` falls back to `is_admin`
+// pre-T-0066.
+// ---------------------------------------------------------------------------
+
+function InviteUserPanel({ serverId }: { serverId: string }) {
+  const [allowed, setAllowed] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getMyProfile()
+      .then((me) => {
+        if (cancelled) return;
+        setAllowed(isSuperAdminFromMe(me));
+      })
+      .catch(() => {
+        // Treat fetch failure as "not allowed" — the panel is hidden, the
+        // user can still watch the install progress above.
+        if (!cancelled) setAllowed(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!allowed) return null;
+  return <InviteUserForm serverId={serverId} />;
+}
+
+function InviteUserForm({ serverId }: { serverId: string }) {
+  const [targetUsername, setTargetUsername] = useState("");
+  const [role, setRole] = useState<InviteRole>("non-admin");
+  const [minting, setMinting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [minted, setMinted] = useState<MintedInvite | null>(null);
+
+  async function onMint(e: React.FormEvent) {
+    e.preventDefault();
+    setMinting(true);
+    setError(null);
+    try {
+      const out = await mothershipApi.createInvite(
+        serverId,
+        targetUsername.trim(),
+        role,
+      );
+      setMinted(out);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMinting(false);
+    }
+  }
+
+  return (
+    <section
+      style={{
+        marginTop: "2rem",
+        border: "1px solid var(--mc-border)",
+        borderRadius: 4,
+        padding: "1rem 1.1rem",
+        background: "var(--mc-surface)",
+      }}
+    >
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: "0.25rem" }}>
+        Invite a user to this server
+      </div>
+      <div style={{ fontSize: 12, color: "var(--mc-text-dim)", marginBottom: "0.7rem" }}>
+        Mint a one-shot invite URL for an additional Linux user. The URL is
+        single-use, expires in 24 h, and is shown exactly once below —
+        copy it before navigating away.
+      </div>
+      <form
+        onSubmit={onMint}
+        style={{ display: "grid", gap: "0.6rem", maxWidth: 420 }}
+      >
+        <label style={{ display: "grid", gap: 4, fontSize: 12, letterSpacing: "0.05em" }}>
+          <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase" }}>
+            target linux username
+          </span>
+          <input
+            required
+            value={targetUsername}
+            placeholder="e.g. alice"
+            onChange={(e) => setTargetUsername(e.target.value)}
+            style={{
+              padding: "6px 10px",
+              background: "var(--mc-surface)",
+              border: "1px solid var(--mc-border)",
+              color: "var(--mc-text)",
+              fontFamily: "var(--mc-mono)",
+              fontSize: 13,
+              borderRadius: 3,
+            }}
+          />
+        </label>
+        <label style={{ display: "grid", gap: 4, fontSize: 12, letterSpacing: "0.05em" }}>
+          <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase" }}>
+            role
+          </span>
+          <select
+            value={role}
+            onChange={(e) => setRole(e.target.value as InviteRole)}
+            style={{
+              padding: "6px 10px",
+              background: "var(--mc-surface)",
+              border: "1px solid var(--mc-border)",
+              color: "var(--mc-text)",
+              fontFamily: "var(--mc-mono)",
+              fontSize: 13,
+              borderRadius: 3,
+            }}
+          >
+            <option value="non-admin">non-admin</option>
+            <option value="admin">admin (bot-squad group)</option>
+          </select>
+        </label>
+        {error && (
+          <div className="mc-badge mc-badge-danger" style={{ alignSelf: "start" }}>
+            {error}
+          </div>
+        )}
+        <div>
+          <button
+            type="submit"
+            disabled={minting || !targetUsername.trim()}
+            className="mc-badge mc-badge-info"
+            style={{
+              padding: "8px 18px",
+              cursor: minting ? "wait" : "pointer",
+              background: "transparent",
+              fontSize: 12,
+            }}
+          >
+            {minting ? "minting…" : "mint invite →"}
+          </button>
+        </div>
+      </form>
+      {minted && <MintedInviteResult serverId={serverId} minted={minted} />}
+    </section>
+  );
+}
+
+function MintedInviteResult(props: {
+  serverId: string;
+  minted: MintedInvite;
+}) {
+  const { minted, serverId } = props;
+  const [copied, setCopied] = useState(false);
+  return (
+    <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.5rem" }}>
+      <div style={{ fontSize: 12, color: "var(--mc-text-dim)" }}>
+        Invite minted for{" "}
+        <code style={{ fontFamily: "var(--mc-mono)" }}>{minted.target_username}</code>{" "}
+        as <code style={{ fontFamily: "var(--mc-mono)" }}>{minted.role}</code>.
+        Expires{" "}
+        <code style={{ fontFamily: "var(--mc-mono)" }}>
+          {minted.expires_at ?? "—"}
+        </code>
+        . Share the URL below; it's one-shot.
+      </div>
+      <div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: "0.25rem",
+            gap: "0.5rem",
+          }}
+        >
+          <span
+            style={{
+              fontSize: 11,
+              color: "var(--mc-text-dim)",
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+            }}
+          >
+            invite url (one-shot, 24h)
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              navigator.clipboard
+                .writeText(minted.install_url)
+                .then(() => {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 1500);
+                })
+                .catch(() => setCopied(false));
+            }}
+            className={copied ? "mc-badge mc-badge-ok" : "mc-badge mc-badge-info"}
+            style={{
+              padding: "2px 10px",
+              cursor: "pointer",
+              background: "transparent",
+              fontSize: 11,
+            }}
+          >
+            {copied ? "copied" : "copy"}
+          </button>
+        </div>
+        <pre
+          className="mc-code-block"
+          data-testid="minted-invite-url"
+          style={{
+            padding: "0.6rem 0.8rem",
+            margin: 0,
+            background: "var(--mc-bg)",
+            border: "1px solid var(--mc-border)",
+            borderRadius: 3,
+            overflowX: "auto",
+            fontSize: 12,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {minted.install_url}
+        </pre>
+      </div>
+      <div style={{ fontSize: 12 }}>
+        <Link
+          to={`/m/servers/${encodeURIComponent(serverId)}`}
+          style={{ textDecoration: "none" }}
+        >
+          Watch invitee join in real time on this checkpoint stream →
+        </Link>
+      </div>
     </div>
   );
 }

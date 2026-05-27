@@ -37,7 +37,10 @@ import {
   buildClaudePromptOnTarget,
   buildClaudePromptViaSsh,
   buildCurlOneLiner,
+  buildInviteClaudePrompt,
   initialAnswers,
+  inviteWhatComesNext,
+  parseInvitePaste,
   renderChatAgentPrompt,
   visibleSections,
   type WizardAnswers,
@@ -249,6 +252,11 @@ function WizardBody(props: {
           <Q30Section
             value={answers.joining}
             onChange={(v) => onAnswers({ ...answers, joining: v })}
+            invitePaste={answers.invitePaste}
+            onInvitePaste={(v) =>
+              onAnswers({ ...answers, invitePaste: v })
+            }
+            mothershipBase={mothershipBase}
           />
         )}
         {sections.includes("q31") && (
@@ -409,12 +417,15 @@ function CopyBlock(props: { text: string; label?: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// §3.0 — invite-join (coming-soon stub; T-0026 dependency)
+// §3.0 — invite-join: paste an invite URL from an existing admin (T-0125)
 // ---------------------------------------------------------------------------
 
 function Q30Section(props: {
   value: "yes" | "no" | null;
   onChange: (v: "yes" | "no") => void;
+  invitePaste: string;
+  onInvitePaste: (v: string) => void;
+  mothershipBase: string;
 }) {
   return (
     <Section
@@ -426,26 +437,122 @@ function Q30Section(props: {
         onChange={props.onChange}
         yesLabel="Joining an existing install"
         noLabel="Fresh install"
-        yesDisabled
-        yesDisabledHint="Invite-link join will land alongside the admin-role model (T-0026). For now, use the fresh-install path."
       />
       {props.value === "yes" && (
-        <div
-          style={{
-            marginTop: "0.6rem",
-            padding: "0.6rem 0.8rem",
-            border: "1px dashed var(--mc-border)",
-            borderRadius: 3,
-            color: "var(--mc-text-dim)",
-            fontSize: 12,
-          }}
-        >
-          Invite-link join is coming soon — it lands together with the
-          admin-role model. For now, pick "Fresh install" and ask the
-          existing admin to add your account afterwards.
-        </div>
+        <InvitePasteStep
+          raw={props.invitePaste}
+          onRaw={props.onInvitePaste}
+          mothershipBase={props.mothershipBase}
+        />
       )}
     </Section>
+  );
+}
+
+function InvitePasteStep(props: {
+  raw: string;
+  onRaw: (v: string) => void;
+  mothershipBase: string;
+}) {
+  const parsed = parseInvitePaste(props.raw);
+  const whatNext = inviteWhatComesNext(parsed.kind);
+  // The §3.1 claude prompt for an invite reuses the inviter's mothership
+  // URL when the paste was a full URL; otherwise we fall back to the
+  // current origin (the wizard's mothership), which is correct when the
+  // joining user is on the same install.
+  const promptBase = parsed.mothershipBase ?? props.mothershipBase;
+  return (
+    <div style={{ marginTop: "0.6rem", display: "grid", gap: "0.6rem" }}>
+      <div style={{ fontSize: 12, color: "var(--mc-text-dim)" }}>
+        Paste the invite URL the existing admin shared with you. It looks
+        like <code style={{ fontFamily: "var(--mc-mono)" }}>https://&lt;mothership&gt;/i/bsq_invite_…/install.sh</code>.
+        You can also paste just the token.
+      </div>
+      <LabeledInput
+        label="invite url or token"
+        value={props.raw}
+        placeholder="https://example.com/i/bsq_invite_…/install.sh"
+        onChange={props.onRaw}
+      />
+      {parsed.error && (
+        <div className="mc-badge mc-badge-warn" style={{ alignSelf: "start" }}>
+          {parsed.error}
+        </div>
+      )}
+      {parsed.token && (
+        <ParsedInviteSummary
+          token={parsed.token}
+          kind={parsed.kind}
+          mothershipBase={parsed.mothershipBase}
+        />
+      )}
+      <div
+        style={{
+          padding: "0.6rem 0.8rem",
+          border: "1px dashed var(--mc-border)",
+          borderRadius: 3,
+          color: "var(--mc-text-dim)",
+          fontSize: 12,
+        }}
+        data-testid="invite-what-comes-next"
+      >
+        {whatNext}
+      </div>
+      {parsed.kind === "invite" && parsed.token && (
+        <CopyBlock
+          text={buildInviteClaudePrompt({
+            mothershipBase: promptBase,
+            token: parsed.token,
+          })}
+          label="claude prompt (invite-join)"
+        />
+      )}
+    </div>
+  );
+}
+
+function ParsedInviteSummary(props: {
+  token: string;
+  kind: "invite" | "install" | "unknown";
+  mothershipBase: string | null;
+}) {
+  const badge =
+    props.kind === "invite"
+      ? "mc-badge mc-badge-ok"
+      : props.kind === "install"
+        ? "mc-badge mc-badge-danger"
+        : "mc-badge mc-badge-warn";
+  const label =
+    props.kind === "invite"
+      ? "invite token"
+      : props.kind === "install"
+        ? "install token (wrong branch)"
+        : "unknown token";
+  return (
+    <div
+      style={{
+        display: "grid",
+        gap: "0.25rem",
+        padding: "0.5rem 0.7rem",
+        background: "var(--mc-bg)",
+        border: "1px solid var(--mc-border)",
+        borderRadius: 3,
+        fontSize: 12,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+        <span className={badge}>{label}</span>
+        <code style={{ fontFamily: "var(--mc-mono)" }}>{props.token}</code>
+      </div>
+      {props.mothershipBase && (
+        <div style={{ color: "var(--mc-text-dim)" }}>
+          mothership:{" "}
+          <code style={{ fontFamily: "var(--mc-mono)" }}>
+            {props.mothershipBase}
+          </code>
+        </div>
+      )}
+    </div>
   );
 }
 

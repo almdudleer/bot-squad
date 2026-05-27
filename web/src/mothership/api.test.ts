@@ -83,6 +83,90 @@ describe("mothershipApi.projectsFor", () => {
   });
 });
 
+// T-0125: createInvite mints a one-shot invite token for an additional
+// Linux user to join an existing install. The plaintext invite_token is
+// returned exactly once in the response body; subsequent listServers()
+// calls only see the SHA-256.
+describe("mothershipApi.createInvite (T-0125)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("POSTs target_username + role to /api/m/servers/<id>/invites and returns the minted envelope", async () => {
+    const minted = {
+      server_id: "srv_x",
+      invite_token: "bsq_invite_ABC",
+      install_url: "https://example.com/i/bsq_invite_ABC/install.sh",
+      instructions_url: "https://example.com/i/bsq_invite_ABC/instructions.md",
+      target_username: "alice",
+      role: "admin",
+      expires_at: "2026-05-28T00:00:00Z",
+    };
+    const spy = mockFetchSequence([{ json: async () => minted }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    const out = await mothershipApi.createInvite("srv_x", "alice", "admin");
+
+    expect(out).toEqual(minted);
+    // Round-trip the URL/body shape the BE expects.
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_x/invites",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ target_username: "alice", role: "admin" }),
+      }),
+    );
+  });
+
+  test("URL-encodes the server id", async () => {
+    const spy = mockFetchSequence([
+      {
+        json: async () => ({
+          server_id: "srv/odd",
+          invite_token: "bsq_invite_T",
+          install_url: "u",
+          instructions_url: "i",
+          target_username: "bob",
+          role: "non-admin",
+          expires_at: null,
+        }),
+      },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await mothershipApi.createInvite("srv/odd", "bob", "non-admin");
+    expect((spy as FetchSpy).mock.calls[0][0]).toBe(
+      "/api/m/servers/srv%2Fodd/invites",
+    );
+  });
+
+  test("non-admin role is forwarded verbatim (so the BE 400 on bad roles is the only role validator)", async () => {
+    const spy = mockFetchSequence([
+      {
+        json: async () => ({
+          server_id: "srv_y",
+          invite_token: "bsq_invite_NA",
+          install_url: "https://x/i/bsq_invite_NA/install.sh",
+          instructions_url: "https://x/i/bsq_invite_NA/instructions.md",
+          target_username: "carol",
+          role: "non-admin",
+          expires_at: "2026-05-28T00:00:00Z",
+        }),
+      },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await mothershipApi.createInvite("srv_y", "carol", "non-admin");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_y/invites",
+      expect.objectContaining({
+        body: JSON.stringify({
+          target_username: "carol",
+          role: "non-admin",
+        }),
+      }),
+    );
+  });
+});
+
 describe("mothershipApi.refreshProjects", () => {
   test("POSTs to /api/m/servers/<id>/projects/refresh", async () => {
     const spy = mockFetchSequence([

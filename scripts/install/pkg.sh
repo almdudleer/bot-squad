@@ -18,12 +18,12 @@
 #   pkg_have <bin>             Wrapper for `command -v <bin>` — exists
 #                              for symmetry with the rest of the API.
 #
-# The detected distro family ("debian" | "fedora" | "arch") is taken
-# from $BOTSQUAD_DISTRO_FAMILY when set, or derived from /etc/os-release
-# at source-time by detect_distro_family. install.sh's detect_distro
-# checkpoint runs first and is responsible for persisting the family to
-# the state file (so a re-run on a different distro errors loudly
-# rather than silently picking the wrong manager).
+# The detected distro family ("debian" | "fedora" | "arch" | "alpine")
+# is taken from $BOTSQUAD_DISTRO_FAMILY when set, or derived from
+# /etc/os-release at source-time by detect_distro_family. install.sh's
+# detect_distro checkpoint runs first and is responsible for
+# persisting the family to the state file (so a re-run on a different
+# distro errors loudly rather than silently picking the wrong manager).
 #
 # Test seams (all default to the family-appropriate sudo+manager
 # invocation; the unit tests stub these to capture call args):
@@ -38,9 +38,10 @@
 
 # detect_distro_family — print the detected family name to stdout.
 # Mapping rules (matches /etc/os-release ID and ID_LIKE):
-#   ubuntu / debian / linuxmint / pop / raspbian → debian
-#   fedora / rhel / centos / rocky / almalinux / amzn → fedora
-#   arch / manjaro / endeavouros / cachyos        → arch
+#   ubuntu / debian / linuxmint / pop / raspbian       → debian
+#   fedora / rhel / centos / rocky / almalinux / amzn  → fedora
+#   arch / manjaro / endeavouros / cachyos             → arch
+#   alpine                                             → alpine
 # Anything else prints empty (caller must die_struct).
 detect_distro_family() {
   if [[ -n "${BOTSQUAD_DISTRO_FAMILY:-}" ]]; then
@@ -63,6 +64,8 @@ detect_distro_family() {
         printf '%s' fedora; return 0 ;;
       arch|manjaro|endeavouros|cachyos)
         printf '%s' arch; return 0 ;;
+      alpine)
+        printf '%s' alpine; return 0 ;;
     esac
   done
   printf ''
@@ -117,6 +120,20 @@ pkg_map_one() {
     arch:python3-venv)      printf '' ;;
     arch:python3-pip)       printf 'python-pip' ;;
 
+    alpine:curl)            printf 'curl' ;;
+    alpine:git)             printf 'git' ;;
+    alpine:jq)              printf 'jq' ;;
+    alpine:tmux)            printf 'tmux' ;;
+    alpine:ca-certificates) printf 'ca-certificates' ;;
+    # Alpine's main repo ships nodejs + npm as separate packages, same
+    # shape as Arch (npm is required for install_claude_code).
+    alpine:nodejs)          printf 'nodejs npm' ;;
+    alpine:python3)         printf 'python3' ;;
+    # Alpine's python3 ships venv built-in (since 3.12); no separate package.
+    alpine:python3-venv)    printf '' ;;
+    # Alpine uses py3-* prefix for python3 modules from the system index.
+    alpine:python3-pip)     printf 'py3-pip' ;;
+
     *)
       # Unknown family or unknown logical → pass-through (last-resort
       # so a caller can ask for a literal native package by name).
@@ -162,6 +179,12 @@ pkg_install() {
     arch)
       sudo pacman -S --noconfirm --needed "${pkgs[@]}" >/dev/null
       ;;
+    alpine)
+      # --no-cache keeps /var/cache/apk/ empty (Alpine convention) and
+      # implicitly refreshes the index so a separate `apk update` isn't
+      # required before this call.
+      sudo apk add --no-cache "${pkgs[@]}" >/dev/null
+      ;;
     *)
       echo "[pkg.sh] no install command for family '$family'" >&2
       return 1
@@ -175,6 +198,8 @@ pkg_install() {
 #             on "updates available" which we'd have to special-case)
 #   - arch:   pacman -Sy   (sync only; no -u, we don't want to upgrade
 #             the world from inside an installer)
+#   - alpine: apk update   (sync only; --no-cache on pkg_install is the
+#             usual idiom, but a standalone refresh is still cheap)
 pkg_update() {
   if [[ -n "${BOTSQUAD_PKG_UPDATE_CMD:-}" ]]; then
     bash -c "$BOTSQUAD_PKG_UPDATE_CMD"
@@ -185,6 +210,7 @@ pkg_update() {
     debian) sudo apt-get update -y >/dev/null ;;
     fedora) sudo dnf -y makecache >/dev/null ;;
     arch)   sudo pacman -Sy --noconfirm >/dev/null ;;
+    alpine) sudo apk update >/dev/null ;;
     *)
       echo "[pkg.sh] no update command for family '$family'" >&2
       return 1

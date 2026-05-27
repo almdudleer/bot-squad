@@ -287,10 +287,10 @@ exists next to install.sh)."
     die_struct detect_distro \
       "Could not detect a supported distro family from /etc/os-release (ID='${id:-?}')." \
       "Supported families: debian (Ubuntu 22.04+/Debian 12+), fedora
-(Fedora 40+/RHEL 9+), arch (rolling). If your host is a derivative we
-don't recognize, re-run with BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch
-to force a family. Alpine and NixOS are explicitly out of scope (see
-backlog T-0055 / T-0056)."
+(Fedora 40+/RHEL 9+), arch (rolling), alpine (3.18+). If your host is
+a derivative we don't recognize, re-run with
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch|alpine to force a family.
+NixOS is explicitly out of scope (see backlog T-0055)."
   fi
   export BOTSQUAD_DISTRO_FAMILY="$family"
   # Mismatch guard: if a previous run recorded a different family on
@@ -560,11 +560,21 @@ network, re-run with BOTSQUAD_PROXY_URL=http://... and retry."
         || die_struct install_nodejs "pacman -S nodejs npm failed." \
            "Run 'sudo pacman -S nodejs npm' to see the exact pacman error."
       ;;
+    alpine)
+      # Alpine main repo ships nodejs + npm (separate packages, mapped
+      # via pkg.sh). No NodeSource setup script — Alpine's nodejs tracks
+      # the LTS that ships with the release.
+      pkg_install nodejs \
+        || die_struct install_nodejs "apk add nodejs npm failed." \
+           "Run 'sudo apk add nodejs npm' to see the exact apk error.
+If your Alpine release is older than 3.18, upgrade — earlier releases
+ship nodejs < 18 which claude-code refuses to start under."
+      ;;
     *)
       die_struct install_nodejs \
         "Unknown distro family '${BOTSQUAD_DISTRO_FAMILY:-?}'; cannot install nodejs." \
         "Re-run after the detect_distro checkpoint succeeds, or set
-BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch explicitly."
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch|alpine explicitly."
       ;;
   esac
 }
@@ -733,6 +743,15 @@ docker_run_install_cmd() {
       sudo pacman -S --noconfirm --needed docker docker-compose >/dev/null || return 1
       sudo systemctl enable --now docker >/dev/null 2>&1 || return 1
       ;;
+    alpine)
+      # Alpine community ships docker + the compose-as-plugin (so
+      # `docker compose version` works, matching the probe default).
+      # Alpine is OpenRC, not systemd: enable at boot via rc-update,
+      # start now via the service wrapper.
+      sudo apk add --no-cache docker docker-cli-compose >/dev/null || return 1
+      sudo rc-update add docker default >/dev/null 2>&1 || return 1
+      sudo service docker start >/dev/null 2>&1 || return 1
+      ;;
     *)
       return 1
       ;;
@@ -774,14 +793,14 @@ you're behind a proxy, re-run with BOTSQUAD_PROXY_URL=http://..."
           "Could not write $BOTSQUAD_DOCKER_APT_LIST." \
           "Check sudo permissions on $(dirname "$BOTSQUAD_DOCKER_APT_LIST")."
       ;;
-    fedora|arch)
+    fedora|arch|alpine)
       log "docker: using ${BOTSQUAD_DISTRO_FAMILY} package source (no apt keyring/list)"
       ;;
     *)
       die_struct install_docker \
         "Cannot install Docker on family '${BOTSQUAD_DISTRO_FAMILY:-?}'." \
         "Re-run after the detect_distro checkpoint succeeds, or set
-BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch explicitly."
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch|alpine explicitly."
       ;;
   esac
 

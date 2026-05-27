@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 import uvicorn
@@ -24,6 +25,7 @@ import uvicorn
 from bot_squad_worker.actions import set_config, set_mode, set_scheduler
 from bot_squad_worker.config import Config
 from bot_squad_worker.install_role import is_mothership, warn_if_misconfigured
+from bot_squad_worker.intersession import set_shutdown_event
 from bot_squad_worker.scheduler import build_scheduler
 from bot_squad_worker.server import build_app
 
@@ -90,8 +92,15 @@ def main() -> int:
 
     app = build_app()
 
+    # T-0119: shutdown event flipped by SIGTERM/SIGINT so in-flight
+    # peer_inbox_wait long-polls return early (reason=shutdown) instead of
+    # being SIGKILL'd by systemd 90s later.
+    shutdown_event = threading.Event()
+    set_shutdown_event(shutdown_event)
+
     def _shutdown(*_: object) -> None:
         log.info("shutdown signal received")
+        shutdown_event.set()
         if sched is not None:
             sched.shutdown(wait=False)
         sys.exit(0)

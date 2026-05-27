@@ -14,6 +14,11 @@ Environment=BOT_SQUAD_MODE=coordinator
 ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
 Restart=on-failure
 RestartSec=10s
+# T-0119: cap graceful-shutdown wait so in-flight peer_inbox_wait long-polls
+# don't hold systemd for the default 90s before SIGKILL. The worker handler
+# trips the shutdown event on SIGTERM and inbox_wait returns reason=shutdown
+# within ~1 poll tick; this is defense-in-depth for any other slow surface.
+TimeoutStopSec=10s
 
 # Hardening (defense-in-depth — worker still has docker/git/tmux/claude access
 # for spec #3 actions, but we lock down what we can).

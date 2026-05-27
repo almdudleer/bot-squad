@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,18 @@ from typing import Any
 _MAX_TEXT_LEN = 4000
 _MAX_WAIT_TIMEOUT = 1800
 _HEARTBEAT_INTERVAL = 10.0
+
+# T-0119: shutdown signal threaded in by __main__ so in-flight inbox_wait
+# long-polls abort within one poll tick (≈1s) on SIGTERM instead of being
+# SIGKILL'd 90s later by systemd. Set via set_shutdown_event() at startup;
+# tests can pass their own Event into inbox_wait() directly.
+_SHUTDOWN_EVENT: threading.Event | None = None
+
+
+def set_shutdown_event(ev: threading.Event | None) -> None:
+    """Install the process-wide shutdown event read by inbox_wait."""
+    global _SHUTDOWN_EVENT
+    _SHUTDOWN_EVENT = ev
 
 
 def _chat_dir(cfg: Any, slug: str) -> Path:
@@ -167,12 +180,24 @@ def inbox_read(cfg: Any, slug: str, sid: str) -> dict:
     return {"ok": True, "messages": messages, "count": len(messages)}
 
 
-def inbox_wait(cfg: Any, slug: str, sid: str, timeout: float) -> dict:
+def inbox_wait(
+    cfg: Any,
+    slug: str,
+    sid: str,
+    timeout: float,
+    shutdown_event: threading.Event | None = None,
+) -> dict:
     """Long-poll for inbox growth.
 
     Returns ``{"ok": True, "ready": bool, "elapsed_sec": float}``. ``ready``
     True means "you have new mail, call ``inbox_read``"; False means the
     timeout expired without new mail.
+
+    T-0119: if the process-wide shutdown event (or one passed via
+    ``shutdown_event``) is set, returns early with
+    ``{"ok": True, "ready": False, "elapsed_sec": <x>, "reason": "shutdown"}``
+    so curl clients see a clean response instead of an SIGKILL-induced
+    empty reply when systemd restarts the worker.
     """
     timeout = max(0.0, min(float(timeout), float(_MAX_WAIT_TIMEOUT)))
     inbox = _inbox_path(cfg, slug, sid)
@@ -185,6 +210,8 @@ def inbox_wait(cfg: Any, slug: str, sid: str, timeout: float) -> dict:
     except (FileNotFoundError, ValueError):
         offset = 0
 
+    ev = shutdown_event if shutdown_event is not None else _SHUTDOWN_EVENT
+
     start = time.monotonic()
     deadline = start + timeout
     last_hb = 0.0
@@ -194,6 +221,13 @@ def inbox_wait(cfg: Any, slug: str, sid: str, timeout: float) -> dict:
     poll_interval = 1.0
     while True:
         now = time.monotonic()
+        if ev is not None and ev.is_set():
+            return {
+                "ok": True,
+                "ready": False,
+                "elapsed_sec": now - start,
+                "reason": "shutdown",
+            }
         if now - last_hb >= _HEARTBEAT_INTERVAL:
             _touch(hb)
             last_hb = now

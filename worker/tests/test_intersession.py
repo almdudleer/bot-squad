@@ -147,6 +147,44 @@ def test_wait_caps_timeout(tmp_path, monkeypatch):
     assert out["elapsed_sec"] <= 1801
 
 
+def test_wait_returns_early_on_shutdown_event_arg(tmp_path):
+    """T-0119: explicit shutdown_event arg trips inbox_wait within one poll."""
+    cfg = _make_cfg(tmp_path)
+    ev = threading.Event()
+    ev.set()  # already set — should return on the first loop iteration
+
+    t0 = time.monotonic()
+    out = I.inbox_wait(cfg, "p", "S-to", timeout=30, shutdown_event=ev)
+    elapsed = time.monotonic() - t0
+
+    assert out["ok"] is True
+    assert out["ready"] is False
+    assert out["reason"] == "shutdown"
+    assert elapsed < 2.0  # must NOT wait the 30s timeout
+
+
+def test_wait_returns_early_on_shutdown_event_global(tmp_path):
+    """T-0119: process-wide event set via set_shutdown_event also works."""
+    cfg = _make_cfg(tmp_path)
+    ev = threading.Event()
+    I.set_shutdown_event(ev)
+    try:
+        def trip():
+            time.sleep(0.3)
+            ev.set()
+        threading.Thread(target=trip, daemon=True).start()
+
+        t0 = time.monotonic()
+        out = I.inbox_wait(cfg, "p", "S-to", timeout=30)
+        elapsed = time.monotonic() - t0
+
+        assert out["ready"] is False
+        assert out["reason"] == "shutdown"
+        assert elapsed < 3.0
+    finally:
+        I.set_shutdown_event(None)
+
+
 def test_chat_dir_created_with_group_write(tmp_path):
     cfg = _make_cfg(tmp_path)
     I.send(cfg, "p", "S-from", "S-to", "hi")

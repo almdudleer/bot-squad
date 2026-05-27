@@ -43,6 +43,8 @@ Environment=BOT_SQUAD_MODE=user-worker
 ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
 Restart=on-failure
 RestartSec=10s
+# T-0119: same graceful-shutdown cap as the coordinator unit.
+TimeoutStopSec=10s
 
 # Hardening — same posture as the coordinator unit but without the
 # heartbeat / deploy writes. The user-worker still needs tmux + claude

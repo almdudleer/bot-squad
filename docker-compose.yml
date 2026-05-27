@@ -19,6 +19,7 @@ services:
       - BUILD_AT_IMPORT=1
       - CLAUDE_PROJECTS_DIR=/home/almdudleer/.claude/projects
       - MOTHERSHIP=${MOTHERSHIP:-0}
+      - MOTHERSHIP_BASE_URL=${MOTHERSHIP_BASE_URL:-}
     volumes:
       - ./config:/config:rw
       - ./data:/data:rw

@@ -18,12 +18,16 @@
 #   pkg_have <bin>             Wrapper for `command -v <bin>` — exists
 #                              for symmetry with the rest of the API.
 #
-# The detected distro family ("debian" | "fedora" | "arch" | "alpine")
-# is taken from $BOTSQUAD_DISTRO_FAMILY when set, or derived from
-# /etc/os-release at source-time by detect_distro_family. install.sh's
-# detect_distro checkpoint runs first and is responsible for
-# persisting the family to the state file (so a re-run on a different
-# distro errors loudly rather than silently picking the wrong manager).
+# The detected distro family ("debian" | "fedora" | "arch" | "alpine" |
+# "nixos") is taken from $BOTSQUAD_DISTRO_FAMILY when set, or derived
+# from /etc/os-release at source-time by detect_distro_family.
+# install.sh's detect_distro checkpoint runs first and is responsible
+# for persisting the family to the state file (so a re-run on a
+# different distro errors loudly rather than silently picking the
+# wrong manager). The "nixos" family is recognized but intentionally
+# has no pkg_install / pkg_update branch (T-0057) — install.sh routes
+# NixOS to a declarative emit-module step instead, and pkg_* calls on
+# family=nixos die loudly with the default-case error.
 #
 # Test seams (all default to the family-appropriate sudo+manager
 # invocation; the unit tests stub these to capture call args):
@@ -42,6 +46,9 @@
 #   fedora / rhel / centos / rocky / almalinux / amzn  → fedora
 #   arch / manjaro / endeavouros / cachyos             → arch
 #   alpine                                             → alpine
+#   nixos                                              → nixos (T-0057;
+#       declarative-only — pkg_install/pkg_update have no nixos branch
+#       and will die loudly if called)
 # Anything else prints empty (caller must die_struct).
 detect_distro_family() {
   if [[ -n "${BOTSQUAD_DISTRO_FAMILY:-}" ]]; then
@@ -66,6 +73,8 @@ detect_distro_family() {
         printf '%s' arch; return 0 ;;
       alpine)
         printf '%s' alpine; return 0 ;;
+      nixos)
+        printf '%s' nixos; return 0 ;;
     esac
   done
   printf ''

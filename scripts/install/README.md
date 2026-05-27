@@ -10,6 +10,8 @@ the FE wizard (T-0031) — not served from a tokened URL.
 | File                                  | Served at                                                | Purpose                                              |
 |---------------------------------------|----------------------------------------------------------|------------------------------------------------------|
 | `install.sh`                          | `/i/<token>/install.sh`                                  | Idempotent installer. The only artifact that runs.   |
+| `pkg.sh`                              | _(loaded by `install.sh` from alongside it)_             | Per-distro package-manager abstraction.              |
+| `nixos/bot-squad.nix`                 | _(copied into `<install_dir>/nixos/` on NixOS hosts)_    | Declarative NixOS module (T-0057).                   |
 | `bootstrap-claude-instructions.md`    | `/i/<token>/instructions.md`                             | Brief for a Claude Code session (tool-using).        |
 | `chat-agent-prompt.txt`               | _(rendered inline by FE wizard T-0031, not a tokened URL)_ | Prompt for a generic chat AI (copy-paste-loop user). |
 
@@ -68,3 +70,27 @@ BOTSQUAD_SKIP_MOTHERSHIP=1 \
 
 Idempotency check: run twice. Second run should print only `skip` lines
 for each checkpoint until the final `print_attach`.
+
+## NixOS (T-0057, declarative)
+
+NixOS hosts get a shorter chain: `detect_distro` + `emit_nixos_module`.
+The installer cannot `apt-get`/`dnf`/`pacman`/`apk` docker on a NixOS
+host without breaking `/etc/nixos/configuration.nix` as the
+source-of-truth. Instead, when `/etc/os-release` announces `ID=nixos`
+(or `BOTSQUAD_DISTRO_FAMILY=nixos` is forced), the chain copies
+`scripts/install/nixos/bot-squad.nix` into
+`<install_dir>/nixos/bot-squad.nix` and prints an instructions block
+telling the admin to:
+
+1. Review the emitted module.
+2. Add `imports = [ ./bot-squad.nix ];` + `services.bot-squad.enable =
+   true;` to `/etc/nixos/configuration.nix`.
+3. Run `sudo nixos-rebuild switch`.
+4. Manually clone the repo into the install dir and
+   `docker compose up -d --build` — auto-clone + compose-up from
+   `install.sh` on NixOS is deferred (the module declares docker +
+   nodejs + python3 + tmux + ca-certificates + the
+   `bot-squad-worker` systemd unit, which is the contract).
+
+Override the module destination with `BOTSQUAD_NIXOS_MODULE_DEST=...`
+or the source-of-truth path with `BOTSQUAD_NIXOS_MODULE_SRC=...`.

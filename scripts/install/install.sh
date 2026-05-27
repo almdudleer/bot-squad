@@ -287,10 +287,12 @@ exists next to install.sh)."
     die_struct detect_distro \
       "Could not detect a supported distro family from /etc/os-release (ID='${id:-?}')." \
       "Supported families: debian (Ubuntu 22.04+/Debian 12+), fedora
-(Fedora 40+/RHEL 9+), arch (rolling), alpine (3.18+). If your host is
-a derivative we don't recognize, re-run with
-BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch|alpine to force a family.
-NixOS is explicitly out of scope (see backlog T-0055)."
+(Fedora 40+/RHEL 9+), arch (rolling), alpine (3.18+), nixos (24.05+;
+declarative-only — install.sh emits a NixOS module and exits, the
+admin runs nixos-rebuild switch). If your host is a derivative we
+don't recognize, re-run with
+BOTSQUAD_DISTRO_FAMILY=debian|fedora|arch|alpine|nixos to force a
+family."
   fi
   export BOTSQUAD_DISTRO_FAMILY="$family"
   # Mismatch guard: if a previous run recorded a different family on
@@ -1305,6 +1307,106 @@ State:    $STATE_FILE
 EOF
 }
 
+# ---- NixOS-mode checkpoint (T-0057) -----------------------------------------
+# NixOS is declarative: packages and systemd units come from
+# /etc/nixos/configuration.nix, not from `apk add` / `nix-env -i` invoked
+# at runtime. install.sh therefore CANNOT install docker (etc.) on a
+# NixOS host the way it does on debian/fedora/arch/alpine — that would
+# bypass the configuration.nix source-of-truth and leave the host in
+# an unmanaged state.
+#
+# Instead, when /etc/os-release announces ID=nixos (or
+# BOTSQUAD_DISTRO_FAMILY=nixos is forced), main() picks the NIXOS_STEPS
+# chain (just detect_distro + emit_nixos_module). emit_nixos_module
+# copies scripts/install/nixos/bot-squad.nix into <install_dir>/nixos/,
+# prints the imports/instructions block, and exits. The admin reviews
+# the module, adds it to their configuration.nix imports list, and
+# runs `nixos-rebuild switch`. The post-rebuild repo clone +
+# docker-compose-up are deferred (see backlog T-0057 notes).
+#
+# Seams:
+#   BOTSQUAD_NIXOS_MODULE_DEST — override destination path (default
+#                                $BOTSQUAD_INSTALL_DIR/nixos/bot-squad.nix)
+#   BOTSQUAD_NIXOS_MODULE_SRC  — override source-of-truth path
+#                                (default $__BS_INSTALL_DIR/nixos/bot-squad.nix,
+#                                 i.e. alongside install.sh in a repo
+#                                 checkout)
+
+step_emit_nixos_module() {
+  local dst="${BOTSQUAD_NIXOS_MODULE_DEST:-${BOTSQUAD_INSTALL_DIR}/nixos/bot-squad.nix}"
+  local src="${BOTSQUAD_NIXOS_MODULE_SRC:-${__BS_INSTALL_DIR}/nixos/bot-squad.nix}"
+  [[ -r "$src" ]] || die_struct emit_nixos_module \
+    "Source NixOS module not found at $src." \
+    "The installer bundle is incomplete. Re-fetch install.sh AND its
+nixos/ subdir from the mothership (or, if running from a repo checkout,
+ensure scripts/install/nixos/bot-squad.nix is present alongside
+install.sh). You can also point BOTSQUAD_NIXOS_MODULE_SRC at a custom
+path if you've staged the module elsewhere on this host."
+  local dst_dir; dst_dir="$(dirname "$dst")"
+  if [[ ! -d "$dst_dir" ]]; then
+    if ! mkdir -p "$dst_dir" 2>/dev/null; then
+      sudo mkdir -p "$dst_dir" || die_struct emit_nixos_module \
+        "Could not mkdir $dst_dir for the bot-squad.nix module." \
+        "Check parent permissions and try 'sudo mkdir -p $dst_dir'."
+    fi
+  fi
+  if [[ -w "$dst_dir" ]] || { [[ -f "$dst" ]] && [[ -w "$dst" ]]; }; then
+    install -m 0644 "$src" "$dst" \
+      || die_struct emit_nixos_module \
+        "Could not write $dst." \
+        "Check write permissions on $dst_dir."
+  else
+    sudo install -m 0644 "$src" "$dst" \
+      || die_struct emit_nixos_module \
+        "Could not write $dst (with sudo)." \
+        "Check sudo + write permissions on $dst_dir."
+  fi
+  log "bot-squad NixOS module written to $dst"
+  cat <<EOF
+
+============================================================
+bot-squad on NixOS — declarative integration required.
+------------------------------------------------------------
+NixOS configures system packages declaratively, so the
+installer cannot apt-get/dnf/pacman/apk docker on this host.
+It emitted a NixOS module that declares bot-squad's OS-level
+dependencies (docker, nodejs, python3, tmux, jq, curl,
+ca-certificates) + the bot-squad-worker systemd unit.
+
+Module file:
+    $dst
+
+To finish:
+
+  1. Review the module:
+         less $dst
+
+  2. Add it to /etc/nixos/configuration.nix (imports list):
+         imports = [
+           /etc/nixos/hardware-configuration.nix
+           $dst
+         ];
+     And enable it elsewhere in the same file:
+         services.bot-squad.enable = true;
+         services.bot-squad.user   = "$(id -un)";
+
+  3. Rebuild your NixOS system:
+         sudo nixos-rebuild switch
+
+  4. After the rebuild succeeds, the docker socket + tmux +
+     nodejs are available system-wide. Manual follow-up:
+     clone the bot-squad repo into the install dir
+     ($BOTSQUAD_INSTALL_DIR by default), provision the Python
+     venv under worker/.venv, and run
+     'docker compose up -d --build' to bring the API + worker
+     stack online. Auto-clone + compose-up from install.sh on
+     NixOS is deferred (see backlog T-0057 notes).
+
+State: $STATE_FILE
+============================================================
+EOF
+}
+
 # ---- Invite-mode checkpoints (T-0026) ---------------------------------------
 # When BOTSQUAD_INSTALL_TOKEN carries an invite prefix (bsq_invite_*), the
 # script runs the join-existing-install chain instead of fresh-install. The
@@ -1494,7 +1596,7 @@ EOF
 }
 
 # ---- Step order -------------------------------------------------------------
-# Two chains, dispatched by the prefix of $BOTSQUAD_INSTALL_TOKEN:
+# Three chains, dispatched at main() startup time:
 #   - INSTALL_STEPS: fresh install on a never-installed host. Owns the
 #     install dir, creates the www group, drops systemd units, runs
 #     docker compose up.
@@ -1503,6 +1605,12 @@ EOF
 #     create, NO install-dir create, NO systemd UNIT install at
 #     install-level, NO docker compose up. The existing coordinator
 #     keeps the install; this script just provisions the invitee.
+#   - NIXOS_STEPS  (T-0057): declarative-distro path. install.sh CANNOT
+#     install OS packages via configuration.nix from a shell script
+#     without breaking NixOS's source-of-truth contract. The chain
+#     short-circuits to detect_distro + emit_nixos_module — the latter
+#     copies scripts/install/nixos/bot-squad.nix into <install_dir>/
+#     and prints the admin's nixos-rebuild instructions block.
 INSTALL_STEPS=(
   detect_distro
   require_sudo
@@ -1542,20 +1650,31 @@ INVITE_STEPS=(
   agent_teams_flag
   print_join_attach
 )
+NIXOS_STEPS=(
+  detect_distro
+  emit_nixos_module
+)
 # STEPS is selected at runtime in main(). Default to INSTALL_STEPS so a
 # sourced-without-main test (smoke_engine.sh) sees the historical array.
 STEPS=("${INSTALL_STEPS[@]}")
 
 main() {
   ensure_state_dir
-  # Prefix-detect on the token to pick the chain. The exact prefix string
-  # matches install_tokens.py:INVITE_PREFIX. We do this BEFORE
-  # checkpoint resolution so the state file is consistent across reruns:
-  # a partial fresh-install state dir + a later invite-token rerun would
-  # otherwise silently skip half the steps.
+  # Pick the chain. Three signals, evaluated in order:
+  #   1. invite-token prefix (bsq_invite_*) → INVITE_STEPS
+  #   2. /etc/os-release ID=nixos (or BOTSQUAD_DISTRO_FAMILY=nixos) →
+  #      NIXOS_STEPS — declarative, can't run apt/dnf/pacman/apk
+  #   3. else → INSTALL_STEPS (debian/fedora/arch/alpine)
+  # We resolve BEFORE checkpoint dispatch so the state file is
+  # consistent across reruns (a half-finished INSTALL_STEPS state +
+  # a NixOS rerun would otherwise silently skip half the steps).
+  # The prefix detect matches install_tokens.py:INVITE_PREFIX.
   if [[ "$BOTSQUAD_INSTALL_TOKEN" == bsq_invite_* ]]; then
     STEPS=("${INVITE_STEPS[@]}")
     log "bot-squad installer starting in INVITE mode (state file: $STATE_FILE)"
+  elif [[ "$(detect_distro_family 2>/dev/null || true)" = "nixos" ]]; then
+    STEPS=("${NIXOS_STEPS[@]}")
+    log "bot-squad installer starting in NIXOS mode (declarative; emit module + exit; state file: $STATE_FILE)"
   else
     STEPS=("${INSTALL_STEPS[@]}")
     log "bot-squad installer starting (state file: $STATE_FILE)"

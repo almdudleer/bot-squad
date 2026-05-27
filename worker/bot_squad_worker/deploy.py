@@ -202,9 +202,17 @@ def is_clean_for_target(cfg: "Config", slug: str, target: str) -> bool:
 
     Lets callers (e.g. the deploy_monitor in jobs.py) gate user-facing
     notifications without re-implementing the check or popping a queue file.
+
+    Returns False when the tree is dirty OR when the target clone has
+    local-only commits not yet pushed to origin (T-0116) — both are
+    direct-edit anti-patterns that would be wiped by the recipe's
+    `git merge --ff-only origin/...` and must be resolved by the agent.
     """
     project = cfg.projects[slug]
-    return _is_clean(project.repo_for_target(target))
+    repo = project.repo_for_target(target)
+    if not _is_clean(repo):
+        return False
+    return not _local_only_commits(repo)
 
 
 def run_next(cfg: "Config", slug: str) -> DeployResult | None:
@@ -241,6 +249,26 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         log.info("deploy.run_next: %s %s tree is dirty — skipping (%s)", slug, target, repo)
         # Put the queue file back so we retry next tick
         return None
+
+    # T-0116: refuse to deploy when the target clone has local-only commits
+    # not yet on origin. The recipe's `git merge --ff-only origin/<branch>`
+    # would wipe them silently — list them loudly so the agent can recover
+    # (cherry-pick into the canonical dev clone, push, re-deploy). This
+    # mirrors the staging.sh precheck shipped in T-0110 but runs regardless
+    # of recipe presence, so a fresh-host install inherits the guard.
+    # Bypass for tests / emergency via BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1.
+    if os.environ.get("BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS") != "1":
+        local_only = _local_only_commits(repo)
+        if local_only:
+            log.error(
+                "deploy.run_next: %s/%s REFUSED — %d local-only commit(s) on %s would be wiped by ff-merge from origin:\n    %s\n"
+                "Recover by cherry-picking these into the canonical dev clone and pushing, then re-deploy. "
+                "Set BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1 to bypass.",
+                slug, target, len(local_only), repo, "\n    ".join(local_only),
+            )
+            # Match dirty-tree behaviour: leave the queue file in place so
+            # the agent can fix the install and the next tick picks it up.
+            return None
 
     # Collapse same-target trailing entries — they would deploy the same
     # code anyway (each recipe does `git checkout <branch> && git merge`
@@ -357,6 +385,56 @@ def _is_clean(repo_path: Path) -> bool:
         if not any(pat in path_part for pat in _QUIESCENCE_IGNORE):
             return False
     return True
+
+
+def _local_only_commits(repo_path: Path) -> list[str]:
+    """Return short SHAs+subjects of commits on HEAD but not on origin/<branch>.
+
+    T-0116: a non-empty list means the target clone has direct-install commits
+    that would be wiped by the recipe's `git merge --ff-only origin/<branch>`.
+    Returns [] when in sync, when no matching origin ref exists, or when git
+    misbehaves (fail-open is safe — `_is_clean` already gates the bigger risk
+    of uncommitted edits, and an unreachable origin shouldn't wedge deploys).
+    """
+    try:
+        branch_proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if branch_proc.returncode != 0:
+            return []
+        branch = branch_proc.stdout.strip()
+        if not branch or branch == "HEAD":
+            return []
+        upstream = f"origin/{branch}"
+        # Verify upstream ref exists before asking for the symmetric diff —
+        # `git log <missing-ref>..HEAD` otherwise errors out and we'd lose
+        # the signal. A fresh-host install with no upstream yet is benign.
+        verify = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", upstream],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if verify.returncode != 0:
+            return []
+        log_proc = subprocess.run(
+            ["git", "log", "--oneline", f"{upstream}..HEAD"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if log_proc.returncode != 0:
+            return []
+        return [ln for ln in log_proc.stdout.splitlines() if ln.strip()]
+    except Exception:
+        log.exception("deploy._local_only_commits: git failed for %s", repo_path)
+        return []
 
 
 def _finish(

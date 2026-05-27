@@ -216,3 +216,135 @@ def test_run_next_missing_recipe_fails_with_rc99(tmp_path: Path) -> None:
     processed_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processed"
     fail_files = list(processed_dir.glob("*.fail.99"))
     assert len(fail_files) == 1
+
+
+# ---------------------------------------------------------------------------
+# T-0116: local-only-commits guard
+# ---------------------------------------------------------------------------
+
+
+def _attach_origin(repo: Path, tmp_path: Path) -> Path:
+    """Give ``repo`` a bare upstream at ``origin`` whose HEAD == repo's HEAD.
+
+    Simulates a normal install: HEAD matches origin, no local-only commits.
+    """
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(bare)], cwd=str(repo), check=True
+    )
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "-q", "origin", branch], cwd=str(repo), check=True
+    )
+    return bare
+
+
+def _add_local_commit(repo: Path, filename: str = "local.txt") -> str:
+    """Add a commit that exists only locally. Returns the short SHA."""
+    (repo / filename).write_text("direct edit on install")
+    subprocess.run(["git", "add", filename], cwd=str(repo), check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", f"direct edit ({filename})"],
+        cwd=str(repo), check=True,
+    )
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return sha
+
+
+def test_run_next_refuses_local_only_commits(tmp_path: Path, caplog) -> None:
+    """A direct-install commit on the target clone blocks the deploy (T-0116)."""
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    _attach_origin(proj.repo_path, tmp_path)
+    sha = _add_local_commit(proj.repo_path)
+
+    enqueue(cfg, proj.slug, "staging", "should be blocked", "user")
+
+    import logging
+    with caplog.at_level(logging.ERROR):
+        result = run_next(cfg, proj.slug)
+
+    assert result is None
+    # Queue file must remain so the agent can re-deploy after cherry-picking.
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+    assert len(list(queue_dir.glob("*.json"))) == 1
+    # The SHA of the offending commit must surface in the log.
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert sha in joined
+    assert "local-only" in joined
+
+
+def test_run_next_env_bypass_allows_local_only_commits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1 lets the deploy through."""
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    _attach_origin(proj.repo_path, tmp_path)
+    _add_local_commit(proj.repo_path)
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS", "1")
+
+    queue_id = enqueue(cfg, proj.slug, "staging", "bypass", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is True
+    assert result.queue_id == queue_id
+
+
+def test_run_next_proceeds_when_in_sync_with_origin(tmp_path: Path) -> None:
+    """Origin attached, no local-only commits → deploy runs normally."""
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    _attach_origin(proj.repo_path, tmp_path)
+
+    queue_id = enqueue(cfg, proj.slug, "staging", "in sync", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is True
+    assert result.queue_id == queue_id
+
+
+def test_run_next_proceeds_when_no_origin_configured(tmp_path: Path) -> None:
+    """Fresh repo with no origin (or no matching upstream ref) deploys fine.
+
+    Fail-open is intentional: the guard exists to catch the "edited on the
+    install dir" anti-pattern, not to wedge fresh-host installs where the
+    upstream hasn't been wired up yet.
+    """
+    proj = _make_project(tmp_path)  # no origin attached
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+
+    queue_id = enqueue(cfg, proj.slug, "staging", "no origin", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is True
+    assert result.queue_id == queue_id
+
+
+def test_is_clean_for_target_flags_local_only_commits(tmp_path: Path) -> None:
+    """deploy_monitor relies on is_clean_for_target for its pre-ping gate."""
+    from bot_squad_worker.deploy import is_clean_for_target
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+
+    assert is_clean_for_target(cfg, proj.slug, "staging") is True
+
+    _add_local_commit(proj.repo_path)
+    assert is_clean_for_target(cfg, proj.slug, "staging") is False

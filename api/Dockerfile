@@ -8,8 +8,10 @@ COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
 # Mothership add-server wizard ?raw-imports the canonical chat-agent
-# install prompt from scripts/install/. Sibling path to /web so the
-# `../scripts/...` resolution from vite/Rollup matches local dev.
+# install prompt via the `@install/...` vite alias (T-0050, see
+# web/vite.config.ts). The alias resolves relative to vite.config.ts, so
+# the file has to live at /scripts/install/ — sibling to /web — for the
+# docker build to match local-dev layout.
 COPY scripts/install /scripts/install
 RUN npm run build
 

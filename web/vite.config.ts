@@ -10,12 +10,24 @@ import { fileURLToPath } from "node:url";
 // inline; the mothership BE does not serve a /prompt.txt endpoint).
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
+// Alias for the canonical install bundle. Production builds run through
+// Rollup which won't resolve a `../../../scripts/install/...` path from
+// web/ (T-0050) — the alias turns it into a stable virtual prefix that
+// resolves to the same physical directory in both local and docker
+// contexts (docker stages it at /scripts/install/ via api/Dockerfile).
+const installBundleDir = fileURLToPath(
+  new URL("../scripts/install", import.meta.url),
+);
+
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      "@install": installBundleDir,
+    },
+  },
   server: {
     fs: {
-      // Dev-server only — production builds resolve via Rollup, which
-      // is not bound by this allowlist.
       allow: [".", repoRoot],
     },
     proxy: {

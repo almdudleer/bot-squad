@@ -50,7 +50,9 @@ import {
 // (sibling to install.sh and bootstrap-claude-instructions.md). The
 // mothership BE does NOT serve this file at /i/<token>/prompt.txt — the
 // wizard substitutes it client-side instead (T-0044 F-7 resolution).
-import chatAgentPromptTemplate from "../../../scripts/install/chat-agent-prompt.txt?raw";
+// `@install/...` is a vite alias (see web/vite.config.ts, T-0050) so
+// Rollup can resolve the out-of-tree path during the production build.
+import chatAgentPromptTemplate from "@install/chat-agent-prompt.txt?raw";
 
 export function AddServerWizard() {
   const navigate = useNavigate();

@@ -81,6 +81,70 @@ export function projectCardLinkFor(
   return `/m/servers/${encodeURIComponent(server.id)}/p/${encodeURIComponent(slug)}`;
 }
 
+// T-0113: install-tokens sub-table state per attached server. The mothership
+// store only ever keeps ONE outstanding install token per server (minted at
+// /api/m/servers, burned at /installer/connect — see mothership_store.py),
+// so this is a single-row "table" — we surface it as a one-liner under the
+// section header rather than a separate <table>. Per-server token revoke +
+// re-mint endpoints aren't on the BE yet (filed under T-0129); until they
+// land the FE shows status only.
+export type InstallTokenStatus = "active" | "expired" | "consumed" | "n/a";
+
+export function installTokenStatus(
+  server: Pick<
+    AttachedServer,
+    "install_state" | "install_token_expires_at" | "is_self"
+  >,
+  now: Date = new Date(),
+): { status: InstallTokenStatus; expiresAt: string | null } {
+  // Self entries skip the install-token lifecycle entirely (see
+  // mothership_store.register_self_if_missing). Render nothing for them.
+  if (server.is_self) return { status: "n/a", expiresAt: null };
+  if (server.install_state === "pending") {
+    const exp = server.install_token_expires_at;
+    if (!exp) return { status: "n/a", expiresAt: null };
+    const expDate = new Date(exp);
+    if (Number.isNaN(expDate.getTime())) {
+      return { status: "n/a", expiresAt: exp };
+    }
+    if (now.getTime() >= expDate.getTime()) {
+      return { status: "expired", expiresAt: exp };
+    }
+    return { status: "active", expiresAt: exp };
+  }
+  // connected / ready / failed — token was burned (or never minted in the
+  // failed-pre-connect case, which is indistinguishable from the FE).
+  return { status: "consumed", expiresAt: null };
+}
+
+export function installTokenLabel(
+  state: { status: InstallTokenStatus; expiresAt: string | null },
+): string {
+  switch (state.status) {
+    case "active":
+      return `install token active · expires ${state.expiresAt}`;
+    case "expired":
+      return `install token expired (${state.expiresAt})`;
+    case "consumed":
+      return "install token consumed";
+    case "n/a":
+      return "";
+  }
+}
+
+export function installTokenBadgeClass(status: InstallTokenStatus): string {
+  switch (status) {
+    case "active":
+      return "mc-badge mc-badge-active";
+    case "expired":
+      return "mc-badge mc-badge-danger";
+    case "consumed":
+      return "mc-badge mc-badge-dim";
+    case "n/a":
+      return "mc-badge mc-badge-dim";
+  }
+}
+
 export function statusBadgeClass(status: ServerStatus): string {
   switch (status) {
     case "working":
@@ -412,8 +476,37 @@ function ServerSectionView({ section }: { section: ServerSection }) {
         </div>
         <ServerHeaderBadge section={section} />
       </header>
+      <InstallTokenRow server={server} />
       <ServerSectionBody server={server} kind={kind} result={result} />
     </section>
+  );
+}
+
+function InstallTokenRow({ server }: { server: AttachedServer }) {
+  const state = installTokenStatus(server);
+  // Self entries + nothing-to-show cases collapse — keeps the all-projects
+  // view clean for the common case (ready peers + the self entry) while
+  // still surfacing the pending/expired states the operator needs.
+  if (state.status === "n/a") return null;
+  if (state.status === "consumed") return null;
+  return (
+    <div
+      data-testid={`install-token-${server.id}`}
+      data-token-status={state.status}
+      style={{
+        fontSize: 12,
+        color: "var(--mc-text-dim)",
+        marginBottom: "0.5rem",
+        display: "flex",
+        gap: "0.5rem",
+        alignItems: "center",
+      }}
+    >
+      <span className={installTokenBadgeClass(state.status)}>
+        {state.status}
+      </span>
+      <span>{installTokenLabel(state)}</span>
+    </div>
   );
 }
 

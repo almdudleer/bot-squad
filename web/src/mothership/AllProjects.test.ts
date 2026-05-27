@@ -10,6 +10,9 @@ import { describe, expect, test } from "vitest";
 
 import {
   buildSections,
+  installTokenBadgeClass,
+  installTokenLabel,
+  installTokenStatus,
   projectCardLinkFor,
   serverHeaderLabel,
   statusBadgeClass,
@@ -178,5 +181,133 @@ describe("projectCardLinkFor (T-0068)", () => {
       "name with spaces",
     );
     expect(link).toBe("/m/servers/srv%2Fwith%20spaces/p/name%20with%20spaces");
+  });
+});
+
+// T-0113: install-tokens sub-table. The helper distills the registry row
+// (install_state + install_token_expires_at) into a discrete enum the
+// renderer keys off — keeps the time-dependent expiry check off the React
+// render path and out of jsdom.
+describe("installTokenStatus (T-0113)", () => {
+  const NOW = new Date("2026-05-27T12:00:00Z");
+
+  test("pending + future expiry → active", () => {
+    const s = installTokenStatus(
+      {
+        install_state: "pending",
+        install_token_expires_at: "2026-05-28T12:00:00Z",
+        is_self: false,
+      },
+      NOW,
+    );
+    expect(s.status).toBe("active");
+    expect(s.expiresAt).toBe("2026-05-28T12:00:00Z");
+  });
+
+  test("pending + past expiry → expired (the token would 410 at /connect)", () => {
+    const s = installTokenStatus(
+      {
+        install_state: "pending",
+        install_token_expires_at: "2026-05-26T12:00:00Z",
+        is_self: false,
+      },
+      NOW,
+    );
+    expect(s.status).toBe("expired");
+  });
+
+  test("connected → consumed (token burned at /connect)", () => {
+    expect(
+      installTokenStatus({
+        install_state: "connected",
+        install_token_expires_at: null,
+        is_self: false,
+      }).status,
+    ).toBe("consumed");
+  });
+
+  test("ready → consumed", () => {
+    expect(
+      installTokenStatus({
+        install_state: "ready",
+        install_token_expires_at: null,
+        is_self: false,
+      }).status,
+    ).toBe("consumed");
+  });
+
+  test("failed → consumed (whatever was minted is gone, indistinguishable from burned)", () => {
+    expect(
+      installTokenStatus({
+        install_state: "failed",
+        install_token_expires_at: null,
+        is_self: false,
+      }).status,
+    ).toBe("consumed");
+  });
+
+  test("is_self → n/a (the mothership's own row skips the token lifecycle)", () => {
+    const s = installTokenStatus(
+      {
+        install_state: "ready",
+        install_token_expires_at: null,
+        is_self: true,
+      },
+      NOW,
+    );
+    expect(s.status).toBe("n/a");
+  });
+
+  test("pending row missing expires_at defensively maps to n/a (shouldn't happen on disk, but doesn't 500 the page)", () => {
+    expect(
+      installTokenStatus({
+        install_state: "pending",
+        install_token_expires_at: null,
+        is_self: false,
+      }).status,
+    ).toBe("n/a");
+  });
+
+  test("pending with garbage expiry string falls back to n/a", () => {
+    expect(
+      installTokenStatus({
+        install_state: "pending",
+        install_token_expires_at: "not-a-date",
+        is_self: false,
+      }).status,
+    ).toBe("n/a");
+  });
+});
+
+describe("installTokenLabel + installTokenBadgeClass (T-0113)", () => {
+  test("active label embeds the expiry timestamp", () => {
+    const label = installTokenLabel({
+      status: "active",
+      expiresAt: "2026-05-28T12:00:00Z",
+    });
+    expect(label).toContain("active");
+    expect(label).toContain("2026-05-28T12:00:00Z");
+  });
+
+  test("expired label embeds the timestamp", () => {
+    expect(
+      installTokenLabel({
+        status: "expired",
+        expiresAt: "2026-05-26T12:00:00Z",
+      }),
+    ).toContain("2026-05-26T12:00:00Z");
+  });
+
+  test("consumed label is a fixed string with no timestamp", () => {
+    expect(installTokenLabel({ status: "consumed", expiresAt: null })).toBe(
+      "install token consumed",
+    );
+  });
+
+  test("badge class differentiates the three on-screen states", () => {
+    const a = installTokenBadgeClass("active");
+    const e = installTokenBadgeClass("expired");
+    const c = installTokenBadgeClass("consumed");
+    expect(new Set([a, e, c]).size).toBeGreaterThan(1);
   });
 });

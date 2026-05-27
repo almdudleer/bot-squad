@@ -112,6 +112,20 @@ export type Checkpoint = {
   received_at: string;
 };
 
+/** Public projection of a GlobalUser registry row (T-0066 / T-0113).
+ *  ``password_hash`` is stripped server-side. ``attached_servers`` is a
+ *  follow-on (T-0129 BE) — until then the FE renders an em-dash. */
+export type GlobalUser = {
+  id: string;
+  username: string;
+  display_name: string;
+  email: string;
+  timezone: string;
+  is_super_admin: boolean;
+  created_at: string;
+  attached_servers?: number;
+};
+
 // ---------------------------------------------------------------------------
 // Release-feed surface (T-0087)
 // ---------------------------------------------------------------------------
@@ -211,6 +225,10 @@ export const mothershipApi = {
         body: JSON.stringify({ target_username, role }),
       },
     ),
+
+  /** T-0113: list every GlobalUser. Super-admin only (403 otherwise) — the
+   *  Users page surfaces the 403 as a "super-admin only" empty state. */
+  listUsers: () => call<GlobalUser[]>("/api/m/users"),
 
   projectsFor: (serverId: string) =>
     call<ServerProject[]>(

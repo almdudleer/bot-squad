@@ -167,6 +167,81 @@ describe("mothershipApi.createInvite (T-0125)", () => {
   });
 });
 
+// T-0113: super-admin directory backing the /m/users page.
+describe("mothershipApi.listUsers (T-0113)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("GETs /api/m/users and returns the array", async () => {
+    const users = [
+      {
+        id: "gu_a",
+        username: "alice",
+        display_name: "Alice",
+        email: "alice@example.com",
+        timezone: "UTC",
+        is_super_admin: true,
+        created_at: "2026-05-27T00:00:00Z",
+      },
+    ];
+    const spy = mockFetchSequence([{ json: async () => users }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    const out = await mothershipApi.listUsers();
+    expect(out).toEqual(users);
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/users",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  test("empty registry comes through as []", async () => {
+    globalThis.fetch = mockFetchSequence([{ json: async () => [] }]) as unknown as typeof fetch;
+    expect(await mothershipApi.listUsers()).toEqual([]);
+  });
+
+  test("403 from the BE super-admin gate surfaces as an `API error 403` rejection", async () => {
+    globalThis.fetch = mockFetchSequence([
+      { ok: false, status: 403, text: async () => "super-admin only" },
+    ]) as unknown as typeof fetch;
+    await expect(mothershipApi.listUsers()).rejects.toThrow(/API error 403/);
+  });
+});
+
+// T-0113: the install-token mint round-trip is the existing T-0024 surface.
+// /m/users coverage isn't complete without pinning that the FE adapter
+// returns the one-shot install_token + install_url envelope verbatim — the
+// AllProjects install-tokens sub-table reads `install_token_expires_at`
+// from listServers() but the *mint* is what gets that field onto disk.
+describe("mothershipApi.createServer (install-token mint)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("POSTs display_name + base_url and returns the one-shot install_token envelope", async () => {
+    const minted = {
+      id: "srv_new",
+      install_token: "bsq_install_ABC",
+      install_url: "https://staging.botsquad.dev/i/bsq_install_ABC/install.sh",
+      instructions_url:
+        "https://staging.botsquad.dev/i/bsq_install_ABC/instructions.md",
+      expires_at: "2026-05-28T00:00:00Z",
+    };
+    const spy = mockFetchSequence([{ json: async () => minted }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    const out = await mothershipApi.createServer("staging", "https://x.example.com");
+    expect(out).toEqual(minted);
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          display_name: "staging",
+          base_url: "https://x.example.com",
+        }),
+      }),
+    );
+  });
+});
+
 describe("mothershipApi.refreshProjects", () => {
   test("POSTs to /api/m/servers/<id>/projects/refresh", async () => {
     const spy = mockFetchSequence([

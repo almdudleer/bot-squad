@@ -10,6 +10,7 @@ import {
 import { AddServerWizard } from "./AddServerWizard";
 import { MothershipProject } from "./MothershipProject";
 import { Releases } from "./Releases";
+import { Users } from "./Users";
 import { api } from "../api";
 import { isSuperAdminFromMe } from "../components/sidebarHelpers";
 
@@ -480,6 +481,9 @@ export default function MothershipRoutes() {
           whole module + its chunk gets tree-shaken from detached builds
           via the same VITE_MOTHERSHIP gate in App.tsx. */}
       <Route path="releases" element={<Releases />} />
+      {/* T-0113: super-admin directory of GlobalUsers. Backed by
+          /api/m/users (T-0066). Empty until the first registry mint. */}
+      <Route path="users" element={<Users />} />
       <Route path="*" element={<NotFound />} />
     </Routes>
   );

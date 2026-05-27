@@ -103,14 +103,7 @@ export function Workflow() {
     api
       .repoAgentsMd(slug)
       .then((r) => setAgentsMd({ name: "AGENTS.md", content: r.content }))
-      .catch((e) => {
-        // 404 means file missing — show empty editor seed so user can create it.
-        if (String(e).includes("404")) {
-          setAgentsMd({ name: "AGENTS.md", content: "" });
-        } else {
-          setError(String(e));
-        }
-      });
+      .catch((e) => setError(String(e)));
   }
 
   useEffect(() => {

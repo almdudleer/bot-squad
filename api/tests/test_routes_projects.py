@@ -198,14 +198,17 @@ def test_get_repo_agents_md(tmp_bot_squad: Path, monkeypatch):
         (repo / "AGENTS.md").unlink(missing_ok=True)
 
 
-def test_get_repo_agents_md_missing_404(tmp_bot_squad: Path, monkeypatch):
+def test_get_repo_agents_md_missing_returns_empty(tmp_bot_squad: Path, monkeypatch):
+    # T-0131: missing AGENTS.md must return 200 with empty content (not 404)
+    # so the browser console isn't polluted on every Workflow page visit.
     repo = Path("/tmp/test-repo")
     repo.mkdir(parents=True, exist_ok=True)
     (repo / "AGENTS.md").unlink(missing_ok=True)
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         r = client.get("/api/projects/test-project/repo-agents-md")
-    assert r.status_code == 404
+    assert r.status_code == 200
+    assert r.json() == {"content": ""}
 
 
 # ---------------------------------------------------------------------------

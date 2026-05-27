@@ -518,8 +518,11 @@ def get_repo_agents_md(slug: str, request: Request) -> dict:
     if proj is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
     path = proj.repo_path / "AGENTS.md"
+    # T-0131: missing AGENTS.md is a normal state (the FE's Workflow page
+    # seeds an empty editor either way). Returning 404 here only polluted
+    # the browser console — return 200 with empty content instead.
     if not path.exists():
-        raise HTTPException(status_code=404, detail="AGENTS.md not found in repo")
+        return {"content": ""}
     return {"content": path.read_text(encoding="utf-8")}
 
 

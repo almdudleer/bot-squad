@@ -1003,6 +1003,36 @@ def _action_autoupdate_force(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"autoupdate_force: {e}") from e
 
 
+_RELOAD_PROJECTS_ALLOWED: set[str] = set()
+
+
+def _action_reload_projects(params: dict[str, Any]) -> dict[str, Any]:
+    """Re-read projects.toml + rebuild the in-memory project list.
+
+    Takes no params. Returns ``{ok: true, projects: [<slug>, ...], count: N}``.
+
+    Called by the API after ``POST /api/projects`` writes a new project
+    block. The worker reads projects.toml only at startup, so without this
+    nudge any slug-keyed action (peer_send role-resolution, tg_notify,
+    deploy, etc.) would 404 on the new slug until a restart. The on-disk
+    state is already consistent before this fires; failures here only
+    leave the in-memory worker view stale (the next restart fixes it).
+    """
+    extra = set(params) - _RELOAD_PROJECTS_ALLOWED
+    if extra:
+        raise ActionError(f"reload_projects got unexpected params: {sorted(extra)}")
+
+    cfg = _get_config()
+    from bot_squad_worker.config import Config
+    new_cfg = Config.load(cfg.config_dir)
+    set_config(new_cfg)
+    return {
+        "ok": True,
+        "projects": sorted(new_cfg.projects.keys()),
+        "count": len(new_cfg.projects),
+    }
+
+
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
@@ -1035,6 +1065,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "autoupdate_force": _action_autoupdate_force,
     # T-0089: trigger an out-of-cadence poller tick from the consumer UI.
     "autoupdate_check_now": _action_autoupdate_check_now,
+    # T-0054: nudge the worker after POST /api/projects so the in-memory
+    # project list picks up the new slug without a worker restart.
+    "reload_projects": _action_reload_projects,
 }
 
 
@@ -1075,6 +1108,8 @@ ACTION_MODES: dict[str, str] = {
     "autoupdate_force": "coordinator_only",
     # T-0089: scheduler-coupled (modifies the autoupdate job's next_run).
     "autoupdate_check_now": "coordinator_only",
+    # T-0054: rebuilds the global Config (touches module-level state).
+    "reload_projects": "coordinator_only",
 }
 
 

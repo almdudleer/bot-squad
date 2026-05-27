@@ -118,7 +118,7 @@ def _read_projects_toml(config_dir: Path) -> dict[str, dict]:
 
 
 @router.post("", status_code=201)
-def create_project(
+async def create_project(
     request: Request,
     payload: dict,
     _admin: dict = Depends(require_admin),
@@ -170,11 +170,21 @@ def create_project(
     for sub in ("backlog", "vision", "feedback", "sessions"):
         (data_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    # Hot-reload the API's view; the worker still reads projects.toml on
-    # startup, so peer/session routing for this slug requires a worker
-    # restart. TODO: a worker `reload_projects` action — separate ticket,
-    # out of scope for the minimal create affordance.
+    # Hot-reload the API's view, then nudge the worker so its in-memory
+    # project list picks up the new slug without a restart (T-0054). On-disk
+    # state is already consistent above; if the worker is unreachable we log
+    # and still 201 — the next worker restart will pick up projects.toml.
+    # Staleness window: roughly (now → next worker restart) during which
+    # slug-keyed worker actions (tg_notify, deploy, etc.) will 404 the new
+    # slug. peer_send is unaffected — its inbox files are slug-directory-
+    # scoped, not config-list-scoped.
     request.app.state.api_config = ApiConfig.load(config_dir)
+    try:
+        await request.app.state.worker_router.coordinator().call_action(
+            "reload_projects", {}, timeout=5.0,
+        )
+    except WorkerError as e:
+        log.warning("create_project %s: worker reload_projects failed: %s", slug, e)
 
     return {
         "slug": slug,

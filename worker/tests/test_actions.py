@@ -48,6 +48,7 @@ def test_registry_lists_only_allowed_actions():
     # Phase 1 message bus adds peer_send, peer_inbox_read, peer_inbox_wait.
     assert set(ACTION_REGISTRY.keys()) == {
         "noop", "tg_verify_login", "tg_notify", "deploy",
+        "pause_deploys", "resume_deploys",
         "list_sessions", "pause_session", "suspend_session", "resume_session",
         "spawn_session",
         "scheduler_state", "inject_input",
@@ -63,6 +64,8 @@ def test_registry_lists_only_allowed_actions():
         "autoupdate_retry", "autoupdate_force",
         # T-0089: trigger an out-of-cadence poller tick from the consumer UI.
         "autoupdate_check_now",
+        # T-0054: hot-reload projects.toml after POST /api/projects.
+        "reload_projects",
     }
 
 
@@ -1003,3 +1006,51 @@ def test_task_progress_add_preserves_verbatim_section(tmp_path, monkeypatch):
     assert "ctx text" in content
     assert content.count("S-x · first") == 1
     assert content.count("S-y · second") == 1
+
+
+# ---------------------------------------------------------------------------
+# reload_projects tests (T-0054)
+# ---------------------------------------------------------------------------
+
+
+def test_reload_projects_picks_up_new_slug(tmp_config_dir: Path, monkeypatch):
+    """After projects.toml gains a new block, reload_projects rebuilds the
+    in-memory config so cfg.projects sees the new slug without restart."""
+    import bot_squad_worker.actions as A
+
+    cfg = Config.load(tmp_config_dir)
+    A.set_config(cfg)
+    assert set(A._get_config().projects.keys()) == {"test-project"}
+
+    # Append a second project block to projects.toml.
+    projects_toml = tmp_config_dir / "projects.toml"
+    projects_toml.write_text(
+        projects_toml.read_text()
+        + "\n[projects.fresh]\n"
+        'slug = "fresh"\n'
+        'display_name = "Fresh"\n'
+        'repo_path = "/tmp/fresh-repo"\n'
+        'deploy_branch = ""\n'
+        'master_branch = ""\n'
+        'prod_url = ""\n'
+        'staging_url = ""\n'
+        'dev_url = ""\n'
+        'deploy_targets = []\n'
+        'tg_chat = ""\n'
+    )
+
+    out = A.dispatch("reload_projects", {})
+    assert out["ok"] is True
+    assert out["count"] == 2
+    assert out["projects"] == ["fresh", "test-project"]
+    # Module-level config was actually swapped in — subsequent action lookups
+    # see the new slug.
+    assert "fresh" in A._get_config().projects
+
+
+def test_reload_projects_rejects_params(tmp_config_dir: Path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    A.set_config(Config.load(tmp_config_dir))
+    with pytest.raises(ActionError, match="unexpected"):
+        A.dispatch("reload_projects", {"slug": "test-project"})

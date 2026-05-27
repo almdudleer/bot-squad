@@ -112,6 +112,10 @@ export type SessionRow = {
   // T-0080: UI username that spawned the session. Empty for legacy
   // pre-T-0080 sessions; backend filters non-admins to only their own.
   owner?: string;
+  // T-0078: which tmux session the pane lives in (`<slug>` for legacy
+  // panes, `<slug>-<initiative-stem>` for initiative TLs). Empty when
+  // the worker can't determine it (pre-T-0078 md without backfill).
+  tmux_session?: string;
 };
 
 export type RunRow = {

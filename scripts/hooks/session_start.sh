@@ -76,9 +76,18 @@ if [ -z "$task_id" ] && [ "${src_window#T-}" != "$src_window" ]; then
     [ -n "$num" ] && [ "$num" != "$src_window" ] && task_id="T-$num"
 fi
 
+# T-0078: capture the tmux session this pane lives in. Source of truth for
+# the "copy `tmux a -t …`" affordance and the discoverability story in the
+# tmux-window-strategy initiative. Re-read on every hook fire so a manual
+# `tmux move-pane` shows up next time the md is rewritten.
+tmux_session=""
+if [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
+    tmux_session="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || echo "")"
+fi
+
 if [ -n "$sid" ] && [ -n "$CLAUDE_SID" ]; then
     mkdir -p "$DATA/sessions"
-    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" python3 - <<'PY' 2>/dev/null || true
+    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" TMUX_SESSION="$tmux_session" python3 - <<'PY' 2>/dev/null || true
 import os, time
 from pathlib import Path
 
@@ -90,6 +99,7 @@ cwd        = os.environ["CWD"]
 task_id    = os.environ.get("TASK_ID") or ""
 initiative = os.environ.get("INITIATIVE") or ""
 owner      = os.environ.get("OWNER") or ""
+tmux_session = os.environ.get("TMUX_SESSION") or ""
 window     = sid.rsplit("-p", 1)[0].split("-", 2)[-1] if "-p" in sid else ""
 now        = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 md_path    = data / "sessions" / f"{sid}.md"
@@ -126,6 +136,13 @@ if not owner:
 if owner == "~":
     owner = ""
 
+# T-0078: tmux says which tmux session the pane lives in; prefer that, fall
+# back to the md's prior value so an out-of-tmux re-run preserves the field.
+if not tmux_session:
+    tmux_session = existing.get("tmux_session") or ""
+if tmux_session == "~":
+    tmux_session = ""
+
 started_at = existing.get("started_at") or "~"
 if started_at == "~" or not started_at:
     started_at = now
@@ -148,6 +165,7 @@ md_path.write_text(
     f"extra_initiatives: {extra_initiatives}\n"
     f"started_at: {started_at}\n"
     f"owner: {owner or '~'}\n"
+    f"tmux_session: {tmux_session or '~'}\n"
     "---\n"
 )
 PY
@@ -277,6 +295,10 @@ def tmux_q(fmt):
 
 new_window = tmux_q('#W')
 pane_raw   = tmux_q('#{pane_id}')
+# T-0078: re-query the post-break-pane tmux session so the SessionMd
+# reflects the destination (`<slug>-<initiative>` for an initiative TL,
+# `<slug>` for the legacy main session).
+new_tmux_session = tmux_q('#S')
 if not new_window or not pane_raw:
     raise SystemExit
 new_window = re.sub(r'[^A-Za-z0-9_-]', '_', new_window)
@@ -300,8 +322,24 @@ def sub_field(t, key, value):
         return pat.sub(f'{key}: {value}', t, count=1)
     return t
 
+def upsert_field(t, key, value):
+    # T-0078: like sub_field but inserts a line before the closing `---`
+    # when the key is absent (so a legacy md without tmux_session picks
+    # the field up on its next break-pane migration).
+    pat = re.compile(rf'^{re.escape(key)}:.*$', re.M)
+    if pat.search(t):
+        return pat.sub(f'{key}: {value}', t, count=1)
+    fm_close = re.compile(r'^---\s*$', re.M)
+    matches = list(fm_close.finditer(t))
+    if len(matches) >= 2:
+        idx = matches[1].start()
+        return t[:idx] + f'{key}: {value}\n' + t[idx:]
+    return t
+
 text = sub_field(text, 'sid', new_sid)
 text = sub_field(text, 'window', new_window)
+if new_tmux_session:
+    text = upsert_field(text, 'tmux_session', new_tmux_session)
 
 # Atomic-ish: write new first, then unlink old. If they're the same path
 # (defensive: can't happen given the new_sid==old_sid early-exit above)

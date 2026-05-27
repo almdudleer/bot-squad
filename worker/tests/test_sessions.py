@@ -1617,6 +1617,190 @@ def test_list_sessions_emits_owner_from_md(tmp_path, monkeypatch):
     assert by_sid["S-u-sus-p1"]["owner"] == "aqice"
 
 
+# ---------------------------------------------------------------------------
+# T-0078: tmux_session field on SessionMd + list_sessions rows
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_writes_tmux_session_to_session_md(tmp_path, monkeypatch):
+    """T-0078: spawn() pre-stamps tmux_session on the SessionMd so the
+    field is populated even before the SessionStart hook fires.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%5|w|9|{repo}|claude|test-project\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = spawn(cfg, "test-project", "w")
+    md_path = (
+        cfg.data_dir / "test-project" / "sessions" / f"{result['sid']}.md"
+    )
+    meta = _read_session_metadata(md_path)
+    assert meta is not None
+    assert meta["tmux_session"] == "test-project"
+
+
+def test_spawn_with_initiative_writes_sibling_tmux_session(tmp_path, monkeypatch):
+    """T-0078: TLs spawned with an initiative get the sibling session name
+    (`<slug>-<initiative-stem>`) stamped onto their SessionMd, matching the
+    sibling tmux session the new-window targets.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "has-session" in args:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%9|tl|99|{repo}|claude|test-project-multi\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = spawn(cfg, "test-project", "tl", initiative="multi.md")
+    md_path = (
+        cfg.data_dir / "test-project" / "sessions" / f"{result['sid']}.md"
+    )
+    meta = _read_session_metadata(md_path)
+    assert meta is not None
+    assert meta["tmux_session"] == "test-project-multi"
+
+
+def test_list_sessions_emits_tmux_session(tmp_path, monkeypatch):
+    """T-0078: list_sessions surfaces tmux_session for both active panes
+    (from list-panes' session_name column) and suspended mds (from the
+    SessionMd frontmatter)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-u-sus-p1.md", {
+        "sid": "S-u-sus-p1",
+        "status": "suspended",
+        "window": "sus",
+        "cwd": str(repo),
+        "claude_uuid": "abc",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:00:00Z",
+        "suspended_at": "2026-05-16T11:00:00Z",
+        "tmux_session": "test-project-multi",
+    })
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"%4|act|111|{repo}|claude|test-project-multi\n",
+                "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows}
+    assert by_sid["S-u-act-p4"]["tmux_session"] == "test-project-multi"
+    assert by_sid["S-u-sus-p1"]["tmux_session"] == "test-project-multi"
+
+
+def test_suspend_preserves_tmux_session_field(tmp_path, monkeypatch):
+    """T-0078: suspend() must keep tmux_session stamped — the resume()
+    that follows wants to know which tmux session the pane originally
+    lived in.
+    """
+    from bot_squad_worker.sessions import suspend
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-u-tl-p3.md", {
+        "sid": "S-u-tl-p3",
+        "status": "active",
+        "window": "tl",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-1",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:00:00Z",
+        "tmux_session": "test-project-multi",
+    })
+
+    pane_calls = [0]
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            pane_calls[0] += 1
+            if pane_calls[0] == 1:
+                return subprocess.CompletedProcess(
+                    args, 0, f"%3|tl|11|{repo}|claude|test-project-multi\n", "",
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    suspend(cfg, "test-project", "S-u-tl-p3")
+    meta = _read_session_metadata(sessions_dir / "S-u-tl-p3.md")
+    assert meta["tmux_session"] == "test-project-multi"
+
+
+def test_session_start_hook_writes_tmux_session_field():
+    """T-0078: scripts/hooks/session_start.sh's inline python writes
+    `tmux_session: ...` into the SessionMd frontmatter, sourcing the
+    value from `tmux display-message -p -t $TMUX_PANE '#S'`.
+
+    Skipped when the hook isn't reachable from the test cwd.
+    """
+    import pathlib as _pl
+    here = _pl.Path(__file__).resolve()
+    hook = None
+    for ancestor in here.parents:
+        cand = ancestor / "scripts" / "hooks" / "session_start.sh"
+        if cand.is_file():
+            hook = cand
+            break
+    if hook is None:
+        pytest.skip("session_start.sh not reachable from test cwd")
+    text = hook.read_text()
+    # The bash block must read tmux_session from `tmux display-message #S`
+    # and pass it through the env to the python md-write block.
+    assert "tmux_session=\"$(tmux display-message" in text, \
+        "T-0078: hook must source tmux_session from `tmux display-message`"
+    assert "TMUX_SESSION=\"$tmux_session\"" in text, \
+        "T-0078: hook must pass TMUX_SESSION env var to the python block"
+    assert 'f"tmux_session: {tmux_session or \'~\'}\\n"' in text, \
+        "T-0078: hook must write tmux_session into SessionMd frontmatter"
+
+
 def test_suspend_preserves_owner_field(tmp_path, monkeypatch):
     """suspend() rewrites the md but must keep owner stamped."""
     from bot_squad_worker.sessions import suspend

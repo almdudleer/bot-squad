@@ -624,6 +624,15 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "suspended_at": None,
             "archived": archived_flag,
             "owner": owner_meta,
+            # T-0078: live tmux session name — for the "copy `tmux a -t …`"
+            # affordance the UI offers. Comes from list-panes' session_name
+            # field; falls back to whatever the md has if the pane row
+            # didn't carry one (legacy 5-field tmux output).
+            "tmux_session": (
+                pane.session
+                or (existing.get("tmux_session") if existing else "")
+                or ""
+            ),
         })
 
     # --- Non-active sessions from metadata files ---
@@ -671,6 +680,12 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             md_archived = str(meta.get("archived", "")).lower() == "true"
             md_owner_val = meta.get("owner")
             md_owner = str(md_owner_val) if (md_owner_val and md_owner_val != "~") else ""
+            md_tmux_session_val = meta.get("tmux_session")
+            md_tmux_session = (
+                str(md_tmux_session_val)
+                if md_tmux_session_val and md_tmux_session_val != "~"
+                else ""
+            )
             rows.append({
                 "sid": sid,
                 "status": display_status,
@@ -692,6 +707,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "suspended_at": meta.get("suspended_at"),
                 "archived": md_archived,
                 "owner": md_owner,
+                # T-0078: surface tmux_session so the UI can still suggest the
+                # right `tmux a -t …` even after suspend.
+                "tmux_session": md_tmux_session,
             })
 
     return rows
@@ -780,6 +798,13 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
     # T-0080: preserve owner field across suspend/resume so per-user
     # listing filters keep working after a session is suspended.
     owner_val = existing.get("owner") or "~"
+    # T-0078: preserve tmux_session across suspend → resume so a stale
+    # SessionMd still carries the last-known session name (used by the
+    # UI's resurrect affordance and by the one-shot backfill script).
+    # Fall back to the live pane's session name when the md was missing.
+    tmux_sess_val = existing.get("tmux_session")
+    if not tmux_sess_val or tmux_sess_val == "~":
+        tmux_sess_val = target_pane.session or "~"
     meta: dict = {
         "sid": sid,
         "status": "suspended",
@@ -790,6 +815,7 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         "started_at": started_at,
         "suspended_at": now,
         "owner": owner_val,
+        "tmux_session": tmux_sess_val,
     }
     _write_session_metadata(meta_file, meta)
 
@@ -914,6 +940,10 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     # Update metadata
     meta["status"] = "active"
     meta["sid"] = new_sid
+    # T-0078: resurrect into the same tmux session the spawn put us in;
+    # reflect that on the SessionMd so list_sessions surfaces the correct
+    # `tmux a -t …` target without waiting for the hook.
+    meta["tmux_session"] = target_session
     meta.pop("paused_at", None)
     new_meta_file = _session_file(data_dir, slug, new_sid)
     _write_session_metadata(new_meta_file, meta)
@@ -1220,6 +1250,23 @@ def spawn(
 
     new_pane = max(new_panes, key=lambda p: int(p.pane_id.lstrip("%")) if p.pane_id.lstrip("%").isdigit() else 0)
     new_sid = compute_sid(user, new_pane.window, new_pane.pane_id)
+
+    # T-0078: pre-stamp tmux_session on the SessionMd so the field is
+    # populated even before the SessionStart hook fires (and survives the
+    # hook's rewrite, which now preserves tmux_session via env passthrough).
+    # We use the deterministic _tmux_session_name(slug, initiative) value;
+    # the hook's `tmux display-message #S` read against the live pane will
+    # converge on the same string. pane.session would also work but legacy
+    # 5-field tmux output drops it.
+    try:
+        seed_meta_file = _session_file(cfg.data_dir, slug, new_sid)
+        seed_meta = _read_session_metadata(seed_meta_file) or {}
+        seed_meta.setdefault("sid", new_sid)
+        seed_meta["tmux_session"] = target_session
+        _write_session_metadata(seed_meta_file, seed_meta)
+    except OSError:
+        # Best-effort: the hook will populate the field next time it fires.
+        pass
 
     # T-0105: stamp the freshly-spawned SID into the task md's
     # session_history list so the task carries forensics for *every*

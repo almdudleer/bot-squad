@@ -135,7 +135,12 @@ function ServerForm(props: {
 }) {
   return (
     <div className="container py-4" style={{ maxWidth: 560 }}>
+      {/* T-0132: page identity for screen-readers + heading-scan navigation.
+          The visual `mc-section-title` chrome stays put; the h1 sits above
+          it semantically so a11y tools land here first. */}
+      <h1 className="visually-hidden">Add a server</h1>
       <div className="mc-section-title">Mothership · add server</div>
+      <h2 className="mc-wizard-step-heading">Step 1 — Name your server</h2>
       <p style={{ color: "var(--mc-text-dim)", fontSize: "0.85rem", marginTop: "0.5rem" }}>
         Step 1 of 2 — name the server and tell us where it'll live. We'll
         mint a single-use install token, then walk you through getting
@@ -232,6 +237,10 @@ function WizardBody(props: {
 
   return (
     <div className="container py-4" style={{ maxWidth: 760 }}>
+      {/* T-0132: same page identity as the form step — h1 stays "Add a
+          server" across both wizard states so a screen-reader user
+          hears one consistent label. */}
+      <h1 className="visually-hidden">Add a server</h1>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.5rem" }}>
         <div className="mc-section-title">Mothership · install wizard</div>
         <Link
@@ -309,9 +318,12 @@ function Section(props: {
         background: "var(--mc-surface)",
       }}
     >
-      <div style={{ fontSize: 13, color: "var(--mc-text)", marginBottom: "0.25rem", fontWeight: 600 }}>
+      {/* T-0132: promote each visible wizard step to an <h2> so screen-
+          reader users and heading-scan tools land on the section labels.
+          Visual styling is preserved by keeping the inline styles. */}
+      <h2 style={{ fontSize: 13, color: "var(--mc-text)", margin: "0 0 0.25rem", fontWeight: 600 }}>
         {props.title}
-      </div>
+      </h2>
       {props.subtitle && (
         <div style={{ fontSize: 12, color: "var(--mc-text-dim)", marginBottom: "0.6rem" }}>
           {props.subtitle}

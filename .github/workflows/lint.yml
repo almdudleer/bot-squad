@@ -1,0 +1,34 @@
+# T-0121: CI hook for the backlog status-schema lint.
+#
+# This is a syntax-only sanity check — the live data tree
+# (/home/www/bot-squad/data) is not present on GitHub runners, so the lint
+# runs against the in-repo synthetic fixtures via pytest. The actual data
+# tree is policed by the pre-commit framework (see .pre-commit-config.yaml)
+# when operators opt in locally, and by the API PATCH validator at write
+# time (api/app/routes_backlog.py::_VALID_STATUSES).
+name: lint
+
+on:
+  push:
+    branches: [master, bot_squad/dev]
+  pull_request:
+
+jobs:
+  backlog-frontmatter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Smoke-run the lint script (empty default root → exit 0)
+        run: |
+          python3 scripts/lint/backlog_frontmatter.py /nonexistent
+      - name: Install api test deps
+        run: |
+          pip install --upgrade pip
+          pip install -e api[dev]
+      - name: Run lint script unit tests
+        run: |
+          cd api && pytest tests/test_backlog_frontmatter_lint.py -x -q

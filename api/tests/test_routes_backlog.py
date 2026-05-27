@@ -301,6 +301,11 @@ def test_patch_task_invalid_status(tmp_bot_squad: Path, monkeypatch):
             json={"status": "invalid"},
         )
     assert r.status_code == 400
+    # T-0121: error message must cite the canonical set so direct-file editors
+    # see exactly what's allowed without grepping the source.
+    detail = r.json()["detail"]
+    for canon in ("planned", "open", "in_progress", "totest", "reopened", "closed"):
+        assert canon in detail, f"canonical {canon!r} missing from 400 detail: {detail!r}"
 
 
 def test_patch_task_requires_auth(tmp_bot_squad: Path, monkeypatch):

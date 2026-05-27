@@ -28,6 +28,14 @@ router = APIRouter(
 )
 
 _VALID_STATUSES = {"planned", "open", "in_progress", "totest", "reopened", "closed"}
+
+
+def _invalid_status_detail(value: object) -> str:
+    """T-0121: 400 message that cites the canonical schema, not just echoes input."""
+    canon = ", ".join(sorted(_VALID_STATUSES))
+    return f"invalid status: {value!r} — must be one of {{{canon}}}"
+
+
 _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 
 # T-0038: optional linkage fields settable via PATCH alongside title/status.
@@ -182,7 +190,7 @@ def create_task(
         raise HTTPException(status_code=400, detail="title must not be empty")
     status = payload.get("status", "open")
     if status not in _VALID_STATUSES:
-        raise HTTPException(status_code=400, detail=f"invalid status: {status!r}")
+        raise HTTPException(status_code=400, detail=_invalid_status_detail(status))
     # Phase 7: prefer `verbatim_request` (composed into canonical body).
     # Fall back to legacy `body` (stored as-is — caller knows the convention).
     verbatim_request = payload.get("verbatim_request")
@@ -241,7 +249,7 @@ def patch_task(
     _validate_task_id(task_id)
 
     if "status" in payload and payload["status"] not in _VALID_STATUSES:
-        raise HTTPException(status_code=400, detail=f"invalid status: {payload['status']!r}")
+        raise HTTPException(status_code=400, detail=_invalid_status_detail(payload["status"]))
     if "title" in payload and not (payload.get("title") or "").strip():
         raise HTTPException(status_code=400, detail="title must not be empty")
 

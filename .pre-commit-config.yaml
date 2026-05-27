@@ -1,0 +1,22 @@
+# T-0121: lint backlog md frontmatter against the canonical status schema
+# (planned/open/in_progress/totest/reopened/closed). The source-of-truth is
+# api/app/routes_backlog.py::_VALID_STATUSES; this hook catches direct-file
+# edits that bypass the API PATCH validator.
+#
+# Local installation (operator opt-in, not enforced):
+#     pip install pre-commit && pre-commit install
+#
+# Direct invocation (no framework required):
+#     python3 scripts/lint/backlog_frontmatter.py [DATA_DIR ...]
+repos:
+  - repo: local
+    hooks:
+      - id: backlog-frontmatter-schema
+        name: backlog frontmatter status schema
+        entry: python3 scripts/lint/backlog_frontmatter.py
+        language: system
+        # Runs on every invocation; defaults to the install data dir
+        # (/home/www/bot-squad/data) when no arg is given. No file filter —
+        # the script walks the data tree itself.
+        pass_filenames: false
+        always_run: true

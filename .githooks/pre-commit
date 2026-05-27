@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# pre-commit hook — surface recent peer activity on files being committed.
+#
+# Bot-squad sessions share a single working tree per project and all
+# commit under one git identity. There is no cross-session "this file is
+# being edited" signal, and the Edit tool's freshness check is per-tool-
+# call, not per-region. That has caused commits to silently delete lines
+# another session added hours earlier (e.g. wiping a freshly-added kill
+# switch or env-var gate).
+#
+# This hook doesn't block — it prints a one-shot situational report and
+# requires the agent to re-run `git commit` with BOT_SQUAD_ACK_PEERS=1
+# to acknowledge. The first attempt always exits non-zero so the warning
+# can't be missed; the second attempt passes through if the env is set.
+#
+# Disable per-commit (not recommended) with: BOT_SQUAD_SKIP_PEER_CHECK=1
+# Enable hook globally in this clone with:   git config core.hooksPath .githooks
+#
+# Reference impl committed first in signal-tracker (.githooks/pre-commit);
+# T-0093 baked it into every bot-squad-managed clone.
+
+set -uo pipefail
+
+[ "${BOT_SQUAD_SKIP_PEER_CHECK:-}" = "1" ] && exit 0
+
+LOOKBACK_HOURS=${BOT_SQUAD_LOOKBACK_HOURS:-24}
+LOOKBACK_ARG="${LOOKBACK_HOURS} hours ago"
+
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+[ -z "$staged" ] && exit 0
+
+# HEAD (parent of this commit) is what 'recent' is measured against.
+parent=$(git rev-parse --verify HEAD 2>/dev/null || echo "")
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+warnings_found=0
+report=""
+
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+
+    # 1) Commits that touched this file in the lookback window. In the
+    #    shared clone the author column is usually the same identity for
+    #    every peer — the hash + subject lets the agent recognize peer
+    #    work by topic anyway.
+    recent=$(git log --since="$LOOKBACK_ARG" --pretty=format:'%h  %ar  %an  %s' -- "$f" 2>/dev/null)
+
+    # 2) Lines this commit DELETES that were ADDED inside the lookback
+    #    window — the specific "wiped a freshly-added peer line" pattern.
+    fresh_deletions=""
+    if [ -n "$parent" ]; then
+        deleted_lines=$(git diff --cached --unified=0 -- "$f" \
+            | awk '/^@@/ { match($0, /-[0-9]+(,[0-9]+)?/, a); split(substr(a[0],2), b, ","); start=b[1]; cnt=(length(b[2]) ? b[2] : 1); for (i=0;i<cnt;i++) print start+i }' \
+            2>/dev/null)
+        if [ -n "$deleted_lines" ]; then
+            for ln in $deleted_lines; do
+                blame=$(git blame -L "$ln,$ln" --porcelain "$parent" -- "$f" 2>/dev/null | head -1)
+                [ -z "$blame" ] && continue
+                bhash=$(echo "$blame" | awk '{print $1}')
+                bts=$(git show -s --format=%ct "$bhash" 2>/dev/null)
+                cutoff=$(date -d "$LOOKBACK_ARG" +%s 2>/dev/null)
+                if [ -n "$bts" ] && [ -n "$cutoff" ] && [ "$bts" -gt "$cutoff" ]; then
+                    msg=$(git show -s --format='%h  %ar  %an  %s' "$bhash" 2>/dev/null)
+                    fresh_deletions="${fresh_deletions}  line $ln  ←  $msg"$'\n'
+                fi
+            done
+        fi
+    fi
+
+    if [ -n "$recent" ] || [ -n "$fresh_deletions" ]; then
+        warnings_found=1
+        report="${report}
+$(bold "── $f ──")"
+        if [ -n "$recent" ]; then
+            report="${report}
+recent commits touching this file (last ${LOOKBACK_HOURS}h):
+$(echo "$recent" | sed 's/^/  /')
+"
+        fi
+        if [ -n "$fresh_deletions" ]; then
+            report="${report}
+$(red "you are deleting lines that were added in the last ${LOOKBACK_HOURS}h:")
+${fresh_deletions}"
+        fi
+    fi
+done <<< "$staged"
+
+[ "$warnings_found" = "0" ] && exit 0
+
+cat >&2 <<EOF
+
+$(yellow "── peer-activity check ──")
+$(bold "$(echo "$staged" | wc -l) file(s) staged. Recent activity from peers found:")
+$report
+
+This hook fires because bot-squad sessions share a working tree and
+typically the same git identity. A peer may have landed code in these
+files since you last looked — your commit may silently delete it.
+
+Review the diff carefully:
+  git diff --cached --stat
+  git diff --cached -- <file>
+
+Especially confirm no infrastructure (env-var gates, kill switches,
+schedulers, lifecycle hooks) is being removed by accident.
+
+If your removals are intentional, re-run the commit with:
+  BOT_SQUAD_ACK_PEERS=1 git commit ...
+
+Concurrent commits in this clone collide on .git/index.lock (only one
+holder at a time). Prefer the safe-commit wrapper, which takes an
+advisory flock first so peer sessions queue instead of crashing:
+  ops/bot-squad-bin/safe-commit -- <files>
+
+EOF
+
+[ "${BOT_SQUAD_ACK_PEERS:-}" = "1" ] && exit 0
+exit 1

@@ -142,6 +142,38 @@ EOF
         echo "Created: $bin_dir/deploy -> $BOT_SQUAD/scripts/cli/deploy.sh"
     fi
 
+    # T-0093: drop ops/bot-squad-bin/safe-commit symlink → bot-squad's
+    # flock wrapper. Concurrent `git commit` calls in a shared bot-squad
+    # clone collide on .git/index.lock (O_EXCL); safe-commit takes an
+    # advisory flock first so peer sessions queue instead of crashing.
+    if [ ! -e "$bin_dir/safe-commit" ]; then
+        mkdir -p "$bin_dir"
+        ln -sf "$BOT_SQUAD/scripts/cli/safe-commit.sh" "$bin_dir/safe-commit"
+        echo "Created: $bin_dir/safe-commit -> $BOT_SQUAD/scripts/cli/safe-commit.sh"
+    fi
+
+    # T-0093: install .githooks/pre-commit (peer-activity warn) and wire
+    # core.hooksPath. The hook is bot-squad-distributed (single source of
+    # truth lives at $BOT_SQUAD/.githooks/pre-commit) so we copy rather
+    # than symlink — committed in the project repo lets clones picked up
+    # elsewhere (e.g. a fresh host pull) keep the hook even if bot-squad
+    # is reinstalled at a different path. Idempotent: create if missing.
+    local hook_dir="$repo/.githooks"
+    local hook_path="$hook_dir/pre-commit"
+    local hook_src="$BOT_SQUAD/.githooks/pre-commit"
+    if [ -f "$hook_src" ] && [ ! -f "$hook_path" ]; then
+        mkdir -p "$hook_dir"
+        cp "$hook_src" "$hook_path"
+        chmod +x "$hook_path"
+        echo "Created: $hook_path (peer-activity pre-commit hook)"
+    fi
+    local current_hooks_path
+    current_hooks_path=$(git -C "$repo" config --get core.hooksPath || true)
+    if [ "$current_hooks_path" != ".githooks" ]; then
+        git -C "$repo" config core.hooksPath .githooks
+        echo "Set: $repo/.git/config core.hooksPath=.githooks"
+    fi
+
     # Patch .gitignore (idempotent).
     touch "$repo/.gitignore"
     local gitignore_updated="false"

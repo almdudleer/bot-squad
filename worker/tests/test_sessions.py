@@ -224,6 +224,71 @@ def test_list_sessions_active_pane(tmp_path, monkeypatch):
     assert rows[0]["initiative"] == ""
 
 
+def test_list_sessions_operator_pane_in_workspace_parent(tmp_path, monkeypatch):
+    """T-0003: operator pane lives in repo_workspace (parent of dev clone).
+
+    Repo: /tmp/x/bot-squad/dev. Operator pane cwd: /tmp/x/bot-squad
+    (the workspace, parent of dev). Previously the cwd-match required
+    pane_cwd == or descendant of repo_path, so the operator was filtered
+    out of active enumeration and re-emerged via the suspended-md loop
+    as status=suspended even though the pane is alive.
+
+    Fix: accept the parent-of-repo case when bounded by tmux session ==
+    slug (here `bot-squad`) or window == 'operator'.
+    """
+    workspace = tmp_path / "bot-squad"
+    workspace.mkdir()
+    repo = workspace / "dev"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    # Override slug for clarity — _make_cfg writes test-project; rebuild with bot-squad.
+    cfg_dir = tmp_path / "config"
+    (cfg_dir / "projects.toml").write_text(
+        f'[projects.bot-squad]\n'
+        f'slug = "bot-squad"\n'
+        f'display_name = "Bot Squad"\n'
+        f'repo_path = "{repo}"\n'
+        f'deploy_branch = "bot_squad/dev"\n'
+        f'master_branch = "master"\n'
+        f'prod_url = ""\n'
+        f'staging_url = ""\n'
+        f'dev_url = ""\n'
+        f'deploy_targets = ["staging"]\n'
+        f'tg_chat = "0"\n'
+        f'created_at = 2026-05-10\n'
+    )
+    from bot_squad_worker.config import Config
+    import types
+    reloaded = Config.load(cfg_dir)
+    cfg = types.SimpleNamespace(
+        projects=reloaded.projects,
+        data_dir=cfg.data_dir,
+        tg_bot_token=reloaded.tg_bot_token,
+    )
+    (cfg.data_dir / "bot-squad" / "backlog").mkdir(parents=True, exist_ok=True)
+    (cfg.data_dir / "bot-squad" / "sessions").mkdir(parents=True, exist_ok=True)
+
+    # 6-field format: pane_id|window|pid|cwd|command|session_name
+    fake_pane_output = f"%7|operator|1234|{workspace}|claude|bot-squad\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "almdudleer")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "bot-squad")
+    assert len(rows) == 1, rows
+    assert rows[0]["sid"] == "S-almdudleer-operator-p7"
+    assert rows[0]["status"] == "active"
+    assert rows[0]["window"] == "operator"
+    assert rows[0]["cwd"] == str(workspace)
+
+
 def test_list_sessions_filters_non_claude_panes(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

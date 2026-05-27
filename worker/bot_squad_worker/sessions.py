@@ -41,6 +41,7 @@ class PaneInfo:
     pid: str
     cwd: str
     command: str
+    session: str = ""  # tmux session name (== project slug for project panes)
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ def list_panes() -> list[PaneInfo]:
 
     Returns an empty list if tmux is not running or no panes exist.
     """
-    fmt = "#{pane_id}|#{window_name}|#{pane_pid}|#{pane_current_path}|#{pane_current_command}"
+    fmt = "#{pane_id}|#{window_name}|#{pane_pid}|#{pane_current_path}|#{pane_current_command}|#{session_name}"
     result = _run(["tmux", "list-panes", "-a", "-F", fmt])
     if result.returncode != 0:
         return []
@@ -66,8 +67,9 @@ def list_panes() -> list[PaneInfo]:
         line = line.strip()
         if not line:
             continue
-        parts = line.split("|", 4)
-        if len(parts) != 5:
+        parts = line.split("|", 5)
+        # Tolerate legacy 5-field lines (no session_name) — session defaults to "".
+        if len(parts) < 5:
             continue
         panes.append(PaneInfo(
             pane_id=parts[0],
@@ -75,6 +77,7 @@ def list_panes() -> list[PaneInfo]:
             pid=parts[2],
             cwd=parts[3],
             command=parts[4],
+            session=parts[5] if len(parts) >= 6 else "",
         ))
     return panes
 
@@ -440,6 +443,18 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 or pane_real == repo_real
                 or pane_real.is_relative_to(repo_real)
             )
+            # T-0003: operator pane lives in repo_workspace (parent of the dev
+            # clone), e.g. cwd=/home/x/bot-squad while repo_path=/home/x/bot-squad/dev.
+            # Accept the parent-cwd case only when bounded by tmux session == slug
+            # (every project pane lives in a tmux session named after the slug, per
+            # _ensure_project_tmux_session) or window == 'operator' (spawn fixes it
+            # in routes_projects.create_project). Either bound prevents over-match
+            # to unrelated panes whose cwd happens to be an ancestor of repo_path.
+            if not match and (pane.session == slug or pane.window == "operator"):
+                match = (
+                    repo_path.is_relative_to(pane_cwd)
+                    or repo_real.is_relative_to(pane_cwd)
+                )
             if not match:
                 continue
         except (ValueError, TypeError):

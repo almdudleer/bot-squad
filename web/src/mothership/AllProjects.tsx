@@ -188,11 +188,17 @@ export function AllProjects() {
     setCreateSaving(true);
     setCreateError(null);
     try {
-      await api.createProject(
-        creating.slug.trim(),
-        creating.display_name.trim(),
-        creating.repo_path.trim() || undefined,
-      );
+      // T-0051: createProject now takes the JSON body directly. The
+      // mothership AllProjects view only uses the minimal back-compat
+      // shape (no mode field); the deep wizard lives on the per-server
+      // Picker (see pages/Picker.tsx).
+      const body: Record<string, unknown> = {
+        slug: creating.slug.trim(),
+        display_name: creating.display_name.trim(),
+      };
+      const repo = creating.repo_path.trim();
+      if (repo) body.repo_path = repo;
+      await api.createProject(body);
       setCreating(null);
       reload();
     } catch (e) {

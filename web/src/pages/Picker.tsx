@@ -3,24 +3,15 @@ import { Link } from "react-router-dom";
 import { api, Project } from "../api";
 import { Modal } from "../components/Modal";
 import { Coachmark, Typewriter, useOnboardingStep } from "../onboarding";
-
-// Auto-derive a slug from a display name on the fly so users only have to
-// type one of the two. Lowercase, replace runs of non-alnum with '-', strip
-// leading non-letter chars to satisfy the server's ^[a-z][a-z0-9_-]*$.
-function deriveSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^[^a-z]+/, "")
-    .replace(/-+$/g, "");
-}
-
-interface NewProjectState {
-  display_name: string;
-  slug: string;
-  slug_touched: boolean;
-  repo_path: string;
-}
+import {
+  deriveSlug,
+  emptyWizardState,
+  modeOptions,
+  payloadFromWizard,
+  validateWizard,
+  type ProjectCreateMode,
+  type ProjectCreateState,
+} from "./projectCreateWizard";
 
 // Mirror T-0025's statusBadgeClass so single-server and cross-server views
 // paint the same colours from the same enum. Unknown strings fall back to
@@ -42,9 +33,16 @@ export function Picker() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
-  const [creating, setCreating] = useState<NewProjectState | null>(null);
+  const [creating, setCreating] = useState<ProjectCreateState | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSaving, setCreateSaving] = useState(false);
+  // Rationale expander state — fetched on first open of the modal,
+  // cached for the page lifetime. The SSOT lives at
+  // api/app/data/project-create-modes.md (T-0051) so the UI text
+  // can't drift from the per-user bot-squad-manager AGENT_INSTRUCTIONS.
+  const [rationaleOpen, setRationaleOpen] = useState(false);
+  const [rationaleText, setRationaleText] = useState<string | null>(null);
+  const [rationaleError, setRationaleError] = useState<string | null>(null);
 
   // T-0018 / §9.4: the slug of the first project on the picker that hosts a
   // session NOT prefixed with the current user's `S-<linux_user>-…` SID.
@@ -64,18 +62,15 @@ export function Picker() {
 
   async function submitCreate() {
     if (!creating) return;
-    if (!creating.display_name.trim() || !creating.slug.trim()) {
-      setCreateError("display name and slug required");
+    const errs = validateWizard(creating);
+    if (errs.length > 0) {
+      setCreateError(errs[0]);
       return;
     }
     setCreateSaving(true);
     setCreateError(null);
     try {
-      await api.createProject(
-        creating.slug.trim(),
-        creating.display_name.trim(),
-        creating.repo_path.trim() || undefined,
-      );
+      await api.createProject(payloadFromWizard(creating));
       setCreating(null);
       reload();
     } catch (e) {
@@ -83,6 +78,15 @@ export function Picker() {
     } finally {
       setCreateSaving(false);
     }
+  }
+
+  function openRationale() {
+    setRationaleOpen(true);
+    if (rationaleText !== null || rationaleError !== null) return;
+    api
+      .createModesDoc()
+      .then((r) => setRationaleText(r.content))
+      .catch((e) => setRationaleError(String(e)));
   }
 
   // Alien-detection scan: only runs while §9.4 is still pending (gated on
@@ -193,14 +197,7 @@ export function Picker() {
             className="btn btn-outline-primary btn-sm"
             style={{ fontSize: "0.72rem" }}
             data-onboarding-anchor="create-project"
-            onClick={() =>
-              setCreating({
-                display_name: "",
-                slug: "",
-                slug_touched: false,
-                repo_path: "",
-              })
-            }
+            onClick={() => setCreating(emptyWizardState())}
           >
             + New project
           </button>
@@ -266,7 +263,7 @@ export function Picker() {
               type="button"
               className="btn btn-primary"
               onClick={submitCreate}
-              disabled={createSaving}
+              disabled={createSaving || (creating?.mode === "attach_destructive")}
             >
               {createSaving ? "Creating…" : "Create"}
             </button>
@@ -305,18 +302,146 @@ export function Picker() {
             placeholder="lowercase, letters/digits/-/_"
           />
         </div>
+
         <div className="mb-3">
-          <label className="form-label">Repo path</label>
-          <input
-            className="form-control"
-            style={{ fontFamily: "var(--mc-mono)" }}
-            value={creating?.repo_path ?? ""}
-            onChange={(e) =>
-              creating && setCreating({ ...creating, repo_path: e.target.value })
-            }
-            placeholder="optional — fill in projects.toml later"
-          />
+          <div className="form-label d-flex align-items-center justify-content-between">
+            <span>Setup mode</span>
+            <button
+              type="button"
+              className="btn btn-link btn-sm p-0"
+              style={{ fontSize: "0.72rem" }}
+              data-onboarding-anchor="rationale-expand"
+              onClick={() => (rationaleOpen ? setRationaleOpen(false) : openRationale())}
+            >
+              {rationaleOpen ? "hide" : "why does bot-squad require this?"}
+            </button>
+          </div>
+          {rationaleOpen && (
+            <div
+              className="border rounded p-2 mb-2"
+              style={{
+                fontSize: "0.78rem",
+                whiteSpace: "pre-wrap",
+                background: "var(--mc-bg-soft, #fafafa)",
+                maxHeight: "260px",
+                overflowY: "auto",
+              }}
+              data-testid="project-create-rationale"
+            >
+              {rationaleText === null && rationaleError === null && "Loading…"}
+              {rationaleError && (
+                <span className="text-danger">Could not load: {rationaleError}</span>
+              )}
+              {rationaleText !== null && rationaleText}
+            </div>
+          )}
+
+          {modeOptions().map((opt) => {
+            const checked = creating?.mode === opt.key;
+            const id = `proj-mode-${opt.key}`;
+            return (
+              <div className="form-check" key={opt.key}>
+                <input
+                  className="form-check-input"
+                  type="radio"
+                  id={id}
+                  name="proj-mode"
+                  disabled={opt.disabled}
+                  checked={checked}
+                  onChange={() =>
+                    creating &&
+                    setCreating({ ...creating, mode: opt.key as ProjectCreateMode })
+                  }
+                />
+                <label className="form-check-label" htmlFor={id}>
+                  <span>
+                    {opt.label}
+                    {opt.recommended && (
+                      <span className="badge bg-success ms-2" style={{ fontSize: "0.62rem" }}>
+                        recommended
+                      </span>
+                    )}
+                  </span>
+                  <div className="text-muted" style={{ fontSize: "0.72rem" }}>
+                    {opt.hint}
+                    {opt.disabled && opt.disabled_reason && (
+                      <> — <em>{opt.disabled_reason}</em></>
+                    )}
+                  </div>
+                </label>
+              </div>
+            );
+          })}
         </div>
+
+        {creating?.mode === "new_from_scratch" && (
+          <>
+            <div className="mb-3">
+              <label className="form-label">Mother dir *</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.mother_dir}
+                onChange={(e) => setCreating({ ...creating, mother_dir: e.target.value })}
+                placeholder={`/home/<user>/${creating.slug || "<slug>"}`}
+              />
+            </div>
+            <div className="mb-3">
+              <label className="form-label">Git remote URL</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.git_remote}
+                onChange={(e) => setCreating({ ...creating, git_remote: e.target.value })}
+                placeholder="optional — leave blank to git init locally"
+              />
+            </div>
+          </>
+        )}
+
+        {creating?.mode === "paths_as_they_are" && (
+          <>
+            <div className="mb-3">
+              <label className="form-label">Mother dir *</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.mother_dir}
+                onChange={(e) => setCreating({ ...creating, mother_dir: e.target.value })}
+                placeholder={`/home/<user>/${creating.slug || "<slug>"}`}
+              />
+            </div>
+            <div className="mb-3">
+              <label className="form-label">Dev clone path *</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.repo_path}
+                onChange={(e) => setCreating({ ...creating, repo_path: e.target.value })}
+                placeholder="/path/to/existing/dev-clone"
+              />
+            </div>
+            <div className="mb-3">
+              <label className="form-label">Master clone path *</label>
+              <input
+                className="form-control"
+                style={{ fontFamily: "var(--mc-mono)" }}
+                value={creating.repo_master}
+                onChange={(e) => setCreating({ ...creating, repo_master: e.target.value })}
+                placeholder="/path/to/existing/master-clone"
+              />
+            </div>
+          </>
+        )}
+
+        {creating?.mode === "attach_destructive" && (
+          <div className="alert alert-warning" style={{ fontSize: "0.78rem" }}>
+            The destructive-move flow is not implemented yet. It will rename
+            your existing repo into the mother dir; see the T-0051 follow-up
+            ticket. For now use <strong>paths-as-they-are</strong> to attach
+            without moving the repo.
+          </div>
+        )}
       </Modal>
     </div>
   );

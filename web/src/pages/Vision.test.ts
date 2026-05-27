@@ -24,7 +24,6 @@ function tl(overrides: Partial<SessionRow>): SessionRow {
     status: "active",
     window: "tl",
     cwd: "/tmp",
-    linked_tasks: [],
     task_id: null,
     initiative: null,
     extra_initiatives: [],

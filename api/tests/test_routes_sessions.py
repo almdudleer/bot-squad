@@ -28,7 +28,6 @@ _SAMPLE_SESSION = {
     "started_at": None,
     "last_prompt_at": None,
     "claude_uuid": "9d7b3153-0000-0000-0000-000000000001",
-    "linked_tasks": [],
 }
 
 
@@ -448,7 +447,7 @@ def test_list_sessions_fans_out_and_merges(
         @app.post("/actions/list_sessions")
         def list_sessions(params: dict | None = None) -> dict:
             return {"sessions": [{"sid": sid, "status": "active", "window": "w",
-                                  "cwd": "/", "linked_tasks": []}]}
+                                  "cwd": "/"}]}
 
         cfg = uvicorn.Config(app, uds=str(sock), log_level="warning")
         server = uvicorn.Server(cfg)
@@ -738,11 +737,11 @@ def test_list_sessions_non_admin_drops_other_owners(
 
     rows = [
         {"sid": "S-x-a-p1", "status": "active", "window": "a", "cwd": "/",
-         "owner": "alexey",  "linked_tasks": []},
+         "owner": "alexey"},
         {"sid": "S-x-b-p2", "status": "active", "window": "b", "cwd": "/",
-         "owner": "testuser", "linked_tasks": []},
+         "owner": "testuser"},
         {"sid": "S-x-c-p3", "status": "suspended", "window": "c", "cwd": "/",
-         "owner": "", "linked_tasks": []},  # legacy / unstamped
+         "owner": ""},  # legacy / unstamped
     ]
     app = FastAPI()
 
@@ -790,11 +789,11 @@ def test_list_sessions_admin_sees_all_owners(
 
     rows = [
         {"sid": "S-x-a-p1", "status": "active", "window": "a", "cwd": "/",
-         "owner": "alexey",  "linked_tasks": []},
+         "owner": "alexey"},
         {"sid": "S-x-b-p2", "status": "active", "window": "b", "cwd": "/",
-         "owner": "aqice", "linked_tasks": []},
+         "owner": "aqice"},
         {"sid": "S-x-c-p3", "status": "suspended", "window": "c", "cwd": "/",
-         "owner": "", "linked_tasks": []},
+         "owner": ""},
     ]
     app = FastAPI()
 

@@ -14,7 +14,6 @@ function row(over: Partial<SessionRow>): SessionRow {
     status: "active",
     window: "dev",
     cwd: "/tmp",
-    linked_tasks: [],
     ...over,
   } as SessionRow;
 }

@@ -102,7 +102,6 @@ export type SessionRow = {
   claude_uuid?: string | null;
   task_id?: string | null;
   initiative?: string | null;
-  linked_tasks: string[];
   // Phase 9: multi-binding. A dev may carry extra tasks; a TL extra
   // initiatives. Both are empty lists by default.
   extra_task_ids?: string[];

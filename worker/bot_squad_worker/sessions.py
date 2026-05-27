@@ -384,23 +384,6 @@ def _read_session_metadata(path: Path) -> dict | None:
     return meta
 
 
-def _scan_linked_tasks(data_dir: Path, slug: str, sid: str, claude_uuid: str | None) -> list[str]:
-    """Scan backlog T-*.md files for tasks with a matching session field."""
-    backlog_dir = data_dir / slug / "backlog"
-    if not backlog_dir.exists():
-        return []
-    linked = []
-    for task_file in sorted(backlog_dir.glob("T-*.md")):
-        meta = _read_session_metadata(task_file)
-        if meta is None:
-            continue
-        session_val = meta.get("session", "")
-        if session_val and (session_val == sid or (claude_uuid and session_val == claude_uuid)):
-            task_id = task_file.stem  # T-0042
-            linked.append(task_id)
-    return linked
-
-
 def _get_current_user() -> str:
     """Return the OS username."""
     import getpass
@@ -543,7 +526,6 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             _pane_claude_uuid_from_proc(pane.pid, user_home)
             or discover_claude_uuid(pane.cwd, user_home)
         )
-        linked_tasks = _scan_linked_tasks(data_dir, slug, sid, claude_uuid)
 
         # Check for last_prompt_at via .claude/last_user_prompt_ts mtime
         last_prompt_at = None
@@ -636,7 +618,6 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "claude_uuid": claude_uuid,
             "task_id": task_id,
             "initiative": initiative,
-            "linked_tasks": linked_tasks,
             "extra_task_ids": extra_task_ids,
             "extra_initiatives": extra_initiatives,
             "paused_at": paused_at_meta,
@@ -705,7 +686,6 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "claude_uuid": meta.get("claude_uuid"),
                 "task_id": md_task_id,
                 "initiative": md_initiative,
-                "linked_tasks": meta.get("linked_tasks") or [],
                 "extra_task_ids": md_extra_tids,
                 "extra_initiatives": md_extra_inits,
                 "paused_at": meta.get("paused_at"),
@@ -795,7 +775,6 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         claude_uuid = discover_claude_uuid(target_pane.cwd, user_home)
     started_at = existing.get("started_at") or "~"
     task_id = existing.get("task_id") or "~"
-    linked_tasks = _scan_linked_tasks(data_dir, slug, sid, claude_uuid)
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # T-0080: preserve owner field across suspend/resume so per-user
@@ -810,7 +789,6 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         "task_id": task_id,
         "started_at": started_at,
         "suspended_at": now,
-        "linked_tasks": linked_tasks,
         "owner": owner_val,
     }
     _write_session_metadata(meta_file, meta)

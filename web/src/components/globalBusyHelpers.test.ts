@@ -15,7 +15,6 @@ function s(over: Partial<SessionRow> = {}): SessionRow {
     status: "active",
     window: "w",
     cwd: "/tmp",
-    linked_tasks: [],
     task_id: "T-1",
     owner: "alex",
     ...over,

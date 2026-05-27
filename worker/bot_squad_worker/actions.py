@@ -328,7 +328,7 @@ def _action_list_sessions(params: dict[str, Any]) -> dict[str, Any]:
     """List all Claude sessions for a project (active + paused).
 
     Required params: slug
-    Returns: [{sid, status, window, cwd, started_at, last_prompt_at, claude_uuid, linked_tasks}]
+    Returns: [{sid, status, window, cwd, started_at, last_prompt_at, claude_uuid, task_id, ...}]
     """
     extra = set(params) - _LIST_SESSIONS_ALLOWED
     if extra:

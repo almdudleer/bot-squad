@@ -566,14 +566,6 @@ export function Sessions() {
                 <dd style={{ margin: 0, color: "var(--mc-text)" }}>{s.suspended_at}</dd>
               </>
             )}
-            {(s.linked_tasks ?? []).length > 0 && (
-              <>
-                <dt>linked tasks</dt>
-                <dd style={{ margin: 0, color: "var(--mc-text)" }}>
-                  {(s.linked_tasks ?? []).join(", ")}
-                </dd>
-              </>
-            )}
           </dl>
         </td>
       </tr>
@@ -656,8 +648,7 @@ export function Sessions() {
 
           {/* Role */}
           <td>
-            {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
-              (s.linked_tasks ?? []).length > 0) ? (
+            {(s.task_id && s.task_id !== "" && s.task_id !== "~") ? (
               <span className="mc-badge mc-badge-info">Dev</span>
             ) : (
               <span className="mc-badge mc-badge-ok">Teamlead</span>
@@ -683,22 +674,6 @@ export function Sessions() {
             title={LAST_ACTIVITY_TOOLTIP}
           >
             {sessionLastActivity(s)}
-          </td>
-
-          {/* Linked tasks */}
-          <td onClick={(e) => e.stopPropagation()}>
-            <div className="d-flex flex-wrap gap-1">
-              {(s.linked_tasks ?? []).map((tid) => (
-                <Link
-                  key={tid}
-                  to={`/p/${slug}/t/${tid}`}
-                  className="mc-badge mc-badge-info"
-                  style={{ textDecoration: "none" }}
-                >
-                  {tid}
-                </Link>
-              ))}
-            </div>
           </td>
 
           {/* Actions */}
@@ -780,7 +755,7 @@ export function Sessions() {
             </div>
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 11)}
+        {isOpen && renderDetailRow(s, 10)}
       </Fragment>
     );
   }
@@ -822,8 +797,7 @@ export function Sessions() {
             <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
           </td>
           <td>
-            {((s.task_id && s.task_id !== "" && s.task_id !== "~") ||
-              (s.linked_tasks ?? []).length > 0) ? (
+            {(s.task_id && s.task_id !== "" && s.task_id !== "~") ? (
               <span className="mc-badge mc-badge-dim">Dev</span>
             ) : (
               <span className="mc-badge mc-badge-dim">Teamlead</span>
@@ -1320,7 +1294,6 @@ export function Sessions() {
                 <th>Status</th>
                 <th>Started</th>
                 <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
-                <th>Tasks</th>
                 <th></th>
               </tr>
             </thead>

@@ -159,8 +159,20 @@ def list_global_users(request: Request) -> list[dict]:
     one-shot migration) are NOT visible here. That's intentional: this
     surface is the cross-server identity directory, not a union of every
     local auth.toml.
+
+    T-0129: each row carries an ``attached_servers`` count (number of
+    Attachment rows for the user) so the FE can render the per-user
+    attached-server tally without an N+1 follow-up GET. The count is
+    computed by walking the per-user attachments dir — cheap at the
+    registry sizes we expect (single-digit users × single-digit servers).
     """
-    return [u.to_public() for u in _users_store(request).list_users()]
+    store = _users_store(request)
+    out: list[dict] = []
+    for u in store.list_users():
+        d = u.to_public()
+        d["attached_servers"] = len(store.list_attachments_for_user(u.id))
+        out.append(d)
+    return out
 
 
 # ---- T-0066: /users/verify — server-bearer auth (consumed by /api/auth/attach)
@@ -293,6 +305,68 @@ def create_invite(
         "target_username": target_username,
         "role": role,
         "expires_at": minted["expires_at"] if minted else None,
+    }
+
+
+# ---- T-0129: install-token revoke + re-mint (super-admin) -------------------
+
+
+@router.post(
+    "/servers/{server_id}/install-tokens/revoke",
+    dependencies=[Depends(_require_super_admin)],
+)
+def revoke_install_token(request: Request, server_id: str) -> dict:
+    """Clear the install_token on a still-pending server.
+
+    Self-service rotation for when the install URL leaks or is sent to the
+    wrong host. Idempotent — re-revoking a server whose token is already
+    absent (already revoked, or already burned by /connect) returns the
+    same public projection. The FE doesn't track burn state, so a 200 in
+    every safe case keeps the button "always clickable" without surfacing
+    confusing 409s.
+
+    Pair with ``/install-tokens/mint`` below to issue a fresh token; the
+    two are split so the FE can offer "revoke then look later" without
+    forcing a re-mint side-effect.
+    """
+    updated = _store(request).revoke_install_token(server_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    return updated.to_public()
+
+
+@router.post(
+    "/servers/{server_id}/install-tokens/mint",
+    dependencies=[Depends(_require_super_admin)],
+)
+def remint_install_token(request: Request, server_id: str) -> dict:
+    """Mint a fresh install_token for an existing pending server.
+
+    Same one-shot envelope as ``POST /api/m/servers`` — the plaintext is in
+    the response body exactly once, and only its SHA-256 lands on disk.
+    Returns 409 if the server already burned its install_token via
+    /connect (state ∈ {connected, ready, failed}); re-minting against a
+    burned server is not the right surface for that, since the consumer
+    has a server_bearer it would never know to drop.
+    """
+    store = _store(request)
+    if store.get_server(server_id) is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        result = store.remint_install_token(server_id)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if result is None:
+        # Race: server was deleted between get_server and remint. Treat as 404.
+        raise HTTPException(status_code=404, detail="server not found")
+    entry, token = result
+    base = _mothership_base_url(request)
+    return {
+        "id": entry.id,
+        "install_token": token,
+        "install_url": f"{base}/i/{token}/install.sh",
+        "instructions_url": f"{base}/i/{token}/instructions.md",
+        "expires_at": entry.install_token_expires_at,
     }
 
 

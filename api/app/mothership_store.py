@@ -305,6 +305,81 @@ class MothershipStore:
             self.write(servers)
             return entry
 
+    def revoke_install_token(self, server_id: str) -> AttachedServer | None:
+        """Clear the install_token on a pending server. Idempotent.
+
+        T-0129: super-admin self-service revoke for a still-pending server
+        whose install URL leaked / was sent to the wrong host. Clears the
+        hash + expiry but leaves ``install_state`` at ``pending`` so the
+        operator can /install-tokens/mint a fresh token without recreating
+        the registry row.
+
+        Idempotent: if the install_token is already absent (already revoked,
+        or already burned by /connect), returns the row unchanged. Caller
+        gets the same 200 either way — the FE doesn't have to keep track
+        of which side of the burn it's on.
+
+        Returns the (possibly unchanged) entry, or ``None`` if no such
+        server.
+        """
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                if s.install_token_hash is None and s.install_token_expires_at is None:
+                    return s
+                servers[i] = replace(
+                    s,
+                    install_token_hash=None,
+                    install_token_expires_at=None,
+                )
+                self.write(servers)
+                return servers[i]
+        return None
+
+    def remint_install_token(
+        self,
+        server_id: str,
+        *,
+        ttl_seconds: int = INSTALL_TOKEN_TTL_SECONDS,
+    ) -> tuple[AttachedServer, str] | None:
+        """Mint a fresh install_token for an existing pending server.
+
+        T-0129: lets a super-admin rotate the install_token without churning
+        the registry row when the original expired before /connect ever
+        landed. The prior hash (if any) is overwritten in the same critical
+        section as the new one is written, so a concurrent /connect using
+        the old plaintext can't sneak through after the mint completes.
+
+        Returns ``(entry, plaintext_token)`` on success. Returns ``None`` if
+        no such server. Raises ``ValueError`` if the server's install_state
+        is not ``pending`` — re-minting against a burned/ready/failed
+        server is not the right surface (re-attach is a separate flow).
+        """
+        token = mint_install_token()
+        token_hash = hash_token(token)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                if s.install_state != "pending":
+                    raise ValueError(
+                        f"cannot re-mint install_token: server state is "
+                        f"{s.install_state!r}, expected 'pending'"
+                    )
+                servers[i] = replace(
+                    s,
+                    install_token_hash=token_hash,
+                    install_token_expires_at=expires.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                )
+                self.write(servers)
+                return servers[i], token
+        return None
+
     def consume_install_token(
         self,
         token: str,

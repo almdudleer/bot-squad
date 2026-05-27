@@ -11,6 +11,7 @@ import bcrypt
 from fastapi.testclient import TestClient
 
 from app.main import build_app
+from app.mothership_store import MothershipStore
 from app.mothership_users_store import MothershipUsersStore
 
 
@@ -73,6 +74,53 @@ def test_list_global_users_returns_public_projection(tmp_bot_squad: Path, monkey
     for u in body:
         assert "password_hash" not in u
         assert u["id"].startswith("gu_")
+
+
+def test_list_global_users_attached_servers_counts(tmp_bot_squad: Path, monkeypatch):
+    """T-0129: each row carries an ``attached_servers`` int derived from
+    ``MothershipUsersStore.list_attachments_for_user``.
+
+    Three cases in one shot so the projection contract is locked:
+    - alice has 0 attachments → 0
+    - bob has 1 attachment → 1
+    - carol has 2 attachments → 2
+    """
+    alice_id = _mint_global(tmp_bot_squad, username="alice", password="x")
+    bob_id = _mint_global(tmp_bot_squad, username="bob", password="x")
+    carol_id = _mint_global(tmp_bot_squad, username="carol", password="x")
+    # Need actual server rows for the attachment server_id keys — the
+    # attachments dir is global-user-keyed, so technically we could use
+    # any server_id string here, but real-world attachments always
+    # reference a real srv_ id. Mint via the store directly.
+    srv_store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    s1, _ = srv_store.register_server(
+        display_name="s1", base_url="https://s1.example.com", owner_user="testuser"
+    )
+    s2, _ = srv_store.register_server(
+        display_name="s2", base_url="https://s2.example.com", owner_user="testuser"
+    )
+    users_store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    users_store.upsert_attachment(
+        global_user_id=bob_id, server_id=s1.id, server_username="bob"
+    )
+    users_store.upsert_attachment(
+        global_user_id=carol_id, server_id=s1.id, server_username="carol"
+    )
+    users_store.upsert_attachment(
+        global_user_id=carol_id, server_id=s2.id, server_username="carol"
+    )
+
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        r = client.get("/api/m/users")
+    assert r.status_code == 200, r.text
+    by_name = {u["username"]: u for u in r.json()}
+    assert by_name["alice"]["attached_servers"] == 0
+    assert by_name["bob"]["attached_servers"] == 1
+    assert by_name["carol"]["attached_servers"] == 2
+    # Self-check: the keys are the real global-user ids we minted, not
+    # accidentally swapped between rows.
+    assert by_name["alice"]["id"] == alice_id
 
 
 def test_list_global_users_unauthenticated(tmp_bot_squad: Path, monkeypatch):

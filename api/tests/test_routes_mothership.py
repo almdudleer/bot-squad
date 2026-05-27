@@ -963,6 +963,206 @@ def test_invite_token_bundle_get_serves_install_sh(tmp_bot_squad: Path, monkeypa
         assert len(on_disk.invites) == 1  # still there, not burned
 
 
+# ---- T-0129: install-token revoke + re-mint --------------------------------
+
+
+def test_install_token_revoke_clears_hash_and_invalidates(tmp_bot_squad: Path, monkeypatch):
+    """POST /api/m/servers/{id}/install-tokens/revoke clears the hash + expiry.
+
+    After revoke the install_token plaintext the FE has must no longer
+    authenticate /connect (returns 410) — the burn-side contract is the
+    same as a missing token from the registry's POV.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, token = _mint_server(client)
+        r = client.post(f"/api/m/servers/{sid}/install-tokens/revoke")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Public projection — install_state stays pending; the hash + expiry
+        # are absent (stripped by to_public; never serialised regardless).
+        assert body["id"] == sid
+        assert body["install_state"] == "pending"
+        # On-disk row has the credential bits cleared.
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        on_disk = store.get_server(sid)
+        assert on_disk is not None
+        assert on_disk.install_token_hash is None
+        assert on_disk.install_token_expires_at is None
+        # The plaintext that the FE / installer still holds no longer
+        # authenticates /connect.
+        client.cookies.clear()
+        r2 = client.post(
+            "/api/m/installer/connect",
+            json={"token": token, "server_meta": {"hostname": "h"}},
+        )
+    assert r2.status_code == 410
+
+
+def test_install_token_revoke_is_idempotent(tmp_bot_squad: Path, monkeypatch):
+    """Re-revoking a server whose token is already cleared returns 200, not 409.
+
+    The FE doesn't track whether /connect has burned the token already;
+    a 200 either way means the button is safe to spam. Covers both
+    paths: (a) already-revoked, (b) already-burned-by-/connect.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _ = _mint_server(client)
+        first = client.post(f"/api/m/servers/{sid}/install-tokens/revoke")
+        assert first.status_code == 200, first.text
+        second = client.post(f"/api/m/servers/{sid}/install-tokens/revoke")
+        assert second.status_code == 200, second.text
+        assert second.json()["install_state"] == "pending"
+
+        # Path (b): connect burns the token, then revoke is still 200.
+        sid2, token2 = _mint_server(client)
+        client.cookies.clear()
+        connect = client.post(
+            "/api/m/installer/connect",
+            json={"token": token2, "server_meta": {"hostname": "h"}},
+        )
+        assert connect.status_code == 200, connect.text
+        # Restore cookie auth for the super-admin revoke.
+        _login(client)
+        r = client.post(f"/api/m/servers/{sid2}/install-tokens/revoke")
+    assert r.status_code == 200
+    # State stays at "connected" — revoke on a burned server is a no-op
+    # for the credential bits (already None) but doesn't roll back the
+    # /connect transition.
+    assert r.json()["install_state"] == "connected"
+
+
+def test_install_token_revoke_unknown_server_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        r = client.post("/api/m/servers/srv_does_not_exist/install-tokens/revoke")
+    assert r.status_code == 404
+
+
+def test_install_token_revoke_requires_super_admin(tmp_bot_squad: Path, monkeypatch):
+    """Non-admin → 403. Same gate as /api/m/users."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'plain = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.plain]\n'
+        'linux_user = "plain"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        client.post("/api/auth/login", json={"username": "plain", "password": "test"})
+        r = client.post("/api/m/servers/srv_x/install-tokens/revoke")
+    assert r.status_code == 403
+
+
+def test_install_token_remint_returns_fresh_and_invalidates_prior(tmp_bot_squad: Path, monkeypatch):
+    """POST /install-tokens/mint mints a fresh token and invalidates the old.
+
+    Re-mint envelope matches POST /api/m/servers — install_token +
+    install_url + instructions_url + expires_at, plus the server id.
+    The PRIOR plaintext must no longer authenticate /connect after the
+    re-mint, otherwise rotation would leave two simultaneously-valid
+    tokens until the old TTL expires.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, old_token = _mint_server(client)
+        r = client.post(f"/api/m/servers/{sid}/install-tokens/mint")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        new_token = body["install_token"]
+        assert new_token.startswith(INSTALL_PREFIX)
+        assert new_token != old_token
+        assert body["id"] == sid
+        assert new_token in body["install_url"]
+        assert new_token in body["instructions_url"]
+        assert body["expires_at"] is not None
+
+        # On-disk hash is the SHA-256 of the new plaintext, not the old.
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        on_disk = store.get_server(sid)
+        assert on_disk is not None
+        assert on_disk.install_token_hash == hash_token(new_token)
+        assert on_disk.install_state == "pending"
+
+        # The OLD plaintext no longer authenticates /connect.
+        client.cookies.clear()
+        old_connect = client.post(
+            "/api/m/installer/connect",
+            json={"token": old_token, "server_meta": {"hostname": "h"}},
+        )
+        assert old_connect.status_code == 410
+        # The NEW plaintext does.
+        new_connect = client.post(
+            "/api/m/installer/connect",
+            json={"token": new_token, "server_meta": {"hostname": "h"}},
+        )
+    assert new_connect.status_code == 200
+
+
+def test_install_token_remint_after_expiry(tmp_bot_squad: Path, monkeypatch):
+    """Re-mint works when the prior token expired without a /connect — the
+    primary motivating case in T-0129. Confirms the state-pending gate
+    treats an expired-but-pending row as eligible.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, _old_token = _mint_server(client)
+        # Backdate expiry directly on disk.
+        store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+        servers = store.list_servers()
+        idx = next(i for i, s in enumerate(servers) if s.id == sid)
+        old = servers[idx]
+        servers[idx] = type(old)(
+            **{**old.__dict__, "install_token_expires_at":
+              (datetime.now(timezone.utc) - timedelta(hours=1))
+              .isoformat().replace("+00:00", "Z")}
+        )
+        store.write(servers)
+        # Server is still ``pending`` — only the expiry moved.
+        r = client.post(f"/api/m/servers/{sid}/install-tokens/mint")
+    assert r.status_code == 200, r.text
+    assert r.json()["install_token"].startswith(INSTALL_PREFIX)
+
+
+def test_install_token_remint_rejects_burned_server(tmp_bot_squad: Path, monkeypatch):
+    """Re-mint against a server that already burned its token via /connect → 409.
+
+    The consumer holds a server_bearer it would never know to drop, so
+    re-minting an install_token for it would silently dead-letter.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        sid, token = _mint_server(client)
+        client.cookies.clear()
+        connect = client.post(
+            "/api/m/installer/connect",
+            json={"token": token, "server_meta": {"hostname": "h"}},
+        )
+        assert connect.status_code == 200
+        _login(client)
+        r = client.post(f"/api/m/servers/{sid}/install-tokens/mint")
+    assert r.status_code == 409
+
+
+def test_install_token_remint_unknown_server_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        r = client.post("/api/m/servers/srv_does_not_exist/install-tokens/mint")
+    assert r.status_code == 404
+
+
+def test_install_token_remint_requires_super_admin(tmp_bot_squad: Path, monkeypatch):
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'plain = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.plain]\n'
+        'linux_user = "plain"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        client.post("/api/auth/login", json={"username": "plain", "password": "test"})
+        r = client.post("/api/m/servers/srv_x/install-tokens/mint")
+    assert r.status_code == 403
+
+
 def test_invite_mint_requires_auth(tmp_bot_squad: Path, monkeypatch):
     """Cookie-auth gate on the invite-mint surface — only logged-in
     botsquad.dev users can issue invites."""

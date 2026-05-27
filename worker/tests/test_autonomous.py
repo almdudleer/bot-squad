@@ -275,9 +275,11 @@ def test_tick_sleep_window_transitions_to_sleeping(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_tick_idle_with_task_spawns_and_transitions_to_working(tmp_path, monkeypatch):
-    """tick(idle) with an available task spawns a pane and transitions to working.
+    """tick(idle) with an available task spawns via sessions.spawn and transitions to working.
 
-    subprocess.run is monkeypatched — no real tmux or claude is invoked.
+    T-0074: spawn_worker now delegates to sessions.spawn so the binding graph
+    sees the orchestrator's pane. We mock sessions.spawn directly rather
+    than subprocess.run so the test doesn't need to model every tmux call.
     """
     cfg = _make_cfg(tmp_path)
     state = AutonomousState(slug="test-proj", enabled=True, sleep_start_hour=22, sleep_end_hour=8)
@@ -288,15 +290,13 @@ def test_tick_idle_with_task_spawns_and_transitions_to_working(tmp_path, monkeyp
 
     _write_task(cfg, "test-proj", "T-0001", "Implement the feature", status="open")
 
-    # Mock subprocess.run so tmux new-window returns a fake pane_id
-    run_calls = []
-    def fake_subprocess_run(args, **kwargs):
-        run_calls.append(args)
-        if "new-window" in args:
-            return subprocess.CompletedProcess(args, 0, stdout="%42\n", stderr="")
-        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    spawn_calls = []
+    def fake_sessions_spawn(cfg_arg, slug_arg, window, **kwargs):
+        spawn_calls.append({"slug": slug_arg, "window": window, **kwargs})
+        # Return a sid in the canonical format so spawn_worker can derive pane_id.
+        return {"ok": True, "sid": f"S-testuser-{window}-p42"}
 
-    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr("bot_squad_worker.sessions.spawn", fake_sessions_spawn)
     monkeypatch.setattr("time.sleep", lambda x: None)
 
     tick(cfg, "test-proj")
@@ -306,9 +306,13 @@ def test_tick_idle_with_task_spawns_and_transitions_to_working(tmp_path, monkeyp
     assert loaded.current_task_id == "T-0001"
     assert loaded.current_pane_id == "%42"
 
-    # Verify subprocess was called (tmux new-window) but NOT the real claude
-    tmux_calls = [c for c in run_calls if "tmux" in c]
-    assert any("new-window" in c for c in tmux_calls)
+    # T-0074: confirm the binding-graph plumbing (slug + task_id + window
+    # prefix) is being passed through, not silently dropped.
+    assert len(spawn_calls) == 1
+    call = spawn_calls[0]
+    assert call["slug"] == "test-proj"
+    assert call["window"] == "auto-T-0001"
+    assert call["task_id"] == "T-0001"
 
 
 # ---------------------------------------------------------------------------

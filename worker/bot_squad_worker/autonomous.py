@@ -265,12 +265,27 @@ def pick_next_task(cfg: Any, slug: str) -> Optional[dict]:
 def spawn_worker(cfg: Any, slug: str, task: dict) -> str:
     """Spawn a tmux window running claude with the task prompt.
 
-    Returns the pane_id string (e.g. "%42").
+    T-0074: thin wrapper over ``sessions.spawn`` so the spawned pane lands
+    inside the project's tmux session, drops ``.claude/task_id``, writes a
+    SessionMd, and is therefore visible to the binding graph (``list_sessions``,
+    ``_find_owner``, peer-bus role resolution). The pre-T-0074 code-path
+    used a bare ``tmux new-window`` with no ``-t <slug>:`` and no marker drop,
+    so orchestrator panes were invisible to every binding-graph reader.
+
+    Returns the pane_id string (e.g. ``%42``) — derived from the SID
+    ``sessions.spawn`` returns so the back-compat ``pane_alive`` /
+    ``kill-pane`` paths in ``_tick_working`` keep working without an
+    AutonomousState schema change.
     """
-    # Build the initial prompt
     task_id = task.get("id", "unknown")
     task_title = task.get("title", "")
     task_body = task.get("body", "")
+
+    # T-0074: initiative may be a basename ("foo.md") or a virtual category
+    # ("binding-audit", "tooling", ...). sessions.spawn requires the .md
+    # form, so drop category-style values rather than fail the spawn.
+    raw_init = (task.get("initiative") or "").strip()
+    initiative = raw_init if raw_init.endswith(".md") else ""
 
     # Try to load vision context
     tactical_ctx = ""
@@ -307,31 +322,22 @@ def spawn_worker(cfg: Any, slug: str, task: dict) -> str:
 
     window_name = f"auto-{task_id}"
 
-    # Create a new tmux window; get its pane id
-    result = subprocess.run(
-        ["tmux", "new-window", "-d", "-n", window_name, "-P", "-F", "#{pane_id}"],
-        capture_output=True, text=True,
+    from bot_squad_worker import sessions as _sessions
+    spawn_result = _sessions.spawn(
+        cfg,
+        slug,
+        window_name,
+        initial_prompt=prompt,
+        task_id=task_id if task_id and task_id != "unknown" else None,
+        initiative=initiative or None,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"tmux new-window failed: {result.stderr}")
-
-    pane_id = result.stdout.strip()
-    if not pane_id:
-        raise RuntimeError("tmux new-window returned empty pane_id")
-
-    # Launch claude in the new window
-    subprocess.run(
-        ["tmux", "send-keys", "-t", pane_id, "claude", "Enter"],
-        check=False,
-    )
-    # Wait a moment for claude to start, then send the prompt
-    time.sleep(2)
-    subprocess.run(
-        ["tmux", "send-keys", "-t", pane_id, "--", prompt, "Enter"],
-        check=False,
-    )
-
-    return pane_id
+    sid = spawn_result.get("sid", "")
+    # SID format: S-<user>-<window>-p<pane_no_pct>. Recover pane_id so
+    # _tick_working's pane_alive / kill-pane paths keep working.
+    pane_no_pct = sid.rsplit("-p", 1)[1] if "-p" in sid else ""
+    if not pane_no_pct:
+        raise RuntimeError(f"spawn_worker: could not derive pane_id from sid {sid!r}")
+    return f"%{pane_no_pct}"
 
 
 def pane_alive(pane_id: str) -> bool:

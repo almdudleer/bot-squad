@@ -352,6 +352,30 @@ if old_md.resolve() != new_md.resolve():
     except FileNotFoundError:
         pass
 
+
+# T-0072: migrate the peer-bus inbox triple from old_sid → new_sid so any
+# pre-rotation messages stay readable and peers still addressing old_sid
+# don't land in a dead inbox. Best-effort via the worker socket — if the
+# worker is down the hook still succeeds.
+import json as _t72_json
+slug_for_sock = (data.parts[-1] if data.parts else '')
+_t72_payload = _t72_json.dumps({
+    'slug': slug_for_sock,
+    'old_sid': old_sid,
+    'new_sid': new_sid,
+})
+try:
+    subprocess.run(
+        ['curl', '-sS', '--max-time', '3',
+         '--unix-socket', '/home/www/bot-squad/data/_sock/worker.sock',
+         '-X', 'POST', '-H', 'Content-Type: application/json',
+         '-d', _t72_payload,
+         'http://w/actions/peer_rebind_sid'],
+        capture_output=True, timeout=5, check=False,
+    )
+except Exception:
+    pass
+
 # T-0105: SID rotation — append new_sid to session_history of every
 # task this session was bound to (primary + extras). The common
 # agent-teams case has no task_id at break-pane time (lead binds the

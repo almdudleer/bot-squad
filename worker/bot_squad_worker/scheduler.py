@@ -12,6 +12,7 @@ from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.jobs import (
     autoupdate_apply_tick,
     autoupdate_tick,
+    binding_gc_tick,
     deploy_monitor,
     heartbeat,
     oauth_refresh,
@@ -101,6 +102,21 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=_autoupdate.interval_seconds(),
         args=[cfg],
         id="autoupdate",
+        replace_existing=True,
+    )
+    # binding_gc_tick: T-0072/0073/0077 — once per minute, reconcile the
+    # on-disk SessionMd graph with live tmux state (zombie repair) and
+    # strip duplicate primary task_id claimants (stale-binding repair).
+    # max_instances=1 + coalesce keeps overlapping ticks from racing on the
+    # same mds; the tick is idempotent so a missed run is no problem.
+    sched.add_job(
+        binding_gc_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="binding_gc",
+        max_instances=1,
+        coalesce=True,
         replace_existing=True,
     )
     # autoupdate_apply_tick: drain the apply queue (T-0084). Runs at a

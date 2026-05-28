@@ -333,8 +333,13 @@ def _find_session_md(sessions_dir: Path, sid: str, claude_uuid: str | None) -> P
     return None
 
 
-def _write_session_metadata(path: Path, meta: dict) -> None:
-    """Write a session metadata file with YAML frontmatter."""
+def _write_session_metadata(path: Path, meta: dict, *, atomic: bool = False) -> None:
+    """Write a session metadata file with YAML frontmatter.
+
+    ``atomic=True`` writes to a sibling ``*.tmp`` then ``os.rename`` — used by
+    the gc reconcilers (T-0073 / T-0077) so a concurrent reader never sees a
+    half-written md.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["---"]
     for k, v in meta.items():
@@ -349,7 +354,13 @@ def _write_session_metadata(path: Path, meta: dict) -> None:
             lines.append(f"{k}: {v}")
     lines.append("---")
     lines.append("")
-    path.write_text("\n".join(lines))
+    body = "\n".join(lines)
+    if atomic:
+        tmp = path.parent / (path.name + ".tmp")
+        tmp.write_text(body)
+        os.rename(tmp, path)
+    else:
+        path.write_text(body)
 
 
 def _read_session_metadata(path: Path) -> dict | None:
@@ -951,6 +962,18 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     # Remove old metadata file if SID changed
     if new_sid != sid and meta_file.exists():
         meta_file.unlink()
+
+    # T-0072: migrate the peer-bus inbox triple to the new SID so messages
+    # already in the pre-rotation inbox stay readable and peers still
+    # addressing the old SID don't get silently dropped into a dead file.
+    # Best-effort: a failure here doesn't break resume; it just leaves an
+    # orphan inbox the migration script can mop up.
+    if new_sid != sid:
+        try:
+            from bot_squad_worker import intersession as _is
+            _is.rebind_sid(cfg, slug, sid, new_sid)
+        except OSError:
+            pass
 
     # T-0105: SID rotation — append the rotated SID to every task this
     # session was bound to (primary + extras). The pre-rotation SID is
@@ -1648,3 +1671,153 @@ def unbind_initiative(cfg: Any, slug: str, sid: str, initiative: str) -> dict:
         _write_session_metadata(meta_file, meta)
 
     return {"ok": True, "sid": sid, "initiative": clean, "extras": extras, "changed": changed}
+
+
+# ---------------------------------------------------------------------------
+# Binding-graph reconcilers (T-0073 / T-0077)
+# ---------------------------------------------------------------------------
+
+def _current_user_sid_prefix() -> str:
+    """Return ``S-<linux_user>-`` so gc helpers can scope to their own user.
+
+    The worker can only see its own linux user's tmux server via ``list_panes``;
+    another user's sessions would be misclassified as zombies without this.
+    SessionMd filenames embed the linux user as the second SID segment, so a
+    prefix-match keeps reconcilers safely user-scoped without needing
+    cross-user coordination.
+    """
+    return f"S-{_get_current_user()}-"
+
+
+def gc_sessions(cfg: Any, slug: str) -> dict:
+    """T-0077: flip md ``status: active`` to ``suspended`` when no live pane.
+
+    Walks ``data/<slug>/sessions/*.md`` filtered to the current linux user.
+    For each SessionMd claiming ``status: active`` whose SID is not in
+    ``list_panes()``, rewrites the md atomically with ``status: suspended``
+    + ``suspended_at: <now>``. Original ``started_at`` and ``claude_uuid``
+    are preserved so the session remains resurrectable via ``resume()``.
+    Skips mds with ``archived: true`` (operator intent).
+
+    Returns ``{"ok": True, "scanned": N, "repaired": K, "sids": [...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"gc_sessions: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "repaired": 0, "sids": []}
+
+    user = _get_current_user()
+    user_prefix = f"S-{user}-"
+    live_sids = {compute_sid(user, p.window, p.pane_id) for p in list_panes()}
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    scanned = 0
+    repaired: list[str] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        if not md.stem.startswith(user_prefix):
+            continue
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        if meta.get("status") != "active":
+            continue
+        sid = meta.get("sid", md.stem)
+        if sid in live_sids:
+            continue
+        if str(meta.get("archived", "")).lower() == "true":
+            continue
+        meta["status"] = "suspended"
+        meta["suspended_at"] = now
+        _write_session_metadata(md, meta, atomic=True)
+        repaired.append(sid)
+    return {"ok": True, "scanned": scanned, "repaired": len(repaired), "sids": repaired}
+
+
+def _started_at_key(value: Any) -> tuple[int, str]:
+    """Sort key for ``started_at`` — newer wins. Missing values rank lowest."""
+    if not value or value == "~":
+        return (0, "")
+    return (1, str(value))
+
+
+def gc_stale_bindings(cfg: Any, slug: str) -> dict:
+    """T-0073: strip stale primary ``task_id`` from sessions losing a dup race.
+
+    For each ``task_id`` claimed by >1 SessionMd (under the current linux
+    user's prefix), picks the winner = (live pane AND latest ``started_at``)
+    or (latest ``started_at``) when no claimant is live. Strips ``task_id``
+    from the losers, preserving the old value under ``last_task_id`` for
+    forensics, and marks ``archive_reason: stale-binding``. Does NOT touch
+    sessions with ``archived: true`` (operator already classified them) and
+    does NOT touch a session that is the lone claimant of its ``task_id``.
+
+    Returns ``{"ok": True, "scanned": N, "stripped": K, "details": [...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"gc_stale_bindings: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "stripped": 0, "details": []}
+
+    user = _get_current_user()
+    user_prefix = f"S-{user}-"
+    live_sids = {compute_sid(user, p.window, p.pane_id) for p in list_panes()}
+
+    # Group SessionMds by primary task_id (current user only).
+    by_task: dict[str, list[tuple[Path, dict, str]]] = {}
+    scanned = 0
+    for md in sorted(sessions_dir.glob("*.md")):
+        if not md.stem.startswith(user_prefix):
+            continue
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        tid = meta.get("task_id")
+        if not tid or tid == "~":
+            continue
+        sid = meta.get("sid", md.stem)
+        by_task.setdefault(tid, []).append((md, meta, sid))
+
+    details: list[dict] = []
+    for task_id, claimants in by_task.items():
+        if len(claimants) < 2:
+            continue
+        # Winner: prefer (live, latest started_at). Sort descending — first wins.
+        def _rank(item: tuple[Path, dict, str]) -> tuple[int, tuple[int, str]]:
+            _, m, s = item
+            return (1 if s in live_sids else 0, _started_at_key(m.get("started_at")))
+        ordered = sorted(claimants, key=_rank, reverse=True)
+        winner_md, winner_meta, winner_sid = ordered[0]
+        for md, meta, sid in ordered[1:]:
+            if str(meta.get("archived", "")).lower() == "true":
+                # Operator already archived; still strip the dangling task_id so
+                # _find_owner stops blocking new binds, but don't double-mark.
+                meta["last_task_id"] = meta.get("task_id")
+                meta["task_id"] = "~"
+                _write_session_metadata(md, meta, atomic=True)
+                details.append({
+                    "sid": sid, "task_id": task_id, "winner": winner_sid,
+                    "stripped": True, "archived_already": True,
+                })
+                continue
+            meta["last_task_id"] = meta.get("task_id")
+            meta["task_id"] = "~"
+            meta["archive_reason"] = "stale-binding"
+            _write_session_metadata(md, meta, atomic=True)
+            details.append({
+                "sid": sid, "task_id": task_id, "winner": winner_sid,
+                "stripped": True, "archived_already": False,
+            })
+
+    return {"ok": True, "scanned": scanned, "stripped": len(details), "details": details}

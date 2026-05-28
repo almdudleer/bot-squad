@@ -18,12 +18,15 @@ File layout under ``data/<slug>/_chat/``:
 """
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 _MAX_TEXT_LEN = 4000
 _MAX_WAIT_TIMEOUT = 1800
@@ -136,6 +139,57 @@ def _touch(p: Path) -> None:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def rebind_sid(cfg: Any, slug: str, old_sid: str, new_sid: str) -> dict:
+    """T-0072: atomically rename a peer-bus triple from ``old_sid`` to ``new_sid``.
+
+    Touches:
+      - ``inbox-<sid>.log``    — append-only message log
+      - ``seen-<sid>``         — read high-water mark (byte offset)
+      - ``heartbeat-<sid>``    — long-poll heartbeat marker
+
+    SID rotation happens on ``sessions.resume()`` (new pane → new SID) and
+    on the SessionStart hook's ``tmux break-pane`` block (agent-teams
+    teammate gets its own window → new SID). Without this primitive the
+    pre-rotation messages stay in ``inbox-<old_sid>.log`` and any peer that
+    still addresses ``old_sid`` lands in a dead inbox.
+
+    No-op on self-rebind (``old_sid == new_sid``). On collision (target file
+    already exists), the source is left in place and a warning is logged —
+    a silent merge would re-order messages relative to whatever already
+    landed in the target inbox. Counts only files that actually moved in
+    the returned ``renamed`` list; missing sources are simply skipped (the
+    inbox triple is created lazily, not all three always exist).
+    """
+    if not old_sid or not new_sid:
+        return {"ok": True, "renamed": [], "reason": "empty-sid"}
+    if old_sid == new_sid:
+        return {"ok": True, "renamed": [], "reason": "self"}
+    chat = _chat_dir(cfg, slug)
+    suffixes = [
+        ("inbox-", ".log"),
+        ("seen-", ""),
+        ("heartbeat-", ""),
+    ]
+    renamed: list[str] = []
+    collisions: list[str] = []
+    for prefix, suffix in suffixes:
+        old_p = chat / f"{prefix}{old_sid}{suffix}"
+        new_p = chat / f"{prefix}{new_sid}{suffix}"
+        if not old_p.exists():
+            continue
+        if new_p.exists():
+            log.warning(
+                "rebind_sid: collision at %s — leaving both, not merging "
+                "(old_sid=%s new_sid=%s slug=%s)",
+                new_p.name, old_sid, new_sid, slug,
+            )
+            collisions.append(new_p.name)
+            continue
+        os.rename(old_p, new_p)
+        renamed.append(old_p.name)
+    return {"ok": True, "renamed": renamed, "collisions": collisions}
 
 
 def send(cfg: Any, slug: str, from_sid: str, to: str, text: str) -> dict:

@@ -68,6 +68,8 @@ def test_registry_lists_only_allowed_actions():
         "autoupdate_check_now",
         # T-0054: hot-reload projects.toml after POST /api/projects.
         "reload_projects",
+        # T-0072/0073/0077: binding-graph reconcilers + peer-bus rebind.
+        "gc_sessions", "gc_stale_bindings", "peer_rebind_sid",
     }
 
 

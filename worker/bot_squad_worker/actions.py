@@ -794,6 +794,8 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
 
     line = f"- {ts} · {sid} · {_sanitize_progress_text(text)}"
     return {"ok": True, "task_id": task_id, "line_appended": line}
+
+
 _TASK_NEW_REQUIRED = {"slug", "title"}
 _TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
 _TASK_NEW_TITLE_MAX = 240
@@ -917,8 +919,6 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
     return {"ok": True, "id": new_id, "file_path": str(file_path)}
-
-
 
 
 _PEER_INBOX_WAIT_REQUIRED = {"slug", "sid", "timeout"}
@@ -1073,6 +1073,83 @@ def _action_unarchive_session(params: dict[str, Any]) -> dict[str, Any]:
     cfg = _get_config()
     from bot_squad_worker import sessions as _sessions
     return _sessions.unarchive_session(cfg, params["slug"], params["sid"])
+
+
+# ---------------------------------------------------------------------------
+# Binding-graph reconcilers (T-0072 / T-0073 / T-0077)
+# ---------------------------------------------------------------------------
+
+_GC_SESSIONS_REQUIRED = {"slug"}
+_GC_SESSIONS_ALLOWED = _GC_SESSIONS_REQUIRED
+
+
+def _action_gc_sessions(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0077: flip md ``status: active`` → ``suspended`` for panes that died.
+
+    Required params: slug
+    Returns: {ok, scanned, repaired, sids: [...]}
+    """
+    extra = set(params) - _GC_SESSIONS_ALLOWED
+    if extra:
+        raise ActionError(f"gc_sessions got unexpected params: {sorted(extra)}")
+    missing = _GC_SESSIONS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"gc_sessions missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.gc_sessions(cfg, params["slug"])
+
+
+_GC_STALE_BINDINGS_REQUIRED = {"slug"}
+_GC_STALE_BINDINGS_ALLOWED = _GC_STALE_BINDINGS_REQUIRED
+
+
+def _action_gc_stale_bindings(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0073: strip stale ``task_id`` from sessions losing a duplicate-binding race.
+
+    Required params: slug
+    Returns: {ok, scanned, stripped, details: [...]}
+    """
+    extra = set(params) - _GC_STALE_BINDINGS_ALLOWED
+    if extra:
+        raise ActionError(f"gc_stale_bindings got unexpected params: {sorted(extra)}")
+    missing = _GC_STALE_BINDINGS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"gc_stale_bindings missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.gc_stale_bindings(cfg, params["slug"])
+
+
+_PEER_REBIND_SID_REQUIRED = {"slug", "old_sid", "new_sid"}
+_PEER_REBIND_SID_ALLOWED = _PEER_REBIND_SID_REQUIRED
+
+
+def _action_peer_rebind_sid(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0072: rename the peer-bus inbox triple from ``old_sid`` to ``new_sid``.
+
+    Required params: slug, old_sid, new_sid
+    Returns: {ok, renamed: [...], collisions: [...]}
+
+    Invoked by ``scripts/hooks/session_start.sh`` after a ``tmux break-pane``
+    rotates the live SID, and (internally) by ``sessions.resume()``.
+    """
+    extra = set(params) - _PEER_REBIND_SID_ALLOWED
+    if extra:
+        raise ActionError(f"peer_rebind_sid got unexpected params: {sorted(extra)}")
+    missing = _PEER_REBIND_SID_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"peer_rebind_sid missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"peer_rebind_sid: unknown project slug {slug!r}")
+
+    from bot_squad_worker import intersession as _is
+    return _is.rebind_sid(cfg, slug, params["old_sid"], params["new_sid"])
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1326,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
     "unarchive_session": _action_unarchive_session,
+    # T-0072/0073/0077: binding-graph reconcilers + peer-bus SID rotation.
+    "gc_sessions": _action_gc_sessions,
+    "gc_stale_bindings": _action_gc_stale_bindings,
+    "peer_rebind_sid": _action_peer_rebind_sid,
     # T-0085: autoupdate operator handoff levers.
     "autoupdate_retry": _action_autoupdate_retry,
     "autoupdate_force": _action_autoupdate_force,
@@ -1293,6 +1374,13 @@ ACTION_MODES: dict[str, str] = {
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",
     "unarchive_session": "coordinator_only",
+    # T-0072/0073/0077: reconcilers walk SessionMd + live tmux; coordinator-only
+    # because the scheduler tick and migration semantics expect a single writer
+    # per host. (Filesystem & tmux are user-local; multi-user multi-host
+    # coordination is out of scope for this bundle.)
+    "gc_sessions": "coordinator_only",
+    "gc_stale_bindings": "coordinator_only",
+    "peer_rebind_sid": "coordinator_only",
     # T-0085: autoupdate handoff is install-scoped (coordinator).
     "autoupdate_retry": "coordinator_only",
     "autoupdate_force": "coordinator_only",

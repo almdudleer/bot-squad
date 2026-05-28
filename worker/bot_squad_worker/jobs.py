@@ -154,6 +154,34 @@ def autoupdate_apply_tick(cfg: Config) -> None:
         log.exception("autoupdate_apply_tick error")
 
 
+def binding_gc_tick(cfg: Config) -> None:
+    """T-0072/0073/0077: run the binding-graph reconcilers for every project.
+
+    Two passes per tick:
+      1. ``gc_sessions`` — flip ``status: active`` SessionMds with no live pane
+         to ``status: suspended`` so the on-disk graph matches reality.
+      2. ``gc_stale_bindings`` — strip duplicate-claim primary ``task_id`` from
+         losers in a dup race (preserve old value as ``last_task_id``).
+
+    ``gc_sessions`` runs first so the freshly-suspended sessions inform the
+    stale-binding race resolution (a live-pane claimant beats a dead one).
+
+    Per-project errors are caught and logged so one bad project never kills
+    the sweep.
+    """
+    from bot_squad_worker import sessions as _sessions
+
+    for slug in cfg.projects:
+        try:
+            _sessions.gc_sessions(cfg, slug)
+        except Exception:
+            log.exception("binding_gc_tick: gc_sessions failed for %s", slug)
+        try:
+            _sessions.gc_stale_bindings(cfg, slug)
+        except Exception:
+            log.exception("binding_gc_tick: gc_stale_bindings failed for %s", slug)
+
+
 def autonomous_tick(cfg: Config) -> None:
     """Run one orchestrator tick for every project that has autonomous mode enabled.
 

@@ -2084,3 +2084,346 @@ def test_session_start_hook_uses_tl_pane_tmux_session_for_break_pane():
         "T-0103 regression: break-pane target reverted to hardcoded $slug"
     assert "'#S'" in text, \
         "T-0103: target_session must come from `tmux display-message ... #S`"
+
+
+# ---------------------------------------------------------------------------
+# T-0077: gc_sessions — flip zombie status:active without live pane → suspended
+# ---------------------------------------------------------------------------
+
+def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
+    """Zombie md (status: active + no live pane) → patched to suspended."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])  # no live panes
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    zombie = sessions_dir / "S-testuser-T-0026-p60.md"
+    _write_session_metadata(zombie, {
+        "sid": "S-testuser-T-0026-p60",
+        "status": "active",
+        "task_id": "T-0026",
+        "started_at": "2026-05-15T11:18:04Z",
+        "claude_uuid": "uuid-zombie",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["ok"] is True
+    assert result["repaired"] == 1
+    assert result["sids"] == ["S-testuser-T-0026-p60"]
+
+    after = _read_session_metadata(zombie)
+    assert after["status"] == "suspended"
+    assert after["suspended_at"]
+    # T-0077: started_at + claude_uuid preserved so the session is resurrectable.
+    assert after["started_at"] == "2026-05-15T11:18:04Z"
+    assert after["claude_uuid"] == "uuid-zombie"
+
+
+def test_gc_sessions_skips_live_pane(tmp_path, monkeypatch):
+    """status:active with a matching live pane is left alone."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [_fake_pane(pane_id="%5", window="multi_server")])
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    live_md = sessions_dir / "S-testuser-multi_server-p5.md"
+    _write_session_metadata(live_md, {
+        "sid": "S-testuser-multi_server-p5",
+        "status": "active",
+        "task_id": "T-0099",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 0
+    assert _read_session_metadata(live_md)["status"] == "active"
+
+
+def test_gc_sessions_skips_archived(tmp_path, monkeypatch):
+    """archived: true is operator intent — janitor must not touch it."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-w-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-w-p9",
+        "status": "active",
+        "archived": "true",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 0
+    assert _read_session_metadata(md)["status"] == "active"
+
+
+def test_gc_sessions_other_user_sids_untouched(tmp_path, monkeypatch):
+    """SessionMds belonging to another linux user are out of scope.
+
+    The worker only sees its own user's tmux server via list_panes; flipping
+    status on cross-user mds would mis-classify their live sessions as zombies.
+    """
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    cross_user = sessions_dir / "S-alexey-claude-p1.md"
+    _write_session_metadata(cross_user, {
+        "sid": "S-alexey-claude-p1",
+        "status": "active",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 0
+    assert _read_session_metadata(cross_user)["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# T-0073: gc_stale_bindings — strip primary task_id from dup-claim losers
+# ---------------------------------------------------------------------------
+
+def test_gc_stale_bindings_picks_live_winner(tmp_path, monkeypatch):
+    """Two sessions claim same task_id; live + latest started_at wins."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    # multi_server-p5 is live; T-0026-p60 is the dead duplicate.
+    monkeypatch.setattr(S, "list_panes", lambda: [
+        _fake_pane(pane_id="%5", window="multi_server"),
+    ])
+
+    sess = tmp_path / "data" / "test-project" / "sessions"
+    winner = sess / "S-testuser-multi_server-p5.md"
+    loser = sess / "S-testuser-T-0026-p60.md"
+    _write_session_metadata(winner, {
+        "sid": "S-testuser-multi_server-p5",
+        "status": "active",
+        "task_id": "T-0026",
+        "started_at": "2026-05-20T10:00:00Z",
+    })
+    _write_session_metadata(loser, {
+        "sid": "S-testuser-T-0026-p60",
+        "status": "suspended",
+        "task_id": "T-0026",
+        "started_at": "2026-05-15T11:18:04Z",
+    })
+
+    result = S.gc_stale_bindings(cfg, "test-project")
+    assert result["stripped"] == 1
+    assert result["details"][0]["winner"] == "S-testuser-multi_server-p5"
+    assert result["details"][0]["sid"] == "S-testuser-T-0026-p60"
+
+    assert _read_session_metadata(winner)["task_id"] == "T-0026"
+    loser_meta = _read_session_metadata(loser)
+    assert loser_meta["task_id"] is None  # ~ → parsed as None
+    assert loser_meta["last_task_id"] == "T-0026"
+    assert loser_meta["archive_reason"] == "stale-binding"
+
+
+def test_gc_stale_bindings_no_dup_is_noop(tmp_path, monkeypatch):
+    """Lone claimant keeps its task_id."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+    sess = tmp_path / "data" / "test-project" / "sessions"
+    md = sess / "S-testuser-w-p1.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-w-p1",
+        "status": "suspended",
+        "task_id": "T-0099",
+    })
+
+    result = S.gc_stale_bindings(cfg, "test-project")
+    assert result["stripped"] == 0
+    assert _read_session_metadata(md)["task_id"] == "T-0099"
+
+
+def test_gc_stale_bindings_no_live_picks_latest_started_at(tmp_path, monkeypatch):
+    """All claimants dead — newest started_at wins; older losers stripped."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+    sess = tmp_path / "data" / "test-project" / "sessions"
+    older = sess / "S-testuser-w-p1.md"
+    newer = sess / "S-testuser-w-p2.md"
+    _write_session_metadata(older, {
+        "sid": "S-testuser-w-p1",
+        "status": "suspended",
+        "task_id": "T-0050",
+        "started_at": "2026-04-01T00:00:00Z",
+    })
+    _write_session_metadata(newer, {
+        "sid": "S-testuser-w-p2",
+        "status": "suspended",
+        "task_id": "T-0050",
+        "started_at": "2026-05-01T00:00:00Z",
+    })
+
+    result = S.gc_stale_bindings(cfg, "test-project")
+    assert result["stripped"] == 1
+    assert result["details"][0]["winner"] == "S-testuser-w-p2"
+    assert _read_session_metadata(newer)["task_id"] == "T-0050"
+    assert _read_session_metadata(older)["task_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# T-0072: rebind_sid — atomic peer-bus inbox triple rename on SID rotation
+# ---------------------------------------------------------------------------
+
+def test_rebind_sid_renames_inbox_triple(tmp_path):
+    """All three peer-bus files migrate from old_sid to new_sid."""
+    from bot_squad_worker import intersession as I
+    import types
+    cfg = types.SimpleNamespace(data_dir=tmp_path / "data")
+    I.send(cfg, "p", "S-from", "S-old", "hi there")
+    # Drain so seen-S-old has a non-zero byte offset.
+    I.inbox_read(cfg, "p", "S-old")
+
+    chat = tmp_path / "data" / "p" / "_chat"
+    assert (chat / "inbox-S-old.log").exists()
+    assert (chat / "seen-S-old").exists()
+    assert (chat / "heartbeat-S-old").exists()
+
+    out = I.rebind_sid(cfg, "p", "S-old", "S-new")
+    assert out["ok"] is True
+    assert sorted(out["renamed"]) == sorted([
+        "inbox-S-old.log", "seen-S-old", "heartbeat-S-old",
+    ])
+    assert out["collisions"] == []
+
+    assert not (chat / "inbox-S-old.log").exists()
+    assert (chat / "inbox-S-new.log").exists()
+    assert (chat / "seen-S-new").exists()
+    assert (chat / "heartbeat-S-new").exists()
+
+
+def test_rebind_sid_self_is_noop(tmp_path):
+    """old_sid == new_sid → renamed=[]."""
+    from bot_squad_worker import intersession as I
+    import types
+    cfg = types.SimpleNamespace(data_dir=tmp_path / "data")
+    I.send(cfg, "p", "S-from", "S-same", "msg")
+    out = I.rebind_sid(cfg, "p", "S-same", "S-same")
+    assert out["renamed"] == []
+    assert out["reason"] == "self"
+    chat = tmp_path / "data" / "p" / "_chat"
+    assert (chat / "inbox-S-same.log").exists()
+
+
+def test_rebind_sid_collision_leaves_both(tmp_path):
+    """Target inbox already exists → leave both, do NOT silently merge."""
+    from bot_squad_worker import intersession as I
+    import types
+    cfg = types.SimpleNamespace(data_dir=tmp_path / "data")
+    I.send(cfg, "p", "S-from", "S-old", "old msg")
+    I.send(cfg, "p", "S-from", "S-new", "new msg")  # creates inbox-S-new.log
+
+    out = I.rebind_sid(cfg, "p", "S-old", "S-new")
+    chat = tmp_path / "data" / "p" / "_chat"
+    # inbox-S-old.log left alone (collision), no merge.
+    assert (chat / "inbox-S-old.log").exists()
+    assert "inbox-S-new.log" in out["collisions"]
+    # New still has only its original message.
+    read_new = I.inbox_read(cfg, "p", "S-new")
+    assert any("new msg" in m for m in read_new["messages"])
+    assert not any("old msg" in m for m in read_new["messages"])
+
+
+def test_rebind_sid_missing_source_is_noop(tmp_path):
+    """No inbox files for old_sid → returns ok with empty renamed list."""
+    from bot_squad_worker import intersession as I
+    import types
+    cfg = types.SimpleNamespace(data_dir=tmp_path / "data")
+    out = I.rebind_sid(cfg, "p", "S-never", "S-new")
+    assert out["ok"] is True
+    assert out["renamed"] == []
+
+
+def test_resume_rebinds_peer_inbox_on_sid_rotation(tmp_path, monkeypatch):
+    """End-to-end: resume() rotates SID and migrates the peer inbox triple."""
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker import intersession as I
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # Pre-rotation SessionMd + a peer-bus message addressed to the old SID.
+    sess = tmp_path / "data" / "test-project" / "sessions"
+    old_sid = "S-testuser-w-p5"
+    new_sid = "S-testuser-w-p9"
+    _write_session_metadata(sess / f"{old_sid}.md", {
+        "sid": old_sid,
+        "status": "suspended",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-x",
+        "task_id": "~",
+    })
+    I.send(cfg, "test-project", "S-peer", old_sid, "pre-rotation msg")
+
+    # Fake tmux state for resume(): no live pane initially, then one with %9.
+    snapshot = {"phase": 0}
+
+    def fake_list_panes():
+        if snapshot["phase"] == 0:
+            return []
+        return [_fake_pane(pane_id="%9", window="w", cwd=str(repo))]
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["tmux", "has-session"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["tmux", "new-window"]:
+            snapshot["phase"] = 1
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "list_panes", fake_list_panes)
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S.time, "sleep", lambda _x: None)
+
+    result = S.resume(cfg, "test-project", old_sid)
+    assert result["sid"] == new_sid
+
+    chat = tmp_path / "data" / "test-project" / "_chat"
+    assert not (chat / f"inbox-{old_sid}.log").exists()
+    assert (chat / f"inbox-{new_sid}.log").exists()
+    read = I.inbox_read(cfg, "test-project", new_sid)
+    assert any("pre-rotation msg" in m for m in read["messages"])
+
+
+def test_session_start_hook_calls_peer_rebind_sid():
+    """Hook break-pane block invokes worker action peer_rebind_sid via socket."""
+    import pathlib as _pl
+    here = _pl.Path(__file__).resolve()
+    hook = None
+    for ancestor in here.parents:
+        cand = ancestor / "scripts" / "hooks" / "session_start.sh"
+        if cand.is_file():
+            hook = cand
+            break
+    if hook is None:
+        pytest.skip("session_start.sh not reachable")
+    text = hook.read_text()
+    # T-0072: the break-pane block must rebind the peer-bus triple after the
+    # SessionMd migration. Otherwise messages still addressed to old_sid land
+    # in a dead inbox.
+    assert "/actions/peer_rebind_sid" in text, \
+        "T-0072 regression: SessionStart hook break-pane no longer rebinds peer inbox"

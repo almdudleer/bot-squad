@@ -55,6 +55,8 @@ def test_registry_lists_only_allowed_actions():
         "autonomous_status", "autonomous_enable", "autonomous_disable",
         "peer_send", "peer_inbox_read", "peer_inbox_wait",
         "task_progress_add",
+        # T-0042: atomic T-NNNN allocator.
+        "task_new",
         # Phase 9: bind multi-task-per-dev / multi-initiative-per-TL.
         "bind_task", "bind_initiative",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
@@ -1140,3 +1142,146 @@ def test_reload_projects_rejects_params(tmp_config_dir: Path, monkeypatch):
     A.set_config(Config.load(tmp_config_dir))
     with pytest.raises(ActionError, match="unexpected"):
         A.dispatch("reload_projects", {"slug": "test-project"})
+
+
+# ---------------------------------------------------------------------------
+# task_new tests (T-0042 — atomic T-NNNN allocator)
+# ---------------------------------------------------------------------------
+
+
+def _setup_task_new(tmp_path: Path, tmp_config_dir: Path, monkeypatch) -> Path:
+    """Wire the config + return the backlog dir for the test-project slug."""
+    import bot_squad_worker.actions as A
+
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    backlog = tmp_path / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True)
+    return backlog
+
+
+def test_task_new_empty_backlog_allocates_t0001(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    backlog = _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("task_new", {"slug": "test-project", "title": "first task"})
+    assert out["ok"] is True
+    assert out["id"] == "T-0001"
+    p = Path(out["file_path"])
+    assert p.parent == backlog
+    assert p.name == "T-0001-first-task.md"
+    body = p.read_text()
+    assert "id: T-0001" in body
+    assert "status: planned" in body
+    assert "## Verbatim request" in body
+    assert "(filed via task_new)" in body
+    assert "## DoD" in body
+
+
+def test_task_new_returns_t0134_for_existing_133(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    backlog = _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    # Seed T-0001..T-0133 as empty stubs — only the filename matters for max-id.
+    for i in range(1, 134):
+        (backlog / f"T-{i:04d}-seed.md").write_text("---\nid: T-XXXX\n---\n")
+    out = A.dispatch("task_new", {"slug": "test-project", "title": "next one"})
+    assert out["id"] == "T-0134"
+    assert Path(out["file_path"]).name == "T-0134-next-one.md"
+
+
+def test_task_new_concurrent_threads_get_distinct_ids(tmp_path, tmp_config_dir, monkeypatch):
+    """4 threads racing on task_new must each get a distinct T-NNNN id."""
+    from concurrent.futures import ThreadPoolExecutor
+    import bot_squad_worker.actions as A
+
+    backlog = _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+
+    def _alloc(i: int) -> dict:
+        return A.dispatch(
+            "task_new",
+            {"slug": "test-project", "title": f"concurrent task {i}"},
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(_alloc, range(4)))
+
+    ids = [r["id"] for r in results]
+    assert len(set(ids)) == 4, f"ids must be distinct, got {ids}"
+    assert set(ids) == {"T-0001", "T-0002", "T-0003", "T-0004"}
+    # Files all exist with non-overlapping ids.
+    for r in results:
+        p = Path(r["file_path"])
+        assert p.exists()
+        assert p.parent == backlog
+        assert p.name.startswith(r["id"] + "-")
+    # Filenames on disk match the four returned ids exactly (plus the lock).
+    on_disk_ids = sorted(
+        p.name.split("-", 2)[0] + "-" + p.name.split("-", 2)[1]
+        for p in backlog.glob("T-*.md")
+    )
+    assert on_disk_ids == sorted(ids)
+
+
+def test_task_new_writes_optional_frontmatter_fields(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("task_new", {
+        "slug": "test-project",
+        "title": "with extras",
+        "initiative": "multi-server-installation-process.md",
+        "priority": "P1",
+        "owner": "alexey",
+    })
+    body = Path(out["file_path"]).read_text()
+    assert 'initiative: "multi-server-installation-process.md"' in body
+    assert 'priority: "P1"' in body
+    assert 'owner: "alexey"' in body
+
+
+def test_task_new_quotes_titles_with_yaml_specials(tmp_path, tmp_config_dir, monkeypatch):
+    """Titles with ':' or '#' must not break the YAML frontmatter."""
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    title = 'Fix: cache miss in #ingest path'
+    out = A.dispatch("task_new", {"slug": "test-project", "title": title})
+    body = Path(out["file_path"]).read_text()
+    # Pull the title line out, parse with tomllib? No — frontmatter is YAML;
+    # just confirm the quoted form is what we wrote.
+    assert f'title: "Fix: cache miss in #ingest path"' in body
+
+
+def test_task_new_rejects_extra_params(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected"):
+        A.dispatch("task_new", {
+            "slug": "test-project", "title": "x", "evil": 1,
+        })
+
+
+def test_task_new_rejects_empty_title(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="empty title"):
+        A.dispatch("task_new", {"slug": "test-project", "title": "   "})
+
+
+def test_task_new_rejects_multiline_title(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="single-line"):
+        A.dispatch("task_new", {"slug": "test-project", "title": "a\nb"})
+
+
+def test_task_new_unknown_slug_raises(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("task_new", {"slug": "no-such", "title": "x"})

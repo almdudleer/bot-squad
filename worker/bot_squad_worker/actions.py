@@ -794,6 +794,131 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
 
     line = f"- {ts} · {sid} · {_sanitize_progress_text(text)}"
     return {"ok": True, "task_id": task_id, "line_appended": line}
+_TASK_NEW_REQUIRED = {"slug", "title"}
+_TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
+_TASK_NEW_TITLE_MAX = 240
+
+
+def _slugify_title(title: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", title.strip().lower()).strip("-")
+    return (s[:60].rstrip("-") or "task")
+
+
+def _yaml_quote(s: str) -> str:
+    """Return a YAML scalar that is safe even when ``s`` contains : # " etc.
+
+    Always emits double-quoted form with JSON-style escaping, which is a
+    valid subset of YAML 1.2 plain double-quoted strings.
+    """
+    import json as _json
+    return _json.dumps(s, ensure_ascii=False)
+
+
+def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
+    """Atomically allocate the next T-NNNN id and write a stub task md.
+
+    Required params: slug, title
+    Optional params: initiative, priority, owner
+    Returns: {ok: true, id: "T-NNNN", file_path: "<abs path>"}
+
+    Allocation is serialised by an fcntl.flock on
+    ``data/<slug>/backlog/.task-id.lock``: callers (including concurrent
+    sessions on the same host) cannot collide on the same id. The lock
+    file persists; the body is empty (the lock is the only thing we care
+    about). Crashes between alloc and write merely burn one id — that's
+    fine, ids aren't scarce.
+    """
+    extra = set(params) - _TASK_NEW_ALLOWED
+    if extra:
+        raise ActionError(f"task_new got unexpected params: {sorted(extra)}")
+    missing = _TASK_NEW_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"task_new missing required params: {sorted(missing)}")
+
+    slug = params["slug"]
+    title = params["title"]
+    if not isinstance(title, str) or not title.strip():
+        raise ActionError("task_new: empty title")
+    if "\n" in title or "\r" in title:
+        raise ActionError("task_new: title must be single-line")
+    if len(title) > _TASK_NEW_TITLE_MAX:
+        raise ActionError(f"task_new: title too long (max {_TASK_NEW_TITLE_MAX})")
+
+    cfg = _get_config()
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"task_new: unknown project slug {slug!r}")
+
+    import fcntl
+    from datetime import datetime, timezone
+
+    backlog_dir: Path = cfg.data_dir / slug / "backlog"
+    backlog_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = backlog_dir / ".task-id.lock"
+
+    _id_re = re.compile(r"^T-(\d+)-")
+
+    with open(lock_path, "a+") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            max_id = 0
+            for p in backlog_dir.glob("T-*.md"):
+                m = _id_re.match(p.name)
+                if m:
+                    n = int(m.group(1))
+                    if n > max_id:
+                        max_id = n
+            next_id = max_id + 1
+            new_id = f"T-{next_id:04d}"
+
+            file_path = backlog_dir / f"{new_id}-{_slugify_title(title)}.md"
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            fm_lines = [
+                f"id: {new_id}",
+                f"title: {_yaml_quote(title)}",
+                "status: planned",
+                f"created: {ts}",
+            ]
+            for opt_key in ("initiative", "priority", "owner"):
+                if opt_key in params:
+                    val = params[opt_key]
+                    if val is None or (isinstance(val, str) and not val.strip()):
+                        continue
+                    fm_lines.append(f"{opt_key}: {_yaml_quote(str(val))}")
+
+            body = (
+                "## Verbatim request\n\n"
+                "(filed via task_new)\n\n"
+                "## DoD\n\n"
+                "TBD\n"
+            )
+            content = f"---\n" + "\n".join(fm_lines) + f"\n---\n\n{body}"
+
+            # O_EXCL is belt-and-braces: under the flock no other caller can
+            # race us, but if the filesystem already has a T-NNNN-*.md with
+            # this exact filename we surface that rather than overwrite.
+            fd = os.open(
+                str(file_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+            except BaseException:
+                # On any write failure, do NOT leave a half-written file
+                # squatting on the id we just allocated.
+                try:
+                    os.unlink(str(file_path))
+                except FileNotFoundError:
+                    pass
+                raise
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    return {"ok": True, "id": new_id, "file_path": str(file_path)}
+
+
 
 
 _PEER_INBOX_WAIT_REQUIRED = {"slug", "sid", "timeout"}
@@ -1116,6 +1241,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "peer_inbox_read": _action_peer_inbox_read,
     "peer_inbox_wait": _action_peer_inbox_wait,
     "task_progress_add": _action_task_progress_add,
+    # T-0042: atomic T-NNNN allocator (flock-protected).
+    "task_new": _action_task_new,
     "bind_task": _action_bind_task,
     "bind_initiative": _action_bind_initiative,
     "unbind_task": _action_unbind_task,
@@ -1159,6 +1286,7 @@ ACTION_MODES: dict[str, str] = {
     "peer_inbox_read": "coordinator_only",
     "peer_inbox_wait": "coordinator_only",
     "task_progress_add": "coordinator_only",
+    "task_new": "coordinator_only",
     "bind_task": "coordinator_only",
     "bind_initiative": "coordinator_only",
     "unbind_task": "coordinator_only",

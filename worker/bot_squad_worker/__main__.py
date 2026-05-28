@@ -132,7 +132,7 @@ def main() -> int:
     elif mode == "user-worker":
         # Best-effort: set group ownership on the per-user socket so the API
         # container (which runs as group www) can connect.
-        import grp, threading, time as _time
+        import grp, time as _time
         def _delayed_chgrp() -> None:
             _time.sleep(1.0)
             try:

@@ -880,3 +880,51 @@ def test_pause_other_user_owner_blocked(
     r = client.post(f"/api/projects/test-project/sessions/{sid}/pause")
     assert r.status_code == 403
     assert "owned by" in r.json()["detail"]
+
+
+def test_suspend_tl_sid_alias_resolves_to_human_owner(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """T-0135: TL spawns dev with owner=<TL-SID>; TL's human owner can suspend.
+
+    Setup: TL session md is stamped owner=aqice (human owner). The TL spawns
+    a dev whose md is stamped owner=<TL-SID>. aqice's JWT should clear the
+    suspend check via the TL-SID alias hop, returning 200 not 403.
+    """
+    tl_sid = "S-aqice-tl-p0"
+    dev_sid = "S-aqice-feature-p99"
+    _write_session_md_full(tmp_bot_squad, tl_sid, owner="aqice")
+    _write_session_md_full(tmp_bot_squad, dev_sid, owner=tl_sid)
+
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'aqice = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.aqice]\n'
+        'linux_user = "aqice"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(fake_worker_sessions))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    client = TestClient(build_app())
+    client.post("/api/auth/login", json={"username": "aqice", "password": "test"})
+    r = client.post(f"/api/projects/test-project/sessions/{dev_sid}/suspend")
+    assert r.status_code == 200, r.text
+
+    # Negative: a different user should still get 403 — the alias only
+    # rescues the TL's actual human owner, not anyone.
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'mallory = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.mallory]\n'
+        'linux_user = "mallory"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    client = TestClient(build_app())
+    client.post("/api/auth/login", json={"username": "mallory", "password": "test"})
+    r = client.post(f"/api/projects/test-project/sessions/{dev_sid}/suspend")
+    assert r.status_code == 403

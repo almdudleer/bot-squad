@@ -98,6 +98,13 @@ def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter,
         if md_owner is not None:
             if md_owner == user.get("username"):
                 return
+            # T-0135: TLs spawn devs with owner=<TL-SID>; allow the TL's own
+            # human owner to act on those devs by resolving the TL-SID's md
+            # `owner` field one hop deeper.
+            if md_owner.startswith("S-"):
+                tl_owner = _read_session_owner(data_dir, slug, md_owner)
+                if tl_owner == user.get("username"):
+                    return
             raise HTTPException(
                 status_code=403,
                 detail=f"session {sid!r} is owned by {md_owner!r}; "

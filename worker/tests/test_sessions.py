@@ -2091,7 +2091,7 @@ def test_session_start_hook_uses_tl_pane_tmux_session_for_break_pane():
 # ---------------------------------------------------------------------------
 
 def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
-    """Zombie md (status: active + no live pane) → patched to suspended."""
+    """Zombie md (status: active + pane_id no longer in tmux) → patched to suspended."""
     import bot_squad_worker.sessions as S
 
     cfg = _make_cfg(tmp_path)
@@ -2104,6 +2104,7 @@ def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
         "sid": "S-testuser-T-0026-p60",
         "status": "active",
         "task_id": "T-0026",
+        "pane_id": "%60",
         "started_at": "2026-05-15T11:18:04Z",
         "claude_uuid": "uuid-zombie",
     })
@@ -2119,6 +2120,45 @@ def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
     # T-0077: started_at + claude_uuid preserved so the session is resurrectable.
     assert after["started_at"] == "2026-05-15T11:18:04Z"
     assert after["claude_uuid"] == "uuid-zombie"
+
+
+def test_gc_sessions_skips_missing_pane_id_unverifiable(tmp_path, monkeypatch):
+    """T-0134 regression: SessionMd without pane_id (legacy schema, or claude
+    in non-bot-squad tmux pane) must be treated as UNVERIFIABLE — skipped, not
+    flagged as zombie. Caught on Day-6 deploy: gc_sessions flipped 4 live TL
+    sessions to suspended on first invocation because they predated the
+    pane_id field.
+    """
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])  # no live panes
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    # Case 1: pane_id field entirely absent (legacy SessionMd schema).
+    legacy = sessions_dir / "S-testuser-multi_server-p8.md"
+    _write_session_metadata(legacy, {
+        "sid": "S-testuser-multi_server-p8",
+        "status": "active",
+        "claude_uuid": "uuid-legacy-live",
+    })
+    # Case 2: pane_id explicitly null (~) — same semantic.
+    null_pane = sessions_dir / "S-testuser-teamlead-p13.md"
+    _write_session_metadata(null_pane, {
+        "sid": "S-testuser-teamlead-p13",
+        "status": "active",
+        "pane_id": "~",
+        "claude_uuid": "uuid-null-pane",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 0, (
+        f"T-0134: pane_id-less SessionMds must be skipped (unverifiable), "
+        f"not flipped. Got repaired={result!r}."
+    )
+    assert _read_session_metadata(legacy)["status"] == "active"
+    assert _read_session_metadata(null_pane)["status"] == "active"
 
 
 def test_gc_sessions_skips_live_pane(tmp_path, monkeypatch):

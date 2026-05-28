@@ -1713,7 +1713,9 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
 
     user = _get_current_user()
     user_prefix = f"S-{user}-"
-    live_sids = {compute_sid(user, p.window, p.pane_id) for p in list_panes()}
+    live_panes = list_panes()
+    live_sids = {compute_sid(user, p.window, p.pane_id) for p in live_panes}
+    live_pane_ids = {p.pane_id for p in live_panes}
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     scanned = 0
@@ -1731,6 +1733,16 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
         if sid in live_sids:
             continue
         if str(meta.get("archived", "")).lower() == "true":
+            continue
+        # T-0134: require an explicit pane_id on SessionMd to flag suspended.
+        # Sessions without a recorded pane_id are unverifiable (legacy schema,
+        # or claude running in a non-bot-squad tmux pane) — skip them rather
+        # than false-flag as zombie.
+        recorded_pane_id = meta.get("pane_id")
+        if not recorded_pane_id or recorded_pane_id == "~":
+            continue
+        # Verified suspect: pane_id is recorded but no longer in tmux list-panes.
+        if recorded_pane_id in live_pane_ids:
             continue
         meta["status"] = "suspended"
         meta["suspended_at"] = now

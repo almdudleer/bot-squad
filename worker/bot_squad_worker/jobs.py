@@ -172,10 +172,10 @@ def binding_gc_tick(cfg: Config) -> None:
     from bot_squad_worker import sessions as _sessions
 
     for slug in cfg.projects:
-        # T-0134: gc_sessions periodic tick disabled — false-positives on
-        # legacy SessionMds without pane_id (no-pane_id treated as zombie
-        # instead of unverifiable). Manual invocation still works for ops
-        # use. Re-enable here when T-0134 lands.
+        try:
+            _sessions.gc_sessions(cfg, slug)
+        except Exception:
+            log.exception("binding_gc_tick: gc_sessions failed for %s", slug)
         try:
             _sessions.gc_stale_bindings(cfg, slug)
         except Exception:

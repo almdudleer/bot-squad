@@ -104,6 +104,10 @@ via your peer inbox, treat it as a delegated spawn. Steps:
 - When you create a new task (e.g. handling a DEV SPAWN REQUEST without
   a bound task), put the stakeholder's exact words in the `## Verbatim
   request` section. Never paraphrase.
+- Never hand-pick the T-NNNN id when filing a new ticket. Call the
+  `task_new` worker action (`{slug, title, initiative?, priority?,
+  owner?}` → `{id, file_path}`), then edit the returned md. The
+  allocator is flock-protected; hand-picked ids collide across sessions.
 - Add your own clarifications under `## Context`. Optional, short.
 - Use `task_progress_add` to log shipped milestones / blockers. Don't
   rewrite the task body to status-narrate; that's what progress notes are for.

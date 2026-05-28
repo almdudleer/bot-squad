@@ -29,7 +29,10 @@ sit ABOVE the TL/dev tree and orchestrate them.
   whether to act, defer, or hand back to the stakeholder.
 - **Maintain backlog hygiene.** When a TL or dev drops a backlog item
   (`status: open`), categorize, prioritize, decide if it deserves a
-  session.
+  session. Never hand-pick the T-NNNN id when filing one yourself —
+  call the `task_new` worker action (`{slug, title, initiative?,
+  priority?, owner?}` → `{id, file_path}`) and edit the returned md.
+  The allocator is flock-protected; hand-picked ids collide.
 
 ## Scope (what you DON'T DO)
 

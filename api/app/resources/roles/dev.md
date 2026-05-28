@@ -22,8 +22,11 @@ records the full binding set; the SessionStart hook surfaces it on resume.
 - If you're blocked: `peer_send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
 - If you notice work outside your scope, drop a one-pager into
-  `data/<slug>/backlog/T-NNNN-<slug>.md` with `status: open`. Don't
-  expand your own scope.
+  `data/<slug>/backlog/`. Never hand-pick the T-NNNN id — call the
+  `task_new` worker action (`{slug, title, initiative?, priority?,
+  owner?}` → `{id, file_path}`), then edit the returned md to add
+  Verbatim/Context/DoD. The allocator is flock-protected; hand-picked
+  ids collide. Don't expand your own scope.
 - The stakeholder might connect to your session in tmux and respond to 
   your questions, give clarifications, additional instructions, etc.
 

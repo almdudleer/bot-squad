@@ -30,10 +30,11 @@ try:
 except Exception as e:
     print(f"error: cannot read projects.toml: {e}", file=sys.stderr)
     sys.exit(1)
-cwd = os.getcwd()
+cwd = os.path.realpath(os.getcwd())
 for slug, p in cfg.get("projects", {}).items():
     repo = p.get("repo_path", "")
-    if repo and (cwd == repo or cwd.startswith(repo.rstrip("/") + "/")):
+    repo_real = os.path.realpath(repo) if repo else ""
+    if repo_real and (cwd == repo_real or cwd.startswith(repo_real.rstrip("/") + "/")):
         print(slug)
         sys.exit(0)
 print(f"error: CWD {cwd!r} not in any registered project", file=sys.stderr)

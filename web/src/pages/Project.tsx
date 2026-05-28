@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import type { SessionRow, Task, VisionFile } from "../api";
+import { isNotFoundError, type SessionRow, type Task, type VisionFile } from "../api";
 import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
@@ -99,6 +99,10 @@ export function Project() {
   // silently); TaskCard falls back to mapping the raw md status.
   const [sessionsBySid, setSessionsBySid] = useState<Record<string, SessionRow>>({});
   const [error, setError] = useState<string | null>(null);
+  // T-0138: gate the chrome on the project actually existing. `null` =
+  // checking; `false` = backlog 404'd, render a not-found panel instead of
+  // the full sidebar/board so per-project polling doesn't fire stray 404s.
+  const [slugMissing, setSlugMissing] = useState<boolean | null>(null);
 
   // T-0039: view controls. Defaults reproduce the pre-T-0039 board exactly.
   // T-0097: persisted in URL query params (`group`, `view`, `init`) so
@@ -204,14 +208,35 @@ export function Project() {
       });
   };
 
+  // T-0138: probe the slug via /backlog. 404 → not-found panel; any other
+  // outcome opens the gate for the periodic polls below.
   useEffect(() => {
-    reload();
+    let cancelled = false;
+    setSlugMissing(null);
+    setError(null);
+    api.backlog(slug)
+      .then((rows) => {
+        if (cancelled) return;
+        setTasks(rows);
+        setSlugMissing(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        if (isNotFoundError(e)) setSlugMissing(true);
+        else { setSlugMissing(false); setError(String(e)); }
+      });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  useEffect(() => {
+    if (slugMissing !== false) return;
     api.vision(slug).then(setVision).catch(() => setVision([]));
     reloadSessions();
     const id = setInterval(reloadSessions, 10_000);
     return () => clearInterval(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug]);
+  }, [slug, slugMissing]);
 
   // T-0104: enrich task.session.activity by joining with the sessions
   // map. We do NOT mutate the original task; useMemo builds a new
@@ -540,6 +565,25 @@ export function Project() {
     } finally {
       setSaving(false);
     }
+  }
+
+  if (slugMissing === true) {
+    return (
+      <div className="container py-4">
+        <div className="alert alert-warning">
+          Project <code>{slug}</code> not found.
+        </div>
+        <Link to="/" style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}>
+          ← back to all projects
+        </Link>
+      </div>
+    );
+  }
+
+  if (slugMissing === null) {
+    return (
+      <div className="container py-4"><div className="mc-loading">Loading</div></div>
+    );
   }
 
   return (

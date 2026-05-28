@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api } from "./api";
+import { api, isNotFoundError } from "./api";
 
 function mockOnce(json: unknown = {}): ReturnType<typeof vi.fn> {
   const spy = vi.fn().mockResolvedValueOnce({
@@ -41,6 +41,20 @@ describe("global api (self-server) — URLs stay un-proxied", () => {
       "/api/projects/alpha/sessions",
       expect.any(Object),
     );
+  });
+
+  // T-0138 / T-0139: pages branch on this decoder to render a "not-found"
+  // panel vs a transient-network retry. Lock the contract here so a future
+  // tweak to `call()`'s thrown-message shape can't silently break the
+  // not-found UX on /p/:slug and /p/:slug/t/:id.
+  test("isNotFoundError matches the exact 404 shape from call()", () => {
+    expect(isNotFoundError(new Error("API error 404: unknown project: zzz"))).toBe(true);
+    expect(isNotFoundError(new Error("API error 404"))).toBe(true);
+    expect(isNotFoundError(new Error("API error 500: boom"))).toBe(false);
+    expect(isNotFoundError(new Error("not authenticated"))).toBe(false);
+    expect(isNotFoundError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isNotFoundError(null)).toBe(false);
+    expect(isNotFoundError(undefined)).toBe(false);
   });
 
   test("peerSend posts the from_sid envelope to the local route", async () => {

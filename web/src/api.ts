@@ -1,5 +1,14 @@
 type Json = Record<string, unknown> | unknown[];
 
+// T-0138/T-0139: pages distinguish "the slug/task doesn't exist" (render a
+// not-found panel) from transient network errors (offer a retry). The
+// `call()` helper packs the HTTP status into the Error message — this is
+// the canonical decoder for that shape.
+export function isNotFoundError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /^API error 404\b/.test(msg);
+}
+
 async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     credentials: "include",

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, SessionRow, Task, VisionFile } from "../api";
+import { api, isNotFoundError, SessionRow, Task, VisionFile } from "../api";
 import { Select, type SelectOption } from "../components/Select";
 import {
   isRunning,
@@ -40,6 +40,11 @@ export function TaskDetail() {
 
   const [task, setTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // T-0139: distinguish three terminal states for the initial load —
+  // "loading" → spinner; "not_found" → titled panel with back-link;
+  // "network_error" → retryable banner. Replaces the previous single
+  // `error` string which conflated 404 with transient failures.
+  const [loadState, setLoadState] = useState<"loading" | "ok" | "not_found" | "network_error">("loading");
   const [saving, setSaving] = useState(false);
   const [activeDevs, setActiveDevs] = useState<SessionRow[]>([]);
   // T-0104: keep every session row keyed by sid so we can look up the
@@ -73,47 +78,52 @@ export function TaskDetail() {
 
   function loadTask() {
     setError(null);
+    setLoadState("loading");
     api
       .backlog(slug)
       .then((tasks) => {
         const found = tasks.find((t) => t.id === id);
-        if (!found) { setError(`Task ${id} not found`); return; }
+        if (!found) { setLoadState("not_found"); return; }
         setTask(found);
         setTitleValue(found.title);
         setStatusValue(found.status);
         setVerbatimValue(found.verbatim ?? "");
         setContextValue(found.context ?? "");
+        setLoadState("ok");
+        // Side-loads only fire once the parent project is known to exist
+        // (i.e. backlog returned 200). Keeps the not-found path quiet —
+        // no extra 404s on /sessions or /vision.
+        api.sessions(slug)
+          .then((rows) => {
+            setActiveDevs(rows.filter((s) => {
+              if (s.status !== "active") return false;
+              const tid = (s.task_id ?? "").trim();
+              return Boolean(tid) && tid !== "~";
+            }));
+            const map: Record<string, SessionRow> = {};
+            for (const r of rows) map[r.sid] = r;
+            setSessionsBySid(map);
+          })
+          .catch(() => {
+            setActiveDevs([]);
+            setSessionsBySid({});
+          });
+        api.vision(slug)
+          .then((files) =>
+            setInitiatives(
+              files.filter(
+                (f) =>
+                  f.name.startsWith("initiatives/") && !f.name.endsWith("/_TEMPLATE.md"),
+              ),
+            ),
+          )
+          .catch(() => setInitiatives([]));
       })
-      .catch((e) => setError(String(e)));
-    // Phase 9: surface active devs so the user can bind this task to an
-    // already-running dev (multi-binding). Silent on error. T-0104:
-    // also stash every row by sid for activity lookup against the
-    // bound session pill below.
-    api.sessions(slug)
-      .then((rows) => {
-        setActiveDevs(rows.filter((s) => {
-          if (s.status !== "active") return false;
-          const tid = (s.task_id ?? "").trim();
-          return Boolean(tid) && tid !== "~";
-        }));
-        const map: Record<string, SessionRow> = {};
-        for (const r of rows) map[r.sid] = r;
-        setSessionsBySid(map);
-      })
-      .catch(() => {
-        setActiveDevs([]);
-        setSessionsBySid({});
+      .catch((e) => {
+        if (isNotFoundError(e)) { setLoadState("not_found"); return; }
+        setError(String(e));
+        setLoadState("network_error");
       });
-    api.vision(slug)
-      .then((files) =>
-        setInitiatives(
-          files.filter(
-            (f) =>
-              f.name.startsWith("initiatives/") && !f.name.endsWith("/_TEMPLATE.md"),
-          ),
-        ),
-      )
-      .catch(() => setInitiatives([]));
   }
 
   // Build the option list once per `initiatives` change. Sort active first,
@@ -284,15 +294,36 @@ export function TaskDetail() {
     }
   }
 
-  if (error) {
+  if (loadState === "not_found") {
     return (
       <div className="container py-4">
-        <div className="alert alert-danger">{error}</div>
+        <h4 style={{ fontSize: "1.05rem", fontWeight: 600, marginBottom: "0.75rem" }}>
+          Task {id} not found
+        </h4>
+        <p style={{ fontSize: "0.85rem", color: "var(--mc-text-dim)" }}>
+          No backlog entry for <code>{id}</code> in project <code>{slug}</code>.
+        </p>
+        <Link to={`/p/${slug}`} style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}>
+          ← back to backlog
+        </Link>
       </div>
     );
   }
 
-  if (!task) {
+  if (loadState === "network_error") {
+    return (
+      <div className="container py-4">
+        <div className="alert alert-danger">
+          Couldn't load task — {error}
+        </div>
+        <button type="button" className="btn btn-sm btn-outline-secondary" onClick={loadTask}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (loadState === "loading" || !task) {
     return (
       <div className="container py-4">
         <div className="mc-loading">Loading</div>

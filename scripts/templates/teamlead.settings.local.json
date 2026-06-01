@@ -1,0 +1,22 @@
+{
+  "//": "T-0144 TL pre-approval template. Drop into a TL session's .claude/settings.local.json on hosts that do NOT run --dangerously-skip-permissions, so routine dispatch tool calls never block on an operator approval prompt. See vision/roles/session-lifecycle-contract.md.",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(bsq:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(tmux list-sessions:*)",
+      "Bash(tmux list-panes:*)",
+      "Bash(tmux list-windows:*)",
+      "Bash(pytest:*)",
+      "Bash(npm run build:*)",
+      "Bash(ops/bot-squad-bin/deploy:*)"
+    ]
+  }
+}

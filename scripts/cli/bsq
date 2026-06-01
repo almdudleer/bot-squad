@@ -230,7 +230,17 @@ def cmd_inbox_check(args) -> None:
         print("(no new mail)")
         return
     for m in messages:
+        env = _extract_envelope(m)
+        if env and getattr(args, "envelopes", False):
+            # Envelope-only view: print the typed action + payload compactly.
+            print(f"[dispatch:{env.get('action')}] {json.dumps(env.get('payload', {}))}"
+                  + (f"  note={env.get('note')}" if env.get("note") else ""))
+            continue
         print(m)
+        if env:
+            print(f"    ⤷ dispatch action={env.get('action')} "
+                  f"payload={json.dumps(env.get('payload', {}))}"
+                  + (f" note={env.get('note')}" if env.get("note") else ""))
 
 
 def cmd_inbox_wait(args) -> None:
@@ -247,6 +257,72 @@ def cmd_inbox_wait(args) -> None:
     else:
         reason = res.get("reason", "timeout")
         print(f"(no mail; {reason} after {res.get('elapsed_sec', 0):.0f}s)")
+
+
+# --------------------------------------------------------------------------
+# Structured dispatch envelope (T-0144)
+# --------------------------------------------------------------------------
+# Operator → TL hand-offs used to be free text the TL had to parse by eye,
+# which was unreliable. A dispatch is now a typed envelope: a one-line marker
+# + single-line JSON `{action, payload, note}`, embedded in the peer message so
+# it still rides the normal inbox/`check mail` bus. The marker is greppable and
+# the JSON parses with a plain split — see vision/roles/teamlead.md for the
+# action vocabulary (assign / archive_team / status / message).
+ENVELOPE_MARKER = "[[bsq-dispatch v1]]"
+
+
+def _format_envelope(action: str, payload: dict, note: str | None) -> str:
+    body = {"action": action, "payload": payload or {}}
+    if note:
+        body["note"] = note
+    return ENVELOPE_MARKER + json.dumps(body, separators=(",", ":"))
+
+
+def _extract_envelope(text: str) -> dict | None:
+    idx = text.find(ENVELOPE_MARKER)
+    if idx < 0:
+        return None
+    raw = text[idx + len(ENVELOPE_MARKER):].strip()
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) and "action" in obj else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def cmd_dispatch(args) -> None:
+    slug = resolve_slug()
+    from_sid = require_sid(args.from_sid)
+    payload: dict = {}
+    if args.json:
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as e:
+            die(f"--json is not valid JSON: {e}")
+        if not isinstance(payload, dict):
+            die("--json payload must be a JSON object")
+    for kv in (args.field or []):
+        if "=" not in kv:
+            die(f"--field expects key=value, got {kv!r}")
+        k, _, v = kv.partition("=")
+        payload[k.strip()] = v
+    text = _format_envelope(args.action, payload, args.note)
+    res = post(
+        "peer_send",
+        {"slug": slug, "from_sid": from_sid, "to": args.to, "text": text},
+    )
+    delivered = res.get("delivered_to", [])
+    print(f"dispatched [{args.action}] to {len(delivered)} inbox(es): "
+          f"{', '.join(delivered) or '(none)'}")
+    if args.no_signal or not delivered:
+        return
+    for rsid in delivered:
+        if rsid == from_sid:
+            continue
+        try:
+            post("inject_input", {"sid": rsid, "text": MAIL_SIGNAL}, fatal=False)
+        except WorkerError:
+            pass
 
 
 def cmd_peer_send(args) -> None:
@@ -496,6 +572,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--since", help="only show messages with ISO ts >= this")
     c.add_argument("--sid", help="override this session's SID")
     c.add_argument("--json", action="store_true", help="raw JSON output")
+    c.add_argument("--envelopes", action="store_true",
+                   help="show only structured dispatch envelopes (T-0144)")
     c.set_defaults(func=cmd_inbox_check)
     w = inbox_sub.add_parser("wait", help="opt-in long-poll until mail arrives")
     w.add_argument("--timeout", default=1800, type=float, help="seconds (default 1800)")
@@ -512,6 +590,20 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--no-signal", action="store_true",
                     help="skip the 'check mail' tmux nudge")
     ps.set_defaults(func=cmd_peer_send)
+
+    # dispatch (structured operator → TL envelope, T-0144)
+    dp = peer_sub.add_parser("dispatch",
+                             help="send a typed dispatch envelope (action + payload)")
+    dp.add_argument("to", help="target SID or role keyword (teamlead/dev/all)")
+    dp.add_argument("action", help="dispatch action (assign/archive_team/status/message)")
+    dp.add_argument("--field", action="append", metavar="K=V",
+                    help="payload key=value (repeatable)")
+    dp.add_argument("--json", help="payload as a JSON object (merged under --field)")
+    dp.add_argument("--note", help="free-text note alongside the typed payload")
+    dp.add_argument("--from", dest="from_sid", help="override sender SID")
+    dp.add_argument("--no-signal", action="store_true",
+                    help="skip the 'check mail' tmux nudge")
+    dp.set_defaults(func=cmd_dispatch)
 
     # spawn
     sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")

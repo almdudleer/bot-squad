@@ -740,8 +740,9 @@ def test_inject_input_multiline(tmp_path, monkeypatch):
 
     result = A.dispatch("inject_input", {"sid": "S-testuser-win-p7", "text": "line1\nline2\nline3"})
     assert result["lines_sent"] == 3
-    # 3 send-keys calls
-    assert len(run_calls) == 3
+    # 2 send-keys calls per line (text + Enter sent separately so Enter submits
+    # outside tmux's bracketed-paste — see _action_inject_input)
+    assert len(run_calls) == 6
 
 
 def test_inject_input_unknown_sid(tmp_path, monkeypatch):

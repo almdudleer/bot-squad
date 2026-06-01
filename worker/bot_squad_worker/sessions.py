@@ -299,6 +299,62 @@ def _derive_activity(
     return "idle"
 
 
+# ---------------------------------------------------------------------------
+# T-0141 — authoritative session role.
+#
+# The sessions list used to infer role purely from task_id presence ("no
+# task_id ⟹ teamlead"). On a project driven by agent-teams — where the lead
+# break-panes each teammate into a feature-named window and binds its task_id
+# only afterwards (if at all) — nearly every task-less row rendered as a
+# teamlead (stakeholder note 9: "almost all the sessions … are teamleads,
+# something's leaking them"). The leak is the *default*: an ambiguous,
+# marker-less, task-less session fell into the teamlead bucket.
+#
+# Role is now positively derived. A session is a teamlead only with real
+# evidence — an explicit `-TL`/`_tl`/`teamlead` window marker, or an
+# initiative binding with no task. The operator pane is its own role. The
+# fall-through default is "dev", never "teamlead".
+#
+# The separator-guarded `tl` match (`(^|[-_])tl$`) avoids false positives on
+# words that merely end in "tl" (e.g. `some-ctl`).
+# ---------------------------------------------------------------------------
+_TL_WINDOW_RE = re.compile(r"(?:^|[-_])(?:tl|teamlead)$", re.IGNORECASE)
+_OPERATOR_WINDOW_RE = re.compile(r"(?:^|[-_])operator$", re.IGNORECASE)
+
+
+def _derive_role(
+    window: str | None,
+    task_id: str | None,
+    initiative: str | None,
+    *,
+    extra_task_ids: list | None = None,
+    extra_initiatives: list | None = None,
+) -> str:
+    """Map a session's identity fields → role enum: ``teamlead|dev|operator``.
+
+    Precedence (first match wins):
+      1. operator window marker (`operator`, `<x>-operator`) → ``operator``
+      2. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
+      3. any task binding (primary or extra) → ``dev``
+      4. any initiative binding, no task → ``teamlead`` (worker-spawned TL)
+      5. default → ``dev``
+
+    `~` is the registry's "unset" sentinel and is treated as absent.
+    """
+    w = (window or "").strip()
+    if _OPERATOR_WINDOW_RE.search(w):
+        return "operator"
+    if _TL_WINDOW_RE.search(w):
+        return "teamlead"
+    has_task = bool(task_id and task_id != "~") or bool(extra_task_ids)
+    if has_task:
+        return "dev"
+    has_init = bool(initiative and initiative != "~") or bool(extra_initiatives)
+    if has_init:
+        return "teamlead"
+    return "dev"
+
+
 def _get_user_home() -> str:
     """Return the home directory for the current user."""
     return str(Path.home())
@@ -622,6 +678,12 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "activity": activity,
             "activity_at": activity_at,
             "active_at_prompt": active_at_prompt,
+            # T-0141: authoritative role — no longer "task-less ⟹ teamlead".
+            "role": _derive_role(
+                pane.window, task_id, initiative,
+                extra_task_ids=extra_task_ids,
+                extra_initiatives=extra_initiatives,
+            ),
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
@@ -705,6 +767,12 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "activity": "suspended",
                 "activity_at": None,
                 "active_at_prompt": False,
+                # T-0141: authoritative role for suspended rows too.
+                "role": _derive_role(
+                    meta.get("window", ""), md_task_id, md_initiative,
+                    extra_task_ids=md_extra_tids,
+                    extra_initiatives=md_extra_inits,
+                ),
                 "window": meta.get("window", ""),
                 "cwd": meta.get("cwd", ""),
                 "started_at": meta.get("started_at"),

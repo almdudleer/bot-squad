@@ -2467,3 +2467,101 @@ def test_session_start_hook_calls_peer_rebind_sid():
     # in a dead inbox.
     assert "/actions/peer_rebind_sid" in text, \
         "T-0072 regression: SessionStart hook break-pane no longer rebinds peer inbox"
+
+
+# ---------------------------------------------------------------------------
+# T-0141 — authoritative role resolver (fixes "everything is a teamlead" leak)
+# ---------------------------------------------------------------------------
+
+def test_derive_role_explicit_tl_window_markers():
+    from bot_squad_worker.sessions import _derive_role
+    # Real-world TL window names seen on staging signal-tracker / bot-squad.
+    for win in (
+        "multi_server-TL",
+        "live-news-tl",
+        "prod-ops-tl",
+        "trader_multitool_backbone_teamlead",
+        "TL",
+        "foo_teamlead",
+    ):
+        assert _derive_role(win, None, None) == "teamlead", win
+
+
+def test_derive_role_task_bound_is_dev_even_without_tl_marker():
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("backtest_tab", "T-0033", None) == "dev"
+    # extras-only binding still counts as a dev.
+    assert _derive_role("somewin", "~", None, extra_task_ids=["T-9"]) == "dev"
+
+
+def test_derive_role_taskless_featurewindow_is_dev_not_teamlead():
+    """The core leak: a task-less feature/stream window must NOT default to TL."""
+    from bot_squad_worker.sessions import _derive_role
+    for win in (
+        "v08-stream-a-ws-transport",
+        "live-news-polish",
+        "signal-page-polish",
+        "newsd-matcher-tightness",
+        "bash",
+        "claude",
+        "bsq-cli",
+    ):
+        assert _derive_role(win, "~", "~") == "dev", win
+
+
+def test_derive_role_initiative_bound_taskless_is_teamlead():
+    """Worker-spawned TL: initiative set, no task, generic window name."""
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("genericwin", None, "operator-ux-and-session-mgmt.md") == "teamlead"
+    assert _derive_role("genericwin", "~", "~", extra_initiatives=["x.md"]) == "teamlead"
+
+
+def test_derive_role_operator_pane():
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("operator", None, None) == "operator"
+    assert _derive_role("bot-squad-operator", "~", "~") == "operator"
+
+
+def test_derive_role_ctl_suffix_is_not_teamlead():
+    """Guard against false-positive `tl` matches (e.g. ...ctl)."""
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("some-ctl", "~", "~") == "dev"
+    assert _derive_role("html", "~", "~") == "dev"
+
+
+def test_list_sessions_emits_role_for_active_and_suspended(tmp_path, monkeypatch):
+    """list_sessions stamps an authoritative `role` on every row."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    # One active TL-named pane + one active task-less feature pane.
+    fake_pane_output = (
+        f"%9|multi_server-TL|1234|{repo}|claude|test-project\n"
+        f"%11|sessions-list|1235|{repo}|claude|test-project\n"
+    )
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    # A suspended dev md (task-less feature window) that must NOT leak as TL.
+    sdir = tmp_path / "data" / "test-project" / "sessions"
+    _write_session_metadata(sdir / "S-testuser-v08-stream-a-p50.md", {
+        "sid": "S-testuser-v08-stream-a-p50",
+        "status": "suspended",
+        "window": "v08-stream-a",
+        "task_id": "~",
+        "initiative": "~",
+    })
+
+    rows = {r["sid"]: r for r in list_sessions(cfg, "test-project")}
+    assert rows["S-testuser-multi_server-TL-p9"]["role"] == "teamlead"
+    assert rows["S-testuser-sessions-list-p11"]["role"] == "dev"
+    assert rows["S-testuser-v08-stream-a-p50"]["role"] == "dev"

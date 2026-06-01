@@ -11,8 +11,10 @@ Verbs:
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
   bsq spawn <ticket> [--bundle ids] spawn a dev session for a backlog ticket
   bsq team status                   list this project's sessions
-  bsq team archive <sid>            retire a session  (T-0142 seam)
-  bsq team resurrect <sid>          bring a session back (T-0142 seam)
+  bsq team list                     list persisted Team rosters (T-0142)
+  bsq team archive <sid>            true-archive a session (suspend + archive)
+  bsq team resurrect <sid>          bring a session back (unarchive + resume)
+  bsq team rename <sid> <name>      rename a session (tmux + UI + registry sync)
   bsq compact [--sid SID]           send /compact to a session (self by default)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
 
@@ -368,25 +370,58 @@ def cmd_team_status(args) -> None:
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
 
 
+def cmd_team_list(args) -> None:
+    slug = resolve_slug()
+    res = post("list_teams", {"slug": slug})
+    teams = res.get("teams", [])
+    if args.json:
+        print(json.dumps(teams, indent=2))
+        return
+    if not teams:
+        print("(no teams yet — reconcile_teams runs on the 60s dispatch tick)")
+        return
+    rows = [("NAME", "TL", "TEAMMATES", "ARCHIVED", "STATE")]
+    for t in teams:
+        mates = [m for m in (t.get("teammates") or []) if m and m != "~"]
+        arch = [m for m in (t.get("archived_members") or []) if m and m != "~"]
+        rows.append((
+            t.get("name", ""),
+            t.get("tl") or "-",
+            str(len(mates)),
+            str(len(arch)),
+            "archived" if str(t.get("archived", "")).lower() == "true" else "active",
+        ))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+
+
 def cmd_team_archive(args) -> None:
     slug = resolve_slug()
-    # T-0142 seam: there is no first-class `archive_session` worker action yet.
-    # suspend_session is the closest current primitive (keeps the registry md,
-    # frees the pane). When T-0142 lands a true archive (removed from the
-    # active pool, hidden from the default roster), repoint this verb at it.
-    # TODO(T-0142): swap suspend_session -> archive_session once it exists.
-    res = post("suspend_session", {"slug": slug, "sid": args.sid})
-    print(f"archived {args.sid} via suspend_session (interim — T-0142 will add "
-          f"a true archive): {json.dumps(res)}")
+    # T-0142: true archive (replaces the interim suspend-only seam). Suspend
+    # first to free the pane (idempotent if already suspended), then mark the
+    # session archived so it leaves the default roster and its task binding is
+    # released by the next gc tick.
+    post("suspend_session", {"slug": slug, "sid": args.sid})
+    res = post("archive_session", {"slug": slug, "sid": args.sid})
+    print(f"archived {args.sid}: {json.dumps(res)}")
 
 
 def cmd_team_resurrect(args) -> None:
     slug = resolve_slug()
-    # T-0142 seam: resume_session is the current primitive for bringing a
-    # suspended session back. TODO(T-0142): align with archive_session's
-    # resurrect path once that lands.
+    # T-0142: clear the archive flag, then resume the session (rotates its SID
+    # and re-spawns the tmux window via claude --resume <uuid>).
+    post("unarchive_session", {"slug": slug, "sid": args.sid})
     res = post("resume_session", {"slug": slug, "sid": args.sid})
     print(f"resurrected: {json.dumps(res)}")
+
+
+def cmd_team_rename(args) -> None:
+    slug = resolve_slug()
+    # T-0142: single-source-of-truth rename — tmux window + registry (+ SID
+    # rotation + peer-bus rebind when live).
+    res = post("sync_session_name", {"slug": slug, "sid": args.sid, "name": args.name})
+    print(f"renamed {args.sid} -> {res.get('new_sid')} (window {res.get('name')})")
 
 
 def cmd_compact(args) -> None:
@@ -497,12 +532,19 @@ def build_parser() -> argparse.ArgumentParser:
     ts.add_argument("--all", action="store_true", help="include suspended sessions")
     ts.add_argument("--json", action="store_true", help="raw JSON output")
     ts.set_defaults(func=cmd_team_status)
-    ta = team_sub.add_parser("archive", help="retire a session (interim: suspend)")
+    tlst = team_sub.add_parser("list", help="list persisted Team rosters (T-0142)")
+    tlst.add_argument("--json", action="store_true", help="raw JSON output")
+    tlst.set_defaults(func=cmd_team_list)
+    ta = team_sub.add_parser("archive", help="true-archive a session (suspend + archive)")
     ta.add_argument("sid", help="target session SID")
     ta.set_defaults(func=cmd_team_archive)
-    tr = team_sub.add_parser("resurrect", help="bring a session back (resume)")
+    tr = team_sub.add_parser("resurrect", help="bring a session back (unarchive + resume)")
     tr.add_argument("sid", help="target session SID")
     tr.set_defaults(func=cmd_team_resurrect)
+    trn = team_sub.add_parser("rename", help="rename a session (tmux + UI + registry sync)")
+    trn.add_argument("sid", help="target session SID")
+    trn.add_argument("name", help="new session/window name")
+    trn.set_defaults(func=cmd_team_rename)
 
     # compact
     cp = sub.add_parser("compact", help="send /compact to a session (self by default)")

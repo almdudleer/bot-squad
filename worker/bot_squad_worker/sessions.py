@@ -1216,6 +1216,33 @@ def _wait_for_claude_composer_ready(pane_id: str) -> bool:
     return False
 
 
+def _deliver_prompt(pane_id: str, text: str) -> None:
+    """Reliably deliver a prompt into a claude composer (T-0126/T-0144 fix).
+
+    Loads ``text`` into a dedicated tmux paste buffer and pastes it in
+    bracketed-paste mode (``paste-buffer -p``), then submits with a *separate*
+    Enter. This is the operator's proven manual recovery (load-buffer +
+    paste-buffer + Enter): unlike ``send-keys`` of a long literal — which can
+    interleave with the TUI, mis-escape, or exceed argv limits, and whose
+    chained Enter lands *inside* the bracketed-paste wrap rather than
+    submitting — a paste-buffer lands the whole prompt in claude's input box
+    atomically as one block (embedded newlines stay newlines, not submits),
+    and the trailing standalone Enter is what submits it.
+
+    Single-line prompts remain safest (one paste, one Enter, one message);
+    a multi-line prompt is still pasted as a single block and submitted once.
+    """
+    import re as _re
+    digits = _re.sub(r"[^0-9]", "", pane_id) or "x"
+    buf = f"bsq-prompt-{digits}"
+    # set-buffer takes the data as an argument (`--` guards a leading dash),
+    # so delivery is testable without stdin plumbing.
+    _run(["tmux", "set-buffer", "-b", buf, "--", text])
+    _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf, "-p", "-d"])
+    time.sleep(0.4)
+    _run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+
+
 def spawn(
     cfg: Any,
     slug: str,
@@ -1372,17 +1399,20 @@ def spawn(
         except OSError:
             pass
 
-    # Send initial prompt if provided. Two-phase: text first, brief pause,
-    # then a *separate* Enter. tmux wraps long text as a bracketed-paste
-    # escape sequence; an Enter inside the paste isn't a submit, so the
-    # standalone Enter that follows the wrap-end is what submits the prompt
-    # to claude's input box.
+    # Deliver the initial prompt once the composer is up.
     #
-    # T-0126: a fixed sleep before send-keys lost the prompt on a loaded
-    # host (Claude's TUI startup can exceed several seconds). Poll for the
-    # composer prompt marker `❯` via capture-pane and only then type. If
-    # the marker never appears within the budget, raise — the spawned pane
-    # is still alive, so the caller can recover via inject_input.
+    # T-0126 first gated delivery on a `❯`-composer poll (kept below) but still
+    # typed via `send-keys <long-literal>`, which is the unreliable part the
+    # operator worked around by hand: a long send-keys literal can interleave
+    # with the TUI, mis-escape, or exceed limits, and the trailing Enter lands
+    # inside tmux's bracketed-paste wrap instead of submitting.
+    #
+    # T-0144 root-causes it: deliver via the operator's proven manual recovery
+    # — load the text into a tmux paste buffer and paste it (bracketed-paste,
+    # length-safe, atomic), then a SEPARATE Enter to submit. See
+    # `_deliver_prompt`. The composer-ready poll still guards against typing
+    # before claude's TUI exists; if `❯` never appears, raise so the caller can
+    # recover via inject_input (the pane is up).
     if initial_prompt:
         if not _wait_for_claude_composer_ready(new_pane.pane_id):
             from bot_squad_worker.actions import ActionError
@@ -1391,9 +1421,7 @@ def spawn(
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
-        _run(["tmux", "send-keys", "-t", new_pane.pane_id, initial_prompt])
-        time.sleep(0.4)
-        _run(["tmux", "send-keys", "-t", new_pane.pane_id, "Enter"])
+        _deliver_prompt(new_pane.pane_id, initial_prompt)
 
     return {"ok": True, "sid": new_sid}
 

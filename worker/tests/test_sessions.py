@@ -1300,7 +1300,7 @@ def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
     new_window_called = [False]
 
     def fake_run(args, **kwargs):
-        if "send-keys" in args:
+        if "send-keys" in args or "set-buffer" in args or "paste-buffer" in args:
             key_calls.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
         if "capture-pane" in args:
@@ -1324,8 +1324,12 @@ def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
 
     spawn(cfg, "test-project", "newwin", initial_prompt="hello world")
 
-    assert any("hello world" in str(c) for c in key_calls), \
-        f"expected hello world send-keys; got: {key_calls}"
+    # T-0144: prompt delivery is via tmux set-buffer + paste-buffer (bracketed
+    # paste), the operator's proven-reliable primitive — not a send-keys literal.
+    assert any("set-buffer" in c and "hello world" in str(c) for c in key_calls), \
+        f"expected hello world via set-buffer; got: {key_calls}"
+    assert any("paste-buffer" in c for c in key_calls), \
+        f"expected a paste-buffer delivery; got: {key_calls}"
 
 
 def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkeypatch):
@@ -1336,7 +1340,7 @@ def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkey
     repo.mkdir()
     cfg = _make_cfg(tmp_path, repo)
 
-    call_log: list[str] = []  # ordered tags: "capture-not-ready", "capture-ready", "send-text", "send-enter"
+    call_log: list[str] = []  # ordered tags: "capture-not-ready", "capture-ready", "paste-text", "send-enter"
     capture_calls = [0]
 
     def fake_run(args, **kwargs):
@@ -1349,12 +1353,14 @@ def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkey
                 return subprocess.CompletedProcess(args, 0, "bash-5.2$\n", "")
             call_log.append("capture-ready")
             return subprocess.CompletedProcess(args, 0, "❯ \n", "")
+        if "set-buffer" in args:
+            # The prompt text is loaded into the paste buffer.
+            call_log.append("paste-text")
+            return subprocess.CompletedProcess(args, 0, "", "")
         if "send-keys" in args:
-            # Distinguish the prompt text from the trailing Enter.
+            # The only send-keys in the delivery path is the trailing Enter.
             if args[-1] == "Enter":
                 call_log.append("send-enter")
-            else:
-                call_log.append("send-text")
             return subprocess.CompletedProcess(args, 0, "", "")
         if "list-panes" in args:
             return subprocess.CompletedProcess(args, 0, f"%11|w|1234|{repo}|claude\n", "")
@@ -1369,10 +1375,10 @@ def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkey
     result = spawn(cfg, "test-project", "w", initial_prompt="go")
     assert result["ok"] is True
 
-    # send-keys for the prompt text + Enter must come strictly AFTER the
-    # first ready capture, and the not-ready captures must come first.
+    # The paste (set-buffer) + Enter must come strictly AFTER the first ready
+    # capture, and the not-ready captures must come first.
     ready_idx = call_log.index("capture-ready")
-    text_idx = call_log.index("send-text")
+    text_idx = call_log.index("paste-text")
     enter_idx = call_log.index("send-enter")
     assert ready_idx < text_idx < enter_idx, f"unexpected order: {call_log}"
     # And spawn() must actually have polled — at least one not-ready capture.

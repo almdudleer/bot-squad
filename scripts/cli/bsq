@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""bsq — slim bot-squad CLI for agents (T-0146).
+
+One binary, kubectl-style verbs, that wrap the bot-squad worker-socket
+actions so agents stop hand-rolling curl + tmux send-keys. `bsq --help`
+is the canonical reference — AGENT_INSTRUCTIONS.md points here.
+
+Verbs:
+  bsq inbox check [--since TS]      drain this session's peer inbox
+  bsq inbox wait  [--timeout N]     opt-in long-poll (the bg-watcher mode)
+  bsq peer send <to> <text>         peer_send + nudge the recipient pane
+  bsq spawn <ticket> [--bundle ids] spawn a dev session for a backlog ticket
+  bsq team status                   list this project's sessions
+  bsq team archive <sid>            retire a session  (T-0142 seam)
+  bsq team resurrect <sid>          bring a session back (T-0142 seam)
+  bsq compact [--sid SID]           send /compact to a session (self by default)
+  bsq commit -m MSG <files..>       stage explicit paths + safe-commit
+
+Conventions shared with the other ops shims:
+  - $BOT_SQUAD       install root (default /home/www/bot-squad)
+  - $WORKER_SOCK     worker unix socket
+  - slug is resolved from $PWD against config/projects.toml
+  - this session's SID is read from tmux (override with --sid / --from)
+"""
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+BOT_SQUAD = os.environ.get("BOT_SQUAD", "/home/www/bot-squad")
+WORKER_SOCK = os.environ.get("WORKER_SOCK", f"{BOT_SQUAD}/data/_sock/worker.sock")
+PROJECTS_TOML = f"{BOT_SQUAD}/config/projects.toml"
+
+# The "check mail" payload bsq injects into a recipient pane. Seeing this
+# in its composer is an agent's cue to run `bsq inbox check`. This is the
+# PRIMARY cross-session signal (T-0146); the long-poll bg-watcher
+# (`bsq inbox wait`) is opt-in only.
+MAIL_SIGNAL = "check mail"
+
+
+# --------------------------------------------------------------------------
+# worker socket transport
+# --------------------------------------------------------------------------
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, sock_path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self._sock_path = sock_path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._sock_path)
+        self.sock = s
+
+
+class WorkerError(Exception):
+    """A worker action failed (transport or 4xx). Caught by best-effort callers."""
+
+
+def post(action: str, params: dict, timeout: float = 35.0, fatal: bool = True) -> dict:
+    """POST params to /actions/<action> over the worker unix socket.
+
+    On failure: exit with a message when ``fatal`` (the default), else raise
+    ``WorkerError`` so best-effort callers (e.g. the peer-send nudge) can
+    swallow it quietly.
+    """
+    def fail(msg: str) -> None:
+        if fatal:
+            die(msg)
+        raise WorkerError(msg)
+
+    if not os.path.exists(WORKER_SOCK):
+        fail(f"worker socket not found: {WORKER_SOCK} (is the worker running?)")
+    conn = _UnixHTTPConnection(WORKER_SOCK, timeout=timeout)
+    raw, status = "", 0
+    try:
+        conn.request(
+            "POST",
+            f"/actions/{action}",
+            body=json.dumps(params),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", errors="replace")
+        status = resp.status
+    except OSError as e:
+        fail(f"worker call failed ({action}): {e}")
+    finally:
+        conn.close()
+
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        fail(f"worker returned non-JSON for {action} (HTTP {status}): {raw[:200]}")
+        data = {}
+    if status != 200:
+        detail = data.get("detail", raw) if isinstance(data, dict) else raw
+        fail(f"worker rejected {action}: {detail}")
+    return data
+
+
+# --------------------------------------------------------------------------
+# context resolution: slug + own SID
+# --------------------------------------------------------------------------
+def resolve_slug(cwd: str | None = None) -> str:
+    cwd = cwd or os.getcwd()
+    real_cwd = os.path.realpath(cwd)
+    try:
+        with open(PROJECTS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+    except OSError as e:
+        die(f"cannot read {PROJECTS_TOML}: {e}")
+
+    def _match(target: str) -> bool:
+        if not target:
+            return False
+        rt = os.path.realpath(target)
+        t = target.rstrip("/")
+        return (
+            cwd == target
+            or cwd.startswith(t + "/")
+            or real_cwd == rt
+            or real_cwd.startswith(rt + "/")
+        )
+
+    for slug, p in cfg.get("projects", {}).items():
+        for key in ("repo_path", "repo_master", "repo_workspace"):
+            if _match(p.get(key, "")):
+                return slug
+    die(f"CWD {cwd} is not inside any registered project (see {PROJECTS_TOML})")
+
+
+def my_sid() -> str | None:
+    """Compute this session's SID from tmux (mirrors hook_my_sid.sh)."""
+    hook = f"{BOT_SQUAD}/scripts/hooks/hook_my_sid.sh"
+    if os.path.exists(hook):
+        try:
+            out = subprocess.run([hook], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Inline fallback.
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        user = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip() or "u"
+        user = re.sub(r"[^A-Za-z0-9_]", "_", user)
+        target = ["-t", os.environ["TMUX_PANE"]] if os.environ.get("TMUX_PANE") else []
+        window = subprocess.run(
+            ["tmux", "display-message", "-p", *target, "-F", "#W"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        window = re.sub(r"[^A-Za-z0-9_-]", "_", window)
+        pane = subprocess.run(
+            ["tmux", "display-message", "-p", *target, "-F", "#{pane_id}"],
+            capture_output=True, text=True,
+        ).stdout.strip().lstrip("%")
+        if window and pane:
+            return f"S-{user}-{window}-p{pane}"
+    except (OSError, KeyError):
+        pass
+    return None
+
+
+def require_sid(explicit: str | None) -> str:
+    sid = explicit or my_sid()
+    if not sid:
+        die("could not determine SID from tmux — pass --sid <SID> explicitly")
+    return sid
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def die(msg: str, code: int = 2) -> None:
+    print(f"bsq: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def backlog_dir(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "backlog"
+
+
+def find_ticket(slug: str, ticket: str) -> Path:
+    matches = sorted(backlog_dir(slug).glob(f"{ticket}-*.md"))
+    if not matches:
+        die(f"ticket not found: {ticket} (looked in {backlog_dir(slug)})")
+    return matches[0]
+
+
+def read_frontmatter(path: Path) -> dict:
+    """Tiny flat-YAML frontmatter reader (key: value lines only)."""
+    text = path.read_text()
+    m = re.match(r"\A---\n(.*?)\n---\n", text, re.DOTALL)
+    if not m:
+        return {}
+    fm: dict = {}
+    for line in m.group(1).splitlines():
+        mm = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
+        if mm:
+            fm[mm.group(1)] = mm.group(2).strip()
+    return fm
+
+
+# --------------------------------------------------------------------------
+# verbs
+# --------------------------------------------------------------------------
+def cmd_inbox_check(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    res = post("peer_inbox_read", {"slug": slug, "sid": sid})
+    messages = res.get("messages", [])
+    if args.since:
+        messages = [m for m in messages if m.split("\t", 1)[0] >= args.since]
+    if args.json:
+        print(json.dumps({"sid": sid, "messages": messages, "count": len(messages)}))
+        return
+    if not messages:
+        print("(no new mail)")
+        return
+    for m in messages:
+        print(m)
+
+
+def cmd_inbox_wait(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    timeout = float(args.timeout)
+    res = post(
+        "peer_inbox_wait",
+        {"slug": slug, "sid": sid, "timeout": timeout},
+        timeout=timeout + 15,
+    )
+    if res.get("ready"):
+        print("mail ready — run `bsq inbox check`")
+    else:
+        reason = res.get("reason", "timeout")
+        print(f"(no mail; {reason} after {res.get('elapsed_sec', 0):.0f}s)")
+
+
+def cmd_peer_send(args) -> None:
+    slug = resolve_slug()
+    from_sid = require_sid(args.from_sid)
+    res = post(
+        "peer_send",
+        {"slug": slug, "from_sid": from_sid, "to": args.to, "text": args.text},
+    )
+    delivered = res.get("delivered_to", [])
+    print(f"sent to {len(delivered)} inbox(es): {', '.join(delivered) or '(none)'}")
+
+    if args.no_signal or not delivered:
+        return
+    # Primary cross-session signal: nudge each live recipient pane with the
+    # "check mail" payload so the peer drains its inbox without an armed
+    # long-poll. Best-effort — recipients without a live pane (suspended /
+    # non-tmux) just pick the message up on their next `bsq inbox check`.
+    nudged, skipped = [], []
+    for rsid in delivered:
+        if rsid == from_sid:
+            continue
+        try:
+            post("inject_input", {"sid": rsid, "text": MAIL_SIGNAL}, fatal=False)
+            nudged.append(rsid)
+        except WorkerError:
+            skipped.append(rsid)
+    if nudged:
+        print(f"signalled: {', '.join(nudged)}")
+    if skipped:
+        print(f"no live pane (will read on next check): {', '.join(skipped)}")
+
+
+def cmd_spawn(args) -> None:
+    slug = resolve_slug()
+    ticket = args.ticket.strip()
+    path = find_ticket(slug, ticket)
+    fm = read_frontmatter(path)
+
+    # window: feature slug after the ticket id, overridable.
+    stem = path.stem  # e.g. T-0146-slim-cli-for-agents
+    feature = stem.split("-", 2)[2] if stem.count("-") >= 2 else stem
+    window = args.window or feature[:40]
+
+    initiative = args.initiative or fm.get("initiative") or None
+    bundle = [b.strip() for b in args.bundle.split(",") if b.strip()] if args.bundle else []
+
+    if args.prompt_file:
+        initial_prompt = Path(args.prompt_file).read_text().strip()
+    elif args.prompt:
+        initial_prompt = args.prompt
+    else:
+        initial_prompt = _default_brief(slug, ticket, path, fm, bundle)
+
+    params = {"slug": slug, "window": window, "initial_prompt": initial_prompt, "task_id": ticket}
+    if initiative:
+        params["initiative"] = initiative
+    if args.owner:
+        params["owner"] = args.owner
+
+    if args.dry_run:
+        print(json.dumps({**params, "initial_prompt": initial_prompt}, indent=2))
+        return
+
+    res = post("spawn_session", params, timeout=90)
+    print(f"spawned {res.get('sid')} (window={window}, task={ticket}"
+          + (f", bundle={','.join(bundle)}" if bundle else "") + ")")
+
+
+def _default_brief(slug: str, ticket: str, path: Path, fm: dict, bundle: list[str]) -> str:
+    tl = my_sid() or "<your TL SID>"
+    title = fm.get("title", ticket)
+    bundle_line = ""
+    if bundle:
+        bundle_line = (
+            f" You are ALSO bound to {', '.join(bundle)} — read each "
+            f"{backlog_dir(slug)}/<id>-*.md and handle them in the same session."
+        )
+    return (
+        f"You are a bot-squad dev assigned ticket {ticket} ({title}). "
+        f"FIRST read {path} for full scope+DoD and AGENT_INSTRUCTIONS.md for "
+        f"paths/git-rules.{bundle_line} The 'Verbatim request' section is "
+        f"HUMAN-ONLY — never edit it. Edit the shared tree directly on branch "
+        f"bot_squad/dev — no worktree, no branch switch, no git stash. Commit "
+        f"ONLY with `bsq commit -m <msg> --ack <files..>` (review the printed "
+        f"peer report first); never wide-add, never rewrite pushed history "
+        f"(revert to undo). Do NOT push or merge — your TL reviews and deploys. "
+        f"Smoke-test before declaring done. When DoD is green: set the ticket "
+        f"status frontmatter to totest, add a task_progress_add note, then "
+        f"report READY to your TL at {tl} via `bsq peer send {tl} '<summary>'`. "
+        f"Run `bsq --help` for the full verb reference."
+    )
+
+
+def cmd_team_status(args) -> None:
+    slug = resolve_slug()
+    res = post("list_sessions", {"slug": slug})
+    sessions = res.get("sessions", [])
+    if not args.all:
+        # Default to the working roster: active + paused. Suspended sessions
+        # are resting roster members (often dozens); --all surfaces them.
+        sessions = [s for s in sessions if s.get("status") in ("active", "paused")]
+    if args.json:
+        print(json.dumps(sessions, indent=2))
+        return
+    if not sessions:
+        print("(no active/paused sessions — use --all to include suspended)")
+        return
+    rows = [("SID", "STATUS", "ACT", "WINDOW", "TASK", "INITIATIVE")]
+    for s in sessions:
+        rows.append((
+            s.get("sid", ""),
+            s.get("status", ""),
+            s.get("activity", "") or "-",
+            s.get("window", ""),
+            s.get("task_id") or "-",
+            s.get("initiative") or "-",
+        ))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+
+
+def cmd_team_archive(args) -> None:
+    slug = resolve_slug()
+    # T-0142 seam: there is no first-class `archive_session` worker action yet.
+    # suspend_session is the closest current primitive (keeps the registry md,
+    # frees the pane). When T-0142 lands a true archive (removed from the
+    # active pool, hidden from the default roster), repoint this verb at it.
+    # TODO(T-0142): swap suspend_session -> archive_session once it exists.
+    res = post("suspend_session", {"slug": slug, "sid": args.sid})
+    print(f"archived {args.sid} via suspend_session (interim — T-0142 will add "
+          f"a true archive): {json.dumps(res)}")
+
+
+def cmd_team_resurrect(args) -> None:
+    slug = resolve_slug()
+    # T-0142 seam: resume_session is the current primitive for bringing a
+    # suspended session back. TODO(T-0142): align with archive_session's
+    # resurrect path once that lands.
+    res = post("resume_session", {"slug": slug, "sid": args.sid})
+    print(f"resurrected: {json.dumps(res)}")
+
+
+def cmd_compact(args) -> None:
+    sid = require_sid(args.sid)
+    res = post("inject_input", {"sid": sid, "text": "/compact"})
+    print(f"/compact sent to {sid} (pane {res.get('pane_id')})")
+
+
+def cmd_commit(args) -> None:
+    if not args.files:
+        die("commit needs explicit file paths (never wide-add)")
+    repo_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    ).stdout.strip()
+    if not repo_root:
+        die("not inside a git repo")
+    safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
+    if not os.path.exists(safe_commit):
+        safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
+
+    # Stage ONLY the explicit paths (no `git add .` / `-u` / dir — that
+    # sweeps peers' in-flight work into your commit).
+    add = subprocess.run(["git", "add", "--", *args.files])
+    if add.returncode != 0:
+        die("git add failed", add.returncode)
+
+    env = dict(os.environ)
+    if args.ack:
+        env["BOT_SQUAD_ACK_PEERS"] = "1"
+    cmd = [safe_commit, "-m", args.message, "--", *args.files]
+    rc = subprocess.run(cmd, env=env).returncode
+    if rc != 0 and not args.ack:
+        print(
+            "\nbsq: commit blocked by the peer-activity pre-commit hook (this is "
+            "expected on the first attempt). Review the report above, then re-run "
+            "with --ack to acknowledge:\n"
+            f"  bsq commit --ack -m {json.dumps(args.message)} {' '.join(args.files)}",
+            file=sys.stderr,
+        )
+    sys.exit(rc)
+
+
+# --------------------------------------------------------------------------
+# arg parsing
+# --------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bsq",
+        description="Slim bot-squad CLI for agents — wraps worker-socket actions "
+                    "as kubectl-style verbs. Canonical agent reference.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  bsq inbox check                  drain new peer mail\n"
+            "  bsq peer send teamlead 'READY T-0146 — shipped, sha abc123'\n"
+            "  bsq spawn T-0150 --bundle T-0151,T-0152\n"
+            "  bsq team status\n"
+            "  bsq compact\n"
+            "  bsq commit --ack -m 'fix: thing' path/to/file.py\n\n"
+            "The 'check mail' tmux signal: `bsq peer send` nudges each live\n"
+            "recipient pane with the text 'check mail' — that is an agent's\n"
+            "cue to run `bsq inbox check`. The long-poll watcher\n"
+            "(`bsq inbox wait`) is opt-in only."
+        ),
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # inbox
+    inbox = sub.add_parser("inbox", help="peer inbox: check / wait")
+    inbox_sub = inbox.add_subparsers(dest="sub", required=True)
+    c = inbox_sub.add_parser("check", help="drain new peer messages for this session")
+    c.add_argument("--since", help="only show messages with ISO ts >= this")
+    c.add_argument("--sid", help="override this session's SID")
+    c.add_argument("--json", action="store_true", help="raw JSON output")
+    c.set_defaults(func=cmd_inbox_check)
+    w = inbox_sub.add_parser("wait", help="opt-in long-poll until mail arrives")
+    w.add_argument("--timeout", default=1800, type=float, help="seconds (default 1800)")
+    w.add_argument("--sid", help="override this session's SID")
+    w.set_defaults(func=cmd_inbox_wait)
+
+    # peer
+    peer = sub.add_parser("peer", help="peer messaging")
+    peer_sub = peer.add_subparsers(dest="sub", required=True)
+    ps = peer_sub.add_parser("send", help="send a message + signal the recipient pane")
+    ps.add_argument("to", help="target SID or role keyword (teamlead/dev/all)")
+    ps.add_argument("text", help="message text")
+    ps.add_argument("--from", dest="from_sid", help="override sender SID")
+    ps.add_argument("--no-signal", action="store_true",
+                    help="skip the 'check mail' tmux nudge")
+    ps.set_defaults(func=cmd_peer_send)
+
+    # spawn
+    sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")
+    sp.add_argument("ticket", help="ticket id, e.g. T-0150")
+    sp.add_argument("--bundle", help="comma-separated extra ticket ids bound to the same session")
+    sp.add_argument("--window", help="tmux window name (default: ticket feature slug)")
+    sp.add_argument("--initiative", help="initiative md (default: from ticket frontmatter)")
+    sp.add_argument("--owner", help="UI username to stamp on the session")
+    sp.add_argument("--prompt", help="custom initial prompt (overrides the default brief)")
+    sp.add_argument("--prompt-file", help="read initial prompt from a file")
+    sp.add_argument("--dry-run", action="store_true", help="print params without spawning")
+    sp.set_defaults(func=cmd_spawn)
+
+    # team
+    team = sub.add_parser("team", help="session roster (composes with T-0142)")
+    team_sub = team.add_subparsers(dest="sub", required=True)
+    ts = team_sub.add_parser("status", help="list this project's sessions")
+    ts.add_argument("--all", action="store_true", help="include suspended sessions")
+    ts.add_argument("--json", action="store_true", help="raw JSON output")
+    ts.set_defaults(func=cmd_team_status)
+    ta = team_sub.add_parser("archive", help="retire a session (interim: suspend)")
+    ta.add_argument("sid", help="target session SID")
+    ta.set_defaults(func=cmd_team_archive)
+    tr = team_sub.add_parser("resurrect", help="bring a session back (resume)")
+    tr.add_argument("sid", help="target session SID")
+    tr.set_defaults(func=cmd_team_resurrect)
+
+    # compact
+    cp = sub.add_parser("compact", help="send /compact to a session (self by default)")
+    cp.add_argument("--sid", help="target SID (default: this session)")
+    cp.set_defaults(func=cmd_compact)
+
+    # commit
+    cm = sub.add_parser("commit", help="stage explicit paths + safe-commit")
+    cm.add_argument("-m", "--message", required=True, help="commit message")
+    cm.add_argument("--ack", action="store_true",
+                    help="acknowledge the peer-activity report (BOT_SQUAD_ACK_PEERS=1)")
+    cm.add_argument("files", nargs="*", help="explicit file paths to stage + commit")
+    cm.set_defaults(func=cmd_commit)
+
+    return p
+
+
+def main(argv: list[str]) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -618,28 +618,25 @@ fi
 if [ -n "$sid" ]; then
     print_section "MESSAGE BUS"
     cat <<BUS_EOF
-Cross-session messaging via bot-squad worker actions (no raw nc):
+Cross-session messaging is the \`bsq\` CLI — run \`bsq --help\` for the full
+verb reference (canonical). The common moves:
 
-  # Send to a peer SID, or to a role keyword (teamlead / dev / all):
-  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
-    -X POST -H 'Content-Type: application/json' \\
-    -d '{"slug":"$slug","from_sid":"$sid","to":"<target>","text":"hello"}' \\
-    http://w/actions/peer_send
+  bsq inbox check                 # drain new messages addressed to you
+  bsq peer send <target> "<text>" # <target> = a SID or role (teamlead/dev/all)
 
-  # Drain new messages:
-  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
-    -X POST -H 'Content-Type: application/json' \\
-    -d '{"slug":"$slug","sid":"$sid"}' \\
-    http://w/actions/peer_inbox_read
+\`bsq peer send\` also nudges each live recipient pane with the text
+"check mail" — the PRIMARY cross-session signal. When you see "check mail"
+in your composer, run \`bsq inbox check\`. The long-poll watcher is OPT-IN:
 
-  # Long-poll: block until new mail or timeout, then re-arm.
-  # Run with run_in_background:true so Claude Code wakes you between turns.
-  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
-    -X POST -H 'Content-Type: application/json' \\
-    -d '{"slug":"$slug","sid":"$sid","timeout":1800}' \\
-    http://w/actions/peer_inbox_wait
+  bsq inbox wait --timeout 1800   # blocks until mail (run in background)
 
 Your SID is: $sid
+
+Fallback — raw worker-socket curl if bsq is unavailable:
+  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
+    -X POST -H 'Content-Type: application/json' \\
+    -d '{"slug":"$slug","from_sid":"$sid","to":"<target>","text":"hi"}' \\
+    http://w/actions/peer_send          # peer_inbox_read / peer_inbox_wait too
 BUS_EOF
 fi
 

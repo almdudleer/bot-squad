@@ -5,8 +5,14 @@ import type { SessionRow, Task, VisionFile } from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
+import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
 import { Select } from "../components/Select";
-import { sessionActivity, sessionLabel } from "../utils/sessionStatus";
+import {
+  sessionActivity,
+  sessionLabel,
+  sessionRole,
+  sessionRoleLabel,
+} from "../utils/sessionStatus";
 
 import { PageHelp } from "../components/PageHelp";
 // ---------------------------------------------------------------------------
@@ -43,6 +49,21 @@ function StatusBadge({ row }: { row: SessionRow }) {
       <span className="mc-badge mc-badge-dim">{sessionLabel(a)}</span>
     </span>
   );
+}
+
+// T-0141: role badge keyed off the worker-derived `role` (falls back to the
+// legacy task_id inference for a pre-T-0141 worker). Teamlead = green,
+// operator = amber, dev = blue. `dim` mutes the badge for archived rows.
+function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
+  const role = sessionRole(row);
+  if (dim) return <span className="mc-badge mc-badge-dim">{sessionRoleLabel(role)}</span>;
+  const cls =
+    role === "teamlead"
+      ? "mc-badge mc-badge-ok"
+      : role === "operator"
+        ? "mc-badge mc-badge-warn"
+        : "mc-badge mc-badge-info";
+  return <span className={cls}>{sessionRoleLabel(role)}</span>;
 }
 
 function relativeTime(raw: string | number | null | undefined): string {
@@ -108,7 +129,7 @@ export function Sessions() {
   // session that just appeared. Computed by diffing the SID set before and
   // after the spawn call so we don't need a return-value contract change on
   // api.spawnSession.
-  const [spawnNotice, setSpawnNotice] = useState<{ sid: string; window: string } | null>(null);
+  const [spawnNotice, setSpawnNotice] = useState<{ sid: string; window: string; tmuxSession: string } | null>(null);
 
   // Send-message modal (cross-session bus)
   const [sendOpen, setSendOpen] = useState(false);
@@ -133,9 +154,13 @@ export function Sessions() {
 
   // T-0039 follow-up: group sessions by initiative on this page too.
   // Default = none (preserves the pre-group view).
-  type SessGroupBy = "none" | "initiative";
+  // T-0141: tmux grouping is the stakeholder's mental model (notes 5 + 13) —
+  // the page now groups by tmux session by default, with the TL highlighted
+  // and child sessions nested under it.
+  type SessGroupBy = "tmux" | "none" | "initiative";
   const SESS_UNATTACHED = "__unattached__";
-  const [groupBy, setGroupBy] = useState<SessGroupBy>("none");
+  const TMUX_NONE = "(no tmux session)";
+  const [groupBy, setGroupBy] = useState<SessGroupBy>("tmux");
   const [filterInit, setFilterInit] = useState<string>(""); // "" = all
   // Initiatives for grouping (separate from modal's `initiatives` so the
   // grouping view doesn't depend on the modal being opened).
@@ -156,8 +181,24 @@ export function Sessions() {
       /* silent */
     }
   }, [collapsedSessLanesKey, collapsedSessLanes]);
-  function toggleSessLane(key: string) {
-    setCollapsedSessLanes((prev) => ({ ...prev, [key]: !prev[key] }));
+  // `effective` lets a caller flip a lane whose displayed state is a computed
+  // default (not yet an explicit entry in the map) — e.g. the tmux zero-alive
+  // lanes that render collapsed by default. Without it, the first click on a
+  // default-collapsed lane would write `true` and appear to do nothing.
+  function toggleSessLane(key: string, effective?: boolean) {
+    setCollapsedSessLanes((prev) => ({
+      ...prev,
+      [key]: effective === undefined ? !prev[key] : !effective,
+    }));
+  }
+  // T-0141: a tmux lane with no live (active/paused) session is historical
+  // noise (mostly legacy suspended mds without a tmux_session field, which
+  // pile into "(no tmux session)"). Default it collapsed so the page opens
+  // showing the live tmux sessions — "the actual recent tmux tabs" the
+  // stakeholder expects (note 3) — while an explicit user toggle still wins.
+  function tmuxLaneCollapsed(key: string, rows: SessionRow[]): boolean {
+    if (key in collapsedSessLanes) return Boolean(collapsedSessLanes[key]);
+    return !rows.some((r) => r.status === "active" || r.status === "paused");
   }
 
   function toggleRow(sid: string) {
@@ -423,12 +464,11 @@ export function Sessions() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetSid, sessions]);
 
-  // Active TLs are sessions with no task_id and status === "active".
+  // Active TLs: role === "teamlead" and live. T-0141: keys off the
+  // authoritative role instead of the old "no task_id" inference, so the
+  // dev-spawn target picker no longer offers every task-less session.
   const activeTeamleads: SessionRow[] = (sessions ?? []).filter(
-    (s) =>
-      s.status === "active" &&
-      !(s.task_id && s.task_id !== "") &&
-      !s.archived,
+    (s) => s.status === "active" && sessionRole(s) === "teamlead" && !s.archived,
   );
 
   // Split visible vs archived for the two-section layout.
@@ -572,16 +612,49 @@ export function Sessions() {
     );
   }
 
+  // T-0141: assemble the action set for a row's overflow (kebab) menu so the
+  // row stays short. Mirrors the prior inline button logic exactly.
+  function rowActions(s: SessionRow): RowAction[] {
+    const isSuspended = s.status === "suspended";
+    const acts: RowAction[] = [];
+    if (s.status === "active") {
+      acts.push({ label: "Pause", onClick: () => handlePause(s.sid), variant: "warning" });
+      acts.push({ label: "Suspend", onClick: () => handleSuspend(s.sid) });
+    } else if (s.status === "paused") {
+      acts.push({ label: "Resume", onClick: () => handleResume(s.sid), variant: "success" });
+      acts.push({ label: "Suspend", onClick: () => handleSuspend(s.sid) });
+    } else if (s.status === "suspended") {
+      acts.push({ label: "Resurrect", onClick: () => handleResume(s.sid), variant: "success" });
+    }
+    acts.push({ label: "Send msg", onClick: () => openSendModal(s.sid) });
+    acts.push({
+      label: "Archive",
+      onClick: () => handleArchive(s.sid),
+      disabled: !isSuspended,
+      title: isSuspended ? "Archive this suspended session" : "Suspend the session first",
+    });
+    return acts;
+  }
+
   function renderSessionRow(s: SessionRow, level = 0) {
     const isOpen = expandedSids.has(s.sid);
-    const isSuspended = s.status === "suspended";
     const isFlashing = flashSid === s.sid;
+    const isTL = sessionRole(s) === "teamlead";
     return (
       <Fragment key={s.sid}>
         <tr
           id={`sess-row-${s.sid}`}
           className={isFlashing ? "mc-row-flash" : undefined}
-          style={{ cursor: "pointer" }}
+          style={{
+            cursor: "pointer",
+            // T-0141: highlight the TL row within its tmux group.
+            ...(isTL && level === 0
+              ? {
+                  borderLeft: "3px solid var(--mc-accent-success, #4ade80)",
+                  background: "rgba(74, 222, 128, 0.05)",
+                }
+              : {}),
+          }}
           onClick={() => toggleRow(s.sid)}
         >
           {/* Expand chevron (T-0040: paddingLeft scales with tree depth) */}
@@ -598,8 +671,19 @@ export function Sessions() {
             {isOpen ? "▾" : "▸"}
           </td>
 
-          {/* SID — prefix with a faint tree branch glyph when nested */}
-          <td onClick={(e) => e.stopPropagation()}>
+          {/* SID — prefix with a faint tree branch glyph when nested.
+              T-0141: one-line + ellipsis so a long SID can't wrap the row
+              past 48px (the full SID stays in the expandable detail row). */}
+          <td
+            onClick={(e) => e.stopPropagation()}
+            title={s.sid}
+            style={{
+              maxWidth: "16rem",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             {level > 0 && (
               <span
                 aria-hidden
@@ -641,18 +725,16 @@ export function Sessions() {
             {s.window}
           </td>
 
-          {/* Attach (T-0006 / collapsed to icon button per T-0098) */}
+          {/* Attach — T-0141: the copyable command targets the tmux SESSION
+              (`tmux a -t <tmux_session>:<window>`), not the SID. Passing the
+              SID built `tmux a -t S-…:<window>` which never attached. */}
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
+            <CopyableTmuxAttach session={s.tmux_session || slug} window={s.window} iconOnly />
           </td>
 
-          {/* Role */}
+          {/* Role — T-0141: worker-derived, no longer "task-less ⟹ TL". */}
           <td>
-            {(s.task_id && s.task_id !== "" && s.task_id !== "~") ? (
-              <span className="mc-badge mc-badge-info">Dev</span>
-            ) : (
-              <span className="mc-badge mc-badge-ok">Teamlead</span>
-            )}
+            <RoleBadge row={s} />
           </td>
 
           {/* Bound (initiative for TL / task for dev) */}
@@ -676,83 +758,10 @@ export function Sessions() {
             {sessionLastActivity(s)}
           </td>
 
-          {/* Actions */}
-          <td onClick={(e) => e.stopPropagation()}>
-            <div className="d-flex gap-1 flex-wrap">
-              {s.status === "active" && (
-                <>
-                  <button
-                    type="button"
-                    className="btn btn-outline-warning btn-sm"
-                    style={{ fontSize: "0.72rem" }}
-                    onClick={() => handlePause(s.sid)}
-                  >
-                    Pause
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-outline-secondary btn-sm"
-                    style={{ fontSize: "0.72rem" }}
-                    onClick={() => handleSuspend(s.sid)}
-                  >
-                    Suspend
-                  </button>
-                </>
-              )}
-              {s.status === "paused" && (
-                <>
-                  <button
-                    type="button"
-                    className="btn btn-outline-success btn-sm"
-                    style={{ fontSize: "0.72rem" }}
-                    onClick={() => handleResume(s.sid)}
-                  >
-                    Resume
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-outline-secondary btn-sm"
-                    style={{ fontSize: "0.72rem" }}
-                    onClick={() => handleSuspend(s.sid)}
-                  >
-                    Suspend
-                  </button>
-                </>
-              )}
-              {s.status === "suspended" && (
-                <button
-                  type="button"
-                  className="btn btn-outline-success btn-sm"
-                  style={{ fontSize: "0.72rem" }}
-                  onClick={() => handleResume(s.sid)}
-                >
-                  Resurrect
-                </button>
-              )}
-              <button
-                type="button"
-                className="btn btn-outline-info btn-sm"
-                style={{ fontSize: "0.72rem" }}
-                onClick={() => openSendModal(s.sid)}
-              >
-                Send msg
-              </button>
-              {/* Archive: only enabled for suspended sessions. */}
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                style={{ fontSize: "0.72rem" }}
-                disabled={!isSuspended}
-                title={
-                  isSuspended
-                    ? "Archive this suspended session"
-                    : "Suspend the session first"
-                }
-                onClick={() => handleArchive(s.sid)}
-              >
-                Archive
-              </button>
-            </div>
+          {/* Actions — T-0141: collapsed behind a kebab so the row stays
+              ≤48px (stakeholder note 10). */}
+          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
+            <RowActionsMenu actions={rowActions(s)} ariaLabel={`Actions for ${s.sid}`} />
           </td>
         </tr>
         {isOpen && renderDetailRow(s, 10)}
@@ -781,7 +790,16 @@ export function Sessions() {
           >
             {isOpen ? "▾" : "▸"}
           </td>
-          <td onClick={(e) => e.stopPropagation()}>
+          <td
+            onClick={(e) => e.stopPropagation()}
+            title={s.sid}
+            style={{
+              maxWidth: "16rem",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             <code
               style={{
                 fontFamily: "var(--mc-mono)",
@@ -794,14 +812,10 @@ export function Sessions() {
           </td>
           <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            <CopyableTmuxAttach session={s.sid} window={s.window} iconOnly />
+            <CopyableTmuxAttach session={s.tmux_session || slug} window={s.window} iconOnly />
           </td>
           <td>
-            {(s.task_id && s.task_id !== "" && s.task_id !== "~") ? (
-              <span className="mc-badge mc-badge-dim">Dev</span>
-            ) : (
-              <span className="mc-badge mc-badge-dim">Teamlead</span>
-            )}
+            <RoleBadge row={s} dim />
           </td>
           <td>{renderBoundCell(s)}</td>
           <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
@@ -813,25 +827,18 @@ export function Sessions() {
           >
             {sessionLastActivity(s)}
           </td>
-          <td onClick={(e) => e.stopPropagation()}>
-            <div className="d-flex gap-1 flex-wrap">
-              <button
-                type="button"
-                className="btn btn-outline-success btn-sm"
-                style={{ fontSize: "0.72rem" }}
-                onClick={() => handleResurrectFromArchive(s.sid)}
-              >
-                Resurrect
-              </button>
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                style={{ fontSize: "0.72rem" }}
-                onClick={() => api.unarchiveSession(slug, s.sid).then(load).catch((e) => setActionError(String(e)))}
-              >
-                Unarchive
-              </button>
-            </div>
+          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
+            <RowActionsMenu
+              ariaLabel={`Actions for ${s.sid}`}
+              actions={[
+                { label: "Resurrect", onClick: () => handleResurrectFromArchive(s.sid), variant: "success" },
+                {
+                  label: "Unarchive",
+                  onClick: () =>
+                    api.unarchiveSession(slug, s.sid).then(load).catch((e) => setActionError(String(e))),
+                },
+              ]}
+            />
           </td>
         </tr>
         {isOpen && renderDetailRow(s, 9)}
@@ -863,7 +870,7 @@ export function Sessions() {
         setError(null);
         const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
         if (fresh) {
-          setSpawnNotice({ sid: fresh.sid, window: fresh.window });
+          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
         }
       } catch {
         // Best-effort: if the post-spawn fetch fails, fall back to the
@@ -940,6 +947,111 @@ export function Sessions() {
     const extras = (s.extra_initiatives ?? []).filter((i) => i && i !== "~");
     if (extras.length > 0) return extras[0];
     return SESS_UNATTACHED;
+  }
+
+  // ---- T-0141: tmux-session grouping (the default view) ----
+  function sessionTmuxKey(s: SessionRow): string {
+    const t = (s.tmux_session ?? "").trim();
+    return t && t !== "~" ? t : TMUX_NONE;
+  }
+  function isAliveRow(s: SessionRow): boolean {
+    return s.status === "active" || s.status === "paused";
+  }
+  // Group rows by tmux session. Groups with a live (active/paused) session
+  // sort first, then alphabetical; the "(no tmux session)" bucket is last.
+  function groupSessionsByTmux(rows: SessionRow[]): { key: string; rows: SessionRow[] }[] {
+    const map = new Map<string, SessionRow[]>();
+    for (const s of rows) {
+      const k = sessionTmuxKey(s);
+      const list = map.get(k) ?? [];
+      list.push(s);
+      map.set(k, list);
+    }
+    const groups = Array.from(map.entries()).map(([key, gr]) => ({ key, rows: gr }));
+    groups.sort((a, b) => {
+      if (a.key === TMUX_NONE) return 1;
+      if (b.key === TMUX_NONE) return -1;
+      const al = a.rows.some(isAliveRow) ? 0 : 1;
+      const bl = b.rows.some(isAliveRow) ? 0 : 1;
+      if (al !== bl) return al - bl;
+      return a.key.localeCompare(b.key);
+    });
+    return groups;
+  }
+  // Within a tmux group: operator + TL(s) at root (TL highlighted in the row
+  // renderer), every other session nested one level under — matching the
+  // stakeholder's mental model of "a team with the teamlead, N alive, M
+  // suspended" (note 13). When the group has no TL, all rows sit at root.
+  function buildTmuxGroupTree(rows: SessionRow[]): { row: SessionRow; level: number }[] {
+    const ops = rows.filter((r) => sessionRole(r) === "operator");
+    const leads = rows.filter((r) => sessionRole(r) === "teamlead");
+    const rest = rows.filter((r) => {
+      const role = sessionRole(r);
+      return role !== "operator" && role !== "teamlead";
+    });
+    const hasLead = leads.length > 0;
+    const out: { row: SessionRow; level: number }[] = [];
+    for (const o of ops) out.push({ row: o, level: 0 });
+    for (const l of leads) out.push({ row: l, level: 0 });
+    for (const d of rest) out.push({ row: d, level: hasLead ? 1 : 0 });
+    return out;
+  }
+  function renderTmuxLaneHeaderRow(
+    key: string,
+    rows: SessionRow[],
+    colSpan: number,
+    collapsed: boolean,
+  ) {
+    const alive = rows.filter(isAliveRow).length;
+    const suspended = rows.filter((r) => r.status === "suspended").length;
+    const isNone = key === TMUX_NONE;
+    return (
+      <tr
+        key={`tmux-lane-${key}`}
+        style={{ background: "var(--mc-surface-deep)", borderTop: "1px solid var(--mc-border)" }}
+      >
+        <td colSpan={colSpan} style={{ padding: "0.45rem 0.75rem", fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}>
+          <div className="d-flex align-items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              onClick={() => toggleSessLane(key, collapsed)}
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? `Expand ${key}` : `Collapse ${key}`}
+              title={collapsed ? "Expand tmux session" : "Collapse tmux session"}
+              style={{
+                background: "none",
+                border: "none",
+                color: "var(--mc-text-dim)",
+                cursor: "pointer",
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.8rem",
+                padding: "0 0.15rem",
+                lineHeight: 1,
+                width: "1.1rem",
+              }}
+            >
+              {collapsed ? "▸" : "▾"}
+            </button>
+            <span style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }} aria-hidden>
+              ▣
+            </span>
+            <code
+              style={{
+                fontWeight: 700,
+                color: isNone ? "var(--mc-text-dim)" : "var(--mc-text)",
+                fontSize: "0.85rem",
+                fontFamily: "var(--mc-mono)",
+              }}
+            >
+              {isNone ? "(no tmux session)" : `tmux a -t ${key}`}
+            </code>
+            <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.65rem", color: "var(--mc-text-dim)", marginLeft: "0.5rem" }}>
+              {alive} alive · {suspended} suspended
+            </span>
+          </div>
+        </td>
+      </tr>
+    );
   }
 
   // T-0040 lean: rendering-only tree. Devs are visually indented under
@@ -1185,7 +1297,7 @@ export function Sessions() {
             Spawned <code style={{ fontFamily: "var(--mc-mono)" }}>{spawnNotice.window}</code>.
             Attach with:{" "}
             <CopyableTmuxAttach
-              session={spawnNotice.sid}
+              session={spawnNotice.tmuxSession}
               window={spawnNotice.window}
               size="md"
             />
@@ -1244,7 +1356,7 @@ export function Sessions() {
             group by:
           </span>
           <div className="btn-group btn-group-sm" role="group">
-            {(["none", "initiative"] as const).map((v) => (
+            {(["tmux", "none", "initiative"] as const).map((v) => (
               <button
                 key={v}
                 type="button"
@@ -1298,26 +1410,39 @@ export function Sessions() {
               </tr>
             </thead>
             <tbody>
-              {groupBy === "none"
-                ? buildSessionTree(applySessFilter(visibleSessions)).map(
-                    ({ row, level }) => renderSessionRow(row, level),
-                  )
-                : buildVisibleLanes(visibleSessions).flatMap((lane) => {
-                    const laneRows = groupSessionsByLane(visibleSessions)[lane.key] ?? [];
-                    const collapsed = Boolean(collapsedSessLanes[lane.key]);
+              {groupBy === "tmux"
+                ? groupSessionsByTmux(applySessFilter(visibleSessions)).flatMap((g) => {
+                    const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                     const nodes: React.ReactNode[] = [
-                      renderLaneHeaderRow(lane, laneRows.length, 11),
+                      renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed),
                     ];
                     if (!collapsed) {
-                      // Within each initiative lane the tree is also useful — TL at
-                      // top, devs indented under it. Orphans (no TL bound to the
-                      // lane initiative) render at root within the lane.
-                      for (const { row, level } of buildSessionTree(laneRows)) {
+                      for (const { row, level } of buildTmuxGroupTree(g.rows)) {
                         nodes.push(renderSessionRow(row, level));
                       }
                     }
                     return nodes;
-                  })}
+                  })
+                : groupBy === "none"
+                  ? buildSessionTree(applySessFilter(visibleSessions)).map(
+                      ({ row, level }) => renderSessionRow(row, level),
+                    )
+                  : buildVisibleLanes(visibleSessions).flatMap((lane) => {
+                      const laneRows = groupSessionsByLane(visibleSessions)[lane.key] ?? [];
+                      const collapsed = Boolean(collapsedSessLanes[lane.key]);
+                      const nodes: React.ReactNode[] = [
+                        renderLaneHeaderRow(lane, laneRows.length, 11),
+                      ];
+                      if (!collapsed) {
+                        // Within each initiative lane the tree is also useful — TL at
+                        // top, devs indented under it. Orphans (no TL bound to the
+                        // lane initiative) render at root within the lane.
+                        for (const { row, level } of buildSessionTree(laneRows)) {
+                          nodes.push(renderSessionRow(row, level));
+                        }
+                      }
+                      return nodes;
+                    })}
             </tbody>
           </table>
         </div>
@@ -1360,22 +1485,33 @@ export function Sessions() {
                 </tr>
               </thead>
               <tbody>
-                {groupBy === "none"
-                  ? applySessFilter(archivedSessions).map((s) => renderArchivedRow(s))
-                  : buildVisibleLanes(archivedSessions).flatMap((lane) => {
-                      const laneRows = groupSessionsByLane(archivedSessions)[lane.key] ?? [];
-                      const collapsed = Boolean(collapsedSessLanes[lane.key]);
-                      // Skip empty lanes here — archived view is already
-                      // off-by-default so noise-suppression matters more.
-                      if (laneRows.length === 0) return [];
+                {groupBy === "tmux"
+                  ? groupSessionsByTmux(applySessFilter(archivedSessions)).flatMap((g) => {
+                      const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                       const nodes: React.ReactNode[] = [
-                        renderLaneHeaderRow(lane, laneRows.length, 9),
+                        renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed),
                       ];
                       if (!collapsed) {
-                        for (const s of laneRows) nodes.push(renderArchivedRow(s));
+                        for (const s of g.rows) nodes.push(renderArchivedRow(s));
                       }
                       return nodes;
-                    })}
+                    })
+                  : groupBy === "none"
+                    ? applySessFilter(archivedSessions).map((s) => renderArchivedRow(s))
+                    : buildVisibleLanes(archivedSessions).flatMap((lane) => {
+                        const laneRows = groupSessionsByLane(archivedSessions)[lane.key] ?? [];
+                        const collapsed = Boolean(collapsedSessLanes[lane.key]);
+                        // Skip empty lanes here — archived view is already
+                        // off-by-default so noise-suppression matters more.
+                        if (laneRows.length === 0) return [];
+                        const nodes: React.ReactNode[] = [
+                          renderLaneHeaderRow(lane, laneRows.length, 9),
+                        ];
+                        if (!collapsed) {
+                          for (const s of laneRows) nodes.push(renderArchivedRow(s));
+                        }
+                        return nodes;
+                      })}
               </tbody>
             </table>
           </div>

@@ -57,3 +57,37 @@ export function sessionLabel(activity: SessionActivity): string {
 export function isRunning(activity: SessionActivity): boolean {
   return activity === "running";
 }
+
+// ---------------------------------------------------------------------------
+// T-0141 — authoritative session role.
+//
+// The role was historically inferred client-side as "no task_id ⟹ teamlead",
+// which leaked nearly every task-less agent-teams session as a teamlead. The
+// worker now derives an authoritative `role` (sessions.py::_derive_role); the
+// UI prefers it and only falls back to the legacy inference for a pre-T-0141
+// worker that doesn't yet emit the field.
+// ---------------------------------------------------------------------------
+export type SessionRoleName = "teamlead" | "dev" | "operator";
+
+export function sessionRole(
+  src: { role?: string | null; task_id?: string | null } | null | undefined,
+): SessionRoleName {
+  if (!src) return "dev";
+  const r = src.role;
+  if (r === "teamlead" || r === "dev" || r === "operator") return r;
+  // Legacy fallback: a real task binding means dev, otherwise teamlead.
+  const t = (src.task_id ?? "").trim();
+  return t && t !== "~" ? "dev" : "teamlead";
+}
+
+/** Human-readable role label for the sessions table Role column. */
+export function sessionRoleLabel(role: SessionRoleName): string {
+  switch (role) {
+    case "teamlead":
+      return "Teamlead";
+    case "operator":
+      return "Operator";
+    case "dev":
+      return "Dev";
+  }
+}

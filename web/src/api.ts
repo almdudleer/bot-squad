@@ -125,6 +125,11 @@ export type SessionRow = {
   // panes, `<slug>-<initiative-stem>` for initiative TLs). Empty when
   // the worker can't determine it (pre-T-0078 md without backfill).
   tmux_session?: string;
+  // T-0141: worker-derived authoritative role. Replaces the old
+  // "task-less ⟹ teamlead" inference that leaked nearly every agent-teams
+  // dive as a teamlead. Optional so a pre-T-0141 worker doesn't break the
+  // contract; the UI falls back to the legacy inference when absent.
+  role?: "teamlead" | "dev" | "operator";
 };
 
 export type RunRow = {

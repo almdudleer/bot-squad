@@ -1,0 +1,197 @@
+"""Tests for the T-0142 binding-refresh + auto-archive reconcilers."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from bot_squad_worker import sessions as S
+from bot_squad_worker.sessions import (
+    PaneInfo,
+    gc_dead_bindings,
+    archive_dead_teammates,
+    _write_session_metadata,
+)
+
+
+def _make_cfg(tmp_path: Path) -> Any:
+    from bot_squad_worker.config import Config
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(exist_ok=True)
+    data_dir = tmp_path / "data"
+    (data_dir / "test-project" / "sessions").mkdir(parents=True, exist_ok=True)
+    (data_dir / "test-project" / "backlog").mkdir(parents=True, exist_ok=True)
+    (data_dir / "test-project" / "vision" / "initiatives").mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.test-project]\n'
+        'slug = "test-project"\n'
+        'display_name = "Test Project"\n'
+        f'repo_path = "{tmp_path / "repo"}"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    import types
+    return types.SimpleNamespace(projects=cfg.projects, data_dir=data_dir, tg_bot_token="")
+
+
+def _seed_session(cfg, sid, **fields) -> Path:
+    meta = {"sid": sid, "status": "active"}
+    meta.update(fields)
+    p = S._session_file(cfg.data_dir, "test-project", sid)
+    _write_session_metadata(p, meta)
+    return p
+
+
+def _seed_task(cfg, task_id, status) -> None:
+    p = cfg.data_dir / "test-project" / "backlog" / f"{task_id}-thing.md"
+    p.write_text(f"---\nid: {task_id}\nstatus: {status}\n---\nbody\n")
+
+
+def _seed_initiative(cfg, name) -> None:
+    (cfg.data_dir / "test-project" / "vision" / "initiatives" / name).write_text(
+        "---\nname: x\n---\n")
+
+
+@pytest.fixture(autouse=True)
+def _user(monkeypatch):
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+
+# --- gc_dead_bindings ---
+
+def test_closed_task_binding_is_cleared(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "closed")
+    p = _seed_session(cfg, "S-u-dev-p1", window="dev", task_id="T-0001", status="suspended")
+    res = gc_dead_bindings(cfg, "test-project")
+    assert res["cleared"] == 1
+    meta = S._read_session_metadata(p)
+    assert meta["task_id"] is None  # ~ parses to None
+    assert meta["last_task_id"] == "T-0001"
+
+
+def test_missing_task_binding_is_cleared(tmp_path):
+    cfg = _make_cfg(tmp_path)  # no task file at all
+    p = _seed_session(cfg, "S-u-dev-p1", window="dev", task_id="T-0099")
+    res = gc_dead_bindings(cfg, "test-project")
+    assert res["cleared"] == 1
+    assert S._read_session_metadata(p)["task_id"] is None
+
+
+def test_open_task_binding_is_preserved(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-dev-p1", window="dev", task_id="T-0001")
+    res = gc_dead_bindings(cfg, "test-project")
+    assert res["cleared"] == 0
+    assert S._read_session_metadata(p)["task_id"] == "T-0001"
+
+
+def test_totest_task_binding_is_preserved(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "totest")
+    p = _seed_session(cfg, "S-u-dev-p1", window="dev", task_id="T-0001")
+    gc_dead_bindings(cfg, "test-project")
+    assert S._read_session_metadata(p)["task_id"] == "T-0001"
+
+
+def test_missing_initiative_is_cleared(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    p = _seed_session(cfg, "S-u-TL-p1", window="TL", task_id="~",
+                      initiative="gone.md")
+    res = gc_dead_bindings(cfg, "test-project")
+    assert res["cleared"] == 1
+    meta = S._read_session_metadata(p)
+    assert meta["initiative"] is None
+    assert meta["last_initiative"] == "gone.md"
+
+
+def test_present_initiative_is_preserved(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_initiative(cfg, "live.md")
+    p = _seed_session(cfg, "S-u-TL-p1", window="TL", task_id="~", initiative="live.md")
+    gc_dead_bindings(cfg, "test-project")
+    assert S._read_session_metadata(p)["initiative"] == "live.md"
+
+
+def test_extra_task_ids_pruned_of_closed(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    _seed_task(cfg, "T-0002", "closed")
+    p = _seed_session(cfg, "S-u-dev-p1", window="dev", task_id="T-0001",
+                      extra_task_ids=["T-0002"])
+    gc_dead_bindings(cfg, "test-project")
+    assert S._read_session_metadata(p)["extra_task_ids"] == []
+
+
+# --- archive_dead_teammates ---
+
+def test_exited_totest_dev_is_archived(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "totest")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    # no live panes -> exited
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    meta = S._read_session_metadata(p)
+    assert str(meta["archived"]).lower() == "true"
+    assert meta["status"] == "suspended"
+    assert meta["task_id"] is None
+    assert meta["last_task_id"] == "T-0001"
+
+
+def test_exited_in_progress_dev_is_not_archived(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0  # crashed-but-resumable, left for gc_sessions
+    assert "archived" not in S._read_session_metadata(p)
+
+
+def test_live_totest_dev_is_not_force_suspended(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "totest")
+    _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    monkeypatch.setattr(
+        S, "list_panes",
+        lambda: [PaneInfo(pane_id="%1", window="feat-dev", pid="1", cwd="/x", command="claude")],
+    )
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda *a, **k: suspended.append(a))
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    assert suspended == []  # live totest dev left alone
+
+
+def test_live_closed_dev_is_suspended_and_archived(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "closed")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    monkeypatch.setattr(
+        S, "list_panes",
+        lambda: [PaneInfo(pane_id="%1", window="feat-dev", pid="1", cwd="/x", command="claude")],
+    )
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda cfg, slug, sid: suspended.append(sid))
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    assert suspended == ["S-u-feat-dev-p1"]
+    assert str(S._read_session_metadata(p)["archived"]).lower() == "true"
+
+
+def test_tl_role_is_never_auto_archived(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "S-u-feat-TL-p1", window="feat-TL", task_id="~",
+                  initiative="x.md")
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0

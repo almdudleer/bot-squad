@@ -1153,6 +1153,166 @@ def _action_peer_rebind_sid(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Session-lifecycle + Team entity actions (T-0142 / T-0144)
+# ---------------------------------------------------------------------------
+
+_GC_DEAD_BINDINGS_REQUIRED = {"slug"}
+_GC_DEAD_BINDINGS_ALLOWED = _GC_DEAD_BINDINGS_REQUIRED
+
+
+def _action_gc_dead_bindings(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142: clear task/initiative bindings whose target is closed or gone.
+
+    Required params: slug
+    Returns: {ok, scanned, cleared, details: [...]}
+    """
+    extra = set(params) - _GC_DEAD_BINDINGS_ALLOWED
+    if extra:
+        raise ActionError(f"gc_dead_bindings got unexpected params: {sorted(extra)}")
+    missing = _GC_DEAD_BINDINGS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"gc_dead_bindings missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.gc_dead_bindings(cfg, params["slug"])
+
+
+_ARCHIVE_DEAD_TEAMMATES_REQUIRED = {"slug"}
+_ARCHIVE_DEAD_TEAMMATES_ALLOWED = _ARCHIVE_DEAD_TEAMMATES_REQUIRED
+
+
+def _action_archive_dead_teammates(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142/T-0144: auto-archive cleanly-exited / verified-done dev teammates.
+
+    Required params: slug
+    Returns: {ok, scanned, archived, sids: [...]}
+    """
+    extra = set(params) - _ARCHIVE_DEAD_TEAMMATES_ALLOWED
+    if extra:
+        raise ActionError(f"archive_dead_teammates got unexpected params: {sorted(extra)}")
+    missing = _ARCHIVE_DEAD_TEAMMATES_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"archive_dead_teammates missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.archive_dead_teammates(cfg, params["slug"])
+
+
+_RECONCILE_TEAMS_REQUIRED = {"slug"}
+_RECONCILE_TEAMS_ALLOWED = _RECONCILE_TEAMS_REQUIRED
+
+
+def _action_reconcile_teams(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142: rebuild the tmux-session-keyed Team mds from the SessionMd registry.
+
+    Required params: slug
+    Returns: {ok, teams: [...], reconciled: N}
+    """
+    extra = set(params) - _RECONCILE_TEAMS_ALLOWED
+    if extra:
+        raise ActionError(f"reconcile_teams got unexpected params: {sorted(extra)}")
+    missing = _RECONCILE_TEAMS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"reconcile_teams missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import teams as _teams
+    return _teams.reconcile_teams(cfg, params["slug"])
+
+
+_LIST_TEAMS_REQUIRED = {"slug"}
+_LIST_TEAMS_ALLOWED = _LIST_TEAMS_REQUIRED
+
+
+def _action_list_teams(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142: list persisted Team mds for a project.
+
+    Required params: slug
+    Returns: {ok, teams: [<team meta>, ...]}
+    """
+    extra = set(params) - _LIST_TEAMS_ALLOWED
+    if extra:
+        raise ActionError(f"list_teams got unexpected params: {sorted(extra)}")
+    missing = _LIST_TEAMS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"list_teams missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import teams as _teams
+    return _teams.list_teams(cfg, params["slug"])
+
+
+_ARCHIVE_TEAM_REQUIRED = {"slug", "name"}
+_ARCHIVE_TEAM_ALLOWED = _ARCHIVE_TEAM_REQUIRED
+
+
+def _action_archive_team(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142: true Team archive — suspend live members + flag the team archived.
+
+    Required params: slug, name (tmux session name)
+    Returns: {ok, name, suspended: [...], archived: true}
+    """
+    extra = set(params) - _ARCHIVE_TEAM_ALLOWED
+    if extra:
+        raise ActionError(f"archive_team got unexpected params: {sorted(extra)}")
+    missing = _ARCHIVE_TEAM_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"archive_team missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import teams as _teams
+    return _teams.archive_team(cfg, params["slug"], params["name"])
+
+
+_RESURRECT_TEAM_REQUIRED = {"slug", "name"}
+_RESURRECT_TEAM_ALLOWED = _RESURRECT_TEAM_REQUIRED
+
+
+def _action_resurrect_team(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142: bring an archived team back — clear the flag + resume the TL.
+
+    Required params: slug, name (tmux session name)
+    Returns: {ok, name, tl: <resumed SID or None>}
+    """
+    extra = set(params) - _RESURRECT_TEAM_ALLOWED
+    if extra:
+        raise ActionError(f"resurrect_team got unexpected params: {sorted(extra)}")
+    missing = _RESURRECT_TEAM_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"resurrect_team missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import teams as _teams
+    return _teams.resurrect_team(cfg, params["slug"], params["name"])
+
+
+_SYNC_SESSION_NAME_REQUIRED = {"slug", "sid", "name"}
+_SYNC_SESSION_NAME_ALLOWED = _SYNC_SESSION_NAME_REQUIRED
+
+
+def _action_sync_session_name(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0142: single-source-of-truth session rename across tmux + registry.
+
+    Required params: slug, sid, name (new window/display name)
+    Returns: {ok, sid, new_sid, name}
+    """
+    extra = set(params) - _SYNC_SESSION_NAME_ALLOWED
+    if extra:
+        raise ActionError(f"sync_session_name got unexpected params: {sorted(extra)}")
+    missing = _SYNC_SESSION_NAME_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_session_name missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.sync_session_name(
+        cfg, params["slug"], params["sid"], params["name"]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Autoupdate operator handoff actions (T-0085)
 # ---------------------------------------------------------------------------
 
@@ -1330,6 +1490,14 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "gc_sessions": _action_gc_sessions,
     "gc_stale_bindings": _action_gc_stale_bindings,
     "peer_rebind_sid": _action_peer_rebind_sid,
+    # T-0142/0144: session-lifecycle reconcilers + Team entity + rename sync.
+    "gc_dead_bindings": _action_gc_dead_bindings,
+    "archive_dead_teammates": _action_archive_dead_teammates,
+    "reconcile_teams": _action_reconcile_teams,
+    "list_teams": _action_list_teams,
+    "archive_team": _action_archive_team,
+    "resurrect_team": _action_resurrect_team,
+    "sync_session_name": _action_sync_session_name,
     # T-0085: autoupdate operator handoff levers.
     "autoupdate_retry": _action_autoupdate_retry,
     "autoupdate_force": _action_autoupdate_force,
@@ -1381,6 +1549,17 @@ ACTION_MODES: dict[str, str] = {
     "gc_sessions": "coordinator_only",
     "gc_stale_bindings": "coordinator_only",
     "peer_rebind_sid": "coordinator_only",
+    # T-0142/0144: reconcilers + Team entity walk SessionMd + live tmux; the
+    # scheduler tick is the single writer, so coordinator-only. sync_session_name
+    # mutates tmux + the registry (tmux-local) but is coordinator-gated for the
+    # same single-writer reason the other reconcilers are.
+    "gc_dead_bindings": "coordinator_only",
+    "archive_dead_teammates": "coordinator_only",
+    "reconcile_teams": "coordinator_only",
+    "list_teams": "coordinator_only",
+    "archive_team": "coordinator_only",
+    "resurrect_team": "coordinator_only",
+    "sync_session_name": "coordinator_only",
     # T-0085: autoupdate handoff is install-scoped (coordinator).
     "autoupdate_retry": "coordinator_only",
     "autoupdate_force": "coordinator_only",

@@ -155,31 +155,46 @@ def autoupdate_apply_tick(cfg: Config) -> None:
 
 
 def binding_gc_tick(cfg: Config) -> None:
-    """T-0072/0073/0077: run the binding-graph reconcilers for every project.
+    """T-0072/0073/0077/0142/0144: run the binding-graph reconcilers per project.
 
-    Two passes per tick:
+    Five ordered passes per tick:
       1. ``gc_sessions`` — flip ``status: active`` SessionMds with no live pane
          to ``status: suspended`` so the on-disk graph matches reality.
-      2. ``gc_stale_bindings`` — strip duplicate-claim primary ``task_id`` from
+      2. ``gc_dead_bindings`` (T-0142) — refresh bindings from disk: strip
+         ``task_id`` for closed/missing tasks and ``initiative`` for missing
+         initiative files (fixes suspended devs showing stale task_ids).
+      3. ``gc_stale_bindings`` — strip duplicate-claim primary ``task_id`` from
          losers in a dup race (preserve old value as ``last_task_id``).
+      4. ``archive_dead_teammates`` (T-0142/0144) — auto-archive cleanly-exited
+         post-totest devs (and verified-done live devs); makes dev zombies
+         impossible without a TL lifting a finger.
+      5. ``reconcile_teams`` (T-0142) — rebuild the tmux-session-keyed Team mds
+         from the (now-reconciled) SessionMd registry so the team roster, TL
+         slot, and archived members survive a worker reload.
 
     ``gc_sessions`` runs first so the freshly-suspended sessions inform the
-    stale-binding race resolution (a live-pane claimant beats a dead one).
+    stale-binding race resolution (a live-pane claimant beats a dead one);
+    ``reconcile_teams`` runs last so it sees the post-archive truth.
 
-    Per-project errors are caught and logged so one bad project never kills
-    the sweep.
+    Per-project / per-pass errors are caught and logged so one bad project or
+    pass never kills the sweep.
     """
     from bot_squad_worker import sessions as _sessions
+    from bot_squad_worker import teams as _teams
 
+    passes = [
+        ("gc_sessions", _sessions.gc_sessions),
+        ("gc_dead_bindings", _sessions.gc_dead_bindings),
+        ("gc_stale_bindings", _sessions.gc_stale_bindings),
+        ("archive_dead_teammates", _sessions.archive_dead_teammates),
+        ("reconcile_teams", _teams.reconcile_teams),
+    ]
     for slug in cfg.projects:
-        try:
-            _sessions.gc_sessions(cfg, slug)
-        except Exception:
-            log.exception("binding_gc_tick: gc_sessions failed for %s", slug)
-        try:
-            _sessions.gc_stale_bindings(cfg, slug)
-        except Exception:
-            log.exception("binding_gc_tick: gc_stale_bindings failed for %s", slug)
+        for name, fn in passes:
+            try:
+                fn(cfg, slug)
+            except Exception:
+                log.exception("binding_gc_tick: %s failed for %s", name, slug)
 
 
 def autonomous_tick(cfg: Config) -> None:

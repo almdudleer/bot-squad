@@ -1,0 +1,183 @@
+"""Tests for worker.teams — the persisted Team entity (T-0142)."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from bot_squad_worker import teams as T
+from bot_squad_worker import sessions as S
+from bot_squad_worker.sessions import PaneInfo, _write_session_metadata
+
+
+def _make_cfg(tmp_path: Path) -> Any:
+    from bot_squad_worker.config import Config
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(exist_ok=True)
+    data_dir = tmp_path / "data"
+    (data_dir / "test-project" / "sessions").mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.test-project]\n'
+        'slug = "test-project"\n'
+        'display_name = "Test Project"\n'
+        f'repo_path = "{tmp_path / "repo"}"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = ""\n'
+        'staging_url = ""\n'
+        'dev_url = ""\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    cfg = Config.load(cfg_dir)
+    import types
+    return types.SimpleNamespace(
+        projects=cfg.projects, data_dir=data_dir, tg_bot_token=cfg.tg_bot_token,
+    )
+
+
+def _seed_session(cfg, slug, sid, **fields) -> None:
+    meta = {"sid": sid, "status": "active"}
+    meta.update(fields)
+    _write_session_metadata(S._session_file(cfg.data_dir, slug, sid), meta)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_user(monkeypatch):
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+
+
+def test_reconcile_groups_sessions_by_tmux_session(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    # Two tmux sessions: a feature team and the main project session.
+    _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
+                  window="feat-TL", tmux_session="test-project-feat",
+                  initiative="feat.md", task_id="~", started_at="2026-06-01T00:00:00Z")
+    _seed_session(cfg, "test-project", "S-u-feat-dev-p2",
+                  window="feat-dev", tmux_session="test-project-feat",
+                  task_id="T-0001", started_at="2026-06-01T00:01:00Z")
+    _seed_session(cfg, "test-project", "S-u-operator-p3",
+                  window="operator", tmux_session="test-project",
+                  task_id="~", started_at="2026-06-01T00:02:00Z")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+    res = T.reconcile_teams(cfg, "test-project")
+    assert res["ok"] is True
+    assert set(res["teams"]) == {"test-project-feat", "test-project"}
+
+    feat = T.load_team(cfg, "test-project", "test-project-feat")
+    assert feat["tl"] == "S-u-feat-TL-p1"
+    assert feat["teammates"] == ["S-u-feat-dev-p2"]
+
+    main = T.load_team(cfg, "test-project", "test-project")
+    assert main["tl"] == "S-u-operator-p3"
+
+
+def test_reconcile_prefers_live_tl_then_latest(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
+                  window="feat-TL", tmux_session="test-project-feat",
+                  initiative="feat.md", task_id="~", started_at="2026-06-01T00:00:00Z")
+    # An older, dead TL-role md in the same group must lose to the live one.
+    _seed_session(cfg, "test-project", "S-u-feat-TL-p9",
+                  window="feat-TL", tmux_session="test-project-feat",
+                  initiative="feat.md", task_id="~", started_at="2026-05-01T00:00:00Z")
+    monkeypatch.setattr(
+        S, "list_panes",
+        lambda: [PaneInfo(pane_id="%1", window="feat-TL", pid="1", cwd="/x", command="claude")],
+    )
+    T.reconcile_teams(cfg, "test-project")
+    feat = T.load_team(cfg, "test-project", "test-project-feat")
+    # %1 -> S-u-feat-TL-p1 is live; it wins over the older dead p9.
+    assert feat["tl"] == "S-u-feat-TL-p1"
+
+
+def test_reconcile_buckets_archived_members(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-w-dev-p2",
+                  window="w-dev", tmux_session="test-project",
+                  task_id="T-0001", archived="true")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    T.reconcile_teams(cfg, "test-project")
+    team = T.load_team(cfg, "test-project", "test-project")
+    assert team["archived_members"] == ["S-u-w-dev-p2"]
+    assert team["teammates"] == []
+
+
+def test_reconcile_preserves_created_at(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-operator-p3",
+                  window="operator", tmux_session="test-project", task_id="~")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    T.reconcile_teams(cfg, "test-project")
+    first = T.load_team(cfg, "test-project", "test-project")
+    created = first["created_at"]
+    T.reconcile_teams(cfg, "test-project")
+    again = T.load_team(cfg, "test-project", "test-project")
+    assert again["created_at"] == created
+
+
+def test_reconcile_survives_reload_via_disk(tmp_path, monkeypatch):
+    """The team md persists; a fresh cfg (worker reload) reads it back."""
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-operator-p3",
+                  window="operator", tmux_session="test-project", task_id="~")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    T.reconcile_teams(cfg, "test-project")
+    # Simulate reload: brand-new cfg pointed at the same data dir.
+    import types
+    cfg2 = types.SimpleNamespace(projects=cfg.projects, data_dir=cfg.data_dir, tg_bot_token="")
+    res = T.list_teams(cfg2, "test-project")
+    names = [t["name"] for t in res["teams"]]
+    assert "test-project" in names
+
+
+def test_archive_team_suspends_live_members_and_marks_archived(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
+                  window="feat-TL", tmux_session="test-project-feat",
+                  initiative="feat.md", task_id="~")
+    _seed_session(cfg, "test-project", "S-u-feat-dev-p2",
+                  window="feat-dev", tmux_session="test-project-feat", task_id="T-0001")
+    monkeypatch.setattr(
+        S, "list_panes",
+        lambda: [PaneInfo(pane_id="%2", window="feat-dev", pid="1", cwd="/x", command="claude")],
+    )
+    T.reconcile_teams(cfg, "test-project")
+
+    suspended_calls = []
+    monkeypatch.setattr(
+        S, "suspend",
+        lambda cfg, slug, sid: suspended_calls.append(sid) or {"ok": True},
+    )
+    res = T.archive_team(cfg, "test-project", "test-project-feat")
+    assert res["archived"] is True
+    # Only the live member (the dev) gets suspended.
+    assert suspended_calls == ["S-u-feat-dev-p2"]
+    team = T.load_team(cfg, "test-project", "test-project-feat")
+    assert str(team["archived"]).lower() == "true"
+
+
+def test_resurrect_team_resumes_tl_and_clears_flag(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
+                  window="feat-TL", tmux_session="test-project-feat",
+                  initiative="feat.md", task_id="~")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    T.reconcile_teams(cfg, "test-project")
+    path = T._team_file(cfg.data_dir, "test-project", "test-project-feat")
+    m = T._read_team(path)
+    m["archived"] = "true"
+    T._write_team(path, m)
+
+    monkeypatch.setattr(
+        S, "resume",
+        lambda cfg, slug, sid: {"ok": True, "sid": "S-u-feat-TL-p5"},
+    )
+    res = T.resurrect_team(cfg, "test-project", "test-project-feat")
+    assert res["tl"] == "S-u-feat-TL-p5"
+    team = T.load_team(cfg, "test-project", "test-project-feat")
+    assert str(team["archived"]).lower() == "false"

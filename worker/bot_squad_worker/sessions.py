@@ -1901,3 +1901,339 @@ def gc_stale_bindings(cfg: Any, slug: str) -> dict:
             })
 
     return {"ok": True, "scanned": scanned, "stripped": len(details), "details": details}
+
+
+def _task_status(data_dir: Path, slug: str, task_id: str) -> str | None:
+    """Return a backlog task's ``status`` frontmatter, or None if the file is gone.
+
+    Resolves ``data/<slug>/backlog/<task_id>-*.md`` (the canonical naming). A
+    missing file yields None so callers can treat "task deleted" distinctly
+    from "task closed". Parsing is the same minimal frontmatter reader the
+    rest of the worker uses.
+    """
+    backlog_dir = data_dir / slug / "backlog"
+    if not backlog_dir.exists():
+        return None
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        direct = backlog_dir / f"{task_id}.md"
+        if direct.exists():
+            matches = [direct]
+    if not matches:
+        return None
+    text = matches[0].read_text()
+    if not text.startswith("---"):
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    for line in parts[1].splitlines():
+        k, _, v = line.partition(":")
+        if k.strip() == "status":
+            return v.strip().strip('"').strip("'") or None
+    return None
+
+
+def _initiative_exists(data_dir: Path, slug: str, initiative: str) -> bool:
+    init = (initiative or "").strip()
+    if not init or init == "~":
+        return True  # nothing bound → nothing stale
+    return (data_dir / slug / "vision" / "initiatives" / init).exists()
+
+
+def gc_dead_bindings(cfg: Any, slug: str) -> dict:
+    """T-0142: clear task/initiative bindings whose target is closed or gone.
+
+    Refreshes every SessionMd's bindings against the *current* state on disk
+    (recomputed each dispatch tick, per the T-0142 DoD):
+
+      - primary ``task_id`` pointing at a backlog task that is ``closed`` or
+        whose md is missing → stripped to ``last_task_id`` (this is the live
+        symptom the stakeholder reported: suspended devs still showing the
+        old task_id in the sessions UI long after the task closed).
+      - entries in ``extra_task_ids`` for closed/missing tasks → dropped.
+      - primary ``initiative`` whose file is missing → stripped to
+        ``last_initiative``; missing entries in ``extra_initiatives`` dropped.
+
+    Bindings for ``open`` / ``in_progress`` / ``totest`` / ``reopened`` tasks
+    are left untouched — they are still meaningfully claimed. Duplicate-claim
+    races are a separate pass (``gc_stale_bindings``); this pass is about
+    *dead* targets, not contested ones.
+
+    Returns ``{"ok": True, "scanned": N, "cleared": K, "details": [...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"gc_dead_bindings: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "cleared": 0, "details": []}
+
+    data_dir = cfg.data_dir
+    user = _get_current_user()
+    user_prefix = f"S-{user}-"
+    # statuses that mean the binding is still legitimately held
+    LIVE_STATUSES = {"open", "in_progress", "totest", "reopened", "planned"}
+
+    scanned = 0
+    details: list[dict] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        if not md.stem.startswith(user_prefix):
+            continue
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        sid = meta.get("sid", md.stem)
+        changed = False
+
+        # --- primary task_id ---
+        tid = meta.get("task_id")
+        if tid and tid != "~":
+            st = _task_status(data_dir, slug, tid)
+            if st is None or st == "closed":
+                meta["last_task_id"] = tid
+                meta["task_id"] = "~"
+                meta["archive_reason"] = f"dead-binding:task-{'missing' if st is None else 'closed'}"
+                changed = True
+                details.append({"sid": sid, "cleared": tid,
+                                "reason": "missing" if st is None else "closed"})
+
+        # --- extra_task_ids ---
+        extras = [t for t in (meta.get("extra_task_ids") or []) if t and t != "~"]
+        kept_extras = []
+        for et in extras:
+            st = _task_status(data_dir, slug, et)
+            if st is None or st == "closed":
+                changed = True
+                details.append({"sid": sid, "cleared": et,
+                                "reason": "extra-missing" if st is None else "extra-closed"})
+            else:
+                kept_extras.append(et)
+        if kept_extras != extras:
+            meta["extra_task_ids"] = kept_extras
+
+        # --- primary initiative ---
+        init = meta.get("initiative")
+        if init and init != "~" and not _initiative_exists(data_dir, slug, init):
+            meta["last_initiative"] = init
+            meta["initiative"] = "~"
+            changed = True
+            details.append({"sid": sid, "cleared": init, "reason": "initiative-missing"})
+
+        # --- extra_initiatives ---
+        einits = [i for i in (meta.get("extra_initiatives") or []) if i and i != "~"]
+        kept_inits = [i for i in einits if _initiative_exists(data_dir, slug, i)]
+        if kept_inits != einits:
+            meta["extra_initiatives"] = kept_inits
+            changed = True
+
+        if changed:
+            _write_session_metadata(md, meta, atomic=True)
+
+    return {"ok": True, "scanned": scanned, "cleared": len(details), "details": details}
+
+
+def archive_dead_teammates(cfg: Any, slug: str) -> dict:
+    """T-0142/T-0144: auto-archive cleanly-delivered dev teammates.
+
+    Runs on every dispatch tick so a TL never has to manually archive a dev
+    whose work is done. Operates only on **dev-role** sessions (a TL/operator
+    is never auto-archived) under two rules:
+
+      1. **Exited + delivered.** A dev whose claude pane is gone AND whose task
+         is ``totest`` / ``closed`` / missing (or had no binding) is the clean
+         post-totest exit the stakeholder wants archived: flip
+         ``status: suspended`` + ``archived: true``, clear its task binding,
+         and best-effort kill any lingering tmux window. This makes a dev
+         *zombie impossible* (T-0144): no live pane + done ⟹ archived, never
+         left ``active`` with a stale binding.
+
+      2. **Live + verified-done.** A dev still holding a live pane whose task
+         is ``closed`` (TL-verified) is suspended (pane closed) then archived —
+         the aggressive working-set trim. We deliberately do NOT force-suspend
+         a *live* ``totest`` dev: the TL may still be iterating review with it,
+         and killing live in-progress work is the one irreversible mistake to
+         avoid. Crashed in-progress devs (pane gone, task still open) are left
+         resumable for ``gc_sessions`` to mark suspended.
+
+    Returns ``{"ok": True, "scanned": N, "archived": K, "sids": [...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"archive_dead_teammates: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "archived": 0, "sids": []}
+
+    data_dir = cfg.data_dir
+    user = _get_current_user()
+    user_prefix = f"S-{user}-"
+    live_panes = list_panes()
+    live_sids = {compute_sid(user, p.window, p.pane_id) for p in live_panes}
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    scanned = 0
+    archived: list[str] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        if not md.stem.startswith(user_prefix):
+            continue
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        if str(meta.get("archived", "")).lower() == "true":
+            continue
+        sid = meta.get("sid", md.stem)
+        role = _derive_role(
+            meta.get("window"), meta.get("task_id"), meta.get("initiative"),
+            extra_task_ids=[t for t in (meta.get("extra_task_ids") or []) if t and t != "~"],
+            extra_initiatives=[i for i in (meta.get("extra_initiatives") or []) if i and i != "~"],
+        )
+        if role != "dev":
+            continue
+
+        is_live = sid in live_sids
+        tid = meta.get("task_id")
+        has_task = bool(tid and tid != "~")
+        st = _task_status(data_dir, slug, tid) if has_task else None
+        reason = None
+        if is_live:
+            # Live dev: only trim when verified-done (task closed).
+            if has_task and st == "closed":
+                reason = "live-closed"
+        else:
+            # Exited dev: archive when delivered or orphaned.
+            if not has_task:
+                reason = "exited-no-task"
+            elif st is None:
+                reason = "exited-task-missing"
+            elif st in ("totest", "closed"):
+                reason = f"exited-{st}"
+        if reason is None:
+            continue
+
+        if is_live:
+            try:
+                suspend(cfg, slug, sid)
+            except Exception:
+                pass  # if it won't suspend, still record the archive intent
+            meta = _read_session_metadata(md) or meta
+
+        # Best-effort: kill a lingering tmux window in this team's session.
+        win = meta.get("window")
+        sess = meta.get("tmux_session") or slug
+        if win:
+            for p in live_panes:
+                if p.window == win and (p.session or slug) == sess:
+                    _run(["tmux", "kill-window", "-t", p.pane_id])
+                    break
+
+        meta["status"] = "suspended"
+        meta.setdefault("suspended_at", now)
+        if has_task:
+            meta["last_task_id"] = tid
+            meta["task_id"] = "~"
+        meta["archived"] = "true"
+        meta["archive_reason"] = f"auto-archive:{reason}"
+        _write_session_metadata(md, meta, atomic=True)
+        archived.append(sid)
+
+    return {"ok": True, "scanned": scanned, "archived": len(archived), "sids": archived}
+
+
+_WINDOW_SANITISE_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _sanitise_window(name: str) -> str:
+    """Window-name token used in SID derivation (mirrors hook_my_sid.sh)."""
+    return _WINDOW_SANITISE_RE.sub("_", (name or "").strip())
+
+
+def sync_session_name(cfg: Any, slug: str, sid: str, name: str) -> dict:
+    """T-0142: rename a session from a single source of truth (the tmux window).
+
+    The session name is one value reflected in three surfaces — the UI/sessions
+    row label, the tmux window name, and (cosmetically) the claude tab title.
+    The tmux window name is the source of truth; this action is the single
+    mutation point the UI and ``bsq team rename`` call so all surfaces stay in
+    sync within a tick.
+
+    For a **live** session, renames the tmux window (which rotates the
+    pane-derived SID), migrates the SessionMd to the new SID path, rebinds the
+    peer-bus inbox triple (T-0072), and re-reconciles the team roster. For a
+    **suspended** session (no live pane), updates the registry ``window`` field
+    in place — the rename takes visual effect immediately and the SID will
+    settle on the next resume.
+
+    Returns ``{"ok": True, "sid": <old>, "new_sid": <new>, "name": <window>}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"sync_session_name: unknown project slug {slug!r}")
+
+    clean = _sanitise_window(name)
+    if not clean:
+        raise ActionError(f"sync_session_name: invalid name {name!r}")
+
+    data_dir = cfg.data_dir
+    user = _get_current_user()
+    sessions_dir = data_dir / slug / "sessions"
+
+    # Resolve the md (SID-keyed, falling back to a claude_uuid scan for a
+    # session whose window was already renamed out from under its SID).
+    meta_file = _session_file(data_dir, slug, sid)
+    meta = _read_session_metadata(meta_file)
+    if meta is None:
+        meta_file2 = _find_session_md(sessions_dir, sid, None)
+        if meta_file2 is not None:
+            meta_file = meta_file2
+            meta = _read_session_metadata(meta_file)
+    if meta is None:
+        raise ActionError(f"sync_session_name: no metadata for SID {sid!r}")
+
+    # Find the live pane for this SID.
+    target_pane: PaneInfo | None = None
+    for pane in list_panes():
+        if compute_sid(user, pane.window, pane.pane_id) == sid:
+            target_pane = pane
+            break
+
+    if target_pane is None:
+        # Suspended/dead: display-rename only, no SID rotation.
+        meta["window"] = clean
+        _write_session_metadata(meta_file, meta)
+        return {"ok": True, "sid": sid, "new_sid": sid, "name": clean}
+
+    # Live: rename the tmux window, rotate the SID, migrate md + peer bus.
+    _run(["tmux", "rename-window", "-t", target_pane.pane_id, clean])
+    new_sid = compute_sid(user, clean, target_pane.pane_id)
+
+    meta["sid"] = new_sid
+    meta["window"] = clean
+    new_meta_file = _session_file(data_dir, slug, new_sid)
+    _write_session_metadata(new_meta_file, meta)
+    if new_sid != sid and meta_file.exists() and meta_file != new_meta_file:
+        meta_file.unlink()
+
+    if new_sid != sid:
+        try:
+            from bot_squad_worker import intersession as _is
+            _is.rebind_sid(cfg, slug, sid, new_sid)
+        except Exception:
+            pass  # peer-bus rebind is best-effort; gc will reconcile
+        try:
+            from bot_squad_worker import teams as _teams
+            _teams.reconcile_teams(cfg, slug)
+        except Exception:
+            pass
+
+    return {"ok": True, "sid": sid, "new_sid": new_sid, "name": clean}

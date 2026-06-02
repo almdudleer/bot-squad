@@ -614,6 +614,99 @@ def _action_autonomous_disable(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Autopilot actions (T-0153) — prompt-driven, time-boxed autonomous runs
+# ---------------------------------------------------------------------------
+
+_AUTOPILOT_START_REQUIRED = {"slug", "kind", "prompt"}
+_AUTOPILOT_START_ALLOWED = _AUTOPILOT_START_REQUIRED | {
+    "ref", "early_exit", "duration_hours", "stall_minutes", "watchdog_minutes", "created_by",
+}
+
+
+def _action_autopilot_start(params: dict[str, Any]) -> dict[str, Any]:
+    """Start an autopilot run for a team / session / project target.
+
+    Required params: slug, kind ("team"|"session"|"project"), prompt
+    Optional params: ref (team name / sid; defaults to slug for project),
+        early_exit, duration_hours (default 8), stall_minutes (default 60),
+        watchdog_minutes (default 5), created_by
+    Returns the autopilot handle: {ok, key, target_sid, expires_at, spawned, ...}
+    """
+    extra = set(params) - _AUTOPILOT_START_ALLOWED
+    if extra:
+        raise ActionError(f"autopilot_start got unexpected params: {sorted(extra)}")
+    missing = _AUTOPILOT_START_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"autopilot_start missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import autopilot as _ap
+    return _ap.start(
+        cfg,
+        params["slug"],
+        kind=params["kind"],
+        ref=params.get("ref", "") or "",
+        prompt=params["prompt"],
+        early_exit=params.get("early_exit", "") or "",
+        duration_hours=params.get("duration_hours", 8.0),
+        stall_minutes=params.get("stall_minutes", 60),
+        watchdog_minutes=params.get("watchdog_minutes", 5),
+        created_by=params.get("created_by", "") or "",
+    )
+
+
+_AUTOPILOT_STOP_REQUIRED = {"slug"}
+_AUTOPILOT_STOP_ALLOWED = _AUTOPILOT_STOP_REQUIRED | {"key", "target_sid", "reason", "stopped_by"}
+
+
+def _action_autopilot_stop(params: dict[str, Any]) -> dict[str, Any]:
+    """End an autopilot early.
+
+    Required params: slug, and at least one of {key, target_sid}.
+    Optional params: reason (set ⟹ early-exit met), stopped_by.
+    Returns {ok, key, status, exit_reason}.
+    """
+    extra = set(params) - _AUTOPILOT_STOP_ALLOWED
+    if extra:
+        raise ActionError(f"autopilot_stop got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("autopilot_stop missing required param: slug")
+    if not (params.get("key") or params.get("target_sid")):
+        raise ActionError("autopilot_stop needs one of: key, target_sid")
+
+    cfg = _get_config()
+    from bot_squad_worker import autopilot as _ap
+    return _ap.stop(
+        cfg,
+        params["slug"],
+        key=params.get("key"),
+        target_sid=params.get("target_sid"),
+        reason=params.get("reason", "") or "",
+        stopped_by=params.get("stopped_by", "") or "",
+    )
+
+
+_AUTOPILOT_STATUS_ALLOWED = {"slug"}
+
+
+def _action_autopilot_status(params: dict[str, Any]) -> dict[str, Any]:
+    """Return every autopilot state (active + recently ended) for a project.
+
+    Required params: slug
+    Returns {ok, slug, autopilots: [...]}.
+    """
+    extra = set(params) - _AUTOPILOT_STATUS_ALLOWED
+    if extra:
+        raise ActionError(f"autopilot_status got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("autopilot_status missing required param: slug")
+
+    cfg = _get_config()
+    from bot_squad_worker import autopilot as _ap
+    return _ap.status(cfg, params["slug"])
+
+
+# ---------------------------------------------------------------------------
 # Cross-session message bus actions (Phase 1)
 # ---------------------------------------------------------------------------
 
@@ -1474,6 +1567,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "autonomous_status": _action_autonomous_status,
     "autonomous_enable": _action_autonomous_enable,
     "autonomous_disable": _action_autonomous_disable,
+    # T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
+    "autopilot_start": _action_autopilot_start,
+    "autopilot_stop": _action_autopilot_stop,
+    "autopilot_status": _action_autopilot_status,
     "peer_send": _action_peer_send,
     "peer_inbox_read": _action_peer_inbox_read,
     "peer_inbox_wait": _action_peer_inbox_wait,
@@ -1531,6 +1628,11 @@ ACTION_MODES: dict[str, str] = {
     "autonomous_status": "coordinator_only",
     "autonomous_enable": "coordinator_only",
     "autonomous_disable": "coordinator_only",
+    # T-0153: autopilot reads/writes coordinator state (peer bus, spawn, tg,
+    # scheduler-coupled watchdog), so coordinator-only like the rest.
+    "autopilot_start": "coordinator_only",
+    "autopilot_stop": "coordinator_only",
+    "autopilot_status": "coordinator_only",
     "peer_send": "coordinator_only",
     "peer_inbox_read": "coordinator_only",
     "peer_inbox_wait": "coordinator_only",

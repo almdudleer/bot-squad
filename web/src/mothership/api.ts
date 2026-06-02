@@ -24,6 +24,8 @@
  * single-install bundle emits zero mothership code.
  */
 import type {
+  AutopilotConfig,
+  AutopilotStatus,
   CreateTaskBody,
   Project,
   ProjectApi,
@@ -488,6 +490,19 @@ export function apiFor(serverId: string): ServerApi {
           method: "POST",
           body: JSON.stringify({ from_sid: fromSid, to, text }),
         },
+      ),
+    // T-0153: autopilot — mirrors the singleton in web/src/api.ts.
+    autopilotStatus: (slug) =>
+      fwd<AutopilotStatus>(`/api/projects/${slug}/autopilot`),
+    autopilotStart: (slug, cfg: AutopilotConfig) =>
+      fwd<{ ok: boolean; key: string; target_sid: string; expires_at: string; spawned: boolean }>(
+        `/api/projects/${slug}/autopilot/start`,
+        { method: "POST", body: JSON.stringify(cfg) },
+      ),
+    autopilotStop: (slug, opts: { key?: string; target_sid?: string; reason?: string }) =>
+      fwd<{ ok: boolean; key: string; status: string; exit_reason: string }>(
+        `/api/projects/${slug}/autopilot/stop`,
+        { method: "POST", body: JSON.stringify(opts) },
       ),
   };
 }

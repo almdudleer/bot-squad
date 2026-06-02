@@ -635,6 +635,71 @@ def cmd_team_rename(args) -> None:
     print(f"renamed {args.sid} -> {res.get('new_sid')} (window {res.get('name')})")
 
 
+def cmd_autopilot_start(args) -> None:
+    slug = resolve_slug()
+    params = {"slug": slug, "kind": args.kind, "prompt": args.prompt}
+    if args.ref:
+        params["ref"] = args.ref
+    if args.early_exit:
+        params["early_exit"] = args.early_exit
+    if args.hours is not None:
+        params["duration_hours"] = args.hours
+    if args.stall is not None:
+        params["stall_minutes"] = args.stall
+    if args.watchdog is not None:
+        params["watchdog_minutes"] = args.watchdog
+    sid = my_sid()
+    if sid:
+        params["created_by"] = sid
+    res = post("autopilot_start", params, timeout=90)
+    print(f"autopilot started: key={res.get('key')} target={res.get('target_sid')}"
+          f"{' (spawned TL)' if res.get('spawned') else ''} expires={res.get('expires_at')}")
+
+
+def cmd_autopilot_stop(args) -> None:
+    slug = resolve_slug()
+    params = {"slug": slug}
+    if args.key:
+        params["key"] = args.key
+    # Default: stop the autopilot this very session is running under.
+    if not args.key:
+        sid = require_sid(args.sid)
+        params["target_sid"] = sid
+    if args.reason:
+        params["reason"] = args.reason
+    sid_for_by = my_sid()
+    if sid_for_by:
+        params["stopped_by"] = sid_for_by
+    res = post("autopilot_stop", params)
+    print(f"autopilot {res.get('status')}: key={res.get('key')}"
+          + (f" — {res.get('exit_reason')}" if res.get('exit_reason') else ""))
+
+
+def cmd_autopilot_status(args) -> None:
+    slug = resolve_slug()
+    res = post("autopilot_status", {"slug": slug})
+    autopilots = res.get("autopilots", [])
+    if args.json:
+        print(json.dumps(autopilots, indent=2))
+        return
+    if not autopilots:
+        print("(no autopilot runs)")
+        return
+    rows = [("KEY", "KIND", "TARGET", "STATUS", "PINGS", "EXPIRES")]
+    for a in autopilots:
+        rows.append((
+            a.get("key", ""),
+            a.get("kind", ""),
+            a.get("target_sid", "") or "-",
+            a.get("status", ""),
+            str(a.get("pings", 0)),
+            a.get("expires_at", "") or "-",
+        ))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+
+
 def cmd_compact(args) -> None:
     sid = require_sid(args.sid)
     res = post("inject_input", {"sid": sid, "text": "/compact"})
@@ -1154,6 +1219,27 @@ def build_parser() -> argparse.ArgumentParser:
     scn.add_argument("ticket", help="ticket id, e.g. T-0149")
     scn.add_argument("--force", action="store_true", help="overwrite an existing scenario file")
     scn.set_defaults(func=cmd_scenario_new)
+
+    # autopilot (T-0153: prompt-driven, time-boxed autonomous runs)
+    ap = sub.add_parser("autopilot", help="prompt-driven, time-boxed autonomous runs (T-0153)")
+    ap_sub = ap.add_subparsers(dest="sub", required=True)
+    aps = ap_sub.add_parser("start", help="start an autopilot run for a team/session/project")
+    aps.add_argument("kind", choices=["team", "session", "project"], help="target level")
+    aps.add_argument("prompt", help="the autopilot task prompt the TL will drive")
+    aps.add_argument("--ref", help="team name or session SID (omit for project-level)")
+    aps.add_argument("--early-exit", dest="early_exit", help="early-exit condition (TL-evaluated)")
+    aps.add_argument("--hours", type=float, help="duration in hours (default 8)")
+    aps.add_argument("--stall", type=int, help="stall threshold in minutes (default 60)")
+    aps.add_argument("--watchdog", type=int, help="watchdog cadence in minutes (default 5)")
+    aps.set_defaults(func=cmd_autopilot_start)
+    apx = ap_sub.add_parser("stop", help="end an autopilot early (TL early-exit, or operator cancel)")
+    apx.add_argument("--key", help="autopilot key (default: the run targeting this session)")
+    apx.add_argument("--reason", help="early-exit reason (set ⟹ exited; omit ⟹ stopped)")
+    apx.add_argument("--sid", help="override this session's SID (target match)")
+    apx.set_defaults(func=cmd_autopilot_stop)
+    apl = ap_sub.add_parser("status", help="list autopilot runs for this project")
+    apl.add_argument("--json", action="store_true", help="raw JSON output")
+    apl.set_defaults(func=cmd_autopilot_status)
 
     # compact
     cp = sub.add_parser("compact", help="send /compact to a session (self by default)")

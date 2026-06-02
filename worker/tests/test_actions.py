@@ -53,6 +53,8 @@ def test_registry_lists_only_allowed_actions():
         "spawn_session",
         "scheduler_state", "inject_input",
         "autonomous_status", "autonomous_enable", "autonomous_disable",
+        # T-0153: autopilot — prompt-driven, time-boxed autonomous runs.
+        "autopilot_start", "autopilot_stop", "autopilot_status",
         "peer_send", "peer_inbox_read", "peer_inbox_wait",
         "task_progress_add",
         # T-0042: atomic T-NNNN allocator.

@@ -5,6 +5,8 @@ import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
+import { RowActionsMenu } from "../components/RowActionsMenu";
+import { AutopilotDialog } from "../components/AutopilotDialog";
 import { Select, type SelectOption } from "../components/Select";
 import { MenuAction, TaskCard } from "../components/TaskCard";
 import { sessionActivity } from "../utils/sessionStatus";
@@ -186,6 +188,8 @@ export function Project() {
 
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
+  // T-0153: project-level autopilot dialog.
+  const [autopilotOpen, setAutopilotOpen] = useState(false);
 
   const reload = () => {
     api.backlog(slug).then(setTasks).catch((e) => setError(String(e)));
@@ -591,10 +595,26 @@ export function Project() {
       <ProjectOnboarding slug={slug} sessions={Object.values(sessionsBySid)} />
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Backlog</h2>
-        <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>
-          + New task
-        </button>
+        <div className="d-flex align-items-center gap-2">
+          <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>
+            + New task
+          </button>
+          {/* T-0153: project-level autopilot (spawns a TL if none is live). */}
+          <RowActionsMenu
+            actions={[
+              { label: "Autopilot…", onClick: () => setAutopilotOpen(true) },
+            ]}
+            ariaLabel="Project actions"
+          />
+        </div>
       </div>
+
+      <AutopilotDialog
+        open={autopilotOpen}
+        slug={slug}
+        target={{ kind: "project", label: slug }}
+        onClose={() => setAutopilotOpen(false)}
+      />
       <PageHelp>
         Open work for this project across four statuses. <strong>Drag</strong> a card
         to change status, <strong>click</strong> a card for full detail, or <strong>⋯</strong>

@@ -234,6 +234,25 @@ def autonomous_tick(cfg: Config) -> None:
             log.exception("autonomous_tick: unhandled error for project %s", slug)
 
 
+def autopilot_tick(cfg: Config) -> None:
+    """T-0153: per-project autopilot watchdog pass.
+
+    Walks every active autopilot run, auto-ends ones whose duration has elapsed
+    (notifying the stakeholder), and re-pings stalled targets (no commits /
+    progress notes / activity for >= the configured stall threshold). Each
+    autopilot self-throttles to its own ``watchdog_minutes`` cadence, so this
+    can safely fire every 60s. Per-project errors are caught and logged so one
+    bad project never kills the sweep.
+    """
+    from bot_squad_worker import autopilot as _ap
+
+    for slug in cfg.projects:
+        try:
+            _ap.tick(cfg, slug)
+        except Exception:
+            log.exception("autopilot_tick: unhandled error for project %s", slug)
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

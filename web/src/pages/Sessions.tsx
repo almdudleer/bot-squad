@@ -6,6 +6,7 @@ import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
+import { AutopilotDialog, type AutopilotTarget } from "../components/AutopilotDialog";
 import { Select } from "../components/Select";
 import {
   sessionActivity,
@@ -139,6 +140,10 @@ export function Sessions() {
   const [sendInfo, setSendInfo] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [meUsername, setMeUsername] = useState<string>("stakeholder");
+
+  // T-0153: autopilot dialog (kebab on a team lane or a single session row).
+  const [autopilotOpen, setAutopilotOpen] = useState(false);
+  const [autopilotTarget, setAutopilotTarget] = useState<AutopilotTarget | null>(null);
 
   // Row expansion (click-through cwd / metadata detail) and archived
   // section toggle.
@@ -337,6 +342,12 @@ export function Sessions() {
     setSendError(null);
     setSendInfo(null);
     setSendOpen(true);
+  }
+
+  // T-0153: open the autopilot dialog for a target (session / team / project).
+  function openAutopilot(target: AutopilotTarget) {
+    setAutopilotTarget(target);
+    setAutopilotOpen(true);
   }
 
   async function handleSend() {
@@ -627,6 +638,13 @@ export function Sessions() {
       acts.push({ label: "Resurrect", onClick: () => handleResume(s.sid), variant: "success" });
     }
     acts.push({ label: "Send msg", onClick: () => openSendModal(s.sid) });
+    // T-0153: per-session autopilot — hand this session a time-boxed brief.
+    if (!isSuspended) {
+      acts.push({
+        label: "Autopilot…",
+        onClick: () => openAutopilot({ kind: "session", ref: s.sid, label: s.sid }),
+      });
+    }
     acts.push({
       label: "Archive",
       onClick: () => handleArchive(s.sid),
@@ -1048,6 +1066,20 @@ export function Sessions() {
             <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.65rem", color: "var(--mc-text-dim)", marginLeft: "0.5rem" }}>
               {alive} alive · {suspended} suspended
             </span>
+            {/* T-0153: team-level autopilot — kebab on the tmux-session lane. */}
+            {!isNone && (
+              <div className="ms-auto" onClick={(e) => e.stopPropagation()}>
+                <RowActionsMenu
+                  actions={[
+                    {
+                      label: "Autopilot…",
+                      onClick: () => openAutopilot({ kind: "team", ref: key, label: `team ${key}` }),
+                    },
+                  ]}
+                  ariaLabel={`Team actions for ${key}`}
+                />
+              </div>
+            )}
           </div>
         </td>
       </tr>
@@ -1741,6 +1773,15 @@ export function Sessions() {
           />
         </div>
       </Modal>
+
+      {/* Autopilot dialog (T-0153) — team-lane or single-session target. */}
+      <AutopilotDialog
+        open={autopilotOpen}
+        slug={slug}
+        target={autopilotTarget}
+        onClose={() => setAutopilotOpen(false)}
+        onStarted={() => load()}
+      />
     </div>
   );
 }

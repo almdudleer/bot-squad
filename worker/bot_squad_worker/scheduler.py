@@ -10,6 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from bot_squad_worker.config import Config
 from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.jobs import (
+    autopilot_tick,
     autoupdate_apply_tick,
     autoupdate_tick,
     binding_gc_tick,
@@ -147,6 +148,22 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=120,
         args=[cfg],
         id="drift_check",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # autopilot_tick: T-0153 — watchdog for prompt-driven, time-boxed autopilot
+    # runs. Fires every 60s; each autopilot self-throttles to its own
+    # watchdog_minutes cadence and only re-pings once its no-progress window
+    # reaches the configured stall threshold. max_instances=1 so a long
+    # delivery never overlaps the next pass.
+    sched.add_job(
+        autopilot_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="autopilot",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

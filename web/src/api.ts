@@ -184,6 +184,47 @@ export type AutonomousState = {
   tick_log: TickLogEntry[];
 };
 
+// T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
+export type AutopilotKind = "team" | "session" | "project";
+
+export type AutopilotConfig = {
+  kind: AutopilotKind;
+  ref?: string;
+  prompt: string;
+  early_exit?: string;
+  duration_hours?: number;
+  stall_minutes?: number;
+  watchdog_minutes?: number;
+};
+
+export type AutopilotRun = {
+  key: string;
+  kind: AutopilotKind;
+  ref: string;
+  target_sid: string;
+  prompt: string;
+  early_exit: string;
+  duration_hours: number;
+  stall_minutes: number;
+  watchdog_minutes: number;
+  enabled: boolean;
+  status: "running" | "expired" | "exited" | "stopped";
+  exit_reason: string;
+  created_by: string;
+  started_at: string;
+  expires_at: string;
+  last_check_at: string | null;
+  last_ping_at: string | null;
+  pings: number;
+  log: TickLogEntry[];
+};
+
+export type AutopilotStatus = {
+  ok: boolean;
+  slug: string;
+  autopilots: AutopilotRun[];
+};
+
 export type Me = {
   username: string;
   linux_user: string;
@@ -453,6 +494,22 @@ export const api = {
     call(`/api/projects/${slug}/autonomous/disable`, { method: "POST" }),
   autonomousLog: (slug: string) =>
     call<TickLogEntry[]>(`/api/projects/${slug}/autonomous/log`),
+  // T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
+  autopilotStatus: (slug: string) =>
+    call<AutopilotStatus>(`/api/projects/${slug}/autopilot`),
+  autopilotStart: (slug: string, cfg: AutopilotConfig) =>
+    call<{ ok: boolean; key: string; target_sid: string; expires_at: string; spawned: boolean }>(
+      `/api/projects/${slug}/autopilot/start`,
+      { method: "POST", body: JSON.stringify(cfg) },
+    ),
+  autopilotStop: (
+    slug: string,
+    opts: { key?: string; target_sid?: string; reason?: string },
+  ) =>
+    call<{ ok: boolean; key: string; status: string; exit_reason: string }>(
+      `/api/projects/${slug}/autopilot/stop`,
+      { method: "POST", body: JSON.stringify(opts) },
+    ),
   peerSend: (slug: string, fromSid: string, to: string, text: string) =>
     call<{ ok: boolean; delivered_to: string[] }>(
       `/api/projects/${slug}/peer/send`,
@@ -560,4 +617,7 @@ export type ProjectApi = Pick<
   | "spawnSession"
   | "devSpawnRequest"
   | "peerSend"
+  | "autopilotStatus"
+  | "autopilotStart"
+  | "autopilotStop"
 >;

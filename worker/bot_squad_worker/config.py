@@ -28,6 +28,12 @@ class Project:
     # set, non-prod deploys run from here instead of the shared dev clone, so
     # dev-tree dirtiness stops gating deploys. None → legacy in-place behaviour.
     repo_deploy: Path | None = None
+    # T-0184: per-project opt-in to the drift-check tick (T-0149). The worker is
+    # multi-project, so an unconditional sweep nags dev sessions in EVERY project
+    # — a signal-tracker dev once got a bot-squad-style drift nag for an unrelated
+    # ticket. Only projects that explicitly set ``drift_enforcement = true`` get
+    # the tick; everyone else is left alone. Default False = safe (opt-in).
+    drift_enforcement: bool = False
 
     def repo_for_target(self, target: str) -> Path:
         """Pick the clone the deploy recipe EXECUTES in for ``target``.
@@ -85,6 +91,7 @@ class Project:
             ),
             repo_master=Path(raw["repo_master"]) if raw.get("repo_master") else None,
             repo_deploy=Path(raw["repo_deploy"]) if raw.get("repo_deploy") else None,
+            drift_enforcement=bool(raw.get("drift_enforcement", False)),
         )
 
 

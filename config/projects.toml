@@ -64,5 +64,10 @@ deploy_targets = ["staging", "prod"]
 # poller (T-0083) and apply (T-0084) short-circuit when this is true so the
 # mothership never tries to consume its own releases. See T-0086.
 mothership    = true
+# T-0184: opt this project into the drift-check tick (T-0149). The worker is
+# multi-project; without this gate the tick nagged dev sessions in EVERY project
+# (a signal-tracker dev once got a drift nag for an unrelated ticket). bot-squad
+# is the only project that opts in today — others stay off by default.
+drift_enforcement = true
 tg_chat       = "404580642"
 created_at    = 2026-05-14

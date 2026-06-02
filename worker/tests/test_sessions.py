@@ -17,6 +17,7 @@ from bot_squad_worker.sessions import (
     list_sessions,
     pause,
     resume,
+    set_drift_paused,
     spawn,
     _read_session_metadata,
     _write_session_metadata,
@@ -2056,6 +2057,66 @@ def test_session_history_appended_on_bind_task(tmp_path, monkeypatch):
     bind_task(cfg, "test-project", "S-alice-w-p2", "T-0093")
 
     assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+
+def test_bind_task_refuses_constant_team_session(tmp_path, monkeypatch):
+    """T-0185: a constant-team / queue-consumer session must never be assigned a
+    single-ticket binding (the p38 mis-bind that triggered false drift nags)."""
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.sessions import bind_task
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    (backlog / "T-0176-sid-redesign.md").write_text(
+        "---\nid: T-0176\ntitle: SID redesign\nstatus: in_progress\n---\n\nbody\n"
+    )
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # A constant-team triage session: owner=constant-team, NO primary task_id.
+    _write_session_metadata(sessions_dir / "S-alice-feedback-p38.md", {
+        "sid": "S-alice-feedback-p38",
+        "status": "active",
+        "window": "user-feedback",
+        "cwd": str(repo),
+        "claude_uuid": "u-38",
+        "task_id": "~",
+        "owner": "constant-team",
+        "initiative": "user-feedback.md",
+    })
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+
+    with pytest.raises(ActionError) as excinfo:
+        bind_task(cfg, "test-project", "S-alice-feedback-p38", "T-0176")
+    assert "constant-team" in str(excinfo.value)
+
+
+def test_set_drift_paused_round_trip(tmp_path, monkeypatch):
+    """T-0184: set_drift_paused toggles the drift_paused flag on the SessionMd."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    md = sessions_dir / "S-alice-w-p2.md"
+    _write_session_metadata(md, {
+        "sid": "S-alice-w-p2", "status": "active", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
+    })
+
+    res = set_drift_paused(cfg, "test-project", "S-alice-w-p2", True)
+    assert res["ok"] and res["drift_paused"] is True
+    assert _read_session_metadata(md).get("drift_paused") in (True, "true", "True")
+
+    res = set_drift_paused(cfg, "test-project", "S-alice-w-p2", False)
+    assert res["drift_paused"] is False
+    assert "drift_paused" not in _read_session_metadata(md)
 
 
 def test_session_history_rotates_on_resume(tmp_path, monkeypatch):

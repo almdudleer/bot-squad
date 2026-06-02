@@ -28,6 +28,18 @@ entry and submits once. A per-session ``drift_checked_at`` cooldown
 Kill switch: ``BOT_SQUAD_DRIFT_MINUTES=0`` disables the tick entirely. The
 tick targets only ``role: dev`` sessions by default to bound blast radius;
 coordinators (TL/operator) self-manage.
+
+T-0184 (per-project opt-in + per-session off-ramp): the worker is multi-project,
+so an unconditional sweep nagged dev sessions in EVERY project — a signal-tracker
+dev once received a bot-squad-style nag for an unrelated ticket (T-0034). Two
+guards now bound the blast radius:
+  * **Per-project**: only projects with ``drift_enforcement = true`` in
+    ``config/projects.toml`` are swept. Bot-squad opts in; others stay off.
+  * **Per-session**: a session can silence itself with ``bsq drift off`` (sets
+    ``drift_paused: true`` in its SessionMd); the tick skips paused sessions.
+Two structural guards also suppress *meaningless* nags (T-0185): constant-team /
+queue-consumer sessions (no single-ticket DoD to re-anchor to) are skipped, and
+a session is only nagged about a ticket whose initiative matches its own.
 """
 from __future__ import annotations
 
@@ -47,6 +59,48 @@ _WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _JSONL_TAIL_LINES = 150
 _SUPERPOWERS_RE = re.compile(r"\.claude/superpowers/|/superpowers/")
 _AUTOMATION_RE = re.compile(r"\.mjs$|\.spec\.|\.test\.|playwright", re.IGNORECASE)
+
+# T-0185: constant-team / queue-consumer sessions are stamped with this owner at
+# spawn (constant_teams._spawn_member). They consume a line-queue and have no
+# single-ticket DoD, so a "you drifted from ticket X" nag is structurally
+# meaningless for them — skip them entirely.
+_CONSTANT_TEAM_OWNER = "constant-team"
+
+# T-0184: appended to every drift reminder so the user always has an obvious
+# off-ramp. ``bsq drift off`` sets ``drift_paused: true`` on the SessionMd.
+_OFF_RAMP_FOOTER = (
+    "\n\n(Off-ramp: silence drift checks for THIS session with `bsq drift off` — "
+    "re-enable later with `bsq drift on`.)"
+)
+
+
+def _initiative_stem(value: str | None) -> str:
+    """Normalise an initiative ref (``foo.md`` / ``foo`` / ``~``) to its bare stem."""
+    v = (value or "").strip()
+    if not v or v == "~":
+        return ""
+    return v[:-3] if v.endswith(".md") else v
+
+
+def _is_constant_team(row: dict, const_stems: set[str]) -> bool:
+    """True when a session is a constant-team / queue-consumer (not a single-ticket dev).
+
+    Two independent signals (either suffices): the ``owner: constant-team`` stamp
+    written at spawn (constant_teams._spawn_member), or a primary/extra initiative
+    that is flagged ``constant_team: true``. Both are checked so a session whose
+    owner stamp was lost still gets recognised by its initiative, and vice-versa.
+    """
+    if str(row.get("owner") or "") == _CONSTANT_TEAM_OWNER:
+        return True
+    inits = [row.get("initiative")] + list(row.get("extra_initiatives") or [])
+    return any(_initiative_stem(i) in const_stems for i in inits if _initiative_stem(i))
+
+
+def _truthy(value: Any) -> bool:
+    """Accept YAML/JSON-ish truthy values from SessionMd frontmatter."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
 def _minutes_env(name: str, default: int) -> int:
@@ -158,21 +212,24 @@ def _classify(cfg: Any, slug: str, task_id: str, title: str, stale_min: int,
                 f"ALL task tracking goes on bot-squad ticket {task_id}: use "
                 f"`bsq ticket note {task_id} <text>` for progress; in-session todos "
                 f"only for sub-steps. Re-anchor to the ticket DoD now. If the write "
-                f"was intentional, record why with `bsq ticket note {task_id}`.")
+                f"was intentional, record why with `bsq ticket note {task_id}`."
+                + _OFF_RAMP_FOOTER)
     if any(_AUTOMATION_RE.search(t) for t in targets) and not _scenario_exists(cfg, slug, task_id):
         return ("automation",
                 f"⚠️ DRIFT CHECK (T-0158, enforced): you appear to be writing "
                 f"automation/test code before a manual walkthrough of {task_id}. "
                 f"Order is: write the scenario (`bsq scenario new {task_id}`), walk it "
                 f"through MANUALLY observing the real result, THEN automate. Do the "
-                f"manual pass first.")
+                f"manual pass first."
+                + _OFF_RAMP_FOOTER)
     if stale_min >= drift_minutes():
         return ("stale",
                 f"⚠️ DRIFT CHECK (T-0149, enforced): ~{stale_min}min since you last "
                 f"updated ticket {task_id} ({title}). Re-read its DoD. Are you still on "
                 f"the original task, or have you drifted/deferred something? Log "
                 f"progress with `bsq ticket note {task_id} <text>`, or note explicitly "
-                f"why you deferred. Don't lose the thread.")
+                f"why you deferred. Don't lose the thread."
+                + _OFF_RAMP_FOOTER)
     return (None, "")
 
 
@@ -190,6 +247,11 @@ def drift_check(cfg: Any, slug: str) -> dict:
     project = cfg.projects.get(slug)
     if project is None:
         raise ActionError(f"drift_check: unknown project slug {slug!r}")
+    # T-0184: per-project opt-in. The worker sweeps every project; without this
+    # gate a dev session in a non-opted-in project (e.g. signal-tracker) gets
+    # nagged about its ticket. Only projects that explicitly opt in are enforced.
+    if not getattr(project, "drift_enforcement", False):
+        return {"ok": True, "skipped": "drift_enforcement_off", "nudged": []}
 
     user_home = os.path.expanduser("~")
     backlog_dir = cfg.data_dir / slug / "backlog"
@@ -208,12 +270,28 @@ def drift_check(cfg: Any, slug: str) -> dict:
     user = S._get_current_user()
     panes = {S.compute_sid(user, p.window, p.pane_id): p for p in S.list_panes()}
 
+    # T-0185: initiative stems flagged ``constant_team: true`` — a session bound
+    # to one of these (or stamped ``owner: constant-team``) is a queue consumer,
+    # not a single-ticket dev. Resolved once per project.
+    try:
+        from bot_squad_worker.constant_teams import constant_team_stems
+        const_stems = constant_team_stems(cfg, slug)
+    except Exception:
+        log.exception("drift_check: constant_team_stems failed for %s", slug)
+        const_stems = set()
+
     nudged: list[dict] = []
     for row in rows:
         if row.get("status") != "active":
             continue
         if row.get("role") != "dev":
             continue  # coordinators self-manage; bound blast radius
+        # T-0185: a constant-team / queue-consumer session has no single-ticket
+        # DoD to re-anchor to, so a "you drifted from ticket X" nag is
+        # structurally meaningless — and the ticket it carries is usually a
+        # mis-bind (p38 carried an unrelated unassigned T-0176). Skip it.
+        if _is_constant_team(row, const_stems):
+            continue
         task_id = row.get("task_id")
         if not task_id or task_id == "~":
             continue
@@ -227,15 +305,36 @@ def drift_check(cfg: Any, slug: str) -> dict:
         if pane is None:
             continue
 
+        # T-0184: per-session off-ramp. ``bsq drift off`` stamps ``drift_paused:
+        # true`` on the SessionMd; honour it so a user temporarily on something
+        # else (or a session that opted out) is left alone. Read the md once and
+        # reuse it below for the cooldown stamp.
+        md_path = S._find_session_md(sessions_dir, sid, row.get("claude_uuid"))
+        meta = S._read_session_metadata(md_path) if md_path else None
+        if meta is not None and _truthy(meta.get("drift_paused")):
+            continue
+
         matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
         if not matches:
             continue
         ticket_path = matches[0]
         title = ""
+        ticket_initiative = ""
         fm = re.match(r"\A---\n(.*?)\n---\n", ticket_path.read_text(errors="replace"), re.DOTALL)
         if fm:
             tm = re.search(r"^title:\s*(.+)$", fm.group(1), re.MULTILINE)
             title = tm.group(1).strip() if tm else ""
+            im = re.search(r"^initiative:\s*(.+)$", fm.group(1), re.MULTILINE)
+            ticket_initiative = _initiative_stem(im.group(1) if im else "")
+
+        # T-0185: only nag about a ticket whose initiative matches the session's.
+        # The p38 incident was a feedback-initiative session nagged about a ticket
+        # from operator-ux-and-session-mgmt — a cross-initiative mis-bind. Guard is
+        # conservative: only skip when BOTH initiatives are known AND they differ,
+        # so legacy sessions/tickets with no initiative are never falsely silenced.
+        session_initiative = _initiative_stem(row.get("initiative"))
+        if ticket_initiative and session_initiative and ticket_initiative != session_initiative:
+            continue
 
         last_touch = _ticket_last_touch(ticket_path) or _parse_iso(row.get("started_at")) or now
         stale_min = int((now - last_touch) / 60)
@@ -247,9 +346,8 @@ def drift_check(cfg: Any, slug: str) -> dict:
         if signal is None:
             continue
 
-        # Cooldown: read drift_checked_at from the SessionMd.
-        md_path = S._find_session_md(sessions_dir, sid, row.get("claude_uuid"))
-        meta = S._read_session_metadata(md_path) if md_path else None
+        # Cooldown: read drift_checked_at from the SessionMd (md/meta already
+        # resolved above for the drift_paused check).
         last_check = _parse_iso((meta or {}).get("drift_checked_at"))
         if last_check is not None and (now - last_check) < cooldown:
             continue

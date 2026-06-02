@@ -1598,6 +1598,19 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     if meta is None:
         raise ActionError(f"bind_task: no session metadata for SID {sid!r}")
 
+    # T-0185: a constant-team / queue-consumer session must never carry a
+    # single-ticket binding — it consumes a line-queue and has no single-ticket
+    # DoD, so a bound ticket is meaningless (and triggers false drift nags). The
+    # p38 incident wired an unrelated unassigned ticket onto a feedback-triage
+    # session; refuse the bind outright with a clear error rather than the
+    # generic "not a dev session" below. (defence-in-depth: drift.py also skips
+    # these, so even a binding that slips in via another path won't nag.)
+    if str(meta.get("owner") or "") == "constant-team":
+        raise ActionError(
+            f"bind_task: session {sid!r} is a constant-team/queue-consumer "
+            f"(owner=constant-team) — single-ticket bindings are not allowed"
+        )
+
     primary = meta.get("task_id")
     if not primary or primary == "~":
         raise ActionError(f"bind_task: session {sid!r} is not a dev session (no primary task_id)")
@@ -1678,6 +1691,38 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         pass
 
     return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras}
+
+
+def set_drift_paused(cfg: Any, slug: str, sid: str, paused: bool) -> dict:
+    """T-0184: per-session off-ramp for the drift-check tick (T-0149).
+
+    ``bsq drift off`` sets ``drift_paused: true`` on the SessionMd; ``bsq drift
+    on`` clears it. ``drift.drift_check`` reads this flag and skips paused
+    sessions. Resolves the md by SID with the rename-tolerant claude_uuid
+    fallback so a window-renamed session can still pause itself. Idempotent.
+
+    Returns ``{ok, sid, drift_paused}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"set_drift_paused: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    md_path = _find_session_md(sessions_dir, sid, None)
+    if md_path is None:
+        raise ActionError(f"set_drift_paused: no session metadata for SID {sid!r}")
+    meta = _read_session_metadata(md_path)
+    if meta is None:
+        raise ActionError(f"set_drift_paused: unreadable session metadata for SID {sid!r}")
+
+    if paused:
+        meta["drift_paused"] = True
+    else:
+        meta.pop("drift_paused", None)
+    _write_session_metadata(md_path, meta, atomic=True)
+    return {"ok": True, "sid": meta.get("sid", sid), "drift_paused": bool(paused)}
 
 
 def archive_session(cfg: Any, slug: str, sid: str) -> dict:

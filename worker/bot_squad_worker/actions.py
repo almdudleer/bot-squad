@@ -1336,6 +1336,32 @@ def _action_bind_task(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.bind_task(cfg, params["slug"], params["sid"], params["task_id"])
 
 
+_SET_DRIFT_PAUSED_REQUIRED = {"slug", "sid", "paused"}
+_SET_DRIFT_PAUSED_ALLOWED = _SET_DRIFT_PAUSED_REQUIRED
+
+
+def _action_set_drift_paused(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0184: pause/resume the drift-check tick for a single session.
+
+    Required params: slug, sid, paused (bool). Returns {ok, sid, drift_paused}.
+    Backs ``bsq drift off`` / ``bsq drift on`` — the per-session off-ramp for
+    the drift reminder. ``tmux_only`` so a dev session can silence itself via
+    the user-worker without coordinator privileges.
+    """
+    extra = set(params) - _SET_DRIFT_PAUSED_ALLOWED
+    if extra:
+        raise ActionError(f"set_drift_paused got unexpected params: {sorted(extra)}")
+    missing = _SET_DRIFT_PAUSED_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"set_drift_paused missing required params: {sorted(missing)}")
+    if not isinstance(params["paused"], bool):
+        raise ActionError("set_drift_paused: 'paused' must be a boolean")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.set_drift_paused(cfg, params["slug"], params["sid"], params["paused"])
+
+
 _BIND_INITIATIVE_REQUIRED = {"slug", "sid", "initiative"}
 _BIND_INITIATIVE_ALLOWED = _BIND_INITIATIVE_REQUIRED
 
@@ -1912,6 +1938,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "initiative_new": _action_initiative_new,
     "bind_task": _action_bind_task,
     "bind_initiative": _action_bind_initiative,
+    # T-0184: per-session drift-check off-ramp (bsq drift on/off).
+    "set_drift_paused": _action_set_drift_paused,
     "unbind_task": _action_unbind_task,
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
@@ -1980,6 +2008,10 @@ ACTION_MODES: dict[str, str] = {
     "initiative_new": "coordinator_only",
     "bind_task": "coordinator_only",
     "bind_initiative": "coordinator_only",
+    # T-0184: a dev session silences its OWN drift checks via the user-worker —
+    # it writes only its own SessionMd frontmatter (filesystem-local), so
+    # tmux_only (no coordinator privilege required).
+    "set_drift_paused": "tmux_only",
     "unbind_task": "coordinator_only",
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",

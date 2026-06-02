@@ -1393,6 +1393,40 @@ def cmd_compact(args) -> None:
     print(f"/compact sent to {sid} (pane {res.get('pane_id')})")
 
 
+def sessions_dir(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "sessions"
+
+
+def _set_drift_paused(args, paused: bool) -> None:
+    """Toggle the per-session drift off-ramp (T-0184)."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    res = post("set_drift_paused", {"slug": slug, "sid": sid, "paused": paused})
+    state = "OFF (paused)" if res.get("drift_paused") else "ON (active)"
+    print(f"drift checks for {res.get('sid', sid)}: {state}")
+
+
+def cmd_drift_off(args) -> None:
+    _set_drift_paused(args, True)
+
+
+def cmd_drift_on(args) -> None:
+    _set_drift_paused(args, False)
+
+
+def cmd_drift_status(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    md = sessions_dir(slug) / f"{sid}.md"
+    paused = False
+    if md.exists():
+        fm = read_frontmatter(md)
+        paused = str(fm.get("drift_paused", "")).strip().lower() in {"true", "1", "yes", "on"}
+    else:
+        print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
+    print(f"drift checks for {sid}: {'OFF (paused)' if paused else 'ON (active)'}")
+
+
 def cmd_commit(args) -> None:
     if not args.files:
         die("commit needs explicit file paths (never wide-add)")
@@ -2321,6 +2355,25 @@ def build_parser() -> argparse.ArgumentParser:
     tpo.add_argument("--apply", action="store_true",
                      help="delete the orphan team files (GATED — default is a dry-run preview)")
     tpo.set_defaults(func=cmd_team_prune_orphans)
+
+    # drift (T-0184: per-session off-ramp for the drift-check tick, T-0149)
+    dr = sub.add_parser("drift", help="silence/restore the drift-check nag for THIS session (T-0184)")
+    dr_sub = dr.add_subparsers(dest="sub", required=True)
+    dro = dr_sub.add_parser("off", help="pause drift checks for this session")
+    dro.add_argument("--sid", help="target SID (default: this session)")
+    dro.set_defaults(func=cmd_drift_off)
+    drp = dr_sub.add_parser("pause", help="alias for 'off'")
+    drp.add_argument("--sid", help="target SID (default: this session)")
+    drp.set_defaults(func=cmd_drift_off)
+    dron = dr_sub.add_parser("on", help="re-enable drift checks for this session")
+    dron.add_argument("--sid", help="target SID (default: this session)")
+    dron.set_defaults(func=cmd_drift_on)
+    drr = dr_sub.add_parser("resume", help="alias for 'on'")
+    drr.add_argument("--sid", help="target SID (default: this session)")
+    drr.set_defaults(func=cmd_drift_on)
+    drs = dr_sub.add_parser("status", help="show whether drift checks are paused for this session")
+    drs.add_argument("--sid", help="target SID (default: this session)")
+    drs.set_defaults(func=cmd_drift_status)
 
     # guidance (T-0151: surface buried stakeholder guidance)
     gd = sub.add_parser("guidance", help="search prior stakeholder guidance (T-0151)")

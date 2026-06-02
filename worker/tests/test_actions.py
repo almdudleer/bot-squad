@@ -65,6 +65,8 @@ def test_registry_lists_only_allowed_actions():
         "doc_new", "uc_new", "flow_new", "initiative_new",
         # Phase 9: bind multi-task-per-dev / multi-initiative-per-TL.
         "bind_task", "bind_initiative",
+        # T-0184: per-session drift-check off-ramp (bsq drift on/off).
+        "set_drift_paused",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
         "unbind_task", "unbind_initiative",
         "archive_session", "unarchive_session",

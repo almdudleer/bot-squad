@@ -176,6 +176,62 @@ h1, h2, h3, h4, h5, h6 {
 .mc-sidebar-section::before { content: "[ "; }
 .mc-sidebar-section::after  { content: " ]"; }
 
+/* ---- Sidebar: MORE collapsible drawer (T-0140) ----------- */
+/* The MORE toggle reuses the section-header look (a `<button>` styled like
+   `.mc-sidebar-section`) but adds a caret + interactive affordances. */
+.mc-sidebar-more-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--mc-border);
+  text-align: left;
+  cursor: pointer;
+}
+.mc-sidebar-more-toggle:hover {
+  color: var(--mc-amber-bright);
+}
+.mc-sidebar-more-caret {
+  font-size: 0.7rem;
+  line-height: 1;
+  opacity: 0.8;
+}
+/* Sub-group labels inside the drawer (attachment / mothership): quieter than
+   a full section header — no brackets, dimmer, smaller. */
+.mc-sidebar-more-sub {
+  padding: 0.6rem 1rem 0.2rem;
+  font-family: var(--mc-mono);
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--mc-text-faint);
+}
+.mc-sidebar-more-picker {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem 0.25rem;
+}
+.mc-sidebar-more-picker-label {
+  font-family: var(--mc-mono);
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--mc-text-faint);
+}
+/* Footer worker-health pill (relocated from ATTACHMENT, T-0140). */
+.mc-sidebar-footer-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-family: var(--mc-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+
 /* ---- Sidebar: project info ------------------------------- */
 .mc-sidebar-project {
   padding: 0.5rem 1rem 0.75rem;

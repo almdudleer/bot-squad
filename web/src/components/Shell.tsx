@@ -11,6 +11,9 @@ import {
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
+// T-0140: remember whether the collapsed "MORE" drawer (rarely-used server /
+// attachment / mothership surfaces) is expanded, so the choice survives reloads.
+const MORE_OPEN_KEY = "bot-squad:sidebar-more-open";
 
 // T-0089: the autoupdate pill is consumer-side only — Vite inlines this
 // constant so the mothership bundle tree-shakes the component import away.
@@ -51,6 +54,14 @@ export function Shell() {
   // falls back to is_admin. Drop the fallback once users-model-split lands.
   const [isSuperAdmin, setIsSuperAdmin] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // T-0140: collapsed-by-default "MORE" drawer.
+  const [moreOpen, setMoreOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(MORE_OPEN_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   // T-0060: which server the SERVER section + (later) ATTACHMENT scope
   // belongs to. Only meaningful on mothership; on detach the single
   // installation is implicit and the picker isn't rendered.
@@ -142,6 +153,18 @@ export function Shell() {
       .catch(() => (window.location.href = "/login"));
   }
 
+  function toggleMore() {
+    setMoreOpen((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(MORE_OPEN_KEY, next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }
+
   // The ONLY way to unpin (other than sign-out).
   function unpinProject() {
     try {
@@ -192,8 +215,8 @@ export function Shell() {
         </div>
 
         {/* GLOBAL — per-user cross-server (T-0059). Audience: every logged-in
-            user, regardless of which server they're attached to. See
-            vision/multi-server/nav-restructure.md for the locked scope. */}
+            user, regardless of which server they're attached to. T-0140 drops
+            the decorative per-item diamond glyphs to cut sidebar noise. */}
         <div className="mc-sidebar-section">GLOBAL</div>
         <ul className="mc-sidebar-nav">
           <li>
@@ -203,7 +226,6 @@ export function Shell() {
               data-onboarding-anchor="all-projects-nav"
               className={({ isActive }) => (isActive ? "active" : undefined)}
             >
-              <span className="mc-nav-diamond">◇</span>
               ALL PROJECTS
             </NavLink>
           </li>
@@ -212,7 +234,6 @@ export function Shell() {
               to="/me"
               className={({ isActive }) => (isActive ? "active" : undefined)}
             >
-              <span className="mc-nav-diamond">◇</span>
               MY PROFILE
             </NavLink>
           </li>
@@ -222,7 +243,6 @@ export function Shell() {
               data-onboarding-anchor="help-nav"
               className={({ isActive }) => (isActive ? "active" : undefined)}
             >
-              <span className="mc-nav-diamond">◇</span>
               HELP
             </NavLink>
           </li>
@@ -245,7 +265,6 @@ export function Shell() {
                   end
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
                   BOARD
                 </NavLink>
               </li>
@@ -254,7 +273,6 @@ export function Shell() {
                   to={`/p/${slug}/vision`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
                   ROADMAP
                 </NavLink>
               </li>
@@ -263,7 +281,6 @@ export function Shell() {
                   to={`/p/${slug}/feedback`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
                   USER FEEDBACK
                 </NavLink>
               </li>
@@ -272,7 +289,6 @@ export function Shell() {
                   to={`/p/${slug}/workflow`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◆</span>
                   WORKFLOW
                 </NavLink>
               </li>
@@ -289,7 +305,6 @@ export function Shell() {
                   data-onboarding-anchor="sessions-nav"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">▸</span>
                   AGENT SESSIONS
                 </NavLink>
               </li>
@@ -298,7 +313,6 @@ export function Shell() {
                   to={`/p/${slug}/runs`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">▸</span>
                   DEPLOYMENT QUEUE
                 </NavLink>
               </li>
@@ -308,159 +322,152 @@ export function Shell() {
           </>
         )}
 
-        {/* SERVER — installation-level scope (T-0060 + T-0065). On
-            mothership the header carries a ▾ picker; on detach there's
-            only one server so we render a plain "[ SERVER ]" header
-            (matches today's SYSTEM look). The picker ternary is a
-            literal-known constant (IS_MOTHERSHIP_BUILD ? lazy : null),
-            so Vite folds the false branch + tree-shakes the Suspense
-            wrapper out of the detach bundle. */}
-        {ServerPicker ? (
-          <div className="mc-sidebar-section mc-sidebar-section-row">
-            <span>SERVER</span>
-            <Suspense fallback={<span className="mc-srv-picker-loading">▾ …</span>}>
-              <ServerPicker
-                currentServerId={null}
-                onChange={setPickedServerId}
-              />
-            </Suspense>
-          </div>
-        ) : (
-          <div className="mc-sidebar-section">SERVER</div>
-        )}
-        <ul className="mc-sidebar-nav" data-picked-server-id={pickedServerId ?? ""}>
-          <li>
-            <NavLink
-              to="/scheduler"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
+        {/* MORE — T-0140. The server/attachment/mothership scopes were three
+            always-expanded sections (~10 rarely-used rows) that the stakeholder
+            flagged as the bulk of the sidebar's clutter. They now collapse
+            behind one default-collapsed drawer; the daily-driver GLOBAL +
+            Project nav above stays one click away. The operational-status pill
+            moved to the footer so worker health is never hidden by the collapse. */}
+        <button
+          type="button"
+          className={`mc-sidebar-section mc-sidebar-more-toggle${moreOpen ? " open" : ""}`}
+          aria-expanded={moreOpen}
+          onClick={toggleMore}
+        >
+          MORE
+          <span className="mc-sidebar-more-caret" aria-hidden="true">
+            {moreOpen ? "▾" : "▸"}
+          </span>
+        </button>
+        {moreOpen && (
+          <div className="mc-sidebar-more">
+            {/* SERVER scope. On mothership the picker selects which server the
+                rows below + ATTACHMENT pages scope to (T-0060); tree-shaken on
+                detach via the IS_MOTHERSHIP_BUILD literal gate. */}
+            {ServerPicker && (
+              <div className="mc-sidebar-more-picker">
+                <span className="mc-sidebar-more-picker-label">SERVER</span>
+                <Suspense
+                  fallback={<span className="mc-srv-picker-loading">▾ …</span>}
+                >
+                  <ServerPicker
+                    currentServerId={null}
+                    onChange={setPickedServerId}
+                  />
+                </Suspense>
+              </div>
+            )}
+            <ul
+              className="mc-sidebar-nav"
+              data-picked-server-id={pickedServerId ?? ""}
             >
-              <span className="mc-nav-diamond">◇</span>
-              SCHEDULER
-            </NavLink>
-          </li>
-          {/* T-0087: mothership-only Releases tab. Vite inlines the
-              VITE_MOTHERSHIP literal so this entire <li> is tree-shaken
-              from detached single-install bundles — same posture as the
-              AutoupdatePill gate above and the /m/* route below. */}
-          {IS_MOTHERSHIP_BUILD && (
-            <li>
-              <NavLink
-                to="/m/releases"
-                data-onboarding-anchor="releases-nav"
-                className={({ isActive }) => (isActive ? "active" : undefined)}
-              >
-                <span className="mc-nav-diamond">◇</span>
-                RELEASES
-              </NavLink>
-            </li>
-          )}
-          {/* T-0055: SERVERS nav removed — the unified all-projects view at
-              "/" hosts the +Add server affordance inline on mothership builds.
-              T-0060: SERVER>users + SERVER>settings are server-local
-              (auth.toml on the picked server). Until cross-server admin
-              endpoints land (T-0068 plumbing), they route to the existing
-              single-install /users + /system-settings on the local server. */}
-          {isAdmin && (
-            <>
               <li>
                 <NavLink
-                  to="/users"
+                  to="/scheduler"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  <span className="mc-nav-diamond">◇</span>
-                  USERS
+                  SCHEDULER
                 </NavLink>
               </li>
-              <li>
-                <NavLink
-                  to="/system-settings"
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  <span className="mc-nav-diamond">◇</span>
-                  SETTINGS
-                </NavLink>
-              </li>
-            </>
-          )}
-        </ul>
-
-        {/* ATTACHMENT — per-user-per-server (T-0061 + T-0063). Scoped to
-            the currently-picked SERVER (T-0060) via SERVER_PICKER_STORAGE_KEY
-            which each child page reads (Shell stays presentation-only). The
-            operational-status pill lives as the section's chrome row (it
-            belongs to this scope per T-0063); the nav rows below come from
-            ``attachmentSidebarItems()`` so the locked-spec order has a
-            single source of truth shared with vitest. */}
-        <div className="mc-sidebar-section">ATTACHMENT</div>
-        <ul className="mc-sidebar-nav" aria-live="polite">
-          <li
-            className="mc-sidebar-attachment-status"
-            data-onboarding-anchor="operational-status"
-          >
-            <span className={workerPaint.dotClass} />
-            <span style={{ color: workerPaint.color }}>{workerPaint.label}</span>
-          </li>
-          {attachmentSidebarItems().map((item) => (
-            <li key={item.key}>
-              <NavLink
-                to={item.to}
-                data-onboarding-anchor={item.onboardingAnchor}
-                className={({ isActive }) => (isActive ? "active" : undefined)}
-              >
-                <span className="mc-nav-diamond">◇</span>
-                {item.label}
-              </NavLink>
-            </li>
-          ))}
-        </ul>
-
-        {/* MOTHERSHIP — super-admin only on mothership builds (T-0062).
-            VITE_MOTHERSHIP=0 builds tree-shake the whole block out via the
-            literal gate. On detach, the contract says MOTHERSHIP "GONE
-            entirely" — that's what this conditional + the import gate above
-            achieve together. The /m/users page + /api/m/users + the install-
-            tokens sub-table are deferred (BE owned by Bundle B's users-model
-            split; the mothership route table is owned by Bundle E this
-            sprint). For now /m/users falls through to the wildcard NotFound
-            until those land; /m/servers/add reaches the existing wizard. */}
-        {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
-          <>
-            <div className="mc-sidebar-section">MOTHERSHIP</div>
-            <ul className="mc-sidebar-nav">
-              <li>
-                <NavLink
-                  to="/m/users"
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  <span className="mc-nav-diamond">◇</span>
-                  ALL USERS
-                </NavLink>
-              </li>
-              <li>
-                <NavLink
-                  to="/"
-                  end
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  <span className="mc-nav-diamond">◇</span>
-                  ATTACHED SERVERS
-                </NavLink>
-              </li>
-              <li>
-                <NavLink
-                  to="/m/servers/add"
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  <span className="mc-nav-diamond">◇</span>
-                  + ADD SERVER
-                </NavLink>
-              </li>
+              {IS_MOTHERSHIP_BUILD && (
+                <li>
+                  <NavLink
+                    to="/m/releases"
+                    data-onboarding-anchor="releases-nav"
+                    className={({ isActive }) => (isActive ? "active" : undefined)}
+                  >
+                    RELEASES
+                  </NavLink>
+                </li>
+              )}
+              {isAdmin && (
+                <>
+                  <li>
+                    <NavLink
+                      to="/users"
+                      className={({ isActive }) => (isActive ? "active" : undefined)}
+                    >
+                      USERS
+                    </NavLink>
+                  </li>
+                  <li>
+                    <NavLink
+                      to="/system-settings"
+                      className={({ isActive }) => (isActive ? "active" : undefined)}
+                    >
+                      SETTINGS
+                    </NavLink>
+                  </li>
+                </>
+              )}
             </ul>
-          </>
+
+            {/* ATTACHMENT — per-user-per-server (T-0061). Locked-order rows
+                from attachmentSidebarItems(); the status pill moved to the
+                footer (T-0140). */}
+            <div className="mc-sidebar-more-sub">attachment</div>
+            <ul className="mc-sidebar-nav" aria-live="polite">
+              {attachmentSidebarItems().map((item) => (
+                <li key={item.key}>
+                  <NavLink
+                    to={item.to}
+                    data-onboarding-anchor={item.onboardingAnchor}
+                    className={({ isActive }) => (isActive ? "active" : undefined)}
+                  >
+                    {item.label}
+                  </NavLink>
+                </li>
+              ))}
+            </ul>
+
+            {/* MOTHERSHIP — super-admin only on mothership builds (T-0062).
+                Tree-shaken out of detach bundles via the literal gate. */}
+            {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
+              <>
+                <div className="mc-sidebar-more-sub">mothership</div>
+                <ul className="mc-sidebar-nav">
+                  <li>
+                    <NavLink
+                      to="/m/users"
+                      className={({ isActive }) => (isActive ? "active" : undefined)}
+                    >
+                      ALL USERS
+                    </NavLink>
+                  </li>
+                  <li>
+                    <NavLink
+                      to="/"
+                      end
+                      className={({ isActive }) => (isActive ? "active" : undefined)}
+                    >
+                      ATTACHED SERVERS
+                    </NavLink>
+                  </li>
+                  <li>
+                    <NavLink
+                      to="/m/servers/add"
+                      className={({ isActive }) => (isActive ? "active" : undefined)}
+                    >
+                      + ADD SERVER
+                    </NavLink>
+                  </li>
+                </ul>
+              </>
+            )}
+          </div>
         )}
 
         {/* Footer */}
         <div className="mc-sidebar-footer">
+          {/* T-0140: operational-status pill relocated here from the (now
+              collapsed) ATTACHMENT section so worker health stays visible. */}
+          <div
+            className="mc-sidebar-footer-status"
+            data-onboarding-anchor="operational-status"
+          >
+            <span className={workerPaint.dotClass} />
+            <span style={{ color: workerPaint.color }}>{workerPaint.label}</span>
+          </div>
           {username && (
             <div className="mc-sidebar-user">
               {username}

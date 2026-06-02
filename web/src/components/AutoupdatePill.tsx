@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type AutoupdateStatus } from "../api";
+import { useAnchorRect, anchoredBelowLeft } from "./useAnchorRect";
 
 /**
  * AutoupdatePill — consumer-side header chip surfacing the install's
@@ -87,6 +88,10 @@ export function AutoupdatePill() {
   const [busy, setBusy] = useState<"pause" | "check" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  // T-0140: fixed-position the popover off the trigger so the sidebar overflow
+  // clip can't crop it at the rail edge (see useAnchorRect).
+  const anchorRect = useAnchorRect(triggerRef, open);
 
   const refresh = useCallback(async () => {
     try {
@@ -182,6 +187,7 @@ export function AutoupdatePill() {
     <div className="mc-autoupdate-pill" ref={popoverRef}>
       <button
         type="button"
+        ref={triggerRef}
         className={`mc-badge mc-badge-${kind} mc-autoupdate-pill-trigger`}
         aria-haspopup="true"
         aria-expanded={open}
@@ -191,7 +197,12 @@ export function AutoupdatePill() {
         {label}
       </button>
       {open && (
-        <div className="mc-autoupdate-popover" role="dialog" aria-label="Autoupdate controls">
+        <div
+          className="mc-autoupdate-popover"
+          role="dialog"
+          aria-label="Autoupdate controls"
+          style={anchoredBelowLeft(anchorRect)}
+        >
           <div className="mc-autoupdate-popover-row">
             <span className="mc-autoupdate-popover-label">installed</span>
             <span className="mc-mono">{status.installed_version ?? "—"}</span>

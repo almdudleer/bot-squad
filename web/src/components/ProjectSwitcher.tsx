@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { api, type Project } from "../api";
+import { useAnchorRect, anchoredBelowLeft } from "./useAnchorRect";
 
 export function statusBadgeClass(status: string): string {
   switch (status) {
@@ -27,6 +28,10 @@ export function ProjectSwitcher({ slug, onUnpin }: ProjectSwitcherProps) {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  // T-0140: fixed-position the dropdown so the sidebar overflow clip can't crop
+  // it at the rail edge (see useAnchorRect).
+  const anchorRect = useAnchorRect(triggerRef, open);
 
   const close = useCallback(() => setOpen(false), []);
 
@@ -80,6 +85,7 @@ export function ProjectSwitcher({ slug, onUnpin }: ProjectSwitcherProps) {
     <div className="mc-switcher" ref={rootRef}>
       <button
         type="button"
+        ref={triggerRef}
         className="mc-switcher-trigger"
         data-onboarding-anchor="switch-project"
         aria-haspopup="listbox"
@@ -90,7 +96,11 @@ export function ProjectSwitcher({ slug, onUnpin }: ProjectSwitcherProps) {
       </button>
 
       {open && (
-        <div className="mc-switcher-panel" role="listbox">
+        <div
+          className="mc-switcher-panel"
+          role="listbox"
+          style={anchoredBelowLeft(anchorRect)}
+        >
           {error && (
             <div className="mc-switcher-empty mc-switcher-error">
               Could not load projects.

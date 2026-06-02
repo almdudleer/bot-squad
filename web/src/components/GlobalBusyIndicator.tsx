@@ -22,6 +22,7 @@ import {
   type IndicatorState,
   type ProjectSessions,
 } from "./globalBusyHelpers";
+import { useAnchorRect, anchoredBelowLeft } from "./useAnchorRect";
 
 const POLL_INTERVAL_MS = 8000;
 const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
@@ -66,6 +67,10 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
   });
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  // T-0140: render the panel with position:fixed off the trigger rect so the
+  // sidebar's overflow clip can't crop it at the rail's right edge.
+  const anchorRect = useAnchorRect(triggerRef, open);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,6 +124,7 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
     >
       <button
         type="button"
+        ref={triggerRef}
         className="mc-global-busy-trigger"
         aria-label={
           lit
@@ -133,7 +139,11 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
         {lit && <span className="mc-global-busy-count">{state.rows.length}</span>}
       </button>
       {open && (
-        <div className="mc-global-busy-panel" role="dialog">
+        <div
+          className="mc-global-busy-panel"
+          role="dialog"
+          style={anchoredBelowLeft(anchorRect)}
+        >
           {state.rows.length === 0 ? (
             <div className="mc-global-busy-empty">No tasks in flight.</div>
           ) : (

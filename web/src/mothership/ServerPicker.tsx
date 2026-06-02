@@ -14,6 +14,7 @@ import {
   resolveInitialPickedServer,
   SERVER_PICKER_STORAGE_KEY,
 } from "../components/sidebarHelpers";
+import { useAnchorRect, anchoredBelowLeft } from "../components/useAnchorRect";
 
 export type ServerPickerProps = {
   /** Server id of "where the user currently is" (derived from URL/route
@@ -30,6 +31,10 @@ export function ServerPicker({ currentServerId, onChange }: ServerPickerProps) {
   const [open, setOpen] = useState(false);
   const [picked, setPicked] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  // T-0140: fixed-position the dropdown so the sidebar overflow clip can't crop
+  // it at the rail edge (see useAnchorRect).
+  const anchorRect = useAnchorRect(triggerRef, open);
 
   const close = useCallback(() => setOpen(false), []);
 
@@ -110,6 +115,7 @@ export function ServerPicker({ currentServerId, onChange }: ServerPickerProps) {
     <div className="mc-srv-picker" ref={rootRef}>
       <button
         type="button"
+        ref={triggerRef}
         className="mc-srv-picker-trigger"
         aria-haspopup="listbox"
         aria-expanded={open}
@@ -118,7 +124,11 @@ export function ServerPicker({ currentServerId, onChange }: ServerPickerProps) {
         ▾ <span className="mc-srv-picker-label">{label}</span>
       </button>
       {open && servers && (
-        <div className="mc-srv-picker-panel" role="listbox">
+        <div
+          className="mc-srv-picker-panel"
+          role="listbox"
+          style={anchoredBelowLeft(anchorRect)}
+        >
           {servers.length === 0 ? (
             <div className="mc-srv-picker-empty">No servers attached.</div>
           ) : (

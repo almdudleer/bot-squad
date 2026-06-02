@@ -273,6 +273,14 @@ export function Shell() {
                   USE CASES
                 </NavLink>
               </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/docs`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  DOCS
+                </NavLink>
+              </li>
             </ul>
 
             {/* T-0170: AGENTS is a NESTED sub-section under PROJECT, not a

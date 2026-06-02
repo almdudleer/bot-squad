@@ -37,7 +37,12 @@ def _invalid_status_detail(value: object) -> str:
 _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 
 # T-0038: optional linkage fields settable via PATCH alongside title/status.
-_LINKAGE_PATCH_KEYS = frozenset({"initiative", "parent_task", "blocked_by"})
+# T-0172: `related_docs` (list of D-NNNN) — the ticket→doc half of the
+# bidirectional mention. The doc→ticket half lives in routes_docs link/unlink,
+# which keeps both sides in sync; this key lets the UI edit it directly too.
+_LINKAGE_PATCH_KEYS = frozenset({"initiative", "parent_task", "blocked_by", "related_docs"})
+
+_DOC_ID_RE = re.compile(r"^D-\d{4}$")
 
 # Permissive — basename of a vision/initiatives/<name> .md file. Empty string
 # allowed (callers must pass null to clear, not empty).
@@ -273,6 +278,12 @@ def patch_task(
             isinstance(x, str) and _TASK_ID_RE.match(x) for x in v
         ):
             raise HTTPException(status_code=400, detail="blocked_by must be a list of T-NNNN ids")
+    if "related_docs" in payload and payload["related_docs"] is not None:
+        v = payload["related_docs"]
+        if not isinstance(v, list) or not all(
+            isinstance(x, str) and _DOC_ID_RE.match(x) for x in v
+        ):
+            raise HTTPException(status_code=400, detail="related_docs must be a list of D-NNNN ids")
 
     backlog_dir = _backlog_dir(request, slug)
     path = _find_task_file(backlog_dir, task_id)

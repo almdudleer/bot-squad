@@ -76,6 +76,9 @@ export function TaskDetail() {
 
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // T-0172: related docs (ticket→doc half of the bidirectional mention).
+  const [docToLink, setDocToLink] = useState("");
+
   function loadTask() {
     setError(null);
     setLoadState("loading");
@@ -280,6 +283,32 @@ export function TaskDetail() {
       setProgressError(String(e));
     } finally {
       setProgressSaving(false);
+    }
+  }
+
+  async function linkDoc() {
+    if (!task) return;
+    const d = docToLink.trim().toUpperCase();
+    if (!/^D-\d{4}$/.test(d)) { setActionError("Doc must look like D-0123."); return; }
+    setActionError(null);
+    try {
+      // Bidirectional: also writes this doc-id into task.related_docs.
+      await api.linkDoc(slug, d, task.id);
+      setDocToLink("");
+      loadTask();
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }
+
+  async function unlinkDoc(docId: string) {
+    if (!task) return;
+    setActionError(null);
+    try {
+      await api.unlinkDoc(slug, docId, task.id);
+      loadTask();
+    } catch (e) {
+      setActionError(String(e));
     }
   }
 
@@ -666,6 +695,38 @@ export function TaskDetail() {
         ) : (
           <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>(no context yet)</p>
         )}
+      </div>
+
+      {/* Related docs — ticket→doc half of the T-0172 bidirectional mention */}
+      <div className="mb-4">
+        <div className="mc-section-title">Related docs ({(task.related_docs ?? []).length})</div>
+        <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
+          {(task.related_docs ?? []).length === 0 && (
+            <span style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
+              No docs linked. Link an architecture/design/support doc so agents find the context.
+            </span>
+          )}
+          {(task.related_docs ?? []).map((d) => (
+            <span key={d} className="d-inline-flex align-items-center gap-1" style={{ fontSize: "0.78rem" }}>
+              <Link to={`/p/${slug}/docs?doc=${encodeURIComponent(d)}`} style={{ fontFamily: "var(--mc-mono)" }}>{d}</Link>
+              <button type="button" className="btn btn-link btn-sm p-0" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }} title="Unlink" onClick={() => unlinkDoc(d)}>✕</button>
+            </span>
+          ))}
+        </div>
+        <div className="d-flex gap-2" style={{ maxWidth: "20rem" }}>
+          <input
+            type="text"
+            className="form-control form-control-sm"
+            style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem" }}
+            placeholder="D-0123"
+            value={docToLink}
+            onChange={(e) => setDocToLink(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); linkDoc(); } }}
+          />
+          <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} onClick={linkDoc}>
+            Link doc
+          </button>
+        </div>
       </div>
 
       {/* Progress — read-only list, append-only via the worker action */}

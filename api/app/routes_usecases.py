@@ -219,3 +219,158 @@ async def run_use_case(slug: str, uc_id: str, request: Request,
     except WorkerError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return {"ok": True, "id": uc_id, "window": window, "sid": res.get("sid")}
+
+
+# --------------------------------------------------------------------------
+# User flows attached to a use case (T-0173).
+#
+# Storage: ``data/<slug>/use_cases/<uc-id>/flows/F-NNNN-<slug>.md`` — frontmatter
+# (id, uc_id, title, status, created) + a markdown body that carries a numbered
+# ``## Steps`` list and a ``## Mermaid`` fenced block. The UC page renders the
+# mermaid client-side and hands agents both the prose and the diagram so they
+# can walk the flow manually (agent-manual-first, T-0158) before automating.
+#
+# The in-system node/branch model (DoD "optional v2") is DEFERRED — markdown +
+# mermaid is the v1 surface; follow-up ticket tracks the structured editor.
+# --------------------------------------------------------------------------
+import json  # noqa: E402
+
+_FLOW_ID_RE = re.compile(r"^F-\d{4}$")
+
+
+def _slugify(s: str, max_len: int = 60) -> str:
+    s = re.sub(r"[^a-zA-Z0-9\s-]", "", s).lower().strip()
+    s = re.sub(r"[\s-]+", "-", s).strip("-")
+    return s[:max_len]
+
+
+def _flows_dir(request: Request, slug: str, uc_id: str) -> Path:
+    return _uc_dir(request, slug) / uc_id / "flows"
+
+
+def _validate_flow_id(flow_id: str) -> None:
+    if not _FLOW_ID_RE.match(flow_id):
+        raise HTTPException(status_code=400, detail=f"invalid flow id: {flow_id!r}")
+
+
+def _uc_exists(request: Request, slug: str, uc_id: str) -> bool:
+    root = _uc_dir(request, slug)
+    return (root / f"{uc_id}.md").exists() or (root / uc_id).is_dir()
+
+
+def _find_flow(request: Request, slug: str, uc_id: str, flow_id: str) -> Optional[Path]:
+    d = _flows_dir(request, slug, uc_id)
+    if not d.exists():
+        return None
+    for f in d.glob(f"{flow_id}-*.md"):
+        return f
+    for f in d.glob(f"{flow_id}.md"):
+        return f
+    return None
+
+
+@router.get("/{uc_id}/flows")
+def list_flows(slug: str, uc_id: str, request: Request) -> list[dict]:
+    _validate_id(uc_id)
+    d = _flows_dir(request, slug, uc_id)
+    if not d.exists():
+        return []
+    out = []
+    for f in sorted(d.glob("*.md")):
+        fl = _parse(f)
+        # `_parse` sets id = path.stem (right for UCs, where the stem IS the id),
+        # but a flow's stem is `F-NNNN-<slug>` — derive the canonical F-NNNN.
+        parts = f.stem.split("-", 2)
+        fid = "-".join(parts[:2]) if len(parts) >= 2 else f.stem
+        out.append({
+            "id": fid,
+            "uc_id": uc_id,
+            "title": fl.get("title", fid),
+            "status": fl.get("status", ""),
+        })
+    return out
+
+
+@router.get("/{uc_id}/flows/{flow_id}")
+def get_flow(slug: str, uc_id: str, flow_id: str, request: Request) -> dict:
+    _validate_id(uc_id)
+    _validate_flow_id(flow_id)
+    path = _find_flow(request, slug, uc_id, flow_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"flow not found: {flow_id}")
+    fl = _parse(path)
+    # `_parse` set id = full stem (`F-NNNN-<slug>`); force the canonical F-NNNN
+    # so the round-trip id matches what list_flows / the validator expect.
+    fl["id"] = flow_id
+    fl["uc_id"] = uc_id
+    return fl
+
+
+class NewFlow(BaseModel):
+    title: str
+
+
+@router.post("/{uc_id}/flows")
+def create_flow(slug: str, uc_id: str, request: Request, body: NewFlow,
+                user: dict = Depends(require_auth)) -> dict:
+    """Allocate an F-NNNN id atomically and write a stub flow under a use case.
+
+    Mirrors the worker ``flow_new`` action's storage + frontmatter + mermaid
+    stub so a web create and an agent ``bsq flow new`` are byte-compatible.
+    """
+    from app import idalloc
+
+    _validate_id(uc_id)
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title must not be empty")
+
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    if not _uc_exists(request, slug, uc_id):
+        raise HTTPException(status_code=404, detail=f"use case not found: {uc_id}")
+
+    d = _flows_dir(request, slug, uc_id)
+    d.mkdir(parents=True, exist_ok=True)
+    flow_id = idalloc.allocate_id(cfg.data_dir, slug, "flow")
+    path = d / f"{flow_id}-{_slugify(title)}.md"
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fm = "\n".join([
+        f"id: {flow_id}",
+        f"uc_id: {uc_id}",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        "status: draft",
+        f"created: {now}",
+    ])
+    body_md = (
+        f"# {title}\n\n## Steps\n\n1. TBD\n\n## Mermaid\n\n"
+        "```mermaid\ngraph TD\n  A[start] --> B[TBD]\n```\n\n"
+        "(new user flow — T-0173)\n"
+    )
+    content = f"---\n{fm}\n---\n\n{body_md}"
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+    return {"ok": True, "id": flow_id, "uc_id": uc_id}
+
+
+@router.put("/{uc_id}/flows/{flow_id}")
+def put_flow(slug: str, uc_id: str, flow_id: str, request: Request, body: PutUseCase,
+             user: dict = Depends(require_auth)) -> dict:
+    _validate_id(uc_id)
+    _validate_flow_id(flow_id)
+    content = body.content or ""
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="content must not be empty")
+    if len(content.encode("utf-8")) > _MAX_CONTENT_BYTES:
+        raise HTTPException(status_code=400, detail="content exceeds 200 KB limit")
+    path = _find_flow(request, slug, uc_id, flow_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"flow not found: {flow_id}")
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+    return {"ok": True, "id": flow_id, "uc_id": uc_id}

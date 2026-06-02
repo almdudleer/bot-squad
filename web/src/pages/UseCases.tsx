@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api, UseCaseSummary, UseCaseDetail } from "../api";
+import { api, FlowDetail, FlowSummary, UseCaseSummary, UseCaseDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
+import { Mermaid, extractMermaid } from "../components/Mermaid";
 
 export function UseCases() {
   const { slug = "" } = useParams();
@@ -14,6 +15,12 @@ export function UseCases() {
   const [busy, setBusy] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
 
+  // T-0173: user flows attached to the selected use case.
+  const [flows, setFlows] = useState<FlowSummary[] | null>(null);
+  const [openFlowId, setOpenFlowId] = useState<string | null>(null);
+  const [flowDetail, setFlowDetail] = useState<FlowDetail | null>(null);
+  const [flowDraft, setFlowDraft] = useState<string | null>(null);
+
   function reload() {
     api.useCases(slug).then(setItems).catch((e) => setError(String(e)));
   }
@@ -23,21 +30,27 @@ export function UseCases() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
+  function reloadFlows(ucId: string) {
+    api.flows(slug, ucId).then(setFlows).catch(() => setFlows([]));
+  }
+
   async function open(id: string) {
     setSelected(id);
     setDetail(null);
     setDraft(null);
     setFlash(null);
+    setFlows(null);
+    setOpenFlowId(null);
+    setFlowDetail(null);
+    setFlowDraft(null);
     try {
       setDetail(await api.useCase(slug, id));
+      reloadFlows(id);
     } catch (e) {
       setError(String(e));
     }
   }
 
-  // T-0174: the id is allocated server-side (UC-NNNN) — never hand-typed.
-  // Clicking "+ New" creates a stub with an atomic id, then drops you into the
-  // editor to fill in the details (title/persona/steps).
   async function startNew() {
     setBusy(true);
     setError(null);
@@ -90,6 +103,57 @@ export function UseCases() {
     }
   }
 
+  // ---- flows ----
+  async function openFlow(flowId: string) {
+    if (!selected) return;
+    setOpenFlowId(flowId);
+    setFlowDetail(null);
+    setFlowDraft(null);
+    try {
+      setFlowDetail(await api.flow(slug, selected, flowId));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function startNewFlow() {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.createFlow(slug, selected, "New flow");
+      reloadFlows(selected);
+      const fd = await api.flow(slug, selected, res.id);
+      setOpenFlowId(res.id);
+      setFlowDetail(fd);
+      setFlowDraft(fd.raw);
+      setFlash(`Created flow ${res.id} — edit steps + mermaid, then Save.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveFlow() {
+    if (!selected || !openFlowId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.putFlow(slug, selected, openFlowId, flowDraft ?? "");
+      setFlowDraft(null);
+      reloadFlows(selected);
+      setFlowDetail(await api.flow(slug, selected, openFlowId));
+      setFlash("Flow saved.");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const mermaidSrc = flowDetail ? extractMermaid(flowDetail.body) : null;
+
   return (
     <div className="container py-4" style={{ maxWidth: "980px" }}>
       <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
@@ -99,9 +163,10 @@ export function UseCases() {
       <PageHelp>
         User flows stored as <code>data/&lt;slug&gt;/use_cases/&lt;id&gt;.md</code>. Pick one to
         view/edit; <strong>Run</strong> spawns a testing-dev session pre-briefed on the flow
-        (playwright, manual-first per T-0158). Feedback submitted with
-        <code>bsq feedback submit --usecase &lt;id&gt;</code> attaches to its <code>## Feedback</code>
-        section and is replayed into the next run.
+        (playwright, manual-first per T-0158). Each use case can carry one or more
+        <strong> user flows</strong> (T-0173) — numbered steps plus a <code>```mermaid</code> block
+        that renders as a diagram below. Agents read the flow + diagram, walk it manually, then
+        automate.
       </PageHelp>
 
       {error && <div className="alert alert-danger py-1 small">{error}</div>}
@@ -151,6 +216,79 @@ export function UseCases() {
                 </div>
               </div>
               <pre className="mc-pre">{detail.raw}</pre>
+
+              {/* T-0173: attached user flows */}
+              <div className="mt-4">
+                <div className="d-flex justify-content-between align-items-center mb-2">
+                  <div className="mc-section-title" style={{ margin: 0 }}>
+                    User flows ({flows?.length ?? 0})
+                  </div>
+                  <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} disabled={busy} onClick={startNewFlow}>
+                    + New flow
+                  </button>
+                </div>
+                {flows === null && <div className="mc-loading">Loading flows</div>}
+                {flows?.length === 0 && (
+                  <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
+                    No flows yet. A flow is a numbered walkthrough + a mermaid diagram an agent can follow.
+                  </p>
+                )}
+                <div className="d-flex flex-wrap gap-2 mb-2">
+                  {flows?.map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      className={`btn btn-sm ${openFlowId === f.id ? "btn-secondary" : "btn-outline-secondary"}`}
+                      style={{ fontSize: "0.72rem" }}
+                      onClick={() => openFlow(f.id)}
+                    >
+                      <span style={{ fontFamily: "var(--mc-mono)" }}>{f.id}</span> · {f.title}
+                    </button>
+                  ))}
+                </div>
+
+                {openFlowId && flowDraft === null && flowDetail && (
+                  <div style={{ border: "1px solid var(--mc-border)", borderRadius: "4px", padding: "0.75rem" }}>
+                    <div className="d-flex justify-content-between align-items-center mb-2">
+                      <div style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem", fontWeight: 600 }}>
+                        {flowDetail.id} — {flowDetail.title}
+                      </div>
+                      <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.7rem" }} onClick={() => setFlowDraft(flowDetail.raw)}>
+                        Edit flow
+                      </button>
+                    </div>
+                    {mermaidSrc ? (
+                      <Mermaid code={mermaidSrc} />
+                    ) : (
+                      <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+                        (no <code>```mermaid</code> block in this flow yet)
+                      </div>
+                    )}
+                    <pre className="mc-pre mt-2">{flowDetail.body}</pre>
+                  </div>
+                )}
+
+                {openFlowId && flowDraft !== null && (
+                  <div style={{ border: "1px solid var(--mc-border)", borderRadius: "4px", padding: "0.75rem" }}>
+                    <textarea
+                      className="form-control mb-2"
+                      rows={18}
+                      value={flowDraft}
+                      style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem" }}
+                      onChange={(e) => setFlowDraft(e.target.value)}
+                      autoFocus
+                    />
+                    <div className="d-flex gap-2">
+                      <button type="button" className="btn btn-primary btn-sm" onClick={saveFlow} disabled={busy}>
+                        {busy ? "Saving…" : "Save flow"}
+                      </button>
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => setFlowDraft(null)}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </>
           )}
 

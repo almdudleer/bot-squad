@@ -23,6 +23,9 @@ _ALLOWED_UPDATE_KEYS = frozenset({
     "title", "status", "body", "priority",
     "initiative", "parent_task", "blocked_by",
     "session_history",
+    # T-0172: ticket→doc mentions (list of D-NNNN). Kept in sync with each
+    # doc's `related_tickets` by routes_docs link/unlink.
+    "related_docs",
 })
 
 _TASK_ID_RE = re.compile(r"^T-(\d{4})-")

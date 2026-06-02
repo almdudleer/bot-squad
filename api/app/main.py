@@ -72,6 +72,7 @@ def build_app() -> FastAPI:
     from app.routes_vision import router as vision_router
     from app.routes_feedback import router as feedback_router
     from app.routes_usecases import router as usecases_router
+    from app.routes_docs import router as docs_router
     from app.routes_sessions import router as sessions_router, dev_spawn_router
     from app.routes_runs import router as runs_router
     from app.routes_messages import router as messages_router
@@ -79,6 +80,7 @@ def build_app() -> FastAPI:
     app.include_router(vision_router, prefix="/api")
     app.include_router(feedback_router, prefix="/api")
     app.include_router(usecases_router, prefix="/api")
+    app.include_router(docs_router, prefix="/api")
     app.include_router(sessions_router, prefix="/api")
     app.include_router(dev_spawn_router, prefix="/api")
     app.include_router(runs_router, prefix="/api")

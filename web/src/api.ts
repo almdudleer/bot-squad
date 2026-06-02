@@ -63,6 +63,9 @@ export type Task = {
   initiative?: string | null;
   parent_task?: string | null;
   blocked_by?: string[] | null;
+  // T-0172: ticket→doc mentions (list of D-NNNN). Kept in sync with each
+  // doc's `related_tickets` by the docs link/unlink endpoints.
+  related_docs?: string[] | null;
   // T-0105 + T-0106: append-only list of SIDs that worked on this task,
   // oldest first. Worker stamps on spawn/bind/resume; rendered as a panel
   // on TaskDetail. May be undefined for legacy tasks created before T-0105.
@@ -111,6 +114,45 @@ export type UseCaseDetail = {
   success_criteria?: string;
   related_tickets?: string;
   status?: string;
+  body: string;
+  raw: string;
+};
+
+// T-0172: project docs system. Docs live at
+// data/<slug>/docs/<category>/D-NNNN-<slug>.md.
+export type DocSummary = {
+  id: string;
+  title: string;
+  category: string;
+  status: string;
+  related_tickets: string[];
+};
+export type DocDetail = {
+  id: string;
+  title?: string;
+  category: string;
+  status?: string;
+  created?: string;
+  related_tickets?: string[];
+  body: string;
+  raw: string;
+  path?: string;
+};
+
+// T-0173: user flows attached to a use case
+// (data/<slug>/use_cases/<uc-id>/flows/F-NNNN-<slug>.md).
+export type FlowSummary = {
+  id: string;
+  uc_id: string;
+  title: string;
+  status: string;
+};
+export type FlowDetail = {
+  id: string;
+  uc_id?: string;
+  title?: string;
+  status?: string;
+  created?: string;
   body: string;
   raw: string;
 };
@@ -465,6 +507,39 @@ export const api = {
     call<{ ok: boolean; id: string }>(`/api/projects/${slug}/use_cases`, { method: "POST", body: JSON.stringify({ title }) }),
   runUseCase: (slug: string, id: string) =>
     call<{ ok: boolean; id: string; window: string; sid?: string }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/run`, { method: "POST" }),
+  // T-0173: user flows attached to a use case.
+  flows: (slug: string, ucId: string) =>
+    call<FlowSummary[]>(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows`),
+  flow: (slug: string, ucId: string, flowId: string) =>
+    call<FlowDetail>(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows/${encodeURIComponent(flowId)}`),
+  createFlow: (slug: string, ucId: string, title: string) =>
+    call<{ ok: boolean; id: string; uc_id: string }>(
+      `/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows`,
+      { method: "POST", body: JSON.stringify({ title }) },
+    ),
+  putFlow: (slug: string, ucId: string, flowId: string, content: string) =>
+    call(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows/${encodeURIComponent(flowId)}`,
+      { method: "PUT", body: JSON.stringify({ content }) }),
+  // T-0172: project docs.
+  docs: (slug: string, category?: string) =>
+    call<DocSummary[]>(`/api/projects/${slug}/docs${category ? `?category=${encodeURIComponent(category)}` : ""}`),
+  docCategories: (slug: string) =>
+    call<string[]>(`/api/projects/${slug}/docs/categories`),
+  doc: (slug: string, id: string) =>
+    call<DocDetail>(`/api/projects/${slug}/docs/${encodeURIComponent(id)}`),
+  createDoc: (slug: string, category: string, title: string) =>
+    call<{ ok: boolean; id: string; category: string }>(`/api/projects/${slug}/docs`,
+      { method: "POST", body: JSON.stringify({ category, title }) }),
+  putDoc: (slug: string, id: string, content: string) =>
+    call(`/api/projects/${slug}/docs/${encodeURIComponent(id)}`,
+      { method: "PUT", body: JSON.stringify({ content }) }),
+  linkDoc: (slug: string, id: string, ticket: string) =>
+    call<{ ok: boolean; id: string; ticket: string; linked: boolean }>(
+      `/api/projects/${slug}/docs/${encodeURIComponent(id)}/link`,
+      { method: "POST", body: JSON.stringify({ ticket }) }),
+  unlinkDoc: (slug: string, id: string, ticket: string) =>
+    call(`/api/projects/${slug}/docs/${encodeURIComponent(id)}/link/${encodeURIComponent(ticket)}`,
+      { method: "DELETE" }),
   sessions: (slug: string) =>
     call<SessionRow[]>(`/api/projects/${slug}/sessions`),
   pauseSession: (slug: string, sid: string) =>

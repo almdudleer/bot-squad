@@ -1706,6 +1706,144 @@ def cmd_doc_new(args) -> None:
     print(f"{res['id']}  ({res['category']})  ->  {res['file_path']}")
 
 
+def _docs_dir(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "docs"
+
+
+def _doc_id_from_stem(stem: str) -> str:
+    """`D-NNNN-<slug>` → `D-NNNN`; bare `D-NNNN` passes through."""
+    parts = stem.split("-", 2)
+    return "-".join(parts[:2]) if len(parts) >= 2 else stem
+
+
+def _find_doc_file(slug: str, doc_id: str) -> Path | None:
+    root = _docs_dir(slug)
+    if not root.exists():
+        return None
+    for f in root.glob(f"*/{doc_id}-*.md"):
+        return f
+    for f in root.glob(f"*/{doc_id}.md"):
+        return f
+    return None
+
+
+def _mutate_fm_list(path: Path, field: str, value: str, *, add: bool) -> None:
+    """Add/remove ``value`` from a YAML-frontmatter list field, idempotently."""
+    import yaml
+    text = path.read_text()
+    m = re.match(r"\A---\n(.*?)\n---\n(.*)\Z", text, re.DOTALL)
+    if not m:
+        die(f"no frontmatter in {path}")
+    meta = yaml.safe_load(m.group(1)) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    body = m.group(2)
+    cur = meta.get(field) or []
+    if not isinstance(cur, list):
+        cur = [cur]
+    cur = [str(x) for x in cur]
+    if add and value not in cur:
+        cur.append(value)
+    elif not add and value in cur:
+        cur = [x for x in cur if x != value]
+    meta[field] = cur
+    fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(f"---\n{fm}---\n\n{body.lstrip(chr(10))}")
+    os.replace(tmp, path)
+
+
+def cmd_doc_list(args) -> None:
+    slug = resolve_slug()
+    root = _docs_dir(slug)
+    cats = [args.category] if args.category else (
+        sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    )
+    rows = []
+    for cat in cats:
+        cdir = root / cat
+        if not cdir.is_dir():
+            continue
+        for f in sorted(cdir.glob("*.md")):
+            fm = read_frontmatter(f)
+            rows.append({
+                "id": fm.get("id") or _doc_id_from_stem(f.stem),
+                "category": cat,
+                "status": fm.get("status", "") or "-",
+                "title": fm.get("title", f.stem).strip('"'),
+            })
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print(f"(no docs yet — `bsq docs new <category> <title>` to add one in {root})")
+        return
+    table = [("ID", "CATEGORY", "STATUS", "TITLE")] + [
+        (r["id"], r["category"], r["status"], r["title"]) for r in rows
+    ]
+    widths = [max(len(r[i]) for r in table) for i in range(len(table[0]))]
+    for r in table:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+
+
+def cmd_doc_link(args) -> None:
+    slug = resolve_slug()
+    doc_id = args.doc_id.upper()
+    ticket = args.ticket.upper()
+    if not re.match(r"^D-\d{4}$", doc_id):
+        die(f"invalid doc id: {doc_id!r} (expect D-NNNN)")
+    if not re.match(r"^T-\d{4}$", ticket):
+        die(f"invalid ticket id: {ticket!r} (expect T-NNNN)")
+    doc_path = _find_doc_file(slug, doc_id)
+    if doc_path is None:
+        die(f"doc not found: {doc_id}")
+    ticket_path = find_ticket(slug, ticket)  # dies if missing
+    add = not args.unlink
+    _mutate_fm_list(doc_path, "related_tickets", ticket, add=add)
+    _mutate_fm_list(ticket_path, "related_docs", doc_id, add=add)
+    verb = "linked" if add else "unlinked"
+    print(f"{verb}: {doc_id} <-> {ticket}")
+
+
+def cmd_doc_sync(args) -> None:
+    """Symlink data/<slug>/docs/ into the dev + master clones (T-0172).
+
+    So `cat ~/<project>/dev/docs/architecture/...md` works for any agent
+    running with a clone as cwd, without copying the docs out of bot-squad.
+    """
+    slug = resolve_slug()
+    docs_target = _docs_dir(slug)
+    docs_target.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(PROJECTS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+    except OSError as e:
+        die(f"cannot read {PROJECTS_TOML}: {e}")
+    proj = cfg.get("projects", {}).get(slug, {})
+    clones = [proj.get(k) for k in ("repo_path", "repo_master")]
+    made = 0
+    for clone in clones:
+        if not clone:
+            continue
+        link = Path(clone) / "docs"
+        if link.is_symlink():
+            if os.path.realpath(link) == os.path.realpath(docs_target):
+                print(f"ok (already linked): {link} -> {docs_target}")
+                continue
+            link.unlink()
+        elif link.exists():
+            print(f"SKIP {link}: a real directory/file already exists there "
+                  f"(not clobbering — move it into {docs_target} first)", file=sys.stderr)
+            continue
+        if not Path(clone).is_dir():
+            print(f"SKIP {clone}: clone dir does not exist", file=sys.stderr)
+            continue
+        link.symlink_to(docs_target)
+        print(f"linked: {link} -> {docs_target}")
+        made += 1
+    print(f"docs sync done ({made} new symlink(s)).")
+
+
 def cmd_uc_new(args) -> None:
     slug = resolve_slug()
     res = post("uc_new", {"slug": slug, "title": args.title})
@@ -2222,13 +2360,24 @@ def build_parser() -> argparse.ArgumentParser:
     tnn.add_argument("--owner", help="owner role/name (frontmatter)")
     tnn.set_defaults(func=cmd_task_new)
 
-    # doc new (composes T-0172 docs system)
-    dn = sub.add_parser("doc", help="project docs: new (atomic id, composes T-0172)")
+    # docs (T-0172 docs system): new / list / link / sync. `doc` + `docs` both work.
+    dn = sub.add_parser("doc", aliases=["docs"], help="project docs (T-0172): new / list / link / sync")
     dn_sub = dn.add_subparsers(dest="sub", required=True)
     dnn = dn_sub.add_parser("new", help="allocate the next D-NNNN + write a stub doc")
     dnn.add_argument("category", help="doc category, e.g. architecture/design/support/runbook/product")
     dnn.add_argument("title", help="single-line doc title")
     dnn.set_defaults(func=cmd_doc_new)
+    dnl = dn_sub.add_parser("list", help="list this project's docs (optionally by category)")
+    dnl.add_argument("--category", help="filter to a single category")
+    dnl.add_argument("--json", action="store_true", help="raw JSON output")
+    dnl.set_defaults(func=cmd_doc_list)
+    dnk = dn_sub.add_parser("link", help="bidirectionally link a doc <-> ticket")
+    dnk.add_argument("doc_id", help="doc id, e.g. D-0001")
+    dnk.add_argument("ticket", help="ticket id, e.g. T-0123")
+    dnk.add_argument("--unlink", action="store_true", help="remove the link instead of adding it")
+    dnk.set_defaults(func=cmd_doc_link)
+    dns = dn_sub.add_parser("sync", help="symlink docs/ into the dev + master clones")
+    dns.set_defaults(func=cmd_doc_sync)
 
     # uc new (atomic numeric UC ids; composes T-0159/T-0173)
     ucx = sub.add_parser("uc", help="use cases: new (atomic UC-NNNN id) / list / run (T-0174)")

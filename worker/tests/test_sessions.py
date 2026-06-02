@@ -2680,3 +2680,96 @@ def test_list_sessions_emits_role_for_active_and_suspended(tmp_path, monkeypatch
     assert rows["S-testuser-multi_server-TL-p9"]["role"] == "teamlead"
     assert rows["S-testuser-sessions-list-p11"]["role"] == "dev"
     assert rows["S-testuser-v08-stream-a-p50"]["role"] == "dev"
+
+
+# ---------------------------------------------------------------------------
+# T-0176 #5/#6 — dedup_sessions: collapse duplicate SessionMds to one keeper
+# ---------------------------------------------------------------------------
+
+def _seed_md(cfg, slug, sid, **fields):
+    from bot_squad_worker.sessions import _session_file, _write_session_metadata
+    meta = {"sid": sid, "status": "suspended"}
+    meta.update(fields)
+    _write_session_metadata(_session_file(cfg.data_dir, slug, sid), meta)
+
+
+def _read_md(cfg, slug, sid):
+    from bot_squad_worker.sessions import _session_file, _read_session_metadata
+    return _read_session_metadata(_session_file(cfg.data_dir, slug, sid))
+
+
+def test_dedup_mode_a_same_uuid_keeps_newest(tmp_path, monkeypatch):
+    """Mode A: two SessionMds sharing a claude_uuid (pane rotation p8→p9) are one
+    logical session — keep the most-recent, mark the other merged_into it."""
+    from bot_squad_worker.sessions import dedup_sessions
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
+    _seed_md(cfg, "test-project", "S-u-multi-p8", claude_uuid="UUID-1",
+             window="multi", last_task_id="T-0100", started_at="2026-05-14T00:00:00Z")
+    _seed_md(cfg, "test-project", "S-u-multi-p9", claude_uuid="UUID-1",
+             window="multi", last_task_id="T-0100", started_at="2026-05-23T00:00:00Z")
+
+    res = dedup_sessions(cfg, "test-project", dry_run=False)
+    keep = _read_md(cfg, "test-project", "S-u-multi-p9")
+    drop = _read_md(cfg, "test-project", "S-u-multi-p8")
+    assert "merged_into" not in keep or keep.get("merged_into") in (None, "~")
+    assert drop["merged_into"] == "S-u-multi-p9"
+    assert str(drop["archived"]).lower() == "true"
+    assert res["merged_count"] == 1
+
+
+def test_dedup_mode_b_same_task_window_distinct_uuid(tmp_path, monkeypatch):
+    """Mode B: the T-0080 p92..p99 storm — distinct uuids, same window+task —
+    collapses to one keeper (newest) with the rest merged_into it."""
+    from bot_squad_worker.sessions import dedup_sessions
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
+    for i, ts in enumerate(["00:00", "05:00", "09:00"]):
+        _seed_md(cfg, "test-project", f"S-u-T-0080-p9{i}", claude_uuid=f"UUID-{i}",
+                 window="T-0080", last_task_id="T-0080",
+                 started_at=f"2026-05-16T{ts}:00Z")
+    res = dedup_sessions(cfg, "test-project", dry_run=False)
+    keeper = _read_md(cfg, "test-project", "S-u-T-0080-p92")  # 09:00 newest
+    assert keeper.get("merged_into", "~") in (None, "~")
+    for loser in ("S-u-T-0080-p90", "S-u-T-0080-p91"):
+        assert _read_md(cfg, "test-project", loser)["merged_into"] == "S-u-T-0080-p92"
+    assert res["merged_count"] == 2
+
+
+def test_dedup_excludes_constant_team_sessions(tmp_path, monkeypatch):
+    """A constant-team session mis-bound to another's task must NOT be merged
+    into that task's cluster (TL p38 data point)."""
+    from bot_squad_worker.sessions import dedup_sessions
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
+    # Two real workers on T-0080 (same window) + a constant-team feedback session
+    # stamped with task_id T-0080 but a different window/owner.
+    _seed_md(cfg, "test-project", "S-u-T-0080-p1", claude_uuid="U1",
+             window="T-0080", last_task_id="T-0080", started_at="2026-05-16T00:00:00Z")
+    _seed_md(cfg, "test-project", "S-u-T-0080-p2", claude_uuid="U2",
+             window="T-0080", last_task_id="T-0080", started_at="2026-05-16T01:00:00Z")
+    _seed_md(cfg, "test-project", "S-u-user-feedback-p3", claude_uuid="U3",
+             window="user-feedback", task_id="T-0080", owner="constant-team",
+             initiative="user-feedback.md", started_at="2026-05-16T02:00:00Z")
+    res = dedup_sessions(cfg, "test-project", dry_run=False)
+    fb = _read_md(cfg, "test-project", "S-u-user-feedback-p3")
+    assert fb.get("merged_into", "~") in (None, "~"), "constant-team session must not be merged"
+    assert res["merged_count"] == 1  # only the two real T-0080 workers dedup
+
+
+def test_dedup_dry_run_writes_nothing(tmp_path, monkeypatch):
+    from bot_squad_worker.sessions import dedup_sessions
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
+    _seed_md(cfg, "test-project", "S-u-multi-p8", claude_uuid="UUID-1",
+             window="multi", last_task_id="T-0100", started_at="2026-05-14T00:00:00Z")
+    _seed_md(cfg, "test-project", "S-u-multi-p9", claude_uuid="UUID-1",
+             window="multi", last_task_id="T-0100", started_at="2026-05-23T00:00:00Z")
+    res = dedup_sessions(cfg, "test-project", dry_run=True)
+    assert res["merged_count"] == 1            # reports what it WOULD do
+    drop = _read_md(cfg, "test-project", "S-u-multi-p8")
+    assert drop.get("merged_into", "~") in (None, "~")  # but wrote nothing

@@ -1934,6 +1934,131 @@ def _started_at_key(value: Any) -> tuple[int, str]:
     return (1, str(value))
 
 
+def dedup_sessions(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
+    """T-0176 #5/#6: collapse duplicate SessionMds to one keeper per logical
+    session, marking the rest ``merged_into: <keeper>`` so the UI can show one
+    row per logical session instead of the p92..p99 parade.
+
+    Two failure modes (see scenarios/T-0176):
+
+      * **Mode A — same ``claude_uuid``**: one conversation that produced several
+        SessionMds because the tmux pane id rotated across a restart
+        (e.g. ``multi-p8`` / ``multi-p9`` sharing one uuid). Unambiguous.
+      * **Mode B — distinct uuids, same ``window`` + task**: a spawn storm
+        (e.g. ``T-0080-p92..p99``), eight separate claude launches all bound to
+        one task in one window. Keyed on **task AND window** — never task alone —
+        and **constant-team sessions are excluded** (owner ``constant-team`` or a
+        ``constant_team: true`` initiative), so a feedback processor mis-bound to
+        someone else's task is never swept into their cluster.
+
+    Keeper = the live session if any, else the most-recent ``started_at``. Live
+    sessions are never archived. ``dry_run=True`` (default) reports the merges it
+    *would* make without writing. Idempotent: already-``merged_into`` rows are
+    left alone.
+
+    Returns ``{ok, dry_run, merged_count, merges: [{loser, keeper, mode}, ...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.constant_teams import constant_team_stems
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"dedup_sessions: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "dry_run": dry_run, "merged_count": 0, "merges": []}
+
+    user = _get_current_user()
+    user_prefix = f"S-{user}-"
+    live_sids = {compute_sid(user, p.window, p.pane_id) for p in list_panes()}
+    const_stems = constant_team_stems(cfg, slug)
+
+    rows: list[tuple[str, dict, Any]] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        if not md.stem.startswith(user_prefix):
+            continue
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        rows.append((meta.get("sid", md.stem), meta, md))
+
+    def _keeper_key(item: tuple[str, dict, Any]) -> tuple:
+        sid, meta, _ = item
+        live = 1 if sid in live_sids else 0
+        return (live, _started_at_key(meta.get("started_at")), sid)
+
+    def _already_merged(meta: dict) -> bool:
+        return bool(meta.get("merged_into") and meta.get("merged_into") != "~")
+
+    def _is_constant(meta: dict) -> bool:
+        if str(meta.get("owner") or "") == "constant-team":
+            return True
+        stem = Path(str(meta.get("initiative") or "")).stem
+        return bool(stem and stem in const_stems)
+
+    def _task_key(meta: dict) -> str | None:
+        for field in ("task_id", "last_task_id"):
+            v = meta.get(field)
+            if v and v != "~":
+                return str(v)
+        return None
+
+    merged: dict[str, tuple[str, str]] = {}  # loser_sid -> (keeper_sid, mode)
+
+    def _collapse(members: list[tuple[str, dict, Any]], mode: str) -> None:
+        if len(members) < 2:
+            return
+        keeper = max(members, key=_keeper_key)[0]
+        for sid, meta, _ in members:
+            if sid == keeper or sid in merged or sid in live_sids:
+                continue
+            if _already_merged(meta):
+                continue
+            merged[sid] = (keeper, mode)
+
+    # Mode A — exact: same claude_uuid.
+    by_uuid: dict[str, list[tuple[str, dict, Any]]] = {}
+    for sid, meta, md in rows:
+        u = meta.get("claude_uuid")
+        if not u or u == "~":
+            continue
+        by_uuid.setdefault(u, []).append((sid, meta, md))
+    for members in by_uuid.values():
+        _collapse(members, "uuid")
+
+    # Mode B — heuristic: same (task, window), constant teams excluded.
+    by_taskwin: dict[tuple[str, str], list[tuple[str, dict, Any]]] = {}
+    for sid, meta, md in rows:
+        if sid in merged or _is_constant(meta):
+            continue
+        task = _task_key(meta)
+        if task is None:
+            continue
+        by_taskwin.setdefault((task, meta.get("window") or ""), []).append((sid, meta, md))
+    for members in by_taskwin.values():
+        _collapse(members, "task-window")
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    row_by_sid = {sid: (meta, md) for sid, meta, md in rows}
+    if not dry_run:
+        for loser, (keeper, _mode) in merged.items():
+            meta, md = row_by_sid[loser]
+            meta["merged_into"] = keeper
+            meta["archived"] = "true"
+            if meta.get("status") == "active":
+                meta["status"] = "suspended"
+                meta.setdefault("suspended_at", now)
+            meta["archive_reason"] = f"merged-into:{keeper}"
+            _write_session_metadata(md, meta, atomic=True)
+
+    merges = [
+        {"loser": loser, "keeper": keeper, "mode": mode}
+        for loser, (keeper, mode) in sorted(merged.items())
+    ]
+    return {"ok": True, "dry_run": dry_run, "merged_count": len(merges), "merges": merges}
+
+
 def gc_stale_bindings(cfg: Any, slug: str) -> dict:
     """T-0073: strip stale primary ``task_id`` from sessions losing a dup race.
 

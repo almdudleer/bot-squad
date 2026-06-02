@@ -1139,3 +1139,178 @@ def test_create_project_operator_brief_falls_back_to_placeholder(
     body = r.json()
     assert body["operator_sid"] == "S-almdudleer-operator-p99"
     assert body["spawn_error"] is None
+
+
+# ---------------------------------------------------------------------------
+# T-0156 — per-project Telegram group/topic binding
+# ---------------------------------------------------------------------------
+
+from app.routes_projects import _serialize_projects_toml  # noqa: E402
+
+
+def test_serialize_emits_topic_as_bare_int():
+    raw = {
+        "p": {
+            "slug": "p", "display_name": "P", "repo_path": "/r",
+            "deploy_branch": "d", "master_branch": "m",
+            "prod_url": "", "staging_url": "", "dev_url": "",
+            "deploy_targets": ["staging"],
+            "tg_chat": "-1001234567890", "tg_topic_id": 99,
+        }
+    }
+    text = _serialize_projects_toml(raw)
+    assert 'tg_chat = "-1001234567890"' in text
+    assert "tg_topic_id = 99" in text  # bare int, no quotes
+    # round-trips back through tomllib as an int
+    parsed = tomllib.loads(text)["projects"]["p"]
+    assert parsed["tg_topic_id"] == 99
+
+
+def test_serialize_omits_topic_when_unset():
+    raw = {
+        "p": {
+            "slug": "p", "display_name": "P", "repo_path": "/r",
+            "deploy_branch": "d", "master_branch": "m",
+            "prod_url": "", "staging_url": "", "dev_url": "",
+            "deploy_targets": [], "tg_chat": "0",
+        }
+    }
+    assert "tg_topic_id" not in _serialize_projects_toml(raw)
+
+
+def test_put_project_tg_persists_and_get_reflects(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "-1009876543210", "tg_topic_id": 42},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "slug": "test-project",
+            "tg_chat": "-1009876543210",
+            "tg_topic_id": 42,
+        }
+        g = client.get("/api/projects/test-project")
+    assert g.json()["tg_chat"] == "-1009876543210"
+    assert g.json()["tg_topic_id"] == 42
+    # on-disk projects.toml has a bare int
+    toml = (tmp_bot_squad / "config" / "projects.toml").read_text()
+    assert "tg_topic_id = 42" in toml
+
+
+def test_put_project_tg_clears_topic_when_omitted(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "-100111", "tg_topic_id": 5},
+        )
+        r = client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "-100111"},
+        )
+        assert r.status_code == 200
+        assert r.json()["tg_topic_id"] is None
+        g = client.get("/api/projects/test-project")
+    assert g.json()["tg_topic_id"] is None
+    assert "tg_topic_id" not in (tmp_bot_squad / "config" / "projects.toml").read_text()
+
+
+def test_put_project_tg_topic_without_chat_400(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "", "tg_topic_id": 5},
+        )
+    assert r.status_code == 400
+    assert "requires" in r.json()["detail"]
+
+
+def test_put_project_tg_bad_chat_400(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "not-a-number"},
+        )
+    assert r.status_code == 400
+
+
+def test_put_project_tg_bad_topic_400(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "-100111", "tg_topic_id": "abc"},
+        )
+    assert r.status_code == 400
+
+
+def test_put_project_tg_unknown_project_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.put("/api/projects/nope/tg", json={"tg_chat": "1"})
+    assert r.status_code == 404
+
+
+def test_put_project_tg_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        r = client.put("/api/projects/test-project/tg", json={"tg_chat": "1"})
+    assert r.status_code == 401
+
+
+def test_test_project_tg_no_binding_400(tmp_bot_squad: Path, monkeypatch):
+    # Clear the binding so the test-ping precondition (chat bound) fails.
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        client.put("/api/projects/test-project/tg", json={"tg_chat": ""})
+        r = client.post("/api/projects/test-project/tg/test")
+    assert r.status_code == 400
+
+
+@pytest.fixture
+def fake_worker_tg_notify(tmp_bot_squad: Path):
+    """Fake worker that records tg_notify calls + serves reload_projects."""
+    sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    calls: list[dict] = []
+    fake = FastAPI()
+
+    @fake.post("/actions/reload_projects")
+    def reload_projects(params: dict | None = None) -> dict:
+        return {"ok": True}
+
+    @fake.post("/actions/tg_notify")
+    def tg_notify(params: dict) -> dict:
+        calls.append(params)
+        return {"ok": True, "sent": True}
+
+    config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if sock.exists():
+            break
+        time.sleep(0.05)
+    yield calls
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_test_project_tg_pings_worker_with_slug(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_tg_notify: list,
+):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        client.put(
+            "/api/projects/test-project/tg",
+            json={"tg_chat": "-100222", "tg_topic_id": 11},
+        )
+        r = client.post("/api/projects/test-project/tg/test")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+    # Worker resolves chat+topic from the slug, so the action carries the slug.
+    assert fake_worker_tg_notify[-1]["slug"] == "test-project"

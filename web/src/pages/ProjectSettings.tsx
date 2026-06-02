@@ -1,0 +1,186 @@
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { api, ProjectDetail } from "../api";
+
+// T-0156: per-project Telegram binding settings.
+//
+// tg_chat may be a normal DM chat id or a (negative) group/supergroup id.
+// tg_topic_id is the optional forum-thread (topic) id — only meaningful for
+// a forum-enabled group, so it's disabled until a chat id is entered. Both
+// are persisted to projects.toml via PUT /api/projects/:slug/tg and the
+// worker re-reads them so project-bound sends (tg_notify, stall escalation)
+// land in the right thread.
+
+export function ProjectSettings() {
+  const { slug = "" } = useParams<{ slug: string }>();
+  const [proj, setProj] = useState<ProjectDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  const [chat, setChat] = useState<string>("");
+  const [topic, setTopic] = useState<string>("");
+
+  function load() {
+    setError(null);
+    api
+      .project(slug)
+      .then((p) => {
+        setProj(p);
+        setChat(p.tg_chat ?? "");
+        setTopic(p.tg_topic_id == null ? "" : String(p.tg_topic_id));
+      })
+      .catch((e) => setError(String(e)));
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
+  function validate(): string | null {
+    const c = chat.trim();
+    if (c && !/^-?\d+$/.test(c)) {
+      return "Chat id must be an integer (negative for groups) or empty.";
+    }
+    const t = topic.trim();
+    if (t) {
+      if (!/^\d+$/.test(t) || Number.parseInt(t, 10) <= 0) {
+        return "Topic id must be a positive integer or empty.";
+      }
+      if (!c) {
+        return "Topic id requires a group chat id.";
+      }
+    }
+    return null;
+  }
+
+  async function save() {
+    setNotice(null);
+    setError(null);
+    const v = validate();
+    if (v !== null) {
+      setError(v);
+      return;
+    }
+    setSaving(true);
+    try {
+      const t = topic.trim();
+      const result = await api.setProjectTg(slug, {
+        tg_chat: chat.trim(),
+        tg_topic_id: t ? Number.parseInt(t, 10) : null,
+      });
+      setProj((p) =>
+        p ? { ...p, tg_chat: result.tg_chat, tg_topic_id: result.tg_topic_id } : p,
+      );
+      setNotice("Saved. The bot will now post project messages here.");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function testPing() {
+    setNotice(null);
+    setError(null);
+    setTesting(true);
+    try {
+      const r = await api.testProjectTg(slug);
+      setNotice(
+        r.sent
+          ? "Test ping sent — check the bound chat/thread."
+          : "Worker accepted the ping but suppressed it (debounce or quiet hours). Try again shortly.",
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <div className="container py-4" style={{ maxWidth: "720px" }}>
+      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1rem" }}>
+        {proj?.display_name ?? slug} — settings
+      </h2>
+
+      {error && <div className="alert alert-danger">{error}</div>}
+      {notice && <div className="alert alert-success py-2">{notice}</div>}
+
+      {proj === null && !error && <div className="mc-loading">Loading</div>}
+
+      {proj && (
+        <section className="mb-4">
+          <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
+            Telegram binding
+          </h3>
+          <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.75rem" }}>
+            Bind this project to a Telegram chat. Use a negative id for a group
+            or supergroup. For a forum (topic-enabled) group, add the topic id
+            so the bot posts into a specific thread.
+          </p>
+
+          <div className="mb-3">
+            <label className="form-label" style={{ fontSize: "0.72rem" }}>
+              Chat id
+            </label>
+            <input
+              type="text"
+              className="form-control"
+              value={chat}
+              onChange={(e) => setChat(e.target.value)}
+              placeholder="e.g. -1001234567890 (group) or 404580642 (DM)"
+              style={{ width: "22rem", fontFamily: "var(--mc-mono)" }}
+            />
+          </div>
+
+          <div className="mb-3">
+            <label className="form-label" style={{ fontSize: "0.72rem" }}>
+              Topic id <span style={{ color: "var(--mc-text-dim)" }}>(optional, forum thread)</span>
+            </label>
+            <input
+              type="text"
+              className="form-control"
+              value={topic}
+              onChange={(e) => setTopic(e.target.value)}
+              placeholder="e.g. 42 — leave blank for the group's general feed"
+              disabled={!chat.trim()}
+              style={{ width: "12rem", fontFamily: "var(--mc-mono)" }}
+            />
+            <div>
+              <small style={{ color: "var(--mc-text-dim)" }}>
+                Find a topic id by copying a message link from the thread — it's
+                the second number in <code>t.me/c/&lt;chat&gt;/&lt;topic&gt;/&lt;msg&gt;</code>.
+              </small>
+            </div>
+          </div>
+
+          <div className="d-flex gap-2">
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={save}
+              disabled={saving}
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary"
+              onClick={testPing}
+              disabled={testing || !proj.tg_chat?.trim()}
+              title={proj.tg_chat?.trim() ? "Send a test message to the saved binding" : "Save a chat id first"}
+            >
+              {testing ? "Sending…" : "Send test ping"}
+            </button>
+          </div>
+          <small style={{ color: "var(--mc-text-dim)", display: "block", marginTop: "0.5rem" }}>
+            Test ping uses the <em>saved</em> binding — save first, then test.
+          </small>
+        </section>
+      )}
+    </div>
+  );
+}

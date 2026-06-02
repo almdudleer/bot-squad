@@ -19,6 +19,9 @@ class Project:
     dev_url: str
     deploy_targets: tuple[str, ...]
     tg_chat: str
+    # T-0156: optional forum-thread id for group-chat bindings (paired with
+    # tg_chat). None when unset / DM / general feed.
+    tg_topic_id: int | None = None
     # T-0051: per-project layout — repo_master is the prod-side clone,
     # repo_workspace is the mother dir that owns both clones (or none of
     # them, in Mode 3 paths-as-they-are). Optional for back-compat: the
@@ -41,6 +44,11 @@ class Project:
             dev_url=raw["dev_url"],
             deploy_targets=tuple(raw["deploy_targets"]),
             tg_chat=str(raw["tg_chat"]),
+            tg_topic_id=(
+                int(raw["tg_topic_id"])
+                if raw.get("tg_topic_id") not in (None, "")
+                else None
+            ),
             repo_master=Path(rm) if rm else None,
             repo_workspace=Path(rw) if rw else None,
         )

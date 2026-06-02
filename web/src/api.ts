@@ -40,6 +40,10 @@ export type ProjectDetail = Project & {
   prod_url: string;
   staging_url: string;
   dev_url: string;
+  // T-0156: per-project Telegram binding. tg_chat may be a DM or group id;
+  // tg_topic_id is the optional forum-thread id (null unless a group thread).
+  tg_chat: string;
+  tg_topic_id: number | null;
   counts: { backlog: number; vision: number; feedback: number; sessions: number };
 };
 
@@ -379,6 +383,16 @@ export const api = {
   createModesDoc: () =>
     call<{ content: string }>("/api/projects/_/create-modes"),
   project: (slug: string) => call<ProjectDetail>(`/api/projects/${slug}`),
+  // T-0156: set per-project Telegram binding (group/DM chat + optional topic).
+  setProjectTg: (slug: string, body: { tg_chat: string; tg_topic_id: number | null }) =>
+    call<{ slug: string; tg_chat: string; tg_topic_id: number | null }>(
+      `/api/projects/${slug}/tg`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  testProjectTg: (slug: string) =>
+    call<{ ok: boolean; sent: boolean }>(`/api/projects/${slug}/tg/test`, {
+      method: "POST",
+    }),
   repoAgentsMd: (slug: string) =>
     call<{ content: string }>(`/api/projects/${slug}/repo-agents-md`),
   putRepoAgentsMd: (slug: string, content: string) =>

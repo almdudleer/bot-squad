@@ -138,6 +138,56 @@ def test_message_no_prefix_when_no_sid(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# T-0156: group-chat topic (forum thread) support — message_thread_id
+# ---------------------------------------------------------------------------
+
+def test_send_passes_topic_id_to_post(tmp_path: Path) -> None:
+    client, mock_post = _make_client_with_mock_post(tmp_path)
+    client.send(chat_id="-1001234567890", text="hi", topic_id=42)
+    assert mock_post.call_args.kwargs["topic_id"] == 42
+
+
+def test_send_omits_topic_id_when_none(tmp_path: Path) -> None:
+    client, mock_post = _make_client_with_mock_post(tmp_path)
+    client.send(chat_id="123", text="hi")
+    assert mock_post.call_args.kwargs.get("topic_id") is None
+
+
+def test_post_includes_message_thread_id_when_topic_set(tmp_path: Path) -> None:
+    """_post must put message_thread_id in the Telegram payload when topic given."""
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002 - mirror httpx sig
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="-100999", text="body", topic_id=7)
+    assert captured["json"]["message_thread_id"] == 7
+    assert captured["json"]["chat_id"] == "-100999"
+
+
+def test_post_omits_message_thread_id_when_no_topic(tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="123", text="body")
+    assert "message_thread_id" not in captured["json"]
+
+
+# ---------------------------------------------------------------------------
 # Quiet hours config — defaults to 17→5 UTC, override via system_settings.toml
 # ---------------------------------------------------------------------------
 

@@ -137,8 +137,8 @@ class _FakeTgClient:
         self.calls: list[dict] = []
         self._suppress = False  # when True, send() returns False (debounce sim)
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False) -> bool:
-        self.calls.append({"chat_id": chat_id, "text": text, "sid": sid, "user": user, "urgent": urgent})
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None) -> bool:
+        self.calls.append({"chat_id": chat_id, "text": text, "sid": sid, "user": user, "urgent": urgent, "topic_id": topic_id})
         return not self._suppress
 
 
@@ -225,6 +225,67 @@ def test_tg_notify_sid_and_user_forwarded(tmp_config_dir, monkeypatch):
     call = fake.calls[0]
     assert call["sid"] == "S-x-p1"
     assert call["user"] == "alexey"
+
+
+# --- T-0156: project-bound forum topic resolution ---
+
+def _config_dir_with_topic(tmp_path: Path) -> Path:
+    """A config dir whose project binds a group chat + forum topic."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "projects.toml").write_text(
+        '[projects.group-project]\n'
+        'slug = "group-project"\n'
+        'display_name = "Group Project"\n'
+        'repo_path = "/tmp/group-repo"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = "https://example.com"\n'
+        'staging_url = "https://staging.example.com"\n'
+        'dev_url = "https://dev.example.com"\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "-1001234567890"\n'
+        'tg_topic_id = 99\n'
+    )
+    (cfg / "secrets.toml").write_text(
+        '[telegram]\nbot_token = "TESTBOT:TOKEN"\nauth_age_max = 86400\n'
+    )
+    return cfg
+
+
+def test_tg_notify_inherits_project_topic(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    _, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "-1001234567890"
+    assert fake.calls[0]["topic_id"] == 99
+
+
+def test_tg_notify_explicit_topic_id_overrides_project(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    _, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi", "topic_id": 7})
+    assert fake.calls[0]["topic_id"] == 7
+
+
+def test_tg_notify_topic_none_when_project_has_no_topic(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    A.dispatch("tg_notify", {"slug": "test-project", "message": "hi"})
+    assert fake.calls[0]["topic_id"] is None
+
+
+def test_tg_notify_rejects_non_integer_topic(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir)
+    with pytest.raises(ActionError, match="topic_id must be an integer"):
+        A.dispatch("tg_notify", {"message": "hi", "topic_id": "abc"})
 
 
 # ---------------------------------------------------------------------------

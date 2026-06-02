@@ -137,7 +137,7 @@ def _action_tg_verify_login(params: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-_TG_NOTIFY_ALLOWED = {"slug", "chat_id", "message", "sid", "user", "urgent"}
+_TG_NOTIFY_ALLOWED = {"slug", "chat_id", "message", "sid", "user", "urgent", "topic_id"}
 
 
 def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
@@ -164,8 +164,12 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
 
-    # --- resolve chat_id ---
+    # --- resolve chat_id (+ project-bound forum topic, T-0156) ---
+    # An explicit topic_id param wins; otherwise, when the chat is resolved
+    # from a project, inherit that project's tg_topic_id so group bindings
+    # land in the right forum thread without the caller spelling it out.
     chat_id: str | None = params.get("chat_id") or None
+    topic_id: int | None = _coerce_topic_id(params.get("topic_id"))
     if not chat_id:
         slug: str = params.get("slug") or ""
         if slug:
@@ -173,10 +177,15 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
             if project is None:
                 raise ActionError(f"tg_notify: unknown project slug {slug!r}")
             chat_id = project.tg_chat
+            if topic_id is None:
+                topic_id = project.tg_topic_id
         else:
             # Fallback: first registered project's chat (single-project setups)
             if cfg.projects:
-                chat_id = next(iter(cfg.projects.values())).tg_chat
+                project = next(iter(cfg.projects.values()))
+                chat_id = project.tg_chat
+                if topic_id is None:
+                    topic_id = project.tg_topic_id
             else:
                 raise ActionError("tg_notify: no chat_id, no slug, and no projects configured")
 
@@ -187,8 +196,19 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         sid=params.get("sid", ""),
         user=params.get("user", ""),
         urgent=bool(params.get("urgent", False)),
+        topic_id=topic_id,
     )
     return {"ok": True, "sent": sent}
+
+
+def _coerce_topic_id(raw: Any) -> int | None:
+    """Normalise a topic_id param to int|None. Empty/None → None."""
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ActionError(f"tg_notify: topic_id must be an integer, got {raw!r}")
 
 
 _TG_STALL_CLEAR_REQUIRED = {"slug", "sid"}

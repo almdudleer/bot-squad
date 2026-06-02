@@ -336,6 +336,15 @@ export function Shell() {
               </li>
               {/* AUTONOMOUS TEAM — link hidden 2026-05-12, autonomous work frozen.
                   Route still exists; restore this <li> when re-enabling. */}
+              {/* T-0156: per-project settings (Telegram group/topic binding). */}
+              <li>
+                <NavLink
+                  to={`/p/${slug}/settings`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  PROJECT SETTINGS
+                </NavLink>
+              </li>
             </ul>
           </>
         )}

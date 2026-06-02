@@ -121,6 +121,11 @@ def _serialize_projects_toml(projects_raw: dict[str, dict]) -> str:
         items = ", ".join(f'"{_toml_escape(str(t))}"' for t in targets)
         out.append(f"deploy_targets = [{items}]")
         out.append(f'tg_chat = "{_toml_escape(str(p.get("tg_chat", "")))}"')
+        # T-0156: optional forum-thread id — bare TOML integer, emitted only
+        # when set so DM/general-feed projects don't grow a spurious key.
+        topic = p.get("tg_topic_id")
+        if topic not in (None, ""):
+            out.append(f"tg_topic_id = {int(topic)}")
         out.append("")
     return "\n".join(out)
 
@@ -434,6 +439,9 @@ def get_project(slug: str, request: Request) -> dict:
         "prod_url": proj.prod_url,
         "staging_url": proj.staging_url,
         "dev_url": proj.dev_url,
+        # T-0156: per-project TG binding so the settings page can pre-fill.
+        "tg_chat": proj.tg_chat,
+        "tg_topic_id": proj.tg_topic_id,
         "counts": counts,
     }
 
@@ -442,6 +450,119 @@ def _count(path) -> int:
     if not path.exists():
         return 0
     return sum(1 for _ in path.glob("*.md"))
+
+
+def _write_projects_toml(config_dir: Path, projects_raw: dict[str, dict]) -> None:
+    """Atomically rewrite projects.toml from a raw project dict."""
+    text = _serialize_projects_toml(projects_raw)
+    path = config_dir / "projects.toml"
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(text)
+    os.rename(tmp, path)
+
+
+async def _reload_worker_projects(request: Request, slug: str) -> None:
+    """Nudge the worker to re-read projects.toml (best-effort, like create)."""
+    try:
+        await request.app.state.worker_router.coordinator().call_action(
+            "reload_projects", {}, timeout=5.0,
+        )
+    except WorkerError as e:
+        log.warning("project %s: worker reload_projects failed: %s", slug, e)
+
+
+@router.put("/{slug}/tg")
+async def put_project_tg(
+    slug: str,
+    request: Request,
+    payload: dict,
+    admin: dict = Depends(require_admin),
+) -> dict:
+    """T-0156: set a project's Telegram binding — group/DM chat + optional
+    forum topic. Body: ``{"tg_chat": "<id>", "tg_topic_id": <int|null>}``.
+
+    ``tg_chat`` accepts a normal DM chat id or a (negative) group/supergroup
+    id. ``tg_topic_id`` only makes sense for a forum-enabled group; it is
+    rejected without a ``tg_chat``. Both empty/null clears the binding.
+    """
+    cfg: ApiConfig = request.app.state.api_config
+    proj = cfg.project(slug)
+    if proj is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="json object required")
+
+    chat = str(payload.get("tg_chat", "") or "").strip()
+    if chat and not chat.lstrip("-").isdigit():
+        raise HTTPException(
+            status_code=400, detail="tg_chat must be an integer chat id or empty"
+        )
+
+    topic_raw = payload.get("tg_topic_id")
+    topic: int | None = None
+    if topic_raw not in (None, ""):
+        try:
+            topic = int(topic_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail="tg_topic_id must be an integer or empty"
+            )
+        if topic <= 0:
+            raise HTTPException(
+                status_code=400, detail="tg_topic_id must be a positive integer"
+            )
+    if topic is not None and not chat:
+        raise HTTPException(
+            status_code=400, detail="tg_topic_id requires a tg_chat group binding"
+        )
+
+    config_dir = cfg.config_dir
+    new_raw = _read_projects_toml(config_dir)
+    if slug not in new_raw:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    new_raw[slug]["tg_chat"] = chat
+    if topic is None:
+        new_raw[slug].pop("tg_topic_id", None)
+    else:
+        new_raw[slug]["tg_topic_id"] = topic
+
+    _write_projects_toml(config_dir, new_raw)
+    request.app.state.api_config = ApiConfig.load(config_dir)
+    await _reload_worker_projects(request, slug)
+    return {"slug": slug, "tg_chat": chat, "tg_topic_id": topic}
+
+
+@router.post("/{slug}/tg/test")
+async def test_project_tg(
+    slug: str,
+    request: Request,
+    admin: dict = Depends(require_admin),
+) -> dict:
+    """Send a test ping to the project's bound chat (+ topic) via the worker's
+    ``tg_notify`` action. Resolution (chat + topic) happens worker-side from
+    the slug, so this exercises the exact production send path."""
+    cfg: ApiConfig = request.app.state.api_config
+    proj = cfg.project(slug)
+    if proj is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    if not (proj.tg_chat or "").strip():
+        raise HTTPException(status_code=400, detail="no tg_chat bound for project")
+
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action(
+            "tg_notify",
+            {
+                "slug": slug,
+                "message": f"bot-squad test ping for project {slug} — binding works",
+            },
+            timeout=10.0,
+        )
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=str(result))
+    return {"ok": True, "sent": bool(result.get("sent", True))}
 
 
 @router.post("/{slug}/deploy", status_code=202)

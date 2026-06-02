@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Login } from "./pages/Login";
 import { Picker } from "./pages/Picker";
 import { Project } from "./pages/Project";
+import { ProjectSettings } from "./pages/ProjectSettings";
 import { Vision } from "./pages/Vision";
 import { Feedback } from "./pages/Feedback";
 import { UseCases } from "./pages/UseCases";
@@ -74,6 +75,7 @@ export function App() {
           <Route path="/p/:slug/feedback" element={<Feedback />} />
           <Route path="/p/:slug/usecases" element={<UseCases />} />
           <Route path="/p/:slug/sessions" element={<Sessions />} />
+          <Route path="/p/:slug/settings" element={<ProjectSettings />} />
           <Route path="/p/:slug/analytics" element={<Analytics />} />
           <Route path="/p/:slug/runs" element={<Runs />} />
           <Route path="/p/:slug/runs/:id" element={<RunLog />} />

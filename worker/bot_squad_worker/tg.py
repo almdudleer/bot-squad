@@ -52,6 +52,7 @@ class TgClient:
         sid: str = "",
         user: str = "",
         urgent: bool = False,
+        topic_id: int | None = None,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -61,6 +62,10 @@ class TgClient:
         ``urgent=True`` bypasses quiet hours (use for hard failures the
         stakeholder explicitly asked to be paged on; not for routine
         "needs your input" pings).
+
+        ``topic_id`` (T-0156): when ``chat_id`` is a forum-enabled group,
+        delivers into the given forum thread via ``message_thread_id``.
+        ``None`` posts to the group's general feed (or a normal DM).
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
@@ -76,7 +81,7 @@ class TgClient:
             log.debug("tg.send: debounced (same payload within %ds)", self._cooldown)
             return False
 
-        self._post(chat_id=chat_id, text=full_text)
+        self._post(chat_id=chat_id, text=full_text, topic_id=topic_id)
         self._record(chat_id=chat_id, sid=sid, text=text)
         return True
 
@@ -101,13 +106,16 @@ class TgClient:
         p = self._debounce_path(chat_id, sid, text)
         p.touch()
 
-    def _post(self, *, chat_id: str, text: str) -> None:
+    def _post(self, *, chat_id: str, text: str, topic_id: int | None = None) -> None:
         import httpx  # lazy import — not available in all envs
 
         url = _TG_API.format(token=self._token)
+        payload: dict = {"chat_id": chat_id, "text": text}
+        if topic_id is not None:
+            payload["message_thread_id"] = topic_id
         resp = httpx.post(
             url,
-            json={"chat_id": chat_id, "text": text},
+            json=payload,
             timeout=10,
         )
         resp.raise_for_status()

@@ -18,6 +18,10 @@ class Project:
     dev_url: str
     deploy_targets: tuple[str, ...]
     tg_chat: str
+    # T-0156: optional forum-thread id for group-chat bindings. When tg_chat is
+    # a forum-enabled group, project-bound TG sends target this thread via
+    # message_thread_id. None → the group's general feed (or a plain DM).
+    tg_topic_id: int | None = None
     repo_master: Path | None = None  # master clone for prod deploys + hotfixes
     # T-0143: local CI/CD deploy clone — a throwaway checkout parallel to
     # dev/master, force-synced to origin/<deploy_branch> on each deploy. When
@@ -74,6 +78,11 @@ class Project:
             dev_url=raw["dev_url"],
             deploy_targets=tuple(raw["deploy_targets"]),
             tg_chat=str(raw["tg_chat"]),
+            tg_topic_id=(
+                int(raw["tg_topic_id"])
+                if raw.get("tg_topic_id") not in (None, "")
+                else None
+            ),
             repo_master=Path(raw["repo_master"]) if raw.get("repo_master") else None,
             repo_deploy=Path(raw["repo_deploy"]) if raw.get("repo_deploy") else None,
         )

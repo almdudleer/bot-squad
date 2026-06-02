@@ -94,12 +94,19 @@ export function Users() {
         }}
       >
         <div className="mc-section-title">Mothership</div>
-        {/* T-0170: the sidebar's three mothership rows collapsed to one
-            "Mothership" entry → this page. The add-server / invite flow
-            (formerly the "+ ADD SERVER" row) is reachable from here. */}
-        <Link to="/m/servers/add" style={{ fontSize: "0.8rem", textDecoration: "none" }}>
-          + Add a server / invite →
-        </Link>
+        {/* T-0170: the sidebar's three mothership rows + the MORE-drawer
+            Releases row collapsed onto this one "Mothership" entry → this
+            page. Both the add-server/invite flow (formerly "+ ADD SERVER")
+            and the release-history tab (formerly the MORE "RELEASES" row,
+            route /m/releases) stay reachable from here. */}
+        <div style={{ display: "flex", gap: "1rem", fontSize: "0.8rem" }}>
+          <Link to="/m/releases" style={{ textDecoration: "none" }}>
+            Releases →
+          </Link>
+          <Link to="/m/servers/add" style={{ textDecoration: "none" }}>
+            + Add a server / invite →
+          </Link>
+        </div>
       </div>
 
       <div

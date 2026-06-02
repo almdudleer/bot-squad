@@ -140,3 +140,21 @@ def test_kill_switch(cfg_slug, monkeypatch):
     res = ct.tick(cfg, slug)
     assert res.get("disabled") is True
     assert spawns == []
+
+
+# ---------------------------------------------------------------------------
+# T-0177 — constant_team_stems: which initiatives keep their own team
+# ---------------------------------------------------------------------------
+
+def test_constant_team_stems_returns_flagged_initiatives(cfg_slug):
+    cfg, slug, _ = cfg_slug
+    _write_initiative(cfg, slug, "user-feedback", {"constant_team": "true"})
+    _write_initiative(cfg, slug, "prod-support", {"constant_team": "true"})
+    _write_initiative(cfg, slug, "operator-ux", {})  # normal initiative
+    assert ct.constant_team_stems(cfg, slug) == {"user-feedback", "prod-support"}
+
+
+def test_constant_team_stems_empty_when_none_flagged(cfg_slug):
+    cfg, slug, _ = cfg_slug
+    _write_initiative(cfg, slug, "operator-ux", {})
+    assert ct.constant_team_stems(cfg, slug) == set()

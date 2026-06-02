@@ -45,20 +45,29 @@ def _seed_session(cfg, slug, sid, **fields) -> None:
     _write_session_metadata(S._session_file(cfg.data_dir, slug, sid), meta)
 
 
+def _seed_constant_initiative(cfg, slug, stem) -> None:
+    """Write a vision/initiatives/<stem>.md flagged constant_team: true."""
+    d = cfg.data_dir / slug / "vision" / "initiatives"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{stem}.md").write_text(f"---\nname: {stem}\nconstant_team: true\n---\n")
+
+
 @pytest.fixture(autouse=True)
 def _fixed_user(monkeypatch):
     monkeypatch.setattr(S, "_get_current_user", lambda: "u")
 
 
-def test_reconcile_groups_sessions_by_tmux_session(tmp_path, monkeypatch):
+def test_reconcile_folds_nonconstant_initiatives_into_project_team(tmp_path, monkeypatch):
+    """T-0177: normal-initiative sub-sessions fold into the single project team
+    so the project TL and its initiative devs share one roster (option 2)."""
     cfg = _make_cfg(tmp_path)
-    # Two tmux sessions: a feature team and the main project session.
+    # An initiative TL + dev (their own tmux session) and the project operator.
     _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
                   window="feat-TL", tmux_session="test-project-feat",
                   initiative="feat.md", task_id="~", started_at="2026-06-01T00:00:00Z")
     _seed_session(cfg, "test-project", "S-u-feat-dev-p2",
                   window="feat-dev", tmux_session="test-project-feat",
-                  task_id="T-0001", started_at="2026-06-01T00:01:00Z")
+                  initiative="feat.md", task_id="T-0001", started_at="2026-06-01T00:01:00Z")
     _seed_session(cfg, "test-project", "S-u-operator-p3",
                   window="operator", tmux_session="test-project",
                   task_id="~", started_at="2026-06-01T00:02:00Z")
@@ -66,14 +75,55 @@ def test_reconcile_groups_sessions_by_tmux_session(tmp_path, monkeypatch):
 
     res = T.reconcile_teams(cfg, "test-project")
     assert res["ok"] is True
-    assert set(res["teams"]) == {"test-project-feat", "test-project"}
-
-    feat = T.load_team(cfg, "test-project", "test-project-feat")
-    assert feat["tl"] == "S-u-feat-TL-p1"
-    assert feat["teammates"] == ["S-u-feat-dev-p2"]
+    # feat.md is a NORMAL initiative → everything folds into one project team.
+    assert set(res["teams"]) == {"test-project"}
 
     main = T.load_team(cfg, "test-project", "test-project")
+    # operator started latest → holds the lead slot; the initiative dev AND the
+    # initiative TL both appear in the project roster (nobody is dropped).
     assert main["tl"] == "S-u-operator-p3"
+    assert "S-u-feat-dev-p2" in main["teammates"]
+    assert "S-u-feat-TL-p1" in main["teammates"]
+
+
+def test_reconcile_keeps_constant_team_separate(tmp_path, monkeypatch):
+    """T-0177: a constant_team initiative keeps its own team — NOT folded."""
+    cfg = _make_cfg(tmp_path)
+    _seed_constant_initiative(cfg, "test-project", "user-feedback")
+    _seed_session(cfg, "test-project", "S-u-dev-p1",
+                  window="some-feature", tmux_session="test-project",
+                  task_id="T-0001", started_at="2026-06-01T00:00:00Z")
+    _seed_session(cfg, "test-project", "S-u-user-feedback-p2",
+                  window="user-feedback", tmux_session="test-project-user-feedback",
+                  initiative="user-feedback.md", task_id="~",
+                  started_at="2026-06-01T00:01:00Z")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+    res = T.reconcile_teams(cfg, "test-project")
+    assert set(res["teams"]) == {"test-project", "test-project-user-feedback"}
+    main = T.load_team(cfg, "test-project", "test-project")
+    assert main["teammates"] == ["S-u-dev-p1"]
+    assert "S-u-user-feedback-p2" not in main["teammates"]
+    const = T.load_team(cfg, "test-project", "test-project-user-feedback")
+    assert const["teammates"] == ["S-u-user-feedback-p2"]
+
+
+def test_reconcile_retains_extra_tl_candidate_as_teammate(tmp_path, monkeypatch):
+    """T-0177: folding many sessions into one team means several teamlead/operator
+    roles may co-occur; only one holds the lead slot, the rest stay visible as
+    teammates rather than vanishing."""
+    cfg = _make_cfg(tmp_path)
+    _seed_session(cfg, "test-project", "S-u-a-TL-p1",
+                  window="a-TL", tmux_session="test-project",
+                  task_id="~", started_at="2026-06-01T00:00:00Z")
+    _seed_session(cfg, "test-project", "S-u-b-TL-p2",
+                  window="b-TL", tmux_session="test-project",
+                  task_id="~", started_at="2026-06-01T00:05:00Z")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    T.reconcile_teams(cfg, "test-project")
+    main = T.load_team(cfg, "test-project", "test-project")
+    assert main["tl"] == "S-u-b-TL-p2"           # latest started wins the slot
+    assert main["teammates"] == ["S-u-a-TL-p1"]  # loser retained, not dropped
 
 
 def test_reconcile_prefers_live_tl_then_latest(tmp_path, monkeypatch):
@@ -90,9 +140,12 @@ def test_reconcile_prefers_live_tl_then_latest(tmp_path, monkeypatch):
         lambda: [PaneInfo(pane_id="%1", window="feat-TL", pid="1", cwd="/x", command="claude")],
     )
     T.reconcile_teams(cfg, "test-project")
-    feat = T.load_team(cfg, "test-project", "test-project-feat")
-    # %1 -> S-u-feat-TL-p1 is live; it wins over the older dead p9.
-    assert feat["tl"] == "S-u-feat-TL-p1"
+    # feat.md is a normal initiative → folds into the project team (T-0177).
+    team = T.load_team(cfg, "test-project", "test-project")
+    # %1 -> S-u-feat-TL-p1 is live; it wins the lead slot over the older dead p9.
+    assert team["tl"] == "S-u-feat-TL-p1"
+    # The dead loser is retained as a teammate, not dropped.
+    assert team["teammates"] == ["S-u-feat-TL-p9"]
 
 
 def test_reconcile_buckets_archived_members(tmp_path, monkeypatch):
@@ -137,11 +190,15 @@ def test_reconcile_survives_reload_via_disk(tmp_path, monkeypatch):
 
 def test_archive_team_suspends_live_members_and_marks_archived(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
+    # A constant-team sub-team keeps its own identity (T-0177), so archive/
+    # resurrect operate on a real named team separate from the project team.
+    _seed_constant_initiative(cfg, "test-project", "feat")
     _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
                   window="feat-TL", tmux_session="test-project-feat",
                   initiative="feat.md", task_id="~")
     _seed_session(cfg, "test-project", "S-u-feat-dev-p2",
-                  window="feat-dev", tmux_session="test-project-feat", task_id="T-0001")
+                  window="feat-dev", tmux_session="test-project-feat",
+                  initiative="feat.md", task_id="T-0001")
     monkeypatch.setattr(
         S, "list_panes",
         lambda: [PaneInfo(pane_id="%2", window="feat-dev", pid="1", cwd="/x", command="claude")],
@@ -163,6 +220,7 @@ def test_archive_team_suspends_live_members_and_marks_archived(tmp_path, monkeyp
 
 def test_resurrect_team_resumes_tl_and_clears_flag(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
+    _seed_constant_initiative(cfg, "test-project", "feat")
     _seed_session(cfg, "test-project", "S-u-feat-TL-p1",
                   window="feat-TL", tmux_session="test-project-feat",
                   initiative="feat.md", task_id="~")

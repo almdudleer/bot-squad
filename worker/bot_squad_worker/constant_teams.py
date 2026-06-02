@@ -325,6 +325,26 @@ def _maintain_initiative(cfg: Any, slug: str, init_path: Path, fm: dict) -> list
     return actions
 
 
+def constant_team_stems(cfg: Any, slug: str) -> set[str]:
+    """Return the set of initiative stems flagged ``constant_team: true``.
+
+    T-0177: the team reconciler folds normal-initiative + main sessions into the
+    single project team, but a *constant* team (prod-support, user-feedback —
+    initiatives with ``constant_team: true``) keeps its own identity. This is the
+    membership oracle for that distinction, keyed by initiative file stem (the
+    same key ``_tmux_session_name`` appends to form ``<slug>-<stem>``).
+    """
+    init_dir = cfg.data_dir / slug / "vision" / "initiatives"
+    stems: set[str] = set()
+    if not init_dir.exists():
+        return stems
+    for init_path in sorted(init_dir.glob("*.md")):
+        fm = _read_frontmatter(init_path)
+        if _truthy(fm.get("constant_team")):
+            stems.add(init_path.stem)
+    return stems
+
+
 def tick(cfg: Any, slug: str) -> dict:
     """One maintenance pass for a project's constant teams.
 

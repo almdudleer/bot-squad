@@ -105,6 +105,28 @@ def reconcile_teams(cfg: Any, slug: str) -> dict:
         for p in _sessions.list_panes()
     }
 
+    # T-0177: teams are keyed by the project (slug), not by tmux session — the
+    # project TL and its initiative devs (spread across `<slug>-<initiative>`
+    # tmux sessions by the T-0001 per-initiative routing) fold into ONE roster.
+    # The exception is a *constant* team (prod-support, user-feedback — an
+    # initiative flagged `constant_team: true`): it keeps its own identity,
+    # keyed by its tmux session `<slug>-<stem>`. The sessions LIST still
+    # sub-groups by live tmux for [[T-0176]] reality; team identity is the
+    # project.
+    from bot_squad_worker.constant_teams import constant_team_stems
+
+    const_stems = constant_team_stems(cfg, slug)
+    const_sessions = {f"{slug}-{stem}" for stem in const_stems}
+
+    def _group_for(meta: dict) -> str:
+        ts = meta.get("tmux_session")
+        init_stem = Path(str(meta.get("initiative") or "")).stem
+        if ts in const_sessions:
+            return ts
+        if init_stem and init_stem in const_stems:
+            return f"{slug}-{init_stem}"
+        return slug
+
     # group name -> list of (sid, meta)
     groups: dict[str, list[tuple[str, dict]]] = {}
     for md in sorted(sessions_dir.glob("*.md")):
@@ -114,10 +136,7 @@ def reconcile_teams(cfg: Any, slug: str) -> dict:
         if meta is None:
             continue
         sid = meta.get("sid", md.stem)
-        group = meta.get("tmux_session") or slug
-        if group == "~":
-            group = slug
-        groups.setdefault(group, []).append((sid, meta))
+        groups.setdefault(_group_for(meta), []).append((sid, meta))
 
     teams_dir = _teams_dir(cfg.data_dir, slug)
     teams_dir.mkdir(parents=True, exist_ok=True)
@@ -155,7 +174,12 @@ def reconcile_teams(cfg: Any, slug: str) -> dict:
 
         tl = "~"
         if tl_candidates:
-            tl = sorted(tl_candidates, key=_tl_rank, reverse=True)[0][0]
+            ranked = sorted(tl_candidates, key=_tl_rank, reverse=True)
+            tl = ranked[0][0]
+            # T-0177: folding by project can put several teamlead/operator-role
+            # sessions in one group. Only one holds the lead slot; the rest stay
+            # visible as teammates rather than being silently dropped.
+            teammates.extend(sid for sid, _ in ranked[1:])
 
         path = _team_file(cfg.data_dir, slug, name)
         prev = _read_team(path) or {}

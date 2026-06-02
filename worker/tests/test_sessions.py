@@ -2614,11 +2614,21 @@ def test_derive_role_taskless_featurewindow_is_dev_not_teamlead():
         assert _derive_role(win, "~", "~") == "dev", win
 
 
-def test_derive_role_initiative_bound_taskless_is_teamlead():
-    """Worker-spawned TL: initiative set, no task, generic window name."""
+def test_derive_role_initiative_bound_taskless_is_dev():
+    """T-0175: an initiative-bound, task-less, marker-less session is a DEV, not
+    a teamlead. T-0141's rule #4 ("initiative + no task ⇒ teamlead") still leaked:
+    a dev that finishes its task (task_id cleared to ~) keeps its initiative and
+    flipped to teamlead. Genuine TLs carry an explicit `-TL`/`_teamlead` window
+    marker (rule #2) and are unaffected; everything else defaults to dev.
+
+    Real leak instance (TL data point 2026-06-02): the constant-team feedback
+    processor `user-feedback` window, initiative=user-feedback.md, no task —
+    must be `dev`, never `teamlead`.
+    """
     from bot_squad_worker.sessions import _derive_role
-    assert _derive_role("genericwin", None, "operator-ux-and-session-mgmt.md") == "teamlead"
-    assert _derive_role("genericwin", "~", "~", extra_initiatives=["x.md"]) == "teamlead"
+    assert _derive_role("genericwin", None, "operator-ux-and-session-mgmt.md") == "dev"
+    assert _derive_role("genericwin", "~", "~", extra_initiatives=["x.md"]) == "dev"
+    assert _derive_role("user-feedback", None, "user-feedback.md") == "dev"
 
 
 def test_derive_role_operator_pane():

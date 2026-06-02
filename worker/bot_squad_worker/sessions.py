@@ -312,9 +312,14 @@ def _derive_activity(
 # marker-less, task-less session fell into the teamlead bucket.
 #
 # Role is now positively derived. A session is a teamlead only with real
-# evidence — an explicit `-TL`/`_tl`/`teamlead` window marker, or an
-# initiative binding with no task. The operator pane is its own role. The
-# fall-through default is "dev", never "teamlead".
+# evidence — an explicit `-TL`/`_tl`/`teamlead` window marker. The operator pane
+# is its own role. The fall-through default is "dev", never "teamlead".
+#
+# T-0175: the earlier "initiative binding with no task ⇒ teamlead" heuristic
+# still leaked — a dev that finishes its task (task_id cleared to ~) keeps its
+# initiative and flipped to teamlead. Initiative/task bindings no longer change
+# the role; teamlead requires an explicit window marker. Genuine worker-spawned
+# TLs carry a `-TL`/`_teamlead` window, so they are unaffected.
 #
 # The separator-guarded `tl` match (`(^|[-_])tl$`) avoids false positives on
 # words that merely end in "tl" (e.g. `some-ctl`).
@@ -336,9 +341,13 @@ def _derive_role(
     Precedence (first match wins):
       1. operator window marker (`operator`, `<x>-operator`) → ``operator``
       2. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
-      3. any task binding (primary or extra) → ``dev``
-      4. any initiative binding, no task → ``teamlead`` (worker-spawned TL)
-      5. default → ``dev``
+      3. default → ``dev``
+
+    T-0175: ``task_id`` / ``initiative`` (and their ``extra_*`` lists) no longer
+    influence the role — they are accepted for call-site compatibility but a
+    teamlead is recognised *only* by an explicit window marker. A task-less,
+    initiative-bound, marker-less session is a dev (it is most often a dev that
+    finished its task), not a teamlead.
 
     `~` is the registry's "unset" sentinel and is treated as absent.
     """
@@ -346,12 +355,6 @@ def _derive_role(
     if _OPERATOR_WINDOW_RE.search(w):
         return "operator"
     if _TL_WINDOW_RE.search(w):
-        return "teamlead"
-    has_task = bool(task_id and task_id != "~") or bool(extra_task_ids)
-    if has_task:
-        return "dev"
-    has_init = bool(initiative and initiative != "~") or bool(extra_initiatives)
-    if has_init:
         return "teamlead"
     return "dev"
 

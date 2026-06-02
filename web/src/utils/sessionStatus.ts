@@ -64,8 +64,8 @@ export function isRunning(activity: SessionActivity): boolean {
 // The role was historically inferred client-side as "no task_id ⟹ teamlead",
 // which leaked nearly every task-less agent-teams session as a teamlead. The
 // worker now derives an authoritative `role` (sessions.py::_derive_role); the
-// UI prefers it and only falls back to the legacy inference for a pre-T-0141
-// worker that doesn't yet emit the field.
+// UI prefers it and, when the field is absent (a pre-T-0141 worker), defaults
+// to dev — T-0175: never re-introduce the teamlead leak via the fallback.
 // ---------------------------------------------------------------------------
 export type SessionRoleName = "teamlead" | "dev" | "operator";
 
@@ -75,9 +75,10 @@ export function sessionRole(
   if (!src) return "dev";
   const r = src.role;
   if (r === "teamlead" || r === "dev" || r === "operator") return r;
-  // Legacy fallback: a real task binding means dev, otherwise teamlead.
-  const t = (src.task_id ?? "").trim();
-  return t && t !== "~" ? "dev" : "teamlead";
+  // T-0175: a missing/unknown role defaults to dev, never teamlead. The old
+  // "task-less ⟹ teamlead" fallback leaked nearly every finished dev (task_id
+  // cleared to ~) as a teamlead.
+  return "dev";
 }
 
 /** Human-readable role label for the sessions table Role column. */

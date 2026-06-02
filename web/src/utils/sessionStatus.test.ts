@@ -12,10 +12,12 @@ describe("sessionRole", () => {
     expect(sessionRole({ role: "operator", task_id: "~" })).toBe("operator");
   });
 
-  it("falls back to task binding when role is absent (pre-T-0141 worker)", () => {
+  it("falls back to dev when role is absent (pre-T-0141 worker), never teamlead", () => {
+    // T-0175: a missing/unknown role must default to dev, not teamlead. The old
+    // "task-less ⟹ teamlead" fallback leaked nearly every finished dev as a TL.
     expect(sessionRole({ task_id: "T-9" })).toBe("dev");
-    expect(sessionRole({ task_id: "~" })).toBe("teamlead");
-    expect(sessionRole({})).toBe("teamlead");
+    expect(sessionRole({ task_id: "~" })).toBe("dev");
+    expect(sessionRole({})).toBe("dev");
   });
 
   it("ignores unknown role strings and falls back", () => {

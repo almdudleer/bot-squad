@@ -209,6 +209,35 @@ def test_tg_notify_unknown_slug_raises(tmp_config_dir, monkeypatch):
         A.dispatch("tg_notify", {"slug": "no-such-slug", "message": "hi"})
 
 
+def test_tg_notify_uses_system_default_chat_over_first_project(tmp_config_dir, monkeypatch):
+    """T-0171: with a system default_chat_id, a notify carrying neither chat_id
+    nor slug resolves to that default (the detached local-bot path) instead of
+    guessing the first registered project's chat."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[tg]\ndefault_chat_id = "DEFAULT_999"\n'
+    )
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    assert cfg.tg_default_chat_id == "DEFAULT_999"
+    out = A.dispatch("tg_notify", {"message": "detached hello"})
+    assert out["ok"] is True
+    assert fake.calls[0]["chat_id"] == "DEFAULT_999"
+
+
+def test_tg_notify_slug_still_wins_over_default_chat(tmp_config_dir, monkeypatch):
+    """A project-bound notify still targets the project chat — the system
+    default only fills the no-slug/no-chat gap."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[tg]\ndefault_chat_id = "DEFAULT_999"\n'
+    )
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    A.dispatch("tg_notify", {"slug": "test-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "0"  # test-project tg_chat, not the default
+
+
 def test_tg_notify_debounce_returns_sent_false(tmp_config_dir, monkeypatch):
     """When TgClient.send returns False (debounced), tg_notify reports sent=False."""
     import bot_squad_worker.actions as A

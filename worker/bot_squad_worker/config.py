@@ -94,6 +94,12 @@ class Config:
     projects: dict[str, Project] = field(default_factory=dict)
     tg_bot_token: str = ""
     tg_auth_age_max: int = 86400
+    # T-0171: per-server default Telegram chat id for the LOCAL (detached /
+    # standalone) bot. Used as the chat fallback when a tg_notify carries
+    # neither an explicit chat_id nor a project slug. Loaded from
+    # system_settings.toml [tg].default_chat_id. Empty → fall back to the first
+    # registered project's tg_chat (legacy behaviour).
+    tg_default_chat_id: str = ""
     # Quiet hours during which non-urgent TG sends are dropped. UTC. Loaded
     # from <config_dir>/system_settings.toml; defaults match historical
     # 17→05 UTC sleep window for the Tashkent stakeholder.
@@ -146,6 +152,7 @@ class Config:
         quiet_end = 5
         stall_minutes = 15
         remote_control_url = ""
+        default_chat_id = ""
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -154,6 +161,7 @@ class Config:
             quiet_end = int(tg_block.get("quiet_hours_end_utc", quiet_end))
             stall_minutes = int(tg_block.get("stall_minutes", stall_minutes))
             remote_control_url = str(tg_block.get("remote_control_url", remote_control_url))
+            default_chat_id = str(tg_block.get("default_chat_id", default_chat_id))
 
         return cls(
             config_dir=config_dir,
@@ -164,4 +172,5 @@ class Config:
             tg_quiet_hours_end_utc=quiet_end,
             tg_stall_minutes=stall_minutes,
             tg_remote_control_url=remote_control_url,
+            tg_default_chat_id=default_chat_id,
         )

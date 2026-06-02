@@ -16,6 +16,7 @@ export function SystemSettings() {
 
   const [botToken, setBotToken] = useState<string>("");
   const [showToken, setShowToken] = useState(false);
+  const [defaultChatId, setDefaultChatId] = useState<string>("");
   const [quietStart, setQuietStart] = useState<number>(17);
   const [quietEnd, setQuietEnd] = useState<number>(5);
   const [ttl, setTtl] = useState<string>("7d");
@@ -29,6 +30,7 @@ export function SystemSettings() {
         setSettings(s);
         setQuietStart(s.tg.quiet_hours_start_utc);
         setQuietEnd(s.tg.quiet_hours_end_utc);
+        setDefaultChatId(s.tg.default_chat_id);
         setTtl(s.session.ttl);
         setCoordUser(s.admin.coordinator_user);
       })
@@ -71,11 +73,19 @@ export function SystemSettings() {
     }
     setSaving(true);
     try {
+      // When attached to the mothership, the bot token + default chat are locked
+      // (inputs disabled). Omit them from the payload so the API doesn't 409.
+      const managed = settings?.tg.managed_by_mothership ?? false;
       const body = {
         tg: {
           quiet_hours_start_utc: quietStart,
           quiet_hours_end_utc: quietEnd,
-          ...(botToken !== "" ? { bot_token: botToken } : {}),
+          ...(managed
+            ? {}
+            : {
+                default_chat_id: defaultChatId.trim(),
+                ...(botToken !== "" ? { bot_token: botToken } : {}),
+              }),
         },
         session: { ttl },
         admin: { coordinator_user: coordUser.trim() },
@@ -148,13 +158,41 @@ export function SystemSettings() {
         <>
           <section className="mb-4">
             <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-              Telegram bot token
+              Telegram bot
             </h3>
+
+            {/* T-0171: when this server is an attached mothership consumer, the
+                per-server bot token + default chat are locked — notifications
+                flow through the mothership's @bot_squad_bot. */}
+            {settings.tg.managed_by_mothership && (
+              <div
+                className="alert alert-info py-2"
+                style={{ fontSize: "0.8rem" }}
+                data-testid="tg-mothership-lock-banner"
+              >
+                🔒 Locked — this server is attached to{" "}
+                {settings.tg.mothership_url ? (
+                  <a href={settings.tg.mothership_url} target="_blank" rel="noreferrer">
+                    the mothership
+                  </a>
+                ) : (
+                  "the mothership"
+                )}
+                . Notifications are delivered through the mothership's{" "}
+                <code>@bot_squad_bot</code>, so this server doesn't need its own
+                bot. Detach to use your own bot token.
+              </div>
+            )}
+
+            <label className="form-label" style={{ fontSize: "0.72rem" }}>
+              Bot token
+            </label>
             <div className="d-flex gap-2 align-items-center mb-1">
               <input
                 type={showToken ? "text" : "password"}
                 className="form-control"
                 value={botToken}
+                disabled={settings.tg.managed_by_mothership}
                 onChange={(e) => setBotToken(e.target.value)}
                 placeholder={settings.tg.bot_token_set ? "•••••• (token configured)" : "paste bot token"}
                 style={{ fontFamily: "var(--mc-mono)" }}
@@ -162,14 +200,32 @@ export function SystemSettings() {
               <button
                 type="button"
                 className="btn btn-outline-secondary btn-sm"
+                disabled={settings.tg.managed_by_mothership}
                 onClick={() => setShowToken((v) => !v)}
               >
                 {showToken ? "Hide" : "Show"}
               </button>
             </div>
-            <small style={{ color: "var(--mc-text-dim)" }}>
+            <small style={{ display: "block", color: "var(--mc-text-dim)" }}>
               Bot token configured: {settings.tg.bot_token_set ? "yes" : "no"}.
               Leave blank to keep current. Submit an empty value to clear (use Show then Clear).
+            </small>
+
+            <label className="form-label mt-3" style={{ fontSize: "0.72rem" }}>
+              Default chat id
+            </label>
+            <input
+              type="text"
+              className="form-control"
+              value={defaultChatId}
+              disabled={settings.tg.managed_by_mothership}
+              onChange={(e) => setDefaultChatId(e.target.value)}
+              placeholder="e.g. 404580642"
+              style={{ width: "18rem", fontFamily: "var(--mc-mono)" }}
+            />
+            <small style={{ display: "block", color: "var(--mc-text-dim)" }}>
+              Default Telegram chat for notifications that aren't bound to a
+              project. Used by this server's own bot when detached.
             </small>
           </section>
 

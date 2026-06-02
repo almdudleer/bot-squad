@@ -46,6 +46,21 @@ def test_stall_settings_default(tmp_config_dir: Path) -> None:
     assert cfg.tg_remote_control_url == ""
 
 
+def test_default_chat_id_default_empty(tmp_config_dir: Path) -> None:
+    # T-0171: absent system_settings.toml → no per-server default chat.
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_default_chat_id == ""
+
+
+def test_default_chat_id_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0171: admin sets the per-server (detached) default chat via [tg].
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[tg]\ndefault_chat_id = "404580642"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_default_chat_id == "404580642"
+
+
 def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
     # T-0155: admin overrides via [tg] in system_settings.toml.
     (tmp_config_dir / "system_settings.toml").write_text(

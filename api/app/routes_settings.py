@@ -22,10 +22,37 @@ _DEFAULTS = {
     "tg": {
         "quiet_hours_start_utc": 17,
         "quiet_hours_end_utc": 5,
+        # T-0171: per-server default Telegram chat id, used by the local
+        # (detached / standalone) bot when a notify has no explicit chat/slug.
+        "default_chat_id": "",
     },
     "session": {"ttl": "7d"},
     "admin": {"coordinator_user": "almdudleer"},
 }
+
+
+def _mothership_state() -> dict:
+    """Describe this install's relation to a mothership (T-0171).
+
+    - ``is_self``: this install IS the mothership (``MOTHERSHIP=1``). It owns
+      @bot_squad_bot, so its TG token stays editable.
+    - ``url``: the upstream mothership this server consumes from, if any
+      (mirrors the worker / autoupdate env lookup order).
+    - ``attached``: this is an attached *consumer* — not the mothership itself,
+      but pointed at one. In this state notifications flow through the
+      mothership's TG bot, so the per-server token + default chat are LOCKED.
+
+    A *detached / standalone* server is ``is_self=False`` + no ``url`` → not
+    attached → token editable (it runs its own bot).
+    """
+    is_self = os.environ.get("MOTHERSHIP", "0") == "1"
+    url = (
+        os.environ.get("BOT_SQUAD_MOTHERSHIP_URL")
+        or os.environ.get("BOTSQUAD_MOTHERSHIP_URL")
+        or ""
+    ).rstrip("/")
+    attached = (not is_self) and bool(url)
+    return {"is_self": is_self, "url": url or None, "attached": attached}
 
 
 def _toml_escape(s: str) -> str:
@@ -52,6 +79,9 @@ def _read_system_settings(config_dir: Path) -> dict:
             "quiet_hours_end_utc": int(
                 tg.get("quiet_hours_end_utc", _DEFAULTS["tg"]["quiet_hours_end_utc"])
             ),
+            "default_chat_id": str(
+                tg.get("default_chat_id", _DEFAULTS["tg"]["default_chat_id"])
+            ),
         },
         "session": {"ttl": str(sess.get("ttl", _DEFAULTS["session"]["ttl"]))},
         "admin": {
@@ -69,6 +99,7 @@ def _write_system_settings(config_dir: Path, settings: dict) -> None:
     out.append("[tg]")
     out.append(f"quiet_hours_start_utc = {int(settings['tg']['quiet_hours_start_utc'])}")
     out.append(f"quiet_hours_end_utc = {int(settings['tg']['quiet_hours_end_utc'])}")
+    out.append(f'default_chat_id = "{_toml_escape(str(settings["tg"]["default_chat_id"]))}"')
     out.append("")
     out.append("[session]")
     out.append(f'ttl = "{_toml_escape(settings["session"]["ttl"])}"')
@@ -114,11 +145,19 @@ def _bot_token_set(config_dir: Path) -> bool:
 
 def _shape(config_dir: Path) -> dict:
     s = _read_system_settings(config_dir)
+    ms = _mothership_state()
     return {
         "tg": {
             "bot_token_set": _bot_token_set(config_dir),
+            "default_chat_id": s["tg"]["default_chat_id"],
             "quiet_hours_start_utc": s["tg"]["quiet_hours_start_utc"],
             "quiet_hours_end_utc": s["tg"]["quiet_hours_end_utc"],
+            # T-0171: when this server is an attached mothership consumer, the
+            # per-server bot token + default chat are LOCKED — notifications
+            # flow through the mothership's @bot_squad_bot. The UI greys the
+            # fields + shows a banner; the PUT handler also refuses writes.
+            "managed_by_mothership": ms["attached"],
+            "mothership_url": ms["url"],
         },
         "session": {"ttl": s["session"]["ttl"]},
         "admin": {"coordinator_user": s["admin"]["coordinator_user"]},
@@ -143,6 +182,23 @@ def put_settings(request: Request, payload: dict) -> dict:
     admin_in = (
         (payload.get("admin") or {}) if isinstance(payload.get("admin"), dict) else {}
     )
+
+    # T-0171: the per-server TG bot token + default chat are locked while this
+    # server is an attached mothership consumer (notifications flow through the
+    # mothership's bot). The UI disables the inputs; enforce server-side too so
+    # a stale client or direct API call can't write them.
+    locked = _mothership_state()["attached"]
+    if locked and ("bot_token" in tg_in or "default_chat_id" in tg_in):
+        raise HTTPException(
+            status_code=409,
+            detail="TG bot token + default chat are locked while attached to the mothership",
+        )
+
+    if "default_chat_id" in tg_in:
+        v = tg_in["default_chat_id"]
+        if not isinstance(v, str):
+            raise HTTPException(status_code=400, detail="tg.default_chat_id must be a string")
+        current["tg"]["default_chat_id"] = v.strip()
 
     if "quiet_hours_start_utc" in tg_in:
         v = tg_in["quiet_hours_start_utc"]

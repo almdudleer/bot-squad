@@ -375,7 +375,19 @@ def cmd_spawn(args) -> None:
     elif args.prompt:
         initial_prompt = args.prompt
     else:
-        initial_prompt = _default_brief(slug, ticket, path, fm, bundle)
+        # T-0149: deterministic assembly from ticket(s) + role + guidance + rules.
+        all_tickets = [ticket] + [b for b in bundle if b != ticket]
+        paths = {ticket: path}
+        fms = {ticket: fm}
+        for b in bundle:
+            if b in paths:
+                continue
+            bp = find_ticket(slug, b)
+            paths[b] = bp
+            fms[b] = read_frontmatter(bp)
+        report_to = my_sid() or "<your TL SID>"
+        initial_prompt = _assemble_prompt(
+            slug, all_tickets, paths, fms, args.role, report_to)
 
     params = {"slug": slug, "window": window, "initial_prompt": initial_prompt, "task_id": ticket}
     if initiative:
@@ -390,6 +402,129 @@ def cmd_spawn(args) -> None:
     res = post("spawn_session", params, timeout=90)
     print(f"spawned {res.get('sid')} (window={window}, task={ticket}"
           + (f", bundle={','.join(bundle)}" if bundle else "") + ")")
+
+
+_ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
+               "operator": "operator.md"}
+_KW_STOP = {"the", "and", "for", "with", "from", "into", "via", "not", "per",
+            "fix", "add", "new", "use", "all", "any", "out", "off", "more"}
+
+
+def _ticket_keywords(fms: dict[str, dict]) -> list[str]:
+    """Derive guidance-search keywords from assigned tickets (ids + title words)."""
+    kws: list[str] = list(fms.keys())  # ticket ids
+    for fm in fms.values():
+        for w in re.split(r"[^A-Za-z0-9]+", fm.get("title", "").lower()):
+            if len(w) >= 4 and w not in _KW_STOP and w not in kws:
+                kws.append(w)
+    return kws[:8]
+
+
+def _body_after_frontmatter(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    return re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL).strip()
+
+
+def _cross_refs(bodies: list[str], own: set[str]) -> list[str]:
+    """`Related: [[T-xxxx]]` ids referenced by the assigned tickets (minus own)."""
+    refs: list[str] = []
+    for b in bodies:
+        for m in re.findall(r"\[\[(T-\d+)\]\]", b):
+            if m not in own and m not in refs:
+                refs.append(m)
+    return refs
+
+
+def _assemble_prompt(slug: str, tickets: list[str], paths: dict[str, Path],
+                     fms: dict[str, dict], role: str, report_to: str) -> str:
+    """T-0149: deterministic per-task/role initial-prompt assembly.
+
+    Composes the brief from the ticket bodies + role contract + initiative +
+    cross-refs + prior stakeholder guidance (T-0151) + the hard process rules
+    (no-superpowers-drift T-0152, manual-first verification T-0158, git/commit
+    discipline, report-READY protocol). Replaces the hand-pasted brief so every
+    spawn gets the same complete context regardless of who spawns it.
+    """
+    primary = tickets[0]
+    role = role if role in _ROLE_FILES else "dev"
+    roles_dir = Path(BOT_SQUAD) / "data" / slug / "vision" / "roles"
+    role_path = roles_dir / _ROLE_FILES[role]
+    role_text = role_path.read_text(encoding="utf-8", errors="replace").strip() \
+        if role_path.exists() else "(role file missing)"
+
+    bodies = {t: _body_after_frontmatter(paths[t]) for t in tickets}
+    initiative = fms[primary].get("initiative") or ""
+    ai_path = Path(BOT_SQUAD) / "data" / slug / "AGENT_INSTRUCTIONS.md"
+    init_path = (Path(BOT_SQUAD) / "data" / slug / "vision" / "initiatives" / initiative
+                 if initiative else None)
+
+    # Prior stakeholder guidance (T-0151) folded in deterministically.
+    kws = _ticket_keywords(fms)
+    hits, total, _ = _collect_guidance(slug, kws, 5)
+    if hits:
+        guidance = "\n".join(
+            f"  • [{h['source']} · {(h.get('ts') or '')[:10]}] {h['text']}" for h in hits)
+        guidance = (f"Prior stakeholder guidance found for this work "
+                    f"(via `bsq guidance search`, {total} hit(s); re-run for more):\n{guidance}")
+    else:
+        guidance = ("No prior stakeholder guidance matched. Before designing your "
+                    "approach, run `bsq guidance search <keywords>` yourself with "
+                    "other terms — buried guidance saves repeating questions (T-0151).")
+
+    refs = _cross_refs(list(bodies.values()), set(tickets))
+    refs_line = (f"Cross-referenced tickets (consult via `bsq ticket status <id>`): "
+                 f"{', '.join(refs)}.\n\n" if refs else "")
+
+    ticket_blocks = "\n\n".join(
+        f"### {t}: {fms[t].get('title', t)}\n{bodies[t]}" for t in tickets)
+    bundle_note = (f" You are bundled {len(tickets)} tickets: {', '.join(tickets)} — "
+                   f"handle them together in this one session."
+                   if len(tickets) > 1 else "")
+
+    return f"""\
+You are a bot-squad {role} session assigned {primary}{bundle_note}
+
+The full scope+DoD of each assigned ticket is INLINED below — this brief is
+self-contained, but FIRST also read AGENT_INSTRUCTIONS.md ({ai_path}) for
+paths/git-rules and your initiative file{f' ({init_path})' if init_path else ''}.
+The 'Verbatim request — source of truth' section of any ticket is HUMAN-ONLY —
+never edit it.
+
+== ASSIGNED TICKET(S) ==
+{ticket_blocks}
+
+{refs_line}== YOUR ROLE CONTRACT ({_ROLE_FILES[role]}) ==
+{role_text}
+
+== PRIOR STAKEHOLDER GUIDANCE (T-0151) ==
+{guidance}
+
+== HARD PROCESS RULES (enforced — not suggestions) ==
+1. TASK MANAGEMENT VIA BOT-SQUAD TICKETS ONLY (T-0152). Do NOT write planning
+   artifacts, notes, or task lists into ~/.claude/superpowers/* or other doc
+   folders — that's where sessions get lost. Track all multi-step work on the
+   ticket: `bsq ticket note <id> <text>` for progress, `bsq ticket update <id>
+   <status>` for status. In-session TodoWrite/TaskCreate is ONLY for sub-steps
+   within one ticket.
+2. MANUAL-TESTING-FIRST (T-0158). For any verification DoD item: (a) write the
+   user scenario in plain English (`bsq scenario new <id>` opens a template),
+   (b) walk it through MANUALLY (playwright MCP or narrated scripted
+   walkthrough) observing the REAL result, (c) automate ONLY after the manual
+   pass. A test .mjs written before the manual walkthrough is a process
+   violation.
+3. GIT DISCIPLINE. Edit the shared tree directly on branch bot_squad/dev — no
+   worktree, no branch switch, no git stash. Commit ONLY with `bsq commit -m
+   <msg> --ack <explicit files>` (review the peer report first). Never wide-add,
+   never rewrite pushed history (revert to undo), never push or merge — your
+   {('TL' if role == 'dev' else 'reviewer')} reviews and deploys.
+4. STAY ON TASK (T-0149). A drift-check tick monitors time-since-commit and
+   time-since-progress-note. Come back to the DoD regularly; if you defer or
+   descope anything, record WHY via `bsq ticket note` — don't silently drift.
+5. REPORT READY. When a ticket's DoD (incl. manual walkthrough) is green:
+   `bsq ticket update <id> totest`, `bsq ticket note <id> '<summary>'`, then
+   `bsq peer send {report_to} 'READY <id> — <summary>'`.
+
+Run `bsq --help` for the full verb reference."""
 
 
 def _default_brief(slug: str, ticket: str, path: Path, fm: dict, bundle: list[str]) -> str:
@@ -688,12 +823,12 @@ def _scan_md_section(path: Path, kws: list[str], section: str | None) -> list[di
              "score": sc, "text": _snippet(body, kws)}]
 
 
-def cmd_guidance_search(args) -> None:
-    slug = resolve_slug()
-    kws = [k.lower() for k in args.keywords if k.strip()]
-    if not kws:
-        die("guidance search needs at least one keyword")
+def _collect_guidance(slug: str, kws: list[str], limit: int,
+                      all_projects: bool = False) -> tuple[list[dict], int, int]:
+    """Core of guidance search — returns (top_hits, total_unique, truncated).
 
+    Shared by `bsq guidance search` and T-0149 deterministic spawn assembly.
+    """
     hits: list[dict] = []
     # 1. backlog Verbatim sections (stakeholder source-of-truth).
     for p in sorted(backlog_dir(slug).glob("T-*.md")):
@@ -704,7 +839,7 @@ def cmd_guidance_search(args) -> None:
         for p in sorted(sess_dir.glob("*.md")):
             hits += _scan_md_section(p, kws, None)
     # 3. jsonl conversation logs (human-typed messages).
-    dirs = _jsonl_search_dirs(slug, getattr(args, "all_projects", False))
+    dirs = _jsonl_search_dirs(slug, all_projects)
     candidates = _grep_candidate_jsonl(kws, dirs)
     truncated = 0
     if len(candidates) > _JSONL_PARSE_CAP:
@@ -725,7 +860,16 @@ def cmd_guidance_search(args) -> None:
         seen.add(key)
         uniq.append(h)
     uniq.sort(key=lambda h: (h["score"], h.get("ts", "")), reverse=True)
-    top = uniq[:args.limit]
+    return uniq[:limit], len(uniq), truncated
+
+
+def cmd_guidance_search(args) -> None:
+    slug = resolve_slug()
+    kws = [k.lower() for k in args.keywords if k.strip()]
+    if not kws:
+        die("guidance search needs at least one keyword")
+    top, total, truncated = _collect_guidance(
+        slug, kws, args.limit, getattr(args, "all_projects", False))
 
     if args.json:
         print(json.dumps({"query": kws, "hits": top, "truncated": truncated}))
@@ -734,7 +878,7 @@ def cmd_guidance_search(args) -> None:
         print(f"(no prior stakeholder guidance found for: {' '.join(kws)})")
         return
     print(f"prior stakeholder guidance for [{' '.join(kws)}] — top {len(top)} "
-          f"of {len(uniq)} match(es):\n")
+          f"of {total} match(es):\n")
     for h in top:
         ts = (h.get("ts") or "")[:19] or "?"
         print(f"• [{h['source']} · {ts} · score {h['score']}]")
@@ -946,7 +1090,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--window", help="tmux window name (default: ticket feature slug)")
     sp.add_argument("--initiative", help="initiative md (default: from ticket frontmatter)")
     sp.add_argument("--owner", help="UI username to stamp on the session")
-    sp.add_argument("--prompt", help="custom initial prompt (overrides the default brief)")
+    sp.add_argument("--role", default="dev", choices=["dev", "tl", "teamlead", "operator"],
+                    help="role contract to assemble into the prompt (default dev)")
+    sp.add_argument("--prompt", help="custom initial prompt (overrides deterministic assembly)")
     sp.add_argument("--prompt-file", help="read initial prompt from a file")
     sp.add_argument("--dry-run", action="store_true", help="print params without spawning")
     sp.set_defaults(func=cmd_spawn)

@@ -14,6 +14,7 @@ from bot_squad_worker.jobs import (
     autoupdate_tick,
     binding_gc_tick,
     deploy_monitor,
+    drift_check_tick,
     heartbeat,
     oauth_refresh,
     tg_listener_tick,
@@ -129,6 +130,23 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="autoupdate_apply",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # drift_check_tick: T-0149 — enforce ticket focus by injecting a
+    # drift-check reminder into live dev sessions that have gone too long
+    # without touching their ticket, or whose recent activity is off-task.
+    # Gentler cadence than binding_gc (it types into live panes); gated by
+    # BOT_SQUAD_DRIFT_MINUTES (0 = disabled). max_instances=1 so an inject
+    # that runs long never overlaps the next pass.
+    sched.add_job(
+        drift_check_tick,
+        "interval",
+        seconds=120,
+        args=[cfg],
+        id="drift_check",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

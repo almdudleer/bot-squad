@@ -197,6 +197,24 @@ def binding_gc_tick(cfg: Config) -> None:
                 log.exception("binding_gc_tick: %s failed for %s", name, slug)
 
 
+def drift_check_tick(cfg: Config) -> None:
+    """T-0149: per-project drift-enforcement pass.
+
+    Injects a drift-check reminder into live, task-bound dev sessions that
+    have gone too long without updating their ticket or whose recent activity
+    is off-task (superpowers docs / premature automation). Disabled when
+    ``BOT_SQUAD_DRIFT_MINUTES=0``. Per-project errors are caught and logged so
+    one bad project never kills the sweep.
+    """
+    from bot_squad_worker import drift as _drift
+
+    for slug in cfg.projects:
+        try:
+            _drift.drift_check(cfg, slug)
+        except Exception:
+            log.exception("drift_check_tick: unhandled error for project %s", slug)
+
+
 def autonomous_tick(cfg: Config) -> None:
     """Run one orchestrator tick for every project that has autonomous mode enabled.
 

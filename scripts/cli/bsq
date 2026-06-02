@@ -541,6 +541,210 @@ def cmd_commit(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# guidance search (T-0151) — stakeholder guidance gets buried in suspended
+# sessions' .jsonl logs and in ticket bodies; new sessions repeat questions
+# 3-4× because they don't dig for it. This verb surfaces prior
+# stakeholder-attributed comments matching a query across three corpora:
+#   1. backlog T-*.md  "Verbatim request" sections (human source-of-truth)
+#   2. data/<slug>/sessions/*.md bodies (close-hook appends stakeholder notes)
+#   3. ~/.claude/projects/*/*.jsonl  human-typed (userType=external) messages
+# T-0149's deterministic spawn prompt auto-runs this and folds in the hits.
+# --------------------------------------------------------------------------
+_CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+# jsonl user-string lines that are NOT stakeholder guidance (bus signals,
+# injected briefs, dispatch envelopes, command/system wrappers).
+_NON_STAKEHOLDER_PREFIXES = ("You are a bot-squad", ENVELOPE_MARKER)
+_JSONL_PARSE_CAP = 400  # most-recently-modified candidate files to parse
+
+
+def _snippet(text: str, kws: list[str], width: int = 220) -> str:
+    """One-line snippet centred on the first matched keyword."""
+    flat = re.sub(r"\s+", " ", text).strip()
+    low = flat.lower()
+    pos = min((low.find(k) for k in kws if low.find(k) >= 0), default=0)
+    start = max(0, pos - 40)
+    end = min(len(flat), start + width)
+    s = flat[start:end]
+    if start > 0:
+        s = "…" + s
+    if end < len(flat):
+        s = s + "…"
+    return s
+
+
+def _score(text: str, kws: list[str]) -> int:
+    low = text.lower()
+    return sum(1 for k in kws if k in low)
+
+
+def _jsonl_search_dirs(slug: str, all_projects: bool) -> list[str]:
+    """Which ~/.claude/projects/* dirs to grep.
+
+    Default: dirs whose name contains a slug token (the stakeholder discusses
+    a project inside that project's own sessions — far smaller corpus, ~10×
+    faster than the full tree). ``--all-projects`` greps everything.
+    """
+    if not os.path.isdir(_CLAUDE_PROJECTS):
+        return []
+    all_dirs = [os.path.join(_CLAUDE_PROJECTS, d) for d in os.listdir(_CLAUDE_PROJECTS)
+                if os.path.isdir(os.path.join(_CLAUDE_PROJECTS, d))]
+    if all_projects:
+        return all_dirs
+    # Match the full normalized slug ("bot-squad") in the dir basename — the
+    # path-derived dir names use '-' as the separator, so the slug appears
+    # literally. (Per-token matching is too loose: "bot" hits "watchrobot".)
+    needle = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+    scoped = [d for d in all_dirs if needle in os.path.basename(d).lower()]
+    return scoped or all_dirs  # fall back to all if no slug-matched dir
+
+
+def _grep_candidate_jsonl(kws: list[str], dirs: list[str]) -> list[str]:
+    """Fast prefilter: jsonl files containing ANY keyword (fixed-string)."""
+    if not dirs:
+        return []
+    cmd = ["grep", "-rlFi", "--include=*.jsonl"]
+    for k in kws:
+        cmd += ["-e", k]
+    cmd += dirs
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _scan_jsonl(path: str, kws: list[str]) -> list[dict]:
+    hits = []
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return hits
+    with fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                o = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if o.get("type") != "user" or o.get("isSidechain"):
+                continue
+            msg = o.get("message") or {}
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            if o.get("userType") != "external":
+                continue
+            c = content.strip()
+            if not c or c.startswith("<") or c == MAIL_SIGNAL:
+                continue
+            if any(c.startswith(p) for p in _NON_STAKEHOLDER_PREFIXES):
+                continue
+            sc = _score(c, kws)
+            if sc <= 0:
+                continue
+            proj = os.path.basename(os.path.dirname(path))
+            hits.append({
+                "ts": o.get("timestamp", ""),
+                "source": f"jsonl:{proj}",
+                "score": sc,
+                "text": _snippet(c, kws),
+            })
+    return hits
+
+
+def _scan_md_section(path: Path, kws: list[str], section: str | None) -> list[dict]:
+    """Match keywords in a ticket Verbatim section / whole session body."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    fm = read_frontmatter(path)
+    body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
+    if section:
+        # Line-based section slice: from the matching heading line up to the
+        # next heading. (A regex with lazy capture + DOTALL mis-slices here.)
+        lines = body.splitlines()
+        out, collecting = [], False
+        for ln in lines:
+            is_heading = bool(re.match(r"^#+\s", ln))
+            if is_heading and section.lower() in ln.lower():
+                collecting = True
+                continue
+            if collecting and is_heading:
+                break
+            if collecting:
+                out.append(ln)
+        body = "\n".join(out)
+    body = body.strip()
+    if not body:
+        return []
+    sc = _score(body, kws)
+    if sc <= 0:
+        return []
+    ts = fm.get("updated") or fm.get("created") or ""
+    label = fm.get("id") or path.stem
+    return [{"ts": ts, "source": f"{path.parent.name}:{label}",
+             "score": sc, "text": _snippet(body, kws)}]
+
+
+def cmd_guidance_search(args) -> None:
+    slug = resolve_slug()
+    kws = [k.lower() for k in args.keywords if k.strip()]
+    if not kws:
+        die("guidance search needs at least one keyword")
+
+    hits: list[dict] = []
+    # 1. backlog Verbatim sections (stakeholder source-of-truth).
+    for p in sorted(backlog_dir(slug).glob("T-*.md")):
+        hits += _scan_md_section(p, kws, "Verbatim request")
+    # 2. session bodies (close-hook-appended stakeholder notes; T-0151 area 4).
+    sess_dir = Path(BOT_SQUAD) / "data" / slug / "sessions"
+    if sess_dir.is_dir():
+        for p in sorted(sess_dir.glob("*.md")):
+            hits += _scan_md_section(p, kws, None)
+    # 3. jsonl conversation logs (human-typed messages).
+    dirs = _jsonl_search_dirs(slug, getattr(args, "all_projects", False))
+    candidates = _grep_candidate_jsonl(kws, dirs)
+    truncated = 0
+    if len(candidates) > _JSONL_PARSE_CAP:
+        candidates.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0,
+                        reverse=True)
+        truncated = len(candidates) - _JSONL_PARSE_CAP
+        candidates = candidates[:_JSONL_PARSE_CAP]
+    for f in candidates:
+        hits += _scan_jsonl(f, kws)
+
+    # Dedupe identical snippets (jsonl retries/edits repeat verbatim).
+    seen = set()
+    uniq = []
+    for h in hits:
+        key = h["text"]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(h)
+    uniq.sort(key=lambda h: (h["score"], h.get("ts", "")), reverse=True)
+    top = uniq[:args.limit]
+
+    if args.json:
+        print(json.dumps({"query": kws, "hits": top, "truncated": truncated}))
+        return
+    if not top:
+        print(f"(no prior stakeholder guidance found for: {' '.join(kws)})")
+        return
+    print(f"prior stakeholder guidance for [{' '.join(kws)}] — top {len(top)} "
+          f"of {len(uniq)} match(es):\n")
+    for h in top:
+        ts = (h.get("ts") or "")[:19] or "?"
+        print(f"• [{h['source']} · {ts} · score {h['score']}]")
+        print(f"  {h['text']}\n")
+    if truncated:
+        print(f"(note: {truncated} older jsonl file(s) beyond the {_JSONL_PARSE_CAP}-file "
+              f"parse cap were skipped — narrow keywords to surface them)")
+
+
+# --------------------------------------------------------------------------
 # ticket verbs (T-0152) — make bot-squad-ticket-bound work feel native so
 # sessions stop wandering into ~/.claude/superpowers/* docs to track work.
 # --------------------------------------------------------------------------
@@ -767,6 +971,18 @@ def build_parser() -> argparse.ArgumentParser:
     trn.add_argument("sid", help="target session SID")
     trn.add_argument("name", help="new session/window name")
     trn.set_defaults(func=cmd_team_rename)
+
+    # guidance (T-0151: surface buried stakeholder guidance)
+    gd = sub.add_parser("guidance", help="search prior stakeholder guidance (T-0151)")
+    gd_sub = gd.add_subparsers(dest="sub", required=True)
+    gds = gd_sub.add_parser("search",
+                            help="grep tickets + sessions + jsonl logs for stakeholder comments")
+    gds.add_argument("keywords", nargs="+", help="keywords (e.g. a ticket id + title words)")
+    gds.add_argument("--limit", type=int, default=12, help="max hits to show (default 12)")
+    gds.add_argument("--all-projects", action="store_true",
+                     help="grep every ~/.claude/projects dir (default: slug-matched dirs only)")
+    gds.add_argument("--json", action="store_true", help="raw JSON output")
+    gds.set_defaults(func=cmd_guidance_search)
 
     # ticket (T-0152: native bot-squad-ticket task management)
     tk = sub.add_parser("ticket", help="bot-squad backlog ticket status / update / note")

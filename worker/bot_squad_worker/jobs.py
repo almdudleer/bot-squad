@@ -157,7 +157,7 @@ def autoupdate_apply_tick(cfg: Config) -> None:
 def binding_gc_tick(cfg: Config) -> None:
     """T-0072/0073/0077/0142/0144: run the binding-graph reconcilers per project.
 
-    Five ordered passes per tick:
+    Ordered passes per tick (gc + reconcile, then T-0151 guidance harvest):
       1. ``gc_sessions`` — flip ``status: active`` SessionMds with no live pane
          to ``status: suspended`` so the on-disk graph matches reality.
       2. ``gc_dead_bindings`` (T-0142) — refresh bindings from disk: strip
@@ -181,6 +181,7 @@ def binding_gc_tick(cfg: Config) -> None:
     """
     from bot_squad_worker import sessions as _sessions
     from bot_squad_worker import teams as _teams
+    from bot_squad_worker import close_hook as _close_hook
 
     passes = [
         ("gc_sessions", _sessions.gc_sessions),
@@ -188,6 +189,9 @@ def binding_gc_tick(cfg: Config) -> None:
         ("gc_stale_bindings", _sessions.gc_stale_bindings),
         ("archive_dead_teammates", _sessions.archive_dead_teammates),
         ("reconcile_teams", _teams.reconcile_teams),
+        # T-0151: harvest stakeholder guidance from freshly-suspended sessions
+        # into their ticket (runs after gc_sessions has flipped them suspended).
+        ("harvest_guidance", _close_hook.harvest_tick),
     ]
     for slug in cfg.projects:
         for name, fn in passes:

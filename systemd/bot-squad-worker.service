@@ -11,6 +11,11 @@ Environment=LOG_LEVEL=info
 # for this user. Per-user workers (other Linux users) use the separate
 # bot-squad-user-worker.service template.
 Environment=BOT_SQUAD_MODE=coordinator
+# T-0184 hotfix 2026-06-02: drift_check_tick leaks across projects (cross-project
+# T-NNNN id collisions fire false drift alerts on unrelated sessions, e.g. a
+# watchrobot live-news session being nagged about bot-squad's T-0080). Kill
+# switch ON until the per-project opt-in fix lands (bundled with T-0185).
+Environment=BOT_SQUAD_DRIFT_MINUTES=0
 ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
 Restart=on-failure
 RestartSec=10s

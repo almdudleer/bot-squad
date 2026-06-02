@@ -18,6 +18,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type Project, type SessionRow } from "../api";
 import {
   aggregateIndicator,
+  indicatorView,
   type FanResult,
   type IndicatorState,
   type ProjectSessions,
@@ -112,12 +113,17 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
     };
   }, [open]);
 
-  const lit = state.rows.length > 0;
-  const cls = "mc-global-busy" + (lit ? " mc-global-busy-on" : "");
+  // T-0170: the indicator is meaningless when nothing is running — the
+  // stakeholder flagged the "lonely dot" at 0 as confusing. The pure
+  // `indicatorView` decides visibility + the explicit "N running" label +
+  // the explanatory tooltip (unit-tested in globalBusyHelpers.test.ts).
+  const view = indicatorView(state.rows.length);
+  if (!view.visible) return null;
+  const { label, tooltip: explain } = view;
 
   return (
     <div
-      className={cls}
+      className="mc-global-busy mc-global-busy-on"
       ref={rootRef}
       onMouseEnter={() => setOpen(true)}
       onMouseLeave={() => setOpen(false)}
@@ -126,17 +132,14 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
         type="button"
         ref={triggerRef}
         className="mc-global-busy-trigger"
-        aria-label={
-          lit
-            ? `${state.rows.length} task${state.rows.length === 1 ? "" : "s"} in flight`
-            : "no tasks in flight"
-        }
+        title={explain}
+        aria-label={explain}
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
         <span className="mc-global-busy-dot" aria-hidden="true">●</span>
-        {lit && <span className="mc-global-busy-count">{state.rows.length}</span>}
+        <span className="mc-global-busy-count">{label}</span>
       </button>
       {open && (
         <div
@@ -144,11 +147,8 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
           role="dialog"
           style={anchoredBelowLeft(anchorRect)}
         >
-          {state.rows.length === 0 ? (
-            <div className="mc-global-busy-empty">No tasks in flight.</div>
-          ) : (
-            <ul className="mc-global-busy-list">
-              {state.rows.map((r) => (
+          <ul className="mc-global-busy-list">
+            {state.rows.map((r) => (
                 <li key={`${r.serverId ?? "."}/${r.projectSlug}/${r.sid}`}>
                   <div className="mc-global-busy-row">
                     <span className="mc-badge mc-badge-active">
@@ -163,9 +163,8 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
                     <span className="mc-global-busy-sid">{r.sid}</span>
                   </div>
                 </li>
-              ))}
-            </ul>
-          )}
+            ))}
+          </ul>
           {state.failedServerCount > 0 && (
             <div className="mc-global-busy-warn">
               {state.failedServerCount} peer

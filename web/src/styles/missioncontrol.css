@@ -179,6 +179,33 @@ h1, h2, h3, h4, h5, h6 {
   color: var(--mc-cyan);
   border-color: var(--mc-cyan);
 }
+/* T-0170: icon cluster on the right of the header row — server-settings
+   gear (admin-only) sits left of the help `?`. */
+.mc-sidebar-header-icons {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+/* Server settings gear, parallel to the per-project gear (T-0167) but
+   server-scoped. Sized to align with the round help icon beside it. */
+.mc-sidebar-server-gear {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--mc-text-dim);
+  text-decoration: none !important;
+  transition: color 0.1s;
+}
+.mc-sidebar-server-gear:hover,
+.mc-sidebar-server-gear.active {
+  color: var(--mc-cyan);
+}
 
 .mc-worker-status {
   display: flex;
@@ -205,6 +232,23 @@ h1, h2, h3, h4, h5, h6 {
 }
 .mc-sidebar-section::before { content: "[ "; }
 .mc-sidebar-section::after  { content: " ]"; }
+
+/* T-0170: AGENTS nested sub-section header — a child of [ PROJECT ], so it
+   reads as subordinate: no brackets, dimmer/smaller than a section header,
+   slightly inset. Distinct from the bracketed `.mc-sidebar-section`. */
+.mc-sidebar-subsection {
+  padding: 0.7rem 1rem 0.2rem 1.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--mc-text-faint);
+  font-weight: 600;
+}
+/* Nav list nested under a sub-section reads as indented under its header. */
+.mc-sidebar-nav-nested > li > a {
+  padding-left: 1.4rem;
+}
 
 /* ---- Sidebar: MORE collapsible drawer (T-0140) ----------- */
 /* The MORE toggle reuses the section-header look (a `<button>` styled like

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, SystemSettings as Settings } from "../api";
 import { Modal } from "../components/Modal";
 import { Coachmark } from "../onboarding";
@@ -112,9 +113,31 @@ export function SystemSettings() {
         />
       )}
 
-      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "1rem" }}>
-        System settings
+      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.75rem" }}>
+        Server settings
       </h2>
+
+      {/* T-0170: server-admin tools that lost their sidebar "MORE" rows are
+          re-homed here, behind the server-settings gear. The settings form
+          below covers the server's TG bot config (incl. the detached-install
+          token, T-0171), quiet hours, session TTL and coordinator user. */}
+      {isAdmin && (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "0.5rem",
+            marginBottom: "1.25rem",
+          }}
+        >
+          <Link to="/users" className="mc-badge mc-badge-info" style={{ textDecoration: "none", padding: "0.3rem 0.7rem" }}>
+            Manage users →
+          </Link>
+          <Link to="/scheduler" className="mc-badge mc-badge-info" style={{ textDecoration: "none", padding: "0.3rem 0.7rem" }}>
+            Scheduler →
+          </Link>
+        </div>
+      )}
 
       {error && <div className="alert alert-danger">{error}</div>}
       {notice && <div className="alert alert-success py-2">{notice}</div>}

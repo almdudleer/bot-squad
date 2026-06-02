@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import type { SessionRow } from "../api";
 import {
   aggregateIndicator,
+  indicatorView,
   isMyInFlight,
   inFlightRowsFromProject,
   type FanResult,
@@ -143,5 +144,34 @@ describe("aggregateIndicator (fan-out failure isolation)", () => {
     );
     expect(got.rows).toEqual([]);
     expect(got.failedServerCount).toBe(2);
+  });
+});
+
+describe("indicatorView (T-0170)", () => {
+  test("count 0 → not visible (no lonely dot)", () => {
+    const v = indicatorView(0);
+    expect(v.visible).toBe(false);
+    expect(v.label).toBe("");
+  });
+
+  test("negative/garbage count → not visible", () => {
+    expect(indicatorView(-1).visible).toBe(false);
+  });
+
+  test("count 1 → singular label + tooltip", () => {
+    const v = indicatorView(1);
+    expect(v.visible).toBe(true);
+    expect(v.label).toBe("1 running");
+    expect(v.tooltip).toContain("1 agent session ");
+    expect(v.tooltip).not.toContain("sessions");
+  });
+
+  test("count >1 → plural tooltip + word-labelled count", () => {
+    const v = indicatorView(3);
+    expect(v.visible).toBe(true);
+    expect(v.label).toBe("3 running");
+    expect(v.tooltip).toContain("3 agent sessions");
+    // explicit word, not a bare number (the stakeholder's complaint)
+    expect(v.label).toMatch(/running/);
   });
 });

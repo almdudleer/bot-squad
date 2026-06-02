@@ -111,3 +111,32 @@ export function aggregateIndicator(
   }
   return { rows, failedServerCount };
 }
+
+/**
+ * T-0170 — what the header work-indicator should paint for a given count.
+ *
+ * Stakeholder feedback: the old "dot + bare number, dot-only at 0" was
+ * unclear. The rules now:
+ *   • count === 0 → NOT visible (no lonely dot at all).
+ *   • count  >  0 → an explicit word-label ("3 running") plus a hover
+ *     tooltip explaining what the number counts.
+ *
+ * Pure so the rendering decision is unit-tested without a DOM (matches the
+ * helpers-not-components test convention used throughout this file).
+ */
+export type IndicatorView = {
+  visible: boolean;
+  label: string;
+  tooltip: string;
+};
+
+export function indicatorView(count: number): IndicatorView {
+  if (count <= 0) {
+    return { visible: false, label: "", tooltip: "" };
+  }
+  return {
+    visible: true,
+    label: `${count} running`,
+    tooltip: `${count} agent session${count === 1 ? "" : "s"} currently running across your projects — click for details`,
+  };
+}

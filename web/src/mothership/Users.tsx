@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { mothershipApi, type GlobalUser } from "./api";
+import { Link } from "react-router-dom";
+import { mothershipApi, type GlobalUser, type AttachedServer } from "./api";
 import { api } from "../api";
 import { isSuperAdminFromMe } from "../components/sidebarHelpers";
 
@@ -83,11 +84,139 @@ export function Users() {
 
   return (
     <div className="container py-4" style={{ maxWidth: 960 }}>
-      <div className="mc-section-title" style={{ marginBottom: "1rem" }}>
-        Mothership · all users
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          gap: "1rem",
+          marginBottom: "1rem",
+        }}
+      >
+        <div className="mc-section-title">Mothership</div>
+        {/* T-0170: the sidebar's three mothership rows collapsed to one
+            "Mothership" entry → this page. The add-server / invite flow
+            (formerly the "+ ADD SERVER" row) is reachable from here. */}
+        <Link to="/m/servers/add" style={{ fontSize: "0.8rem", textDecoration: "none" }}>
+          + Add a server / invite →
+        </Link>
+      </div>
+
+      <div
+        style={{
+          fontSize: "0.72rem",
+          textTransform: "uppercase",
+          letterSpacing: "0.1em",
+          color: "var(--mc-text-faint)",
+          marginBottom: "0.4rem",
+        }}
+      >
+        Global users
       </div>
       <UsersBody state={state} />
+
+      {/* T-0170: connected-servers list — distinct from the "All Projects"
+          user view. This is the mothership-admin roster of servers attached
+          to botsquad.dev (not necessarily the viewer's own). */}
+      <ConnectedServers />
     </div>
+  );
+}
+
+type ServersLoadState =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "loaded"; servers: AttachedServer[] };
+
+function ConnectedServers() {
+  const [state, setState] = useState<ServersLoadState>({ kind: "loading" });
+
+  useEffect(() => {
+    let cancelled = false;
+    mothershipApi
+      .listServers()
+      .then((servers) => {
+        if (!cancelled) setState({ kind: "loaded", servers });
+      })
+      .catch((err) => {
+        if (!cancelled)
+          setState({
+            kind: "error",
+            message: err instanceof Error ? err.message : String(err),
+          });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <section style={{ marginTop: "2.5rem" }}>
+      <div
+        style={{
+          fontSize: "0.72rem",
+          textTransform: "uppercase",
+          letterSpacing: "0.1em",
+          color: "var(--mc-text-faint)",
+          marginBottom: "0.4rem",
+        }}
+      >
+        Connected servers
+      </div>
+      {state.kind === "loading" && <div className="mc-loading">Loading</div>}
+      {state.kind === "error" && (
+        <div className="alert alert-danger">{state.message}</div>
+      )}
+      {state.kind === "loaded" && state.servers.length === 0 && (
+        <div className="mc-empty">
+          <div className="mc-empty-icon">◯</div>
+          <div>No servers connected yet.</div>
+        </div>
+      )}
+      {state.kind === "loaded" && state.servers.length > 0 && (
+        <table className="table" style={{ fontSize: "0.85rem" }}>
+          <thead>
+            <tr>
+              <th>server</th>
+              <th>base url</th>
+              <th>owner</th>
+              <th>state</th>
+              <th>last seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.servers.map((s) => (
+              <tr key={s.id}>
+                <td>
+                  {s.display_name}
+                  {s.is_self && (
+                    <span className="mc-badge mc-badge-info" style={{ marginLeft: "0.4rem" }}>
+                      self
+                    </span>
+                  )}
+                </td>
+                <td style={{ fontFamily: "var(--mc-mono)" }}>{s.base_url}</td>
+                <td style={{ fontFamily: "var(--mc-mono)" }}>{s.owner_user}</td>
+                <td>
+                  <span
+                    className={
+                      s.install_state === "ready" || s.install_state === "connected"
+                        ? "mc-badge mc-badge-ok"
+                        : s.install_state === "failed"
+                          ? "mc-badge mc-badge-danger"
+                          : "mc-badge mc-badge-active"
+                    }
+                  >
+                    {s.install_state}
+                  </span>
+                </td>
+                <td style={{ color: "var(--mc-text-dim)" }}>{s.last_seen_at ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }
 

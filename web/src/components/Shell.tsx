@@ -1,45 +1,41 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
-import {
-  attachmentSidebarItems,
-  isSuperAdminFromMe,
-} from "./sidebarHelpers";
+import { isSuperAdminFromMe } from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
-// T-0140: remember whether the collapsed "MORE" drawer (rarely-used server /
-// attachment / mothership surfaces) is expanded, so the choice survives reloads.
-const MORE_OPEN_KEY = "bot-squad:sidebar-more-open";
 
 // T-0089: the autoupdate pill is consumer-side only — Vite inlines this
 // constant so the mothership bundle tree-shakes the component import away.
 const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
 
-// T-0060: server picker is mothership-only. Lazy + literal-gated so the
-// detach bundle never imports the chunk (same pattern as App.tsx's
-// MothershipRoutes — Vite resolves the conditional to `null` at build).
-const ServerPicker = IS_MOTHERSHIP_BUILD
-  ? lazy(() =>
-      import("../mothership/ServerPicker").then((m) => ({
-        default: m.ServerPicker,
-      })),
-    )
-  : null;
-
 /**
  * Shell — left sidebar navigation present on every authenticated page.
- * 240 px sticky sidebar: wordmark + worker LED, project info, nav links, system links, footer.
+ *
+ * T-0170 (sidebar v3) collapses the IA onto the role hierarchy
+ * (`vision/roles/role-hierarchy.md`):
+ *   • PROJECT  — the prominent `[ PROJECT ]` block: Board / Roadmap / User
+ *                Feedback / Use Cases, with a quieter nested AGENTS sub-section
+ *                (Agent Sessions / Workflow / Deployment Queue / Analytics).
+ *   • MOTHERSHIP — a single "Mothership" entry, global-admin only (global
+ *                users + invites + connected servers). Tree-shaken off
+ *                detach builds via the VITE_MOTHERSHIP literal gate.
+ *   • Server settings live behind a gear in the header (admin-gated → the
+ *                server settings page), parallel to the project gear (T-0167).
+ * The v2 "MORE" drawer + "Attachment" sub-group + "All Projects" sidebar
+ * entry are gone — their children re-homed to the server-settings page and
+ * My Profile, and the server picker dropped (per-attachment scoping now
+ * defaults to self).
  *
  * Project pinning contract (one pin or none, exactly one way each):
- *   • PIN     — visiting any /p/:slug/* URL pins that slug. The only practical
- *               way to trigger this is by clicking a project in the picker.
+ *   • PIN     — visiting any /p/:slug/* URL pins that slug.
  *   • UNPIN   — the "← all projects" row inside the ProjectSwitcher dropdown
  *               (the only un-pin affordance other than sign-out).
- *   • The pin survives navigating to /, /scheduler, /help, etc. — the
- *               [PROJECT] block stays so per-project links remain one click away.
+ *   • The pin survives navigating to /, /help, etc. — the [PROJECT] block
+ *               stays so per-project links remain one click away.
  */
 export function Shell() {
   const { slug: urlSlug } = useParams<{ slug?: string }>();
@@ -52,18 +48,6 @@ export function Shell() {
   // falls back to is_admin. Drop the fallback once users-model-split lands.
   const [isSuperAdmin, setIsSuperAdmin] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  // T-0140: collapsed-by-default "MORE" drawer.
-  const [moreOpen, setMoreOpen] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(MORE_OPEN_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
-  // T-0060: which server the SERVER section + (later) ATTACHMENT scope
-  // belongs to. Only meaningful on mothership; on detach the single
-  // installation is implicit and the picker isn't rendered.
-  const [pickedServerId, setPickedServerId] = useState<string | null>(null);
   const [pinnedSlug, setPinnedSlug] = useState<string | null>(() => {
     try {
       return localStorage.getItem(PINNED_PROJECT_KEY);
@@ -151,18 +135,6 @@ export function Shell() {
       .catch(() => (window.location.href = "/login"));
   }
 
-  function toggleMore() {
-    setMoreOpen((v) => {
-      const next = !v;
-      try {
-        localStorage.setItem(MORE_OPEN_KEY, next ? "1" : "0");
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  }
-
   // The ONLY way to unpin (other than sign-out).
   function unpinProject() {
     try {
@@ -194,28 +166,45 @@ export function Shell() {
       {/* ── Sidebar ─────────────────────────────────────────── */}
       <nav className={`mc-sidebar${sidebarOpen ? " open" : ""}`}>
 
-        {/* Header strip. T-0063 evacuated the per-worker operational-status
-            pill (it was misscoped — per-user-per-server, now under
-            ATTACHMENT). The freed space hosts the new cross-server GLOBAL
-            busy indicator (T-0064): one dot for "is any task in-flight
-            RIGHT NOW for any of my projects on any server"; hover for the
-            list with project + server badges. */}
+        {/* Header strip. Hosts the wordmark (→ home / all-projects), the
+            cross-project work indicator (T-0064/T-0170), and an icon cluster:
+            a server-settings gear (admin-gated — the server-level half of the
+            old ATTACHMENT/SERVER groups now lives behind it, T-0170) plus the
+            help `?` (T-0167). */}
         <div className="mc-sidebar-header">
-          {/* T-0167: Help relocated out of the sidebar body into a `?` icon
-              sitting next to the wordmark; the GLOBAL section (All Projects /
-              My Profile / Help) is gone — All Projects is reachable via the
-              wordmark + project switcher, My Profile moved to the footer. */}
           <div className="mc-sidebar-header-top">
             <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
-            <Link
-              to="/help"
-              className="mc-sidebar-help-icon"
-              aria-label="Help"
-              title="Help"
-              data-onboarding-anchor="help-nav"
-            >
-              ?
-            </Link>
+            <div className="mc-sidebar-header-icons">
+              {/* T-0170: server settings reached via a gear here, parallel to
+                  the per-project settings gear (T-0167). Admin-gated because
+                  /system-settings is server-admin only; non-admins never see
+                  it. This is the re-home target for the old SERVER-scope rows
+                  (server users / scheduler are linked from that page) and the
+                  detached-install TG-bot config (T-0171). */}
+              {isAdmin && (
+                <NavLink
+                  to="/system-settings"
+                  className={({ isActive }) =>
+                    isActive
+                      ? "mc-sidebar-server-gear active"
+                      : "mc-sidebar-server-gear"
+                  }
+                  aria-label="Server settings"
+                  title="Server settings"
+                >
+                  ⚙
+                </NavLink>
+              )}
+              <Link
+                to="/help"
+                className="mc-sidebar-help-icon"
+                aria-label="Help"
+                title="Help"
+                data-onboarding-anchor="help-nav"
+              >
+                ?
+              </Link>
+            </div>
           </div>
           <GlobalBusyIndicator myUsername={username} />
           {/* T-0089: consumer-only autoupdate status pill. Skipped on the
@@ -248,8 +237,8 @@ export function Shell() {
               <ProjectSwitcher slug={slug} onUnpin={unpinProject} />
             </div>
 
-            {/* PRODUCT — about the product (T-0167). First section, so no
-                header label needed. */}
+            {/* Product nav — the body of the [ PROJECT ] section. No header
+                of its own; it reads as the project's primary links. */}
             <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
@@ -286,12 +275,12 @@ export function Shell() {
               </li>
             </ul>
 
-            {/* Divider between PRODUCT (above) and AGENTS (below) */}
-            <div className="mc-sidebar-divider" aria-hidden="true" />
-
-            {/* AGENTS — about the agents working the product (T-0167). */}
-            <div className="mc-sidebar-section">AGENTS</div>
-            <ul className="mc-sidebar-nav">
+            {/* T-0170: AGENTS is a NESTED sub-section under PROJECT, not a
+                peer of it — a quieter, unbracketed header (vs. the bracketed
+                `[ PROJECT ]`). These links are about the agents working this
+                project: sessions, workflow, deploy queue, analytics. */}
+            <div className="mc-sidebar-subsection">Agents</div>
+            <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
               <li>
                 <NavLink
                   to={`/p/${slug}/sessions`}
@@ -331,139 +320,29 @@ export function Shell() {
           </>
         )}
 
-        {/* MORE — T-0140. The server/attachment/mothership scopes were three
-            always-expanded sections (~10 rarely-used rows) that the stakeholder
-            flagged as the bulk of the sidebar's clutter. They now collapse
-            behind one default-collapsed drawer; the daily-driver GLOBAL +
-            Project nav above stays one click away. The operational-status pill
-            moved to the footer so worker health is never hidden by the collapse. */}
-        <button
-          type="button"
-          className={`mc-sidebar-section mc-sidebar-more-toggle${moreOpen ? " open" : ""}`}
-          aria-expanded={moreOpen}
-          onClick={toggleMore}
-        >
-          MORE
-          <span className="mc-sidebar-more-caret" aria-hidden="true">
-            {moreOpen ? "▾" : "▸"}
-          </span>
-        </button>
-        {moreOpen && (
-          <div className="mc-sidebar-more">
-            {/* SERVER scope. On mothership the picker selects which server the
-                rows below + ATTACHMENT pages scope to (T-0060); tree-shaken on
-                detach via the IS_MOTHERSHIP_BUILD literal gate. */}
-            {ServerPicker && (
-              <div className="mc-sidebar-more-picker">
-                <span className="mc-sidebar-more-picker-label">SERVER</span>
-                <Suspense
-                  fallback={<span className="mc-srv-picker-loading">▾ …</span>}
-                >
-                  <ServerPicker
-                    currentServerId={null}
-                    onChange={setPickedServerId}
-                  />
-                </Suspense>
-              </div>
-            )}
-            <ul
-              className="mc-sidebar-nav"
-              data-picked-server-id={pickedServerId ?? ""}
-            >
+        {/* MOTHERSHIP — T-0170. Global-admin-only, and a SINGLE entry now
+            (was three rows: All Users / Attached Servers / + Add Server, with
+            "Attached Servers" wrongly pointing at the all-projects view at `/`
+            — the stakeholder's "attached servers still showing the allprojects
+            view" complaint). It links to the consolidated mothership admin page
+            (global users + invites + connected servers). Tree-shaken out of
+            detach bundles via the VITE_MOTHERSHIP literal gate; further gated
+            on super-admin so global members never see it. Distinct from "All
+            Projects" (a user surface, reached via the wordmark + switcher). */}
+        {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
+          <>
+            <div className="mc-sidebar-divider" aria-hidden="true" />
+            <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
-                  to="/scheduler"
+                  to="/m/users"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  SCHEDULER
+                  MOTHERSHIP
                 </NavLink>
               </li>
-              {IS_MOTHERSHIP_BUILD && (
-                <li>
-                  <NavLink
-                    to="/m/releases"
-                    data-onboarding-anchor="releases-nav"
-                    className={({ isActive }) => (isActive ? "active" : undefined)}
-                  >
-                    RELEASES
-                  </NavLink>
-                </li>
-              )}
-              {isAdmin && (
-                <>
-                  <li>
-                    <NavLink
-                      to="/users"
-                      className={({ isActive }) => (isActive ? "active" : undefined)}
-                    >
-                      USERS
-                    </NavLink>
-                  </li>
-                  <li>
-                    <NavLink
-                      to="/system-settings"
-                      className={({ isActive }) => (isActive ? "active" : undefined)}
-                    >
-                      SETTINGS
-                    </NavLink>
-                  </li>
-                </>
-              )}
             </ul>
-
-            {/* ATTACHMENT — per-user-per-server (T-0061). Locked-order rows
-                from attachmentSidebarItems(); the status pill moved to the
-                footer (T-0140). */}
-            <div className="mc-sidebar-more-sub">attachment</div>
-            <ul className="mc-sidebar-nav" aria-live="polite">
-              {attachmentSidebarItems().map((item) => (
-                <li key={item.key}>
-                  <NavLink
-                    to={item.to}
-                    data-onboarding-anchor={item.onboardingAnchor}
-                    className={({ isActive }) => (isActive ? "active" : undefined)}
-                  >
-                    {item.label}
-                  </NavLink>
-                </li>
-              ))}
-            </ul>
-
-            {/* MOTHERSHIP — super-admin only on mothership builds (T-0062).
-                Tree-shaken out of detach bundles via the literal gate. */}
-            {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
-              <>
-                <div className="mc-sidebar-more-sub">mothership</div>
-                <ul className="mc-sidebar-nav">
-                  <li>
-                    <NavLink
-                      to="/m/users"
-                      className={({ isActive }) => (isActive ? "active" : undefined)}
-                    >
-                      ALL USERS
-                    </NavLink>
-                  </li>
-                  <li>
-                    <NavLink
-                      to="/"
-                      end
-                      className={({ isActive }) => (isActive ? "active" : undefined)}
-                    >
-                      ATTACHED SERVERS
-                    </NavLink>
-                  </li>
-                  <li>
-                    <NavLink
-                      to="/m/servers/add"
-                      className={({ isActive }) => (isActive ? "active" : undefined)}
-                    >
-                      + ADD SERVER
-                    </NavLink>
-                  </li>
-                </ul>
-              </>
-            )}
-          </div>
+          </>
         )}
 
         {/* Footer — T-0167: the OPERATIONAL worker-status pill is gone (the

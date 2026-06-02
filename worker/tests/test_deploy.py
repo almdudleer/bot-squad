@@ -55,21 +55,31 @@ def _make_project(tmp_path: Path, targets: tuple[str, ...] = ("staging",)) -> Pr
 def _make_config(tmp_path: Path, project: Project) -> Config:
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir(exist_ok=True)
-    # write minimal projects.toml
-    (cfg_dir / "projects.toml").write_text(
-        f'[projects.{project.slug}]\n'
-        f'slug = "{project.slug}"\n'
-        f'display_name = "{project.display_name}"\n'
-        f'repo_path = "{project.repo_path}"\n'
-        f'deploy_branch = "{project.deploy_branch}"\n'
-        f'master_branch = "{project.master_branch}"\n'
-        f'prod_url = ""\n'
-        f'staging_url = ""\n'
-        f'dev_url = ""\n'
-        f'deploy_targets = ["staging"]\n'
-        f'tg_chat = "0"\n'
-        f'created_at = 2026-05-10\n'
-    )
+    # write minimal projects.toml — honour the project's optional repo_master /
+    # repo_deploy / deploy_targets so deploy-clone tests round-trip through the
+    # real Config.load() path.
+    lines = [
+        f"[projects.{project.slug}]",
+        f'slug = "{project.slug}"',
+        f'display_name = "{project.display_name}"',
+        f'repo_path = "{project.repo_path}"',
+    ]
+    if project.repo_master is not None:
+        lines.append(f'repo_master = "{project.repo_master}"')
+    if project.repo_deploy is not None:
+        lines.append(f'repo_deploy = "{project.repo_deploy}"')
+    targets = ", ".join(f'"{t}"' for t in project.deploy_targets)
+    lines += [
+        f'deploy_branch = "{project.deploy_branch}"',
+        f'master_branch = "{project.master_branch}"',
+        'prod_url = ""',
+        'staging_url = ""',
+        'dev_url = ""',
+        f"deploy_targets = [{targets}]",
+        'tg_chat = "0"',
+        "created_at = 2026-05-10",
+    ]
+    (cfg_dir / "projects.toml").write_text("\n".join(lines) + "\n")
     (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
     return Config.load(cfg_dir)
 
@@ -346,5 +356,190 @@ def test_is_clean_for_target_flags_local_only_commits(tmp_path: Path) -> None:
 
     assert is_clean_for_target(cfg, proj.slug, "staging") is True
 
+    _add_local_commit(proj.repo_path)
+    assert is_clean_for_target(cfg, proj.slug, "staging") is False
+
+
+# ---------------------------------------------------------------------------
+# T-0143: local CI/CD deploy clone
+# ---------------------------------------------------------------------------
+
+
+def _make_deploy_project(
+    tmp_path: Path, targets: tuple[str, ...] = ("staging",)
+) -> Project:
+    """Dev clone on ``bot_squad/dev`` + a (not-yet-created) sibling deploy clone.
+
+    The deploy clone path intentionally does NOT exist yet — provisioning is
+    the deploy worker's job on first deploy (T-0143).
+    """
+    repo = tmp_path / "devclone"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "bot_squad/dev"], cwd=str(repo), check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True)
+    (repo / "README.md").write_text("hi")
+    subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(repo), check=True)
+    return Project(
+        slug="test-deploy",
+        display_name="Test Deploy",
+        repo_path=repo,
+        deploy_branch="bot_squad/dev",
+        master_branch="master",
+        prod_url="",
+        staging_url="",
+        dev_url="",
+        deploy_targets=targets,
+        tg_chat="0",
+        repo_deploy=tmp_path / "deployclone",
+    )
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _recipe_recording_head(
+    tmp_path: Path, cfg: Config, slug: str, target: str, head_file: Path
+) -> Path:
+    """A recipe that records the HEAD of its cwd (the clone it runs in)."""
+    recipe_dir = cfg.data_dir / slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / f"{target}.sh"
+    recipe.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        f'git rev-parse HEAD > "{head_file}"\n'
+    )
+    recipe.chmod(0o755)
+    return recipe
+
+
+def test_config_repo_for_target_prefers_deploy_clone(tmp_path: Path) -> None:
+    proj = _make_deploy_project(tmp_path)
+    assert proj.repo_for_target("staging") == proj.repo_deploy
+    # The editing clone (where unpushed commits are guarded) stays the dev clone.
+    assert proj.editing_repo_for_target("staging") == proj.repo_path
+    assert proj.uses_deploy_clone("staging") is True
+
+
+def test_run_next_provisions_deploy_clone_on_first_deploy(tmp_path: Path) -> None:
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)  # origin/bot_squad/dev
+    head_file = tmp_path / "deploy_head.txt"
+    _recipe_recording_head(tmp_path, cfg, proj.slug, "staging", head_file)
+
+    assert not proj.repo_deploy.exists()  # not provisioned yet
+
+    enqueue(cfg, proj.slug, "staging", "first deploy", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.ok is True
+    # Deploy clone was created, on bot_squad/dev, at origin's tip.
+    assert (proj.repo_deploy / ".git").exists()
+    assert _head(proj.repo_deploy) == _head(proj.repo_path)
+    # The recipe ran INSIDE the deploy clone (its recorded HEAD matches).
+    assert head_file.read_text().strip() == _head(proj.repo_deploy)
+
+
+def test_run_next_deploy_clone_ignores_dirty_dev_tree(tmp_path: Path) -> None:
+    """THE ticket smoke: a dirty dev tree no longer blocks the deploy."""
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+
+    # Dirty the dev clone with uncommitted edits — the old behaviour deferred.
+    (proj.repo_path / "WIP.txt").write_text("uncommitted work in progress")
+
+    queue_id = enqueue(cfg, proj.slug, "staging", "dirty dev tree", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is True
+    assert result.queue_id == queue_id
+
+
+def test_run_next_deploy_clone_refreshes_to_origin(tmp_path: Path) -> None:
+    """An existing deploy clone fast-forwards to the latest pushed commit."""
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+    head_file = tmp_path / "deploy_head.txt"
+    _recipe_recording_head(tmp_path, cfg, proj.slug, "staging", head_file)
+
+    # First deploy provisions the clone at commit 1.
+    enqueue(cfg, proj.slug, "staging", "deploy 1", "user")
+    assert run_next(cfg, proj.slug).ok is True
+    commit1 = _head(proj.repo_deploy)
+    assert head_file.read_text().strip() == commit1
+
+    # Land + PUSH a new commit to origin from the dev clone.
+    (proj.repo_path / "feature.txt").write_text("new pushed work")
+    subprocess.run(["git", "add", "feature.txt"], cwd=str(proj.repo_path), check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "feature"], cwd=str(proj.repo_path), check=True
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "bot_squad/dev"],
+        cwd=str(proj.repo_path), check=True,
+    )
+    commit2 = _head(proj.repo_path)
+    assert commit2 != commit1
+
+    # Second deploy refreshes the existing clone to the new origin tip.
+    enqueue(cfg, proj.slug, "staging", "deploy 2", "user")
+    assert run_next(cfg, proj.slug).ok is True
+    assert _head(proj.repo_deploy) == commit2
+    assert head_file.read_text().strip() == commit2
+
+
+def test_run_next_deploy_clone_refuses_unpushed_dev_commits(
+    tmp_path: Path, caplog
+) -> None:
+    """Commit-guard still fires — but now against the dev (editing) clone.
+
+    A commit on dev that isn't on origin would be silently omitted by a deploy
+    that ships origin/<branch>, so refuse until it's pushed.
+    """
+    import logging
+
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+
+    sha = _add_local_commit(proj.repo_path)  # committed to dev, NOT pushed
+
+    enqueue(cfg, proj.slug, "staging", "should be refused", "user")
+    with caplog.at_level(logging.ERROR):
+        result = run_next(cfg, proj.slug)
+
+    assert result is None
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+    assert len(list(queue_dir.glob("*.json"))) == 1  # queue file preserved
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert sha in joined
+    assert "local-only" in joined
+
+
+def test_is_clean_for_target_deploy_clone_ignores_dev_dirtiness(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import is_clean_for_target
+
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+
+    # Dirty dev tree — must NOT gate a deploy-clone deploy.
+    (proj.repo_path / "WIP.txt").write_text("uncommitted")
+    assert is_clean_for_target(cfg, proj.slug, "staging") is True
+
+    # But an unpushed dev commit must still gate.
     _add_local_commit(proj.repo_path)
     assert is_clean_for_target(cfg, proj.slug, "staging") is False

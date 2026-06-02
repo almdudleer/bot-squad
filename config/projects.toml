@@ -39,6 +39,11 @@ repo_path     = "/home/almdudleer/bot-squad/dev"
 # deploy. The running installation at /home/www/bot-squad is a deploy
 # TARGET, not part of the project tree.
 repo_master   = "/home/almdudleer/bot-squad/master"
+# Deploy clone (T-0143): local CI/CD checkout, parallel to dev/master. The
+# deploy worker creates it on first deploy and force-syncs it to
+# origin/bot_squad/dev each run, so a dirty dev tree no longer gates deploys —
+# the recipe builds from the latest PUSHED commit. No agent ever edits here.
+repo_deploy   = "/home/almdudleer/bot-squad/deploy"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
 prod_url      = "https://botsquad.dev"

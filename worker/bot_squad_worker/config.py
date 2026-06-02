@@ -19,18 +19,47 @@ class Project:
     deploy_targets: tuple[str, ...]
     tg_chat: str
     repo_master: Path | None = None  # master clone for prod deploys + hotfixes
+    # T-0143: local CI/CD deploy clone — a throwaway checkout parallel to
+    # dev/master, force-synced to origin/<deploy_branch> on each deploy. When
+    # set, non-prod deploys run from here instead of the shared dev clone, so
+    # dev-tree dirtiness stops gating deploys. None → legacy in-place behaviour.
+    repo_deploy: Path | None = None
 
     def repo_for_target(self, target: str) -> Path:
-        """Pick the right clone for a deploy target.
+        """Pick the clone the deploy recipe EXECUTES in for ``target``.
 
         - ``prod``: master clone (separate dir so dev work continues
           uninterrupted while a prod deploy is in flight). Falls back to
           ``repo_path`` if ``repo_master`` is not configured.
-        - everything else (``staging``, ``dev``, …): dev clone = ``repo_path``.
+        - everything else (``staging``, ``dev``, …): the deploy clone
+          (``repo_deploy``) if configured — a CI checkout synced to origin —
+          else the dev clone = ``repo_path`` (legacy in-place behaviour).
+        """
+        if target == "prod" and self.repo_master is not None:
+            return self.repo_master
+        if self.repo_deploy is not None:
+            return self.repo_deploy
+        return self.repo_path
+
+    def editing_repo_for_target(self, target: str) -> Path:
+        """The human/agent EDITING clone that feeds ``target``.
+
+        This is the clone whose local-only (unpushed) commits the deploy
+        commit-guard checks (T-0110/T-0116): a deploy ships ``origin/<branch>``,
+        so unpushed commits here would be silently OMITTED from the release.
+        Independent of ``repo_deploy`` (which only ever tracks origin).
+
+        - ``prod``: master clone if configured, else dev clone.
+        - everything else: dev clone = ``repo_path``.
         """
         if target == "prod" and self.repo_master is not None:
             return self.repo_master
         return self.repo_path
+
+    def uses_deploy_clone(self, target: str) -> bool:
+        """True when ``target`` runs in a separate, origin-synced deploy clone
+        (i.e. the exec clone differs from the editing clone)."""
+        return self.repo_for_target(target) != self.editing_repo_for_target(target)
 
     @classmethod
     def from_toml(cls, raw: dict) -> "Project":
@@ -46,6 +75,7 @@ class Project:
             deploy_targets=tuple(raw["deploy_targets"]),
             tg_chat=str(raw["tg_chat"]),
             repo_master=Path(raw["repo_master"]) if raw.get("repo_master") else None,
+            repo_deploy=Path(raw["repo_deploy"]) if raw.get("repo_deploy") else None,
         )
 
 

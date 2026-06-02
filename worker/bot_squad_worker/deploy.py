@@ -9,9 +9,13 @@ list_queued(cfg, slug) -> list[Path]
     Return queue files sorted oldest-first (by filename, which is ts-prefixed).
 
 run_next(cfg, slug) -> DeployResult | None
-    Pop the oldest queued request, check git tree cleanliness, run the recipe.
+    Pop the oldest queued request, run the commit-guard + clone prep, run recipe.
     - Returns None if queue is empty.
-    - Returns None if tree is dirty (queue file stays).
+    - Returns None if the editing clone has unpushed local-only commits (queue
+      file stays — push first), or deploy-clone provisioning failed.
+    - Returns None if the legacy in-place tree is dirty (queue file stays).
+      When a deploy clone is configured (T-0143) the recipe runs in a disposable
+      clone force-synced to origin, so dev-tree dirtiness no longer gates.
     - Returns DeployResult(ok, returncode, queue_id, log_path) on success or
       failure (rc != 0 or recipe file missing → rc=99).
 
@@ -27,7 +31,9 @@ Queue file lifecycle:
         → processed/<id>.fail.<rc>  (on failure)
 
 Recipe convention: data/<slug>/deploy/<target>.sh
-    Executed via ``bash <recipe_path>`` with cwd = proj.repo_path.
+    Executed via ``bash <recipe_path>`` with cwd = the exec clone for the
+    target (``project.repo_for_target``): the deploy clone when configured,
+    else the dev clone (staging) / master clone (prod).
     stdout+stderr captured to data/<slug>/_jobs/deploy/runs/<id>.log.
 """
 from __future__ import annotations
@@ -198,21 +204,30 @@ def list_queued(cfg: "Config", slug: str) -> list[Path]:
 
 
 def is_clean_for_target(cfg: "Config", slug: str, target: str) -> bool:
-    """Public cleanliness check for the clone associated with this target.
+    """Public "is this deploy clear to start?" check for ``target``.
 
     Lets callers (e.g. the deploy_monitor in jobs.py) gate user-facing
     notifications without re-implementing the check or popping a queue file.
 
-    Returns False when the tree is dirty OR when the target clone has
-    local-only commits not yet pushed to origin (T-0116) — both are
-    direct-edit anti-patterns that would be wiped by the recipe's
-    `git merge --ff-only origin/...` and must be resolved by the agent.
+    Returns False when:
+    - (legacy, no deploy clone) the exec/editing clone has a dirty working
+      tree — the recipe runs in place, so uncommitted edits would leak in; OR
+    - the EDITING clone (dev/master) has local-only commits not yet on origin
+      (T-0110/T-0116) — a deploy ships ``origin/<branch>`` and would silently
+      omit them, so the agent must push first.
+
+    When a deploy clone is configured (T-0143), the dev tree's dirty/clean
+    state is NO LONGER a gate: the deploy runs from a disposable clone that
+    ``run_next`` force-syncs to origin. Only the unpushed-commit guard remains.
     """
     project = cfg.projects[slug]
-    repo = project.repo_for_target(target)
-    if not _is_clean(repo):
-        return False
-    return not _local_only_commits(repo)
+    edit_repo = project.editing_repo_for_target(target)
+    if not project.uses_deploy_clone(target):
+        # Legacy in-place deploy: the exec clone IS the editing clone — its
+        # uncommitted edits would leak into the recipe, so gate on cleanliness.
+        if not _is_clean(edit_repo):
+            return False
+    return not _local_only_commits(edit_repo)
 
 
 def run_next(cfg: "Config", slug: str) -> DeployResult | None:
@@ -242,32 +257,52 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     queue_id = payload["queue_id"]
     target = payload["target"]
 
-    # Pick the clone for this target: prod → master clone (separate dir so
-    # dev work continues uninterrupted); everything else → dev clone.
+    # Pick the clone the recipe EXECUTES in: prod → master clone; staging/etc
+    # → deploy clone if configured (T-0143), else dev clone. The EDITING clone
+    # (dev/master) is where the commit-guard looks for unpushed work.
     repo = project.repo_for_target(target)
-    if not _is_clean(repo):
-        log.info("deploy.run_next: %s %s tree is dirty — skipping (%s)", slug, target, repo)
-        # Put the queue file back so we retry next tick
-        return None
+    edit_repo = project.editing_repo_for_target(target)
+    uses_deploy = project.uses_deploy_clone(target)
 
-    # T-0116: refuse to deploy when the target clone has local-only commits
-    # not yet on origin. The recipe's `git merge --ff-only origin/<branch>`
-    # would wipe them silently — list them loudly so the agent can recover
-    # (cherry-pick into the canonical dev clone, push, re-deploy). This
-    # mirrors the staging.sh precheck shipped in T-0110 but runs regardless
-    # of recipe presence, so a fresh-host install inherits the guard.
+    # Commit-guard (T-0110/T-0116/T-0143): refuse when the EDITING clone has
+    # local-only commits not yet on origin. With a deploy clone the deploy ships
+    # origin/<branch>, so unpushed commits would be silently OMITTED from the
+    # release; without one the recipe's `git merge --ff-only origin/<branch>`
+    # would wipe them. Either way the fix is the same — push first. List them
+    # loudly so the agent can recover. Runs regardless of recipe presence so a
+    # fresh-host install inherits the guard.
     # Bypass for tests / emergency via BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1.
     if os.environ.get("BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS") != "1":
-        local_only = _local_only_commits(repo)
+        local_only = _local_only_commits(edit_repo)
         if local_only:
             log.error(
-                "deploy.run_next: %s/%s REFUSED — %d local-only commit(s) on %s would be wiped by ff-merge from origin:\n    %s\n"
-                "Recover by cherry-picking these into the canonical dev clone and pushing, then re-deploy. "
+                "deploy.run_next: %s/%s REFUSED — %d local-only commit(s) on %s not pushed to origin "
+                "(a deploy ships origin/<branch> and would silently omit them):\n    %s\n"
+                "Recover by pushing them to origin (or cherry-picking into the canonical dev clone), then re-deploy. "
                 "Set BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1 to bypass.",
-                slug, target, len(local_only), repo, "\n    ".join(local_only),
+                slug, target, len(local_only), edit_repo, "\n    ".join(local_only),
             )
-            # Match dirty-tree behaviour: leave the queue file in place so
-            # the agent can fix the install and the next tick picks it up.
+            # Leave the queue file in place so the next tick picks it up once
+            # the agent has pushed.
+            return None
+
+    if uses_deploy:
+        # Provision/refresh the disposable deploy clone to origin/<branch>. The
+        # force-sync guarantees a clean tree at the latest pushed commit, so the
+        # shared dev tree's dirty/clean state no longer gates the deploy (T-0143).
+        if not _ensure_deploy_clone(edit_repo, repo, project.deploy_branch):
+            log.error(
+                "deploy.run_next: %s/%s deploy-clone provisioning failed (%s) — "
+                "leaving queue file for retry next tick.",
+                slug, target, repo,
+            )
+            return None
+    else:
+        # Legacy in-place deploy: the recipe runs in the editing clone, so its
+        # uncommitted edits would leak in — gate on a clean tree.
+        if not _is_clean(repo):
+            log.info("deploy.run_next: %s %s tree is dirty — skipping (%s)", slug, target, repo)
+            # Put the queue file back so we retry next tick
             return None
 
     # Collapse same-target trailing entries — they would deploy the same
@@ -435,6 +470,90 @@ def _local_only_commits(repo_path: Path) -> list[str]:
     except Exception:
         log.exception("deploy._local_only_commits: git failed for %s", repo_path)
         return []
+
+
+def _origin_url(repo_path: Path) -> str | None:
+    """Return the ``origin`` remote URL of ``repo_path``, or None if unset."""
+    try:
+        proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 0:
+            url = proc.stdout.strip()
+            return url or None
+    except Exception:
+        log.exception("deploy._origin_url: git failed for %s", repo_path)
+    return None
+
+
+def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> bool:
+    """Create-if-missing + fetch + force-checkout ``origin/<branch>`` in the
+    disposable deploy clone (T-0143).
+
+    The deploy clone is a local CI checkout, parallel to dev/master, that no
+    agent ever edits. So unlike the shared dev clone — where history rewrites
+    and forced checkouts are forbidden — force-syncing it to the latest pushed
+    commit is the correct, expected behaviour. The clone tracks the SAME origin
+    as the editing clone, so ``origin/<branch>`` is the latest *pushed* code.
+
+    Returns True when the clone is ready at ``origin/<branch>``; False on any
+    git failure (the caller leaves the queue file in place to retry next tick).
+    """
+    deploy_repo = Path(deploy_repo)
+    try:
+        if not (deploy_repo / ".git").exists():
+            deploy_repo.parent.mkdir(parents=True, exist_ok=True)
+            # Prefer the real remote URL so the clone tracks origin directly.
+            # Fall back to the editing clone's path for local-only projects
+            # (no remote) — "pushed" is moot there, but the deploy still works.
+            url = _origin_url(edit_repo) or str(edit_repo)
+            clone = subprocess.run(
+                ["git", "clone", "--branch", branch, url, str(deploy_repo)],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if clone.returncode != 0:
+                log.error(
+                    "deploy._ensure_deploy_clone: clone failed (url=%s, branch=%s): %s",
+                    url, branch, clone.stderr.strip(),
+                )
+                return False
+        # Refresh an existing (or freshly-cloned) tree to the latest pushed tip.
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", "--prune"],
+            cwd=str(deploy_repo),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if fetch.returncode != 0:
+            log.error(
+                "deploy._ensure_deploy_clone: fetch failed for %s: %s",
+                deploy_repo, fetch.stderr.strip(),
+            )
+            return False
+        checkout = subprocess.run(
+            ["git", "checkout", "-f", "-B", branch, f"origin/{branch}"],
+            cwd=str(deploy_repo),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if checkout.returncode != 0:
+            log.error(
+                "deploy._ensure_deploy_clone: checkout origin/%s failed for %s: %s",
+                branch, deploy_repo, checkout.stderr.strip(),
+            )
+            return False
+        return True
+    except Exception:
+        log.exception("deploy._ensure_deploy_clone: unexpected error for %s", deploy_repo)
+        return False
 
 
 def _finish(

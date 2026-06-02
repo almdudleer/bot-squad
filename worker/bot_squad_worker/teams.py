@@ -198,6 +198,43 @@ def reconcile_teams(cfg: Any, slug: str) -> dict:
     return {"ok": True, "teams": sorted(written), "reconciled": len(written)}
 
 
+def prune_orphan_teams(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
+    """T-0177 (gated): remove stale team md files left by the tmux-session →
+    project regroup. After ``reconcile_teams`` rebuilds the project team, the old
+    per-initiative team files (e.g. ``<slug>-operator-ux-and-session-mgmt.md``)
+    are orphans. Valid teams = the project team (``slug``) + each constant team
+    (``<slug>-<stem>`` for a ``constant_team: true`` initiative). Any other team
+    file is pruned, UNLESS it is ``archived: true`` (operator intent preserved).
+
+    ``dry_run=True`` (default) reports what it *would* prune without deleting.
+    Returns ``{ok, dry_run, pruned: [<name>, ...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.constant_teams import constant_team_stems
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"prune_orphan_teams: unknown project slug {slug!r}")
+
+    teams_dir = _teams_dir(cfg.data_dir, slug)
+    if not teams_dir.exists():
+        return {"ok": True, "dry_run": dry_run, "pruned": []}
+
+    valid = {slug} | {f"{slug}-{stem}" for stem in constant_team_stems(cfg, slug)}
+    pruned: list[str] = []
+    for md in sorted(teams_dir.glob("*.md")):
+        meta = _read_team(md)
+        if meta is None:
+            continue
+        name = meta.get("name", md.stem)
+        if name in valid or _is_truthy(meta.get("archived")):
+            continue
+        pruned.append(name)
+        if not dry_run:
+            md.unlink()
+    return {"ok": True, "dry_run": dry_run, "pruned": sorted(pruned)}
+
+
 def list_teams(cfg: Any, slug: str) -> dict:
     """Return every persisted Team md for ``slug`` (read-only)."""
     from bot_squad_worker.actions import ActionError

@@ -1495,6 +1495,33 @@ def _action_dedup_sessions(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.dedup_sessions(cfg, params["slug"], dry_run=bool(dry_run))
 
 
+_PRUNE_ORPHAN_TEAMS_REQUIRED = {"slug"}
+_PRUNE_ORPHAN_TEAMS_ALLOWED = _PRUNE_ORPHAN_TEAMS_REQUIRED | {"dry_run"}
+
+
+def _action_prune_orphan_teams(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0177: prune stale per-initiative team md files after the project regroup.
+    GATED — dry_run defaults to True; pass dry_run=False to delete.
+
+    Required params: slug. Optional: dry_run (bool, default True).
+    Returns: {ok, dry_run, pruned: [...]}
+    """
+    extra = set(params) - _PRUNE_ORPHAN_TEAMS_ALLOWED
+    if extra:
+        raise ActionError(f"prune_orphan_teams got unexpected params: {sorted(extra)}")
+    missing = _PRUNE_ORPHAN_TEAMS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"prune_orphan_teams missing required params: {sorted(missing)}")
+
+    dry_run = params.get("dry_run", True)
+    if isinstance(dry_run, str):
+        dry_run = dry_run.strip().lower() not in ("false", "0", "no", "off")
+
+    cfg = _get_config()
+    from bot_squad_worker import teams as _teams
+    return _teams.prune_orphan_teams(cfg, params["slug"], dry_run=bool(dry_run))
+
+
 _GC_STALE_BINDINGS_REQUIRED = {"slug"}
 _GC_STALE_BINDINGS_ALLOWED = _GC_STALE_BINDINGS_REQUIRED
 
@@ -1892,6 +1919,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0072/0073/0077: binding-graph reconcilers + peer-bus SID rotation.
     "gc_sessions": _action_gc_sessions,
     "dedup_sessions": _action_dedup_sessions,
+    "prune_orphan_teams": _action_prune_orphan_teams,
     "gc_stale_bindings": _action_gc_stale_bindings,
     "peer_rebind_sid": _action_peer_rebind_sid,
     # T-0142/0144: session-lifecycle reconcilers + Team entity + rename sync.
@@ -1962,6 +1990,7 @@ ACTION_MODES: dict[str, str] = {
     # coordination is out of scope for this bundle.)
     "gc_sessions": "coordinator_only",
     "dedup_sessions": "coordinator_only",
+    "prune_orphan_teams": "coordinator_only",
     "gc_stale_bindings": "coordinator_only",
     "peer_rebind_sid": "coordinator_only",
     # T-0142/0144: reconcilers + Team entity walk SessionMd + live tmux; the

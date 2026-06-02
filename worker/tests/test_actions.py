@@ -78,6 +78,8 @@ def test_registry_lists_only_allowed_actions():
         "gc_sessions", "gc_stale_bindings", "peer_rebind_sid",
         # T-0176 #5/#6: one-shot duplicate-SessionMd dedup migration (gated).
         "dedup_sessions",
+        # T-0177: gated prune of stale per-initiative team files post-regroup.
+        "prune_orphan_teams",
         # T-0142/0144: session-lifecycle reconcilers + Team entity + rename sync.
         "gc_dead_bindings", "archive_dead_teammates", "reconcile_teams",
         "list_teams", "archive_team", "resurrect_team", "sync_session_name",

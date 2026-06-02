@@ -239,3 +239,46 @@ def test_resurrect_team_resumes_tl_and_clears_flag(tmp_path, monkeypatch):
     assert res["tl"] == "S-u-feat-TL-p5"
     team = T.load_team(cfg, "test-project", "test-project-feat")
     assert str(team["archived"]).lower() == "false"
+
+
+# ---------------------------------------------------------------------------
+# T-0177 — prune_orphan_teams: gated fold-cleanup of stale initiative teams
+# ---------------------------------------------------------------------------
+
+def _seed_team(cfg, slug, name, **fields):
+    meta = {"name": name, "tl": "~", "teammates": [], "archived_members": [],
+            "archived": "false"}
+    meta.update(fields)
+    T._write_team(T._team_file(cfg.data_dir, slug, name), meta)
+
+
+def test_prune_orphan_teams_removes_stale_initiative_team(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_constant_initiative(cfg, "test-project", "user-feedback")
+    _seed_team(cfg, "test-project", "test-project")                       # project team
+    _seed_team(cfg, "test-project", "test-project-user-feedback")         # constant team
+    _seed_team(cfg, "test-project", "test-project-operator-ux")           # ORPHAN initiative team
+    res = T.prune_orphan_teams(cfg, "test-project", dry_run=False)
+    names = {t["name"] for t in T.list_teams(cfg, "test-project")["teams"]}
+    assert names == {"test-project", "test-project-user-feedback"}
+    assert res["pruned"] == ["test-project-operator-ux"]
+
+
+def test_prune_orphan_teams_preserves_archived(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_team(cfg, "test-project", "test-project")
+    _seed_team(cfg, "test-project", "test-project-old-init", archived="true")  # archived orphan
+    res = T.prune_orphan_teams(cfg, "test-project", dry_run=False)
+    names = {t["name"] for t in T.list_teams(cfg, "test-project")["teams"]}
+    assert "test-project-old-init" in names      # archived intent preserved
+    assert res["pruned"] == []
+
+
+def test_prune_orphan_teams_dry_run_writes_nothing(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _seed_team(cfg, "test-project", "test-project")
+    _seed_team(cfg, "test-project", "test-project-orphan")
+    res = T.prune_orphan_teams(cfg, "test-project", dry_run=True)
+    names = {t["name"] for t in T.list_teams(cfg, "test-project")["teams"]}
+    assert "test-project-orphan" in names        # nothing deleted
+    assert res["pruned"] == ["test-project-orphan"]   # but reported

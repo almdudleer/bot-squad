@@ -1306,6 +1306,22 @@ def cmd_team_dedup(args) -> None:
         print("re-run with --apply to write (gated — confirm READY-FOR-MIGRATION first)")
 
 
+def cmd_team_prune_orphans(args) -> None:
+    slug = resolve_slug()
+    # T-0177: GATED prune of stale per-initiative team files after the project
+    # regroup. Default dry-run; --apply deletes. reconcile_teams (every tick)
+    # rebuilds the project team first, so this only removes orphans.
+    dry_run = not args.apply
+    res = post("prune_orphan_teams", {"slug": slug, "dry_run": dry_run})
+    mode = "DRY-RUN (no changes written)" if res.get("dry_run") else "APPLIED"
+    pruned = res.get("pruned", [])
+    print(f"prune-orphans {mode}: {len(pruned)} stale team file(s)")
+    for name in pruned:
+        print(f"  {name}")
+    if dry_run and pruned:
+        print("re-run with --apply to delete (gated — confirm READY-FOR-MIGRATION first)")
+
+
 def cmd_autopilot_start(args) -> None:
     slug = resolve_slug()
     params = {"slug": slug, "kind": args.kind, "prompt": args.prompt}
@@ -2300,6 +2316,11 @@ def build_parser() -> argparse.ArgumentParser:
     tdd.add_argument("--apply", action="store_true",
                      help="write the merges (GATED — default is a dry-run preview)")
     tdd.set_defaults(func=cmd_team_dedup)
+    tpo = team_sub.add_parser("prune-orphans",
+                              help="T-0177: prune stale per-initiative team files after regroup (dry-run unless --apply)")
+    tpo.add_argument("--apply", action="store_true",
+                     help="delete the orphan team files (GATED — default is a dry-run preview)")
+    tpo.set_defaults(func=cmd_team_prune_orphans)
 
     # guidance (T-0151: surface buried stakeholder guidance)
     gd = sub.add_parser("guidance", help="search prior stakeholder guidance (T-0151)")

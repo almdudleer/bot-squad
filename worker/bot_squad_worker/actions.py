@@ -191,6 +191,32 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "sent": sent}
 
 
+_TG_STALL_CLEAR_REQUIRED = {"slug", "sid"}
+_TG_STALL_CLEAR_ALLOWED = _TG_STALL_CLEAR_REQUIRED
+
+
+def _action_tg_stall_clear(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0155: clear a session's stall marker (the agent is unblocked).
+
+    Fired by the UserPromptSubmit hook: when a prompt is submitted into a
+    pane, whoever was blocked there just got input (typically the stakeholder
+    replying in tmux), so any pending TG escalation must be cancelled.
+
+    Required params: slug, sid. Returns {ok, cleared: bool}.
+    """
+    extra = set(params) - _TG_STALL_CLEAR_ALLOWED
+    if extra:
+        raise ActionError(f"tg_stall_clear got unexpected params: {sorted(extra)}")
+    missing = _TG_STALL_CLEAR_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_stall_clear missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import tg_stall as _tg_stall
+    cleared = _tg_stall.clear_blocked(cfg, params["slug"], params["sid"])
+    return {"ok": True, "cleared": cleared}
+
+
 _DEPLOY_REQUIRED = {"slug", "target", "reason", "requested_by"}
 _DEPLOY_ALLOWED = _DEPLOY_REQUIRED
 
@@ -761,6 +787,17 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     cfg = _get_config()
     from bot_squad_worker import intersession as _is
     result = _is.send(cfg, params["slug"], params["from_sid"], params["to"], params["text"])
+
+    # T-0155: feed the stall-watchdog — a send to an operator-role session marks
+    # the sender blocked on the stakeholder; an operator's send clears the
+    # recipients' markers. Never let it break the bus write.
+    try:
+        from bot_squad_worker import tg_stall as _tg_stall
+        _tg_stall.on_peer_send(
+            cfg, params["slug"], params["from_sid"], result.get("delivered_to", []),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("peer_send: tg_stall hook failed (non-fatal)")
 
     for recipient_sid in result.get("delivered_to", []):
         username = _parse_ui_sid_username(recipient_sid)
@@ -1554,6 +1591,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
     "tg_notify": _action_tg_notify,
+    "tg_stall_clear": _action_tg_stall_clear,
     "deploy": _action_deploy,
     "pause_deploys": _action_pause_deploys,
     "resume_deploys": _action_resume_deploys,
@@ -1615,6 +1653,7 @@ ACTION_MODES: dict[str, str] = {
     "noop": "both",
     "tg_verify_login": "coordinator_only",
     "tg_notify": "coordinator_only",
+    "tg_stall_clear": "coordinator_only",
     "deploy": "coordinator_only",
     "pause_deploys": "coordinator_only",
     "resume_deploys": "coordinator_only",

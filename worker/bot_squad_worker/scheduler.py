@@ -19,6 +19,7 @@ from bot_squad_worker.jobs import (
     heartbeat,
     oauth_refresh,
     tg_listener_tick,
+    tg_stall_tick,
 )
 
 if TYPE_CHECKING:
@@ -164,6 +165,20 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="autopilot",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # tg_stall_tick: T-0155 — escalate agents blocked on the stakeholder to TG
+    # when the block has aged past tg_stall_minutes AND the tmux window isn't
+    # being watched. One-shot per marker; self-throttling, so 60s is safe.
+    sched.add_job(
+        tg_stall_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="tg_stall",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

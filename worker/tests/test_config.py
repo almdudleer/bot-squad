@@ -39,6 +39,25 @@ def test_secrets_loads(tmp_config_dir: Path) -> None:
     assert cfg.tg_bot_token == "TESTBOT:TOKEN"
 
 
+def test_stall_settings_default(tmp_config_dir: Path) -> None:
+    # T-0155: defaults when system_settings.toml is absent.
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_stall_minutes == 15
+    assert cfg.tg_remote_control_url == ""
+
+
+def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0155: admin overrides via [tg] in system_settings.toml.
+    (tmp_config_dir / "system_settings.toml").write_text(
+        "[tg]\n"
+        "stall_minutes = 20\n"
+        'remote_control_url = "https://claude.ai/code?session={sid}"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_stall_minutes == 20
+    assert cfg.tg_remote_control_url == "https://claude.ai/code?session={sid}"
+
+
 def test_secrets_missing_raises(tmp_path: Path) -> None:
     # Build a config dir that has projects.toml but NOT secrets.toml.
     cfg_dir = tmp_path / "config"

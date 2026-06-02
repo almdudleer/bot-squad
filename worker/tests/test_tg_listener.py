@@ -162,6 +162,24 @@ def test_handle_update_dispatches_reply_to_inject(tmp_path, monkeypatch):
     assert result["sid"] == "S-alice-spec5-p3"
 
 
+def test_handle_update_reply_clears_stall_marker(tmp_path, monkeypatch):
+    # T-0155: a TG reply unblocks the agent → its stall marker is removed.
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    sid = "S-alice-spec5-p3"
+
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.tg_stall as TS
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True})
+
+    TS.mark_blocked(cfg, "test-project", sid, "need a call")
+    assert TS._marker_path(cfg, "test-project", sid).exists()
+
+    update = {"update_id": 4, "message": _reply_message(sid, "ship it", chat_id=12345)}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "inject"
+    assert not TS._marker_path(cfg, "test-project", sid).exists()
+
+
 def test_handle_update_dispatches_sessions_slash(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     msg = _slash_message("/sessions", chat_id=12345)

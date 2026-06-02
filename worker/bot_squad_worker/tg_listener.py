@@ -104,10 +104,24 @@ def _handle_reply(cfg, chat_id: str, sid: str, text: str) -> dict:
     from bot_squad_worker import actions as A
     try:
         result = A.dispatch("inject_input", {"sid": sid, "text": text})
+        # T-0155: the stakeholder answered via TG — the agent is no longer
+        # blocked on him; cancel any pending stall escalation.
+        _clear_stall(cfg, chat_id, sid)
         return {"ok": True, "action": "inject", "sid": sid, "result": result}
     except A.ActionError as e:
         _notify(cfg, chat_id, f"❌ session {sid} not active — message dropped")
         return {"ok": False, "action": "inject_failed", "sid": sid, "error": str(e)}
+
+
+def _clear_stall(cfg, chat_id: str, sid: str) -> None:
+    """Clear ``sid``'s stall marker in whichever project owns ``chat_id``."""
+    try:
+        from bot_squad_worker import tg_stall as _tg_stall
+        for slug, p in cfg.projects.items():
+            if str(getattr(p, "tg_chat", "")) == str(chat_id):
+                _tg_stall.clear_blocked(cfg, slug, sid)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:

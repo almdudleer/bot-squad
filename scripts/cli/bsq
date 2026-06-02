@@ -9,6 +9,7 @@ Verbs:
   bsq inbox check [--since TS]      drain this session's peer inbox
   bsq inbox wait  [--timeout N]     opt-in long-poll (the bg-watcher mode)
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
+  bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
   bsq spawn <ticket> [--bundle ids] spawn a dev session for a backlog ticket
   bsq team status                   list this project's sessions
   bsq team list                     list persisted Team rosters (T-0142)
@@ -325,6 +326,30 @@ def cmd_dispatch(args) -> None:
             pass
 
 
+def cmd_tg_ping(args) -> None:
+    """Explicitly DM the stakeholder on Telegram (T-0155).
+
+    This is the ONLY agent-initiated TG path — there is no implicit per-idle
+    flood any more. Use it when you genuinely need the stakeholder's input and
+    don't want to wait for the 15-min stall watchdog to escalate for you.
+
+    The message is prefixed with this session's SID, so the stakeholder can
+    reply to the TG message and have his answer land back in this tmux pane.
+    """
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    message = " ".join(args.message).strip()
+    if not message:
+        die("tg ping: empty message")
+    res = post("tg_notify", {"slug": slug, "message": message, "sid": sid,
+                             "urgent": bool(args.urgent)})
+    if res.get("sent"):
+        print(f"tg ping sent (slug={slug}, sid={sid})")
+    else:
+        print("tg ping suppressed (no bot token, debounce, or quiet hours) — "
+              "not sent. Reply will still route if a prior message went out.")
+
+
 def cmd_peer_send(args) -> None:
     slug = resolve_slug()
     from_sid = require_sid(args.from_sid)
@@ -523,6 +548,14 @@ never edit it.
 5. REPORT READY. When a ticket's DoD (incl. manual walkthrough) is green:
    `bsq ticket update <id> totest`, `bsq ticket note <id> '<summary>'`, then
    `bsq peer send {report_to} 'READY <id> — <summary>'`.
+6. REACHING THE STAKEHOLDER (T-0155). Bot-squad NO LONGER DMs the stakeholder on
+   every idle turn. If you are genuinely blocked on HIM (not your TL) and need a
+   decision, send ONE explicit `bsq tg ping '<what you need>'` — he can reply
+   straight to that Telegram message and his answer lands back in this pane.
+   Don't spam it. If you forget and stay blocked on him with your tmux window
+   unwatched for ~15+ min, the worker auto-escalates for you — but the explicit
+   ping is faster and clearer. Route routine questions to your TL via
+   `bsq peer send` first.
 
 Run `bsq --help` for the full verb reference."""
 
@@ -1147,6 +1180,18 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--no-signal", action="store_true",
                     help="skip the 'check mail' tmux nudge")
     dp.set_defaults(func=cmd_dispatch)
+
+    # tg (T-0155) — explicit stakeholder DM; the only agent-initiated TG path.
+    tg = sub.add_parser("tg", help="Telegram: explicitly DM the stakeholder")
+    tg_sub = tg.add_subparsers(dest="sub", required=True)
+    tgp = tg_sub.add_parser(
+        "ping",
+        help="DM the stakeholder now (reply routes back to your tmux pane)")
+    tgp.add_argument("message", nargs="+", help="message text for the stakeholder")
+    tgp.add_argument("--sid", help="override this session's SID")
+    tgp.add_argument("--urgent", action="store_true",
+                     help="bypass quiet hours (use sparingly — hard blockers only)")
+    tgp.set_defaults(func=cmd_tg_ping)
 
     # spawn
     sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")

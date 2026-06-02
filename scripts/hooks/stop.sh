@@ -1,78 +1,19 @@
 #!/usr/bin/env bash
-# Stop hook — fire a Telegram ping if the session stopped after being idle >60s.
+# Stop hook — intentionally a no-op since T-0155.
 #
-# Fires when Claude Code exits (Stop event). If the last user prompt was >60s
-# ago it means the agent ran a long sequence with no new user input — worth
-# notifying so the stakeholder can review and continue.
+# This hook USED to fire a Telegram DM ("needs your input") on *every* idle
+# Stop event. That flooded the stakeholder's DMs on every idle turn, often
+# with a wrong SID prefix. Per T-0155 the implicit per-idle flood is removed.
 #
-# Design notes:
-#   - Never exits non-zero: a broken hook must not block Claude Code sessions.
-#   - Silent exit 0 on: not in tmux, no timestamp file, age ≤ 60s, unknown project.
-#   - set -uo pipefail (no -e) so a failed subcommand doesn't kill the script.
+# TG is now reached two ways instead:
+#   1. Explicitly — an agent runs `bsq tg ping <message>` when it actually
+#      needs the stakeholder (the tg_notify action).
+#   2. Auto-escalation — the worker's tg_stall watchdog (tg_stall.py +
+#      tg_stall_tick) pages the stakeholder only when an agent has been
+#      blocked on him for >= tg_stall_minutes AND his tmux window isn't open.
+#
+# The hook is kept (rather than deleted) so the deployed Stop-hook wiring in
+# every session's settings.json still resolves to a valid script. It must
+# never exit non-zero — a broken Stop hook would wedge Claude Code sessions.
 set -uo pipefail
-
-BOT_SQUAD="${BOT_SQUAD:-/home/www/bot-squad}"
-WORKER_SOCK="${WORKER_SOCK:-$BOT_SQUAD/data/_sock/worker.sock}"
-
-# Must be in tmux to have a meaningful SID.
-sid=$("$BOT_SQUAD/scripts/hooks/hook_my_sid.sh" 2>/dev/null) || exit 0
-[ -n "$sid" ] || exit 0
-
-# Check timestamp file (written by user_prompt_submit.sh).
-stamp=".claude/last_user_prompt_ts"
-[ -f "$stamp" ] || exit 0
-
-mtime=$(stat -c %Y "$stamp" 2>/dev/null || echo 0)
-now=$(date +%s)
-age=$((now - mtime))
-[ "$age" -gt 60 ] || exit 0
-
-# Resolve slug from CWD against projects.toml. Matches both clones (dev +
-# master) and dereferences symlinks so layouts like signal_tracker/dev →
-# signal_tracker_mgmt work either way.
-slug=$(python3 - <<'PY'
-import os, sys, tomllib
-cfg_path = os.environ.get("BOT_SQUAD", "/home/www/bot-squad") + "/config/projects.toml"
-try:
-    cfg = tomllib.loads(open(cfg_path).read())
-except Exception:
-    sys.exit(0)
-cwd = os.getcwd()
-real_cwd = os.path.realpath(cwd)
-def _match(target):
-    if not target:
-        return False
-    real_t = os.path.realpath(target)
-    return (
-        cwd == target
-        or cwd.startswith(target.rstrip("/") + "/")
-        or real_cwd == real_t
-        or real_cwd.startswith(real_t.rstrip("/") + "/")
-    )
-for slug, p in cfg.get("projects", {}).items():
-    if _match(p.get("repo_path", "")) or _match(p.get("repo_master", "")):
-        print(slug)
-        sys.exit(0)
-sys.exit(0)
-PY
-2>/dev/null) || exit 0
-[ -n "$slug" ] || exit 0
-
-# Build the JSON payload and POST to the worker.
-username=$(id -un 2>/dev/null || echo unknown)
-payload=$(python3 -c '
-import json, sys
-print(json.dumps({
-    "slug":    sys.argv[1],
-    "sid":     sys.argv[2],
-    "user":    sys.argv[3],
-    "message": "needs your input",
-}))
-' "$slug" "$sid" "$username" 2>/dev/null) || exit 0
-
-curl -sS --unix-socket "$WORKER_SOCK" \
-    -X POST -H "Content-Type: application/json" \
-    -d "$payload" \
-    http://w/actions/tg_notify >/dev/null 2>&1 || true
-
 exit 0

@@ -253,6 +253,22 @@ def autopilot_tick(cfg: Config) -> None:
             log.exception("autopilot_tick: unhandled error for project %s", slug)
 
 
+def tg_stall_tick(cfg: Config) -> None:
+    """T-0155: escalate agents blocked on the stakeholder to TG.
+
+    Fires every 60s. Each marker self-throttles via its ``since`` timestamp
+    (only escalates past ``cfg.tg_stall_minutes``) and a one-shot ``escalated``
+    flag, so this can safely run on a tight cadence without flooding. Disabled
+    when ``tg_stall_minutes`` <= 0. Errors are caught so one bad sweep never
+    kills the scheduler.
+    """
+    from bot_squad_worker import tg_stall as _tg_stall
+    try:
+        _tg_stall.tick(cfg)
+    except Exception:
+        log.exception("tg_stall_tick error")
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

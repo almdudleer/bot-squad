@@ -90,6 +90,16 @@ class Config:
     # 17→05 UTC sleep window for the Tashkent stakeholder.
     tg_quiet_hours_start_utc: int = 17
     tg_quiet_hours_end_utc: int = 5
+    # T-0155 stall-watchdog: minutes an agent may stay blocked on the operator
+    # (peer_send to an operator-role session, no reply) before the worker
+    # auto-fires a TG ping — but only when the tmux window is not being watched.
+    # 0 disables the watchdog entirely. Loaded from system_settings.toml [tg].
+    tg_stall_minutes: int = 15
+    # Optional remote-control URL template included in the escalation TG message
+    # so the stakeholder can resume the session in the Claude app. ``{sid}`` and
+    # ``{session}`` are substituted when present. Empty → fall back to a
+    # ``tmux attach -t <session>`` hint.
+    tg_remote_control_url: str = ""
 
     @property
     def data_dir(self) -> Path:
@@ -125,12 +135,16 @@ class Config:
         # values so existing deploys behave identically until the admin writes it.
         quiet_start = 17
         quiet_end = 5
+        stall_minutes = 15
+        remote_control_url = ""
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
             tg_block = sys_raw.get("tg", {}) or {}
             quiet_start = int(tg_block.get("quiet_hours_start_utc", quiet_start))
             quiet_end = int(tg_block.get("quiet_hours_end_utc", quiet_end))
+            stall_minutes = int(tg_block.get("stall_minutes", stall_minutes))
+            remote_control_url = str(tg_block.get("remote_control_url", remote_control_url))
 
         return cls(
             config_dir=config_dir,
@@ -139,4 +153,6 @@ class Config:
             tg_auth_age_max=int(sec.get("telegram", {}).get("auth_age_max", 86400)),
             tg_quiet_hours_start_utc=quiet_start,
             tg_quiet_hours_end_utc=quiet_end,
+            tg_stall_minutes=stall_minutes,
+            tg_remote_control_url=remote_control_url,
         )

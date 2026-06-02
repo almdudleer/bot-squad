@@ -327,6 +327,10 @@ def _derive_activity(
 _TL_WINDOW_RE = re.compile(r"(?:^|[-_])(?:tl|teamlead)$", re.IGNORECASE)
 _OPERATOR_WINDOW_RE = re.compile(r"(?:^|[-_])operator$", re.IGNORECASE)
 
+# T-0176 #3: grouping bucket for sessions with no live tmux session — keeps the
+# sessions-list grouping honest against `tmux list-sessions`.
+_NO_TMUX_SESSION = "(no tmux session)"
+
 
 def _derive_role(
     window: str | None,
@@ -571,6 +575,12 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
     except Exception:
         panes = []
 
+    # T-0176 #3: the set of tmux sessions that are actually live right now (have
+    # ≥1 pane). Suspended rows group by this — a stored tmux_session that no
+    # longer appears here is stale and falls into the "(no tmux session)" bucket,
+    # so the UI grouping matches `tmux list-sessions` instead of stale metadata.
+    live_tmux_sessions = {p.session for p in panes if p.session}
+
     import re as _re_cmd
     _claude_version_re = _re_cmd.compile(r"^\d+\.\d+\.\d+$")
     for pane in panes:
@@ -789,10 +799,18 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             md_owner_val = meta.get("owner")
             md_owner = str(md_owner_val) if (md_owner_val and md_owner_val != "~") else ""
             md_tmux_session_val = meta.get("tmux_session")
-            md_tmux_session = (
+            md_tmux_session_raw = (
                 str(md_tmux_session_val)
                 if md_tmux_session_val and md_tmux_session_val != "~"
                 else ""
+            )
+            # T-0176 #3: group by LIVE tmux. Keep the stored tmux session only if
+            # it still has live panes; otherwise this suspended row falls into the
+            # "(no tmux session)" bucket rather than a phantom group.
+            md_tmux_session = (
+                md_tmux_session_raw
+                if md_tmux_session_raw and md_tmux_session_raw in live_tmux_sessions
+                else _NO_TMUX_SESSION
             )
             rows.append({
                 "sid": sid,

@@ -2850,3 +2850,49 @@ def test_resolve_session_unknown_is_none(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
     assert resolve_session(cfg, "test-project", "S-u-nope-p1") is None
+
+
+# ---------------------------------------------------------------------------
+# T-0176 #3 — sessions list groups by LIVE tmux, dead sessions → bucket
+# ---------------------------------------------------------------------------
+
+def test_list_sessions_suspended_dead_tmux_goes_to_bucket(tmp_path, monkeypatch):
+    """A suspended row whose stored tmux_session is no longer live is grouped
+    under '(no tmux session)', not blended into a phantom group."""
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-old-p7.md", {
+        "sid": "S-testuser-old-p7", "status": "suspended", "window": "old",
+        "cwd": str(repo), "claude_uuid": "u-old", "tmux_session": "test-project-dead",
+    })
+    monkeypatch.setattr(S, "list_panes", lambda: [])  # no live tmux at all
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    rows = S.list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["tmux_session"] == "(no tmux session)"
+
+
+def test_list_sessions_suspended_keeps_still_live_tmux(tmp_path, monkeypatch):
+    """A suspended row whose tmux_session still has live panes keeps it (the
+    session exists; only this pane is gone)."""
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-old-p7.md", {
+        "sid": "S-testuser-old-p7", "status": "suspended", "window": "old",
+        "cwd": str(repo), "claude_uuid": "u-old", "tmux_session": "test-project-live",
+    })
+    live = S.PaneInfo(pane_id="%2", window="other", pid="1", cwd=str(repo),
+                      command="claude", session="test-project-live")
+    monkeypatch.setattr(S, "list_panes", lambda: [live])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    rows = S.list_sessions(cfg, "test-project")
+    susp = [r for r in rows if r["sid"] == "S-testuser-old-p7"][0]
+    assert susp["tmux_session"] == "test-project-live"

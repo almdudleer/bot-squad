@@ -256,6 +256,38 @@ export type AutoupdateStatus = {
   poll_interval_seconds: number;
 };
 
+// T-0147: product-analytics (internal-usage) snapshot.
+export type DayCount = { date: string; count: number };
+export type Analytics = {
+  slug: string;
+  generated_at: string;
+  window_days: number;
+  sessions: {
+    total: number;
+    archived: number;
+    by_status: Record<string, number>;
+    per_day: DayCount[];
+  };
+  tickets: {
+    total: number;
+    by_status: Record<string, number>;
+    closed_per_day: DayCount[];
+    time_to_close: {
+      closed_measured: number;
+      mean_days: number | null;
+      median_days: number | null;
+    };
+  };
+  deploys: {
+    total: number;
+    ok: number;
+    fail: number;
+    success_rate: number | null;
+    last_deploy_at: string | null;
+    per_week: { week: string; ok: number; fail: number }[];
+  };
+};
+
 export const api = {
   health: () => call("/api/health"),
   me: () => call<Me>("/api/auth/me"),
@@ -292,6 +324,7 @@ export const api = {
   backlog: (slug: string) => call<Task[]>(`/api/projects/${slug}/backlog`),
   vision: (slug: string) => call<VisionFile[]>(`/api/projects/${slug}/vision`),
   feedback: (slug: string) => call<FeedbackFile[]>(`/api/projects/${slug}/feedback`),
+  analytics: (slug: string) => call<Analytics>(`/api/projects/${slug}/analytics`),
   login: (username: string, password: string) =>
     call("/api/auth/login", {
       method: "POST",

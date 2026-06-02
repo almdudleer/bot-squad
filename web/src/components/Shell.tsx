@@ -316,6 +316,16 @@ export function Shell() {
                   DEPLOYMENT QUEUE
                 </NavLink>
               </li>
+              {/* T-0147: internal-usage analytics dashboard. */}
+              <li>
+                <NavLink
+                  to={`/p/${slug}/analytics`}
+                  data-onboarding-anchor="analytics-nav"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  ANALYTICS
+                </NavLink>
+              </li>
               {/* AUTONOMOUS TEAM — link hidden 2026-05-12, autonomous work frozen.
                   Route still exists; restore this <li> when re-enabling. */}
             </ul>

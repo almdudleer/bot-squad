@@ -6,6 +6,7 @@ import { Project } from "./pages/Project";
 import { Vision } from "./pages/Vision";
 import { Feedback } from "./pages/Feedback";
 import { Sessions } from "./pages/Sessions";
+import { Analytics } from "./pages/Analytics";
 import { TaskDetail } from "./pages/TaskDetail";
 import { Runs } from "./pages/Runs";
 import { RunLog } from "./pages/RunLog";
@@ -71,6 +72,7 @@ export function App() {
           <Route path="/p/:slug/workflow" element={<Workflow />} />
           <Route path="/p/:slug/feedback" element={<Feedback />} />
           <Route path="/p/:slug/sessions" element={<Sessions />} />
+          <Route path="/p/:slug/analytics" element={<Analytics />} />
           <Route path="/p/:slug/runs" element={<Runs />} />
           <Route path="/p/:slug/runs/:id" element={<RunLog />} />
           <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />

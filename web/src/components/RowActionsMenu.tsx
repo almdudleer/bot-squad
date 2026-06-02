@@ -61,13 +61,12 @@ export function RowActionsMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={ariaLabel}
-        className="btn btn-outline-secondary btn-sm"
-        style={{
-          fontSize: "1rem",
-          lineHeight: 1,
-          padding: "0.05rem 0.45rem",
-          fontWeight: 700,
-        }}
+        // T-0161: styling lives in `.mc-kebab-trigger` (missioncontrol.css) so a
+        // media query can grow the hit target to ≥44×44 on phone widths while
+        // keeping the compact look on desktop — an inline style can't carry a
+        // media query, and the old inline padding rendered a 33×20px box that
+        // was hard to find/tap on a narrow viewport.
+        className="btn btn-outline-secondary btn-sm mc-kebab-trigger"
         onClick={(e) => {
           e.stopPropagation();
           setOpen((o) => !o);

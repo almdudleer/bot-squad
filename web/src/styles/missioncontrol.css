@@ -2093,3 +2093,26 @@ tr.mc-row-flash > td {
   text-align: right;
   color: var(--mc-text);
 }
+
+/* T-0161: shared kebab/overflow trigger (RowActionsMenu) used on team-lane,
+   session-row and project-header menus — the entry point for the autopilot
+   dialog (T-0153). Compact on desktop (unchanged from the old inline style),
+   but grown to a ≥44×44 CSS-px tap target on phone widths where the feedback
+   reported it was hard to find/tap. */
+.mc-kebab-trigger {
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.05rem 0.45rem;
+  font-weight: 700;
+}
+@media (max-width: 576px) {
+  .mc-kebab-trigger {
+    min-width: 44px;
+    min-height: 44px;
+    /* center the glyph in the enlarged box */
+    padding: 0.5rem 0.6rem;
+    font-size: 1.2rem;
+    /* a touch more affordance so it's easier to spot on a dense mobile row */
+    border-color: var(--mc-border-strong, var(--mc-border));
+  }
+}

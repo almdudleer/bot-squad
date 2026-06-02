@@ -10,6 +10,11 @@ Verbs:
   bsq inbox wait  [--timeout N]     opt-in long-poll (the bg-watcher mode)
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
   bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
+  bsq task new <title>             allocate next T-NNNN + stub (atomic — T-0174)
+  bsq doc new <category> <title>   allocate next D-NNNN + stub doc (T-0172)
+  bsq uc new <title>               allocate next UC-NNNN + stub use case
+  bsq flow new <uc-id> <title>     allocate next F-NNNN + stub flow (T-0173)
+  bsq initiative new <name>        allocate next INI-NN + stub initiative
   bsq spawn <ticket> [--bundle ids] spawn a dev session (auto-resumes an expert)
   bsq expert find <ticket>          rank resumable 'pro' sessions for a ticket
   bsq team status                   list this project's sessions
@@ -1678,6 +1683,48 @@ def cmd_ticket_note(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# entity creation verbs (T-0174) — atomic, collision-free ids for EVERY
+# entity type. Each wraps the matching worker `*_new` action, which allocates
+# from a per-type fcntl-locked counter (data/<slug>/_counters/<type>.txt). No
+# hand-picked ids anywhere — that was the root cause of the collision
+# incidents (T-0042 / T-0114 / T-0120).
+# --------------------------------------------------------------------------
+def cmd_task_new(args) -> None:
+    slug = resolve_slug()
+    params = {"slug": slug, "title": args.title}
+    for k in ("initiative", "priority", "owner"):
+        v = getattr(args, k, None)
+        if v:
+            params[k] = v
+    res = post("task_new", params)
+    print(f"{res['id']}  ->  {res['file_path']}")
+
+
+def cmd_doc_new(args) -> None:
+    slug = resolve_slug()
+    res = post("doc_new", {"slug": slug, "category": args.category, "title": args.title})
+    print(f"{res['id']}  ({res['category']})  ->  {res['file_path']}")
+
+
+def cmd_uc_new(args) -> None:
+    slug = resolve_slug()
+    res = post("uc_new", {"slug": slug, "title": args.title})
+    print(f"{res['id']}  ->  {res['file_path']}")
+
+
+def cmd_flow_new(args) -> None:
+    slug = resolve_slug()
+    res = post("flow_new", {"slug": slug, "uc_id": args.uc_id, "title": args.title})
+    print(f"{res['id']}  ({res['uc_id']})  ->  {res['file_path']}")
+
+
+def cmd_initiative_new(args) -> None:
+    slug = resolve_slug()
+    res = post("initiative_new", {"slug": slug, "name": args.name})
+    print(f"{res['id']}  ->  {res['file_path']}")
+
+
+# --------------------------------------------------------------------------
 # scenario verb (T-0158) — manual-testing-first discipline. A scenario is
 # written + walked through MANUALLY before any automation .mjs is touched.
 # --------------------------------------------------------------------------
@@ -2160,6 +2207,60 @@ def build_parser() -> argparse.ArgumentParser:
     ucr.add_argument("--report-to", dest="report_to", help="SID to report PASS/FAIL to (default: this session)")
     ucr.add_argument("--dry-run", action="store_true", help="print the testing brief without spawning")
     ucr.set_defaults(func=cmd_usecase_run)
+
+    # ----------------------------------------------------------------------
+    # entity creation verbs (T-0174): atomic, collision-free ids for every
+    # entity type. `<noun> new` always allocates — no hand-picked ids.
+    # ----------------------------------------------------------------------
+    # task new — canonical atomic backlog-ticket creation (wraps task_new).
+    tn = sub.add_parser("task", help="backlog tickets: new (atomic id, T-0174)")
+    tn_sub = tn.add_subparsers(dest="sub", required=True)
+    tnn = tn_sub.add_parser("new", help="allocate the next T-NNNN + write a stub ticket")
+    tnn.add_argument("title", help="single-line ticket title")
+    tnn.add_argument("--initiative", help="initiative basename, e.g. operator-ux-and-session-mgmt.md")
+    tnn.add_argument("--priority", help="priority value (frontmatter, verbatim)")
+    tnn.add_argument("--owner", help="owner role/name (frontmatter)")
+    tnn.set_defaults(func=cmd_task_new)
+
+    # doc new (composes T-0172 docs system)
+    dn = sub.add_parser("doc", help="project docs: new (atomic id, composes T-0172)")
+    dn_sub = dn.add_subparsers(dest="sub", required=True)
+    dnn = dn_sub.add_parser("new", help="allocate the next D-NNNN + write a stub doc")
+    dnn.add_argument("category", help="doc category, e.g. architecture/design/support/runbook/product")
+    dnn.add_argument("title", help="single-line doc title")
+    dnn.set_defaults(func=cmd_doc_new)
+
+    # uc new (atomic numeric UC ids; composes T-0159/T-0173)
+    ucx = sub.add_parser("uc", help="use cases: new (atomic UC-NNNN id) / list / run (T-0174)")
+    ucx_sub = ucx.add_subparsers(dest="sub", required=True)
+    ucxn = ucx_sub.add_parser("new", help="allocate the next UC-NNNN + write a stub use case")
+    ucxn.add_argument("title", help="single-line use-case title")
+    ucxn.set_defaults(func=cmd_uc_new)
+    ucxl = ucx_sub.add_parser("list", help="list this project's use cases")
+    ucxl.add_argument("--json", action="store_true", help="raw JSON output")
+    ucxl.set_defaults(func=cmd_usecase_list)
+    ucxr = ucx_sub.add_parser("run", help="spawn a testing-dev session to walk a use case")
+    ucxr.add_argument("id", help="use-case id to run")
+    ucxr.add_argument("--window", help="tmux window name (default: uctest-<id>)")
+    ucxr.add_argument("--owner", help="UI username to stamp on the session")
+    ucxr.add_argument("--report-to", dest="report_to", help="SID to report PASS/FAIL to (default: this session)")
+    ucxr.add_argument("--dry-run", action="store_true", help="print the testing brief without spawning")
+    ucxr.set_defaults(func=cmd_usecase_run)
+
+    # flow new (composes T-0173 user flows)
+    fl = sub.add_parser("flow", help="user flows attached to a use case: new (atomic id, composes T-0173)")
+    fl_sub = fl.add_subparsers(dest="sub", required=True)
+    fln = fl_sub.add_parser("new", help="allocate the next F-NNNN + write a stub flow under a UC")
+    fln.add_argument("uc_id", help="parent use-case id, e.g. UC-0001")
+    fln.add_argument("title", help="single-line flow title")
+    fln.set_defaults(func=cmd_flow_new)
+
+    # initiative new (rare but uniform; INI-NN)
+    ini = sub.add_parser("initiative", help="initiatives: new (atomic INI-NN id, T-0174)")
+    ini_sub = ini.add_subparsers(dest="sub", required=True)
+    inin = ini_sub.add_parser("new", help="allocate the next INI-NN + write a stub initiative")
+    inin.add_argument("name", help="initiative name")
+    inin.set_defaults(func=cmd_initiative_new)
 
     # autopilot (T-0153: prompt-driven, time-boxed autonomous runs)
     ap = sub.add_parser("autopilot", help="prompt-driven, time-boxed autonomous runs (T-0153)")

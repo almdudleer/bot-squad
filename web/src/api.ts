@@ -276,8 +276,15 @@ export type UserRow = {
 export type SystemSettings = {
   tg: {
     bot_token_set: boolean;
+    // T-0171: per-server default chat for the local bot (detached/standalone).
+    default_chat_id: string;
     quiet_hours_start_utc: number;
     quiet_hours_end_utc: number;
+    // T-0171: when this server is an attached mothership consumer, the per-server
+    // bot token + default chat are locked — notifications flow through the
+    // mothership's @bot_squad_bot. UI greys the fields + shows a banner.
+    managed_by_mothership: boolean;
+    mothership_url: string | null;
   };
   session: { ttl: string };
   admin: { coordinator_user: string };
@@ -286,6 +293,7 @@ export type SystemSettings = {
 export type PutSystemSettingsBody = {
   tg?: {
     bot_token?: string;
+    default_chat_id?: string;
     quiet_hours_start_utc?: number;
     quiet_hours_end_utc?: number;
   };
@@ -452,6 +460,9 @@ export const api = {
     call<UseCaseDetail>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`),
   putUseCase: (slug: string, id: string, content: string) =>
     call(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ content }) }),
+  // T-0174: allocate a UC-NNNN id atomically (server-side); no hand-typed ids.
+  createUseCase: (slug: string, title: string) =>
+    call<{ ok: boolean; id: string }>(`/api/projects/${slug}/use_cases`, { method: "POST", body: JSON.stringify({ title }) }),
   runUseCase: (slug: string, id: string) =>
     call<{ ok: boolean; id: string; window: string; sid?: string }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/run`, { method: "POST" }),
   sessions: (slug: string) =>

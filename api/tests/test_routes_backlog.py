@@ -152,6 +152,20 @@ def test_create_task_allocates_sequential_ids(tmp_bot_squad: Path, monkeypatch):
     assert r.json()["id"] == "T-0006"
 
 
+def test_create_task_uses_shared_counter(tmp_bot_squad: Path, monkeypatch):
+    """T-0174: web create now allocates from data/<slug>/_counters/task.txt —
+    the SAME counter the worker's task_new uses, unifying what used to be two
+    independent locks (api .lock vs worker .task-id.lock)."""
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post("/api/projects/test-project/backlog", json={"title": "One"})
+        assert r.json()["id"] == "T-0001"
+        counter = tmp_bot_squad / "data" / "test-project" / "_counters" / "task.txt"
+        assert counter.read_text().strip() == "1"
+        r = client.post("/api/projects/test-project/backlog", json={"title": "Two"})
+        assert r.json()["id"] == "T-0002"
+        assert counter.read_text().strip() == "2"
+
+
 # ---------------------------------------------------------------------------
 # PATCH /api/projects/{slug}/backlog/{id}
 # ---------------------------------------------------------------------------

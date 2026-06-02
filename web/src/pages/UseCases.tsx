@@ -3,26 +3,6 @@ import { useParams } from "react-router-dom";
 import { api, UseCaseSummary, UseCaseDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
 
-const NEW_TEMPLATE = `---
-id: UC-new-flow
-title: New flow
-user_persona: <who is doing this — role + context>
-goal: <one sentence: what they're trying to accomplish>
-preconditions: <state / data / auth that must exist first>
-success_criteria: <observable outcome that means it worked>
-related_tickets: <T-NNNN>
-status: active
----
-
-# New flow
-
-## Steps
-1. <action>
-2. <action>
-
-## Feedback
-`;
-
 export function UseCases() {
   const { slug = "" } = useParams();
 
@@ -55,22 +35,31 @@ export function UseCases() {
     }
   }
 
-  function startNew() {
-    setSelected("");
-    setDetail(null);
+  // T-0174: the id is allocated server-side (UC-NNNN) — never hand-typed.
+  // Clicking "+ New" creates a stub with an atomic id, then drops you into the
+  // editor to fill in the details (title/persona/steps).
+  async function startNew() {
+    setBusy(true);
+    setError(null);
     setFlash(null);
-    setDraft(NEW_TEMPLATE);
-  }
-
-  function idFromDraft(text: string): string {
-    const m = text.match(/^id:\s*(.+)$/m);
-    return m ? m[1].trim() : "";
+    try {
+      const res = await api.createUseCase(slug, "New use case");
+      const d = await api.useCase(slug, res.id);
+      setSelected(res.id);
+      setDetail(d);
+      setDraft(d.raw);
+      reload();
+      setFlash(`Created ${res.id} — edit the details below, then Save.`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function save() {
-    const isNew = selected === "";
-    const id = isNew ? idFromDraft(draft ?? "") : (selected ?? "");
-    if (!id) { setError("Set an `id:` in the frontmatter first."); return; }
+    const id = selected ?? "";
+    if (!id) { setError("No use case selected."); return; }
     const content = draft ?? "";
     setBusy(true);
     setError(null);
@@ -179,7 +168,7 @@ export function UseCases() {
                 <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={busy}>
                   {busy ? "Saving…" : "Save"}
                 </button>
-                <button type="button" className="btn btn-secondary btn-sm" onClick={() => { setDraft(null); if (selected === "") setSelected(null); }}>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => setDraft(null)}>
                   Cancel
                 </button>
               </div>

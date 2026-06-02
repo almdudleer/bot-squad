@@ -1,7 +1,6 @@
 """Backlog read + write endpoints."""
 from __future__ import annotations
 
-import fcntl
 import logging
 import re
 from pathlib import Path
@@ -10,7 +9,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.markdown_parser import ParseError, parse_task
 from app.markdown_writer import (
-    allocate_next_id,
     append_comment,
     merge_task_update,
     slugify,
@@ -209,31 +207,35 @@ def create_task(
     else:
         priority = _default_open_priority(backlog_dir)
 
-    lock_path = backlog_dir / ".lock"
-    with open(lock_path, "w") as lock_f:
-        fcntl.flock(lock_f, fcntl.LOCK_EX)
-        task_id = allocate_next_id(backlog_dir)
-        slug_part = slugify(title)
-        filename = f"{task_id}-{slug_part}.md" if slug_part else f"{task_id}.md"
-        path = backlog_dir / filename
+    # T-0174: allocate via the shared idalloc counter — the SAME
+    # data/<slug>/_counters/task.txt the worker's task_new uses, so a web
+    # create and an agent `bsq task new` can no longer collide on a T-id
+    # (they previously locked different files: .lock here vs .task-id.lock
+    # in the worker).
+    from app import idalloc
+    cfg = request.app.state.api_config
+    task_id = idalloc.allocate_id(cfg.data_dir, slug, "task")
+    slug_part = slugify(title)
+    filename = f"{task_id}-{slug_part}.md" if slug_part else f"{task_id}.md"
+    path = backlog_dir / filename
 
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        fm = {
-            "id": task_id,
-            "title": title,
-            "status": status,
-            "priority": priority,
-            "created": now,
-            "updated": now,
-            # T-0080: stamp the creator's UI username so per-user task
-            # scoping (deferred for v0.9) has the data it needs without a
-            # backfill. Legacy tasks lack this field; they default to
-            # admin-only when filtering eventually lands. None gets
-            # dropped by write_task — only emit owner: if known.
-            "owner": user.get("username") or None,
-        }
-        write_task(path, fm, body)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fm = {
+        "id": task_id,
+        "title": title,
+        "status": status,
+        "priority": priority,
+        "created": now,
+        "updated": now,
+        # T-0080: stamp the creator's UI username so per-user task
+        # scoping (deferred for v0.9) has the data it needs without a
+        # backfill. Legacy tasks lack this field; they default to
+        # admin-only when filtering eventually lands. None gets
+        # dropped by write_task — only emit owner: if known.
+        "owner": user.get("username") or None,
+    }
+    write_task(path, fm, body)
 
     return _enrich_with_sections(parse_task(path))
 

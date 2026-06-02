@@ -91,6 +91,52 @@ class PutUseCase(BaseModel):
     content: str
 
 
+class NewUseCase(BaseModel):
+    title: str
+
+
+@router.post("")
+def create_use_case(slug: str, request: Request, body: NewUseCase,
+                    user: dict = Depends(require_auth)) -> dict:
+    """T-0174: allocate a UC-NNNN id atomically and write a stub use case.
+
+    Replaces hand-typing ``id:`` into the frontmatter (the old flow). The
+    filename stem IS the id — what every other route here keys on — so legacy
+    slug-named UCs (``UC-<slug>.md``) coexist with the new numeric ones.
+    """
+    import json
+
+    from app import idalloc
+
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title must not be empty")
+
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    uc_id = idalloc.allocate_id(cfg.data_dir, slug, "uc")
+
+    d = _uc_dir(request, slug)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{uc_id}.md"
+    fm = "\n".join([
+        f"id: {uc_id}",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        "user_persona: TBD",
+        "goal: TBD",
+        "preconditions: TBD",
+        "success_criteria: TBD",
+        "related_tickets: []",
+        "status: draft",
+    ])
+    content = f"---\n{fm}\n---\n\n# {title}\n\n## Steps\n\n1. TBD\n\n## Feedback\n\n"
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+    return {"ok": True, "id": uc_id}
+
+
 @router.put("/{uc_id}")
 def put_use_case(slug: str, uc_id: str, request: Request, body: PutUseCase,
                  user: dict = Depends(require_auth)) -> dict:

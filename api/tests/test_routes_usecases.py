@@ -101,3 +101,34 @@ def test_edit_replaces(tmp_bot_squad: Path, monkeypatch):
         assert r.status_code == 200
         r = c.get("/api/projects/test-project/use_cases/UC-demo")
         assert r.json()["goal"] == "Do the new thing"
+
+
+def test_create_allocates_uc_id(tmp_bot_squad: Path, monkeypatch):
+    """T-0174: POST allocates a UC-NNNN id atomically — no hand-typed id."""
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/use_cases", json={"title": "First flow"})
+        assert r.status_code == 200, r.text
+        assert r.json()["id"] == "UC-0001"
+        # Counter advanced; second create gets the next id.
+        r2 = c.post("/api/projects/test-project/use_cases", json={"title": "Second flow"})
+        assert r2.json()["id"] == "UC-0002"
+        # The stub is listable and stem-keyed (filename == id).
+        lst = c.get("/api/projects/test-project/use_cases").json()
+        ids = {u["id"] for u in lst}
+        assert {"UC-0001", "UC-0002"} <= ids
+        counter = tmp_bot_squad / "data" / "test-project" / "_counters" / "uc.txt"
+        assert counter.read_text().strip() == "2"
+
+
+def test_create_ignores_legacy_slug_ucs(tmp_bot_squad: Path, monkeypatch):
+    """Legacy slug-named UCs are non-numeric and must not bump the counter."""
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        c.put("/api/projects/test-project/use_cases/UC-demo", json={"content": _UC})
+        r = c.post("/api/projects/test-project/use_cases", json={"title": "Numeric one"})
+        assert r.json()["id"] == "UC-0001"
+
+
+def test_create_empty_title_rejected(tmp_bot_squad: Path, monkeypatch):
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/use_cases", json={"title": "  "})
+    assert r.status_code == 400

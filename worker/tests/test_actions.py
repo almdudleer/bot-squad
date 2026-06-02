@@ -61,6 +61,8 @@ def test_registry_lists_only_allowed_actions():
         "task_progress_add",
         # T-0042: atomic T-NNNN allocator.
         "task_new",
+        # T-0174: generalized atomic allocator across all entity types.
+        "doc_new", "uc_new", "flow_new", "initiative_new",
         # Phase 9: bind multi-task-per-dev / multi-initiative-per-TL.
         "bind_task", "bind_initiative",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
@@ -1379,3 +1381,165 @@ def test_task_new_unknown_slug_raises(tmp_path, tmp_config_dir, monkeypatch):
     _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
     with pytest.raises(ActionError, match="unknown project slug"):
         A.dispatch("task_new", {"slug": "no-such", "title": "x"})
+
+
+def test_task_new_uses_shared_counter(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0174: task_new now allocates from data/<slug>/_counters/task.txt —
+    the same counter the API uses, so the two can't hand out the same id."""
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    A.dispatch("task_new", {"slug": "test-project", "title": "one"})
+    counter = tmp_path / "data" / "test-project" / "_counters" / "task.txt"
+    assert counter.read_text().strip() == "1"
+    A.dispatch("task_new", {"slug": "test-project", "title": "two"})
+    assert counter.read_text().strip() == "2"
+
+
+# ---------------------------------------------------------------------------
+# T-0174 — generalized entity_new actions (doc / uc / flow / initiative)
+# ---------------------------------------------------------------------------
+
+
+def _setup_entity_new(tmp_path: Path, tmp_config_dir: Path, monkeypatch) -> Path:
+    """Wire config; return the project data dir for the test-project slug."""
+    import bot_squad_worker.actions as A
+
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    proj = tmp_path / "data" / "test-project"
+    proj.mkdir(parents=True)
+    return proj
+
+
+def test_doc_new_allocates_and_writes_stub(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Edge cache design",
+    })
+    assert out["id"] == "D-0001"
+    assert out["category"] == "architecture"
+    p = Path(out["file_path"])
+    assert p == proj / "docs" / "architecture" / "D-0001-edge-cache-design.md"
+    body = p.read_text()
+    assert "id: D-0001" in body
+    assert "category: architecture" in body
+    assert "status: draft" in body
+    assert (proj / "_counters" / "doc.txt").read_text().strip() == "1"
+
+
+def test_doc_new_rejects_bad_category(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="invalid category"):
+        A.dispatch("doc_new", {
+            "slug": "test-project", "category": "../etc", "title": "x",
+        })
+
+
+def test_uc_new_stem_is_id_and_ignores_legacy_slug_ucs(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    # A legacy slug-named UC is non-numeric and must NOT bump the counter.
+    (proj / "use_cases").mkdir(parents=True)
+    (proj / "use_cases" / "UC-autopilot-popover.md").write_text("---\nid: UC-autopilot-popover\n---\n")
+    out = A.dispatch("uc_new", {"slug": "test-project", "title": "Probe flow"})
+    assert out["id"] == "UC-0001"
+    p = Path(out["file_path"])
+    # filename stem IS the id (what routes_usecases keys on) — no -slug suffix.
+    assert p == proj / "use_cases" / "UC-0001.md"
+    assert "id: UC-0001" in p.read_text()
+
+
+def test_flow_new_requires_existing_uc(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="unknown use case"):
+        A.dispatch("flow_new", {
+            "slug": "test-project", "uc_id": "UC-0001", "title": "x",
+        })
+    # Create the UC, then the flow lands under it.
+    A.dispatch("uc_new", {"slug": "test-project", "title": "parent"})
+    out = A.dispatch("flow_new", {
+        "slug": "test-project", "uc_id": "UC-0001", "title": "Happy path",
+    })
+    assert out["id"] == "F-0001"
+    assert out["uc_id"] == "UC-0001"
+    p = Path(out["file_path"])
+    assert p == proj / "use_cases" / "UC-0001" / "flows" / "F-0001-happy-path.md"
+    body = p.read_text()
+    assert "uc_id: UC-0001" in body
+    assert "```mermaid" in body
+
+
+def test_flow_new_rejects_bad_uc_id(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="invalid uc_id"):
+        A.dispatch("flow_new", {
+            "slug": "test-project", "uc_id": "../evil", "title": "x",
+        })
+
+
+def test_initiative_new_two_digit_pad(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("initiative_new", {"slug": "test-project", "name": "Billing Revamp"})
+    assert out["id"] == "INI-01"
+    p = Path(out["file_path"])
+    assert p == proj / "vision" / "initiatives" / "INI-01-billing-revamp.md"
+    body = p.read_text()
+    assert "id: INI-01" in body
+    assert "name: " in body
+
+
+def test_doc_new_self_heals_against_manual_file(tmp_path, tmp_config_dir, monkeypatch):
+    """A hand-created higher id must not collide — allocator takes max(counter, scan)+1."""
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    arch = proj / "docs" / "architecture"
+    arch.mkdir(parents=True)
+    (arch / "D-0099-manual.md").write_text("x")
+    out = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "design", "title": "next",
+    })
+    assert out["id"] == "D-0100"
+
+
+def test_doc_new_concurrent_no_collisions(tmp_path, tmp_config_dir, monkeypatch):
+    """The DoD's core check: spawn parallel doc_new, verify zero collisions."""
+    from concurrent.futures import ThreadPoolExecutor
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+
+    def _alloc(i: int) -> dict:
+        return A.dispatch("doc_new", {
+            "slug": "test-project", "category": "design", "title": f"race {i}",
+        })
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_alloc, range(8)))
+
+    ids = [r["id"] for r in results]
+    assert len(set(ids)) == 8, f"ids must be distinct, got {ids}"
+    assert set(ids) == {f"D-{i:04d}" for i in range(1, 9)}
+    files = sorted((proj / "docs" / "design").glob("D-*.md"))
+    assert len(files) == 8
+    assert (proj / "_counters" / "doc.txt").read_text().strip() == "8"
+
+
+def test_entity_new_unknown_slug_raises(tmp_path, tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("doc_new", {"slug": "no-such", "category": "design", "title": "x"})

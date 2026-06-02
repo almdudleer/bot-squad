@@ -179,6 +179,10 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
             chat_id = project.tg_chat
             if topic_id is None:
                 topic_id = project.tg_topic_id
+        elif cfg.tg_default_chat_id:
+            # T-0171: per-server default chat for the local (detached/standalone)
+            # bot — preferred over the first-project guess when configured.
+            chat_id = cfg.tg_default_chat_id
         else:
             # Fallback: first registered project's chat (single-project setups)
             if cfg.projects:
@@ -189,6 +193,13 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
             else:
                 raise ActionError("tg_notify: no chat_id, no slug, and no projects configured")
 
+    # T-0171 / T-0178 dispatcher seam: this server sends DIRECTLY via its own
+    # bot token (TgClient → api.telegram.org) — the "detached / standalone"
+    # branch. The "attached" branch (POST to the mothership's relay so it sends
+    # via @bot_squad_bot, with a 5-min connectivity fallback to the local token)
+    # is intentionally NOT built here — it is net-new cross-server infra
+    # deferred to the non-active detach-sequence initiative. When that lands,
+    # branch here on the attached-consumer state. See T-0178.
     tg = _get_tg_client(cfg)
     sent = tg.send(
         chat_id=chat_id,
@@ -974,6 +985,26 @@ def _yaml_quote(s: str) -> str:
     return _json.dumps(s, ensure_ascii=False)
 
 
+def _atomic_write_new(path: Path, content: str) -> None:
+    """O_EXCL write of a freshly-allocated entity file.
+
+    Belt-and-braces over the allocator's flock: if the filesystem already
+    has a file with this exact name we surface that rather than overwrite,
+    and on any write failure we don't leave a half-written file squatting
+    on the id we just allocated.
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except BaseException:
+        try:
+            os.unlink(str(path))
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     """Atomically allocate the next T-NNNN id and write a stub task md.
 
@@ -981,12 +1012,12 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     Optional params: initiative, priority, owner
     Returns: {ok: true, id: "T-NNNN", file_path: "<abs path>"}
 
-    Allocation is serialised by an fcntl.flock on
-    ``data/<slug>/backlog/.task-id.lock``: callers (including concurrent
-    sessions on the same host) cannot collide on the same id. The lock
-    file persists; the body is empty (the lock is the only thing we care
-    about). Crashes between alloc and write merely burn one id — that's
-    fine, ids aren't scarce.
+    Allocation goes through the shared ``idalloc`` allocator (T-0174), which
+    serialises on ``data/<slug>/_counters/task.txt`` — the SAME counter the
+    API's ``POST /backlog`` uses, so a web create and an agent ``task new``
+    can no longer hand out the same id (they used to lock different files).
+    Crashes between alloc and write merely burn one id — fine, ids aren't
+    scarce.
     """
     extra = set(params) - _TASK_NEW_ALLOWED
     if extra:
@@ -1008,74 +1039,252 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     if cfg.projects.get(slug) is None:
         raise ActionError(f"task_new: unknown project slug {slug!r}")
 
-    import fcntl
     from datetime import datetime, timezone
+    from bot_squad_worker import idalloc
 
     backlog_dir: Path = cfg.data_dir / slug / "backlog"
     backlog_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = backlog_dir / ".task-id.lock"
 
-    _id_re = re.compile(r"^T-(\d+)-")
+    new_id = idalloc.allocate_id(cfg.data_dir, slug, "task")
+    file_path = backlog_dir / f"{new_id}-{_slugify_title(title)}.md"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    with open(lock_path, "a+") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        try:
-            max_id = 0
-            for p in backlog_dir.glob("T-*.md"):
-                m = _id_re.match(p.name)
-                if m:
-                    n = int(m.group(1))
-                    if n > max_id:
-                        max_id = n
-            next_id = max_id + 1
-            new_id = f"T-{next_id:04d}"
+    fm_lines = [
+        f"id: {new_id}",
+        f"title: {_yaml_quote(title)}",
+        "status: planned",
+        f"created: {ts}",
+    ]
+    for opt_key in ("initiative", "priority", "owner"):
+        if opt_key in params:
+            val = params[opt_key]
+            if val is None or (isinstance(val, str) and not val.strip()):
+                continue
+            fm_lines.append(f"{opt_key}: {_yaml_quote(str(val))}")
 
-            file_path = backlog_dir / f"{new_id}-{_slugify_title(title)}.md"
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = (
+        "## Verbatim request\n\n"
+        "(filed via task_new)\n\n"
+        "## DoD\n\n"
+        "TBD\n"
+    )
+    content = "---\n" + "\n".join(fm_lines) + f"\n---\n\n{body}"
+    _atomic_write_new(file_path, content)
 
-            fm_lines = [
-                f"id: {new_id}",
-                f"title: {_yaml_quote(title)}",
-                "status: planned",
-                f"created: {ts}",
-            ]
-            for opt_key in ("initiative", "priority", "owner"):
-                if opt_key in params:
-                    val = params[opt_key]
-                    if val is None or (isinstance(val, str) and not val.strip()):
-                        continue
-                    fm_lines.append(f"{opt_key}: {_yaml_quote(str(val))}")
+    return {"ok": True, "id": new_id, "file_path": str(file_path)}
 
-            body = (
-                "## Verbatim request\n\n"
-                "(filed via task_new)\n\n"
-                "## DoD\n\n"
-                "TBD\n"
-            )
-            content = f"---\n" + "\n".join(fm_lines) + f"\n---\n\n{body}"
 
-            # O_EXCL is belt-and-braces: under the flock no other caller can
-            # race us, but if the filesystem already has a T-NNNN-*.md with
-            # this exact filename we surface that rather than overwrite.
-            fd = os.open(
-                str(file_path),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o644,
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(content)
-            except BaseException:
-                # On any write failure, do NOT leave a half-written file
-                # squatting on the id we just allocated.
-                try:
-                    os.unlink(str(file_path))
-                except FileNotFoundError:
-                    pass
-                raise
-        finally:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+# ---------------------------------------------------------------------------
+# T-0174: generalized entity_new actions (doc / uc / flow / initiative).
+# All wrap the same idalloc allocator + _atomic_write_new helper as task_new,
+# so every entity type gets collision-free ids from a per-type counter.
+# ---------------------------------------------------------------------------
 
+_ENTITY_TITLE_MAX = 240
+_DOC_CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _require_str(params: dict[str, Any], key: str, action: str) -> str:
+    val = params.get(key)
+    if not isinstance(val, str) or not val.strip():
+        raise ActionError(f"{action}: empty or missing {key!r}")
+    if "\n" in val or "\r" in val:
+        raise ActionError(f"{action}: {key!r} must be single-line")
+    if len(val) > _ENTITY_TITLE_MAX:
+        raise ActionError(f"{action}: {key!r} too long (max {_ENTITY_TITLE_MAX})")
+    return val.strip()
+
+
+def _entity_setup(params: dict[str, Any], required: set, allowed: set, action: str):
+    """Shared param-guard + config/slug resolution for the entity_new actions."""
+    extra = set(params) - allowed
+    if extra:
+        raise ActionError(f"{action} got unexpected params: {sorted(extra)}")
+    missing = required - set(params)
+    if missing:
+        raise ActionError(f"{action} missing required params: {sorted(missing)}")
+    slug = params["slug"]
+    cfg = _get_config()
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"{action}: unknown project slug {slug!r}")
+    return cfg, slug
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_DOC_NEW_REQUIRED = {"slug", "category", "title"}
+_DOC_NEW_ALLOWED = _DOC_NEW_REQUIRED
+
+
+def _action_doc_new(params: dict[str, Any]) -> dict[str, Any]:
+    """Allocate the next D-NNNN id and write a stub doc md (composes T-0172).
+
+    Required params: slug, category, title
+    Returns: {ok, id, file_path, category}
+
+    Storage: ``data/<slug>/docs/<category>/D-NNNN-<slug>.md``. Category must be
+    a safe dir token (lowercase, ``[a-z0-9_-]``); the T-0172 docs system gives
+    it semantic meaning (product/architecture/design/support/runbook, …).
+    """
+    from bot_squad_worker import idalloc
+
+    cfg, slug = _entity_setup(params, _DOC_NEW_REQUIRED, _DOC_NEW_ALLOWED, "doc_new")
+    category = _require_str(params, "category", "doc_new")
+    if not _DOC_CATEGORY_RE.match(category):
+        raise ActionError(
+            f"doc_new: invalid category {category!r} (expect lowercase [a-z0-9_-])"
+        )
+    title = _require_str(params, "title", "doc_new")
+
+    docs_dir = cfg.data_dir / slug / "docs" / category
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    new_id = idalloc.allocate_id(cfg.data_dir, slug, "doc")
+    file_path = docs_dir / f"{new_id}-{_slugify_title(title)}.md"
+
+    fm = "\n".join([
+        f"id: {new_id}",
+        f"title: {_yaml_quote(title)}",
+        f"category: {category}",
+        "status: draft",
+        f"created: {_now_iso()}",
+        "related_tickets: []",
+    ])
+    content = f"---\n{fm}\n---\n\n# {title}\n\n(filed via doc_new — T-0172 docs system)\n"
+    _atomic_write_new(file_path, content)
+    return {"ok": True, "id": new_id, "file_path": str(file_path), "category": category}
+
+
+_UC_NEW_REQUIRED = {"slug", "title"}
+_UC_NEW_ALLOWED = _UC_NEW_REQUIRED
+
+
+def _action_uc_new(params: dict[str, Any]) -> dict[str, Any]:
+    """Allocate the next UC-NNNN id and write a stub use-case md (composes T-0159/T-0173).
+
+    Required params: slug, title
+    Returns: {ok, id, file_path}
+
+    Storage: ``data/<slug>/use_cases/UC-NNNN.md`` — the filename stem IS the id
+    (what routes_usecases keys on). Legacy slug-named UCs (``UC-<slug>.md``) are
+    non-numeric, so the scan ignores them and they keep working alongside the
+    new numeric ones.
+    """
+    from bot_squad_worker import idalloc
+
+    cfg, slug = _entity_setup(params, _UC_NEW_REQUIRED, _UC_NEW_ALLOWED, "uc_new")
+    title = _require_str(params, "title", "uc_new")
+
+    uc_dir = cfg.data_dir / slug / "use_cases"
+    uc_dir.mkdir(parents=True, exist_ok=True)
+    new_id = idalloc.allocate_id(cfg.data_dir, slug, "uc")
+    file_path = uc_dir / f"{new_id}.md"
+
+    fm = "\n".join([
+        f"id: {new_id}",
+        f"title: {_yaml_quote(title)}",
+        "user_persona: TBD",
+        "goal: TBD",
+        "preconditions: TBD",
+        "success_criteria: TBD",
+        "related_tickets: []",
+        "status: draft",
+    ])
+    body = (
+        f"# {title}\n\n## Steps\n\n1. TBD\n\n## Feedback\n\n"
+        "(filed via uc_new — attach user flows with `bsq flow new "
+        f"{new_id} <title>`)\n"
+    )
+    content = f"---\n{fm}\n---\n\n{body}"
+    _atomic_write_new(file_path, content)
+    return {"ok": True, "id": new_id, "file_path": str(file_path)}
+
+
+_FLOW_NEW_REQUIRED = {"slug", "uc_id", "title"}
+_FLOW_NEW_ALLOWED = _FLOW_NEW_REQUIRED
+_UC_ID_RE = re.compile(r"^UC-[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _action_flow_new(params: dict[str, Any]) -> dict[str, Any]:
+    """Allocate the next F-NNNN id and write a stub user-flow md (composes T-0173).
+
+    Required params: slug, uc_id, title
+    Returns: {ok, id, file_path, uc_id}
+
+    Storage: ``data/<slug>/use_cases/<uc-id>/flows/F-NNNN-<slug>.md``. The
+    parent use case must exist (either ``<uc-id>.md`` or a ``<uc-id>/`` dir).
+    The flow counter is per-project (one F-NNNN sequence across all UCs).
+    """
+    from bot_squad_worker import idalloc
+
+    cfg, slug = _entity_setup(params, _FLOW_NEW_REQUIRED, _FLOW_NEW_ALLOWED, "flow_new")
+    uc_id = _require_str(params, "uc_id", "flow_new")
+    if not _UC_ID_RE.match(uc_id):
+        raise ActionError(f"flow_new: invalid uc_id {uc_id!r}")
+    title = _require_str(params, "title", "flow_new")
+
+    uc_root = cfg.data_dir / slug / "use_cases"
+    if not (uc_root / f"{uc_id}.md").exists() and not (uc_root / uc_id).is_dir():
+        raise ActionError(f"flow_new: unknown use case {uc_id!r}")
+
+    flows_dir = uc_root / uc_id / "flows"
+    flows_dir.mkdir(parents=True, exist_ok=True)
+    new_id = idalloc.allocate_id(cfg.data_dir, slug, "flow")
+    file_path = flows_dir / f"{new_id}-{_slugify_title(title)}.md"
+
+    fm = "\n".join([
+        f"id: {new_id}",
+        f"uc_id: {uc_id}",
+        f"title: {_yaml_quote(title)}",
+        "status: draft",
+        f"created: {_now_iso()}",
+    ])
+    body = (
+        f"# {title}\n\n## Steps\n\n1. TBD\n\n## Mermaid\n\n"
+        "```mermaid\ngraph TD\n  A[start] --> B[TBD]\n```\n\n"
+        "(filed via flow_new — T-0173 user flows)\n"
+    )
+    content = f"---\n{fm}\n---\n\n{body}"
+    _atomic_write_new(file_path, content)
+    return {"ok": True, "id": new_id, "file_path": str(file_path), "uc_id": uc_id}
+
+
+_INITIATIVE_NEW_REQUIRED = {"slug", "name"}
+_INITIATIVE_NEW_ALLOWED = _INITIATIVE_NEW_REQUIRED
+
+
+def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
+    """Allocate the next INI-NN id and write a stub initiative md.
+
+    Required params: slug, name
+    Returns: {ok, id, file_path}
+
+    Storage: ``data/<slug>/vision/initiatives/INI-NN-<slug>.md``. Legacy
+    slug-named initiatives are non-numeric and untouched; new ones get an
+    INI-NN id while keeping a human ``name``.
+    """
+    from bot_squad_worker import idalloc
+
+    cfg, slug = _entity_setup(
+        params, _INITIATIVE_NEW_REQUIRED, _INITIATIVE_NEW_ALLOWED, "initiative_new"
+    )
+    name = _require_str(params, "name", "initiative_new")
+
+    init_dir = cfg.data_dir / slug / "vision" / "initiatives"
+    init_dir.mkdir(parents=True, exist_ok=True)
+    new_id = idalloc.allocate_id(cfg.data_dir, slug, "initiative")
+    file_path = init_dir / f"{new_id}-{_slugify_title(name)}.md"
+
+    fm = "\n".join([
+        f"id: {new_id}",
+        f"name: {_yaml_quote(name)}",
+        "status: open",
+        f"created: {_now_iso()}",
+    ])
+    content = f"---\n{fm}\n---\n\n# {name}\n\n(filed via initiative_new)\n"
+    _atomic_write_new(file_path, content)
     return {"ok": True, "id": new_id, "file_path": str(file_path)}
 
 
@@ -1643,6 +1852,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "task_progress_add": _action_task_progress_add,
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
+    "doc_new": _action_doc_new,
+    "uc_new": _action_uc_new,
+    "flow_new": _action_flow_new,
+    "initiative_new": _action_initiative_new,
     "bind_task": _action_bind_task,
     "bind_initiative": _action_bind_initiative,
     "unbind_task": _action_unbind_task,
@@ -1705,6 +1918,10 @@ ACTION_MODES: dict[str, str] = {
     "peer_inbox_wait": "coordinator_only",
     "task_progress_add": "coordinator_only",
     "task_new": "coordinator_only",
+    "doc_new": "coordinator_only",
+    "uc_new": "coordinator_only",
+    "flow_new": "coordinator_only",
+    "initiative_new": "coordinator_only",
     "bind_task": "coordinator_only",
     "bind_initiative": "coordinator_only",
     "unbind_task": "coordinator_only",

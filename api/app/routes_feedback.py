@@ -1,7 +1,6 @@
 """Feedback read + write endpoints."""
 from __future__ import annotations
 
-import fcntl
 import os
 import re
 from datetime import datetime, timezone
@@ -9,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.markdown_writer import allocate_next_id, slugify, write_task
+from app.markdown_writer import slugify, write_task
 from app.routes_auth import require_auth
 
 router = APIRouter(
@@ -128,25 +127,27 @@ def promote_feedback(
     backlog_dir = _backlog_dir(request, slug)
     backlog_dir.mkdir(parents=True, exist_ok=True)
 
-    lock_path = backlog_dir / ".lock"
-    with open(lock_path, "w") as lock_f:
-        fcntl.flock(lock_f, fcntl.LOCK_EX)
-        task_id = allocate_next_id(backlog_dir)
-        slug_part = slugify(title)
-        filename = f"{task_id}-{slug_part}.md" if slug_part else f"{task_id}.md"
-        task_path = backlog_dir / filename
+    # T-0174: allocate via the shared idalloc counter (same as routes_backlog
+    # and the worker's task_new) so promotes can't collide with concurrent
+    # creates on the T-id.
+    from app import idalloc
+    cfg = request.app.state.api_config
+    task_id = idalloc.allocate_id(cfg.data_dir, slug, "task")
+    slug_part = slugify(title)
+    filename = f"{task_id}-{slug_part}.md" if slug_part else f"{task_id}.md"
+    task_path = backlog_dir / filename
 
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        fm = {
-            "id": task_id,
-            "title": title,
-            "status": "open",
-            "created": now,
-            "updated": now,
-            "from": name,
-        }
-        write_task(task_path, fm, task_body)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    fm = {
+        "id": task_id,
+        "title": title,
+        "status": "open",
+        "created": now,
+        "updated": now,
+        "from": name,
+    }
+    write_task(task_path, fm, task_body)
 
     # Append footer to feedback file
     footer = (

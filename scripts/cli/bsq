@@ -10,7 +10,8 @@ Verbs:
   bsq inbox wait  [--timeout N]     opt-in long-poll (the bg-watcher mode)
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
   bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
-  bsq spawn <ticket> [--bundle ids] spawn a dev session for a backlog ticket
+  bsq spawn <ticket> [--bundle ids] spawn a dev session (auto-resumes an expert)
+  bsq expert find <ticket>          rank resumable 'pro' sessions for a ticket
   bsq team status                   list this project's sessions
   bsq team list                     list persisted Team rosters (T-0142)
   bsq team archive <sid>            true-archive a session (suspend + archive)
@@ -35,6 +36,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -400,25 +402,69 @@ def cmd_spawn(args) -> None:
 
     initiative = args.initiative or fm.get("initiative") or None
     bundle = [b.strip() for b in args.bundle.split(",") if b.strip()] if args.bundle else []
+    # T-0160: the extra (bundled) tickets to BIND after the session comes up.
+    # The primary rides in via task_id; extras must be bind_task'd explicitly.
+    extras = [b for b in bundle if b != ticket]
 
+    # All tickets are loaded up front: both the prompt assembler (T-0149) and
+    # the expert scan (T-0150) need the bundle's frontmatter + bodies.
+    all_tickets = [ticket] + extras
+    paths = {ticket: path}
+    fms = {ticket: fm}
+    for b in extras:
+        if b in paths:
+            continue
+        bp = find_ticket(slug, b)
+        paths[b] = bp
+        fms[b] = read_frontmatter(bp)
+
+    report_to = my_sid() or "<your TL SID>"
+    custom_prompt = bool(args.prompt or args.prompt_file)
     if args.prompt_file:
         initial_prompt = Path(args.prompt_file).read_text().strip()
     elif args.prompt:
         initial_prompt = args.prompt
     else:
         # T-0149: deterministic assembly from ticket(s) + role + guidance + rules.
-        all_tickets = [ticket] + [b for b in bundle if b != ticket]
-        paths = {ticket: path}
-        fms = {ticket: fm}
-        for b in bundle:
-            if b in paths:
-                continue
-            bp = find_ticket(slug, b)
-            paths[b] = bp
-            fms[b] = read_frontmatter(bp)
-        report_to = my_sid() or "<your TL SID>"
         initial_prompt = _assemble_prompt(
             slug, all_tickets, paths, fms, args.role, report_to)
+
+    # === T-0150: prefer RESUMING an existing expert over a fresh spawn ===
+    # Oftentimes a (suspended/archived) session already "pro'd" a related task.
+    # Resuming it and handing it a delta brief beats spawning a fresh dev that
+    # re-researches from scratch (often with gaps). Fresh spawn is the fallback.
+    expert = None
+    if not args.fresh:
+        try:
+            sessions = post("list_sessions", {"slug": slug}).get("sessions", [])
+        except WorkerError:
+            sessions = []
+        ranked = _find_expert(slug, sessions, all_tickets, fms, paths, my_sid())
+        if args.resume_sid:
+            # Explicit override: resume this SID even if not auto-pickable.
+            expert = next((c for c in ranked if c["sid"] == args.resume_sid), None)
+            if expert is None:
+                die(f"--resume {args.resume_sid}: not a viable expert candidate. "
+                    f"Candidates: {', '.join(c['sid'] for c in ranked) or '(none)'}")
+        elif custom_prompt:
+            # A hand-written --prompt is an explicit fresh-intent; don't
+            # auto-resume over it (use --resume <sid> to force it).
+            pass
+        elif ranked and ranked[0]["confidence"] == "high":
+            expert = ranked[0]
+        elif ranked:
+            # Medium/low match: don't auto-resume, but tell the operator it exists.
+            top = ranked[0]
+            print(f"note: possible expert {top['sid']} ({top['confidence']}, "
+                  f"score {top['score']}: {'; '.join(top['reasons'])}). Not "
+                  f"auto-resuming — re-run with `--resume {top['sid']}` to use it, "
+                  f"or `--fresh` to silence.", file=sys.stderr)
+
+    if expert is not None:
+        brief = initial_prompt if custom_prompt else _assemble_delta_brief(
+            slug, all_tickets, fms, paths, expert, report_to)
+        _resume_expert(slug, expert, all_tickets, brief, args.dry_run)
+        return
 
     params = {"slug": slug, "window": window, "initial_prompt": initial_prompt, "task_id": ticket}
     if initiative:
@@ -427,12 +473,561 @@ def cmd_spawn(args) -> None:
         params["owner"] = args.owner
 
     if args.dry_run:
-        print(json.dumps({**params, "initial_prompt": initial_prompt}, indent=2))
+        print(json.dumps({"decision": "fresh-spawn", "bind_after": extras,
+                          **params}, indent=2))
         return
 
     res = post("spawn_session", params, timeout=90)
-    print(f"spawned {res.get('sid')} (window={window}, task={ticket}"
+    sid = res.get("sid")
+    print(f"spawned {sid} (window={window}, task={ticket}"
           + (f", bundle={','.join(bundle)}" if bundle else "") + ")")
+    # T-0160: persist the bundle bindings. spawn_session only binds the primary
+    # (via the .claude/task_id marker); each extra needs an explicit bind_task
+    # so extra_task_ids / session_history / gc reconcilers stay honest. Wait for
+    # the SessionStart hook to stamp the primary first so our extras land after
+    # the hook's md write (else it clobbers them).
+    _bind_extras(slug, sid, extras, wait_primary=ticket)
+
+
+def _session_record(slug: str, sid: str) -> dict | None:
+    """Look up one session's live record from list_sessions (None if gone)."""
+    try:
+        sessions = post("list_sessions", {"slug": slug}, fatal=False).get("sessions", [])
+    except WorkerError:
+        return None
+    for s in sessions:
+        if s.get("sid") == sid:
+            return s
+    return None
+
+
+def _wait_for_session_primary(slug: str, sid: str, primary: str,
+                              timeout: float = 45.0, interval: float = 2.0) -> bool:
+    """Block until the SessionStart hook has stamped `primary` as the session's
+    task_id (its md write is then complete). Binding extras only AFTER this
+    avoids the hook's read-modify-write clobbering them (T-0160 root cause: the
+    hook preserves *existing* extra_task_ids, so our write must land after it).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rec = _session_record(slug, sid)
+        if rec and rec.get("task_id") == primary:
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _bind_extras(slug: str, sid: str | None, extras: list[str],
+                 wait_primary: str | None = None) -> None:
+    """T-0160: bind each extra ticket to a freshly-spawned/resumed session.
+
+    Calls the worker ``bind_task`` action per extra (idempotent for already-bound
+    ids), then verifies the bindings stuck and re-binds any the SessionStart hook
+    raced away. A single bind failure is surfaced but does not abort the rest —
+    the session is up and the operator can re-bind.
+    """
+    if not sid or not extras:
+        return
+    if wait_primary and not _wait_for_session_primary(slug, sid, wait_primary):
+        print(f"  note: session {sid} primary task_id not visible yet — binding "
+              f"anyway (will verify + retry)", file=sys.stderr)
+    for tid in extras:
+        try:
+            res = post("bind_task", {"slug": slug, "sid": sid, "task_id": tid},
+                       fatal=False)
+            if res.get("already_bound"):
+                print(f"  bound {tid} -> {sid} (already bound)")
+            else:
+                print(f"  bound {tid} -> {sid} (extras now: "
+                      f"{', '.join(res.get('extras', [])) or '-'})")
+        except WorkerError as e:
+            print(f"  WARNING: failed to bind {tid} -> {sid}: {e}\n"
+                  f"    re-bind manually: bsq spawn ... or worker bind_task "
+                  f"slug={slug} sid={sid} task_id={tid}", file=sys.stderr)
+    # Verify + self-heal: the SessionStart hook (fresh spawn) or resume hook can
+    # rewrite the md from a pre-bind read and drop our extras. Re-check over a
+    # short window and re-bind anything missing.
+    for _ in range(3):
+        rec = _session_record(slug, sid)
+        if rec is None:
+            return
+        have = set(_clean_id_list(rec.get("extra_task_ids")))
+        missing = [t for t in extras if t not in have]
+        if not missing:
+            return
+        time.sleep(4)
+        for tid in missing:
+            try:
+                post("bind_task", {"slug": slug, "sid": sid, "task_id": tid},
+                     fatal=False)
+                print(f"  re-bound {tid} -> {sid} (raced by a session-md rewrite)")
+            except WorkerError:
+                pass
+    rec = _session_record(slug, sid)
+    have = set(_clean_id_list(rec.get("extra_task_ids"))) if rec else set()
+    still = [t for t in extras if t not in have]
+    if still:
+        print(f"  WARNING: bindings not confirmed for {', '.join(still)} on {sid} "
+              f"— verify with `bsq team status --all --json`", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# Expert resumption (T-0150) — oftentimes a (suspended/archived) session has
+# already become a "pro" at a related task. Resuming it + a delta brief beats
+# spawning a fresh dev that re-researches from scratch (research with holes).
+# `_find_expert` scores candidate sessions by ticket-graph overlap (shared /
+# cross-referenced tickets), initiative, title-keyword, files-touched, and
+# recency; `bsq spawn` auto-resumes a high-confidence top match.
+# --------------------------------------------------------------------------
+_EXPERT_W_SHARED = 6        # candidate already worked one of the new tickets
+_EXPERT_W_XREF = 5          # explicit `[[T-x]]` ticket-graph link (high signal)
+_EXPERT_W_MENTION = 3       # plain `T-x` mentioned in the new ticket's scope (medium)
+_EXPERT_W_INITIATIVE = 3    # same initiative
+_EXPERT_W_KEYWORD = 1       # per overlapping title keyword (capped)
+_EXPERT_W_TOUCHED = 2       # per overlapping touched-file basename (capped)
+_EXPERT_KEYWORD_CAP = 3
+_EXPERT_TOUCHED_CAP = 3
+_EXPERT_FILESCAN_TOPN = 6   # only jsonl-scan the top-N cheap-scored candidates
+_EXPERT_JSONL_TAIL = 400    # last N jsonl records to scan for touched files
+_CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+
+
+def _clean_id_list(v) -> list[str]:
+    """Normalise a list/scalar frontmatter value to non-nil string ids."""
+    if isinstance(v, list):
+        items = v
+    elif v in (None, "", "~"):
+        items = []
+    else:
+        items = [v]
+    return [str(x).strip() for x in items if x and str(x).strip() not in ("", "~")]
+
+
+def _session_tickets(s: dict) -> set[str]:
+    out = set(_clean_id_list(s.get("task_id")))
+    out |= set(_clean_id_list(s.get("extra_task_ids")))
+    return out
+
+
+def _session_initiatives(s: dict) -> set[str]:
+    out = set(_clean_id_list(s.get("initiative")))
+    out |= set(_clean_id_list(s.get("extra_initiatives")))
+    return out
+
+
+def _ticket_md(slug: str, tid: str) -> tuple[dict, str] | None:
+    """Non-fatal ticket lookup → (frontmatter, body) or None if not found."""
+    matches = sorted(backlog_dir(slug).glob(f"{tid}-*.md"))
+    if not matches:
+        return None
+    return read_frontmatter(matches[0]), _body_after_frontmatter(matches[0])
+
+
+def _ticket_session_history(slug: str, tid: str) -> set[str]:
+    """SIDs the ticket's `session_history` frontmatter records (T-0105).
+
+    This is the load-bearing bridge for expert discovery: a session's *live*
+    task binding is released when it's archived/GC'd (task_id → None), but the
+    ticket keeps a forensic list of every SID that ever worked it — and the
+    session's current SID is the last one appended (on spawn/bind/resume), so a
+    still-resumable 'pro' session is findable here long after its binding lapsed.
+    """
+    md = _ticket_md(slug, tid)
+    if not md:
+        return set()
+    return set(re.findall(r"S-[A-Za-z0-9_.-]+", str(md[0].get("session_history", "") or "")))
+
+
+def _title_keywords(title: str) -> set[str]:
+    return {w for w in re.split(r"[^A-Za-z0-9]+", (title or "").lower())
+            if len(w) >= 4 and w not in _KW_STOP}
+
+
+def _ticket_path_tokens(bodies: list[str]) -> set[str]:
+    """File-path-ish tokens mentioned in ticket bodies, keyed by basename.
+
+    A ticket like T-0160 names `scripts/cli/bsq`; matching that against a
+    candidate session's touched files is a strong "this is the expert" signal.
+    """
+    tokens: set[str] = set()
+    for b in bodies:
+        for m in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9_]+", b):
+            if "/" in m:
+                tokens.add(os.path.basename(m))
+        # path-with-slash but no extension (e.g. scripts/cli/bsq)
+        for m in re.findall(r"[A-Za-z0-9_./-]+/[A-Za-z0-9_-]+", b):
+            tokens.add(os.path.basename(m))
+    return {t for t in tokens if len(t) >= 3}
+
+
+def _jsonl_for_uuid(uuid: str) -> str | None:
+    if not uuid or uuid == "~":
+        return None
+    hits = []
+    if os.path.isdir(_CLAUDE_PROJECTS):
+        for d in os.listdir(_CLAUDE_PROJECTS):
+            p = os.path.join(_CLAUDE_PROJECTS, d, f"{uuid}.jsonl")
+            if os.path.exists(p):
+                hits.append(p)
+    if not hits:
+        return None
+    return max(hits, key=lambda p: os.path.getmtime(p))
+
+
+def _touched_file_basenames(jsonl_path: str) -> set[str]:
+    """Basenames of files a session wrote (Edit/Write/MultiEdit/NotebookEdit).
+
+    Tails the transcript (last `_EXPERT_JSONL_TAIL` records) — same shape the
+    worker's drift scan reads (T-0149).
+    """
+    try:
+        with open(jsonl_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return set()
+    out: set[str] = set()
+    _write_tools = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+    for line in lines[-_EXPERT_JSONL_TAIL:]:
+        line = line.strip()
+        if not line or '"tool_use"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        content = (o.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") not in _write_tools:
+                continue
+            inp = block.get("input") or {}
+            fp = inp.get("file_path") or inp.get("notebook_path")
+            if isinstance(fp, str) and fp.strip():
+                out.add(os.path.basename(fp.strip()))
+    return out
+
+
+def _recency_key(s: dict):
+    """Sort-friendly recency value (higher = more recent). Best-effort parse."""
+    for k in ("suspended_at", "paused_at", "started_at"):
+        v = s.get(k)
+        if isinstance(v, str) and v and v != "~":
+            try:
+                return datetime.strptime(v[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+    v = s.get("activity_at")
+    if isinstance(v, (int, float)):
+        return float(v)
+    return 0.0
+
+
+def _related_tickets(slug: str, own: set[str], xrefs: set[str],
+                     new_bodies: list[str]) -> dict[str, tuple[int, str, bool]]:
+    """Ticket-graph universe related to the new task → {tid: (weight, reason, high)}.
+
+    High signals (a session that worked the ticket is a HIGH-confidence expert,
+    eligible for auto-resume):
+    - own tickets themselves (a session that already worked THIS ticket),
+    - tickets the new task links to via `Related: [[T-x]]`,
+    - reverse links: any backlog ticket whose body links to one of the new tickets.
+    Medium signal (surfaced, but never auto-resumed):
+    - tickets the new task mentions in prose as plain `T-x` (no `[[ ]]`) — e.g.
+      'Bug is in the bsq spawn path (..., T-0149 assembly)'.
+    """
+    related: dict[str, tuple[int, str, bool]] = {}
+    for t in sorted(own):
+        related[t] = (_EXPERT_W_SHARED, f"already worked {t}", True)
+    for t in sorted(xrefs):
+        related.setdefault(t, (_EXPERT_W_XREF, f"this task links to {t} (which it worked)", True))
+    # Reverse-xref sweep: tickets whose body links back to one of the new tickets.
+    for p in sorted(backlog_dir(slug).glob("T-*.md")):
+        fm = read_frontmatter(p)
+        tid = fm.get("id") or "-".join(p.stem.split("-")[:2])
+        if tid in own or tid in related:
+            continue
+        body = _body_after_frontmatter(p)
+        if any(m in own for m in re.findall(r"\[\[(T-\d+)\]\]", body)):
+            related[tid] = (_EXPERT_W_XREF, f"its {tid} links to this task", True)
+    # Plain prose mentions of other tickets in the new task's scope (medium).
+    mentions = set()
+    for b in new_bodies:
+        mentions |= set(re.findall(r"\bT-\d{3,}\b", b))
+    for t in sorted(mentions - own):
+        related.setdefault(t, (_EXPERT_W_MENTION,
+                               f"new task mentions {t} in scope (which it worked)", False))
+    return related
+
+
+def _find_expert(slug: str, sessions: list[dict], tickets: list[str],
+                 fms: dict[str, dict], paths: dict[str, "Path"],
+                 my_sid_value: str | None) -> list[dict]:
+    """Rank suspended/archived sessions by how 'pro' they are at this task.
+
+    Returns a confidence-then-score-sorted list of candidate dicts
+    ``{sid, uuid, status, archived, tickets, worked, score, confidence, reasons}``.
+    Candidates with no overlap (score 0) are dropped.
+
+    Expert discovery is primarily via the ticket-graph ∩ each related ticket's
+    `session_history` (a session's live binding is released on archive, but the
+    ticket remembers who worked it). Initiative / title-keyword / files-touched /
+    recency refine the ranking. Pure over `sessions` (no worker calls) so it's
+    unit-testable + dry-runnable.
+    """
+    own = set(tickets)
+    new_bodies = [_body_after_frontmatter(paths[t]) for t in tickets]
+    xrefs = set(_cross_refs(new_bodies, own))           # tickets the NEW task links to
+    new_inits: set[str] = set()
+    for t in tickets:
+        new_inits |= set(_clean_id_list(fms[t].get("initiative")))
+    new_kw: set[str] = set()
+    for t in tickets:
+        new_kw |= _title_keywords(fms[t].get("title", ""))
+    new_path_tokens = _ticket_path_tokens(new_bodies)
+
+    related = _related_tickets(slug, own, xrefs, new_bodies)
+    # SIDs that worked each related ticket (forensic, survives binding release).
+    sh_by_ticket = {t: _ticket_session_history(slug, t) for t in related}
+    # Titles of related tickets, for the keyword signal on sessions that worked them.
+    title_cache: dict[str, str] = {}
+
+    def _title(tid: str) -> str:
+        if tid not in title_cache:
+            md = _ticket_md(slug, tid)
+            title_cache[tid] = (md[0].get("title", "") if md else "")
+        return title_cache[tid]
+
+    cands: list[dict] = []
+    for s in sessions:
+        sid = s.get("sid")
+        if not sid or sid == my_sid_value:
+            continue
+        if not (s.get("status") == "suspended" or bool(s.get("archived"))):
+            continue
+        uuid = s.get("claude_uuid")
+        if not uuid or uuid == "~":
+            continue
+        cand_tickets = _session_tickets(s)
+
+        # Which related tickets did THIS session work? Either it still carries
+        # the binding, or its SID is in that ticket's session_history.
+        worked = {t: rel for t, rel in related.items()
+                  if sid in sh_by_ticket.get(t, set()) or t in cand_tickets}
+
+        score = 0
+        reasons: list[str] = []
+        high = False
+        medium = False
+        for t in sorted(worked):
+            w, rsn, is_high = worked[t]
+            score += w
+            if is_high:
+                high = True
+            else:
+                medium = True
+            reasons.append(rsn)
+
+        shared_init = _session_initiatives(s) & new_inits
+        if shared_init:
+            score += _EXPERT_W_INITIATIVE
+            medium = True
+            reasons.append(f"same initiative {sorted(shared_init)[0]}")
+
+        # Keyword signal: candidate's worked-ticket titles + its window name.
+        cand_kw = _title_keywords(s.get("window", "").replace("-", " ").replace("_", " "))
+        for t in set(worked) | cand_tickets:
+            cand_kw |= _title_keywords(_title(t))
+        kw_hit = cand_kw & new_kw
+        if kw_hit:
+            score += min(len(kw_hit), _EXPERT_KEYWORD_CAP) * _EXPERT_W_KEYWORD
+            if len(kw_hit) >= 2:
+                medium = True
+            reasons.append(f"keyword overlap: {', '.join(sorted(kw_hit)[:3])}")
+
+        cands.append({
+            "sid": sid, "uuid": uuid, "status": s.get("status", ""),
+            "archived": bool(s.get("archived")), "window": s.get("window", ""),
+            "tickets": sorted(set(worked) | cand_tickets),
+            "worked": sorted(worked), "score": score, "reasons": reasons,
+            "_high": high, "_medium": medium, "_recency": _recency_key(s),
+        })
+
+    # Files-touched pass: only for the top-N cheap-scored candidates, and only
+    # if the new tickets actually name files (else nothing to match against).
+    if new_path_tokens:
+        for c in sorted(cands, key=lambda c: c["score"], reverse=True)[:_EXPERT_FILESCAN_TOPN]:
+            jp = _jsonl_for_uuid(c["uuid"])
+            if not jp:
+                continue
+            overlap = _touched_file_basenames(jp) & new_path_tokens
+            if overlap:
+                c["score"] += min(len(overlap), _EXPERT_TOUCHED_CAP) * _EXPERT_W_TOUCHED
+                c["_medium"] = True
+                c["reasons"].append(f"touched {', '.join(sorted(overlap)[:3])}")
+
+    out = []
+    for c in cands:
+        # Drop no-overlap candidates and lone-keyword noise (a single shared
+        # title word is too weak to surface; keep high/medium + multi-signal lows).
+        if c["score"] <= 0 or (not c["_high"] and not c["_medium"] and c["score"] < 2):
+            continue
+        c["confidence"] = "high" if c["_high"] else ("medium" if c["_medium"] else "low")
+        out.append(c)
+    out.sort(key=lambda c: (_CONFIDENCE_RANK[c["confidence"]], c["score"], c["_recency"]),
+             reverse=True)
+    # Strip private keys from the returned view.
+    for c in out:
+        for k in ("_high", "_medium", "_recency"):
+            c.pop(k, None)
+    return out
+
+
+def _assemble_delta_brief(slug: str, tickets: list[str], fms: dict[str, dict],
+                          paths: dict[str, "Path"], expert: dict,
+                          report_to: str) -> str:
+    """T-0150: the brief handed to a RESUMED expert — a delta on its prior work.
+
+    Unlike the fresh-spawn assembly (full role contract + guidance + rules), this
+    leans on the session's existing context: it states what it already did, the
+    new related task, and *why* it's the right session, then inlines the new
+    ticket(s) + the load-bearing process reminders.
+    """
+    bodies = {t: _body_after_frontmatter(paths[t]) for t in tickets}
+    ticket_blocks = "\n\n".join(
+        f"### {t}: {fms[t].get('title', t)}\n{bodies[t]}" for t in tickets)
+    prior = ", ".join(expert.get("tickets", [])) or "(your prior work in this session)"
+    overlap = "; ".join(expert.get("reasons", [])) or "related prior work"
+    bundle_note = (f" Handle all of {', '.join(tickets)} together in this session."
+                   if len(tickets) > 1 else "")
+    ai_path = Path(BOT_SQUAD) / "data" / slug / "AGENT_INSTRUCTIONS.md"
+    return f"""\
+You are being RESUMED as the resident expert — NOT spawned fresh. You previously
+worked: {prior}. A new, RELATED task now builds on that work. Apply what you
+already know; do NOT re-research from scratch (that's the whole point of resuming
+you).{bundle_note}
+
+Why you (overlap with your prior work): {overlap}
+
+== NEW ASSIGNED TICKET(S) ==
+{ticket_blocks}
+
+== REMINDERS (you know these; quick refresh) ==
+- This is a delta on your existing context — reuse it. If your memory of the
+  paths/rules is stale, re-read AGENT_INSTRUCTIONS.md ({ai_path}).
+- Track ALL work on the ticket: `bsq ticket note <id> <text>` / `bsq ticket
+  update <id> <status>`. Never plan into superpowers/* docs (T-0152).
+- Verify MANUAL-FIRST (T-0158): write the user scenario, walk it through, then
+  automate. The 'Verbatim request' section of a ticket is HUMAN-ONLY.
+- Git: edit the shared tree on bot_squad/dev (no worktree/stash). Commit ONLY
+  with `bsq commit -m <msg> --ack <explicit files>`; never wide-add, never push
+  or merge — your TL reviews + deploys.
+- When DoD is green: `bsq ticket update <id> totest`, `bsq ticket note <id>
+  '<summary>'`, then `bsq peer send {report_to} 'READY <id> — <summary>'`.
+
+Run `bsq --help` for the full verb reference."""
+
+
+def _resume_expert(slug: str, expert: dict, all_tickets: list[str],
+                   brief: str, dry_run: bool) -> None:
+    """Resume a matched expert session and hand it the delta brief + bindings."""
+    sid = expert["sid"]
+    if dry_run:
+        print(json.dumps({
+            "decision": "resume-expert", "sid": sid, "uuid": expert.get("uuid"),
+            "confidence": expert["confidence"], "score": expert["score"],
+            "reasons": expert["reasons"],
+            "prior_tickets": expert.get("tickets", []),
+            "bind": all_tickets, "delta_brief": brief,
+        }, indent=2))
+        return
+    print(f"resuming expert {sid} (score {expert['score']}, {expert['confidence']}): "
+          f"{'; '.join(expert['reasons'])}")
+    if expert.get("archived"):
+        # Clear the archive flag first (operator-retired sessions are exactly the
+        # 'old pro' we want back). Best-effort — resume still works if it no-ops.
+        try:
+            post("unarchive_session", {"slug": slug, "sid": sid}, fatal=False)
+        except WorkerError:
+            pass
+    # Preferred: hand the delta brief straight to the resumed composer
+    # (worker resume_session learned `initial_prompt` in T-0150). Param
+    # validation runs before any resume work, so a rejection from a pre-T0150
+    # worker leaves no partial state — fall back to a plain resume + bus delivery.
+    delivered = "prompt"
+    try:
+        res = post("resume_session",
+                   {"slug": slug, "sid": sid, "initial_prompt": brief},
+                   timeout=120, fatal=False)
+    except WorkerError as e:
+        if "initial_prompt" in str(e) and "unexpected" in str(e):
+            res = post("resume_session", {"slug": slug, "sid": sid}, timeout=120)
+            delivered = "bus"
+        else:
+            die(f"resume_session failed for {sid}: {e}")
+    new_sid = res.get("sid", sid)
+    if delivered == "bus":
+        _deliver_brief_via_bus(slug, new_sid, brief)
+        print(f"resumed -> {new_sid}; delta brief delivered via peer inbox "
+              f"(pre-T0150 worker — direct prompt delivery lands after the worker deploy)")
+    else:
+        print(f"resumed -> {new_sid}; delivered delta brief for {', '.join(all_tickets)}")
+    # Bind every assigned ticket to the resumed expert. Its primary task stays
+    # its original; the new ones land in extra_task_ids (idempotent).
+    _bind_extras(slug, new_sid, all_tickets)
+
+
+def _deliver_brief_via_bus(slug: str, sid: str, brief: str) -> None:
+    """Fallback brief delivery for pre-T0150 workers: drop the delta brief into
+    the resumed session's peer inbox (newlines are flattened to spaces by the
+    bus) and nudge its pane to drain. The session reads it on `bsq inbox check`.
+    """
+    sender = my_sid() or "stakeholder"
+    header = "[RESUME DELTA BRIEF — you were resumed as the expert; full brief follows] || "
+    post("peer_send", {"slug": slug, "from_sid": sender, "to": sid,
+                       "text": header + brief}, fatal=False)
+    try:
+        post("inject_input", {"sid": sid, "text": MAIL_SIGNAL}, fatal=False)
+    except WorkerError:
+        pass
+
+
+def cmd_expert_find(args) -> None:
+    slug = resolve_slug()
+    ticket = args.ticket.strip()
+    path = find_ticket(slug, ticket)
+    fm = read_frontmatter(path)
+    bundle = [b.strip() for b in args.bundle.split(",") if b.strip()] if args.bundle else []
+    extras = [b for b in bundle if b != ticket]
+    all_tickets = [ticket] + extras
+    paths = {ticket: path}
+    fms = {ticket: fm}
+    for b in extras:
+        if b in paths:
+            continue
+        bp = find_ticket(slug, b)
+        paths[b] = bp
+        fms[b] = read_frontmatter(bp)
+    sessions = post("list_sessions", {"slug": slug}).get("sessions", [])
+    ranked = _find_expert(slug, sessions, all_tickets, fms, paths, my_sid())
+    if args.json:
+        print(json.dumps(ranked, indent=2))
+        return
+    if not ranked:
+        print(f"(no expert candidates for {', '.join(all_tickets)} — a fresh "
+              f"spawn is the right call)")
+        return
+    print(f"expert candidates for {', '.join(all_tickets)} (best first):\n")
+    for c in ranked:
+        print(f"• {c['sid']}  [{c['confidence']}, score {c['score']}]  "
+              f"uuid={c.get('uuid', '?')}")
+        print(f"  prior tickets: {', '.join(c.get('tickets', [])) or '-'}")
+        print(f"  why: {'; '.join(c['reasons'])}\n")
+    print("`bsq spawn <ticket>` auto-resumes a HIGH-confidence top match; for a "
+          "medium/low one use `bsq spawn <ticket> --resume <sid>`.")
 
 
 _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
@@ -1372,6 +1967,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  bsq inbox check                  drain new peer mail\n"
             "  bsq peer send teamlead 'READY T-0146 — shipped, sha abc123'\n"
             "  bsq spawn T-0150 --bundle T-0151,T-0152\n"
+            "  bsq expert find T-0150            who has already 'pro'd related work\n"
+            "  bsq spawn T-0150 --fresh         skip expert-resume, force fresh spawn\n"
             "  bsq team status\n"
             "  bsq compact\n"
             "  bsq commit --ack -m 'fix: thing' path/to/file.py\n\n"
@@ -1446,8 +2043,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="role contract to assemble into the prompt (default dev)")
     sp.add_argument("--prompt", help="custom initial prompt (overrides deterministic assembly)")
     sp.add_argument("--prompt-file", help="read initial prompt from a file")
-    sp.add_argument("--dry-run", action="store_true", help="print params without spawning")
+    sp.add_argument("--fresh", action="store_true",
+                    help="skip the expert scan (T-0150) — force a fresh spawn")
+    sp.add_argument("--resume", dest="resume_sid", metavar="SID",
+                    help="resume this specific session as the expert (T-0150)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="print the resume/spawn decision + params without acting")
     sp.set_defaults(func=cmd_spawn)
+
+    # expert (T-0150: find a resumable 'pro' session for a ticket)
+    ex = sub.add_parser("expert", help="find an existing expert session to resume (T-0150)")
+    ex_sub = ex.add_subparsers(dest="sub", required=True)
+    exf = ex_sub.add_parser("find",
+                            help="rank suspended/archived sessions by overlap with a ticket")
+    exf.add_argument("ticket", help="ticket id, e.g. T-0150")
+    exf.add_argument("--bundle", help="comma-separated extra ticket ids (same as spawn)")
+    exf.add_argument("--json", action="store_true", help="raw JSON output")
+    exf.set_defaults(func=cmd_expert_find)
 
     # team
     team = sub.add_parser("team", help="session roster (composes with T-0142)")

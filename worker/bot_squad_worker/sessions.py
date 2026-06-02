@@ -915,7 +915,7 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
     return {"ok": True, "suspended": True}
 
 
-def resume(cfg: Any, slug: str, sid: str) -> dict:
+def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None) -> dict:
     """Resume a Claude session — handles paused, suspended, and zombie cases.
 
     - status=paused with live pane → just clear paused status; user types in tmux.
@@ -923,6 +923,14 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
     - status=suspended → resurrect (new window + ``claude --resume <uuid>``).
     - status=active with no live pane (zombie) → resurrect.
     - status=active with live pane → error (use pause/suspend first).
+
+    T-0150: when ``initial_prompt`` is provided, it is delivered into the
+    resumed composer (same composer-ready poll + paste-buffer path as
+    ``spawn``). This powers the "resume an existing expert with a delta brief"
+    flow — instead of spawning a fresh dev that re-researches from scratch, the
+    caller resurrects the session that already did the related work and hands it
+    the new, related task. Only delivered on the resurrect path (a new pane);
+    a paused-but-live session is left for the user to type into directly.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -1061,6 +1069,20 @@ def resume(cfg: Any, slug: str, sid: str) -> dict:
                 _append_task_session_history(backlog_dir, tid, new_sid)
             except OSError:
                 pass
+
+    # T-0150: deliver the delta brief into the resumed composer, same proven
+    # path spawn() uses (composer-ready poll, then bracketed paste-buffer + a
+    # separate Enter). If the composer never shows ❯, raise so the caller can
+    # recover via inject_input — the pane is up, only the prompt didn't land.
+    if initial_prompt:
+        if not _wait_for_claude_composer_ready(new_pane.pane_id):
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(
+                f"resume: claude composer never showed ❯ for sid {new_sid} within "
+                f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
+                "(pane is up; recover via inject_input)"
+            )
+        _deliver_prompt(new_pane.pane_id, initial_prompt)
 
     return {"ok": True, "sid": new_sid}
 

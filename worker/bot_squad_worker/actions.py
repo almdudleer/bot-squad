@@ -415,7 +415,7 @@ def _action_suspend_session(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _RESUME_SESSION_REQUIRED = {"slug", "sid"}
-_RESUME_SESSION_ALLOWED = _RESUME_SESSION_REQUIRED
+_RESUME_SESSION_ALLOWED = _RESUME_SESSION_REQUIRED | {"initial_prompt"}
 
 
 def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
@@ -433,7 +433,10 @@ def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     from bot_squad_worker import sessions as _sessions
-    return _sessions.resume(cfg, params["slug"], params["sid"])
+    return _sessions.resume(
+        cfg, params["slug"], params["sid"],
+        initial_prompt=params.get("initial_prompt"),
+    )
 
 
 _SPAWN_SESSION_REQUIRED = {"slug", "window"}

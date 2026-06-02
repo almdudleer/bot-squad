@@ -1483,6 +1483,105 @@ def test_resume_unknown_sid_raises(tmp_path, monkeypatch):
         resume(cfg, "test-project", "S-testuser-nowin-p0")
 
 
+def test_resume_delivers_initial_prompt(tmp_path, monkeypatch):
+    """T-0150: resurrecting a suspended session with `initial_prompt` delivers
+    the delta brief into the resumed composer via the same composer-ready poll
+    + paste-buffer path spawn uses (so a resumed expert gets its brief)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-expert-p7.md", {
+        "sid": "S-testuser-expert-p7",
+        "status": "suspended",
+        "window": "expert",
+        "cwd": str(repo),
+        "claude_uuid": "expert-uuid-9",
+        "task_id": "T-0001",
+        "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    key_calls: list[list] = []
+    new_window_called = [False]
+
+    def fake_run(args, **kwargs):
+        if "set-buffer" in args or "paste-buffer" in args or "send-keys" in args:
+            key_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "capture-pane" in args:
+            return subprocess.CompletedProcess(args, 0, "❯ \n", "")
+        if "new-window" in args:
+            new_window_called[0] = True
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            if new_window_called[0]:
+                return subprocess.CompletedProcess(args, 0, f"%7|expert|4242|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = resume(cfg, "test-project", "S-testuser-expert-p7",
+                    initial_prompt="delta: now do T-0002 building on T-0001")
+    assert result["ok"] is True
+    # Delivered via set-buffer (bracketed paste), not a send-keys literal.
+    assert any("set-buffer" in c and "delta:" in str(c) for c in key_calls), \
+        f"expected delta brief via set-buffer; got: {key_calls}"
+    assert any("paste-buffer" in c for c in key_calls), \
+        f"expected a paste-buffer delivery; got: {key_calls}"
+
+
+def test_resume_without_initial_prompt_delivers_nothing(tmp_path, monkeypatch):
+    """T-0150: omitting initial_prompt must not paste anything (back-compat)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-testuser-expert-p8.md", {
+        "sid": "S-testuser-expert-p8",
+        "status": "suspended",
+        "window": "expert",
+        "cwd": str(repo),
+        "claude_uuid": "expert-uuid-8",
+        "task_id": "T-0001",
+        "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    paste_calls: list[list] = []
+    new_window_called = [False]
+
+    def fake_run(args, **kwargs):
+        if "set-buffer" in args or "paste-buffer" in args:
+            paste_calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "capture-pane" in args:
+            return subprocess.CompletedProcess(args, 0, "❯ \n", "")
+        if "new-window" in args:
+            new_window_called[0] = True
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            if new_window_called[0]:
+                return subprocess.CompletedProcess(args, 0, f"%8|expert|4243|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-testuser-expert-p8")
+    assert paste_calls == [], f"no prompt expected, but pasted: {paste_calls}"
+
+
 # ---------------------------------------------------------------------------
 # T-0080: owner field plumbing
 # ---------------------------------------------------------------------------

@@ -573,6 +573,29 @@ def test_spawn_session_action_rejects_extra_params(tmp_path, monkeypatch):
         A.dispatch("spawn_session", {"slug": "test-project", "window": "w", "evil": "x"})
 
 
+def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):
+    """T-0150: resume_session must accept the optional initial_prompt param and
+    pass it through to sessions.resume (so a resumed expert gets a delta brief)."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    captured = {}
+
+    def fake_resume(cfg, slug, sid, initial_prompt=None):
+        captured["args"] = (slug, sid, initial_prompt)
+        return {"ok": True, "sid": sid}
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "resume", fake_resume)
+
+    result = A.dispatch("resume_session", {
+        "slug": "test-project", "sid": "S-u-w-p1",
+        "initial_prompt": "delta brief here",
+    })
+    assert result["ok"] is True
+    assert captured["args"] == ("test-project", "S-u-w-p1", "delta brief here")
+
+
 # ---------------------------------------------------------------------------
 # scheduler_state action tests (spec #6)
 # ---------------------------------------------------------------------------

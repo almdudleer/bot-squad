@@ -162,9 +162,12 @@ export function Sessions() {
   // T-0141: tmux grouping is the stakeholder's mental model (notes 5 + 13) —
   // the page now groups by tmux session by default, with the TL highlighted
   // and child sessions nested under it.
-  type SessGroupBy = "tmux" | "none" | "initiative";
+  // T-0157: "user" groups by linux_user → then tmux session, for multi-user
+  // projects where several Linux users work in one project from their own tmux.
+  type SessGroupBy = "tmux" | "user" | "none" | "initiative";
   const SESS_UNATTACHED = "__unattached__";
   const TMUX_NONE = "(no tmux session)";
+  const USER_NONE = "(unknown user)"; // T-0157: rows with no parseable linux_user
   const [groupBy, setGroupBy] = useState<SessGroupBy>("tmux");
   const [filterInit, setFilterInit] = useState<string>(""); // "" = all
   // Initiatives for grouping (separate from modal's `initiatives` so the
@@ -967,6 +970,81 @@ export function Sessions() {
     return SESS_UNATTACHED;
   }
 
+  // ---- T-0157: linux-user marking + grouping (multi-user projects) ----
+  // The owning linux user is the explicit `linux_user` field, falling back to
+  // the SID prefix (S-<user>-…) for pre-T-0157 rows.
+  function sessionUserKey(s: SessionRow): string {
+    const u = (s.linux_user ?? "").trim();
+    if (u && u !== "~") return u;
+    const sid = s.sid ?? "";
+    if (sid.startsWith("S-")) {
+      const parts = sid.split("-");
+      if (parts.length >= 2 && parts[1]) return parts[1];
+    }
+    return USER_NONE;
+  }
+  // Distinct linux users present in a set of rows — used for the per-lane mark.
+  function laneUsers(rows: SessionRow[]): string[] {
+    const seen = new Set<string>();
+    for (const r of rows) {
+      const u = sessionUserKey(r);
+      if (u !== USER_NONE) seen.add(u);
+    }
+    return Array.from(seen).sort();
+  }
+  // Group rows by linux user. Groups with a live session sort first, then
+  // alphabetical; the "(unknown user)" bucket is last. Mirrors groupSessionsByTmux.
+  function groupSessionsByUser(rows: SessionRow[]): { key: string; rows: SessionRow[] }[] {
+    const map = new Map<string, SessionRow[]>();
+    for (const s of rows) {
+      const k = sessionUserKey(s);
+      const list = map.get(k) ?? [];
+      list.push(s);
+      map.set(k, list);
+    }
+    const groups = Array.from(map.entries()).map(([key, gr]) => ({ key, rows: gr }));
+    groups.sort((a, b) => {
+      if (a.key === USER_NONE) return 1;
+      if (b.key === USER_NONE) return -1;
+      const al = a.rows.some(isAliveRow) ? 0 : 1;
+      const bl = b.rows.some(isAliveRow) ? 0 : 1;
+      if (al !== bl) return al - bl;
+      return a.key.localeCompare(b.key);
+    });
+    return groups;
+  }
+  function renderUserHeaderRow(key: string, rows: SessionRow[], colSpan: number) {
+    const alive = rows.filter(isAliveRow).length;
+    const suspended = rows.filter((r) => r.status === "suspended").length;
+    const isNone = key === USER_NONE;
+    return (
+      <tr
+        key={`user-section-${key}`}
+        style={{ background: "var(--mc-surface-deep)", borderTop: "2px solid var(--mc-border)" }}
+      >
+        <td colSpan={colSpan} style={{ padding: "0.5rem 0.75rem", fontFamily: "var(--mc-mono)", fontSize: "0.8rem" }}>
+          <div className="d-flex align-items-center gap-2 flex-wrap">
+            <span
+              className="badge"
+              style={{
+                background: isNone ? "var(--mc-surface-raised)" : "var(--mc-accent, #3b82f6)",
+                color: isNone ? "var(--mc-text-dim)" : "#fff",
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.72rem",
+                fontWeight: 700,
+              }}
+            >
+              {isNone ? "(unknown user)" : `👤 ${key}`}
+            </span>
+            <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.65rem", color: "var(--mc-text-dim)" }}>
+              {alive} alive · {suspended} suspended
+            </span>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
   // ---- T-0141: tmux-session grouping (the default view) ----
   function sessionTmuxKey(s: SessionRow): string {
     const t = (s.tmux_session ?? "").trim();
@@ -1066,6 +1144,24 @@ export function Sessions() {
             <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.65rem", color: "var(--mc-text-dim)", marginLeft: "0.5rem" }}>
               {alive} alive · {suspended} suspended
             </span>
+            {/* T-0157: mark the owning linux user(s) on the lane so the default
+                tmux view is user-marked too (multi-user projects). */}
+            {laneUsers(rows).map((u) => (
+              <span
+                key={`lane-user-${key}-${u}`}
+                className="badge"
+                title={`linux user: ${u}`}
+                style={{
+                  background: "var(--mc-accent, #3b82f6)",
+                  color: "#fff",
+                  fontFamily: "var(--mc-mono)",
+                  fontSize: "0.6rem",
+                  fontWeight: 700,
+                }}
+              >
+                👤 {u}
+              </span>
+            ))}
             {/* T-0153: team-level autopilot — kebab on the tmux-session lane. */}
             {!isNone && (
               <div className="ms-auto" onClick={(e) => e.stopPropagation()}>
@@ -1388,7 +1484,7 @@ export function Sessions() {
             group by:
           </span>
           <div className="btn-group btn-group-sm" role="group">
-            {(["tmux", "none", "initiative"] as const).map((v) => (
+            {(["tmux", "user", "none", "initiative"] as const).map((v) => (
               <button
                 key={v}
                 type="button"
@@ -1451,6 +1547,24 @@ export function Sessions() {
                     if (!collapsed) {
                       for (const { row, level } of buildTmuxGroupTree(g.rows)) {
                         nodes.push(renderSessionRow(row, level));
+                      }
+                    }
+                    return nodes;
+                  })
+                : groupBy === "user"
+                ? // T-0157: linux user → tmux session → tree. Each user section
+                  // header marks the owner; tmux lanes nest inside it.
+                  groupSessionsByUser(applySessFilter(visibleSessions)).flatMap((ug) => {
+                    const nodes: React.ReactNode[] = [
+                      renderUserHeaderRow(ug.key, ug.rows, 10),
+                    ];
+                    for (const g of groupSessionsByTmux(ug.rows)) {
+                      const collapsed = tmuxLaneCollapsed(g.key, g.rows);
+                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed));
+                      if (!collapsed) {
+                        for (const { row, level } of buildTmuxGroupTree(g.rows)) {
+                          nodes.push(renderSessionRow(row, level));
+                        }
                       }
                     }
                     return nodes;

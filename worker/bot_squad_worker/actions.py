@@ -740,7 +740,9 @@ def _action_autopilot_status(params: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _PEER_SEND_REQUIRED = {"slug", "from_sid", "to", "text"}
-_PEER_SEND_ALLOWED = _PEER_SEND_REQUIRED
+# T-0157: optional `user` overrides the linux-user scope for role-keyword
+# fan-out (teamlead/dev/all) — cross-user messaging is opt-in.
+_PEER_SEND_ALLOWED = _PEER_SEND_REQUIRED | {"user"}
 
 # T-0035 (lean Option B): peer_send replies to a UI-shaped SID are mirrored
 # to that user's bound Telegram chat so a stakeholder browsing the UI still
@@ -789,7 +791,10 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     from bot_squad_worker import intersession as _is
-    result = _is.send(cfg, params["slug"], params["from_sid"], params["to"], params["text"])
+    result = _is.send(
+        cfg, params["slug"], params["from_sid"], params["to"], params["text"],
+        user=params.get("user"),
+    )
 
     # T-0155: feed the stall-watchdog — a send to an operator-role session marks
     # the sender blocked on the stakeholder; an operator's send clears the

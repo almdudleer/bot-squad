@@ -91,7 +91,30 @@ def _list_session_sids(cfg: Any, slug: str) -> list[tuple[str, dict]]:
     return out
 
 
-def _resolve_recipients(cfg: Any, slug: str, to: str) -> list[str]:
+def _linux_user_from_sid(sid: str) -> str:
+    """T-0157: linux user segment of an SID ``S-<user>-<window>-p<pane>`` ("" if none)."""
+    if sid and sid.startswith("S-"):
+        parts = sid.split("-", 2)
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return ""
+
+
+def _session_linux_user(sid: str, meta: dict) -> str:
+    """T-0157: explicit ``linux_user`` field wins, else the SID prefix."""
+    v = (meta or {}).get("linux_user")
+    if v and v != "~":
+        return str(v)
+    return _linux_user_from_sid(sid)
+
+
+def _resolve_recipients(
+    cfg: Any,
+    slug: str,
+    to: str,
+    from_sid: str | None = None,
+    user: str | None = None,
+) -> list[str]:
     """Map a recipient spec to a list of SIDs.
 
     Role keywords:
@@ -102,10 +125,36 @@ def _resolve_recipients(cfg: Any, slug: str, to: str) -> list[str]:
     Anything else is treated as a literal SID (returned as-is — see ``send``
     docstring: an unknown SID still gets a per-sid inbox so the recipient
     will pick it up on their next read).
+
+    T-0157 (multi-user boundary): role-keyword fan-out is scoped to a single
+    linux user so a TL on one user's tmux can't message another user's
+    sessions by default. The scope user is the explicit ``user`` override
+    when given, else the sender's own linux user (parsed from ``from_sid``).
+
+    Scoping only engages when the project actually has MORE THAN ONE distinct
+    linux user among its sessions — a single-user project (the common case)
+    behaves exactly as pre-T-0157 ("works just as good as one user"). When no
+    scope user resolves (legacy non-SID sender like "stakeholder", no override)
+    the fan-out is also unscoped, preserving cross-user notifications such as
+    ``bind_task``'s stakeholder→SID notify (a literal SID anyway). A literal-SID
+    target is never scoped: addressing a specific ``S-<user>-…`` SID is already
+    an explicit choice.
     """
     if to in {"teamlead", "dev", "all"}:
+        rows = _list_session_sids(cfg, slug)
+        distinct_users = {
+            u for u in (_session_linux_user(sid, meta) for sid, meta in rows) if u
+        }
+        multi_user = len(distinct_users) > 1
+        scope_user = (user or "").strip() or _linux_user_from_sid(from_sid or "")
+        # An explicit `user` override always scopes (the caller is deliberately
+        # crossing/selecting a user); the sender's implicit user only scopes
+        # when the project is genuinely multi-user.
+        apply_scope = bool(scope_user) and (bool((user or "").strip()) or multi_user)
         sids: list[str] = []
-        for sid, meta in _list_session_sids(cfg, slug):
+        for sid, meta in rows:
+            if apply_scope and _session_linux_user(sid, meta) != scope_user:
+                continue
             tid = meta.get("task_id", "") or ""
             is_dev = bool(tid) and tid != "~"
             if to == "all":
@@ -192,13 +241,24 @@ def rebind_sid(cfg: Any, slug: str, old_sid: str, new_sid: str) -> dict:
     return {"ok": True, "renamed": renamed, "collisions": collisions}
 
 
-def send(cfg: Any, slug: str, from_sid: str, to: str, text: str) -> dict:
+def send(
+    cfg: Any,
+    slug: str,
+    from_sid: str,
+    to: str,
+    text: str,
+    user: str | None = None,
+) -> dict:
     """Append a message line to recipient inboxes.
 
     Returns ``{"ok": True, "delivered_to": [sid, ...]}``.
+
+    T-0157: ``user`` overrides the linux-user scope for role-keyword fan-out
+    (``teamlead``/``dev``/``all``); without it the scope is the sender's own
+    linux user parsed from ``from_sid``. See ``_resolve_recipients``.
     """
     sanitized = _sanitize(text)
-    recipients = _resolve_recipients(cfg, slug, to)
+    recipients = _resolve_recipients(cfg, slug, to, from_sid=from_sid, user=user)
     line = f"{_now_iso()}\t[from {from_sid}]\t{sanitized}\n"
     delivered: list[str] = []
     for sid in recipients:

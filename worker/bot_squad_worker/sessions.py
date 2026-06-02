@@ -8,6 +8,7 @@ Session ID (SID) format: ``S-<user>-<window>-p<pane_id_no_pct>``
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shlex
@@ -457,6 +458,34 @@ def _get_current_user() -> str:
     return getpass.getuser()
 
 
+def _linux_user_from_sid(sid: str) -> str:
+    """T-0157: extract the linux user from an SID ``S-<user>-<window>-p<pane>``.
+
+    The SID's user segment is the linux login the session's tmux server runs
+    as (set by ``compute_sid``). Usernames carry no ``-`` in practice (the
+    same assumption ``WorkerRouter.for_sid`` makes), so ``split("-", 2)[1]``
+    is the user. Returns "" when the SID doesn't parse (legacy / non-SID).
+    """
+    if sid and sid.startswith("S-"):
+        parts = sid.split("-", 2)
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return ""
+
+
+def _session_linux_user(sid: str, meta: dict | None) -> str:
+    """T-0157: the linux user owning a session — explicit field wins, else SID.
+
+    Prefer the ``linux_user`` frontmatter stamped at spawn time; fall back to
+    the SID prefix so pre-T-0157 session mds (no field) still report a user.
+    """
+    if meta:
+        v = meta.get("linux_user")
+        if v and v != "~":
+            return str(v)
+    return _linux_user_from_sid(sid)
+
+
 def _tmux_session_name(slug: str, initiative: str | None) -> str:
     """T-0001: per-initiative tmux session routing.
 
@@ -697,6 +726,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "suspended_at": None,
             "archived": archived_flag,
             "owner": owner_meta,
+            # T-0157: linux user that owns this session (explicit field, else
+            # SID prefix). For active panes the SID's user IS the worker's user.
+            "linux_user": _session_linux_user(sid, existing),
             # T-0078: live tmux session name — for the "copy `tmux a -t …`"
             # affordance the UI offers. Comes from list-panes' session_name
             # field; falls back to whatever the md has if the pane row
@@ -786,6 +818,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "suspended_at": meta.get("suspended_at"),
                 "archived": md_archived,
                 "owner": md_owner,
+                # T-0157: linux user owning this (suspended) session.
+                "linux_user": _session_linux_user(sid, meta),
                 # T-0078: surface tmux_session so the UI can still suggest the
                 # right `tmux a -t …` even after suspend.
                 "tmux_session": md_tmux_session,
@@ -1403,6 +1437,10 @@ def spawn(
         seed_meta = _read_session_metadata(seed_meta_file) or {}
         seed_meta.setdefault("sid", new_sid)
         seed_meta["tmux_session"] = target_session
+        # T-0157: stamp the spawning linux user so the SessionMd carries an
+        # explicit user mark (the SID prefix already encodes it, but the field
+        # makes per-user listing/grouping robust to SID rotation).
+        seed_meta.setdefault("linux_user", user)
         _write_session_metadata(seed_meta_file, seed_meta)
     except OSError:
         # Best-effort: the hook will populate the field next time it fires.
@@ -1537,15 +1575,32 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         extras = [t for t in (meta.get("extra_task_ids") or []) if t and t != "~"]
         return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras, "already_bound": True}
 
-    owner = _find_owner(data_dir, slug, task_id=task_id)
-    if owner is not None and owner != sid:
-        raise ActionError(f"bind_task: task {task_id} already bound to {owner}")
+    # T-0157: multi-user claim lock — first-to-claim wins. Two users (or two
+    # concurrent dispatches) can race the check-then-write below; without a
+    # lock both pass `_find_owner` (each sees the task free) and both write,
+    # double-binding the task. Serialize the find+write under a per-project
+    # flock so exactly one claimant wins; the loser sees the freshly-written
+    # owner and raises. The lock file lives beside the backlog (shared store)
+    # so it is visible across the coordinator + per-user worker processes.
+    claim_lock = backlog_dir / ".task-claim.lock"
+    claim_lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(claim_lock, "w") as _lockf:
+        fcntl.flock(_lockf, fcntl.LOCK_EX)
+        owner = _find_owner(data_dir, slug, task_id=task_id)
+        if owner is not None and owner != sid:
+            raise ActionError(f"bind_task: task {task_id} already bound to {owner}")
 
-    extras = list(meta.get("extra_task_ids") or [])
-    extras = [t for t in extras if t and t != "~"]
-    extras.append(task_id)
-    meta["extra_task_ids"] = extras
-    _write_session_metadata(meta_file, meta)
+        # Re-read under the lock so a concurrent bind to THIS session (its own
+        # extras growing) isn't clobbered by our stale snapshot — last write
+        # wins on lost-update otherwise.
+        meta = _read_session_metadata(meta_file) or meta
+        extras = list(meta.get("extra_task_ids") or [])
+        extras = [t for t in extras if t and t != "~"]
+        if task_id not in extras:
+            extras.append(task_id)
+        meta["extra_task_ids"] = extras
+        _write_session_metadata(meta_file, meta)
+    # flock released on close
 
     # T-0105: stamp the binding SID into the new task's session_history.
     # Best-effort; the SessionMd write above is the source of truth.

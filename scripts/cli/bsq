@@ -361,10 +361,13 @@ def cmd_tg_ping(args) -> None:
 def cmd_peer_send(args) -> None:
     slug = resolve_slug()
     from_sid = require_sid(args.from_sid)
-    res = post(
-        "peer_send",
-        {"slug": slug, "from_sid": from_sid, "to": args.to, "text": args.text},
-    )
+    params = {"slug": slug, "from_sid": from_sid, "to": args.to, "text": args.text}
+    # T-0157: --user widens role-keyword fan-out (teamlead/dev/all) to another
+    # linux user's sessions. Without it, role keywords stay scoped to the
+    # sender's own user. Ignored for a literal-SID target (always explicit).
+    if getattr(args, "user", None):
+        params["user"] = args.user
+    res = post("peer_send", params)
     delivered = res.get("delivered_to", [])
     print(f"sent to {len(delivered)} inbox(es): {', '.join(delivered) or '(none)'}")
 
@@ -1206,10 +1209,18 @@ def cmd_team_status(args) -> None:
     if not sessions:
         print("(no active/paused sessions — use --all to include suspended)")
         return
-    rows = [("SID", "STATUS", "ACT", "WINDOW", "TASK", "INITIATIVE")]
+    rows = [("SID", "USER", "STATUS", "ACT", "WINDOW", "TASK", "INITIATIVE")]
     for s in sessions:
+        # T-0157: surface the owning linux user (explicit field, else SID prefix).
+        luser = s.get("linux_user") or ""
+        if not luser:
+            sid = s.get("sid", "")
+            if sid.startswith("S-"):
+                parts = sid.split("-", 2)
+                luser = parts[1] if len(parts) >= 2 else ""
         rows.append((
             s.get("sid", ""),
+            luser or "-",
             s.get("status", ""),
             s.get("activity", "") or "-",
             s.get("window", ""),
@@ -2002,6 +2013,9 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("to", help="target SID or role keyword (teamlead/dev/all)")
     ps.add_argument("text", help="message text")
     ps.add_argument("--from", dest="from_sid", help="override sender SID")
+    ps.add_argument("--user", dest="user",
+                    help="(T-0157) cross-user role fan-out: scope teamlead/dev/all "
+                         "to this linux user instead of your own")
     ps.add_argument("--no-signal", action="store_true",
                     help="skip the 'check mail' tmux nudge")
     ps.set_defaults(func=cmd_peer_send)

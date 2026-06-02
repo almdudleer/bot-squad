@@ -397,3 +397,55 @@ def test_list_sessions_returns_extras(tmp_path, monkeypatch):
     assert row["task_id"] == "T-0001"
     assert row["extra_task_ids"] == ["T-0002"]
     assert row["extra_initiatives"] == []
+
+
+# ---------------------------------------------------------------------------
+# T-0157: multi-user claim lock — first-to-claim wins; no double-bind.
+# ---------------------------------------------------------------------------
+
+def test_bind_task_concurrent_claim_single_winner(tmp_path):
+    """Two sessions racing to bind the SAME task: exactly one wins (flock)."""
+    import threading
+
+    cfg = _make_cfg(tmp_path)
+    # Two dev sessions, each with its own primary task, both try to ALSO claim T-9.
+    _make_dev_session(cfg, "S-alice-w-p1", task_id="T-0001")
+    _make_dev_session(cfg, "S-bob-w-p2", task_id="T-0002")
+    _make_task(cfg, "T-0001")
+    _make_task(cfg, "T-0002")
+    _make_task(cfg, "T-0009")
+
+    results: dict[str, object] = {}
+    barrier = threading.Barrier(2)
+
+    def claim(sid: str):
+        barrier.wait()  # maximise the race window
+        try:
+            results[sid] = bind_task(cfg, "test-project", sid, "T-0009")
+        except ActionError as e:
+            results[sid] = e
+
+    threads = [
+        threading.Thread(target=claim, args=("S-alice-w-p1",)),
+        threading.Thread(target=claim, args=("S-bob-w-p2",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    oks = [sid for sid, r in results.items() if not isinstance(r, ActionError)]
+    errs = [sid for sid, r in results.items() if isinstance(r, ActionError)]
+    assert len(oks) == 1, f"expected exactly one winner, got {results}"
+    assert len(errs) == 1
+    assert "already bound" in str(results[errs[0]])
+
+    # The task is bound to exactly one session on disk.
+    winners = []
+    for sid in ("S-alice-w-p1", "S-bob-w-p2"):
+        meta = _read_session_metadata(
+            cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+        )
+        if "T-0009" in (meta.get("extra_task_ids") or []):
+            winners.append(sid)
+    assert winners == oks, f"on-disk owner {winners} != winner {oks}"

@@ -101,6 +101,9 @@ initiative = os.environ.get("INITIATIVE") or ""
 owner      = os.environ.get("OWNER") or ""
 tmux_session = os.environ.get("TMUX_SESSION") or ""
 window     = sid.rsplit("-p", 1)[0].split("-", 2)[-1] if "-p" in sid else ""
+# T-0157: linux user owning this session = the SID's user segment
+# (S-<user>-<window>-p<pane>). The same value compute_sid stamped at spawn.
+linux_user = sid.split("-", 2)[1] if (sid.startswith("S-") and len(sid.split("-", 2)) >= 2) else ""
 now        = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 md_path    = data / "sessions" / f"{sid}.md"
 
@@ -143,6 +146,13 @@ if not tmux_session:
 if tmux_session == "~":
     tmux_session = ""
 
+# T-0157: prefer the SID-derived user; fall back to any prior md value so a
+# legacy md (pre-T-0157) keeps whatever it had if the SID can't be parsed.
+if not linux_user:
+    linux_user = existing.get("linux_user") or ""
+if linux_user == "~":
+    linux_user = ""
+
 started_at = existing.get("started_at") or "~"
 if started_at == "~" or not started_at:
     started_at = now
@@ -166,6 +176,7 @@ md_path.write_text(
     f"started_at: {started_at}\n"
     f"owner: {owner or '~'}\n"
     f"tmux_session: {tmux_session or '~'}\n"
+    f"linux_user: {linux_user or '~'}\n"
     "---\n"
 )
 PY

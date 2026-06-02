@@ -194,3 +194,82 @@ def test_chat_dir_created_with_group_write(tmp_path):
     # Some tmpfs / CI filesystems strip group-write; assert at least the
     # owner+group can write. The chmod is best-effort.
     assert mode & 0o600
+
+
+# ---------------------------------------------------------------------------
+# T-0157: multi-user peer boundaries — role-keyword fan-out is scoped to one
+# linux user by default; an explicit `user` widens it; literal SIDs always pass.
+# ---------------------------------------------------------------------------
+
+def _write_user_session(tmp_path, slug, sid, *, task_id="", linux_user=None):
+    """Write a session md; linux_user defaults to the SID prefix (omitted field)."""
+    sess_dir = tmp_path / "data" / slug / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["---", f"sid: {sid}", "status: active", f"task_id: {task_id or '~'}"]
+    if linux_user is not None:
+        lines.append(f"linux_user: {linux_user}")
+    lines += ["---", ""]
+    (sess_dir / f"{sid}.md").write_text("\n".join(lines))
+
+
+def test_resolve_recipients_scopes_to_sender_user(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    # alice TL + alice dev; bob TL + bob dev. linux_user derived from SID prefix.
+    _write_user_session(tmp_path, "p", "S-alice-tl-p1", task_id="")
+    _write_user_session(tmp_path, "p", "S-alice-dev-p2", task_id="T-1")
+    _write_user_session(tmp_path, "p", "S-bob-tl-p3", task_id="")
+    _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
+
+    # alice sends to "all" → only alice's sessions.
+    got = I._resolve_recipients(cfg, "p", "all", from_sid="S-alice-tl-p1")
+    assert set(got) == {"S-alice-tl-p1", "S-alice-dev-p2"}
+
+    # alice → "dev" → only alice's dev.
+    assert I._resolve_recipients(cfg, "p", "dev", from_sid="S-alice-tl-p1") == ["S-alice-dev-p2"]
+
+
+def test_resolve_recipients_user_override_crosses_boundary(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _write_user_session(tmp_path, "p", "S-alice-tl-p1", task_id="")
+    _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
+
+    # alice explicitly targets bob's user.
+    got = I._resolve_recipients(cfg, "p", "all", from_sid="S-alice-tl-p1", user="bob")
+    assert got == ["S-bob-dev-p4"]
+
+
+def test_resolve_recipients_legacy_sender_unscoped(tmp_path):
+    """A non-SID sender (e.g. 'stakeholder') resolves to no scope → unfiltered."""
+    cfg = _make_cfg(tmp_path)
+    _write_user_session(tmp_path, "p", "S-alice-tl-p1", task_id="")
+    _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
+    got = I._resolve_recipients(cfg, "p", "all", from_sid="stakeholder")
+    assert set(got) == {"S-alice-tl-p1", "S-bob-dev-p4"}
+
+
+def test_resolve_recipients_explicit_field_wins_over_sid(tmp_path):
+    """An explicit linux_user field overrides the SID prefix for scoping."""
+    cfg = _make_cfg(tmp_path)
+    # SID says 'svc' but the session is really owned by alice (field wins).
+    _write_user_session(tmp_path, "p", "S-svc-tl-p9", task_id="", linux_user="alice")
+    _write_user_session(tmp_path, "p", "S-alice-dev-p2", task_id="T-1")
+    # A bob session makes the project genuinely multi-user so scoping engages.
+    _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
+    got = I._resolve_recipients(cfg, "p", "all", from_sid="S-alice-dev-p2")
+    # alice-scoped → the svc-named-but-alice-owned TL is included; bob excluded.
+    assert set(got) == {"S-svc-tl-p9", "S-alice-dev-p2"}
+
+
+def test_resolve_recipients_literal_sid_never_scoped(tmp_path):
+    """Addressing a specific cross-user SID is always allowed (explicit)."""
+    cfg = _make_cfg(tmp_path)
+    _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
+    assert I._resolve_recipients(cfg, "p", "S-bob-dev-p4", from_sid="S-alice-tl-p1") == ["S-bob-dev-p4"]
+
+
+def test_send_scopes_role_fanout_to_sender_user(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _write_user_session(tmp_path, "p", "S-alice-dev-p2", task_id="T-1")
+    _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
+    out = I.send(cfg, "p", "S-alice-tl-p1", "dev", "ping")
+    assert out["delivered_to"] == ["S-alice-dev-p2"]

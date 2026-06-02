@@ -1468,6 +1468,33 @@ def _action_gc_sessions(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.gc_sessions(cfg, params["slug"])
 
 
+_DEDUP_SESSIONS_REQUIRED = {"slug"}
+_DEDUP_SESSIONS_ALLOWED = _DEDUP_SESSIONS_REQUIRED | {"dry_run"}
+
+
+def _action_dedup_sessions(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0176 #5/#6: collapse duplicate SessionMds to one keeper per logical
+    session. GATED — dry_run defaults to True; pass dry_run=False to apply.
+
+    Required params: slug. Optional: dry_run (bool, default True).
+    Returns: {ok, dry_run, merged_count, merges: [...]}
+    """
+    extra = set(params) - _DEDUP_SESSIONS_ALLOWED
+    if extra:
+        raise ActionError(f"dedup_sessions got unexpected params: {sorted(extra)}")
+    missing = _DEDUP_SESSIONS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"dedup_sessions missing required params: {sorted(missing)}")
+
+    dry_run = params.get("dry_run", True)
+    if isinstance(dry_run, str):
+        dry_run = dry_run.strip().lower() not in ("false", "0", "no", "off")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.dedup_sessions(cfg, params["slug"], dry_run=bool(dry_run))
+
+
 _GC_STALE_BINDINGS_REQUIRED = {"slug"}
 _GC_STALE_BINDINGS_ALLOWED = _GC_STALE_BINDINGS_REQUIRED
 
@@ -1864,6 +1891,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "unarchive_session": _action_unarchive_session,
     # T-0072/0073/0077: binding-graph reconcilers + peer-bus SID rotation.
     "gc_sessions": _action_gc_sessions,
+    "dedup_sessions": _action_dedup_sessions,
     "gc_stale_bindings": _action_gc_stale_bindings,
     "peer_rebind_sid": _action_peer_rebind_sid,
     # T-0142/0144: session-lifecycle reconcilers + Team entity + rename sync.
@@ -1933,6 +1961,7 @@ ACTION_MODES: dict[str, str] = {
     # per host. (Filesystem & tmux are user-local; multi-user multi-host
     # coordination is out of scope for this bundle.)
     "gc_sessions": "coordinator_only",
+    "dedup_sessions": "coordinator_only",
     "gc_stale_bindings": "coordinator_only",
     "peer_rebind_sid": "coordinator_only",
     # T-0142/0144: reconcilers + Team entity walk SessionMd + live tmux; the

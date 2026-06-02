@@ -1291,6 +1291,21 @@ def cmd_team_rename(args) -> None:
     print(f"renamed {args.sid} -> {res.get('new_sid')} (window {res.get('name')})")
 
 
+def cmd_team_dedup(args) -> None:
+    slug = resolve_slug()
+    # T-0176 #5/#6: GATED one-shot dedup of duplicate SessionMds. Default is a
+    # dry-run that prints the merge plan; --apply writes merged_into + archives
+    # the losers. Confirm with the TL (READY-FOR-MIGRATION) before --apply.
+    dry_run = not args.apply
+    res = post("dedup_sessions", {"slug": slug, "dry_run": dry_run})
+    mode = "DRY-RUN (no changes written)" if res.get("dry_run") else "APPLIED"
+    print(f"dedup {mode}: {res.get('merged_count', 0)} duplicate SessionMd(s)")
+    for m in res.get("merges", []):
+        print(f"  {m['loser']}  ->  {m['keeper']}  [{m['mode']}]")
+    if dry_run and res.get("merged_count"):
+        print("re-run with --apply to write (gated — confirm READY-FOR-MIGRATION first)")
+
+
 def cmd_autopilot_start(args) -> None:
     slug = resolve_slug()
     params = {"slug": slug, "kind": args.kind, "prompt": args.prompt}
@@ -2280,6 +2295,11 @@ def build_parser() -> argparse.ArgumentParser:
     trn.add_argument("sid", help="target session SID")
     trn.add_argument("name", help="new session/window name")
     trn.set_defaults(func=cmd_team_rename)
+    tdd = team_sub.add_parser("dedup",
+                              help="T-0176: collapse duplicate SessionMds to one keeper (dry-run unless --apply)")
+    tdd.add_argument("--apply", action="store_true",
+                     help="write the merges (GATED — default is a dry-run preview)")
+    tdd.set_defaults(func=cmd_team_dedup)
 
     # guidance (T-0151: surface buried stakeholder guidance)
     gd = sub.add_parser("guidance", help="search prior stakeholder guidance (T-0151)")

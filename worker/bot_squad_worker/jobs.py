@@ -253,6 +253,23 @@ def autopilot_tick(cfg: Config) -> None:
             log.exception("autopilot_tick: unhandled error for project %s", slug)
 
 
+def constant_team_tick(cfg: Config) -> None:
+    """T-0154: per-project constant-team maintenance pass.
+
+    Keeps long-lived teams (initiatives with ``constant_team: true``) staffed:
+    spawns a triage session when there is pending work and the team is below
+    ``team_size``. Demand-driven — an idle queue spawns nothing. Per-project
+    errors are caught and logged so one bad project never kills the sweep.
+    """
+    from bot_squad_worker import constant_teams as _ct
+
+    for slug in cfg.projects:
+        try:
+            _ct.tick(cfg, slug)
+        except Exception:
+            log.exception("constant_team_tick: unhandled error for project %s", slug)
+
+
 def tg_stall_tick(cfg: Config) -> None:
     """T-0155: escalate agents blocked on the stakeholder to TG.
 

@@ -5,6 +5,7 @@ import { Picker } from "./pages/Picker";
 import { Project } from "./pages/Project";
 import { Vision } from "./pages/Vision";
 import { Feedback } from "./pages/Feedback";
+import { UseCases } from "./pages/UseCases";
 import { Sessions } from "./pages/Sessions";
 import { Analytics } from "./pages/Analytics";
 import { TaskDetail } from "./pages/TaskDetail";
@@ -71,6 +72,7 @@ export function App() {
           <Route path="/p/:slug/vision" element={<Vision />} />
           <Route path="/p/:slug/workflow" element={<Workflow />} />
           <Route path="/p/:slug/feedback" element={<Feedback />} />
+          <Route path="/p/:slug/usecases" element={<UseCases />} />
           <Route path="/p/:slug/sessions" element={<Sessions />} />
           <Route path="/p/:slug/analytics" element={<Analytics />} />
           <Route path="/p/:slug/runs" element={<Runs />} />

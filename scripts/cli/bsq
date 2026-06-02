@@ -36,7 +36,13 @@ import socket
 import subprocess
 import sys
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _utc_now() -> str:
+    """ISO-8601 UTC timestamp (``...Z``), matching the worker's note format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 BOT_SQUAD = os.environ.get("BOT_SQUAD", "/home/www/bot-squad")
 WORKER_SOCK = os.environ.get("WORKER_SOCK", f"{BOT_SQUAD}/data/_sock/worker.sock")
@@ -556,6 +562,12 @@ never edit it.
    unwatched for ~15+ min, the worker auto-escalates for you — but the explicit
    ping is faster and clearer. Route routine questions to your TL via
    `bsq peer send` first.
+7. REPORT FRICTION UPSTREAM (T-0154). When the process itself fights you —
+   you hit the SAME workaround twice, the ticket scope conflicts with reality,
+   a tool/recipe is broken or missing, or guidance is contradictory — submit it:
+   `bsq feedback submit '<what bit you + what would help>'`. It lands in the
+   project feedback queue for the operator to triage; don't silently absorb it.
+   This is how the process improves. (Tag a use case with `--usecase <id>`.)
 
 Run `bsq --help` for the full verb reference."""
 
@@ -1098,6 +1110,76 @@ _SCENARIO_TEMPLATE = """\
 """
 
 
+# --------------------------------------------------------------------------
+# use-case storage template + testing-agent prompt template (T-0159).
+# --------------------------------------------------------------------------
+_USECASE_TEMPLATE = """\
+---
+id: {id}
+title: {title}
+user_persona: <who is doing this — role + context>
+goal: <one sentence: what they're trying to accomplish>
+preconditions: <state / data / auth that must exist first>
+success_criteria: <observable outcome that means it worked>
+related_tickets: <T-NNNN, T-NNNN>
+status: active
+---
+
+# {title}
+
+## Steps
+1. <action — what the user does>
+2. <action>
+3. <action>
+
+## Feedback
+<!-- entries appended by `bsq feedback submit --usecase {id} '<note>'` land here;
+     testing runs read them and verify each is addressed -->
+"""
+
+
+# Delivered as the initial prompt of a testing-dev session by `bsq usecase run`.
+_USECASE_TEST_BRIEF = """\
+You are a TESTING-DEV session running use case {uc_id} for project '{slug}'.
+Your job is to walk this user flow MANUALLY (playwright MCP) on the real app,
+capture evidence per step, and report a pass/fail verdict — NOT to change code.
+
+== USE CASE: {title} ({uc_id}) ==
+- Persona:          {persona}
+- Goal:             {goal}
+- Preconditions:    {preconditions}
+- Success criteria: {success_criteria}
+- Related tickets:  {related}
+
+Steps to walk:
+{steps}{feedback_block}
+
+== HOW TO TEST (manual-first, T-0158) ==
+1. SCENARIO NARRATION. Restate the flow in your own words first; confirm the
+   preconditions hold (auth, data, target env = staging.botsquad.dev). If a
+   precondition can't be met, STOP and report it as a blocker.
+2. EVIDENCE PER STEP. Drive each step with the playwright MCP. After each step,
+   take a screenshot and note expected-vs-actual. Do not batch — one observation
+   per step, so a failure is pinned to the exact step.
+3. PASS/FAIL RUBRIC. The run PASSES only if every step's actual matches expected
+   AND the success criterion is observably met. Any deviation = FAIL.
+4. REGRESSION-VS-NEW-ISSUE TRIAGE. For each failure decide: is this a REGRESSION
+   (worked before / contradicts a related-ticket DoD) or a NEW ISSUE (gap never
+   covered)? Label it. Cross-check the prior feedback above — a failure that
+   matches old feedback is a regression of a known fix.
+5. RECORD. Write the walkthrough + evidence into a scenario file
+   (`bsq scenario new` style) under data/{slug}/scenarios/ or note results on the
+   related tickets. File a backlog ticket via `task_new` for every confirmed
+   issue (never hand-pick a T-id). Submit process friction with
+   `bsq feedback submit --usecase {uc_id} '<note>'`.
+6. REPORT. When done, peer-send a one-line PASS/FAIL summary to {report_to}
+   (`bsq peer send {report_to} 'UC {uc_id}: PASS|FAIL — <n> issues, <m> regressions'`).
+
+FIRST read AGENT_INSTRUCTIONS.md for paths + the staging JWT/playwright recipe.
+Track all work on tickets, never in superpowers docs. Run `bsq --help` for verbs.
+"""
+
+
 def cmd_scenario_new(args) -> None:
     slug = resolve_slug()
     ticket = args.ticket.strip()
@@ -1114,6 +1196,166 @@ def cmd_scenario_new(args) -> None:
     out.write_text(_SCENARIO_TEMPLATE.format(
         ticket=ticket, title=fm.get("title", ticket), sid=my_sid() or "?"))
     print(f"scenario template written: {out}\nfill it in, then walk it through MANUALLY before automating.")
+
+
+# --------------------------------------------------------------------------
+# feedback verb (T-0154) — friction-submission channel for in-project agents.
+# Appends to data/<slug>/feedback/inbox.log (an append-only line queue the
+# "user-feedback" constant team consumes). --usecase also threads the note into
+# that use case's md so the next testing run sees it (T-0159 integration).
+# --------------------------------------------------------------------------
+def _feedback_log(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "feedback" / "inbox.log"
+
+
+def cmd_feedback_submit(args) -> None:
+    slug = resolve_slug()
+    text = " ".join(args.message).strip().replace("\n", " ")
+    if not text:
+        die("feedback message must not be empty")
+    sid = args.sid or my_sid() or "?"
+    ts = _utc_now()
+    uc = (args.usecase or "").strip()
+    uc_field = f"uc={uc} | " if uc else ""
+    line = f"{ts} | {sid} | {uc_field}{text}\n"
+
+    log_path = _feedback_log(slug)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"feedback queued → {log_path}")
+
+    if uc:
+        try:
+            _attach_feedback_to_usecase(slug, uc, ts, sid, text)
+            print(f"attached to use case {uc}")
+        except WorkerError as e:
+            print(f"(note: could not attach to use case {uc}: {e})")
+
+
+# --------------------------------------------------------------------------
+# usecase verbs (T-0159) — use cases / user flows as first-class storage, with
+# TL tooling to launch testing-dev sessions against them. Storage lives at
+# data/<slug>/use_cases/<id>.md.
+# --------------------------------------------------------------------------
+def _usecases_dir(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "use_cases"
+
+
+def _usecase_path(slug: str, uc_id: str) -> Path:
+    uc_id = uc_id.strip()
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", uc_id):
+        die(f"invalid use-case id {uc_id!r} (allowed: letters, digits, - _ .)")
+    return _usecases_dir(slug) / f"{uc_id}.md"
+
+
+def _find_usecase(slug: str, uc_id: str) -> Path:
+    p = _usecase_path(slug, uc_id)
+    if not p.exists():
+        die(f"use case not found: {uc_id} (looked in {_usecases_dir(slug)})")
+    return p
+
+
+_FEEDBACK_HEADING = "## Feedback"
+
+
+def _attach_feedback_to_usecase(slug: str, uc_id: str, ts: str, sid: str, text: str) -> None:
+    p = _usecase_path(slug, uc_id)
+    if not p.exists():
+        raise WorkerError(f"use case {uc_id} does not exist")
+    body = p.read_text(encoding="utf-8")
+    entry = f"- [{ts} · {sid}] {text}\n"
+    if _FEEDBACK_HEADING in body:
+        # Insert directly under the heading line.
+        body = re.sub(
+            rf"({re.escape(_FEEDBACK_HEADING)}\n)",
+            rf"\1{entry}",
+            body, count=1,
+        )
+    else:
+        body = body.rstrip() + f"\n\n{_FEEDBACK_HEADING}\n{entry}"
+    _write_atomic(p, body)
+
+
+def cmd_usecase_new(args) -> None:
+    slug = resolve_slug()
+    p = _usecase_path(slug, args.id)
+    if p.exists() and not args.force:
+        print(f"use case already exists: {p}\n(edit it, or pass --force to overwrite)")
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_USECASE_TEMPLATE.format(
+        id=args.id.strip(), title=args.title or args.id.strip()))
+    print(f"use case written: {p}\nfill in persona/goal/success-criteria + steps, then `bsq usecase run {args.id}`.")
+
+
+def cmd_usecase_list(args) -> None:
+    slug = resolve_slug()
+    d = _usecases_dir(slug)
+    files = sorted(d.glob("*.md")) if d.exists() else []
+    if args.json:
+        out = []
+        for f in files:
+            fm = read_frontmatter(f)
+            out.append({"id": f.stem, "title": fm.get("title", f.stem),
+                        "status": fm.get("status", ""), "goal": fm.get("goal", "")})
+        print(json.dumps(out, indent=2))
+        return
+    if not files:
+        print(f"(no use cases yet — `bsq usecase new <id>` to add one in {d})")
+        return
+    rows = [("ID", "STATUS", "TITLE")]
+    for f in files:
+        fm = read_frontmatter(f)
+        rows.append((f.stem, fm.get("status", "") or "-", fm.get("title", f.stem)))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+
+
+def _usecase_section(body: str, heading: str) -> str:
+    """Return the text under a `## heading` up to the next `## ` (or EOF)."""
+    m = re.search(rf"^{re.escape(heading)}\s*\n(.*?)(?=^\#\# |\Z)", body,
+                  re.MULTILINE | re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def cmd_usecase_run(args) -> None:
+    slug = resolve_slug()
+    path = _find_usecase(slug, args.id)
+    fm = read_frontmatter(path)
+    body = _body_after_frontmatter(path)
+    uc_id = path.stem
+
+    steps = _usecase_section(body, "## Steps") or "(no steps recorded — see use case md)"
+    feedback = _usecase_section(body, _FEEDBACK_HEADING)
+    feedback_block = (
+        f"\n\nPRIOR FEEDBACK on this use case — verify each item is addressed, "
+        f"and flag any that regressed:\n{feedback}\n"
+        if feedback else ""
+    )
+    report_to = args.report_to or my_sid() or "<your TL SID>"
+    window = args.window or f"uctest-{uc_id}"[:40]
+
+    brief = _USECASE_TEST_BRIEF.format(
+        slug=slug, uc_id=uc_id, title=fm.get("title", uc_id),
+        persona=fm.get("user_persona", "(unspecified)"),
+        goal=fm.get("goal", "(unspecified)"),
+        preconditions=fm.get("preconditions", "(unspecified)"),
+        success_criteria=fm.get("success_criteria", "(unspecified)"),
+        related=fm.get("related_tickets", "(none)"),
+        steps=steps, feedback_block=feedback_block, report_to=report_to,
+    )
+
+    if args.dry_run:
+        print(brief)
+        return
+
+    params = {"slug": slug, "window": window, "initial_prompt": brief}
+    if args.owner:
+        params["owner"] = args.owner
+    res = post("spawn_session", params, timeout=90)
+    print(f"spawned testing-dev {res.get('sid')} for use case {uc_id} (window={window})")
 
 
 # --------------------------------------------------------------------------
@@ -1264,6 +1506,34 @@ def build_parser() -> argparse.ArgumentParser:
     scn.add_argument("ticket", help="ticket id, e.g. T-0149")
     scn.add_argument("--force", action="store_true", help="overwrite an existing scenario file")
     scn.set_defaults(func=cmd_scenario_new)
+
+    # feedback (T-0154: friction-submission channel for in-project agents)
+    fb = sub.add_parser("feedback", help="submit process/product friction upstream (T-0154)")
+    fb_sub = fb.add_subparsers(dest="sub", required=True)
+    fbs = fb_sub.add_parser("submit", help="append a friction note to the project feedback queue")
+    fbs.add_argument("message", nargs="+", help="what bit you + what would help")
+    fbs.add_argument("--usecase", help="attach this feedback to a use case id (T-0159)")
+    fbs.add_argument("--sid", help="override this session's SID")
+    fbs.set_defaults(func=cmd_feedback_submit)
+
+    # usecase (T-0159: use cases / user flows as first-class storage + tooling)
+    uc = sub.add_parser("usecase", help="use cases / user flows: new / list / run (T-0159)")
+    uc_sub = uc.add_subparsers(dest="sub", required=True)
+    ucn = uc_sub.add_parser("new", help="scaffold a use-case md")
+    ucn.add_argument("id", help="use-case id, e.g. UC-operator-dispatch-loop")
+    ucn.add_argument("--title", help="human title (default: the id)")
+    ucn.add_argument("--force", action="store_true", help="overwrite an existing use case")
+    ucn.set_defaults(func=cmd_usecase_new)
+    ucl = uc_sub.add_parser("list", help="list this project's use cases")
+    ucl.add_argument("--json", action="store_true", help="raw JSON output")
+    ucl.set_defaults(func=cmd_usecase_list)
+    ucr = uc_sub.add_parser("run", help="spawn a testing-dev session to walk a use case")
+    ucr.add_argument("id", help="use-case id to run")
+    ucr.add_argument("--window", help="tmux window name (default: uctest-<id>)")
+    ucr.add_argument("--owner", help="UI username to stamp on the session")
+    ucr.add_argument("--report-to", dest="report_to", help="SID to report PASS/FAIL to (default: this session)")
+    ucr.add_argument("--dry-run", action="store_true", help="print the testing brief without spawning")
+    ucr.set_defaults(func=cmd_usecase_run)
 
     # autopilot (T-0153: prompt-driven, time-boxed autonomous runs)
     ap = sub.add_parser("autopilot", help="prompt-driven, time-boxed autonomous runs (T-0153)")

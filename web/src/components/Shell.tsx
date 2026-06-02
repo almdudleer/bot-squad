@@ -286,6 +286,14 @@ export function Shell() {
               </li>
               <li>
                 <NavLink
+                  to={`/p/${slug}/usecases`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  USE CASES
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
                   to={`/p/${slug}/workflow`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >

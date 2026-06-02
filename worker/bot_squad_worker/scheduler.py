@@ -14,6 +14,7 @@ from bot_squad_worker.jobs import (
     autoupdate_apply_tick,
     autoupdate_tick,
     binding_gc_tick,
+    constant_team_tick,
     deploy_monitor,
     drift_check_tick,
     heartbeat,
@@ -179,6 +180,22 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="tg_stall",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # constant_team_tick: T-0154 — keep long-lived teams (prod-support, user-
+    # feedback, …) staffed. Demand-driven: only spawns when there's pending
+    # work and the team is below team_size, so an idle queue is a no-op.
+    # max_instances=1 + the per-team spawn cooldown keep overlapping ticks
+    # from double-spawning. Kill switch: BOT_SQUAD_CONSTANT_TEAMS_DISABLED=1.
+    sched.add_job(
+        constant_team_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="constant_team",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

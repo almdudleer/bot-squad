@@ -91,6 +91,26 @@ export type CreateTaskBody = {
 export type VisionFile = { name: string; content: string; active?: boolean; finished?: boolean };
 export type FeedbackFile = { name: string; content: string };
 
+export type UseCaseSummary = {
+  id: string;
+  title: string;
+  status: string;
+  user_persona: string;
+  goal: string;
+};
+export type UseCaseDetail = {
+  id: string;
+  title?: string;
+  user_persona?: string;
+  goal?: string;
+  preconditions?: string;
+  success_criteria?: string;
+  related_tickets?: string;
+  status?: string;
+  body: string;
+  raw: string;
+};
+
 export type SessionRow = {
   sid: string;
   // Raw md/zombie-reclassified status. Kept for back-compat and for
@@ -408,6 +428,14 @@ export const api = {
     call(`/api/projects/${slug}/feedback/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   promoteFeedback: (slug: string, name: string, title?: string, body?: string) =>
     call<{ task_id: string }>(`/api/projects/${slug}/feedback/${name}/promote`, { method: "POST", body: JSON.stringify({ title, body }) }),
+  useCases: (slug: string) =>
+    call<UseCaseSummary[]>(`/api/projects/${slug}/use_cases`),
+  useCase: (slug: string, id: string) =>
+    call<UseCaseDetail>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`),
+  putUseCase: (slug: string, id: string, content: string) =>
+    call(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ content }) }),
+  runUseCase: (slug: string, id: string) =>
+    call<{ ok: boolean; id: string; window: string; sid?: string }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/run`, { method: "POST" }),
   sessions: (slug: string) =>
     call<SessionRow[]>(`/api/projects/${slug}/sessions`),
   pauseSession: (slug: string, sid: string) =>

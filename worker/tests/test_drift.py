@@ -157,6 +157,24 @@ def test_automation_signal_suppressed_when_scenario_exists(tmp_path, monkeypatch
     assert res["nudged"] == [] and not delivered
 
 
+def test_recent_write_targets_ignores_bash_commands(tmp_path):
+    # Regression (T-0158 manual walkthrough): a Bash command that merely
+    # MENTIONS a superpowers path / .mjs must not be treated as a write target
+    # — only Edit/Write file_paths count. Otherwise sessions working on this
+    # very feature false-flag themselves.
+    jsonl = tmp_path / "t.jsonl"
+    import json as _j
+    with open(jsonl, "w") as fh:
+        fh.write(_j.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "grep -r superpowers ~/.claude/superpowers/foo.mjs"}}]}}) + "\n")
+        fh.write(_j.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write",
+             "input": {"file_path": "/repo/src/real.py"}}]}}) + "\n")
+    targets = drift._recent_write_targets(jsonl)
+    assert targets == ["/repo/src/real.py"]
+
+
 def test_cooldown_suppresses_second_nudge(tmp_path, monkeypatch):
     cfg, slug, now, ticket, patch = _setup(tmp_path, updated_ago_min=90, activity_ago_sec=10)
     patch(monkeypatch)

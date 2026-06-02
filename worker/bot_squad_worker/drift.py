@@ -108,11 +108,15 @@ def _jsonl_path(cwd: str, claude_uuid: str | None, user_home: str) -> Path | Non
 
 
 def _recent_write_targets(jsonl_path: Path, tail_lines: int = _JSONL_TAIL_LINES) -> list[str]:
-    """Extract file paths / Bash command strings from the session's recent turns.
+    """Extract recent WRITE targets (Edit/Write/... ``file_path``) from a transcript.
 
     Reads the last ``tail_lines`` records and pulls ``file_path`` inputs from
-    write-tool calls plus Bash ``command`` strings — enough to spot off-task
-    targets (superpowers docs, premature automation files).
+    write-tool calls only. We deliberately do NOT scan Bash command strings:
+    reading/grepping a superpowers path (or a sentence mentioning ``.mjs``) is
+    not drift — *writing* planning artifacts to superpowers or *creating* an
+    automation file before the manual walkthrough is. Scanning command text
+    false-flags the very sessions working on these features (they legitimately
+    type those paths) — caught in the T-0158 manual walkthrough of this tick.
     """
     try:
         with open(jsonl_path, encoding="utf-8", errors="replace") as fh:
@@ -133,12 +137,9 @@ def _recent_write_targets(jsonl_path: Path, tail_lines: int = _JSONL_TAIL_LINES)
         for blk in content:
             if not isinstance(blk, dict) or blk.get("type") != "tool_use":
                 continue
-            name = blk.get("name")
             inp = blk.get("input") or {}
-            if name in _WRITE_TOOLS and isinstance(inp.get("file_path"), str):
+            if blk.get("name") in _WRITE_TOOLS and isinstance(inp.get("file_path"), str):
                 targets.append(inp["file_path"])
-            elif name == "Bash" and isinstance(inp.get("command"), str):
-                targets.append(inp["command"])
     return targets
 
 

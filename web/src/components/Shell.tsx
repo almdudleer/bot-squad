@@ -6,7 +6,6 @@ import { ProjectSwitcher } from "./ProjectSwitcher";
 import {
   attachmentSidebarItems,
   isSuperAdminFromMe,
-  workerStatusPaint,
 } from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
@@ -45,7 +44,6 @@ const ServerPicker = IS_MOTHERSHIP_BUILD
 export function Shell() {
   const { slug: urlSlug } = useParams<{ slug?: string }>();
   const location = useLocation();
-  const [workerAlive, setWorkerAlive] = useState<boolean | null>(null);
   const [username, setUsername] = useState<string | null>(null);
   const [linuxUser, setLinuxUser] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
@@ -90,7 +88,9 @@ export function Shell() {
   const slug = urlSlug ?? pinnedSlug;
   const hasProject = Boolean(slug);
 
-  // Poll worker health every 30 s
+  // Poll the health endpoint every 30 s — kept only for the username fallback
+  // now that the worker-status pill is gone (T-0167 removed the OPERATIONAL
+  // footer readout the stakeholder flagged as meaningless).
   useEffect(() => {
     let cancelled = false;
     function checkHealth() {
@@ -98,13 +98,11 @@ export function Shell() {
         .health()
         .then((h) => {
           if (cancelled) return;
-          const alive = !!(h as Record<string, unknown>)?.ok;
-          setWorkerAlive(alive);
           const u = (h as Record<string, unknown>)?.username;
           if (typeof u === "string") setUsername(u);
         })
         .catch(() => {
-          if (!cancelled) setWorkerAlive(false);
+          /* health unavailable — username still comes from /api/me */
         });
     }
     checkHealth();
@@ -175,10 +173,6 @@ export function Shell() {
     setPinnedSlug(null);
   }
 
-  // T-0063: pill moved out of the top header into the ATTACHMENT chrome.
-  // Inline ternary collapsed into workerStatusPaint() for unit-testability.
-  const workerPaint = workerStatusPaint(workerAlive);
-
   return (
     <div className="mc-layout">
       {/* Mobile toggle */}
@@ -207,58 +201,56 @@ export function Shell() {
             RIGHT NOW for any of my projects on any server"; hover for the
             list with project + server badges. */}
         <div className="mc-sidebar-header">
-          <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
+          {/* T-0167: Help relocated out of the sidebar body into a `?` icon
+              sitting next to the wordmark; the GLOBAL section (All Projects /
+              My Profile / Help) is gone — All Projects is reachable via the
+              wordmark + project switcher, My Profile moved to the footer. */}
+          <div className="mc-sidebar-header-top">
+            <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
+            <Link
+              to="/help"
+              className="mc-sidebar-help-icon"
+              aria-label="Help"
+              title="Help"
+              data-onboarding-anchor="help-nav"
+            >
+              ?
+            </Link>
+          </div>
           <GlobalBusyIndicator myUsername={username} />
           {/* T-0089: consumer-only autoupdate status pill. Skipped on the
               mothership build so we don't poll a 404 endpoint forever. */}
           {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}
         </div>
 
-        {/* GLOBAL — per-user cross-server (T-0059). Audience: every logged-in
-            user, regardless of which server they're attached to. T-0140 drops
-            the decorative per-item diamond glyphs to cut sidebar noise. */}
-        <div className="mc-sidebar-section">GLOBAL</div>
-        <ul className="mc-sidebar-nav">
-          <li>
-            <NavLink
-              to="/"
-              end
-              data-onboarding-anchor="all-projects-nav"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              ALL PROJECTS
-            </NavLink>
-          </li>
-          <li>
-            <NavLink
-              to="/me"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              MY PROFILE
-            </NavLink>
-          </li>
-          <li>
-            <NavLink
-              to="/help"
-              data-onboarding-anchor="help-nav"
-              className={({ isActive }) => (isActive ? "active" : undefined)}
-            >
-              HELP
-            </NavLink>
-          </li>
-        </ul>
-
         {/* Project section — shows pinned project even on global routes */}
         {hasProject && slug && (
           <>
             <div className="mc-sidebar-section">Project</div>
             <div className="mc-sidebar-project">
-              <div className="mc-sidebar-project-name">{slug}</div>
+              {/* T-0167: Project Settings left the nav list and is now a gear
+                  icon sitting next to the project name. */}
+              <div className="mc-sidebar-project-name-row">
+                <div className="mc-sidebar-project-name">{slug}</div>
+                <NavLink
+                  to={`/p/${slug}/settings`}
+                  className={({ isActive }) =>
+                    isActive
+                      ? "mc-sidebar-project-gear active"
+                      : "mc-sidebar-project-gear"
+                  }
+                  aria-label="Project settings"
+                  title="Project settings"
+                >
+                  ⚙
+                </NavLink>
+              </div>
               <ProjectSwitcher slug={slug} onUnpin={unpinProject} />
             </div>
 
+            {/* PRODUCT — about the product (T-0167). First section, so no
+                header label needed. */}
             <ul className="mc-sidebar-nav">
-              {/* Management — planning content */}
               <li>
                 <NavLink
                   to={`/p/${slug}`}
@@ -292,21 +284,14 @@ export function Shell() {
                   USE CASES
                 </NavLink>
               </li>
-              <li>
-                <NavLink
-                  to={`/p/${slug}/workflow`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  WORKFLOW
-                </NavLink>
-              </li>
             </ul>
 
-            {/* Separator between management (above) and execution (below) */}
+            {/* Divider between PRODUCT (above) and AGENTS (below) */}
             <div className="mc-sidebar-divider" aria-hidden="true" />
 
+            {/* AGENTS — about the agents working the product (T-0167). */}
+            <div className="mc-sidebar-section">AGENTS</div>
             <ul className="mc-sidebar-nav">
-              {/* Execution — running things */}
               <li>
                 <NavLink
                   to={`/p/${slug}/sessions`}
@@ -314,6 +299,14 @@ export function Shell() {
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
                   AGENT SESSIONS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to={`/p/${slug}/workflow`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  AGENT WORKFLOW
                 </NavLink>
               </li>
               <li>
@@ -332,17 +325,6 @@ export function Shell() {
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
                   ANALYTICS
-                </NavLink>
-              </li>
-              {/* AUTONOMOUS TEAM — link hidden 2026-05-12, autonomous work frozen.
-                  Route still exists; restore this <li> when re-enabling. */}
-              {/* T-0156: per-project settings (Telegram group/topic binding). */}
-              <li>
-                <NavLink
-                  to={`/p/${slug}/settings`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  PROJECT SETTINGS
                 </NavLink>
               </li>
             </ul>
@@ -484,31 +466,40 @@ export function Shell() {
           </div>
         )}
 
-        {/* Footer */}
+        {/* Footer — T-0167: the OPERATIONAL worker-status pill is gone (the
+            stakeholder flagged it as meaningless near the profile). The
+            bottom-most row is now a clickable "My Profile" link showing the
+            user, with a smaller secondary-weight sign-out icon beside it. */}
         <div className="mc-sidebar-footer">
-          {/* T-0140: operational-status pill relocated here from the (now
-              collapsed) ATTACHMENT section so worker health stays visible. */}
-          <div
-            className="mc-sidebar-footer-status"
-            data-onboarding-anchor="operational-status"
-          >
-            <span className={workerPaint.dotClass} />
-            <span style={{ color: workerPaint.color }}>{workerPaint.label}</span>
+          <div className="mc-sidebar-profile-row">
+            <NavLink
+              to="/me"
+              className={({ isActive }) =>
+                isActive
+                  ? "mc-sidebar-profile active"
+                  : "mc-sidebar-profile"
+              }
+            >
+              <span className="mc-sidebar-profile-label">My Profile</span>
+              {username && (
+                <span className="mc-sidebar-profile-user">
+                  {username}
+                  {linuxUser && linuxUser !== username
+                    ? ` (${linuxUser})`
+                    : ""}
+                </span>
+              )}
+            </NavLink>
+            <button
+              type="button"
+              className="mc-sidebar-signout-icon"
+              onClick={handleSignOut}
+              aria-label="Sign out"
+              title="Sign out"
+            >
+              ⏻
+            </button>
           </div>
-          {username && (
-            <div className="mc-sidebar-user">
-              {username}
-              {linuxUser && linuxUser !== username ? ` (${linuxUser})` : ""}
-              {" "}@ bot-squad
-            </div>
-          )}
-          <button
-            type="button"
-            className="mc-sidebar-signout"
-            onClick={handleSignOut}
-          >
-            Sign out
-          </button>
         </div>
       </nav>
 

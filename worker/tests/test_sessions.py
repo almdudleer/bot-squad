@@ -2773,3 +2773,80 @@ def test_dedup_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert res["merged_count"] == 1            # reports what it WOULD do
     drop = _read_md(cfg, "test-project", "S-u-multi-p8")
     assert drop.get("merged_into", "~") in (None, "~")  # but wrote nothing
+
+
+def test_dedup_never_archives_active_rows(tmp_path, monkeypatch):
+    """Migration guardrail (TL): a status=active row is never merged/archived,
+    even if it shares a uuid/task+window with a zombie — only dead rows collapse."""
+    from bot_squad_worker.sessions import dedup_sessions
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
+    # An active worker + an older suspended zombie sharing the same uuid.
+    _seed_md(cfg, "test-project", "S-u-multi-p9", claude_uuid="UUID-1", status="active",
+             window="multi", last_task_id="T-0100", started_at="2026-05-23T00:00:00Z")
+    _seed_md(cfg, "test-project", "S-u-multi-p8", claude_uuid="UUID-1", status="suspended",
+             window="multi", last_task_id="T-0100", started_at="2026-05-14T00:00:00Z")
+    res = dedup_sessions(cfg, "test-project", dry_run=False)
+    # The active p9 keeps the slot; only the suspended p8 is merged.
+    assert _read_md(cfg, "test-project", "S-u-multi-p9").get("merged_into", "~") in (None, "~")
+    assert _read_md(cfg, "test-project", "S-u-multi-p8")["merged_into"] == "S-u-multi-p9"
+    assert res["merged_count"] == 1
+
+
+def test_dedup_active_dup_pair_is_left_untouched(tmp_path, monkeypatch):
+    """Two active rows sharing a uuid: neither is archived (both active = hands
+    off; gc_sessions must suspend the dead one first)."""
+    from bot_squad_worker.sessions import dedup_sessions
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
+    _seed_md(cfg, "test-project", "S-u-multi-p9", claude_uuid="UUID-1", status="active",
+             window="multi", last_task_id="T-0100", started_at="2026-05-23T00:00:00Z")
+    _seed_md(cfg, "test-project", "S-u-multi-p8", claude_uuid="UUID-1", status="active",
+             window="multi", last_task_id="T-0100", started_at="2026-05-14T00:00:00Z")
+    res = dedup_sessions(cfg, "test-project", dry_run=False)
+    assert res["merged_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# T-0176 #1/#2 — resolve_session: display-SID<->UUID addressability shim
+# ---------------------------------------------------------------------------
+
+def test_resolve_session_by_sid(tmp_path, monkeypatch):
+    from bot_squad_worker.sessions import resolve_session
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    _seed_md(cfg, "test-project", "S-u-feat-p1", claude_uuid="UUID-1", status="active")
+    res = resolve_session(cfg, "test-project", "S-u-feat-p1")
+    assert res is not None and res["sid"] == "S-u-feat-p1"
+
+
+def test_resolve_session_by_uuid(tmp_path, monkeypatch):
+    """Peer-bus callers may address by uuid — resolves to the same SessionMd."""
+    from bot_squad_worker.sessions import resolve_session
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    _seed_md(cfg, "test-project", "S-u-feat-p1", claude_uuid="UUID-1", status="active")
+    res = resolve_session(cfg, "test-project", "UUID-1")
+    assert res is not None and res["sid"] == "S-u-feat-p1"
+
+
+def test_resolve_session_follows_merged_into_to_keeper(tmp_path, monkeypatch):
+    """Addressing a deduped-away SID redirects to the surviving keeper — the
+    phased shim that preserves addressability across the dedup migration."""
+    from bot_squad_worker.sessions import resolve_session
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    _seed_md(cfg, "test-project", "S-u-feat-p9", claude_uuid="UUID-9", status="active")
+    _seed_md(cfg, "test-project", "S-u-feat-p8", claude_uuid="UUID-8", status="suspended",
+             merged_into="S-u-feat-p9", archived="true")
+    res = resolve_session(cfg, "test-project", "S-u-feat-p8")
+    assert res is not None and res["sid"] == "S-u-feat-p9"
+
+
+def test_resolve_session_unknown_is_none(tmp_path, monkeypatch):
+    from bot_squad_worker.sessions import resolve_session
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr("bot_squad_worker.sessions._get_current_user", lambda: "u")
+    assert resolve_session(cfg, "test-project", "S-u-nope-p1") is None

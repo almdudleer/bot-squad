@@ -1934,6 +1934,48 @@ def _started_at_key(value: Any) -> tuple[int, str]:
     return (1, str(value))
 
 
+def resolve_session(cfg: Any, slug: str, ident: str) -> dict | None:
+    """T-0176 #1/#2 addressability shim: resolve a display SID *or* a claude_uuid
+    to its canonical SessionMd, following ``merged_into`` so an address to a
+    deduped-away zombie redirects to the surviving keeper.
+
+    This is the guarantee that the dedup migration (and the eventual UUID re-key,
+    [[T-0187]]) never invalidates a live address: a peer-bus caller can pass the
+    current ``S-<user>-<window>-pN`` SID *or* the uuid and reach the same live
+    session. Returns the resolved meta dict, or None if nothing matches.
+    """
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return None
+
+    def _lookup(key: str) -> dict | None:
+        direct = sessions_dir / f"{key}.md"
+        if direct.exists():
+            return _read_session_metadata(direct)
+        for md in sessions_dir.glob("*.md"):
+            meta = _read_session_metadata(md)
+            if meta is None:
+                continue
+            if meta.get("sid") == key or meta.get("claude_uuid") == key:
+                return meta
+        return None
+
+    meta = _lookup(ident)
+    if meta is None:
+        return None
+    seen: set[str] = set()
+    while meta is not None:
+        mi = meta.get("merged_into")
+        if not mi or mi == "~" or mi in seen:
+            break
+        seen.add(mi)
+        nxt = _lookup(mi)
+        if nxt is None:
+            break
+        meta = nxt
+    return meta
+
+
 def dedup_sessions(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
     """T-0176 #5/#6: collapse duplicate SessionMds to one keeper per logical
     session, marking the rest ``merged_into: <keeper>`` so the UI can show one
@@ -2012,6 +2054,11 @@ def dedup_sessions(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
         keeper = max(members, key=_keeper_key)[0]
         for sid, meta, _ in members:
             if sid == keeper or sid in merged or sid in live_sids:
+                continue
+            # Migration guardrail (T-0176): NEVER archive a status=active row.
+            # The destructive part targets dead zombies only; an active-but-not-
+            # live row is left for gc_sessions to suspend first.
+            if str(meta.get("status") or "").lower() == "active":
                 continue
             if _already_merged(meta):
                 continue

@@ -84,8 +84,19 @@ class _FakeTgClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def send(self, *, chat_id: str, text: str, sid: str = "", user: str = "") -> bool:
-        self.calls.append({"chat_id": chat_id, "text": text, "sid": sid})
+    def send(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        sid: str = "",
+        user: str = "",
+        urgent: bool = False,
+        topic_id: int | None = None,
+    ) -> bool:
+        self.calls.append(
+            {"chat_id": chat_id, "text": text, "sid": sid, "urgent": urgent}
+        )
         return True
 
 
@@ -152,6 +163,41 @@ def test_deploy_monitor_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     texts = [c["text"] for c in fake_tg.calls]
     assert any("🚚" in t or "starting" in t for t in texts)
     assert any("SUCCESS" in t or "✅" in t for t in texts)
+
+
+def test_deploy_monitor_pings_are_urgent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0188 regression: deploy start+finish pings MUST be urgent=True.
+
+    Deploy events are project-bound system notifications, not idle DM flood —
+    they must fire by default for a project with a tg_chat set, bypassing the
+    quiet-hours gate. Before the fix the pings went through tg.send with
+    urgent=False, so every deploy alert fired during the stakeholder's Tashkent
+    night (17–05 UTC quiet window) was silently dropped — the reported
+    "no more alerts from @bot_squad_bot" regression.
+    """
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+    _make_recipe(cfg, proj.slug, "staging", rc=0)
+
+    from bot_squad_worker import deploy as _deploy
+    _deploy.enqueue(cfg, proj.slug, "staging", "urgency test", "pytest")
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    deploy_monitor(cfg)
+
+    # A deploy event in a project with tg_chat set produced tg.send calls...
+    assert fake_tg.calls, "deploy event produced no tg.send call"
+    assert all(c["chat_id"] == proj.tg_chat for c in fake_tg.calls)
+    # ...and EVERY one of them is urgent so quiet hours cannot drop it.
+    assert all(c["urgent"] is True for c in fake_tg.calls), (
+        "deploy pings must be urgent=True to bypass quiet hours; "
+        f"got {[(c['text'], c['urgent']) for c in fake_tg.calls]}"
+    )
 
 
 def test_deploy_monitor_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

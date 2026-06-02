@@ -85,9 +85,17 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     # propagated out of deploy_monitor, leaving queued recipes wedged in
     # the queue dir indefinitely. Swallow + log; the deploy queue is the
     # source of truth, the TG ping is best-effort observability.
+    #
+    # urgent=True (T-0188): deploy start/finish are project-bound SYSTEM
+    # notifications, not idle-DM flood — they must fire by default for any
+    # project with a tg_chat set, INCLUDING during quiet hours. Without this
+    # flag the quiet-hours gate (17–05 UTC ≈ the stakeholder's whole Tashkent
+    # evening/night) silently dropped every deploy alert: the regression the
+    # stakeholder reported as "no more alerts from @bot_squad_bot". Same
+    # precedent as autoupdate_apply's apply-failure ping.
     def _tg_safe(text: str) -> None:
         try:
-            tg.send(chat_id=chat_id, text=text, sid=sid)
+            tg.send(chat_id=chat_id, text=text, sid=sid, urgent=True)
         except Exception:
             log.exception("deploy_monitor: tg.send failed (non-fatal): %s", text)
 

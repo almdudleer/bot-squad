@@ -2896,3 +2896,39 @@ def test_list_sessions_suspended_keeps_still_live_tmux(tmp_path, monkeypatch):
     rows = S.list_sessions(cfg, "test-project")
     susp = [r for r in rows if r["sid"] == "S-testuser-old-p7"][0]
     assert susp["tmux_session"] == "test-project-live"
+
+
+def test_list_sessions_syncs_renamed_window_label_to_md(tmp_path, monkeypatch):
+    """T-0176 #4: claude /rename changes the live tmux window; the stored
+    SessionMd window label is synced to match (it used to lag). The sid/filename
+    (the peer-bus address) stays frozen — only the display label updates."""
+    import bot_squad_worker.sessions as S
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    md_path = sessions_dir / "S-testuser-teamlead-p11.md"
+    _write_session_metadata(md_path, {
+        "sid": "S-testuser-teamlead-p11", "status": "active", "window": "teamlead",
+        "cwd": str(repo), "claude_uuid": "uuid-renamed", "task_id": "T-0100",
+        "started_at": "2026-05-23T15:37:12Z",
+    })
+    encoded = str(repo).replace("/", "-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "uuid-renamed.jsonl").write_text("{}")
+    fake_pane_output = f"%11|ui_polish-TL|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    S.list_sessions(cfg, "test-project")
+    updated = _read_session_metadata(md_path)
+    assert updated["window"] == "ui_polish-TL"      # label synced
+    assert updated["sid"] == "S-testuser-teamlead-p11"  # address frozen

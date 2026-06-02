@@ -653,6 +653,22 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         session_md_path = _find_session_md(sessions_dir_path, sid, claude_uuid)
         existing = _read_session_metadata(session_md_path) if session_md_path else None
 
+        # T-0176 #4: a claude `/rename` changes the live tmux window name; sync
+        # the stored SessionMd display label to match (it used to lag behind the
+        # pre-rename window). uuid identity + the frozen sid/filename (the
+        # peer-bus address) are untouched — only the human label is refreshed.
+        if (
+            existing is not None
+            and session_md_path is not None
+            and pane.window
+            and existing.get("window") != pane.window
+        ):
+            existing["window"] = pane.window
+            try:
+                _write_session_metadata(session_md_path, existing, atomic=True)
+            except Exception:
+                pass
+
         started_at = None
         task_id: str | None = None
         initiative: str = ""

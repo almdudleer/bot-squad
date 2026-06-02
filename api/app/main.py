@@ -65,6 +65,10 @@ def build_app() -> FastAPI:
     from app.routes_backlog import router as backlog_router
     app.include_router(backlog_router, prefix="/api")
 
+    # T-0147: product-analytics (internal-usage) dashboard.
+    from app.routes_analytics import router as analytics_router
+    app.include_router(analytics_router, prefix="/api")
+
     from app.routes_vision import router as vision_router
     from app.routes_feedback import router as feedback_router
     from app.routes_sessions import router as sessions_router, dev_spawn_router

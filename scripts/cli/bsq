@@ -541,6 +541,136 @@ def cmd_commit(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# ticket verbs (T-0152) — make bot-squad-ticket-bound work feel native so
+# sessions stop wandering into ~/.claude/superpowers/* docs to track work.
+# --------------------------------------------------------------------------
+# Canonical backlog statuses. Source of truth: api/app/routes_backlog.py
+# ::_VALID_STATUSES (enforced on every PATCH). Mirrored here so `bsq ticket
+# update` can validate offline without an API round-trip. Keep in sync.
+TICKET_STATUSES = ("planned", "open", "in_progress", "totest", "reopened", "closed")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.rename(tmp, path)
+
+
+def cmd_ticket_status(args) -> None:
+    slug = resolve_slug()
+    path = find_ticket(slug, args.id.strip())
+    fm = read_frontmatter(path)
+    if args.json:
+        print(json.dumps({"id": args.id, "file": str(path), **fm}))
+        return
+    print(f"{fm.get('id', args.id)}  {fm.get('title', '')}")
+    print(f"  status:     {fm.get('status', '?')}")
+    print(f"  owner:      {fm.get('owner', '-')}")
+    print(f"  initiative: {fm.get('initiative', '-')}")
+    print(f"  updated:    {fm.get('updated', '-')}")
+    print(f"  file:       {path}")
+
+
+def cmd_ticket_update(args) -> None:
+    slug = resolve_slug()
+    status = args.status.strip()
+    if status not in TICKET_STATUSES:
+        die(f"invalid status {status!r}; canonical: {', '.join(TICKET_STATUSES)}")
+    path = find_ticket(slug, args.id.strip())
+    text = path.read_text()
+    m = re.match(r"\A---\n(.*?)\n---\n", text, re.DOTALL)
+    if not m:
+        die(f"no frontmatter in {path}")
+    fm_block = text[m.start(1):m.end(1)]
+    lines = fm_block.splitlines()
+    old = "?"
+    found = False
+    for i, ln in enumerate(lines):
+        mm = re.match(r"^status:\s*(.*)$", ln)
+        if mm:
+            old = mm.group(1).strip()
+            lines[i] = f"status: {status}"
+            found = True
+            break
+    if not found:
+        lines.append(f"status: {status}")
+    new_fm = "\n".join(lines)
+    new_text = text[:m.start(1)] + new_fm + text[m.end(1):]
+    _write_atomic(path, new_text)
+    print(f"{args.id}: status {old} -> {status}")
+    # No tree-wide lint here: the status value was validated against
+    # TICKET_STATUSES before the write, so the file we just wrote is
+    # canonical by construction. (scripts/lint/backlog_frontmatter.py scans
+    # every project — it would false-warn on other projects' legacy values.)
+
+
+def cmd_ticket_note(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    res = post("task_progress_add", {
+        "slug": slug, "sid": sid, "task_id": args.id.strip(), "text": args.body,
+    })
+    print(f"noted on {args.id}: {res.get('line_appended', '(ok)')}")
+
+
+# --------------------------------------------------------------------------
+# scenario verb (T-0158) — manual-testing-first discipline. A scenario is
+# written + walked through MANUALLY before any automation .mjs is touched.
+# --------------------------------------------------------------------------
+_SCENARIO_TEMPLATE = """\
+# Manual test scenario — {ticket} ({title})
+
+> Manual-first (T-0158): write this scenario, walk it through with playwright
+> MCP (or narrate a scripted walkthrough) observing the REAL result, and only
+> THEN promote to an automated .mjs. Automation written before this passes is
+> a process violation (drift signal, cf T-0149).
+
+- ticket: {ticket}
+- author SID: {sid}
+- written: (fill in)
+
+## User goal
+<one sentence: what the user is trying to accomplish>
+
+## Prerequisites
+- <state / data / auth that must exist before step 1>
+
+## Steps
+1. <action>
+2. <action>
+3. <action>
+
+## Expected vs actual
+| step | expected | actual | pass? |
+|------|----------|--------|-------|
+| 1    |          |        |       |
+| 2    |          |        |       |
+| 3    |          |        |       |
+
+## Notes / regressions surfaced
+<anything the manual walkthrough caught that automation would have missed>
+"""
+
+
+def cmd_scenario_new(args) -> None:
+    slug = resolve_slug()
+    ticket = args.ticket.strip()
+    path = find_ticket(slug, ticket)  # validates the ticket exists
+    fm = read_frontmatter(path)
+    stem = path.stem
+    feature = stem.split("-", 2)[2] if stem.count("-") >= 2 else stem
+    scen_dir = Path(BOT_SQUAD) / "data" / slug / "scenarios"
+    scen_dir.mkdir(parents=True, exist_ok=True)
+    out = scen_dir / f"{ticket}-{feature}.md"
+    if out.exists() and not args.force:
+        print(f"scenario already exists: {out}\n(edit it, or pass --force to overwrite)")
+        return
+    out.write_text(_SCENARIO_TEMPLATE.format(
+        ticket=ticket, title=fm.get("title", ticket), sid=my_sid() or "?"))
+    print(f"scenario template written: {out}\nfill it in, then walk it through MANUALLY before automating.")
+
+
+# --------------------------------------------------------------------------
 # arg parsing
 # --------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -637,6 +767,31 @@ def build_parser() -> argparse.ArgumentParser:
     trn.add_argument("sid", help="target session SID")
     trn.add_argument("name", help="new session/window name")
     trn.set_defaults(func=cmd_team_rename)
+
+    # ticket (T-0152: native bot-squad-ticket task management)
+    tk = sub.add_parser("ticket", help="bot-squad backlog ticket status / update / note")
+    tk_sub = tk.add_subparsers(dest="sub", required=True)
+    tks = tk_sub.add_parser("status", help="show a ticket's status + bindings")
+    tks.add_argument("id", help="ticket id, e.g. T-0149")
+    tks.add_argument("--json", action="store_true", help="raw JSON output")
+    tks.set_defaults(func=cmd_ticket_status)
+    tku = tk_sub.add_parser("update", help="set a ticket's status (canonical schema)")
+    tku.add_argument("id", help="ticket id")
+    tku.add_argument("status", help="new status: " + "/".join(TICKET_STATUSES))
+    tku.set_defaults(func=cmd_ticket_update)
+    tkn = tk_sub.add_parser("note", help="append a progress note to a ticket")
+    tkn.add_argument("id", help="ticket id")
+    tkn.add_argument("body", help="progress note text")
+    tkn.add_argument("--sid", help="override this session's SID")
+    tkn.set_defaults(func=cmd_ticket_note)
+
+    # scenario (T-0158: manual-testing-first discipline)
+    sc = sub.add_parser("scenario", help="manual test scenario templates (T-0158)")
+    sc_sub = sc.add_subparsers(dest="sub", required=True)
+    scn = sc_sub.add_parser("new", help="write a scenario template for a ticket")
+    scn.add_argument("ticket", help="ticket id, e.g. T-0149")
+    scn.add_argument("--force", action="store_true", help="overwrite an existing scenario file")
+    scn.set_defaults(func=cmd_scenario_new)
 
     # compact
     cp = sub.add_parser("compact", help="send /compact to a session (self by default)")

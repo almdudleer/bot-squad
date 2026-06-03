@@ -137,6 +137,52 @@ def extract_tactical(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-project test commands (config-driven — T-0195)
+# ---------------------------------------------------------------------------
+
+# Ordered (field, label) spec for the "## Test commands" block. Each field is
+# OPTIONAL in projects.toml; a project only renders the lines it defines, so no
+# other project's commands (e.g. watchrobot's `docker exec signal-tracker`)
+# leak into a file that didn't ask for them. The field VALUE is the rendered
+# markdown for the command part (it carries its own backticks/annotations),
+# because the lines are heterogeneous — some wrap the whole command in backticks,
+# some prefix it with "from `web/`,". Keeping the markdown in the value lets one
+# uniform `- {label}: {value}` line template reproduce every existing line
+# byte-for-byte.
+_TEST_COMMAND_FIELDS: tuple[tuple[str, str], ...] = (
+    ("test_backend_cmd", "Backend"),
+    ("test_build_cmd", "Build"),
+    ("test_e2e_cmd", "Frontend e2e"),
+    ("test_typecheck_cmd", "Type-check"),
+    ("test_lint_cmd", "Lint"),
+)
+
+# Shown when a project defines none of the fields above — a neutral placeholder
+# rather than a stale/wrong command (DoD: graceful fallback, no KeyError).
+_NO_TEST_COMMANDS = (
+    "- _(No project-specific test commands configured. Add `test_backend_cmd` "
+    "etc. to this project's `[projects.<slug>]` table in `projects.toml`.)_"
+)
+
+
+def render_test_commands(project: dict) -> str:
+    """Build the bullet block for the AGENTS.md '## Test commands' section.
+
+    Pulls only the `test_*_cmd` fields the project actually defines (graceful
+    fallback: a field-less project gets a neutral placeholder, never a KeyError
+    and never another project's command). Returned as a plain string and
+    substituted into the template as a single ``{test_commands}`` value, so
+    ``str.format`` never re-scans command text for literal ``{...}`` braces.
+    """
+    lines = [
+        f"- {label}: {project[field]}"
+        for field, label in _TEST_COMMAND_FIELDS
+        if project.get(field)
+    ]
+    return "\n".join(lines) if lines else _NO_TEST_COMMANDS
+
+
+# ---------------------------------------------------------------------------
 # Template
 # ---------------------------------------------------------------------------
 
@@ -224,10 +270,7 @@ deploy prod.
 
 ## Test commands
 
-- Backend: `docker exec signal-tracker python test_api.py`
-- Frontend e2e: `npm run test:e2e` (from `web/`)
-- Type-check: from `web/`, `npx tsc -b --noEmit`
-- Lint: from `web/`, `npm run lint`
+{test_commands}
 
 ## When you need more (not every-turn — read on demand)
 
@@ -279,6 +322,7 @@ def render(slug: str, config_dir: Path, data_dir: Path) -> str:
         north_star_body=ns_body,
         strategy_body=strategy_body,
         tactical_body=tactical_body,
+        test_commands=render_test_commands(project),
     )
 
 

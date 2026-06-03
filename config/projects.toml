@@ -30,6 +30,15 @@ dev_url       = "https://signal-dev.dev.uzinvestapi.com"
 deploy_targets = ["staging", "prod"]
 tg_chat       = "404580642"
 created_at    = 2026-05-10
+# T-0195: per-project test commands for the generated AGENTS.md "## Test
+# commands" block (render_agents_md.py). Optional `test_*_cmd` fields — each
+# value is the rendered markdown for the command part (carries its own
+# backticks/annotations). Absent fields render no line. These four reproduce
+# watchrobot's existing AGENTS.md block exactly.
+test_backend_cmd   = "`docker exec signal-tracker python test_api.py`"
+test_e2e_cmd       = "`npm run test:e2e` (from `web/`)"
+test_typecheck_cmd = "from `web/`, `npx tsc -b --noEmit`"
+test_lint_cmd      = "from `web/`, `npm run lint`"
 
 [projects.bot-squad]
 slug          = "bot-squad"
@@ -75,3 +84,8 @@ mothership    = true
 drift_enforcement = true
 tg_chat       = "404580642"
 created_at    = 2026-05-14
+# T-0195: bot-squad's OWN test commands (was wrongly advertising watchrobot's
+# `docker exec signal-tracker` before this was config-driven). Backend = api +
+# worker pytest; Build = web build (no e2e yet). No `signal-tracker` leakage.
+test_backend_cmd = "`cd api && pytest`, `cd worker && pytest`"
+test_build_cmd   = "`cd web && npm run build` (build only — no e2e yet)"

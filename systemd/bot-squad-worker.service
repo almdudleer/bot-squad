@@ -11,16 +11,12 @@ Environment=LOG_LEVEL=info
 # for this user. Per-user workers (other Linux users) use the separate
 # bot-squad-user-worker.service template.
 Environment=BOT_SQUAD_MODE=coordinator
-# T-0194 (2026-06-03): Telegram is DPI-blocked from this host (UZ) — api.telegram.org
-# is directly unroutable, so all TG send + inbound getUpdates fail silently (see
-# T-0192). Route outbound HTTPS through the same egress proxy watchrobot uses (a
-# machine of ours that DOES reach Telegram). tg.py's httpx.post honours HTTPS_PROXY
-# (trust_env default), so this transparently fixes both directions. NO_PROXY exempts
-# self/local so deploy smoke-checks (staging.botsquad.dev) + localhost bypass the
-# proxy. This is the lift-and-shift immediate fix; the durable per-install
-# tg_proxy_url setting is T-0194.
-Environment=HTTPS_PROXY=http://153.80.195.83:8888
-Environment=NO_PROXY=localhost,127.0.0.1,.botsquad.dev,botsquad.dev,.local
+# T-0194 (2026-06-03): the blunt global HTTPS_PROXY lift-and-shift (which proxied
+# ALL worker HTTPS to work around the Telegram DPI-block, T-0192) was REMOVED here
+# once the durable, TG-ONLY primitive landed: tg.py + tg_listener now honour
+# `[tg].proxy_url` from config/system_settings.toml (set via the settings gear UI
+# or `--tg-proxy-url` at install). So only Telegram egress is proxied; all other
+# worker HTTPS goes direct. To proxy TG, set [tg].proxy_url — NOT this env.
 # T-0184/T-0185 (2026-06-02): the system-wide drift kill-switch
 # (BOT_SQUAD_DRIFT_MINUTES=0, operator hotfix 1e612aa) was REMOVED here once the
 # per-project opt-in landed — drift now fires only for projects that set

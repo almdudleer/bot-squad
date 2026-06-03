@@ -31,13 +31,16 @@ it on resume.
 
   When a session must survive across your Claude Code crashes (long-
   running, UI-addressable in bot-squad's session list, tmux-attachable
-  by the stakeholder), spawn it via the bot-squad `spawn_session`
-  worker action instead:
+  by the stakeholder), spawn it via the `bsq` CLI instead:
 
-      curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \
-        -X POST -H 'Content-Type: application/json' \
-        -d '{"slug":"<slug>","window":"<feature-name>","task_id":"T-NNNN","initiative":"<your-init.md>","initial_prompt":"<one-paragraph brief>"}' \
-        http://w/actions/spawn_session
+      bsq spawn T-NNNN --window <feature-name> \
+        --initiative <your-init.md> \
+        --prompt "<one-paragraph brief>"
+
+  (`bsq spawn` resolves the slug/socket/wire shape itself and assembles
+  a deterministic dev prompt for the ticket. Pass `--role tl` to spawn a
+  TL, `--prompt-file <path>` for a long brief, `--bundle T-A,T-B` to bind
+  extra tickets. `bsq spawn --help` for the rest.)
 
   Use this fallback for: persistent operators, project-side roles
   that must outlive a TL crash, anything the stakeholder needs to
@@ -51,9 +54,9 @@ it on resume.
   (note: bot-squad sessions run with `--dangerously-skip-permissions`
   by default, so relays are uncommon).
 - Coordinate agent-teams teammates via SendMessage (instant, in-session).
-  Coordinate `spawn_session`-spawned standalone tmux workers via the
-  bot-squad peer message bus (`peer_send` to the SID; the worker reads
-  with `peer_inbox_read` / `peer_inbox_wait`).
+  Coordinate `bsq spawn`-spawned standalone tmux workers via the
+  bot-squad peer message bus (`bsq peer send` to the SID; the worker reads
+  with `bsq inbox check` / `bsq inbox wait`).
 
 ## Listening for peer messages (mandatory for TL)
 
@@ -87,10 +90,10 @@ via your peer inbox, treat it as a delegated spawn. Steps:
      verbatim section).
    - If not found: create a new T-NNNN-<slug>.md with status: open and the
      stakeholder's instructions verbatim as the body.
-3. Spawn a dev worker via the bot-squad `spawn_session` worker action
-   (see the example curl above). The window name should describe the
-   feature, not contain the task id. Pass `task_id`, `initiative`, and
-   an `initial_prompt` that briefs the worker on:
+3. Spawn a dev worker via `bsq spawn` (see the example above). The
+   `--window` name should describe the feature, not contain the task id.
+   Pass the ticket id, `--initiative`, and a `--prompt` (or
+   `--prompt-file`) that briefs the worker on:
    - their task id and the path to its md file
    - the stakeholder's additional instructions (if any)
    - the DoD

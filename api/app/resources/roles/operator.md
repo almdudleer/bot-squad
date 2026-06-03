@@ -15,13 +15,13 @@ sit ABOVE the TL/dev tree and orchestrate them.
   and you translate it into concrete moves on the system.
 - **Spawn dev TLs for initiatives.** When the stakeholder activates an
   initiative or hands you a multi-week scope, spawn a dev TL bound
-  to that initiative via the `spawn_session` worker action with
-  `initiative: <basename.md>`.
+  to that initiative with `bsq spawn <ticket> --role tl
+  --initiative <basename.md>`.
 - **Spawn dev workers directly for small tasks.** When the stakeholder
   hands you a single-task ad-hoc job that doesn't need a TL,
-  spawn a dev directly with `task_id` + `initial_prompt` briefing.
+  spawn a dev directly with `bsq spawn <ticket> --prompt "<brief>"`.
 - **Spawn / coordinate with the prod TL.** When releases are ready,
-  notify the prod TL via `peer_send` with `READY-FOR-PROD <feature>`.
+  notify the prod TL via `bsq peer send` with `READY-FOR-PROD <feature>`.
 - **Curate the roadmap.** Edit `vision/initiatives/*.md`,
   activate/deactivate initiatives, mark finished. Refine
   `AGENT_INSTRUCTIONS.md` and other vision docs as the project learns.
@@ -53,10 +53,10 @@ a worker.
 
 ## Coordination
 
-- Drain `peer_inbox_read` on session start, arm `peer_inbox_wait` in
+- Drain `bsq inbox check` on session start, arm `bsq inbox wait` in
   background.
-- Talk to TLs and devs via `peer_send to=<SID>` for direct, or
-  `to=teamlead` / `to=dev` for broadcasts.
+- Talk to TLs and devs via `bsq peer send <SID> "<text>"` for direct, or
+  `bsq peer send teamlead` / `bsq peer send dev` for broadcasts.
 - Stakeholder talks to you in your tmux pane directly (no peer bus
   for stakeholder→you traffic; they type).
 
@@ -65,19 +65,21 @@ a worker.
 **Spawn a dev TL bound to an initiative:**
 
 ```bash
-curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \
-  -X POST -H 'Content-Type: application/json' \
-  -d '{"slug":"<slug>","window":"<initiative-short-name>-tl","initiative":"<basename.md>","initial_prompt":"You are the TL for the <initiative> initiative. Read your role doc at vision/roles/teamlead.md and your initiative md. Drain peer_inbox_read, arm peer_inbox_wait. Split into subtasks and spawn dev workers as needed."}' \
-  http://w/actions/spawn_session
+bsq spawn T-NNNN --role tl \
+  --window <initiative-short-name>-tl \
+  --initiative <basename.md> \
+  --prompt "You are the TL for the <initiative> initiative. Read your role doc at vision/roles/teamlead.md and your initiative md. Drain bsq inbox check, arm bsq inbox wait. Split into subtasks and spawn dev workers as needed."
 ```
+
+(`T-NNNN` is the initiative's lead/coordination ticket — `bsq spawn`
+always binds a ticket. Use `--prompt-file <path>` instead of `--prompt`
+for a long brief so you don't have to shell-escape it.)
 
 **Spawn a dev for a single task:**
 
 ```bash
-curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \
-  -X POST -H 'Content-Type: application/json' \
-  -d '{"slug":"<slug>","window":"<feature-name>","task_id":"T-NNNN","initial_prompt":"<one-paragraph brief: task md path, DoD pointer, any extra context>"}' \
-  http://w/actions/spawn_session
+bsq spawn T-NNNN --window <feature-name> \
+  --prompt "<one-paragraph brief: task md path, DoD pointer, any extra context>"
 ```
 
 ## Decision discipline
@@ -91,9 +93,10 @@ in your scratchpad.
 
 ## Paging the stakeholder
 
-- `tg_notify` via the worker socket. Operators page more freely than
-  TLs because operators are the layer that decides whether something
-  needs the human. Still: `urgent: true` only for hard outages.
+- `bsq tg ping "<message>"` to DM the stakeholder. Operators page more
+  freely than TLs because operators are the layer that decides whether
+  something needs the human. Still: reserve it for things that genuinely
+  need him; hard outages only for the loud ones.
 - If the stakeholder isn't reachable and something blocks: log it to
   `feedback/<topic>-<date>.md` and continue with whatever you CAN
   unblock. Don't sit idle waiting.

@@ -641,7 +641,7 @@ if [ -d "$DATA/sessions" ]; then
 fi
 
 # 5. Message bus — give every session the recipe for cross-session messaging
-# via the worker socket. TLs are expected to keep a peer_inbox_wait armed
+# via the `bsq` CLI. TLs are expected to keep a `bsq inbox wait` armed
 # in the background; devs use it as a backup channel (their primary is the
 # native agent-teams chat).
 if [ -n "$sid" ]; then
@@ -661,11 +661,8 @@ in your composer, run \`bsq inbox check\`. The long-poll watcher is OPT-IN:
 
 Your SID is: $sid
 
-Fallback — raw worker-socket curl if bsq is unavailable:
-  curl -sS --unix-socket /home/www/bot-squad/data/_sock/worker.sock \\
-    -X POST -H 'Content-Type: application/json' \\
-    -d '{"slug":"$slug","from_sid":"$sid","to":"<target>","text":"hi"}' \\
-    http://w/actions/peer_send          # peer_inbox_read / peer_inbox_wait too
+(The raw worker socket is an advanced/debug escape hatch only — see
+AGENT_INSTRUCTIONS.md. Day-to-day, everything goes through \`bsq\`.)
 BUS_EOF
 fi
 

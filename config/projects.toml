@@ -1,18 +1,21 @@
 # bot-squad project registry. Add a new project via:
 #   scripts/cli/bot-squad project init <slug> --repo <path>
 
-[projects.signal-tracker]
-slug          = "signal-tracker"
-display_name  = "Signal Tracker"
+[projects.watchrobot]
+slug          = "watchrobot"
+display_name  = "Watchrobot"
+# T-0189 (stakeholder 2026-06-02, "it's all watchrobot now"): the bot-squad
+# project SLUG is now `watchrobot`, matching the public brand (repo, home dir,
+# staging domain). This SUPERSEDES the 2026-05-19 decision to keep the slug
+# `signal-tracker` while only the home dir carried the brand — the data dir
+# moved data/signal-tracker → data/watchrobot and a ~30-day /p/signal-tracker
+# redirect covers stale links (App.tsx). The DEPLOY INFRA below is deliberately
+# RETAINED as-is: prod/staging/dev URLs (signal-*.dev.uzinvestapi.com) and the
+# docker service/container names (signal-tracker-staging in deploy/staging.sh)
+# point at watchrobot's real running deployment — renaming those is a separate
+# external-infra task, NOT T-0189.
 # Dev clone: where agents work. On the deploy_branch (bot_squad/dev), pushes
 # to staging on every deploy queue.
-# 2026-05-19: physical path is `watchrobot/dev` (matches the public brand).
-# Two consecutive migrations same day, both no-symlink: first from
-# `signal_tracker/dev → signal_tracker_mgmt` (symlink) to a real
-# `signal-tracker/dev` dir, then renamed to `watchrobot`. Slug stays
-# `signal-tracker` (containers, DB, code untouched — only the home dir
-# carries the brand name). See data/bot-squad/feedback/F-0001 for the
-# shared-tree pain history that motivated dropping the symlink.
 repo_path     = "/home/almdudleer/watchrobot/dev"
 # Master clone: separate working tree on master branch for prod deploys,
 # hotfixes, and rollbacks. The dev clone is never touched for these so the
@@ -20,6 +23,7 @@ repo_path     = "/home/almdudleer/watchrobot/dev"
 repo_master   = "/home/almdudleer/watchrobot/master"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
+# RETAINED (external infra — see note above): real deployment URLs.
 prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
 staging_url   = "https://signal-staging.dev.uzinvestapi.com"
 dev_url       = "https://signal-dev.dev.uzinvestapi.com"

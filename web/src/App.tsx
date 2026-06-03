@@ -1,5 +1,13 @@
 import { lazy, Suspense } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import {
+  BrowserRouter,
+  Routes,
+  Route,
+  Navigate,
+  Outlet,
+  useLocation,
+  useParams,
+} from "react-router-dom";
 import { Login } from "./pages/Login";
 import { Picker } from "./pages/Picker";
 import { Project } from "./pages/Project";
@@ -44,6 +52,36 @@ const MothershipHome = MOTHERSHIP_ENABLED
     )
   : null;
 
+// T-0189: legacy slug redirects. The `signal-tracker` project was renamed to
+// `watchrobot` (the public brand — repo, staging domain, home dir all moved).
+// Old `/p/signal-tracker/*` deep-links and bookmarks redirect (replace, so the
+// stale URL doesn't linger in history) to `/p/watchrobot/*` so nothing breaks
+// during the cutover. SAFE TO REMOVE after ~2026-07-03 (≈30 days) once stale
+// links have aged out — delete this map and inline the project routes back
+// under a plain `/p/:slug` parent (drop the SlugAliasGuard layer).
+const LEGACY_SLUG_ALIASES: Record<string, string> = {
+  "signal-tracker": "watchrobot",
+};
+
+// Layout route at `/p/:slug` — sees the resolved slug at ANY depth, so a
+// legacy slug redirects whether the URL is the bare project, a tab, or a deep
+// task link. (A flat `/p/<from>/*` splat route does NOT work: React Router
+// ranks the splat below the concrete `/p/:slug/<tab>` routes, so subpaths
+// slip past it — caught by the T-0189 manual walkthrough.)
+function SlugAliasGuard() {
+  const { slug } = useParams();
+  const location = useLocation();
+  const alias = slug ? LEGACY_SLUG_ALIASES[slug] : undefined;
+  if (alias) {
+    const target =
+      location.pathname.replace(`/p/${slug}`, `/p/${alias}`) +
+      location.search +
+      location.hash;
+    return <Navigate to={target} replace />;
+  }
+  return <Outlet />;
+}
+
 export function App() {
   return (
     <BrowserRouter>
@@ -69,20 +107,25 @@ export function App() {
           />
           <Route path="/help" element={<Help />} />
           <Route path="/welcome" element={<Welcome />} />
-          <Route path="/p/:slug" element={<Project />} />
-          <Route path="/p/:slug/t/:id" element={<TaskDetail />} />
-          <Route path="/p/:slug/vision" element={<Vision />} />
-          <Route path="/p/:slug/workflow" element={<Workflow />} />
-          <Route path="/p/:slug/feedback" element={<Feedback />} />
-          <Route path="/p/:slug/usecases" element={<UseCases />} />
-          <Route path="/p/:slug/docs" element={<Docs />} />
-          <Route path="/p/:slug/sessions" element={<Sessions />} />
-          <Route path="/p/:slug/settings" element={<ProjectSettings />} />
-          <Route path="/p/:slug/analytics" element={<Analytics />} />
-          <Route path="/p/:slug/runs" element={<Runs />} />
-          <Route path="/p/:slug/runs/:id" element={<RunLog />} />
-          <Route path="/p/:slug/sessions/:claude_uuid/messages" element={<Messages />} />
-          <Route path="/p/:slug/autonomous" element={<Autonomous />} />
+          {/* T-0189: project routes nest under SlugAliasGuard so a legacy
+              slug (signal-tracker → watchrobot) redirects at ANY depth. The
+              child paths are relative to `/p/:slug`. */}
+          <Route path="/p/:slug" element={<SlugAliasGuard />}>
+            <Route index element={<Project />} />
+            <Route path="t/:id" element={<TaskDetail />} />
+            <Route path="vision" element={<Vision />} />
+            <Route path="workflow" element={<Workflow />} />
+            <Route path="feedback" element={<Feedback />} />
+            <Route path="usecases" element={<UseCases />} />
+            <Route path="docs" element={<Docs />} />
+            <Route path="sessions" element={<Sessions />} />
+            <Route path="settings" element={<ProjectSettings />} />
+            <Route path="analytics" element={<Analytics />} />
+            <Route path="runs" element={<Runs />} />
+            <Route path="runs/:id" element={<RunLog />} />
+            <Route path="sessions/:claude_uuid/messages" element={<Messages />} />
+            <Route path="autonomous" element={<Autonomous />} />
+          </Route>
           <Route path="/scheduler" element={<Scheduler />} />
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />

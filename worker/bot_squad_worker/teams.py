@@ -198,6 +198,46 @@ def reconcile_teams(cfg: Any, slug: str) -> dict:
     return {"ok": True, "teams": sorted(written), "reconciled": len(written)}
 
 
+def find_team_for_sid(cfg: Any, slug: str, sid: str) -> dict | None:
+    """Return the Team projection (meta dict) whose roster lists ``sid``.
+
+    Searches the live/suspended ``teammates`` and the ``tl`` slot first, then
+    ``archived_members``. Returns ``None`` if no team md mentions the SID (the
+    common case for an operator that is itself a lead slot, or a session whose
+    team hasn't been reconciled yet). Reading the projection — not a registry
+    ``parent_sid`` field — is the source of truth for a session's parent
+    (T-0142/T-0177; the ruling on T-0034).
+    """
+    teams_dir = _teams_dir(cfg.data_dir, slug)
+    if not sid or not teams_dir.exists():
+        return None
+    for md in sorted(teams_dir.glob("*.md")):
+        meta = _read_team(md)
+        if meta is None:
+            continue
+        if sid == meta.get("tl") \
+                or sid in (meta.get("teammates") or []) \
+                or sid in (meta.get("archived_members") or []):
+            return meta
+    return None
+
+
+def tl_for_sid(cfg: Any, slug: str, sid: str) -> str | None:
+    """Return the ``tl`` slot SID of the team that lists ``sid``, or ``None``.
+
+    ``None`` means either no team owns the SID, or the team's lead slot is the
+    unset sentinel ``~``. The caller decides what an operator-role ``tl`` means
+    versus a teamlead-role one — this just resolves the projection edge.
+    """
+    team = find_team_for_sid(cfg, slug, sid)
+    if team is None:
+        return None
+    tl = team.get("tl")
+    if not tl or tl in ("~", sid):
+        return None
+    return tl
+
+
 def prune_orphan_teams(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
     """T-0177 (gated): remove stale team md files left by the tmux-session →
     project regroup. After ``reconcile_teams`` rebuilds the project team, the old

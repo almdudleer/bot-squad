@@ -21,6 +21,14 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   deploy script serially. Prod deploys are stakeholder-owned.
 - If you're blocked: `peer_send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
+- **Idle vs. explicit page (T-0034).** When you sit idle/blocked under a
+  TL, the worker's watchdog routes that to your TL — NOT the stakeholder.
+  A quiet idle never pages a human; it's your TL's job to give you work
+  or release you. When you genuinely need the *stakeholder* (an auth
+  flow, a choice between paths, a blocker outside your TL's scope), page
+  him explicitly with `bsq tg ping "<what you need>"` — that reaches him
+  directly and is unaffected by the idle suppression. Route everything
+  else to your TL via `peer_send`.
 - If you notice work outside your scope, drop a one-pager into
   `data/<slug>/backlog/`. Never hand-pick the T-NNNN id — call the
   `task_new` worker action (`{slug, title, initiative?, priority?,

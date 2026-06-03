@@ -128,10 +128,14 @@ def _age_marker(cfg, sid, seconds):
     p.write_text(json.dumps(d))
 
 
-def _stub_pane(monkeypatch, visible: bool, present: bool = True):
+def _stub_pane(monkeypatch, visible: bool, present: bool = True, route=None):
     pane = types.SimpleNamespace(pane_id="%7", window="tg-gating", session="bot-squad")
     monkeypatch.setattr(TS, "_pane_for_sid", lambda sid: pane if present else None)
     monkeypatch.setattr(TS, "_window_visible", lambda pid: visible)
+    # T-0034: default route=None means "no upstream → TG the stakeholder" (the
+    # operator / prod-teamlead case), keeping these the TG-path tests they were.
+    # A redirect test passes route=<target SID>.
+    monkeypatch.setattr(TS, "_route_idle_escalation", lambda cfg, slug, sid: route)
 
 
 def test_tick_too_early_no_tg(tmp_path, faketg, monkeypatch):
@@ -268,3 +272,152 @@ def test_window_visible_tmux_error(monkeypatch):
         return types.SimpleNamespace(returncode=1, stdout="")
     monkeypatch.setattr(TS.subprocess, "run", fake_run)
     assert TS._window_visible("%7") is False
+
+
+# ---------------------------------------------------------------------------
+# T-0034: idle-notify routing by role + TL parent
+# ---------------------------------------------------------------------------
+
+TL = "S-almdudleer-multi_server-TL-p30"
+
+
+def _stub_rows(monkeypatch, rows, tl_of=None):
+    """Stub the session list + team-projection lookup the router consults."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.teams as T
+    monkeypatch.setattr(S, "list_sessions", lambda cfg, slug: rows)
+    monkeypatch.setattr(T, "tl_for_sid", lambda cfg, slug, sid: (tl_of or {}).get(sid))
+
+
+def test_route_dev_with_teamlead_parent_returns_tl(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _stub_rows(
+        monkeypatch,
+        [{"sid": DEV, "role": "dev"}, {"sid": TL, "role": "teamlead"},
+         {"sid": OP, "role": "operator"}],
+        tl_of={DEV: TL},
+    )
+    assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == TL
+
+
+def test_route_dev_without_tl_returns_operator(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    # team lead slot is the operator (or no team at all) → ad-hoc dev → operator
+    _stub_rows(
+        monkeypatch,
+        [{"sid": DEV, "role": "dev"}, {"sid": OP, "role": "operator"}],
+        tl_of={DEV: OP},   # tl resolves to an operator-role session → not a TL
+    )
+    assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == OP
+
+
+def test_route_dev_no_team_returns_operator(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _stub_rows(
+        monkeypatch,
+        [{"sid": DEV, "role": "dev"}, {"sid": OP, "role": "operator"}],
+        tl_of={},          # no team owns the dev
+    )
+    assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == OP
+
+
+def test_route_teamlead_returns_operator(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _stub_rows(
+        monkeypatch,
+        [{"sid": TL, "role": "teamlead"}, {"sid": OP, "role": "operator"}],
+    )
+    assert TS._route_idle_escalation(cfg, "bot-squad", TL) == OP
+
+
+def test_route_operator_returns_none_tg(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _stub_rows(monkeypatch, [{"sid": OP, "role": "operator"}])
+    assert TS._route_idle_escalation(cfg, "bot-squad", OP) is None
+
+
+def test_route_prod_teamlead_no_operator_returns_none_tg(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    # prod contour: a teamlead with no operator session above it → TG.
+    _stub_rows(monkeypatch, [{"sid": TL, "role": "teamlead"}])
+    assert TS._route_idle_escalation(cfg, "bot-squad", TL) is None
+
+
+def test_route_session_list_failure_falls_back_to_tg(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    import bot_squad_worker.sessions as S
+
+    def boom(cfg, slug):
+        raise RuntimeError("no tmux")
+
+    monkeypatch.setattr(S, "list_sessions", boom)
+    assert TS._route_idle_escalation(cfg, "bot-squad", DEV) is None
+
+
+# ---------------------------------------------------------------------------
+# Redirect path through tick: dev under a TL escalates to the TL, NOT the
+# stakeholder (the core T-0034 DoD).
+# ---------------------------------------------------------------------------
+
+def _capture_bus(monkeypatch):
+    sent = []
+    nudged = []
+    import bot_squad_worker.intersession as IS
+
+    monkeypatch.setattr(
+        IS, "send",
+        lambda cfg, slug, from_sid, to, text, user=None: (
+            sent.append({"from": from_sid, "to": to, "text": text})
+            or {"ok": True, "delivered_to": [to]}
+        ),
+    )
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(
+        A, "_action_inject_input",
+        lambda params: nudged.append(params) or {"ok": True},
+    )
+    return sent, nudged
+
+
+def test_tick_dev_under_tl_redirects_to_tl_not_stakeholder(tmp_path, faketg, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "stuck on the failing migration")
+    _age_marker(cfg, DEV, 16 * 60)
+    # Window visibility is irrelevant for a peer-bus redirect.
+    _stub_pane(monkeypatch, visible=True, route=TL)
+    sent, nudged = _capture_bus(monkeypatch)
+
+    audit = TS.tick(cfg)
+
+    assert audit["escalated"] == 1
+    assert faketg.sent == []                      # stakeholder NOT paged
+    assert len(sent) == 1 and sent[0]["to"] == TL
+    assert "stuck on the failing migration" in sent[0]["text"]
+    assert nudged and nudged[0]["sid"] == TL      # check-mail nudge to the TL
+    marker = json.loads(TS._marker_path(cfg, "bot-squad", DEV).read_text())
+    assert marker["escalated"] is True
+    assert marker["routed_to"] == TL
+
+    # One-shot: a second tick must not re-deliver.
+    audit2 = TS.tick(cfg)
+    assert audit2["escalated"] == 0
+    assert len(sent) == 1
+
+
+def test_tick_redirect_bus_failure_leaves_marker_pending(tmp_path, faketg, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    _age_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False, route=TL)
+    import bot_squad_worker.intersession as IS
+
+    def boom(*a, **k):
+        raise RuntimeError("bus down")
+
+    monkeypatch.setattr(IS, "send", boom)
+
+    audit = TS.tick(cfg)
+    assert audit["escalated"] == 0
+    assert faketg.sent == []
+    # Marker stays pending (un-escalated) so a later tick retries the redirect.
+    assert json.loads(TS._marker_path(cfg, "bot-squad", DEV).read_text())["escalated"] is False

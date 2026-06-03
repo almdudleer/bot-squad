@@ -201,6 +201,105 @@ def _window_visible(pane_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# T-0034: idle-notify routing by role + TL parent
+# ---------------------------------------------------------------------------
+
+def _route_idle_escalation(cfg: Any, slug: str, sid: str) -> Optional[str]:
+    """Where should ``sid``'s idle/blocked escalation go? (T-0034)
+
+    Returns a target SID to ``peer_send``, or ``None`` meaning "page the
+    stakeholder via TG" (the existing behaviour). Routing follows the ticket:
+
+      - **dev**, team ``tl`` is a teamlead    → that TL.
+      - **dev**, team ``tl`` is operator/none → the operator session.
+      - **teamlead** (regular dev TL)         → the operator session.
+      - **operator**                          → ``None`` (TG the stakeholder).
+      - **teamlead with no operator** (a prod-teamlead on the prod contour,
+        which has no operator above it)       → ``None`` (TG the stakeholder).
+
+    The fall-through to TG is exactly "no upstream session to peer_send". The
+    point of T-0034: a dev going idle under a TL never pages the stakeholder —
+    the TL gets the peer_send instead. Explicit ``bsq tg ping`` pages bypass
+    this watchdog entirely and still reach the stakeholder.
+
+    Best-effort: any lookup failure routes to ``None`` (TG) — the safe default
+    that never silently swallows an escalation.
+    """
+    try:
+        from bot_squad_worker import sessions as S
+        rows = S.list_sessions(cfg, slug)
+    except Exception:  # noqa: BLE001
+        log.exception("tg_stall: idle-routing session lookup failed (slug=%s)", slug)
+        return None
+
+    by_sid = {r.get("sid"): r for r in rows}
+    role = (by_sid.get(sid) or {}).get("role")
+    operator_sid = next((r.get("sid") for r in rows if r.get("role") == "operator"), None)
+
+    if role == "operator":
+        # The stakeholder's own session — nothing above it. TG.
+        return None
+
+    if role == "dev":
+        try:
+            from bot_squad_worker import teams as T
+            tl = T.tl_for_sid(cfg, slug, sid)
+        except Exception:  # noqa: BLE001
+            log.exception("tg_stall: team-projection lookup failed for %s", sid)
+            tl = None
+        if tl and (by_sid.get(tl) or {}).get("role") == "teamlead":
+            return tl              # dev under a TL → the TL
+        return operator_sid        # ad-hoc dev (no TL) → the operator
+
+    # teamlead (regular dev TL) → the operator. A prod-teamlead on the prod
+    # contour has no operator session, so operator_sid is None → TG. The same
+    # safe fall-through covers an unknown/None role.
+    return operator_sid
+
+
+def _redirect_to_upstream(
+    cfg: Any, slug: str, sid: str, target: str, data: dict, marker: Path,
+) -> bool:
+    """Deliver the idle escalation to ``target`` over the peer bus + nudge,
+    instead of paging the stakeholder. Consumes the marker (one-shot).
+
+    Calls ``intersession.send`` directly (not the ``peer_send`` action) so the
+    stall-watchdog hook does not re-fire on this system-generated message.
+    Then injects a ``check mail`` nudge into the target's pane, mirroring what
+    ``bsq peer send`` does — best-effort; a suspended/non-tmux target just
+    reads it on its next inbox check.
+    """
+    stall_minutes = int(getattr(cfg, "tg_stall_minutes", 15))
+    text = str(data.get("text", "")).strip() or "is idle / waiting on a reply"
+    body = (
+        f"⏳ idle-notify: {sid} {text} (no reply for ≥{stall_minutes}m). "
+        "Give them work or release them."
+    )
+    try:
+        from bot_squad_worker import intersession as _is
+        _is.send(cfg, slug, sid, target, body)
+    except Exception:  # noqa: BLE001
+        log.exception("tg_stall: idle redirect to %s failed for %s", target, sid)
+        return False
+
+    # Primary cross-session signal — nudge the target's pane (best-effort).
+    try:
+        from bot_squad_worker.actions import _action_inject_input
+        _action_inject_input({"sid": target, "text": "check mail"})
+    except Exception:  # noqa: BLE001
+        log.debug("tg_stall: pane nudge skipped for %s (no live pane?)", target)
+
+    data["escalated"] = True
+    data["escalated_at"] = time.time()
+    data["routed_to"] = target
+    tmp = marker.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(marker)
+    log.info("tg_stall: %s idle-redirected to %s (slug=%s) — no TG", sid, target, slug)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Escalation message
 # ---------------------------------------------------------------------------
 
@@ -266,9 +365,14 @@ def tick(cfg: Any) -> dict:
 
 
 def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
-    """Fire one TG ping for a stale marker, iff its window isn't being watched.
+    """Escalate one stale marker. Returns True if it was consumed (a TG sent or
+    an in-bus redirect delivered) so the watchdog counts it once.
 
-    Returns True if a TG was sent (and the marker flipped to escalated).
+    T-0034: the escalation is routed by the blocked session's role + TL parent.
+    A dev under a TL (and any non-operator session with an upstream) gets the
+    nudge delivered to its TL / the operator over the peer bus — the
+    stakeholder is NOT paged. Only an operator (or a prod-teamlead with no
+    operator above it) falls through to the TG path below.
     """
     sid = data.get("sid", "")
     pane = _pane_for_sid(sid)
@@ -278,6 +382,15 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
         marker.unlink(missing_ok=True)
         log.info("tg_stall: %s pane gone — dropping marker (no escalation)", sid)
         return False
+
+    # T-0034: redirect to the TL / operator instead of TG, when there is one.
+    # No window-visible gate here — the upstream session is a different
+    # recipient than the stakeholder watching the dev's pane, and the marker is
+    # one-shot, so it never re-floods.
+    target = _route_idle_escalation(cfg, slug, sid)
+    if target:
+        return _redirect_to_upstream(cfg, slug, sid, target, data, marker)
+
     if _window_visible(pane.pane_id):
         # Stakeholder is looking at the window — no TG needed.
         log.info("tg_stall: %s window is visible — skip escalation", sid)

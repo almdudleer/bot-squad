@@ -31,7 +31,7 @@ def _setup(tmp_path: Path, *, updated_ago_min: int, activity_ago_sec: int,
            role: str = "dev", status: str = "active", task_id: str = "T-0149",
            drift_enforcement: bool = True, owner: str = "",
            session_initiative: str = "", ticket_initiative: str = "",
-           drift_paused: bool = False):
+           drift_paused: bool = False, ticket_status: str = "in_progress"):
     """Build cfg + a backlog ticket + a session md, return (cfg, slug, now, ticket).
 
     drift_enforcement defaults True so the legacy fire-tests keep firing under
@@ -50,7 +50,7 @@ def _setup(tmp_path: Path, *, updated_ago_min: int, activity_ago_sec: int,
     init_line = f"initiative: {ticket_initiative}\n" if ticket_initiative else ""
     ticket.write_text(
         f"---\nid: {task_id}\ntitle: Dynamic context manager\n"
-        f"status: in_progress\n{init_line}updated: {_iso(now - updated_ago_min * 60)}\n---\n\n"
+        f"status: {ticket_status}\n{init_line}updated: {_iso(now - updated_ago_min * 60)}\n---\n\n"
         "## DoD\n- do the thing\n"
     )
 
@@ -286,6 +286,51 @@ def test_initiative_match_still_nudges(tmp_path, monkeypatch):
         tmp_path, updated_ago_min=120, activity_ago_sec=30,
         session_initiative="operator-ux-and-session-mgmt.md",
         ticket_initiative="operator-ux-and-session-mgmt.md")
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered = []
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    res = drift.drift_check(cfg, slug)
+    assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+
+
+# --- T-0190: skip a dev whose bound ticket is terminal (totest/closed) ---
+
+@pytest.mark.parametrize("terminal_status", ["totest", "closed"])
+def test_terminal_ticket_status_not_nudged(tmp_path, monkeypatch, terminal_status):
+    # A dev that reported READY and set its ticket totest/closed is done &
+    # awaiting TL review — stale + actively-working, yet must NOT be nagged
+    # (the dogfood incident: drift dev nagged about its own ticket 89 min after
+    # setting it totest).
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=90, activity_ago_sec=30, ticket_status=terminal_status)
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered = []
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    res = drift.drift_check(cfg, slug)
+    assert res["nudged"] == [] and not delivered
+
+
+def test_in_progress_ticket_still_nudges(tmp_path, monkeypatch):
+    # in_progress is NOT terminal → a stale, actively-working dev is still nagged.
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=90, activity_ago_sec=30, ticket_status="in_progress")
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered = []
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    res = drift.drift_check(cfg, slug)
+    assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+
+
+def test_reopened_ticket_still_nudges(tmp_path, monkeypatch):
+    # reopened is NOT terminal — the work is live again, so a stale dev is nagged.
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=90, activity_ago_sec=30, ticket_status="reopened")
     patch(monkeypatch)
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])

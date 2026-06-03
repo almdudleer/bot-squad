@@ -66,6 +66,15 @@ _AUTOMATION_RE = re.compile(r"\.mjs$|\.spec\.|\.test\.|playwright", re.IGNORECAS
 # meaningless for them — skip them entirely.
 _CONSTANT_TEAM_OWNER = "constant-team"
 
+# T-0190: a dev whose bound ticket is in a terminal status has reported READY and
+# is awaiting TL review — it is DONE, not drifting, so the "re-anchor to the
+# ticket DoD" nag is structurally meaningless for it (found dogfooding the
+# T-0184/T-0185 drift bundle: the drift dev was nagged about its OWN ticket
+# ~89 min after setting it to ``totest``). ``reopened`` is deliberately NOT
+# terminal — when a TL reopens a ticket the work is live again and the dev
+# should be re-anchored.
+_TERMINAL_TICKET_STATUSES = {"totest", "closed"}
+
 # T-0184: appended to every drift reminder so the user always has an obvious
 # off-ramp. ``bsq drift off`` sets ``drift_paused: true`` on the SessionMd.
 _OFF_RAMP_FOOTER = (
@@ -320,12 +329,22 @@ def drift_check(cfg: Any, slug: str) -> dict:
         ticket_path = matches[0]
         title = ""
         ticket_initiative = ""
+        ticket_status = ""
         fm = re.match(r"\A---\n(.*?)\n---\n", ticket_path.read_text(errors="replace"), re.DOTALL)
         if fm:
             tm = re.search(r"^title:\s*(.+)$", fm.group(1), re.MULTILINE)
             title = tm.group(1).strip() if tm else ""
             im = re.search(r"^initiative:\s*(.+)$", fm.group(1), re.MULTILINE)
             ticket_initiative = _initiative_stem(im.group(1) if im else "")
+            sm = re.search(r"^status:\s*(.+)$", fm.group(1), re.MULTILINE)
+            ticket_status = sm.group(1).strip().lower() if sm else ""
+
+        # T-0190: a dev whose bound ticket is terminal (totest/closed) has reported
+        # READY and is awaiting TL review — done, not drifting. Skip it. ``reopened``
+        # is NOT terminal: the work is live again, so it still gets nagged. Composes
+        # with the constant-team + initiative-match guards above/below.
+        if ticket_status in _TERMINAL_TICKET_STATUSES:
+            continue
 
         # T-0185: only nag about a ticket whose initiative matches the session's.
         # The p38 incident was a feedback-initiative session nagged about a ticket

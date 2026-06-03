@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from bot_squad_worker import frontmatter as _frontmatter
+
 log = logging.getLogger(__name__)
 
 # Maximum time (seconds) a worker pane may run before being killed.
@@ -139,37 +141,19 @@ def _log_tick(state: AutonomousState, msg: str) -> None:
 # Task parsing
 # ---------------------------------------------------------------------------
 
-_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
-
 
 def _parse_task(path: Path) -> dict:
     """Parse a backlog markdown task file into a dict with frontmatter + body.
 
-    Uses a minimal line-by-line parser for simple ``key: value`` frontmatter
-    so the worker module doesn't need PyYAML as a dependency.
+    T-0075: delegates to the shared pyyaml-based frontmatter parser so block-
+    and inline-style YAML lists read identically (no silent drift). Returns
+    ``{}`` on any I/O or parse failure (callers treat that as "skip").
     """
     try:
-        text = path.read_text()
-        m = _FRONTMATTER_RE.match(text)
-        if not m:
+        parsed = _frontmatter.parse_or_none(path.read_text())
+        if parsed is None:
             return {}
-        # Minimal YAML parser: key: value lines only (no nested structures)
-        meta: dict = {}
-        for line in m.group(1).splitlines():
-            line = line.rstrip()
-            if not line or line.startswith("#"):
-                continue
-            colon = line.find(":")
-            if colon <= 0:
-                continue
-            key = line[:colon].strip()
-            value = line[colon + 1:].strip()
-            # Strip surrounding quotes
-            if (value.startswith('"') and value.endswith('"')) or \
-               (value.startswith("'") and value.endswith("'")):
-                value = value[1:-1]
-            meta[key] = value
-        body = m.group(2).lstrip("\n")
+        meta, body = parsed
         return {**meta, "body": body, "path": str(path)}
     except Exception as e:
         log.debug("autonomous: _parse_task error for %s: %s", path, e)
@@ -485,48 +469,25 @@ def _close_task(cfg: Any, slug: str, task_id: str) -> None:
 
 
 def _patch_task_file(path: Path, updates: dict, comment: Optional[str]) -> None:
-    """Minimal in-place frontmatter patch + optional comment append.
+    """Frontmatter patch + optional comment append.
 
-    Only patches simple key: value lines; preserves structure of the rest.
+    T-0075: delegates to the shared pyyaml writer so any block-style list
+    field a previous api PATCH wrote (``blocked_by`` etc.) is read correctly
+    and re-emitted inline instead of preserved as opaque, reader-invisible
+    text. Applies ``updates`` (preserving existing key order), bumps
+    ``updated``, then appends the optional orchestrator comment.
     """
-    text = path.read_text()
-    m = _FRONTMATTER_RE.match(text)
-    if not m:
+    parsed = _frontmatter.parse_or_none(path.read_text())
+    if parsed is None:
         return
+    meta, body = parsed
 
-    # Parse frontmatter lines, updating matching keys
-    fm_lines = m.group(1).splitlines()
-    updated_keys = set(updates.keys())
-    new_fm_lines = []
-    for line in fm_lines:
-        stripped = line.rstrip()
-        colon = stripped.find(":")
-        if colon > 0:
-            key = stripped[:colon].strip()
-            if key in updated_keys:
-                new_fm_lines.append(f"{key}: {updates[key]}")
-                updated_keys.discard(key)
-                continue
-        new_fm_lines.append(stripped)
-
-    # Append any keys that were not already present
-    for key in list(updates.keys()):
-        if key in updated_keys:
-            new_fm_lines.append(f"{key}: {updates[key]}")
-    # Add updated timestamp
-    # Overwrite or add updated field
+    for key, val in updates.items():
+        meta[key] = val
     ts = _now_iso()
-    has_updated = any(ln.startswith("updated:") for ln in new_fm_lines)
-    if has_updated:
-        new_fm_lines = [f"updated: {ts}" if ln.startswith("updated:") else ln
-                        for ln in new_fm_lines]
-    else:
-        new_fm_lines.append(f"updated: {ts}")
+    meta["updated"] = ts
 
-    body = m.group(2).lstrip("\n")
-    new_fm = "\n".join(new_fm_lines)
-    new_text = f"---\n{new_fm}\n---\n\n{body}"
-
+    new_text = _frontmatter.dump(meta, body)
     if comment:
         new_text = new_text.rstrip("\n") + f"\n\n---\n\n**[orchestrator {ts}]** {comment}\n"
 

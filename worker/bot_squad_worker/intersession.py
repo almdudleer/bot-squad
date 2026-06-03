@@ -26,10 +26,18 @@ import time
 from pathlib import Path
 from typing import Any
 
+from bot_squad_worker import frontmatter as _frontmatter
+
 log = logging.getLogger(__name__)
 
 _MAX_TEXT_LEN = 4000
-_MAX_WAIT_TIMEOUT = 1800
+# T-0091: cap raised 1800→7200 (2h). A long-blocking inbox_wait costs the
+# worker nothing (a single condition-variable wait per SID), but every clean
+# timeout fires a harness <task-notification> in the operator's pane and burns
+# a prompt-cache re-arm cycle. 7200 lets an operator/TL/dev honoring a
+# low-cadence idle preference ("re-arm every ~2h") actually get that cadence
+# instead of churning every 30 minutes.
+_MAX_WAIT_TIMEOUT = 7200
 _HEARTBEAT_INTERVAL = 10.0
 
 # T-0119: shutdown signal threaded in by __main__ so in-flight inbox_wait
@@ -67,27 +75,20 @@ def _sanitize(text: str) -> str:
 def _list_session_sids(cfg: Any, slug: str) -> list[tuple[str, dict]]:
     """Parse session md frontmatter for every session in data/<slug>/sessions/.
 
-    Returns (sid, meta) tuples. Meta values are raw strings (no type coercion).
+    Returns (sid, meta) tuples. T-0075: meta comes from the shared pyyaml
+    parser (``~`` → None, lists typed), not the old line-based reader.
     """
     sess_dir = Path(cfg.data_dir) / slug / "sessions"
     if not sess_dir.exists():
         return []
     out: list[tuple[str, dict]] = []
     for md in sorted(sess_dir.glob("*.md")):
-        text = md.read_text()
-        if not text.startswith("---"):
+        parsed = _frontmatter.parse_or_none(md.read_text())
+        if parsed is None:
             continue
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            continue
-        meta: dict[str, str] = {}
-        for line in parts[1].strip().splitlines():
-            if ":" not in line:
-                continue
-            k, _, v = line.partition(":")
-            meta[k.strip()] = v.strip()
-        sid = meta.get("sid", md.stem)
-        out.append((sid, meta))
+        meta = parsed[0]
+        sid = meta.get("sid") or md.stem
+        out.append((str(sid), meta))
     return out
 
 
@@ -305,7 +306,8 @@ def inbox_wait(
 
     Returns ``{"ok": True, "ready": bool, "elapsed_sec": float}``. ``ready``
     True means "you have new mail, call ``inbox_read``"; False means the
-    timeout expired without new mail.
+    timeout expired without new mail. ``timeout`` is clamped to
+    ``_MAX_WAIT_TIMEOUT`` (7200s / 2h as of T-0091).
 
     T-0119: if the process-wide shutdown event (or one passed via
     ``shutdown_event``) is set, returns early with

@@ -9,6 +9,11 @@ dependencies = [
     # T-0194: [socks] extra pulls in socksio so cfg.tg_proxy_url may be a
     # socks5:// proxy (http(s):// work without it). Used by tg.py + tg_listener.
     "httpx[socks]>=0.27",
+    # T-0075: the shared frontmatter parser/writer (bot_squad_worker.frontmatter,
+    # mirrored from api/app/frontmatter.py) reads/writes task + session md via
+    # pyyaml so block- and inline-style YAML lists parse identically. Replaces
+    # the worker's hand-rolled line-based frontmatter readers.
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]

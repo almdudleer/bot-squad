@@ -101,3 +101,16 @@ def test_parse_task_parent_and_blocked_by(tmp_path: Path) -> None:
     parsed = parse_task(f)
     assert parsed["parent_task"] == "T-0007"
     assert parsed["blocked_by"] == ["T-0001", "T-0002"]
+
+
+def test_parse_task_block_style_blocked_by(tmp_path: Path) -> None:
+    """T-0075 regression: a BLOCK-style list (what the old api yaml.safe_dump
+    PATCH path emitted) must read identically to the inline form — pre-T-0075
+    the line-based readers silently dropped the list contents."""
+    f = tmp_path / "T-0062-block.md"
+    f.write_text(
+        "---\nid: T-0062\ntitle: L\nstatus: open\n"
+        "blocked_by:\n- T-0001\n- T-0002\n---\n\nbody\n"
+    )
+    parsed = parse_task(f)
+    assert parsed["blocked_by"] == ["T-0001", "T-0002"]

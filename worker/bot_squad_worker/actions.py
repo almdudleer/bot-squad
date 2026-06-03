@@ -1295,7 +1295,7 @@ _PEER_INBOX_WAIT_ALLOWED = _PEER_INBOX_WAIT_REQUIRED
 def _action_peer_inbox_wait(params: dict[str, Any]) -> dict[str, Any]:
     """Long-poll until inbox grows past the seen offset, or timeout.
 
-    Required params: slug, sid, timeout (seconds, capped at 1800)
+    Required params: slug, sid, timeout (seconds, capped at 7200 / 2h — T-0091)
     Returns: {ok: true, ready: bool, elapsed_sec: float}
     """
     extra = set(params) - _PEER_INBOX_WAIT_ALLOWED

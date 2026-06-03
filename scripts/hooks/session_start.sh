@@ -111,6 +111,16 @@ md_path    = data / "sessions" / f"{sid}.md"
 # (existing wins if non-empty). T-0080: owner is the UI username stamp
 # passed in via BOT_SQUAD_OWNER at spawn time; preserve once stamped so
 # resumes / break-pane SID rotations don't lose attribution.
+#
+# T-0075 CONSTRAINT — this hook is the ONE acceptable line-based frontmatter
+# parser (the rest of the codebase now shares bot_squad_worker.frontmatter /
+# app.frontmatter, a pyyaml pair). It is safe ONLY because every field it
+# reads here is INLINE-ONLY: scalars (task_id / initiative / owner / status /
+# started_at) and inline list literals (extra_task_ids: [a, b], parsed below
+# by a bracket regex). The shared writer always emits lists inline and None as
+# `~`, so block-style YAML never reaches this reader. Do NOT add a reader for a
+# field that the writer could emit block-style — route it through the shared
+# parser instead.
 existing = {}
 if md_path.exists():
     text = md_path.read_text()

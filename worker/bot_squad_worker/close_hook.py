@@ -143,7 +143,10 @@ def harvest_tick(cfg: Any, slug: str) -> dict:
                         added = _append_comments(matches[0], comments, meta.get("sid", md.stem))
                 except Exception:
                     log.exception("harvest_tick: harvest failed for %s", md.stem)
-        meta[_MARKER] = "true"
+        # T-0075: stamp a real YAML bool — the shared writer emits `true`
+        # (unquoted); the read guard above (`str(...).lower() == "true"`)
+        # accepts both bool and legacy string forms.
+        meta[_MARKER] = True
         try:
             S._write_session_metadata(md, meta, atomic=True)
         except OSError:

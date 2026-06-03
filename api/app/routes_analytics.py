@@ -20,6 +20,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.frontmatter import parse_or_none
 from app.markdown_parser import ParseError, parse_task
 from app.routes_auth import require_auth
 
@@ -81,20 +82,15 @@ def _series_to_list(series: dict[str, int]) -> list[dict]:
 
 
 def _read_frontmatter(path: Path) -> dict:
-    """Lightweight YAML-frontmatter read (sessions don't go through parse_task)."""
-    text = path.read_text()
-    if not text.startswith("---"):
-        return {}
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}
-    meta: dict[str, str] = {}
-    for line in parts[1].strip().splitlines():
-        if ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        meta[k.strip()] = v.strip()
-    return meta
+    """Read session md frontmatter via the shared parser (T-0075).
+
+    Sessions don't go through ``parse_task`` (no priority coercion) but use the
+    SAME pyyaml-based parser, so list fields + ``~``/timestamps behave
+    consistently. ``_parse_ts`` already tolerates the plain-string timestamps
+    this returns.
+    """
+    parsed = parse_or_none(path.read_text())
+    return parsed[0] if parsed is not None else {}
 
 
 def _sessions_stats(data_dir: Path, today: datetime) -> dict:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.frontmatter import as_list, parse_or_none
 from app.markdown_parser import ParseError, parse_task
 from app.markdown_writer import (
     append_comment,
@@ -95,29 +96,17 @@ def _session_map_by_task(sessions_dir: Path) -> dict[str, dict]:
             text = f.read_text()
         except OSError:
             continue
-        if not text.startswith("---"):
+        parsed = parse_or_none(text)  # T-0075: shared parser
+        if parsed is None:
             continue
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            continue
-        meta: dict[str, str] = {}
-        for line in parts[1].strip().splitlines():
-            if ":" in line:
-                k, _, v = line.partition(":")
-                meta[k.strip()] = v.strip()
+        meta, _ = parsed
         sid = meta.get("sid") or f.stem
-        status = meta.get("status", "unknown")
+        status = meta.get("status") or "unknown"
         task_ids: list[str] = []
-        primary = meta.get("task_id", "")
+        primary = meta.get("task_id")
         if primary and primary != "~":
-            task_ids.append(primary)
-        extras_raw = meta.get("extra_task_ids", "")
-        if extras_raw.startswith("[") and extras_raw.endswith("]"):
-            inner = extras_raw[1:-1].strip()
-            if inner:
-                for t in (x.strip() for x in inner.split(",")):
-                    if t and t != "~":
-                        task_ids.append(t)
+            task_ids.append(str(primary))
+        task_ids.extend(as_list(meta.get("extra_task_ids")))
         for tid in task_ids:
             existing = out.get(tid)
             if existing and existing["status"] == "active" and status != "active":

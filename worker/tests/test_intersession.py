@@ -123,9 +123,9 @@ def test_wait_returns_ready_when_inbox_grows(tmp_path):
 
 
 def test_wait_caps_timeout(tmp_path, monkeypatch):
-    """Timeout > 1800 should be clamped."""
+    """Timeout > 7200 (the T-0091 cap) should be clamped."""
     cfg = _make_cfg(tmp_path)
-    # Patch time.sleep + monotonic to verify clamp without burning 1800s.
+    # Patch time.sleep + monotonic to verify clamp without burning 7200s.
     calls: list[float] = []
     real_monotonic = time.monotonic
     start = real_monotonic()
@@ -140,11 +140,11 @@ def test_wait_caps_timeout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(I.time, "monotonic", fake_monotonic)
     monkeypatch.setattr(I.time, "sleep", fake_sleep)
-    out = I.inbox_wait(cfg, "p", "S-to", timeout=9999)
+    out = I.inbox_wait(cfg, "p", "S-to", timeout=99999)
     assert out["ready"] is False
-    # Should have slept its way to roughly 1800s, not 9999s.
-    assert sum(calls) <= 1801
-    assert out["elapsed_sec"] <= 1801
+    # Should have slept its way to roughly 7200s, not 99999s.
+    assert sum(calls) <= I._MAX_WAIT_TIMEOUT + 1
+    assert out["elapsed_sec"] <= I._MAX_WAIT_TIMEOUT + 1
 
 
 def test_wait_returns_early_on_shutdown_event_arg(tmp_path):

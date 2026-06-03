@@ -8,17 +8,16 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
-
+from app.frontmatter import dump_frontmatter
 from app.markdown_parser import parse_task
 
 # Keys allowed in merge_task_update `updates` dict.
 # T-0038 adds first-class linkage fields: `initiative` (basename under
 # vision/initiatives/), `parent_task` (T-NNNN), `blocked_by` (list of T-NNNN).
 # T-0105 adds `session_history` (append-only list of SIDs that worked on
-# this task, oldest first). Worker writes the field inline-format
-# (`[sid1, sid2]`) via sessions.py; the api PATCH path lets us backfill
-# block-format via the yaml-dump writer when needed.
+# this task, oldest first). T-0075: the shared writer emits list fields
+# INLINE (`[sid1, sid2]`) regardless of write path, so worker- and api-written
+# lists are byte-shape-identical and the old block-vs-inline drift is gone.
 _ALLOWED_UPDATE_KEYS = frozenset({
     "title", "status", "body", "priority",
     "initiative", "parent_task", "blocked_by",
@@ -40,7 +39,7 @@ def write_task(path: Path, frontmatter: dict, body: str) -> None:
     # Drop None values so missing keys (notably `priority`) don't serialize
     # as `key: null` — keeps frontmatter clean and parser semantics symmetric.
     fm_clean = {k: v for k, v in frontmatter.items() if v is not None}
-    fm_str = yaml.safe_dump(fm_clean, allow_unicode=True, sort_keys=False)
+    fm_str = dump_frontmatter(fm_clean)
     content = f"---\n{fm_str}---\n\n{body}"
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(content, encoding="utf-8")

@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bot_squad_worker import frontmatter as _frontmatter
+
 
 # ---------------------------------------------------------------------------
 # T-0104 — activity-derived "running" vs "idle" threshold.
@@ -405,20 +407,12 @@ def _write_session_metadata(path: Path, meta: dict, *, atomic: bool = False) -> 
     half-written md.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["---"]
-    for k, v in meta.items():
-        if isinstance(v, list):
-            if v:
-                lines.append(f"{k}: [{', '.join(str(i) for i in v)}]")
-            else:
-                lines.append(f"{k}: []")
-        elif v is None:
-            lines.append(f"{k}: ~")
-        else:
-            lines.append(f"{k}: {v}")
-    lines.append("---")
-    lines.append("")
-    body = "\n".join(lines)
+    # T-0075: delegate serialization to the shared frontmatter writer (lists
+    # inline, None as `~`, timestamps unquoted). Map the legacy "~" string
+    # sentinel → None so it still emits as `~` (unquoted) and round-trips to
+    # None, byte-matching the pre-T-0075 hand-rolled output.
+    norm = {k: (None if v == "~" else v) for k, v in meta.items()}
+    body = f"---\n{_frontmatter.dump_frontmatter(norm)}---\n"
     if atomic:
         tmp = path.parent / (path.name + ".tmp")
         tmp.write_text(body)
@@ -428,35 +422,15 @@ def _write_session_metadata(path: Path, meta: dict, *, atomic: bool = False) -> 
 
 
 def _read_session_metadata(path: Path) -> dict | None:
-    """Parse YAML-like frontmatter from a session metadata file.
+    """Parse YAML frontmatter from a session metadata file (T-0075: shared
+    pyyaml parser, so block- and inline-style lists read identically).
 
     Returns None if the file doesn't exist or has no frontmatter.
     """
     if not path.exists():
         return None
-    text = path.read_text()
-    if not text.startswith("---"):
-        return None
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return None
-    fm = parts[1].strip()
-    meta: dict = {}
-    for line in fm.splitlines():
-        if ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        k = k.strip()
-        v = v.strip()
-        # Parse list values like [T-0042, T-0043]
-        if v.startswith("[") and v.endswith("]"):
-            inner = v[1:-1].strip()
-            meta[k] = [x.strip() for x in inner.split(",")] if inner else []
-        elif v == "~" or v == "null":
-            meta[k] = None
-        else:
-            meta[k] = v
-    return meta
+    parsed = _frontmatter.parse_or_none(path.read_text())
+    return parsed[0] if parsed is not None else None
 
 
 def _get_current_user() -> str:
@@ -1184,47 +1158,32 @@ def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> b
         text = path.read_text()
     except OSError:
         return False
-    m = re.match(r"\A---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-    if not m:
+    parsed = _frontmatter.parse_or_none(text)  # T-0075: shared parser
+    if parsed is None:
         return False
-    fm_block = m.group(1)
-    body = m.group(2)
-    fm_lines = fm_block.splitlines()
+    meta, body = parsed
 
-    history_idx = -1
-    existing: list[str] = []
-    for i, ln in enumerate(fm_lines):
-        stripped = ln.lstrip()
-        if stripped.startswith("session_history:"):
-            history_idx = i
-            _, _, val = stripped.partition(":")
-            val = val.strip()
-            if val.startswith("[") and val.endswith("]"):
-                inner = val[1:-1].strip()
-                if inner:
-                    existing = [x.strip() for x in inner.split(",") if x.strip() and x.strip() != "~"]
-            break
-
+    existing = _frontmatter.as_list(meta.get("session_history"))
     if sid in existing:
         return False  # idempotent — de-dup, preserve order
 
     new_list = existing + [sid]
-    new_line = f"session_history: [{', '.join(new_list)}]"
-
-    if history_idx >= 0:
-        fm_lines[history_idx] = new_line
+    if "session_history" in meta:
+        meta["session_history"] = new_list
     else:
-        insert_at = len(fm_lines)
-        for i, ln in enumerate(fm_lines):
-            if ln.lstrip().startswith("status:"):
-                insert_at = i + 1
-                break
-        fm_lines.insert(insert_at, new_line)
+        # Insert after `status` for stable ordering (else append at end).
+        rebuilt: dict = {}
+        inserted = False
+        for k, v in meta.items():
+            rebuilt[k] = v
+            if k == "status":
+                rebuilt["session_history"] = new_list
+                inserted = True
+        if not inserted:
+            rebuilt["session_history"] = new_list
+        meta = rebuilt
 
-    new_fm = "\n".join(fm_lines)
-    content = f"---\n{new_fm}\n---\n{body}"
-    if not body.startswith("\n"):
-        content = f"---\n{new_fm}\n---\n\n{body}"
+    content = _frontmatter.dump(meta, body)
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     os.rename(tmp, path)
@@ -1249,27 +1208,24 @@ def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative
         text = path.read_text()
     except OSError:
         return False
-    m = re.match(r"\A---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-    if not m:
+    parsed = _frontmatter.parse_or_none(text)  # T-0075: shared parser
+    if parsed is None:
         return False
-    fm_block = m.group(1)
-    body = m.group(2)
-    fm_lines = fm_block.splitlines()
-    for ln in fm_lines:
-        if ln.lstrip().startswith("initiative:"):
-            return False  # already set — don't clobber
-    # Insert after the `status:` line for stable ordering; if no status line,
+    meta, body = parsed
+    if "initiative" in meta:
+        return False  # already set (even if `~`) — don't clobber
+    # Insert after the `status` key for stable ordering; if no status key,
     # append at the end of frontmatter.
-    insert_at = len(fm_lines)
-    for i, ln in enumerate(fm_lines):
-        if ln.lstrip().startswith("status:"):
-            insert_at = i + 1
-            break
-    fm_lines.insert(insert_at, f"initiative: {initiative}")
-    new_fm = "\n".join(fm_lines)
-    content = f"---\n{new_fm}\n---\n{body}"
-    if not body.startswith("\n"):
-        content = f"---\n{new_fm}\n---\n\n{body}"
+    rebuilt: dict = {}
+    inserted = False
+    for k, v in meta.items():
+        rebuilt[k] = v
+        if k == "status":
+            rebuilt["initiative"] = initiative
+            inserted = True
+    if not inserted:
+        rebuilt["initiative"] = initiative
+    content = _frontmatter.dump(rebuilt, body)
     tmp = path.parent / (path.name + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     os.rename(tmp, path)
@@ -2280,17 +2236,13 @@ def _task_status(data_dir: Path, slug: str, task_id: str) -> str | None:
             matches = [direct]
     if not matches:
         return None
-    text = matches[0].read_text()
-    if not text.startswith("---"):
+    parsed = _frontmatter.parse_or_none(matches[0].read_text())  # T-0075
+    if parsed is None:
         return None
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    status = parsed[0].get("status")
+    if status is None:
         return None
-    for line in parts[1].splitlines():
-        k, _, v = line.partition(":")
-        if k.strip() == "status":
-            return v.strip().strip('"').strip("'") or None
-    return None
+    return str(status) or None
 
 
 def _initiative_exists(data_dir: Path, slug: str, initiative: str) -> bool:

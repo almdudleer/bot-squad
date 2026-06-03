@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app.frontmatter import parse_or_none
 from app.routes_auth import require_auth
 from app.worker_client import WorkerClient, WorkerError, WorkerRouter
 
@@ -64,21 +65,13 @@ def _read_session_owner(data_dir: Path, slug: str, sid: str) -> str | None:
         text = md.read_text()
     except OSError:
         return None
-    if not text.startswith("---"):
+    parsed = parse_or_none(text)  # T-0075: shared parser
+    if parsed is None:
         return None
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    owner = parsed[0].get("owner")
+    if owner is None or owner == "~" or owner == "":
         return None
-    for line in parts[1].strip().splitlines():
-        if ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        if k.strip() == "owner":
-            v = v.strip()
-            if not v or v == "~":
-                return None
-            return v
-    return None
+    return str(owner)
 
 
 def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter,
@@ -452,23 +445,12 @@ class DevSpawnRequest(BaseModel):
 
 
 def _read_session_meta(sessions_dir: Path, sid: str) -> dict | None:
-    """Lightweight YAML-frontmatter parser for session md files."""
+    """Read session md frontmatter via the shared parser (T-0075)."""
     p = sessions_dir / f"{sid}.md"
     if not p.exists():
         return None
-    text = p.read_text()
-    if not text.startswith("---"):
-        return None
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return None
-    meta: dict[str, str] = {}
-    for line in parts[1].strip().splitlines():
-        if ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        meta[k.strip()] = v.strip()
-    return meta
+    parsed = parse_or_none(p.read_text())
+    return parsed[0] if parsed is not None else None
 
 
 def _compose_tl_message(slug: str, task_id: Optional[str], instructions: str) -> str:

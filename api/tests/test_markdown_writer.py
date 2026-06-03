@@ -195,6 +195,35 @@ def test_merge_task_update_accepts_session_history(tmp_path: Path):
     assert task["session_history"] == ["S-alice-w-p2", "S-alice-w-p9"]
 
 
+def test_write_task_emits_inline_lists(tmp_path: Path):
+    """T-0075: the shared writer emits list fields INLINE (`[a, b]`), not block
+    style — so worker- and api-written lists are byte-shape-identical and the
+    block-vs-inline drift that hid lists from line-based readers is gone."""
+    p = tmp_path / "T-0064-inline.md"
+    write_task(p, {
+        "id": "T-0064", "title": "X", "status": "open",
+        "blocked_by": ["T-0001", "T-0002"],
+    }, "body\n")
+    raw = p.read_text()
+    assert "blocked_by: [T-0001, T-0002]" in raw
+    assert "- T-0001" not in raw
+
+
+def test_merge_heals_block_style_to_inline(tmp_path: Path):
+    """A pre-existing block-style list is rewritten inline on the next merge."""
+    p = tmp_path / "T-0065-heal.md"
+    p.write_text(
+        "---\nid: T-0065\ntitle: X\nstatus: open\n"
+        "blocked_by:\n- T-0001\n- T-0002\n---\n\nbody\n"
+    )
+    merge_task_update(p, {"status": "totest"})
+    raw = p.read_text()
+    assert "blocked_by: [T-0001, T-0002]" in raw
+    assert "- T-0001" not in raw
+    from app.markdown_parser import parse_task
+    assert parse_task(p)["blocked_by"] == ["T-0001", "T-0002"]
+
+
 # ---------------------------------------------------------------------------
 # append_comment
 # ---------------------------------------------------------------------------

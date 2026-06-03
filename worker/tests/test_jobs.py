@@ -492,6 +492,35 @@ def test_oauth_refresh_failure_pings_tg(
     assert "test failure" in fake_tg.calls[0]["text"]
 
 
+def test_oauth_refresh_failure_ping_is_urgent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0193 regression: oauth_refresh failure ping MUST be urgent=True.
+
+    An oauth-refresh failure is a P1 SYSTEM alert (once creds expire every
+    session breaks). Before the fix the failure ping went through tg.send with
+    urgent=False — the exact T-0188 class bug — so it hit the quiet-hours gate
+    (22-04 UTC) and was silently dropped. It must bypass quiet hours.
+    """
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    import bot_squad_worker.refresh_oauth as RO
+    monkeypatch.setattr(RO, "refresh_oauth", lambda _cfg: {"ok": False, "action": "failed", "detail": "creds expired"})
+
+    oauth_refresh(cfg)
+
+    assert fake_tg.calls, "oauth failure produced no tg.send call"
+    assert all(c["urgent"] is True for c in fake_tg.calls), (
+        "oauth_refresh failure ping must be urgent=True to bypass quiet hours; "
+        f"got {[(c['text'], c['urgent']) for c in fake_tg.calls]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # tg_listener_tick tests (spec #7)
 # ---------------------------------------------------------------------------

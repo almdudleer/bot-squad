@@ -313,9 +313,14 @@ def oauth_refresh(cfg: Config) -> None:
         tg = _get_tg_client(cfg)
         detail = result.get("detail", "unknown error")
         for slug, project in cfg.projects.items():
+            # urgent=True (T-0193, mirrors the T-0188 deploy fix at jobs.py:98):
+            # an oauth-refresh failure is a P1 SYSTEM alert — once creds expire
+            # every session breaks — so it must bypass the quiet-hours gate
+            # instead of being silently dropped 22-04 UTC.
             tg.send(
                 chat_id=project.tg_chat,
                 text=f"❌ oauth_refresh FAILED: {detail}",
                 sid="oauth_refresh",
+                urgent=True,
             )
             break  # ping only the first project (single TG chat for now)

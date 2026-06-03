@@ -211,6 +211,13 @@ files repeatedly, the right answer probably belongs here.
 - TG-pings on success/failure.
 - You don't manage the loop. Commit, squash, request, walk away.
 
+Hold deploys without killing the worker: `ops/bot-squad-bin/pause-deploys
+"<reason>"` writes a `PAUSED.json` marker the monitor honors — queued + new
+deploys defer silently (one TG ping at pause, no per-tick spam, queue
+preserved). `ops/bot-squad-bin/resume-deploys` clears it and the next tick
+runs. Per-project; use it to investigate, coordinate, or land a sensitive
+multi-commit ship.
+
 Manual prod release: stakeholder reviews staging → merges bot_squad/dev (or
 staging) into master → builds the prod container → deploys. Agents never
 deploy prod.

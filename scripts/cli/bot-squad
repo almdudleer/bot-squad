@@ -152,6 +152,21 @@ EOF
         echo "Created: $bin_dir/safe-commit -> $BOT_SQUAD/scripts/cli/safe-commit.sh"
     fi
 
+    # T-0094: drop ops/bot-squad-bin/{pause-deploys,resume-deploys} symlinks.
+    # pause-deploys "<reason>" writes a PAUSED.json marker so deploy_monitor
+    # defers every queued + new deploy for this project (one TG ping, no
+    # per-tick spam); resume-deploys removes it. Slug resolves from cwd.
+    if [ ! -e "$bin_dir/pause-deploys" ]; then
+        mkdir -p "$bin_dir"
+        ln -sf "$BOT_SQUAD/scripts/cli/pause-deploys.sh" "$bin_dir/pause-deploys"
+        echo "Created: $bin_dir/pause-deploys -> $BOT_SQUAD/scripts/cli/pause-deploys.sh"
+    fi
+    if [ ! -e "$bin_dir/resume-deploys" ]; then
+        mkdir -p "$bin_dir"
+        ln -sf "$BOT_SQUAD/scripts/cli/resume-deploys.sh" "$bin_dir/resume-deploys"
+        echo "Created: $bin_dir/resume-deploys -> $BOT_SQUAD/scripts/cli/resume-deploys.sh"
+    fi
+
     # T-0093: install .githooks/pre-commit (peer-activity warn) and wire
     # core.hooksPath. The hook is bot-squad-distributed (single source of
     # truth lives at $BOT_SQUAD/.githooks/pre-commit) so we copy rather

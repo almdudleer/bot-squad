@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { sessionRole, sessionRoleLabel } from "./sessionStatus";
+import {
+  isOperatorWindow,
+  operatorWindow,
+  sessionRole,
+  sessionRoleLabel,
+} from "./sessionStatus";
 
 // T-0141 — the UI must prefer the worker-derived `role` and only fall back to
 // the legacy "task-less ⟹ teamlead" inference when the field is absent.
@@ -35,5 +40,33 @@ describe("sessionRoleLabel", () => {
     expect(sessionRoleLabel("teamlead")).toBe("Teamlead");
     expect(sessionRoleLabel("dev")).toBe("Dev");
     expect(sessionRoleLabel("operator")).toBe("Operator");
+  });
+});
+
+// T-0041 — the Operator spawn option must guarantee a window that resolves to
+// the operator role (mirrors the worker _OPERATOR_WINDOW_RE = (?:^|[-_])operator$).
+describe("operatorWindow / isOperatorWindow", () => {
+  it("appends the -operator marker when absent", () => {
+    expect(operatorWindow("bot-squad")).toBe("bot-squad-operator");
+    expect(operatorWindow("ops")).toBe("ops-operator");
+  });
+
+  it("leaves an already-marked window untouched (any case / separator)", () => {
+    expect(operatorWindow("operator")).toBe("operator");
+    expect(operatorWindow("ops-operator")).toBe("ops-operator");
+    expect(operatorWindow("ops_operator")).toBe("ops_operator");
+    expect(operatorWindow("Ops_OPERATOR")).toBe("Ops_OPERATOR");
+  });
+
+  it("defaults an empty/whitespace window to 'operator'", () => {
+    expect(operatorWindow("")).toBe("operator");
+    expect(operatorWindow("   ")).toBe("operator");
+  });
+
+  it("isOperatorWindow recognises the marker, rejects coincidental suffixes", () => {
+    expect(isOperatorWindow("bot-squad-operator")).toBe(true);
+    expect(isOperatorWindow("operator")).toBe(true);
+    expect(isOperatorWindow("xoperator")).toBe(false); // no separator ⟹ not a marker
+    expect(isOperatorWindow("operator-foo")).toBe(false); // marker must be a suffix
   });
 });

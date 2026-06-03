@@ -92,3 +92,31 @@ export function sessionRoleLabel(role: SessionRoleName): string {
       return "Dev";
   }
 }
+
+// ---------------------------------------------------------------------------
+// T-0041 — operator spawn-window normalisation.
+//
+// A session's role is derived from its WINDOW NAME marker (worker
+// sessions.py::_derive_role + the SessionStart hook's bash mirror
+// scripts/hooks/derive_role.sh). A window resolves to `operator` iff it is
+// exactly "operator" or ends in "-operator" / "_operator" (case-insensitive),
+// mirroring the worker's `_OPERATOR_WINDOW_RE = (?:^|[-_])operator$`.
+//
+// The New-session modal's Operator option normalises the user's window through
+// `operatorWindow()` so picking "Operator" ALWAYS spawns a session that resolves
+// to operator.md — never a silent dev (the exact bug class T-0041 fixes on the
+// hook side).
+// ---------------------------------------------------------------------------
+const OPERATOR_WINDOW_RE = /(?:^|[-_])operator$/i;
+
+/** True when `window` already carries the operator marker. */
+export function isOperatorWindow(window: string): boolean {
+  return OPERATOR_WINDOW_RE.test(window.trim());
+}
+
+/** Normalise a window so it resolves to the operator role (appends the marker). */
+export function operatorWindow(name: string): string {
+  const base = name.trim();
+  if (!base) return "operator";
+  return OPERATOR_WINDOW_RE.test(base) ? base : `${base}-operator`;
+}

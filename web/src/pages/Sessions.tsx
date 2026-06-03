@@ -9,6 +9,7 @@ import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
 import { AutopilotDialog, type AutopilotTarget } from "../components/AutopilotDialog";
 import { Select } from "../components/Select";
 import {
+  operatorWindow,
   sessionActivity,
   sessionLabel,
   sessionRole,
@@ -113,7 +114,7 @@ export function Sessions() {
 
   // New session modal
   const [modalOpen, setModalOpen] = useState(false);
-  const [newRole, setNewRole] = useState<"teamlead" | "dev" | null>(null);
+  const [newRole, setNewRole] = useState<"operator" | "teamlead" | "dev" | null>(null);
   const [newWindow, setNewWindow] = useState("");
   const [newPrompt, setNewPrompt] = useState("");
   const [newTaskId, setNewTaskId] = useState("");
@@ -376,7 +377,7 @@ export function Sessions() {
   }
 
   function openModal(prefill?: {
-    role?: "teamlead" | "dev";
+    role?: "operator" | "teamlead" | "dev";
     taskId?: string;
     initiative?: string;
   }) {
@@ -406,7 +407,7 @@ export function Sessions() {
   // doesn't keep re-opening the modal.
   useEffect(() => {
     const roleParam = searchParams.get("role");
-    if (roleParam !== "dev" && roleParam !== "teamlead") return;
+    if (roleParam !== "dev" && roleParam !== "teamlead" && roleParam !== "operator") return;
     const taskId = searchParams.get("task") ?? undefined;
     const initiative = searchParams.get("initiative") ?? undefined;
     openModal({ role: roleParam, taskId, initiative });
@@ -896,6 +897,36 @@ export function Sessions() {
       } catch {
         // Best-effort: if the post-spawn fetch fails, fall back to the
         // regular poll loop.
+        load();
+      }
+      setModalOpen(false);
+    } catch (e: unknown) {
+      setModalError(String(e));
+    } finally {
+      setSpawning(false);
+    }
+  }
+
+  // T-0041: spawn an operator session. The window is normalised so it always
+  // carries the operator marker (…-operator) and therefore resolves to
+  // operator.md via the worker's _derive_role + the SessionStart hook — never a
+  // silent dev. Operators are not bound to a task or initiative.
+  async function handleSpawnOperator() {
+    const window = operatorWindow(newWindow);
+    setSpawning(true);
+    setModalError(null);
+    try {
+      const before = new Set((sessions ?? []).map((s) => s.sid));
+      await api.spawnSession(slug, window, newPrompt.trim() || undefined);
+      try {
+        const after = await api.sessions(slug);
+        setSessions(after);
+        setError(null);
+        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
+        if (fresh) {
+          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
+        }
+      } catch {
         load();
       }
       setModalOpen(false);
@@ -1674,6 +1705,11 @@ export function Sessions() {
             <button type="button" className="btn btn-secondary" onClick={() => setModalOpen(false)}>
               {newRole && modalInfo ? "Close" : "Cancel"}
             </button>
+            {newRole === "operator" && (
+              <button type="button" className="btn btn-primary" onClick={handleSpawnOperator} disabled={spawning}>
+                {spawning ? "Spawning…" : "Spawn operator"}
+              </button>
+            )}
             {newRole === "teamlead" && (
               <button type="button" className="btn btn-primary" onClick={handleSpawnTeamlead} disabled={spawning}>
                 {spawning ? "Spawning…" : "Spawn teamlead"}
@@ -1698,6 +1734,16 @@ export function Sessions() {
           <div className="d-flex gap-2">
             <button
               type="button"
+              className={`btn ${newRole === "operator" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
+              onClick={() => { setNewRole("operator"); setModalError(null); setModalInfo(null); }}
+            >
+              Operator
+              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
+                drives projects, spawns teamleads
+              </div>
+            </button>
+            <button
+              type="button"
               className={`btn ${newRole === "teamlead" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
               onClick={() => { setNewRole("teamlead"); setModalError(null); setModalInfo(null); }}
             >
@@ -1718,6 +1764,47 @@ export function Sessions() {
             </button>
           </div>
         </div>
+
+        {/* Step 2 (operator): Operator form. The window is normalised to carry
+            the -operator marker so the session resolves to operator.md (T-0041). */}
+        {newRole === "operator" && (
+          <>
+            <hr style={{ borderColor: "var(--mc-border)" }} />
+            <div className="mb-3">
+              <label className="form-label">
+                Window name{" "}
+                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
+                  (optional — defaults to "operator")
+                </span>
+              </label>
+              <input
+                className="form-control"
+                value={newWindow}
+                onChange={(e) => setNewWindow(e.target.value)}
+                placeholder="e.g. operator, bot-squad"
+                autoFocus
+              />
+              <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
+                Spawns as{" "}
+                <code style={{ color: "var(--mc-accent)" }}>{operatorWindow(newWindow)}</code>{" "}
+                → resolves to the operator role (operator.md).
+              </div>
+            </div>
+            <div className="mb-3">
+              <label className="form-label">
+                Initial prompt{" "}
+                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
+              </label>
+              <textarea
+                className="form-control"
+                rows={4}
+                value={newPrompt}
+                onChange={(e) => setNewPrompt(e.target.value)}
+                placeholder="Type a message to send immediately after claude starts…"
+              />
+            </div>
+          </>
+        )}
 
         {/* Step 2a: Teamlead form */}
         {newRole === "teamlead" && (

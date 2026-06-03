@@ -482,10 +482,18 @@ print_section() {
     echo "=== $1 ==="
 }
 
-# Resolve role early so per-role sections below can branch on it.
-# "dev" matches vision/roles/dev.md (workers get a task_id, TLs don't).
-ROLE="teamlead"
-[ -n "$task_id" ] && ROLE="dev"
+# Resolve role early so per-role sections below can branch on it. Role is
+# derived from the WINDOW NAME markers via bsq_derive_role — the bash mirror of
+# the worker's bot_squad_worker.sessions._derive_role (the single source of
+# truth for the role enum, T-0175). This replaces the old task_id heuristic
+# (task-less ⟹ teamlead), which mislabelled operator sessions as teamlead and
+# surfaced teamlead.md / "## Your role: TEAMLEAD" for operators (T-0041). An
+# operator window (…-operator) now correctly resolves to operator.md; a
+# teamlead window (…-TL) to teamlead.md; everything else to dev.md. So the hook
+# banner and the UI/list_sessions badge now agree byte-for-behavior.
+# shellcheck source=scripts/hooks/derive_role.sh
+. "$BOT_SQUAD/scripts/hooks/derive_role.sh"
+ROLE="$(bsq_derive_role "$src_window")"
 
 # 1. Product description (small, anchors orientation). The big stuff —
 # AGENT_INSTRUCTIONS.md and the full active-initiative spec — is pointed

@@ -11,6 +11,13 @@ import httpx
 SID_RE = re.compile(r"\[(S-[A-Za-z0-9_-]+?-p\d+)")
 
 
+def _proxy_kwargs(cfg) -> dict:
+    """T-0194: ``{"proxy": url}`` when a per-installation TG proxy is set, else
+    ``{}`` — so the no-proxy httpx call shape (and trust_env) is unchanged."""
+    proxy = getattr(cfg, "tg_proxy_url", "") or ""
+    return {"proxy": proxy} if proxy else {}
+
+
 def _last_update_id_path(cfg) -> Path:
     return cfg.data_dir / "_worker" / "tg_last_update_id"
 
@@ -41,8 +48,11 @@ def poll_updates(cfg, last_update_id: int, timeout: int = 25) -> list[dict]:
         "timeout": timeout,
         "allowed_updates": ["message"],
     }
+    # T-0194: route inbound long-poll through the per-installation TG proxy when
+    # set (mirrors tg.py egress). Only passed when configured.
+    extra = _proxy_kwargs(cfg)
     try:
-        r = httpx.get(url, params=params, timeout=timeout + 5)
+        r = httpx.get(url, params=params, timeout=timeout + 5, **extra)
         r.raise_for_status()
         return r.json().get("result", [])
     except (httpx.HTTPError, ValueError):
@@ -166,8 +176,9 @@ def _notify(cfg, chat_id: str, message: str) -> None:
     if not cfg.tg_bot_token:
         return
     url = f"https://api.telegram.org/bot{cfg.tg_bot_token}/sendMessage"
+    extra = _proxy_kwargs(cfg)
     try:
-        httpx.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
+        httpx.post(url, data={"chat_id": chat_id, "text": message}, timeout=10, **extra)
     except httpx.HTTPError:
         pass
 

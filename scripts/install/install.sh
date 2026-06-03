@@ -72,6 +72,17 @@ BOTSQUAD_NONINTERACTIVE="${BOTSQUAD_NONINTERACTIVE:-0}"
 BOTSQUAD_PROXY_APT_CONF="${BOTSQUAD_PROXY_APT_CONF:-/etc/apt/apt.conf.d/01proxy}"
 BOTSQUAD_CLAUDE_SETTINGS="${BOTSQUAD_CLAUDE_SETTINGS:-${HOME}/.claude/settings.json}"
 BOTSQUAD_PROXY_PROBE_CMD="${BOTSQUAD_PROXY_PROBE_CMD:-}"
+# T-0194: per-installation Telegram egress proxy, distinct from the general
+# install-time proxy above. The general proxy wires apt/npm/curl/claude; this
+# one is the RUNTIME config the worker (tg.py + tg_listener) reads to route
+# Telegram API calls — the durable, TG-only replacement for the blunt global
+# HTTPS_PROXY on the worker unit (T-0192). Set via --tg-proxy-url=<url> (parsed
+# into this env) or directly. Empty/unset → no TG proxy (direct egress).
+# Validated as socks5(h)://, http://, or https://; written to the install's
+# config/system_settings.toml [tg].proxy_url by the tg_proxy checkpoint.
+#   BOTSQUAD_TG_PROXY_PY — python interpreter override (test seam); default
+#                          prefers the worker venv python, then host python3.
+BOTSQUAD_TG_PROXY_PY="${BOTSQUAD_TG_PROXY_PY:-}"
 # install_docker checkpoint seams. Override target paths if needed (tests
 # redirect these into a temp dir):
 #   BOTSQUAD_DOCKER_GPG_KEYRING — keyring sink (default
@@ -1066,6 +1077,106 @@ EOF
   chmod 0640 "$ENV_FILE"
 }
 
+# --- tg_proxy checkpoint (T-0194) --------------------------------------------
+#
+# Seeds the per-installation Telegram egress proxy into the install's
+# config/system_settings.toml under [tg].proxy_url — the same key the worker's
+# Config.load() reads and the admin Settings UI writes. Merges (preserves any
+# other keys an admin already set via the UI) rather than clobbering; idempotent
+# (re-run with the same URL leaves the file's mtime alone). Empty/unset env →
+# no-op (no proxy configured).
+
+# Pick a python with tomllib (3.11+). Test seam wins; else worker venv; else host.
+tg_proxy_python() {
+  if [[ -n "$BOTSQUAD_TG_PROXY_PY" ]]; then
+    printf '%s' "$BOTSQUAD_TG_PROXY_PY"; return 0
+  fi
+  local venv_py="$BOTSQUAD_INSTALL_DIR/worker/.venv/bin/python"
+  if [[ -x "$venv_py" ]]; then printf '%s' "$venv_py"; return 0; fi
+  if command -v python3 >/dev/null 2>&1; then printf '%s' python3; return 0; fi
+  return 1
+}
+
+step_tg_proxy() {
+  if [[ "${BOTSQUAD_TG_PROXY_URL:-}" = "" ]]; then
+    log "no TG egress proxy configured (BOTSQUAD_TG_PROXY_URL unset/empty)"
+    return 0
+  fi
+  local url="$BOTSQUAD_TG_PROXY_URL"
+  # Validate scheme — mirror api routes_settings._PROXY_RE and the UI's PROXY_RE.
+  if [[ ! "$url" =~ ^(socks5h?|https?):// ]]; then
+    die_struct tg_proxy \
+      "TG proxy URL '$url' is not valid." \
+      "Use socks5://, http://, or https:// — e.g.
+  --tg-proxy-url=http://153.80.195.83:8888
+Unset it (or pass an empty value) to configure no TG proxy."
+  fi
+  local cfg_dir="$BOTSQUAD_INSTALL_DIR/config"
+  local settings="$cfg_dir/system_settings.toml"
+  if [[ ! -d "$cfg_dir" ]]; then
+    mkdir -p "$cfg_dir" 2>/dev/null || sudo mkdir -p "$cfg_dir" \
+      || die_struct tg_proxy "Could not create $cfg_dir." \
+         "Check permissions on $BOTSQUAD_INSTALL_DIR (the clone_repo +
+install_dir checkpoints should have created it group-writable)."
+  fi
+  local py
+  py="$(tg_proxy_python)" || die_struct tg_proxy \
+    "No python3 with tomllib available to merge $settings." \
+    "Ensure the python_venv checkpoint succeeded (it provisions
+$BOTSQUAD_INSTALL_DIR/worker/.venv), or install a system python3 (>=3.11)."
+  # Merge proxy_url into [tg], preserving other keys; idempotent write.
+  BOTSQUAD_TG_PROXY_URL="$url" "$py" - "$settings" <<'PY' || die_struct tg_proxy \
+    "Failed to write proxy_url into the system settings file." \
+    "Inspect the python error above. Check that $BOTSQUAD_INSTALL_DIR/config
+is writable by the installing user."
+import os, sys, tomllib
+
+path = sys.argv[1]
+url = os.environ["BOTSQUAD_TG_PROXY_URL"]
+
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except FileNotFoundError:
+    data = {}
+
+data.setdefault("tg", {})["proxy_url"] = url
+
+def emit(d):
+    # One-level tables of scalars — matches the system_settings schema.
+    out = ["# bot-squad system settings. Managed by /api/system-settings + installer (T-0194)."]
+    for table, body in d.items():
+        if not isinstance(body, dict):
+            continue
+        out.append("")
+        out.append(f"[{table}]")
+        for k, v in body.items():
+            if isinstance(v, bool):
+                out.append(f"{k} = {'true' if v else 'false'}")
+            elif isinstance(v, (int, float)):
+                out.append(f"{k} = {v}")
+            else:
+                s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+                out.append(f'{k} = "{s}"')
+    out.append("")
+    return "\n".join(out)
+
+new = emit(data)
+old = None
+try:
+    with open(path) as f:
+        old = f.read()
+except FileNotFoundError:
+    pass
+if new != old:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    os.replace(tmp, path)
+PY
+  log "TG egress proxy written to $settings ([tg].proxy_url=$url)"
+}
+
 step_mothership_handshake() {
   if [[ "$BOTSQUAD_SKIP_MOTHERSHIP" = "1" ]]; then
     log "skipping mothership handshake (BOTSQUAD_SKIP_MOTHERSHIP=1)"
@@ -1627,6 +1738,7 @@ INSTALL_STEPS=(
   render_env
   mothership_handshake
   python_venv
+  tg_proxy
   systemd_unit
   per_user_worker_unit
   install_reverse_proxy
@@ -1658,7 +1770,22 @@ NIXOS_STEPS=(
 # sourced-without-main test (smoke_engine.sh) sees the historical array.
 STEPS=("${INSTALL_STEPS[@]}")
 
+# Parse the handful of CLI flags the installer accepts. Everything else is
+# env-driven; flags are sugar that set the matching BOTSQUAD_* env var so the
+# checkpoints read them uniformly. Unknown args are ignored (forward-compatible
+# with mothership-appended flags). T-0194: --tg-proxy-url.
+parse_cli_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tg-proxy-url=*) export BOTSQUAD_TG_PROXY_URL="${1#*=}"; shift ;;
+      --tg-proxy-url)   export BOTSQUAD_TG_PROXY_URL="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+}
+
 main() {
+  parse_cli_args "$@"
   ensure_state_dir
   # Pick the chain. Three signals, evaluated in order:
   #   1. invite-token prefix (bsq_invite_*) → INVITE_STEPS

@@ -36,9 +36,10 @@ def test_prefix_user_only_no_prefix():
 # ---------------------------------------------------------------------------
 
 class _FakeCfg:
-    def __init__(self, token: str, data_dir: Path) -> None:
+    def __init__(self, token: str, data_dir: Path, proxy_url: str = "") -> None:
         self.tg_bot_token = token
         self.data_dir = data_dir
+        self.tg_proxy_url = proxy_url
 
 
 def test_send_returns_false_when_no_token(tmp_path: Path) -> None:
@@ -185,6 +186,46 @@ def test_post_omits_message_thread_id_when_no_topic(tmp_path: Path) -> None:
     with patch("httpx.post", side_effect=fake_httpx_post):
         client._post(chat_id="123", text="body")
     assert "message_thread_id" not in captured["json"]
+
+
+# ---------------------------------------------------------------------------
+# T-0194: per-installation TG egress proxy — _post routes through cfg.tg_proxy_url
+# ---------------------------------------------------------------------------
+
+def test_post_passes_proxy_when_configured(tmp_path: Path) -> None:
+    """When cfg.tg_proxy_url is set, _post must hand it to httpx.post as proxy=."""
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None, proxy=None):  # noqa: A002
+        captured["proxy"] = proxy
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path, proxy_url="http://153.80.195.83:8888")
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="123", text="body")
+    assert captured["proxy"] == "http://153.80.195.83:8888"
+
+
+def test_post_omits_proxy_when_not_configured(tmp_path: Path) -> None:
+    """No proxy configured → httpx.post is called WITHOUT a proxy kwarg, so
+    trust_env behaviour (and the existing fakes) stay intact."""
+    captured: dict = {}
+
+    # Sig deliberately lacks proxy: a proxy kwarg would raise TypeError here.
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["called"] = True
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)  # no proxy
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="123", text="body")
+    assert captured.get("called") is True
 
 
 # ---------------------------------------------------------------------------

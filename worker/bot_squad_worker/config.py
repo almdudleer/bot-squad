@@ -122,6 +122,14 @@ class Config:
     # ``{session}`` are substituted when present. Empty → fall back to a
     # ``tmux attach -t <session>`` hint.
     tg_remote_control_url: str = ""
+    # T-0194: per-installation Telegram egress proxy. When set, ALL Telegram API
+    # calls (tg.py send + tg_listener getUpdates/sendMessage) route through this
+    # proxy — the durable, TG-only replacement for the blunt global HTTPS_PROXY
+    # env on the worker systemd unit (the T-0192 lift-and-shift). socks5://,
+    # http://, or https://. Loaded from system_settings.toml [tg].proxy_url.
+    # Empty → direct egress (httpx trust_env still applies). socks5:// needs the
+    # httpx[socks] extra (a worker dependency).
+    tg_proxy_url: str = ""
 
     @property
     def data_dir(self) -> Path:
@@ -160,6 +168,7 @@ class Config:
         stall_minutes = 15
         remote_control_url = ""
         default_chat_id = ""
+        proxy_url = ""
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -169,6 +178,7 @@ class Config:
             stall_minutes = int(tg_block.get("stall_minutes", stall_minutes))
             remote_control_url = str(tg_block.get("remote_control_url", remote_control_url))
             default_chat_id = str(tg_block.get("default_chat_id", default_chat_id))
+            proxy_url = str(tg_block.get("proxy_url", proxy_url))
 
         return cls(
             config_dir=config_dir,
@@ -180,4 +190,5 @@ class Config:
             tg_stall_minutes=stall_minutes,
             tg_remote_control_url=remote_control_url,
             tg_default_chat_id=default_chat_id,
+            tg_proxy_url=proxy_url,
         )

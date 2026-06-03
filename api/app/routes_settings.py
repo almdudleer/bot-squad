@@ -17,6 +17,10 @@ router = APIRouter(
 )
 
 _TTL_RE = re.compile(r"^\d+[smhd]$")
+# T-0194: accepted per-installation TG egress proxy schemes. socks5h:// is the
+# DNS-through-proxy variant httpx also supports; http(s):// + socks5:// are the
+# DoD set. Empty string = direct egress (no proxy).
+_PROXY_RE = re.compile(r"^(socks5h?|https?)://.+", re.IGNORECASE)
 
 _DEFAULTS = {
     "tg": {
@@ -25,6 +29,9 @@ _DEFAULTS = {
         # T-0171: per-server default Telegram chat id, used by the local
         # (detached / standalone) bot when a notify has no explicit chat/slug.
         "default_chat_id": "",
+        # T-0194: per-installation TG egress proxy (socks5/http/https). Empty →
+        # direct. Consumed by the worker's tg.py + tg_listener.
+        "proxy_url": "",
     },
     "session": {"ttl": "7d"},
     "admin": {"coordinator_user": "almdudleer"},
@@ -82,6 +89,7 @@ def _read_system_settings(config_dir: Path) -> dict:
             "default_chat_id": str(
                 tg.get("default_chat_id", _DEFAULTS["tg"]["default_chat_id"])
             ),
+            "proxy_url": str(tg.get("proxy_url", _DEFAULTS["tg"]["proxy_url"])),
         },
         "session": {"ttl": str(sess.get("ttl", _DEFAULTS["session"]["ttl"]))},
         "admin": {
@@ -100,6 +108,7 @@ def _write_system_settings(config_dir: Path, settings: dict) -> None:
     out.append(f"quiet_hours_start_utc = {int(settings['tg']['quiet_hours_start_utc'])}")
     out.append(f"quiet_hours_end_utc = {int(settings['tg']['quiet_hours_end_utc'])}")
     out.append(f'default_chat_id = "{_toml_escape(str(settings["tg"]["default_chat_id"]))}"')
+    out.append(f'proxy_url = "{_toml_escape(str(settings["tg"]["proxy_url"]))}"')
     out.append("")
     out.append("[session]")
     out.append(f'ttl = "{_toml_escape(settings["session"]["ttl"])}"')
@@ -150,6 +159,9 @@ def _shape(config_dir: Path) -> dict:
         "tg": {
             "bot_token_set": _bot_token_set(config_dir),
             "default_chat_id": s["tg"]["default_chat_id"],
+            # T-0194: per-installation TG egress proxy. NOT mothership-locked —
+            # it's a host-network concern independent of whose bot token routes.
+            "proxy_url": s["tg"]["proxy_url"],
             "quiet_hours_start_utc": s["tg"]["quiet_hours_start_utc"],
             "quiet_hours_end_utc": s["tg"]["quiet_hours_end_utc"],
             # T-0171: when this server is an attached mothership consumer, the
@@ -199,6 +211,20 @@ def put_settings(request: Request, payload: dict) -> dict:
         if not isinstance(v, str):
             raise HTTPException(status_code=400, detail="tg.default_chat_id must be a string")
         current["tg"]["default_chat_id"] = v.strip()
+
+    # T-0194: per-installation TG egress proxy. Not mothership-locked (host
+    # network concern). Empty clears it; otherwise must be socks5/http(s)://.
+    if "proxy_url" in tg_in:
+        v = tg_in["proxy_url"]
+        if not isinstance(v, str):
+            raise HTTPException(status_code=400, detail="tg.proxy_url must be a string")
+        v = v.strip()
+        if v and not _PROXY_RE.match(v):
+            raise HTTPException(
+                status_code=400,
+                detail="tg.proxy_url must be socks5://, http://, or https:// (or empty)",
+            )
+        current["tg"]["proxy_url"] = v
 
     if "quiet_hours_start_utc" in tg_in:
         v = tg_in["quiet_hours_start_utc"]

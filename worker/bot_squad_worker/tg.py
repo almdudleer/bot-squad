@@ -39,6 +39,9 @@ class TgClient:
         self._cooldown: int = cooldown_sec
         self._quiet_start_utc: int = getattr(cfg, "tg_quiet_hours_start_utc", 17)
         self._quiet_end_utc: int = getattr(cfg, "tg_quiet_hours_end_utc", 5)
+        # T-0194: per-installation TG egress proxy (socks5/http/https). Empty →
+        # direct. Routed only here so non-TG worker egress stays un-proxied.
+        self._proxy: str = getattr(cfg, "tg_proxy_url", "") or ""
 
     # ------------------------------------------------------------------
     # Public API
@@ -113,10 +116,14 @@ class TgClient:
         payload: dict = {"chat_id": chat_id, "text": text}
         if topic_id is not None:
             payload["message_thread_id"] = topic_id
+        # T-0194: pass proxy= only when configured, so the no-proxy call shape
+        # (and httpx trust_env) is unchanged.
+        extra = {"proxy": self._proxy} if self._proxy else {}
         resp = httpx.post(
             url,
             json=payload,
             timeout=10,
+            **extra,
         )
         resp.raise_for_status()
         data = resp.json()

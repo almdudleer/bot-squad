@@ -175,6 +175,72 @@ def test_put_default_chat_id_roundtrip(tmp_bot_squad: Path, monkeypatch) -> None
         assert client.get("/api/system-settings").json()["tg"]["default_chat_id"] == "404580642"
 
 
+def test_tg_proxy_url_default_empty(tmp_bot_squad: Path, monkeypatch) -> None:
+    # T-0194: no system_settings.toml → proxy is empty (direct egress).
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        body = client.get("/api/system-settings").json()
+    assert body["tg"]["proxy_url"] == ""
+
+
+def test_put_tg_proxy_url_roundtrip(tmp_bot_squad: Path, monkeypatch) -> None:
+    # T-0194: admin sets + persists + clears the per-installation TG proxy.
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            "/api/system-settings",
+            json={"tg": {"proxy_url": "http://153.80.195.83:8888"}},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["tg"]["proxy_url"] == "http://153.80.195.83:8888"
+        raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
+        assert raw["tg"]["proxy_url"] == "http://153.80.195.83:8888"
+        assert client.get("/api/system-settings").json()["tg"]["proxy_url"] == "http://153.80.195.83:8888"
+        # socks5:// is accepted too
+        assert client.put(
+            "/api/system-settings", json={"tg": {"proxy_url": "socks5://10.0.0.1:1080"}}
+        ).status_code == 200
+        # cleared back to direct
+        r = client.put("/api/system-settings", json={"tg": {"proxy_url": ""}})
+        assert r.status_code == 200
+        assert r.json()["tg"]["proxy_url"] == ""
+
+
+def test_put_tg_proxy_url_rejects_bad_scheme(tmp_bot_squad: Path, monkeypatch) -> None:
+    # T-0194: only socks5://, http://, https:// (or empty) are valid.
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        assert client.put(
+            "/api/system-settings", json={"tg": {"proxy_url": "ftp://nope"}}
+        ).status_code == 400
+        assert client.put(
+            "/api/system-settings", json={"tg": {"proxy_url": "153.80.195.83:8888"}}
+        ).status_code == 400
+
+
+def test_tg_proxy_url_editable_while_attached(tmp_bot_squad: Path, monkeypatch) -> None:
+    # T-0194: the proxy is a host-network egress concern, independent of whose
+    # bot token is used — so it is NOT locked while attached to a mothership.
+    _set_env(monkeypatch, tmp_bot_squad)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mom.example/")
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        # token + default_chat are locked (409) but proxy_url saves fine.
+        assert client.put("/api/system-settings", json={"tg": {"bot_token": "x"}}).status_code == 409
+        r = client.put(
+            "/api/system-settings", json={"tg": {"proxy_url": "http://153.80.195.83:8888"}}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["tg"]["proxy_url"] == "http://153.80.195.83:8888"
+
+
 def test_managed_when_attached_consumer_and_writes_refused(tmp_bot_squad: Path, monkeypatch) -> None:
     _set_env(monkeypatch, tmp_bot_squad)
     # Attached consumer: not the mothership, but pointed at one.

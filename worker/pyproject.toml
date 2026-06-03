@@ -6,7 +6,9 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "apscheduler>=3.10",
-    "httpx>=0.27",
+    # T-0194: [socks] extra pulls in socksio so cfg.tg_proxy_url may be a
+    # socks5:// proxy (http(s):// work without it). Used by tg.py + tg_listener.
+    "httpx[socks]>=0.27",
 ]
 
 [project.optional-dependencies]

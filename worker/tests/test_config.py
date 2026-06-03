@@ -61,6 +61,21 @@ def test_default_chat_id_from_system_settings(tmp_config_dir: Path) -> None:
     assert cfg.tg_default_chat_id == "404580642"
 
 
+def test_tg_proxy_url_default_empty(tmp_config_dir: Path) -> None:
+    # T-0194: absent system_settings.toml → no TG egress proxy (direct).
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_proxy_url == ""
+
+
+def test_tg_proxy_url_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0194: admin sets a per-installation TG egress proxy via [tg].proxy_url.
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[tg]\nproxy_url = "http://153.80.195.83:8888"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_proxy_url == "http://153.80.195.83:8888"
+
+
 def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
     # T-0155: admin overrides via [tg] in system_settings.toml.
     (tmp_config_dir / "system_settings.toml").write_text(

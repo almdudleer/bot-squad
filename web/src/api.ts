@@ -320,6 +320,9 @@ export type SystemSettings = {
     bot_token_set: boolean;
     // T-0171: per-server default chat for the local bot (detached/standalone).
     default_chat_id: string;
+    // T-0194: per-installation TG egress proxy (socks5/http/https), or "" for
+    // direct. NOT mothership-locked — it's a host-network egress concern.
+    proxy_url: string;
     quiet_hours_start_utc: number;
     quiet_hours_end_utc: number;
     // T-0171: when this server is an attached mothership consumer, the per-server
@@ -336,6 +339,7 @@ export type PutSystemSettingsBody = {
   tg?: {
     bot_token?: string;
     default_chat_id?: string;
+    proxy_url?: string;
     quiet_hours_start_utc?: number;
     quiet_hours_end_utc?: number;
   };

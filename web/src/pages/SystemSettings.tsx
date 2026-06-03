@@ -5,6 +5,8 @@ import { Modal } from "../components/Modal";
 import { Coachmark } from "../onboarding";
 
 const TTL_RE = /^\d+[smhd]$/;
+// T-0194: socks5(h)/http(s) — mirrors the API's _PROXY_RE. Empty = direct.
+const PROXY_RE = /^(socks5h?|https?):\/\/.+/i;
 
 export function SystemSettings() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -17,6 +19,7 @@ export function SystemSettings() {
   const [botToken, setBotToken] = useState<string>("");
   const [showToken, setShowToken] = useState(false);
   const [defaultChatId, setDefaultChatId] = useState<string>("");
+  const [proxyUrl, setProxyUrl] = useState<string>("");
   const [quietStart, setQuietStart] = useState<number>(17);
   const [quietEnd, setQuietEnd] = useState<number>(5);
   const [ttl, setTtl] = useState<string>("7d");
@@ -31,6 +34,7 @@ export function SystemSettings() {
         setQuietStart(s.tg.quiet_hours_start_utc);
         setQuietEnd(s.tg.quiet_hours_end_utc);
         setDefaultChatId(s.tg.default_chat_id);
+        setProxyUrl(s.tg.proxy_url);
         setTtl(s.session.ttl);
         setCoordUser(s.admin.coordinator_user);
       })
@@ -57,6 +61,9 @@ export function SystemSettings() {
     if (!TTL_RE.test(ttl)) {
       return "session TTL must match ^\\d+[smhd]$ (e.g. 7d, 24h, 30m)";
     }
+    if (proxyUrl.trim() && !PROXY_RE.test(proxyUrl.trim())) {
+      return "TG proxy URL must be socks5://, http://, or https:// (or empty)";
+    }
     if (!coordUser.trim()) {
       return "coordinator linux user must not be empty";
     }
@@ -80,6 +87,8 @@ export function SystemSettings() {
         tg: {
           quiet_hours_start_utc: quietStart,
           quiet_hours_end_utc: quietEnd,
+          // T-0194: proxy_url is NOT mothership-locked — always sent.
+          proxy_url: proxyUrl.trim(),
           ...(managed
             ? {}
             : {
@@ -226,6 +235,28 @@ export function SystemSettings() {
             <small style={{ display: "block", color: "var(--mc-text-dim)" }}>
               Default Telegram chat for notifications that aren't bound to a
               project. Used by this server's own bot when detached.
+            </small>
+
+            {/* T-0194: per-installation TG egress proxy. NOT mothership-locked —
+                it's a host-network concern (some hosts DPI-block Telegram, T-0192).
+                Routes ONLY the worker's Telegram traffic through the proxy. */}
+            <label className="form-label mt-3" style={{ fontSize: "0.72rem" }}>
+              Egress proxy URL
+            </label>
+            <input
+              type="text"
+              className="form-control"
+              value={proxyUrl}
+              onChange={(e) => setProxyUrl(e.target.value)}
+              placeholder="e.g. http://153.80.195.83:8888 or socks5://host:1080"
+              data-testid="tg-proxy-url"
+              style={{ width: "24rem", fontFamily: "var(--mc-mono)" }}
+            />
+            <small style={{ display: "block", color: "var(--mc-text-dim)" }}>
+              Route this server's Telegram traffic through a proxy
+              (<code>socks5://</code>, <code>http://</code>, or <code>https://</code>).
+              Use when the host can't reach api.telegram.org directly. Leave blank
+              for direct egress. Restart the worker after saving.
             </small>
           </section>
 

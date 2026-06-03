@@ -15,7 +15,13 @@ import bot_squad_worker.tg_listener as TL
 # ---------------------------------------------------------------------------
 
 
-def _make_cfg(tmp_path: Path, *, bot_token: str = "TESTBOT:TOKEN", tg_chat: str = "12345"):
+def _make_cfg(
+    tmp_path: Path,
+    *,
+    bot_token: str = "TESTBOT:TOKEN",
+    tg_chat: str = "12345",
+    proxy_url: str = "",
+):
     """Build a minimal config-like namespace for tg_listener tests."""
     data_dir = tmp_path / "data"
     (data_dir / "_worker").mkdir(parents=True)
@@ -24,6 +30,7 @@ def _make_cfg(tmp_path: Path, *, bot_token: str = "TESTBOT:TOKEN", tg_chat: str 
         tg_bot_token=bot_token,
         data_dir=data_dir,
         projects={"test-project": proj},
+        tg_proxy_url=proxy_url,
     )
 
 
@@ -321,3 +328,55 @@ def test_tick_bad_update_does_not_poison_offset(tmp_path, monkeypatch):
     # max_id should still be 201
     assert result["max_update_id"] == 201
     assert TL._read_last_update_id(cfg) == 201
+
+
+# ---------------------------------------------------------------------------
+# T-0194: per-installation TG egress proxy — getUpdates + _notify route through
+# cfg.tg_proxy_url when set.
+# ---------------------------------------------------------------------------
+
+
+def test_poll_updates_passes_proxy_when_configured(tmp_path):
+    cfg = _make_cfg(tmp_path, proxy_url="http://153.80.195.83:8888")
+    captured: dict = {}
+
+    def fake_get(url, params=None, timeout=None, proxy=None):
+        captured["proxy"] = proxy
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"result": []}
+        return resp
+
+    with patch("httpx.get", side_effect=fake_get):
+        TL.poll_updates(cfg, 0, timeout=1)
+    assert captured["proxy"] == "http://153.80.195.83:8888"
+
+
+def test_poll_updates_omits_proxy_when_not_configured(tmp_path):
+    cfg = _make_cfg(tmp_path)  # no proxy
+    captured: dict = {}
+
+    # Sig lacks proxy: a proxy kwarg would raise TypeError here.
+    def fake_get(url, params=None, timeout=None):
+        captured["called"] = True
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"result": []}
+        return resp
+
+    with patch("httpx.get", side_effect=fake_get):
+        TL.poll_updates(cfg, 0, timeout=1)
+    assert captured.get("called") is True
+
+
+def test_notify_passes_proxy_when_configured(tmp_path):
+    cfg = _make_cfg(tmp_path, proxy_url="socks5://10.0.0.1:1080")
+    captured: dict = {}
+
+    def fake_post(url, data=None, timeout=None, proxy=None):
+        captured["proxy"] = proxy
+        return MagicMock()
+
+    with patch("httpx.post", side_effect=fake_post):
+        TL._notify(cfg, "12345", "hello")
+    assert captured["proxy"] == "socks5://10.0.0.1:1080"

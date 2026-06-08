@@ -158,3 +158,20 @@ def test_constant_team_stems_empty_when_none_flagged(cfg_slug):
     cfg, slug, _ = cfg_slug
     _write_initiative(cfg, slug, "operator-ux", {})
     assert ct.constant_team_stems(cfg, slug) == set()
+
+
+def test_read_frontmatter_strips_yaml_quotes(cfg_slug, tmp_path):
+    """T-0200: a YAML-quoted scalar must not keep its quotes — a stray `"` in
+    `name`/`team_window` is the literal-quote escape bug's origin."""
+    p = tmp_path / "quoted.md"
+    p.write_text(
+        '---\n'
+        'name: "prod-support"\n'
+        "team_window: 'prod-support'\n"
+        'team_size: 1\n'
+        '---\n\n# body\n'
+    )
+    fm = ct._read_frontmatter(p)
+    assert fm["name"] == "prod-support"
+    assert fm["team_window"] == "prod-support"
+    assert fm["team_size"] == "1"

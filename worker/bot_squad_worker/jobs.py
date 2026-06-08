@@ -179,6 +179,11 @@ def binding_gc_tick(cfg: Config) -> None:
       5. ``reconcile_teams`` (T-0142) — rebuild the tmux-session-keyed Team mds
          from the (now-reconciled) SessionMd registry so the team roster, TL
          slot, and archived members survive a worker reload.
+      6. ``gc_tmux_sessions`` (T-0200) — reap idle, empty per-initiative/per-team
+         tmux sessions (``<slug>-*`` with no live claude pane, idle past the
+         grace) so they stop cluttering the host's ``tmux ls``. Runs after
+         ``reconcile_teams`` so the durable Team md is already written before its
+         (now-idle) tmux shell is removed.
 
     ``gc_sessions`` runs first so the freshly-suspended sessions inform the
     stale-binding race resolution (a live-pane claimant beats a dead one);
@@ -197,6 +202,10 @@ def binding_gc_tick(cfg: Config) -> None:
         ("gc_stale_bindings", _sessions.gc_stale_bindings),
         ("archive_dead_teammates", _sessions.archive_dead_teammates),
         ("reconcile_teams", _teams.reconcile_teams),
+        # T-0200: reap idle empty per-initiative/per-team tmux sessions after the
+        # Team md is rebuilt, so the durable entity survives while the empty tmux
+        # shell is cleaned up.
+        ("gc_tmux_sessions", _sessions.gc_tmux_sessions),
         # T-0151: harvest stakeholder guidance from freshly-suspended sessions
         # into their ticket (runs after gc_sessions has flipped them suspended).
         ("harvest_guidance", _close_hook.harvest_tick),

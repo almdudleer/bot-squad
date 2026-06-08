@@ -1095,6 +1095,208 @@ def test_tmux_session_name_with_initiative_appends_stem():
     assert _tmux_session_name("p", "a.b.md") == "p-a.b"
 
 
+# ---------------------------------------------------------------------------
+# T-0200: tmux session name sanitisation (the literal-quote escape bug)
+# ---------------------------------------------------------------------------
+
+def test_tmux_session_name_strips_shell_unsafe_chars():
+    """T-0200: a quoted initiative must not leak a literal quote into the tmux
+    session name. The live incident produced `bot-squad-"prod-support` from an
+    initiative value of `"prod-support.md`. The derived session name is now
+    sanitised to [A-Za-z0-9._-] so no quote / space / shell metachar survives.
+    """
+    from bot_squad_worker.sessions import _tmux_session_name
+    assert _tmux_session_name("bot-squad", '"prod-support.md') == "bot-squad-prod-support"
+    assert _tmux_session_name("bot-squad", 'prod support.md') == "bot-squad-prodsupport"
+    assert _tmux_session_name("bot-squad", "feat$(rm).md") == "bot-squad-featrm"
+    # A stem that sanitises to empty falls back to the main session.
+    assert _tmux_session_name("bot-squad", '".md') == "bot-squad"
+
+
+# ---------------------------------------------------------------------------
+# T-0200: gc_tmux_sessions — reap idle empty per-initiative/per-team sessions
+# ---------------------------------------------------------------------------
+
+def _ls_line(name: str, activity: int) -> str:
+    return f"{name}|{activity}"
+
+
+def test_gc_tmux_sessions_reaps_empty_idle_sibling(tmp_path, monkeypatch):
+    """An `<slug>-*` session with 0 live claude panes, idle past the grace, is
+    killed. The on-disk team md is NOT this function's concern."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+
+    killed: list[str] = []
+
+    # Empty sibling holds only an _init bash pane rooted in the repo.
+    panes = [
+        PaneInfo(pane_id="%1", window="_init", pid="1", cwd=str(repo),
+                 command="bash", session="test-project-ghost"),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+
+    def fake_run(args, **kwargs):
+        if "list-sessions" in args:
+            return subprocess.CompletedProcess(
+                args, 0, _ls_line("test-project-ghost", 1000) + "\n", "")
+        if "kill-session" in args:
+            killed.append(args[args.index("-t") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S.time, "time", lambda: 1000 + 7200)  # 2h later
+
+    res = S.gc_tmux_sessions(cfg, "test-project")
+    assert res["ok"] is True
+    assert res["reaped"] == ["test-project-ghost"]
+    assert killed == ["test-project-ghost"]
+
+
+def test_gc_tmux_sessions_spares_staffed_sibling(tmp_path, monkeypatch):
+    """A sibling session with a live claude pane is NEVER reaped, even idle."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+
+    killed: list[str] = []
+    panes = [
+        PaneInfo(pane_id="%1", window="_init", pid="1", cwd=str(repo),
+                 command="bash", session="test-project-feat"),
+        PaneInfo(pane_id="%2", window="dev", pid="2", cwd=str(repo),
+                 command="claude", session="test-project-feat"),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+
+    def fake_run(args, **kwargs):
+        if "list-sessions" in args:
+            return subprocess.CompletedProcess(
+                args, 0, _ls_line("test-project-feat", 1) + "\n", "")
+        if "kill-session" in args:
+            killed.append(args[args.index("-t") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S.time, "time", lambda: 999999)
+
+    res = S.gc_tmux_sessions(cfg, "test-project")
+    assert res["reaped"] == []
+    assert killed == []
+
+
+def test_gc_tmux_sessions_never_reaps_main_or_other_projects(tmp_path, monkeypatch):
+    """The bare `<slug>` main session and other projects' sessions are untouched,
+    even when empty/idle."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+
+    killed: list[str] = []
+    panes = [
+        # main session, empty (only _init) but must be spared
+        PaneInfo(pane_id="%1", window="_init", pid="1", cwd=str(repo),
+                 command="bash", session="test-project"),
+        # a different project's session, coincidentally prefix-ish
+        PaneInfo(pane_id="%2", window="_init", pid="2", cwd="/somewhere/else",
+                 command="bash", session="other-project-x"),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+
+    def fake_run(args, **kwargs):
+        if "list-sessions" in args:
+            return subprocess.CompletedProcess(
+                args, 0,
+                _ls_line("test-project", 1) + "\n" + _ls_line("other-project-x", 1) + "\n",
+                "")
+        if "kill-session" in args:
+            killed.append(args[args.index("-t") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S.time, "time", lambda: 999999)
+
+    res = S.gc_tmux_sessions(cfg, "test-project")
+    assert res["reaped"] == []
+    assert killed == []
+
+
+def test_gc_tmux_sessions_spares_recent_empty_sibling(tmp_path, monkeypatch):
+    """A freshly-created empty sibling (mid-spawn) is within the idle grace and
+    must survive — this is what prevents the GC racing a just-spawned team."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+
+    killed: list[str] = []
+    panes = [
+        PaneInfo(pane_id="%1", window="_init", pid="1", cwd=str(repo),
+                 command="bash", session="test-project-fresh"),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+
+    def fake_run(args, **kwargs):
+        if "list-sessions" in args:
+            return subprocess.CompletedProcess(
+                args, 0, _ls_line("test-project-fresh", 1000) + "\n", "")
+        if "kill-session" in args:
+            killed.append(args[args.index("-t") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    # Only 5 minutes later — inside the default 1h grace.
+    monkeypatch.setattr(S.time, "time", lambda: 1000 + 300)
+
+    res = S.gc_tmux_sessions(cfg, "test-project")
+    assert res["reaped"] == []
+    assert killed == []
+
+
+def test_gc_tmux_sessions_spares_empty_session_rooted_elsewhere(tmp_path, monkeypatch):
+    """Safety gate: a `<slug>-`prefixed session whose panes are NOT rooted in
+    the project repo is spared (it isn't ours)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+
+    killed: list[str] = []
+    panes = [
+        PaneInfo(pane_id="%1", window="_init", pid="1", cwd="/not/the/repo",
+                 command="bash", session="test-project-alien"),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+
+    def fake_run(args, **kwargs):
+        if "list-sessions" in args:
+            return subprocess.CompletedProcess(
+                args, 0, _ls_line("test-project-alien", 1) + "\n", "")
+        if "kill-session" in args:
+            killed.append(args[args.index("-t") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S.time, "time", lambda: 999999)
+
+    res = S.gc_tmux_sessions(cfg, "test-project")
+    assert res["reaped"] == []
+    assert killed == []
+
+
 def test_spawn_with_initiative_targets_sibling_tmux_session(tmp_path, monkeypatch):
     """T-0001: spawn(initiative=...) issues tmux new-window into
     `<slug>-<initiative-stem>:`, not the main `<slug>:` session.

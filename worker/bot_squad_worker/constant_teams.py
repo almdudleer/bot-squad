@@ -76,8 +76,22 @@ def _read_frontmatter(path: Path) -> dict:
     for line in m.group(1).splitlines():
         mm = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
         if mm:
-            fm[mm.group(1)] = mm.group(2).strip()
+            fm[mm.group(1)] = _strip_yaml_quotes(mm.group(2).strip())
     return fm
+
+
+def _strip_yaml_quotes(value: str) -> str:
+    """Strip a single pair of surrounding YAML quotes.
+
+    T-0200: this flat parser captures the raw post-colon text, so a YAML-quoted
+    scalar (``name: "prod-support"``) would otherwise keep its quotes and leak a
+    literal ``"`` downstream — into the team window name, the cooldown state-file
+    key, and (historically) the tmux session name. Strip one matching pair so
+    ``"prod-support"`` / ``'prod-support'`` → ``prod-support``.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
 
 
 def _truthy(value: Any) -> bool:

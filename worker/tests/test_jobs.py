@@ -597,3 +597,42 @@ def test_autonomous_tick_swallows_exceptions(
 
     # Must not raise
     autonomous_tick(cfg)
+
+
+def test_binding_gc_tick_runs_gc_tmux_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0200: binding_gc_tick must invoke gc_tmux_sessions per project so idle
+    empty per-team tmux sessions are reaped on the 60s tick."""
+    from bot_squad_worker.jobs import binding_gc_tick
+    from bot_squad_worker import sessions as _sessions
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    gc_calls: list[str] = []
+    monkeypatch.setattr(
+        _sessions, "gc_tmux_sessions",
+        lambda c, s: gc_calls.append(s) or {"ok": True, "reaped": []},
+    )
+
+    binding_gc_tick(cfg)
+    assert gc_calls == [proj.slug]
+
+
+def test_binding_gc_tick_swallows_gc_tmux_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing gc_tmux_sessions pass must not kill the sweep."""
+    from bot_squad_worker.jobs import binding_gc_tick
+    from bot_squad_worker import sessions as _sessions
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    monkeypatch.setattr(
+        _sessions, "gc_tmux_sessions",
+        lambda c, s: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    # Must not raise.
+    binding_gc_tick(cfg)

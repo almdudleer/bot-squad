@@ -467,6 +467,14 @@ def _session_linux_user(sid: str, meta: dict | None) -> str:
     return _linux_user_from_sid(sid)
 
 
+# T-0200: a tmux session name must never carry a shell/tmux metacharacter. A
+# live incident produced the session `bot-squad-"prod-support` from an initiative
+# value of `"prod-support.md` (a stray YAML quote that survived a flat parse).
+# We sanitise the derived stem to this conservative charset so no quote / space /
+# `$(...)` / etc. can ever leak into a `tmux new-session -s <name>` argument.
+_SESSION_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _tmux_session_name(slug: str, initiative: str | None) -> str:
     """T-0001: per-initiative tmux session routing.
 
@@ -481,13 +489,28 @@ def _tmux_session_name(slug: str, initiative: str | None) -> str:
     ``initiative`` is the basename of a file under ``vision/initiatives/``
     (e.g. ``multi-server-installation-process.md``); the stem (``Path.stem``)
     is what gets appended. Empty / None → main session.
+
+    T-0200: the stem is sanitised to ``[A-Za-z0-9._-]`` so a malformed
+    initiative value (e.g. a stray quote) can't produce a session name like
+    ``bot-squad-"prod-support``. A stem that sanitises to empty → main session.
     """
     if not initiative:
         return slug
-    stem = Path(initiative).stem
+    stem = _SESSION_NAME_SAFE_RE.sub("", Path(initiative).stem)
     if not stem:
         return slug
     return f"{slug}-{stem}"
+
+
+# T-0200: the tmux pane command for a Claude session is either the top-level
+# ``claude`` binary or a version-named binary (e.g. ``2.1.139``) that Claude Code
+# spawns for agent-teams subagents. Shared by ``list_sessions`` grouping and the
+# ``gc_tmux_sessions`` reaper so both agree on what counts as a live claude pane.
+_CLAUDE_CMD_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _is_claude_command(command: str) -> bool:
+    return command == "claude" or bool(_CLAUDE_CMD_RE.match(command or ""))
 
 
 def _ensure_project_tmux_session(slug: str, cwd: str, initiative: str | None = None) -> None:
@@ -1960,6 +1983,112 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
         _write_session_metadata(md, meta, atomic=True)
         repaired.append(sid)
     return {"ok": True, "scanned": scanned, "repaired": len(repaired), "sids": repaired}
+
+
+# T-0200: idle grace before an empty per-initiative/per-team tmux session is
+# reaped. Default 1h (the DoD threshold). A session created seconds ago by an
+# in-flight spawn is well inside this window, so the reaper never races a
+# just-spawned team. Override via env for tests / faster local cleanup.
+_TMUX_GC_IDLE_SEC = float(os.environ.get("BOT_SQUAD_TMUX_GC_IDLE_SEC") or 3600)
+
+
+def gc_tmux_sessions(cfg: Any, slug: str) -> dict:
+    """T-0200: reap idle, empty per-initiative/per-team tmux sessions.
+
+    The T-0001 per-initiative routing creates a sibling tmux session
+    ``<slug>-<stem>`` for each initiative/constant team, each parking a never-used
+    ``_init`` placeholder window. When the team's claude windows exit, the
+    ``_init`` window keeps the otherwise-empty session alive forever — the
+    "7 spurious ``bot-squad-<initiative>`` sessions" the stakeholder hit. This
+    reconciler enforces the invariant *a sibling tmux session exists only while
+    its team has a live claude pane*: any ``<slug>-*`` session with **zero** live
+    claude panes whose last activity is older than ``_TMUX_GC_IDLE_SEC`` is
+    killed. The on-disk Team md is untouched (``reconcile_teams`` keeps the
+    project team), so "idle teams keep on-disk entity but no tmux session".
+
+    Guard rails:
+      - The bare ``<slug>`` main session is NEVER reaped (project home; hosts the
+        operator pane and is recreated on demand anyway).
+      - Only sessions whose panes are rooted in this project's repo cwd are
+        eligible, so a coincidentally ``<slug>-``prefixed session belonging to
+        another project / a human is spared.
+      - A session with ≥1 live claude pane is spared regardless of idle time.
+
+    Same pass serves the periodic GC (DoD #2) and the one-shot migration of
+    pre-existing empties (DoD #4): an old spurious session is already idle past
+    the grace, so it is reaped on the first tick it is seen.
+
+    Returns ``{"ok": True, "reaped": [<name>, ...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"gc_tmux_sessions: unknown project slug {slug!r}")
+
+    prefix = f"{slug}-"
+    repo_path = Path(project.repo_path)
+    try:
+        repo_real = repo_path.resolve()
+    except OSError:
+        repo_real = repo_path
+
+    # Bucket live panes by tmux session: claude-pane count + are any panes rooted
+    # in this project (the ownership gate).
+    claude_counts: dict[str, int] = {}
+    rooted: dict[str, bool] = {}
+    for p in list_panes():
+        sess = p.session
+        if not sess:
+            continue
+        if _is_claude_command(p.command):
+            claude_counts[sess] = claude_counts.get(sess, 0) + 1
+        if not rooted.get(sess) and p.cwd:
+            pane_cwd = Path(p.cwd)
+            try:
+                pane_real = pane_cwd.resolve()
+            except OSError:
+                pane_real = pane_cwd
+            try:
+                in_project = (
+                    pane_cwd == repo_path
+                    or pane_cwd.is_relative_to(repo_path)
+                    or pane_real == repo_real
+                    or pane_real.is_relative_to(repo_real)
+                )
+            except (OSError, ValueError):
+                in_project = False
+            if in_project:
+                rooted[sess] = True
+
+    res = _run(["tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}"])
+    if res.returncode != 0:
+        # No tmux server / no sessions — nothing to reap.
+        return {"ok": True, "reaped": []}
+
+    now = time.time()
+    reaped: list[str] = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, _, activity_s = line.partition("|")
+        if name == slug or not name.startswith(prefix):
+            continue  # main session or another project — never reap
+        if claude_counts.get(name, 0) > 0:
+            continue  # staffed — has a live claude pane
+        if not rooted.get(name):
+            continue  # not rooted in this project's repo — not ours
+        try:
+            activity = float(activity_s)
+        except (TypeError, ValueError):
+            activity = 0.0
+        if now - activity < _TMUX_GC_IDLE_SEC:
+            continue  # still within the idle grace (e.g. mid-spawn)
+        kill = _run(["tmux", "kill-session", "-t", name])
+        if kill.returncode == 0:
+            reaped.append(name)
+    return {"ok": True, "reaped": reaped}
 
 
 def _started_at_key(value: Any) -> tuple[int, str]:

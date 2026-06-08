@@ -1175,6 +1175,89 @@ never edit it.
 Run `bsq --help` for the full verb reference."""
 
 
+def _role_from_sid(sid: str | None) -> str:
+    """Mirror of scripts/hooks/derive_role.sh / sessions._derive_role: map a
+    session's window name → role enum. Window is the SID's middle segment
+    (S-<user>-<window>-p<pane>)."""
+    if not sid:
+        return "dev"
+    m = re.match(r"^S-[^-]+-(.*)-p\d+$", sid)
+    window = (m.group(1) if m else sid).lower()
+    if window == "operator" or re.search(r"[-_]operator$", window):
+        return "operator"
+    if window in ("tl", "teamlead") or re.search(r"[-_](tl|teamlead)$", window):
+        return "teamlead"
+    return "dev"
+
+
+def _fm_list(raw) -> list[str]:
+    """Parse an inline-list frontmatter value ('[a, b]') from read_frontmatter
+    into clean ids — read_frontmatter returns lists as raw strings."""
+    if isinstance(raw, list):
+        items = raw
+    else:
+        s = (raw or "").strip()
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        items = s.split(",")
+    return [x.strip() for x in items if x and x.strip() not in ("", "~")]
+
+
+def cmd_brief(args) -> None:
+    """T-0203: print the FULL orientation on demand — product + team protocol +
+    role contract + this session's bindings. This is the pull-home for the
+    context the SessionStart hook no longer auto-dumps on every fire/compact.
+    Use it after a `/compact`, on a manually-started session, or whenever your
+    memory of the role rules / protocol is stale."""
+    slug = resolve_slug()
+    data = Path(BOT_SQUAD) / "data" / slug
+    sid = my_sid()
+    role = _role_from_sid(sid)
+    role_file = _ROLE_FILES.get(role, "dev.md")
+
+    print(f"=== BRIEF: {slug} === role: {role.upper()}"
+          + (f"  ·  {sid}" if sid else ""))
+
+    def _emit(title: str, path: Path) -> None:
+        if path.exists():
+            print(f"\n=== {title} ===")
+            print(path.read_text(encoding="utf-8", errors="replace").rstrip())
+        else:
+            print(f"\n=== {title} ===\n(missing: {path})")
+
+    _emit("PRODUCT", data / "vision" / "product.md")
+    _emit("TEAM PROTOCOL", data / "vision" / "team_protocol.md")
+    _emit(f"YOUR ROLE CONTRACT ({role_file})", data / "vision" / "roles" / role_file)
+
+    # Bindings from the session md (primary + extras).
+    if sid:
+        md = data / "sessions" / f"{sid}.md"
+        if md.exists():
+            fm = read_frontmatter(md)
+            primary_t = (fm.get("task_id") or "").strip()
+            primary_t = "" if primary_t in ("", "~") else primary_t
+            extras_t = _fm_list(fm.get("extra_task_ids"))
+            primary_i = (fm.get("initiative") or "").strip()
+            primary_i = "" if primary_i in ("", "~") else primary_i
+            extras_i = _fm_list(fm.get("extra_initiatives"))
+            print("\n=== YOUR BINDINGS ===")
+            if primary_t or extras_t:
+                parts = [f"{primary_t} (primary)"] if primary_t else []
+                parts += extras_t
+                print(f"Tasks: {', '.join(parts)} — read each md under "
+                      f"data/{slug}/backlog/<id>-*.md")
+            if primary_i or extras_i:
+                parts = [f"{primary_i} (primary)"] if primary_i else []
+                parts += extras_i
+                print(f"Initiatives: {', '.join(parts)} — "
+                      f"data/{slug}/vision/initiatives/")
+            if not (primary_t or extras_t or primary_i or extras_i):
+                print("(no task/initiative bound to this session)")
+
+    print("\n(AGENT_INSTRUCTIONS.md + constitution.md are separate on-demand "
+          "reads — see the ORIENTATION pointers in your session banner.)")
+
+
 def _default_brief(slug: str, ticket: str, path: Path, fm: dict, bundle: list[str]) -> str:
     tl = my_sid() or "<your TL SID>"
     title = fm.get("title", ticket)
@@ -2525,6 +2608,11 @@ def build_parser() -> argparse.ArgumentParser:
     apl = ap_sub.add_parser("status", help="list autopilot runs for this project")
     apl.add_argument("--json", action="store_true", help="raw JSON output")
     apl.set_defaults(func=cmd_autopilot_status)
+
+    # brief
+    br = sub.add_parser("brief",
+                        help="print full orientation on demand (product + protocol + role + bindings) — T-0203")
+    br.set_defaults(func=cmd_brief)
 
     # compact
     cp = sub.add_parser("compact", help="send /compact to a session (self by default)")

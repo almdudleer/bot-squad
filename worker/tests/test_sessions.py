@@ -2109,6 +2109,100 @@ def test_session_start_hook_writes_tmux_session_field():
         "T-0078: hook must write tmux_session into SessionMd frontmatter"
 
 
+def _find_hook(name: str):
+    import pathlib as _pl
+    here = _pl.Path(__file__).resolve()
+    for ancestor in here.parents:
+        cand = ancestor / "scripts" / "hooks" / name
+        if cand.is_file():
+            return cand
+    return None
+
+
+def test_session_start_hook_branches_on_source():
+    """T-0203: the hook must extract the SessionStart `source` and branch on it
+    so resume/compact don't re-dump the full banner, and the heavy team_protocol
+    + full role-doc cats are gone from the startup path (pointer-ized via
+    `bsq brief`)."""
+    hook = _find_hook("session_start.sh")
+    if hook is None:
+        pytest.skip("session_start.sh not reachable from test cwd")
+    text = hook.read_text()
+    assert 'get("source"' in text, "T-0203: hook must read the `source` field"
+    assert ('[ "$HOOK_SOURCE" = "resume" ] || [ "$HOOK_SOURCE" = "compact" ]' in text), \
+        "T-0203: hook must early-exit lean on resume/compact"
+    # The post-compact reflexive AGENT_INSTRUCTIONS re-read must be suppressed.
+    assert "reflexively re-read" in text, \
+        "T-0203: compact/resume branch must tell the agent NOT to re-read AGENT_INSTRUCTIONS"
+    # Heavy dumps removed from the banner — content now lives behind `bsq brief`.
+    assert 'cat "$DATA/vision/team_protocol.md"' not in text, \
+        "T-0203: team_protocol.md must no longer be cat'd into every session start"
+    assert 'cat "$role_file"' not in text, \
+        "T-0203: the full role doc must no longer be cat'd into every session start"
+    assert "bsq brief" in text, "T-0203: hook must point at `bsq brief` for full orientation"
+
+
+def test_session_start_hook_compact_output_is_lean():
+    """T-0203 behavioral: exec the hook with source=compact against a minimal
+    BOT_SQUAD and assert the printed context is a tiny re-anchor — no product /
+    team-protocol / role-doc body — while startup still emits the orientation
+    pointers + product."""
+    import os, shutil, subprocess as _sp, tempfile
+    real_hook = _find_hook("session_start.sh")
+    derive = _find_hook("derive_role.sh")
+    my_sid_sh = _find_hook("hook_my_sid.sh")
+    if not (real_hook and derive):
+        pytest.skip("hook scripts not reachable from test cwd")
+
+    with tempfile.TemporaryDirectory() as td:
+        bs = Path(td) / "bs"
+        repo = Path(td) / "repo"
+        repo.mkdir(parents=True)
+        (bs / "scripts" / "hooks").mkdir(parents=True)
+        (bs / "config").mkdir(parents=True)
+        # Symlink the support scripts the hook sources by $BOT_SQUAD path.
+        os.symlink(derive, bs / "scripts" / "hooks" / "derive_role.sh")
+        if my_sid_sh:
+            os.symlink(my_sid_sh, bs / "scripts" / "hooks" / "hook_my_sid.sh")
+        (bs / "config" / "projects.toml").write_text(
+            "[projects.test-project]\nrepo_path = \"%s\"\n" % repo)
+        vision = bs / "data" / "test-project" / "vision"
+        (vision / "roles").mkdir(parents=True)
+        (vision / "product.md").write_text("# test-project\nPRODUCT_BODY_MARKER\n")
+        (vision / "team_protocol.md").write_text("# protocol\nPROTOCOL_BODY_MARKER\n")
+        (vision / "roles" / "dev.md").write_text("# dev\nROLEDOC_BODY_MARKER\n")
+        (vision / "constitution.md").write_text("# constitution\n")
+        (bs / "data" / "test-project" / "sessions").mkdir(parents=True)
+
+        env = dict(os.environ)
+        env["BOT_SQUAD"] = str(bs)
+        for k in ("TMUX", "TMUX_PANE", "BOT_SQUAD_INITIATIVE", "BOT_SQUAD_OWNER"):
+            env.pop(k, None)
+
+        def run(source):
+            return _sp.run(
+                ["bash", str(real_hook)],
+                input='{"source":"%s"}' % source,
+                capture_output=True, text=True, cwd=str(repo), env=env,
+            ).stdout
+
+        compact = run("compact")
+        assert "PROTOCOL_BODY_MARKER" not in compact
+        assert "ROLEDOC_BODY_MARKER" not in compact
+        assert "PRODUCT_BODY_MARKER" not in compact
+        assert "reflexively re-read" in compact
+        assert len(compact) < 1500, f"compact banner too big: {len(compact)} bytes"
+
+        startup = run("startup")
+        # Startup keeps the cheap product anchor + pointers, drops heavy dumps.
+        assert "PRODUCT_BODY_MARKER" in startup
+        assert "PROTOCOL_BODY_MARKER" not in startup
+        assert "ROLEDOC_BODY_MARKER" not in startup
+        assert "bsq brief" in startup
+        assert len(startup) < len(
+            "x" * 12780), "startup must be far smaller than the old ~12.8KB banner"
+
+
 def test_suspend_preserves_owner_field(tmp_path, monkeypatch):
     """suspend() rewrites the md but must keep owner stamped."""
     from bot_squad_worker.sessions import suspend

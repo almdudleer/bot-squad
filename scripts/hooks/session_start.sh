@@ -21,6 +21,16 @@ CLAUDE_SID="$(printf '%s' "$HOOK_INPUT" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("session_id","") or "")
 except Exception: print("")' 2>/dev/null || echo "")"
 
+# T-0203: the hook event `source` is one of startup|resume|clear|compact. We
+# branch the printed CONTEXT on it so we stop re-dumping the full
+# product+protocol+role banner (~3.2K tok) — and stop triggering a reflexive
+# AGENT_INSTRUCTIONS.md re-read (~5.5K tok) — on every resume and every
+# compaction. The registry-write + break-pane bookkeeping below still runs
+# unconditionally. See vision/audits/session-context-bloat-2026-06-08.md.
+HOOK_SOURCE="$(printf '%s' "$HOOK_INPUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("source","") or "")
+except Exception: print("")' 2>/dev/null || echo "")"
+
 # Resolve current project by matching CWD against any of the project's
 # clones (repo_path = dev clone, repo_master = master clone). Compares both
 # the literal path and the resolved (readlink) path so symlinked layouts
@@ -495,6 +505,32 @@ print_section() {
 . "$BOT_SQUAD/scripts/hooks/derive_role.sh"
 ROLE="$(bsq_derive_role "$src_window")"
 
+# T-0203: resume / compact already carry the orientation (or, for compact, its
+# summary). Emit only a tiny re-anchor + active sessions, and explicitly
+# suppress the reflexive AGENT_INSTRUCTIONS.md re-read that dominated
+# post-compact token cost. The lifecycle bookkeeping above already ran.
+if [ "$HOOK_SOURCE" = "resume" ] || [ "$HOOK_SOURCE" = "compact" ]; then
+    ROLE_UC="$(printf '%s' "$ROLE" | tr '[:lower:]' '[:upper:]')"
+    print_section "BOT-SQUAD — ${HOOK_SOURCE} (orientation unchanged)"
+    echo "You are ${sid:-this session} — role: ${ROLE_UC}${task_id:+, task ${task_id}}."
+    echo "Message bus = \`bsq\`: \`bsq inbox check\` drains mail; \`bsq peer send <to> \"…\"\` sends."
+    echo
+    echo "Your role contract, AGENT_INSTRUCTIONS.md and the team protocol are UNCHANGED"
+    echo "from before the ${HOOK_SOURCE}. Re-read a specific file — or run \`bsq brief\` for"
+    echo "the full orientation — ONLY if your memory of a rule/path is stale. Do NOT"
+    echo "reflexively re-read AGENT_INSTRUCTIONS.md; open it on the specific need."
+    if [ -d "$DATA/sessions" ]; then
+        active=$(grep -l 'status: active' "$DATA/sessions"/*.md 2>/dev/null | wc -l)
+        if [ "$active" -gt 0 ]; then
+            print_section "ACTIVE SESSIONS"
+            for f in "$DATA/sessions"/*.md; do
+                grep -q 'status: active' "$f" 2>/dev/null && echo "- $(basename "$f" .md)"
+            done
+        fi
+    fi
+    exit 0
+fi
+
 # 1. Product description (small, anchors orientation). The big stuff —
 # AGENT_INSTRUCTIONS.md and the full active-initiative spec — is pointed
 # at, not pasted, so the per-session-start context stays lean. Agents
@@ -512,17 +548,15 @@ if [ -n "${BOT_SQUAD_INITIATIVE:-}" ]; then
     active_init="$BOT_SQUAD_INITIATIVE"
 fi
 
-print_section "READ ONCE ON YOUR FIRST ACTION"
-echo "These files are heavy — fetched on demand, not piped in every turn."
-echo
-echo "- AGENT_INSTRUCTIONS.md  : $DATA/AGENT_INSTRUCTIONS.md"
-echo "  (project-specific recipes, gotchas, paths)"
+print_section "ORIENTATION — read on demand (not piped in every turn, to keep context lean)"
+echo "- Your role contract : $DATA/vision/roles/$ROLE.md"
+echo "  (your rules — read on your FIRST action if this session wasn't spawned with a brief)"
+echo "- AGENT_INSTRUCTIONS  : $DATA/AGENT_INSTRUCTIONS.md  (recipes/paths — open on the specific need)"
 if [ -n "$active_init" ] && [ -f "$DATA/vision/initiatives/$active_init" ]; then
-    echo "- Your initiative        : $DATA/vision/initiatives/$active_init"
-    echo "  (your bound scope — required reading on day one)"
+    echo "- Your initiative    : $DATA/vision/initiatives/$active_init  (your bound scope)"
 fi
-echo "- Constitution           : $DATA/vision/constitution.md"
-echo "  (governance, hard rules — consult when in doubt)"
+echo "- Constitution       : $DATA/vision/constitution.md  (governance — consult when in doubt)"
+echo "- Full briefing      : run \`bsq brief\`  (product + team protocol + role contract + your bindings)"
 
 # Phase 9: surface extra bindings (multi-task devs, multi-initiative TLs).
 # Read the live session md (rewritten above) to pull the current extras list.
@@ -647,87 +681,20 @@ fi
 if [ -n "$sid" ]; then
     print_section "MESSAGE BUS"
     cat <<BUS_EOF
-Cross-session messaging is the \`bsq\` CLI — run \`bsq --help\` for the full
-verb reference (canonical). The common moves:
-
-  bsq inbox check                 # drain new messages addressed to you
-  bsq peer send <target> "<text>" # <target> = a SID or role (teamlead/dev/all)
-
-\`bsq peer send\` also nudges each live recipient pane with the text
-"check mail" — the PRIMARY cross-session signal. When you see "check mail"
-in your composer, run \`bsq inbox check\`. The long-poll watcher is OPT-IN:
-
-  bsq inbox wait --timeout 1800   # blocks until mail (run in background)
-
-Your SID is: $sid
-
-(The raw worker socket is an advanced/debug escape hatch only — see
-AGENT_INSTRUCTIONS.md. Day-to-day, everything goes through \`bsq\`.)
+Cross-session messaging = the \`bsq\` CLI (\`bsq --help\` = full reference):
+  bsq inbox check                  # drain new messages addressed to you
+  bsq peer send <target> "<text>"  # <target> = a SID or role (teamlead/dev/all)
+\`bsq peer send\` also injects "check mail" into the recipient's pane — when you
+see "check mail" in your composer, run \`bsq inbox check\`. Your SID is: $sid
 BUS_EOF
 fi
 
-# 6. Team protocol — sourced from data/<slug>/vision/team_protocol.md so the
-# stakeholder can edit it from the Workflow UI. Hardcoded fallback if the
-# file is missing.
-print_section "BOT-SQUAD TEAM PROTOCOL"
-if [ -f "$DATA/vision/team_protocol.md" ]; then
-    cat "$DATA/vision/team_protocol.md"
-else
-cat <<'PROTO'
-You are running inside bot-squad — the active-context manager for this
-project. Permissions in .claude/settings.json are auto-allowed
-(--dangerously-skip-permissions is on). Just act; don't ask before tools.
-
-- One session per task.
-- Branching: bot_squad/dev in the dev clone; stakeholder owns merges to master.
-- Tests first. Run them yourself before saying you're done.
-- Out-of-scope items go to data/<slug>/backlog/T-NNNN-<slug>.md (status: open).
-- Coordinate with peers via Claude Code's native agent-teams chat.
-- DO NOT invoke the superpowers `brainstorming` skill. Choose, justify in
-  one sentence, build.
-- Ping stakeholder via tg_notify; urgent:true for hard outages only.
-- Do not kill peer sessions on your own — ping the stakeholder.
-PROTO
-fi
-
-role_file="$DATA/vision/roles/$ROLE.md"
-if [ -f "$role_file" ]; then
-    echo
-    echo "## Your role: $(echo "$ROLE" | tr a-z A-Z)"
-    echo
-    cat "$role_file"
-elif [ "$ROLE" = "teamlead" ]; then
-cat <<'TL_PROTO'
-
-## Your role: TEAMLEAD
-
-You were not spawned with a task_id — you are the team-lead session.
-
-- Anchor on the **ACTIVE INITIATIVE** section above (if present).
-- When the stakeholder hands you work: split it into specific, named
-  subtasks. For each, spawn a worker session via Claude's agent-teams
-  feature ("form a team with one teammate for <feature>"). bot-squad's
-  SessionStart hook will break each teammate pane into its own tmux
-  window named for the feature.
-- **Do not kill worker sessions on your own.** If a worker is
-  misbehaving, TG the stakeholder and propose what to do.
-- Approve permission relays from workers with "allow during this session".
-TL_PROTO
-else
-cat <<WORKER_PROTO
-
-## Your role: DEV WORKER
-
-You own one task: \`$task_id\`. Read its md under
-\`data/$slug/backlog/$task_id-*.md\` for scope + DoD.
-
-- Build, test, commit on \`bot_squad/dev\`.
-- When DoD is green: set the task md's \`status\` to \`totest\`, commit
-  with a one-line message describing what shipped, and signal READY in
-  the agent-teams chat.
-- If blocked: ping the teamlead via agent-teams chat first; only TG the
-  stakeholder if there's no TL or you've been stuck > 1h.
-WORKER_PROTO
-fi
+# T-0203: the full team protocol (team_protocol.md, ~1.6K tok) and the full
+# role contract (roles/<role>.md, ~1K tok) are NO LONGER auto-dumped here.
+# They were pushed on every fire (~2.5K tok) and, on a `bsq spawn`, the role
+# contract + hard rules are ALREADY inlined into the session's first message —
+# pure duplication. Both are now surfaced on demand via `bsq brief` and pointed
+# at in the ORIENTATION section above. The team protocol stays editable at
+# data/<slug>/vision/team_protocol.md (Workflow UI); `bsq brief` reads it live.
 
 exit 0

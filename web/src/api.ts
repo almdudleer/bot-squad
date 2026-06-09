@@ -86,6 +86,30 @@ export type Task = {
   };
 };
 
+// T-0206: defend the SPA against a non-string text field slipping through from
+// a malformed/legacy backlog md. The root cause (a frontmatter parser that read
+// a colon-bearing `title` into a `{"Recheck model switch": "..."}` mapping) is
+// fixed server-side, but a single object-valued `title` once rendered as a raw
+// React child threw React error #31 (objects-are-not-valid-as-a-React-child)
+// and white-screened the ENTIRE board — not just the one bad card. Coerce
+// defensively at the data boundary so any future field-shape regression
+// degrades to readable text instead of taking the whole page down.
+export function coerceTaskText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  // A mapping (the exact #31 shape) → show its keys, which carry the human text
+  // for the colon-in-title case (`{"Recheck model switch": "..."}` → the line).
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return keys.length ? keys.join(" ") : JSON.stringify(value);
+  }
+  return String(value);
+}
+
+export function normalizeTask(t: Task): Task {
+  return { ...t, title: coerceTaskText(t.title as unknown) };
+}
+
 export type CreateTaskBody = {
   title: string;
   status?: Task["status"];
@@ -454,7 +478,8 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ content }),
     }),
-  backlog: (slug: string) => call<Task[]>(`/api/projects/${slug}/backlog`),
+  backlog: (slug: string) =>
+    call<Task[]>(`/api/projects/${slug}/backlog`).then((tasks) => tasks.map(normalizeTask)),
   vision: (slug: string) => call<VisionFile[]>(`/api/projects/${slug}/vision`),
   feedback: (slug: string) => call<FeedbackFile[]>(`/api/projects/${slug}/feedback`),
   analytics: (slug: string) => call<Analytics>(`/api/projects/${slug}/analytics`),

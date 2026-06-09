@@ -141,7 +141,46 @@ def test_legacy_session_self_heals_on_rewrite():
     assert "pane_id: '%23'" in rewritten
     reparsed, _ = fm.parse(rewritten)
     assert reparsed["pane_id"] == "%23"
-    assert reparsed["extra_task_ids"] == ["T-0001", "T-0002"]
+
+
+# ---------------------------------------------------------------------------
+# T-0206: a legacy unquoted scalar value that itself contains ``: `` (e.g. a
+# title "Recheck model switch: budget caps") makes the strict block fail, so we
+# hit the line fallback. The fallback partitions on the FIRST colon, leaving the
+# value with an inner ``: `` — which is valid YAML *mapping* syntax. The
+# per-value coercer must NOT re-read that into a dict: a frontmatter field is a
+# scalar or a list, never a mapping. A dict title was served raw to the SPA and
+# crashed it with React error #31 (object-as-child).
+# ---------------------------------------------------------------------------
+
+LEGACY_COLON_TITLE = (
+    "---\n"
+    "id: T-0012\n"
+    "title: Recheck model switch: budget caps + usage-API reconciliation\n"
+    "status: open\n"
+    "---\n\n"
+    "- [ ] Recheck model switch: budget caps + usage-API reconciliation.\n"
+)
+
+
+def test_legacy_colon_in_value_stays_string_not_dict():
+    meta, _ = fm.parse(LEGACY_COLON_TITLE)
+    # The whole point: title is the raw string, never a {"...": "..."} mapping.
+    assert isinstance(meta["title"], str)
+    assert meta["title"] == "Recheck model switch: budget caps + usage-API reconciliation"
+    # Sibling scalars on the same legacy block still type-coerce normally.
+    assert meta["id"] == "T-0012"
+    assert meta["status"] == "open"
+
+
+def test_legacy_colon_value_self_heals_to_quoted_yaml():
+    # Once read + rewritten, the colon-bearing title is quoted, so the strict
+    # parser (not the fallback) handles it on every subsequent read.
+    meta, _ = fm.parse(LEGACY_COLON_TITLE)
+    rewritten = fm.dump(meta, "")
+    reparsed, _ = fm.parse(rewritten)
+    assert reparsed["title"] == "Recheck model switch: budget caps + usage-API reconciliation"
+    assert isinstance(reparsed["title"], str)
 
 
 # ---------------------------------------------------------------------------

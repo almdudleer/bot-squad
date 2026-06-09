@@ -103,11 +103,22 @@ def _coerce_scalar(v: str) -> Any:
     scalar (e.g. a bare ``%9``), the raw string is kept. This keeps the
     fallback's per-value semantics equal to the strict parse so a legacy file
     round-trips byte-for-byte once rewritten.
+
+    A frontmatter field value is a scalar or a list — never a mapping. The
+    fallback partitions on the FIRST ``:`` per line, so a value that itself
+    contains ``: `` (e.g. a legacy unquoted ``title: Recheck model switch:
+    budget caps``) leaves an inner ``key: value`` that pyyaml would re-read into
+    a ``dict``. That is a mis-parse, not a real mapping — keep the raw string so
+    the title stays a string. (T-0206: a dict title was served raw to the SPA
+    and crashed it with React error #31, object-as-child.)
     """
     try:
-        return yaml.load(v, Loader=_Loader)
+        loaded = yaml.load(v, Loader=_Loader)
     except yaml.YAMLError:
         return v
+    if isinstance(loaded, dict):
+        return v
+    return loaded
 
 
 def _line_based_parse(block: str) -> dict:

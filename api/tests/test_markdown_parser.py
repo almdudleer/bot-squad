@@ -114,3 +114,22 @@ def test_parse_task_block_style_blocked_by(tmp_path: Path) -> None:
     )
     parsed = parse_task(f)
     assert parsed["blocked_by"] == ["T-0001", "T-0002"]
+
+
+def test_parse_task_title_with_inner_colon_is_string(tmp_path: Path) -> None:
+    """T-0206 regression: a legacy unquoted title that itself contains ``: ``
+    makes the strict YAML block fail (mapping-values-not-allowed), so we hit the
+    tolerant line fallback. The served ``title`` must be a STRING — never the
+    ``{"Recheck model switch": "..."}`` mapping pyyaml would otherwise re-read
+    it into. A dict title was served raw to the SPA and crashed it with React
+    error #31 (objects-are-not-valid-as-a-React-child)."""
+    f = tmp_path / "T-0012-colon.md"
+    f.write_text(
+        "---\nid: T-0012\n"
+        "title: Recheck model switch: budget caps + usage-API reconciliation\n"
+        "status: open\n---\n\n"
+        "- [ ] Recheck model switch: budget caps + usage-API reconciliation.\n"
+    )
+    parsed = parse_task(f)
+    assert isinstance(parsed["title"], str)
+    assert parsed["title"] == "Recheck model switch: budget caps + usage-API reconciliation"

@@ -39,6 +39,19 @@ test_backend_cmd   = "`docker exec signal-tracker python test_api.py`"
 test_e2e_cmd       = "`npm run test:e2e` (from `web/`)"
 test_typecheck_cmd = "from `web/`, `npx tsc -b --noEmit`"
 test_lint_cmd      = "from `web/`, `npm run lint`"
+# T-0199: per-project identity for the generated AGENTS.md (render_agents_md.py).
+# All optional — an absent field renders a neutral placeholder / omitted line,
+# never another project's identity. ops_path = in-clone prefix of the data-dir
+# symlink; watchrobot predates the plain-`ops` scaffold convention
+# (project_scaffold._link_ops) — its clone has `ops/bot-squad ->
+# data/signal-tracker`.
+ops_path     = "ops/bot-squad"
+stack        = "FastAPI + asyncpg backend, React 19 + Vite + TS + Tailwind frontend, PostgreSQL, Docker + traefik."
+stakeholders = "Alexey (chat 404580642, @alexeysdk) and Timofey (@timpo). Equal authority — see the constitution."
+tg_bot       = "@watchbot"
+extra_hard_rules = [
+  "Don't read or copy from `/home/www/bot-squad/archived/signal-tracker-old/` — that's the deprecated multi-role flow. Patterns there don't apply.",
+]
 
 [projects.bot-squad]
 slug          = "bot-squad"
@@ -89,3 +102,8 @@ created_at    = 2026-05-14
 # worker pytest; Build = web build (no e2e yet). No `signal-tracker` leakage.
 test_backend_cmd = "`cd api && pytest`, `cd worker && pytest`"
 test_build_cmd   = "`cd web && npm run build` (build only — no e2e yet)"
+# T-0199: AGENTS.md identity fields. bot-squad's dev clone has NO data-dir
+# symlink (its real ops/ holds only bot-squad-bin; the data symlink lives at
+# the workspace dir), so ops_path is the absolute install data dir.
+ops_path = "/home/www/bot-squad/data/bot-squad"
+stack    = "FastAPI API + uvicorn worker (Python), React + Vite + Bootstrap web UI, tmux + per-user unix-socket worker for session orchestration."

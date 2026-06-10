@@ -4,10 +4,18 @@
 Usage:
     python3 render_agents_md.py <slug> [--config-dir /home/www/bot-squad/config]
 
-Reads vision/{north-star,strategy,tactical}.md from data/<slug>/vision/,
-interpolates them into the canonical AGENTS.md template, and writes the
-result to <repo_path>/AGENTS.md.  Prints a unified diff to stdout so the
-caller can review before committing.
+Reads the CURRENT vision schema from data/<slug>/vision/ — `product.md` plus
+the `active_initiatives` list and `initiatives/<name>.md` (T-0199; the old
+north-star/strategy/tactical trio no longer exists in live data) —
+interpolates it into the canonical AGENTS.md template, and writes the result
+to <repo_path>/AGENTS.md.  Prints a unified diff to stdout so the caller can
+review before committing.
+
+Everything project-specific in the template is config-driven via OPTIONAL
+`[projects.<slug>]` fields in projects.toml (same pattern as T-0195's
+test_*_cmd fields): `ops_path`, `stack`, `stakeholders`, `tg_bot`,
+`extra_hard_rules`, `test_*_cmd`.  A field-less project renders neutral
+placeholders — never a KeyError and never another project's identity.
 """
 from __future__ import annotations
 
@@ -38,7 +46,7 @@ def get_project(config_dir: Path, slug: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Vision extraction
+# Vision extraction (current schema — T-0199)
 # ---------------------------------------------------------------------------
 
 def _strip_h1(text: str) -> str:
@@ -57,83 +65,57 @@ def _strip_h1(text: str) -> str:
     return "\n".join(lines[i:]).rstrip()
 
 
-def extract_north_star(text: str) -> tuple[str, str]:
-    """Return (h1_title, body_before_decision_framework).
+def extract_product(text: str) -> str:
+    """Return product.md's lead statement: H1 stripped, cut at the first H2.
 
-    Stops at '## How we decide' section and before operational metadata
-    lines (Prod/Staging/Dev URLs, Stack, Server, Login, Stakeholders) that
-    belong in the full vision file but not in the always-cached AGENTS.md.
+    product.md may carry operational subsections (e.g. bot-squad's
+    `## Distribution`, `## Read once`); the always-cached AGENTS.md takes only
+    the core product statement and points at the full file for the rest.
     """
-    # Find title
-    title = "North star"
-    for line in text.splitlines():
-        if line.startswith("# "):
-            title = line[2:].strip()
-            break
-
     body = _strip_h1(text)
-
-    # Cut at the embedded "How we decide" H2 if present
-    cut = re.search(r"^## How we decide", body, re.MULTILINE)
+    cut = re.search(r"^## ", body, re.MULTILINE)
     if cut:
         body = body[: cut.start()].rstrip()
-
-    # Also cut at operational metadata lines (Prod/Staging/Dev/Stack/Server/Login/Stakeholders)
-    # These live in the vision file for background context but are too noisy for AGENTS.md.
-    operational_re = re.compile(
-        r"^\*\*(Prod|Staging|Dev|Stack|Server|Login|Stakeholders)\*\*",
-        re.MULTILINE,
-    )
-    op_match = operational_re.search(body)
-    if op_match:
-        body = body[: op_match.start()].rstrip()
-
-    return title, body
+    return body.strip()
 
 
-def extract_strategy(text: str) -> str:
-    """Return the strategy body (skip H1 and meta lines, stop at PM-reference block)."""
-    body = _strip_h1(text)
-
-    # Stop at a horizontal rule (---) that precedes PM-only reference notes.
-    hr_match = re.search(r"^---\s*$", body, re.MULTILINE)
-    if hr_match:
-        body = body[: hr_match.start()].rstrip()
-
-    # The strategy file may have ## sub-headers; include them but trim meta lines.
-    lines = body.splitlines()
-    result_lines: list[str] = []
-    skip_next_blank = False
-
-    for line in lines:
-        stripped = line.strip()
-        # Skip meta/refresh lines
-        if re.match(r"^_Refreshed by", stripped):
-            skip_next_blank = True
-            continue
-        if skip_next_blank and not stripped:
-            skip_next_blank = False
-            continue
-        result_lines.append(line)
-
-    return "\n".join(result_lines).strip()
+def _md_title(path: Path) -> str | None:
+    """First H1 of a markdown file, or None when unreadable/untitled."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return None
 
 
-def extract_tactical(text: str) -> str:
-    """Return tactical body (skip H1; keep the directive and status lines)."""
-    body = _strip_h1(text)
+def render_active_initiatives(vision_dir: Path, ops: str) -> str:
+    """Bullet list of the project's active initiatives.
 
-    lines = body.splitlines()
-    result_lines: list[str] = []
+    `vision/active_initiatives` lists one `initiatives/<basename>` per line
+    (blank lines ignored).  Each bullet carries the initiative's H1 title —
+    falling back to the basename stem when the file is missing or untitled —
+    plus its path.  Graceful when the list file is absent or empty.
+    """
+    listing = vision_dir / "active_initiatives"
+    names: list[str] = []
+    if listing.exists():
+        names = [ln.strip() for ln in listing.read_text().splitlines() if ln.strip()]
+    if not names:
+        return f"_(No active initiatives listed — see `{ops}/vision/initiatives/`.)_"
+    lines = []
+    for name in names:
+        title = _md_title(vision_dir / "initiatives" / name) or Path(name).stem
+        lines.append(f"- **{title}** — `{ops}/vision/initiatives/{name}`")
+    return "\n".join(lines)
 
-    for line in lines:
-        stripped = line.strip()
-        # Skip HTML comments
-        if stripped.startswith("<!--") or stripped.endswith("-->"):
-            continue
-        result_lines.append(line)
 
-    return "\n".join(result_lines).strip()
+_NO_PRODUCT = (
+    "_(No `vision/product.md` yet — write one; it anchors every build/no-build "
+    "decision.)_"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -183,75 +165,116 @@ def render_test_commands(project: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-project identity blocks (config-driven — T-0199)
+# ---------------------------------------------------------------------------
+
+def render_hard_rules(project: dict, ops: str) -> str:
+    """Base hard rules (project-agnostic) + optional per-project extras.
+
+    `extra_hard_rules` is an optional TOML array of bullet bodies — e.g.
+    watchrobot's "don't read signal-tracker-old" rule lives there now instead
+    of being baked into every project's AGENTS.md.
+    """
+    lines = [
+        "- Never push, never merge, never amend. Those are user actions.",
+        f"- Never edit `{ops}/vision/constitution.md` — agent-immutable.",
+        "- Never run destructive commands (`rm -rf`, `git reset --hard`,\n"
+        "  `git push --force`, dropping DB tables) without explicit user ask.",
+    ]
+    for rule in project.get("extra_hard_rules", ()):
+        lines.append(f"- {rule}")
+    return "\n".join(lines)
+
+
+def render_stack_paths(project: dict, slug: str, ops: str, data_dir: Path) -> str:
+    """'## Stack & paths' bullets: optional stack + stakeholders lines, plus
+    the repo path and the project's data-dir pointer (`ops_path` prefix)."""
+    lines: list[str] = []
+    if project.get("stack"):
+        lines.append(f"- Stack: {project['stack']}")
+    lines.append(f"- Repo: `{project.get('repo_path', '')}`.")
+    data_path = str(data_dir / slug)
+    if ops == data_path:
+        # ops_path IS the absolute data dir (no in-clone symlink) — an
+        # `X → X` arrow line would be noise.
+        lines.append(f"- Vision / backlog / feedback: `{ops}/`.")
+    else:
+        lines.append(f"- Vision / backlog / feedback: `{ops}/` → `{data_path}/`.")
+    if project.get("stakeholders"):
+        lines.append(f"- Stakeholders: {project['stakeholders']}")
+    return "\n".join(lines)
+
+
+def render_telegram(project: dict) -> str:
+    """'## Telegram' body. Names the project's bot only when `tg_bot` is
+    configured; otherwise stays generic (no @watchbot leaking everywhere)."""
+    bot = project.get("tg_bot")
+    intro = f"Bot `{bot}` (token in `.env` / `secrets.toml`). " if bot else ""
+    return (
+        f"{intro}Ping the stakeholder rarely — hard blockers, prod errors,\n"
+        'finished long-running work — via `bsq tg ping "<message>"` (worker\n'
+        "action `tg_notify`)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Template
 # ---------------------------------------------------------------------------
 
+# NOTE: every dynamic value is substituted exactly once via str.format on this
+# template; the values themselves are never re-scanned, so literal braces in
+# config/vision content survive (T-0195). Keep the template itself brace-free
+# except for the named placeholders.
 TEMPLATE = """\
 # {display_name} — agent quick reference
 
 Always-cached, every-turn. If you find yourself re-reading larger context
 files repeatedly, the right answer probably belongs here.
 
-## North star — do not lose sight of
+## Product — do not lose sight of
 
-{north_star_body}
+{product_body}
 
-(Full: `ops/bot-squad/vision/north-star.md`.)
+(Full: `{ops}/vision/product.md`.)
 
 ## How we decide what to build
 
 1. Identify the user problem first (Jobs-to-be-Done framing).
-2. Find evidence in user feedback (`ops/bot-squad/feedback/`).
+2. Find evidence in user feedback (`{ops}/feedback/`).
 3. Filter user-suggested SOLUTIONS — implement the underlying problem,
    not the literal request.
-4. Score against the north-star: does this raise user catch-rate?
+4. Score against the product vision: does this move its core promise
+   forward for real users?
 5. If unclear, raise to stakeholders rather than guessing.
 
-## Current strategy (this cycle's bets)
+## Active initiatives — this cycle's bets
 
-{strategy_body}
+{initiatives_block}
 
-(Full: `ops/bot-squad/vision/strategy.md`.)
-
-## Current tactical priorities
-
-{tactical_body}
-
-(Full: `ops/bot-squad/vision/tactical.md`.)
+(The active set is `{ops}/vision/active_initiatives`; full texts live in
+`{ops}/vision/initiatives/`.)
 
 ## Hard rules — non-negotiable
 
-- Never push, never merge, never amend. Those are user actions.
-- Never edit `ops/bot-squad/vision/constitution.md` — agent-immutable.
-- Never run destructive commands (`rm -rf`, `git reset --hard`,
-  `git push --force`, dropping DB tables) without explicit user ask.
-- Don't read or copy from `/home/www/bot-squad/archived/signal-tracker-old/`
-  — that's the deprecated multi-role flow. Patterns there don't apply.
+{hard_rules_block}
 
 ## Stack & paths
 
-- FastAPI + asyncpg backend, React 19 + Vite + TS + Tailwind frontend,
-  PostgreSQL, Docker + traefik.
-- Repo: `{repo_path}`.
-- Vision / backlog / feedback: `ops/bot-squad/` (gitignored symlink to
-  `/home/www/bot-squad/data/{slug}/`).
-- Stakeholders: Alexey (chat 404580642, @alexeysdk) and Timofey (@timpo).
-  Equal authority — see `ops/bot-squad/vision/constitution.md`.
+{stack_paths_block}
 
 ## Branching & commits
 
-- Working branch: `bot_squad/dev`. Branch off master, never push, never merge,
-  never amend.
+- Working branch: `{deploy_branch}`. Branch off {master_branch}, never push,
+  never merge, never amend.
 - Commit prefix: `[backend]`, `[web]`, `[ops]`, `[docs]`. Imperative summary,
   ≤70 chars. Co-Authored-By auto-added.
-- Squash before requesting a deploy or handing off:
-    `BASE=$(git merge-base HEAD master)`
-    `git reset --soft "$BASE" && git commit -m "<single-line message>"`
-  (Don't squash on master/staging, with a dirty tree, or if BASE == HEAD.)
+- Squash your own noise before requesting a deploy or handing off — within
+  the project's git discipline (safe-commit, explicit pathspecs, no rewrite
+  of pushed history; see `{ops}/AGENT_INSTRUCTIONS.md`).
 
 ## Deploy
 
-`ops/bot-squad-bin/deploy <target> "<reason>"` — targets: `staging`, `dev`.
+`ops/bot-squad-bin/deploy <target> "<reason>"` — targets: {deploy_targets_md}.
 - Queues a deploy. The monitor processes it within ~60s when the tree is clean.
 - Tree clean = `git status --porcelain` empty (logs/cache excluded).
 - TG-pings on success/failure.
@@ -264,8 +287,8 @@ preserved). `ops/bot-squad-bin/resume-deploys` clears it and the next tick
 runs. Per-project; use it to investigate, coordinate, or land a sensitive
 multi-commit ship.
 
-Manual prod release: stakeholder reviews staging → merges bot_squad/dev (or
-staging) into master → builds the prod container → deploys. Agents never
+Manual prod release: stakeholder reviews staging → merges `{deploy_branch}`
+into `{master_branch}` → builds the prod container → deploys. Agents never
 deploy prod.
 
 ## Test commands
@@ -274,24 +297,24 @@ deploy prod.
 
 ## When you need more (not every-turn — read on demand)
 
-- `ops/bot-squad/vision/strategy.md` — full current bets + rationale
-- `ops/bot-squad/vision/tactical.md` — full current cycle priorities
-- `ops/bot-squad/vision/initiatives/` — discrete strategic bets
-- `ops/bot-squad/backlog/` — all open work, one .md per task
-- `ops/bot-squad/feedback/` — raw user feedback for JTBD evidence
-- `ops/bot-squad/AGENT_INSTRUCTIONS.md` — recipes, gotchas, paths
+- `{ops}/vision/team_protocol.md` — working conventions for every session
+- `{ops}/vision/roles/` — role contracts (operator, teamlead, dev)
+- `{ops}/vision/initiatives/` — discrete strategic bets, full texts
+- `{ops}/backlog/` — all open work, one .md per task
+- `{ops}/feedback/` — raw user feedback for JTBD evidence
+- `{ops}/docs/` — categorized project docs (architecture / design /
+  support / runbook / product)
+- `{ops}/AGENT_INSTRUCTIONS.md` — recipes, gotchas, paths
 
 ## Telegram
 
-Bot `@watchbot` (token in `.env` / `secrets.toml`). Ping the user rarely —
-hard blockers, prod errors, finished long-running work — via worker action
-`tg_notify` (POST to bot-squad worker over Unix socket).
+{telegram_block}
 
 ## What NOT to put here
 
 Long history, decision logs, recipes for one-off ops, detailed task
 breakdowns. Those go in `AGENT_INSTRUCTIONS.md` or under
-`ops/bot-squad/`. Keep this file dense and product-first.
+`{ops}/`. Keep this file dense and product-first.
 """
 
 
@@ -302,26 +325,34 @@ breakdowns. Those go in `AGENT_INSTRUCTIONS.md` or under
 def render(slug: str, config_dir: Path, data_dir: Path) -> str:
     project = get_project(config_dir, slug)
     vision_dir = data_dir / slug / "vision"
+    # In-clone prefix of the project's data-dir symlink. New scaffolds plant a
+    # plain `ops` symlink (project_scaffold._link_ops); legacy clones differ
+    # (watchrobot: `ops/bot-squad`) and override via the optional `ops_path`.
+    ops = project.get("ops_path", "ops")
 
-    ns_path = vision_dir / "north-star.md"
-    st_path = vision_dir / "strategy.md"
-    ta_path = vision_dir / "tactical.md"
+    product_path = vision_dir / "product.md"
+    product_body = (
+        extract_product(product_path.read_text())
+        if product_path.exists()
+        else _NO_PRODUCT
+    )
+    if not product_body:
+        product_body = _NO_PRODUCT
 
-    for p in (ns_path, st_path, ta_path):
-        if not p.exists():
-            raise FileNotFoundError(f"Vision file missing: {p}")
-
-    _, ns_body = extract_north_star(ns_path.read_text())
-    strategy_body = extract_strategy(st_path.read_text())
-    tactical_body = extract_tactical(ta_path.read_text())
+    targets = project.get("deploy_targets") or ["staging"]
+    deploy_targets_md = ", ".join(f"`{t}`" for t in targets)
 
     return TEMPLATE.format(
         display_name=project.get("display_name", slug),
-        slug=slug,
-        repo_path=project.get("repo_path", ""),
-        north_star_body=ns_body,
-        strategy_body=strategy_body,
-        tactical_body=tactical_body,
+        ops=ops,
+        product_body=product_body,
+        initiatives_block=render_active_initiatives(vision_dir, ops),
+        hard_rules_block=render_hard_rules(project, ops),
+        stack_paths_block=render_stack_paths(project, slug, ops, data_dir),
+        deploy_branch=project.get("deploy_branch", "bot_squad/dev"),
+        master_branch=project.get("master_branch", "master"),
+        deploy_targets_md=deploy_targets_md,
+        telegram_block=render_telegram(project),
         test_commands=render_test_commands(project),
     )
 

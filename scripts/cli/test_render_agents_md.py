@@ -1,14 +1,20 @@
-"""Tests for render_agents_md.py's config-driven '## Test commands' block (T-0195).
+"""Tests for render_agents_md.py (T-0195 test-commands block + T-0199 rewrite).
 
-Before T-0195 the template hardcoded watchrobot's
-`docker exec signal-tracker python test_api.py`, so EVERY project's generated
-AGENTS.md advertised watchrobot's container. The block is now built from
-optional per-project `test_*_cmd` fields in projects.toml.
+T-0195: the template hardcoded watchrobot's `docker exec signal-tracker python
+test_api.py`, so EVERY project's generated AGENTS.md advertised watchrobot's
+container. The '## Test commands' block is now built from optional per-project
+`test_*_cmd` fields in projects.toml.
 
-The module reads vision/{north-star,strategy,tactical}.md to render the full
-template; those files no longer exist in live data (the vision schema moved to
-product.md etc.), so these tests render against minimal fixture vision files in
-a tmp data dir — exercising the real `render()` end-to-end, not just the helper.
+T-0199: render() now reads the CURRENT vision schema (product.md +
+active_initiatives + initiatives/<name>.md — the old north-star/strategy/
+tactical trio is gone from live data), and the REST of the template identity
+(ops path prefix, stack, stakeholders, Telegram bot, extra hard rules) is
+config-driven the same way: optional [projects.<slug>] fields, neutral
+placeholders when absent, never another project's identity.
+
+Tests render against fixture vision files in a tmp data dir — exercising the
+real `render()` end-to-end — and, for the two real projects, against the ACTUAL
+config/projects.toml shipped in this repo, so a registry regression is caught.
 """
 from __future__ import annotations
 
@@ -28,7 +34,32 @@ _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 
 # ---------------------------------------------------------------------------
-# render_test_commands() — the pure builder
+# Fixture vision (CURRENT schema — T-0199)
+# ---------------------------------------------------------------------------
+
+def _seed_vision(data_dir: Path, slug: str, *, active: bool = True) -> None:
+    vis = data_dir / slug / "vision"
+    (vis / "initiatives").mkdir(parents=True, exist_ok=True)
+    (vis / "product.md").write_text(
+        "# Prod\n\nThe core product statement.\n\n## Distribution\n\nNot for AGENTS.md.\n"
+    )
+    (vis / "initiatives" / "alpha.md").write_text("# Alpha — first bet\n\nbody\n")
+    (vis / "initiatives" / "untitled.md").write_text("no h1 here\n")
+    if active:
+        (vis / "active_initiatives").write_text("alpha.md\nuntitled.md\nmissing.md\n")
+
+
+def _synthetic_config(tmp_path: Path, extra: str = "") -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "projects.toml").write_text(
+        '[projects.synthetic]\nslug = "synthetic"\nrepo_path = "/tmp/syn"\n' + extra
+    )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# render_test_commands() — the pure builder (T-0195, unchanged behavior)
 # ---------------------------------------------------------------------------
 
 def test_fieldless_project_graceful():
@@ -55,31 +86,99 @@ def test_empty_string_field_is_skipped():
     assert block == "- Build: `make`"
 
 
-def test_brace_in_command_survives_format():
+def test_brace_in_command_survives_format(tmp_path):
     """A command containing literal {braces} must pass through str.format
-    untouched (DoD: mind brace-escaping)."""
-    project = {"test_backend_cmd": "`grep -o '{.*}' x.json`"}
-    block = ram.render_test_commands(project)
-    # Substituted as a single {test_commands} value → never re-scanned.
-    out = ram.TEMPLATE.format(
-        display_name="X", slug="x", repo_path="/x",
-        north_star_body="ns", strategy_body="st", tactical_body="ta",
-        test_commands=block,
+    untouched (T-0195 DoD: mind brace-escaping). End-to-end via render()."""
+    cfg = _synthetic_config(
+        tmp_path, 'test_backend_cmd = "`grep -o \'{.*}\' x.json`"\n'
     )
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
     assert "grep -o '{.*}' x.json" in out
 
 
 # ---------------------------------------------------------------------------
-# Full render() against fixture vision + the REAL registry
+# Current vision schema (T-0199)
 # ---------------------------------------------------------------------------
 
-def _seed_vision(data_dir: Path, slug: str) -> None:
-    vis = data_dir / slug / "vision"
-    vis.mkdir(parents=True, exist_ok=True)
-    (vis / "north-star.md").write_text("# North star\n\nWin.\n")
-    (vis / "strategy.md").write_text("# Strategy\n\nBet on it.\n")
-    (vis / "tactical.md").write_text("# Tactical\n\nDo the thing.\n")
+def test_renders_current_vision_schema(tmp_path):
+    """render() reads product.md + active_initiatives — end-to-end, no
+    north-star/strategy/tactical files anywhere (they no longer exist)."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "The core product statement." in out
+    # product.md subsections after the first H2 stay out of the always-cached file
+    assert "Not for AGENTS.md" not in out
+    # initiative with H1 → title; without H1 / missing file → stem fallback
+    assert "- **Alpha — first bet** — `ops/vision/initiatives/alpha.md`" in out
+    assert "- **untitled** — `ops/vision/initiatives/untitled.md`" in out
+    assert "- **missing** — `ops/vision/initiatives/missing.md`" in out
 
+
+def test_missing_vision_entirely_graceful(tmp_path):
+    """A project with NO vision dir at all: placeholders, no exception."""
+    cfg = _synthetic_config(tmp_path)
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "No `vision/product.md` yet" in out
+    assert "No active initiatives listed" in out
+
+
+def test_default_ops_prefix(tmp_path):
+    """Without ops_path the template uses the scaffold convention: plain `ops`."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "`ops/vision/product.md`" in out
+    assert "ops/bot-squad/" not in out
+
+
+def test_optional_identity_fields_render(tmp_path):
+    """ops_path / stack / stakeholders / tg_bot / extra_hard_rules all flow
+    from config into the rendered file."""
+    cfg = _synthetic_config(
+        tmp_path,
+        'ops_path = "ops/custom"\n'
+        'stack = "Rust + htmx."\n'
+        'stakeholders = "Jane (@jane)."\n'
+        'tg_bot = "@synbot"\n'
+        'extra_hard_rules = ["Never touch `legacy/`."]\n',
+    )
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "`ops/custom/vision/constitution.md`" in out
+    assert "- Stack: Rust + htmx." in out
+    assert "- Stakeholders: Jane (@jane)." in out
+    assert "Bot `@synbot`" in out
+    assert "- Never touch `legacy/`." in out
+
+
+def test_fieldless_project_omits_identity_lines(tmp_path):
+    """Absent optional fields → omitted/neutral lines, never another
+    project's identity (no @watchbot, no watchrobot stakeholders, no
+    signal-tracker-old rule, no Tailwind stack)."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    for leaked in ("@watchbot", "signal-tracker", "Tailwind", "@alexeysdk",
+                   "@timpo", "- Stack:", "- Stakeholders:"):
+        assert leaked not in out, leaked
+
+
+def test_absolute_ops_path_no_arrow(tmp_path):
+    """When ops_path IS the absolute data dir (bot-squad's case: clone has no
+    data symlink), the paths line renders once — no `X → X` arrow noise."""
+    _seed_vision(tmp_path, "synthetic")
+    data_path = str(tmp_path / "synthetic")
+    cfg = _synthetic_config(tmp_path, f'ops_path = "{data_path}"\n')
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert f"- Vision / backlog / feedback: `{data_path}/`." in out
+    assert f"`{data_path}/` → `{data_path}/`" not in out
+
+
+# ---------------------------------------------------------------------------
+# The two REAL projects against the REAL registry
+# ---------------------------------------------------------------------------
 
 def _test_block(rendered: str) -> str:
     """Slice the '## Test commands' section out of a rendered AGENTS.md."""
@@ -88,11 +187,16 @@ def _test_block(rendered: str) -> str:
     return rendered[start:end].strip()
 
 
-def test_watchrobot_block_unchanged(tmp_path):
-    """watchrobot's rendered test block must be byte-identical to the lines its
-    AGENTS.md carried before the template stopped hardcoding them."""
+def test_watchrobot_real_config(tmp_path):
+    """watchrobot renders with ITS identity: legacy ops/bot-squad prefix, the
+    signal-tracker-old hard rule (now config-driven), @watchbot, and the exact
+    pre-T-0195 test-commands block."""
     _seed_vision(tmp_path, "watchrobot")
     out = ram.render("watchrobot", _CONFIG_DIR, tmp_path)
+    assert "`ops/bot-squad/vision/constitution.md`" in out
+    assert "archived/signal-tracker-old" in out
+    assert "Bot `@watchbot`" in out
+    assert "Tailwind" in out
     assert _test_block(out) == (
         "## Test commands\n\n"
         "- Backend: `docker exec signal-tracker python test_api.py`\n"
@@ -100,38 +204,23 @@ def test_watchrobot_block_unchanged(tmp_path):
         "- Type-check: from `web/`, `npx tsc -b --noEmit`\n"
         "- Lint: from `web/`, `npm run lint`"
     )
+    # No bot-squad-project identity in watchrobot's render.
+    for leaked in ("cd api && pytest", "/home/almdudleer/bot-squad", "Bootstrap"):
+        assert leaked not in out, leaked
 
 
-def test_botsquad_no_signaltracker_leak(tmp_path):
-    """bot-squad's AGENTS.md gets its OWN commands; the TEST-COMMANDS block
-    never advertises watchrobot's signal-tracker container.
-
-    NB: the assertion is scoped to the test block on purpose — the rest of the
-    template is independently bot-squad/watchrobot-hardcoded (`ops/bot-squad/`,
-    a `signal-tracker-old` hard rule, `@watchbot`), which is a SEPARATE, broader
-    issue tracked in its own follow-up ticket, not T-0195's DoD."""
+def test_botsquad_real_config_no_watchrobot_leak(tmp_path):
+    """T-0199 headline: bot-squad's WHOLE rendered file (not just the test
+    block) carries zero watchrobot identity."""
     _seed_vision(tmp_path, "bot-squad")
     out = ram.render("bot-squad", _CONFIG_DIR, tmp_path)
-    block = _test_block(out)
-    assert "signal-tracker" not in block
-    assert "- Backend: `cd api && pytest`, `cd worker && pytest`" in block
-    assert "- Build: `cd web && npm run build` (build only — no e2e yet)" in block
-
-
-def test_fieldless_project_full_render(tmp_path):
-    """An end-to-end render of a project with no test_*_cmd fields: no KeyError,
-    placeholder in the section, no signal-tracker leak."""
-    slug = "synthetic"
-    _seed_vision(tmp_path, slug)
-    project = {"display_name": "Synthetic", "repo_path": "/tmp/syn"}
-    rendered = ram.TEMPLATE.format(
-        display_name="Synthetic", slug=slug, repo_path="/tmp/syn",
-        north_star_body="ns", strategy_body="st", tactical_body="ta",
-        test_commands=ram.render_test_commands(project),
-    )
-    test_block = _test_block(rendered)
-    assert "signal-tracker" not in test_block
-    assert "No project-specific test commands" in test_block
+    for leaked in ("signal-tracker", "@watchbot", "watchrobot", "Tailwind",
+                   "@timpo", "@alexeysdk", "asyncpg"):
+        assert leaked not in out, leaked
+    assert "- Backend: `cd api && pytest`, `cd worker && pytest`" in out
+    assert "- Build: `cd web && npm run build` (build only — no e2e yet)" in out
+    # ops_path is the absolute install data dir (clone has no data symlink).
+    assert "`/home/www/bot-squad/data/bot-squad/vision/constitution.md`" in out
 
 
 if __name__ == "__main__":

@@ -189,6 +189,90 @@ def test_live_closed_dev_is_suspended_and_archived(tmp_path, monkeypatch):
     assert str(S._read_session_metadata(p)["archived"]).lower() == "true"
 
 
+# --- T-0202: live dev whose binding was already cleared (task_id ~) ---
+
+def _live_feat_dev_pane(monkeypatch):
+    monkeypatch.setattr(
+        S, "list_panes",
+        lambda: [PaneInfo(pane_id="%1", window="feat-dev", pid="1", cwd="/x", command="claude")],
+    )
+
+
+def test_live_dev_last_task_closed_is_archived(tmp_path, monkeypatch):
+    """T-0202 regression: gc_dead_bindings already stripped task_id to ~ in the
+    same tick; the live idle dev must still be trimmed via last_task_id."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "closed")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="~",
+                      last_task_id="T-0001")
+    _live_feat_dev_pane(monkeypatch)
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda cfg, slug, sid: suspended.append(sid))
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    assert suspended == ["S-u-feat-dev-p1"]
+    meta = S._read_session_metadata(p)
+    assert str(meta["archived"]).lower() == "true"
+    assert meta["status"] == "suspended"
+    assert meta["archive_reason"] == "auto-archive:live-last-closed"
+    assert meta["last_task_id"] == "T-0001"  # preserved through suspend's rewrite
+
+
+def test_live_dev_last_task_totest_is_not_archived(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "totest")
+    _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="~",
+                  last_task_id="T-0001")
+    _live_feat_dev_pane(monkeypatch)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0  # TL may still be iterating review
+
+
+def test_live_dev_last_task_closed_but_pane_busy_is_not_archived(tmp_path, monkeypatch):
+    """Idle guard: a pane with fresh jsonl activity is never trimmed mid-write."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "closed")
+    _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="~",
+                  last_task_id="T-0001", claude_uuid="u" * 8)
+    _live_feat_dev_pane(monkeypatch)
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time())
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
+def test_live_dev_last_task_closed_but_live_extra_task_is_not_archived(tmp_path, monkeypatch):
+    """A surviving extra_task_ids entry is real remaining work (closed extras
+    were already pruned by gc_dead_bindings) — never trim."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "closed")
+    _seed_task(cfg, "T-0002", "in_progress")
+    _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="~",
+                  last_task_id="T-0001", extra_task_ids=["T-0002"])
+    _live_feat_dev_pane(monkeypatch)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
+def test_same_tick_close_then_trim(tmp_path, monkeypatch):
+    """End-to-end intra-tick order (the T-0202 bug): gc_dead_bindings strips the
+    just-closed binding, then archive_dead_teammates trims in the SAME tick."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "closed")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    _live_feat_dev_pane(monkeypatch)
+    monkeypatch.setattr(S, "suspend", lambda cfg, slug, sid: None)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    assert gc_dead_bindings(cfg, "test-project")["cleared"] == 1
+    assert S._read_session_metadata(p)["task_id"] is None
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    meta = S._read_session_metadata(p)
+    assert meta["archive_reason"] == "auto-archive:live-last-closed"
+    assert meta["last_task_id"] == "T-0001"
+
+
 def test_tl_role_is_never_auto_archived(tmp_path):
     cfg = _make_cfg(tmp_path)
     _seed_session(cfg, "S-u-feat-TL-p1", window="feat-TL", task_id="~",

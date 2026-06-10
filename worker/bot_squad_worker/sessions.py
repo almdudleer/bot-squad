@@ -2500,6 +2500,17 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
          avoid. Crashed in-progress devs (pane gone, task still open) are left
          resumable for ``gc_sessions`` to mark suspended.
 
+         T-0202: ``gc_dead_bindings`` runs *earlier in the same tick* and
+         strips a just-closed primary ``task_id`` to ``~`` (preserving it as
+         ``last_task_id``), so a live verified-done dev never actually
+         presents here as live+closed — it presents as live + no current
+         task. Rule 2 therefore also consults ``last_task_id``: a live dev
+         with no current task, no surviving ``extra_task_ids``, an *idle*
+         pane, and ``last_task_id`` → ``closed`` is trimmed with reason
+         ``live-last-closed``. Closed-only (never ``totest``) preserves the
+         rule-2 safety above; the idle guard (``IDLE_AT_PROMPT_SECONDS`` of
+         jsonl quiet) additionally spares a pane that is still mid-write.
+
     Returns ``{"ok": True, "scanned": N, "archived": K, "sids": [...]}``.
     """
     from bot_squad_worker.actions import ActionError
@@ -2514,10 +2525,12 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
 
     data_dir = cfg.data_dir
     user = _get_current_user()
+    user_home = _get_user_home()
     user_prefix = f"S-{user}-"
     live_panes = list_panes()
     live_sids = {compute_sid(user, p.window, p.pane_id) for p in live_panes}
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now_epoch = time.time()
 
     scanned = 0
     archived: list[str] = []
@@ -2544,10 +2557,30 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
         has_task = bool(tid and tid != "~")
         st = _task_status(data_dir, slug, tid) if has_task else None
         reason = None
+        ltid = None
         if is_live:
             # Live dev: only trim when verified-done (task closed).
             if has_task and st == "closed":
                 reason = "live-closed"
+            elif not has_task:
+                # T-0202: the binding for a just-closed task was already
+                # stripped by gc_dead_bindings earlier in this tick, so the
+                # verified-done signal lives in last_task_id. Trim only when
+                # the dev holds no other live work (gc_dead_bindings has
+                # already pruned closed extras, so any survivor is a real
+                # claim) and its pane is idle — a missing jsonl activity
+                # signal counts as idle, mirroring _derive_activity.
+                ltid = meta.get("last_task_id")
+                extras = [t for t in (meta.get("extra_task_ids") or []) if t and t != "~"]
+                if (
+                    ltid and ltid != "~" and not extras
+                    and _task_status(data_dir, slug, ltid) == "closed"
+                ):
+                    activity_at = _pane_activity_at(
+                        str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
+                    )
+                    if activity_at is None or (now_epoch - activity_at) >= IDLE_AT_PROMPT_SECONDS:
+                        reason = "live-last-closed"
         else:
             # Exited dev: archive when delivered or orphaned.
             if not has_task:
@@ -2580,6 +2613,10 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
         if has_task:
             meta["last_task_id"] = tid
             meta["task_id"] = "~"
+        elif reason == "live-last-closed":
+            # suspend() rewrote the md with a fixed key set that drops
+            # last_task_id — restore the signal that justified this trim.
+            meta["last_task_id"] = ltid
         meta["archived"] = "true"
         meta["archive_reason"] = f"auto-archive:{reason}"
         _write_session_metadata(md, meta, atomic=True)

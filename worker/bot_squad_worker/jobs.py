@@ -175,7 +175,8 @@ def binding_gc_tick(cfg: Config) -> None:
          losers in a dup race (preserve old value as ``last_task_id``).
       4. ``archive_dead_teammates`` (T-0142/0144) — auto-archive cleanly-exited
          post-totest devs (and verified-done live devs); makes dev zombies
-         impossible without a TL lifting a finger.
+         impossible without a TL lifting a finger. T-0202: also trims a live
+         idle dev whose binding pass 2 just cleared, via ``last_task_id``.
       5. ``reconcile_teams`` (T-0142) — rebuild the tmux-session-keyed Team mds
          from the (now-reconciled) SessionMd registry so the team roster, TL
          slot, and archived members survive a worker reload.

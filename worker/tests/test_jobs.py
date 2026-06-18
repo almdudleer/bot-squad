@@ -448,6 +448,162 @@ def test_deploy_monitor_collapses_only_same_target(
 
 
 # ---------------------------------------------------------------------------
+# T-0212: per-project isolation + no-progress watchdog + orphan reaper
+# ---------------------------------------------------------------------------
+
+
+def _two_project_config(tmp_path: Path) -> tuple[Config, Project, Project]:
+    """A Config with two real projects A (wedger) + B (healthy)."""
+    proj_a = _make_project_with_repo(tmp_path / "A", slug="proj-a")
+    proj_b = _make_project_with_repo(tmp_path / "B", slug="proj-b")
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(exist_ok=True)
+    blocks = []
+    for p in (proj_a, proj_b):
+        blocks.append(
+            f'[projects.{p.slug}]\n'
+            f'slug = "{p.slug}"\n'
+            f'display_name = "{p.display_name}"\n'
+            f'repo_path = "{p.repo_path}"\n'
+            f'deploy_branch = "{p.deploy_branch}"\n'
+            f'master_branch = "{p.master_branch}"\n'
+            f'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+            f'deploy_targets = ["staging"]\n'
+            f'tg_chat = "{p.tg_chat}"\n'
+            f'created_at = 2026-05-10\n'
+        )
+    (cfg_dir / "projects.toml").write_text("\n".join(blocks))
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    return Config.load(cfg_dir), proj_a, proj_b
+
+
+def _hang_recipe(cfg: Config, slug: str) -> None:
+    recipe_dir = cfg.data_dir / slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    r = recipe_dir / "staging.sh"
+    r.write_text('#!/usr/bin/env bash\necho start\nwhile true; do sleep 60; done\n')
+    r.chmod(0o755)
+
+
+def test_deploy_monitor_per_project_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE T-0212 scenario: a wedged build in project A must NOT block B.
+
+    Wedge A with a no-output build; assert (a) A is watchdog-failed with a loud
+    marker, and (b) B still deploys to completion — on its own monitor tick,
+    not held behind A.
+    """
+    from bot_squad_worker import deploy as _deploy
+    from bot_squad_worker.jobs import deploy_monitor_one
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+
+    cfg, proj_a, proj_b = _two_project_config(tmp_path)
+    _hang_recipe(cfg, proj_a.slug)            # A wedges
+    _make_recipe(cfg, proj_b.slug, "staging", rc=0)  # B healthy
+
+    _deploy.enqueue(cfg, proj_a.slug, "staging", "wedge", "pytest")
+    _deploy.enqueue(cfg, proj_b.slug, "staging", "healthy", "pytest")
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    # A's tick: wedged build is watchdog-killed (does NOT hang the test).
+    deploy_monitor_one(cfg, proj_a.slug)
+    a_base = cfg.data_dir / proj_a.slug / "_jobs" / "deploy"
+    assert list((a_base / "processing").glob("*.json")) == []  # nothing stranded
+    assert len(list((a_base / "processed").glob(f"*.fail.{_deploy.RC_NO_PROGRESS}"))) == 1
+
+    # B's tick: deploys fine, fully independent of A's wedge.
+    deploy_monitor_one(cfg, proj_b.slug)
+    b_base = cfg.data_dir / proj_b.slug / "_jobs" / "deploy"
+    assert len(list((b_base / "processed").glob("*.ok"))) == 1
+
+
+def test_deploy_monitor_watchdog_fires_targeted_operator_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watchdog kill → loud urgent TG + a TARGETED operator peer_send.
+
+    Not a broadcast (role=all): a literal operator SID, mirroring the telemetry
+    guardrail (T-0210).
+    """
+    from bot_squad_worker import deploy as _deploy
+    from bot_squad_worker.jobs import deploy_monitor_one
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+    _hang_recipe(cfg, proj.slug)
+    _deploy.enqueue(cfg, proj.slug, "staging", "wedge", "pytest")
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    # One operator-role session + capture peer_sends.
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as IS
+    monkeypatch.setattr(
+        S, "list_sessions",
+        lambda _cfg, _slug: [{"sid": "S-op-1", "role": "operator"},
+                             {"sid": "S-dev-9", "role": "dev"}],
+    )
+    peers: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        IS, "send",
+        lambda _cfg, _slug, frm, to, text, user=None: peers.append((to, text)) or {"ok": True},
+    )
+
+    deploy_monitor_one(cfg, proj.slug)
+
+    # Urgent TG carried the loud KILLED marker.
+    kill_tgs = [c for c in fake_tg.calls if "KILLED" in c["text"]]
+    assert kill_tgs and all(c["urgent"] is True for c in kill_tgs)
+    # Targeted peer_send went to the operator SID ONLY (never the dev / role=all).
+    assert peers and all(to == "S-op-1" for to, _ in peers)
+    assert all("KILLED" in t for _, t in peers)
+
+
+def test_deploy_monitor_reaps_orphan_with_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """deploy_monitor_one sweeps a stale processing/ orphan + fires an alert."""
+    import os
+    import time as _time
+    import json as _j
+    from bot_squad_worker import deploy as _deploy
+    from bot_squad_worker.jobs import deploy_monitor_one
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+    # No queued deploy — only a stranded orphan to reap.
+    proc_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processing"
+    proc_dir.mkdir(parents=True, exist_ok=True)
+    orphan = proc_dir / "1700000000000-old-orphan.json"
+    orphan.write_text(_j.dumps({"queue_id": "old-orphan", "target": "staging"}))
+    old = _time.time() - 3 * 3600
+    os.utime(orphan, (old, old))
+
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    deploy_monitor_one(cfg, proj.slug)
+
+    processed = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processed"
+    assert len(list(processed.glob(f"*.fail.{_deploy.RC_ORPHAN}"))) == 1
+    assert any("ORPHAN" in c["text"] and c["urgent"] for c in fake_tg.calls)
+
+
+# ---------------------------------------------------------------------------
 # oauth_refresh tests
 # ---------------------------------------------------------------------------
 

@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import subprocess
 import time
 import uuid
@@ -52,6 +53,13 @@ if TYPE_CHECKING:
     from bot_squad_worker.config import Config
 
 log = logging.getLogger(__name__)
+
+# Sentinel deploy exit codes (T-0212). Distinct values so the run-log marker,
+# the TG/operator alert text, and the tests can all tell *why* a deploy failed
+# apart from a plain non-zero recipe rc.
+RC_TIMEOUT = 124       # hard wall-clock backstop tripped (build ran too long)
+RC_NO_PROGRESS = 125   # no-progress watchdog: zero run-log output for N minutes
+RC_ORPHAN = 126        # stale-orphan reaper: file stranded in processing/ swept
 
 # Patterns in git --porcelain output that are ignored for cleanliness checks.
 # Each is tested against the full line (e.g. " M logs/something.log").
@@ -81,6 +89,11 @@ class DeployResult:
     # other 4 happened separately.
     collapsed_count: int = 1
     collapsed_reasons: tuple[str, ...] = ()
+    # T-0212: set when the watchdog (not the recipe) ended the run —
+    # "no_progress" (no run-log output for N min) or "timeout" (hard backstop).
+    # None on a normal exit (success OR an honest non-zero recipe rc). Lets the
+    # caller fire the loud, TARGETED operator alert only for a wedged build.
+    killed_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -357,32 +370,45 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
 
     # Run recipe with cwd matching the target clone (dev clone for staging,
     # master clone for prod). Recipes assume their cwd is the right tree.
-    # Timeout: signal-tracker's image build (vite + npm install + COPY backend)
-    # has crept past the original 600s ceiling — fresh-cache builds now take
-    # ~17 min, blowing the timeout right after `Built` and before the
-    # docker-compose-up swap could finish. 1800s (30 min) gives headroom
-    # without masking truly hung recipes. Override with $BOT_SQUAD_DEPLOY_TIMEOUT.
+    #
+    # Two watchdogs guard the run (T-0212), because the old single
+    # `subprocess.run(timeout=)` both (a) let a hung build hold the whole
+    # serial monitor for up to 30 min, and (b) RAISED TimeoutExpired on a
+    # hang — uncaught, that stranded the file in processing/ forever (the
+    # 2-week-old watchrobot orphans):
+    #   - no-progress watchdog: kill the build when its run-log has produced
+    #     no new bytes for BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS (default 600s =
+    #     10 min). A healthy build emits layer/step progress continuously even
+    #     when slow; 10 min of total silence means it's wedged (buildx frozen
+    #     at `COPY web/ .` at 0% CPU, the live watchrobot symptom).
+    #   - hard timeout: wall-clock backstop. signal-tracker's fresh-cache image
+    #     build (vite + npm install + COPY backend) runs ~17 min, so the 1800s
+    #     (30 min) default leaves headroom. Override $BOT_SQUAD_DEPLOY_TIMEOUT.
+    # Either watchdog kills the whole process group (the recipe's children —
+    # docker build etc. — survive a kill of just the bash parent), appends a
+    # loud marker to the run-log, and returns a sentinel rc instead of raising,
+    # so the queue file always lands in processed/ and the queue is unblocked.
     timeout_s = int(os.environ.get("BOT_SQUAD_DEPLOY_TIMEOUT", "1800"))
-    log.info("deploy.run_next: running %s (recipe: %s, cwd: %s, timeout=%ds)", queue_id, recipe, repo, timeout_s)
-    with log_path.open("w") as lf:
-        proc = subprocess.run(
-            ["bash", str(recipe)],
-            cwd=str(repo),
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            timeout=timeout_s,
-        )
+    no_progress_s = int(os.environ.get("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "600"))
+    log.info(
+        "deploy.run_next: running %s (recipe: %s, cwd: %s, timeout=%ds, no_progress=%ds)",
+        queue_id, recipe, repo, timeout_s, no_progress_s,
+    )
+    rc, killed_reason = _run_recipe_watchdog(recipe, repo, log_path, timeout_s, no_progress_s)
 
-    rc = proc.returncode
     _finish(cfg, slug, processing_file, queue_id, rc=rc)
     for pf in collapsed_processing:
         _finish(cfg, slug, pf, _queue_id_of(pf), rc=rc)
     ok = rc == 0
-    log.info("deploy.run_next: %s/%s finished rc=%d (collapsed=%d)", slug, target, rc, 1 + len(collapsed_processing))
+    log.info(
+        "deploy.run_next: %s/%s finished rc=%d killed=%s (collapsed=%d)",
+        slug, target, rc, killed_reason, 1 + len(collapsed_processing),
+    )
     return DeployResult(
         ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
         collapsed_count=1 + len(collapsed_processing),
         collapsed_reasons=tuple(collapsed_reasons),
+        killed_reason=killed_reason,
     )
 
 
@@ -392,6 +418,168 @@ def _queue_id_of(processing_file: Path) -> str:
     # Everything after the first dash is the uuid
     _, _, qid = stem.partition("-")
     return qid
+
+
+def _run_recipe_watchdog(
+    recipe: Path,
+    repo: Path,
+    log_path: Path,
+    timeout_s: int,
+    no_progress_s: int,
+) -> tuple[int, str | None]:
+    """Run ``bash <recipe>`` (cwd=repo, output→log_path) under two watchdogs.
+
+    Returns ``(returncode, killed_reason)``:
+      - ``(rc, None)`` — the recipe exited on its own with code ``rc``.
+      - ``(RC_NO_PROGRESS, "no_progress")`` — the run-log produced no new bytes
+        for ``no_progress_s`` seconds; the build was killed.
+      - ``(RC_TIMEOUT, "timeout")`` — the run exceeded ``timeout_s`` wall-clock
+        seconds; the build was killed.
+
+    The child is launched in its own process group (``start_new_session=True``)
+    so a watchdog kill reaches the recipe's descendants (docker build, npm,
+    …), not just the bash wrapper. A watchdog kill appends a loud marker to
+    the run-log and NEVER raises — the caller relies on always getting an rc so
+    the queue file is finished (moved out of processing/) and the queue
+    unblocked. ``no_progress_s``/``timeout_s`` <= 0 disable that watchdog.
+    """
+    poll_interval = float(os.environ.get("BOT_SQUAD_DEPLOY_POLL_SECONDS", "5"))
+    with log_path.open("w") as lf:
+        proc = subprocess.Popen(
+            ["bash", str(recipe)],
+            cwd=str(repo),
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # own process group → killpg reaches children
+        )
+
+    start = time.monotonic()
+    last_progress = start
+    last_size = -1
+    killed_reason: str | None = None
+    rc: int
+
+    while True:
+        try:
+            rc = proc.wait(timeout=poll_interval)
+            return rc, None  # recipe finished on its own
+        except subprocess.TimeoutExpired:
+            pass
+
+        now = time.monotonic()
+        try:
+            size = log_path.stat().st_size
+        except OSError:
+            size = last_size
+        if size != last_size:
+            last_size = size
+            last_progress = now
+
+        if no_progress_s > 0 and (now - last_progress) >= no_progress_s:
+            killed_reason = "no_progress"
+            rc = RC_NO_PROGRESS
+            break
+        if timeout_s > 0 and (now - start) >= timeout_s:
+            killed_reason = "timeout"
+            rc = RC_TIMEOUT
+            break
+
+    _kill_process_group(proc)
+    elapsed = time.monotonic() - start
+    if killed_reason == "no_progress":
+        marker = (
+            f"\n\n❌ WATCHDOG: killed — no run-log output for "
+            f"{no_progress_s}s (build wedged). Elapsed {elapsed:.0f}s. "
+            f"rc={rc}.\n"
+        )
+    else:
+        marker = (
+            f"\n\n❌ WATCHDOG: killed — exceeded hard timeout of "
+            f"{timeout_s}s. Elapsed {elapsed:.0f}s. rc={rc}.\n"
+        )
+    log.error(
+        "deploy._run_recipe_watchdog: killed %s (reason=%s, elapsed=%.0fs)",
+        recipe, killed_reason, elapsed,
+    )
+    try:
+        with log_path.open("a") as lf:
+            lf.write(marker)
+    except OSError:
+        log.exception("deploy._run_recipe_watchdog: could not append marker to %s", log_path)
+    return rc, killed_reason
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """Terminate the recipe's whole process group: SIGTERM, then SIGKILL.
+
+    The child was started with ``start_new_session=True`` so it leads its own
+    process group; killing the group reaches grandchildren (docker, npm) that
+    a kill of the bash wrapper alone would orphan.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return  # already gone
+    for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 10.0)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def reap_orphans(cfg: "Config", slug: str, max_age_seconds: int | None = None) -> list[dict]:
+    """Sweep stale files stranded in processing/ to processed/.fail.<RC_ORPHAN>.
+
+    A file in ``processing/`` older than ``max_age_seconds`` is an orphan: a
+    run whose worker died mid-deploy (or, pre-T-0212, a recipe that raised
+    TimeoutExpired and left its file stranded). Left alone it lingers forever
+    with no alert — the 2-week-old watchrobot orphans the ticket cites.
+
+    ``max_age_seconds`` defaults to BOT_SQUAD_DEPLOY_ORPHAN_SECONDS (7200s =
+    2h), comfortably above the 1800s hard deploy timeout so a legitimately
+    in-flight deploy is never reaped. (Per-project monitor jobs also serialise
+    reap-then-run, so the reaper never races a live deploy of the same slug.)
+
+    Returns one info dict per reaped orphan (queue_id / target / reason /
+    age_seconds) for the caller to raise a targeted alert on.
+    """
+    if max_age_seconds is None:
+        max_age_seconds = int(os.environ.get("BOT_SQUAD_DEPLOY_ORPHAN_SECONDS", "7200"))
+    processing_dir = _processing_dir(cfg, slug)
+    if not processing_dir.exists():
+        return []
+    now = time.time()
+    reaped: list[dict] = []
+    for f in sorted(processing_dir.glob("*.json")):
+        try:
+            age = now - f.stat().st_mtime
+        except OSError:
+            continue
+        if age < max_age_seconds:
+            continue
+        qid = _queue_id_of(f)
+        try:
+            payload = json.loads(f.read_text())
+        except Exception:
+            payload = {}
+        _finish(cfg, slug, f, qid, rc=RC_ORPHAN)
+        log.error(
+            "deploy.reap_orphans: %s swept stale processing job %s "
+            "(age %.0fs >= %ds, target=%s) → processed/.fail.%d",
+            slug, qid, age, max_age_seconds, payload.get("target"), RC_ORPHAN,
+        )
+        reaped.append({
+            "queue_id": qid,
+            "age_seconds": age,
+            "target": payload.get("target"),
+            "reason": payload.get("reason"),
+        })
+    return reaped
 
 
 # ---------------------------------------------------------------------------

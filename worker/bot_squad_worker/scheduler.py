@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from bot_squad_worker.config import Config
@@ -15,7 +16,7 @@ from bot_squad_worker.jobs import (
     autoupdate_tick,
     binding_gc_tick,
     constant_team_tick,
-    deploy_monitor,
+    deploy_monitor_one,
     drift_check_tick,
     heartbeat,
     oauth_refresh,
@@ -57,7 +58,15 @@ def state_for_api(sched: BackgroundScheduler, cfg: Config) -> dict:
 
 
 def build_scheduler(cfg: Config) -> BackgroundScheduler:
-    sched = BackgroundScheduler(timezone="UTC")
+    # T-0212: a wedged deploy now blocks its own thread for the whole build
+    # (up to the 30-min hard timeout) instead of the old single serial sweep.
+    # With one deploy job per project (below) several can run at once, so widen
+    # the default ThreadPoolExecutor (10) to keep long deploys from starving the
+    # quick lifecycle ticks (heartbeat, binding_gc, telemetry, …).
+    sched = BackgroundScheduler(
+        timezone="UTC",
+        executors={"default": ThreadPoolExecutor(max_workers=30)},
+    )
 
     sched.add_job(
         heartbeat,
@@ -67,14 +76,28 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         id="heartbeat",
         replace_existing=True,
     )
-    sched.add_job(
-        deploy_monitor,
-        "interval",
-        seconds=60,
-        args=[cfg],
-        id="deploy_monitor",
-        replace_existing=True,
-    )
+    # deploy_monitor (T-0212): ONE job PER PROJECT, not a single serial sweep.
+    # Previously a lone deploy_monitor job (apscheduler default max_instances=1)
+    # iterated every project serially AND blocked on each recipe subprocess for
+    # up to the 30-min timeout — so a hung build in one project head-of-line-
+    # blocked every other project's deploys and every subsequent tick logged
+    # "skipped: maximum number of running instances reached (1)" (the live
+    # watchrobot jam that blocked T-0211). Per-project jobs (each
+    # max_instances=1 + coalesce) isolate a wedged project: its job holds only
+    # its own instance; sibling projects run on their own scheduler threads.
+    # New projects are picked up on the next worker restart (config is loaded
+    # once at startup, same as before).
+    for _slug in cfg.projects:
+        sched.add_job(
+            deploy_monitor_one,
+            "interval",
+            seconds=60,
+            args=[cfg, _slug],
+            id=f"deploy_monitor:{_slug}",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
     # oauth_refresh: v1 placeholder — checks claude binary reachable.
     # Full token-rotation port from cctv-backend deferred to a later spec.
     sched.add_job(

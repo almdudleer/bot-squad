@@ -529,6 +529,176 @@ def test_run_next_deploy_clone_refuses_unpushed_dev_commits(
     assert "local-only" in joined
 
 
+# ---------------------------------------------------------------------------
+# T-0212: no-progress watchdog + hard-timeout + stale-orphan reaper
+# ---------------------------------------------------------------------------
+
+
+def _make_hanging_recipe(
+    cfg: Config, slug: str, target: str, prelude: str = 'echo "starting"'
+) -> Path:
+    """Recipe that emits one line then hangs forever with NO further output.
+
+    Mimics buildx frozen at `COPY web/ .` (0% CPU, silent run-log) — the live
+    watchrobot symptom the no-progress watchdog must catch.
+    """
+    recipe_dir = cfg.data_dir / slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / f"{target}.sh"
+    recipe.write_text(
+        "#!/usr/bin/env bash\n" + prelude + "\nwhile true; do sleep 60; done\n"
+    )
+    recipe.chmod(0o755)
+    return recipe
+
+
+def test_run_next_no_progress_watchdog_kills_hung_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A build with no run-log output for N seconds is killed + failed loudly.
+
+    THE ticket smoke (T-0212): no exception is raised (the old
+    subprocess.run(timeout=) raised TimeoutExpired, stranding the file in
+    processing/ forever), the queue file lands in processed/.fail.<RC_NO_PROGRESS>,
+    and the run-log carries a loud WATCHDOG marker.
+    """
+    from bot_squad_worker.deploy import RC_NO_PROGRESS
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")  # backstop far away
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_hanging_recipe(cfg, proj.slug, "staging")
+
+    enqueue(cfg, proj.slug, "staging", "hung build", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is False
+    assert result.returncode == RC_NO_PROGRESS
+    assert result.killed_reason == "no_progress"
+
+    base = cfg.data_dir / proj.slug / "_jobs" / "deploy"
+    assert list((base / "processing").glob("*.json")) == []  # nothing stranded
+    assert len(list((base / "processed").glob(f"*.fail.{RC_NO_PROGRESS}"))) == 1
+    log_text = result.log_path.read_text()
+    assert "WATCHDOG" in log_text and "no run-log output" in log_text
+
+
+def test_run_next_hard_timeout_kills_long_build(tmp_path: Path, monkeypatch) -> None:
+    """A build that keeps printing (no-progress never fires) but runs too long
+    is killed by the wall-clock backstop with RC_TIMEOUT."""
+    from bot_squad_worker.deploy import RC_TIMEOUT
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "60")  # never fires
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "2")
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    # Chatty recipe: emits output continuously so only the hard timeout can fire.
+    recipe_dir = cfg.data_dir / proj.slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / "staging.sh"
+    recipe.write_text(
+        "#!/usr/bin/env bash\nwhile true; do echo tick; sleep 0.2; done\n"
+    )
+    recipe.chmod(0o755)
+
+    enqueue(cfg, proj.slug, "staging", "slow build", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.ok is False
+    assert result.returncode == RC_TIMEOUT
+    assert result.killed_reason == "timeout"
+    assert "WATCHDOG" in result.log_path.read_text()
+
+
+def test_watchdog_kills_whole_process_group(tmp_path: Path, monkeypatch) -> None:
+    """The recipe's CHILD (docker/npm stand-in) is killed too, not just bash.
+
+    The manual walkthrough surfaced this: killing only the bash wrapper would
+    orphan the actual build child. start_new_session + killpg fixes it.
+    """
+    import os
+    import time as _time
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    pid_file = tmp_path / "child.pid"
+    recipe_dir = cfg.data_dir / proj.slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / "staging.sh"
+    # Background child writes its pid, then both parent + child hang silently.
+    recipe.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "starting"\n'
+        "( sleep 300 ) &\n"
+        f'echo $! > "{pid_file}"\n'
+        "wait\n"
+    )
+    recipe.chmod(0o755)
+
+    enqueue(cfg, proj.slug, "staging", "child-leak test", "user")
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.killed_reason == "no_progress"
+
+    child_pid = int(pid_file.read_text().strip())
+    _time.sleep(0.5)  # let the kill settle
+    # The child must be gone (os.kill 0 raises ProcessLookupError once reaped).
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_reap_orphans_sweeps_stale_processing(tmp_path: Path, monkeypatch) -> None:
+    """A file stranded in processing/ past max-age is swept to processed/.fail."""
+    import os
+    import time as _time
+    from bot_squad_worker.deploy import RC_ORPHAN, reap_orphans
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    proc_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processing"
+    proc_dir.mkdir(parents=True, exist_ok=True)
+    orphan = proc_dir / "1700000000000-deadbeef-orphan.json"
+    orphan.write_text(json.dumps({"queue_id": "deadbeef-orphan", "target": "staging"}))
+    old = _time.time() - 3 * 3600  # 3h old
+    os.utime(orphan, (old, old))
+
+    reaped = reap_orphans(cfg, proj.slug)  # default max-age 7200s
+
+    assert len(reaped) == 1
+    assert reaped[0]["queue_id"] == "deadbeef-orphan"
+    assert reaped[0]["age_seconds"] >= 7200
+    assert list(proc_dir.glob("*.json")) == []
+    processed = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processed"
+    assert len(list(processed.glob(f"*.fail.{RC_ORPHAN}"))) == 1
+
+
+def test_reap_orphans_ignores_fresh_processing(tmp_path: Path) -> None:
+    """A freshly-moved processing file (a live deploy) is NOT reaped."""
+    from bot_squad_worker.deploy import reap_orphans
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    proc_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processing"
+    proc_dir.mkdir(parents=True, exist_ok=True)
+    fresh = proc_dir / "1700000000000-fresh.json"
+    fresh.write_text(json.dumps({"queue_id": "fresh", "target": "staging"}))
+    # mtime = now (default) → well under the 7200s default max-age.
+
+    reaped = reap_orphans(cfg, proj.slug)
+
+    assert reaped == []
+    assert len(list(proc_dir.glob("*.json"))) == 1
+
+
 def test_is_clean_for_target_deploy_clone_ignores_dev_dirtiness(tmp_path: Path) -> None:
     from bot_squad_worker.deploy import is_clean_for_target
 

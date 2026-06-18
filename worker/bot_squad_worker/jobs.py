@@ -19,18 +19,64 @@ def heartbeat(cfg: Config) -> None:
 
 
 def deploy_monitor(cfg: Config) -> None:
-    """Iterate registered projects; run the next queued deploy for each.
+    """Sweep ALL registered projects (serial), running each one's deploy tick.
 
-    Per-project exceptions are caught and logged; one bad project doesn't
-    kill the whole sweep.
+    Retained as a manual all-projects sweep + the test entrypoint. Production
+    no longer schedules THIS as a single job: T-0212 registers one
+    ``deploy_monitor_one`` apscheduler job PER PROJECT so a hung build can't
+    head-of-line-block the others (see scheduler.build_scheduler). Per-project
+    exceptions are caught and logged; one bad project doesn't kill the sweep.
+    """
+    for slug in cfg.projects:
+        try:
+            deploy_monitor_one(cfg, slug)
+        except Exception:
+            log.exception("deploy_monitor: unhandled error for project %s", slug)
+
+
+def deploy_monitor_one(cfg: Config, slug: str) -> None:
+    """Run the deploy lifecycle for ONE project: reap stale orphans, then run
+    the next queued deploy.
+
+    Registered as its own apscheduler job per project (``max_instances=1``),
+    so a wedged build in project A holds only A's instance — sibling projects'
+    jobs run independently on their own scheduler threads (T-0212 per-project
+    isolation). The two stages are guarded separately so a reaper error never
+    skips the deploy and vice-versa.
+    """
+    project = cfg.projects.get(slug)
+    if project is None:
+        return
+    try:
+        _reap_project_orphans(cfg, slug, project)
+    except Exception:
+        log.exception("deploy_monitor: orphan reap failed for %s", slug)
+    try:
+        _run_project_deploy(cfg, slug, project)
+    except Exception:
+        log.exception("deploy_monitor: deploy run failed for %s", slug)
+
+
+def _reap_project_orphans(cfg: Config, slug: str, project: object) -> None:
+    """Sweep stale processing/ orphans for ``slug`` and alert the operator.
+
+    A run stranded in processing/ (crashed worker, or a pre-T-0212
+    TimeoutExpired) is moved to processed/.fail and a TARGETED operator alert
+    fires — so a wedged run can't linger for days unnoticed (the 2-week-old
+    watchrobot orphans the ticket cites).
     """
     from bot_squad_worker import deploy as _deploy
 
-    for slug, project in cfg.projects.items():
-        try:
-            _run_project_deploy(cfg, slug, project)
-        except Exception:
-            log.exception("deploy_monitor: unhandled error for project %s", slug)
+    reaped = _deploy.reap_orphans(cfg, slug)
+    for orphan in reaped:
+        hrs = (orphan.get("age_seconds") or 0) / 3600.0
+        _alert_operators(
+            cfg, slug, project,
+            f"🧟 deploy ORPHAN reaped — {slug}/{orphan.get('target')} job "
+            f"{orphan.get('queue_id')} sat in processing/ for {hrs:.1f}h "
+            f"(crashed/killed run, never finished) → swept to "
+            f"processed/.fail.{_deploy.RC_ORPHAN}. The queue is now unblocked.",
+        )
 
 
 def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
@@ -114,8 +160,68 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     )
     if result.ok:
         _tg_safe(f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){suffix}")
+    elif result.killed_reason:
+        # A watchdog (not the recipe) killed this build — the loud, TARGETED
+        # operator alert path (T-0212), not the routine project-channel ping.
+        kind = (
+            "no-progress watchdog (build made no log output)"
+            if result.killed_reason == "no_progress"
+            else "hard timeout (build ran too long)"
+        )
+        _alert_operators(
+            cfg, slug, project,
+            f"❌ deploy {slug}/{target} KILLED by {kind} (rc={result.returncode})"
+            f"{suffix}. The build was terminated and the queue is now unblocked. "
+            f"Log: {result.log_path}",
+        )
     else:
         _tg_safe(f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}")
+
+
+def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None:
+    """Loud, TARGETED deploy alert (T-0212) — never a broadcast.
+
+    Two targeted channels, mirroring the telemetry alert guardrail (T-0210):
+      1. urgent TG to the project's single bound chat (``tg_chat``) — one chat,
+         urgent so the quiet-hours gate can't drop a wedged-build alert;
+      2. a peer_send to each operator-role SID for the project.
+    Both are best-effort; a TG outage or a missing operator pane never raises.
+    """
+    from bot_squad_worker.actions import _get_tg_client
+
+    chat_id = getattr(project, "tg_chat", "") if project else ""
+    if chat_id:
+        try:
+            _get_tg_client(cfg).send(
+                chat_id=chat_id, text=text, sid="deploy_monitor", urgent=True
+            )
+        except Exception:
+            log.exception("deploy_monitor: operator tg.send failed (non-fatal): %s", text)
+    try:
+        _peer_to_operators(cfg, slug, text)
+    except Exception:
+        log.exception("deploy_monitor: operator peer_send failed (non-fatal)")
+
+
+def _peer_to_operators(cfg: Config, slug: str, text: str) -> None:
+    """Targeted peer_send to each operator-role SID for ``slug`` (no broadcast)."""
+    from bot_squad_worker import sessions as _sessions
+    from bot_squad_worker import intersession as _is
+
+    try:
+        rows = _sessions.list_sessions(cfg, slug)
+    except Exception:
+        log.exception("deploy_monitor: list_sessions failed for %s", slug)
+        return
+    operator_sids = [
+        r.get("sid") for r in rows
+        if r.get("role") == "operator" and r.get("sid")
+    ]
+    for sid in dict.fromkeys(operator_sids):  # dedupe, preserve order
+        try:
+            _is.send(cfg, slug, "S-deploy_monitor", sid, text)
+        except Exception:
+            log.exception("deploy_monitor: peer_send to %s failed (non-fatal)", sid)
 
 
 def tg_listener_tick(cfg: Config) -> None:

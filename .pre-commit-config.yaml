@@ -20,3 +20,14 @@ repos:
         # the script walks the data tree itself.
         pass_filenames: false
         always_run: true
+      # T-0207: catch a ticket whose id was hand-picked (out-of-band write that
+      # skipped the flock'd allocator) — the operator dispatch-templating
+      # collision this ticket closes. Flags id-above-counter, duplicate ids,
+      # and filename/frontmatter id mismatch. SSOT for minting is the allocator
+      # (worker task_new / api routes_backlog -> idalloc.allocate_id).
+      - id: backlog-ids-allocator
+        name: backlog ticket ids from allocator (no out-of-band)
+        entry: python3 scripts/lint/backlog_ids.py
+        language: system
+        pass_filenames: false
+        always_run: true

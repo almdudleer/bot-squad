@@ -475,6 +475,20 @@ def _session_linux_user(sid: str, meta: dict | None) -> str:
 _SESSION_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+def _strip_surrounding_quotes(v: str) -> str:
+    """Strip one layer of matching surrounding single/double quotes (T-0208).
+
+    Quoted YAML scalars (`initiative: "x.md"`) are now the norm — the shared
+    pyyaml dump (T-0075) and ``bsq task new`` both emit them. When such a
+    value reaches spawn() unstripped, the trailing quote fails the
+    ``.endswith(".md")`` validator. bsq's read_frontmatter strips upstream;
+    this is the worker-side safety net.
+    """
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+
+
 def _tmux_session_name(slug: str, initiative: str | None) -> str:
     """T-0001: per-initiative tmux session routing.
 
@@ -1354,6 +1368,15 @@ def spawn(
     if project is None:
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"spawn: unknown project slug {slug!r}")
+
+    # T-0208: defense-in-depth — tolerate a quoted frontmatter scalar passed
+    # through from a ticket (`initiative: "x.md"`). The bsq read_frontmatter
+    # fix strips these upstream, but a caller (older bsq, raw worker action)
+    # may still hand us `"x.md"`; normalize once here so the validator, the
+    # task-md initiative stamp, the tmux session name, and the env var all
+    # see the bare value.
+    if initiative:
+        initiative = _strip_surrounding_quotes(initiative.strip())
 
     cwd = str(project.repo_path)
     user = _get_current_user()

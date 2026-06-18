@@ -1494,6 +1494,65 @@ def test_spawn_does_not_clobber_existing_initiative(tmp_path, monkeypatch):
     assert "initiative: different.md" not in txt
 
 
+def test_strip_surrounding_quotes():
+    """T-0208: strip ONE layer of matching surrounding single/double quotes."""
+    import bot_squad_worker.sessions as S
+    assert S._strip_surrounding_quotes('"x.md"') == "x.md"
+    assert S._strip_surrounding_quotes("'x.md'") == "x.md"
+    assert S._strip_surrounding_quotes("x.md") == "x.md"          # already bare
+    assert S._strip_surrounding_quotes('"x.md') == '"x.md'        # unmatched
+    assert S._strip_surrounding_quotes('x.md"') == 'x.md"'        # unmatched
+    assert S._strip_surrounding_quotes('""') == ""               # empty quoted
+    assert S._strip_surrounding_quotes('"') == '"'               # single char
+    assert S._strip_surrounding_quotes("") == ""
+
+
+def test_spawn_accepts_quoted_initiative(tmp_path, monkeypatch):
+    """T-0208: a quoted frontmatter scalar (`initiative: "x.md"`) reaching
+    spawn() must NOT trip the `.endswith(".md")` validator. The worker
+    normalizes surrounding quotes before validating, and the unquoted value
+    is what gets stamped onto the task md + baked into the shell env."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    task_md = backlog / "T-0009-foo.md"
+    task_md.write_text("---\nid: T-0009\ntitle: Foo\nstatus: open\n---\n\nbody\n")
+
+    captured_shell_cmd: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            try:
+                i = args.index("-lc")
+                captured_shell_cmd.append(args[i + 1])
+            except (ValueError, IndexError):
+                pass
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%9|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    # Does not raise ActionError("invalid initiative name ...").
+    spawn(cfg, "test-project", "w",
+          task_id="T-0009", initiative='"operator-ux-and-session-mgmt.md"')
+
+    # Stamped onto the task md WITHOUT the literal quotes.
+    txt = task_md.read_text()
+    assert "initiative: operator-ux-and-session-mgmt.md" in txt
+    assert 'initiative: "operator' not in txt
+    # Baked into the shell env without literal quotes around the basename.
+    assert captured_shell_cmd, "expected a new-window call"
+    assert "BOT_SQUAD_INITIATIVE=operator-ux-and-session-mgmt.md" in captured_shell_cmd[0]
+
+
 def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -29,10 +29,14 @@ sit ABOVE the TL/dev tree and orchestrate them.
   whether to act, defer, or hand back to the stakeholder.
 - **Maintain backlog hygiene.** When a TL or dev drops a backlog item
   (`status: open`), categorize, prioritize, decide if it deserves a
-  session. Never hand-pick the T-NNNN id when filing one yourself —
-  call the `task_new` worker action (`{slug, title, initiative?,
-  priority?, owner?}` → `{id, file_path}`) and edit the returned md.
-  The allocator is flock-protected; hand-picked ids collide.
+  session. Never hand-pick the T-NNNN id OR hand-write the
+  `backlog/T-NNNN-*.md` file when filing one yourself — call the
+  `task_new` worker action (`{slug, title, initiative?, priority?,
+  owner?}` → `{id, file_path}`) / `bsq task new`, THEN edit the
+  returned md. The allocator is flock-protected; a direct write with a
+  pre-chosen id skips the lock and collides with concurrent dispatches
+  (T-0207). Out-of-band writes are caught by
+  `scripts/lint/backlog_ids.py` (pre-commit + CI).
 
 ## Scope (what you DON'T DO)
 

@@ -213,6 +213,21 @@ def find_ticket(slug: str, ticket: str) -> Path:
     return matches[0]
 
 
+def _strip_surrounding_quotes(v: str) -> str:
+    """Strip one layer of matching surrounding single/double quotes (T-0208).
+
+    The shared pyyaml dump (T-0075) and ``bsq task new`` write quoted YAML
+    scalars like ``initiative: "x.md"`` / ``priority: '110'``. The flat
+    reader below must hand downstream consumers (spawn, init_path
+    resolution, expert scan) the bare value, not one with literal quotes —
+    otherwise e.g. the spawn validator rejects ``"x.md"`` on its
+    ``.endswith(".md")`` check.
+    """
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+
+
 def read_frontmatter(path: Path) -> dict:
     """Tiny flat-YAML frontmatter reader (key: value lines only)."""
     text = path.read_text()
@@ -223,7 +238,7 @@ def read_frontmatter(path: Path) -> dict:
     for line in m.group(1).splitlines():
         mm = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
         if mm:
-            fm[mm.group(1)] = mm.group(2).strip()
+            fm[mm.group(1)] = _strip_surrounding_quotes(mm.group(2).strip())
     return fm
 
 

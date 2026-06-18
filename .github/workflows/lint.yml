@@ -22,13 +22,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Smoke-run the lint script (empty default root → exit 0)
+      - name: Smoke-run the lint scripts (empty default root → exit 0)
         run: |
           python3 scripts/lint/backlog_frontmatter.py /nonexistent
+          python3 scripts/lint/backlog_ids.py /nonexistent
       - name: Install api test deps
         run: |
           pip install --upgrade pip
           pip install -e api[dev]
       - name: Run lint script unit tests
         run: |
-          cd api && pytest tests/test_backlog_frontmatter_lint.py -x -q
+          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py -x -q

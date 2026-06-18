@@ -3357,6 +3357,46 @@ def test_derive_role_ctl_suffix_is_not_teamlead():
     assert _derive_role("html", "~", "~") == "dev"
 
 
+# ---------------------------------------------------------------------------
+# T-0197 — prod-teamlead + qa as first-class spawnable roles.
+# ---------------------------------------------------------------------------
+
+def test_derive_role_prod_teamlead_window_markers():
+    from bot_squad_worker.sessions import _derive_role
+    for win in (
+        "prod-tl",
+        "prod_tl",
+        "prod-teamlead",
+        "prod_teamlead",
+        "bot-squad-prod-tl",
+        "bot_squad_prod_teamlead",
+        "PROD-TL",
+    ):
+        assert _derive_role(win, None, None) == "prod-teamlead", win
+
+
+def test_derive_role_prod_tl_precedence_over_plain_tl():
+    """A `…-prod-tl` window also ends in `tl`; prod-TL must win, not teamlead."""
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("bot-squad-prod-tl", "~", "~") == "prod-teamlead"
+    # …but `prod-ops-tl` has no `prod` adjacent to the trailing `-tl`, so it
+    # stays a (dev-side) teamlead — guards the existing test_..._tl_window_markers.
+    assert _derive_role("prod-ops-tl", "~", "~") == "teamlead"
+
+
+def test_derive_role_qa_window_markers():
+    from bot_squad_worker.sessions import _derive_role
+    for win in ("qa", "bot-squad-qa", "signal_tracker_qa", "QA"):
+        assert _derive_role(win, None, None) == "qa", win
+
+
+def test_derive_role_qa_false_positive_suffix_is_dev():
+    """A window merely ending in `qa` without a separator is a dev, not qa."""
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("vodqa", "~", "~") == "dev"  # no separator ⟹ dev
+    assert _derive_role("qa-runner", "~", "~") == "dev"  # marker must be a suffix
+
+
 def test_list_sessions_emits_role_for_active_and_suspended(tmp_path, monkeypatch):
     """list_sessions stamps an authoritative `role` on every row."""
     repo = tmp_path / "repo"

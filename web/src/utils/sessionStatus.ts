@@ -67,14 +67,28 @@ export function isRunning(activity: SessionActivity): boolean {
 // UI prefers it and, when the field is absent (a pre-T-0141 worker), defaults
 // to dev — T-0175: never re-introduce the teamlead leak via the fallback.
 // ---------------------------------------------------------------------------
-export type SessionRoleName = "teamlead" | "dev" | "operator";
+// T-0197: prod-teamlead + qa become first-class spawnable roles. Mirror the
+// worker's `_derive_role` enum (operator|prod-teamlead|qa|teamlead|dev).
+export type SessionRoleName =
+  | "teamlead"
+  | "dev"
+  | "operator"
+  | "prod-teamlead"
+  | "qa";
 
 export function sessionRole(
   src: { role?: string | null; task_id?: string | null } | null | undefined,
 ): SessionRoleName {
   if (!src) return "dev";
   const r = src.role;
-  if (r === "teamlead" || r === "dev" || r === "operator") return r;
+  if (
+    r === "teamlead" ||
+    r === "dev" ||
+    r === "operator" ||
+    r === "prod-teamlead" ||
+    r === "qa"
+  )
+    return r;
   // T-0175: a missing/unknown role defaults to dev, never teamlead. The old
   // "task-less ⟹ teamlead" fallback leaked nearly every finished dev (task_id
   // cleared to ~) as a teamlead.
@@ -88,6 +102,10 @@ export function sessionRoleLabel(role: SessionRoleName): string {
       return "Teamlead";
     case "operator":
       return "Operator";
+    case "prod-teamlead":
+      return "Prod-TL";
+    case "qa":
+      return "QA";
     case "dev":
       return "Dev";
   }
@@ -119,4 +137,42 @@ export function operatorWindow(name: string): string {
   const base = name.trim();
   if (!base) return "operator";
   return OPERATOR_WINDOW_RE.test(base) ? base : `${base}-operator`;
+}
+
+// ---------------------------------------------------------------------------
+// T-0197 — prod-teamlead + qa spawn-window normalisation.
+//
+// Same pattern as operatorWindow: the New-session modal's Prod-TL / QA options
+// normalise the user's window so picking the role ALWAYS spawns a session that
+// resolves (via the worker _derive_role + the SessionStart hook) to
+// prod-teamlead.md / qa.md, never a silent dev. The regexes mirror the worker's
+// _PROD_TL_WINDOW_RE = (?:^|[-_])prod[-_](?:tl|teamlead)$ and
+// _QA_WINDOW_RE = (?:^|[-_])qa$.
+// ---------------------------------------------------------------------------
+const PROD_TL_WINDOW_RE = /(?:^|[-_])prod[-_](?:tl|teamlead)$/i;
+
+/** True when `window` already carries the prod-teamlead marker. */
+export function isProdTeamleadWindow(window: string): boolean {
+  return PROD_TL_WINDOW_RE.test(window.trim());
+}
+
+/** Normalise a window so it resolves to the prod-teamlead role. */
+export function prodTeamleadWindow(name: string): string {
+  const base = name.trim();
+  if (!base) return "prod-tl";
+  return PROD_TL_WINDOW_RE.test(base) ? base : `${base}-prod-tl`;
+}
+
+const QA_WINDOW_RE = /(?:^|[-_])qa$/i;
+
+/** True when `window` already carries the qa marker. */
+export function isQaWindow(window: string): boolean {
+  return QA_WINDOW_RE.test(window.trim());
+}
+
+/** Normalise a window so it resolves to the qa role (appends the marker). */
+export function qaWindow(name: string): string {
+  const base = name.trim();
+  if (!base) return "qa";
+  return QA_WINDOW_RE.test(base) ? base : `${base}-qa`;
 }

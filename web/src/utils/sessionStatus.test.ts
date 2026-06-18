@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   isOperatorWindow,
+  isProdTeamleadWindow,
+  isQaWindow,
   operatorWindow,
+  prodTeamleadWindow,
+  qaWindow,
   sessionRole,
   sessionRoleLabel,
 } from "./sessionStatus";
@@ -29,6 +33,11 @@ describe("sessionRole", () => {
     expect(sessionRole({ role: "bogus", task_id: "T-2" })).toBe("dev");
   });
 
+  it("recognises the T-0197 prod-teamlead + qa roles", () => {
+    expect(sessionRole({ role: "prod-teamlead", task_id: "~" })).toBe("prod-teamlead");
+    expect(sessionRole({ role: "qa", task_id: "~" })).toBe("qa");
+  });
+
   it("handles null/undefined input", () => {
     expect(sessionRole(null)).toBe("dev");
     expect(sessionRole(undefined)).toBe("dev");
@@ -40,6 +49,8 @@ describe("sessionRoleLabel", () => {
     expect(sessionRoleLabel("teamlead")).toBe("Teamlead");
     expect(sessionRoleLabel("dev")).toBe("Dev");
     expect(sessionRoleLabel("operator")).toBe("Operator");
+    expect(sessionRoleLabel("prod-teamlead")).toBe("Prod-TL");
+    expect(sessionRoleLabel("qa")).toBe("QA");
   });
 });
 
@@ -68,5 +79,57 @@ describe("operatorWindow / isOperatorWindow", () => {
     expect(isOperatorWindow("operator")).toBe(true);
     expect(isOperatorWindow("xoperator")).toBe(false); // no separator ⟹ not a marker
     expect(isOperatorWindow("operator-foo")).toBe(false); // marker must be a suffix
+  });
+});
+
+// T-0197 — the Prod-TL / QA spawn options must guarantee a window that resolves
+// to the matching role (mirrors the worker _PROD_TL_WINDOW_RE / _QA_WINDOW_RE).
+describe("prodTeamleadWindow / isProdTeamleadWindow", () => {
+  it("appends the -prod-tl marker when absent", () => {
+    expect(prodTeamleadWindow("bot-squad")).toBe("bot-squad-prod-tl");
+    expect(prodTeamleadWindow("ops")).toBe("ops-prod-tl");
+  });
+
+  it("leaves an already-marked window untouched (any case / separator / form)", () => {
+    expect(prodTeamleadWindow("prod-tl")).toBe("prod-tl");
+    expect(prodTeamleadWindow("ops_prod_teamlead")).toBe("ops_prod_teamlead");
+    expect(prodTeamleadWindow("Ops-PROD-TL")).toBe("Ops-PROD-TL");
+  });
+
+  it("defaults an empty/whitespace window to 'prod-tl'", () => {
+    expect(prodTeamleadWindow("")).toBe("prod-tl");
+    expect(prodTeamleadWindow("   ")).toBe("prod-tl");
+  });
+
+  it("isProdTeamleadWindow recognises the marker, rejects plain-TL / coincidental", () => {
+    expect(isProdTeamleadWindow("bot-squad-prod-tl")).toBe(true);
+    expect(isProdTeamleadWindow("prod-teamlead")).toBe(true);
+    expect(isProdTeamleadWindow("prod-ops-tl")).toBe(false); // no prod adjacent to -tl
+    expect(isProdTeamleadWindow("multi_server-TL")).toBe(false); // plain TL ≠ prod-TL
+  });
+});
+
+describe("qaWindow / isQaWindow", () => {
+  it("appends the -qa marker when absent", () => {
+    expect(qaWindow("bot-squad")).toBe("bot-squad-qa");
+    expect(qaWindow("verify")).toBe("verify-qa");
+  });
+
+  it("leaves an already-marked window untouched (any case / separator)", () => {
+    expect(qaWindow("qa")).toBe("qa");
+    expect(qaWindow("bot_squad_qa")).toBe("bot_squad_qa");
+    expect(qaWindow("Bot-Squad-QA")).toBe("Bot-Squad-QA");
+  });
+
+  it("defaults an empty/whitespace window to 'qa'", () => {
+    expect(qaWindow("")).toBe("qa");
+    expect(qaWindow("   ")).toBe("qa");
+  });
+
+  it("isQaWindow recognises the marker, rejects coincidental suffixes", () => {
+    expect(isQaWindow("bot-squad-qa")).toBe(true);
+    expect(isQaWindow("qa")).toBe(true);
+    expect(isQaWindow("vodqa")).toBe(false); // no separator ⟹ not a marker
+    expect(isQaWindow("qa-runner")).toBe(false); // marker must be a suffix
   });
 });

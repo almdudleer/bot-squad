@@ -10,6 +10,8 @@ import { AutopilotDialog, type AutopilotTarget } from "../components/AutopilotDi
 import { Select } from "../components/Select";
 import {
   operatorWindow,
+  prodTeamleadWindow,
+  qaWindow,
   sessionActivity,
   sessionLabel,
   sessionRole,
@@ -55,7 +57,8 @@ function StatusBadge({ row }: { row: SessionRow }) {
 
 // T-0141: role badge keyed off the worker-derived `role` (falls back to the
 // legacy task_id inference for a pre-T-0141 worker). Teamlead = green,
-// operator = amber, dev = blue. `dim` mutes the badge for archived rows.
+// operator = amber, dev = blue. T-0197: prod-teamlead = red (prod caution),
+// qa = active/purple. `dim` mutes the badge for archived rows.
 function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
   const role = sessionRole(row);
   if (dim) return <span className="mc-badge mc-badge-dim">{sessionRoleLabel(role)}</span>;
@@ -64,7 +67,11 @@ function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
       ? "mc-badge mc-badge-ok"
       : role === "operator"
         ? "mc-badge mc-badge-warn"
-        : "mc-badge mc-badge-info";
+        : role === "prod-teamlead"
+          ? "mc-badge mc-badge-danger"
+          : role === "qa"
+            ? "mc-badge mc-badge-active"
+            : "mc-badge mc-badge-info";
   return <span className={cls}>{sessionRoleLabel(role)}</span>;
 }
 
@@ -114,7 +121,9 @@ export function Sessions() {
 
   // New session modal
   const [modalOpen, setModalOpen] = useState(false);
-  const [newRole, setNewRole] = useState<"operator" | "teamlead" | "dev" | null>(null);
+  const [newRole, setNewRole] = useState<
+    "operator" | "teamlead" | "dev" | "prod-teamlead" | "qa" | null
+  >(null);
   const [newWindow, setNewWindow] = useState("");
   const [newPrompt, setNewPrompt] = useState("");
   const [newTaskId, setNewTaskId] = useState("");
@@ -377,7 +386,7 @@ export function Sessions() {
   }
 
   function openModal(prefill?: {
-    role?: "operator" | "teamlead" | "dev";
+    role?: "operator" | "teamlead" | "dev" | "prod-teamlead" | "qa";
     taskId?: string;
     initiative?: string;
   }) {
@@ -407,7 +416,14 @@ export function Sessions() {
   // doesn't keep re-opening the modal.
   useEffect(() => {
     const roleParam = searchParams.get("role");
-    if (roleParam !== "dev" && roleParam !== "teamlead" && roleParam !== "operator") return;
+    if (
+      roleParam !== "dev" &&
+      roleParam !== "teamlead" &&
+      roleParam !== "operator" &&
+      roleParam !== "prod-teamlead" &&
+      roleParam !== "qa"
+    )
+      return;
     const taskId = searchParams.get("task") ?? undefined;
     const initiative = searchParams.get("initiative") ?? undefined;
     openModal({ role: roleParam, taskId, initiative });
@@ -913,6 +929,66 @@ export function Sessions() {
   // silent dev. Operators are not bound to a task or initiative.
   async function handleSpawnOperator() {
     const window = operatorWindow(newWindow);
+    setSpawning(true);
+    setModalError(null);
+    try {
+      const before = new Set((sessions ?? []).map((s) => s.sid));
+      await api.spawnSession(slug, window, newPrompt.trim() || undefined);
+      try {
+        const after = await api.sessions(slug);
+        setSessions(after);
+        setError(null);
+        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
+        if (fresh) {
+          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
+        }
+      } catch {
+        load();
+      }
+      setModalOpen(false);
+    } catch (e: unknown) {
+      setModalError(String(e));
+    } finally {
+      setSpawning(false);
+    }
+  }
+
+  // T-0197: spawn a prod-teamlead session. Like the operator, the window is
+  // normalised so it always carries the -prod-tl marker and therefore resolves
+  // to prod-teamlead.md via _derive_role + the SessionStart hook — never a
+  // silent dev. Prod-TLs are not bound to a task or initiative (they live in
+  // the prod clone and watch the deploy queue).
+  async function handleSpawnProdTeamlead() {
+    const window = prodTeamleadWindow(newWindow);
+    setSpawning(true);
+    setModalError(null);
+    try {
+      const before = new Set((sessions ?? []).map((s) => s.sid));
+      await api.spawnSession(slug, window, newPrompt.trim() || undefined);
+      try {
+        const after = await api.sessions(slug);
+        setSessions(after);
+        setError(null);
+        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
+        if (fresh) {
+          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
+        }
+      } catch {
+        load();
+      }
+      setModalOpen(false);
+    } catch (e: unknown) {
+      setModalError(String(e));
+    } finally {
+      setSpawning(false);
+    }
+  }
+
+  // T-0197: spawn a QA session. The window is normalised to carry the -qa
+  // marker so it resolves to qa.md. QA lives in the dev clone and picks up
+  // totest tickets; it is not bound to a single task at spawn time.
+  async function handleSpawnQa() {
+    const window = qaWindow(newWindow);
     setSpawning(true);
     setModalError(null);
     try {
@@ -1715,6 +1791,16 @@ export function Sessions() {
                 {spawning ? "Spawning…" : "Spawn teamlead"}
               </button>
             )}
+            {newRole === "prod-teamlead" && (
+              <button type="button" className="btn btn-primary" onClick={handleSpawnProdTeamlead} disabled={spawning}>
+                {spawning ? "Spawning…" : "Spawn prod-TL"}
+              </button>
+            )}
+            {newRole === "qa" && (
+              <button type="button" className="btn btn-primary" onClick={handleSpawnQa} disabled={spawning}>
+                {spawning ? "Spawning…" : "Spawn QA"}
+              </button>
+            )}
             {newRole === "dev" && (
               <button type="button" className="btn btn-primary" onClick={handleDevSpawnRequest} disabled={spawning}>
                 {spawning ? "Sending…" : "Send to teamlead"}
@@ -1763,6 +1849,30 @@ export function Sessions() {
               </div>
             </button>
           </div>
+          {/* T-0197: second row — the prod-ops + QA roles, less common than the
+              feature-dev trio above but now first-class spawnable. */}
+          <div className="d-flex gap-2 mt-2">
+            <button
+              type="button"
+              className={`btn ${newRole === "prod-teamlead" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
+              onClick={() => { setNewRole("prod-teamlead"); setModalError(null); setModalInfo(null); }}
+            >
+              Prod-Teamlead
+              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
+                cuts releases from the prod clone
+              </div>
+            </button>
+            <button
+              type="button"
+              className={`btn ${newRole === "qa" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
+              onClick={() => { setNewRole("qa"); setModalError(null); setModalInfo(null); }}
+            >
+              QA
+              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
+                verifies totest tickets vs DoD
+              </div>
+            </button>
+          </div>
         </div>
 
         {/* Step 2 (operator): Operator form. The window is normalised to carry
@@ -1788,6 +1898,90 @@ export function Sessions() {
                 Spawns as{" "}
                 <code style={{ color: "var(--mc-accent)" }}>{operatorWindow(newWindow)}</code>{" "}
                 → resolves to the operator role (operator.md).
+              </div>
+            </div>
+            <div className="mb-3">
+              <label className="form-label">
+                Initial prompt{" "}
+                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
+              </label>
+              <textarea
+                className="form-control"
+                rows={4}
+                value={newPrompt}
+                onChange={(e) => setNewPrompt(e.target.value)}
+                placeholder="Type a message to send immediately after claude starts…"
+              />
+            </div>
+          </>
+        )}
+
+        {/* Step 2 (prod-teamlead): like operator, the window is normalised to
+            carry the -prod-tl marker so the session resolves to
+            prod-teamlead.md (T-0197). Not bound to a task/initiative. */}
+        {newRole === "prod-teamlead" && (
+          <>
+            <hr style={{ borderColor: "var(--mc-border)" }} />
+            <div className="mb-3">
+              <label className="form-label">
+                Window name{" "}
+                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
+                  (optional — defaults to "prod-tl")
+                </span>
+              </label>
+              <input
+                className="form-control"
+                value={newWindow}
+                onChange={(e) => setNewWindow(e.target.value)}
+                placeholder="e.g. prod-tl, bot-squad"
+                autoFocus
+              />
+              <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
+                Spawns as{" "}
+                <code style={{ color: "var(--mc-accent)" }}>{prodTeamleadWindow(newWindow)}</code>{" "}
+                → resolves to the prod-teamlead role (prod-teamlead.md).
+              </div>
+            </div>
+            <div className="mb-3">
+              <label className="form-label">
+                Initial prompt{" "}
+                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
+              </label>
+              <textarea
+                className="form-control"
+                rows={4}
+                value={newPrompt}
+                onChange={(e) => setNewPrompt(e.target.value)}
+                placeholder="Type a message to send immediately after claude starts…"
+              />
+            </div>
+          </>
+        )}
+
+        {/* Step 2 (qa): window normalised to carry the -qa marker so the
+            session resolves to qa.md (T-0197). QA picks up totest tickets;
+            not bound to a single task at spawn. */}
+        {newRole === "qa" && (
+          <>
+            <hr style={{ borderColor: "var(--mc-border)" }} />
+            <div className="mb-3">
+              <label className="form-label">
+                Window name{" "}
+                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
+                  (optional — defaults to "qa")
+                </span>
+              </label>
+              <input
+                className="form-control"
+                value={newWindow}
+                onChange={(e) => setNewWindow(e.target.value)}
+                placeholder="e.g. qa, bot-squad"
+                autoFocus
+              />
+              <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
+                Spawns as{" "}
+                <code style={{ color: "var(--mc-accent)" }}>{qaWindow(newWindow)}</code>{" "}
+                → resolves to the QA role (qa.md).
               </div>
             </div>
             <div className="mb-3">

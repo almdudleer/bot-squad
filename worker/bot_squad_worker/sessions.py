@@ -328,6 +328,13 @@ def _derive_activity(
 # ---------------------------------------------------------------------------
 _TL_WINDOW_RE = re.compile(r"(?:^|[-_])(?:tl|teamlead)$", re.IGNORECASE)
 _OPERATOR_WINDOW_RE = re.compile(r"(?:^|[-_])operator$", re.IGNORECASE)
+# T-0197: prod-teamlead + qa become first-class spawnable roles. The prod-TL
+# marker (`prod-tl` / `prod_teamlead`) must be tested BEFORE _TL_WINDOW_RE — a
+# `…-prod-tl` window also ends in `tl`, so plain-TL precedence would otherwise
+# swallow it. `prod-ops-tl` does NOT match (no `prod` adjacent to the trailing
+# `-tl`), so genuine dev-side prod-ops TLs stay `teamlead`.
+_PROD_TL_WINDOW_RE = re.compile(r"(?:^|[-_])prod[-_](?:tl|teamlead)$", re.IGNORECASE)
+_QA_WINDOW_RE = re.compile(r"(?:^|[-_])qa$", re.IGNORECASE)
 
 # T-0176 #3: grouping bucket for sessions with no live tmux session — keeps the
 # sessions-list grouping honest against `tmux list-sessions`.
@@ -342,12 +349,17 @@ def _derive_role(
     extra_task_ids: list | None = None,
     extra_initiatives: list | None = None,
 ) -> str:
-    """Map a session's identity fields → role enum: ``teamlead|dev|operator``.
+    """Map a session's identity fields → role enum:
+    ``operator|prod-teamlead|qa|teamlead|dev``.
 
     Precedence (first match wins):
       1. operator window marker (`operator`, `<x>-operator`) → ``operator``
-      2. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
-      3. default → ``dev``
+      2. prod-TL window marker (`prod-tl`, `<x>_prod_teamlead`, …)
+         → ``prod-teamlead`` (T-0197 — BEFORE plain TL, since a prod-tl window
+         also ends in `tl`)
+      3. qa window marker (`qa`, `<x>-qa`) → ``qa`` (T-0197)
+      4. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
+      5. default → ``dev``
 
     T-0175: ``task_id`` / ``initiative`` (and their ``extra_*`` lists) no longer
     influence the role — they are accepted for call-site compatibility but a
@@ -360,6 +372,10 @@ def _derive_role(
     w = (window or "").strip()
     if _OPERATOR_WINDOW_RE.search(w):
         return "operator"
+    if _PROD_TL_WINDOW_RE.search(w):
+        return "prod-teamlead"
+    if _QA_WINDOW_RE.search(w):
+        return "qa"
     if _TL_WINDOW_RE.search(w):
         return "teamlead"
     return "dev"

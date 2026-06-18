@@ -29,6 +29,16 @@ CASES=(
     "operator-as-distinct-role-not-teamlead	teamlead"  # -teamlead suffix ⟹ teamlead (shared FP)
     "xoperator	dev"                                      # no separator ⟹ dev
     "total	dev"                                          # ends in 'al', not a tl marker ⟹ dev
+    "prod-tl	prod-teamlead"                              # T-0197 prod-TL marker
+    "bot-squad-prod-tl	prod-teamlead"                      # …before plain-TL (also ends in tl)
+    "bot_squad_prod_teamlead	prod-teamlead"              # underscore separators
+    "PROD-TL	prod-teamlead"                              # case-insensitive
+    "prod-ops-tl	teamlead"                               # no prod adjacent to -tl ⟹ teamlead
+    "qa	qa"                                                 # T-0197 qa marker
+    "bot-squad-qa	qa"
+    "signal_tracker_qa	qa"
+    "vodqa	dev"                                            # no separator ⟹ dev
+    "qa-runner	dev"                                        # marker must be a suffix
 )
 
 fail=0

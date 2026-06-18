@@ -584,7 +584,9 @@ async def test_sse_replays_persisted_checkpoints(tmp_bot_squad: Path, monkeypatc
 
     from app.routes_mothership import checkpoints_stream
     request = _FakeRequest()
-    resp = await checkpoints_stream(entry.id, request)  # type: ignore[arg-type]
+    resp = await checkpoints_stream(
+        entry.id, request, user={"username": "testuser", "is_admin": True}
+    )  # type: ignore[arg-type]
     assert resp.media_type == "text/event-stream"
 
     chunks: list[bytes] = []
@@ -654,7 +656,9 @@ async def test_sse_forwards_live_events_after_replay(tmp_bot_squad: Path, monkey
     from app.routes_mothership import _broadcast, checkpoints_stream
 
     request = _FakeRequest()
-    resp = await checkpoints_stream(entry.id, request)  # type: ignore[arg-type]
+    resp = await checkpoints_stream(
+        entry.id, request, user={"username": "testuser", "is_admin": True}
+    )  # type: ignore[arg-type]
 
     async def _drain_until_sentinel() -> None:
         async for chunk in resp.body_iterator:

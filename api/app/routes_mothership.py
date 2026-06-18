@@ -85,6 +85,29 @@ def _require_super_admin(user: dict = Depends(require_auth)) -> dict:
     return user
 
 
+def _require_server_access(server, user: dict) -> None:
+    """Authorize a mothership user to ACT ON / ENTER a specific server.
+
+    T-0169: closes the pivot where ANY authenticated user could proxy into
+    ANY registered server via the stored server_bearer. A user may touch a
+    server only if they own it (owner_user) or are super-admin. ``is_self``
+    (the mothership's own entry) is allowed through here because entering
+    its projects fans into the LOCAL api whose own auth applies.
+
+    NOTE: keeping super-admin (is_admin) allowed is deliberate/conservative
+    — it preserves today's behaviour and closes the actual any-user hole.
+    Whether the spec's stricter "even global admin cannot enter non-owned"
+    should also deny admins is a separate decision (left to the TL).
+    """
+    if getattr(server, "is_self", False):
+        return
+    if user.get("is_admin"):
+        return
+    if user.get("username") == server.owner_user:
+        return
+    raise HTTPException(status_code=403, detail="not authorized for this server")
+
+
 def _mothership_base_url(request: Request) -> str:
     """Public URL the install bundle should point installers back at.
 
@@ -264,8 +287,10 @@ def create_invite(
     + 24h TTL bounds the blast radius if the link leaks.
     """
     store = _store(request)
-    if store.get_server(server_id) is None:
+    server_entry = store.get_server(server_id)
+    if server_entry is None:
         raise HTTPException(status_code=404, detail="server not found")
+    _require_server_access(server_entry, user)
     target_username = (payload.get("target_username") or "").strip()
     role = (payload.get("role") or "").strip()
     if not target_username:
@@ -371,7 +396,11 @@ def remint_install_token(request: Request, server_id: str) -> dict:
 
 
 @router.get("/servers/{server_id}/checkpoints")
-async def checkpoints_stream(server_id: str, request: Request) -> StreamingResponse:
+async def checkpoints_stream(
+    server_id: str,
+    request: Request,
+    user: dict = Depends(require_auth),
+) -> StreamingResponse:
     """SSE: replay the persisted log, then forward live events.
 
     The wizard UI calls this immediately after the mothership returns the
@@ -383,6 +412,7 @@ async def checkpoints_stream(server_id: str, request: Request) -> StreamingRespo
     server = store.get_server(server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
+    _require_server_access(server, user)
 
     async def _gen() -> AsyncIterator[bytes]:
         # Subscribe BEFORE replay. A POST /installer/checkpoint that
@@ -637,7 +667,11 @@ def _proxy_client(base_url: str) -> httpx.AsyncClient:
 
 
 @router.get("/servers/{server_id}/projects")
-async def list_server_projects(server_id: str, request: Request) -> list[dict]:
+async def list_server_projects(
+    server_id: str,
+    request: Request,
+    user: dict = Depends(require_auth),
+) -> list[dict]:
     """Return the project list for ``server_id``.
 
     For peer (attached) servers: returns the registry's cached list (cheap,
@@ -650,6 +684,7 @@ async def list_server_projects(server_id: str, request: Request) -> list[dict]:
     server = _store(request).get_server(server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
+    _require_server_access(server, user)
     if server.is_self:
         from .routes_projects import list_projects as _list_local_projects
         return await _list_local_projects(request)
@@ -657,7 +692,11 @@ async def list_server_projects(server_id: str, request: Request) -> list[dict]:
 
 
 @router.post("/servers/{server_id}/projects/refresh")
-async def refresh_server_projects(server_id: str, request: Request) -> list[dict]:
+async def refresh_server_projects(
+    server_id: str,
+    request: Request,
+    user: dict = Depends(require_auth),
+) -> list[dict]:
     """Force-refresh the projects cache by hitting upstream ``/api/projects``.
 
     On upstream failure (502), the existing cache is preserved — a
@@ -669,6 +708,7 @@ async def refresh_server_projects(server_id: str, request: Request) -> list[dict
     server = store.get_server(server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
+    _require_server_access(server, user)
     bearer = store.read_server_bearer(server_id)
     if not bearer:
         raise HTTPException(
@@ -706,11 +746,17 @@ _PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
 @router.api_route("/servers/{server_id}/api/{rest:path}", methods=_PROXY_METHODS)
-async def server_api_proxy(server_id: str, rest: str, request: Request) -> Response:
+async def server_api_proxy(
+    server_id: str,
+    rest: str,
+    request: Request,
+    user: dict = Depends(require_auth),
+) -> Response:
     store = _store(request)
     server = store.get_server(server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
+    _require_server_access(server, user)
     bearer = store.read_server_bearer(server_id)
     if not bearer:
         raise HTTPException(

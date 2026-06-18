@@ -101,6 +101,9 @@ PY
         mkdir -p "$repo/.claude"
         cat > "$settings_path" <<EOF
 {
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "0"
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -126,7 +129,7 @@ PY
   }
 }
 EOF
-        echo "Written: $settings_path (3 hooks: SessionStart, UserPromptSubmit, Stop)"
+        echo "Written: $settings_path (3 hooks: SessionStart, UserPromptSubmit, Stop; native agent-teams off — T-0148)"
     fi
 
     if [ ! -e "$repo/ops/bot-squad" ]; then

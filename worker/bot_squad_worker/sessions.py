@@ -2528,7 +2528,18 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
     user_home = _get_user_home()
     user_prefix = f"S-{user}-"
     live_panes = list_panes()
-    live_sids = {compute_sid(user, p.window, p.pane_id) for p in live_panes}
+    # T-0211: map each live pane to its FULL SID (window + pane_id). The
+    # kill-lingering-window cleanup below must target a pane by this SID, never
+    # by window name: window names are derived from the ticket slug and recur
+    # across respawns, so a dead session's window name collides with a
+    # *different* live dev's window in the same tmux session — and a name match
+    # would kill that live sibling. `user` equals every processed sid's
+    # linux_user because the md loop below is filtered to `user_prefix`, so this
+    # keying is identical to the `sid` values it is matched against.
+    live_pane_by_sid = {
+        compute_sid(user, p.window, p.pane_id): p for p in live_panes
+    }
+    live_sids = set(live_pane_by_sid)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     now_epoch = time.time()
 
@@ -2599,14 +2610,16 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                 pass  # if it won't suspend, still record the archive intent
             meta = _read_session_metadata(md) or meta
 
-        # Best-effort: kill a lingering tmux window in this team's session.
-        win = meta.get("window")
-        sess = meta.get("tmux_session") or slug
-        if win:
-            for p in live_panes:
-                if p.window == win and (p.session or slug) == sess:
-                    _run(["tmux", "kill-window", "-t", p.pane_id])
-                    break
+        # Best-effort: kill THIS session's own lingering tmux window — matched
+        # by full SID (window + pane_id), never by window name. T-0211: window
+        # names recur across respawns of the same ticket, so a name match could
+        # (and did) hit a live *sibling* dev's pane in the same tmux session.
+        # An exited dev has no pane here (no-op); a live dev was already closed
+        # by suspend() above, so this only mops up a pane that outlived its
+        # claude.
+        own_pane = live_pane_by_sid.get(sid)
+        if own_pane is not None:
+            _run(["tmux", "kill-window", "-t", own_pane.pane_id])
 
         meta["status"] = "suspended"
         meta.setdefault("suspended_at", now)

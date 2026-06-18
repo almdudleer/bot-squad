@@ -279,3 +279,45 @@ def test_tl_role_is_never_auto_archived(tmp_path):
                   initiative="x.md")
     res = archive_dead_teammates(cfg, "test-project")
     assert res["archived"] == 0
+
+
+# --- T-0211: archiving a dead dev must not kill a live same-named sibling ---
+
+def test_archive_dead_dev_does_not_kill_live_same_named_sibling(tmp_path, monkeypatch):
+    """T-0211 root cause: a dead predecessor (p87) and a LIVE different dev
+    (p109) share the same window name in the same tmux session — the exact
+    shape produced by respawning the same ticket into a per-initiative session
+    (window name is derived from the ticket slug, so it recurs). The buggy
+    "kill lingering window" block matched the pane to kill by window-name +
+    tmux-session instead of by the archived session's own SID/pane_id, so
+    archiving the dead p87 killed the live p109's pane. p109 then self-exited
+    ~30-60s after spawn — the reported cascade.
+    """
+    cfg = _make_cfg(tmp_path)
+    # Dead predecessor: no live pane, task-less -> rule-1 "exited-no-task".
+    _seed_session(cfg, "S-u-route-dev-p87", window="route-dev",
+                  task_id="~", tmux_session="proj-init")
+    # Live successor: same window name + tmux session, different pane id; a
+    # healthy in-progress dev that must be left completely untouched.
+    _seed_task(cfg, "T-0207", "in_progress")
+    live = _seed_session(cfg, "S-u-route-dev-p109", window="route-dev",
+                         task_id="T-0207", tmux_session="proj-init")
+    monkeypatch.setattr(
+        S, "list_panes",
+        lambda: [PaneInfo(pane_id="%109", window="route-dev", pid="1",
+                          cwd="/x", command="claude", session="proj-init")],
+    )
+    runs: list = []
+    monkeypatch.setattr(S, "_run", lambda args, **k: runs.append(args))
+    res = archive_dead_teammates(cfg, "test-project")
+
+    # The dead predecessor IS archived (correct, expected behaviour).
+    assert "S-u-route-dev-p87" in res["sids"]
+    # ...but the LIVE sibling's pane must NEVER be killed.
+    kills = [a for a in runs if any("kill" in str(tok) for tok in a)]
+    assert not any("%109" in a for a in kills), (
+        f"live sibling pane %109 was killed by archiving its dead twin: {kills}")
+    # And the live sibling's md is untouched (still active, not archived).
+    lmeta = S._read_session_metadata(live)
+    assert lmeta["status"] == "active"
+    assert "archived" not in lmeta

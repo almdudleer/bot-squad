@@ -2590,7 +2590,15 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
     Runs after ``reconcile_teams`` in the binding-gc tick so the Team
     projection it consults is fresh.
 
-    Returns ``{"ok": True, "scanned": N, "filled": K, "details": [...]}``.
+    Only DEV rows (carrying a primary ``task_id``) are backfilled — this
+    mirrors the web tree's ``isDevRow`` gate. Non-dev rows (TL / prod-tl / qa)
+    are tree roots unless an explicit spawn-time ``parent_sid`` was stamped, so
+    the heuristic must never invent a parent for them. Operator rows are
+    additionally self-healed: an operator is always a root, so any stale
+    ``parent_sid`` (e.g. from an earlier over-eager backfill) is cleared.
+
+    Returns ``{"ok": True, "scanned": N, "filled": K, "corrected": C,
+    "details": [...]}`` where ``corrected`` counts cleared operator rows.
     """
     from bot_squad_worker.actions import ActionError
     from bot_squad_worker import teams as _teams
@@ -2605,16 +2613,40 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
 
     scanned = 0
     filled = 0
+    corrected = 0
     details: list[dict] = []
     for md in sorted(sessions_dir.glob("*.md")):
         meta = _read_session_metadata(md)
         if meta is None:
             continue
         scanned += 1
+        sid = meta.get("sid", md.stem)
+        role = _derive_role(
+            meta.get("window"), meta.get("task_id"), meta.get("initiative")
+        )
+        # Operators are always tree ROOTS — they have no parent. Self-heal any
+        # stale value (e.g. an earlier over-eager backfill that mapped the
+        # operator under a TL via the team projection) and never stamp one.
+        if role == "operator":
+            if _parent_sid_of(meta):
+                meta.pop("parent_sid", None)
+                try:
+                    _write_session_metadata(md, meta, atomic=True)
+                except OSError:
+                    continue
+                corrected += 1
+                details.append({"sid": sid, "cleared": True})
+            continue
         # Fill-once: never overwrite an existing (spawn-time) parent_sid.
         if _parent_sid_of(meta):
             continue
-        sid = meta.get("sid", md.stem)
+        # Only DEV rows (carrying a primary task_id) get a backfilled parent —
+        # mirrors the web tree's isDevRow gate. Non-dev rows (TL / prod-tl / qa)
+        # are roots unless an explicit spawn-time parent_sid was stamped, so
+        # the heuristic must not invent a parent for them.
+        tid = meta.get("task_id")
+        if not (tid and tid != "~"):
+            continue
         try:
             parent = _teams.tl_for_sid(cfg, slug, sid)
         except Exception:
@@ -2628,7 +2660,13 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
             continue
         filled += 1
         details.append({"sid": sid, "parent_sid": parent})
-    return {"ok": True, "scanned": scanned, "filled": filled, "details": details}
+    return {
+        "ok": True,
+        "scanned": scanned,
+        "filled": filled,
+        "corrected": corrected,
+        "details": details,
+    }
 
 
 def gc_dead_bindings(cfg: Any, slug: str) -> dict:

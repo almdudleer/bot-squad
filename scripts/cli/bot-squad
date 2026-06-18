@@ -247,8 +247,8 @@ Project '$slug' initialized.
   deploy shim: $repo/ops/bot-squad-bin/deploy
 
 Next steps (in $repo):
-  1. Fill in vision: $data/vision/{north-star,strategy,tactical}.md
-  2. Write a slim AGENTS.md (see plan §6.1)
+  1. Fill in vision: $data/vision/product.md + $data/vision/initiatives/*.md
+  2. Write a slim AGENTS.md (or run: bot-squad render-agents-md $slug)
   3. Review changes:   git -C $repo status
   4. Stage and commit: git -C $repo add AGENTS.md .claude/ .gitignore && git commit -m "ops: register with bot-squad"
 EOF

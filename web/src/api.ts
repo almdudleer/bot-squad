@@ -30,7 +30,7 @@ export type Project = {
   display_name: string;
   // T-0016 quick-status. Canonical enum locked with T-0025: any unknown
   // string is tolerated for forward-compat but won't be painted as a
-  // coloured pill. See vision/multi-server/quick-status.md.
+  // coloured pill. See docs/architecture/D-0018-quick-status.md.
   status?: "working" | "needs-input" | "idle" | string;
   status_since?: string | null;
 };

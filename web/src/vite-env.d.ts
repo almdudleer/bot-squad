@@ -6,7 +6,7 @@ interface ImportMetaEnv {
    * layer (/m/* routes, cross-server picker swap). Unset or "0" on a
    * single-install build. Vite inlines this at build time, so the guarded
    * dynamic imports are tree-shaken when off. Frozen by
-   * vision/architecture/mothership-seam.md.
+   * docs/architecture/D-0017-mothership-seam.md.
    */
   readonly VITE_MOTHERSHIP?: string;
 }

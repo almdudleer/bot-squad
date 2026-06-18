@@ -30,7 +30,7 @@ interface NewProjectState {
 /**
  * Cross-server all-projects view (T-0025). Mounted at /m on the mothership
  * build, and at / on the mothership build via App.tsx's VITE_MOTHERSHIP swap
- * (per vision/architecture/mothership-seam.md).
+ * (per docs/architecture/D-0017-mothership-seam.md).
  *
  * Quick-status enum (working|needs-input|idle) is locked here as the canonical
  * shape — coordinated with the multi_server TL on 2026-05-14. T-0016 will

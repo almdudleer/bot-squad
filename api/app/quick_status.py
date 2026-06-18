@@ -1,6 +1,6 @@
 """Project-level quick-status aggregation.
 
-The canonical contract — see vision/multi-server/quick-status.md — derives a
+The canonical contract — see docs/architecture/D-0018-quick-status.md — derives a
 single string per project from its session rows:
 
     working      = at least one `active` session genuinely crunching

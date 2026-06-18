@@ -116,7 +116,7 @@ BOTSQUAD_DOCKER_USERMOD_CMD="${BOTSQUAD_DOCKER_USERMOD_CMD:-}"
 BOTSQUAD_DOCKER_CHECK_CMD="${BOTSQUAD_DOCKER_CHECK_CMD:-docker compose version}"
 # install_reverse_proxy checkpoint seams (T-0029). The default shape is the
 # HTTP-only fallback (shape 2 in T-0029); the bundled-traefik shape was
-# rejected — see vision/multi-server/reverse-proxy-decision.md.
+# rejected — see docs/design/D-0021-reverse-proxy-decision.md.
 #   BOTSQUAD_REVERSE_PROXY_MODE — auto|shared|fresh (default auto)
 #                                  auto  → detect via the network probe below
 #                                  shared → assume an external traefik is in
@@ -201,7 +201,7 @@ post_checkpoint_event() {
     --arg cp "$cp" --arg status "$status" \
     --arg host "$(hostname -f 2>/dev/null || hostname)" \
     '{checkpoint: $cp, status: $status, hostname: $host, ts: (now | todate)}') || return 0
-  # Endpoint locked in vision/architecture/mothership-seam.md; treated
+  # Endpoint locked in docs/architecture/D-0017-mothership-seam.md; treated
   # as best-effort because UI display, not install correctness, depends
   # on it. Body: { checkpoint, status, hostname, ts }.
   curl -fsS --max-time 5 -X POST \
@@ -886,7 +886,7 @@ see the underlying error."
 # published port; users layer their own caddy / nginx / traefik in front
 # (the gitea/plausible/forgejo playbook).
 #
-# Rationale: vision/multi-server/reverse-proxy-decision.md
+# Rationale: docs/design/D-0021-reverse-proxy-decision.md
 
 reverse_proxy_override_path() {
   if [[ -n "$BOTSQUAD_FRESH_HOST_OVERRIDE" ]]; then
@@ -1605,7 +1605,7 @@ step_user_groups_join() {
   # Two group memberships, gated by invite role:
   #   - 'www' (BOTSQUAD_SHARED_GROUP, default "www") — EVERY invited user
   #     needs this for read access to the per-user socket dir at
-  #     $BOTSQUAD_INSTALL_DIR/data/_sock. Per docs/multi-user-setup.md
+  #     $BOTSQUAD_INSTALL_DIR/data/_sock. Per docs/runbook/D-0004-multi-user-setup-per-user-worker-onboarding.md
   #     step 1, this is unconditional for any non-coordinator user.
   #   - 'bot-squad' (BOTSQUAD_ADMIN_GROUP, default "bot-squad") — admin
   #     role only, per the T-0026 DoD: "Admin gets added to bot-squad
@@ -1651,7 +1651,7 @@ admin group membership. The install admin can create it later
     log "non-admin invite — skipping '$admin_group' group membership"
   fi
   # loginctl enable-linger so the user-worker survives logout (per
-  # docs/multi-user-setup.md step 1). Idempotent.
+  # docs/runbook/D-0004-multi-user-setup-per-user-worker-onboarding.md step 1). Idempotent.
   if command -v loginctl >/dev/null 2>&1; then
     if [[ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" != "yes" ]]; then
       sudo loginctl enable-linger "$user" || warn "loginctl enable-linger $user failed; the user-worker won't survive logout"

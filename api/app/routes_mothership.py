@@ -19,7 +19,7 @@ distinct auth surfaces:
   ``instructions.md`` to the very-first ``curl`` on a fresh box, which
   has no credentials at all yet.
 
-Contract is fixed in ``vision/architecture/mothership-seam.md`` — read
+Contract is fixed in ``docs/architecture/D-0017-mothership-seam.md`` — read
 that before touching the wire shapes.
 """
 from __future__ import annotations

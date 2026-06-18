@@ -41,3 +41,9 @@ INITIAL_LOGIN.txt
 # above. These two land in the repo root, not in web/.
 /package.json
 /package-lock.json
+
+# Project docs live in the ops data dir (data/<slug>/docs/), surfaced into
+# the clone as a `docs/` symlink by `bsq docs sync` (T-0172/T-0183). The
+# legacy tracked docs/ (multi-user-setup + superpowers plans|specs) was
+# migrated into the docs system as D-0004..D-0016; ignore the symlink.
+/docs

@@ -35,7 +35,7 @@ import { AttachmentSessions } from "./pages/AttachmentSessions";
 import { AttachmentWorker } from "./pages/AttachmentWorker";
 import { Shell } from "./components/Shell";
 
-// Mothership centralization layer — vision/architecture/mothership-seam.md.
+// Mothership centralization layer — docs/architecture/D-0017-mothership-seam.md.
 // Vite inlines VITE_MOTHERSHIP at build time, so the dynamic imports resolve
 // to literal `null` on single-install builds and the chunks are tree-shaken.
 const MOTHERSHIP_ENABLED = import.meta.env.VITE_MOTHERSHIP === "1";

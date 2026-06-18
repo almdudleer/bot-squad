@@ -57,7 +57,7 @@ export function welcomeUrlFor(baseUrl: string): string {
  *                        SSE checkpoint.
  *   /m/servers/:id     — install-checkpoint progress view (T-0024).
  *
- * Contract: vision/architecture/mothership-seam.md.
+ * Contract: docs/architecture/D-0017-mothership-seam.md.
  */
 
 function statusBadge(status: Checkpoint["status"]): string {

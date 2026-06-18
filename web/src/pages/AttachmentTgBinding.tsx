@@ -1,7 +1,7 @@
 /**
  * T-0061 — Telegram chat-id binding page.
  *
- * Per the locked spec in ``vision/multi-server/nav-restructure.md``, this
+ * Per the locked spec in ``docs/design/D-0019-nav-restructure.md``, this
  * row moved out of /me (global cross-server profile) into the ATTACHMENT
  * section since it's scoped per-user-per-server. The actual write goes to
  * the Attachment store via ``/api/me/attachment/<server_id>/tg-chat-id``

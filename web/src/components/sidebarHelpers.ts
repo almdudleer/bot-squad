@@ -3,7 +3,7 @@
  *
  * The Shell component renders four scope sections — GLOBAL / SERVER /
  * ATTACHMENT / MOTHERSHIP — per the locked contract in
- * `vision/multi-server/nav-restructure.md`. The visibility, the picker
+ * `docs/design/D-0019-nav-restructure.md`. The visibility, the picker
  * default, and the admin gates are all decided here so we have a vitest
  * seam without a DOM (matches the convention set by Select.test.ts +
  * ProjectSwitcher.test.ts).
@@ -47,7 +47,7 @@ export function sidebarSectionVisibility(flags: SidebarFlags): SidebarVisibility
 
 /**
  * Section headers in render order, per the locked diagram in
- * `vision/multi-server/nav-restructure.md`. Returns only sections that are
+ * `docs/design/D-0019-nav-restructure.md`. Returns only sections that are
  * visible under the given flags — callers iterate to drive both Shell.tsx
  * markup AND tests that pin the contract order.
  */
@@ -163,7 +163,7 @@ export type AttachmentSidebarItem = {
 };
 
 /**
- * Locked contract from ``vision/multi-server/nav-restructure.md``: TG
+ * Locked contract from ``docs/design/D-0019-nav-restructure.md``: TG
  * binding, my sessions, worker controls — in that order, identical on
  * mothership and detach builds. The operational-status pill is rendered
  * separately by Shell.tsx as section chrome (T-0063), not as a nav item.

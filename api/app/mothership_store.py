@@ -4,7 +4,7 @@ Stores the attached-server registry at ``DATA_DIR/_mothership/servers.json``.
 Single-writer in the API process; atomic via rename. Token plaintexts never
 land here — only SHA-256 hashes.
 
-Schema (frozen by ``vision/architecture/mothership-seam.md``)::
+Schema (frozen by ``docs/architecture/D-0017-mothership-seam.md``)::
 
     {
       "version": 1,

@@ -3,7 +3,7 @@
 The mothership exposes ``GET/POST/PUT/PATCH/DELETE /api/m/servers/{id}/api/{path}``
 which forwards to the attached server's API using the stored server-bearer.
 This is the BE half of the seam contract in
-``vision/architecture/mothership-seam.md`` (section "Per-server backend
+``docs/architecture/D-0017-mothership-seam.md`` (section "Per-server backend
 client (T-0023)"). The FE consumes it via ``apiFor(serverId)`` in
 ``web/src/mothership/api.ts``.
 

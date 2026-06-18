@@ -1232,14 +1232,15 @@ _UC_ID_RE = re.compile(r"^UC-[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _action_flow_new(params: dict[str, Any]) -> dict[str, Any]:
-    """Allocate the next F-NNNN id and write a stub user-flow md (composes T-0173).
+    """Allocate the next UF-NNNN id and write a stub user-flow md (composes T-0173).
 
     Required params: slug, uc_id, title
     Returns: {ok, id, file_path, uc_id}
 
-    Storage: ``data/<slug>/use_cases/<uc-id>/flows/F-NNNN-<slug>.md``. The
+    Storage: ``data/<slug>/use_cases/<uc-id>/flows/UF-NNNN-<slug>.md``. The
     parent use case must exist (either ``<uc-id>.md`` or a ``<uc-id>/`` dir).
-    The flow counter is per-project (one F-NNNN sequence across all UCs).
+    The flow counter is per-project (one UF-NNNN sequence across all UCs). The
+    "UF-" (user-flow) prefix is distinct from curated feedback's "F-" (T-0180).
     """
     from bot_squad_worker import idalloc
 

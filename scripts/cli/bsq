@@ -13,7 +13,7 @@ Verbs:
   bsq task new <title>             allocate next T-NNNN + stub (atomic — T-0174)
   bsq doc new <category> <title>   allocate next D-NNNN + stub doc (T-0172)
   bsq uc new <title>               allocate next UC-NNNN + stub use case
-  bsq flow new <uc-id> <title>     allocate next F-NNNN + stub flow (T-0173)
+  bsq flow new <uc-id> <title>     allocate next UF-NNNN + stub flow (T-0173)
   bsq initiative new <name>        allocate next INI-NN + stub initiative
   bsq spawn <ticket> [--bundle ids] spawn a dev session (auto-resumes an expert)
   bsq expert find <ticket>          rank resumable 'pro' sessions for a ticket
@@ -977,17 +977,36 @@ def _resume_expert(slug: str, expert: dict, all_tickets: list[str],
         except WorkerError:
             pass
     # Preferred: hand the delta brief straight to the resumed composer
-    # (worker resume_session learned `initial_prompt` in T-0150). Param
-    # validation runs before any resume work, so a rejection from a pre-T0150
-    # worker leaves no partial state — fall back to a plain resume + bus delivery.
+    # (worker resume_session learned `initial_prompt` in T-0150). T-0166: also
+    # pass the spawn's primary ticket as `task_id` so an expert with no primary
+    # (its own task closed + gc-stripped) adopts THIS ticket as its primary —
+    # otherwise the _bind_extras below fails ("no primary task_id"). Param
+    # validation runs before any resume work, so a rejection from an older
+    # worker leaves no partial state — degrade gracefully param-by-param.
     delivered = "prompt"
+    primary = all_tickets[0] if all_tickets else None
+    base = {"slug": slug, "sid": sid}
+    params = {**base, "initial_prompt": brief}
+    if primary:
+        params["task_id"] = primary
     try:
-        res = post("resume_session",
-                   {"slug": slug, "sid": sid, "initial_prompt": brief},
-                   timeout=120, fatal=False)
+        res = post("resume_session", params, timeout=120, fatal=False)
     except WorkerError as e:
-        if "initial_prompt" in str(e) and "unexpected" in str(e):
-            res = post("resume_session", {"slug": slug, "sid": sid}, timeout=120)
+        msg = str(e)
+        if "unexpected" in msg and "task_id" in msg:
+            # Pre-T0166 worker: retry without the primary-adopt param.
+            try:
+                res = post("resume_session", {**base, "initial_prompt": brief},
+                           timeout=120, fatal=False)
+            except WorkerError as e2:
+                if "initial_prompt" in str(e2) and "unexpected" in str(e2):
+                    res = post("resume_session", base, timeout=120)
+                    delivered = "bus"
+                else:
+                    die(f"resume_session failed for {sid}: {e2}")
+        elif "initial_prompt" in msg and "unexpected" in msg:
+            # Pre-T0150 worker: plain resume + bus delivery.
+            res = post("resume_session", base, timeout=120)
             delivered = "bus"
         else:
             die(f"resume_session failed for {sid}: {e}")
@@ -998,8 +1017,9 @@ def _resume_expert(slug: str, expert: dict, all_tickets: list[str],
               f"(pre-T0150 worker — direct prompt delivery lands after the worker deploy)")
     else:
         print(f"resumed -> {new_sid}; delivered delta brief for {', '.join(all_tickets)}")
-    # Bind every assigned ticket to the resumed expert. Its primary task stays
-    # its original; the new ones land in extra_task_ids (idempotent).
+    # Bind every assigned ticket to the resumed expert (idempotent). With T-0166
+    # the primary now sits in meta.task_id, so bind_task(primary) no-ops as
+    # already-bound and the bundle extras attach cleanly.
     _bind_extras(slug, new_sid, all_tickets)
 
 
@@ -2591,7 +2611,7 @@ def build_parser() -> argparse.ArgumentParser:
     # flow new (composes T-0173 user flows)
     fl = sub.add_parser("flow", help="user flows attached to a use case: new (atomic id, composes T-0173)")
     fl_sub = fl.add_subparsers(dest="sub", required=True)
-    fln = fl_sub.add_parser("new", help="allocate the next F-NNNN + write a stub flow under a UC")
+    fln = fl_sub.add_parser("new", help="allocate the next UF-NNNN + write a stub flow under a UC")
     fln.add_argument("uc_id", help="parent use-case id, e.g. UC-0001")
     fln.add_argument("title", help="single-line flow title")
     fln.set_defaults(func=cmd_flow_new)

@@ -53,16 +53,21 @@ function formatCountdown(iso: string | null, now: number): string {
 
 type PillKind = "ok" | "active" | "danger" | "warn" | "dim";
 
-function pickKind(status: AutoupdateStatus | null): PillKind {
+// T-0168: `status` is coerced at the api boundary (normalizeAutoupdateStatus),
+// so a non-object/null payload arrives here as `null` and every field is a safe
+// type. The `last_apply_outcome` access is additionally guarded belt-and-
+// suspenders — a throw here would unmount the whole Shell, not just the pill.
+export function pickKind(status: AutoupdateStatus | null): PillKind {
   if (!status) return "dim";
   if (status.alert) return "danger";
   if (status.pending_apply_version && !status.paused) return "active";
   if (status.paused) return "warn";
-  if (status.last_apply_outcome.startsWith("failed:")) return "danger";
+  if (typeof status.last_apply_outcome === "string" && status.last_apply_outcome.startsWith("failed:"))
+    return "danger";
   return "ok";
 }
 
-function pillLabel(status: AutoupdateStatus | null, now: number): string {
+export function pillLabel(status: AutoupdateStatus | null, now: number): string {
   if (!status) return "AUTOUPDATE · loading…";
   if (status.alert) {
     return `${status.alert.version} failed at ${status.alert.step} — open`;

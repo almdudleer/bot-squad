@@ -164,7 +164,7 @@ export type DocDetail = {
 };
 
 // T-0173: user flows attached to a use case
-// (data/<slug>/use_cases/<uc-id>/flows/F-NNNN-<slug>.md).
+// (data/<slug>/use_cases/<uc-id>/flows/UF-NNNN-<slug>.md).
 export type FlowSummary = {
   id: string;
   uc_id: string;
@@ -438,6 +438,52 @@ export type AutoupdateStatus = {
   mothership_url: string | null;
   poll_interval_seconds: number;
 };
+
+// T-0168: defensive coercion at the autoupdate data boundary, mirroring the
+// `normalizeTask` #31 defense above. `/api/autoupdate/status` is consumer-side
+// and can misbehave (a non-object body, a null, a payload missing
+// `last_apply_outcome`). Read raw into `pickKind`/`pillLabel`, an unguarded
+// `status.last_apply_outcome.startsWith(...)` (or `status.alert.version`) throws
+// DURING RENDER — and with no error boundary that unmounts the WHOLE Shell, not
+// just the pill (regression surfaced in the T-0167 walkthrough). Coerce here so
+// a malformed/non-object/null payload becomes `null` (pill renders nothing) and
+// every surviving field is forced to a safe type the render logic can't trip on.
+function coerceNullableStr(v: unknown): string | null {
+  return typeof v === "string" ? v : null;
+}
+
+export function normalizeAutoupdateStatus(raw: unknown): AutoupdateStatus | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const s = raw as Record<string, unknown>;
+  const a = s.alert;
+  const alert: AutoupdateAlert | null =
+    a !== null && typeof a === "object" && !Array.isArray(a)
+      ? {
+          version: coerceNullableStr((a as Record<string, unknown>).version) ?? "",
+          step: coerceNullableStr((a as Record<string, unknown>).step) ?? "",
+          log_tail: coerceNullableStr((a as Record<string, unknown>).log_tail) ?? "",
+          occurred_at: coerceNullableStr((a as Record<string, unknown>).occurred_at) ?? "",
+          retry_command: coerceNullableStr((a as Record<string, unknown>).retry_command) ?? "",
+          force_command: coerceNullableStr((a as Record<string, unknown>).force_command) ?? "",
+        }
+      : null;
+  return {
+    installed_version: coerceNullableStr(s.installed_version),
+    last_check_at: coerceNullableStr(s.last_check_at),
+    next_check_at: coerceNullableStr(s.next_check_at),
+    last_apply_at: coerceNullableStr(s.last_apply_at),
+    last_apply_outcome: coerceNullableStr(s.last_apply_outcome) ?? "",
+    current_git_sha: coerceNullableStr(s.current_git_sha),
+    paused: s.paused === true,
+    alert,
+    pending_apply_version: coerceNullableStr(s.pending_apply_version),
+    mothership_url: coerceNullableStr(s.mothership_url),
+    poll_interval_seconds:
+      typeof s.poll_interval_seconds === "number" && Number.isFinite(s.poll_interval_seconds)
+        ? s.poll_interval_seconds
+        : 0,
+  };
+}
 
 // T-0147: product-analytics (internal-usage) snapshot.
 export type DayCount = { date: string; count: number };
@@ -781,7 +827,10 @@ export const api = {
   // 404 on the mothership build; the AutoupdatePill component is also
   // tree-shaken there via VITE_MOTHERSHIP, so these methods are only
   // exercised on consumer installs.
-  autoupdateStatus: () => call<AutoupdateStatus>("/api/autoupdate/status"),
+  // T-0168: coerce the raw body — a non-object/null/malformed payload becomes
+  // `null` so the pill renders nothing instead of throwing during render.
+  autoupdateStatus: async (): Promise<AutoupdateStatus | null> =>
+    normalizeAutoupdateStatus(await call<unknown>("/api/autoupdate/status")),
   autoupdatePause: (paused: boolean) =>
     call<{ ok: boolean; paused: boolean }>("/api/autoupdate/pause", {
       method: "POST",

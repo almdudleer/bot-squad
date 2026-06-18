@@ -2593,12 +2593,15 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
     Only DEV rows (carrying a primary ``task_id``) are backfilled — this
     mirrors the web tree's ``isDevRow`` gate. Non-dev rows (TL / prod-tl / qa)
     are tree roots unless an explicit spawn-time ``parent_sid`` was stamped, so
-    the heuristic must never invent a parent for them. Operator rows are
-    additionally self-healed: an operator is always a root, so any stale
-    ``parent_sid`` (e.g. from an earlier over-eager backfill) is cleared.
+    the heuristic must never invent a parent for them. Non-dev rows are also
+    self-healed against an earlier over-eager backfill: an operator is always
+    a root (any ``parent_sid`` cleared), and for other non-dev rows the value
+    is cleared only when it matches the heuristic's fingerprint
+    (``== tl_for_sid(row)``) — preserving a genuine spawn-time parent such as
+    operator→TL.
 
     Returns ``{"ok": True, "scanned": N, "filled": K, "corrected": C,
-    "details": [...]}`` where ``corrected`` counts cleared operator rows.
+    "details": [...]}`` where ``corrected`` counts cleared non-dev rows.
     """
     from bot_squad_worker.actions import ActionError
     from bot_squad_worker import teams as _teams
@@ -2624,28 +2627,37 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
         role = _derive_role(
             meta.get("window"), meta.get("task_id"), meta.get("initiative")
         )
-        # Operators are always tree ROOTS — they have no parent. Self-heal any
-        # stale value (e.g. an earlier over-eager backfill that mapped the
-        # operator under a TL via the team projection) and never stamp one.
-        if role == "operator":
-            if _parent_sid_of(meta):
-                meta.pop("parent_sid", None)
-                try:
-                    _write_session_metadata(md, meta, atomic=True)
-                except OSError:
-                    continue
-                corrected += 1
-                details.append({"sid": sid, "cleared": True})
-            continue
-        # Fill-once: never overwrite an existing (spawn-time) parent_sid.
-        if _parent_sid_of(meta):
-            continue
-        # Only DEV rows (carrying a primary task_id) get a backfilled parent —
-        # mirrors the web tree's isDevRow gate. Non-dev rows (TL / prod-tl / qa)
-        # are roots unless an explicit spawn-time parent_sid was stamped, so
-        # the heuristic must not invent a parent for them.
         tid = meta.get("task_id")
-        if not (tid and tid != "~"):
+        is_dev = bool(tid and tid != "~")
+
+        if not is_dev:
+            # Non-dev rows (operator / TL / prod-tl / qa) are tree ROOTS in the
+            # web tree, which nests only dev rows — so the tl_for_sid heuristic
+            # must never invent a parent for them. Self-heal artifacts an
+            # earlier over-eager backfill left behind: an operator is *always*
+            # a root (clear unconditionally); for other non-dev rows clear only
+            # when the stored value matches what the heuristic would produce
+            # (its fingerprint), so a genuine spawn-time parent (e.g.
+            # operator→TL) is preserved.
+            if _parent_sid_of(meta):
+                try:
+                    heuristic = _teams.tl_for_sid(cfg, slug, sid)
+                except Exception:
+                    heuristic = None
+                if role == "operator" or (
+                    heuristic and _parent_sid_of(meta) == heuristic
+                ):
+                    meta.pop("parent_sid", None)
+                    try:
+                        _write_session_metadata(md, meta, atomic=True)
+                    except OSError:
+                        continue
+                    corrected += 1
+                    details.append({"sid": sid, "cleared": True})
+            continue
+
+        # Dev row. Fill-once: never overwrite an existing (spawn-time) parent.
+        if _parent_sid_of(meta):
             continue
         try:
             parent = _teams.tl_for_sid(cfg, slug, sid)

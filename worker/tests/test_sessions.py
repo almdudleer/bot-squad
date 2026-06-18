@@ -3887,8 +3887,9 @@ def test_backfill_parent_sid_fills_legacy_and_preserves_existing(tmp_path, monke
 
 def test_backfill_parent_sid_gates_nondev_and_heals_operator(tmp_path, monkeypatch):
     """T-0128: backfill only stamps DEV rows (task_id); never invents a parent
-    for a non-dev row (TL); and self-heals an operator row carrying a stale
-    parent_sid (operators are tree roots, never children of a TL)."""
+    for a non-dev row; self-heals an operator (always a root) unconditionally
+    and other non-dev rows when their stored parent matches the heuristic's
+    fingerprint; and PRESERVES a genuine spawn-time non-dev parent."""
     repo = tmp_path / "repo"
     repo.mkdir()
     cfg = _make_cfg(tmp_path, repo)
@@ -3898,15 +3899,25 @@ def test_backfill_parent_sid_gates_nondev_and_heals_operator(tmp_path, monkeypat
 
     sessions_dir = cfg.data_dir / "test-project" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    # Operator with a stale (wrongly-backfilled) parent_sid → must be cleared.
+    # Operator with a stale (wrongly-backfilled) parent_sid → cleared always.
     _write_session_metadata(sessions_dir / "S-testuser-operator-p5.md", {
         "sid": "S-testuser-operator-p5", "status": "active", "window": "operator",
         "cwd": str(repo), "parent_sid": "S-testuser-tl-p1",
     })
-    # Non-dev TL (no task_id) → must NOT be stamped even if tl_for_sid resolves.
+    # Non-dev TL with NO parent → must NOT be stamped even if tl_for_sid resolves.
     _write_session_metadata(sessions_dir / "S-testuser-tl-p1.md", {
         "sid": "S-testuser-tl-p1", "status": "active", "window": "multi-tl",
         "cwd": str(repo),
+    })
+    # Non-dev TL whose parent == heuristic fingerprint → cleared (artifact).
+    _write_session_metadata(sessions_dir / "S-testuser-otl-p7.md", {
+        "sid": "S-testuser-otl-p7", "status": "active", "window": "other-tl",
+        "cwd": str(repo), "parent_sid": "S-testuser-tl-p1",
+    })
+    # Non-dev TL whose parent is a genuine spawn-time op (≠ heuristic) → KEPT.
+    _write_session_metadata(sessions_dir / "S-testuser-spawned-tl-p8.md", {
+        "sid": "S-testuser-spawned-tl-p8", "status": "active", "window": "spawned-tl",
+        "cwd": str(repo), "parent_sid": "S-testuser-operator-p5",
     })
     # Dev (task_id) → stamped as a control.
     _write_session_metadata(sessions_dir / "S-testuser-dev-p2.md", {
@@ -3917,17 +3928,21 @@ def test_backfill_parent_sid_gates_nondev_and_heals_operator(tmp_path, monkeypat
     monkeypatch.setattr(T, "tl_for_sid", lambda c, s, sid: "S-testuser-tl-p1")
 
     res = S.backfill_parent_sid(cfg, "test-project")
-    assert res["corrected"] == 1   # operator stale parent cleared
+    assert res["corrected"] == 2   # operator + artifact TL cleared
     assert res["filled"] == 1      # only the dev row stamped
 
     op = _read_session_metadata(sessions_dir / "S-testuser-operator-p5.md")
     assert not S._parent_sid_of(op)          # operator is a root again
     tl = _read_session_metadata(sessions_dir / "S-testuser-tl-p1.md")
     assert not S._parent_sid_of(tl)          # non-dev never gets invented parent
+    otl = _read_session_metadata(sessions_dir / "S-testuser-otl-p7.md")
+    assert not S._parent_sid_of(otl)         # artifact fingerprint cleared
+    spawned = _read_session_metadata(sessions_dir / "S-testuser-spawned-tl-p8.md")
+    assert spawned["parent_sid"] == "S-testuser-operator-p5"   # genuine parent kept
     dev = _read_session_metadata(sessions_dir / "S-testuser-dev-p2.md")
     assert dev["parent_sid"] == "S-testuser-tl-p1"
 
-    # Idempotent: operator stays clean, nothing re-filled.
+    # Idempotent: cleared rows stay clean, genuine parent kept, nothing re-filled.
     res2 = S.backfill_parent_sid(cfg, "test-project")
     assert res2["corrected"] == 0
     assert res2["filled"] == 0

@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -60,6 +61,59 @@ log = logging.getLogger(__name__)
 RC_TIMEOUT = 124       # hard wall-clock backstop tripped (build ran too long)
 RC_NO_PROGRESS = 125   # no-progress watchdog: zero run-log output for N minutes
 RC_ORPHAN = 126        # stale-orphan reaper: file stranded in processing/ swept
+
+
+# ---------------------------------------------------------------------------
+# systemd-scope detach (T-0213)
+# ---------------------------------------------------------------------------
+#
+# The deploy recipe runs as a child of the worker process. The worker is a
+# user-systemd service (bot-squad-worker.service) whose default KillMode is
+# control-group, so `systemctl --user restart bot-squad-worker` SIGTERMs the
+# WHOLE cgroup — including an in-flight `docker build` started by the recipe
+# (the live rc=-15 break, 2026-06-18). T-0212's `start_new_session=True` only
+# gives the child its own PROCESS GROUP (so the watchdog's killpg is scoped);
+# it does NOT move it out of the worker's CGROUP.
+#
+# Fix: launch the recipe inside a transient `systemd-run --user --scope` unit.
+# A scope is its own cgroup under the user slice (app.slice), NOT under
+# bot-squad-worker.service, so a worker restart can't reach it. The same
+# primitive lets T-0181's post-deploy worker-restart step survive restarting
+# the very worker it runs under.
+#
+# `--scope` runs SYNCHRONOUSLY and execs into the command, so:
+#   - stdout/stderr still redirect to the run-log (Popen stdout=lf), and
+#   - `proc.pid` IS the recipe bash (pgid == pid), so the watchdog's
+#     `os.getpgid(proc.pid)` + `os.killpg` is unchanged — verified live.
+
+
+def _use_systemd_scope() -> bool:
+    """Whether to wrap deploy children in a transient systemd --user scope.
+
+    Explicit override: BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE in {"1","0"}. Otherwise
+    auto-detect: a reachable user systemd manager (XDG_RUNTIME_DIR) AND the
+    systemd-run client on PATH. Tests and non-systemd hosts fall back to a
+    plain `bash` invocation (the legacy behaviour) so nothing breaks where the
+    primitive is unavailable.
+    """
+    knob = os.environ.get("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE")
+    if knob in ("0", "1"):
+        return knob == "1"
+    return bool(os.environ.get("XDG_RUNTIME_DIR")) and shutil.which("systemd-run") is not None
+
+
+def _scope_wrap(argv: list[str], unit: str) -> list[str]:
+    """Prefix ``argv`` with ``systemd-run --user --scope`` when scopes are on.
+
+    ``unit`` names the transient scope (must be unique while active — callers
+    pass a uuid-derived name). When scopes are off, returns ``argv`` unchanged.
+    """
+    if not _use_systemd_scope():
+        return argv
+    return [
+        "systemd-run", "--user", "--scope", "--quiet",
+        f"--unit={unit}", "--collect", "--", *argv,
+    ]
 
 # Patterns in git --porcelain output that are ignored for cleanliness checks.
 # Each is tested against the full line (e.g. " M logs/something.log").
@@ -178,8 +232,15 @@ def enqueue(
     target: str,
     reason: str,
     requested_by: str,
+    restart_worker: bool = False,
 ) -> str:
     """Write a deploy request file and return its queue_id.
+
+    ``restart_worker`` (T-0181, default OFF) opts the deploy into a post-sync
+    worker restart: after a successful recipe, ``run_next`` restarts
+    bot-squad-worker (in a detached scope so it survives) and re-smokes the
+    worker. The agent opts in only when the diff touches worker-loaded code
+    (e.g. ``worker/.../actions.py``); most web/api deploys leave it off.
 
     Raises ValueError if ``target`` is not in the project's deploy_targets.
     Raises KeyError if ``slug`` is not registered.
@@ -207,6 +268,7 @@ def enqueue(
         "reason": reason,
         "requested_by": requested_by,
         "queued_at": queued_at,
+        "restart_worker": bool(restart_worker),
     }
     (queue_dir / filename).write_text(json.dumps(payload, indent=2))
     log.info("deploy.enqueue: %s/%s queued as %s", slug, target, queue_id)
@@ -399,7 +461,9 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         "deploy.run_next: running %s (recipe: %s, cwd: %s, timeout=%ds, no_progress=%ds)",
         queue_id, recipe, repo, timeout_s, no_progress_s,
     )
-    rc, killed_reason = _run_recipe_watchdog(recipe, repo, log_path, timeout_s, no_progress_s)
+    rc, killed_reason = _run_recipe_watchdog(
+        recipe, repo, log_path, timeout_s, no_progress_s, queue_id
+    )
 
     _finish(cfg, slug, processing_file, queue_id, rc=rc)
     for pf in collapsed_processing:
@@ -409,6 +473,21 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         "deploy.run_next: %s/%s finished rc=%d killed=%s (collapsed=%d)",
         slug, target, rc, killed_reason, 1 + len(collapsed_processing),
     )
+
+    # T-0181: optional post-deploy worker restart. Only on a clean success, and
+    # only when the request opted in (the diff touched worker-loaded code). The
+    # restart is detached into its own scope so it survives restarting the very
+    # worker this code runs under — see _restart_worker_detached. Best-effort:
+    # a launch failure is logged but never flips the deploy's own outcome (the
+    # build + install sync already succeeded; the operator can restart by hand).
+    if ok and payload.get("restart_worker"):
+        try:
+            _restart_worker_detached(cfg, slug, queue_id, payload.get("reason", ""))
+        except Exception:
+            log.exception(
+                "deploy.run_next: %s/%s post-deploy worker restart launch failed "
+                "(deploy itself succeeded — restart the worker manually)", slug, target,
+            )
     return DeployResult(
         ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
         collapsed_count=1 + len(collapsed_processing),
@@ -431,6 +510,7 @@ def _run_recipe_watchdog(
     log_path: Path,
     timeout_s: int,
     no_progress_s: int,
+    queue_id: str = "",
 ) -> tuple[int, str | None]:
     """Run ``bash <recipe>`` (cwd=repo, output→log_path) under two watchdogs.
 
@@ -447,11 +527,19 @@ def _run_recipe_watchdog(
     the run-log and NEVER raises — the caller relies on always getting an rc so
     the queue file is finished (moved out of processing/) and the queue
     unblocked. ``no_progress_s``/``timeout_s`` <= 0 disable that watchdog.
+
+    T-0213: when a user systemd manager is available the recipe is wrapped in a
+    transient ``systemd-run --user --scope`` unit so it lives in its OWN cgroup
+    (under app.slice), not the worker service's — a concurrent
+    ``systemctl --user restart bot-squad-worker`` then can't SIGTERM the build.
+    With ``--scope`` systemd-run execs into the command, so ``proc.pid`` is the
+    recipe bash and ``getpgid``/``killpg`` are unaffected.
     """
     poll_interval = float(os.environ.get("BOT_SQUAD_DEPLOY_POLL_SECONDS", "5"))
+    argv = _scope_wrap(["bash", str(recipe)], f"bot-squad-deploy-{queue_id or 'run'}")
     with log_path.open("w") as lf:
         proc = subprocess.Popen(
-            ["bash", str(recipe)],
+            argv,
             cwd=str(repo),
             stdout=lf,
             stderr=subprocess.STDOUT,
@@ -535,6 +623,125 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
             return
         except subprocess.TimeoutExpired:
             continue
+
+
+def _build_worker_restart_script(
+    worker_dir: Path,
+    pip_path: Path,
+    sock_path: Path,
+    log_path: Path,
+    fail_marker: Path,
+    service: str,
+    delay_s: int,
+    smoke_attempts: int,
+) -> str:
+    """Render the bash script the detached restart scope runs (T-0181).
+
+    Sequence: (1) brief delay so the caller returns + the worker idles;
+    (2) PIP GUARD — ``pip install -e <worker>`` to pull any new deps the synced
+    code needs (the worker is editable-installed, so code is already live; only
+    deps are at risk). On guard failure the worker is left RUNNING on the old
+    code and a FAIL marker is written — a half-applied venv that downs the
+    worker would kill the peer bus, so failing loud-but-safe beats restarting;
+    (3) restart the service; (4) smoke worker ``/health`` (ok + fresh uptime)
+    then one action (``scheduler_state``). Any failure writes the FAIL marker.
+    All paths are shlex-quoted by the caller.
+    """
+    import shlex
+    q = shlex.quote
+    wd, pip, sock = q(str(worker_dir)), q(str(pip_path)), q(str(sock_path))
+    log, fail, svc = q(str(log_path)), q(str(fail_marker)), q(service)
+    return f"""
+set -u
+LOG={log}
+sleep {int(delay_s)}
+echo "[worker-restart] pip guard: install -e {wd}" >> "$LOG"
+if ! {pip} install -e {wd} >> "$LOG" 2>&1; then
+  echo "[worker-restart] PIP_GUARD_FAILED — leaving worker on old code, NOT restarting" >> "$LOG"
+  : > {fail}
+  exit 1
+fi
+echo "[worker-restart] restarting {svc}" >> "$LOG"
+if ! systemctl --user restart {svc} >> "$LOG" 2>&1; then
+  echo "[worker-restart] RESTART_CMD_FAILED" >> "$LOG"
+  : > {fail}
+  exit 1
+fi
+ok=0
+for i in $(seq 1 {int(smoke_attempts)}); do
+  sleep 2
+  resp=$(curl -sS --max-time 5 --unix-socket {sock} http://w/health 2>/dev/null || true)
+  echo "[worker-restart] /health attempt $i: $resp" >> "$LOG"
+  case "$resp" in *'\"ok\":true'*) ok=1; break;; esac
+done
+if [ "$ok" != 1 ]; then
+  echo "[worker-restart] SMOKE_HEALTH_FAILED — worker did not answer /health after restart" >> "$LOG"
+  : > {fail}
+  exit 1
+fi
+act=$(curl -sS --max-time 5 --unix-socket {sock} -X POST -H 'Content-Type: application/json' -d '{{}}' http://w/actions/scheduler_state 2>/dev/null || true)
+echo "[worker-restart] scheduler_state: $act" >> "$LOG"
+case "$act" in
+  *worker_started_at*) echo "[worker-restart] WORKER_RESTART_OK" >> "$LOG"; exit 0;;
+  *) echo "[worker-restart] SMOKE_ACTION_FAILED" >> "$LOG"; : > {fail}; exit 1;;
+esac
+"""
+
+
+def _restart_worker_detached(
+    cfg: "Config", slug: str, queue_id: str, reason: str
+) -> None:
+    """Launch a detached, self-surviving worker restart + smoke (T-0181).
+
+    Runs only when systemd scopes are available (``_use_systemd_scope``) — the
+    whole point is to survive restarting the worker we run under, which is
+    impossible without the scope detach. Without a user systemd manager we log
+    a clear note and SKIP (the operator restarts by hand, the legacy behaviour);
+    a synchronous in-process restart would SIGTERM this very code mid-run.
+
+    The restart script (``_build_worker_restart_script``) is launched in its own
+    transient scope so it outlives the ``systemctl --user restart`` it issues,
+    writing its progress + outcome to ``runs/<queue_id>.worker-restart.log`` and
+    a ``.worker-restart.FAIL`` marker on any failure.
+    """
+    restart_log = _runs_dir(cfg, slug) / f"{queue_id}.worker-restart.log"
+    fail_marker = _runs_dir(cfg, slug) / f"{queue_id}.worker-restart.FAIL"
+    restart_log.parent.mkdir(parents=True, exist_ok=True)
+
+    if not _use_systemd_scope():
+        msg = (
+            f"[worker-restart] systemd --user scope unavailable — SKIPPING "
+            f"auto-restart for {slug} (queue {queue_id}). Restart the worker by "
+            f"hand: systemctl --user restart bot-squad-worker.service\n"
+        )
+        log.warning("deploy._restart_worker_detached: %s", msg.strip())
+        restart_log.write_text(msg)
+        return
+
+    install_root = cfg.config_dir.parent
+    worker_dir = install_root / "worker"
+    pip_path = worker_dir / ".venv" / "bin" / "pip"
+    service = os.environ.get("BOT_SQUAD_WORKER_SERVICE", "bot-squad-worker.service")
+    delay_s = int(os.environ.get("BOT_SQUAD_DEPLOY_WORKER_RESTART_DELAY", "5"))
+    smoke_attempts = int(os.environ.get("BOT_SQUAD_DEPLOY_WORKER_SMOKE_ATTEMPTS", "10"))
+
+    script = _build_worker_restart_script(
+        worker_dir, pip_path, cfg.sock_path, restart_log, fail_marker,
+        service, delay_s, smoke_attempts,
+    )
+    argv = _scope_wrap(["bash", "-c", script], f"bot-squad-worker-restart-{queue_id}")
+    log.info(
+        "deploy._restart_worker_detached: %s launching detached worker restart "
+        "(queue %s, reason=%r) → %s", slug, queue_id, reason, restart_log,
+    )
+    # Fire-and-forget: detached session, no wait. The scope keeps it alive past
+    # the worker restart; we must not block run_next / the monitor on it.
+    subprocess.Popen(
+        argv,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def reap_orphans(cfg: "Config", slug: str, max_age_seconds: int | None = None) -> list[dict]:

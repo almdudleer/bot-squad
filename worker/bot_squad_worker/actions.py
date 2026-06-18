@@ -249,7 +249,10 @@ def _action_tg_stall_clear(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _DEPLOY_REQUIRED = {"slug", "target", "reason", "requested_by"}
-_DEPLOY_ALLOWED = _DEPLOY_REQUIRED
+# restart_worker (T-0181, optional): opt the deploy into a post-sync worker
+# restart — see deploy.enqueue. Default OFF; the agent sets it only when the
+# diff touches worker-loaded code (worker/.../actions.py et al.).
+_DEPLOY_ALLOWED = _DEPLOY_REQUIRED | {"restart_worker"}
 
 
 def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
@@ -283,6 +286,7 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
             target=target,
             reason=params["reason"],
             requested_by=params["requested_by"],
+            restart_worker=bool(params.get("restart_worker", False)),
         )
     except ValueError as e:
         raise ActionError(f"deploy: {e}") from e

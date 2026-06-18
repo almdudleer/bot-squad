@@ -99,6 +99,17 @@ def _make_recipe(tmp_path: Path, cfg: Config, slug: str, target: str, rc: int = 
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_systemd_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default deploy children to a plain `bash` invocation in the test suite.
+
+    This dev host HAS a user systemd manager, so without this the recipe runner
+    would wrap every recipe in a real transient scope (noise + flakiness). The
+    scope-gating tests opt back IN by setting the env knob to "1" themselves.
+    """
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "0")
+
+
 def test_enqueue_writes_queue_file(tmp_path: Path) -> None:
     proj = _make_project(tmp_path)
     cfg = _make_config(tmp_path, proj)
@@ -748,3 +759,245 @@ def test_is_clean_for_target_deploy_clone_ignores_dev_dirtiness(tmp_path: Path) 
     # But an unpushed dev commit must still gate.
     _add_local_commit(proj.repo_path)
     assert is_clean_for_target(cfg, proj.slug, "staging") is False
+
+
+# ---------------------------------------------------------------------------
+# T-0213: systemd-scope detach (deploy survives a concurrent worker restart)
+# ---------------------------------------------------------------------------
+
+
+def test_use_systemd_scope_respects_explicit_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bot_squad_worker.deploy import _use_systemd_scope
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "1")
+    assert _use_systemd_scope() is True
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "0")
+    assert _use_systemd_scope() is False
+
+
+def test_use_systemd_scope_autodetect_needs_manager_and_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no explicit knob, both XDG_RUNTIME_DIR and systemd-run are required."""
+    import bot_squad_worker.deploy as d
+
+    monkeypatch.delenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", raising=False)
+    monkeypatch.setattr(d.shutil, "which", lambda _name: "/usr/bin/systemd-run")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    assert d._use_systemd_scope() is True
+
+    # No user manager → off (a system-service worker, or CI).
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    assert d._use_systemd_scope() is False
+
+    # Manager present but client missing → off (fall back to plain bash).
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setattr(d.shutil, "which", lambda _name: None)
+    assert d._use_systemd_scope() is False
+
+
+def test_scope_wrap_wraps_when_on_and_passes_through_when_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bot_squad_worker.deploy import _scope_wrap
+
+    argv = ["bash", "/path/recipe.sh"]
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "0")
+    assert _scope_wrap(argv, "bot-squad-deploy-xyz") == argv
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "1")
+    wrapped = _scope_wrap(argv, "bot-squad-deploy-xyz")
+    assert wrapped[:4] == ["systemd-run", "--user", "--scope", "--quiet"]
+    assert "--unit=bot-squad-deploy-xyz" in wrapped
+    # The original command survives intact after the `--` separator.
+    assert wrapped[-2:] == argv
+    assert "--" in wrapped
+
+
+def test_run_next_routes_recipe_through_scope_wrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_next hands the recipe command to _scope_wrap with the queue-id unit.
+
+    We spy on _scope_wrap (returning a plain `bash recipe` so the recipe still
+    runs and the deploy succeeds), proving the integration point without
+    spawning a real transient unit. The wrap/passthrough behaviour itself is
+    covered by test_scope_wrap_wraps_when_on_and_passes_through_when_off.
+    """
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    recipe = _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    queue_id = enqueue(cfg, proj.slug, "staging", "scoped deploy", "user")
+
+    captured: dict = {}
+
+    def _spy(argv, unit):
+        captured["argv"] = argv
+        captured["unit"] = unit
+        return argv  # plain — let the recipe actually run
+
+    monkeypatch.setattr(d, "_scope_wrap", _spy)
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.ok is True
+    assert captured["argv"] == ["bash", str(recipe)]
+    assert captured["unit"] == f"bot-squad-deploy-{queue_id}"
+
+
+# ---------------------------------------------------------------------------
+# T-0181: optional post-deploy worker-restart step
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_carries_restart_worker_flag(tmp_path: Path) -> None:
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+
+    # Default OFF.
+    enqueue(cfg, proj.slug, "staging", "web-only", "user")
+    data = json.loads(next(queue_dir.glob("*.json")).read_text())
+    assert data["restart_worker"] is False
+
+    # Explicit opt-in round-trips.
+    for f in queue_dir.glob("*.json"):
+        f.unlink()
+    enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
+    data = json.loads(next(queue_dir.glob("*.json")).read_text())
+    assert data["restart_worker"] is True
+
+
+def test_run_next_no_restart_when_flag_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "no restart", "user")  # default OFF
+
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+    assert calls == []
+
+
+def test_run_next_triggers_restart_on_success_when_flag_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    queue_id = enqueue(
+        cfg, proj.slug, "staging", "worker change", "user", restart_worker=True
+    )
+
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+    assert len(calls) == 1
+    # _restart_worker_detached(cfg, slug, queue_id, reason)
+    assert calls[0][1] == proj.slug
+    assert calls[0][2] == queue_id
+
+
+def test_run_next_no_restart_on_recipe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed deploy must NOT bounce the worker even with the flag set."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=5)
+    enqueue(cfg, proj.slug, "staging", "broken worker change", "user", restart_worker=True)
+
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is False
+    assert calls == []
+
+
+def test_restart_worker_detached_skips_without_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No user systemd manager → SKIP (and never spawn a process)."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "0")
+
+    popen_calls: list = []
+    monkeypatch.setattr(
+        d.subprocess, "Popen", lambda *a, **k: popen_calls.append(a)
+    )
+    d._restart_worker_detached(cfg, proj.slug, "qid-1", "worker change")
+
+    assert popen_calls == []
+    skip_log = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "runs" / "qid-1.worker-restart.log"
+    assert skip_log.exists()
+    assert "SKIPPING" in skip_log.read_text()
+
+
+def test_restart_worker_detached_launches_scoped_when_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scope ON → launch the restart script wrapped in a transient scope, detached."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_SYSTEMD_SCOPE", "1")
+
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(d.subprocess, "Popen", _FakePopen)
+    d._restart_worker_detached(cfg, proj.slug, "qid-2", "worker change")
+
+    argv = captured["argv"]
+    assert argv[0] == "systemd-run"
+    assert any(a == "--unit=bot-squad-worker-restart-qid-2" for a in argv)
+    assert argv[-3] == "bash" and argv[-2] == "-c"
+    # detached so it survives the restart it triggers
+    assert captured["kwargs"].get("start_new_session") is True
+
+
+def test_build_worker_restart_script_has_guard_restart_smoke(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _build_worker_restart_script
+
+    script = _build_worker_restart_script(
+        worker_dir=Path("/install/worker"),
+        pip_path=Path("/install/worker/.venv/bin/pip"),
+        sock_path=Path("/install/data/_sock/worker.sock"),
+        log_path=Path("/runs/q.log"),
+        fail_marker=Path("/runs/q.FAIL"),
+        service="bot-squad-worker.service",
+        delay_s=5,
+        smoke_attempts=10,
+    )
+    # pip guard runs BEFORE the restart, and aborts (no restart) on failure.
+    assert "pip" in script and "install -e" in script
+    guard_idx = script.index("install -e")
+    restart_idx = script.index("systemctl --user restart")
+    assert guard_idx < restart_idx
+    # smoke hits /health then one action over the unix socket
+    assert "http://w/health" in script
+    assert "scheduler_state" in script
+    assert "/install/data/_sock/worker.sock" in script
+    # failure paths drop the FAIL marker
+    assert "/runs/q.FAIL" in script

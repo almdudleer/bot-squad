@@ -3685,3 +3685,201 @@ def test_list_sessions_syncs_renamed_window_label_to_md(tmp_path, monkeypatch):
     updated = _read_session_metadata(md_path)
     assert updated["window"] == "ui_polish-TL"      # label synced
     assert updated["sid"] == "S-testuser-teamlead-p11"  # address frozen
+
+
+# ---------------------------------------------------------------------------
+# T-0128: persist parent_sid at spawn time + list it + backfill legacy
+# ---------------------------------------------------------------------------
+
+def test_spawn_stamps_parent_sid(tmp_path, monkeypatch):
+    """T-0128: spawn() writes the requesting session's SID as parent_sid
+    into the new session md frontmatter (survives worker restart)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%5|devwin|2222|{repo}|claude|test-project\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = spawn(cfg, "test-project", "devwin", parent_sid="S-testuser-tl-p1")
+    sid = result["sid"]
+    assert sid == "S-testuser-devwin-p5"
+    md_path = cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+    meta = _read_session_metadata(md_path)
+    assert meta is not None
+    assert meta.get("parent_sid") == "S-testuser-tl-p1"
+
+
+def test_spawn_without_parent_sid_omits_field(tmp_path, monkeypatch):
+    """T-0128: backward-compat — a spawn with no parent_sid leaves the field
+    unset (legacy callers keep working; backfill fills it later)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%5|w|9|{repo}|claude|test-project\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = spawn(cfg, "test-project", "w")
+    meta = _read_session_metadata(
+        cfg.data_dir / "test-project" / "sessions" / f"{result['sid']}.md"
+    )
+    assert meta is not None
+    assert not meta.get("parent_sid")
+
+
+def test_spawn_does_not_stamp_self_as_parent(tmp_path, monkeypatch):
+    """T-0128: a parent_sid equal to the new session's own SID is ignored
+    (a session is never its own parent)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%5|devwin|2222|{repo}|claude|test-project\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    result = spawn(cfg, "test-project", "devwin",
+                   parent_sid="S-testuser-devwin-p5")
+    meta = _read_session_metadata(
+        cfg.data_dir / "test-project" / "sessions" / f"{result['sid']}.md"
+    )
+    assert meta is not None
+    assert not meta.get("parent_sid")
+
+
+def test_list_sessions_returns_parent_sid(tmp_path, monkeypatch):
+    """T-0128: list_sessions surfaces parent_sid for active and suspended
+    rows, and "" for a legacy row lacking the field."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Active pane md (carries parent_sid).
+    _write_session_metadata(sessions_dir / "S-testuser-devwin-p2.md", {
+        "sid": "S-testuser-devwin-p2",
+        "status": "active",
+        "window": "devwin",
+        "cwd": str(repo),
+        "task_id": "T-0001",
+        "parent_sid": "S-testuser-tl-p1",
+    })
+    # Suspended md (carries parent_sid).
+    _write_session_metadata(sessions_dir / "S-testuser-old-p9.md", {
+        "sid": "S-testuser-old-p9",
+        "status": "suspended",
+        "window": "old",
+        "cwd": str(repo),
+        "parent_sid": "S-testuser-tl-p1",
+    })
+    # Legacy suspended md (no parent_sid).
+    _write_session_metadata(sessions_dir / "S-testuser-legacy-p8.md", {
+        "sid": "S-testuser-legacy-p8",
+        "status": "suspended",
+        "window": "legacy",
+        "cwd": str(repo),
+    })
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%2|devwin|1234|{repo}|claude|test-project\n", "",
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows}
+    assert by_sid["S-testuser-devwin-p2"]["parent_sid"] == "S-testuser-tl-p1"
+    assert by_sid["S-testuser-old-p9"]["parent_sid"] == "S-testuser-tl-p1"
+    assert by_sid["S-testuser-legacy-p8"]["parent_sid"] == ""
+
+
+def test_backfill_parent_sid_fills_legacy_and_preserves_existing(tmp_path, monkeypatch):
+    """T-0128: backfill populates parent_sid for a legacy session via the
+    team heuristic, NEVER overwrites an existing value, and leaves a session
+    with no resolvable parent untouched."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.teams as T
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Legacy dev — should be filled via the heuristic.
+    _write_session_metadata(sessions_dir / "S-testuser-dev-p2.md", {
+        "sid": "S-testuser-dev-p2", "status": "active", "window": "dev",
+        "cwd": str(repo), "task_id": "T-0001",
+    })
+    # Already has parent_sid — must NOT be overwritten (fill-once).
+    _write_session_metadata(sessions_dir / "S-testuser-dev2-p3.md", {
+        "sid": "S-testuser-dev2-p3", "status": "active", "window": "dev2",
+        "cwd": str(repo), "task_id": "T-0002",
+        "parent_sid": "S-testuser-PRESET-p0",
+    })
+    # No resolvable parent (heuristic returns None) — left untouched.
+    _write_session_metadata(sessions_dir / "S-testuser-root-p4.md", {
+        "sid": "S-testuser-root-p4", "status": "active", "window": "root",
+        "cwd": str(repo),
+    })
+
+    def fake_tl_for_sid(cfg_, slug_, sid_):
+        if sid_ == "S-testuser-root-p4":
+            return None
+        return "S-testuser-tl-p1"
+
+    monkeypatch.setattr(T, "tl_for_sid", fake_tl_for_sid)
+
+    res = S.backfill_parent_sid(cfg, "test-project")
+    assert res["ok"] is True
+    assert res["filled"] == 1
+
+    m1 = _read_session_metadata(sessions_dir / "S-testuser-dev-p2.md")
+    assert m1["parent_sid"] == "S-testuser-tl-p1"
+    # Existing value preserved.
+    m2 = _read_session_metadata(sessions_dir / "S-testuser-dev2-p3.md")
+    assert m2["parent_sid"] == "S-testuser-PRESET-p0"
+    # No-parent session left unset.
+    m3 = _read_session_metadata(sessions_dir / "S-testuser-root-p4.md")
+    assert not m3.get("parent_sid")
+
+    # Idempotent: a second pass fills nothing more.
+    res2 = S.backfill_parent_sid(cfg, "test-project")
+    assert res2["filled"] == 0

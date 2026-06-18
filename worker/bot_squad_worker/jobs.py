@@ -286,6 +286,9 @@ def binding_gc_tick(cfg: Config) -> None:
       5. ``reconcile_teams`` (T-0142) — rebuild the tmux-session-keyed Team mds
          from the (now-reconciled) SessionMd registry so the team roster, TL
          slot, and archived members survive a worker reload.
+      5b. ``backfill_parent_sid`` (T-0128) — fill ``parent_sid`` for legacy /
+         agent-teams sessions via the team-projection heuristic (fill-once);
+         runs after ``reconcile_teams`` so the Team md it reads is fresh.
       6. ``gc_tmux_sessions`` (T-0200) — reap idle, empty per-initiative/per-team
          tmux sessions (``<slug>-*`` with no live claude pane, idle past the
          grace) so they stop cluttering the host's ``tmux ls``. Runs after
@@ -309,6 +312,11 @@ def binding_gc_tick(cfg: Config) -> None:
         ("gc_stale_bindings", _sessions.gc_stale_bindings),
         ("archive_dead_teammates", _sessions.archive_dead_teammates),
         ("reconcile_teams", _teams.reconcile_teams),
+        # T-0128: backfill parent_sid for legacy / agent-teams-spawned sessions
+        # via the team-projection heuristic (fill-once, never overwrites the
+        # spawn-time value). Runs after reconcile_teams so the Team md it
+        # consults is freshly rebuilt this tick.
+        ("backfill_parent_sid", _sessions.backfill_parent_sid),
         # T-0200: reap idle empty per-initiative/per-team tmux sessions after the
         # Team md is rebuilt, so the durable entity survives while the empty tmux
         # shell is cleaned up.

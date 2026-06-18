@@ -449,6 +449,21 @@ def _read_session_metadata(path: Path) -> dict | None:
     return parsed[0] if parsed is not None else None
 
 
+def _parent_sid_of(meta: dict | None) -> str:
+    """T-0128: read the persisted ``parent_sid`` from a session md, or "".
+
+    Treats the ``~`` unset sentinel and missing field as absent (returns "").
+    The empty string signals "legacy session" so the web tree falls back to
+    the task→initiative→TL heuristic for that row.
+    """
+    if not meta:
+        return ""
+    v = meta.get("parent_sid")
+    if v and v != "~":
+        return str(v)
+    return ""
+
+
 def _get_current_user() -> str:
     """Return the OS username."""
     import getpass
@@ -782,6 +797,10 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "suspended_at": None,
             "archived": archived_flag,
             "owner": owner_meta,
+            # T-0128: persisted spawn-time parent (the SID that requested this
+            # spawn). Empty string when unset (legacy session) — the web tree
+            # falls back to the task→initiative→TL heuristic in that case.
+            "parent_sid": _parent_sid_of(existing),
             # T-0157: linux user that owns this session (explicit field, else
             # SID prefix). For active panes the SID's user IS the worker's user.
             "linux_user": _session_linux_user(sid, existing),
@@ -882,6 +901,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "suspended_at": meta.get("suspended_at"),
                 "archived": md_archived,
                 "owner": md_owner,
+                # T-0128: persisted spawn-time parent for suspended rows too.
+                "parent_sid": _parent_sid_of(meta),
                 # T-0157: linux user owning this (suspended) session.
                 "linux_user": _session_linux_user(sid, meta),
                 # T-0078: surface tmux_session so the UI can still suggest the
@@ -1468,6 +1489,7 @@ def spawn(
     task_id: str | None = None,
     initiative: str | None = None,
     owner: str | None = None,
+    parent_sid: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -1494,6 +1516,14 @@ def spawn(
     with ``owner: <username>`` so per-user listing filters can scope
     results without relying on the SID linux_user prefix. The owner is
     the UI username from the JWT claims, not the linux_user.
+
+    T-0128: when ``parent_sid`` is provided, it is the SID of the session
+    that requested this spawn (operator→TL, TL→dev). It is stamped into the
+    new session's md frontmatter so the session-tree is reliable across
+    worker restarts instead of being reconstructed from the
+    task→initiative→TL heuristic. Strictly optional and backward-compatible:
+    legacy spawns / callers that omit it leave the field unset, and the
+    ``backfill_parent_sid`` pass populates it for them via the heuristic.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -1611,6 +1641,13 @@ def spawn(
         # explicit user mark (the SID prefix already encodes it, but the field
         # makes per-user listing/grouping robust to SID rotation).
         seed_meta.setdefault("linux_user", user)
+        # T-0128: stamp the requesting session's SID as parent_sid so the
+        # session-tree survives worker restart without the heuristic. Only
+        # when provided and non-self; never clobber an already-set value.
+        if parent_sid:
+            ps = str(parent_sid).strip()
+            if ps and ps != "~" and ps != new_sid and not seed_meta.get("parent_sid"):
+                seed_meta["parent_sid"] = ps
         _write_session_metadata(seed_meta_file, seed_meta)
     except OSError:
         # Best-effort: the hook will populate the field next time it fires.
@@ -2533,6 +2570,65 @@ def _initiative_exists(data_dir: Path, slug: str, initiative: str) -> bool:
     if not init or init == "~":
         return True  # nothing bound → nothing stale
     return (data_dir / slug / "vision" / "initiatives" / init).exists()
+
+
+def backfill_parent_sid(cfg: Any, slug: str) -> dict:
+    """T-0128: populate ``parent_sid`` for sessions that predate the field.
+
+    The spawn path now stamps ``parent_sid`` (the SID that requested the
+    spawn) at creation time, but legacy sessions — and sessions created by
+    Claude Code's native agent-teams feature, which never goes through
+    ``sessions.spawn`` — lack it. This idempotent reconciler fills the gap
+    using the *same heuristic* the web tree falls back to: a session nests
+    under the team-lead of the team that lists it (``teams.tl_for_sid``,
+    which resolves the tmux-session-keyed Team projection rebuilt by
+    ``reconcile_teams``). Mirrors the rendering rule "a dev nests under its
+    TL" but persists the result so it survives a worker restart.
+
+    Strictly fill-once: a session that already has a ``parent_sid`` is left
+    untouched — the spawn-time value is authoritative and never overwritten.
+    Runs after ``reconcile_teams`` in the binding-gc tick so the Team
+    projection it consults is fresh.
+
+    Returns ``{"ok": True, "scanned": N, "filled": K, "details": [...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker import teams as _teams
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"backfill_parent_sid: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "filled": 0, "details": []}
+
+    scanned = 0
+    filled = 0
+    details: list[dict] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        # Fill-once: never overwrite an existing (spawn-time) parent_sid.
+        if _parent_sid_of(meta):
+            continue
+        sid = meta.get("sid", md.stem)
+        try:
+            parent = _teams.tl_for_sid(cfg, slug, sid)
+        except Exception:
+            parent = None
+        if not parent or parent == sid:
+            continue
+        meta["parent_sid"] = parent
+        try:
+            _write_session_metadata(md, meta, atomic=True)
+        except OSError:
+            continue
+        filled += 1
+        details.append({"sid": sid, "parent_sid": parent})
+    return {"ok": True, "scanned": scanned, "filled": filled, "details": details}
 
 
 def gc_dead_bindings(cfg: Any, slug: str) -> dict:

@@ -499,7 +499,11 @@ def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _SPAWN_SESSION_REQUIRED = {"slug", "window"}
-_SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {"initial_prompt", "task_id", "initiative", "owner"}
+# T-0128: parent_sid (the SID that requested this spawn) is an OPTIONAL param —
+# the worker stamps it into the new session md so the tree survives a restart.
+_SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {
+    "initial_prompt", "task_id", "initiative", "owner", "parent_sid",
+}
 
 
 def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
@@ -526,6 +530,7 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         task_id=params.get("task_id"),
         initiative=params.get("initiative"),
         owner=params.get("owner"),
+        parent_sid=params.get("parent_sid"),
     )
 
 

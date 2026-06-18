@@ -494,6 +494,14 @@ def cmd_spawn(args) -> None:
         params["initiative"] = initiative
     if args.owner:
         params["owner"] = args.owner
+    # T-0128: stamp the spawning session's own SID as the new session's parent
+    # so the session-tree survives a worker restart (no heuristic needed). The
+    # parent of a TL-spawned dev is the TL; of an operator-spawned TL, the
+    # operator. Strictly optional — omitted when self-SID can't be resolved
+    # (e.g. invoked outside tmux), in which case the backfill heuristic fills it.
+    _self_sid = my_sid()
+    if _self_sid:
+        params["parent_sid"] = _self_sid
 
     if args.dry_run:
         print(json.dumps({"decision": "fresh-spawn", "bind_after": extras,
@@ -2328,6 +2336,10 @@ def cmd_usecase_run(args) -> None:
     params = {"slug": slug, "window": window, "initial_prompt": brief}
     if args.owner:
         params["owner"] = args.owner
+    # T-0128: stamp the spawning session's SID as the testing-dev's parent_sid.
+    _self_sid = my_sid()
+    if _self_sid:
+        params["parent_sid"] = _self_sid
     res = post("spawn_session", params, timeout=90)
     print(f"spawned testing-dev {res.get('sid')} for use case {uc_id} (window={window})")
 

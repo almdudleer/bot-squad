@@ -224,6 +224,13 @@ export type SessionRow = {
   // dive as a teamlead. Optional so a pre-T-0141 worker doesn't break the
   // contract; the UI falls back to the legacy inference when absent.
   role?: "teamlead" | "dev" | "operator";
+  // T-0128: persisted spawn-time parent — the SID that requested this spawn
+  // (operator→TL, TL→dev). Stamped into the session md at spawn time so the
+  // session-tree is reliable across worker restarts. Preferred over the
+  // task→initiative→TL heuristic when present; empty/absent on legacy sessions
+  // (and agent-teams-spawned devs until the worker backfill fills it), in
+  // which case the tree falls back to the heuristic.
+  parent_sid?: string;
 };
 
 // T-0210: per-session resource telemetry record (worker-sampled).

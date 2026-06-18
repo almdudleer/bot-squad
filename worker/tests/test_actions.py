@@ -683,6 +683,28 @@ def test_spawn_session_action_rejects_extra_params(tmp_path, monkeypatch):
         A.dispatch("spawn_session", {"slug": "test-project", "window": "w", "evil": "x"})
 
 
+def test_spawn_session_action_threads_parent_sid(tmp_path, monkeypatch):
+    """T-0128: spawn_session accepts the optional parent_sid param and threads
+    it to sessions.spawn (allowlist + wiring)."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured.update(kw)
+        return {"ok": True, "sid": "S-x-w-p1"}
+
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+    result = A.dispatch("spawn_session", {
+        "slug": "test-project", "window": "w",
+        "parent_sid": "S-x-tl-p0",
+    })
+    assert result["ok"] is True
+    assert captured.get("parent_sid") == "S-x-tl-p0"
+
+
 def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):
     """T-0150: resume_session must accept the optional initial_prompt param and
     pass it through to sessions.resume (so a resumed expert gets a delta brief)."""

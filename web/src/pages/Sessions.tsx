@@ -107,6 +107,81 @@ const LAST_ACTIVITY_TOOLTIP =
   "Suspended rows show the suspend/pause timestamp.";
 
 // ---------------------------------------------------------------------------
+// Session tree (T-0040 / T-0128)
+//
+// A dev row is one carrying a primary task_id. Devs are visually indented
+// under their parent session.
+//
+// T-0128: the worker now persists `parent_sid` (the SID that requested the
+// spawn) at spawn time, so we PREFER it — a dev with a resolvable
+// `parent_sid` nests under that exact session. We fall back to the legacy
+// heuristic (dev.task_id → task.initiative → TL bound to that initiative)
+// only for legacy / agent-teams sessions that lack the field, or whose
+// persisted parent isn't a visible parent row in this slice. An orphan dev
+// means we couldn't trace a parent — not an error.
+//
+// Exported as a pure function (taking the task→initiative map) so it is
+// unit-testable, mirroring computeTlBindings in Vision.tsx.
+// ---------------------------------------------------------------------------
+export function isDevRow(s: SessionRow): boolean {
+  return !!(s.task_id && s.task_id !== "" && s.task_id !== "~");
+}
+
+export function buildSessionTree(
+  rows: SessionRow[],
+  taskInitiative: Map<string, string>,
+): { row: SessionRow; level: number }[] {
+  const tlByInitiative = new Map<string, SessionRow>();
+  // Non-dev rows are the only ones rendered at level 0 (potential parents).
+  const nonDevSids = new Set<string>();
+  for (const s of rows) {
+    if (isDevRow(s)) continue;
+    nonDevSids.add(s.sid);
+    const inits = [(s.initiative ?? "").trim(), ...(s.extra_initiatives ?? [])]
+      .filter((i) => i && i !== "~");
+    for (const init of inits) {
+      if (!tlByInitiative.has(init)) tlByInitiative.set(init, s);
+    }
+  }
+  const devsByTl = new Map<string, SessionRow[]>();
+  const orphanDevs: SessionRow[] = [];
+  for (const s of rows) {
+    if (!isDevRow(s)) continue;
+    // T-0128: prefer the persisted spawn-time parent when it resolves to a
+    // visible parent row; otherwise fall back to the task→initiative→TL
+    // heuristic for legacy sessions lacking the field.
+    let parentSid: string | undefined;
+    const ps = (s.parent_sid ?? "").trim();
+    if (ps && ps !== "~" && ps !== s.sid && nonDevSids.has(ps)) {
+      parentSid = ps;
+    } else {
+      const init = taskInitiative.get(s.task_id!) ?? "";
+      const tl = init ? tlByInitiative.get(init) : undefined;
+      if (tl && tl.sid !== s.sid) parentSid = tl.sid;
+    }
+    if (parentSid) {
+      const list = devsByTl.get(parentSid) ?? [];
+      list.push(s);
+      devsByTl.set(parentSid, list);
+    } else {
+      orphanDevs.push(s);
+    }
+  }
+  const out: { row: SessionRow; level: number }[] = [];
+  for (const s of rows) {
+    if (isDevRow(s)) continue;
+    out.push({ row: s, level: 0 });
+    for (const dev of devsByTl.get(s.sid) ?? []) {
+      out.push({ row: dev, level: 1 });
+    }
+  }
+  for (const orphan of orphanDevs) {
+    out.push({ row: orphan, level: 0 });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -1289,53 +1364,12 @@ export function Sessions() {
     );
   }
 
-  // T-0040 lean: rendering-only tree. Devs are visually indented under
-  // their TL via the heuristic: dev.task_id → task.initiative → TL session
-  // bound to that initiative (primary or extra). Operator/TL/orphan devs
-  // sit at root. The worker still doesn't persist parent_sid (see follow-up
-  // ticket) so this is best-effort; an orphan dev means we couldn't trace
-  // a TL — not an error.
-  function isDevRow(s: SessionRow): boolean {
-    return !!(s.task_id && s.task_id !== "" && s.task_id !== "~");
-  }
-  function buildSessionTree(
+  // T-0040/T-0128 tree — thin wrapper that binds the memoized task→initiative
+  // map to the module-level pure `buildSessionTree` (exported for unit tests).
+  function buildSessionTreeLocal(
     rows: SessionRow[],
   ): { row: SessionRow; level: number }[] {
-    const tlByInitiative = new Map<string, SessionRow>();
-    for (const s of rows) {
-      if (isDevRow(s)) continue;
-      const inits = [(s.initiative ?? "").trim(), ...(s.extra_initiatives ?? [])]
-        .filter((i) => i && i !== "~");
-      for (const init of inits) {
-        if (!tlByInitiative.has(init)) tlByInitiative.set(init, s);
-      }
-    }
-    const devsByTl = new Map<string, SessionRow[]>();
-    const orphanDevs: SessionRow[] = [];
-    for (const s of rows) {
-      if (!isDevRow(s)) continue;
-      const init = taskInitiative.get(s.task_id!) ?? "";
-      const tl = init ? tlByInitiative.get(init) : undefined;
-      if (tl && tl.sid !== s.sid) {
-        const list = devsByTl.get(tl.sid) ?? [];
-        list.push(s);
-        devsByTl.set(tl.sid, list);
-      } else {
-        orphanDevs.push(s);
-      }
-    }
-    const out: { row: SessionRow; level: number }[] = [];
-    for (const s of rows) {
-      if (isDevRow(s)) continue;
-      out.push({ row: s, level: 0 });
-      for (const dev of devsByTl.get(s.sid) ?? []) {
-        out.push({ row: dev, level: 1 });
-      }
-    }
-    for (const orphan of orphanDevs) {
-      out.push({ row: orphan, level: 0 });
-    }
-    return out;
+    return buildSessionTree(rows, taskInitiative);
   }
 
   // Returns sessions filtered by the current filterInit. When filterInit
@@ -1677,7 +1711,7 @@ export function Sessions() {
                     return nodes;
                   })
                 : groupBy === "none"
-                  ? buildSessionTree(applySessFilter(visibleSessions)).map(
+                  ? buildSessionTreeLocal(applySessFilter(visibleSessions)).map(
                       ({ row, level }) => renderSessionRow(row, level),
                     )
                   : buildVisibleLanes(visibleSessions).flatMap((lane) => {
@@ -1690,7 +1724,7 @@ export function Sessions() {
                         // Within each initiative lane the tree is also useful — TL at
                         // top, devs indented under it. Orphans (no TL bound to the
                         // lane initiative) render at root within the lane.
-                        for (const { row, level } of buildSessionTree(laneRows)) {
+                        for (const { row, level } of buildSessionTreeLocal(laneRows)) {
                           nodes.push(renderSessionRow(row, level));
                         }
                       }

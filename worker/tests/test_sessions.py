@@ -1560,13 +1560,26 @@ def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
 
     key_calls = []
     new_window_called = [False]
+    # T-0201: model the real composer transitions — empty before paste,
+    # `[Pasted text …]` once the paste lands, empty again after the Enter
+    # submits — so _deliver_prompt's confirm-then-Enter loop terminates.
+    pasted = [False]
+    entered = [False]
 
     def fake_run(args, **kwargs):
-        if "send-keys" in args or "set-buffer" in args or "paste-buffer" in args:
-            key_calls.append(args)
+        if "load-buffer" in args or "paste-buffer" in args:
+            key_calls.append((args, kwargs.get("input")))
+            if "paste-buffer" in args:
+                pasted[0] = True
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "send-keys" in args:
+            key_calls.append((args, None))
+            if args[-1] == "Enter":
+                entered[0] = True
             return subprocess.CompletedProcess(args, 0, "", "")
         if "capture-pane" in args:
-            # Composer-ready marker is present from the first poll.
+            if pasted[0] and not entered[0]:
+                return subprocess.CompletedProcess(args, 0, "❯ [Pasted text #1 +1 lines]\n", "")
             return subprocess.CompletedProcess(args, 0, "❯ \n", "")
         if "new-window" in args:
             new_window_called[0] = True
@@ -1586,11 +1599,13 @@ def test_spawn_sends_initial_prompt(tmp_path, monkeypatch):
 
     spawn(cfg, "test-project", "newwin", initial_prompt="hello world")
 
-    # T-0144: prompt delivery is via tmux set-buffer + paste-buffer (bracketed
-    # paste), the operator's proven-reliable primitive — not a send-keys literal.
-    assert any("set-buffer" in c and "hello world" in str(c) for c in key_calls), \
-        f"expected hello world via set-buffer; got: {key_calls}"
-    assert any("paste-buffer" in c for c in key_calls), \
+    # T-0144/T-0201: prompt delivery is via tmux load-buffer (stdin) +
+    # paste-buffer (bracketed paste), the operator's proven-reliable primitive
+    # — not a send-keys literal, and not set-buffer (which overflows tmux's
+    # command parser for large briefs).
+    assert any("load-buffer" in a and inp == "hello world" for a, inp in key_calls), \
+        f"expected hello world via load-buffer stdin; got: {key_calls}"
+    assert any("paste-buffer" in a for a, inp in key_calls), \
         f"expected a paste-buffer delivery; got: {key_calls}"
 
 
@@ -1604,25 +1619,38 @@ def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkey
 
     call_log: list[str] = []  # ordered tags: "capture-not-ready", "capture-ready", "paste-text", "send-enter"
     capture_calls = [0]
+    pasted = [False]
+    entered = [False]
 
     def fake_run(args, **kwargs):
         if "capture-pane" in args:
             capture_calls[0] += 1
-            # Composer is not ready for the first two polls (still bash /
-            # claude bootstrapping), then `❯` appears.
+            # Once the paste has landed (but Enter not yet confirmed), the
+            # composer shows the bracketed-paste placeholder; after Enter it
+            # clears back to an empty `❯` (T-0201 confirm-then-Enter).
+            if pasted[0] and not entered[0]:
+                return subprocess.CompletedProcess(args, 0, "❯ [Pasted text #1 +1 lines]\n", "")
+            if pasted[0]:
+                return subprocess.CompletedProcess(args, 0, "❯ \n", "")
+            # Pre-paste: composer is not ready for the first two polls (still
+            # bash / claude bootstrapping), then `❯` appears.
             if capture_calls[0] < 3:
                 call_log.append("capture-not-ready")
                 return subprocess.CompletedProcess(args, 0, "bash-5.2$\n", "")
             call_log.append("capture-ready")
             return subprocess.CompletedProcess(args, 0, "❯ \n", "")
-        if "set-buffer" in args:
-            # The prompt text is loaded into the paste buffer.
+        if "load-buffer" in args:
+            # The prompt text is streamed into the paste buffer over stdin.
             call_log.append("paste-text")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "paste-buffer" in args:
+            pasted[0] = True
             return subprocess.CompletedProcess(args, 0, "", "")
         if "send-keys" in args:
             # The only send-keys in the delivery path is the trailing Enter.
             if args[-1] == "Enter":
                 call_log.append("send-enter")
+                entered[0] = True
             return subprocess.CompletedProcess(args, 0, "", "")
         if "list-panes" in args:
             return subprocess.CompletedProcess(args, 0, f"%11|w|1234|{repo}|claude\n", "")
@@ -1637,7 +1665,7 @@ def test_spawn_waits_for_composer_before_sending_initial_prompt(tmp_path, monkey
     result = spawn(cfg, "test-project", "w", initial_prompt="go")
     assert result["ok"] is True
 
-    # The paste (set-buffer) + Enter must come strictly AFTER the first ready
+    # The paste (load-buffer) + Enter must come strictly AFTER the first ready
     # capture, and the not-ready captures must come first.
     ready_idx = call_log.index("capture-ready")
     text_idx = call_log.index("paste-text")
@@ -1767,12 +1795,21 @@ def test_resume_delivers_initial_prompt(tmp_path, monkeypatch):
 
     key_calls: list[list] = []
     new_window_called = [False]
+    pasted = [False]
+    entered = [False]
 
     def fake_run(args, **kwargs):
-        if "set-buffer" in args or "paste-buffer" in args or "send-keys" in args:
-            key_calls.append(args)
+        if "load-buffer" in args or "paste-buffer" in args or "send-keys" in args:
+            key_calls.append((args, kwargs.get("input")))
+            if "paste-buffer" in args:
+                pasted[0] = True
+            if "send-keys" in args and args[-1] == "Enter":
+                entered[0] = True
             return subprocess.CompletedProcess(args, 0, "", "")
         if "capture-pane" in args:
+            # T-0201: composer shows the paste once it lands, then clears on Enter.
+            if pasted[0] and not entered[0]:
+                return subprocess.CompletedProcess(args, 0, "❯ [Pasted text #1 +1 lines]\n", "")
             return subprocess.CompletedProcess(args, 0, "❯ \n", "")
         if "new-window" in args:
             new_window_called[0] = True
@@ -1792,10 +1829,10 @@ def test_resume_delivers_initial_prompt(tmp_path, monkeypatch):
     result = resume(cfg, "test-project", "S-testuser-expert-p7",
                     initial_prompt="delta: now do T-0002 building on T-0001")
     assert result["ok"] is True
-    # Delivered via set-buffer (bracketed paste), not a send-keys literal.
-    assert any("set-buffer" in c and "delta:" in str(c) for c in key_calls), \
-        f"expected delta brief via set-buffer; got: {key_calls}"
-    assert any("paste-buffer" in c for c in key_calls), \
+    # Delivered via load-buffer stdin (bracketed paste), not a send-keys literal.
+    assert any("load-buffer" in a and (inp or "").startswith("delta:") for a, inp in key_calls), \
+        f"expected delta brief via load-buffer stdin; got: {key_calls}"
+    assert any("paste-buffer" in a for a, inp in key_calls), \
         f"expected a paste-buffer delivery; got: {key_calls}"
 
 
@@ -1820,7 +1857,7 @@ def test_resume_without_initial_prompt_delivers_nothing(tmp_path, monkeypatch):
     new_window_called = [False]
 
     def fake_run(args, **kwargs):
-        if "set-buffer" in args or "paste-buffer" in args:
+        if "load-buffer" in args or "paste-buffer" in args:
             paste_calls.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
         if "capture-pane" in args:
@@ -1842,6 +1879,266 @@ def test_resume_without_initial_prompt_delivers_nothing(tmp_path, monkeypatch):
 
     resume(cfg, "test-project", "S-testuser-expert-p8")
     assert paste_calls == [], f"no prompt expected, but pasted: {paste_calls}"
+
+
+# ---------------------------------------------------------------------------
+# T-0201: _deliver_prompt confirm-then-Enter (no blind sleep before Enter)
+# ---------------------------------------------------------------------------
+
+def _CP(args, out=""):
+    return subprocess.CompletedProcess(args, 0, out, "")
+
+
+def test_deliver_prompt_waits_for_paste_to_land_before_enter(monkeypatch):
+    """T-0201: a large bracketed paste can take ~1s to appear in the composer.
+    _deliver_prompt must poll until the paste lands (composer non-empty) before
+    sending Enter — never the old blind 0.4s sleep — else the Enter is swallowed
+    and the brief sits unsubmitted as '[Pasted text …]'."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    events: list[str] = []
+    pasted = [False]
+    entered = [False]
+    land_polls = [0]
+
+    def fake_run(args, **kwargs):
+        if "load-buffer" in args:
+            events.append("load-buffer"); return _CP(args)
+        if "paste-buffer" in args:
+            events.append("paste-buffer"); pasted[0] = True; return _CP(args)
+        if "send-keys" in args and args[-1] == "Enter":
+            events.append("enter"); entered[0] = True; return _CP(args)
+        if "capture-pane" in args:
+            if not pasted[0]:
+                return _CP(args, "❯ \n")
+            if not entered[0]:
+                # Paste takes two polls to render in the composer.
+                land_polls[0] += 1
+                if land_polls[0] < 2:
+                    return _CP(args, "❯ \n")            # not landed yet
+                return _CP(args, "❯ [Pasted text #1 +140 lines]\n")  # landed
+            return _CP(args, "❯ \n")                    # cleared after Enter
+        return _CP(args)
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    S._deliver_prompt("%5", "a big brief")
+
+    assert events.count("enter") == 1, events
+    # Enter strictly after the paste, and the composer was polled (≥2) until the
+    # paste landed before Enter went out.
+    assert events.index("paste-buffer") < events.index("enter"), events
+    assert land_polls[0] >= 2, land_polls
+
+
+def test_deliver_prompt_retries_enter_until_composer_clears(monkeypatch):
+    """T-0201: if the first Enter is swallowed (composer still shows the paste),
+    _deliver_prompt re-sends Enter until the composer clears."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    monkeypatch.setattr(S, "_PASTE_LANDED_TIMEOUT_SEC", 1.0)
+    monkeypatch.setattr(S, "_PASTE_LANDED_POLL_INTERVAL_SEC", 0.1)
+    monkeypatch.setattr(S, "_SUBMIT_CONFIRM_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(S, "_SUBMIT_CONFIRM_POLL_INTERVAL_SEC", 0.1)
+
+    enters = [0]
+
+    def fake_run(args, **kwargs):
+        if "send-keys" in args and args[-1] == "Enter":
+            enters[0] += 1; return _CP(args)
+        if "capture-pane" in args:
+            # Composer keeps showing the paste until the SECOND Enter lands.
+            if enters[0] < 2:
+                return _CP(args, "❯ [Pasted text #1 +140 lines]\n")
+            return _CP(args, "❯ \n")
+        return _CP(args)
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    S._deliver_prompt("%5", "brief")
+    assert enters[0] == 2, f"expected a retry Enter; got {enters[0]}"
+
+
+def test_deliver_prompt_raises_when_paste_never_lands(monkeypatch):
+    """T-0201: if the paste never appears in the composer, fail loudly and do
+    NOT send Enter into an empty/dead pane."""
+    from bot_squad_worker.actions import ActionError
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    monkeypatch.setattr(S, "_PASTE_LANDED_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(S, "_PASTE_LANDED_POLL_INTERVAL_SEC", 0.1)
+
+    enters = [0]
+
+    def fake_run(args, **kwargs):
+        if "send-keys" in args and args[-1] == "Enter":
+            enters[0] += 1; return _CP(args)
+        if "capture-pane" in args:
+            return _CP(args, "❯ \n")  # composer never shows the paste
+        return _CP(args)
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    with pytest.raises(ActionError, match="never appeared"):
+        S._deliver_prompt("%5", "brief")
+    assert enters[0] == 0, "must not Enter when the paste never landed"
+
+
+def test_deliver_prompt_raises_when_never_submitted(monkeypatch):
+    """T-0201: cap the Enter retries so a genuinely stuck composer fails loudly
+    rather than looping forever."""
+    from bot_squad_worker.actions import ActionError
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    monkeypatch.setattr(S, "_PASTE_LANDED_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(S, "_PASTE_LANDED_POLL_INTERVAL_SEC", 0.1)
+    monkeypatch.setattr(S, "_SUBMIT_CONFIRM_TIMEOUT_SEC", 0.2)
+    monkeypatch.setattr(S, "_SUBMIT_CONFIRM_POLL_INTERVAL_SEC", 0.1)
+    monkeypatch.setattr(S, "_SUBMIT_MAX_RETRIES", 3)
+
+    enters = [0]
+
+    def fake_run(args, **kwargs):
+        if "send-keys" in args and args[-1] == "Enter":
+            enters[0] += 1; return _CP(args)
+        if "capture-pane" in args:
+            return _CP(args, "❯ [Pasted text #1 +140 lines]\n")  # never clears
+        return _CP(args)
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    with pytest.raises(ActionError, match="never cleared"):
+        S._deliver_prompt("%5", "brief")
+    assert enters[0] == 3, f"expected exactly _SUBMIT_MAX_RETRIES Enters; got {enters[0]}"
+
+
+# ---------------------------------------------------------------------------
+# T-0165: resume preserves a multi-bound session's extra_task_ids on rotation
+# ---------------------------------------------------------------------------
+
+def _resume_fake_run(repo, new_pane="%20", window="expert"):
+    """A minimal tmux fake for a no-prompt resurrect (new window + one pane)."""
+    new_window_called = [False]
+
+    def fake_run(args, **kwargs):
+        if "capture-pane" in args:
+            return _CP(args, "❯ \n")
+        if "new-window" in args:
+            new_window_called[0] = True
+            return _CP(args)
+        if "list-panes" in args:
+            if new_window_called[0]:
+                return _CP(args, f"{new_pane}|{window}|4250|{repo}|claude\n")
+            return _CP(args)
+        return _CP(args)
+    return fake_run
+
+
+def test_resume_preserves_extra_task_ids_on_rotation(tmp_path, monkeypatch):
+    """T-0165: resuming a session carrying extra_task_ids:[A,B] must keep BOTH
+    on the rotated session md. (Root cause was block-vs-inline list drift the
+    SessionStart hook's line reader dropped, fixed at the writer by T-0075; this
+    locks the resume metadata-copy layer too.)"""
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sdir = cfg.data_dir / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / "S-testuser-expert-p7.md", {
+        "sid": "S-testuser-expert-p7", "status": "suspended", "window": "expert",
+        "cwd": str(repo), "claude_uuid": "u7", "task_id": "T-0100",
+        "extra_task_ids": ["T-0163", "T-0164"], "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", _resume_fake_run(repo, new_pane="%20"))
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    res = resume(cfg, "test-project", "S-testuser-expert-p7")
+    new_sid = res["sid"]
+    assert new_sid != "S-testuser-expert-p7", "expected SID rotation"
+    meta = _read_session_metadata(sdir / f"{new_sid}.md")
+    assert meta["task_id"] == "T-0100"
+    assert set(meta.get("extra_task_ids") or []) == {"T-0163", "T-0164"}, meta.get("extra_task_ids")
+
+
+def test_session_md_extras_survive_hook_line_reader():
+    """T-0165 root-cause regression: session_start.sh reads extra_task_ids with
+    a line-based partition-on-':' reader (NOT pyyaml). Pre-T-0075 the writer
+    emitted block-style lists which that reader dropped to '[]', losing a
+    session's extra bindings on every resume. Lock the inline list format that
+    the hook reader can parse."""
+    from bot_squad_worker import frontmatter as _fm
+    meta = {"sid": "S-x", "status": "active", "task_id": "T-0100",
+            "extra_task_ids": ["T-0163", "T-0164"], "extra_initiatives": []}
+    md = "---\n" + _fm.dump_frontmatter(meta) + "---\n"
+    # Replicate session_start.sh lines 134-145 + 182 verbatim:
+    existing: dict = {}
+    block = md.split("---", 2)[1]
+    for line in block.strip().splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            existing[k.strip()] = v.strip()
+    extra = existing.get("extra_task_ids") or "[]"
+    assert extra == "[T-0163, T-0164]", f"hook reader would drop extras: {extra!r}"
+
+
+# ---------------------------------------------------------------------------
+# T-0166: resume adopts a primary task when the session has none
+# ---------------------------------------------------------------------------
+
+def test_resume_adopts_primary_when_session_has_none(tmp_path, monkeypatch):
+    """T-0166: an expert whose own task closed has had its primary stripped to
+    ~ (gc). Resuming it for a bsq-spawn must let it adopt the new ticket as its
+    primary so the follow-up bind_task has a primary to attach extras to."""
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sdir = cfg.data_dir / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / "S-testuser-expert-p7.md", {
+        "sid": "S-testuser-expert-p7", "status": "suspended", "window": "expert",
+        "cwd": str(repo), "claude_uuid": "u7", "task_id": "~",
+        "last_task_id": "T-0001", "extra_task_ids": ["T-0050"],
+        "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", _resume_fake_run(repo, new_pane="%20"))
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    res = resume(cfg, "test-project", "S-testuser-expert-p7", task_id="T-0002")
+    new_sid = res["sid"]
+    meta = _read_session_metadata(sdir / f"{new_sid}.md")
+    assert meta["task_id"] == "T-0002", "resumed session should adopt the new primary"
+    # Pre-existing extras preserved (T-0165 too).
+    assert "T-0050" in (meta.get("extra_task_ids") or [])
+    # Marker dropped so the SessionStart hook stamps the same primary.
+    assert (repo / ".claude" / "task_id").read_text().strip() == "T-0002"
+
+
+def test_resume_does_not_overwrite_existing_primary(tmp_path, monkeypatch):
+    """T-0166: resume must NOT clobber an expert that still holds an active
+    primary — the new ticket rides in via extra_task_ids (bind_task) instead."""
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sdir = cfg.data_dir / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / "S-testuser-expert-p7.md", {
+        "sid": "S-testuser-expert-p7", "status": "suspended", "window": "expert",
+        "cwd": str(repo), "claude_uuid": "u7", "task_id": "T-0001",
+        "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", _resume_fake_run(repo, new_pane="%20"))
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    res = resume(cfg, "test-project", "S-testuser-expert-p7", task_id="T-0002")
+    meta = _read_session_metadata(sdir / f"{res['sid']}.md")
+    assert meta["task_id"] == "T-0001", "existing primary must be preserved"
+    assert not (repo / ".claude" / "task_id").exists(), "no marker when not adopting"
 
 
 # ---------------------------------------------------------------------------

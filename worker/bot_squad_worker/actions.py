@@ -469,7 +469,7 @@ def _action_suspend_session(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _RESUME_SESSION_REQUIRED = {"slug", "sid"}
-_RESUME_SESSION_ALLOWED = _RESUME_SESSION_REQUIRED | {"initial_prompt"}
+_RESUME_SESSION_ALLOWED = _RESUME_SESSION_REQUIRED | {"initial_prompt", "task_id"}
 
 
 def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
@@ -490,6 +490,7 @@ def _action_resume_session(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.resume(
         cfg, params["slug"], params["sid"],
         initial_prompt=params.get("initial_prompt"),
+        task_id=params.get("task_id"),
     )
 
 

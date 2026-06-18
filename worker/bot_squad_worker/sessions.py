@@ -997,7 +997,8 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
     return {"ok": True, "suspended": True}
 
 
-def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None) -> dict:
+def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
+           task_id: str | None = None) -> dict:
     """Resume a Claude session — handles paused, suspended, and zombie cases.
 
     - status=paused with live pane → just clear paused status; user types in tmux.
@@ -1013,6 +1014,16 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None) -> 
     caller resurrects the session that already did the related work and hands it
     the new, related task. Only delivered on the resurrect path (a new pane);
     a paused-but-live session is left for the user to type into directly.
+
+    T-0166: when ``task_id`` is provided AND the session has no primary task
+    (``task_id`` is ``~``/empty — the usual state of a suspended *expert* whose
+    own task closed and was stripped to ``last_task_id`` by gc), the resumed
+    session adopts ``task_id`` as its primary: we stamp ``meta["task_id"]`` and
+    drop the ``.claude/task_id`` marker so the SessionStart hook agrees. Without
+    this, ``bsq spawn <ticket> --bundle …`` auto-resuming an expert left the
+    session with no primary, and the follow-up ``bind_task`` (which requires a
+    primary) failed for *every* bundled ticket. An existing primary is left
+    untouched — the new ticket then rides in via ``extra_task_ids`` as before.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -1032,6 +1043,27 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None) -> 
     window = meta.get("window", "claude")
     claude_uuid = meta.get("claude_uuid")
     status = meta.get("status", "")
+
+    # T-0166: adopt a primary task on resume when the session has none. A
+    # suspended expert whose own task closed has had its primary stripped to
+    # ``last_task_id`` by gc_dead_bindings, so it carries no ``task_id``; the
+    # caller (bsq spawn auto-resume) passes the new primary here so the resumed
+    # session is a real dev again and the follow-up bind_task has a primary to
+    # attach extras to. Only fills an EMPTY primary — an expert still holding an
+    # active task keeps it (the new ticket lands in extra_task_ids via bind).
+    cur_primary = meta.get("task_id")
+    if task_id and (not cur_primary or cur_primary == "~"):
+        meta["task_id"] = task_id
+        # Drop the marker the SessionStart hook reads first, so its rewrite
+        # stamps the same primary (mirrors spawn()'s contract).
+        try:
+            marker_dir = Path(cwd) / ".claude"
+            marker_dir.mkdir(parents=True, exist_ok=True)
+            (marker_dir / "task_id").write_text(task_id.strip())
+        except OSError:
+            # Best-effort: meta["task_id"] above is the source of truth; the
+            # hook preserves it via existing.get("task_id") when no marker.
+            pass
     # T-0001: resurrect into the same tmux session the spawn put us in.
     # A TL spawned with an initiative lives in `<slug>-<initiative-stem>`;
     # without that routing, resume would dump it back into the main
@@ -1278,6 +1310,21 @@ def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative
 _COMPOSER_READY_TIMEOUT_SEC = 15.0
 _COMPOSER_READY_POLL_INTERVAL_SEC = 0.3
 
+# T-0201: confirm-then-Enter knobs for _deliver_prompt. The old blind
+# `time.sleep(0.4)` was too short for a large (~140-line) bracketed paste —
+# Claude's composer had not finished ingesting the paste when Enter landed, so
+# the Enter was swallowed / landed inside the bracketed-paste wrapper and the
+# brief sat unsubmitted as "[Pasted text #1 +N lines]". We now (1) poll until
+# the paste actually shows in the composer, then (2) send Enter and poll until
+# the composer clears, re-sending Enter up to a cap so a genuinely stuck pane
+# fails loudly rather than looping forever. Read at call time so tests can
+# monkeypatch them to bound runtime.
+_PASTE_LANDED_TIMEOUT_SEC = 8.0
+_PASTE_LANDED_POLL_INTERVAL_SEC = 0.3
+_SUBMIT_MAX_RETRIES = 5
+_SUBMIT_CONFIRM_TIMEOUT_SEC = 4.0
+_SUBMIT_CONFIRM_POLL_INTERVAL_SEC = 0.3
+
 
 def _wait_for_claude_composer_ready(pane_id: str) -> bool:
     """Poll ``tmux capture-pane`` until Claude's composer prompt rune appears.
@@ -1302,8 +1349,32 @@ def _wait_for_claude_composer_ready(pane_id: str) -> bool:
     return False
 
 
+def _composer_content(pane_id: str) -> str | None:
+    """Return the text Claude's composer currently holds, or None if the pane
+    can't be captured / has no composer line.
+
+    The composer prompt line is ``❯ <content>``. ``""`` means an empty composer
+    (``❯`` with nothing after it); a non-empty string means the composer holds
+    pasted/typed content — the literal text for a short paste, or a
+    ``[Pasted text #N +M lines]`` placeholder for a large bracketed paste
+    (verified live, T-0201). The composer is always rendered at the BOTTOM of
+    the TUI, so we take the last ``❯`` line: even if the conversation
+    scrollback (or the pasted brief itself) contains a ``❯`` above, the input
+    box is the bottom-most one.
+    """
+    cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p"])
+    if cap.returncode != 0:
+        return None
+    content: str | None = None
+    for line in cap.stdout.splitlines():
+        idx = line.find("❯")
+        if idx != -1:
+            content = line[idx + 1:].strip()
+    return content
+
+
 def _deliver_prompt(pane_id: str, text: str) -> None:
-    """Reliably deliver a prompt into a claude composer (T-0126/T-0144 fix).
+    """Reliably deliver a prompt into a claude composer (T-0126/T-0144/T-0201).
 
     Loads ``text`` into a dedicated tmux paste buffer and pastes it in
     bracketed-paste mode (``paste-buffer -p``), then submits with a *separate*
@@ -1315,18 +1386,62 @@ def _deliver_prompt(pane_id: str, text: str) -> None:
     atomically as one block (embedded newlines stay newlines, not submits),
     and the trailing standalone Enter is what submits it.
 
-    Single-line prompts remain safest (one paste, one Enter, one message);
-    a multi-line prompt is still pasted as a single block and submitted once.
+    T-0201: the submit is now confirm-then-Enter instead of a blind
+    ``time.sleep(0.4)``. A large (~140-line) bracketed paste takes ~1s to fully
+    ingest; a 0.4s sleep let the Enter land before the paste settled, so the
+    brief sat unsubmitted as "[Pasted text #1 +N lines]". We (1) poll until the
+    paste actually appears in the composer, then (2) send Enter and poll until
+    the composer clears, re-sending Enter up to ``_SUBMIT_MAX_RETRIES`` so a
+    genuinely stuck pane fails loudly rather than looping forever.
+
+    Raises ``ActionError`` if the paste never lands or the composer never
+    clears — the pane is up and the text is in the buffer, so the caller can
+    recover via ``inject_input`` / a manual Enter (same contract as the
+    composer-ready check the callers run just before this).
     """
+    from bot_squad_worker.actions import ActionError
+
     import re as _re
     digits = _re.sub(r"[^0-9]", "", pane_id) or "x"
     buf = f"bsq-prompt-{digits}"
-    # set-buffer takes the data as an argument (`--` guards a leading dash),
-    # so delivery is testable without stdin plumbing.
-    _run(["tmux", "set-buffer", "-b", buf, "--", text])
+    # T-0201: load the text via `load-buffer -` (stdin), NOT `set-buffer -- <arg>`.
+    # `set-buffer` passes the data as a command ARGUMENT, which tmux's own
+    # command parser rejects with "command too long" for a large (~140-line)
+    # brief — verified live — so the buffer was never created and nothing got
+    # pasted. `load-buffer -` streams the body in over stdin with no length
+    # limit, and (unlike a temp file) sidesteps the worker's read-only /tmp.
+    _run(["tmux", "load-buffer", "-b", buf, "-"], input=text)
     _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf, "-p", "-d"])
-    time.sleep(0.4)
-    _run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+
+    # (1) Confirm the paste landed in the composer (non-empty) before Enter.
+    land_iters = max(1, int(_PASTE_LANDED_TIMEOUT_SEC / _PASTE_LANDED_POLL_INTERVAL_SEC))
+    landed = False
+    for _ in range(land_iters):
+        if _composer_content(pane_id):
+            landed = True
+            break
+        time.sleep(_PASTE_LANDED_POLL_INTERVAL_SEC)
+    if not landed:
+        raise ActionError(
+            f"_deliver_prompt: paste never appeared in the composer for pane "
+            f"{pane_id} within {_PASTE_LANDED_TIMEOUT_SEC:.0f}s — prompt not "
+            "delivered (pane is up; recover via inject_input)"
+        )
+
+    # (2) Submit; confirm the composer cleared, re-sending Enter up to the cap.
+    confirm_iters = max(1, int(_SUBMIT_CONFIRM_TIMEOUT_SEC / _SUBMIT_CONFIRM_POLL_INTERVAL_SEC))
+    for _attempt in range(_SUBMIT_MAX_RETRIES):
+        _run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+        for _ in range(confirm_iters):
+            time.sleep(_SUBMIT_CONFIRM_POLL_INTERVAL_SEC)
+            if _composer_content(pane_id) == "":
+                return  # composer cleared -> the prompt was submitted
+        # still showing the paste -> Enter was swallowed; resend on next loop.
+    raise ActionError(
+        f"_deliver_prompt: composer never cleared after {_SUBMIT_MAX_RETRIES} "
+        f"Enter attempts for pane {pane_id} — prompt may be unsubmitted "
+        "(pane is up; recover via inject_input / a manual Enter)"
+    )
 
 
 def spawn(

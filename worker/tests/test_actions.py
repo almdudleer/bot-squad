@@ -636,6 +636,8 @@ def test_spawn_session_action_accepts_optional_prompt(tmp_path, monkeypatch):
     cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
 
     call_counts = {"list": 0}
+    pasted = [False]
+    entered = [False]
 
     def fake_run(args, **kw):
         import subprocess as sp
@@ -644,9 +646,18 @@ def test_spawn_session_action_accepts_optional_prompt(tmp_path, monkeypatch):
             if call_counts["list"] > 1:
                 return sp.CompletedProcess(args, 0, f"%9|testwin|1111|{repo}|claude\n", "")
             return sp.CompletedProcess(args, 0, "", "")
+        if "paste-buffer" in args:
+            pasted[0] = True
+            return sp.CompletedProcess(args, 0, "", "")
+        if "send-keys" in args and args[-1] == "Enter":
+            entered[0] = True
+            return sp.CompletedProcess(args, 0, "", "")
         if "capture-pane" in args:
             # T-0126: spawn() polls capture-pane for the ❯ composer rune
-            # before send-keys; emit it so the readiness check passes.
+            # before delivery. T-0201: _deliver_prompt then confirms the paste
+            # landed (composer non-empty) and cleared (empty after Enter).
+            if pasted[0] and not entered[0]:
+                return sp.CompletedProcess(args, 0, "❯ [Pasted text #1 +1 lines]\n", "")
             return sp.CompletedProcess(args, 0, "❯ \n", "")
         return sp.CompletedProcess(args, 0, "", "")
 
@@ -680,8 +691,9 @@ def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_resume(cfg, slug, sid, initial_prompt=None):
+    def fake_resume(cfg, slug, sid, initial_prompt=None, task_id=None):
         captured["args"] = (slug, sid, initial_prompt)
+        captured["task_id"] = task_id
         return {"ok": True, "sid": sid}
 
     _make_sessions_cfg(tmp_path, monkeypatch)
@@ -693,6 +705,28 @@ def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):
     })
     assert result["ok"] is True
     assert captured["args"] == ("test-project", "S-u-w-p1", "delta brief here")
+
+
+def test_resume_session_action_passes_task_id(tmp_path, monkeypatch):
+    """T-0166: resume_session must accept the optional task_id param and pass it
+    to sessions.resume so an expert with no primary adopts the new ticket."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    captured = {}
+
+    def fake_resume(cfg, slug, sid, initial_prompt=None, task_id=None):
+        captured["task_id"] = task_id
+        return {"ok": True, "sid": sid}
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "resume", fake_resume)
+
+    result = A.dispatch("resume_session", {
+        "slug": "test-project", "sid": "S-u-w-p1", "task_id": "T-0002",
+    })
+    assert result["ok"] is True
+    assert captured["task_id"] == "T-0002"
 
 
 # ---------------------------------------------------------------------------

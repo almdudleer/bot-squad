@@ -874,6 +874,8 @@ export type ProjectApi = Pick<
   | "spawnSession"
   | "devSpawnRequest"
   | "peerSend"
+  | "peerInboxRead"
+  | "peerInboxWait"
   | "autopilotStatus"
   | "autopilotStart"
   | "autopilotStop"

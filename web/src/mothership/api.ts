@@ -493,6 +493,16 @@ export function apiFor(serverId: string): ServerApi {
           body: JSON.stringify({ from_sid: fromSid, to, text }),
         },
       ),
+    peerInboxRead: (slug, sid) =>
+      fwd<{ ok: boolean; messages: string[]; count: number }>(
+        `/api/projects/${slug}/peer/${encodeURIComponent(sid)}/read`,
+        { method: "POST" },
+      ),
+    peerInboxWait: (slug, sid, timeoutSec) =>
+      fwd<{ ok: boolean; ready: boolean; elapsed_sec: number }>(
+        `/api/projects/${slug}/peer/${encodeURIComponent(sid)}/wait`,
+        { method: "POST", body: JSON.stringify({ timeout: timeoutSec }) },
+      ),
     // T-0153: autopilot — mirrors the singleton in web/src/api.ts.
     autopilotStatus: (slug) =>
       fwd<AutopilotStatus>(`/api/projects/${slug}/autopilot`),

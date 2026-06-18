@@ -19,6 +19,8 @@ import {
 } from "../utils/sessionStatus";
 
 import { PageHelp } from "../components/PageHelp";
+import { PeerInbox } from "../components/PeerInbox";
+import { uiSidFor } from "../peerInbox";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -449,7 +451,7 @@ export function Sessions() {
     try {
       // from_sid is informational; format S-<user>-ui-p0 so the API's
       // user-prefix check passes for the logged-in user.
-      const fromSid = `S-${meUsername}-ui-p0`;
+      const fromSid = uiSidFor(meUsername);
       const result = await api.peerSend(slug, fromSid, sendTarget, sendText.trim());
       setSendInfo(`Delivered to: ${result.delivered_to.join(", ") || "(none)"}`);
       setSendText("");
@@ -1529,6 +1531,8 @@ export function Sessions() {
 
   return (
     <div className="container py-4">
+      {/* T-0127: in-UI peer-reply inbox (coexists with the TG mirror). */}
+      <PeerInbox slug={slug} username={meUsername} />
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>

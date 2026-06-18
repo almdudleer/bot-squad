@@ -1504,10 +1504,10 @@ def test_flow_new_requires_existing_uc(tmp_path, tmp_config_dir, monkeypatch):
     out = A.dispatch("flow_new", {
         "slug": "test-project", "uc_id": "UC-0001", "title": "Happy path",
     })
-    assert out["id"] == "F-0001"
+    assert out["id"] == "UF-0001"  # T-0180: user-flow prefix, distinct from feedback F-
     assert out["uc_id"] == "UC-0001"
     p = Path(out["file_path"])
-    assert p == proj / "use_cases" / "UC-0001" / "flows" / "F-0001-happy-path.md"
+    assert p == proj / "use_cases" / "UC-0001" / "flows" / "UF-0001-happy-path.md"
     body = p.read_text()
     assert "uc_id: UC-0001" in body
     assert "```mermaid" in body

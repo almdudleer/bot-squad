@@ -64,10 +64,13 @@ ENTITY_TYPES: dict[str, EntityType] = {
     "task": EntityType("task", "T", 4, "backlog", False),
     "doc": EntityType("doc", "D", 4, "docs", True),
     "uc": EntityType("uc", "UC", 4, "use_cases", False),
-    # Flows live under use_cases/<uc-id>/flows/, so the scan recurses. They
-    # share the "F-" prefix with feedback items, but feedback lives in a
-    # separate dir with no counter here, so the namespaces never overlap.
-    "flow": EntityType("flow", "F", 4, "use_cases", True),
+    # Flows live under use_cases/<uc-id>/flows/, so the scan recurses. Prefix
+    # "UF-" (user-flow) is deliberately distinct from curated feedback's "F-"
+    # (feedback/F-NNNN-*.md — hand-curated, no counter here) so a bare id is
+    # never ambiguous between a flow and a feedback item (T-0180). The counter
+    # file stays keyed by the type name ("flow.txt"); only the display prefix
+    # changed, so no counter rename is needed.
+    "flow": EntityType("flow", "UF", 4, "use_cases", True),
     # Initiatives are rare; a 2-digit pad is plenty. Legacy initiatives are
     # slug-named (non-numeric) and are ignored by the scan, so new ones start
     # at INI-01 while old ones keep working.

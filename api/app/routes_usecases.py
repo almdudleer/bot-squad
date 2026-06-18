@@ -224,7 +224,7 @@ async def run_use_case(slug: str, uc_id: str, request: Request,
 # --------------------------------------------------------------------------
 # User flows attached to a use case (T-0173).
 #
-# Storage: ``data/<slug>/use_cases/<uc-id>/flows/F-NNNN-<slug>.md`` — frontmatter
+# Storage: ``data/<slug>/use_cases/<uc-id>/flows/UF-NNNN-<slug>.md`` — frontmatter
 # (id, uc_id, title, status, created) + a markdown body that carries a numbered
 # ``## Steps`` list and a ``## Mermaid`` fenced block. The UC page renders the
 # mermaid client-side and hands agents both the prose and the diagram so they
@@ -235,7 +235,9 @@ async def run_use_case(slug: str, uc_id: str, request: Request,
 # --------------------------------------------------------------------------
 import json  # noqa: E402
 
-_FLOW_ID_RE = re.compile(r"^F-\d{4}$")
+# T-0180: flows use the "UF-" (user-flow) prefix, deliberately distinct from
+# curated feedback's "F-" (feedback/F-NNNN-*.md) so a bare id is never ambiguous.
+_FLOW_ID_RE = re.compile(r"^UF-\d{4}$")
 
 
 def _slugify(s: str, max_len: int = 60) -> str:
@@ -279,7 +281,7 @@ def list_flows(slug: str, uc_id: str, request: Request) -> list[dict]:
     for f in sorted(d.glob("*.md")):
         fl = _parse(f)
         # `_parse` sets id = path.stem (right for UCs, where the stem IS the id),
-        # but a flow's stem is `F-NNNN-<slug>` — derive the canonical F-NNNN.
+        # but a flow's stem is `UF-NNNN-<slug>` — derive the canonical UF-NNNN.
         parts = f.stem.split("-", 2)
         fid = "-".join(parts[:2]) if len(parts) >= 2 else f.stem
         out.append({
@@ -299,7 +301,7 @@ def get_flow(slug: str, uc_id: str, flow_id: str, request: Request) -> dict:
     if path is None:
         raise HTTPException(status_code=404, detail=f"flow not found: {flow_id}")
     fl = _parse(path)
-    # `_parse` set id = full stem (`F-NNNN-<slug>`); force the canonical F-NNNN
+    # `_parse` set id = full stem (`UF-NNNN-<slug>`); force the canonical UF-NNNN
     # so the round-trip id matches what list_flows / the validator expect.
     fl["id"] = flow_id
     fl["uc_id"] = uc_id
@@ -313,7 +315,7 @@ class NewFlow(BaseModel):
 @router.post("/{uc_id}/flows")
 def create_flow(slug: str, uc_id: str, request: Request, body: NewFlow,
                 user: dict = Depends(require_auth)) -> dict:
-    """Allocate an F-NNNN id atomically and write a stub flow under a use case.
+    """Allocate a UF-NNNN id atomically and write a stub flow under a use case.
 
     Mirrors the worker ``flow_new`` action's storage + frontmatter + mermaid
     stub so a web create and an agent ``bsq flow new`` are byte-compatible.

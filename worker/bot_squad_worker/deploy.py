@@ -21,8 +21,8 @@ run_next(cfg, slug) -> DeployResult | None
 
 Quiescence-ignore patterns (same as cctv):
     Any line from ``git status --porcelain`` whose filename matches
-    logs/, cache/, __pycache__/, .pyc, *.tmp is ignored when deciding
-    whether the tree is "dirty".
+    logs/, cache/, __pycache__/, .pyc, *.tmp, .claude/ is ignored when
+    deciding whether the tree is "dirty".
 
 Queue file lifecycle:
     queue/<id>.json
@@ -69,6 +69,11 @@ _QUIESCENCE_IGNORE = (
     "__pycache__/",
     ".pyc",
     ".tmp",
+    # T-0204: per-session Claude scratch (e.g. watchrobot git-TRACKS
+    # .claude/scheduled_tasks.lock, rewritten every session). It is never part
+    # of the deployed artifact, so it must never block a deploy on the legacy
+    # in-place path.
+    ".claude/",
 )
 
 

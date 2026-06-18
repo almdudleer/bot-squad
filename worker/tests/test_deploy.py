@@ -169,6 +169,41 @@ def test_run_next_skips_when_dirty(tmp_path: Path) -> None:
     assert len(list(queue_dir.glob("*.json"))) == 1
 
 
+def test_is_clean_ignores_claude_session_state(tmp_path: Path) -> None:
+    """T-0204: a clone dirty ONLY in .claude/ reads as clean.
+
+    Mirrors test_run_next_skips_when_dirty but for a project that git-TRACKS
+    per-session Claude scratch (e.g. watchrobot's .claude/scheduled_tasks.lock,
+    rewritten every session). That dirtiness must never block a deploy.
+    """
+    from bot_squad_worker.deploy import _is_clean
+
+    proj = _make_project(tmp_path)
+    repo = proj.repo_path
+
+    # Commit a tracked .claude/ file, then mutate it so the tree is dirty
+    # ONLY in .claude/ (as an active session would).
+    claude_dir = repo / ".claude"
+    claude_dir.mkdir()
+    lock = claude_dir / "scheduled_tasks.lock"
+    lock.write_text("v1\n")
+    subprocess.run(["git", "add", ".claude/scheduled_tasks.lock"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "track claude state"], cwd=str(repo), check=True)
+    assert _is_clean(repo) is True
+
+    # Tracked .claude/ file rewritten by a live session → still clean.
+    lock.write_text("v2 — session active\n")
+    assert _is_clean(repo) is True
+
+    # An untracked .claude/ file is likewise ignored.
+    (claude_dir / "task_id").write_text("T-0204\n")
+    assert _is_clean(repo) is True
+
+    # But a real source change still flags the tree dirty.
+    (repo / "src.py").write_text("print('changed')\n")
+    assert _is_clean(repo) is False
+
+
 def test_run_next_failure_records_rc(tmp_path: Path) -> None:
     proj = _make_project(tmp_path)
     cfg = _make_config(tmp_path, proj)

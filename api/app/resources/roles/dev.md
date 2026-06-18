@@ -16,9 +16,11 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   `READY <task_id>` to your teamlead (find their SID via the worker
   socket's `list_sessions` action). The teamlead handles release
   coordination.
-- To ship: queue a deploy via
-  `ops/bot-squad-bin/deploy staging "<reason>"`. The worker runs the
-  deploy script serially. Prod deploys are stakeholder-owned.
+- Do NOT deploy, push, or merge yourself. After you signal `READY`, your
+  TL reviews the commits, runs tests, pushes `origin/bot_squad/dev`, and
+  gates the staging deploy + any worker restart. Staging deploys are
+  TL-owned; prod deploys are stakeholder-owned. (This keeps the quality
+  bar: nothing reaches staging unreviewed.)
 - If you're blocked: `peer_send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
 - **Idle vs. explicit page (T-0034).** When you sit idle/blocked under a

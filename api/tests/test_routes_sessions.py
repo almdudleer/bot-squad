@@ -47,6 +47,25 @@ def fake_worker_sessions(tmp_bot_squad: Path):
     def list_sessions(params: dict | None = None) -> dict:
         return {"sessions": [_SAMPLE_SESSION]}
 
+    @fake.post("/actions/telemetry_get")
+    def telemetry_get(params: dict | None = None) -> dict:
+        return {
+            "sessions": [{
+                "sid": "S-almdudleer-spec5-p2",
+                "context": {"tokens": 420000, "pct": 84.0, "ceiling": 500000,
+                            "model": "claude-opus-4-8"},
+                "memory": {"files": 3, "bytes": 4000, "tokens_est": 1000},
+                "output_tokens_cum": 12345,
+                "rate_limited": False,
+            }],
+            "quota": {
+                "burn_tokens_per_hr": 7200.0,
+                "projected_exhaustion_at": None,
+                "throttled": False,
+                "rate_limit_429": {"count": 0, "last_at": None},
+            },
+        }
+
     @fake.post("/actions/pause_session")
     def pause_session(params: dict | None = None) -> dict:
         return {"ok": True, "paused": True}
@@ -120,6 +139,43 @@ def _anon_client(tmp_bot_squad: Path, monkeypatch, sock_path: Path):
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("COOKIE_SECURE", "0")
     return TestClient(build_app())
+
+
+# ---------------------------------------------------------------------------
+# GET /api/projects/{slug}/telemetry  (T-0210)
+# ---------------------------------------------------------------------------
+
+def test_get_telemetry_success(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.get("/api/projects/test-project/telemetry")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["sessions"][0]["context"]["tokens"] == 420000
+    assert data["sessions"][0]["context"]["pct"] == 84.0
+    assert data["quota"]["burn_tokens_per_hr"] == 7200.0
+    assert data["quota"]["throttled"] is False
+
+
+def test_get_telemetry_requires_auth(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _anon_client(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.get("/api/projects/test-project/telemetry")
+    assert r.status_code == 401
+
+
+def test_get_telemetry_unknown_project_404(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.get("/api/projects/no-such-project/telemetry")
+    assert r.status_code == 404
+
+
+def test_get_telemetry_dead_worker_returns_empty(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    broken_sock = tmp_bot_squad / "data" / "_sock" / "nonexistent.sock"
+    with _client_logged_in(tmp_bot_squad, monkeypatch, broken_sock) as client:
+        r = client.get("/api/projects/test-project/telemetry")
+    assert r.status_code == 200
+    assert r.json() == {"sessions": [], "quota": {}}
 
 
 # ---------------------------------------------------------------------------

@@ -179,6 +179,48 @@ async def list_sessions(
     return [r for r in rows if (r.get("owner") or "") == me]
 
 
+@dev_spawn_router.get("/telemetry")
+async def get_telemetry(
+    slug: str, request: Request,
+    user: dict = Depends(require_auth),
+) -> dict:
+    """T-0210: resource telemetry for a project (context/memory/quota).
+
+    Reads the records the worker's ``telemetry_tick`` sampler persists. The
+    records live in the SHARED install data dir (every user worker writes
+    there), so this is a single coordinator read — not a per-user fan-out.
+
+    Non-admin callers see only the sessions they own (same owner gate as the
+    sessions list); the project-level ``quota`` rollup is shown to everyone
+    (it carries no per-user secrets — just burn rate, projection, 429 flag).
+    """
+    _check_project(request, slug)
+    client = _router(request).coordinator()
+    try:
+        result = await client.call_action("telemetry_get", {"slug": slug}, timeout=5.0)
+    except WorkerError as e:
+        log.warning("telemetry_get for %s failed: %s", slug, e)
+        return {"sessions": [], "quota": {}}
+    except Exception as e:
+        log.warning("telemetry_get for %s crashed: %s", slug, e)
+        return {"sessions": [], "quota": {}}
+
+    sessions = result.get("sessions", [])
+    quota = result.get("quota", {})
+    if user.get("is_admin"):
+        return {"sessions": sessions, "quota": quota}
+    # Non-admin owner gate: telemetry records don't carry the UI `owner`, so
+    # join back to the SessionMd owner by sid (same rule as list_sessions —
+    # missing owner = admin-only).
+    data_dir = _data_dir(request)
+    me = user.get("username") or ""
+    visible = [
+        s for s in sessions
+        if (_read_session_owner(data_dir, slug, s.get("sid", "")) or "") == me
+    ]
+    return {"sessions": visible, "quota": quota}
+
+
 # ---------------------------------------------------------------------------
 # POST /api/projects/{slug}/sessions/{sid}/pause
 # ---------------------------------------------------------------------------

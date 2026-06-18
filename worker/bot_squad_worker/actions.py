@@ -400,6 +400,29 @@ def _action_list_sessions(params: dict[str, Any]) -> dict[str, Any]:
     return {"sessions": _sessions.list_sessions(cfg, params["slug"])}
 
 
+_TELEMETRY_GET_REQUIRED = {"slug"}
+_TELEMETRY_GET_ALLOWED = _TELEMETRY_GET_REQUIRED
+
+
+def _action_telemetry_get(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0210: return persisted resource telemetry for a project.
+
+    Required params: slug
+    Returns: {sessions: [{sid, context:{tokens,pct,...}, memory:{...}, ...}],
+              quota: {burn_tokens_per_hr, projected_exhaustion_at, throttled, ...}}
+    """
+    extra = set(params) - _TELEMETRY_GET_ALLOWED
+    if extra:
+        raise ActionError(f"telemetry_get got unexpected params: {sorted(extra)}")
+    missing = _TELEMETRY_GET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"telemetry_get missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import telemetry as _telemetry
+    return _telemetry.read_telemetry(cfg, params["slug"])
+
+
 _PAUSE_SESSION_REQUIRED = {"slug", "sid"}
 _PAUSE_SESSION_ALLOWED = _PAUSE_SESSION_REQUIRED
 
@@ -1913,6 +1936,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "pause_deploys": _action_pause_deploys,
     "resume_deploys": _action_resume_deploys,
     "list_sessions": _action_list_sessions,
+    # T-0210: read persisted resource telemetry (context/memory/quota).
+    "telemetry_get": _action_telemetry_get,
     "pause_session": _action_pause_session,
     "suspend_session": _action_suspend_session,
     "resume_session": _action_resume_session,
@@ -1983,6 +2008,9 @@ ACTION_MODES: dict[str, str] = {
     "pause_deploys": "coordinator_only",
     "resume_deploys": "coordinator_only",
     "list_sessions": "tmux_only",
+    # telemetry_get reads the SHARED install data dir (all users' sampled
+    # records land there) → a single coordinator read, not a per-user fan-out.
+    "telemetry_get": "coordinator_only",
     "pause_session": "tmux_only",
     "suspend_session": "tmux_only",
     "resume_session": "tmux_only",

@@ -219,6 +219,25 @@ def binding_gc_tick(cfg: Config) -> None:
                 log.exception("binding_gc_tick: %s failed for %s", name, slug)
 
 
+def telemetry_tick(cfg: Config) -> None:
+    """T-0210: per-project resource-telemetry sampler.
+
+    Sibling of binding_gc_tick (its own 60s job so a slow transcript read can
+    never delay the lifecycle reconcilers). Samples each LIVE session's
+    context-token window + memory footprint from the Claude transcript jsonl,
+    persists a small per-session record + a project quota rollup, and fires
+    crossing-only urgent alerts (context >400k/>500k, memory near cap, quota
+    projected-exhaust-before-EOD, 429 throttle) to the operator + each TL.
+    Per-project errors are caught and logged so one bad project never kills
+    the sweep.
+    """
+    from bot_squad_worker import telemetry as _telemetry
+    try:
+        _telemetry.tick(cfg)
+    except Exception:
+        log.exception("telemetry_tick error")
+
+
 def drift_check_tick(cfg: Config) -> None:
     """T-0149: per-project drift-enforcement pass.
 

@@ -226,6 +226,42 @@ export type SessionRow = {
   role?: "teamlead" | "dev" | "operator";
 };
 
+// T-0210: per-session resource telemetry record (worker-sampled).
+export type TelemetrySession = {
+  sid: string;
+  role?: string;
+  task_id?: string | null;
+  context: {
+    tokens: number;
+    pct: number;        // % of ceiling
+    ceiling: number;    // 500_000 (contract v3)
+    model?: string | null;
+  };
+  memory: { files: number; bytes: number; tokens_est: number };
+  output_tokens_cum?: number;
+  rate_limited?: boolean;
+  sampled_at?: string;
+};
+
+// T-0210: project-level quota burndown rollup. Quota is NOT live-queryable on
+// Max plan — burn is estimated from output tokens; the projection only
+// resolves when the operator sets an (optional) budget anchor.
+export type TelemetryQuota = {
+  burn_tokens_per_hr?: number | null;
+  output_tokens_cum_total?: number;
+  projected_exhaustion_at?: string | null;
+  remaining_tokens?: number | null;
+  anchor?: { budget_tokens: number; set_at?: string } | null;
+  throttled?: boolean;
+  rate_limit_429?: { count: number; last_at: string | null };
+  sampled_at?: string;
+};
+
+export type TelemetryResponse = {
+  sessions: TelemetrySession[];
+  quota: TelemetryQuota;
+};
+
 export type RunRow = {
   id: string;
   target: string;
@@ -571,6 +607,9 @@ export const api = {
       { method: "DELETE" }),
   sessions: (slug: string) =>
     call<SessionRow[]>(`/api/projects/${slug}/sessions`),
+  // T-0210: resource telemetry (per-session context/memory + quota burndown).
+  telemetry: (slug: string) =>
+    call<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
   pauseSession: (slug: string, sid: string) =>
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`, { method: "POST" }),
   suspendSession: (slug: string, sid: string) =>
@@ -765,6 +804,7 @@ export type ProjectApi = Pick<
   | "backlog"
   | "vision"
   | "sessions"
+  | "telemetry"
   | "createTask"
   | "patchTask"
   | "patchTaskPriority"

@@ -31,6 +31,7 @@ import type {
   ProjectApi,
   SessionRow,
   Task,
+  TelemetryResponse,
   VisionFile,
 } from "../api";
 
@@ -423,6 +424,7 @@ export function apiFor(serverId: string): ServerApi {
     backlog: (slug) => fwd<Task[]>(`/api/projects/${slug}/backlog`),
     vision: (slug) => fwd<VisionFile[]>(`/api/projects/${slug}/vision`),
     sessions: (slug) => fwd<SessionRow[]>(`/api/projects/${slug}/sessions`),
+    telemetry: (slug) => fwd<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
     createTask: (slug, t: CreateTaskBody) =>
       fwd<Task>(`/api/projects/${slug}/backlog`, {
         method: "POST",

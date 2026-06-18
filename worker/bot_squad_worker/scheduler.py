@@ -19,6 +19,7 @@ from bot_squad_worker.jobs import (
     drift_check_tick,
     heartbeat,
     oauth_refresh,
+    telemetry_tick,
     tg_listener_tick,
     tg_stall_tick,
 )
@@ -119,6 +120,21 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="binding_gc",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # telemetry_tick: T-0210 — resource telemetry sampler. Sibling of
+    # binding_gc (its own job) so a slow transcript read can't delay the
+    # lifecycle reconcilers. max_instances=1 + coalesce keeps overlapping
+    # samples from racing on the per-session record files; the sampler is
+    # idempotent (offset-based incremental read) so a missed run is harmless.
+    sched.add_job(
+        telemetry_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="telemetry",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

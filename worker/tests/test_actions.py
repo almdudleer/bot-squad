@@ -51,7 +51,8 @@ def test_registry_lists_only_allowed_actions():
         # T-0155: stall-watchdog marker clear (UserPromptSubmit hook).
         "tg_stall_clear",
         "pause_deploys", "resume_deploys",
-        "list_sessions", "pause_session", "suspend_session", "resume_session",
+        "list_sessions", "telemetry_get",
+        "pause_session", "suspend_session", "resume_session",
         "spawn_session",
         "scheduler_state", "inject_input",
         "autonomous_status", "autonomous_enable", "autonomous_disable",

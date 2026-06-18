@@ -26,6 +26,12 @@ jobs:
         run: |
           python3 scripts/lint/backlog_frontmatter.py /nonexistent
           python3 scripts/lint/backlog_ids.py /nonexistent
+      - name: Cross-module attribute smoke (T-0186 absorption-split gate)
+        # Stdlib-only AST check — proves every cfg.<attr> access in a consumer
+        # resolves to a real Config member. Catches a wide-add split that ships
+        # actions.py without its config.py field BEFORE deploy (origin build).
+        run: |
+          python3 scripts/lint/cross_module_attr_smoke.py
       - name: Install api test deps
         run: |
           pip install --upgrade pip

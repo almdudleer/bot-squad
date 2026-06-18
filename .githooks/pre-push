@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# pre-push hook — cross-module attribute smoke (T-0186).
+#
+# The shared dev clone is edited by many concurrent bot-squad sessions. A
+# peer's raw `git add -A` / `git add <dir>` can sweep ANOTHER session's
+# unstaged, in-flight edits into the peer's commit (the T-0068 / T-0145
+# incident class). The danger is a *split* absorb: a multi-file change where
+# only SOME files get swept — e.g. `actions.py` ships referencing a new
+# `Config` field while the `config.py` that defines it does not (the live
+# `fb01921` / T-0171 break → AttributeError on origin, after deploy).
+#
+# This hook runs the cross-module attribute smoke before a push reaches
+# origin (and thus before the deploy, which builds from origin). It statically
+# proves every `cfg.<attr>` access in a consumer resolves to a real member of
+# the provider class. A split is caught HERE, not at runtime on staging.
+#
+# Pure stdlib (ast only) — no deps, no data tree, fast. Blocks the push on a
+# failure. CI (.github/workflows/lint.yml) runs the same check as
+# defense-in-depth for pushes that bypass the hook.
+#
+# Enable in this clone with: git config core.hooksPath .githooks
+# Skip per-push (not recommended) with: BOT_SQUAD_SKIP_ATTR_SMOKE=1
+
+set -uo pipefail
+
+[ "${BOT_SQUAD_SKIP_ATTR_SMOKE:-}" = "1" ] && exit 0
+
+# Resolve the repo root from the hook's location (.githooks/ is at the top).
+hook_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$hook_dir/.." && pwd)
+smoke="$repo_root/scripts/lint/cross_module_attr_smoke.py"
+
+[ -f "$smoke" ] || exit 0  # smoke absent (older checkout) → don't block
+
+python3 "$smoke" --root "$repo_root"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    printf '\033[31m%s\033[0m\n' \
+        "pre-push BLOCKED by cross-module attribute smoke (T-0186): a consumer references a provider member that does not exist — likely a wide-add absorption split. Fix the missing field/import (or set BOT_SQUAD_SKIP_ATTR_SMOKE=1 to override) and re-push."
+    exit "$rc"
+fi
+exit 0

@@ -194,6 +194,21 @@ def test_list_sessions_success(tmp_bot_squad: Path, monkeypatch, fake_worker_ses
     # T-0104: derived activity field passes through unchanged.
     assert data[0]["activity"] == "running"
     assert data[0]["activity_at"] == 1_700_000_000.0
+    # T-0232: explicit `live` boolean (running|idle = alive) for the FE
+    # live-only view. running → live.
+    assert data[0]["live"] is True
+
+
+def test_is_live_maps_running_and_idle_only():
+    # T-0232: live = the session is alive in tmux (running or idle). paused +
+    # suspended (and any archived → suspended) are NOT live → dropped from view.
+    from app.routes_sessions import _is_live
+    assert _is_live("running") is True
+    assert _is_live("idle") is True
+    assert _is_live("paused") is False
+    assert _is_live("suspended") is False
+    assert _is_live("") is False
+    assert _is_live(None) is False
 
 
 def test_list_sessions_requires_auth(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):

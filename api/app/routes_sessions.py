@@ -119,6 +119,16 @@ def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter,
 # GET /api/projects/{slug}/sessions  — fan-out across all user workers
 # ---------------------------------------------------------------------------
 
+# T-0232: live = the session is alive in tmux (running or idle). paused +
+# suspended (and any archived, which surfaces as suspended) are NOT live and
+# drop out of the FE live-only sessions view (Pillar A of the reframe).
+_LIVE_ACTIVITY = {"running", "idle"}
+
+
+def _is_live(activity: object) -> bool:
+    return activity in _LIVE_ACTIVITY
+
+
 @router.get("")
 async def list_sessions(
     slug: str, request: Request,
@@ -171,6 +181,8 @@ async def list_sessions(
                 merged[sid] = row
 
     rows = list(merged.values())
+    for r in rows:
+        r["live"] = _is_live(r.get("activity"))  # T-0232
     if user.get("is_admin"):
         return rows
     # Non-admin: drop rows whose owner doesn't match. Missing owner

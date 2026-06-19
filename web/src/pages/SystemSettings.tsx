@@ -3,10 +3,63 @@ import { Link } from "react-router-dom";
 import { api, SystemSettings as Settings } from "../api";
 import { Modal } from "../components/Modal";
 import { Coachmark } from "../onboarding";
+import {
+  ProjectUtilization,
+  aggregateUtilization,
+  isOverCap,
+  utilizationRatio,
+  validateCapInput,
+} from "./resourceCaps";
 
 const TTL_RE = /^\d+[smhd]$/;
 // T-0194: socks5(h)/http(s) — mirrors the API's _PROXY_RE. Empty = direct.
 const PROXY_RE = /^(socks5h?|https?):\/\/.+/i;
+
+// T-0240: Task-Manager-style utilization meter — current usage vs the configured
+// cap. `used === null` while utilization is still loading; an unlimited cap (0)
+// renders no bar fill and an "Unlimited" target.
+function CapMeter({
+  label,
+  used,
+  cap,
+  format = (n: number) => n.toLocaleString(),
+}: {
+  label: string;
+  used: number | null;
+  cap: number;
+  format?: (n: number) => string;
+}) {
+  const ratio = used === null ? null : utilizationRatio(used, cap);
+  const over = used !== null && isOverCap(used, cap);
+  const fill = ratio === null ? 0 : Math.min(100, ratio * 100);
+  const barColor = over
+    ? "var(--mc-accent-danger, #d33)"
+    : fill >= 80
+      ? "var(--mc-accent-warn, #e0a000)"
+      : "var(--mc-accent, #2f6feb)";
+  return (
+    <div style={{ marginBottom: "0.6rem" }}>
+      <div
+        className="d-flex justify-content-between"
+        style={{ fontSize: "0.72rem", marginBottom: 3 }}
+      >
+        <span style={{ color: "var(--mc-text-mid)" }}>{label}</span>
+        <span style={{ fontFamily: "var(--mc-mono)", color: over ? "var(--mc-accent-danger, #d33)" : "var(--mc-text-mid)" }}>
+          {used === null ? "—" : format(used)} / {cap === 0 ? "Unlimited" : format(cap)}
+        </span>
+      </div>
+      <div
+        style={{
+          position: "relative", height: 8, borderRadius: 2,
+          background: "var(--mc-border)", overflow: "hidden",
+        }}
+        title={cap === 0 ? "Unlimited (no cap)" : `${used ?? "—"} of ${cap}`}
+      >
+        <div style={{ position: "absolute", inset: 0, width: `${fill}%`, background: barColor }} />
+      </div>
+    </div>
+  );
+}
 
 export function SystemSettings() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -25,6 +78,11 @@ export function SystemSettings() {
   const [ttl, setTtl] = useState<string>("7d");
   const [coordUser, setCoordUser] = useState<string>("");
 
+  // T-0240: resource caps + live server-wide utilization (Task-Manager style).
+  const [maxParallel, setMaxParallel] = useState<number>(0);
+  const [maxTokens, setMaxTokens] = useState<number>(0);
+  const [util, setUtil] = useState<{ liveSessions: number; totalTokens: number } | null>(null);
+
   function load() {
     setError(null);
     api
@@ -37,12 +95,35 @@ export function SystemSettings() {
         setProxyUrl(s.tg.proxy_url);
         setTtl(s.session.ttl);
         setCoordUser(s.admin.coordinator_user);
+        setMaxParallel(s.caps.max_parallel_sessions);
+        setMaxTokens(s.caps.max_total_tokens);
       })
       .catch((e) => setError(String(e)));
   }
 
+  // T-0240: caps are a server-wide policy but the sessions/telemetry endpoints
+  // are project-scoped, so fan out over projects and aggregate. A failed
+  // per-project fetch contributes 0 (null slot) rather than sinking the readout.
+  function loadUtilization() {
+    api
+      .projects()
+      .then(async (projects) => {
+        const perProject: ProjectUtilization[] = await Promise.all(
+          projects.map(async (p) => ({
+            sessions: await api.sessions(p.slug).catch(() => null),
+            telemetry: await api.telemetry(p.slug).catch(() => null),
+          })),
+        );
+        setUtil(aggregateUtilization(perProject));
+      })
+      .catch(() => {
+        /* utilization is best-effort; leave it null (renders "—") on failure */
+      });
+  }
+
   useEffect(() => {
     load();
+    loadUtilization();
     api
       .me()
       .then((m) => setIsAdmin(Boolean(m.is_admin)))
@@ -66,6 +147,13 @@ export function SystemSettings() {
     }
     if (!coordUser.trim()) {
       return "coordinator linux user must not be empty";
+    }
+    // T-0240: caps are non-negative ints; 0 = unlimited.
+    const capErr =
+      validateCapInput(maxParallel, "Max parallel sessions") ??
+      validateCapInput(maxTokens, "Max total tokens");
+    if (capErr !== null) {
+      return capErr;
     }
     return null;
   }
@@ -98,11 +186,19 @@ export function SystemSettings() {
         },
         session: { ttl },
         admin: { coordinator_user: coordUser.trim() },
+        // T-0240: resource caps (non-negative ints, 0 = unlimited).
+        caps: { max_parallel_sessions: maxParallel, max_total_tokens: maxTokens },
       };
       const result = await api.putSystemSettings(body);
       setSettings(result);
+      setMaxParallel(result.caps.max_parallel_sessions);
+      setMaxTokens(result.caps.max_total_tokens);
       setBotToken("");
-      setNotice("Saved. Restart worker for changes to take effect.");
+      setNotice(
+        result.restart_required
+          ? "Saved. Restart the worker for changes (incl. resource caps) to take effect."
+          : "Saved.",
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -328,6 +424,69 @@ export function SystemSettings() {
             />
             <small style={{ color: "var(--mc-text-dim)" }}>
               Linux user that hosts the coordinator worker. Changing this requires re-deploy.
+            </small>
+          </section>
+
+          {/* T-0240: resource caps — Task-Manager-style view + set of the
+              parallel-session / token caps, with live server-wide utilization.
+              Caps are admin-settable; the worker enforces them at spawn-time
+              (T-0239 slice 2). 0 = unlimited. */}
+          <section className="mb-4" data-testid="resource-caps">
+            <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
+              Resource caps
+            </h3>
+
+            <div style={{ maxWidth: "26rem", marginBottom: "0.9rem" }}>
+              <CapMeter
+                label="Parallel sessions (live)"
+                used={util ? util.liveSessions : null}
+                cap={maxParallel}
+              />
+              <CapMeter
+                label="Total tokens (cumulative output)"
+                used={util ? util.totalTokens : null}
+                cap={maxTokens}
+              />
+            </div>
+
+            <div className="d-flex gap-3 align-items-end flex-wrap">
+              <div>
+                <label className="form-label" style={{ fontSize: "0.72rem" }}>
+                  Max parallel sessions
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  className="form-control"
+                  data-testid="cap-parallel"
+                  value={maxParallel}
+                  disabled={!isAdmin}
+                  onChange={(e) => setMaxParallel(Number.parseInt(e.target.value, 10) || 0)}
+                  style={{ width: "9rem" }}
+                />
+              </div>
+              <div>
+                <label className="form-label" style={{ fontSize: "0.72rem" }}>
+                  Max total tokens
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1000}
+                  className="form-control"
+                  data-testid="cap-tokens"
+                  value={maxTokens}
+                  disabled={!isAdmin}
+                  onChange={(e) => setMaxTokens(Number.parseInt(e.target.value, 10) || 0)}
+                  style={{ width: "11rem" }}
+                />
+              </div>
+            </div>
+            <small style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.35rem" }}>
+              <strong>0 = unlimited.</strong> Caps the simultaneously-live sessions
+              and aggregate output tokens the system allows. Enforced at spawn-time;
+              restart the worker after saving.{!isAdmin && " Admin-only."}
             </small>
           </section>
 

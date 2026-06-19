@@ -445,6 +445,11 @@ export type SystemSettings = {
   };
   session: { ttl: string };
   admin: { coordinator_user: string };
+  // T-0239/T-0240: user-settable resource caps the system enforces at
+  // spawn-time. 0 = unlimited (fresh/legacy install stays uncapped).
+  // max_parallel_sessions caps simultaneously-live sessions; max_total_tokens
+  // bounds aggregate usage (against the telemetry quota).
+  caps: { max_parallel_sessions: number; max_total_tokens: number };
 };
 
 export type PutSystemSettingsBody = {
@@ -457,6 +462,8 @@ export type PutSystemSettingsBody = {
   };
   session?: { ttl?: string };
   admin?: { coordinator_user?: string };
+  // T-0240: partial update OK — an omitted cap keeps its current value.
+  caps?: { max_parallel_sessions?: number; max_total_tokens?: number };
 };
 
 export type PutSystemSettingsResult = SystemSettings & {

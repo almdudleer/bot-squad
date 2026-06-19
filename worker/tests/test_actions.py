@@ -409,6 +409,129 @@ def test_peer_send_no_mirror_for_non_ui_sid(tmp_path, tmp_config_dir, monkeypatc
 
 
 # ---------------------------------------------------------------------------
+# T-0218: per-user notify precedence (project -> server -> global)
+# ---------------------------------------------------------------------------
+
+
+def _seed_migrated_attachment(
+    tmp_path, *, gu_id="GU-1", server_id="srv-self",
+    tg_chat_id="", project_tg_chat_ids=None,
+):
+    """Write a self-server registry + an Attachment JSON on disk, mirroring the
+    API's mothership store layout so the worker resolver can read it."""
+    import json
+
+    mship = tmp_path / "data" / "_mothership"
+    (mship).mkdir(parents=True, exist_ok=True)
+    (mship / "servers.json").write_text(
+        json.dumps({"version": 1, "servers": [{"id": server_id, "is_self": True}]})
+    )
+    att_dir = mship / "attachments" / gu_id
+    att_dir.mkdir(parents=True, exist_ok=True)
+    (att_dir / f"{server_id}.json").write_text(
+        json.dumps({
+            "global_user_id": gu_id,
+            "server_id": server_id,
+            "server_username": "alexey",
+            "attached_at": "2026-06-19T00:00:00Z",
+            "tg_chat_id": tg_chat_id,
+            "seen_steps": [],
+            "last_seen_at": None,
+            "project_tg_chat_ids": project_tg_chat_ids or {},
+        })
+    )
+
+
+def test_resolve_user_tg_unmigrated_project_over_global(tmp_path, tmp_config_dir):
+    """Un-migrated user: a per-project override beats the global tg_chat_id;
+    an unmapped slug falls back to global."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "111"\n'
+        'project_tg_chat_ids = { "proj-x" = "333" }\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert A._resolve_user_tg_chat_id(cfg, "alexey", slug="proj-x") == "333"
+    assert A._resolve_user_tg_chat_id(cfg, "alexey", slug="other") == "111"
+    assert A._resolve_user_tg_chat_id(cfg, "alexey") == "111"
+
+
+def test_resolve_user_tg_migrated_precedence(tmp_path, tmp_config_dir):
+    """Migrated user: project > server > global, each level falling through."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "111"\n'
+        'attached_to_global_user = "GU-1"\n'
+    )
+    _seed_migrated_attachment(
+        tmp_path, tg_chat_id="222", project_tg_chat_ids={"proj-x": "333"}
+    )
+    cfg = Config.load(tmp_config_dir)
+    # project override wins
+    assert A._resolve_user_tg_chat_id(cfg, "alexey", slug="proj-x") == "333"
+    # no project override → server level
+    assert A._resolve_user_tg_chat_id(cfg, "alexey", slug="other") == "222"
+    # no slug → server level (still beats global)
+    assert A._resolve_user_tg_chat_id(cfg, "alexey") == "222"
+
+
+def test_resolve_user_tg_migrated_server_empty_falls_to_global(
+    tmp_path, tmp_config_dir
+):
+    """Migrated user with no per-server override → global tg_chat_id."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "111"\n'
+        'attached_to_global_user = "GU-1"\n'
+    )
+    _seed_migrated_attachment(tmp_path, tg_chat_id="", project_tg_chat_ids={})
+    cfg = Config.load(tmp_config_dir)
+    assert A._resolve_user_tg_chat_id(cfg, "alexey", slug="proj-x") == "111"
+
+
+def test_peer_send_tg_mirror_uses_project_override(
+    tmp_path, tmp_config_dir, monkeypatch
+):
+    """peer_send tg-mirror fires to the project-override chat for the slug it
+    was sent under, not the global binding."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[users]\n'
+        'alexey = "hash"\n'
+        '\n'
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "111"\n'
+        'attached_to_global_user = "GU-1"\n'
+    )
+    _seed_migrated_attachment(
+        tmp_path, tg_chat_id="222", project_tg_chat_ids={"test-project": "999"}
+    )
+    (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+
+    out = A.dispatch("peer_send", {
+        "slug": "test-project",
+        "from_sid": "S-almdudleer-operator-p23",
+        "to": "S-alexey-ui-p0",
+        "text": "project-scoped ping",
+    })
+    assert out["ok"] is True
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["chat_id"] == "999"
+
+
+# ---------------------------------------------------------------------------
 # deploy action tests
 # ---------------------------------------------------------------------------
 

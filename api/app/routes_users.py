@@ -49,6 +49,17 @@ def _serialize_auth_toml(users: dict[str, str], user_meta: dict, session_ttl: st
         attached = getattr(meta, "attached_to_global_user", "") or ""
         if attached:
             out.append(f'attached_to_global_user = "{_toml_escape(attached)}"')
+        # T-0218: per-project personal notification overrides (un-migrated
+        # users). Inline table keeps the one-key-per-line block intact and
+        # avoids TOML sub-table ordering pitfalls. Omitted when empty so
+        # override-less users stay byte-identical on roundtrip.
+        proj_map = getattr(meta, "project_tg_chat_ids", {}) or {}
+        if proj_map:
+            items = ", ".join(
+                f'"{_toml_escape(k)}" = "{_toml_escape(v)}"'
+                for k, v in sorted(proj_map.items())
+            )
+            out.append(f"project_tg_chat_ids = {{{items}}}")
         out.append("")
     out.append("[session]")
     out.append(f'ttl = "{_toml_escape(session_ttl)}"')

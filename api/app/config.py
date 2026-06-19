@@ -109,6 +109,10 @@ class UserMeta:
     # mothership owns the canonical credentials and per-server state
     # (tg_chat_id, seen_steps) is mirrored into an Attachment record.
     attached_to_global_user: str = ""
+    # T-0218: per-project personal notification overrides, keyed by project
+    # slug — the un-migrated counterpart to Attachment.project_tg_chat_ids.
+    # Sits above the global tg_chat_id in the notify precedence. Empty = none.
+    project_tg_chat_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -144,12 +148,19 @@ class AuthConfig:
             raw_steps = m.get("seen_steps", [])
             if not isinstance(raw_steps, list):
                 raw_steps = []
+            raw_proj = m.get("project_tg_chat_ids", {})
+            proj_map = (
+                {str(k): str(v) for k, v in raw_proj.items()}
+                if isinstance(raw_proj, dict)
+                else {}
+            )
             user_meta[name] = UserMeta(
                 linux_user=str(m.get("linux_user", name)),
                 is_admin=bool(m.get("is_admin", False)),
                 seen_steps=tuple(str(s) for s in raw_steps),
                 tg_chat_id=str(m.get("tg_chat_id", "")),
                 attached_to_global_user=str(m.get("attached_to_global_user", "")),
+                project_tg_chat_ids=proj_map,
             )
         ttl_str = raw.get("session", {}).get("ttl", "7d")
         return cls(

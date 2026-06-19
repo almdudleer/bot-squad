@@ -779,3 +779,188 @@ def test_project_test_ping_400_when_nothing_resolves(
         r = client.post("/api/me/project/proj-x/tg-chat-id/test")
     assert r.status_code == 400
     assert "no tg_chat_id resolves" in r.json()["detail"]
+
+
+# ── T-0218 follow-up: per-project override PERSISTENCE (D-0022 Q2) ─────────
+#
+# The override is stored in a ``project_tg_chat_ids: {slug -> chat_id}`` map —
+# on the Attachment (migrated users) or UserMeta (un-migrated). GET reads it
+# back, the resolved view ranks it above server+global, and the test ping
+# fires to the project-resolved chat.
+
+
+def test_project_tg_chat_id_persists_unmigrated(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Un-migrated user: PUT a project override → GET reads it back; the value
+    lands in auth.toml's per-user project_tg_chat_ids table."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        put = client.put(
+            "/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"}
+        )
+        assert put.status_code == 200, put.text
+        assert put.json() == {"slug": "proj-x", "tg_chat_id": "333"}
+        get = client.get("/api/me/project/proj-x/tg-chat-id")
+    assert get.json() == {"slug": "proj-x", "tg_chat_id": "333"}
+
+    raw = tomllib.loads((tmp_bot_squad / "config" / "auth.toml").read_text())
+    assert raw["user_meta"]["testuser"]["project_tg_chat_ids"]["proj-x"] == "333"
+
+
+def test_project_override_wins_in_resolved_unmigrated(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Un-migrated: project override beats the global binding in the resolved view."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "111"})
+        client.put("/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"})
+        r = client.get("/api/me/notifications/resolved?slug=proj-x")
+    body = r.json()
+    assert body["levels"]["global"] == {"tg_chat_id": "111", "set": True}
+    assert body["levels"]["project"] == {
+        "slug": "proj-x",
+        "tg_chat_id": "333",
+        "set": True,
+    }
+    assert body["effective"] == {"tg_chat_id": "333", "source": "project"}
+    # A DIFFERENT project with no override still falls through to global.
+    with TestClient(app) as client:
+        _login(client)
+        r2 = client.get("/api/me/notifications/resolved?slug=other-proj")
+    assert r2.json()["effective"] == {"tg_chat_id": "111", "source": "global"}
+
+
+def test_project_tg_chat_id_persists_migrated(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Migrated user: the override lands in Attachment.project_tg_chat_ids, not
+    auth.toml."""
+    from app.mothership_users_store import MothershipUsersStore
+
+    gu_id, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="222")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        put = client.put(
+            "/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"}
+        )
+        assert put.status_code == 200, put.text
+        get = client.get("/api/me/project/proj-x/tg-chat-id")
+    assert get.json() == {"slug": "proj-x", "tg_chat_id": "333"}
+
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    att = store.get_attachment(gu_id, server_id)
+    assert att is not None
+    assert att.project_tg_chat_ids == {"proj-x": "333"}
+    # The migrated branch never writes the override back into auth.toml.
+    raw = tomllib.loads((tmp_bot_squad / "config" / "auth.toml").read_text())
+    assert "project_tg_chat_ids" not in raw["user_meta"]["testuser"]
+
+
+def test_project_override_wins_in_resolved_migrated(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Migrated: project > server > global precedence in the resolved view."""
+    _attach_testuser(tmp_bot_squad, tg_chat_id="222")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "111"})
+        client.put("/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"})
+        r = client.get("/api/me/notifications/resolved?server_id=self&slug=proj-x")
+    body = r.json()
+    assert body["levels"]["server"]["tg_chat_id"] == "222"
+    assert body["levels"]["project"]["tg_chat_id"] == "333"
+    assert body["effective"] == {"tg_chat_id": "333", "source": "project"}
+
+
+def test_project_put_preserves_server_chat_and_seen_steps(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Writing a project override must not clobber the Attachment's per-server
+    tg_chat_id or seen_steps tuple."""
+    from app.mothership_users_store import MothershipUsersStore
+
+    gu_id, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="222")
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    store.upsert_attachment(
+        global_user_id=gu_id,
+        server_id=server_id,
+        server_username="testuser",
+        tg_chat_id="222",
+        seen_steps=("welcome", "tour"),
+    )
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"})
+
+    att = store.get_attachment(gu_id, server_id)
+    assert att is not None
+    assert att.tg_chat_id == "222"
+    assert att.seen_steps == ("welcome", "tour")
+    assert att.project_tg_chat_ids == {"proj-x": "333"}
+
+
+def test_project_override_empty_clears_migrated(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """PUT empty removes the slug from the map → GET null, resolved falls back."""
+    from app.mothership_users_store import MothershipUsersStore
+
+    gu_id, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="222")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"})
+        cleared = client.put(
+            "/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": ""}
+        )
+        assert cleared.json() == {"slug": "proj-x", "tg_chat_id": None}
+        resolved = client.get(
+            "/api/me/notifications/resolved?server_id=self&slug=proj-x"
+        )
+    assert resolved.json()["effective"] == {"tg_chat_id": "222", "source": "server"}
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    att = store.get_attachment(gu_id, server_id)
+    assert att is not None
+    assert "proj-x" not in att.project_tg_chat_ids
+
+
+def test_project_test_ping_uses_project_override(
+    tmp_bot_squad: Path, monkeypatch, fake_tg_worker: _FakeTgWorker
+) -> None:
+    """The project test ping fires to the project-override chat, not global."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "111"})
+        client.put("/api/me/project/proj-x/tg-chat-id", json={"tg_chat_id": "333"})
+        r = client.post("/api/me/project/proj-x/tg-chat-id/test")
+    assert r.status_code == 200, r.text
+    assert fake_tg_worker.calls[-1]["chat_id"] == "333"
+
+
+def test_writer_omits_project_map_when_empty(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """No project overrides → auth.toml carries no project_tg_chat_ids key
+    (byte-clean roundtrip, same discipline as seen_steps/tg_chat_id)."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "111"})
+    raw = tomllib.loads((tmp_bot_squad / "config" / "auth.toml").read_text())
+    assert "project_tg_chat_ids" not in raw["user_meta"]["testuser"]

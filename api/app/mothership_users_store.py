@@ -68,6 +68,10 @@ class Attachment:
     tg_chat_id: str = ""
     seen_steps: tuple[str, ...] = ()
     last_seen_at: str | None = None
+    # T-0218: per-(user × server) personal notification overrides, keyed by
+    # project slug. Sits above the per-server ``tg_chat_id`` in the worker's
+    # notify precedence (project -> server -> global). Empty = no overrides.
+    project_tg_chat_ids: dict[str, str] = field(default_factory=dict)
 
 
 class MothershipUsersStore:
@@ -242,16 +246,23 @@ class MothershipUsersStore:
         tg_chat_id: str = "",
         seen_steps: tuple[str, ...] = (),
         last_seen_at: str | None = None,
+        project_tg_chat_ids: dict[str, str] | None = None,
     ) -> tuple[Attachment, bool]:
         """Create-or-update an Attachment. Returns ``(entry, created)``.
 
         Update path preserves ``attached_at`` from the existing row — that
         timestamp records the FIRST binding, not the latest write.
+
+        ``project_tg_chat_ids=None`` PRESERVES the existing per-project override
+        map (so an unrelated per-server ``tg_chat_id`` write doesn't wipe it);
+        pass an explicit dict to replace it.
         """
         with self._lock:
             existing = self.get_attachment(global_user_id, server_id)
             created = existing is None
             attached_at = existing.attached_at if existing is not None else _utc_now_iso()
+            if project_tg_chat_ids is None:
+                project_tg_chat_ids = dict(existing.project_tg_chat_ids) if existing else {}
             entry = Attachment(
                 global_user_id=global_user_id,
                 server_id=server_id,
@@ -260,6 +271,7 @@ class MothershipUsersStore:
                 tg_chat_id=tg_chat_id,
                 seen_steps=tuple(seen_steps),
                 last_seen_at=last_seen_at,
+                project_tg_chat_ids=dict(project_tg_chat_ids),
             )
             d = self._attachments_dir(global_user_id)
             d.mkdir(parents=True, exist_ok=True)

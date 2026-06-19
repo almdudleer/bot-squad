@@ -15,6 +15,7 @@ tmux_only, or both. The dispatcher checks the running worker's mode
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -821,18 +822,69 @@ def _parse_ui_sid_username(sid: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _lookup_user_tg_chat_id(cfg: Any, username: str) -> str:
-    """Load auth.toml and return user_meta[<username>].tg_chat_id (or "" if unset/missing)."""
+def _read_self_attachment(cfg: Any, global_user_id: str) -> dict | None:
+    """Read the (user × this-install) Attachment JSON from the mothership store,
+    or ``None`` when there's no self-server registry / attachment on disk.
+
+    Mirrors ``api/app/mothership_users_store.py`` layout so the worker can apply
+    the per-server + per-project notify overrides without importing the API."""
+    mship = Path(cfg.data_dir) / "_mothership"
+    servers_path = mship / "servers.json"
+    if not servers_path.is_file():
+        return None
+    try:
+        servers = json.loads(servers_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    self_id = next(
+        (s.get("id") for s in servers.get("servers", []) if s.get("is_self")), None
+    )
+    if not self_id:
+        return None
+    att_path = mship / "attachments" / global_user_id / f"{self_id}.json"
+    if not att_path.is_file():
+        return None
+    try:
+        return json.loads(att_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _resolve_user_tg_chat_id(cfg: Any, username: str, slug: str = "") -> str:
+    """Resolve ``username``'s personal Telegram chat with T-0218 precedence:
+    ``project -> server(this install) -> global``, each falling through on empty.
+
+    Global + the un-migrated project map come from ``auth.toml``; for migrated
+    users (``attached_to_global_user`` set) the server + project levels come from
+    the self-server Attachment JSON. Returns ``""`` when nothing resolves."""
     auth_path = Path(cfg.config_dir) / "auth.toml"
     if not auth_path.exists():
         return ""
     try:
         raw = tomllib.loads(auth_path.read_text())
     except (OSError, tomllib.TOMLDecodeError) as e:
-        log.warning("peer_send tg-mirror: failed to read auth.toml: %s", e)
+        log.warning("tg-notify resolve: failed to read auth.toml: %s", e)
         return ""
     meta = raw.get("user_meta", {}).get(username, {}) or {}
-    return str(meta.get("tg_chat_id", "") or "")
+    global_chat = str(meta.get("tg_chat_id", "") or "")
+    attached = str(meta.get("attached_to_global_user", "") or "")
+
+    if not attached:
+        # Un-migrated: the per-project map lives on user_meta itself.
+        proj_map = meta.get("project_tg_chat_ids", {})
+        if slug and isinstance(proj_map, dict) and proj_map.get(slug):
+            return str(proj_map[slug])
+        return global_chat
+
+    att = _read_self_attachment(cfg, attached)
+    if att is not None:
+        proj_map = att.get("project_tg_chat_ids", {})
+        if slug and isinstance(proj_map, dict) and proj_map.get(slug):
+            return str(proj_map[slug])
+        server_chat = str(att.get("tg_chat_id", "") or "")
+        if server_chat:
+            return server_chat
+    return global_chat
 
 
 def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
@@ -842,9 +894,10 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     Returns: {ok: true, delivered_to: [sid, ...]}
 
     T-0035: any delivered SID matching ``S-<user>-ui-p<N>`` also fires a
-    ``tg.send`` to that user's bound ``tg_chat_id`` (from
-    ``config/auth.toml [user_meta.<user>]``). Mirror failures are logged
-    but never break the bus write — delivered_to still reflects the inbox.
+    ``tg.send`` to that user's resolved personal chat. T-0218: resolution now
+    honors the ``project -> server -> global`` precedence for the message's
+    ``slug`` (see ``_resolve_user_tg_chat_id``). Mirror failures are logged but
+    never break the bus write — delivered_to still reflects the inbox.
     """
     extra = set(params) - _PEER_SEND_ALLOWED
     if extra:
@@ -875,7 +928,7 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
         username = _parse_ui_sid_username(recipient_sid)
         if not username:
             continue
-        chat_id = _lookup_user_tg_chat_id(cfg, username)
+        chat_id = _resolve_user_tg_chat_id(cfg, username, slug=params.get("slug", ""))
         if not chat_id:
             log.debug(
                 "peer_send tg-mirror: user %r has no tg_chat_id bound — skipping",

@@ -402,17 +402,17 @@ async def test_attachment_tg_chat_id(
 
 # --- T-0218: per-project personal override + resolved view (D-0022) ---
 #
-# STUB SCOPE (this commit, unblocks Team-2 FE): the routes + shapes + validation
-# + the global/server resolution are LIVE-REAL. The per-project personal override
-# is NOT yet persisted — GET returns null (inherit), PUT validates + echoes. Full
-# persistence + worker tg_notify precedence land in the T-0218 follow-up. Storage
-# DECISION (Q2): a ``project_tg_chat_ids: dict[slug -> chat_id]`` map on the
-# ``Attachment`` (migrated) with a parallel map on ``UserMeta`` for un-migrated
-# users — mirroring how ``tg_chat_id`` already lives in both stores. Q1 (topic_id):
-# personal targeting stays chat_id-only; personal ``topic_id`` is OUT of scope for
-# T-0218 (topic_id remains project-wide-only). Q3: yes — the per-project path
-# falls back to UserMeta exactly like the per-server route. Q4: paths confirmed as
-# written below (``/me/project/{slug}/tg-chat-id`` + ``/me/notifications/resolved``).
+# Per-project personal notification override, now fully persisted (follow-up to
+# the stub commit). Storage (Q2): a ``project_tg_chat_ids: dict[slug -> chat_id]``
+# map on the ``Attachment`` (migrated users) with a parallel map on ``UserMeta``
+# for un-migrated users — mirroring how ``tg_chat_id`` already lives in both
+# stores. The map sits ABOVE the per-server ``tg_chat_id`` in the notify
+# precedence (project -> server -> global), enforced here for the resolved view
+# and in the worker's ``_resolve_user_tg_chat_id`` for actual sends. Q1
+# (topic_id): personal targeting stays chat_id-only; personal ``topic_id`` is OUT
+# of scope (topic_id remains project-wide-only). Q3: yes — the per-project path
+# falls back to UserMeta exactly like the per-server route. Q4: paths confirmed
+# (``/me/project/{slug}/tg-chat-id`` + ``/me/notifications/resolved``).
 
 
 def _validate_chat_id(raw: object) -> str:
@@ -446,21 +446,43 @@ def _raw_server_tg(request: Request, user: dict, server_id: str) -> tuple[str, s
     return resolved, raw, bool(raw)
 
 
+def _read_project_override(
+    request: Request, user: dict, slug: str, server_id: str = "self"
+) -> tuple[str, bool]:
+    """``(raw per-project tg_chat_id, set?)`` for (user, resolved server, slug).
+
+    Migrated users read the ``Attachment.project_tg_chat_ids`` map for the
+    resolved server; un-migrated users read the parallel ``UserMeta`` map (Q3
+    fallback). NO fallthrough to coarser levels — the resolved view reports
+    each level's own value so ``set`` + the precedence winner stay honest."""
+    if not slug:
+        return "", False
+    cfg: AuthConfig = request.app.state.auth_config
+    meta = cfg.meta_for(user["username"])
+    if not meta.attached_to_global_user:
+        raw = (meta.project_tg_chat_ids or {}).get(slug, "")
+        return raw, bool(raw)
+    resolved = _resolve_server_id(request, server_id)
+    att = _users_store(request).get_attachment(meta.attached_to_global_user, resolved)
+    if att is None:
+        return "", False
+    raw = (att.project_tg_chat_ids or {}).get(slug, "")
+    return raw, bool(raw)
+
+
 def _resolve_notification(
     request: Request, user: dict, server_id: str, slug: str
 ) -> dict:
     """Compute the 3-level resolved view for (user, server, project).
 
     Precedence (most specific wins, falling through on empty):
-    ``project -> server -> global -> none``. The project level is stubbed
-    (``null``) until persistence lands; global + server are real today.
+    ``project -> server -> global -> none``.
     """
     cfg: AuthConfig = request.app.state.auth_config
     meta = cfg.meta_for(user["username"])
     global_raw = meta.tg_chat_id or ""
     resolved_sid, server_raw, server_set = _raw_server_tg(request, user, server_id)
-    # Per-project personal override — stubbed (not yet persisted; see scope note).
-    project_raw, project_set = "", False
+    project_raw, project_set = _read_project_override(request, user, slug, server_id)
 
     levels = {
         "global": {"tg_chat_id": global_raw or None, "set": bool(global_raw)},
@@ -497,8 +519,8 @@ def _project_payload(slug: str, tg_chat_id: str | None) -> dict:
 def get_project_tg_chat_id(
     slug: str, request: Request, user: dict = Depends(require_auth)
 ) -> dict:
-    # STUB: no per-project override persisted yet → null (inherit). Stable shape.
-    return _project_payload(slug, None)
+    raw, _ = _read_project_override(request, user, slug)
+    return _project_payload(slug, raw or None)
 
 
 @router.put("/project/{slug}/tg-chat-id")
@@ -508,10 +530,51 @@ def put_project_tg_chat_id(
     payload: dict,
     user: dict = Depends(require_auth),
 ) -> dict:
-    # STUB: real validation + echoes the submitted value so the FE round-trips
-    # optimistically. Persistence lands in the T-0218 follow-up (see scope note).
+    """Set (or clear, on empty) the per-project personal override for the
+    current server. Migrated users write the Attachment map; un-migrated users
+    write the parallel UserMeta map (Q3 fallback)."""
     new_id = _validate_chat_id(payload.get("tg_chat_id", ""))
-    return _project_payload(slug, new_id)
+    cfg: AuthConfig = request.app.state.auth_config
+    username = user["username"]
+    meta = cfg.meta_for(username)
+
+    if not meta.attached_to_global_user:
+        new_map = dict(meta.project_tg_chat_ids or {})
+        if new_id:
+            new_map[slug] = new_id
+        else:
+            new_map.pop(slug, None)
+        new_meta = UserMeta(
+            linux_user=meta.linux_user,
+            is_admin=meta.is_admin,
+            seen_steps=meta.seen_steps,
+            tg_chat_id=meta.tg_chat_id,
+            attached_to_global_user=meta.attached_to_global_user,
+            project_tg_chat_ids=new_map,
+        )
+        _write_user_meta(request, username, new_meta)
+        return _project_payload(slug, new_id or None)
+
+    store = _users_store(request)
+    resolved = _resolve_server_id(request, "self")
+    existing = store.get_attachment(meta.attached_to_global_user, resolved)
+    new_map = dict(existing.project_tg_chat_ids) if existing else {}
+    if new_id:
+        new_map[slug] = new_id
+    else:
+        new_map.pop(slug, None)
+    # Preserve the other per-server fields — upsert overwrites the whole row.
+    server_username = existing.server_username if existing else username
+    store.upsert_attachment(
+        global_user_id=meta.attached_to_global_user,
+        server_id=resolved,
+        server_username=server_username,
+        tg_chat_id=existing.tg_chat_id if existing else "",
+        seen_steps=existing.seen_steps if existing else (),
+        last_seen_at=existing.last_seen_at if existing else None,
+        project_tg_chat_ids=new_map,
+    )
+    return _project_payload(slug, new_id or None)
 
 
 @router.get("/notifications/resolved")

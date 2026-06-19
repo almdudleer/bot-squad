@@ -1,57 +1,20 @@
 /**
- * Pure helpers for Shell.tsx's sidebar restructure (T-0059 — T-0065).
+ * Pure helpers backing the Shell sidebar + the server-attachment surface.
  *
- * The Shell component renders four scope sections — GLOBAL / SERVER /
- * ATTACHMENT / MOTHERSHIP — per the locked contract in
- * `docs/design/D-0019-nav-restructure.md`. The visibility, the picker
- * default, and the admin gates are all decided here so we have a vitest
- * seam without a DOM (matches the convention set by Select.test.ts +
+ * History: this module once encoded a four-scope sidebar model (GLOBAL /
+ * SERVER / ATTACHMENT / MOTHERSHIP, the locked `D-0019-nav-restructure`
+ * contract). Sidebar v3 (T-0170) collapsed the IA onto the role hierarchy
+ * and stopped rendering that model entirely, so the dead abstraction
+ * (`sidebarSectionVisibility`, `visibleSidebarSections`,
+ * `ATTACHMENT_SIDEBAR_ITEMS`, the ATTACHMENT worker-status pill) was
+ * removed in T-0224. What remains are the helpers v3 still imports:
+ *   • the super-admin gate read off `/api/me` (Shell + mothership pages);
+ *   • the server-picker storage key + initial-selection resolver
+ *     (mothership/ServerPicker);
+ *   • the attachment server-id read used by the per-attachment pages.
+ * They keep a no-DOM vitest seam (matches Select.test.ts +
  * ProjectSwitcher.test.ts).
  */
-
-export type SidebarFlags = {
-  /** import.meta.env.VITE_MOTHERSHIP === "1". */
-  isMothershipBuild: boolean;
-  /** Super-admin (T-0066 introduces `is_super_admin` on /api/me;
-   *  until then we fall back to `is_admin`). */
-  isSuperAdmin: boolean;
-  /** Server-local admin (auth.toml `is_admin` on the picked server). */
-  isServerAdmin: boolean;
-};
-
-export type SidebarVisibility = {
-  /** Always true. */
-  global: boolean;
-  /** Always true. The picker dropdown is only rendered on mothership. */
-  server: boolean;
-  /** Mothership-only AND super-admin. */
-  serverPicker: boolean;
-  /** SERVER > users / settings rows. */
-  serverAdminItems: boolean;
-  /** Always true. ATTACHMENT body is per-attachment (Bundle C fills it). */
-  attachment: boolean;
-  /** Mothership-only AND super-admin. Tree-shaken on detach. */
-  mothership: boolean;
-};
-
-export function sidebarSectionVisibility(flags: SidebarFlags): SidebarVisibility {
-  return {
-    global: true,
-    server: true,
-    serverPicker: flags.isMothershipBuild,
-    serverAdminItems: flags.isServerAdmin,
-    attachment: true,
-    mothership: flags.isMothershipBuild && flags.isSuperAdmin,
-  };
-}
-
-/**
- * Section headers in render order, per the locked diagram in
- * `docs/design/D-0019-nav-restructure.md`. Returns only sections that are
- * visible under the given flags — callers iterate to drive both Shell.tsx
- * markup AND tests that pin the contract order.
- */
-export type SidebarSectionKey = "global" | "server" | "attachment" | "mothership";
 
 /**
  * T-0062 — read the super-admin flag from /api/me, falling back to the
@@ -69,51 +32,6 @@ export function isSuperAdminFromMe(me: MeLike | null | undefined): boolean {
   if (!me) return false;
   if (typeof me.is_super_admin === "boolean") return me.is_super_admin;
   return Boolean(me.is_admin);
-}
-
-export function visibleSidebarSections(flags: SidebarFlags): SidebarSectionKey[] {
-  const v = sidebarSectionVisibility(flags);
-  const ordered: SidebarSectionKey[] = ["global", "server", "attachment", "mothership"];
-  return ordered.filter((k) => v[k]);
-}
-
-/**
- * T-0063 — operational-status pill. Pulled out of inline JSX so the
- * three-way ternary (unknown / alive / offline) is unit-testable. The
- * pill itself moves out of the Shell top header into the ATTACHMENT
- * section chrome per the contract.
- */
-export type WorkerAlive = boolean | null;
-
-export type WorkerStatusPaint = {
-  /** Status class for the dot: idle (unknown), active (alive), error (down). */
-  dotClass: string;
-  /** Short label rendered next to the dot. */
-  label: string;
-  /** Foreground colour token for the label text. */
-  color: string;
-};
-
-export function workerStatusPaint(alive: WorkerAlive): WorkerStatusPaint {
-  if (alive === null) {
-    return {
-      dotClass: "mc-dot mc-dot-idle",
-      label: "UNKNOWN",
-      color: "var(--mc-text-faint)",
-    };
-  }
-  if (alive) {
-    return {
-      dotClass: "mc-dot mc-dot-active",
-      label: "OPERATIONAL",
-      color: "var(--mc-green)",
-    };
-  }
-  return {
-    dotClass: "mc-dot mc-dot-error",
-    label: "WORKER OFFLINE",
-    color: "var(--mc-red)",
-  };
 }
 
 /** T-0060 — localStorage key for the server picker selection. Scoped per
@@ -151,44 +69,6 @@ export function readAttachmentServerId(storage?: StorageLike | null): string {
     /* ignore quota / disabled */
   }
   return SELF_SERVER_ID;
-}
-
-/** T-0061 — ATTACHMENT section nav items, in render order. */
-export type AttachmentSidebarItem = {
-  key: string;
-  label: string;
-  to: string;
-  /** Optional data-onboarding-anchor for §9.x spotlight beats. */
-  onboardingAnchor?: string;
-};
-
-/**
- * Locked contract from ``docs/design/D-0019-nav-restructure.md``: TG
- * binding, my sessions, worker controls — in that order, identical on
- * mothership and detach builds. The operational-status pill is rendered
- * separately by Shell.tsx as section chrome (T-0063), not as a nav item.
- */
-export const ATTACHMENT_SIDEBAR_ITEMS: AttachmentSidebarItem[] = [
-  {
-    key: "tg-binding",
-    label: "TG BINDING",
-    to: "/attachment/tg-binding",
-    onboardingAnchor: "attachment-tg-binding",
-  },
-  {
-    key: "my-sessions",
-    label: "MY SESSIONS",
-    to: "/attachment/sessions",
-  },
-  {
-    key: "my-worker",
-    label: "WORKER CONTROLS",
-    to: "/attachment/worker",
-  },
-];
-
-export function attachmentSidebarItems(): AttachmentSidebarItem[] {
-  return ATTACHMENT_SIDEBAR_ITEMS;
 }
 
 export type PickerCandidate = {

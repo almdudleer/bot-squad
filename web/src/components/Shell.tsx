@@ -189,8 +189,11 @@ export function Shell() {
                       ? "mc-sidebar-server-gear active"
                       : "mc-sidebar-server-gear"
                   }
-                  aria-label="Server settings"
-                  title="Server settings"
+                  // T-0224: the header gear (server/system-wide settings) and
+                  // the [PROJECT] gear are visually identical, so spell out the
+                  // scope in title/aria-label to disambiguate them at a glance.
+                  aria-label="Server / system settings"
+                  title="Server / system settings"
                 >
                   ⚙
                 </NavLink>
@@ -254,7 +257,7 @@ export function Shell() {
                   to={`/p/${slug}/vision`}
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  ROADMAP
+                  VISION
                 </NavLink>
               </li>
               <li>

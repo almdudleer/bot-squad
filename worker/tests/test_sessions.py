@@ -3946,3 +3946,105 @@ def test_backfill_parent_sid_gates_nondev_and_heals_operator(tmp_path, monkeypat
     res2 = S.backfill_parent_sid(cfg, "test-project")
     assert res2["corrected"] == 0
     assert res2["filled"] == 0
+
+
+# ---------------------------------------------------------------------------
+# T-0220: suspended-row role badge validates cwd, not just window name
+# ---------------------------------------------------------------------------
+
+def _suspended_cwd_cfg(tmp_path, monkeypatch):
+    """Shared setup: a project repo + empty pane list (everything suspended)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        # No live panes → all sessions surface from the suspended-md loop.
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    return cfg, repo
+
+
+def test_suspended_role_neutralized_on_cwd_mismatch(tmp_path, monkeypatch):
+    """A suspended row with an operator window but a cwd OUTSIDE the project
+    must not render the elevated badge: role falls back to "dev" and the row
+    is flagged role_cwd_mismatch=True for audit."""
+    cfg, repo = _suspended_cwd_cfg(tmp_path, monkeypatch)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-testuser-test-operator-p7.md", {
+        "sid": "S-testuser-test-operator-p7",
+        "status": "suspended",
+        "window": "test-operator",
+        "cwd": "/tmp/somewhere-else",
+        "claude_uuid": "uuid-op",
+        "suspended_at": "2026-06-19T10:00:00Z",
+    })
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["role"] == "dev"
+    assert rows[0]["role_cwd_mismatch"] is True
+
+
+def test_suspended_role_preserved_on_cwd_match(tmp_path, monkeypatch):
+    """A suspended operator whose cwd is the workspace parent of the dev clone
+    (the legitimate operator location) keeps its role and is NOT flagged."""
+    cfg, repo = _suspended_cwd_cfg(tmp_path, monkeypatch)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-testuser-test-operator-p7.md", {
+        "sid": "S-testuser-test-operator-p7",
+        "status": "suspended",
+        "window": "test-operator",
+        # operator lives in the workspace parent of repo (allow_parent match)
+        "cwd": str(repo.parent),
+        "claude_uuid": "uuid-op",
+        "suspended_at": "2026-06-19T10:00:00Z",
+    })
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["role"] == "operator"
+    assert not rows[0].get("role_cwd_mismatch")
+
+
+def test_suspended_teamlead_cwd_match_preserved(tmp_path, monkeypatch):
+    """A suspended teamlead whose cwd IS the repo keeps the elevated role."""
+    cfg, repo = _suspended_cwd_cfg(tmp_path, monkeypatch)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-testuser-mine-TL-p3.md", {
+        "sid": "S-testuser-mine-TL-p3",
+        "status": "suspended",
+        "window": "mine-TL",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-tl",
+        "suspended_at": "2026-06-19T10:00:00Z",
+    })
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["role"] == "teamlead"
+    assert not rows[0].get("role_cwd_mismatch")
+
+
+def test_suspended_legacy_empty_cwd_no_false_positive(tmp_path, monkeypatch):
+    """A legacy suspended row with no persisted cwd keeps its window-derived
+    role (we can't validate what isn't there) and is NOT flagged."""
+    cfg, repo = _suspended_cwd_cfg(tmp_path, monkeypatch)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-testuser-old-TL-p1.md", {
+        "sid": "S-testuser-old-TL-p1",
+        "status": "suspended",
+        "window": "old-TL",
+        "cwd": "",
+        "claude_uuid": "uuid-legacy",
+        "suspended_at": "2026-06-19T10:00:00Z",
+    })
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["role"] == "teamlead"
+    assert not rows[0].get("role_cwd_mismatch")

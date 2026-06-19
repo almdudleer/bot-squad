@@ -381,6 +381,48 @@ def _derive_role(
     return "dev"
 
 
+def _cwd_matches_repo(
+    cwd: Path | str | None,
+    repo_path: Path,
+    repo_real: Path,
+    *,
+    allow_parent: bool = False,
+) -> bool:
+    """True when ``cwd`` belongs to the project's repo, for pane filtering and
+    role-badge validation.
+
+    Mirrors the active-pane cwd filter (T-0003): a cwd matches when it IS the
+    repo, lives UNDER it, or — via resolved symlinks (symlinked dev clones) —
+    matches the real target. ``repo_real`` is ``repo_path.resolve()`` (passed in
+    so callers resolve it once). When ``allow_parent`` is set (operator panes
+    live in the workspace *parent* of the dev clone, e.g. cwd=/home/x/bot-squad
+    while repo=/home/x/bot-squad/dev), also accept a cwd that is an ANCESTOR of
+    the repo. Returns False on a None/unparseable cwd.
+    """
+    if cwd is None or cwd == "":
+        return False
+    cwd_path = cwd if isinstance(cwd, Path) else Path(cwd)
+    try:
+        cwd_real = cwd_path.resolve()
+    except OSError:
+        cwd_real = cwd_path
+    try:
+        match = (
+            cwd_path == repo_path
+            or cwd_path.is_relative_to(repo_path)
+            or cwd_real == repo_real
+            or cwd_real.is_relative_to(repo_real)
+        )
+        if not match and allow_parent:
+            match = (
+                repo_path.is_relative_to(cwd_path)
+                or repo_real.is_relative_to(cwd_path)
+            )
+        return match
+    except (ValueError, TypeError):
+        return False
+
+
 def _get_user_home() -> str:
     """Return the home directory for the current user."""
     return str(Path.home())
@@ -634,32 +676,19 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             continue
         if pane_cwd is None:
             continue
-        try:
-            pane_real = pane_cwd.resolve()
-        except OSError:
-            pane_real = pane_cwd
-        try:
-            match = (
-                pane_cwd == repo_path
-                or pane_cwd.is_relative_to(repo_path)
-                or pane_real == repo_real
-                or pane_real.is_relative_to(repo_real)
-            )
-            # T-0003: operator pane lives in repo_workspace (parent of the dev
-            # clone), e.g. cwd=/home/x/bot-squad while repo_path=/home/x/bot-squad/dev.
-            # Accept the parent-cwd case only when bounded by tmux session == slug
-            # (every project pane lives in a tmux session named after the slug, per
-            # _ensure_project_tmux_session) or window == 'operator' (spawn fixes it
-            # in routes_projects.create_project). Either bound prevents over-match
-            # to unrelated panes whose cwd happens to be an ancestor of repo_path.
-            if not match and (pane.session == slug or pane.window == "operator"):
-                match = (
-                    repo_path.is_relative_to(pane_cwd)
-                    or repo_real.is_relative_to(pane_cwd)
-                )
-            if not match:
-                continue
-        except (ValueError, TypeError):
+        # T-0003: operator pane lives in repo_workspace (parent of the dev
+        # clone), e.g. cwd=/home/x/bot-squad while repo_path=/home/x/bot-squad/dev.
+        # Accept the parent-cwd case only when bounded by tmux session == slug
+        # (every project pane lives in a tmux session named after the slug, per
+        # _ensure_project_tmux_session) or window == 'operator' (spawn fixes it
+        # in routes_projects.create_project). Either bound prevents over-match
+        # to unrelated panes whose cwd happens to be an ancestor of repo_path.
+        # T-0220: this match is factored into _cwd_matches_repo, shared with the
+        # suspended-row role-badge validation below.
+        allow_parent = pane.session == slug or pane.window == "operator"
+        if not _cwd_matches_repo(
+            pane_cwd, repo_path, repo_real, allow_parent=allow_parent
+        ):
             continue
 
         sid = compute_sid(user, pane.window, pane.pane_id)
@@ -874,6 +903,33 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 if md_tmux_session_raw and md_tmux_session_raw in live_tmux_sessions
                 else _NO_TMUX_SESSION
             )
+            # T-0141: authoritative role for suspended rows too.
+            md_role = _derive_role(
+                meta.get("window", ""), md_task_id, md_initiative,
+                extra_task_ids=md_extra_tids,
+                extra_initiatives=md_extra_inits,
+            )
+            # T-0220 (T-0169 audit §5): an ACTIVE pane's elevated role is already
+            # backed by a cwd filter (above). For a SUSPENDED row the role comes
+            # from the persisted window name ALONE — so a row whose window claims
+            # an elevated role (operator/teamlead/prod-tl/qa) but whose persisted
+            # cwd doesn't actually belong to this project would render a
+            # misleading badge. Validate the persisted cwd with the SAME matching
+            # logic the active path uses; on mismatch, neutralize to the safe
+            # "dev" default and flag the row for audit. A matching cwd — or an
+            # absent cwd (legacy rows that never persisted one) — leaves the role
+            # untouched, so existing good rows don't regress.
+            md_cwd = meta.get("cwd", "")
+            if md_cwd == "~":
+                md_cwd = ""
+            role_cwd_mismatch = False
+            if md_role != "dev" and md_cwd:
+                if not _cwd_matches_repo(
+                    md_cwd, repo_path, repo_real,
+                    allow_parent=(md_role == "operator"),
+                ):
+                    md_role = "dev"
+                    role_cwd_mismatch = True
             rows.append({
                 "sid": sid,
                 "status": display_status,
@@ -882,12 +938,10 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "activity": "suspended",
                 "activity_at": None,
                 "active_at_prompt": False,
-                # T-0141: authoritative role for suspended rows too.
-                "role": _derive_role(
-                    meta.get("window", ""), md_task_id, md_initiative,
-                    extra_task_ids=md_extra_tids,
-                    extra_initiatives=md_extra_inits,
-                ),
+                "role": md_role,
+                # T-0220: True when an elevated window-derived role was
+                # neutralized because the persisted cwd didn't match the project.
+                "role_cwd_mismatch": role_cwd_mismatch,
                 "window": meta.get("window", ""),
                 "cwd": meta.get("cwd", ""),
                 "started_at": meta.get("started_at"),
@@ -2235,21 +2289,8 @@ def gc_tmux_sessions(cfg: Any, slug: str) -> dict:
         if _is_claude_command(p.command):
             claude_counts[sess] = claude_counts.get(sess, 0) + 1
         if not rooted.get(sess) and p.cwd:
-            pane_cwd = Path(p.cwd)
-            try:
-                pane_real = pane_cwd.resolve()
-            except OSError:
-                pane_real = pane_cwd
-            try:
-                in_project = (
-                    pane_cwd == repo_path
-                    or pane_cwd.is_relative_to(repo_path)
-                    or pane_real == repo_real
-                    or pane_real.is_relative_to(repo_real)
-                )
-            except (OSError, ValueError):
-                in_project = False
-            if in_project:
+            # T-0220: shared with the active-pane / suspended-row cwd match.
+            if _cwd_matches_repo(Path(p.cwd), repo_path, repo_real):
                 rooted[sess] = True
 
     res = _run(["tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}"])

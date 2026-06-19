@@ -5,7 +5,8 @@ threshold alerts to the operator + each TL.
 Research (full notes on the ticket) bottomed out three data sources:
 
 * **Context usage** — the Claude transcript jsonl. The number that grows
-  toward the 500k compaction ceiling is the *latest* ``type:"assistant"``
+  toward the compaction ceiling (``context_ceiling()``; default 700k, T-0210)
+  is the *latest* ``type:"assistant"``
   line's ``usage.input_tokens + cache_read_input_tokens +
   cache_creation_input_tokens`` (cache_read already carries the running prior
   context, so the last turn's input side ≈ the live window size). The
@@ -45,11 +46,39 @@ from typing import Any, Iterable
 
 log = logging.getLogger(__name__)
 
-# --- thresholds (contract v3: 500k context ceiling) -------------------------
-CONTEXT_CEILING = 500_000
-CONTEXT_WARN = 400_000      # >80% → warn ("plan a compact")
-CONTEXT_URGENT = 500_000    # >=ceiling → urgent ("compact now")
+# --- thresholds (T-0210; stakeholder 2026-06-19: 700k context ceiling) -------
+# The ceiling is the 100% / "compact now" line; warn fires at CONTEXT_WARN_RATIO
+# of it (0.8 preserves the historical 400k:500k ratio → 560k at the 700k default).
+# Tunable per-install WITHOUT a redeploy via the BOT_SQUAD_CONTEXT_CEILING env
+# (read per-call), so the threshold can be retuned with a worker env change.
+DEFAULT_CONTEXT_CEILING = 700_000
+CONTEXT_WARN_RATIO = 0.8
 MEMORY_WARN_TOKENS = 40_000  # per-agent memory footprint warn line
+
+
+def context_ceiling() -> int:
+    """Context-window ceiling in tokens (100% / "compact now"). Overridable via
+    ``BOT_SQUAD_CONTEXT_CEILING``; non-positive/garbage values fall back to the
+    default so a bad env can never disable the alerts."""
+    raw = os.environ.get("BOT_SQUAD_CONTEXT_CEILING")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_CONTEXT_CEILING
+
+
+def context_urgent() -> int:
+    """Tokens at/above which context is 'urgent' (= the ceiling)."""
+    return context_ceiling()
+
+
+def context_warn() -> int:
+    """Tokens at/above which context is 'warn' (CONTEXT_WARN_RATIO of ceiling)."""
+    return int(context_ceiling() * CONTEXT_WARN_RATIO)
 
 # First-sample tail size: enough to contain at least one full assistant turn.
 _TAIL_BYTES = 256 * 1024
@@ -180,9 +209,9 @@ def memory_stats(memory_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def context_level(tokens: int) -> str:
-    if tokens >= CONTEXT_URGENT:
+    if tokens >= context_urgent():
         return "urgent"
-    if tokens >= CONTEXT_WARN:
+    if tokens >= context_warn():
         return "warn"
     return "none"
 
@@ -421,7 +450,7 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
                 saw_429 = scan["saw_429"]
         memory = memory_stats(transcript.parent / "memory")
 
-    pct = round(context_tokens / CONTEXT_CEILING * 100.0, 1)
+    pct = round(context_tokens / context_ceiling() * 100.0, 1)
     rec = {
         "sid": sid,
         "claude_uuid": claude_uuid,
@@ -433,7 +462,7 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
         "context": {
             "tokens": context_tokens,
             "pct": pct,
-            "ceiling": CONTEXT_CEILING,
+            "ceiling": context_ceiling(),
             "model": model,
         },
         "memory": memory,
@@ -556,9 +585,9 @@ def _fire_alerts(
             _alert_session(
                 cfg, slug, sid, operator_sids,
                 f"{verb} — {sid} context {ctx_tokens:,} tok "
-                f"({rec['context']['pct']}% of {CONTEXT_CEILING:,}). "
+                f"({rec['context']['pct']}% of {context_ceiling():,}). "
                 + ("Run /compact immediately." if ctx_new == "urgent"
-                   else "Plan a /compact before the 500k ceiling."),
+                   else f"Plan a /compact before the {context_ceiling():,} ceiling."),
             )
         if last.get("context") != ctx_new:
             last["context"] = ctx_new

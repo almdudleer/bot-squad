@@ -340,7 +340,8 @@ def telemetry_tick(cfg: Config) -> None:
     never delay the lifecycle reconcilers). Samples each LIVE session's
     context-token window + memory footprint from the Claude transcript jsonl,
     persists a small per-session record + a project quota rollup, and fires
-    crossing-only urgent alerts (context >400k/>500k, memory near cap, quota
+    crossing-only urgent alerts (context warn/urgent at 0.8×/1.0× the ceiling,
+    default 560k/700k per T-0210, memory near cap, quota
     projected-exhaust-before-EOD, 429 throttle) to the operator + each TL.
     Per-project errors are caught and logged so one bad project never kills
     the sweep.

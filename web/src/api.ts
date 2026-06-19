@@ -1,4 +1,8 @@
+import type { FlowGraph } from "./utils/flowGraph";
+
 type Json = Record<string, unknown> | unknown[];
+
+export type { FlowGraph };
 
 // T-0138/T-0139: pages distinguish "the slug/task doesn't exist" (render a
 // not-found panel) from transient network errors (offer a retry). The
@@ -179,6 +183,9 @@ export type FlowDetail = {
   created?: string;
   body: string;
   raw: string;
+  // T-0226: structured node-graph (parsed from the flow md `graph:` frontmatter
+  // key by the backend's `{**meta}` spread). Absent == markdown-only flow.
+  graph?: FlowGraph;
 };
 
 export type SessionRow = {

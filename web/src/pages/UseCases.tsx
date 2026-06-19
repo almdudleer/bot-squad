@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 import { api, FlowDetail, FlowSummary, UseCaseSummary, UseCaseDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
 import { Mermaid, extractMermaid } from "../components/Mermaid";
+import { FlowGraphEditor } from "../components/FlowGraphEditor";
 
 export function UseCases() {
   const { slug = "" } = useParams();
@@ -20,6 +21,8 @@ export function UseCases() {
   const [openFlowId, setOpenFlowId] = useState<string | null>(null);
   const [flowDetail, setFlowDetail] = useState<FlowDetail | null>(null);
   const [flowDraft, setFlowDraft] = useState<string | null>(null);
+  // T-0226: structured node-graph editor mode (parallel to the raw-md editor).
+  const [graphEditing, setGraphEditing] = useState(false);
 
   function reload() {
     api.useCases(slug).then(setItems).catch((e) => setError(String(e)));
@@ -109,6 +112,7 @@ export function UseCases() {
     setOpenFlowId(flowId);
     setFlowDetail(null);
     setFlowDraft(null);
+    setGraphEditing(false);
     try {
       setFlowDetail(await api.flow(slug, selected, flowId));
     } catch (e) {
@@ -145,6 +149,25 @@ export function UseCases() {
       reloadFlows(selected);
       setFlowDetail(await api.flow(slug, selected, openFlowId));
       setFlash("Flow saved.");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // T-0226: persist the structured graph — the editor already serialized it
+  // into the flow md (frontmatter graph: + derived mermaid); we just PUT raw.
+  async function saveFlowGraph(newRaw: string) {
+    if (!selected || !openFlowId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.putFlow(slug, selected, openFlowId, newRaw);
+      setGraphEditing(false);
+      reloadFlows(selected);
+      setFlowDetail(await api.flow(slug, selected, openFlowId));
+      setFlash("Flow graph saved — mermaid regenerated.");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -247,15 +270,26 @@ export function UseCases() {
                   ))}
                 </div>
 
-                {openFlowId && flowDraft === null && flowDetail && (
+                {openFlowId && flowDraft === null && !graphEditing && flowDetail && (
                   <div style={{ border: "1px solid var(--mc-border)", borderRadius: "4px", padding: "0.75rem" }}>
                     <div className="d-flex justify-content-between align-items-center mb-2">
                       <div style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem", fontWeight: 600 }}>
                         {flowDetail.id} — {flowDetail.title}
+                        {flowDetail.graph && flowDetail.graph.nodes.length > 0 && (
+                          <span className="badge ms-2" style={{ background: "var(--mc-accent, #2f6feb)", fontSize: "0.6rem" }}>
+                            graph · {flowDetail.graph.nodes.length} nodes
+                          </span>
+                        )}
                       </div>
-                      <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.7rem" }} onClick={() => setFlowDraft(flowDetail.raw)}>
-                        Edit flow
-                      </button>
+                      <div className="d-flex gap-2">
+                        {/* T-0226: structured graph editor (mermaid derived). */}
+                        <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} onClick={() => setGraphEditing(true)}>
+                          {flowDetail.graph && flowDetail.graph.nodes.length > 0 ? "Edit graph" : "Build graph"}
+                        </button>
+                        <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.7rem" }} onClick={() => setFlowDraft(flowDetail.raw)}>
+                          Edit md
+                        </button>
+                      </div>
                     </div>
                     {mermaidSrc ? (
                       <Mermaid code={mermaidSrc} />
@@ -266,6 +300,16 @@ export function UseCases() {
                     )}
                     <pre className="mc-pre mt-2">{flowDetail.body}</pre>
                   </div>
+                )}
+
+                {openFlowId && graphEditing && flowDetail && (
+                  <FlowGraphEditor
+                    initial={flowDetail.graph}
+                    rawMd={flowDetail.raw}
+                    busy={busy}
+                    onSave={saveFlowGraph}
+                    onCancel={() => setGraphEditing(false)}
+                  />
                 )}
 
                 {openFlowId && flowDraft !== null && (

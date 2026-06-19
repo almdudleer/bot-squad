@@ -10,6 +10,10 @@ dependencies = [
     "python-multipart>=0.0.9",
     "pyyaml>=6.0",
     "bcrypt>=5",
+    # T-0179: Fernet at-rest encryption for secrets.toml values. Used by the
+    # shared secret_crypto.py (mirrored to worker/bot_squad_worker/) that
+    # routes_settings calls to encrypt the TG bot token on write.
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

@@ -102,6 +102,8 @@ def test_put_writes_settings_and_creates_file(tmp_bot_squad: Path, monkeypatch) 
 
 
 def test_put_bot_token_writes_secrets(tmp_bot_squad: Path, monkeypatch) -> None:
+    # No BOT_SQUAD_SECRETS_KEY (dev / fresh install) → plaintext passthrough.
+    monkeypatch.delenv("BOT_SQUAD_SECRETS_KEY", raising=False)
     _set_env(monkeypatch, tmp_bot_squad)
     app = build_app()
     with TestClient(app) as client:
@@ -112,6 +114,28 @@ def test_put_bot_token_writes_secrets(tmp_bot_squad: Path, monkeypatch) -> None:
     assert body["tg"]["bot_token_set"] is True
     raw = tomllib.loads((tmp_bot_squad / "config" / "secrets.toml").read_text())
     assert raw["telegram"]["bot_token"] == "12345:ABCDEF"
+
+
+def test_put_bot_token_encrypts_at_rest_with_key(tmp_bot_squad: Path, monkeypatch) -> None:
+    # T-0179: when a key is configured, the token is encrypted at rest (enc:
+    # prefix) — the plaintext never lands on disk — and round-trips via decrypt.
+    from cryptography.fernet import Fernet
+
+    from app import secret_crypto
+
+    monkeypatch.setenv("BOT_SQUAD_SECRETS_KEY", Fernet.generate_key().decode("ascii"))
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put("/api/system-settings", json={"tg": {"bot_token": "12345:ABCDEF"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["tg"]["bot_token_set"] is True
+    raw = tomllib.loads((tmp_bot_squad / "config" / "secrets.toml").read_text())
+    stored = raw["telegram"]["bot_token"]
+    assert stored.startswith("enc:")
+    assert "12345:ABCDEF" not in stored  # plaintext is not on disk
+    assert secret_crypto.decrypt(stored) == "12345:ABCDEF"
 
 
 def test_put_bot_token_clear(tmp_bot_squad: Path, monkeypatch) -> None:

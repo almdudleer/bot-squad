@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import secret_crypto
+
 
 @dataclass(frozen=True)
 class Project:
@@ -160,6 +162,11 @@ class Config:
             for slug, p in raw.get("projects", {}).items()
         }
         sec = tomllib.loads(secrets_toml.read_text())
+        # T-0179: secret values are encrypted at rest (enc: prefix) when a
+        # BOT_SQUAD_SECRETS_KEY is configured. decrypt() transparently returns
+        # legacy plaintext as-is, and raises loud on an enc: value it can't
+        # decrypt (never silently reads ciphertext as the token).
+        bot_token = secret_crypto.decrypt(sec.get("telegram", {}).get("bot_token", ""))
 
         # system_settings.toml is optional; defaults match the historical hardcoded
         # values so existing deploys behave identically until the admin writes it.
@@ -183,7 +190,7 @@ class Config:
         return cls(
             config_dir=config_dir,
             projects=projects,
-            tg_bot_token=sec.get("telegram", {}).get("bot_token", ""),
+            tg_bot_token=bot_token,
             tg_auth_age_max=int(sec.get("telegram", {}).get("auth_age_max", 86400)),
             tg_quiet_hours_start_utc=quiet_start,
             tg_quiet_hours_end_utc=quiet_end,

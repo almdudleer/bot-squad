@@ -14,6 +14,10 @@ dependencies = [
     # pyyaml so block- and inline-style YAML lists parse identically. Replaces
     # the worker's hand-rolled line-based frontmatter readers.
     "pyyaml>=6",
+    # T-0179: Fernet at-rest encryption for secrets.toml values. Used by the
+    # shared secret_crypto.py (mirrored from api/app/secret_crypto.py) that
+    # config.load() calls to decrypt the TG bot token.
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

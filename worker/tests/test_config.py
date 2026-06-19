@@ -39,6 +39,51 @@ def test_secrets_loads(tmp_config_dir: Path) -> None:
     assert cfg.tg_bot_token == "TESTBOT:TOKEN"
 
 
+def test_secrets_decrypts_encrypted_bot_token(tmp_config_dir: Path, monkeypatch) -> None:
+    # T-0179: a key-encrypted bot_token at rest is transparently decrypted on load.
+    from cryptography.fernet import Fernet
+
+    from bot_squad_worker import secret_crypto
+
+    monkeypatch.setenv("BOT_SQUAD_SECRETS_KEY", Fernet.generate_key().decode("ascii"))
+    enc = secret_crypto.encrypt("REALBOT:SECRET")
+    assert enc.startswith("enc:")  # sanity: actually encrypted
+    (tmp_config_dir / "secrets.toml").write_text(
+        f'[telegram]\nbot_token = "{enc}"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_bot_token == "REALBOT:SECRET"
+
+
+def test_secrets_legacy_plaintext_read_even_with_key(tmp_config_dir: Path, monkeypatch) -> None:
+    # T-0179 migration: a not-yet-migrated plaintext token stays readable.
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("BOT_SQUAD_SECRETS_KEY", Fernet.generate_key().decode("ascii"))
+    (tmp_config_dir / "secrets.toml").write_text(
+        '[telegram]\nbot_token = "LEGACY:PLAINTEXT"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tg_bot_token == "LEGACY:PLAINTEXT"
+
+
+def test_secrets_enc_token_without_key_raises_loud(tmp_config_dir: Path, monkeypatch) -> None:
+    # T-0179 landmine: an enc: token with no key must fail loud, never be read
+    # as ciphertext-as-if-plaintext.
+    from cryptography.fernet import Fernet
+
+    from bot_squad_worker import secret_crypto
+
+    monkeypatch.setenv("BOT_SQUAD_SECRETS_KEY", Fernet.generate_key().decode("ascii"))
+    enc = secret_crypto.encrypt("REALBOT:SECRET")
+    monkeypatch.delenv("BOT_SQUAD_SECRETS_KEY", raising=False)
+    (tmp_config_dir / "secrets.toml").write_text(
+        f'[telegram]\nbot_token = "{enc}"\n'
+    )
+    with pytest.raises(secret_crypto.SecretCryptoError):
+        Config.load(tmp_config_dir)
+
+
 def test_stall_settings_default(tmp_config_dir: Path) -> None:
     # T-0155: defaults when system_settings.toml is absent.
     cfg = Config.load(tmp_config_dir)

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app import secret_crypto
 from app.routes_auth import require_admin
 
 router = APIRouter(
@@ -136,7 +137,10 @@ def _write_secrets(config_dir: Path, bot_token: str, auth_age_max: int) -> None:
         "# also mounted RO into the worker.",
         "",
         "[telegram]",
-        f'bot_token = "{_toml_escape(bot_token)}"',
+        # T-0179: encrypt the token at rest when a BOT_SQUAD_SECRETS_KEY is
+        # configured. No key (dev / fresh install) → encrypt() is a passthrough
+        # and the value stays plaintext. A cleared ("") token stays "".
+        f'bot_token = "{_toml_escape(secret_crypto.encrypt(bot_token))}"',
         f"auth_age_max = {int(auth_age_max)}",
         "",
     ]

@@ -39,6 +39,11 @@ Type=simple
 WorkingDirectory=/home/www/bot-squad
 Environment=PYTHONUNBUFFERED=1
 Environment=LOG_LEVEL=info
+# T-0179: load the install .env so the worker sees BOT_SQUAD_SECRETS_KEY (the
+# at-rest encryption key for secrets.toml). Leading '-' = optional so a missing
+# .env never blocks startup (no key → secrets stay plaintext). See the
+# coordinator unit for the full rationale.
+EnvironmentFile=-/home/www/bot-squad/.env
 Environment=BOT_SQUAD_MODE=user-worker
 ExecStart=/home/www/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/www/bot-squad/config
 Restart=on-failure

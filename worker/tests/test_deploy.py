@@ -13,7 +13,14 @@ from pathlib import Path
 import pytest
 
 from bot_squad_worker.config import Config, Project
-from bot_squad_worker.deploy import DeployResult, enqueue, list_queued, run_next
+from bot_squad_worker.deploy import (
+    DeployResult,
+    _recipe_path,
+    _tracked_recipe_path,
+    enqueue,
+    list_queued,
+    run_next,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +279,69 @@ def test_run_next_missing_recipe_fails_with_rc99(tmp_path: Path) -> None:
     processed_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processed"
     fail_files = list(processed_dir.glob("*.fail.99"))
     assert len(fail_files) == 1
+
+
+# ---------------------------------------------------------------------------
+# T-0205: version-controlled recipes (deploy-recipes/<slug>/<target>.sh)
+# preferred over the legacy runtime copy under data/.
+# ---------------------------------------------------------------------------
+
+
+def _make_tracked_recipe(
+    cfg: Config, slug: str, target: str, rc: int = 0, marker: str = "tracked"
+) -> Path:
+    """Drop a version-controlled recipe at <install>/deploy-recipes/<slug>/<target>.sh."""
+    recipe_dir = cfg.config_dir.parent / "deploy-recipes" / slug
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / f"{target}.sh"
+    recipe.write_text(
+        f'#!/usr/bin/env bash\nset -euo pipefail\necho "{marker} recipe running"\nexit {rc}\n'
+    )
+    recipe.chmod(0o755)
+    return recipe
+
+
+def test_recipe_path_falls_back_to_data_when_untracked(tmp_path: Path) -> None:
+    """No tracked copy → resolve the legacy data/<slug>/deploy/<target>.sh."""
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    legacy = _make_recipe(tmp_path, cfg, proj.slug, "staging")
+
+    assert _recipe_path(cfg, proj.slug, "staging") == legacy
+
+
+def test_recipe_path_prefers_tracked_over_data(tmp_path: Path) -> None:
+    """A version-controlled copy wins over the legacy runtime copy."""
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging")  # legacy data/ copy present
+    tracked = _make_tracked_recipe(cfg, proj.slug, "staging")
+
+    resolved = _recipe_path(cfg, proj.slug, "staging")
+    assert resolved == tracked
+    assert resolved == _tracked_recipe_path(cfg, proj.slug, "staging")
+    assert resolved != cfg.data_dir / proj.slug / "deploy" / "staging.sh"
+
+
+def test_run_next_executes_tracked_recipe(tmp_path: Path) -> None:
+    """run_next runs the tracked recipe, not the legacy data/ copy.
+
+    The legacy copy is rigged to FAIL (rc=17) and the tracked copy to SUCCEED
+    (rc=0); a clean success + the tracked marker in the run-log proves which
+    file actually ran.
+    """
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=17)  # would fail if used
+    _make_tracked_recipe(cfg, proj.slug, "staging", rc=0)
+
+    enqueue(cfg, proj.slug, "staging", "tracked deploy", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is True
+    assert result.returncode == 0
+    assert "tracked recipe running" in result.log_path.read_text()
 
 
 # ---------------------------------------------------------------------------

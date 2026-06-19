@@ -30,7 +30,11 @@ Queue file lifecycle:
         → processed/<id>.ok      (on success)
         → processed/<id>.fail.<rc>  (on failure)
 
-Recipe convention: data/<slug>/deploy/<target>.sh
+Recipe convention (T-0205): the recipe is version-controlled in the bot-squad
+    repo at ``deploy-recipes/<slug>/<target>.sh`` and shipped into the install
+    root by the install's git ff-merge. ``_recipe_path`` PREFERS that tracked
+    copy and falls back to the legacy runtime copy at
+    ``data/<slug>/deploy/<target>.sh`` for not-yet-migrated projects.
     Executed via ``bash <recipe_path>`` with cwd = the exec clone for the
     target (``project.repo_for_target``): the deploy clone when configured,
     else the dev clone (staging) / master clone (prod).
@@ -217,7 +221,30 @@ def resume(cfg: "Config", slug: str) -> bool:
     return True
 
 
+def _tracked_recipe_path(cfg: "Config", slug: str, target: str) -> Path:
+    """Version-controlled recipe location (T-0205).
+
+    Tracked in the bot-squad repo at ``deploy-recipes/<slug>/<target>.sh`` and
+    shipped into the install root (``config_dir.parent`` ==
+    ``/home/www/bot-squad``) by the install's git ff-merge on every bot-squad
+    deploy. This is the SSOT a recipe change goes through review + git history,
+    instead of a live hand-edit of the runtime copy under ``data/``.
+    """
+    return cfg.config_dir.parent / "deploy-recipes" / slug / f"{target}.sh"
+
+
 def _recipe_path(cfg: "Config", slug: str, target: str) -> Path:
+    """Resolve the deploy recipe for ``slug``/``target``.
+
+    Prefers the version-controlled copy (``_tracked_recipe_path``) so recipe
+    changes are reviewable + versioned (T-0205). Falls back to the legacy
+    runtime copy at ``data/<slug>/deploy/<target>.sh`` for projects whose
+    recipe has not been brought under version control yet — so migration is
+    incremental and un-tracked projects keep working unchanged.
+    """
+    tracked = _tracked_recipe_path(cfg, slug, target)
+    if tracked.exists():
+        return tracked
     return cfg.data_dir / slug / "deploy" / f"{target}.sh"
 
 

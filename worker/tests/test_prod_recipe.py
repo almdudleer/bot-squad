@@ -1,12 +1,15 @@
-"""Smoke test for data/bot-squad/deploy/prod.sh (T-0081).
+"""Smoke test for deploy-recipes/bot-squad/prod.sh (T-0081, T-0205).
 
 Exercises the real recipe end-to-end against a throwaway git repo + install
 dir. Skipped if the recipe isn't present on the host (e.g. a dev checkout
 without the install symlink).
 
-The recipe lives in the install's ops dir (`$BOT_SQUAD/data/bot-squad/
-deploy/prod.sh`), not in the source tree — same pattern as staging.sh.
-We resolve it by env-var, defaulting to the standard install path.
+T-0205 brought deploy recipes under version control: the SSOT is now the
+tracked ``deploy-recipes/bot-squad/prod.sh`` in this repo (shipped into the
+install root by the install's git ff-merge). We resolve the recipe in priority
+order: the ``BOTSQUAD_PROD_RECIPE`` env override, then the tracked repo copy
+(so the test smokes exactly the file under review), then the legacy runtime
+copy under ``data/`` for backward compatibility.
 """
 from __future__ import annotations
 
@@ -19,12 +22,18 @@ from pathlib import Path
 import pytest
 
 
-RECIPE_PATH = Path(
-    os.environ.get(
-        "BOTSQUAD_PROD_RECIPE",
-        "/home/www/bot-squad/data/bot-squad/deploy/prod.sh",
-    )
-)
+def _resolve_recipe() -> Path:
+    override = os.environ.get("BOTSQUAD_PROD_RECIPE")
+    if override:
+        return Path(override)
+    # repo_root/worker/tests/test_prod_recipe.py → parents[2] == repo root.
+    tracked = Path(__file__).resolve().parents[2] / "deploy-recipes" / "bot-squad" / "prod.sh"
+    if tracked.exists():
+        return tracked
+    return Path("/home/www/bot-squad/data/bot-squad/deploy/prod.sh")
+
+
+RECIPE_PATH = _resolve_recipe()
 
 
 pytestmark = pytest.mark.skipif(

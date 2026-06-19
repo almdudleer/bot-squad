@@ -66,6 +66,8 @@ def test_registry_lists_only_allowed_actions():
         "doc_new", "uc_new", "flow_new", "initiative_new",
         # Phase 9: bind multi-task-per-dev / multi-initiative-per-TL.
         "bind_task", "bind_initiative",
+        # T-0237 Layer-2: operator-invoked reuse-vs-spawn dispatch decision.
+        "dispatch_decision",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.

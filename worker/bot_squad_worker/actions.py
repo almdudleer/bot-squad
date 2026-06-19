@@ -1423,6 +1423,30 @@ def _action_bind_task(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.bind_task(cfg, params["slug"], params["sid"], params["task_id"])
 
 
+_DISPATCH_DECISION_REQUIRED = {"slug", "task_id"}
+_DISPATCH_DECISION_ALLOWED = _DISPATCH_DECISION_REQUIRED
+
+
+def _action_dispatch_decision(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0237 Layer-2 v1: recommend reuse-vs-spawn for an unbound task.
+
+    Required params: slug, task_id. Returns the decision record
+    ``{ok, decision: 'reuse'|'spawn', target_sid, reason, candidates: [...]}``.
+    Advisory only — the operator/TL acts on the recommendation via the existing
+    spawn / resume paths; this never spawns on its own (operator fork S2).
+    """
+    extra = set(params) - _DISPATCH_DECISION_ALLOWED
+    if extra:
+        raise ActionError(f"dispatch_decision got unexpected params: {sorted(extra)}")
+    missing = _DISPATCH_DECISION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"dispatch_decision missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import dispatch as _dispatch
+    return _dispatch.decide_dispatch(cfg, params["slug"], params["task_id"])
+
+
 _SET_DRIFT_PAUSED_REQUIRED = {"slug", "sid", "paused"}
 _SET_DRIFT_PAUSED_ALLOWED = _SET_DRIFT_PAUSED_REQUIRED
 
@@ -2027,6 +2051,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "initiative_new": _action_initiative_new,
     "bind_task": _action_bind_task,
     "bind_initiative": _action_bind_initiative,
+    # T-0237 Layer-2: operator-invoked reuse-vs-spawn dispatch recommendation.
+    "dispatch_decision": _action_dispatch_decision,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
     "unbind_task": _action_unbind_task,
@@ -2072,6 +2098,8 @@ ACTION_MODES: dict[str, str] = {
     "pause_deploys": "coordinator_only",
     "resume_deploys": "coordinator_only",
     "list_sessions": "tmux_only",
+    # T-0237: pure local fs read (session mds + telemetry records), no tmux.
+    "dispatch_decision": "tmux_only",
     # telemetry_get reads the SHARED install data dir (all users' sampled
     # records land there) → a single coordinator read, not a per-user fan-out.
     "telemetry_get": "coordinator_only",

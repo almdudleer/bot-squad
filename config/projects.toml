@@ -21,6 +21,15 @@ repo_path     = "/home/almdudleer/watchrobot/dev"
 # hotfixes, and rollbacks. The dev clone is never touched for these so the
 # agent team can keep working uninterrupted.
 repo_master   = "/home/almdudleer/watchrobot/master"
+# Deploy clone (T-0143/T-0225): local CI/CD checkout for the STAGING target,
+# parallel to dev/master. The deploy worker creates it on first deploy and
+# force-syncs it to origin/bot_squad/dev each run, so the SHARED dev clone's
+# dirty tree / unpushed commits no longer gate watchrobot's staging deploy —
+# the recipe builds from the latest PUSHED commit. This removes the multi-team
+# head-of-line block (one team's WIP on the shared clone deferring all teams'
+# deploys). No agent ever edits here. (prod still deploys in-place from the
+# master clone above, which keeps the destroy-guard on unpushed commits.)
+repo_deploy   = "/home/almdudleer/watchrobot/deploy"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
 # RETAINED (external infra — see note above): real deployment URLs.

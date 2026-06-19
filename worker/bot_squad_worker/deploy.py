@@ -11,11 +11,14 @@ list_queued(cfg, slug) -> list[Path]
 run_next(cfg, slug) -> DeployResult | None
     Pop the oldest queued request, run the commit-guard + clone prep, run recipe.
     - Returns None if queue is empty.
-    - Returns None if the editing clone has unpushed local-only commits (queue
-      file stays — push first), or deploy-clone provisioning failed.
-    - Returns None if the legacy in-place tree is dirty (queue file stays).
-      When a deploy clone is configured (T-0143) the recipe runs in a disposable
-      clone force-synced to origin, so dev-tree dirtiness no longer gates.
+    - Returns None if deploy-clone provisioning failed.
+    - (Legacy in-place path only) Returns None if the editing tree is dirty or
+      has unpushed local-only commits (queue file stays — push first), because
+      the recipe runs in place and its ff-only merge would wipe them.
+    - When a deploy clone is configured (T-0143) the recipe runs in a disposable
+      clone force-synced to origin, so the shared editing tree's dirtiness AND
+      its unpushed commits no longer gate (T-0225) — unpushed commits there are
+      merely OMITTED from the release, logged as a loud advisory, not blocked.
     - Returns DeployResult(ok, returncode, queue_id, log_path) on success or
       failure (rc != 0 or recipe file missing → rc=99).
 
@@ -316,24 +319,32 @@ def is_clean_for_target(cfg: "Config", slug: str, target: str) -> bool:
     Lets callers (e.g. the deploy_monitor in jobs.py) gate user-facing
     notifications without re-implementing the check or popping a queue file.
 
-    Returns False when:
-    - (legacy, no deploy clone) the exec/editing clone has a dirty working
-      tree — the recipe runs in place, so uncommitted edits would leak in; OR
-    - the EDITING clone (dev/master) has local-only commits not yet on origin
-      (T-0110/T-0116) — a deploy ships ``origin/<branch>`` and would silently
-      omit them, so the agent must push first.
+    Deploy-clone path (T-0143/T-0225): when a deploy clone is configured the
+    recipe runs from a disposable clone ``run_next`` force-syncs to
+    origin/<branch>; the shared editing clone is never touched. So NEITHER its
+    dirty working tree NOR its unpushed commits can affect or be destroyed by
+    the deploy — they'd merely be OMITTED (origin is the SSOT). Gating on the
+    shared clone's state HOL-blocks EVERY team's deploy whenever any one team
+    has WIP there (the multi-team stall T-0225 fixes), so this returns True and
+    the deploy is always clear to start. ``run_next`` still logs a loud advisory
+    for any unpushed commits so the deployer knows to push them.
 
-    When a deploy clone is configured (T-0143), the dev tree's dirty/clean
-    state is NO LONGER a gate: the deploy runs from a disposable clone that
-    ``run_next`` force-syncs to origin. Only the unpushed-commit guard remains.
+    Legacy in-place path (no deploy clone) returns False when:
+    - the exec/editing clone has a dirty working tree — the recipe runs in
+      place, so uncommitted edits would leak in; OR
+    - the editing clone has local-only commits not yet on origin (T-0110/T-0116)
+      — the recipe's ``git merge --ff-only origin/<branch>`` would WIPE them,
+      so the agent must push first.
     """
     project = cfg.projects[slug]
     edit_repo = project.editing_repo_for_target(target)
-    if not project.uses_deploy_clone(target):
-        # Legacy in-place deploy: the exec clone IS the editing clone — its
-        # uncommitted edits would leak into the recipe, so gate on cleanliness.
-        if not _is_clean(edit_repo):
-            return False
+    if project.uses_deploy_clone(target):
+        return True
+    # Legacy in-place deploy: the exec clone IS the editing clone — uncommitted
+    # edits would leak into the recipe and unpushed commits would be destroyed
+    # by its ff-only merge, so both gate.
+    if not _is_clean(edit_repo):
+        return False
     return not _local_only_commits(edit_repo)
 
 
@@ -371,20 +382,36 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     edit_repo = project.editing_repo_for_target(target)
     uses_deploy = project.uses_deploy_clone(target)
 
-    # Commit-guard (T-0110/T-0116/T-0143): refuse when the EDITING clone has
-    # local-only commits not yet on origin. With a deploy clone the deploy ships
-    # origin/<branch>, so unpushed commits would be silently OMITTED from the
-    # release; without one the recipe's `git merge --ff-only origin/<branch>`
-    # would wipe them. Either way the fix is the same — push first. List them
-    # loudly so the agent can recover. Runs regardless of recipe presence so a
-    # fresh-host install inherits the guard.
-    # Bypass for tests / emergency via BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1.
-    if os.environ.get("BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS") != "1":
-        local_only = _local_only_commits(edit_repo)
-        if local_only:
+    # Commit-guard (T-0110/T-0116/T-0143/T-0225): the EDITING clone may carry
+    # commits not yet on origin. What that means for the deploy depends on the
+    # path, so the guard is BLOCK-on-destroy / WARN-on-omit:
+    #   - Legacy in-place path (no deploy clone): the recipe runs `git merge
+    #     --ff-only origin/<branch>` IN the editing clone, so unpushed local
+    #     commits would be DESTROYED. Hard refuse — push first. List them loudly.
+    #     Runs regardless of recipe presence so a fresh-host install inherits it.
+    #     Bypass for tests/emergency via BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1.
+    #   - Deploy-clone path (T-0225): the recipe runs in a disposable clone
+    #     force-synced to origin/<branch>; the shared editing clone is never
+    #     touched, so unpushed commits there can't be destroyed — only OMITTED
+    #     from this release. Hard-blocking here HOL-defers EVERY team's deploy
+    #     whenever any one team has committed-but-unpushed WIP on the shared
+    #     clone (the multi-team stall). So log a loud advisory naming the omitted
+    #     commits (so the deployer can push) and PROCEED from origin.
+    local_only = _local_only_commits(edit_repo)
+    if local_only:
+        if uses_deploy:
+            log.warning(
+                "deploy.run_next: %s/%s — %d commit(s) on the editing clone %s are NOT on "
+                "origin and will be OMITTED from this release (the deploy ships origin/%s from "
+                "the deploy clone, which never touches the shared editing tree):\n    %s\n"
+                "Push them if they belong in this deploy; proceeding from origin/%s.",
+                slug, target, len(local_only), edit_repo, project.deploy_branch,
+                "\n    ".join(local_only), project.deploy_branch,
+            )
+        elif os.environ.get("BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS") != "1":
             log.error(
                 "deploy.run_next: %s/%s REFUSED — %d local-only commit(s) on %s not pushed to origin "
-                "(a deploy ships origin/<branch> and would silently omit them):\n    %s\n"
+                "(a legacy in-place deploy ff-only-merges origin/<branch> and would WIPE them):\n    %s\n"
                 "Recover by pushing them to origin (or cherry-picking into the canonical dev clone), then re-deploy. "
                 "Set BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS=1 to bypass.",
                 slug, target, len(local_only), edit_repo, "\n    ".join(local_only),

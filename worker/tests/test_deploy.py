@@ -616,13 +616,17 @@ def test_run_next_deploy_clone_refreshes_to_origin(tmp_path: Path) -> None:
     assert head_file.read_text().strip() == commit2
 
 
-def test_run_next_deploy_clone_refuses_unpushed_dev_commits(
+def test_run_next_deploy_clone_proceeds_with_unpushed_dev_commits(
     tmp_path: Path, caplog
 ) -> None:
-    """Commit-guard still fires — but now against the dev (editing) clone.
+    """T-0225: unpushed dev commits no longer DEFER a deploy-clone deploy.
 
-    A commit on dev that isn't on origin would be silently omitted by a deploy
-    that ships origin/<branch>, so refuse until it's pushed.
+    The deploy ships origin/<branch> from a disposable clone that never touches
+    the shared editing tree, so an unpushed commit there is merely OMITTED — not
+    destroyed. Hard-blocking it (the pre-T-0225 behaviour) HOL-deferred EVERY
+    team's deploy whenever one team had committed-but-unpushed WIP on the shared
+    clone. So the deploy PROCEEDS, logging a loud advisory naming the omitted
+    commit(s) so the deployer knows to push them.
     """
     import logging
 
@@ -633,16 +637,41 @@ def test_run_next_deploy_clone_refuses_unpushed_dev_commits(
 
     sha = _add_local_commit(proj.repo_path)  # committed to dev, NOT pushed
 
-    enqueue(cfg, proj.slug, "staging", "should be refused", "user")
-    with caplog.at_level(logging.ERROR):
+    enqueue(cfg, proj.slug, "staging", "proceeds despite unpushed", "user")
+    with caplog.at_level(logging.WARNING):
         result = run_next(cfg, proj.slug)
 
-    assert result is None
-    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
-    assert len(list(queue_dir.glob("*.json"))) == 1  # queue file preserved
+    assert result is not None
+    assert result.ok is True
+    # The advisory names the omitted commit (so the deployer can push it).
     joined = "\n".join(r.getMessage() for r in caplog.records)
     assert sha in joined
-    assert "local-only" in joined
+    assert "OMITTED" in joined
+
+
+def test_run_next_deploy_clone_ships_origin_not_unpushed_dev_commit(
+    tmp_path: Path,
+) -> None:
+    """T-0225 correctness: with an unpushed dev commit present, the deploy still
+    runs from origin's tip (the deploy clone), NOT the dev clone's unpushed HEAD
+    — proceeding does not leak unpushed work into the release."""
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+    head_file = tmp_path / "deploy_head.txt"
+    _recipe_recording_head(tmp_path, cfg, proj.slug, "staging", head_file)
+
+    origin_tip = _head(proj.repo_path)  # == origin (pushed by _attach_origin)
+    _add_local_commit(proj.repo_path)   # dev HEAD now ahead of origin (unpushed)
+    assert _head(proj.repo_path) != origin_tip
+
+    enqueue(cfg, proj.slug, "staging", "ship origin", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.ok is True
+    # The recipe ran in the deploy clone at ORIGIN's tip, not the unpushed HEAD.
+    assert _head(proj.repo_deploy) == origin_tip
+    assert head_file.read_text().strip() == origin_tip
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +844,10 @@ def test_reap_orphans_ignores_fresh_processing(tmp_path: Path) -> None:
     assert len(list(proc_dir.glob("*.json"))) == 1
 
 
-def test_is_clean_for_target_deploy_clone_ignores_dev_dirtiness(tmp_path: Path) -> None:
+def test_is_clean_for_target_deploy_clone_ignores_dev_state(tmp_path: Path) -> None:
+    """T-0225: for a deploy-clone project, NEITHER a dirty dev tree NOR unpushed
+    dev commits gate the pre-ping cleanliness check — origin is the SSOT, so one
+    team's WIP on the shared clone never defers another team's deploy."""
     from bot_squad_worker.deploy import is_clean_for_target
 
     proj = _make_deploy_project(tmp_path)
@@ -826,9 +858,10 @@ def test_is_clean_for_target_deploy_clone_ignores_dev_dirtiness(tmp_path: Path) 
     (proj.repo_path / "WIP.txt").write_text("uncommitted")
     assert is_clean_for_target(cfg, proj.slug, "staging") is True
 
-    # But an unpushed dev commit must still gate.
+    # An unpushed dev commit (e.g. another team's committed-but-unpushed WIP)
+    # must ALSO not gate now (pre-T-0225 this returned False — the live stall).
     _add_local_commit(proj.repo_path)
-    assert is_clean_for_target(cfg, proj.slug, "staging") is False
+    assert is_clean_for_target(cfg, proj.slug, "staging") is True
 
 
 # ---------------------------------------------------------------------------

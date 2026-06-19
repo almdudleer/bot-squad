@@ -16,6 +16,7 @@ import { Vision } from "./pages/Vision";
 import { Feedback } from "./pages/Feedback";
 import { UseCases } from "./pages/UseCases";
 import { Docs } from "./pages/Docs";
+import { DocsSection } from "./pages/DocsSection";
 import { Sessions } from "./pages/Sessions";
 import { Analytics } from "./pages/Analytics";
 import { TaskDetail } from "./pages/TaskDetail";
@@ -82,6 +83,14 @@ function SlugAliasGuard() {
   return <Outlet />;
 }
 
+// T-0235: legacy top-level /p/:slug/feedback + /usecases deep-links redirect
+// into the relocated docs section (/p/:slug/docs/<sub>). Absolute target so
+// resolution doesn't depend on relative route nesting.
+function LegacyDocsRedirect({ sub }: { sub: string }) {
+  const { slug = "" } = useParams();
+  return <Navigate to={`/p/${slug}/docs/${sub}`} replace />;
+}
+
 export function App() {
   return (
     <BrowserRouter>
@@ -115,9 +124,17 @@ export function App() {
             <Route path="t/:id" element={<TaskDetail />} />
             <Route path="vision" element={<Vision />} />
             <Route path="workflow" element={<Workflow />} />
-            <Route path="feedback" element={<Feedback />} />
-            <Route path="usecases" element={<UseCases />} />
-            <Route path="docs" element={<Docs />} />
+            {/* T-0235 (Pillar C): User Feedback + Use Cases relocated UNDER
+                the docs section (retired as top-level nav). The DocsSection
+                wrapper renders the sub-nav; the three pages live in its outlet.
+                Old top-level /feedback + /usecases deep-links redirect in. */}
+            <Route path="docs" element={<DocsSection />}>
+              <Route index element={<Docs />} />
+              <Route path="feedback" element={<Feedback />} />
+              <Route path="usecases" element={<UseCases />} />
+            </Route>
+            <Route path="feedback" element={<LegacyDocsRedirect sub="feedback" />} />
+            <Route path="usecases" element={<LegacyDocsRedirect sub="usecases" />} />
             <Route path="sessions" element={<Sessions />} />
             <Route path="settings" element={<ProjectSettings />} />
             <Route path="analytics" element={<Analytics />} />

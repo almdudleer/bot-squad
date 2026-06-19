@@ -260,22 +260,10 @@ export function Shell() {
                   VISION
                 </NavLink>
               </li>
-              <li>
-                <NavLink
-                  to={`/p/${slug}/feedback`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  USER FEEDBACK
-                </NavLink>
-              </li>
-              <li>
-                <NavLink
-                  to={`/p/${slug}/usecases`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  USE CASES
-                </NavLink>
-              </li>
+              {/* T-0235 (Pillar C): USER FEEDBACK + USE CASES retired as
+                  top-level nav — they now live UNDER the docs section via its
+                  sub-nav (Docs · User Feedback · Use Cases). Old deep-links
+                  redirect into /docs/<sub> (App.tsx LegacyDocsRedirect). */}
               <li>
                 <NavLink
                   to={`/p/${slug}/docs`}

@@ -1060,10 +1060,12 @@ def test_create_project_spawns_operator_happy_path(
     p = spawn_calls[0]
     assert p["slug"] == "newp"
     assert p["window"] == "operator"
-    # Operator brief includes the per-project framing + the role-doc body.
+    # T-0236: operator brief is the per-project framing + an on-demand pointer
+    # (`bsq brief`), NOT the inlined role-doc body.
     assert "operator" in p["initial_prompt"].lower()
     assert "newp" in p["initial_prompt"]
-    assert "You are the operator." in p["initial_prompt"]
+    assert "bsq brief" in p["initial_prompt"]
+    assert "You are the operator." not in p["initial_prompt"]  # body not inlined
     # No task_id — operator is long-lived, not task-bound.
     assert "task_id" not in p
     # The caller's UI username gets stamped on the spawned session md.
@@ -1139,6 +1141,28 @@ def test_create_project_operator_brief_falls_back_to_placeholder(
     body = r.json()
     assert body["operator_sid"] == "S-almdudleer-operator-p99"
     assert body["spawn_error"] is None
+
+
+def test_operator_brief_points_to_bsq_brief_instead_of_inlining_role_doc(tmp_path):
+    """T-0236: the operator spawn brief hands a small on-demand POINTER
+    (run `bsq brief`) instead of inlining the full operator role doc, keeping
+    spawn context lean (consistent with the T-0203 context-bloat work). No loss
+    of guidance — `bsq brief` pulls the same doc on demand."""
+    import types as _types
+    from app.routes_projects import _load_operator_brief
+
+    role_md = tmp_path / "bot-squad" / "vision" / "roles" / "operator.md"
+    role_md.parent.mkdir(parents=True)
+    sentinel = "ZZUNIQUE_ROLE_BODY_LINE_NOT_TO_BE_INLINED"
+    role_md.write_text(f"# Operator role\n\n{sentinel}\n" + "padding line\n" * 200)
+
+    cfg = _types.SimpleNamespace(data_dir=tmp_path)
+    brief = _load_operator_brief(cfg, "demo")
+
+    assert "demo" in brief             # per-project framing kept
+    assert "bsq brief" in brief        # the on-demand pointer
+    assert sentinel not in brief       # the bulk role doc is NOT inlined
+    assert len(brief) < 1000           # lean vs the ~5KB inline baseline
 
 
 # ---------------------------------------------------------------------------

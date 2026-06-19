@@ -166,19 +166,25 @@ _OPERATOR_PLACEHOLDER = (
 def _load_operator_brief(cfg: ApiConfig, slug: str) -> str:
     """Build the initial_prompt for a freshly-spawned operator session.
 
-    Reads the canonical operator role md from the install's `bot-squad`
-    project data dir (where the dev repo's vision tree gets symlinked to
-    on each install) and prepends the per-project framing. Falls back to
-    a minimal placeholder when the role doc is absent so a fresh install
-    without the bot-squad project still ships a usable brief — the
-    follow-on to actually write `vision/roles/operator.md` is T-0052's
-    sibling DoD bullet (file at brief time if missing)."""
+    T-0236 (with T-0203): pointer-ize, don't inline. This previously read the
+    full operator role md (~5KB / ~1.3k tokens) into the spawn prompt on every
+    operator spawn. Consistent with the T-0203 context-bloat work, the brief now
+    hands the operator a small POINTER and lets it pull its full orientation on
+    demand via ``bsq brief`` (which emits product + team protocol + the operator
+    role contract) — no loss of guidance, far less spawn context. We still gate
+    the pointer on the role doc existing so a fresh install without the canonical
+    ``vision/roles/operator.md`` falls back to the self-contained placeholder
+    (the follow-on to write that doc is T-0052's sibling DoD bullet)."""
     role_md = cfg.data_dir / "bot-squad" / "vision" / "roles" / "operator.md"
     if role_md.exists():
-        body = role_md.read_text(encoding="utf-8")
         return (
-            f'You are the bot-squad project-operator for "{slug}". '
-            f"Your role doc follows.\n\n{body}"
+            f'You are the bot-squad project-operator for "{slug}".\n\n'
+            "Run `bsq brief` to load your full orientation on demand — it prints "
+            "the product overview, the team protocol, and your operator role "
+            "contract (vision/roles/operator.md). Pull other docs (tickets, "
+            "initiatives, AGENT_INSTRUCTIONS.md) only when you need them rather "
+            "than holding them in context.\n\n"
+            "First actions: run `bsq brief`, then `bsq inbox check`."
         )
     return _OPERATOR_PLACEHOLDER.format(slug=slug)
 

@@ -85,27 +85,65 @@ def _require_super_admin(user: dict = Depends(require_auth)) -> dict:
     return user
 
 
+def _has_active_grant(server, username: str | None) -> bool:
+    """True iff ``username`` holds a non-revoked grant on ``server``.
+
+    A grant row is ``{username, granted_by, granted_at, revoked_at}``; it
+    authorizes access only while ``revoked_at`` is falsy. Re-granting a
+    previously-revoked user appends a fresh active row, so a single active
+    row anywhere in the list is enough.
+    """
+    if not username:
+        return False
+    for g in getattr(server, "grants", None) or []:
+        if g.get("username") == username and not g.get("revoked_at"):
+            return True
+    return False
+
+
+def _can_access(server, user: dict) -> bool:
+    """Single authorization predicate shared by the server-enter gate and the
+    server-list scope (T-0221 D2 / T-0219 D3).
+
+    A mothership user may see + enter a server iff:
+      - it is the mothership's own ``is_self`` entry (fans into the LOCAL api
+        whose own auth applies), OR
+      - they OWN it (``owner_user``), OR
+      - they hold an active per-server GRANT.
+
+    ``is_admin`` is deliberately ABSENT: stakeholder decision D2 removes
+    global-admin god-mode — every bot-squad install is an independent server,
+    and cross-server access is an explicit, revocable grant, not a blanket
+    admin power. This SUPERSEDES T-0169's conservative kept-god-mode stopgap.
+    """
+    if getattr(server, "is_self", False):
+        return True
+    username = user.get("username")
+    if username and username == server.owner_user:
+        return True
+    return _has_active_grant(server, username)
+
+
 def _require_server_access(server, user: dict) -> None:
-    """Authorize a mothership user to ACT ON / ENTER a specific server.
+    """Raise 403 unless ``user`` may act on / enter ``server`` (see
+    ``_can_access``). Applied to every gated server handler."""
+    if not _can_access(server, user):
+        raise HTTPException(status_code=403, detail="not authorized for this server")
 
-    T-0169: closes the pivot where ANY authenticated user could proxy into
-    ANY registered server via the stored server_bearer. A user may touch a
-    server only if they own it (owner_user) or are super-admin. ``is_self``
-    (the mothership's own entry) is allowed through here because entering
-    its projects fans into the LOCAL api whose own auth applies.
 
-    NOTE: keeping super-admin (is_admin) allowed is deliberate/conservative
-    — it preserves today's behaviour and closes the actual any-user hole.
-    Whether the spec's stricter "even global admin cannot enter non-owned"
-    should also deny admins is a separate decision (left to the TL).
+def _require_owner(server, user: dict) -> None:
+    """Raise 403 unless ``user`` OWNS ``server`` (or it is ``is_self``).
+
+    Gate for the grant-lifecycle endpoints: only the owner may add/revoke/list
+    grants. Deliberately STRICTER than ``_can_access`` — a grantee must not be
+    able to re-grant (no privilege escalation), and an admin has no special
+    standing here either.
     """
     if getattr(server, "is_self", False):
         return
-    if user.get("is_admin"):
-        return
     if user.get("username") == server.owner_user:
         return
-    raise HTTPException(status_code=403, detail="not authorized for this server")
+    raise HTTPException(status_code=403, detail="server owner only")
 
 
 def _mothership_base_url(request: Request) -> str:
@@ -165,8 +203,19 @@ def _broadcast(server_id: str, event: dict) -> None:
 
 
 @router.get("/servers")
-def list_servers(request: Request) -> list[dict]:
-    return [s.to_public() for s in _store(request).list_servers()]
+def list_servers(request: Request, user: dict = Depends(require_auth)) -> list[dict]:
+    """List servers the caller may see — owner/grant-scoped (T-0219 D3).
+
+    Uses the SAME ``_can_access`` predicate as the server-enter gate: a user
+    sees only servers they own, hold an active grant for, or the mothership's
+    own ``is_self`` entry. There is no global all-servers view; a global admin
+    does NOT see others' ungranted servers (god-mode removed, T-0221 D2).
+    """
+    return [
+        s.to_public()
+        for s in _store(request).list_servers()
+        if _can_access(s, user)
+    ]
 
 
 # ---- T-0066: GlobalUser registry (super-admin cookie auth) ------------------
@@ -331,6 +380,80 @@ def create_invite(
         "role": role,
         "expires_at": minted["expires_at"] if minted else None,
     }
+
+
+# ---- T-0221: per-server access grants (owner-only) --------------------------
+# The owner of a server may grant other mothership users explicit, revocable
+# access to see + enter it. Grant management is strictly the owner's — gated by
+# ``_require_owner`` (NOT ``_require_server_access``), so a grantee cannot
+# re-grant and a non-owning admin has no standing.
+
+
+def _active_grants(server) -> list[dict]:
+    """Public projection of a server's ACTIVE grants (revoked rows dropped)."""
+    return [
+        {
+            "username": g.get("username"),
+            "granted_by": g.get("granted_by"),
+            "granted_at": g.get("granted_at"),
+        }
+        for g in (getattr(server, "grants", None) or [])
+        if not g.get("revoked_at")
+    ]
+
+
+@router.get("/servers/{server_id}/grants")
+def list_grants(
+    request: Request,
+    server_id: str,
+    user: dict = Depends(require_auth),
+) -> dict:
+    store = _store(request)
+    server = store.get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    _require_owner(server, user)
+    return {"server_id": server_id, "grants": _active_grants(server)}
+
+
+@router.post("/servers/{server_id}/grants")
+def create_grant(
+    request: Request,
+    server_id: str,
+    payload: dict,
+    user: dict = Depends(require_auth),
+) -> dict:
+    store = _store(request)
+    server = store.get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    _require_owner(server, user)
+    username = (payload.get("username") or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+    updated = store.add_grant(server_id, username, granted_by=user["username"])
+    if updated is None:
+        # Race: server removed between get_server and add_grant. Treat as 404.
+        raise HTTPException(status_code=404, detail="server not found")
+    return {"server_id": server_id, "grants": _active_grants(updated)}
+
+
+@router.delete("/servers/{server_id}/grants/{username}")
+def delete_grant(
+    request: Request,
+    server_id: str,
+    username: str,
+    user: dict = Depends(require_auth),
+) -> dict:
+    store = _store(request)
+    server = store.get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    _require_owner(server, user)
+    updated = store.revoke_grant(server_id, username)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    return {"server_id": server_id, "grants": _active_grants(updated)}
 
 
 # ---- T-0129: install-token revoke + re-mint (super-admin) -------------------

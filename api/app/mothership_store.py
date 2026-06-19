@@ -51,7 +51,10 @@ from app.install_tokens import (
 )
 
 
-SCHEMA_VERSION = 1
+# v2 (T-0221): adds the per-server ``grants`` list to AttachedServer. Old v1
+# rows (no ``grants`` key) deserialise unchanged — the dataclass default ([])
+# applies via the known-field splat in ``list_servers``.
+SCHEMA_VERSION = 2
 INSTALL_TOKEN_TTL_SECONDS = 24 * 3600
 # Invite tokens (T-0026) share the install-token shape but are per-user, not
 # per-server. Same 24h TTL — same blast radius if the link leaks; the user
@@ -101,6 +104,15 @@ class AttachedServer:
     # Shape: list of dicts {hash, expires_at, target_username, role,
     # created_by, created_at}; role ∈ {"admin","non-admin"}.
     invites: list[dict] = field(default_factory=list)
+    # T-0221: per-server access grants. Each grant authorizes a mothership
+    # user (``username``) to see + enter (proxy into) this server even though
+    # they don't own it. Grants are OWNER-issued and revocable.
+    # Shape: list of dicts {username, granted_by, granted_at, revoked_at};
+    # ``revoked_at`` is None for an active grant. A revoked grant keeps its
+    # row (audit) but stops authorizing — see ``_has_active_grant`` in
+    # routes_mothership.py. Defaults to [] so pre-v2 rows on disk (no key)
+    # deserialise unchanged via the known-field splat in ``list_servers``.
+    grants: list[dict] = field(default_factory=list)
 
     def to_public(self) -> dict:
         d = asdict(self)
@@ -113,6 +125,11 @@ class AttachedServer:
             {k: v for k, v in inv.items() if k != "hash"}
             for inv in d.get("invites", [])
         ]
+        # Grants are NOT in the public projection: exposing them here would
+        # leak who-else-has-access to every grantee that can list the server.
+        # The owner reads them via the dedicated owner-only GET
+        # /servers/{id}/grants endpoint instead.
+        d.pop("grants", None)
         return d
 
 
@@ -518,6 +535,68 @@ class MothershipStore:
                     servers[i] = replace(s, invites=new_invites)
                     self.write(servers)
                     return servers[i], burned
+        return None
+
+    # ---- access grants (T-0221) ---------------------------------------------
+    # Grants embed a per-server access list on the registry row (mirrors the
+    # ``invites`` field) so a server delete sweeps its grants with it. Each
+    # grant is ``{username, granted_by, granted_at, revoked_at}``; an active
+    # grant has ``revoked_at is None``. Owner-issued only (enforced at the
+    # route layer via ``_require_owner``).
+
+    def add_grant(
+        self, server_id: str, username: str, granted_by: str
+    ) -> AttachedServer | None:
+        """Grant ``username`` access to ``server_id``. Idempotent.
+
+        If an active (non-revoked) grant for ``username`` already exists, this
+        is a no-op and returns the unchanged entry. A previously-REVOKED grant
+        is re-activated by appending a fresh active row — the revoked row is
+        kept for audit. Returns ``None`` if no such server.
+        """
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                if any(
+                    g.get("username") == username and not g.get("revoked_at")
+                    for g in s.grants
+                ):
+                    return s
+                grant = {
+                    "username": username,
+                    "granted_by": granted_by,
+                    "granted_at": _utc_now_iso(),
+                    "revoked_at": None,
+                }
+                servers[i] = replace(s, grants=[*s.grants, grant])
+                self.write(servers)
+                return servers[i]
+        return None
+
+    def revoke_grant(self, server_id: str, username: str) -> AttachedServer | None:
+        """Revoke every active grant for ``username`` on ``server_id``.
+
+        Sets ``revoked_at`` on each active matching row (keeps the row for
+        audit). Idempotent: when ``username`` holds no active grant the entry
+        is returned unchanged. Returns ``None`` if no such server.
+        """
+        now = _utc_now_iso()
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                new_grants = [
+                    {**g, "revoked_at": now}
+                    if (g.get("username") == username and not g.get("revoked_at"))
+                    else g
+                    for g in s.grants
+                ]
+                servers[i] = replace(s, grants=new_grants)
+                self.write(servers)
+                return servers[i]
         return None
 
     def set_server_bearer(self, server_id: str, bearer_hash: str | None) -> None:

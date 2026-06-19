@@ -201,6 +201,12 @@ export type SessionRow = {
   // UI falls back via `utils/sessionStatus.sessionActivity`.
   activity?: "running" | "idle" | "paused" | "suspended";
   activity_at?: number | null;
+  // T-0232 (Pillar A): worker-stamped liveness — true when the session is
+  // alive in tmux (activity ∈ {running, idle}). The sessions VIEW filters on
+  // this to show live-only rows; suspended/archived rows are retained in the
+  // registry but dropped from the default view. Optional so a pre-T-0232
+  // worker doesn't break the contract (UI falls back to the activity probe).
+  live?: boolean;
   window: string;
   cwd: string;
   started_at?: string | null;

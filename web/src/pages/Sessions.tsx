@@ -163,6 +163,34 @@ export function isDevRow(s: SessionRow): boolean {
   return !!(s.task_id && s.task_id !== "" && s.task_id !== "~");
 }
 
+// ---------------------------------------------------------------------------
+// T-0232 (Pillar A) — live-only sessions view.
+//
+// The board now shows only sessions that are alive in tmux. The stakeholder's
+// core de-clutter pain was the long tail of dead rows (3 live vs 175 suspended).
+// Suspended/archived rows are retained in the registry but dropped from the
+// default view (revealable on demand via the "show suspended" toggle).
+//
+// Liveness precedence:
+//   1. archived            → never live (it lives in the Archived disclosure).
+//   2. paused              → live: a Ctrl-C interrupt whose pane is still open
+//                            and Resume-able from the row menu. Team-1's `live`
+//                            flag is running/idle only, so we add paused here
+//                            rather than strand the Resume action.
+//   3. explicit `live` flag → preferred (Team-1 stamps it = activity ∈ {running,idle}).
+//   4. fallback            → the activity probe (pre-T-0232 worker without the flag):
+//                            running/idle are live, suspended is dead.
+// Following `sessionActivity` (not the raw md status) means a zombie row
+// (status=active, activity=suspended — T-0104) correctly drops out.
+// ---------------------------------------------------------------------------
+export function isLiveSession(s: SessionRow): boolean {
+  if (s.archived) return false;
+  if (sessionActivity(s) === "paused") return true;
+  if (typeof s.live === "boolean") return s.live;
+  const a = sessionActivity(s);
+  return a === "running" || a === "idle";
+}
+
 export function buildSessionTree(
   rows: SessionRow[],
   taskInitiative: Map<string, string>,
@@ -300,6 +328,9 @@ export function Sessions() {
   // section toggle.
   const [expandedSids, setExpandedSids] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
+  // T-0232: the view is LIVE-only by default; this toggle reveals the
+  // suspended (non-archived) rows on demand without re-cluttering the board.
+  const [showSuspended, setShowSuspended] = useState(false);
 
   // T-0099: deep-link target — when the URL carries ?sid=S-..., scroll
   // that row into view, expand its detail row, and flash a transient
@@ -649,6 +680,15 @@ export function Sessions() {
   // Split visible vs archived for the two-section layout.
   const visibleSessions: SessionRow[] = (sessions ?? []).filter((s) => !s.archived);
   const archivedSessions: SessionRow[] = (sessions ?? []).filter((s) => !!s.archived);
+
+  // T-0232 (Pillar A): the main board shows LIVE-only rows (alive in tmux —
+  // running/idle/paused). Suspended (non-archived) rows are retained in the
+  // registry but dropped from the default view; the `showSuspended` toggle
+  // reveals them on demand. `liveSessions` is what the table renders unless
+  // the toggle is on, in which case it falls back to all non-archived rows.
+  const liveSessions: SessionRow[] = visibleSessions.filter(isLiveSession);
+  const hiddenSuspendedCount = visibleSessions.length - liveSessions.length;
+  const boardSessions: SessionRow[] = showSuspended ? visibleSessions : liveSessions;
 
   // ---------------- Bound-link column ----------------
   // For TL sessions (no task_id): link to the primary initiative on the
@@ -1713,6 +1753,26 @@ export function Sessions() {
               </button>
             ))}
           </div>
+          {/* T-0232: the board is live-only by default. When suspended
+              (non-archived) rows are being hidden, surface a subtle count +
+              toggle so they stay reachable without re-cluttering the view. */}
+          {(hiddenSuspendedCount > 0 || showSuspended) && (
+            <button
+              type="button"
+              className={`btn btn-sm ${showSuspended ? "btn-secondary" : "btn-outline-secondary"}`}
+              style={{ fontSize: "0.72rem", padding: "0.15rem 0.55rem" }}
+              onClick={() => setShowSuspended((v) => !v)}
+              title={
+                showSuspended
+                  ? "Hide suspended sessions (show live only)"
+                  : "Reveal suspended (non-archived) sessions"
+              }
+            >
+              {showSuspended
+                ? "hide suspended"
+                : `${hiddenSuspendedCount} suspended hidden — show`}
+            </button>
+          )}
           <div className="d-flex align-items-center gap-2 ms-auto">
             <span style={{ fontFamily: "var(--mc-mono)", color: "var(--mc-text-dim)" }}>
               filter:
@@ -1756,7 +1816,7 @@ export function Sessions() {
             </thead>
             <tbody>
               {groupBy === "tmux"
-                ? groupSessionsByTmux(applySessFilter(visibleSessions)).flatMap((g) => {
+                ? groupSessionsByTmux(applySessFilter(boardSessions)).flatMap((g) => {
                     const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                     const nodes: React.ReactNode[] = [
                       renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed),
@@ -1771,7 +1831,7 @@ export function Sessions() {
                 : groupBy === "user"
                 ? // T-0157: linux user → tmux session → tree. Each user section
                   // header marks the owner; tmux lanes nest inside it.
-                  groupSessionsByUser(applySessFilter(visibleSessions)).flatMap((ug) => {
+                  groupSessionsByUser(applySessFilter(boardSessions)).flatMap((ug) => {
                     const nodes: React.ReactNode[] = [
                       renderUserHeaderRow(ug.key, ug.rows, 10),
                     ];
@@ -1787,11 +1847,11 @@ export function Sessions() {
                     return nodes;
                   })
                 : groupBy === "none"
-                  ? buildSessionTreeLocal(applySessFilter(visibleSessions)).map(
+                  ? buildSessionTreeLocal(applySessFilter(boardSessions)).map(
                       ({ row, level }) => renderSessionRow(row, level),
                     )
-                  : buildVisibleLanes(visibleSessions).flatMap((lane) => {
-                      const laneRows = groupSessionsByLane(visibleSessions)[lane.key] ?? [];
+                  : buildVisibleLanes(boardSessions).flatMap((lane) => {
+                      const laneRows = groupSessionsByLane(boardSessions)[lane.key] ?? [];
                       const collapsed = Boolean(collapsedSessLanes[lane.key]);
                       const nodes: React.ReactNode[] = [
                         renderLaneHeaderRow(lane, laneRows.length, 11),

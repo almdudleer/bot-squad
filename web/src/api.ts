@@ -224,6 +224,11 @@ export type SessionRow = {
   // dive as a teamlead. Optional so a pre-T-0141 worker doesn't break the
   // contract; the UI falls back to the legacy inference when absent.
   role?: "teamlead" | "dev" | "operator";
+  // T-0220: set true when the worker neutralized an elevated window-derived
+  // role on a SUSPENDED row because the persisted cwd didn't match the
+  // project (the role above is already the safe "dev" fallback). Lets the UI
+  // surface the validation subtly. Absent/false on healthy rows.
+  role_cwd_mismatch?: boolean;
   // T-0128: persisted spawn-time parent — the SID that requested this spawn
   // (operator→TL, TL→dev). Stamped into the session md at spawn time so the
   // session-tree is reliable across worker restarts. Preferred over the

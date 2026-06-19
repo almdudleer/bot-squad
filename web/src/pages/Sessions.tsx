@@ -63,7 +63,26 @@ function StatusBadge({ row }: { row: SessionRow }) {
 // qa = active/purple. `dim` mutes the badge for archived rows.
 function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
   const role = sessionRole(row);
-  if (dim) return <span className="mc-badge mc-badge-dim">{sessionRoleLabel(role)}</span>;
+  // T-0220: the worker neutralized an elevated window-derived role on this
+  // suspended row because its persisted cwd didn't match the project (the role
+  // is already the safe "dev" fallback). Surface it subtly — a ⚠ glyph + title
+  // — so the row stays auditable without any layout churn.
+  const mismatch = row.role_cwd_mismatch === true;
+  const title = mismatch
+    ? "Role validated: window claimed an elevated role but the suspended session's cwd did not match this project — shown as dev"
+    : undefined;
+  const label = (
+    <>
+      {sessionRoleLabel(role)}
+      {mismatch ? " ⚠" : ""}
+    </>
+  );
+  if (dim)
+    return (
+      <span className="mc-badge mc-badge-dim" title={title}>
+        {label}
+      </span>
+    );
   const cls =
     role === "teamlead"
       ? "mc-badge mc-badge-ok"
@@ -74,7 +93,11 @@ function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
           : role === "qa"
             ? "mc-badge mc-badge-active"
             : "mc-badge mc-badge-info";
-  return <span className={cls}>{sessionRoleLabel(role)}</span>;
+  return (
+    <span className={cls} title={title}>
+      {label}
+    </span>
+  );
 }
 
 function relativeTime(raw: string | number | null | undefined): string {

@@ -38,9 +38,11 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from datetime import datetime, timezone
@@ -1553,14 +1555,218 @@ def cmd_drift_status(args) -> None:
     print(f"drift checks for {sid}: {'OFF (paused)' if paused else 'ON (active)'}")
 
 
-def cmd_commit(args) -> None:
+# --------------------------------------------------------------------------
+# T-0215: per-session hunk-isolated commits for co-edited files.
+#
+# The shared clone has one working tree + one `.git/index` across ~10 sessions.
+# `bsq commit -- <f>` (pathspec) is absorb-proof for the INDEX but still commits
+# the WHOLE file from the worktree — so a peer's dirty hunks in <f> ride along.
+# Approach A (T-0215): `bsq edit-begin <f>` snapshots this session's baseline;
+# `bsq commit --hunks -- <f>` commits only the (baseline → current) diff, applied
+# onto a TEMP index seeded from HEAD. The shared index and the peer's worktree
+# hunks are never touched, so a co-edited file can't sweep a peer's work.
+# Limitation: if a peer edits the SAME region AFTER your edit-begin, the apply
+# fails loud (never corrupts) and you resolve manually.
+# --------------------------------------------------------------------------
+def _sanitize_sid(sid: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", sid or "")
+
+
+def worktree_store(slug: str, sid: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "_worktree" / _sanitize_sid(sid)
+
+
+def _snapshot_path(store: Path, relpath: str) -> Path:
+    """Mirror a repo-relative path under <store>/files/, rejecting traversal."""
+    rel = (relpath or "").strip()
+    if not rel or os.path.isabs(rel):
+        raise ValueError(f"unsafe snapshot path: {relpath!r}")
+    files_root = (store / "files").resolve()
+    target = (files_root / rel).resolve()
+    if target != files_root and not str(target).startswith(str(files_root) + os.sep):
+        raise ValueError(f"path escapes snapshot store: {relpath!r}")
+    return store / "files" / rel
+
+
+def _rewrite_patch_headers(raw: str, relpath: str) -> str:
+    """Normalize git `--no-index` scratch a//b// paths to repo-relative a/<rel> b/<rel>.
+
+    Leaves /dev/null markers (new/deleted file) and every body line intact so the
+    result applies with `git apply -p1` at the right repo location.
+    """
+    a, b = f"a/{relpath}", f"b/{relpath}"
+    out: list[str] = []
+    for line in raw.splitlines(keepends=True):
+        nl = "\n" if line.endswith("\n") else ""
+        s = line.rstrip("\n")
+        if s.startswith("diff --git "):
+            out.append(f"diff --git {a} {b}{nl}")
+        elif s.startswith("--- "):
+            out.append(f"--- {'/dev/null' if s[4:] == '/dev/null' else a}{nl}")
+        elif s.startswith("+++ "):
+            out.append(f"+++ {'/dev/null' if s[4:] == '/dev/null' else b}{nl}")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def make_hunk_patch(relpath: str, baseline: Path, current: Path) -> str:
+    """Unified diff baseline→current as a `git apply -p1` patch; '' if identical."""
+    proc = subprocess.run(
+        ["git", "diff", "--no-color", "--no-index", "--", str(baseline), str(current)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0 or not proc.stdout:
+        return ""  # identical (rc 0) or a hard error with no diff body
+    return _rewrite_patch_headers(proc.stdout, relpath)
+
+
+def _repo_root() -> str:
+    rr = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    ).stdout.strip()
+    if not rr:
+        die("not inside a git repo")
+    return rr
+
+
+def _repo_relpath(repo_root: str, f: str) -> str:
+    p = Path(f)
+    ap = p if p.is_absolute() else Path(os.getcwd()) / p
+    rel = os.path.relpath(os.path.realpath(ap), os.path.realpath(repo_root))
+    if rel.startswith(".."):
+        die(f"path not under repo: {f}")
+    return rel
+
+
+def cmd_edit_begin(args) -> None:
+    """Snapshot files' current bytes as this session's baseline for `commit --hunks`."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    repo_root = _repo_root()
+    store = worktree_store(slug, sid)
+    absent: list[str] = []
+    for f in args.files:
+        rel = _repo_relpath(repo_root, f)
+        snap = _snapshot_path(store, rel)
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        src = Path(repo_root) / rel
+        if src.exists():
+            shutil.copyfile(src, snap)
+        else:
+            if snap.exists():
+                snap.unlink()
+            absent.append(rel)
+    if absent:
+        ab = store / "absent.txt"
+        have = set(ab.read_text().split()) if ab.exists() else set()
+        have.update(absent)
+        ab.write_text("\n".join(sorted(have)) + "\n")
+    print(f"edit-begin: baselined {len(args.files)} file(s) for {sid}")
+
+
+def _commit_hunks(args, repo_root: str) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
     if not args.files:
-        die("commit needs explicit file paths (never wide-add)")
+        die("commit --hunks needs explicit file paths")
+    store = worktree_store(slug, sid)
+    if not store.exists():
+        die("commit --hunks: no baseline for this session — run "
+            "`bsq edit-begin <files>` before editing")
+    ab = store / "absent.txt"
+    absent = set(ab.read_text().split()) if ab.exists() else set()
+
+    patches: list[str] = []
+    rels: list[str] = []
+    for f in args.files:
+        rel = _repo_relpath(repo_root, f)
+        snap = _snapshot_path(store, rel)
+        cur = Path(repo_root) / rel
+        if snap.exists():
+            baseline = snap
+        elif rel in absent:
+            baseline = Path("/dev/null")
+        else:
+            die(f"commit --hunks: no baseline for {rel} — run `bsq edit-begin {rel}` first")
+        if not cur.exists():
+            die(f"commit --hunks: {rel} no longer exists in the worktree")
+        patch = make_hunk_patch(rel, baseline, cur)
+        if patch:
+            patches.append(patch)
+            rels.append(rel)
+    if not patches:
+        print("commit --hunks: no changes since edit-begin; nothing to commit")
+        return
+
+    pf = tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False)
+    pf.write("".join(patches))
+    pf.close()
+    tmp_index = pf.name + ".index"
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = tmp_index
+    try:
+        rt = subprocess.run(["git", "read-tree", "HEAD"], cwd=repo_root, env=env,
+                            capture_output=True, text=True)
+        if rt.returncode != 0:
+            die(f"commit --hunks: git read-tree HEAD failed: {rt.stderr.strip()}")
+        ap = subprocess.run(
+            ["git", "apply", "--cached", "--recount", "--whitespace=nowarn", pf.name],
+            cwd=repo_root, env=env, capture_output=True, text=True,
+        )
+        if ap.returncode != 0:
+            die("commit --hunks: could not apply your hunks onto HEAD — your edit "
+                "likely overlaps a peer's concurrent change in the same region; "
+                f"resolve manually.\n{ap.stderr.strip()}")
+        safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
+        if not os.path.exists(safe_commit):
+            safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
+        if args.ack:
+            env["BOT_SQUAD_ACK_PEERS"] = "1"
+        # No pathspec: the temp index already holds EXACTLY HEAD + my hunks.
+        rc = subprocess.run([safe_commit, "-m", args.message], cwd=repo_root, env=env).returncode
+        if rc != 0:
+            if not args.ack:
+                print(
+                    "\nbsq: commit --hunks blocked by the peer-activity hook (expected "
+                    "on the first attempt). Review the report above, then re-run with "
+                    f"--ack:\n  bsq commit --hunks --ack -m {json.dumps(args.message)} "
+                    f"{' '.join(args.files)}",
+                    file=sys.stderr,
+                )
+            sys.exit(rc)
+    finally:
+        for p in (pf.name, tmp_index):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    # Success — clear the consumed baselines so a later edit re-snapshots fresh.
+    for rel in rels:
+        try:
+            _snapshot_path(store, rel).unlink()
+        except (OSError, ValueError):
+            pass
+    if ab.exists():
+        remaining = absent - set(rels)
+        if remaining:
+            ab.write_text("\n".join(sorted(remaining)) + "\n")
+        else:
+            ab.unlink()
+    print(f"commit --hunks: committed {len(rels)} file(s)' own hunks for {sid}")
+    sys.exit(0)
+
+
+def cmd_commit(args) -> None:
     repo_root = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
     ).stdout.strip()
     if not repo_root:
         die("not inside a git repo")
+    if getattr(args, "hunks", False):
+        return _commit_hunks(args, repo_root)
+    if not args.files:
+        die("commit needs explicit file paths (never wide-add)")
     safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
     if not os.path.exists(safe_commit):
         safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
@@ -2666,11 +2872,24 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--sid", help="target SID (default: this session)")
     cp.set_defaults(func=cmd_compact)
 
+    # edit-begin (T-0215) — snapshot a baseline for a later `commit --hunks`
+    eb = sub.add_parser(
+        "edit-begin",
+        help="snapshot files' baseline BEFORE editing, for a later `commit --hunks`")
+    eb.add_argument("--sid", help="session SID (default: derived from tmux)")
+    eb.add_argument("files", nargs="+", help="files to baseline before editing")
+    eb.set_defaults(func=cmd_edit_begin)
+
     # commit
     cm = sub.add_parser("commit", help="stage explicit paths + safe-commit")
     cm.add_argument("-m", "--message", required=True, help="commit message")
     cm.add_argument("--ack", action="store_true",
                     help="acknowledge the peer-activity report (BOT_SQUAD_ACK_PEERS=1)")
+    cm.add_argument(
+        "--hunks", action="store_true",
+        help="T-0215: commit ONLY this session's hunks (the diff since "
+             "`bsq edit-begin`) in <files>, isolating a peer's edits in the same file")
+    cm.add_argument("--sid", help="session SID for --hunks (default: derived from tmux)")
     cm.add_argument("files", nargs="*", help="explicit file paths to stage + commit")
     cm.set_defaults(func=cmd_commit)
 

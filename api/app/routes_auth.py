@@ -20,23 +20,48 @@ def _is_mothership() -> bool:
 
 
 def _derive_global_role(meta) -> GlobalRole:
-    """THE quarantined build-flag bridge (T-0216 Phase A).
+    """The legacy build-flag bridge — now the TRANSITIONAL FALLBACK (T-0228).
 
-    The session layer does not yet resolve the authenticated user's GlobalUser,
-    so global-admin is derived rather than read from the stored
-    ``GlobalUser.global_role``: every server admin on the MOTHERSHIP build is a
-    global admin. This is the ONE place the bridge lives; T-0216 Phase A
-    preserves it exactly. Replacing it with stored-role resolution is a
-    behavior change tracked by **T-0228** (GlobalUser session-resolution).
+    Used only when the session user has no resolvable GlobalUser (un-migrated,
+    or a dangling attachment): every server admin on the MOTHERSHIP build is
+    treated as a global admin. This keeps the bootstrap sole-admin (who may not
+    have a GlobalUser yet) from being locked out. For MIGRATED users the real
+    stored role is read instead — see :func:`_resolve_global_role`. The fallback
+    fully retires once every admin has a GlobalUser.
     """
     if meta.server_role is ServerRole.SERVER_ADMIN and _is_mothership():
         return GlobalRole.GLOBAL_ADMIN
     return GlobalRole.GLOBAL_MEMBER
 
 
+def _resolve_global_role(meta, request: Request) -> GlobalRole:
+    """T-0228: resolve the session user's global role from the STORED
+    ``GlobalUser.global_role`` (the fix for "the gate ignored its own field").
+
+    Fork-1 A (operator-confirmed): a migrated user (``attached_to_global_user``
+    set) is gated on their stored ``global_role``; an un-migrated user, or one
+    whose GlobalUser can't be found, falls back to the legacy bridge so the
+    bootstrap sole-admin is never locked out. Off the mothership build the
+    mothership routes aren't mounted, so the role is irrelevant → member; the
+    store import stays lazy + guarded for detach-safety.
+    """
+    if not _is_mothership():
+        return GlobalRole.GLOBAL_MEMBER
+    if meta.attached_to_global_user:
+        from app.mothership_users_store import MothershipUsersStore
+
+        cfg = request.app.state.api_config
+        store = MothershipUsersStore(cfg.data_dir / "_mothership")
+        gu = store.get_user(meta.attached_to_global_user)
+        if gu is not None:
+            return gu.global_role
+    return _derive_global_role(meta)  # transitional fallback (no GlobalUser)
+
+
 def _is_super_admin(meta) -> bool:
-    """Derived super-admin bool — back-compat over :func:`_derive_global_role`.
-    Behavior-identical to the pre-T-0216 ``is_admin AND _is_mothership()``."""
+    """Fallback-bridge super-admin bool (no GlobalUser resolution). The session
+    value comes from :func:`_resolve_global_role`; this stays for the un-migrated
+    determination + its tests."""
     return _derive_global_role(meta) is GlobalRole.GLOBAL_ADMIN
 
 
@@ -83,15 +108,17 @@ def _enrich(claims: dict, request: Request) -> dict:
     username = claims.get("username", "")
     cfg = request.app.state.auth_config
     meta = cfg.meta_for(username)
-    # T-0216 Phase A: add the canonical role enums alongside the legacy
-    # is_admin/is_super_admin bools (kept for FE compat — Team 2 untouched).
+    # T-0228: resolve the global role ONCE from the stored GlobalUser (migrated)
+    # or the transitional fallback (un-migrated). is_super_admin/global_role both
+    # derive from it; is_admin/is_super_admin keys stay for FE compat (Team 2).
+    global_role = _resolve_global_role(meta, request)
     return {
         "username": username,
         "linux_user": meta.linux_user,
         "is_admin": meta.is_admin,
-        "is_super_admin": _is_super_admin(meta),
+        "is_super_admin": global_role is GlobalRole.GLOBAL_ADMIN,
         "server_role": meta.server_role.value,
-        "global_role": _derive_global_role(meta).value,
+        "global_role": global_role.value,
         "tg_chat_id": meta.tg_chat_id,
         "attached_to_global_user": meta.attached_to_global_user or None,
     }

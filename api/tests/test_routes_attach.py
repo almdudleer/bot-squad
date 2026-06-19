@@ -71,9 +71,13 @@ def test_attach_appears_on_me_endpoint(tmp_bot_squad: Path, monkeypatch):
             json={"global_username": "g_alice", "global_password": "global-pw"},
         )
         me = client.get("/api/auth/me").json()
-    # is_super_admin is the derived flag (admin && MOTHERSHIP=1) — testuser
-    # is admin in the fixture, MOTHERSHIP=1 here.
-    assert me["is_super_admin"] is True
+    # T-0228: once MIGRATED, the global role is read from the stored GlobalUser,
+    # not the build-flag bridge. testuser is a server admin in the fixture, but
+    # g_alice is a global_member → is_super_admin is now correctly False (the
+    # fix for "the gate ignored its own field"). The attachment uuid surfaces.
+    assert me["global_role"] == "global_member"
+    assert me["is_super_admin"] is False
+    assert me["is_admin"] is True  # server scope unchanged
     assert me["attached_to_global_user"] == gu_id
 
 

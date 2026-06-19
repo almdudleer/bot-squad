@@ -20,7 +20,6 @@ import {
 } from "../onboarding/copy";
 
 import { PageHelp } from "../components/PageHelp";
-import { TelemetryPanel } from "../components/TelemetryPanel";
 const COLUMNS = ["planned", "open", "in_progress", "totest", "reopened", "closed"] as const;
 const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
   planned: "Planned",
@@ -622,8 +621,7 @@ export function Project() {
         for the quick menu (status / edit body / comment / delete).
       </PageHelp>
 
-      {/* T-0210: resource telemetry — context/memory/quota for live sessions. */}
-      <TelemetryPanel slug={slug} />
+      {/* T-0230: resource telemetry panel relocated to the Agent sessions page. */}
 
       {error && <div className="alert alert-danger mt-2">{error}</div>}
       {tasks === null && !error && <div className="mc-loading">Loading</div>}

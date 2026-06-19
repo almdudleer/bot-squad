@@ -20,6 +20,7 @@ import {
 
 import { PageHelp } from "../components/PageHelp";
 import { PeerInbox } from "../components/PeerInbox";
+import { TelemetryPanel } from "../components/TelemetryPanel";
 import { uiSidFor } from "../peerInbox";
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1608,6 +1609,11 @@ export function Sessions() {
           {" "}<code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
         </div>
       </PageHelp>
+
+      {/* T-0210/T-0230: resource telemetry — per-session context/memory/quota
+          for live sessions. Relocated here from the board page (it's per-session
+          resource data, a natural fit alongside the sessions list). */}
+      <TelemetryPanel slug={slug} />
 
       {/* T-0006: post-spawn toast. Dismisses on click of the close button,
           stays sticky until then so the user has time to copy the command. */}

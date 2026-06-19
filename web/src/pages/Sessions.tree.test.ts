@@ -104,3 +104,75 @@ describe("buildSessionTree parent_sid preference (T-0128)", () => {
     expect(devEntry?.level).toBe(0);
   });
 });
+
+describe("buildSessionTree task-less nesting (T-0222)", () => {
+  // A task-less child (qa / prod-TL / ad-hoc) — like a TL it carries no
+  // task_id, so isDevRow is false. The distinguishing feature is a genuine
+  // persisted parent_sid.
+  function taskless(overrides: Partial<SessionRow>): SessionRow {
+    return tl({ window: "qa", ...overrides });
+  }
+
+  test("a task-less child WITH a resolvable parent_sid nests under that parent", () => {
+    const lead = tl({ sid: "S-test-tl-p0" });
+    const qa = taskless({ sid: "S-test-qa-p2", parent_sid: "S-test-tl-p0" });
+    const taskInitiative = new Map<string, string>();
+
+    const out = buildSessionTree([lead, qa], taskInitiative);
+    const qaEntry = out.find((e) => e.row.sid === "S-test-qa-p2");
+    // Previously this row flattened to root (level 0) because the tree only
+    // nested dev rows; it must now nest one level under its parent_sid parent.
+    expect(qaEntry?.level).toBe(1);
+    const leadIdx = out.findIndex((e) => e.row.sid === "S-test-tl-p0");
+    expect(out[leadIdx + 1]?.row.sid).toBe("S-test-qa-p2");
+  });
+
+  test("a genuine root (operator, no parent_sid) stays at root", () => {
+    const operator = tl({ sid: "S-test-op-p0", window: "operator" });
+    const qa = taskless({ sid: "S-test-qa-p2", parent_sid: "S-test-op-p0" });
+    const taskInitiative = new Map<string, string>();
+
+    const out = buildSessionTree([operator, qa], taskInitiative);
+    expect(out.find((e) => e.row.sid === "S-test-op-p0")?.level).toBe(0);
+    // and the child still nests under it.
+    expect(out.find((e) => e.row.sid === "S-test-qa-p2")?.level).toBe(1);
+  });
+
+  test("a task-less row whose parent_sid is not visible stays at root", () => {
+    const qa = taskless({ sid: "S-test-qa-p2", parent_sid: "S-test-gone-p7" });
+    const taskInitiative = new Map<string, string>();
+
+    const out = buildSessionTree([qa], taskInitiative);
+    // No heuristic applies to a task-less row → genuine root.
+    expect(out.find((e) => e.row.sid === "S-test-qa-p2")?.level).toBe(0);
+  });
+
+  test("an unparented TL stays at root while a parented sibling TL nests (lineage depth)", () => {
+    // operator → dev-TL (parent_sid=operator) → dev (parent_sid=dev-TL),
+    // plus a second TL with NO parent_sid that must remain a root.
+    const operator = tl({ sid: "S-test-op-p0", window: "operator" });
+    const lead = tl({ sid: "S-test-tl-p0", parent_sid: "S-test-op-p0" });
+    const rootless = tl({ sid: "S-test-tl-p9", window: "tl2" }); // no parent_sid
+    const d = dev({
+      sid: "S-test-dev-p1",
+      task_id: "T-0001",
+      parent_sid: "S-test-tl-p0",
+    });
+    const taskInitiative = new Map<string, string>();
+
+    const out = buildSessionTree([operator, lead, rootless, d], taskInitiative);
+    const lvl = (sid: string) => out.find((e) => e.row.sid === sid)?.level;
+    expect(lvl("S-test-op-p0")).toBe(0); // operator: genuine root
+    expect(lvl("S-test-tl-p0")).toBe(1); // parented TL nests under operator
+    expect(lvl("S-test-dev-p1")).toBe(2); // dev nests under its TL — 3 levels deep
+    expect(lvl("S-test-tl-p9")).toBe(0); // unparented TL stays root
+  });
+
+  test("a parent_sid cycle does not loop — both rows still render", () => {
+    const a = tl({ sid: "S-test-a-p0", parent_sid: "S-test-b-p1" });
+    const b = tl({ sid: "S-test-b-p1", parent_sid: "S-test-a-p0" });
+    const out = buildSessionTree([a, b], new Map());
+    // Neither vanishes; the visited guard breaks the cycle.
+    expect(out.map((e) => e.row.sid).sort()).toEqual(["S-test-a-p0", "S-test-b-p1"]);
+  });
+});

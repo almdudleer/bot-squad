@@ -132,18 +132,28 @@ const LAST_ACTIVITY_TOOLTIP =
   "Suspended rows show the suspend/pause timestamp.";
 
 // ---------------------------------------------------------------------------
-// Session tree (T-0040 / T-0128)
+// Session tree (T-0040 / T-0128 / T-0222)
 //
-// A dev row is one carrying a primary task_id. Devs are visually indented
+// A dev row is one carrying a primary task_id. Children are visually indented
 // under their parent session.
 //
-// T-0128: the worker now persists `parent_sid` (the SID that requested the
-// spawn) at spawn time, so we PREFER it — a dev with a resolvable
-// `parent_sid` nests under that exact session. We fall back to the legacy
-// heuristic (dev.task_id → task.initiative → TL bound to that initiative)
-// only for legacy / agent-teams sessions that lack the field, or whose
-// persisted parent isn't a visible parent row in this slice. An orphan dev
-// means we couldn't trace a parent — not an error.
+// T-0128: the worker persists `parent_sid` (the SID that requested the spawn)
+// at spawn time, so we PREFER it — a row with a resolvable `parent_sid` nests
+// under that exact session. For dev rows we fall back to the legacy heuristic
+// (dev.task_id → task.initiative → TL bound to that initiative) when the field
+// is absent or its parent isn't visible in this slice.
+//
+// T-0222: nesting is no longer dev-only. ANY task-less row (qa, prod-TL, an
+// ad-hoc child) whose persisted `parent_sid` resolves to a visible parent now
+// nests under that spawner too — previously only task-bearing dev rows nested
+// and every task-less session flattened to the root even when it carried a
+// genuine spawn-time parent. Genuine roots (the operator, an unparented TL, or
+// any row whose `parent_sid` is blank / self / not visible in this slice) keep
+// no parent → render at level 0. Because parents may themselves be children,
+// the tree can now be deeper than two levels (operator → TL → dev): we build a
+// parent map over all rows and emit it with a recursive, cycle-safe DFS so any
+// row unreachable from a root still falls back to the root rather than
+// vanishing.
 //
 // Exported as a pure function (taking the task→initiative map) so it is
 // unit-testable, mirroring computeTlBindings in Vision.tsx.
@@ -157,9 +167,10 @@ export function buildSessionTree(
   taskInitiative: Map<string, string>,
 ): { row: SessionRow; level: number }[] {
   const tlByInitiative = new Map<string, SessionRow>();
-  // Non-dev rows are the only ones rendered at level 0 (potential parents).
   const nonDevSids = new Set<string>();
+  const visibleSids = new Set<string>();
   for (const s of rows) {
+    visibleSids.add(s.sid);
     if (isDevRow(s)) continue;
     nonDevSids.add(s.sid);
     const inits = [(s.initiative ?? "").trim(), ...(s.extra_initiatives ?? [])]
@@ -168,41 +179,57 @@ export function buildSessionTree(
       if (!tlByInitiative.has(init)) tlByInitiative.set(init, s);
     }
   }
-  const devsByTl = new Map<string, SessionRow[]>();
-  const orphanDevs: SessionRow[] = [];
+
+  // Resolve each row's parent SID (undefined = genuine root).
+  const parentOf = new Map<string, string | undefined>();
   for (const s of rows) {
-    if (!isDevRow(s)) continue;
-    // T-0128: prefer the persisted spawn-time parent when it resolves to a
-    // visible parent row; otherwise fall back to the task→initiative→TL
-    // heuristic for legacy sessions lacking the field.
-    let parentSid: string | undefined;
     const ps = (s.parent_sid ?? "").trim();
-    if (ps && ps !== "~" && ps !== s.sid && nonDevSids.has(ps)) {
-      parentSid = ps;
+    // A genuine, persisted spawn-time parent that is visible and not self.
+    const resolvedParent =
+      ps && ps !== "~" && ps !== s.sid && visibleSids.has(ps) ? ps : undefined;
+    if (isDevRow(s)) {
+      // T-0128: prefer the persisted parent; else the task→initiative→TL
+      // heuristic for legacy sessions lacking the field.
+      if (resolvedParent) {
+        parentOf.set(s.sid, resolvedParent);
+      } else {
+        const init = taskInitiative.get(s.task_id!) ?? "";
+        const tl = init ? tlByInitiative.get(init) : undefined;
+        parentOf.set(s.sid, tl && tl.sid !== s.sid ? tl.sid : undefined);
+      }
     } else {
-      const init = taskInitiative.get(s.task_id!) ?? "";
-      const tl = init ? tlByInitiative.get(init) : undefined;
-      if (tl && tl.sid !== s.sid) parentSid = tl.sid;
-    }
-    if (parentSid) {
-      const list = devsByTl.get(parentSid) ?? [];
-      list.push(s);
-      devsByTl.set(parentSid, list);
-    } else {
-      orphanDevs.push(s);
+      // T-0222: a task-less row nests under its persisted spawner when that
+      // parent is visible; genuine roots keep parent undefined.
+      parentOf.set(s.sid, resolvedParent);
     }
   }
-  const out: { row: SessionRow; level: number }[] = [];
+
+  // Bucket children under each parent, preserving original row order.
+  const childrenOf = new Map<string, SessionRow[]>();
+  const roots: SessionRow[] = [];
   for (const s of rows) {
-    if (isDevRow(s)) continue;
-    out.push({ row: s, level: 0 });
-    for (const dev of devsByTl.get(s.sid) ?? []) {
-      out.push({ row: dev, level: 1 });
+    const p = parentOf.get(s.sid);
+    if (p === undefined) {
+      roots.push(s);
+    } else {
+      const list = childrenOf.get(p) ?? [];
+      list.push(s);
+      childrenOf.set(p, list);
     }
   }
-  for (const orphan of orphanDevs) {
-    out.push({ row: orphan, level: 0 });
-  }
+
+  const out: { row: SessionRow; level: number }[] = [];
+  const emitted = new Set<string>();
+  const emit = (s: SessionRow, level: number) => {
+    if (emitted.has(s.sid)) return; // cycle / dupe guard
+    emitted.add(s.sid);
+    out.push({ row: s, level });
+    for (const child of childrenOf.get(s.sid) ?? []) emit(child, level + 1);
+  };
+  for (const r of roots) emit(r, 0);
+  // Cycle backstop: any row not reachable from a root (parent chain loops)
+  // renders at root so it can never silently disappear from the table.
+  for (const s of rows) if (!emitted.has(s.sid)) emit(s, 0);
   return out;
 }
 

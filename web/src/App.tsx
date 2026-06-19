@@ -130,8 +130,9 @@ export function App() {
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />
           <Route path="/me" element={<Profile />} />
-          {/* T-0061: ATTACHMENT-scoped (per-user-per-server) pages. Sidebar
-              entries in components/sidebarHelpers.ts ATTACHMENT_SIDEBAR_ITEMS. */}
+          {/* T-0061: ATTACHMENT-scoped (per-user-per-server) pages.
+              (T-0224: dropped the stale pointer to the deleted
+              sidebarHelpers ATTACHMENT_SIDEBAR_ITEMS model.) */}
           <Route path="/attachment/tg-binding" element={<AttachmentTgBinding />} />
           <Route path="/attachment/sessions" element={<AttachmentSessions />} />
           <Route path="/attachment/worker" element={<AttachmentWorker />} />

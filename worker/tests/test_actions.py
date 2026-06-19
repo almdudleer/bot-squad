@@ -267,6 +267,66 @@ def test_tg_notify_sid_and_user_forwarded(tmp_config_dir, monkeypatch):
     assert call["user"] == "alexey"
 
 
+# --- T-0241: needs-input enrichment (tmux-attach command + reply hint) ---
+
+def test_tg_notify_needs_input_appends_tmux_attach(tmp_config_dir, monkeypatch):
+    """needs_input=True + an explicit tmux_session → the DM carries the exact
+    `tmux attach -t <session>` command AND keeps the message text."""
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    A.dispatch("tg_notify", {
+        "message": "Which DB should I use?",
+        "needs_input": True,
+        "tmux_session": "bot-squad-roles",
+    })
+    text = fake.calls[0]["text"]
+    assert "Which DB should I use?" in text
+    assert "tmux attach -t bot-squad-roles" in text
+    assert "Reply" in text  # replying in TG must still work
+
+
+def test_tg_notify_needs_input_forces_urgent(tmp_config_dir, monkeypatch):
+    """A blocked process's input request must clear the quiet-hours gate, so
+    needs_input forces urgent even when the caller didn't pass it."""
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    A.dispatch("tg_notify", {"message": "need a decision", "needs_input": True})
+    assert fake.calls[0]["urgent"] is True
+
+
+def test_tg_notify_needs_input_resolves_session_from_sid(tmp_config_dir, monkeypatch):
+    """With no explicit tmux_session, needs_input resolves the session's
+    tmux_session from its SessionMd (sid + slug)."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    sdir = cfg.data_dir / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / "S-u-roles-dev-p5.md", {
+        "sid": "S-u-roles-dev-p5", "status": "active", "window": "roles-dev",
+        "task_id": "~", "initiative": "~", "tmux_session": "bot-squad-roles",
+    })
+    A.dispatch("tg_notify", {
+        "message": "stuck", "needs_input": True,
+        "slug": "test-project", "sid": "S-u-roles-dev-p5",
+    })
+    assert "tmux attach -t bot-squad-roles" in fake.calls[0]["text"]
+
+
+def test_tg_notify_without_needs_input_unchanged(tmp_config_dir, monkeypatch):
+    """Back-compat: no needs_input → text is the bare message, no footer, and
+    urgent is honored exactly as passed."""
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    A.dispatch("tg_notify", {"message": "plain", "tmux_session": "bot-squad-x"})
+    assert fake.calls[0]["text"] == "plain"
+    assert fake.calls[0]["urgent"] is False
+
+
 # --- T-0156: project-bound forum topic resolution ---
 
 def _config_dir_with_topic(tmp_path: Path) -> Path:

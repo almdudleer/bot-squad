@@ -138,7 +138,27 @@ def _action_tg_verify_login(params: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-_TG_NOTIFY_ALLOWED = {"slug", "chat_id", "message", "sid", "user", "urgent", "topic_id"}
+_TG_NOTIFY_ALLOWED = {
+    "slug", "chat_id", "message", "sid", "user", "urgent", "topic_id",
+    # T-0241: process→user "needs input" enrichment (tmux-attach command).
+    "needs_input", "tmux_session",
+}
+
+
+def _resolve_tmux_session(cfg: Any, slug: str, sid: str) -> str:
+    """Best-effort tmux session name for a SID (its SessionMd ``tmux_session``).
+
+    Used by the T-0241 needs-input enrichment to build the ``tmux attach``
+    command when the caller didn't pass an explicit ``tmux_session``. Returns
+    "" when it can't be resolved (the footer then omits the attach line)."""
+    if not sid or not slug:
+        return ""
+    try:
+        from bot_squad_worker import sessions as _sessions
+        meta = _sessions.resolve_session(cfg, slug, sid)
+    except Exception:
+        meta = None
+    return str((meta or {}).get("tmux_session") or "")
 
 
 def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
@@ -201,13 +221,30 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # is intentionally NOT built here — it is net-new cross-server infra
     # deferred to the non-active detach-sequence initiative. When that lands,
     # branch here on the attached-consumer state. See T-0178.
+    # T-0241: when a process flags it needs human input, enrich the DM with a
+    # join-this-session footer — the exact `tmux attach -t <session>` command
+    # (plus a "reply here works too" hint), reusing the tg_stall escalation
+    # composer for a consistent format. Force urgent so the quiet-hours gate
+    # never drops a blocked process's input request (T-0188).
+    message = params["message"]
+    urgent = bool(params.get("urgent", False))
+    if bool(params.get("needs_input", False)):
+        from bot_squad_worker import tg_stall as _tg_stall
+        session_name = params.get("tmux_session") or _resolve_tmux_session(
+            cfg, params.get("slug", ""), params.get("sid", "")
+        )
+        message = _tg_stall.build_escalation_text(
+            cfg, params.get("sid", ""), message, session_name
+        )
+        urgent = True
+
     tg = _get_tg_client(cfg)
     sent = tg.send(
         chat_id=chat_id,
-        text=params["message"],
+        text=message,
         sid=params.get("sid", ""),
         user=params.get("user", ""),
-        urgent=bool(params.get("urgent", False)),
+        urgent=urgent,
         topic_id=topic_id,
     )
     return {"ok": True, "sent": sent}

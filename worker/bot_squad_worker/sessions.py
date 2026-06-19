@@ -14,6 +14,7 @@ import re
 import shlex
 import subprocess
 import time
+import tomllib
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -1613,6 +1614,11 @@ def spawn(
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"spawn: unknown project slug {slug!r}")
 
+    # T-0239: enforce the user-set parallel-sessions cap BEFORE any spawn side
+    # effect (the task_id marker, tmux session, pane). At/over cap is a
+    # capacity-reached refusal so the task stays pending, never a silent drop.
+    _enforce_parallel_cap(cfg)
+
     # T-0208: defense-in-depth — tolerate a quoted frontmatter scalar passed
     # through from a ticket (`initiative: "x.md"`). The bsq read_frontmatter
     # fix strips these upstream, but a caller (older bsq, raw worker action)
@@ -1874,6 +1880,79 @@ def _live_task_owner(
         if task_id in _full_task_set(meta) and _is_live_holder(meta):
             return sid
     return None
+
+
+# T-0239 slice 2: enforce the user-set resource caps at spawn-time. The caps
+# live in the API's system_settings.toml ([caps] section, written by
+# /api/system-settings); the worker reads them FRESH on each spawn so a cap
+# change takes effect on the next spawn after a worker restart (the PUT returns
+# restart_required=True). 0 / absent = unlimited (a fresh/legacy install is
+# uncapped — back-compat).
+def _caps_config_dir(cfg: Any) -> Path:
+    """The config dir holding system_settings.toml. Prefers cfg.config_dir;
+    falls back to the install-root layout (``<data_dir>/../config``) so a test
+    cfg that carries only data_dir still resolves it."""
+    cd = getattr(cfg, "config_dir", None)
+    if cd:
+        return Path(cd)
+    return Path(cfg.data_dir).parent / "config"
+
+
+def _read_caps(config_dir: Path) -> dict:
+    """Fresh-read the [caps] section from system_settings.toml. Missing file /
+    unparseable / missing keys → unlimited (0). Negative → 0 (unlimited)."""
+    path = Path(config_dir) / "system_settings.toml"
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return {"max_parallel_sessions": 0, "max_total_tokens": 0}
+    caps = raw.get("caps", {}) or {}
+
+    def _c(key: str) -> int:
+        try:
+            v = int(caps.get(key, 0))
+        except (TypeError, ValueError):
+            v = 0
+        return v if v > 0 else 0
+
+    return {
+        "max_parallel_sessions": _c("max_parallel_sessions"),
+        "max_total_tokens": _c("max_total_tokens"),
+    }
+
+
+def _count_live_sessions(cfg: Any) -> int:
+    """Count live sessions (status active/paused, not archived) across every
+    registered project — the cap is a system-wide resource limit."""
+    n = 0
+    for slug in getattr(cfg, "projects", {}) or {}:
+        sess_dir = cfg.data_dir / slug / "sessions"
+        if not sess_dir.exists():
+            continue
+        for md in sess_dir.glob("*.md"):
+            meta = _read_session_metadata(md)
+            if meta and _is_live_holder(meta):
+                n += 1
+    return n
+
+
+def _enforce_parallel_cap(cfg: Any) -> None:
+    """Raise ActionError if spawning would exceed the parallel-sessions cap.
+
+    A capacity-reached *refusal* (the task stays pending), never a silent drop —
+    mirrors the T-0237 S4 admission contract. ``max_parallel_sessions == 0``
+    (unlimited) is a no-op.
+    """
+    cap = _read_caps(_caps_config_dir(cfg))["max_parallel_sessions"]
+    if cap <= 0:
+        return
+    live = _count_live_sessions(cfg)
+    if live >= cap:
+        from bot_squad_worker.actions import ActionError
+        raise ActionError(
+            f"spawn: capacity reached — {live}/{cap} parallel sessions live "
+            f"(max_parallel_sessions cap); spawn refused, task stays pending"
+        )
 
 
 def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:

@@ -309,3 +309,76 @@ def test_get_does_not_leak_bot_token(tmp_bot_squad: Path, monkeypatch) -> None:
     assert body["tg"]["bot_token_set"] is True
     assert "bot_token" not in body["tg"]
     assert "REAL:SECRET" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# T-0239 — user-settable resource caps (parallel sessions + token usage)
+# ---------------------------------------------------------------------------
+
+def test_get_caps_defaults_unlimited(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Fresh install: caps present in the GET contract, 0 = unlimited."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        body = client.get("/api/system-settings").json()
+    assert body["caps"]["max_parallel_sessions"] == 0
+    assert body["caps"]["max_total_tokens"] == 0
+
+
+def test_put_caps_roundtrip(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            "/api/system-settings",
+            json={"caps": {"max_parallel_sessions": 5, "max_total_tokens": 1_000_000}},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["caps"]["max_parallel_sessions"] == 5
+        assert body["caps"]["max_total_tokens"] == 1_000_000
+        # persisted + survives a re-read
+        again = client.get("/api/system-settings").json()
+        assert again["caps"]["max_parallel_sessions"] == 5
+        assert again["caps"]["max_total_tokens"] == 1_000_000
+    raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
+    assert raw["caps"]["max_parallel_sessions"] == 5
+    assert raw["caps"]["max_total_tokens"] == 1_000_000
+
+
+def test_put_caps_partial_update_keeps_other(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/system-settings",
+                   json={"caps": {"max_parallel_sessions": 8, "max_total_tokens": 50}})
+        # update only one field — the other persists
+        body = client.put("/api/system-settings",
+                          json={"caps": {"max_total_tokens": 99}}).json()
+    assert body["caps"]["max_parallel_sessions"] == 8
+    assert body["caps"]["max_total_tokens"] == 99
+
+
+def test_put_caps_rejects_negative(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"max_parallel_sessions": -1}})
+    assert r.status_code == 400
+    assert "max_parallel_sessions" in r.text
+
+
+def test_put_caps_rejects_non_int(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"max_total_tokens": "lots"}})
+    assert r.status_code == 400
+    assert "max_total_tokens" in r.text

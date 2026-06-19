@@ -36,6 +36,11 @@ _DEFAULTS = {
     },
     "session": {"ttl": "7d"},
     "admin": {"coordinator_user": "almdudleer"},
+    # T-0239: user-settable resource caps the system enforces at spawn-time.
+    # 0 (or absent) = unlimited, so a fresh/legacy install is uncapped (back-
+    # compat). max_parallel_sessions caps simultaneously-live sessions; the
+    # token cap bounds aggregate usage (enforced against the telemetry quota).
+    "caps": {"max_parallel_sessions": 0, "max_total_tokens": 0},
 }
 
 
@@ -74,11 +79,21 @@ def _read_system_settings(config_dir: Path) -> dict:
             "tg": dict(_DEFAULTS["tg"]),
             "session": dict(_DEFAULTS["session"]),
             "admin": dict(_DEFAULTS["admin"]),
+            "caps": dict(_DEFAULTS["caps"]),
         }
     raw = tomllib.loads(path.read_text())
     tg = raw.get("tg", {}) or {}
     sess = raw.get("session", {}) or {}
     admin = raw.get("admin", {}) or {}
+    caps = raw.get("caps", {}) or {}
+
+    def _cap(key: str) -> int:
+        try:
+            v = int(caps.get(key, _DEFAULTS["caps"][key]))
+        except (TypeError, ValueError):
+            v = _DEFAULTS["caps"][key]
+        return v if v > 0 else 0
+
     return {
         "tg": {
             "quiet_hours_start_utc": int(
@@ -98,6 +113,10 @@ def _read_system_settings(config_dir: Path) -> dict:
                 admin.get("coordinator_user", _DEFAULTS["admin"]["coordinator_user"])
             )
         },
+        "caps": {
+            "max_parallel_sessions": _cap("max_parallel_sessions"),
+            "max_total_tokens": _cap("max_total_tokens"),
+        },
     }
 
 
@@ -116,6 +135,10 @@ def _write_system_settings(config_dir: Path, settings: dict) -> None:
     out.append("")
     out.append("[admin]")
     out.append(f'coordinator_user = "{_toml_escape(settings["admin"]["coordinator_user"])}"')
+    out.append("")
+    out.append("[caps]")
+    out.append(f"max_parallel_sessions = {int(settings['caps']['max_parallel_sessions'])}")
+    out.append(f"max_total_tokens = {int(settings['caps']['max_total_tokens'])}")
     out.append("")
     path = config_dir / "system_settings.toml"
     tmp = path.with_suffix(".toml.tmp")
@@ -177,6 +200,11 @@ def _shape(config_dir: Path) -> dict:
         },
         "session": {"ttl": s["session"]["ttl"]},
         "admin": {"coordinator_user": s["admin"]["coordinator_user"]},
+        # T-0239: resource caps — the contract Team 2's caps UI (T-0240) reads.
+        "caps": {
+            "max_parallel_sessions": s["caps"]["max_parallel_sessions"],
+            "max_total_tokens": s["caps"]["max_total_tokens"],
+        },
     }
 
 
@@ -255,6 +283,18 @@ def put_settings(request: Request, payload: dict) -> dict:
         if not isinstance(v, str) or not v.strip():
             raise HTTPException(status_code=400, detail="admin.coordinator_user must not be empty")
         current["admin"]["coordinator_user"] = v.strip()
+
+    # T-0239: resource caps. Each is a non-negative int; 0 = unlimited. Partial
+    # updates keep the unspecified cap. bool is rejected (isinstance(True, int)).
+    caps_in = (payload.get("caps") or {}) if isinstance(payload.get("caps"), dict) else {}
+    for key in ("max_parallel_sessions", "max_total_tokens"):
+        if key in caps_in:
+            v = caps_in[key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise HTTPException(
+                    status_code=400, detail=f"caps.{key} must be a non-negative int"
+                )
+            current["caps"][key] = v
 
     _write_system_settings(config_dir, current)
 

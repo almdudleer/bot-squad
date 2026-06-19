@@ -2,7 +2,8 @@
  * T-0210: resource-telemetry panel for the project page.
  *
  * Surfaces the worker-sampled per-session context-token usage (against the
- * 500k contract ceiling), per-agent memory footprint, and the project-level
+ * tunable contract ceiling the worker stamps per session), per-agent memory
+ * footprint, and the project-level
  * quota burndown estimate (burn rate + optional projection + 429 throttle
  * flag). Polls /telemetry on the same 10s cadence as the sessions map.
  *
@@ -81,6 +82,12 @@ export function TelemetryPanel({ slug }: { slug: string }) {
   const sessions = [...data.sessions].sort(
     (a, b) => (b.context?.pct ?? 0) - (a.context?.pct ?? 0),
   );
+  // T-0230: derive the context-column ceiling from the payload itself rather
+  // than hard-coding "500k" — the contract ceiling is tunable (raised to 700k)
+  // and the worker stamps the live value on every session, so the header label
+  // tracks it automatically and never goes stale again.
+  const ceiling = Math.max(0, ...sessions.map((s) => s.context?.ceiling ?? 0));
+  const ceilingLabel = ceiling > 0 ? fmtTokens(ceiling) : "—";
 
   return (
     <div
@@ -127,7 +134,7 @@ export function TelemetryPanel({ slug }: { slug: string }) {
           <thead>
             <tr style={{ color: "var(--mc-muted, #888)", fontSize: "0.62rem", textAlign: "left" }}>
               <th style={{ fontWeight: 500, padding: "1px 6px 1px 0" }}>session</th>
-              <th style={{ fontWeight: 500, padding: "1px 6px" }}>context (/500k)</th>
+              <th style={{ fontWeight: 500, padding: "1px 6px" }}>context (/{ceilingLabel})</th>
               <th style={{ fontWeight: 500, padding: "1px 6px" }}>memory</th>
             </tr>
           </thead>

@@ -89,7 +89,7 @@ def mark_step_seen(request: Request, payload: dict, user: dict = Depends(require
 
     new_meta = UserMeta(
         linux_user=meta.linux_user,
-        is_admin=meta.is_admin,
+        server_role=meta.server_role,
         seen_steps=meta.seen_steps + (step,),
         tg_chat_id=meta.tg_chat_id,
         attached_to_global_user=meta.attached_to_global_user,
@@ -108,7 +108,7 @@ def skip_onboarding(request: Request, user: dict = Depends(require_auth)) -> dic
 
     new_meta = UserMeta(
         linux_user=meta.linux_user,
-        is_admin=meta.is_admin,
+        server_role=meta.server_role,
         seen_steps=meta.seen_steps + (ONBOARDING_SKIP_ALL,),
         tg_chat_id=meta.tg_chat_id,
         attached_to_global_user=meta.attached_to_global_user,
@@ -158,7 +158,7 @@ def put_tg_chat_id(request: Request, payload: dict, user: dict = Depends(require
     meta = cfg.meta_for(username)
     new_meta = UserMeta(
         linux_user=meta.linux_user,
-        is_admin=meta.is_admin,
+        server_role=meta.server_role,
         seen_steps=meta.seen_steps,
         tg_chat_id=new_id,
         attached_to_global_user=meta.attached_to_global_user,
@@ -344,7 +344,7 @@ def put_attachment_tg_chat_id(
         # Attachment, subsequent PUTs will route to the store branch below.
         new_meta = UserMeta(
             linux_user=meta.linux_user,
-            is_admin=meta.is_admin,
+            server_role=meta.server_role,
             seen_steps=meta.seen_steps,
             tg_chat_id=new_id,
             attached_to_global_user=meta.attached_to_global_user,
@@ -546,7 +546,7 @@ def put_project_tg_chat_id(
             new_map.pop(slug, None)
         new_meta = UserMeta(
             linux_user=meta.linux_user,
-            is_admin=meta.is_admin,
+            server_role=meta.server_role,
             seen_steps=meta.seen_steps,
             tg_chat_id=meta.tg_chat_id,
             attached_to_global_user=meta.attached_to_global_user,

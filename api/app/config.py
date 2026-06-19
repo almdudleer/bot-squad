@@ -6,6 +6,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.roles import ServerRole, parse_server_role
+
 
 @dataclass(frozen=True)
 class Project:
@@ -98,7 +100,11 @@ ONBOARDING_SKIP_ALL = "__skip_all__"
 class UserMeta:
     """Per-user metadata loaded from auth.toml [user_meta.<username>]."""
     linux_user: str
-    is_admin: bool = False
+    # T-0216 Phase A: explicit server-scope role replaces the overloaded
+    # `is_admin` bool. `is_admin` survives as a derived compat property so
+    # every existing reader (gates, serializer, /auth/me) is untouched. The
+    # legacy bool is still read off disk via dual-read in AuthConfig.load.
+    server_role: ServerRole = ServerRole.SERVER_MEMBER
     seen_steps: tuple[str, ...] = ()
     # Telegram chat id bound to this user (per T-0019). Empty means unbound.
     # Disambiguated from the per-project `tg_chat` with the `_id` suffix.
@@ -114,6 +120,12 @@ class UserMeta:
     # Sits above the global tg_chat_id in the notify precedence. Empty = none.
     project_tg_chat_ids: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def is_admin(self) -> bool:
+        """Derived server-admin flag — back-compat for readers predating the
+        T-0216 ServerRole field. True iff this user is a server admin."""
+        return self.server_role is ServerRole.SERVER_ADMIN
+
 
 @dataclass(frozen=True)
 class AuthConfig:
@@ -127,7 +139,7 @@ class AuthConfig:
         if m is not None:
             return m
         # Default: linux_user mirrors the UI username, no admin.
-        return UserMeta(linux_user=username, is_admin=False)
+        return UserMeta(linux_user=username, server_role=ServerRole.SERVER_MEMBER)
 
     @staticmethod
     def _parse_ttl(s: str) -> int:
@@ -154,9 +166,15 @@ class AuthConfig:
                 if isinstance(raw_proj, dict)
                 else {}
             )
+            # T-0216 dual-read: explicit server_role wins; else derive from the
+            # legacy is_admin bool so un-migrated rows keep working.
+            server_role = parse_server_role(
+                m.get("server_role"),
+                legacy_is_admin=bool(m.get("is_admin", False)),
+            )
             user_meta[name] = UserMeta(
                 linux_user=str(m.get("linux_user", name)),
-                is_admin=bool(m.get("is_admin", False)),
+                server_role=server_role,
                 seen_steps=tuple(str(s) for s in raw_steps),
                 tg_chat_id=str(m.get("tg_chat_id", "")),
                 attached_to_global_user=str(m.get("attached_to_global_user", "")),

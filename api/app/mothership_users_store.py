@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.roles import GlobalRole, global_role_for, parse_global_role
+
 
 SCHEMA_VERSION = 1
 
@@ -49,13 +51,25 @@ class GlobalUser:
     display_name: str = ""
     email: str = ""
     timezone: str = "UTC"
-    is_super_admin: bool = False
+    # T-0216 Phase A: explicit global-scope role replaces the overloaded
+    # is_super_admin bool. is_super_admin survives as a derived compat property.
+    global_role: GlobalRole = GlobalRole.GLOBAL_MEMBER
+
+    @property
+    def is_super_admin(self) -> bool:
+        """Derived global-admin flag — back-compat for readers predating the
+        T-0216 GlobalRole field."""
+        return self.global_role is GlobalRole.GLOBAL_ADMIN
 
     def to_public(self) -> dict:
         """Projection consumed by ``GET /api/m/users``. Password hash never
-        leaves the registry — strip it before any FE-facing serialisation."""
+        leaves the registry — strip it before any FE-facing serialisation.
+        Keeps the ``is_super_admin`` compat key (FE-facing) alongside the
+        canonical ``global_role`` so the frontend is untouched in Phase A."""
         d = asdict(self)
         d.pop("password_hash", None)
+        d["global_role"] = self.global_role.value
+        d["is_super_admin"] = self.is_super_admin
         return d
 
 
@@ -100,22 +114,40 @@ class MothershipUsersStore:
         # Allowlist by dataclass field names so a future on-disk addition by
         # a newer process doesn't 500 this reader on rollback.
         known = {f.name for f in fields(GlobalUser)}
-        return [
-            GlobalUser(**{k: v for k, v in u.items() if k in known})
-            for u in self._read().get("users", [])
-        ]
+        out: list[GlobalUser] = []
+        for u in self._read().get("users", []):
+            kept = {k: v for k, v in u.items() if k in known}
+            # T-0216 dual-read: explicit global_role wins; else derive from the
+            # legacy is_super_admin bool (is_super_admin is a property now, so
+            # it never survives the allowlist — derive before constructing).
+            kept["global_role"] = parse_global_role(
+                u.get("global_role"),
+                legacy_is_super_admin=bool(u.get("is_super_admin", False)),
+            )
+            out.append(GlobalUser(**kept))
+        return out
 
     def _write_users(self, users: list[GlobalUser]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         tmp = self.users_path.with_suffix(".tmp")
         tmp.write_text(
             json.dumps(
-                {"version": SCHEMA_VERSION, "users": [asdict(u) for u in users]},
+                {"version": SCHEMA_VERSION, "users": [self._user_to_row(u) for u in users]},
                 indent=2,
             ),
             encoding="utf-8",
         )
         os.rename(tmp, self.users_path)
+
+    @staticmethod
+    def _user_to_row(u: "GlobalUser") -> dict:
+        """Serialize a GlobalUser for users.json. T-0216: emit global_role as
+        its string value (canonical) plus a legacy is_super_admin mirror so a
+        rollback to pre-T-0216 code still reads admin status correctly."""
+        row = asdict(u)
+        row["global_role"] = u.global_role.value
+        row["is_super_admin"] = u.is_super_admin
+        return row
 
     # ---- user lookups -------------------------------------------------------
 
@@ -152,7 +184,7 @@ class MothershipUsersStore:
             display_name=display_name,
             email=email,
             timezone=timezone_name,
-            is_super_admin=is_super_admin,
+            global_role=global_role_for(is_super_admin),
         )
         with self._lock:
             users = self.list_users()
@@ -193,7 +225,7 @@ class MothershipUsersStore:
                 display_name=display_name,
                 email=email,
                 timezone=timezone_name,
-                is_super_admin=is_super_admin,
+                global_role=global_role_for(is_super_admin),
             )
             users.append(entry)
             self._write_users(users)

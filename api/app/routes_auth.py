@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.auth import AuthError, issue_jwt, verify_jwt, verify_password
+from app.roles import GlobalRole, ServerRole
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -18,15 +19,25 @@ def _is_mothership() -> bool:
     return os.environ.get("MOTHERSHIP", "0") == "1"
 
 
-def _is_super_admin(meta) -> bool:
-    """Derived super-admin flag for T-0066 Bundle A.
+def _derive_global_role(meta) -> GlobalRole:
+    """THE quarantined build-flag bridge (T-0216 Phase A).
 
-    Until per-user GlobalUser resolution is wired into the session layer
-    (follow-up), every server-local admin on the mothership build is the
-    super-admin. Consumers (single-install) never surface the MOTHERSHIP
-    sidebar section, so this resolves to False there.
+    The session layer does not yet resolve the authenticated user's GlobalUser,
+    so global-admin is derived rather than read from the stored
+    ``GlobalUser.global_role``: every server admin on the MOTHERSHIP build is a
+    global admin. This is the ONE place the bridge lives; T-0216 Phase A
+    preserves it exactly. Replacing it with stored-role resolution is a
+    behavior change tracked by **T-0228** (GlobalUser session-resolution).
     """
-    return bool(meta.is_admin) and _is_mothership()
+    if meta.server_role is ServerRole.SERVER_ADMIN and _is_mothership():
+        return GlobalRole.GLOBAL_ADMIN
+    return GlobalRole.GLOBAL_MEMBER
+
+
+def _is_super_admin(meta) -> bool:
+    """Derived super-admin bool — back-compat over :func:`_derive_global_role`.
+    Behavior-identical to the pre-T-0216 ``is_admin AND _is_mothership()``."""
+    return _derive_global_role(meta) is GlobalRole.GLOBAL_ADMIN
 
 
 @router.post("/login")
@@ -72,11 +83,15 @@ def _enrich(claims: dict, request: Request) -> dict:
     username = claims.get("username", "")
     cfg = request.app.state.auth_config
     meta = cfg.meta_for(username)
+    # T-0216 Phase A: add the canonical role enums alongside the legacy
+    # is_admin/is_super_admin bools (kept for FE compat — Team 2 untouched).
     return {
         "username": username,
         "linux_user": meta.linux_user,
         "is_admin": meta.is_admin,
         "is_super_admin": _is_super_admin(meta),
+        "server_role": meta.server_role.value,
+        "global_role": _derive_global_role(meta).value,
         "tg_chat_id": meta.tg_chat_id,
         "attached_to_global_user": meta.attached_to_global_user or None,
     }
@@ -262,7 +277,7 @@ def attach(
 
     new_meta = UserMeta(
         linux_user=current.linux_user,
-        is_admin=current.is_admin,
+        server_role=current.server_role,
         seen_steps=current.seen_steps,
         tg_chat_id=current.tg_chat_id,
         attached_to_global_user=global_user_id,

@@ -8,6 +8,7 @@ import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import AuthConfig
+from app.roles import server_role_for
 from app.routes_auth import require_admin
 
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(require_admin)])
@@ -30,6 +31,11 @@ def _serialize_auth_toml(users: dict[str, str], user_meta: dict, session_ttl: st
         meta = user_meta[name]
         out.append(f"[user_meta.{name}]")
         out.append(f'linux_user = "{_toml_escape(meta.linux_user)}"')
+        # T-0216 Phase A: server_role is the canonical field. is_admin is kept
+        # as a legacy mirror (same value, derived) so a rollback to pre-T-0216
+        # code still reads admin status correctly. AuthConfig.load dual-reads:
+        # explicit server_role wins, else falls back to is_admin.
+        out.append(f'server_role = "{meta.server_role.value}"')
         out.append(f"is_admin = {'true' if meta.is_admin else 'false'}")
         # Only emit seen_steps when non-empty so existing auth.toml files
         # without onboarding state stay byte-identical on roundtrip.
@@ -139,7 +145,9 @@ def create_user(request: Request, payload: dict) -> dict:
     new_users[username] = _bcrypt(password)
     from app.config import UserMeta
     new_meta = dict(cfg.user_meta)
-    new_meta[username] = UserMeta(linux_user=linux_user, is_admin=is_admin)
+    new_meta[username] = UserMeta(
+        linux_user=linux_user, server_role=server_role_for(is_admin)
+    )
 
     _write_auth_toml(request, new_users, new_meta)
     fresh = request.app.state.auth_config
@@ -167,7 +175,7 @@ def patch_user(username: str, request: Request, payload: dict) -> dict:
     new_meta = dict(cfg.user_meta)
     new_meta[username] = UserMeta(
         linux_user=new_linux_user,
-        is_admin=new_is_admin,
+        server_role=server_role_for(new_is_admin),
         seen_steps=current.seen_steps,
         tg_chat_id=current.tg_chat_id,
         attached_to_global_user=current.attached_to_global_user,

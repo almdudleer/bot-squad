@@ -49,6 +49,7 @@ from app.install_tokens import (
 from app.auth import verify_password
 from app.mothership_store import MothershipStore
 from app.mothership_users_store import MothershipUsersStore
+from app.roles import GlobalRole
 from app.routes_auth import require_auth
 
 
@@ -74,13 +75,13 @@ def _users_store(request: Request) -> MothershipUsersStore:
 def _require_super_admin(user: dict = Depends(require_auth)) -> dict:
     """Super-admin gate for the MOTHERSHIP routes that aren't bearer-auth.
 
-    Until GlobalUser-backed sessions land (follow-up), every server-local
-    admin on the mothership build is the super-admin — same derivation as
-    routes_auth._is_super_admin. Routes that touch the GlobalUser registry
-    use this instead of the looser ``require_auth`` because non-admin
-    users (no MOTHERSHIP scope) MUST get 403, not see anyone's else profile.
+    T-0216 Phase A: reads the explicit ``global_role`` from the enriched
+    session (derived via routes_auth._derive_global_role — the quarantined
+    build-flag bridge, removal tracked by T-0228). Behavior-identical to the
+    pre-T-0216 ``is_admin`` check on the MOTHERSHIP build where these routes
+    mount. Non-global-admin users MUST get 403, not see anyone else's profile.
     """
-    if not user.get("is_admin"):
+    if user.get("global_role") != GlobalRole.GLOBAL_ADMIN.value:
         raise HTTPException(status_code=403, detail="super-admin only")
     return user
 

@@ -413,7 +413,9 @@ export function Project() {
     setSaving(true);
     setModalError(null);
     try {
-      await api.addComment(slug, activeTask.id, commentText.trim());
+      // T-0238: comments land in the working-area feed (progress notes) — the
+      // reused, no-new-schema comment channel. "S-stakeholder" = the user.
+      await api.addProgress(slug, activeTask.id, "S-stakeholder", commentText.trim());
       closeModal();
       reload();
     } catch (e) {
@@ -824,11 +826,15 @@ export function Project() {
         <textarea
           className="form-control"
           rows={4}
-          placeholder="Write your comment…"
+          maxLength={240}
+          placeholder="Write your comment… (cap 240 chars)"
           value={commentText}
           onChange={(e) => setCommentText(e.target.value)}
           autoFocus
         />
+        <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
+          Recorded in the task's working area (the agent working / negotiation log).
+        </div>
       </Modal>
 
       {/* Set initiative modal — T-0038 follow-up. Quick assign from the

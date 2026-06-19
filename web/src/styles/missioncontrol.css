@@ -1221,6 +1221,49 @@ pre.bg-light {
   letter-spacing: 0.05em;
 }
 
+/* ---- Task detail zones (T-0238) -------------------------------
+   The task is the board centerpiece: its detail page splits into a
+   USER-FACING HEADER (what the user asked for + the stage controls)
+   and an AGENT WORKING AREA (progress-notes feed = the agents'
+   working/negotiation log, where user comments are also recorded). */
+.mc-zone-tag {
+  font-family: var(--mc-mono);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--mc-text-dim);
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.mc-task-zone {
+  border: 1px solid var(--mc-border);
+  border-radius: 5px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 1.1rem;
+}
+/* User-facing header: cyan = "you / the ask". */
+.mc-task-zone.mc-zone-header {
+  background: var(--mc-surface);
+  border-left: 3px solid var(--mc-cyan);
+}
+.mc-task-zone.mc-zone-header .mc-zone-tag { color: var(--mc-cyan); }
+/* Agent working area: amber = attention/working. Inset/data feel. */
+.mc-task-zone.mc-zone-work {
+  background: var(--mc-surface-deep);
+  border-left: 3px solid var(--mc-amber);
+}
+.mc-task-zone.mc-zone-work .mc-zone-tag { color: var(--mc-amber); }
+/* Plumbing/details: muted, no accent rail. */
+.mc-task-zone.mc-zone-details {
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--mc-border);
+  border-radius: 0;
+  padding: 1rem 0 0;
+}
+
 /* T-0058: board row replaces Bootstrap `row g-3` so the planned/closed
    rails can collapse to thin drop-strips while the other columns share
    the remaining width on a single line. */

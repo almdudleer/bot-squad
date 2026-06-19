@@ -17,9 +17,33 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "closed", label: "Closed" },
 ];
 
-type ProgressEntry = { ts: string; sid: string; text: string };
+// T-0238: at-a-glance stage label/colour for the user-facing header pill.
+// Covers every status (incl. planned/closed which aren't in STATUS_OPTIONS).
+const STAGE_LABELS: Record<Task["status"], string> = {
+  planned: "Planned",
+  open: "Open",
+  in_progress: "In progress",
+  totest: "To Test",
+  reopened: "Reopened",
+  closed: "Closed",
+};
+function stageColor(s: Task["status"]): string {
+  switch (s) {
+    case "in_progress":
+      return "var(--mc-cyan)";
+    case "totest":
+    case "reopened":
+      return "var(--mc-amber)";
+    case "closed":
+      return "var(--mc-text-dim)";
+    default:
+      return "var(--mc-text-mid)";
+  }
+}
 
-function parseProgressList(progress: string): ProgressEntry[] {
+export type ProgressEntry = { ts: string; sid: string; text: string };
+
+export function parseProgressList(progress: string): ProgressEntry[] {
   if (!progress) return [];
   // Each line: "- <ts> · <sid> · <text>"
   return progress
@@ -33,6 +57,12 @@ function parseProgressList(progress: string): ProgressEntry[] {
       return { ts: parts[0], sid: parts[1], text: parts.slice(2).join(" · ") };
     });
 }
+
+// T-0238: the user (stakeholder) is the author of comments dropped into the
+// working area. Progress notes from a real session carry an S-<...> SID; the
+// stakeholder's comments carry this sentinel so the feed can label them
+// "you" rather than as an agent.
+export const STAKEHOLDER_SID = "S-stakeholder";
 
 export function TaskDetail() {
   const { slug = "", id = "" } = useParams();
@@ -271,12 +301,13 @@ export function TaskDetail() {
   }
 
   async function postProgress() {
-    if (!progressText.trim()) { setProgressError("Progress note cannot be empty"); return; }
+    if (!progressText.trim()) { setProgressError("Comment cannot be empty"); return; }
     setProgressSaving(true);
     setProgressError(null);
     try {
-      // SID for stakeholder-added notes — keep this short + identifiable.
-      await api.addProgress(slug, id, "S-stakeholder", progressText.trim());
+      // T-0238: the stakeholder's comment is recorded into the working-area
+      // feed (progress notes) — the reused, no-new-schema comment channel.
+      await api.addProgress(slug, id, STAKEHOLDER_SID, progressText.trim());
       setProgressText("");
       loadTask();
     } catch (e) {
@@ -383,214 +414,140 @@ export function TaskDetail() {
 
       {actionError && <div className="alert alert-danger">{actionError}</div>}
 
-      {/* Title row */}
-      <div className="d-flex align-items-start gap-3 mb-3">
-        <div className="flex-grow-1">
-          {editingTitle ? (
-            <input
-              ref={titleRef}
-              className="form-control fw-semibold"
-              style={{ fontSize: "1.05rem" }}
-              value={titleValue}
-              onChange={(e) => setTitleValue(e.target.value)}
-              onBlur={saveTitle}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") { e.preventDefault(); saveTitle(); }
-                if (e.key === "Escape") { setEditingTitle(false); setTitleValue(task.title); }
-              }}
-              disabled={saving}
-            />
-          ) : (
-            <h4
-              style={{
-                cursor: "text",
-                marginBottom: 0,
-                fontSize: "1.05rem",
-                fontWeight: 600,
-                color: "var(--mc-text)",
-              }}
-              title="Click to edit title"
-              onClick={() => setEditingTitle(true)}
-            >
-              {task.title}
-            </h4>
-          )}
-        </div>
-      </div>
+      {/* ==================================================================
+          USER-FACING HEADER (T-0238) — what the user asked for + the stage.
+          The header is the user's summary; agents work in the area below.
+          ================================================================== */}
+      <div className="mc-task-zone mc-zone-header">
+        <div className="mc-zone-tag">▸ User-facing — what you asked for</div>
 
-      {/* Two-row control strip — keep the status dropdown and the session
-          control on separate rows so the page doesn't look crowded. */}
-      <div className="mb-2 d-flex align-items-center gap-2" style={{ fontSize: "0.78rem" }}>
-        <label
-          htmlFor="task-status"
-          style={{
-            color: "var(--mc-text-dim)",
-            fontFamily: "var(--mc-mono)",
-            minWidth: "5.5rem",
-            margin: 0,
-          }}
-        >
-          status:
-        </label>
-        <Select
-          id="task-status"
-          value={statusValue}
-          onChange={(v) => saveStatus(v as Task["status"])}
-          disabled={saving}
-          style={{ minWidth: "10rem" }}
-          ariaLabel="task status"
-          options={STATUS_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
-        />
-      </div>
-
-      {/* T-0038: initiative binding. The board's group-by/filter is useless
-          without a way to actually assign initiatives — this select is the
-          primary surface for that. */}
-      <div className="mb-2 d-flex align-items-center gap-2" style={{ fontSize: "0.78rem" }}>
-        <label
-          htmlFor="task-initiative"
-          style={{
-            color: "var(--mc-text-dim)",
-            fontFamily: "var(--mc-mono)",
-            minWidth: "5.5rem",
-            margin: 0,
-          }}
-        >
-          initiative:
-        </label>
-        {(() => {
-          const orphan: SelectOption | null =
-            task.initiative &&
-            !initiativeOptions.some((i) => i.basename === task.initiative)
-              ? { value: task.initiative, label: `${task.initiative} (orphan)` }
-              : null;
-          const options: SelectOption[] = [
-            { value: "", label: "— unattached —" },
-            ...(orphan ? [orphan] : []),
-            ...initiativeOptions.map((i) => {
-              const tag = i.finished ? "done" : i.active ? "active" : "draft";
-              return {
-                value: i.basename,
-                label: i.basename.replace(/\.md$/, ""),
-                hint: tag,
-              };
-            }),
-          ];
-          return (
-            <Select
-              id="task-initiative"
-              value={task.initiative ?? ""}
-              onChange={(v) => saveInitiative(v || null)}
-              disabled={saving}
-              style={{ minWidth: "16rem", maxWidth: "30rem" }}
-              ariaLabel="initiative binding"
-              options={options}
-            />
-          );
-        })()}
-      </div>
-
-      {/* Unified dev-session select: one control replaces the three older
-          affordances (current SID line, "Assign session" button, "or bind"
-          select). Selecting __new__ opens the new-session flow; selecting
-          any other entry binds the task to that existing dev. */}
-      <div className="mb-3 d-flex align-items-center gap-2" style={{ fontSize: "0.78rem" }}>
-        <label
-          htmlFor="task-session"
-          style={{
-            color: "var(--mc-text-dim)",
-            fontFamily: "var(--mc-mono)",
-            minWidth: "5.5rem",
-            margin: 0,
-          }}
-        >
-          dev session:
-        </label>
-        {(() => {
-          // Surface the current binding even if it's not in activeDevs
-          // (paused/suspended) so the select reflects reality. T-0104:
-          // label via the canonical activity formatter so this row reads
-          // the same vocabulary as the rest of the page.
-          const orphanSession: SelectOption | null =
-            task.session && !activeDevs.some((d) => d.sid === task.session!.sid)
-              ? {
-                  value: task.session.sid,
-                  label: `${task.session.sid} (${sessionLabel(
-                    sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
-                  )})`,
-                }
-              : null;
-          const options: SelectOption[] = [
-            { value: "", label: "— none —", disabled: true },
-            ...(orphanSession ? [orphanSession] : []),
-            ...activeDevs.map((d) => ({
-              value: d.sid,
-              label: `${d.window || d.sid} (${d.sid})`,
-            })),
-            {
-              action: true,
-              key: "__new__",
-              label: "+ Create new dev session…",
-              onSelect: () =>
-                navigate(`/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`),
-            },
-          ];
-          return (
-            <Select
-              id="task-session"
-              value={task.session ? task.session.sid : ""}
-              onChange={(v) => {
-                if (v) bindToDev(v);
-              }}
-              disabled={saving}
-              style={{ minWidth: "16rem", maxWidth: "30rem" }}
-              ariaLabel="dev session binding"
-              options={options}
-            />
-          );
-        })()}
-        {task.session && (
-          <button
-            type="button"
-            className="btn btn-outline-secondary btn-sm"
-            style={{ fontSize: "0.7rem" }}
-            title="Clear the dev-session binding for this task"
-            onClick={unassignSession}
-            disabled={saving}
+        {/* Title row — id, editable title, at-a-glance stage pill */}
+        <div className="d-flex align-items-start gap-2 mb-3">
+          <span
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.72rem",
+              color: "var(--mc-text-dim)",
+              paddingTop: "0.35rem",
+            }}
           >
-            Unassign
-          </button>
-        )}
-        {task.session && (() => {
-          // T-0104: prefer the worker-derived activity (from /sessions
-          // join via sessionsBySid) over the raw md status. Falls back
-          // to the status-derived mapping in sessionActivity() when
-          // the session isn't in the live list (e.g. suspended).
-          const live = sessionsBySid[task.session.sid];
-          const act = sessionActivity(live ?? task.session);
-          const green = isRunning(act);
-          return (
-            <span
-              style={{
-                fontFamily: "var(--mc-mono)",
-                fontSize: "0.7rem",
-                color: green
-                  ? "var(--mc-accent-success, #4ade80)"
-                  : "var(--mc-text-dim)",
-              }}
-              title={`session status: ${act}`}
-            >
-              {sessionGlyph(act)} {sessionLabel(act)}
-            </span>
-          );
-        })()}
-      </div>
+            {task.id}
+          </span>
+          <div className="flex-grow-1">
+            {editingTitle ? (
+              <input
+                ref={titleRef}
+                className="form-control fw-semibold"
+                style={{ fontSize: "1.05rem" }}
+                value={titleValue}
+                onChange={(e) => setTitleValue(e.target.value)}
+                onBlur={saveTitle}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); saveTitle(); }
+                  if (e.key === "Escape") { setEditingTitle(false); setTitleValue(task.title); }
+                }}
+                disabled={saving}
+              />
+            ) : (
+              <h4
+                style={{
+                  cursor: "text",
+                  marginBottom: 0,
+                  fontSize: "1.05rem",
+                  fontWeight: 600,
+                  color: "var(--mc-text)",
+                }}
+                title="Click to edit title"
+                onClick={() => setEditingTitle(true)}
+              >
+                {task.title}
+              </h4>
+            )}
+          </div>
+          <span
+            title={`Current stage: ${STAGE_LABELS[statusValue]}`}
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.62rem",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              color: stageColor(statusValue),
+              background: "var(--mc-surface-raised)",
+              border: `1px solid ${stageColor(statusValue)}`,
+              borderRadius: "2px",
+              padding: "1px 6px",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            {STAGE_LABELS[statusValue]}
+          </span>
+        </div>
 
-      {/* Verbatim request — source-of-truth section */}
-      <div className="mb-4">
+        {/* Stage + initiative controls — how the user steers the task. */}
+        <div className="d-flex flex-wrap align-items-center gap-3 mb-3" style={{ fontSize: "0.78rem" }}>
+          <div className="d-flex align-items-center gap-2">
+            <label
+              htmlFor="task-status"
+              style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)", margin: 0 }}
+            >
+              stage:
+            </label>
+            <Select
+              id="task-status"
+              value={statusValue}
+              onChange={(v) => saveStatus(v as Task["status"])}
+              disabled={saving}
+              style={{ minWidth: "9rem" }}
+              ariaLabel="task status"
+              options={STATUS_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
+            />
+          </div>
+          {/* T-0038: initiative binding. */}
+          <div className="d-flex align-items-center gap-2">
+            <label
+              htmlFor="task-initiative"
+              style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)", margin: 0 }}
+            >
+              initiative:
+            </label>
+            {(() => {
+              const orphan: SelectOption | null =
+                task.initiative &&
+                !initiativeOptions.some((i) => i.basename === task.initiative)
+                  ? { value: task.initiative, label: `${task.initiative} (orphan)` }
+                  : null;
+              const options: SelectOption[] = [
+                { value: "", label: "— unattached —" },
+                ...(orphan ? [orphan] : []),
+                ...initiativeOptions.map((i) => {
+                  const tag = i.finished ? "done" : i.active ? "active" : "draft";
+                  return {
+                    value: i.basename,
+                    label: i.basename.replace(/\.md$/, ""),
+                    hint: tag,
+                  };
+                }),
+              ];
+              return (
+                <Select
+                  id="task-initiative"
+                  value={task.initiative ?? ""}
+                  onChange={(v) => saveInitiative(v || null)}
+                  disabled={saving}
+                  style={{ minWidth: "14rem", maxWidth: "26rem" }}
+                  ariaLabel="initiative binding"
+                  options={options}
+                />
+              );
+            })()}
+          </div>
+        </div>
+
+        {/* The ask — verbatim, source of truth */}
         <div className="d-flex justify-content-between align-items-center mb-2">
-          <div className="mc-section-title" style={{ margin: 0 }}>
-            Verbatim request — source of truth
+          <div className="mc-section-title" style={{ margin: 0, border: "none", padding: 0 }}>
+            The ask — source of truth
           </div>
           {!editingVerbatim && (
             <button
@@ -610,8 +567,8 @@ export function TaskDetail() {
             marginBottom: "0.4rem",
           }}
         >
-          The anti-broken-phone record. Sessions do not edit this — only the
-          stakeholder. They append progress notes below.
+          The anti-broken-phone record. Sessions do not edit this — only you.
+          They record their work and your comments in the working area below.
         </div>
         {editingVerbatim ? (
           <>
@@ -641,133 +598,78 @@ export function TaskDetail() {
             style={{
               borderLeft: "3px solid var(--mc-accent-success, #4ade80)",
               paddingLeft: "0.75rem",
+              marginBottom: 0,
             }}
           >
             {task.verbatim?.trim() ? task.verbatim : (
               <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic" }}>
-                (no verbatim request recorded)
+                (no request recorded)
               </span>
             )}
           </pre>
         )}
       </div>
 
-      {/* Context — optional TL clarification */}
-      <div className="mb-4">
-        <div className="d-flex justify-content-between align-items-center mb-2">
-          <div className="mc-section-title" style={{ margin: 0 }}>Context (optional)</div>
-          {!editingContext && (
-            <button
-              type="button"
-              className="btn btn-outline-secondary btn-sm"
-              style={{ fontSize: "0.72rem" }}
-              onClick={() => { setContextValue(task.context ?? ""); setEditingContext(true); }}
-            >
-              Edit
-            </button>
-          )}
+      {/* ==================================================================
+          AGENT WORKING AREA (T-0238) — the progress-notes feed reused as the
+          agents' working / negotiation log AND where the user's comments are
+          recorded. No new schema field (operator fork 2026-06-19).
+          ================================================================== */}
+      <div className="mc-task-zone mc-zone-work">
+        <div className="mc-zone-tag">⚙ Agent working area — working / negotiation log + your comments</div>
+        <div
+          style={{
+            fontSize: "0.7rem",
+            color: "var(--mc-text-dim)",
+            marginBottom: "0.6rem",
+          }}
+        >
+          Where sessions record progress and negotiate the work. Drop a comment
+          here and it's recorded in the same log — newest first.
         </div>
-        {editingContext ? (
-          <>
-            <textarea
-              className="form-control"
-              rows={4}
-              value={contextValue}
-              onChange={(e) => setContextValue(e.target.value)}
-              autoFocus
-              placeholder="Short TL clarification — keep it brief."
-            />
-            <div className="mt-2 d-flex gap-2">
-              <button type="button" className="btn btn-primary btn-sm" onClick={saveContext} disabled={saving}>
-                {saving ? "Saving…" : "Save"}
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => { setEditingContext(false); setContextValue(task.context ?? ""); }}
-              >
-                Cancel
-              </button>
-            </div>
-          </>
-        ) : task.context?.trim() ? (
-          <pre className="mc-pre">{task.context}</pre>
-        ) : (
-          <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>(no context yet)</p>
-        )}
-      </div>
 
-      {/* Related docs — ticket→doc half of the T-0172 bidirectional mention */}
-      <div className="mb-4">
-        <div className="mc-section-title">Related docs ({(task.related_docs ?? []).length})</div>
-        <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
-          {(task.related_docs ?? []).length === 0 && (
-            <span style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
-              No docs linked. Link an architecture/design/support doc so agents find the context.
-            </span>
-          )}
-          {(task.related_docs ?? []).map((d) => (
-            <span key={d} className="d-inline-flex align-items-center gap-1" style={{ fontSize: "0.78rem" }}>
-              <Link to={`/p/${slug}/docs?doc=${encodeURIComponent(d)}`} style={{ fontFamily: "var(--mc-mono)" }}>{d}</Link>
-              <button type="button" className="btn btn-link btn-sm p-0" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }} title="Unlink" onClick={() => unlinkDoc(d)}>✕</button>
-            </span>
-          ))}
-        </div>
-        <div className="d-flex gap-2" style={{ maxWidth: "20rem" }}>
-          <input
-            type="text"
-            className="form-control form-control-sm"
-            style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem" }}
-            placeholder="D-0123"
-            value={docToLink}
-            onChange={(e) => setDocToLink(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); linkDoc(); } }}
-          />
-          <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} onClick={linkDoc}>
-            Link doc
-          </button>
-        </div>
-      </div>
-
-      {/* Progress — read-only list, append-only via the worker action */}
-      <div className="mb-4">
-        <div className="mc-section-title">Progress ({progressEntries.length})</div>
         {progressEntries.length === 0 && (
-          <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>No progress notes yet.</p>
+          <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
+            Nothing recorded yet. Add the first comment below.
+          </p>
         )}
-        {progressEntries.map((p, i) => (
-          <div
-            key={i}
-            style={{
-              background: "var(--mc-surface-raised)",
-              border: "1px solid var(--mc-border)",
-              borderRadius: "3px",
-              padding: "0.4rem 0.625rem",
-              marginBottom: "0.35rem",
-              fontSize: "0.78rem",
-              color: "var(--mc-text-mid)",
-            }}
-          >
-            <span
+        {progressEntries.map((p, i) => {
+          const mine = p.sid === STAKEHOLDER_SID;
+          return (
+            <div
+              key={i}
               style={{
-                fontFamily: "var(--mc-mono)",
-                fontSize: "0.68rem",
-                color: "var(--mc-text-dim)",
-                marginRight: "0.5rem",
+                background: "var(--mc-surface-raised)",
+                border: "1px solid var(--mc-border)",
+                borderLeft: mine ? "3px solid var(--mc-cyan)" : "1px solid var(--mc-border)",
+                borderRadius: "3px",
+                padding: "0.4rem 0.625rem",
+                marginBottom: "0.35rem",
+                fontSize: "0.78rem",
+                color: "var(--mc-text-mid)",
               }}
             >
-              {p.ts} · {p.sid}
-            </span>
-            {p.text}
-          </div>
-        ))}
+              <span
+                style={{
+                  fontFamily: "var(--mc-mono)",
+                  fontSize: "0.68rem",
+                  color: mine ? "var(--mc-cyan)" : "var(--mc-text-dim)",
+                  marginRight: "0.5rem",
+                }}
+              >
+                {p.ts} · {mine ? "you" : p.sid}
+              </span>
+              {p.text}
+            </div>
+          );
+        })}
 
         <div className="mt-3">
           {progressError && <div className="alert alert-danger py-1 small">{progressError}</div>}
           <input
             type="text"
             className="form-control form-control-sm"
-            placeholder="Add progress note (cap 240 chars)…"
+            placeholder="Add a comment — recorded in the working log (cap 240 chars)…"
             maxLength={240}
             value={progressText}
             onChange={(e) => setProgressText(e.target.value)}
@@ -779,79 +681,257 @@ export function TaskDetail() {
             onClick={postProgress}
             disabled={progressSaving}
           >
-            {progressSaving ? "Posting…" : "Add progress note"}
+            {progressSaving ? "Posting…" : "Add comment"}
           </button>
         </div>
       </div>
 
-      {/* Session history — T-0106. Frontmatter `session_history` is an
-          append-only ordered list of SIDs that have ever bound this task
-          (spawn / bind_task / resume). Render chronologically; each row
-          links to the Sessions page deep-linked to that SID, and shows the
-          session's `started_at` (joined from the live sessions list) as a
-          first-touch proxy. */}
-      <div className="mb-4">
-        <div className="mc-section-title">
-          Session history ({(task.session_history ?? []).length})
+      {/* ==================================================================
+          TASK DETAILS — plumbing the user rarely touches. Process binding,
+          TL context, related docs, and the session-history audit trail.
+          ================================================================== */}
+      <div className="mc-task-zone mc-zone-details">
+        <div className="mc-zone-tag">Task details</div>
+
+        {/* Unified dev-session select. */}
+        <div className="mb-3 d-flex align-items-center gap-2 flex-wrap" style={{ fontSize: "0.78rem" }}>
+          <label
+            htmlFor="task-session"
+            style={{
+              color: "var(--mc-text-dim)",
+              fontFamily: "var(--mc-mono)",
+              minWidth: "5.5rem",
+              margin: 0,
+            }}
+          >
+            dev session:
+          </label>
+          {(() => {
+            // Surface the current binding even if it's not in activeDevs
+            // (paused/suspended) so the select reflects reality. T-0104:
+            // label via the canonical activity formatter so this row reads
+            // the same vocabulary as the rest of the page.
+            const orphanSession: SelectOption | null =
+              task.session && !activeDevs.some((d) => d.sid === task.session!.sid)
+                ? {
+                    value: task.session.sid,
+                    label: `${task.session.sid} (${sessionLabel(
+                      sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
+                    )})`,
+                  }
+                : null;
+            const options: SelectOption[] = [
+              { value: "", label: "— none —", disabled: true },
+              ...(orphanSession ? [orphanSession] : []),
+              ...activeDevs.map((d) => ({
+                value: d.sid,
+                label: `${d.window || d.sid} (${d.sid})`,
+              })),
+              {
+                action: true,
+                key: "__new__",
+                label: "+ Create new dev session…",
+                onSelect: () =>
+                  navigate(`/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`),
+              },
+            ];
+            return (
+              <Select
+                id="task-session"
+                value={task.session ? task.session.sid : ""}
+                onChange={(v) => {
+                  if (v) bindToDev(v);
+                }}
+                disabled={saving}
+                style={{ minWidth: "16rem", maxWidth: "30rem" }}
+                ariaLabel="dev session binding"
+                options={options}
+              />
+            );
+          })()}
+          {task.session && (
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              style={{ fontSize: "0.7rem" }}
+              title="Clear the dev-session binding for this task"
+              onClick={unassignSession}
+              disabled={saving}
+            >
+              Unassign
+            </button>
+          )}
+          {task.session && (() => {
+            // T-0104: prefer the worker-derived activity (from /sessions
+            // join via sessionsBySid) over the raw md status. Falls back
+            // to the status-derived mapping in sessionActivity() when
+            // the session isn't in the live list (e.g. suspended).
+            const live = sessionsBySid[task.session.sid];
+            const act = sessionActivity(live ?? task.session);
+            const green = isRunning(act);
+            return (
+              <span
+                style={{
+                  fontFamily: "var(--mc-mono)",
+                  fontSize: "0.7rem",
+                  color: green
+                    ? "var(--mc-accent-success, #4ade80)"
+                    : "var(--mc-text-dim)",
+                }}
+                title={`session status: ${act}`}
+              >
+                {sessionGlyph(act)} {sessionLabel(act)}
+              </span>
+            );
+          })()}
         </div>
-        {(task.session_history ?? []).length === 0 ? (
-          <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
-            No sessions have touched this task yet.
-          </p>
-        ) : (
-          <div>
-            {(task.session_history ?? []).map((sid, i) => {
-              const row = sessionsBySid[sid];
-              const startedAt = row?.started_at;
-              return (
-                <div
-                  key={`${sid}-${i}`}
-                  style={{
-                    background: "var(--mc-surface-raised)",
-                    border: "1px solid var(--mc-border)",
-                    borderRadius: "3px",
-                    padding: "0.4rem 0.625rem",
-                    marginBottom: "0.35rem",
-                    fontSize: "0.78rem",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "0.75rem",
-                  }}
-                >
-                  <Link
-                    to={`/p/${slug}/sessions?sid=${encodeURIComponent(sid)}`}
-                    style={{
-                      fontFamily: "var(--mc-mono)",
-                      fontSize: "0.78rem",
-                      color: "var(--mc-accent)",
-                      textDecoration: "none",
-                    }}
-                    title="Open this session on the Sessions page"
-                  >
-                    {sid}
-                  </Link>
-                  <span
-                    style={{
-                      fontFamily: "var(--mc-mono)",
-                      fontSize: "0.7rem",
-                      color: "var(--mc-text-dim)",
-                      marginLeft: "auto",
-                    }}
-                    title={
-                      startedAt
-                        ? `Session started_at: ${startedAt}`
-                        : "Session not in the current registry (suspended/archived/legacy)"
-                    }
-                  >
-                    {startedAt
-                      ? new Date(startedAt).toLocaleString()
-                      : "—"}
-                  </span>
-                </div>
-              );
-            })}
+
+        {/* Context — optional TL clarification */}
+        <div className="mb-4">
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <div className="mc-section-title" style={{ margin: 0 }}>Context (optional)</div>
+            {!editingContext && (
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                style={{ fontSize: "0.72rem" }}
+                onClick={() => { setContextValue(task.context ?? ""); setEditingContext(true); }}
+              >
+                Edit
+              </button>
+            )}
           </div>
-        )}
+          {editingContext ? (
+            <>
+              <textarea
+                className="form-control"
+                rows={4}
+                value={contextValue}
+                onChange={(e) => setContextValue(e.target.value)}
+                autoFocus
+                placeholder="Short TL clarification — keep it brief."
+              />
+              <div className="mt-2 d-flex gap-2">
+                <button type="button" className="btn btn-primary btn-sm" onClick={saveContext} disabled={saving}>
+                  {saving ? "Saving…" : "Save"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => { setEditingContext(false); setContextValue(task.context ?? ""); }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : task.context?.trim() ? (
+            <pre className="mc-pre">{task.context}</pre>
+          ) : (
+            <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>(no context yet)</p>
+          )}
+        </div>
+
+        {/* Related docs — ticket→doc half of the T-0172 bidirectional mention */}
+        <div className="mb-4">
+          <div className="mc-section-title">Related docs ({(task.related_docs ?? []).length})</div>
+          <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
+            {(task.related_docs ?? []).length === 0 && (
+              <span style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
+                No docs linked. Link an architecture/design/support doc so agents find the context.
+              </span>
+            )}
+            {(task.related_docs ?? []).map((d) => (
+              <span key={d} className="d-inline-flex align-items-center gap-1" style={{ fontSize: "0.78rem" }}>
+                <Link to={`/p/${slug}/docs?doc=${encodeURIComponent(d)}`} style={{ fontFamily: "var(--mc-mono)" }}>{d}</Link>
+                <button type="button" className="btn btn-link btn-sm p-0" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }} title="Unlink" onClick={() => unlinkDoc(d)}>✕</button>
+              </span>
+            ))}
+          </div>
+          <div className="d-flex gap-2" style={{ maxWidth: "20rem" }}>
+            <input
+              type="text"
+              className="form-control form-control-sm"
+              style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem" }}
+              placeholder="D-0123"
+              value={docToLink}
+              onChange={(e) => setDocToLink(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); linkDoc(); } }}
+            />
+            <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} onClick={linkDoc}>
+              Link doc
+            </button>
+          </div>
+        </div>
+
+        {/* Session history — T-0106. Frontmatter `session_history` is an
+            append-only ordered list of SIDs that have ever bound this task
+            (spawn / bind_task / resume). Render chronologically; each row
+            links to the Sessions page deep-linked to that SID, and shows the
+            session's `started_at` (joined from the live sessions list) as a
+            first-touch proxy. */}
+        <div>
+          <div className="mc-section-title">
+            Session history ({(task.session_history ?? []).length})
+          </div>
+          {(task.session_history ?? []).length === 0 ? (
+            <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
+              No sessions have touched this task yet.
+            </p>
+          ) : (
+            <div>
+              {(task.session_history ?? []).map((sid, i) => {
+                const row = sessionsBySid[sid];
+                const startedAt = row?.started_at;
+                return (
+                  <div
+                    key={`${sid}-${i}`}
+                    style={{
+                      background: "var(--mc-surface-raised)",
+                      border: "1px solid var(--mc-border)",
+                      borderRadius: "3px",
+                      padding: "0.4rem 0.625rem",
+                      marginBottom: "0.35rem",
+                      fontSize: "0.78rem",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.75rem",
+                    }}
+                  >
+                    <Link
+                      to={`/p/${slug}/sessions?sid=${encodeURIComponent(sid)}`}
+                      style={{
+                        fontFamily: "var(--mc-mono)",
+                        fontSize: "0.78rem",
+                        color: "var(--mc-accent)",
+                        textDecoration: "none",
+                      }}
+                      title="Open this session on the Sessions page"
+                    >
+                      {sid}
+                    </Link>
+                    <span
+                      style={{
+                        fontFamily: "var(--mc-mono)",
+                        fontSize: "0.7rem",
+                        color: "var(--mc-text-dim)",
+                        marginLeft: "auto",
+                      }}
+                      title={
+                        startedAt
+                          ? `Session started_at: ${startedAt}`
+                          : "Session not in the current registry (suspended/archived/legacy)"
+                      }
+                    >
+                      {startedAt
+                        ? new Date(startedAt).toLocaleString()
+                        : "—"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Actions */}

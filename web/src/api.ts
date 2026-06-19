@@ -954,6 +954,7 @@ export type ProjectApi = Pick<
   | "patchTaskPriority"
   | "deleteTask"
   | "addComment"
+  | "addProgress"
   | "pauseSession"
   | "suspendSession"
   | "resumeSession"

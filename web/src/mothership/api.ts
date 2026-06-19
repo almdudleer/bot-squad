@@ -447,6 +447,11 @@ export function apiFor(serverId: string): ServerApi {
         method: "POST",
         body: JSON.stringify({ body }),
       }),
+    addProgress: (slug, id, sid, text) =>
+      fwd<{ ok: boolean; task_id: string; line_appended: string }>(
+        `/api/projects/${slug}/backlog/${id}/progress`,
+        { method: "POST", body: JSON.stringify({ sid, text }) },
+      ),
     pauseSession: (slug, sid) =>
       fwd(
         `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`,

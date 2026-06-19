@@ -35,8 +35,15 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "closed", label: "Closed" },
 ];
 
-function countComments(body: string): number {
-  return (body.match(/^### /gm) ?? []).length;
+// T-0238: the working area (agent log + user comments) is the progress-notes
+// feed — each note is a line "- <ts> · <sid> · <text>". Count those so the
+// card reflects working-area activity at a glance (the old `### ` body
+// comments are an orphaned legacy channel never rendered on TaskDetail).
+export function countNotes(progress: string | undefined): number {
+  if (!progress) return 0;
+  return progress
+    .split("\n")
+    .filter((ln) => ln.trim().startsWith("- ")).length;
 }
 
 export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: TaskCardProps) {
@@ -44,7 +51,7 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
   const [menuOpen, setMenuOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const dragSuppressClickRef = useRef(false);
-  const commentCount = countComments(task.body);
+  const noteCount = countNotes(task.progress);
   const updated = relativeTime(task.updated);
 
   function handleDragStart(e: React.DragEvent<HTMLDivElement>) {
@@ -229,8 +236,9 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
             ▸ {task.initiative.replace(/\.md$/, "")}
           </span>
         )}
-        {commentCount > 0 && (
+        {noteCount > 0 && (
           <span
+            title="Working-area entries (agent notes + your comments)"
             style={{
               fontFamily: "var(--mc-mono)",
               fontSize: "0.65rem",
@@ -241,7 +249,7 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
               padding: "0 4px",
             }}
           >
-            {commentCount} comments
+            ⚙ {noteCount} {noteCount === 1 ? "note" : "notes"}
           </span>
         )}
         {task.session && (() => {

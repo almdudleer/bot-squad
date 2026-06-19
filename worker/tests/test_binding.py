@@ -249,6 +249,56 @@ def test_bind_task_rejects_already_bound_via_extras(tmp_path):
         bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
 
 
+# --- T-0237 Layer-1: strict binding cap = 1 LIVE session per task ---
+
+def test_bind_task_allows_rebind_when_prior_holder_suspended(tmp_path):
+    """T-0237 cap=1 counts only LIVE holders. A suspended prior holder (a
+    crashed/abandoned one-time run) is a historical record and must NOT block
+    binding the task to a fresh live session — otherwise the task is stuck."""
+    cfg = _make_cfg(tmp_path)
+    _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")  # live binder
+    dead = _make_dev_session(cfg, "S-u-w-p2", task_id="T-0002")  # prior holder
+    m = _read_session_metadata(dead)
+    m["status"] = "suspended"
+    _write_session_metadata(dead, m)
+    _make_task(cfg, "T-0001")
+    _make_task(cfg, "T-0002")
+
+    res = bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
+    assert res["ok"] is True
+    assert res["extras"] == ["T-0002"]
+
+
+def test_bind_task_allows_rebind_when_prior_holder_archived(tmp_path):
+    """An archived holder never counts toward the cap, even if its status row
+    is somehow still active — the archived flag marks it as history."""
+    cfg = _make_cfg(tmp_path)
+    _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")
+    dead = _make_dev_session(cfg, "S-u-w-p2", task_id="T-0002")
+    m = _read_session_metadata(dead)
+    m["archived"] = "true"  # status left 'active' on purpose
+    _write_session_metadata(dead, m)
+    _make_task(cfg, "T-0001")
+    _make_task(cfg, "T-0002")
+
+    res = bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
+    assert res["ok"] is True
+
+
+def test_bind_task_capacity_reached_names_live_holder(tmp_path):
+    """S4: a LIVE holder still blocks at cap=1, and the rejection is a clear
+    capacity-reached state that names the holder (not a silent drop) so the
+    task can be surfaced as pending."""
+    cfg = _make_cfg(tmp_path)
+    _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")
+    _make_dev_session(cfg, "S-u-w-p2", task_id="T-0002")  # live (active) holder
+    _make_task(cfg, "T-0001")
+    _make_task(cfg, "T-0002")
+
+    with pytest.raises(ActionError, match="capacity reached.*S-u-w-p2"):
+        bind_task(cfg, "test-project", "S-u-w-p1", "T-0002")
+
+
 def test_bind_task_idempotent_for_same_session(tmp_path):
     cfg = _make_cfg(tmp_path)
     _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")

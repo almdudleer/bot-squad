@@ -1833,6 +1833,49 @@ def _find_owner(
     return None
 
 
+# T-0237 Layer-1: strict task<->session binding cap. The reframe ("each task is
+# a one-time run executed by a tightly-capped set of sessions") fixes the cap at
+# ONE live session per task (operator-confirmed S1). Suspended/archived holders
+# are historical records (their binding is GC'd to last_task_id) and never count
+# toward the cap, so a fresh run can always rebind an abandoned task.
+BINDING_CAP = 1
+
+
+def _is_live_holder(meta: dict) -> bool:
+    """Whether a session counts toward a task's binding cap: a running process
+    (status active/paused), not a suspended/archived historical record.
+
+    Uses the persisted ``status`` (which ``gc_sessions`` keeps tick-synced with
+    real tmux panes) rather than a live pane scan, so the bind path stays a pure
+    data operation under the claim flock.
+    """
+    if str(meta.get("archived", "")).lower() == "true":
+        return False
+    return str(meta.get("status", "")).lower() in ("active", "paused")
+
+
+def _live_task_owner(
+    data_dir: Path, slug: str, task_id: str, *, exclude_sid: str | None = None
+) -> str | None:
+    """SID of a *live* session (see ``_is_live_holder``) already holding
+    ``task_id`` (primary or extras), or None. Suspended/archived holders are
+    skipped — they do not gatekeep a rebind under the T-0237 cap.
+    """
+    sess_dir = data_dir / slug / "sessions"
+    if not sess_dir.exists():
+        return None
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        sid = meta.get("sid", md.stem)
+        if exclude_sid and sid == exclude_sid:
+            continue
+        if task_id in _full_task_set(meta) and _is_live_holder(meta):
+            return sid
+    return None
+
+
 def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     """Append task_id to a dev session's extra_task_ids.
 
@@ -1889,9 +1932,20 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     claim_lock.parent.mkdir(parents=True, exist_ok=True)
     with open(claim_lock, "w") as _lockf:
         fcntl.flock(_lockf, fcntl.LOCK_EX)
-        owner = _find_owner(data_dir, slug, task_id=task_id)
-        if owner is not None and owner != sid:
-            raise ActionError(f"bind_task: task {task_id} already bound to {owner}")
+        # T-0237 Layer-1: enforce the binding cap (= 1 LIVE session per task)
+        # under the claim flock. Only *live* holders count — a suspended or
+        # archived prior holder is history and must not block a fresh run
+        # (otherwise an abandoned/crashed task is permanently un-rebindable).
+        # S4: at capacity we refuse with a clear "capacity reached" state that
+        # names the live holder; the task simply stays pending (the caller
+        # surfaces it / queues it), never a silent drop or a double-bind.
+        live_owner = _live_task_owner(data_dir, slug, task_id, exclude_sid=sid)
+        if live_owner is not None:
+            raise ActionError(
+                f"bind_task: capacity reached (cap={BINDING_CAP}) — task "
+                f"{task_id} is already bound to live session {live_owner}; "
+                f"task stays pending"
+            )
 
         # Re-read under the lock so a concurrent bind to THIS session (its own
         # extras growing) isn't clobbered by our stale snapshot — last write

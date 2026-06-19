@@ -154,6 +154,10 @@ export type DocSummary = {
   category: string;
   status: string;
   related_tickets: string[];
+  // T-0234/T-0235: nesting key — the mother doc this artifact is attached to
+  // (null/absent for a root/mother doc). The Docs left-rail renders children
+  // indented under their mother.
+  parent_doc_id?: string | null;
 };
 export type DocDetail = {
   id: string;
@@ -165,6 +169,10 @@ export type DocDetail = {
   body: string;
   raw: string;
   path?: string;
+  // T-0234/T-0235: nesting — the mother (parent_doc_id) and the attached
+  // children (child_doc_ids) the detail pane lists as "Attached artifacts".
+  parent_doc_id?: string | null;
+  child_doc_ids?: string[];
 };
 
 // T-0173: user flows attached to a use case
@@ -682,9 +690,19 @@ export const api = {
     call<string[]>(`/api/projects/${slug}/docs/categories`),
   doc: (slug: string, id: string) =>
     call<DocDetail>(`/api/projects/${slug}/docs/${encodeURIComponent(id)}`),
-  createDoc: (slug: string, category: string, title: string) =>
+  // T-0235: createDoc accepts an optional parent so a doc can be born already
+  // attached to a mother doc. The parent_doc_id key is only sent when given,
+  // so existing flat-doc callers keep their `{category, title}` body.
+  createDoc: (slug: string, category: string, title: string, parentDocId?: string | null) =>
     call<{ ok: boolean; id: string; category: string }>(`/api/projects/${slug}/docs`,
-      { method: "POST", body: JSON.stringify({ category, title }) }),
+      {
+        method: "POST",
+        body: JSON.stringify(
+          parentDocId == null
+            ? { category, title }
+            : { category, title, parent_doc_id: parentDocId },
+        ),
+      }),
   putDoc: (slug: string, id: string, content: string) =>
     call(`/api/projects/${slug}/docs/${encodeURIComponent(id)}`,
       { method: "PUT", body: JSON.stringify({ content }) }),
@@ -695,6 +713,14 @@ export const api = {
   unlinkDoc: (slug: string, id: string, ticket: string) =>
     call(`/api/projects/${slug}/docs/${encodeURIComponent(id)}/link/${encodeURIComponent(ticket)}`,
       { method: "DELETE" }),
+  // T-0234/T-0235: nested docs. List a mother doc's attached children, and
+  // adopt/disown a doc by setting (or clearing, with null) its parent_doc_id.
+  docChildren: (slug: string, id: string) =>
+    call<DocSummary[]>(`/api/projects/${slug}/docs/${encodeURIComponent(id)}/children`),
+  setDocParent: (slug: string, id: string, parentDocId: string | null) =>
+    call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
+      `/api/projects/${slug}/docs/${encodeURIComponent(id)}/parent`,
+      { method: "PUT", body: JSON.stringify({ parent_doc_id: parentDocId }) }),
   sessions: (slug: string) =>
     call<SessionRow[]>(`/api/projects/${slug}/sessions`),
   // T-0210: resource telemetry (per-session context/memory + quota burndown).

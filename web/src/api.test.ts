@@ -68,4 +68,50 @@ describe("global api (self-server) — URLs stay un-proxied", () => {
       }),
     );
   });
+
+  // T-0235: nested-docs wrappers over the T-0234 backend endpoints.
+  test("docChildren hits GET /docs/<id>/children", async () => {
+    const spy = mockOnce([]);
+    await api.docChildren("alpha", "D-0001");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/projects/alpha/docs/D-0001/children",
+      expect.any(Object),
+    );
+  });
+
+  test("setDocParent PUTs the parent_doc_id to /docs/<id>/parent", async () => {
+    const spy = mockOnce({ ok: true, id: "D-0002", parent_doc_id: "D-0001" });
+    await api.setDocParent("alpha", "D-0002", "D-0001");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/projects/alpha/docs/D-0002/parent",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ parent_doc_id: "D-0001" }),
+      }),
+    );
+  });
+
+  test("setDocParent with null detaches (disown)", async () => {
+    const spy = mockOnce({ ok: true, id: "D-0002", parent_doc_id: null });
+    await api.setDocParent("alpha", "D-0002", null);
+    expect(spy).toHaveBeenCalledWith(
+      "/api/projects/alpha/docs/D-0002/parent",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ parent_doc_id: null }),
+      }),
+    );
+  });
+
+  test("createDoc forwards an optional parent_doc_id", async () => {
+    const spy = mockOnce({ ok: true, id: "D-0003", category: "product" });
+    await api.createDoc("alpha", "product", "Child doc", "D-0001");
+    expect(spy).toHaveBeenCalledWith(
+      "/api/projects/alpha/docs",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ category: "product", title: "Child doc", parent_doc_id: "D-0001" }),
+      }),
+    );
+  });
 });

@@ -398,3 +398,162 @@ async def test_attachment_tg_chat_id(
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=str(result))
     return {"ok": True, "sent": bool(result.get("sent", True))}
+
+
+# --- T-0218: per-project personal override + resolved view (D-0022) ---
+#
+# STUB SCOPE (this commit, unblocks Team-2 FE): the routes + shapes + validation
+# + the global/server resolution are LIVE-REAL. The per-project personal override
+# is NOT yet persisted — GET returns null (inherit), PUT validates + echoes. Full
+# persistence + worker tg_notify precedence land in the T-0218 follow-up. Storage
+# DECISION (Q2): a ``project_tg_chat_ids: dict[slug -> chat_id]`` map on the
+# ``Attachment`` (migrated) with a parallel map on ``UserMeta`` for un-migrated
+# users — mirroring how ``tg_chat_id`` already lives in both stores. Q1 (topic_id):
+# personal targeting stays chat_id-only; personal ``topic_id`` is OUT of scope for
+# T-0218 (topic_id remains project-wide-only). Q3: yes — the per-project path
+# falls back to UserMeta exactly like the per-server route. Q4: paths confirmed as
+# written below (``/me/project/{slug}/tg-chat-id`` + ``/me/notifications/resolved``).
+
+
+def _validate_chat_id(raw: object) -> str:
+    """Loose int-or-empty validation (same convention as the other tg-chat-id
+    routes): digits with an optional leading ``-``; empty == clear/inherit."""
+    if raw is None:
+        raw = ""
+    new_id = str(raw).strip()
+    if new_id and not (new_id.lstrip("-").isdigit()):
+        raise HTTPException(
+            status_code=400, detail="tg_chat_id must be an integer or empty"
+        )
+    return new_id
+
+
+def _raw_server_tg(request: Request, user: dict, server_id: str) -> tuple[str, str, bool]:
+    """``(resolved_server_id, raw server-level tg_chat_id, set?)`` — with NO
+    global fallback. Unlike ``_read_attachment_tg`` this does not borrow
+    ``UserMeta.tg_chat_id`` when the per-server override is absent: the resolved
+    view must report each level's *own* value honestly so ``set`` and the
+    precedence winner are correct."""
+    cfg: AuthConfig = request.app.state.auth_config
+    meta = cfg.meta_for(user["username"])
+    resolved = _resolve_server_id(request, server_id)
+    if not meta.attached_to_global_user:
+        return resolved, "", False
+    att = _users_store(request).get_attachment(meta.attached_to_global_user, resolved)
+    if att is None:
+        return resolved, "", False
+    raw = att.tg_chat_id or ""
+    return resolved, raw, bool(raw)
+
+
+def _resolve_notification(
+    request: Request, user: dict, server_id: str, slug: str
+) -> dict:
+    """Compute the 3-level resolved view for (user, server, project).
+
+    Precedence (most specific wins, falling through on empty):
+    ``project -> server -> global -> none``. The project level is stubbed
+    (``null``) until persistence lands; global + server are real today.
+    """
+    cfg: AuthConfig = request.app.state.auth_config
+    meta = cfg.meta_for(user["username"])
+    global_raw = meta.tg_chat_id or ""
+    resolved_sid, server_raw, server_set = _raw_server_tg(request, user, server_id)
+    # Per-project personal override — stubbed (not yet persisted; see scope note).
+    project_raw, project_set = "", False
+
+    levels = {
+        "global": {"tg_chat_id": global_raw or None, "set": bool(global_raw)},
+        "server": {
+            "server_id": resolved_sid,
+            "tg_chat_id": server_raw or None,
+            "set": server_set,
+        },
+        "project": {
+            "slug": slug,
+            "tg_chat_id": project_raw or None,
+            "set": project_set,
+        },
+    }
+    if project_set:
+        effective, source = project_raw, "project"
+    elif server_set:
+        effective, source = server_raw, "server"
+    elif global_raw:
+        effective, source = global_raw, "global"
+    else:
+        effective, source = "", "none"
+    return {
+        "levels": levels,
+        "effective": {"tg_chat_id": effective or None, "source": source},
+    }
+
+
+def _project_payload(slug: str, tg_chat_id: str | None) -> dict:
+    return {"slug": slug, "tg_chat_id": tg_chat_id or None}
+
+
+@router.get("/project/{slug}/tg-chat-id")
+def get_project_tg_chat_id(
+    slug: str, request: Request, user: dict = Depends(require_auth)
+) -> dict:
+    # STUB: no per-project override persisted yet → null (inherit). Stable shape.
+    return _project_payload(slug, None)
+
+
+@router.put("/project/{slug}/tg-chat-id")
+def put_project_tg_chat_id(
+    slug: str,
+    request: Request,
+    payload: dict,
+    user: dict = Depends(require_auth),
+) -> dict:
+    # STUB: real validation + echoes the submitted value so the FE round-trips
+    # optimistically. Persistence lands in the T-0218 follow-up (see scope note).
+    new_id = _validate_chat_id(payload.get("tg_chat_id", ""))
+    return _project_payload(slug, new_id)
+
+
+@router.get("/notifications/resolved")
+def get_notifications_resolved(
+    request: Request,
+    server_id: str = "self",
+    slug: str = "",
+    user: dict = Depends(require_auth),
+) -> dict:
+    """Single read powering the 3-row override panel: each level's raw value +
+    ``set`` flag + the effective winner + its ``source``."""
+    return _resolve_notification(request, user, server_id, slug)
+
+
+@router.post("/project/{slug}/tg-chat-id/test")
+async def test_project_tg_chat_id(
+    slug: str, request: Request, user: dict = Depends(require_auth)
+) -> dict:
+    """Ping the RESOLVED chat for this (user, self-server, project). Works today
+    for users with a server/global binding (project override is stubbed)."""
+    resolved = _resolve_notification(request, user, "self", slug)
+    chat_id = (resolved["effective"]["tg_chat_id"] or "").strip()
+    if not chat_id:
+        raise HTTPException(
+            status_code=400, detail="no tg_chat_id resolves for this project"
+        )
+
+    username = user["username"]
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action(
+            "tg_notify",
+            {
+                "chat_id": chat_id,
+                "message": (
+                    f"bot-squad test ping for {username} — project '{slug}' binding works"
+                ),
+                "user": username,
+            },
+        )
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=str(result))
+    return {"ok": True, "sent": bool(result.get("sent", True))}

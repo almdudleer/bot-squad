@@ -650,3 +650,132 @@ def test_legacy_tg_chat_id_endpoints_still_work_post_t0061(
         assert r.status_code == 200
         me = client.get("/api/me").json()
     assert me["tg_chat_id"] == "42"
+
+
+# ── T-0218: per-project personal override + resolved view (D-0022 stub) ────
+#
+# Stub scope: routes + shapes + validation + the global/server resolution are
+# real; the per-project override is not yet persisted (GET null, PUT echoes).
+
+
+def test_project_tg_chat_id_get_returns_null_stub(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.get("/api/me/project/some-proj/tg-chat-id")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"slug": "some-proj", "tg_chat_id": None}
+
+
+def test_project_tg_chat_id_put_validates_and_echoes(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        # Valid digits echo back.
+        r = client.put(
+            "/api/me/project/p1/tg-chat-id", json={"tg_chat_id": "404580642"}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {"slug": "p1", "tg_chat_id": "404580642"}
+        # Negative group id ok.
+        r2 = client.put(
+            "/api/me/project/p1/tg-chat-id", json={"tg_chat_id": "-100123"}
+        )
+        assert r2.json()["tg_chat_id"] == "-100123"
+        # Empty clears → null.
+        r3 = client.put("/api/me/project/p1/tg-chat-id", json={"tg_chat_id": ""})
+        assert r3.json() == {"slug": "p1", "tg_chat_id": None}
+        # Non-numeric rejected.
+        r4 = client.put(
+            "/api/me/project/p1/tg-chat-id", json={"tg_chat_id": "abc"}
+        )
+        assert r4.status_code == 400
+
+
+def test_notifications_resolved_global_only(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Un-migrated user with only a global binding → effective source=global."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "111"})
+        r = client.get("/api/me/notifications/resolved?slug=proj-x")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["levels"]["global"] == {"tg_chat_id": "111", "set": True}
+    assert body["levels"]["server"]["set"] is False
+    assert body["levels"]["project"] == {
+        "slug": "proj-x",
+        "tg_chat_id": None,
+        "set": False,
+    }
+    assert body["effective"] == {"tg_chat_id": "111", "source": "global"}
+
+
+def test_notifications_resolved_server_overrides_global(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Migrated user: per-server override wins over global; project still null."""
+    _, server_id = _attach_testuser(tmp_bot_squad, tg_chat_id="222")
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "111"})
+        r = client.get("/api/me/notifications/resolved?server_id=self&slug=proj-x")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["levels"]["global"] == {"tg_chat_id": "111", "set": True}
+    assert body["levels"]["server"]["server_id"] == server_id
+    assert body["levels"]["server"]["tg_chat_id"] == "222"
+    assert body["levels"]["server"]["set"] is True
+    assert body["effective"] == {"tg_chat_id": "222", "source": "server"}
+
+
+def test_notifications_resolved_none_when_nothing_set(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.get("/api/me/notifications/resolved?slug=proj-x")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["effective"] == {"tg_chat_id": None, "source": "none"}
+
+
+def test_project_test_ping_resolves_and_calls_worker(
+    tmp_bot_squad: Path, monkeypatch, fake_tg_worker: _FakeTgWorker
+) -> None:
+    """Project test pings the RESOLVED chat (global fallback today)."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.put("/api/me/tg-chat-id", json={"tg_chat_id": "404580642"})
+        r = client.post("/api/me/project/proj-x/tg-chat-id/test")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+    assert fake_tg_worker.calls[-1]["chat_id"] == "404580642"
+    assert "proj-x" in fake_tg_worker.calls[-1]["message"]
+
+
+def test_project_test_ping_400_when_nothing_resolves(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.post("/api/me/project/proj-x/tg-chat-id/test")
+    assert r.status_code == 400
+    assert "no tg_chat_id resolves" in r.json()["detail"]

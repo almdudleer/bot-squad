@@ -168,6 +168,33 @@ describe("buildSessionTree task-less nesting (T-0222)", () => {
     expect(lvl("S-test-tl-p9")).toBe(0); // unparented TL stays root
   });
 
+  test("T-0231: roots are ordered operator → team-lead → rest regardless of API order", () => {
+    // API returns them shuffled: a dev-less ad-hoc root, then a TL, then the
+    // operator last. The hierarchy view must still float the operator to the
+    // top, the TL next, then the rest.
+    const adhoc = tl({ sid: "S-test-adhoc-p3", window: "adhoc", role: "dev" });
+    const lead = tl({ sid: "S-test-tl-p0", role: "teamlead" });
+    const operator = tl({ sid: "S-test-op-p9", window: "operator", role: "operator" });
+    const d = dev({ sid: "S-test-dev-p1", task_id: "T-0001", parent_sid: "S-test-tl-p0" });
+    const taskInitiative = new Map<string, string>();
+
+    const out = buildSessionTree([adhoc, lead, operator, d], taskInitiative);
+    // Root rows in emitted order (level 0 only).
+    const rootSids = out.filter((e) => e.level === 0).map((e) => e.row.sid);
+    expect(rootSids).toEqual(["S-test-op-p9", "S-test-tl-p0", "S-test-adhoc-p3"]);
+    // The dev still nests one level under its TL, immediately after it.
+    const leadIdx = out.findIndex((e) => e.row.sid === "S-test-tl-p0");
+    expect(out[leadIdx + 1]?.row.sid).toBe("S-test-dev-p1");
+    expect(out.find((e) => e.row.sid === "S-test-dev-p1")?.level).toBe(1);
+  });
+
+  test("T-0231: same-rank roots keep their incoming order (stable sort)", () => {
+    const op1 = tl({ sid: "S-test-op-p1", window: "operator", role: "operator" });
+    const op2 = tl({ sid: "S-test-op-p2", window: "operator", role: "operator" });
+    const out = buildSessionTree([op1, op2], new Map());
+    expect(out.map((e) => e.row.sid)).toEqual(["S-test-op-p1", "S-test-op-p2"]);
+  });
+
   test("a parent_sid cycle does not loop — both rows still render", () => {
     const a = tl({ sid: "S-test-a-p0", parent_sid: "S-test-b-p1" });
     const b = tl({ sid: "S-test-b-p1", parent_sid: "S-test-a-p0" });

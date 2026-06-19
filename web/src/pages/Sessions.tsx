@@ -219,6 +219,19 @@ export function buildSessionTree(
     }
   }
 
+  // T-0231: pin the operator(s) to the top, then team-leads, then everyone
+  // else — so the process-hierarchy view always reads operator → TL →
+  // teammates regardless of the order the API returned rows in. Only the
+  // ROOT order is normalised; children keep their original (spawn) order, and
+  // the sort is stable so same-rank roots stay in their incoming order.
+  const rootRank = (s: SessionRow): number => {
+    const role = sessionRole(s);
+    if (role === "operator") return 0;
+    if (role === "teamlead" || role === "prod-teamlead") return 1;
+    return 2;
+  };
+  roots.sort((a, b) => rootRank(a) - rootRank(b));
+
   const out: { row: SessionRow; level: number }[] = [];
   const emitted = new Set<string>();
   const emit = (s: SessionRow, level: number) => {
@@ -296,17 +309,20 @@ export function Sessions() {
   const flashedSidRef = useRef<string | null>(null);
 
   // T-0039 follow-up: group sessions by initiative on this page too.
-  // Default = none (preserves the pre-group view).
-  // T-0141: tmux grouping is the stakeholder's mental model (notes 5 + 13) —
-  // the page now groups by tmux session by default, with the TL highlighted
-  // and child sessions nested under it.
+  // T-0141: tmux grouping WAS the default (stakeholder's mental model, notes
+  // 5 + 13) — the page grouped by tmux session with the TL highlighted.
   // T-0157: "user" groups by linux_user → then tmux session, for multi-user
   // projects where several Linux users work in one project from their own tmux.
+  // T-0231 (paradigm reframe, Pillar A): the DEFAULT is now "none" — the
+  // process-hierarchy view (operator → team-leads → their teammates, nested
+  // via parent_sid by buildSessionTree). One glance = who's running / idle /
+  // what each is doing, like a Task Manager. tmux/user/initiative remain
+  // available as explicit group-by toggles.
   type SessGroupBy = "tmux" | "user" | "none" | "initiative";
   const SESS_UNATTACHED = "__unattached__";
   const TMUX_NONE = "(no tmux session)";
   const USER_NONE = "(unknown user)"; // T-0157: rows with no parseable linux_user
-  const [groupBy, setGroupBy] = useState<SessGroupBy>("tmux");
+  const [groupBy, setGroupBy] = useState<SessGroupBy>("none");
   const [filterInit, setFilterInit] = useState<string>(""); // "" = all
   // Initiatives for grouping (separate from modal's `initiatives` so the
   // grouping view doesn't depend on the modal being opened).

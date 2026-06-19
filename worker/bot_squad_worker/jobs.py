@@ -283,6 +283,10 @@ def binding_gc_tick(cfg: Config) -> None:
          post-totest devs (and verified-done live devs); makes dev zombies
          impossible without a TL lifting a finger. T-0202: also trims a live
          idle dev whose binding pass 2 just cleared, via ``last_task_id``.
+         T-0233: also reaps an *exited* dev whose task is still open but whose
+         one-time run has been dead/idle past ``BOT_SQUAD_SESSION_STALE_SEC``
+         (default 24h) — a crashed/abandoned run; the binding is preserved as
+         ``last_task_id`` so the still-open task is re-dispatchable.
       5. ``reconcile_teams`` (T-0142) — rebuild the tmux-session-keyed Team mds
          from the (now-reconciled) SessionMd registry so the team roster, TL
          slot, and archived members survive a worker reload.

@@ -321,3 +321,102 @@ def test_archive_dead_dev_does_not_kill_live_same_named_sibling(tmp_path, monkey
     lmeta = S._read_session_metadata(live)
     assert lmeta["status"] == "active"
     assert "archived" not in lmeta
+
+
+# --- T-0233: aggressive stale-session GC ---
+#
+# Paradigm reframe: a session is a one-time run for a specific task. An exited
+# (pane-gone) dev whose task is still open but which has been dead/idle past the
+# staleness grace is an abandoned/crashed run — reap it (preserving the binding
+# as last_task_id so the still-open task stays re-dispatchable) instead of
+# letting it linger forever in the working set.
+
+def _seed_old_ts(seconds_ago: float) -> str:
+    import time as _t
+    return _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(_t.time() - seconds_ago))
+
+
+def test_exited_in_progress_dev_stale_is_archived(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    # exited (no live pane), suspended long ago -> stale.
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                      status="suspended", suspended_at=_seed_old_ts(48 * 3600))
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", str(24 * 3600))
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    meta = S._read_session_metadata(p)
+    assert str(meta["archived"]).lower() == "true"
+    assert meta["status"] == "suspended"
+    assert meta["archive_reason"] == "auto-archive:exited-stale"
+    # binding freed but preserved so the still-open task is re-dispatchable.
+    assert meta["task_id"] is None
+    assert meta["last_task_id"] == "T-0001"
+    # the task itself is untouched (still open, not closed by the reaper).
+    assert S._task_status(cfg.data_dir, "test-project", "T-0001") == "in_progress"
+
+
+def test_exited_in_progress_dev_fresh_is_not_archived(tmp_path, monkeypatch):
+    """Within the grace window a crashed dev is still resumable -> not reaped."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                      status="suspended", suspended_at=_seed_old_ts(120))
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", str(24 * 3600))
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    assert "archived" not in S._read_session_metadata(p)
+
+
+def test_exited_in_progress_dev_no_timestamp_is_not_archived(tmp_path, monkeypatch):
+    """A session whose age cannot be determined is never stale-reaped
+    (conservative: only reap a run we can positively prove is old)."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", "1")
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    assert "archived" not in S._read_session_metadata(p)
+
+
+def test_stale_reap_respects_env_threshold(tmp_path, monkeypatch):
+    """The grace is env-tunable; a moderately-aged session is reaped only once
+    the threshold drops below its age."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                      status="suspended", suspended_at=_seed_old_ts(3600))
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", str(2 * 3600))
+    assert archive_dead_teammates(cfg, "test-project")["archived"] == 0
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", str(600))
+    assert archive_dead_teammates(cfg, "test-project")["archived"] == 1
+    assert S._read_session_metadata(p)["archive_reason"] == "auto-archive:exited-stale"
+
+
+def test_stale_reap_never_touches_tl_interface_session(tmp_path, monkeypatch):
+    """An ancient operator/TL interface session is never stale-reaped, no matter
+    how old (DoD: never kill an interface process)."""
+    cfg = _make_cfg(tmp_path)
+    p = _seed_session(cfg, "S-u-feat-TL-p1", window="feat-TL", task_id="~",
+                      initiative="x.md", status="suspended",
+                      suspended_at=_seed_old_ts(365 * 24 * 3600))
+    _seed_initiative(cfg, "x.md")
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", "1")
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    assert "archived" not in S._read_session_metadata(p)
+
+
+def test_live_in_progress_dev_is_never_stale_reaped(tmp_path, monkeypatch):
+    """A LIVE pane (working session) is never stale-reaped even with an ancient
+    timestamp — only exited (pane-gone) runs are eligible."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                      suspended_at=_seed_old_ts(365 * 24 * 3600))
+    _live_feat_dev_pane(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", "1")
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    assert "archived" not in S._read_session_metadata(p)

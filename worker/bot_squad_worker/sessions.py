@@ -14,6 +14,7 @@ import re
 import shlex
 import subprocess
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,34 @@ RUNNING_THRESHOLD_SEC = 30.0
 # flip the project pill to needs-input. 60s is the conservative default.
 # ---------------------------------------------------------------------------
 IDLE_AT_PROMPT_SECONDS = float(os.environ.get("BOT_SQUAD_IDLE_AT_PROMPT_SECONDS") or 60)
+
+
+# ---------------------------------------------------------------------------
+# T-0233 — aggressive stale-session GC threshold.
+#
+# Paradigm reframe: each session is a one-time run for a specific task. An
+# *exited* (pane-gone) dev whose task is still open but which has not done
+# anything in this many seconds is an abandoned/crashed run; archive_dead_teammates
+# reaps it (preserving the binding as last_task_id so the still-open task stays
+# re-dispatchable) instead of letting it linger in the working set forever.
+# Read per-call (not frozen at import) so it is env-tunable on a live worker;
+# the default is aggressive-but-safe — a pane-gone run idle > 24h is dead.
+# ---------------------------------------------------------------------------
+DEFAULT_SESSION_STALE_SEC = 24 * 3600
+
+
+def session_stale_sec() -> float:
+    """Staleness grace (seconds) for the T-0233 exited-stale reaper.
+
+    Reads ``BOT_SQUAD_SESSION_STALE_SEC`` each call (env-tunable on a live
+    worker), falling back to ``DEFAULT_SESSION_STALE_SEC``.
+    """
+    raw = os.environ.get("BOT_SQUAD_SESSION_STALE_SEC")
+    try:
+        val = float(raw) if raw else DEFAULT_SESSION_STALE_SEC
+    except ValueError:
+        val = DEFAULT_SESSION_STALE_SEC
+    return val if val > 0 else DEFAULT_SESSION_STALE_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -2818,6 +2847,52 @@ def gc_dead_bindings(cfg: Any, slug: str) -> dict:
     return {"ok": True, "scanned": scanned, "cleared": len(details), "details": details}
 
 
+def _parse_ts_epoch(value: Any) -> float | None:
+    """Best-effort epoch seconds from a frontmatter timestamp, or None.
+
+    Timestamps are written as ``strftime("%Y-%m-%dT%H:%M:%SZ")`` strings, but
+    pyyaml parses ISO-8601 timestamps into ``datetime`` objects on read — so a
+    value may be either a ``datetime`` or a string depending on whether it has
+    round-tripped through a load. Handle both; a naive datetime/string is
+    assumed UTC (every timestamp this codebase writes is UTC).
+    """
+    if value is None or value == "~" or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _session_idle_age(meta: dict, user_home: str, now_epoch: float) -> float | None:
+    """Seconds since this session last did anything, or None if undeterminable.
+
+    Prefers the live Claude transcript activity time (most accurate); falls back
+    to the on-disk ``suspended_at`` / ``updated_at`` / ``started_at`` stamps.
+    Returns ``None`` when no signal exists so the caller can decline to reap a
+    session whose age it cannot positively establish.
+    """
+    act = _pane_activity_at(
+        str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
+    )
+    if act is not None:
+        return max(0.0, now_epoch - act)
+    for key in ("suspended_at", "updated_at", "started_at"):
+        ts = _parse_ts_epoch(meta.get(key))
+        if ts is not None:
+            return max(0.0, now_epoch - ts)
+    return None
+
+
 def archive_dead_teammates(cfg: Any, slug: str) -> dict:
     """T-0142/T-0144: auto-archive cleanly-delivered dev teammates.
 
@@ -2851,6 +2926,17 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
          ``live-last-closed``. Closed-only (never ``totest``) preserves the
          rule-2 safety above; the idle guard (``IDLE_AT_PROMPT_SECONDS`` of
          jsonl quiet) additionally spares a pane that is still mid-write.
+
+      3. **Exited + stale (T-0233).** An *exited* (pane-gone) dev whose task is
+         still open (``open`` / ``in_progress`` / ``reopened`` / ``planned``)
+         but whose one-time run has done nothing past ``session_stale_sec()``
+         (``BOT_SQUAD_SESSION_STALE_SEC``, default 24h) is a crashed/abandoned
+         run — reaped with reason ``exited-stale``. The binding is preserved as
+         ``last_task_id`` (the task stays open and re-dispatchable to a fresh
+         session, per kill-not-resume). Only a run whose age can be positively
+         established (transcript activity, else ``suspended_at`` / ``updated_at``
+         / ``started_at``) is eligible; LIVE panes and non-dev (operator/TL)
+         sessions are never stale-reaped — the role and live guards above hold.
 
     Returns ``{"ok": True, "scanned": N, "archived": K, "sids": [...]}``.
     """
@@ -2941,6 +3027,18 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                 reason = "exited-task-missing"
             elif st in ("totest", "closed"):
                 reason = f"exited-{st}"
+            else:
+                # T-0233: the task is still open (open/in_progress/reopened/
+                # planned) but this one-time run's pane is gone and it has done
+                # nothing past the staleness grace — a crashed/abandoned run.
+                # Reap it so it stops lingering in the working set; the binding
+                # is preserved below as last_task_id (the task itself stays open
+                # and re-dispatchable to a fresh session). Only an exited run
+                # whose age we can positively establish is eligible — a session
+                # with no age signal is left alone.
+                age = _session_idle_age(meta, user_home, now_epoch)
+                if age is not None and age >= session_stale_sec():
+                    reason = "exited-stale"
         if reason is None:
             continue
 

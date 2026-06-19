@@ -1,0 +1,207 @@
+"""Docs API tests — flat docs + nested/grouped docs (T-0234).
+
+Mirrors the FastAPI TestClient + tmp_bot_squad style of test_routes_projects.py.
+The nested-docs model (T-0234) lets a "mother" doc carry CHILD artifacts via a
+``parent_doc_id`` frontmatter field. These tests pin the API contract that
+Team 2's docs UI (T-0235) consumes:
+
+  - POST   /api/projects/{slug}/docs           (NewDoc.parent_doc_id optional)
+  - GET    /api/projects/{slug}/docs/{id}      (payload carries parent_doc_id +
+                                                child_doc_ids)
+  - GET    /api/projects/{slug}/docs/{id}/children
+  - PUT    /api/projects/{slug}/docs/{id}/parent  (adopt / disown)
+  - GET    /api/projects/{slug}/docs           (each item carries parent_doc_id)
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from app.main import build_app
+
+
+def _client(tmp_bot_squad: Path, monkeypatch):
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    app = build_app()
+    return TestClient(app)
+
+
+def _login(client) -> None:
+    client.post("/api/auth/login", json={"username": "testuser", "password": "test"})
+
+
+def _create(client, *, category="product", title="Doc", parent_doc_id=None):
+    body = {"category": category, "title": title}
+    if parent_doc_id is not None:
+        body["parent_doc_id"] = parent_doc_id
+    r = client.post("/api/projects/test-project/docs", json=body)
+    return r
+
+
+# ---------------------------------------------------------------------------
+# back-compat: a flat doc with no parent keeps working
+# ---------------------------------------------------------------------------
+def test_flat_doc_round_trip_no_parent(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = _create(client, title="Flat")
+        assert r.status_code == 200, r.text
+        doc_id = r.json()["id"]
+
+        # listing carries parent_doc_id = None for a root doc
+        listing = client.get("/api/projects/test-project/docs").json()
+        item = next(d for d in listing if d["id"] == doc_id)
+        assert item["parent_doc_id"] is None
+
+        # get serves it, no parent, no children
+        got = client.get(f"/api/projects/test-project/docs/{doc_id}").json()
+        assert got["parent_doc_id"] is None
+        assert got["child_doc_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# create child with parent_doc_id persists + round-trips
+# ---------------------------------------------------------------------------
+def test_create_child_with_parent_persists(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Mother").json()["id"]
+        child_r = _create(client, title="Insight", parent_doc_id=mother)
+        assert child_r.status_code == 200, child_r.text
+        child = child_r.json()["id"]
+        assert child_r.json()["parent_doc_id"] == mother
+
+        got = client.get(f"/api/projects/test-project/docs/{child}").json()
+        assert got["parent_doc_id"] == mother
+
+        # and the frontmatter actually persisted on disk
+        docs_root = tmp_bot_squad / "data" / "test-project" / "docs"
+        files = list(docs_root.rglob(f"{child}-*.md"))
+        assert len(files) == 1
+        assert f"parent_doc_id: {mother}" in files[0].read_text()
+
+
+# ---------------------------------------------------------------------------
+# fetch a mother's children
+# ---------------------------------------------------------------------------
+def test_mother_children_listing(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Mother").json()["id"]
+        c1 = _create(client, title="Insight", parent_doc_id=mother).json()["id"]
+        c2 = _create(client, category="design", title="Diagram",
+                     parent_doc_id=mother).json()["id"]
+        # an unrelated root doc must NOT show up as a child
+        _create(client, title="Unrelated")
+
+        # GET /{id}/children
+        kids = client.get(f"/api/projects/test-project/docs/{mother}/children").json()
+        kid_ids = {k["id"] for k in kids}
+        assert kid_ids == {c1, c2}
+        assert all(k["parent_doc_id"] == mother for k in kids)
+
+        # child_doc_ids on the mother's payload mirrors it
+        got = client.get(f"/api/projects/test-project/docs/{mother}").json()
+        assert set(got["child_doc_ids"]) == {c1, c2}
+
+
+# ---------------------------------------------------------------------------
+# adopt / disown re-parents an existing doc
+# ---------------------------------------------------------------------------
+def test_adopt_and_disown_reparent(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Mother").json()["id"]
+        orphan = _create(client, title="Was Flat").json()["id"]
+
+        # adopt: set parent on an existing root doc
+        r = client.put(
+            f"/api/projects/test-project/docs/{orphan}/parent",
+            json={"parent_doc_id": mother},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["parent_doc_id"] == mother
+        kids = client.get(f"/api/projects/test-project/docs/{mother}/children").json()
+        assert {k["id"] for k in kids} == {orphan}
+
+        # disown: clear the parent (null) → back to root
+        r = client.put(
+            f"/api/projects/test-project/docs/{orphan}/parent",
+            json={"parent_doc_id": None},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["parent_doc_id"] is None
+        got = client.get(f"/api/projects/test-project/docs/{orphan}").json()
+        assert got["parent_doc_id"] is None
+        kids = client.get(f"/api/projects/test-project/docs/{mother}/children").json()
+        assert kids == []
+
+
+# ---------------------------------------------------------------------------
+# self-parent / cycle rejected
+# ---------------------------------------------------------------------------
+def test_self_parent_rejected(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        doc = _create(client, title="Solo").json()["id"]
+        r = client.put(
+            f"/api/projects/test-project/docs/{doc}/parent",
+            json={"parent_doc_id": doc},
+        )
+        assert r.status_code == 400, r.text
+        assert "self" in r.json()["detail"].lower() or "cycle" in r.json()["detail"].lower()
+
+
+def test_cycle_rejected(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        a = _create(client, title="A").json()["id"]
+        b = _create(client, title="B", parent_doc_id=a).json()["id"]
+        # B is already a child of A; making A a child of B would close a cycle.
+        r = client.put(
+            f"/api/projects/test-project/docs/{a}/parent",
+            json={"parent_doc_id": b},
+        )
+        assert r.status_code == 400, r.text
+        assert "cycle" in r.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# create with a non-existent parent is rejected (explicit relationship)
+# ---------------------------------------------------------------------------
+def test_create_with_missing_parent_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = _create(client, title="Child", parent_doc_id="D-9999")
+        assert r.status_code == 404, r.text
+
+
+def test_adopt_missing_parent_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        doc = _create(client, title="X").json()["id"]
+        r = client.put(
+            f"/api/projects/test-project/docs/{doc}/parent",
+            json={"parent_doc_id": "D-9999"},
+        )
+        assert r.status_code == 404, r.text
+
+
+def test_children_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/docs/D-0001/children")
+    assert r.status_code == 401
+
+
+def test_set_parent_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        r = client.put(
+            "/api/projects/test-project/docs/D-0001/parent",
+            json={"parent_doc_id": None},
+        )
+    assert r.status_code == 401

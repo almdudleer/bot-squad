@@ -387,6 +387,25 @@ export type UserRow = {
   is_admin: boolean;
 };
 
+// T-0218 — per-project personal override raw value (null = not set / inherit).
+export type ProjectTgChatId = {
+  slug: string;
+  tg_chat_id: string | null;
+};
+
+// T-0218 — 3-level resolved view. Each level reports its OWN raw value + a
+// `set` flag (explicit override at that level); `effective`/`source` are the
+// precedence winner computed server-side (project -> server -> global -> none).
+export type NotificationLevelSource = "project" | "server" | "global" | "none";
+export type NotificationsResolved = {
+  levels: {
+    global: { tg_chat_id: string | null; set: boolean };
+    server: { server_id: string; tg_chat_id: string | null; set: boolean };
+    project: { slug: string; tg_chat_id: string | null; set: boolean };
+  };
+  effective: { tg_chat_id: string | null; source: NotificationLevelSource };
+};
+
 export type SystemSettings = {
   tg: {
     bot_token_set: boolean;
@@ -830,6 +849,31 @@ export const api = {
     call<{ ok: boolean; sent: boolean }>("/api/me/tg-chat-id/test", {
       method: "POST",
     }),
+
+  // T-0218 — 3-level personal notification inheritance (global -> server ->
+  // project, most-specific wins). The resolved view is the single read powering
+  // the override panel (each level's raw value + `set` flag + the effective
+  // winner + its `source`); the per-project route is the NEW per-(user,project)
+  // override, mirroring the per-server /me/attachment/<id>/tg-chat-id shape.
+  // (Project persistence is a deferred T-0218 follow-up — the GET returns null
+  // / inherit until then; the resolved precedence is computed server-side, the
+  // FE never recomputes it.)
+  notificationsResolved: (serverId: string, slug: string) =>
+    call<NotificationsResolved>(
+      `/api/me/notifications/resolved?server_id=${encodeURIComponent(
+        serverId,
+      )}&slug=${encodeURIComponent(slug)}`,
+    ),
+  putProjectTgChatId: (slug: string, tg_chat_id: string) =>
+    call<ProjectTgChatId>(
+      `/api/me/project/${encodeURIComponent(slug)}/tg-chat-id`,
+      { method: "PUT", body: JSON.stringify({ tg_chat_id }) },
+    ),
+  testProjectTgChatId: (slug: string) =>
+    call<{ ok: boolean; sent: boolean }>(
+      `/api/me/project/${encodeURIComponent(slug)}/tg-chat-id/test`,
+      { method: "POST" },
+    ),
   /** T-0013: resolve the operator tmux session name for the post-install
    * /welcome screen. Server-side constant (env var on the install). */
   welcomeOperator: () =>

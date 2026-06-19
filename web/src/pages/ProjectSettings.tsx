@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, ProjectDetail } from "../api";
+import { PersonalNotificationPanel } from "../components/PersonalNotificationPanel";
 
 // T-0156: per-project Telegram binding settings.
 //
@@ -180,6 +181,16 @@ export function ProjectSettings() {
             Test ping uses the <em>saved</em> binding — save first, then test.
           </small>
         </section>
+      )}
+
+      {/* T-0218 — personal (per-user) notification target, inherited
+          global → server → project. Distinct from the project-wide binding
+          above (which notifies everyone). */}
+      {proj && (
+        <>
+          <hr style={{ borderColor: "var(--mc-border, #333)", margin: "1.5rem 0" }} />
+          <PersonalNotificationPanel slug={slug} />
+        </>
       )}
     </div>
   );

@@ -156,8 +156,11 @@ export function Project() {
       /* quota exceeded, private mode, etc. — silent. */
     }
   }, [collapsedStorageKey, collapsedLanes]);
-  function toggleLane(key: string) {
-    setCollapsedLanes((prev) => ({ ...prev, [key]: !prev[key] }));
+  // T-0272: toggle takes the lane's *effective* collapsed state (which may
+  // be a default, not an explicit entry) and writes its inverse, so the
+  // first click on a default-collapsed done/empty lane always expands it.
+  function toggleLane(key: string, currentCollapsed: boolean) {
+    setCollapsedLanes((prev) => ({ ...prev, [key]: !currentCollapsed }));
   }
 
   // T-0058: which rail (planned|closed) is currently expanded. null = both
@@ -346,6 +349,18 @@ export function Project() {
     if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
       grouped[t.status].push(t);
     }
+  }
+
+  // T-0272: group-by-initiative previously rendered every lane (incl. all
+  // the `done` and empty ones) as a full expanded 6-col board — a wall of
+  // mostly-empty columns. Done and empty lanes now default to collapsed so
+  // the few active lanes are visible without heavy scrolling. An explicit
+  // per-lane toggle (persisted to localStorage) always overrides the default.
+  function laneCollapsed(lane: InitiativeMeta): boolean {
+    const explicit = collapsedLanes[lane.key];
+    if (explicit !== undefined) return explicit;
+    const count = (tasksByInit[lane.key] ?? []).length;
+    return lane.status === "done" || count === 0;
   }
 
   // T-0096: the card chip is redundant whenever the board view already
@@ -716,8 +731,8 @@ export function Project() {
               tasks={tasksByInit[lane.key] ?? []}
               slug={slug}
               viewMode={viewMode}
-              collapsed={Boolean(collapsedLanes[lane.key])}
-              onToggleCollapsed={() => toggleLane(lane.key)}
+              collapsed={laneCollapsed(lane)}
+              onToggleCollapsed={() => toggleLane(lane.key, laneCollapsed(lane))}
               onMenuAction={handleMenuAction}
               onMove={handleMove}
               onReorder={handleReorder}

@@ -143,7 +143,32 @@ export type CreateTaskBody = {
 };
 
 export type VisionFile = { name: string; content: string; active?: boolean; finished?: boolean };
-export type FeedbackFile = { name: string; content: string };
+
+// T-0283 (Pillar C / D-0029): the unified cross-store artifact kind. Every
+// nestable artifact (doc, use-case, feedback theme) carries a `kind` so the
+// Docs-section tree can pick an icon + route per store, and a `parent_doc_id`
+// edge that may point at ANY artifact id (cross-store nesting).
+export type ArtifactKind = "doc" | "use_case" | "feedback";
+// Shape of a `/children` row across all three stores (per D-0029): a UC mother
+// may list doc children, a feedback theme may list evidence children, etc.
+export type ArtifactChild = {
+  id: string;
+  title: string;
+  kind: ArtifactKind;
+  status?: string;
+  parent_doc_id?: string | null;
+};
+
+// T-0283: feedback gains a tolerant frontmatter — `id` (the filename stem) and
+// `parent_doc_id`. Legacy files (no frontmatter) read as root artifacts: the
+// BE adds these keys, so they are optional for forward/backward compat.
+export type FeedbackFile = {
+  name: string;
+  content: string;
+  id?: string;
+  parent_doc_id?: string | null;
+  kind?: ArtifactKind;
+};
 
 export type UseCaseSummary = {
   id: string;
@@ -151,6 +176,10 @@ export type UseCaseSummary = {
   status: string;
   user_persona: string;
   goal: string;
+  // T-0283: the cross-store nesting edge (optional until the BE adds it to the
+  // list summary; the detail GET already carries it).
+  parent_doc_id?: string | null;
+  kind?: ArtifactKind;
 };
 export type UseCaseDetail = {
   id: string;
@@ -163,6 +192,13 @@ export type UseCaseDetail = {
   status?: string;
   body: string;
   raw: string;
+  // T-0283: a use-case is a nestable artifact — it may be parented under any
+  // artifact and may mother child docs/use-cases. `child_artifact_ids` is the
+  // cross-store superset of the legacy doc-only `child_doc_ids`.
+  kind?: ArtifactKind;
+  parent_doc_id?: string | null;
+  child_artifact_ids?: string[];
+  child_doc_ids?: string[];
 };
 
 // T-0172: project docs system. Docs live at
@@ -177,6 +213,8 @@ export type DocSummary = {
   // (null/absent for a root/mother doc). The Docs left-rail renders children
   // indented under their mother.
   parent_doc_id?: string | null;
+  // T-0283: kind discriminator for the cross-store tree (defaults to "doc").
+  kind?: ArtifactKind;
 };
 export type DocDetail = {
   id: string;
@@ -189,9 +227,14 @@ export type DocDetail = {
   raw: string;
   path?: string;
   // T-0234/T-0235: nesting — the mother (parent_doc_id) and the attached
-  // children (child_doc_ids) the detail pane lists as "Attached artifacts".
+  // children the detail pane lists as "Attached artifacts".
   parent_doc_id?: string | null;
+  // T-0283/D-0029: `child_artifact_ids` is the cross-store superset (doc + UC +
+  // feedback children); `child_doc_ids` is the legacy doc-only key kept as a
+  // backward-compatible fallback. Read the superset first.
+  child_artifact_ids?: string[];
   child_doc_ids?: string[];
+  kind?: ArtifactKind;
 };
 
 // T-0173: user flows attached to a use case
@@ -710,12 +753,30 @@ export const api = {
     call(`/api/projects/${slug}/feedback/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   promoteFeedback: (slug: string, name: string, title?: string, body?: string) =>
     call<{ task_id: string }>(`/api/projects/${slug}/feedback/${name}/promote`, { method: "POST", body: JSON.stringify({ title, body }) }),
+  // T-0283/D-0029: feedback themes are nestable cross-store artifacts. List a
+  // theme's children (evidence docs etc.) and adopt/disown the theme by setting
+  // its parent_doc_id (keyed by filename `name`; the parent is any artifact id).
+  feedbackChildren: (slug: string, name: string) =>
+    call<ArtifactChild[]>(`/api/projects/${slug}/feedback/${encodeURIComponent(name)}/children`),
+  setFeedbackParent: (slug: string, name: string, parentDocId: string | null) =>
+    call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
+      `/api/projects/${slug}/feedback/${encodeURIComponent(name)}/parent`,
+      { method: "PUT", body: JSON.stringify({ parent_doc_id: parentDocId }) }),
   useCases: (slug: string) =>
     call<UseCaseSummary[]>(`/api/projects/${slug}/use_cases`),
   useCase: (slug: string, id: string) =>
     call<UseCaseDetail>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`),
   putUseCase: (slug: string, id: string, content: string) =>
     call(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ content }) }),
+  // T-0283/D-0029: use-cases are nestable cross-store artifacts. List a UC's
+  // children (may include docs/feedback) and adopt/disown the UC itself by
+  // setting (or clearing, with null) its parent_doc_id. Cycle-safe on the BE.
+  useCaseChildren: (slug: string, id: string) =>
+    call<ArtifactChild[]>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/children`),
+  setUseCaseParent: (slug: string, id: string, parentDocId: string | null) =>
+    call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
+      `/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/parent`,
+      { method: "PUT", body: JSON.stringify({ parent_doc_id: parentDocId }) }),
   // T-0174: allocate a UC-NNNN id atomically (server-side); no hand-typed ids.
   createUseCase: (slug: string, title: string) =>
     call<{ ok: boolean; id: string }>(`/api/projects/${slug}/use_cases`, { method: "POST", body: JSON.stringify({ title }) }),
@@ -774,10 +835,12 @@ export const api = {
   unlinkDoc: (slug: string, id: string, ticket: string) =>
     call(`/api/projects/${slug}/docs/${encodeURIComponent(id)}/link/${encodeURIComponent(ticket)}`,
       { method: "DELETE" }),
-  // T-0234/T-0235: nested docs. List a mother doc's attached children, and
-  // adopt/disown a doc by setting (or clearing, with null) its parent_doc_id.
+  // T-0234/T-0235/T-0283: nested docs. List a mother's attached children — now
+  // cross-store (EXTENDED per D-0029 to include UC/feedback children, each row
+  // carrying `kind`), and adopt/disown a doc by setting (or clearing, with
+  // null) its parent_doc_id (which may point at any artifact id).
   docChildren: (slug: string, id: string) =>
-    call<DocSummary[]>(`/api/projects/${slug}/docs/${encodeURIComponent(id)}/children`),
+    call<ArtifactChild[]>(`/api/projects/${slug}/docs/${encodeURIComponent(id)}/children`),
   setDocParent: (slug: string, id: string, parentDocId: string | null) =>
     call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
       `/api/projects/${slug}/docs/${encodeURIComponent(id)}/parent`,

@@ -1,15 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, DocSummary, DocDetail, errorDetail } from "../api";
+import { api, DocDetail, errorDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
 import { Markdown } from "../components/Markdown";
+import { ArtifactTreeView, ReparentControl, useArtifacts } from "../components/ArtifactTree";
 
 export function Docs() {
   const { slug = "" } = useParams();
   const [searchParams] = useSearchParams();
 
-  const [items, setItems] = useState<DocSummary[] | null>(null);
-  const [categories, setCategories] = useState<string[]>([]);
+  // T-0283 (Pillar C): the left rail is now the UNIFIED cross-store artifact
+  // tree (docs + use-cases + feedback, nested by parent_doc_id). Clicking a UC
+  // or feedback node routes to its own section page; docs open in place.
+  const tree = useArtifacts(slug, 0);
+
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<DocDetail | null>(null);
@@ -18,81 +22,26 @@ export function Docs() {
   const [flash, setFlash] = useState<string | null>(null);
 
   // + New doc form
+  const [categories, setCategories] = useState<string[]>([]);
   const [newCategory, setNewCategory] = useState("design");
   const [newTitle, setNewTitle] = useState("");
-  const [newParent, setNewParent] = useState(""); // T-0235: optional mother doc
+  const [newParent, setNewParent] = useState(""); // T-0235/T-0283: optional mother artifact (cross-store)
   const [showNew, setShowNew] = useState(false);
 
   // link-a-ticket input
   const [linkTicket, setLinkTicket] = useState("");
 
-  function reload() {
-    api.docs(slug).then(setItems).catch((e) => setError(String(e)));
-  }
-
   useEffect(() => {
-    reload();
     api.docCategories(slug).then(setCategories).catch(() => setCategories([]));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
-  // Deep-link: /p/:slug/docs?doc=D-NNNN opens that doc (from ticket pages).
+  // Deep-link: /p/:slug/docs?doc=D-NNNN opens that doc (from ticket pages + the
+  // shared tree's doc nodes).
   useEffect(() => {
     const d = searchParams.get("doc");
     if (d && d !== selected) open(d);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, slug]);
-
-  // T-0235: nested-docs tree. A doc is a ROOT (mother) when it has no
-  // parent_doc_id (or its parent isn't in this set); children nest under their
-  // mother regardless of their own category. Roots are grouped by category for
-  // the left rail; descendants render indented beneath their mother.
-  const byId = useMemo(() => {
-    const m = new Map<string, DocSummary>();
-    for (const d of items ?? []) m.set(d.id, d);
-    return m;
-  }, [items]);
-  const childrenOf = useMemo(() => {
-    const m = new Map<string, DocSummary[]>();
-    for (const d of items ?? []) {
-      const p = d.parent_doc_id;
-      if (p && byId.has(p)) {
-        if (!m.has(p)) m.set(p, []);
-        m.get(p)!.push(d);
-      }
-    }
-    return m;
-  }, [items, byId]);
-  const isRoot = (d: DocSummary) => !d.parent_doc_id || !byId.has(d.parent_doc_id);
-  // Roots grouped by category (only roots head a category section; children
-  // appear nested under their mother).
-  const byCategory = useMemo(() => {
-    const m = new Map<string, DocSummary[]>();
-    for (const d of items ?? []) {
-      if (!isRoot(d)) continue;
-      if (!m.has(d.category)) m.set(d.category, []);
-      m.get(d.category)!.push(d);
-    }
-    return m;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, byId]);
-
-  // Descendant set of a doc (self + all nested children) — used to keep the
-  // "attach under" picker from offering a cycle (backend rejects too).
-  function descendantsOf(id: string): Set<string> {
-    const out = new Set<string>([id]);
-    const stack = [id];
-    while (stack.length) {
-      const cur = stack.pop()!;
-      for (const c of childrenOf.get(cur) ?? []) {
-        if (!out.has(c.id)) {
-          out.add(c.id);
-          stack.push(c.id);
-        }
-      }
-    }
-    return out;
-  }
 
   async function setParent(childId: string, parentId: string | null) {
     setBusy(true);
@@ -100,11 +49,11 @@ export function Docs() {
     setFlash(null);
     try {
       await api.setDocParent(slug, childId, parentId);
-      reload();
+      tree.reload();
       if (selected) await open(selected);
       setFlash(parentId ? `Attached ${childId} under ${parentId}.` : `Detached ${childId}.`);
     } catch (e) {
-      setError(String(e));
+      setError(errorDetail(e)); // T-0283: surface the BE 4xx cycle/validation detail inline
     } finally {
       setBusy(false);
     }
@@ -131,7 +80,7 @@ export function Docs() {
     setFlash(null);
     try {
       const res = await api.createDoc(slug, newCategory, title, newParent || null);
-      reload();
+      tree.reload();
       const d = await api.doc(slug, res.id);
       setSelected(res.id);
       setDetail(d);
@@ -152,9 +101,8 @@ export function Docs() {
   }
 
   // T-0276: delete a doc. Matches the app's destructive-action pattern
-  // (window.confirm gate, as in Users.tsx) — no new are-you-sure modal. The BE
-  // refuses (409) a mother doc that still has children; surface that detail
-  // (which names the blocking children) inline via errorDetail.
+  // (window.confirm gate). The BE refuses (409) a mother doc that still has
+  // children; surface that detail inline via errorDetail.
   async function removeDoc() {
     if (!selected) return;
     const id = selected;
@@ -167,7 +115,7 @@ export function Docs() {
       setSelected(null);
       setDetail(null);
       setDraft(null);
-      reload();
+      tree.reload();
       setFlash(`Deleted ${id}.`);
     } catch (e) {
       setError(errorDetail(e));
@@ -183,7 +131,7 @@ export function Docs() {
     try {
       await api.putDoc(slug, selected, draft ?? "");
       setDraft(null);
-      reload();
+      tree.reload();
       await open(selected);
       setFlash("Saved.");
     } catch (e) {
@@ -203,7 +151,6 @@ export function Docs() {
       await api.linkDoc(slug, selected, t);
       setLinkTicket("");
       await open(selected);
-      reload();
       setFlash(`Linked ${t}.`);
     } catch (e) {
       setError(String(e));
@@ -219,7 +166,6 @@ export function Docs() {
     try {
       await api.unlinkDoc(slug, selected, ticket);
       await open(selected);
-      reload();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -227,35 +173,9 @@ export function Docs() {
     }
   }
 
-  // T-0235: render a doc + its nested children (recursive, indented).
-  function renderDocNode(d: DocSummary, level: number) {
-    const kids = childrenOf.get(d.id) ?? [];
-    return (
-      <li key={d.id} className="mb-1" style={{ paddingLeft: level > 0 ? "0.7rem" : 0 }}>
-        <button
-          type="button"
-          className={`btn btn-sm w-100 text-start ${selected === d.id ? "btn-secondary" : "btn-outline-secondary"}`}
-          style={{ fontSize: "0.74rem" }}
-          onClick={() => open(d.id)}
-        >
-          <span style={{ fontFamily: "var(--mc-mono)" }}>
-            {level > 0 && <span style={{ color: "var(--mc-text-dim)" }}>└ </span>}
-            {d.id}
-          </span>
-          {kids.length > 0 && (
-            <span style={{ color: "var(--mc-text-dim)", fontSize: "0.68rem" }} title={`${kids.length} attached`}>
-              {" "}📎{kids.length}
-            </span>
-          )}
-          <br />
-          <span style={{ color: "var(--mc-text-dim)", fontSize: "0.7rem" }}>{d.title}</span>
-        </button>
-        {kids.length > 0 && (
-          <ul className="list-unstyled m-0 mt-1">{kids.map((k) => renderDocNode(k, level + 1))}</ul>
-        )}
-      </li>
-    );
-  }
+  // T-0283/D-0029: read the cross-store superset, falling back to the legacy
+  // doc-only key.
+  const childIds = detail ? (detail.child_artifact_ids ?? detail.child_doc_ids ?? []) : [];
 
   return (
     <div className="container py-4" style={{ maxWidth: "980px" }}>
@@ -266,17 +186,16 @@ export function Docs() {
       <PageHelp>
         Project docs stored as <code>data/&lt;slug&gt;/docs/&lt;category&gt;/D-NNNN-&lt;slug&gt;.md</code> and
         symlinked into the dev/master clones (<code>bsq docs sync</code>) so agents reach them at
-        <code> docs/&lt;category&gt;/…</code>. Categories: <strong>product</strong> /
-        <strong> architecture</strong> (fixed) / <strong>design</strong> (blueprints) /
-        <strong> support</strong> (agent-facing) / <strong>runbook</strong>. Docs link
-        bidirectionally to tickets (T-0172).
+        <code> docs/&lt;category&gt;/…</code>. The left rail is the unified artifact tree (T-0283): docs,
+        use-cases (🎯) and feedback (💬) nest under one another by <code>parent_doc_id</code>, across stores.
+        Docs link bidirectionally to tickets (T-0172).
       </PageHelp>
 
       {error && <div className="alert alert-danger py-1 small">{error}</div>}
       {flash && <div className="alert alert-success py-1 small">{flash}</div>}
 
       <div className="d-flex gap-4">
-        {/* List, grouped by category */}
+        {/* Unified cross-store artifact tree */}
         <div style={{ minWidth: "240px", flex: "0 0 240px" }}>
           <button type="button" className="btn btn-outline-primary btn-sm w-100 mb-2" style={{ fontSize: "0.72rem" }} onClick={() => setShowNew((v) => !v)}>
             + New doc
@@ -289,32 +208,23 @@ export function Docs() {
               </select>
               <label className="form-label" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }}>Title</label>
               <input className="form-control form-control-sm mb-2" style={{ fontSize: "0.74rem" }} value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="Doc title" />
-              {/* T-0235: optionally attach the new doc under a mother doc. */}
+              {/* T-0235/T-0283: optionally attach the new doc under any artifact. */}
               <label className="form-label" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }}>Attach under (optional)</label>
               <select className="form-select form-select-sm mb-2" style={{ fontSize: "0.74rem" }} value={newParent} onChange={(e) => setNewParent(e.target.value)}>
                 <option value="">— none (mother doc) —</option>
-                {(items ?? []).map((d) => <option key={d.id} value={d.id}>{d.id} · {d.title}</option>)}
+                {(tree.nodes ?? []).map((n) => <option key={`${n.kind}:${n.id}`} value={n.id}>{n.id} · {n.title}</option>)}
               </select>
               <button type="button" className="btn btn-primary btn-sm w-100" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={createDoc}>
                 {busy ? "Creating…" : "Create"}
               </button>
             </div>
           )}
-          {items === null && !error && <div className="mc-loading">Loading</div>}
-          {items?.length === 0 && <div className="text-muted small">No docs yet.</div>}
-          {[...byCategory.keys()].sort().map((cat) => (
-            <div key={cat} className="mb-2">
-              <div className="mc-sidebar-subsection" style={{ marginTop: 0 }}>{cat}</div>
-              <ul className="list-unstyled m-0">
-                {byCategory.get(cat)!.map((d) => renderDocNode(d, 0))}
-              </ul>
-            </div>
-          ))}
+          <ArtifactTreeView slug={slug} data={tree} selectedKind="doc" selectedId={selected} />
         </div>
 
         {/* Detail / editor */}
         <div style={{ flex: 1, minWidth: 0 }}>
-          {selected === null && <div className="text-muted small">Select a doc, or create one.</div>}
+          {selected === null && <div className="text-muted small">Select an artifact, or create a doc.</div>}
 
           {selected !== null && draft === null && detail && (
             <>
@@ -333,55 +243,34 @@ export function Docs() {
                 </div>
               </div>
 
-              {/* T-0235: nesting — mother (parent) + attached artifacts (children)
-                  + adopt/disown controls (PUT /docs/{id}/parent). */}
-              <div className="mb-3" style={{ border: "1px solid var(--mc-border)", borderRadius: "4px", padding: "0.6rem" }}>
-                <div className="mc-section-title" style={{ margin: "0 0 0.4rem 0" }}>Nesting</div>
-                {detail.parent_doc_id ? (
-                  <div className="d-flex align-items-center gap-2 mb-2" style={{ fontSize: "0.74rem" }}>
-                    <span style={{ color: "var(--mc-text-dim)" }}>Attached under</span>
-                    <button type="button" className="btn btn-link btn-sm p-0" style={{ fontFamily: "var(--mc-mono)" }} onClick={() => open(detail.parent_doc_id!)}>
-                      {detail.parent_doc_id}
-                    </button>
-                    <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.7rem" }} disabled={busy} onClick={() => setParent(detail.id, null)}>
-                      Detach
-                    </button>
+              {/* T-0235/T-0283: cross-store nesting — set/clear this doc's parent
+                  (PUT /docs/{id}/parent, cycle-safe) + list its attached
+                  artifacts (the cross-store child_artifact_ids superset). */}
+              <ReparentControl
+                slug={slug}
+                data={tree}
+                selfId={detail.id}
+                currentParentId={detail.parent_doc_id}
+                busy={busy}
+                onSetParent={(pid) => setParent(detail.id, pid)}
+              />
+              {childIds.length > 0 && (
+                <div className="mb-3">
+                  <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>
+                    Attached artifacts ({childIds.length}):
                   </div>
-                ) : (
-                  <div className="mb-2" style={{ fontSize: "0.74rem", color: "var(--mc-text-dim)" }}>
-                    Mother doc (no parent).
-                  </div>
-                )}
-                {(detail.child_doc_ids ?? []).length > 0 && (
-                  <div className="mb-2">
-                    <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>
-                      Attached artifacts ({detail.child_doc_ids!.length}):
-                    </div>
-                    <div className="d-flex flex-wrap gap-2">
-                      {detail.child_doc_ids!.map((cid) => (
-                        <button key={cid} type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }} onClick={() => open(cid)}>
+                  <div className="d-flex flex-wrap gap-2">
+                    {childIds.map((cid) => {
+                      const n = tree.byId.get(cid);
+                      return (
+                        <button key={cid} type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }} onClick={() => open(cid)} disabled={!!n && n.kind !== "doc"} title={n ? n.title : cid}>
                           📎 {cid}
                         </button>
-                      ))}
-                    </div>
+                      );
+                    })}
                   </div>
-                )}
-                <select
-                  className="form-select form-select-sm"
-                  style={{ fontSize: "0.74rem", maxWidth: "22rem" }}
-                  value=""
-                  disabled={busy}
-                  aria-label="Attach this doc under a mother doc"
-                  onChange={(e) => { if (e.target.value) setParent(detail.id, e.target.value); }}
-                >
-                  <option value="">Attach under…</option>
-                  {(items ?? [])
-                    .filter((d) => !descendantsOf(detail.id).has(d.id) && d.id !== detail.parent_doc_id)
-                    .map((d) => (
-                      <option key={d.id} value={d.id}>{d.id} · {d.title}</option>
-                    ))}
-                </select>
-              </div>
+                </div>
+              )}
 
               {/* Related tickets — the doc→ticket half of the bidirectional mention */}
               <div className="mb-3">
@@ -403,8 +292,7 @@ export function Docs() {
                 </div>
               </div>
 
-              {/* T-0275: render the doc body as markdown (frontmatter stripped,
-                  T-/D- mentions linkified) instead of a raw <pre> dump. */}
+              {/* T-0275: render the doc body as markdown. */}
               <Markdown source={detail.raw} slug={slug} />
             </>
           )}

@@ -1,15 +1,18 @@
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
-import { api, FlowDetail, FlowSummary, UseCaseSummary, UseCaseDetail, errorDetail } from "../api";
+import { useParams, useSearchParams } from "react-router-dom";
+import { api, FlowDetail, FlowSummary, UseCaseDetail, errorDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
 import { Mermaid, extractMermaid } from "../components/Mermaid";
 import { FlowGraphEditor } from "../components/FlowGraphEditor";
 import { Markdown } from "../components/Markdown";
+import { ArtifactTreeView, ReparentControl, useArtifacts } from "../components/ArtifactTree";
 
 export function UseCases() {
   const { slug = "" } = useParams();
+  const [searchParams] = useSearchParams();
 
-  const [items, setItems] = useState<UseCaseSummary[] | null>(null);
+  // T-0283 (Pillar C): the left rail is the unified cross-store artifact tree.
+  const tree = useArtifacts(slug, 0);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<UseCaseDetail | null>(null);
@@ -25,14 +28,13 @@ export function UseCases() {
   // T-0226: structured node-graph editor mode (parallel to the raw-md editor).
   const [graphEditing, setGraphEditing] = useState(false);
 
-  function reload() {
-    api.useCases(slug).then(setItems).catch((e) => setError(String(e)));
-  }
-
+  // Deep-link: /p/:slug/docs/usecases?uc=UC-NNNN opens that use case (from the
+  // shared artifact tree's use-case nodes).
   useEffect(() => {
-    reload();
+    const u = searchParams.get("uc");
+    if (u && u !== selected) open(u);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slug]);
+  }, [searchParams, slug]);
 
   function reloadFlows(ucId: string) {
     api.flows(slug, ucId).then(setFlows).catch(() => setFlows([]));
@@ -65,7 +67,7 @@ export function UseCases() {
       setSelected(res.id);
       setDetail(d);
       setDraft(d.raw);
-      reload();
+      tree.reload();
       setFlash(`Created ${res.id} — edit the details below, then Save.`);
     } catch (e) {
       setError(String(e));
@@ -83,7 +85,7 @@ export function UseCases() {
     try {
       await api.putUseCase(slug, id, content);
       setDraft(null);
-      reload();
+      tree.reload();
       await open(id);
       setFlash("Saved.");
     } catch (e) {
@@ -112,8 +114,28 @@ export function UseCases() {
       setOpenFlowId(null);
       setFlowDetail(null);
       setFlowDraft(null);
-      reload();
+      tree.reload();
       setFlash(`Deleted ${id}.`);
+    } catch (e) {
+      setError(errorDetail(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // T-0283/D-0029: re-parent this use-case under any artifact (cross-store,
+  // cycle-safe on the BE; surface a 4xx cycle/validation detail inline).
+  async function setUcParent(parentId: string | null) {
+    if (!selected) return;
+    const id = selected;
+    setBusy(true);
+    setError(null);
+    setFlash(null);
+    try {
+      await api.setUseCaseParent(slug, id, parentId);
+      tree.reload();
+      await open(id);
+      setFlash(parentId ? `Attached ${id} under ${parentId}.` : `Detached ${id}.`);
     } catch (e) {
       setError(errorDetail(e));
     } finally {
@@ -225,29 +247,12 @@ export function UseCases() {
       {flash && <div className="alert alert-success py-1 small">{flash}</div>}
 
       <div className="d-flex gap-4">
-        {/* List */}
+        {/* T-0283: unified cross-store artifact tree (use-cases highlighted). */}
         <div style={{ minWidth: "240px", flex: "0 0 240px" }}>
           <button type="button" className="btn btn-outline-primary btn-sm w-100 mb-2" style={{ fontSize: "0.72rem" }} onClick={startNew}>
             + New use case
           </button>
-          {items === null && !error && <div className="mc-loading">Loading</div>}
-          {items?.length === 0 && <div className="text-muted small">No use cases yet.</div>}
-          <ul className="list-unstyled m-0">
-            {items?.map((uc) => (
-              <li key={uc.id} className="mb-1">
-                <button
-                  type="button"
-                  className={`btn btn-sm w-100 text-start ${selected === uc.id ? "btn-secondary" : "btn-outline-secondary"}`}
-                  style={{ fontSize: "0.74rem" }}
-                  onClick={() => open(uc.id)}
-                >
-                  <span style={{ fontFamily: "var(--mc-mono)" }}>{uc.id}</span>
-                  <br />
-                  <span style={{ color: "var(--mc-text-dim)", fontSize: "0.7rem" }}>{uc.title}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          <ArtifactTreeView slug={slug} data={tree} selectedKind="use_case" selectedId={selected} />
         </div>
 
         {/* Detail / editor */}
@@ -270,6 +275,35 @@ export function UseCases() {
                   </button>
                 </div>
               </div>
+              {/* T-0283/D-0029: cross-store nesting — set/clear this use-case's
+                  parent (PUT /use_cases/{id}/parent, cycle-safe) + list its
+                  attached artifacts (child_artifact_ids superset). */}
+              <ReparentControl
+                slug={slug}
+                data={tree}
+                selfId={detail.id}
+                currentParentId={detail.parent_doc_id}
+                busy={busy}
+                onSetParent={setUcParent}
+              />
+              {(() => {
+                const childIds = detail.child_artifact_ids ?? detail.child_doc_ids ?? [];
+                return childIds.length > 0 ? (
+                  <div className="mb-3">
+                    <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>
+                      Attached artifacts ({childIds.length}):
+                    </div>
+                    <div className="d-flex flex-wrap gap-2">
+                      {childIds.map((cid) => (
+                        <span key={cid} className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }} title={tree.byId.get(cid)?.title ?? cid}>
+                          📎 {cid}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null;
+              })()}
+
               {/* T-0275: render the use-case body as markdown (frontmatter
                   stripped, T-/D- mentions linkified) instead of a raw <pre>. */}
               <Markdown source={detail.raw} slug={slug} />

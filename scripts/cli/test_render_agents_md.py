@@ -116,6 +116,20 @@ def test_renders_current_vision_schema(tmp_path):
     assert "- **missing** — `ops/vision/initiatives/missing.md`" in out
 
 
+def test_feedback_blurb_is_project_agnostic(tmp_path):
+    """T-0302: every rendered AGENTS.md advertises the feedback channel —
+    `bsq feedback submit` — so every session knows it can/should surface
+    product/process friction upstream. It's project-agnostic (no config
+    field), so it renders for any project, with the project's own ops prefix."""
+    cfg = _synthetic_config(tmp_path, 'ops_path = "ops/custom"\n')
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "## Feedback is welcome and expected" in out
+    assert 'bsq feedback submit "<note>"' in out
+    # ops prefix flows through the blurb's feedback path too.
+    assert "`ops/custom/feedback/`" in out
+
+
 def test_missing_vision_entirely_graceful(tmp_path):
     """A project with NO vision dir at all: placeholders, no exception."""
     cfg = _synthetic_config(tmp_path)

@@ -52,3 +52,11 @@ the prod contour.
 2. Arm `peer_inbox_wait` in the background.
 3. `git status` + `git log --oneline -5` to ground yourself.
 4. Check the deploy queue and last few runs in the UI before you act.
+
+## Feedback is welcome and expected
+
+If you hit product friction, a confusing flow, a missing capability, or a
+broken process/recipe, run `bsq feedback submit "<your note>"` to send it
+upstream to the operator/stakeholder. You don't need permission, and small
+notes are valuable — it lands in the project feedback queue. This is how the
+process improves; don't silently absorb friction.

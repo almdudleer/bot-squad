@@ -247,6 +247,13 @@ files repeatedly, the right answer probably belongs here.
    forward for real users?
 5. If unclear, raise to stakeholders rather than guessing.
 
+## Feedback is welcome and expected
+
+Hit product friction, a confusing flow, a missing capability, or a broken
+recipe? Run `bsq feedback submit "<note>"` to send it upstream to the
+operator/stakeholder — no permission needed, and small notes are valuable.
+It lands in `{ops}/feedback/`; it's how the process improves.
+
 ## Active initiatives — this cycle's bets
 
 {initiatives_block}

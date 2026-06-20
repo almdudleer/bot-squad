@@ -115,3 +115,11 @@ via your peer inbox, treat it as a delegated spawn. Steps:
 - Use `task_progress_add` to log shipped milestones / blockers. Don't
   rewrite the task body to status-narrate; that's what progress notes are for.
 
+
+## Feedback is welcome and expected
+
+If you hit product friction, a confusing flow, a missing capability, or a
+broken process/recipe, run `bsq feedback submit "<your note>"` to send it
+upstream to the operator/stakeholder. You don't need permission, and small
+notes are valuable — it lands in the project feedback queue. This is how the
+process improves; don't silently absorb friction.

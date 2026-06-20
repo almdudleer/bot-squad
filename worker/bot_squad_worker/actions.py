@@ -103,6 +103,19 @@ def _get_tg_client(cfg: Any) -> Any:
     return _TG
 
 
+# T-0247: MaxClient singleton — mirror of the TgClient one above.
+_MAX: Any = None  # MaxClient | None
+
+
+def _get_max_client(cfg: Any) -> Any:
+    """Return the module-level MaxClient, creating it on first call."""
+    global _MAX
+    if _MAX is None:
+        from bot_squad_worker.max import MaxClient
+        _MAX = MaxClient(cfg)
+    return _MAX
+
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
@@ -258,6 +271,55 @@ def _coerce_topic_id(raw: Any) -> int | None:
         return int(raw)
     except (TypeError, ValueError):
         raise ActionError(f"tg_notify: topic_id must be an integer, got {raw!r}")
+
+
+_MAX_NOTIFY_ALLOWED = {
+    "chat_id", "message", "sid", "user", "urgent", "recipient_kind",
+}
+
+
+def _action_max_notify(params: dict[str, Any]) -> dict[str, Any]:
+    """Send a MAX (max.ru) DM — the T-0247 mirror of ``tg_notify``.
+
+    The stakeholder's preferred channel. MAX has no per-project chat binding
+    (projects.toml carries ``tg_chat``, not a MAX id), so the recipient is the
+    explicit ``chat_id`` param when given, else the ``[max].default_chat_id``
+    from system_settings.toml (the stakeholder's MAX id).
+
+    Params (all optional except ``message``):
+        message        : str  — required; the text to send
+        chat_id        : str  — explicit MAX recipient id; wins over the default
+        sid            : str  — SID prefix component
+        user           : str  — user prefix component
+        urgent         : bool — bypass the quiet-hours gate
+        recipient_kind : str  — "chat_id" (default) or "user_id" for a DM;
+                                overrides [max].recipient_kind for this call
+
+    Returns {ok: true, sent: <bool>}.
+    """
+    extra = set(params) - _MAX_NOTIFY_ALLOWED
+    if extra:
+        raise ActionError(f"max_notify got unexpected params: {sorted(extra)}")
+    if "message" not in params:
+        raise ActionError("max_notify missing required param: message")
+
+    cfg = _get_config()
+    chat_id = params.get("chat_id") or cfg.max_default_chat_id
+    if not chat_id:
+        raise ActionError(
+            "max_notify: no chat_id and no [max].default_chat_id configured"
+        )
+
+    client = _get_max_client(cfg)
+    sent = client.send(
+        chat_id=chat_id,
+        text=params["message"],
+        sid=params.get("sid", ""),
+        user=params.get("user", ""),
+        urgent=bool(params.get("urgent", False)),
+        recipient_kind=params.get("recipient_kind"),
+    )
+    return {"ok": True, "sent": sent}
 
 
 _TG_STALL_CLEAR_REQUIRED = {"slug", "sid"}
@@ -2056,6 +2118,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,
     "tg_notify": _action_tg_notify,
+    # T-0247: MAX (max.ru) DM channel — mirrors tg_notify.
+    "max_notify": _action_max_notify,
     "tg_stall_clear": _action_tg_stall_clear,
     "deploy": _action_deploy,
     "pause_deploys": _action_pause_deploys,
@@ -2130,6 +2194,7 @@ ACTION_MODES: dict[str, str] = {
     "noop": "both",
     "tg_verify_login": "coordinator_only",
     "tg_notify": "coordinator_only",
+    "max_notify": "coordinator_only",
     "tg_stall_clear": "coordinator_only",
     "deploy": "coordinator_only",
     "pause_deploys": "coordinator_only",

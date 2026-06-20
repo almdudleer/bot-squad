@@ -132,6 +132,16 @@ class Config:
     # Empty → direct egress (httpx trust_env still applies). socks5:// needs the
     # httpx[socks] extra (a worker dependency).
     tg_proxy_url: str = ""
+    # T-0247: MAX (max.ru) DM channel — the second notification channel,
+    # mirroring the TG fields above. bot_token is encrypted at rest in
+    # secrets.toml [max] (same scheme as telegram.bot_token); the non-secret
+    # bits live in system_settings.toml [max]. recipient_kind selects whether
+    # the configured id is a group chat ("chat_id") or a direct user DM
+    # ("user_id"). Empty token → max.MaxClient.send is a silent no-op.
+    max_bot_token: str = ""
+    max_default_chat_id: str = ""
+    max_proxy_url: str = ""
+    max_recipient_kind: str = "chat_id"
 
     @property
     def data_dir(self) -> Path:
@@ -167,6 +177,8 @@ class Config:
         # legacy plaintext as-is, and raises loud on an enc: value it can't
         # decrypt (never silently reads ciphertext as the token).
         bot_token = secret_crypto.decrypt(sec.get("telegram", {}).get("bot_token", ""))
+        # T-0247: MAX bot token, encrypted at rest the same way as the TG token.
+        max_bot_token = secret_crypto.decrypt(sec.get("max", {}).get("bot_token", ""))
 
         # system_settings.toml is optional; defaults match the historical hardcoded
         # values so existing deploys behave identically until the admin writes it.
@@ -176,6 +188,10 @@ class Config:
         remote_control_url = ""
         default_chat_id = ""
         proxy_url = ""
+        # T-0247: MAX [max] non-secret config (token lives in secrets.toml).
+        max_default_chat_id = ""
+        max_proxy_url = ""
+        max_recipient_kind = "chat_id"
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -186,6 +202,10 @@ class Config:
             remote_control_url = str(tg_block.get("remote_control_url", remote_control_url))
             default_chat_id = str(tg_block.get("default_chat_id", default_chat_id))
             proxy_url = str(tg_block.get("proxy_url", proxy_url))
+            max_block = sys_raw.get("max", {}) or {}
+            max_default_chat_id = str(max_block.get("default_chat_id", max_default_chat_id))
+            max_proxy_url = str(max_block.get("proxy_url", max_proxy_url))
+            max_recipient_kind = str(max_block.get("recipient_kind", max_recipient_kind))
 
         return cls(
             config_dir=config_dir,
@@ -198,4 +218,8 @@ class Config:
             tg_remote_control_url=remote_control_url,
             tg_default_chat_id=default_chat_id,
             tg_proxy_url=proxy_url,
+            max_bot_token=max_bot_token,
+            max_default_chat_id=max_default_chat_id,
+            max_proxy_url=max_proxy_url,
+            max_recipient_kind=max_recipient_kind,
         )

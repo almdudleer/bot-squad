@@ -88,6 +88,8 @@ def test_registry_lists_only_allowed_actions():
         # T-0142/0144: session-lifecycle reconcilers + Team entity + rename sync.
         "gc_dead_bindings", "archive_dead_teammates", "reconcile_teams",
         "list_teams", "archive_team", "resurrect_team", "sync_session_name",
+        # T-0247: MAX (max.ru) DM channel — mirrors tg_notify.
+        "max_notify",
     }
 
 
@@ -386,6 +388,109 @@ def test_tg_notify_rejects_non_integer_topic(tmp_config_dir, monkeypatch):
     _inject_fake_tg(monkeypatch, tmp_config_dir)
     with pytest.raises(ActionError, match="topic_id must be an integer"):
         A.dispatch("tg_notify", {"message": "hi", "topic_id": "abc"})
+
+
+# ---------------------------------------------------------------------------
+# max_notify tests (T-0247) — MAX (max.ru) DM channel, mirrors tg_notify
+# ---------------------------------------------------------------------------
+
+class _FakeMaxClient:
+    """Records calls instead of hitting the real MAX API."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._suppress = False
+
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, recipient_kind=None) -> bool:
+        self.calls.append({
+            "chat_id": chat_id, "text": text, "sid": sid, "user": user,
+            "urgent": urgent, "recipient_kind": recipient_kind,
+        })
+        return not self._suppress
+
+
+def _inject_fake_max(monkeypatch, tmp_config_dir, fake_client=None):
+    import bot_squad_worker.actions as A
+
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    if fake_client is None:
+        fake_client = _FakeMaxClient()
+    monkeypatch.setattr(A, "_get_max_client", lambda _cfg: fake_client)
+    return cfg, fake_client
+
+
+def _config_dir_with_max_default(tmp_config_dir: Path, chat_id: str = "MAXCHAT99") -> None:
+    (tmp_config_dir / "system_settings.toml").write_text(
+        f'[max]\ndefault_chat_id = "{chat_id}"\n'
+    )
+
+
+def test_max_notify_sends_to_explicit_chat_id(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _, fake = _inject_fake_max(monkeypatch, tmp_config_dir)
+    out = A.dispatch("max_notify", {"chat_id": "555", "message": "hello max"})
+    assert out == {"ok": True, "sent": True}
+    assert fake.calls[0]["chat_id"] == "555"
+    assert fake.calls[0]["text"] == "hello max"
+
+
+def test_max_notify_uses_default_chat_when_no_chat_id(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake = _inject_fake_max(monkeypatch, tmp_config_dir)
+    A.dispatch("max_notify", {"message": "to the stakeholder"})
+    assert fake.calls[0]["chat_id"] == "MAXCHAT99"
+
+
+def test_max_notify_no_chat_and_no_default_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_max(monkeypatch, tmp_config_dir)
+    with pytest.raises(ActionError, match="no chat_id"):
+        A.dispatch("max_notify", {"message": "nowhere to go"})
+
+
+def test_max_notify_missing_message_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_max(monkeypatch, tmp_config_dir)
+    with pytest.raises(ActionError, match="missing required param"):
+        A.dispatch("max_notify", {"chat_id": "1"})
+
+
+def test_max_notify_rejects_extra_params(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_max(monkeypatch, tmp_config_dir)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("max_notify", {"chat_id": "1", "message": "hi", "evil": "x"})
+
+
+def test_max_notify_debounce_returns_sent_false(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _, fake = _inject_fake_max(monkeypatch, tmp_config_dir)
+    fake._suppress = True
+    out = A.dispatch("max_notify", {"chat_id": "1", "message": "same"})
+    assert out == {"ok": True, "sent": False}
+
+
+def test_max_notify_sid_user_and_recipient_kind_forwarded(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _, fake = _inject_fake_max(monkeypatch, tmp_config_dir)
+    A.dispatch("max_notify", {
+        "chat_id": "1", "message": "hi", "sid": "S-x-p1", "user": "alexey",
+        "urgent": True, "recipient_kind": "user_id",
+    })
+    call = fake.calls[0]
+    assert call["sid"] == "S-x-p1"
+    assert call["user"] == "alexey"
+    assert call["urgent"] is True
+    assert call["recipient_kind"] == "user_id"
 
 
 # ---------------------------------------------------------------------------

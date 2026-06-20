@@ -2246,6 +2246,12 @@ ACTION_MODES: dict[str, str] = {
     "max_notify": "coordinator_only",
     "tg_stall_clear": "coordinator_only",
     "deploy": "coordinator_only",
+    # T-0296: both run on-host git against the project clones (coordinator-side,
+    # like deploy) — a tmux-only user-worker has neither the repos nor the right
+    # to read clone health or fast-forward the prod clone. pull_master is further
+    # admin-gated at the API edge.
+    "clone_status": "coordinator_only",
+    "pull_master": "coordinator_only",
     "pause_deploys": "coordinator_only",
     "resume_deploys": "coordinator_only",
     "list_sessions": "tmux_only",

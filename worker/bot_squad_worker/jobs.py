@@ -474,6 +474,21 @@ def recovery_tick(cfg: Config) -> None:
         log.exception("recovery_tick error")
 
 
+def park_tick(cfg: Config) -> None:
+    """WS-4 S5 (T-0252): 5h-usage-limit park + retry.
+
+    Default OFF (``BOT_SQUAD_PARK_RETRY=1`` to opt in). Suspends a session whose
+    pane shows the 5h-limit prompt (after a debounce) to free its slot, then
+    resumes it once the limit resets + a slot is free. Errors caught so one bad
+    sweep never kills the scheduler.
+    """
+    from bot_squad_worker import park as _park
+    try:
+        _park.park_tick(cfg)
+    except Exception:
+        log.exception("park_tick error")
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

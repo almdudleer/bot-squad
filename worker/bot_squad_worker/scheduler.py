@@ -16,6 +16,7 @@ from bot_squad_worker.jobs import (
     autoupdate_tick,
     backoff_tick,
     binding_gc_tick,
+    park_tick,
     recovery_tick,
     constant_team_tick,
     deploy_monitor_one,
@@ -251,6 +252,20 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="recovery",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # park_tick: WS-4 S5 (T-0252) — 5h-usage-limit park+retry. Default OFF
+    # (BOT_SQUAD_PARK_RETRY=1); inert until enabled. 60s; the marker debounce
+    # spans samples so the cadence is part of the safety margin. max_instances=1.
+    sched.add_job(
+        park_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="park",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

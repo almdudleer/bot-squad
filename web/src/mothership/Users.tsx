@@ -1,6 +1,11 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { mothershipApi, type GlobalUser, type AttachedServer } from "./api";
+import {
+  mothershipApi,
+  type GlobalUser,
+  type AttachedServer,
+  type Grant,
+} from "./api";
 import { api } from "../api";
 import { isSuperAdminFromMe } from "../components/sidebarHelpers";
 
@@ -33,6 +38,23 @@ export function attachedServerCountText(u: GlobalUser): string {
   // upgrade.
   if (typeof u.attached_servers === "number") return String(u.attached_servers);
   return "—";
+}
+
+/**
+ * T-0292 — the FE mirror of the BE `_require_owner` gate. The grant-
+ * lifecycle (list/add/revoke) is the SERVER OWNER's alone: a user may
+ * manage grants iff they own the server (or it is the mothership's own
+ * `is_self` entry, which `_require_owner` also lets through). There is
+ * deliberately NO `is_super_admin` / `is_admin` branch — no god-mode.
+ * A non-owner gets no grants affordance at all (the BE would 403 the
+ * list call anyway), which is how the no-god-mode model stays visible.
+ */
+export function canManageGrants(
+  server: AttachedServer,
+  username: string | undefined,
+): boolean {
+  if (server.is_self) return true;
+  return !!username && username === server.owner_user;
 }
 
 export function isAccessDeniedError(err: unknown): boolean {
@@ -137,13 +159,22 @@ type ServersLoadState =
 
 function ConnectedServers() {
   const [state, setState] = useState<ServersLoadState>({ kind: "loading" });
+  // T-0292: the viewer's username drives the OWNER-ONLY grants affordance.
+  // A failed /api/me must not blank the servers roster — fall back to
+  // undefined (→ no rows are manageable, the safe no-god-mode default).
+  const [username, setUsername] = useState<string | undefined>(undefined);
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    mothershipApi
-      .listServers()
-      .then((servers) => {
-        if (!cancelled) setState({ kind: "loaded", servers });
+    Promise.all([
+      api.getMyProfile().catch(() => null),
+      mothershipApi.listServers(),
+    ])
+      .then(([me, servers]) => {
+        if (cancelled) return;
+        setUsername(me?.username);
+        setState({ kind: "loaded", servers });
       })
       .catch((err) => {
         if (!cancelled)
@@ -189,41 +220,234 @@ function ConnectedServers() {
               <th>owner</th>
               <th>state</th>
               <th>last seen</th>
+              {/* T-0292: access-grants column. The control is rendered only
+                  for servers the viewer OWNS (no god-mode); other rows show
+                  an em-dash so the owner-scoping is visible, not hidden. */}
+              <th>grants</th>
             </tr>
           </thead>
           <tbody>
-            {state.servers.map((s) => (
-              <tr key={s.id}>
-                <td>
-                  {s.display_name}
-                  {s.is_self && (
-                    <span className="mc-badge mc-badge-info" style={{ marginLeft: "0.4rem" }}>
-                      self
-                    </span>
+            {state.servers.map((s) => {
+              const manageable = canManageGrants(s, username);
+              const isOpen = expanded === s.id;
+              return (
+                <Fragment key={s.id}>
+                  <tr>
+                    <td>
+                      {s.display_name}
+                      {s.is_self && (
+                        <span className="mc-badge mc-badge-info" style={{ marginLeft: "0.4rem" }}>
+                          self
+                        </span>
+                      )}
+                    </td>
+                    <td style={{ fontFamily: "var(--mc-mono)" }}>{s.base_url}</td>
+                    <td style={{ fontFamily: "var(--mc-mono)" }}>{s.owner_user}</td>
+                    <td>
+                      <span
+                        className={
+                          s.install_state === "ready" || s.install_state === "connected"
+                            ? "mc-badge mc-badge-ok"
+                            : s.install_state === "failed"
+                              ? "mc-badge mc-badge-danger"
+                              : "mc-badge mc-badge-active"
+                        }
+                      >
+                        {s.install_state}
+                      </span>
+                    </td>
+                    <td style={{ color: "var(--mc-text-dim)" }}>{s.last_seen_at ?? "—"}</td>
+                    <td>
+                      {manageable ? (
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-outline-secondary"
+                          data-testid={`grants-toggle-${s.id}`}
+                          onClick={() => setExpanded(isOpen ? null : s.id)}
+                        >
+                          {isOpen ? "Hide grants" : "Manage grants"}
+                        </button>
+                      ) : (
+                        <span
+                          style={{ color: "var(--mc-text-dim)" }}
+                          title="Only the server owner can manage access grants"
+                        >
+                          —
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                  {manageable && isOpen && (
+                    <tr data-testid={`grants-panel-${s.id}`}>
+                      <td colSpan={6} style={{ background: "var(--mc-surface-2, transparent)" }}>
+                        <ServerGrants server={s} />
+                      </td>
+                    </tr>
                   )}
-                </td>
-                <td style={{ fontFamily: "var(--mc-mono)" }}>{s.base_url}</td>
-                <td style={{ fontFamily: "var(--mc-mono)" }}>{s.owner_user}</td>
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+/**
+ * T-0292 — owner-only access-grants manager for one connected server.
+ * Rendered ONLY for servers `canManageGrants` cleared, so reaching here
+ * already implies the viewer is the owner; the BE re-checks via
+ * `_require_owner` on every call (list/add/revoke), so a stale FE never
+ * grants god-mode. Surfaces the active grant list + an add-grant input +
+ * a per-row Revoke button.
+ */
+function ServerGrants({ server }: { server: AttachedServer }) {
+  const [grants, setGrants] = useState<Grant[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [newUser, setNewUser] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    mothershipApi
+      .listGrants(server.id)
+      .then((g) => {
+        if (!cancelled) setGrants(g);
+      })
+      .catch((err) => {
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [server.id]);
+
+  const addGrant = async () => {
+    const u = newUser.trim();
+    if (!u || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const g = await mothershipApi.createGrant(server.id, u);
+      setGrants(g);
+      setNewUser("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeGrant = async (username: string) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const g = await mothershipApi.revokeGrant(server.id, username);
+      setGrants(g);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ padding: "0.5rem 0.25rem" }}>
+      <div
+        style={{
+          fontSize: "0.72rem",
+          textTransform: "uppercase",
+          letterSpacing: "0.1em",
+          color: "var(--mc-text-faint)",
+          marginBottom: "0.5rem",
+        }}
+      >
+        Access grants — owner only
+      </div>
+
+      {error && (
+        <div className="alert alert-danger" style={{ fontSize: "0.8rem" }}>
+          {error}
+        </div>
+      )}
+
+      {grants === null && !error && (
+        <div className="mc-loading">Loading grants</div>
+      )}
+
+      {grants !== null && grants.length === 0 && (
+        <div style={{ color: "var(--mc-text-dim)", marginBottom: "0.5rem" }}>
+          No active grants — only you (the owner) can see + enter this server.
+        </div>
+      )}
+
+      {grants !== null && grants.length > 0 && (
+        <table
+          className="table"
+          data-testid={`grants-table-${server.id}`}
+          style={{ fontSize: "0.82rem", marginBottom: "0.5rem" }}
+        >
+          <thead>
+            <tr>
+              <th>user</th>
+              <th>granted by</th>
+              <th>granted at</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {grants.map((g) => (
+              <tr key={g.username} data-testid={`grant-row-${g.username}`}>
+                <td style={{ fontFamily: "var(--mc-mono)" }}>{g.username}</td>
+                <td style={{ fontFamily: "var(--mc-mono)" }}>{g.granted_by}</td>
+                <td style={{ color: "var(--mc-text-dim)" }}>{g.granted_at}</td>
                 <td>
-                  <span
-                    className={
-                      s.install_state === "ready" || s.install_state === "connected"
-                        ? "mc-badge mc-badge-ok"
-                        : s.install_state === "failed"
-                          ? "mc-badge mc-badge-danger"
-                          : "mc-badge mc-badge-active"
-                    }
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline-danger"
+                    data-testid={`grant-revoke-${g.username}`}
+                    disabled={busy}
+                    onClick={() => revokeGrant(g.username)}
                   >
-                    {s.install_state}
-                  </span>
+                    Revoke
+                  </button>
                 </td>
-                <td style={{ color: "var(--mc-text-dim)" }}>{s.last_seen_at ?? "—"}</td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
-    </section>
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void addGrant();
+        }}
+        style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}
+      >
+        <input
+          type="text"
+          className="form-control form-control-sm"
+          style={{ maxWidth: 220 }}
+          placeholder="username to grant"
+          value={newUser}
+          disabled={busy}
+          data-testid={`grant-add-input-${server.id}`}
+          onChange={(e) => setNewUser(e.target.value)}
+        />
+        <button
+          type="submit"
+          className="btn btn-sm btn-primary"
+          disabled={busy || !newUser.trim()}
+          data-testid={`grant-add-btn-${server.id}`}
+        >
+          Add grant
+        </button>
+      </form>
+    </div>
   );
 }
 

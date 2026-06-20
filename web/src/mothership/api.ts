@@ -115,6 +115,23 @@ export type Checkpoint = {
   received_at: string;
 };
 
+/** One active per-server access grant (T-0221 / T-0292). The owner of a
+ *  server may grant other mothership users explicit, revocable access to
+ *  see + enter it. Revoked rows are dropped server-side, so every row the
+ *  FE sees is active. Mirrors `_active_grants` in routes_mothership.py. */
+export type Grant = {
+  username: string;
+  granted_by: string;
+  granted_at: string;
+};
+
+/** Envelope returned by all three grant-lifecycle routes — the full active
+ *  grant list after the mutation, so the FE refreshes from the same call. */
+export type GrantsResponse = {
+  server_id: string;
+  grants: Grant[];
+};
+
 /** Public projection of a GlobalUser registry row (T-0066 / T-0113).
  *  ``password_hash`` is stripped server-side. ``attached_servers`` is a
  *  follow-on (T-0129 BE) — until then the FE renders an em-dash. */
@@ -280,6 +297,38 @@ export const mothershipApi = {
   /** T-0113: list every GlobalUser. Super-admin only (403 otherwise) — the
    *  Users page surfaces the 403 as a "super-admin only" empty state. */
   listUsers: () => call<GlobalUser[]>("/api/m/users"),
+
+  /** T-0292: list a server's ACTIVE access grants. OWNER-ONLY on the BE
+   *  (`_require_owner`, 403 otherwise) — NOT a global-admin power: there is
+   *  no god-mode here, a grantee/admin who isn't the owner gets a 403. The
+   *  Users page only calls this for servers the viewer owns. */
+  listGrants: async (serverId: string): Promise<Grant[]> => {
+    const out = await call<GrantsResponse>(
+      `/api/m/servers/${encodeURIComponent(serverId)}/grants`,
+    );
+    return out.grants;
+  },
+
+  /** T-0292: grant `username` access to a server. Owner-only. Returns the
+   *  refreshed active-grant list (post-mutation), so the caller swaps state
+   *  from the response without a follow-up list call. */
+  createGrant: async (serverId: string, username: string): Promise<Grant[]> => {
+    const out = await call<GrantsResponse>(
+      `/api/m/servers/${encodeURIComponent(serverId)}/grants`,
+      { method: "POST", body: JSON.stringify({ username }) },
+    );
+    return out.grants;
+  },
+
+  /** T-0292: revoke `username`'s grant on a server. Owner-only. Idempotent
+   *  server-side; returns the refreshed active-grant list. */
+  revokeGrant: async (serverId: string, username: string): Promise<Grant[]> => {
+    const out = await call<GrantsResponse>(
+      `/api/m/servers/${encodeURIComponent(serverId)}/grants/${encodeURIComponent(username)}`,
+      { method: "DELETE" },
+    );
+    return out.grants;
+  },
 
   projectsFor: (serverId: string) =>
     call<ServerProject[]>(

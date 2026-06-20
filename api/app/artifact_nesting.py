@@ -84,6 +84,32 @@ def _ref_for(kind: str, path: Path) -> ArtifactRef:
                        title=title, status=status)
 
 
+def split_frontmatter(text: str) -> tuple[dict, str]:
+    """Public: ``(meta, body)``; ``({}, text)`` when there's no frontmatter."""
+    return _split_frontmatter(text)
+
+
+def with_frontmatter(meta: dict, body: str) -> str:
+    """Re-emit ``body`` under ``meta``'s frontmatter (empty meta → body as-is).
+
+    Used by feedback's content PUT to preserve the nesting frontmatter across a
+    body edit — a body replace must never silently drop ``parent_doc_id`` (the
+    same re-graft discipline as the task verbatim guard, T-0289)."""
+    if not meta:
+        return body
+    fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
+    return f"---\n{fm}---\n\n{body.lstrip(chr(10))}"
+
+
+def ref_for_path(kind: str, path: Path) -> ArtifactRef:
+    """Public: build an :class:`ArtifactRef` for a known-kind artifact file.
+
+    Used by per-store list endpoints that already hold the path and want the
+    uniform id/parent_doc_id/title without re-scanning every store.
+    """
+    return _ref_for(kind, path)
+
+
 def iter_artifacts(project_root: Path) -> Iterator[ArtifactRef]:
     """Yield every artifact across the three stores."""
     docs = _docs_root(project_root)

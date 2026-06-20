@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 
+from app import artifact_nesting as AN
 from app.markdown_writer import slugify, write_task
 from app.routes_auth import require_auth
 
@@ -37,6 +39,14 @@ def _backlog_dir(request: Request, slug: str) -> Path:
     return cfg.project_data_dir(slug) / "backlog"
 
 
+def _project_root(request: Request, slug: str) -> Path:
+    """Project data dir — the root the cross-store artifact_nesting walks."""
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    return cfg.project_data_dir(slug)
+
+
 def _validate_feedback_name(name: str) -> None:
     if not _FEEDBACK_NAME_RE.match(name):
         raise HTTPException(status_code=400, detail=f"invalid feedback file name: {name!r}")
@@ -61,10 +71,21 @@ def list_feedback(slug: str, request: Request) -> list[dict]:
     fb_dir = cfg.project_data_dir(slug) / "feedback"
     if not fb_dir.exists():
         return []
-    return [
-        {"name": f.name, "content": f.read_text()}
-        for f in sorted(fb_dir.glob("*.md"))
-    ]
+    out = []
+    for f in sorted(fb_dir.glob("*.md")):
+        # T-0283: feedback is a nestable artifact. Surface its artifact `id`
+        # (filename stem) + `parent_doc_id`; `content` is the BODY (frontmatter
+        # stripped) so the editor never round-trips the nesting block. Legacy
+        # files have no frontmatter, so body == the whole file (unchanged).
+        meta, body = AN.split_frontmatter(f.read_text(encoding="utf-8"))
+        ref = AN.ref_for_path(AN.KIND_FEEDBACK, f)
+        out.append({
+            "name": f.name,
+            "id": ref.id,
+            "parent_doc_id": ref.parent_doc_id,
+            "content": body,
+        })
+    return out
 
 
 @router.put("/{name}")
@@ -85,8 +106,14 @@ def put_feedback(
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
 
+    # T-0283: preserve the nesting frontmatter (parent_doc_id) across a body
+    # edit — a content replace must not silently drop it (same re-graft rule as
+    # the task verbatim guard). Legacy files (no frontmatter) write verbatim.
+    meta, _ = AN.split_frontmatter(path.read_text(encoding="utf-8"))
+    new_text = AN.with_frontmatter(meta, content)
+
     tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
+    tmp.write_text(new_text, encoding="utf-8")
     os.rename(tmp, path)
 
     return {"ok": True}
@@ -158,3 +185,48 @@ def promote_feedback(
         f.write(footer)
 
     return {"ok": True, "task_id": task_id}
+
+
+@router.get("/{name}/children")
+def get_feedback_children(slug: str, name: str, request: Request) -> list[dict]:
+    """Cross-store children of a feedback theme (T-0283): every artifact whose
+    ``parent_doc_id`` points at this feedback item (id = filename stem)."""
+    _validate_feedback_name(name)
+    fb_path = _fb_dir(request, slug) / name
+    if not fb_path.exists():
+        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
+    art_id = name[:-3] if name.endswith(".md") else name
+    return AN.children_of(_project_root(request, slug), art_id)
+
+
+class SetParent(BaseModel):
+    parent_doc_id: str | None = None
+
+
+@router.put("/{name}/parent")
+def set_feedback_parent(slug: str, name: str, request: Request, body: SetParent,
+                        user: dict = Depends(require_auth)) -> dict:
+    """Re-parent (adopt) or clear the parent (disown) of a feedback item across
+    the artifact stores (T-0283). Cycle-safe; injects a frontmatter block into a
+    legacy raw-markdown feedback file on first nesting, preserving the body."""
+    _validate_feedback_name(name)
+    root = _project_root(request, slug)
+    art_id = name[:-3] if name.endswith(".md") else name
+    ref = AN.find_artifact(root, art_id)
+    if ref is None or ref.kind != AN.KIND_FEEDBACK:
+        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
+
+    new_parent = (body.parent_doc_id or "").strip() or None
+    if new_parent is not None:
+        if new_parent == art_id:
+            raise HTTPException(status_code=400, detail="feedback cannot be its own parent")
+        if AN.find_artifact(root, new_parent) is None:
+            raise HTTPException(status_code=404, detail=f"parent artifact not found: {new_parent}")
+        if AN.would_cycle(root, art_id, new_parent):
+            raise HTTPException(
+                status_code=400,
+                detail=f"refusing to set parent {new_parent}: would create a cycle",
+            )
+
+    AN.set_parent(ref, new_parent)
+    return {"ok": True, "id": art_id, "parent_doc_id": new_parent}

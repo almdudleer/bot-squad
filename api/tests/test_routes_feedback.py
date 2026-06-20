@@ -244,3 +244,101 @@ def test_promote_requires_auth(tmp_bot_squad: Path, monkeypatch):
             json={},
         )
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# T-0283 Pillar-C: feedback as nestable cross-store artifacts.
+# ---------------------------------------------------------------------------
+def _fb_dir(tmp_bot_squad: Path) -> Path:
+    return tmp_bot_squad / "data" / "test-project" / "feedback"
+
+
+def _new_doc(c, title="Mother"):
+    return c.post(
+        "/api/projects/test-project/docs", json={"category": "design", "title": title}
+    ).json()["id"]
+
+
+def test_list_feedback_exposes_id_and_parent(tmp_bot_squad: Path, monkeypatch):
+    fb = _fb_dir(tmp_bot_squad)
+    (fb / "F-legacy.md").write_text("# Legacy\n\nraw\n")
+    (fb / "F-fm.md").write_text(
+        "---\nid: F-fm\ntitle: With FM\nparent_doc_id: D-0001\n---\n\n# body\n"
+    )
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        rows = c.get("/api/projects/test-project/feedback").json()
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["F-legacy"]["parent_doc_id"] is None
+    assert by_id["F-fm"]["parent_doc_id"] == "D-0001"
+    # name (with .md) still present for the existing put/promote/content flows
+    assert by_id["F-legacy"]["name"] == "F-legacy.md"
+
+
+def test_feedback_children_cross_store(tmp_bot_squad: Path, monkeypatch):
+    (_fb_dir(tmp_bot_squad) / "F-theme.md").write_text("# Theme\n\nraw\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        # a doc nested under the feedback theme
+        child = c.post(
+            "/api/projects/test-project/docs",
+            json={"category": "design", "title": "Evidence", "parent_doc_id": "F-theme"},
+        ).json()["id"]
+        kids = c.get("/api/projects/test-project/feedback/F-theme.md/children").json()
+    assert [(k["id"], k["kind"]) for k in kids] == [(child, "doc")]
+
+
+def test_set_feedback_parent_on_legacy_adds_frontmatter(tmp_bot_squad: Path, monkeypatch):
+    fb = _fb_dir(tmp_bot_squad)
+    (fb / "F-x.md").write_text("# X\n\nraw feedback body\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        mother = _new_doc(c)
+        r = c.put(
+            "/api/projects/test-project/feedback/F-x.md/parent",
+            json={"parent_doc_id": mother},
+        )
+        assert r.status_code == 200, r.text
+        rows = c.get("/api/projects/test-project/feedback").json()
+    parent = next(x["parent_doc_id"] for x in rows if x["id"] == "F-x")
+    assert parent == mother
+    # legacy body preserved under the new frontmatter block
+    assert "raw feedback body" in (fb / "F-x.md").read_text()
+
+
+def test_set_feedback_parent_clear(tmp_bot_squad: Path, monkeypatch):
+    fb = _fb_dir(tmp_bot_squad)
+    (fb / "F-y.md").write_text("---\nid: F-y\nparent_doc_id: D-0001\n---\n\nbody\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.put(
+            "/api/projects/test-project/feedback/F-y.md/parent",
+            json={"parent_doc_id": None},
+        )
+        assert r.status_code == 200, r.text
+        rows = c.get("/api/projects/test-project/feedback").json()
+    assert next(x["parent_doc_id"] for x in rows if x["id"] == "F-y") is None
+
+
+def test_set_feedback_parent_unknown_404(tmp_bot_squad: Path, monkeypatch):
+    (_fb_dir(tmp_bot_squad) / "F-z.md").write_text("# Z\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.put(
+            "/api/projects/test-project/feedback/F-z.md/parent",
+            json={"parent_doc_id": "D-9999"},
+        )
+    assert r.status_code == 404, r.text
+
+
+def test_set_feedback_parent_cycle_rejected(tmp_bot_squad: Path, monkeypatch):
+    fb = _fb_dir(tmp_bot_squad)
+    # F-a is parent of D via... build F-a -> (child doc D) then try D as F-a's parent.
+    (fb / "F-a.md").write_text("# A\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        d = c.post(
+            "/api/projects/test-project/docs",
+            json={"category": "design", "title": "D", "parent_doc_id": "F-a"},
+        ).json()["id"]
+        # F-a's parent = d would close F-a -> d -> F-a
+        r = c.put(
+            f"/api/projects/test-project/feedback/F-a.md/parent",
+            json={"parent_doc_id": d},
+        )
+    assert r.status_code == 400, r.text
+    assert "cycle" in r.text.lower()

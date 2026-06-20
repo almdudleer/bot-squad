@@ -175,7 +175,7 @@ def test_tg_notify_sends_message(tmp_config_dir, monkeypatch):
 
     cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
     out = A.dispatch("tg_notify", {"message": "hello"})
-    assert out == {"ok": True, "sent": True}
+    assert out == {"ok": True, "sent": True, "channel": "tg"}
     assert len(fake.calls) == 1
     assert fake.calls[0]["text"] == "hello"
 
@@ -258,7 +258,7 @@ def test_tg_notify_debounce_returns_sent_false(tmp_config_dir, monkeypatch):
     cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
     fake._suppress = True
     out = A.dispatch("tg_notify", {"message": "same"})
-    assert out == {"ok": True, "sent": False}
+    assert out == {"ok": True, "sent": False, "channel": "tg"}
 
 
 def test_tg_notify_sid_and_user_forwarded(tmp_config_dir, monkeypatch):
@@ -453,6 +453,69 @@ def test_max_notify_no_chat_and_no_default_raises(tmp_config_dir, monkeypatch):
     _inject_fake_max(monkeypatch, tmp_config_dir)
     with pytest.raises(ActionError, match="no chat_id"):
         A.dispatch("max_notify", {"message": "nowhere to go"})
+
+
+# ---------------------------------------------------------------------------
+# T-0247: channel-aware stakeholder DM — tg_notify routes via MAX when the
+# install has [max].default_chat_id (TG is DPI-blocked here); TG is the fallback.
+# ---------------------------------------------------------------------------
+
+def _inject_both_channels(monkeypatch, tmp_config_dir, max_client=None):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    fake_tg = _FakeTgClient()
+    fake_max = max_client or _FakeMaxClient()
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: fake_tg)
+    monkeypatch.setattr(A, "_get_max_client", lambda _c: fake_max)
+    return cfg, fake_tg, fake_max
+
+
+def test_tg_notify_routes_to_max_when_configured(tmp_config_dir, monkeypatch):
+    """The DEFAULT stakeholder DM goes via MAX (primary) when [max] is set."""
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A.dispatch("tg_notify", {"message": "stakeholder dm", "sid": "S-x-p1"})
+    assert out == {"ok": True, "sent": True, "channel": "max"}
+    assert len(fake_max.calls) == 1 and len(fake_tg.calls) == 0
+    assert fake_max.calls[0]["chat_id"] == "MAXCHAT99"
+    assert fake_max.calls[0]["text"] == "stakeholder dm"
+
+
+def test_tg_notify_uses_tg_when_max_unconfigured(tmp_config_dir, monkeypatch):
+    """No [max].default_chat_id → the existing TG behavior is unchanged."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A.dispatch("tg_notify", {"message": "hi"})
+    assert out["channel"] == "tg"
+    assert len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
+
+
+def test_tg_notify_falls_back_to_tg_when_max_errors(tmp_config_dir, monkeypatch):
+    """MAX configured but its send raises → fall back to TG (loop still closes)."""
+    import bot_squad_worker.actions as A
+
+    class _BoomMax:
+        def send(self, **kwargs):
+            raise RuntimeError("max api down")
+
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir, max_client=_BoomMax())
+    out = A.dispatch("tg_notify", {"message": "hi"})
+    assert out == {"ok": True, "sent": True, "channel": "tg"}
+    assert len(fake_tg.calls) == 1
+
+
+def test_tg_notify_explicit_chat_id_stays_on_tg(tmp_config_dir, monkeypatch):
+    """An explicit chat_id/topic_id is a TG group/forum target — never MAX."""
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A.dispatch("tg_notify", {"message": "to a group", "chat_id": "GROUP-7"})
+    assert out["channel"] == "tg"
+    assert len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
+    assert fake_tg.calls[0]["chat_id"] == "GROUP-7"
 
 
 def test_max_notify_missing_message_raises(tmp_config_dir, monkeypatch):

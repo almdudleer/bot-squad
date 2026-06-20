@@ -251,6 +251,29 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         )
         urgent = True
 
+    # T-0247: channel-aware stakeholder DM. This install's working human channel
+    # is MAX (TG is DPI-blocked and only limps via proxy), so when [max].
+    # default_chat_id is configured the DEFAULT stakeholder DM goes via MAX as
+    # PRIMARY — same quiet-hours/debounce/SID-prefix (MaxClient mirrors TgClient).
+    # TG remains the fallback when MAX is unconfigured OR errors. An EXPLICIT
+    # chat_id/topic_id is a TG group/forum target (MAX has no such binding), so
+    # those always stay on TG.
+    explicit_tg_target = bool(params.get("chat_id")) or (params.get("topic_id") not in (None, ""))
+    max_chat = getattr(cfg, "max_default_chat_id", "") or ""
+    if max_chat and not explicit_tg_target:
+        try:
+            sent = _get_max_client(cfg).send(
+                chat_id=max_chat,
+                text=message,
+                sid=params.get("sid", ""),
+                user=params.get("user", ""),
+                urgent=urgent,
+                recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
+            )
+            return {"ok": True, "sent": sent, "channel": "max"}
+        except Exception:
+            log.exception("tg_notify: MAX delivery failed — falling back to TG")
+
     tg = _get_tg_client(cfg)
     sent = tg.send(
         chat_id=chat_id,
@@ -260,7 +283,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         urgent=urgent,
         topic_id=topic_id,
     )
-    return {"ok": True, "sent": sent}
+    return {"ok": True, "sent": sent, "channel": "tg"}
 
 
 def _coerce_topic_id(raw: Any) -> int | None:

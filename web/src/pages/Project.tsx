@@ -618,7 +618,7 @@ export function Project() {
         onClose={() => setAutopilotOpen(false)}
       />
       <PageHelp>
-        Open work for this project across four statuses. <strong>Drag</strong> a card
+        Open work for this project across six statuses (Planned → Closed). <strong>Drag</strong> a card
         to change status, <strong>click</strong> a card for full detail, or <strong>⋯</strong>
         for the quick menu (status / edit body / comment / delete).
       </PageHelp>

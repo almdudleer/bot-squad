@@ -44,6 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from bot_squad_worker import autocompact
+
 log = logging.getLogger(__name__)
 
 # --- thresholds (T-0210; stakeholder 2026-06-19: 700k context ceiling) -------
@@ -87,6 +89,57 @@ _BURN_SAMPLES = 60          # ~1h at the 60s cadence
 _BURN_WINDOW_SECONDS = 1800  # compute burn over the last 30 min of samples
 
 _LEVELS = {"none": 0, "warn": 1, "urgent": 2}
+
+# --- alert debounce (T-0332) -------------------------------------------------
+# A compact spawns a fresh transcript, so a session's context resets to ~0 and
+# climbs back through the same threshold — a genuine "crossing" each cycle. With
+# many parallel sessions compacting all day that re-fired the same alert every
+# few minutes. So even on a real crossing we suppress a re-ping of the SAME
+# (kind, level) within a cooldown window. Env-tunable per-install.
+DEFAULT_ALERT_COOLDOWN_SEC = 3 * 3600  # one alert per session per threshold / 3h
+
+
+def alert_cooldown_sec() -> int:
+    """Per-(session, threshold-level) alert cooldown in seconds. Overridable via
+    ``BOT_SQUAD_ALERT_COOLDOWN_SEC``; non-positive/garbage falls back to default."""
+    raw = os.environ.get("BOT_SQUAD_ALERT_COOLDOWN_SEC")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_ALERT_COOLDOWN_SEC
+
+
+def cooldown_ok(fired_at: dict, key: str, now: float, window: int | None = None) -> bool:
+    """True when ``key`` may fire now: never fired, or the window has elapsed.
+
+    ``key`` encodes (kind, level) e.g. ``"context:warn"`` so an escalation to a
+    higher level (a different key) is NEVER gated by the lower level's timer.
+    """
+    if window is None:
+        window = alert_cooldown_sec()
+    last = fired_at.get(key)
+    if last is None:
+        return True
+    try:
+        return (now - float(last)) >= window
+    except (TypeError, ValueError):
+        return True
+
+
+# Which (kind, level) alerts are urgent enough to bypass the quiet-hours gate.
+# Context is NOT here — it no longer alerts a human at all (T-0333 auto-compacts
+# instead). Memory is non-urgent (quiet hours respected); only a genuine
+# human-decision (quota-EOD pacing, live 429 throttle) bypasses quiet hours.
+_URGENT_ALERTS = {("quota", "urgent"), ("throttle", "urgent")}
+
+
+def alert_urgent(kind: str, level: str) -> bool:
+    """True when a (kind, level) alert should bypass quiet hours (urgent=True)."""
+    return (kind, level) in _URGENT_ALERTS
 
 
 def _now_iso() -> str:
@@ -400,7 +453,7 @@ def sample(cfg: Any, slug: str) -> dict:
     # Alerts (crossing-only). Done after persistence so a crash mid-alert
     # doesn't re-fire next tick.
     try:
-        _fire_alerts(cfg, slug, sampled, quota, operator_sids)
+        _fire_alerts(cfg, slug, sampled, quota, operator_sids, now)
     except Exception:
         log.exception("telemetry.sample: alerting failed for %s", slug)
 
@@ -437,7 +490,11 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
             if scan["last_window"] is not None:
                 context_tokens = scan["last_window"]
                 model = scan["model"] or model
-            saw_429 = scan["saw_429"]
+            # T-0332: do NOT re-detect a 429 from the fresh tail-read — a stale
+            # marker already in the tail (common after a compact spawns a new
+            # transcript) would re-fire "RATE LIMITED NOW" every cycle. Only a
+            # 429 seen on a later INCREMENTAL read is genuinely new.
+            saw_429 = False
             offset = size
         else:
             text, offset = _read_chunk(transcript, offset)
@@ -458,6 +515,9 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
         "role": row.get("role", ""),
         "task_id": row.get("task_id"),
         "tmux_session": row.get("tmux_session", ""),
+        # T-0333: pane activity (running|idle|paused) gates the auto-compact loop
+        # — only an idle pane is safe to /compact.
+        "activity": row.get("activity", ""),
         "sampled_at": _now_iso(),
         "context": {
             "tokens": context_tokens,
@@ -470,6 +530,10 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
         "transcript_offset": offset,
         "rate_limited": saw_429,
         "last_alert": prev.get("last_alert") or {"context": "none", "memory": "none"},
+        # Per-(kind:level) last-fire epochs — preserved across a compact (fresh
+        # uuid) so the debounce survives the transcript rotation that re-arms the
+        # crossing. (T-0332)
+        "alert_fired_at": prev.get("alert_fired_at") or {},
     }
     _write_json(_record_path(cfg, slug, sid), rec)
     return rec
@@ -513,11 +577,13 @@ def _update_quota(
 # Alerting (crossing-only, urgent=True)
 # ---------------------------------------------------------------------------
 
-def _human_tg(cfg: Any, slug: str, text: str) -> None:
-    """Urgent TG ping to the project's (single) stakeholder chat.
+def _human_tg(cfg: Any, slug: str, text: str, urgent: bool = True) -> None:
+    """TG ping to the project's (single) stakeholder chat.
 
-    This is the human channel — one bound chat, not a broadcast. urgent=True so
-    the quiet-hours gate can't drop a resource alert (mirrors deploy/oauth).
+    This is the human channel — one bound chat, not a broadcast. ``urgent``
+    bypasses the quiet-hours gate (17–05 UTC); T-0332 makes only genuinely-urgent
+    crossings (compact-now / quota-EOD / 429) urgent, so warn/memory alerts are
+    quiet-hours-respecting and stop spamming the stakeholder overnight.
     """
     from bot_squad_worker.actions import _get_tg_client
     project = cfg.projects.get(slug)
@@ -525,7 +591,7 @@ def _human_tg(cfg: Any, slug: str, text: str) -> None:
     if not chat_id:
         return
     try:
-        _get_tg_client(cfg).send(chat_id=chat_id, text=text, sid="telemetry", urgent=True)
+        _get_tg_client(cfg).send(chat_id=chat_id, text=text, sid="telemetry", urgent=urgent)
     except Exception:
         log.exception("telemetry: human tg.send failed (non-fatal): %s", text)
 
@@ -569,79 +635,96 @@ def _all_tls(cfg: Any, slug: str) -> list[str]:
 
 def _fire_alerts(
     cfg: Any, slug: str, sampled: list[dict], quota: dict,
-    operator_sids: list[str],
+    operator_sids: list[str], now: float,
 ) -> None:
     # --- per-session context + memory crossings ---
+    # Fire on a crossing AND only if the same (kind:level) hasn't fired within the
+    # cooldown window (T-0332 debounce — a compact re-arms the crossing; we don't
+    # re-ping). Urgency is level-derived so warn/memory respect quiet hours.
     for rec in sampled:
         sid = rec["sid"]
         last = rec.get("last_alert") or {"context": "none", "memory": "none"}
+        fired = rec.get("alert_fired_at") or {}
         ctx_tokens = rec["context"]["tokens"]
         ctx_new = context_level(ctx_tokens)
         mem_new = memory_level(rec["memory"]["tokens_est"])
         changed = False
 
-        if crossed(last.get("context", "none"), ctx_new):
-            verb = "🟥 COMPACT NOW" if ctx_new == "urgent" else "🟧 context high"
-            _alert_session(
-                cfg, slug, sid, operator_sids,
-                f"{verb} — {sid} context {ctx_tokens:,} tok "
-                f"({rec['context']['pct']}% of {context_ceiling():,}). "
-                + ("Run /compact immediately." if ctx_new == "urgent"
-                   else f"Plan a /compact before the {context_ceiling():,} ceiling."),
-            )
+        # T-0333/T-0334: context-high is SELF-HEALING — the SYSTEM /compacts the
+        # over-ceiling session (when idle, composer-ready) instead of pinging a
+        # human about routine resource management. No human is in this loop; no
+        # session (incl. the operator, T-0334) is exempt from its own close.
+        rec["alert_fired_at"] = fired  # share the cooldown dict with autocompact
+        if autocompact.maybe_compact(cfg, slug, rec, ctx_new, now):
+            fired = rec["alert_fired_at"]
+            changed = True
         if last.get("context") != ctx_new:
             last["context"] = ctx_new
             changed = True
 
-        if crossed(last.get("memory", "none"), mem_new):
+        mem_key = f"memory:{mem_new}"
+        if crossed(last.get("memory", "none"), mem_new) and cooldown_ok(fired, mem_key, now):
             _alert_session(
                 cfg, slug, sid, operator_sids,
                 f"🧠 memory footprint high — {sid} ~{rec['memory']['tokens_est']:,} tok "
                 f"across {rec['memory']['files']} files. Consider pruning.",
+                urgent=alert_urgent("memory", mem_new),
             )
+            fired[mem_key] = now
+            changed = True
         if last.get("memory") != mem_new:
             last["memory"] = mem_new
             changed = True
 
         if changed:
             rec["last_alert"] = last
+            rec["alert_fired_at"] = fired
             _write_json(_record_path(cfg, slug, sid), rec)
 
     # --- project quota crossings (anchor projection + 429 throttle) ---
     qlast = quota.get("last_alert") or {"quota": "none", "throttle_seen": None}
+    qfired = quota.get("alert_fired_at") or {}
     qchanged = False
 
     eta = quota.get("projected_exhaustion_at")
     quota_new = "urgent" if _projected_before_eod(eta) else "none"
-    if crossed(qlast.get("quota", "none"), quota_new):
+    q_key = f"quota:{quota_new}"
+    if crossed(qlast.get("quota", "none"), quota_new) and cooldown_ok(qfired, q_key, now):
         burn = quota.get("burn_tokens_per_hr")
         _alert_project(
             cfg, slug, operator_sids,
             f"⏳ QUOTA — projected to exhaust at {eta} (before EOD) "
             f"at ~{burn:,.0f} tok/hr. Pace the run / pause non-critical sessions.",
+            urgent=alert_urgent("quota", quota_new),
         )
+        qfired[q_key] = now
+        qchanged = True
     if qlast.get("quota") != quota_new:
         qlast["quota"] = quota_new
         qchanged = True
 
     rl = quota.get("rate_limit_429") or {}
     last_seen = qlast.get("throttle_seen")
-    if rl.get("last_at") and rl.get("last_at") != last_seen:
+    if rl.get("last_at") and rl.get("last_at") != last_seen and cooldown_ok(qfired, "throttle:urgent", now):
         _alert_project(
             cfg, slug, operator_sids,
             f"🚫 RATE LIMITED — a session hit a 429 at {rl.get('last_at')} "
             f"(429 count {rl.get('count')}). Quota is being throttled NOW.",
+            urgent=alert_urgent("throttle", "urgent"),
         )
         qlast["throttle_seen"] = rl.get("last_at")
+        qfired["throttle:urgent"] = now
         qchanged = True
 
     if qchanged:
         quota["last_alert"] = qlast
+        quota["alert_fired_at"] = qfired
         _write_json(_quota_path(cfg, slug), quota)
 
 
 def _alert_session(
     cfg: Any, slug: str, sid: str, operator_sids: list[str], text: str,
+    urgent: bool = True,
 ) -> None:
     """Alert the operator SID(s) + the session's TL about a per-session crossing.
 
@@ -650,7 +733,7 @@ def _alert_session(
     in-pane; pinging it would be the self-interrupt the guardrail forbids).
     """
     from bot_squad_worker import teams as _teams
-    _human_tg(cfg, slug, text)
+    _human_tg(cfg, slug, text, urgent=urgent)
     targets: list[str] = list(operator_sids)
     tl = _teams.tl_for_sid(cfg, slug, sid)
     if tl:
@@ -662,12 +745,13 @@ def _alert_session(
 
 def _alert_project(
     cfg: Any, slug: str, operator_sids: list[str], text: str,
+    urgent: bool = True,
 ) -> None:
     """Alert the operator SID(s) + every TL about a project-wide quota crossing.
 
     Targeted to each specific SID (never role=all), plus the human TG chat.
     """
-    _human_tg(cfg, slug, text)
+    _human_tg(cfg, slug, text, urgent=urgent)
     targets = list(operator_sids) + _all_tls(cfg, slug)
     for target in dict.fromkeys(targets):  # dedupe, preserve order
         if target:
@@ -714,7 +798,7 @@ def read_telemetry(cfg: Any, slug: str) -> dict:
     quota = _read_json(_quota_path(cfg, slug)) or {}
     quota_wire = {
         k: v for k, v in quota.items()
-        if k not in ("samples", "last_alert")
+        if k not in ("samples", "last_alert", "alert_fired_at")
     }
     return {"sessions": sessions, "quota": quota_wire}
 

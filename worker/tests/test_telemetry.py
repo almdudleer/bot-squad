@@ -293,7 +293,12 @@ def test_context_alert_fires_once_per_crossing(tmp_path, fake_session):
 
 
 def test_alerts_are_targeted_to_operator_and_tl_never_broadcast(tmp_path, fake_session, monkeypatch):
-    """A context crossing pings the specific operator SID + the session's TL SID."""
+    """A (memory) crossing pings the specific operator SID + the session's TL SID.
+
+    Context no longer alerts a human at all (T-0333 auto-compacts); the
+    targeting guardrail is exercised via the memory crossing, which still uses
+    the same ``_alert_session`` fan-out (operator SID + session TL, never a
+    role/broadcast)."""
     cfg = _make_cfg(tmp_path)
     # add an operator row + a TL for the dev
     fake_session["rows"].append({
@@ -309,9 +314,9 @@ def test_alerts_are_targeted_to_operator_and_tl_never_broadcast(tmp_path, fake_s
 
     f = _write_transcript(fake_session["home"], fake_session["uuid"],
                           [_assistant((2, 70000, 100), 500)])
-    T.sample(cfg, "proj")
-    with f.open("a") as fh:
-        fh.write(_assistant((2, 710000, 100), 100) + "\n")  # urgent crossing (>=700k)
+    # a memory dir over the 40k-token warn line (>160KB) → a memory crossing
+    (f.parent / "memory").mkdir()
+    (f.parent / "memory" / "MEMORY.md").write_text("m" * 200_000)
     T.sample(cfg, "proj")
 
     targets = {sid for sid, _ in fake_session["sent"]}
@@ -319,7 +324,7 @@ def test_alerts_are_targeted_to_operator_and_tl_never_broadcast(tmp_path, fake_s
     assert "S-almdudleer-TL-p9" in targets         # session's TL targeted
     assert "S-almdudleer-dev-p5" not in targets    # affected session not self-pinged
     assert "all" not in targets and "teamlead" not in targets  # never a role/broadcast
-    assert any("COMPACT NOW" in text for _, text in fake_session["sent"])
+    assert any("memory footprint high" in text for _, text in fake_session["sent"])
 
 
 def test_read_telemetry_returns_sessions_and_quota_without_internal_fields(tmp_path, fake_session):
@@ -334,3 +339,94 @@ def test_read_telemetry_returns_sessions_and_quota_without_internal_fields(tmp_p
     assert "samples" not in wire["quota"]
     assert "last_alert" not in wire["quota"]
     assert "burn_tokens_per_hr" in wire["quota"]
+
+
+# ---------------------------------------------------------------------------
+# T-0332: over-firing fixes — debounce, quiet-hours urgency, fresh-429 suppress
+# ---------------------------------------------------------------------------
+
+def test_cooldown_ok_pure(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_ALERT_COOLDOWN_SEC", raising=False)
+    # absent key → always OK to fire
+    assert T.cooldown_ok({}, "context:warn", now=1000.0) is True
+    # within the window → suppressed
+    fired = {"context:warn": 1000.0}
+    assert T.cooldown_ok(fired, "context:warn", now=1000.0 + 10, window=3600) is False
+    # past the window → OK again
+    assert T.cooldown_ok(fired, "context:warn", now=1000.0 + 3601, window=3600) is True
+    # a DIFFERENT key (escalation to urgent) is never gated by warn's timer
+    assert T.cooldown_ok(fired, "context:urgent", now=1000.0 + 10, window=3600) is True
+
+
+def test_alert_urgent_severity_mapping():
+    # only genuine human-DECISION alerts bypass the quiet-hours gate
+    assert T.alert_urgent("quota", "urgent") is True
+    assert T.alert_urgent("throttle", "urgent") is True
+    # context never alerts a human (auto-compacts); memory is non-urgent
+    assert T.alert_urgent("context", "urgent") is False
+    assert T.alert_urgent("memory", "warn") is False
+
+
+def _capture_human_tg(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        T, "_human_tg",
+        lambda cfg, slug, text, urgent=True: calls.append({"text": text, "urgent": urgent}),
+    )
+    return calls
+
+
+def test_context_never_pings_the_human(tmp_path, fake_session, monkeypatch):
+    """T-0333: context crossings are self-healing — the human is NEVER pinged
+    about context (warn OR urgent). The system auto-compacts instead."""
+    cfg = _make_cfg(tmp_path)
+    calls = _capture_human_tg(monkeypatch)
+    # auto-compact is stubbed (no tmux) — we only assert the human isn't pinged
+    monkeypatch.setattr(T.autocompact, "maybe_compact", lambda *a, **k: False)
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    T.sample(cfg, "proj")
+    with f.open("a") as fh:
+        fh.write(_assistant((2, 580000, 100), 100) + "\n")  # warn
+    T.sample(cfg, "proj")
+    with f.open("a") as fh:
+        fh.write(_assistant((2, 710000, 100), 100) + "\n")  # urgent
+    T.sample(cfg, "proj")
+    assert not [c for c in calls if "context" in c["text"].lower()
+                or "COMPACT NOW" in c["text"]]
+
+
+def test_urgent_context_triggers_autocompact_not_a_human_ping(tmp_path, fake_session, monkeypatch):
+    """The over-ceiling session is auto-compacted (closed loop), not handed to a human."""
+    cfg = _make_cfg(tmp_path)
+    calls = _capture_human_tg(monkeypatch)
+    compacted: list[tuple] = []
+    monkeypatch.setattr(
+        T.autocompact, "maybe_compact",
+        lambda cfg, slug, rec, level, now: compacted.append((rec["sid"], level)) or False,
+    )
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    T.sample(cfg, "proj")
+    with f.open("a") as fh:
+        fh.write(_assistant((2, 710000, 100), 100) + "\n")  # urgent (>=700k)
+    T.sample(cfg, "proj")
+    assert ("S-almdudleer-dev-p5", "urgent") in compacted
+    assert calls == []  # human got nothing
+
+
+def test_fresh_tail_read_does_not_redetect_429(tmp_path, fake_session, monkeypatch):
+    """A 429 already in the tail at first-sample (e.g. after a compact spawns a new
+    transcript) must NOT be re-counted — only 429s on the incremental read are new."""
+    cfg = _make_cfg(tmp_path)
+    _capture_human_tg(monkeypatch)
+    rl_line = json.dumps({"error": "rate_limit", "apiErrorStatus": 429})
+    _write_transcript(fake_session["home"], fake_session["uuid"],
+                      [_assistant((2, 70000, 100), 500), rl_line])
+    T.sample(cfg, "proj")  # fresh tail-read sees the 429 but must not count it
+    rec = json.loads((cfg.data_dir / "proj" / "_worker" / "telemetry"
+                      / "S-almdudleer-dev-p5.json").read_text())
+    assert rec["rate_limited"] is False
+    quota = json.loads((cfg.data_dir / "proj" / "_worker" / "telemetry"
+                        / "_quota.json").read_text())
+    assert quota["rate_limit_429"]["count"] == 0

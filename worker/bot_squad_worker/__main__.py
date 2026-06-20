@@ -34,6 +34,41 @@ def _user_sock_path(cfg: Config, linux_user: str) -> Path:
     return cfg.data_dir / "_sock" / f"user-{linux_user}.sock"
 
 
+# Backstop < systemd TimeoutStopSec (10s): even if a long-poll somehow doesn't
+# drain, uvicorn force-closes in-flight connections by this deadline so the
+# worker still exits before SIGKILL.
+_GRACEFUL_SHUTDOWN_TIMEOUT = 8
+
+
+def _install_graceful_shutdown(server, shutdown_event, sched):
+    """Wrap uvicorn ``Server.handle_exit`` so SIGTERM/SIGINT ALSO flips the
+    T-0119 shutdown event + stops the scheduler BEFORE uvicorn starts draining.
+
+    Why this exists: ``uvicorn.run()`` installs uvicorn's own signal handlers,
+    overriding the worker's ``_shutdown`` — so the shutdown event was never set,
+    the ``peer_inbox_wait`` long-polls ran their full timeout, uvicorn's graceful
+    shutdown blocked on them, and systemd SIGKILLed the worker at
+    TimeoutStopSec=10s. Flipping the event here lets the long-polls return within
+    ~1s so uvicorn (and the worker) exit cleanly inside the window. The event is
+    set FIRST, so it survives even if uvicorn's original handler raises.
+    """
+    _orig = server.handle_exit
+
+    def handle_exit(sig, frame):
+        logging.getLogger("bot-squad-worker").info(
+            "shutdown signal received — draining long-polls + stopping scheduler")
+        shutdown_event.set()
+        if sched is not None:
+            try:
+                sched.shutdown(wait=False)
+            except Exception:
+                logging.getLogger("bot-squad-worker").exception("scheduler shutdown error")
+        _orig(sig, frame)
+
+    server.handle_exit = handle_exit
+    return server
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="bot-squad-worker")
     parser.add_argument(
@@ -146,7 +181,18 @@ def main() -> int:
         threading.Thread(target=_delayed_chgrp, daemon=True).start()
 
     log.info("uvicorn binding to %s", sock_path)
-    uvicorn.run(app, uds=str(sock_path), log_level=args.log_level)
+    # Build the Server explicitly (instead of uvicorn.run) so we can wrap its
+    # signal handler — uvicorn installs its own, overriding the _shutdown above,
+    # which is exactly why the worker used to be SIGKILLed on restart (T-0284).
+    config = uvicorn.Config(
+        app,
+        uds=str(sock_path),
+        log_level=args.log_level,
+        timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT,
+    )
+    server = uvicorn.Server(config)
+    _install_graceful_shutdown(server, shutdown_event, sched)
+    server.run()
     return 0
 
 

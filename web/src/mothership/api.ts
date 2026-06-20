@@ -29,6 +29,7 @@ import type {
   CreateTaskBody,
   Project,
   ProjectApi,
+  ReuseDecision,
   SessionRow,
   Task,
   TelemetryResponse,
@@ -474,6 +475,13 @@ export function apiFor(serverId: string): ServerApi {
     vision: (slug) => fwd<VisionFile[]>(`/api/projects/${slug}/vision`),
     sessions: (slug) => fwd<SessionRow[]>(`/api/projects/${slug}/sessions`),
     telemetry: (slug) => fwd<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
+    // T-0329: mirror reuseCandidates so the mothership-mounted Sessions view's
+    // New-session reuse strip proxies to the target server (matches the
+    // singleton path in web/src/api.ts).
+    reuseCandidates: (slug, task) =>
+      fwd<ReuseDecision>(
+        `/api/projects/${slug}/sessions/reuse-candidates?task=${encodeURIComponent(task)}`,
+      ),
     createTask: (slug, t: CreateTaskBody) =>
       fwd<Task>(`/api/projects/${slug}/backlog`, {
         method: "POST",

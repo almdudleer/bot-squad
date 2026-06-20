@@ -2,12 +2,10 @@ import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "rea
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
 import type { ReuseDecision, SessionRow, Task, VisionFile } from "../api";
-// T-0280: the reuse-vs-spawn recommendation isn't on the shared ProjectApi
-// surface yet (the mothership proxy mirror would need a matching method), so
-// the reuse lookup uses the single-install singleton directly. On single
-// install this is the same object useApiClient() returns; resume/spawn still
-// go through the context client.
-import { api as singleInstallApi } from "../api";
+// T-0329: reuseCandidates is now on the shared ProjectApi surface (mirrored in
+// mothership/api.ts), so the reuse lookup goes through the context client like
+// resume/spawn — the mothership-mounted Sessions view proxies to the target
+// server instead of hitting the local single-install singleton.
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
@@ -527,7 +525,7 @@ export function Sessions() {
     let cancelled = false;
     setReuseLoading(true);
     setReuseError(null);
-    singleInstallApi
+    api
       .reuseCandidates(slug, newTaskId)
       .then((r) => {
         if (!cancelled) setReuse(r);

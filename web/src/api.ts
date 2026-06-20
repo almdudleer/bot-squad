@@ -1017,6 +1017,7 @@ export type ProjectApi = Pick<
   | "vision"
   | "sessions"
   | "telemetry"
+  | "reuseCandidates"
   | "createTask"
   | "patchTask"
   | "patchTaskPriority"

@@ -9,7 +9,7 @@ import {
   useParams,
 } from "react-router-dom";
 import { Login } from "./pages/Login";
-import { Picker } from "./pages/Picker";
+import { HomeRedirect } from "./pages/HomeRedirect";
 import { Project } from "./pages/Project";
 import { ProjectSettings } from "./pages/ProjectSettings";
 import { Vision } from "./pages/Vision";
@@ -44,15 +44,12 @@ const MOTHERSHIP_ENABLED = import.meta.env.VITE_MOTHERSHIP === "1";
 const MothershipRoutes = MOTHERSHIP_ENABLED
   ? lazy(() => import("./mothership/routes"))
   : null;
-// T-0025: on the mothership build, `/` renders the cross-server view in
-// place of the local `Picker`. Single-install builds are unaffected.
-const MothershipHome = MOTHERSHIP_ENABLED
-  ? lazy(() =>
-      import("./mothership/AllProjects").then((m) => ({
-        default: m.AllProjects,
-      })),
-    )
-  : null;
+// T-0336 (reframe-operator-paradigm): `/` no longer renders the cross-server
+// AllProjects console. bot-squad reads as a single project brain — `/` lands
+// on the project's process/Task-Manager view (HomeRedirect). The mothership
+// AllProjects console moved to the admin `/m/` index (mothership/routes.tsx),
+// reachable via the super-admin FLEET sidebar entry. (Was T-0025: `/` ===
+// AllProjects on mothership builds.)
 
 // T-0189: legacy slug redirects. The `signal-tracker` project was renamed to
 // `watchrobot` (the public brand — repo, staging domain, home dir all moved).
@@ -101,20 +98,7 @@ export function App() {
 
         {/* Everything else inside the Shell sidebar layout */}
         <Route element={<Shell />}>
-          <Route
-            path="/"
-            element={
-              MothershipHome ? (
-                <Suspense
-                  fallback={<div className="mc-loading">Loading mothership…</div>}
-                >
-                  <MothershipHome />
-                </Suspense>
-              ) : (
-                <Picker />
-              )
-            }
-          />
+          <Route path="/" element={<HomeRedirect />} />
           <Route path="/help" element={<Help />} />
           <Route path="/welcome" element={<Welcome />} />
           {/* T-0189: project routes nest under SlugAliasGuard so a legacy

@@ -330,43 +330,56 @@ export function Shell() {
           </>
         )}
 
-        {/* MOTHERSHIP — T-0170. Global-admin-only, and a SINGLE entry now
-            (was three rows: All Users / Attached Servers / + Add Server, with
-            "Attached Servers" wrongly pointing at the all-projects view at `/`
-            — the stakeholder's "attached servers still showing the allprojects
-            view" complaint). It links to the consolidated mothership admin page
-            (global users + invites + connected servers). Tree-shaken out of
-            detach bundles via the VITE_MOTHERSHIP literal gate; further gated
-            on super-admin so global members never see it. Distinct from "All
-            Projects" (a user surface, reached via the wordmark + switcher). */}
+        {/* FLEET — T-0336 (reframe-operator-paradigm). bot-squad reads as a
+            single project brain operated by one operator, NOT a fleet console.
+            So the multi-server mothership area is DEMOTED from an always-on
+            subsection (GLOBAL USERS + RELEASES shown on every page, incl.
+            inside a single project — the dogfood T-0331 INCOHERENCE) to a
+            single admin "FLEET" entry. Its children (Global Users / Releases /
+            servers / add-server, via the AllProjects console at the `/m` index)
+            surface as a CONTEXTUAL sub-nav only while the operator is inside
+            the fleet area (`/m/*`). Tree-shaken out of detach bundles via the
+            VITE_MOTHERSHIP literal gate; further gated on super-admin so global
+            members never see it. (Was T-0170/T-0318: the always-on MOTHERSHIP
+            subsection.) */}
         {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
           <>
             <div className="mc-sidebar-divider" aria-hidden="true" />
-            {/* T-0318: MOTHERSHIP is now a subsection header (matching the
-                Agents pattern) with its primary destinations as nested rows.
-                T-0170 had collapsed this to a SINGLE link → /m/users, which
-                buried Releases + Global-users two clicks deep behind inline
-                links on the users page. Both are now ≤1 click from the
-                sidebar. */}
-            <div className="mc-sidebar-subsection">Mothership</div>
-            <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
+            <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
-                  to="/m/users"
+                  to="/m"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  GLOBAL USERS
-                </NavLink>
-              </li>
-              <li>
-                <NavLink
-                  to="/m/releases"
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  RELEASES
+                  FLEET
                 </NavLink>
               </li>
             </ul>
+            {(location.pathname === "/m" ||
+              location.pathname.startsWith("/m/")) && (
+              <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
+                <li>
+                  <NavLink
+                    to="/m/users"
+                    className={({ isActive }) =>
+                      isActive ? "active" : undefined
+                    }
+                  >
+                    GLOBAL USERS
+                  </NavLink>
+                </li>
+                <li>
+                  <NavLink
+                    to="/m/releases"
+                    className={({ isActive }) =>
+                      isActive ? "active" : undefined
+                    }
+                  >
+                    RELEASES
+                  </NavLink>
+                </li>
+              </ul>
+            )}
           </>
         )}
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Routes, Route, Link, Navigate, useParams } from "react-router-dom";
+import { Routes, Route, Link, useParams } from "react-router-dom";
 import {
   mothershipApi,
   type AttachedServer,
@@ -9,6 +9,7 @@ import {
   type MintedInvite,
   type ServerProject,
 } from "./api";
+import { AllProjects } from "./AllProjects";
 import { AddServerWizard } from "./AddServerWizard";
 import { MothershipProject } from "./MothershipProject";
 import { Releases } from "./Releases";
@@ -733,11 +734,12 @@ function NotFound() {
 export default function MothershipRoutes() {
   return (
     <Routes>
-      {/* T-0055: /m is no longer the all-projects view — the unified `/`
-          owns that. Redirect for backwards-compat with any internal
-          bookmarks; the wizard + install-progress sub-routes still live
-          here because the install flow URLs are quoted in scripts/docs. */}
-      <Route index element={<Navigate to="/" replace />} />
+      {/* T-0336 (reframe-operator-paradigm): the cross-server AllProjects
+          fleet console lives HERE now, under the admin `/m/` area — it is no
+          longer the operator's default landing frame (`/` is the single-
+          project brain via HomeRedirect). Reached via the super-admin FLEET
+          sidebar entry. (Was T-0055: `/m` redirected to the unified `/`.) */}
+      <Route index element={<AllProjects />} />
       <Route path="servers/add" element={<AddServerWizard />} />
       <Route path="servers/:id" element={<ServerProgress />} />
       {/* T-0068: cross-server per-project view. AllProjects' peer-server

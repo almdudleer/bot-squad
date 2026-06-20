@@ -25,6 +25,7 @@ import { RunLog } from "./pages/RunLog";
 import { Messages } from "./pages/Messages";
 import { Scheduler } from "./pages/Scheduler";
 import { Autonomous } from "./pages/Autonomous";
+import { Clones } from "./pages/Clones";
 import { Workflow } from "./pages/Workflow";
 import { Help } from "./pages/Help";
 import { Welcome } from "./pages/Welcome";
@@ -142,6 +143,8 @@ export function App() {
             <Route path="runs/:id" element={<RunLog />} />
             <Route path="sessions/:claude_uuid/messages" element={<Messages />} />
             <Route path="autonomous" element={<Autonomous />} />
+            {/* T-0296: per-project clone health ("Installation ≠ Project"). */}
+            <Route path="clones" element={<Clones />} />
           </Route>
           <Route path="/scheduler" element={<Scheduler />} />
           <Route path="/users" element={<Users />} />

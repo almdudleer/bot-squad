@@ -305,6 +305,17 @@ export function Shell() {
                   DEPLOYMENT QUEUE
                 </NavLink>
               </li>
+              {/* T-0296: per-project dev/prod clone health ("Installation ≠
+                  Project"). Read is any-authed (the admin-only pull-master
+                  action is gated inside the page). */}
+              <li>
+                <NavLink
+                  to={`/p/${slug}/clones`}
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  CLONES
+                </NavLink>
+              </li>
               {/* T-0147: internal-usage analytics dashboard. */}
               <li>
                 <NavLink

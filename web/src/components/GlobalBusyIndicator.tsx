@@ -113,10 +113,12 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
     };
   }, [open]);
 
-  // T-0170: the indicator is meaningless when nothing is running — the
+  // T-0170: the indicator is meaningless when nothing is in flight — the
   // stakeholder flagged the "lonely dot" at 0 as confusing. The pure
-  // `indicatorView` decides visibility + the explicit "N running" label +
-  // the explanatory tooltip (unit-tested in globalBusyHelpers.test.ts).
+  // `indicatorView` decides visibility + the explicit "N busy" label (T-0340:
+  // "busy", not "running" — this is the cross-project in-flight count, a
+  // different scope from the per-project "live" count) + the explanatory
+  // tooltip (unit-tested in globalBusyHelpers.test.ts).
   const view = indicatorView(state.rows.length);
   if (!view.visible) return null;
   const { label, tooltip: explain } = view;

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, type Analytics as AnalyticsData, type DayCount } from "../api";
 import { PageHelp } from "../components/PageHelp";
+import { LIVE_STATUSES } from "../utils/sessionStatus";
 
 /**
  * T-0147 — product-analytics dashboard (internal-usage / "B" variant).
@@ -139,11 +140,31 @@ const TICKET_PALETTE: Record<string, string> = {
   planned: "var(--mc-text-faint)",
 };
 
+// T-0340: the canonical liveness vocabulary is live | suspended (archived is
+// an orthogonal flag shown parenthetically). The breakdown rolls the raw md
+// statuses up to that category so the chart can't disagree with the headline
+// "N live · M suspended" — see livenessRollup below.
 const SESSION_PALETTE: Record<string, string> = {
-  active: "var(--mc-green)",
-  paused: "var(--mc-amber)",
+  live: "var(--mc-green)",
   suspended: "var(--mc-text-dim)",
 };
+
+// Roll the per-status session counts up to the canonical liveness category
+// (T-0340). `live` sums the LIVE_STATUSES (active + paused); everything else
+// that isn't archived is `suspended`. Keyed identically to SESSION_PALETTE so
+// the "Sessions by status" breakdown and the headline read off ONE truth.
+function livenessRollup(byStatus: Record<string, number>): {
+  live: number;
+  suspended: number;
+} {
+  let live = 0;
+  let suspended = 0;
+  for (const [status, count] of Object.entries(byStatus)) {
+    if (LIVE_STATUSES.has(status)) live += count;
+    else suspended += count;
+  }
+  return { live, suspended };
+}
 
 function dayLabel(iso: string): string {
   // "2026-05-27" → "05/27"
@@ -229,16 +250,20 @@ export function Analytics() {
             <StatCard
               label="SESSIONS"
               value={String(data.sessions.total)}
-              // Sub-counts must partition the headline total: status is the
-              // partition axis (active + suspended === total), whereas
-              // `archived` is an orthogonal frontmatter flag (a subset that
-              // mostly overlaps suspended), so it is shown as a parenthetical
-              // annotation rather than a third additive bucket. This keeps the
-              // displayed sub-counts summing to the headline and matches the
-              // "Sessions by status" breakdown below. (T-0256)
-              sub={`${data.sessions.by_status.active ?? 0} active · ${
-                data.sessions.by_status.suspended ?? 0
-              } suspended (${data.sessions.archived} archived)`}
+              // Sub-counts partition the headline total along the canonical
+              // liveness category (T-0340): live (running|idle|paused) +
+              // suspended === total. `archived` is an orthogonal frontmatter
+              // flag (a subset that mostly overlaps suspended), so it stays a
+              // parenthetical annotation rather than a third additive bucket.
+              // "live" is the SAME word the sidebar/Sessions board use, and the
+              // count rolls up via livenessRollup so it can't disagree with the
+              // "Sessions by status" breakdown below. (T-0256 / T-0340)
+              sub={(() => {
+                const { live, suspended } = livenessRollup(
+                  data.sessions.by_status,
+                );
+                return `${live} live · ${suspended} suspended (${data.sessions.archived} archived)`;
+              })()}
             />
             <StatCard
               label="TICKETS CLOSED"
@@ -308,8 +333,8 @@ export function Analytics() {
               palette={TICKET_PALETTE}
             />
             <StatusBreakdown
-              title="Sessions by status"
-              counts={data.sessions.by_status}
+              title="Sessions by liveness"
+              counts={livenessRollup(data.sessions.by_status)}
               palette={SESSION_PALETTE}
             />
           </div>

@@ -26,6 +26,15 @@ type ProjectCreateResult = {
 // Mirror T-0025's statusBadgeClass so single-server and cross-server views
 // paint the same colours from the same enum. Unknown strings fall back to
 // the dim pill rather than going invisible — same forward-compat policy.
+//
+// T-0340: these project-card pills (working | needs-input | idle) are a
+// PROJECT-level rollup (quick_status.py / D-0018-quick-status.md), a distinct
+// concept from per-session liveness (live | suspended | archived). "working"
+// means a session is actively crunching; "needs-input" rolls up paused +
+// at-prompt sessions; "idle" means no live session. It deliberately carries
+// the extra needs-input signal the liveness vocab doesn't, so it is left as-is
+// here rather than collapsed into live/suspended. (The mothership fleet cards
+// in AllProjects.tsx share this enum and are tracked as the T-0342 follow-up.)
 function statusBadgeClass(status: string): string {
   switch (status) {
     case "working":

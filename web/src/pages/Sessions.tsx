@@ -18,6 +18,7 @@ import {
   qaWindow,
   sessionActivity,
   sessionLabel,
+  sessionLiveness,
   sessionRole,
   sessionRoleLabel,
 } from "../utils/sessionStatus";
@@ -186,13 +187,15 @@ export function isDevRow(s: SessionRow): boolean {
 //                            running/idle are live, suspended is dead.
 // Following `sessionActivity` (not the raw md status) means a zombie row
 // (status=active, activity=suspended — T-0104) correctly drops out.
+//
+// T-0340: the precedence now lives in the shared `sessionLiveness` helper
+// (utils/sessionStatus.ts) so the "live" CATEGORY word + count is defined in
+// ONE place across sidebar / sessions / analytics. This predicate is the
+// boolean projection of that category and stays the canonical liveness probe
+// other surfaces import (resourceCaps, AttachmentSessions).
 // ---------------------------------------------------------------------------
 export function isLiveSession(s: SessionRow): boolean {
-  if (s.archived) return false;
-  if (sessionActivity(s) === "paused") return true;
-  if (typeof s.live === "boolean") return s.live;
-  const a = sessionActivity(s);
-  return a === "running" || a === "idle";
+  return sessionLiveness(s) === "live";
 }
 
 export function buildSessionTree(
@@ -1386,7 +1389,7 @@ export function Sessions() {
               {isNone ? "(unknown user)" : `👤 ${key}`}
             </span>
             <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.65rem", color: "var(--mc-text-dim)" }}>
-              {alive} alive · {suspended} suspended
+              {alive} live · {suspended} suspended
             </span>
           </div>
         </td>
@@ -1399,8 +1402,11 @@ export function Sessions() {
     const t = (s.tmux_session ?? "").trim();
     return t && t !== "~" ? t : TMUX_NONE;
   }
+  // T-0340: "live" is the canonical category — read it off the shared
+  // `sessionLiveness` helper so the lane "N live" counts match the board's
+  // live-only `liveSessions` count exactly (no more "alive" vs "live" drift).
   function isAliveRow(s: SessionRow): boolean {
-    return s.status === "active" || s.status === "paused";
+    return sessionLiveness(s) === "live";
   }
   // Group rows by tmux session. Groups with a live (active/paused) session
   // sort first, then alphabetical; the "(no tmux session)" bucket is last.
@@ -1491,7 +1497,7 @@ export function Sessions() {
               {isNone ? "(no tmux session)" : `tmux a -t ${key}`}
             </code>
             <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.65rem", color: "var(--mc-text-dim)", marginLeft: "0.5rem" }}>
-              {alive} alive · {suspended} suspended
+              {alive} live · {suspended} suspended
             </span>
             {/* T-0157: mark the owning linux user(s) on the lane so the default
                 tmux view is user-marked too (multi-user projects). */}

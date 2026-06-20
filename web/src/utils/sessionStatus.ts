@@ -59,6 +59,63 @@ export function isRunning(activity: SessionActivity): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// T-0340 — canonical session-LIVENESS vocabulary (the count/rollup word).
+//
+// Dogfood T-0331 found the liveness vocabulary + counts diverging across
+// surfaces: the sidebar said "running", the Sessions board said "alive", and
+// Analytics said "active" — three words for the same idea, with "archived"
+// folded under "suspended" in one place and split out in another. This is the
+// SINGLE source every surface reads off so the labels (and the live count)
+// can't drift again.
+//
+// TWO levels, kept distinct on purpose:
+//   • activity sub-state (per row, the green-LED badge): running | idle |
+//     paused | suspended — see `sessionActivity` above. "running" is reserved
+//     for THIS sub-state and is never used as a category/count word.
+//   • liveness CATEGORY (the rollup word, used for counts + section labels):
+//       live      = alive in tmux: activity running | idle | paused, and not
+//                   archived. Replaces the old "active" / "alive" wording.
+//       suspended = registry-retained but the tmux window is closed (not
+//                   archived, not live).
+//       archived  = the orthogonal `archived` frontmatter flag — takes
+//                   precedence (an archived row is never "live").
+//
+// The precedence below mirrors Sessions.tsx::isLiveSession EXACTLY (paused is
+// live even when Team-1's running/idle-only `live` flag says otherwise), so
+// `sessionLiveness(s) === "live"` and `isLiveSession(s)` always agree.
+// ---------------------------------------------------------------------------
+export type SessionLiveness = "live" | "suspended" | "archived";
+
+export function sessionLiveness(
+  src:
+    | {
+        activity?: string | null;
+        status?: string | null;
+        archived?: boolean | null;
+        live?: boolean | null;
+      }
+    | null
+    | undefined,
+): SessionLiveness {
+  if (src?.archived) return "archived";
+  const a = sessionActivity(src);
+  if (a === "paused") return "live";
+  if (typeof src?.live === "boolean") return src.live ? "live" : "suspended";
+  return a === "running" || a === "idle" ? "live" : "suspended";
+}
+
+/** Human-readable label for a liveness category (matches the enum literal). */
+export function livenessLabel(cat: SessionLiveness): string {
+  return cat;
+}
+
+// Analytics aggregates are keyed by the raw md `status` (not the activity
+// probe), so the rollup happens at the status level: status `active` =
+// activity running|idle and status `paused` = paused — both roll up to the
+// `live` category. Exported so Analytics counts "live" off the same truth.
+export const LIVE_STATUSES: ReadonlySet<string> = new Set(["active", "paused"]);
+
+// ---------------------------------------------------------------------------
 // T-0141 — authoritative session role.
 //
 // The role was historically inferred client-side as "no task_id ⟹ teamlead",

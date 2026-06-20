@@ -118,8 +118,18 @@ export function aggregateIndicator(
  * Stakeholder feedback: the old "dot + bare number, dot-only at 0" was
  * unclear. The rules now:
  *   • count === 0 → NOT visible (no lonely dot at all).
- *   • count  >  0 → an explicit word-label ("3 running") plus a hover
+ *   • count  >  0 → an explicit word-label ("3 busy") plus a hover
  *     tooltip explaining what the number counts.
+ *
+ * T-0340 — vocabulary: this indicator counts a DIFFERENT thing from the
+ * per-project Sessions/Analytics "live" count. It is the operator's own
+ * IN-FLIGHT task sessions (status active + a bound task_id) aggregated
+ * ACROSS every project/server — a strict subset of "live" at a different
+ * scope, so it legitimately shows a smaller number. It used to say "N
+ * running", colliding with the per-session "running" LED on the Sessions
+ * board and reading as if it were the same liveness count. We relabel it
+ * "N busy" to reserve "running" for the per-session activity sub-state and
+ * "live" for the liveness category — same data, unambiguous words.
  *
  * Pure so the rendering decision is unit-tested without a DOM (matches the
  * helpers-not-components test convention used throughout this file).
@@ -136,7 +146,7 @@ export function indicatorView(count: number): IndicatorView {
   }
   return {
     visible: true,
-    label: `${count} running`,
-    tooltip: `${count} agent session${count === 1 ? "" : "s"} currently running across your projects — click for details`,
+    label: `${count} busy`,
+    tooltip: `${count} of your agent session${count === 1 ? "" : "s"} busy on a task right now across your projects — click for details`,
   };
 }

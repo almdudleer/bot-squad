@@ -161,17 +161,19 @@ describe("indicatorView (T-0170)", () => {
   test("count 1 → singular label + tooltip", () => {
     const v = indicatorView(1);
     expect(v.visible).toBe(true);
-    expect(v.label).toBe("1 running");
-    expect(v.tooltip).toContain("1 agent session ");
+    // T-0340: "busy" (not "running") — reserves "running" for the per-session
+    // LED and "live" for the per-project liveness count this indicator is NOT.
+    expect(v.label).toBe("1 busy");
+    expect(v.tooltip).toContain("1 of your agent session ");
     expect(v.tooltip).not.toContain("sessions");
   });
 
   test("count >1 → plural tooltip + word-labelled count", () => {
     const v = indicatorView(3);
     expect(v.visible).toBe(true);
-    expect(v.label).toBe("3 running");
-    expect(v.tooltip).toContain("3 agent sessions");
+    expect(v.label).toBe("3 busy");
+    expect(v.tooltip).toContain("3 of your agent sessions");
     // explicit word, not a bare number (the stakeholder's complaint)
-    expect(v.label).toMatch(/running/);
+    expect(v.label).toMatch(/busy/);
   });
 });

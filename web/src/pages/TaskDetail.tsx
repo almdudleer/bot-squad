@@ -59,6 +59,16 @@ export function parseProgressList(progress: string): ProgressEntry[] {
     });
 }
 
+// T-0274: progress-note timestamps render localized (matching the page
+// footer's `updated …` and the session-history rows, both new Date().
+// toLocaleString()), with the exact ISO preserved in a tooltip. Falls back
+// to the raw string if the stored value isn't a parseable date.
+function formatNoteTs(ts: string): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? ts : d.toLocaleString();
+}
+
 // T-0238: the user (stakeholder) is the author of comments dropped into the
 // working area. Progress notes from a real session carry an S-<...> SID; the
 // stakeholder's comments carry this sentinel so the feed can label them
@@ -664,6 +674,7 @@ export function TaskDetail() {
               }}
             >
               <span
+                title={p.ts}
                 style={{
                   fontFamily: "var(--mc-mono)",
                   fontSize: "0.68rem",
@@ -671,7 +682,7 @@ export function TaskDetail() {
                   marginRight: "0.5rem",
                 }}
               >
-                {p.ts} · {mine ? "you" : p.sid}
+                {formatNoteTs(p.ts)} · {mine ? "you" : p.sid}
               </span>
               {p.text}
             </div>

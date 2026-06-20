@@ -189,6 +189,16 @@ export function Docs() {
         <code> docs/&lt;category&gt;/…</code>. The left rail is the unified artifact tree (T-0283): docs,
         use-cases (🎯) and feedback (💬) nest under one another by <code>parent_doc_id</code>, across stores.
         Docs link bidirectionally to tickets (T-0172).
+        {/* T-0277: list the live category set (same source as the + New doc
+            dropdown) rather than hard-coding a list that drifts from the store. */}
+        {categories.length > 0 && (
+          <>
+            {" "}Categories ({categories.length}):{" "}
+            {categories.map((c, i) => (
+              <span key={c}>{i > 0 ? ", " : ""}<code>{c}</code></span>
+            ))}.
+          </>
+        )}
       </PageHelp>
 
       {error && <div className="alert alert-danger py-1 small">{error}</div>}

@@ -674,14 +674,34 @@ def _alert_project(
             _peer_to(cfg, slug, target, text)
 
 
+def _live_sids(cfg: Any, slug: str) -> set:
+    """SIDs of genuinely-live sessions for a project (T-0265).
+
+    ``list_sessions`` enumerates every session and derives an authoritative
+    ``status`` ('active' is pane-backed via ``list_panes`` — the same T-0326 pane
+    truth as ``live_pane_map``, cwd-matched to the project, NOT the empty md
+    ``pane_id`` field). Keeping only status active/paused drops the bulk of
+    suspended ghosts (184 of 190 on bot-squad) down to the ~6 the board shows.
+    """
+    from bot_squad_worker.sessions import list_sessions
+    try:
+        return {
+            r.get("sid") for r in list_sessions(cfg, slug)
+            if r.get("sid") and str(r.get("status", "")).lower() in ("active", "paused")
+        }
+    except Exception:
+        return set()
+
+
 def read_telemetry(cfg: Any, slug: str) -> dict:
     """Read the persisted telemetry for a project (for the API / UI).
 
     Returns ``{"sessions": [record, ...], "quota": {...}}`` from the records the
-    sampler last wrote. Stale records (a session that ended) are filtered to the
-    SIDs currently active so the UI doesn't show ghosts. ``_quota.json``'s noisy
-    internal fields (rolling samples, alert state) are stripped from the wire.
+    sampler last wrote, filtered to genuinely-live sessions (``_live_sids``) so
+    the UI never shows ghosts/zombies. ``_quota.json``'s noisy internal fields
+    (rolling samples, alert state) are stripped from the wire.
     """
+    live = _live_sids(cfg, slug)
     tdir = _telemetry_dir(cfg, slug)
     sessions: list[dict] = []
     if tdir.exists():
@@ -689,7 +709,7 @@ def read_telemetry(cfg: Any, slug: str) -> dict:
             if rec_file.name in ("_quota.json", "_quota.json.tmp"):
                 continue
             rec = _read_json(rec_file)
-            if rec:
+            if rec and rec.get("sid") in live:
                 sessions.append(rec)
     quota = _read_json(_quota_path(cfg, slug)) or {}
     quota_wire = {

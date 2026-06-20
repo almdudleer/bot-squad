@@ -295,6 +295,31 @@ export type TelemetryResponse = {
   quota: TelemetryQuota;
 };
 
+// T-0280: one weighed reuse-vs-spawn candidate (worker dispatch_decision /
+// T-0237 Layer-2). `eligible` candidates can be resumed instead of spawning;
+// `reject` explains why an ineligible one was passed over.
+export type ReuseCandidate = {
+  sid: string;
+  role?: string;
+  live: boolean;
+  idle: boolean;
+  initiative_match: boolean;
+  context_pct: number;
+  eligible: boolean;
+  reject?: string | null;
+};
+
+// T-0280: the worker's reuse-before-spawn recommendation for a task.
+export type ReuseDecision = {
+  ok: boolean;
+  task_id: string;
+  task_initiative: string | null;
+  decision: "reuse" | "spawn";
+  target_sid: string | null;
+  reason: string;
+  candidates: ReuseCandidate[];
+};
+
 export type RunRow = {
   id: string;
   target: string;
@@ -733,6 +758,13 @@ export const api = {
   // T-0210: resource telemetry (per-session context/memory + quota burndown).
   telemetry: (slug: string) =>
     call<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
+  // T-0280: reuse-vs-spawn recommendation for a backlog task (proxies the
+  // worker dispatch_decision action). Powers the New-session "resume before
+  // spawn" candidate strip.
+  reuseCandidates: (slug: string, task: string) =>
+    call<ReuseDecision>(
+      `/api/projects/${slug}/sessions/reuse-candidates?task=${encodeURIComponent(task)}`,
+    ),
   pauseSession: (slug: string, sid: string) =>
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`, { method: "POST" }),
   suspendSession: (slug: string, sid: string) =>

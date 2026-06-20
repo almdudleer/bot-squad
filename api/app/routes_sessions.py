@@ -301,6 +301,43 @@ async def resume_session(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/projects/{slug}/sessions/reuse-candidates?task=T-NNNN
+# ---------------------------------------------------------------------------
+
+@router.get("/reuse-candidates")
+async def reuse_candidates(
+    slug: str, task: str, request: Request,
+    user: dict = Depends(require_auth),
+) -> dict:
+    """T-0280: surface the worker's reuse-vs-spawn recommendation for a task.
+
+    Thin proxy of the worker ``dispatch_decision`` action (T-0237 Layer-2).
+    Given a backlog ``task`` it returns the recommendation record
+    ``{ok, task_id, task_initiative, decision: 'reuse'|'spawn', target_sid,
+    reason, candidates: [{sid, role, live, idle, initiative_match,
+    context_pct, eligible, reject}]}`` so the New-session modal can offer
+    "resume before spawn". The worker derives the task's initiative itself,
+    so there is no separate initiative param. Advisory only — this never
+    spawns or resumes; the operator acts via the existing resume / spawn
+    endpoints.
+
+    Reads across all of the project's session mds (the shared data dir), so
+    this is a single coordinator read — not a per-user fan-out (same shape as
+    /telemetry).
+    """
+    _check_project(request, slug)
+    if not task.strip():
+        raise HTTPException(status_code=400, detail="task query param must not be empty")
+    client = _router(request).coordinator()
+    try:
+        return await client.call_action(
+            "dispatch_decision", {"slug": slug, "task_id": task}, timeout=5.0,
+        )
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # POST /api/projects/{slug}/sessions  (spawn new)
 # ---------------------------------------------------------------------------
 

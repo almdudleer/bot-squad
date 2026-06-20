@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
-import type { SessionRow, Task, VisionFile } from "../api";
+import type { ReuseDecision, SessionRow, Task, VisionFile } from "../api";
+// T-0280: the reuse-vs-spawn recommendation isn't on the shared ProjectApi
+// surface yet (the mothership proxy mirror would need a matching method), so
+// the reuse lookup uses the single-install singleton directly. On single
+// install this is the same object useApiClient() returns; resume/spawn still
+// go through the context client.
+import { api as singleInstallApi } from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
@@ -304,6 +310,12 @@ export function Sessions() {
   const [modalError, setModalError] = useState<string | null>(null);
   const [modalInfo, setModalInfo] = useState<string | null>(null);
   const [spawning, setSpawning] = useState(false);
+  // T-0280: reuse-before-spawn — the worker's reuse-vs-spawn recommendation
+  // for the task selected in the dev form. Drives the candidate strip.
+  const [reuse, setReuse] = useState<ReuseDecision | null>(null);
+  const [reuseLoading, setReuseLoading] = useState(false);
+  const [reuseError, setReuseError] = useState<string | null>(null);
+  const [resumingSid, setResumingSid] = useState<string | null>(null);
 
   // T-0006: post-spawn toast surfacing the copyable tmux attach for the
   // session that just appeared. Computed by diffing the SID set before and
@@ -499,6 +511,54 @@ export function Sessions() {
       load();
     } catch (e: unknown) {
       setActionError(String(e));
+    }
+  }
+
+  // T-0280: fetch the reuse-vs-spawn recommendation for the dev form's
+  // selected task so we can offer "resume before spawn". Keyed on the task
+  // (the worker derives its initiative); cleared when no task is picked.
+  useEffect(() => {
+    if (!modalOpen || newRole !== "dev" || !newTaskId) {
+      setReuse(null);
+      setReuseError(null);
+      setReuseLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setReuseLoading(true);
+    setReuseError(null);
+    singleInstallApi
+      .reuseCandidates(slug, newTaskId)
+      .then((r) => {
+        if (!cancelled) setReuse(r);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setReuse(null);
+          setReuseError(String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setReuseLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modalOpen, newRole, newTaskId, slug]);
+
+  // T-0280: resume an existing live pro instead of spawning a fresh one.
+  // Calls the existing resume endpoint, then closes the modal + reloads.
+  async function handleResumeFromModal(sid: string) {
+    setReuseError(null);
+    setResumingSid(sid);
+    try {
+      await api.resumeSession(slug, sid);
+      setModalOpen(false);
+      load();
+    } catch (e: unknown) {
+      setReuseError(String(e));
+    } finally {
+      setResumingSid(null);
     }
   }
 
@@ -2285,6 +2345,83 @@ export function Sessions() {
                     ]}
                   />
                 </div>
+                {/* T-0280: reuse-before-spawn strip. When a task is picked we
+                    show the worker's reuse-vs-spawn recommendation above the
+                    spawn (Send-to-teamlead) button so the operator can resume
+                    an existing live pro instead of spawning a fresh session. */}
+                {newTaskId && (
+                  <div className="mb-3">
+                    <label className="form-label">
+                      Reuse before spawn{" "}
+                      <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
+                        (resume a live session bound to {newTaskId}&apos;s initiative)
+                      </span>
+                    </label>
+                    {reuseLoading && (
+                      <div style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
+                        Checking for reusable sessions…
+                      </div>
+                    )}
+                    {!reuseLoading && reuseError && (
+                      <div className="alert alert-danger" style={{ fontSize: "0.8rem" }}>
+                        Couldn&apos;t load reuse candidates: {reuseError}
+                      </div>
+                    )}
+                    {!reuseLoading && !reuseError && reuse && (() => {
+                      const eligible = reuse.candidates
+                        .filter((c) => c.eligible)
+                        .sort((a, b) => a.context_pct - b.context_pct);
+                      if (eligible.length === 0) {
+                        return (
+                          <div style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
+                            No reusable session — {reuse.reason}. Spawn a fresh one below.
+                          </div>
+                        );
+                      }
+                      return (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+                          <div style={{ fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
+                            {reuse.reason}
+                          </div>
+                          {eligible.map((c) => (
+                            <div
+                              key={c.sid}
+                              className="d-flex align-items-center justify-content-between"
+                              style={{
+                                border: "1px solid var(--mc-border)",
+                                borderRadius: "6px",
+                                padding: "0.4rem 0.6rem",
+                                gap: "0.6rem",
+                              }}
+                            >
+                              <div style={{ minWidth: 0 }}>
+                                <code style={{ color: "var(--mc-accent)" }}>{c.sid}</code>
+                                {c.sid === reuse.target_sid && (
+                                  <span className="mc-badge mc-badge-ok" style={{ marginLeft: "0.4rem" }}>
+                                    recommended
+                                  </span>
+                                )}
+                                <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+                                  {c.role ?? "dev"} · {c.context_pct}% context ·{" "}
+                                  {c.idle ? "idle" : "busy"}
+                                  {c.initiative_match ? " · same initiative" : ""}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                className="btn btn-outline-primary btn-sm"
+                                disabled={resumingSid !== null}
+                                onClick={() => handleResumeFromModal(c.sid)}
+                              >
+                                {resumingSid === c.sid ? "Resuming…" : "Resume"}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
                 <div className="mb-3">
                   <label className="form-label">
                     Instructions for teamlead <span style={{ color: "var(--mc-accent-danger)" }}>*</span>

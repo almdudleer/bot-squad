@@ -69,6 +69,54 @@ export function buildSections(
   });
 }
 
+// T-0342: a PENDING/installing server card otherwise lingers forever as
+// "install hasn't finished yet" (dogfood F6 — the stale `linza` card). An
+// install that hasn't made progress in this long is treated as stalled: the
+// card switches to a "stalled" wording and gains a dismiss affordance. We use
+// the freshest activity timestamp we have (last_seen_at, else created_at) so a
+// still-progressing install (heartbeating last_seen_at) never trips the gate.
+export const STALE_INSTALL_MS = 30 * 60 * 1000; // 30 min
+
+export function isStaleInstall(
+  server: Pick<AttachedServer, "install_state" | "created_at" | "last_seen_at">,
+  now: Date = new Date(),
+): boolean {
+  // Only non-terminal installs can be "stalled"; `failed` already reads as a
+  // terminal state via its own badge, and `ready` isn't an installing card.
+  if (server.install_state === "ready" || server.install_state === "failed") {
+    return false;
+  }
+  const stamp = server.last_seen_at || server.created_at;
+  if (!stamp) return false;
+  const t = new Date(stamp).getTime();
+  if (Number.isNaN(t)) return false;
+  return now.getTime() - t >= STALE_INSTALL_MS;
+}
+
+// T-0342: dismissed stale-install cards persist per server id in localStorage
+// so a dismissal sticks across reloads (the registry row stays PENDING until
+// the install finishes or an admin deletes it; the FE just stops nagging).
+const DISMISS_KEY = "bot-squad:dismissed-installs";
+
+export function loadDismissedInstalls(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DISMISS_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? new Set(arr.map(String)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function persistDismissedInstalls(ids: Set<string>): void {
+  try {
+    localStorage.setItem(DISMISS_KEY, JSON.stringify([...ids]));
+  } catch {
+    /* storage unavailable — dismissal is best-effort, in-memory only */
+  }
+}
+
 // T-0068: pure helper so the AllProjects card-link routing decision is
 // testable without a DOM. Self-server keeps the short `/p/:slug` URL (so
 // bookmarks from the single-install era still work); peer servers route
@@ -197,6 +245,19 @@ export function AllProjects() {
   const [creating, setCreating] = useState<NewProjectState | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSaving, setCreateSaving] = useState(false);
+  // T-0342: ids of stale install cards the operator dismissed (persisted).
+  const [dismissed, setDismissed] = useState<Set<string>>(() =>
+    loadDismissedInstalls(),
+  );
+
+  function dismissInstall(id: string) {
+    setDismissed((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      persistDismissedInstalls(next);
+      return next;
+    });
+  }
 
   function reload() {
     setTopError(null);
@@ -348,9 +409,15 @@ export function AllProjects() {
 
       {!topError && sections !== null && sections.length > 0 && (
         <div style={{ display: "grid", gap: "1.25rem" }}>
-          {sections.map((section) => (
-            <ServerSectionView key={section.server.id} section={section} />
-          ))}
+          {sections
+            .filter((section) => !dismissed.has(section.server.id))
+            .map((section) => (
+              <ServerSectionView
+                key={section.server.id}
+                section={section}
+                onDismiss={() => dismissInstall(section.server.id)}
+              />
+            ))}
         </div>
       )}
 
@@ -428,9 +495,16 @@ export function AllProjects() {
   );
 }
 
-function ServerSectionView({ section }: { section: ServerSection }) {
+function ServerSectionView({
+  section,
+  onDismiss,
+}: {
+  section: ServerSection;
+  onDismiss: () => void;
+}) {
   const { server, kind, result } = section;
   const label = serverHeaderLabel(server);
+  const stalled = kind === "installing" && isStaleInstall(server);
   return (
     <section
       data-testid={server.is_self ? "server-self" : "server-peer"}
@@ -474,10 +548,32 @@ function ServerSectionView({ section }: { section: ServerSection }) {
             </span>
           )}
         </div>
-        <ServerHeaderBadge section={section} />
+        <div
+          style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
+        >
+          <ServerHeaderBadge section={section} stalled={stalled} />
+          {stalled && (
+            <button
+              type="button"
+              data-testid={`dismiss-install-${server.id}`}
+              onClick={onDismiss}
+              title="Dismiss this stalled install card"
+              aria-label="Dismiss"
+              className="btn btn-sm btn-outline-secondary"
+              style={{ fontSize: "0.7rem", lineHeight: 1, padding: "2px 8px" }}
+            >
+              Dismiss
+            </button>
+          )}
+        </div>
       </header>
       <InstallTokenRow server={server} />
-      <ServerSectionBody server={server} kind={kind} result={result} />
+      <ServerSectionBody
+        server={server}
+        kind={kind}
+        result={result}
+        stalled={stalled}
+      />
     </section>
   );
 }
@@ -510,9 +606,18 @@ function InstallTokenRow({ server }: { server: AttachedServer }) {
   );
 }
 
-function ServerHeaderBadge({ section }: { section: ServerSection }) {
+function ServerHeaderBadge({
+  section,
+  stalled = false,
+}: {
+  section: ServerSection;
+  stalled?: boolean;
+}) {
   const { server, kind, result } = section;
   if (kind === "installing") {
+    if (stalled) {
+      return <span className="mc-badge mc-badge-danger">stalled</span>;
+    }
     const cls =
       server.install_state === "failed"
         ? "mc-badge mc-badge-danger"
@@ -536,15 +641,19 @@ function ServerSectionBody({
   server,
   kind,
   result,
+  stalled = false,
 }: {
   server: AttachedServer;
   kind: ServerSection["kind"];
   result: FanOutResult<ServerProject[]> | null;
+  stalled?: boolean;
 }) {
   if (kind === "installing") {
     return (
       <div style={{ color: "var(--mc-text-dim)", fontSize: 13 }}>
-        Install hasn’t finished yet.{" "}
+        {stalled
+          ? "Install appears stalled — no progress in over 30 min."
+          : "Install hasn’t finished yet."}{" "}
         <Link to={`/m/servers/${encodeURIComponent(server.id)}`}>
           watch progress →
         </Link>

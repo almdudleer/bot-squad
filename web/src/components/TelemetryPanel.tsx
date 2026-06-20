@@ -28,8 +28,14 @@ function contextKind(pct: number): "ok" | "warn" | "danger" {
   return "ok";
 }
 
-function ContextBar({ s }: { s: TelemetrySession }) {
-  const pct = s.context.pct ?? 0;
+function ContextBar({ s, ceiling }: { s: TelemetrySession; ceiling: number }) {
+  // T-0264: normalize the bar width + % to the single header ceiling rather than
+  // the row's own (possibly stale) s.context.ceiling. Older sessions retain the
+  // pre-700k ceiling the worker stamped, so a mix of 500k/700k denominators was
+  // rendering under one "/700k" header — bars weren't comparable. The header
+  // ceiling (max across rows) is the live contract ceiling, so pct = tokens /
+  // headerCeiling gives every row one denominator (and corrects the staleness).
+  const pct = ceiling > 0 ? (s.context.tokens / ceiling) * 100 : 0;
   const kind = contextKind(pct);
   const barColor =
     kind === "danger" ? "var(--mc-danger, #d33)"
@@ -38,7 +44,7 @@ function ContextBar({ s }: { s: TelemetrySession }) {
   return (
     <div style={{ minWidth: 120 }}>
       <div
-        title={`${s.context.tokens.toLocaleString()} / ${s.context.ceiling.toLocaleString()} tokens`}
+        title={`${s.context.tokens.toLocaleString()} / ${ceiling.toLocaleString()} tokens`}
         style={{
           position: "relative", height: 8, borderRadius: 2,
           background: "var(--mc-border)", overflow: "hidden",
@@ -50,7 +56,7 @@ function ContextBar({ s }: { s: TelemetrySession }) {
         }} />
       </div>
       <div style={{ fontSize: "0.62rem", color: "var(--mc-muted, #888)", marginTop: 2 }}>
-        {fmtTokens(s.context.tokens)} · {pct}%
+        {fmtTokens(s.context.tokens)} · {Math.round(pct)}%
       </div>
     </div>
   );
@@ -79,8 +85,11 @@ export function TelemetryPanel({ slug }: { slug: string }) {
   }
 
   const q = data.quota || {};
+  // T-0264: sort by raw tokens so row order matches the now-normalized bar
+  // lengths (sorting by the per-row pct would order rows against a denominator
+  // the bars no longer use).
   const sessions = [...data.sessions].sort(
-    (a, b) => (b.context?.pct ?? 0) - (a.context?.pct ?? 0),
+    (a, b) => (b.context?.tokens ?? 0) - (a.context?.tokens ?? 0),
   );
   // T-0230: derive the context-column ceiling from the payload itself rather
   // than hard-coding "500k" — the contract ceiling is tunable (raised to 700k)
@@ -145,7 +154,7 @@ export function TelemetryPanel({ slug }: { slug: string }) {
                   {s.rate_limited && <span title="hit a 429">🚫 </span>}
                   {s.sid}
                 </td>
-                <td style={{ padding: "3px 6px" }}><ContextBar s={s} /></td>
+                <td style={{ padding: "3px 6px" }}><ContextBar s={s} ceiling={ceiling} /></td>
                 <td style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>
                   {fmtTokens(s.memory.tokens_est)} tok
                   <span style={{ color: "var(--mc-muted, #888)" }}> · {s.memory.files}f</span>

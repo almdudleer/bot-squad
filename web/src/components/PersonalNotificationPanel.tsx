@@ -191,6 +191,7 @@ export function PersonalNotificationPanel({ slug }: { slug: string }) {
               >
                 <div className="d-flex align-items-center gap-2 mb-1">
                   <label
+                    htmlFor={`pnp-chat-${row.key}`}
                     style={{ fontSize: "0.74rem", fontWeight: 600, width: "4rem" }}
                   >
                     {row.label}
@@ -228,9 +229,11 @@ export function PersonalNotificationPanel({ slug }: { slug: string }) {
                 </div>
                 <div className="d-flex gap-2 align-items-center">
                   <input
+                    id={`pnp-chat-${row.key}`}
                     type="text"
                     inputMode="numeric"
                     pattern="-?[0-9]*"
+                    aria-label={`${row.label} chat id`}
                     className="form-control form-control-sm"
                     value={value}
                     onChange={(e) =>

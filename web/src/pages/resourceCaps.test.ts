@@ -6,10 +6,14 @@ import { describe, expect, test } from "vitest";
 
 import { SessionRow, TelemetryResponse } from "../api";
 import {
+  PARALLEL_SESSION_CEILING,
   ProjectUtilization,
   aggregateUtilization,
   capDisplay,
+  capInputError,
+  capSoftWarning,
   isOverCap,
+  sanitizeCapInput,
   utilizationRatio,
   validateCapInput,
 } from "./resourceCaps";
@@ -50,6 +54,44 @@ describe("validateCapInput", () => {
   test("non-integer is rejected", () => {
     expect(validateCapInput(1.5, "Cap")).toMatch(/non-negative integer/);
     expect(validateCapInput(Number.NaN, "Cap")).toMatch(/non-negative integer/);
+  });
+});
+
+// T-0310: input-time validation helpers.
+describe("sanitizeCapInput", () => {
+  test("strips a typed minus sign (no silent negative)", () =>
+    expect(sanitizeCapInput("-5")).toBe("5"));
+  test("strips decimals and e-notation", () => {
+    expect(sanitizeCapInput("1.5")).toBe("15");
+    expect(sanitizeCapInput("1e9")).toBe("19");
+  });
+  test("empty stays empty (distinguishable from 0)", () =>
+    expect(sanitizeCapInput("")).toBe(""));
+  test("plain digits pass through", () => expect(sanitizeCapInput("999")).toBe("999"));
+});
+
+describe("capInputError", () => {
+  test("empty is an error — must NOT silently become 0=unlimited", () => {
+    expect(capInputError("", "Max parallel sessions")).toMatch(/enter a value/i);
+    expect(capInputError("   ", "Max parallel sessions")).toMatch(/enter a value/i);
+  });
+  test("explicit 0 is valid (means unlimited)", () =>
+    expect(capInputError("0", "Cap")).toBeNull());
+  test("positive integer is valid", () => expect(capInputError("8", "Cap")).toBeNull());
+  test("non-integer string is rejected", () =>
+    expect(capInputError("1.5", "Cap")).toMatch(/non-negative integer/));
+});
+
+describe("capSoftWarning", () => {
+  test("within ceiling → no warning", () =>
+    expect(capSoftWarning(8, PARALLEL_SESSION_CEILING, "Max parallel sessions")).toBeNull());
+  test("at ceiling → no warning", () =>
+    expect(capSoftWarning(15, PARALLEL_SESSION_CEILING, "Cap")).toBeNull());
+  test("unlimited (0) → no warning", () =>
+    expect(capSoftWarning(0, PARALLEL_SESSION_CEILING, "Cap")).toBeNull());
+  test("above ceiling → warns and names the ceiling", () => {
+    const w = capSoftWarning(999999, PARALLEL_SESSION_CEILING, "Max parallel sessions");
+    expect(w).toMatch(/above the documented ceiling of 15/);
   });
 });
 

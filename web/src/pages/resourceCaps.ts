@@ -26,6 +26,52 @@ export function validateCapInput(value: number, label: string): string | null {
   return null;
 }
 
+// T-0310: documented hard ceiling for simultaneously-live sessions
+// (guidance §PART 5; the AIMD backoff sentinel is 10_000). Exceeding it is a
+// SOFT warning, not a hard block — an admin may intentionally raise it.
+export const PARALLEL_SESSION_CEILING = 15;
+
+/**
+ * T-0310: strip a raw cap-input string to digits only. Rejects a typed minus
+ * sign, decimal point, or `e`-notation AT INPUT TIME, so the field can never
+ * silently hold a negative/fractional value. Empty stays empty (the caller
+ * distinguishes "" from "0" — see `capInputError`).
+ */
+export function sanitizeCapInput(raw: string): string {
+  return raw.replace(/[^0-9]/g, "");
+}
+
+/**
+ * T-0310: inline (pre-Save) error for a raw cap-input string. An EMPTY field is
+ * an error — it must NOT silently coerce to 0 (= unlimited), which would
+ * uncap the whole system. The explicit `0` is the only way to mean unlimited.
+ */
+export function capInputError(raw: string, label: string): string | null {
+  const t = raw.trim();
+  if (t === "") {
+    return `${label}: enter a value (type 0 for unlimited).`;
+  }
+  if (!/^[0-9]+$/.test(t)) {
+    return `${label} must be a non-negative integer (0 = unlimited).`;
+  }
+  return null;
+}
+
+/**
+ * T-0310: soft over-ceiling warning (non-blocking). Returns null when the value
+ * is unlimited (0), invalid, or within the ceiling.
+ */
+export function capSoftWarning(
+  value: number,
+  ceiling: number,
+  label: string,
+): string | null {
+  if (!Number.isInteger(value) || value <= UNLIMITED || value <= ceiling) {
+    return null;
+  }
+  return `${label} of ${value.toLocaleString()} is above the documented ceiling of ${ceiling}.`;
+}
+
 /** Fill ratio for the Task-Manager bar; null when unlimited (no bar). */
 export function utilizationRatio(used: number, cap: number): number | null {
   if (cap <= UNLIMITED) return null;

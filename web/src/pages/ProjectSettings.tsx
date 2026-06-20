@@ -124,10 +124,11 @@ export function ProjectSettings() {
           </p>
 
           <div className="mb-3">
-            <label className="form-label" style={{ fontSize: "0.72rem" }}>
+            <label htmlFor="ps-tg-chat" className="form-label" style={{ fontSize: "0.72rem" }}>
               Chat id
             </label>
             <input
+              id="ps-tg-chat"
               type="text"
               className="form-control"
               value={chat}
@@ -138,10 +139,11 @@ export function ProjectSettings() {
           </div>
 
           <div className="mb-3">
-            <label className="form-label" style={{ fontSize: "0.72rem" }}>
+            <label htmlFor="ps-tg-topic" className="form-label" style={{ fontSize: "0.72rem" }}>
               Topic id <span style={{ color: "var(--mc-text-dim)" }}>(optional, forum thread)</span>
             </label>
             <input
+              id="ps-tg-topic"
               type="text"
               className="form-control"
               value={topic}

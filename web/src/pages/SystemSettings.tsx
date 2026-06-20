@@ -4,11 +4,14 @@ import { api, SystemSettings as Settings } from "../api";
 import { Modal } from "../components/Modal";
 import { Coachmark } from "../onboarding";
 import {
+  PARALLEL_SESSION_CEILING,
   ProjectUtilization,
   aggregateUtilization,
+  capInputError,
+  capSoftWarning,
   isOverCap,
+  sanitizeCapInput,
   utilizationRatio,
-  validateCapInput,
 } from "./resourceCaps";
 
 const TTL_RE = /^\d+[smhd]$/;
@@ -79,9 +82,25 @@ export function SystemSettings() {
   const [coordUser, setCoordUser] = useState<string>("");
 
   // T-0240: resource caps + live server-wide utilization (Task-Manager style).
-  const [maxParallel, setMaxParallel] = useState<number>(0);
-  const [maxTokens, setMaxTokens] = useState<number>(0);
+  // T-0310: caps are held as raw STRINGS so we can tell an empty field (invalid)
+  // apart from an explicit "0" (= unlimited) — the old number state coerced both
+  // to 0 and silently uncapped the system on a cleared field.
+  const [maxParallel, setMaxParallel] = useState<string>("0");
+  const [maxTokens, setMaxTokens] = useState<string>("0");
   const [util, setUtil] = useState<{ liveSessions: number; totalTokens: number } | null>(null);
+
+  // T-0310: derived numeric caps (null = empty/invalid) + inline validation.
+  const parallelNum = maxParallel.trim() === "" ? null : Number.parseInt(maxParallel, 10);
+  const tokensNum = maxTokens.trim() === "" ? null : Number.parseInt(maxTokens, 10);
+  const parallelErr = capInputError(maxParallel, "Max parallel sessions");
+  const tokensErr = capInputError(maxTokens, "Max total tokens");
+  const parallelWarn =
+    parallelNum === null
+      ? null
+      : capSoftWarning(parallelNum, PARALLEL_SESSION_CEILING, "Max parallel sessions");
+  // T-0308: the token meter is a LIFETIME cumulative counter — flag exhaustion.
+  const tokensExhausted =
+    util !== null && tokensNum !== null && isOverCap(util.totalTokens, tokensNum);
 
   function load() {
     setError(null);
@@ -95,8 +114,8 @@ export function SystemSettings() {
         setProxyUrl(s.tg.proxy_url);
         setTtl(s.session.ttl);
         setCoordUser(s.admin.coordinator_user);
-        setMaxParallel(s.caps.max_parallel_sessions);
-        setMaxTokens(s.caps.max_total_tokens);
+        setMaxParallel(String(s.caps.max_parallel_sessions));
+        setMaxTokens(String(s.caps.max_total_tokens));
       })
       .catch((e) => setError(String(e)));
   }
@@ -148,10 +167,10 @@ export function SystemSettings() {
     if (!coordUser.trim()) {
       return "coordinator linux user must not be empty";
     }
-    // T-0240: caps are non-negative ints; 0 = unlimited.
-    const capErr =
-      validateCapInput(maxParallel, "Max parallel sessions") ??
-      validateCapInput(maxTokens, "Max total tokens");
+    // T-0240/T-0310: caps are non-negative ints; 0 = unlimited. An empty field
+    // is rejected (it must not silently uncap the system). Soft over-ceiling is
+    // a warning only, so it does NOT block Save.
+    const capErr = parallelErr ?? tokensErr;
     if (capErr !== null) {
       return capErr;
     }
@@ -186,13 +205,14 @@ export function SystemSettings() {
         },
         session: { ttl },
         admin: { coordinator_user: coordUser.trim() },
-        // T-0240: resource caps (non-negative ints, 0 = unlimited).
-        caps: { max_parallel_sessions: maxParallel, max_total_tokens: maxTokens },
+        // T-0240/T-0310: resource caps (non-negative ints, 0 = unlimited).
+        // validate() guarantees both are present + valid by this point.
+        caps: { max_parallel_sessions: parallelNum ?? 0, max_total_tokens: tokensNum ?? 0 },
       };
       const result = await api.putSystemSettings(body);
       setSettings(result);
-      setMaxParallel(result.caps.max_parallel_sessions);
-      setMaxTokens(result.caps.max_total_tokens);
+      setMaxParallel(String(result.caps.max_parallel_sessions));
+      setMaxTokens(String(result.caps.max_total_tokens));
       setBotToken("");
       setNotice(
         result.restart_required
@@ -289,11 +309,12 @@ export function SystemSettings() {
               </div>
             )}
 
-            <label className="form-label" style={{ fontSize: "0.72rem" }}>
+            <label htmlFor="ss-bot-token" className="form-label" style={{ fontSize: "0.72rem" }}>
               Bot token
             </label>
             <div className="d-flex gap-2 align-items-center mb-1">
               <input
+                id="ss-bot-token"
                 type={showToken ? "text" : "password"}
                 className="form-control"
                 value={botToken}
@@ -316,10 +337,11 @@ export function SystemSettings() {
               Leave blank to keep current. Submit an empty value to clear (use Show then Clear).
             </small>
 
-            <label className="form-label mt-3" style={{ fontSize: "0.72rem" }}>
+            <label htmlFor="ss-default-chat" className="form-label mt-3" style={{ fontSize: "0.72rem" }}>
               Default chat id
             </label>
             <input
+              id="ss-default-chat"
               type="text"
               className="form-control"
               value={defaultChatId}
@@ -336,10 +358,11 @@ export function SystemSettings() {
             {/* T-0194: per-installation TG egress proxy. NOT mothership-locked —
                 it's a host-network concern (some hosts DPI-block Telegram, T-0192).
                 Routes ONLY the worker's Telegram traffic through the proxy. */}
-            <label className="form-label mt-3" style={{ fontSize: "0.72rem" }}>
+            <label htmlFor="ss-proxy-url" className="form-label mt-3" style={{ fontSize: "0.72rem" }}>
               Egress proxy URL
             </label>
             <input
+              id="ss-proxy-url"
               type="text"
               className="form-control"
               value={proxyUrl}
@@ -362,10 +385,11 @@ export function SystemSettings() {
             </h3>
             <div className="d-flex gap-3 align-items-end">
               <div>
-                <label className="form-label" style={{ fontSize: "0.72rem" }}>
+                <label htmlFor="ss-quiet-start" className="form-label" style={{ fontSize: "0.72rem" }}>
                   Start hour
                 </label>
                 <input
+                  id="ss-quiet-start"
                   type="number"
                   min={0}
                   max={23}
@@ -376,10 +400,11 @@ export function SystemSettings() {
                 />
               </div>
               <div>
-                <label className="form-label" style={{ fontSize: "0.72rem" }}>
+                <label htmlFor="ss-quiet-end" className="form-label" style={{ fontSize: "0.72rem" }}>
                   End hour
                 </label>
                 <input
+                  id="ss-quiet-end"
                   type="number"
                   min={0}
                   max={23}
@@ -400,6 +425,8 @@ export function SystemSettings() {
               Session TTL
             </h3>
             <input
+              id="ss-ttl"
+              aria-label="Session TTL"
               type="text"
               className="form-control"
               value={ttl}
@@ -416,6 +443,8 @@ export function SystemSettings() {
               Coordinator Linux user
             </h3>
             <input
+              id="ss-coord-user"
+              aria-label="Coordinator Linux user"
               type="text"
               className="form-control"
               value={coordUser}
@@ -440,47 +469,87 @@ export function SystemSettings() {
               <CapMeter
                 label="Parallel sessions (live)"
                 used={util ? util.liveSessions : null}
-                cap={maxParallel}
+                cap={parallelNum ?? 0}
               />
               <CapMeter
-                label="Total tokens (cumulative output)"
+                label="Total tokens (cumulative output · lifetime)"
                 used={util ? util.totalTokens : null}
-                cap={maxTokens}
+                cap={tokensNum ?? 0}
               />
+              {/* T-0308: the token figure is a LIFETIME, monotonically-growing
+                  counter — it never resets and has no rolling window. So a
+                  nonzero token cap is a ONE-SHOT lifetime budget: once total
+                  output crosses it, the system stays over-cap until an admin
+                  raises (or clears to 0) the cap. State that plainly. */}
+              <small style={{ display: "block", color: "var(--mc-text-dim)", fontSize: "0.68rem" }}>
+                Token usage is <strong>cumulative since install</strong> — it never
+                resets and has no time window. A nonzero token cap is therefore a
+                one-shot lifetime budget, not a rate limit.
+              </small>
+              {tokensExhausted && (
+                <div
+                  className="alert alert-warning py-1 px-2 mt-2 mb-0"
+                  data-testid="cap-tokens-exhausted"
+                  style={{ fontSize: "0.7rem" }}
+                >
+                  ⚠ Lifetime token budget exhausted — cumulative output has passed
+                  the cap. Spawns stay blocked until you raise the cap (or set 0 =
+                  unlimited); there is no automatic reset.
+                </div>
+              )}
             </div>
 
-            <div className="d-flex gap-3 align-items-end flex-wrap">
+            <div className="d-flex gap-3 align-items-start flex-wrap">
               <div>
-                <label className="form-label" style={{ fontSize: "0.72rem" }}>
+                <label htmlFor="ss-cap-parallel" className="form-label" style={{ fontSize: "0.72rem" }}>
                   Max parallel sessions
                 </label>
+                {/* T-0310: text input + digit-only sanitiser so a typed minus/
+                    decimal can't be held; empty stays empty (≠ 0). */}
                 <input
-                  type="number"
-                  min={0}
-                  step={1}
+                  id="ss-cap-parallel"
+                  type="text"
+                  inputMode="numeric"
                   className="form-control"
                   data-testid="cap-parallel"
                   value={maxParallel}
                   disabled={!isAdmin}
-                  onChange={(e) => setMaxParallel(Number.parseInt(e.target.value, 10) || 0)}
+                  aria-invalid={parallelErr !== null}
+                  onChange={(e) => setMaxParallel(sanitizeCapInput(e.target.value))}
                   style={{ width: "9rem" }}
                 />
+                {parallelErr && (
+                  <div data-testid="cap-parallel-error" style={{ color: "var(--mc-accent-danger, #d33)", fontSize: "0.68rem", marginTop: 2, maxWidth: "11rem" }}>
+                    {parallelErr}
+                  </div>
+                )}
+                {!parallelErr && parallelWarn && (
+                  <div data-testid="cap-parallel-warn" style={{ color: "var(--mc-accent-warn, #e0a000)", fontSize: "0.68rem", marginTop: 2, maxWidth: "11rem" }}>
+                    {parallelWarn}
+                  </div>
+                )}
               </div>
               <div>
-                <label className="form-label" style={{ fontSize: "0.72rem" }}>
+                <label htmlFor="ss-cap-tokens" className="form-label" style={{ fontSize: "0.72rem" }}>
                   Max total tokens
                 </label>
                 <input
-                  type="number"
-                  min={0}
-                  step={1000}
+                  id="ss-cap-tokens"
+                  type="text"
+                  inputMode="numeric"
                   className="form-control"
                   data-testid="cap-tokens"
                   value={maxTokens}
                   disabled={!isAdmin}
-                  onChange={(e) => setMaxTokens(Number.parseInt(e.target.value, 10) || 0)}
+                  aria-invalid={tokensErr !== null}
+                  onChange={(e) => setMaxTokens(sanitizeCapInput(e.target.value))}
                   style={{ width: "11rem" }}
                 />
+                {tokensErr && (
+                  <div data-testid="cap-tokens-error" style={{ color: "var(--mc-accent-danger, #d33)", fontSize: "0.68rem", marginTop: 2, maxWidth: "11rem" }}>
+                    {tokensErr}
+                  </div>
+                )}
               </div>
             </div>
             <small style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.35rem" }}>
@@ -494,7 +563,7 @@ export function SystemSettings() {
             type="button"
             className="btn btn-primary"
             onClick={save}
-            disabled={saving}
+            disabled={saving || parallelErr !== null || tokensErr !== null}
           >
             {saving ? "Saving…" : "Save"}
           </button>

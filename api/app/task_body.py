@@ -62,6 +62,42 @@ def parse_body(text: str) -> dict[str, str]:
     return out
 
 
+_VERBATIM_HEADING_RE = re.compile(r"(?im)^##\s+verbatim request\s*$")
+# Any level-2 heading (used to find where the verbatim section ends).
+_ANY_H2_RE = re.compile(r"(?im)^##\s+\S")
+
+
+def _verbatim_span(body: str) -> tuple[int, int] | None:
+    """Char span of the ``## Verbatim request`` section — its heading through
+    just before the NEXT ``## `` heading (or EOF). ``None`` if absent."""
+    m = _VERBATIM_HEADING_RE.search(body)
+    if m is None:
+        return None
+    nxt = _ANY_H2_RE.search(body, m.end())
+    return m.start(), (nxt.start() if nxt else len(body))
+
+
+def regraft_verbatim(original_body: str, new_body: str) -> str:
+    """Return ``new_body`` with its ``## Verbatim request`` section forced back
+    to ``original_body``'s (T-0289).
+
+    Verbatim is human-only: a body replace (e.g. ``PATCH /backlog``) must never
+    rewrite it. The splice is raw-text and scoped strictly to the verbatim
+    heading, so every OTHER section in ``new_body`` (Context, Progress, and
+    non-canonical sections like Finding/DoD on QA tickets) is preserved exactly
+    as submitted. If the original had no verbatim section there is nothing to
+    protect; if ``new_body`` dropped the heading, the original is re-prepended.
+    """
+    orig = _verbatim_span(original_body)
+    if orig is None:
+        return new_body
+    orig_block = original_body[orig[0]:orig[1]].rstrip("\n")
+    new = _verbatim_span(new_body)
+    if new is None:
+        return orig_block + "\n\n" + new_body.lstrip("\n")
+    return new_body[:new[0]] + orig_block + "\n\n" + new_body[new[1]:].lstrip("\n")
+
+
 def compose_body(verbatim: str, context: str, progress: str) -> str:
     """Emit canonical body. Empty sections are skipped entirely."""
     parts: list[str] = []

@@ -777,3 +777,80 @@ def test_create_task_stamps_owner_from_username(tmp_bot_squad: Path, monkeypatch
     assert matches, "task md not created"
     text = matches[0].read_text()
     assert "owner: testuser" in text
+
+
+# ---------------------------------------------------------------------------
+# T-0289: PATCH must NOT let a body replace clobber '## Verbatim request'
+# (verbatim is human-only — re-graft the original on any body write).
+# ---------------------------------------------------------------------------
+def _create_with_body(client, body: str) -> str:
+    r = client.post(
+        "/api/projects/test-project/backlog",
+        json={"title": "Guard me", "body": body, "status": "open"},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def test_patch_body_cannot_overwrite_verbatim(tmp_bot_squad: Path, monkeypatch):
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    original = (
+        "## Verbatim request\n\nORIGINAL stakeholder words\n\n"
+        "## Context\n\nold context\n"
+    )
+    tid = _create_with_body(client, original)
+
+    # A body PATCH that rewrites verbatim AND edits context.
+    tampered = (
+        "## Verbatim request\n\nHIJACKED by an agent\n\n"
+        "## Context\n\nnew context\n"
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}", json={"body": tampered}
+    )
+    assert r.status_code == 200, r.text
+    got = r.json()
+    # verbatim is preserved (re-grafted); the context edit still lands.
+    assert "ORIGINAL stakeholder words" in got["verbatim"]
+    assert "HIJACKED" not in got["verbatim"]
+    assert "new context" in got["context"]
+
+
+def test_patch_body_preserves_verbatim_when_omitted(tmp_bot_squad: Path, monkeypatch):
+    """A body that drops the verbatim heading entirely must not lose it."""
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    tid = _create_with_body(
+        client, "## Verbatim request\n\nKEEP THIS\n\n## Context\n\nc\n"
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}",
+        json={"body": "## Context\n\nonly context now\n"},
+    )
+    assert r.status_code == 200, r.text
+    assert "KEEP THIS" in r.json()["verbatim"]
+
+
+def test_patch_body_non_canonical_sections_survive(tmp_bot_squad: Path, monkeypatch):
+    """Re-grafting verbatim must not mangle non-canonical sections (Finding/
+    DoD on QA tickets): a legit DoD edit lands, verbatim stays original."""
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    original = (
+        "## Verbatim request\n\nSACRED\n\n"
+        "## Finding\n\na bug\n\n## DoD\n\nold dod\n"
+    )
+    tid = _create_with_body(client, original)
+    edited = (
+        "## Verbatim request\n\nTAMPER\n\n"
+        "## Finding\n\na bug\n\n## DoD\n\nnew dod text\n"
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}", json={"body": edited}
+    )
+    assert r.status_code == 200, r.text
+    # The non-canonical sections (Finding/DoD) parse into `verbatim` since they
+    # aren't recognized headings — assert the original verbatim words survive,
+    # the tamper is dropped, and the edited DoD + Finding content is intact.
+    verbatim = r.json()["verbatim"]
+    assert "SACRED" in verbatim and "TAMPER" not in verbatim
+    assert "new dod text" in verbatim
+    assert "## Finding" in verbatim

@@ -16,7 +16,7 @@ from app.markdown_writer import (
     write_task,
 )
 from app.routes_auth import require_auth
-from app.task_body import compose_body, parse_body
+from app.task_body import compose_body, parse_body, regraft_verbatim
 from app.worker_client import WorkerClient, WorkerError
 
 log = logging.getLogger(__name__)
@@ -280,6 +280,11 @@ def patch_task(
     allowed = {"title", "status"} | _LINKAGE_PATCH_KEYS
     updates = {k: v for k, v in payload.items() if k in allowed}
     body = payload.get("body")
+    if body is not None:
+        # T-0289: `## Verbatim request` is human-only — a body replace must
+        # never clobber it. Re-graft the on-disk verbatim section over whatever
+        # the caller sent; every other section in `body` is preserved as-is.
+        body = regraft_verbatim(parse_task(path)["body"], body)
     try:
         merge_task_update(path, updates, body=body)
     except ValueError as e:

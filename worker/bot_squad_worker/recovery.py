@@ -89,8 +89,10 @@ def _save_state(cfg: Any, state: dict) -> None:
 def _gather(cfg: Any) -> list[dict]:
     """One row per non-archived dev session: {sid, slug, role, pane_live,
     task_id, task_status}."""
-    from bot_squad_worker.autonomous import pane_alive, read_task_status
-    from bot_squad_worker.sessions import _read_session_metadata, _derive_role
+    from bot_squad_worker.autonomous import read_task_status
+    from bot_squad_worker.sessions import (
+        _read_session_metadata, _derive_role, live_pane_map)
+    pane_map = live_pane_map()  # SID -> live pane, the truth (md pane_id is empty)
     rows: list[dict] = []
     for slug in getattr(cfg, "projects", {}) or {}:
         sess_dir = cfg.data_dir / slug / "sessions"
@@ -107,8 +109,7 @@ def _gather(cfg: Any) -> list[dict]:
             task_id = meta.get("task_id")
             if not task_id or task_id == "~":
                 continue
-            pane = str(meta.get("pane_id") or "").strip()
-            pane_live = bool(pane and pane not in ("~", "None") and pane_alive(pane))
+            pane_live = meta.get("sid") in pane_map
             rows.append({
                 "sid": meta.get("sid"), "slug": slug, "role": role,
                 "pane_live": pane_live, "task_id": task_id,

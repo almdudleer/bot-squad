@@ -136,6 +136,26 @@ def compute_sid(user: str, window: str, pane_id: str) -> str:
     return f"S-{user}-{window}-p{pane_no_pct}"
 
 
+def live_pane_map(user: str | None = None) -> dict[str, str]:
+    """Canonical SID → live tmux pane_id, derived from ``list_panes()``.
+
+    The session md ``pane_id`` field is frequently EMPTY for a live session even
+    though a real tmux pane exists and the SID encodes it — so consumers must
+    resolve liveness from the actual panes (the same ``compute_sid`` matching
+    ``suspend()``/``gc_sessions`` use), NOT from the md field. A SID present in
+    this map has a live pane; absent ⇒ no live pane (genuinely gone).
+    """
+    if user is None:
+        user = _get_current_user()
+    out: dict[str, str] = {}
+    for p in list_panes():
+        try:
+            out[compute_sid(user, p.window, p.pane_id)] = p.pane_id
+        except Exception:
+            continue
+    return out
+
+
 def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     """Return the UUID (filename stem) of the most recent .jsonl for this cwd.
 

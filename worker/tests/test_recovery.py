@@ -105,7 +105,9 @@ def test_gather_derives_role_from_window_and_reads_status(monkeypatch, tmp_path)
         "task_id": "T-1", "initiative": "~", "pane_id": "%9"})
     (backlog / "T-1-feature.md").write_text(
         "---\nid: T-1\nstatus: in_progress\n---\n# feature\n")
-    monkeypatch.setattr("bot_squad_worker.autonomous.pane_alive", lambda p: False)
+    # pane_live is now resolved via live_pane_map (real panes); force "no live
+    # pane" deterministically so this dead-pane case is independent of tmux.
+    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
 
     rows = R._gather(cfg)
     assert len(rows) == 1

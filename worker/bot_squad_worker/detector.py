@@ -139,8 +139,17 @@ def _capture_pane(pane_id: str) -> str:
 
 
 def _live_panes(cfg: Any) -> list[tuple[str, str]]:
-    """(sid, pane_id) for every live session that currently holds a tmux pane."""
-    from bot_squad_worker.sessions import _is_live_holder, _read_session_metadata
+    """(sid, pane_id) for every registered live session that holds a tmux pane.
+
+    The pane is resolved from the ACTUAL tmux panes via ``live_pane_map`` — the
+    session md ``pane_id`` field is routinely empty for live sessions, so trusting
+    it makes every live session look pane-dead (the 5h-limit detector no-op + the
+    recovery false-respawn). A session counts here iff it is a persisted
+    live-holder AND its SID maps to a real live pane.
+    """
+    from bot_squad_worker.sessions import (
+        _is_live_holder, _read_session_metadata, live_pane_map)
+    pane_map = live_pane_map()
     out: list[tuple[str, str]] = []
     for slug in getattr(cfg, "projects", {}) or {}:
         sess_dir = cfg.data_dir / slug / "sessions"
@@ -150,10 +159,9 @@ def _live_panes(cfg: Any) -> list[tuple[str, str]]:
             meta = _read_session_metadata(md)
             if not meta or not _is_live_holder(meta):
                 continue
-            pane = str(meta.get("pane_id") or "").strip()
             sid = meta.get("sid")
-            if sid and pane and pane not in ("~", "None"):
-                out.append((sid, pane))
+            if sid and sid in pane_map:
+                out.append((sid, pane_map[sid]))
     return out
 
 

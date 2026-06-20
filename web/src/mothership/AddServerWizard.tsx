@@ -123,6 +123,26 @@ export function AddServerWizard() {
 // Form step
 // ---------------------------------------------------------------------------
 
+// T-0316: validate the base url inline so the user gets immediate feedback
+// instead of a server round-trip + wasted single-use mint. Mirrors the
+// server-side mint validation: a well-formed absolute http(s) URL with a
+// host. `new URL` throws on garbage like "not-a-url", which we treat as
+// invalid.
+function isValidBaseUrl(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  return (
+    (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+    parsed.hostname.length > 0
+  );
+}
+
 function ServerForm(props: {
   displayName: string;
   baseUrl: string;
@@ -133,6 +153,13 @@ function ServerForm(props: {
   onSubmit: (e: React.FormEvent) => void;
   onCancel: () => void;
 }) {
+  // Only surface the inline error once the field has been blurred (or has
+  // content) so we don't flash "invalid" while the user is mid-type.
+  const [baseUrlTouched, setBaseUrlTouched] = useState(false);
+  const baseUrlValid = isValidBaseUrl(props.baseUrl);
+  const showBaseUrlError =
+    baseUrlTouched && props.baseUrl.trim().length > 0 && !baseUrlValid;
+  const submitDisabled = props.submitting || !baseUrlValid;
   return (
     <div className="container py-4" style={{ maxWidth: 560 }}>
       {/* T-0132: page identity for screen-readers + heading-scan navigation.
@@ -156,9 +183,17 @@ function ServerForm(props: {
         />
         <LabeledInput
           label="base url"
+          type="url"
           value={props.baseUrl}
           placeholder="https://bot-squad.example.com"
           onChange={props.onBaseUrl}
+          onBlur={() => setBaseUrlTouched(true)}
+          invalid={showBaseUrlError}
+          error={
+            showBaseUrlError
+              ? "Enter a valid http(s) URL — e.g. https://bot-squad.example.com"
+              : null
+          }
         />
         {props.error && (
           <div className="mc-badge mc-badge-danger" style={{ alignSelf: "start" }}>
@@ -168,9 +203,15 @@ function ServerForm(props: {
         <div style={{ display: "flex", gap: "0.5rem" }}>
           <button
             type="submit"
-            disabled={props.submitting}
-            className="mc-badge mc-badge-info"
-            style={{ padding: "8px 18px", cursor: props.submitting ? "wait" : "pointer", background: "transparent", fontSize: 12 }}
+            disabled={submitDisabled}
+            className={submitDisabled ? "mc-badge mc-badge-dim" : "mc-badge mc-badge-info"}
+            style={{
+              padding: "8px 18px",
+              cursor: props.submitting ? "wait" : submitDisabled ? "not-allowed" : "pointer",
+              background: "transparent",
+              fontSize: 12,
+              opacity: submitDisabled && !props.submitting ? 0.6 : 1,
+            }}
           >
             {props.submitting ? "issuing…" : "issue install link →"}
           </button>
@@ -193,27 +234,39 @@ function LabeledInput(props: {
   value: string;
   placeholder?: string;
   autoFocus?: boolean;
+  type?: string;
+  invalid?: boolean;
+  error?: string | null;
   onChange: (v: string) => void;
+  onBlur?: () => void;
 }) {
   return (
     <label style={{ display: "grid", gap: 4, fontSize: 12, letterSpacing: "0.05em" }}>
       <span style={{ color: "var(--mc-text-dim)", textTransform: "uppercase" }}>{props.label}</span>
       <input
         required
+        type={props.type}
         autoFocus={props.autoFocus}
         value={props.value}
         placeholder={props.placeholder}
+        aria-invalid={props.invalid || undefined}
         onChange={(e) => props.onChange(e.target.value)}
+        onBlur={props.onBlur}
         style={{
           padding: "6px 10px",
           background: "var(--mc-surface)",
-          border: "1px solid var(--mc-border)",
+          border: `1px solid ${props.invalid ? "var(--mc-danger, #c0392b)" : "var(--mc-border)"}`,
           color: "var(--mc-text)",
           fontFamily: "var(--mc-mono)",
           fontSize: 13,
           borderRadius: 3,
         }}
       />
+      {props.error && (
+        <span role="alert" style={{ color: "var(--mc-danger, #c0392b)", fontSize: 11, textTransform: "none", letterSpacing: 0 }}>
+          {props.error}
+        </span>
+      )}
     </label>
   );
 }

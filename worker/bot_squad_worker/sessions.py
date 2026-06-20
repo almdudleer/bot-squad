@@ -1937,22 +1937,34 @@ def _count_live_sessions(cfg: Any) -> int:
 
 
 def _enforce_parallel_cap(cfg: Any) -> None:
-    """Raise ActionError if spawning would exceed the parallel-sessions cap.
+    """Raise ActionError if spawning would exceed the EFFECTIVE concurrency.
 
-    A capacity-reached *refusal* (the task stays pending), never a silent drop —
-    mirrors the T-0237 S4 admission contract. ``max_parallel_sessions == 0``
-    (unlimited) is a no-op.
+    Two layers (T-0239 cap + T-0249 backoff governor):
+      * the hard ``max_parallel_sessions`` cap is the ceiling (0 = unlimited);
+      * the WS-4 backoff governor depresses the effective limit BELOW the cap
+        under Claude rate-limit / 5h-usage-limit pressure.
+    Admission refuses (the task stays pending/QUEUED, never a silent drop — the
+    T-0237 S4 contract) once live sessions reach the effective limit, and the
+    message distinguishes a hard-cap refusal from a backoff (pressure) refusal.
     """
+    from bot_squad_worker import backoff as _backoff
+
     cap = _read_caps(_caps_config_dir(cfg))["max_parallel_sessions"]
-    if cap <= 0:
-        return
+    effective = _backoff.effective_limit(cfg)  # already clamped to the ceiling
     live = _count_live_sessions(cfg)
-    if live >= cap:
-        from bot_squad_worker.actions import ActionError
+    if live < effective:
+        return
+    from bot_squad_worker.actions import ActionError
+    if cap > 0 and effective >= cap:
         raise ActionError(
             f"spawn: capacity reached — {live}/{cap} parallel sessions live "
             f"(max_parallel_sessions cap); spawn refused, task stays pending"
         )
+    raise ActionError(
+        f"spawn: backoff — {live}/{effective} effective concurrency "
+        f"(rate-limit/usage-limit pressure; hard cap={cap or 'unlimited'}); "
+        f"spawn refused, task stays QUEUED, retry on ramp-up"
+    )
 
 
 def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:

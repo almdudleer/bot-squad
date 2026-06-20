@@ -14,6 +14,7 @@ from bot_squad_worker.jobs import (
     autopilot_tick,
     autoupdate_apply_tick,
     autoupdate_tick,
+    backoff_tick,
     binding_gc_tick,
     constant_team_tick,
     deploy_monitor_one,
@@ -219,6 +220,21 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="tg_stall",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # backoff_tick: WS-4 S2 (T-0249) — run-survival parallelism governor. 30s
+    # (faster than the 60s telemetry sampler) so we react within ~half a sample
+    # to Claude rate-limit / 5h-usage-limit pressure. No-op under
+    # BOT_SQUAD_BACKOFF=0. Self-contained AIMD step; max_instances=1.
+    sched.add_job(
+        backoff_tick,
+        "interval",
+        seconds=30,
+        args=[cfg],
+        id="backoff",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

@@ -442,6 +442,23 @@ def tg_stall_tick(cfg: Config) -> None:
         log.exception("tg_stall_tick error")
 
 
+def backoff_tick(cfg: Config) -> None:
+    """WS-4 S2 (T-0249): run-survival parallelism-backoff governor.
+
+    One AIMD step every 30s — depresses effective concurrency under Claude
+    rate-limit / 5h-usage-limit pressure (``detector.session_pressure``) and
+    ramps back toward the cap when clear. ``effective_limit`` is consulted at
+    spawn admission (T-0250). No-op under ``BOT_SQUAD_BACKOFF=0``. The governor
+    step never raises, but wrap it here too so one bad sweep never kills the
+    scheduler.
+    """
+    from bot_squad_worker import backoff as _backoff
+    try:
+        _backoff.backoff_tick(cfg)
+    except Exception:
+        log.exception("backoff_tick error")
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

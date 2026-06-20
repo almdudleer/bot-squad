@@ -157,6 +157,22 @@ def test_list_global_users_seed_is_idempotent(tmp_bot_squad: Path, monkeypatch):
     assert len(rows) == 1
 
 
+def test_list_global_users_attaches_seeded_users_to_self_server(
+    tmp_bot_squad: Path, monkeypatch
+):
+    """T-0317: a seeded local user is attached to the mothership's OWN server,
+    so the directory's ``attached_servers`` count is a real, meaningful number
+    (>=1) instead of a bare 0 / permanent em-dash. The operator shows as
+    attached to THIS server — the column reflects reality once T-0313 seeds it.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        users = client.get("/api/m/users").json()
+    by_name = {u["username"]: u for u in users}
+    assert "testuser" in by_name, f"expected seeded operator, got {users}"
+    assert by_name["testuser"]["attached_servers"] >= 1
+
+
 def test_self_register_is_idempotent_across_reboots(tmp_bot_squad: Path, monkeypatch):
     """Booting the app twice against the same DATA_DIR yields one self entry,
     not two. Dedup is by ``base_url`` (trailing-slash insensitive)."""

@@ -235,16 +235,31 @@ def _seed_local_users(request: Request) -> None:
     idempotent: an already-established GlobalUser (e.g. one created via
     ``/attach`` with its own password hash) is returned unchanged, never
     clobbered.
+
+    T-0317: each seeded user is also attached to the mothership's OWN
+    (``is_self``) server so the directory's ``attached_servers`` count is a
+    real, meaningful number (the operator IS attached to this server) rather
+    than a bare 0 / permanent em-dash. Both upserts are idempotent, so
+    repeated reads neither duplicate nor clobber.
     """
     cfg = request.app.state.auth_config
     store = _users_store(request)
+    self_server = next(
+        (s for s in _store(request).list_servers() if s.is_self), None
+    )
     for username, password_hash in cfg.users.items():
         meta = cfg.meta_for(username)
-        store.upsert_user_by_username(
+        gu, _ = store.upsert_user_by_username(
             username=username,
             password_hash=password_hash,
             is_super_admin=meta.is_admin,
         )
+        if self_server is not None:
+            store.upsert_attachment(
+                global_user_id=gu.id,
+                server_id=self_server.id,
+                server_username=username,
+            )
 
 
 @router.get("/users", dependencies=[Depends(_require_super_admin)])

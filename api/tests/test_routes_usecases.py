@@ -172,3 +172,97 @@ def test_delete_use_case_cascades_flows(tmp_bot_squad: Path, monkeypatch):
     uc_root = tmp_bot_squad / "data" / "test-project" / "use_cases"
     assert not (uc_root / f"{uc_id}.md").exists()
     assert not (uc_root / uc_id).exists()
+
+
+# ---------------------------------------------------------------------------
+# T-0283 Pillar-C: use-cases as nestable cross-store artifacts.
+# ---------------------------------------------------------------------------
+def _new_doc(c, title="Mother", category="design", parent=None):
+    body = {"category": category, "title": title}
+    if parent is not None:
+        body["parent_doc_id"] = parent
+    return c.post("/api/projects/test-project/docs", json=body).json()["id"]
+
+
+def _new_uc(c, title="UC", parent=None):
+    body = {"title": title}
+    if parent is not None:
+        body["parent_doc_id"] = parent
+    return c.post("/api/projects/test-project/use_cases", json=body).json()["id"]
+
+
+def test_get_use_case_exposes_kind_and_parent(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    uc = _new_uc(c)
+    got = c.get(f"/api/projects/test-project/use_cases/{uc}").json()
+    assert got["kind"] == "use_case"
+    assert got["parent_doc_id"] is None
+    assert got["child_artifact_ids"] == []
+
+
+def test_create_use_case_with_parent_persists(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    mother = _new_doc(c, title="Theme")
+    uc = _new_uc(c, parent=mother)
+    got = c.get(f"/api/projects/test-project/use_cases/{uc}").json()
+    assert got["parent_doc_id"] == mother
+
+
+def test_create_use_case_unknown_parent_404(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    r = c.post(
+        "/api/projects/test-project/use_cases",
+        json={"title": "Orphan", "parent_doc_id": "D-9999"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_use_case_children_cross_store(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    uc = _new_uc(c, title="Mother UC")
+    child_doc = _new_doc(c, title="Insight", parent=uc)
+    child_uc = _new_uc(c, title="Sub UC", parent=uc)
+    kids = c.get(f"/api/projects/test-project/use_cases/{uc}/children").json()
+    got = {(k["id"], k["kind"]) for k in kids}
+    assert got == {(child_doc, "doc"), (child_uc, "use_case")}
+    # mother's own GET surfaces the child ids too
+    parent_view = c.get(f"/api/projects/test-project/use_cases/{uc}").json()
+    assert set(parent_view["child_artifact_ids"]) == {child_doc, child_uc}
+
+
+def test_set_use_case_parent_then_clear(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    mother = _new_doc(c, title="M")
+    uc = _new_uc(c)
+    r = c.put(
+        f"/api/projects/test-project/use_cases/{uc}/parent",
+        json={"parent_doc_id": mother},
+    )
+    assert r.status_code == 200, r.text
+    assert c.get(f"/api/projects/test-project/use_cases/{uc}").json()["parent_doc_id"] == mother
+    # clear
+    c.put(f"/api/projects/test-project/use_cases/{uc}/parent", json={"parent_doc_id": None})
+    assert c.get(f"/api/projects/test-project/use_cases/{uc}").json()["parent_doc_id"] is None
+
+
+def test_set_use_case_parent_cycle_rejected(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    a = _new_uc(c, title="A")
+    b = _new_uc(c, title="B", parent=a)  # B under A
+    # Making A's parent B would close A->B->A.
+    r = c.put(
+        f"/api/projects/test-project/use_cases/{a}/parent",
+        json={"parent_doc_id": b},
+    )
+    assert r.status_code == 400, r.text
+    assert "cycle" in r.text.lower()
+
+
+def test_set_use_case_parent_unknown_404(tmp_bot_squad, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    uc = _new_uc(c)
+    r = c.put(
+        f"/api/projects/test-project/use_cases/{uc}/parent",
+        json={"parent_doc_id": "UC-9999"},
+    )
+    assert r.status_code == 404, r.text

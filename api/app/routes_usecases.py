@@ -18,6 +18,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app import artifact_nesting as AN
 from app.routes_auth import require_auth
 from app.worker_client import WorkerError
 
@@ -37,6 +38,14 @@ def _uc_dir(request: Request, slug: str) -> Path:
     if cfg.project(slug) is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
     return cfg.project_data_dir(slug) / "use_cases"
+
+
+def _project_root(request: Request, slug: str) -> Path:
+    """Project data dir — the root the cross-store artifact_nesting walks."""
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    return cfg.project_data_dir(slug)
 
 
 def _validate_id(uc_id: str) -> None:
@@ -85,7 +94,16 @@ def get_use_case(slug: str, uc_id: str, request: Request) -> dict:
     path = _uc_dir(request, slug) / f"{uc_id}.md"
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"use case not found: {uc_id}")
-    return _parse(path)
+    out = _parse(path)
+    # T-0283: surface the nestable-artifact shape (kind so the FE can render a
+    # node's own type without a second lookup; parent + child ids for the tree).
+    out["kind"] = AN.KIND_USE_CASE
+    parent = out.get("parent_doc_id")
+    out["parent_doc_id"] = str(parent).strip() if parent else None
+    out["child_artifact_ids"] = [
+        c["id"] for c in AN.children_of(_project_root(request, slug), uc_id)
+    ]
+    return out
 
 
 class PutUseCase(BaseModel):
@@ -94,6 +112,7 @@ class PutUseCase(BaseModel):
 
 class NewUseCase(BaseModel):
     title: str
+    parent_doc_id: str | None = None
 
 
 @router.post("")
@@ -116,12 +135,22 @@ def create_use_case(slug: str, request: Request, body: NewUseCase,
     cfg = request.app.state.api_config
     if cfg.project(slug) is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+
+    # T-0283: an optional mother artifact (any store) this UC nests under. The
+    # parent must already exist; a freshly-allocated id can't be its own parent
+    # so there's no cycle to check at create time.
+    parent_doc_id = (body.parent_doc_id or "").strip() or None
+    if parent_doc_id is not None and AN.find_artifact(
+        _project_root(request, slug), parent_doc_id
+    ) is None:
+        raise HTTPException(status_code=404, detail=f"parent artifact not found: {parent_doc_id}")
+
     uc_id = idalloc.allocate_id(cfg.data_dir, slug, "uc")
 
     d = _uc_dir(request, slug)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{uc_id}.md"
-    fm = "\n".join([
+    fm_lines = [
         f"id: {uc_id}",
         f"title: {json.dumps(title, ensure_ascii=False)}",
         "user_persona: TBD",
@@ -130,7 +159,10 @@ def create_use_case(slug: str, request: Request, body: NewUseCase,
         "success_criteria: TBD",
         "related_tickets: []",
         "status: draft",
-    ])
+    ]
+    if parent_doc_id is not None:
+        fm_lines.append(f"parent_doc_id: {parent_doc_id}")
+    fm = "\n".join(fm_lines)
     content = f"---\n{fm}\n---\n\n# {title}\n\n## Steps\n\n1. TBD\n\n## Feedback\n\n"
     tmp = path.with_suffix(".md.tmp")
     tmp.write_text(content, encoding="utf-8")
@@ -180,6 +212,45 @@ def delete_use_case(slug: str, uc_id: str, request: Request,
     if owned_dir.is_dir():
         shutil.rmtree(owned_dir)
     return {"ok": True, "id": uc_id, "deleted": True}
+
+
+@router.get("/{uc_id}/children")
+def get_use_case_children(slug: str, uc_id: str, request: Request) -> list[dict]:
+    """Cross-store children of a mother use-case (T-0283): every artifact
+    (doc / use-case / feedback) whose ``parent_doc_id`` points at this UC."""
+    _validate_id(uc_id)
+    return AN.children_of(_project_root(request, slug), uc_id)
+
+
+class SetParent(BaseModel):
+    parent_doc_id: str | None = None
+
+
+@router.put("/{uc_id}/parent")
+def set_use_case_parent(slug: str, uc_id: str, request: Request, body: SetParent,
+                        user: dict = Depends(require_auth)) -> dict:
+    """Re-parent (adopt) or clear the parent (disown) of a use-case across the
+    artifact stores (T-0283). Cycle-safe via the shared ancestry walk."""
+    _validate_id(uc_id)
+    root = _project_root(request, slug)
+    ref = AN.find_artifact(root, uc_id)
+    if ref is None or ref.kind != AN.KIND_USE_CASE:
+        raise HTTPException(status_code=404, detail=f"use case not found: {uc_id}")
+
+    new_parent = (body.parent_doc_id or "").strip() or None
+    if new_parent is not None:
+        if new_parent == uc_id:
+            raise HTTPException(status_code=400, detail="a use case cannot be its own parent")
+        if AN.find_artifact(root, new_parent) is None:
+            raise HTTPException(status_code=404, detail=f"parent artifact not found: {new_parent}")
+        if AN.would_cycle(root, uc_id, new_parent):
+            raise HTTPException(
+                status_code=400,
+                detail=f"refusing to set parent {new_parent}: would create a cycle",
+            )
+
+    AN.set_parent(ref, new_parent)
+    return {"ok": True, "id": uc_id, "parent_doc_id": new_parent}
 
 
 def _section(body: str, heading: str) -> str:

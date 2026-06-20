@@ -28,6 +28,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app import artifact_nesting as AN
 from app.routes_auth import require_auth
 
 router = APIRouter(
@@ -58,6 +59,14 @@ def _docs_dir(request: Request, slug: str) -> Path:
     if cfg.project(slug) is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
     return cfg.project_data_dir(slug) / "docs"
+
+
+def _project_root(request: Request, slug: str) -> Path:
+    """Project data dir — the root the cross-store artifact_nesting walks."""
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    return cfg.project_data_dir(slug)
 
 
 def _backlog_dir(request: Request, slug: str) -> Path:
@@ -272,16 +281,17 @@ def create_doc(slug: str, request: Request, body: NewDoc,
     if cfg.project(slug) is None:
         raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
 
-    # T-0234: an optional mother doc the new child attaches under. The parent
-    # must already exist (an explicit relationship); a freshly-allocated child
-    # can never be its own parent, so there's no cycle to check here.
+    # T-0234/T-0283: an optional mother artifact the new child attaches under.
+    # The parent must already exist (explicit relationship) but may live in ANY
+    # store (doc / use-case / feedback) — the unified nestable model. A
+    # freshly-allocated child can't be its own parent, so no cycle check here.
     parent_doc_id = (body.parent_doc_id or "").strip() or None
-    if parent_doc_id is not None:
-        _validate_doc_id(parent_doc_id)
-        if _find_doc(_docs_dir(request, slug), parent_doc_id) is None:
-            raise HTTPException(
-                status_code=404, detail=f"parent doc not found: {parent_doc_id}"
-            )
+    if parent_doc_id is not None and AN.find_artifact(
+        _project_root(request, slug), parent_doc_id
+    ) is None:
+        raise HTTPException(
+            status_code=404, detail=f"parent artifact not found: {parent_doc_id}"
+        )
 
     cdir = _docs_dir(request, slug) / category
     cdir.mkdir(parents=True, exist_ok=True)

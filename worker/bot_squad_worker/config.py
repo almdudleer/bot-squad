@@ -30,6 +30,9 @@ class Project:
     # set, non-prod deploys run from here instead of the shared dev clone, so
     # dev-tree dirtiness stops gating deploys. None → legacy in-place behaviour.
     repo_deploy: Path | None = None
+    # T-0296: the mother dir that owns the dev+master clones (for the clones
+    # read-model's "workspace present ✓/✗"). Mirrors the API config field.
+    repo_workspace: Path | None = None
     # T-0184: per-project opt-in to the drift-check tick (T-0149). The worker is
     # multi-project, so an unconditional sweep nags dev sessions in EVERY project
     # — a signal-tracker dev once got a bot-squad-style drift nag for an unrelated
@@ -93,6 +96,7 @@ class Project:
             ),
             repo_master=Path(raw["repo_master"]) if raw.get("repo_master") else None,
             repo_deploy=Path(raw["repo_deploy"]) if raw.get("repo_deploy") else None,
+            repo_workspace=Path(raw["repo_workspace"]) if raw.get("repo_workspace") else None,
             drift_enforcement=bool(raw.get("drift_enforcement", False)),
         )
 

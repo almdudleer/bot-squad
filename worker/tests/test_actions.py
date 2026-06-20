@@ -48,6 +48,8 @@ def test_registry_lists_only_allowed_actions():
     # Phase 1 message bus adds peer_send, peer_inbox_read, peer_inbox_wait.
     assert set(ACTION_REGISTRY.keys()) == {
         "noop", "tg_verify_login", "tg_notify", "deploy",
+        # T-0296: per-project clone health read-model + ff-only pull-master.
+        "clone_status", "pull_master",
         # T-0155: stall-watchdog marker clear (UserPromptSubmit hook).
         "tg_stall_clear",
         "pause_deploys", "resume_deploys",

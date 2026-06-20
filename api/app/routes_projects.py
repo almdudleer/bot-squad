@@ -638,6 +638,45 @@ async def queue_deploy(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/{slug}/clones")
+async def get_clones(slug: str, request: Request, user: dict = Depends(require_auth)) -> dict:
+    """Clone health read-model for a project (T-0296, "Installation != Project").
+
+    Proxies the worker's ``clone_status`` action — the worker, not the API,
+    can run git on the on-host clones (the API container mounts only its own
+    data dirs). Read-only; any authed user may view."""
+    cfg: ApiConfig = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    client = request.app.state.worker_router.coordinator()
+    try:
+        return await client.call_action("clone_status", {"slug": slug}, timeout=30.0)
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/{slug}/clones/pull-master")
+async def post_pull_master(
+    slug: str, request: Request, admin: dict = Depends(require_admin)
+) -> dict:
+    """Fast-forward the prod (master) clone to origin (T-0296).
+
+    Admin-gated (server admin — not cross-server god-mode). Proxies the
+    worker's ``pull_master`` action, which does a fetch + ``merge --ff-only``
+    so a diverged/dirty prod clone is refused, not rewritten."""
+    cfg: ApiConfig = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    requested_by = (admin.get("username") if isinstance(admin, dict) else None) or "api"
+    client = request.app.state.worker_router.coordinator()
+    try:
+        return await client.call_action(
+            "pull_master", {"slug": slug, "requested_by": requested_by}, timeout=60.0
+        )
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.get("/{slug}/repo-agents-md")
 def get_repo_agents_md(slug: str, request: Request) -> dict:
     cfg = request.app.state.api_config

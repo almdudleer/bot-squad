@@ -348,6 +348,51 @@ def _action_tg_stall_clear(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "cleared": cleared}
 
 
+_CLONE_STATUS_REQUIRED = {"slug"}
+_CLONE_STATUS_ALLOWED = _CLONE_STATUS_REQUIRED
+
+
+def _action_clone_status(params: dict[str, Any]) -> dict[str, Any]:
+    """Read-only clone health for a project (T-0296). Logic in clones.py.
+
+    Required: slug. Returns the read-model (dev/prod present/branch/ahead-
+    behind/clean + workspace + last-deploy)."""
+    extra = set(params) - _CLONE_STATUS_ALLOWED
+    if extra:
+        raise ActionError(f"clone_status got unexpected params: {sorted(extra)}")
+    missing = _CLONE_STATUS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"clone_status missing required params: {sorted(missing)}")
+    from bot_squad_worker import clones as _clones
+    try:
+        return _clones.clone_status(_get_config(), params["slug"])
+    except KeyError:
+        raise ActionError(f"clone_status: unknown project slug {params['slug']!r}")
+
+
+_PULL_MASTER_REQUIRED = {"slug", "requested_by"}
+_PULL_MASTER_ALLOWED = _PULL_MASTER_REQUIRED
+
+
+def _action_pull_master(params: dict[str, Any]) -> dict[str, Any]:
+    """Fast-forward a project's prod (master) clone to origin (T-0296).
+
+    Admin-gated at the API edge. Required: slug, requested_by. Returns
+    ``{ok, detail, from_sha?, to_sha?}`` — never raises on a refused ff
+    (diverged/dirty prod), only on an unknown slug / bad params."""
+    extra = set(params) - _PULL_MASTER_ALLOWED
+    if extra:
+        raise ActionError(f"pull_master got unexpected params: {sorted(extra)}")
+    missing = _PULL_MASTER_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"pull_master missing required params: {sorted(missing)}")
+    from bot_squad_worker import clones as _clones
+    try:
+        return _clones.pull_master(_get_config(), params["slug"])
+    except KeyError:
+        raise ActionError(f"pull_master: unknown project slug {params['slug']!r}")
+
+
 _DEPLOY_REQUIRED = {"slug", "target", "reason", "requested_by"}
 # restart_worker (T-0181, optional): opt the deploy into a post-sync worker
 # restart — see deploy.enqueue. Default OFF; the agent sets it only when the
@@ -2124,6 +2169,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "max_notify": _action_max_notify,
     "tg_stall_clear": _action_tg_stall_clear,
     "deploy": _action_deploy,
+    "clone_status": _action_clone_status,
+    "pull_master": _action_pull_master,
     "pause_deploys": _action_pause_deploys,
     "resume_deploys": _action_resume_deploys,
     "list_sessions": _action_list_sessions,

@@ -1338,3 +1338,94 @@ def test_test_project_tg_pings_worker_with_slug(
     assert r.json()["ok"] is True
     # Worker resolves chat+topic from the slug, so the action carries the slug.
     assert fake_worker_tg_notify[-1]["slug"] == "test-project"
+
+
+# ---------------------------------------------------------------------------
+# T-0296 — GET /projects/{slug}/clones + POST /clones/pull-master
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def fake_worker_clones(tmp_bot_squad: Path):
+    """Fake worker recording clone_status + pull_master calls."""
+    sock = tmp_bot_squad / "data" / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    calls: dict[str, list] = {"clone_status": [], "pull_master": []}
+    fake = FastAPI()
+
+    @fake.post("/actions/clone_status")
+    def clone_status(params: dict | None = None) -> dict:
+        calls["clone_status"].append(params or {})
+        return {"slug": (params or {}).get("slug"), "dev": {"present": True},
+                "prod": {"configured": False}, "last_deploy": None}
+
+    @fake.post("/actions/pull_master")
+    def pull_master(params: dict | None = None) -> dict:
+        calls["pull_master"].append(params or {})
+        return {"ok": True, "detail": "prod clone fast-forwarded to origin/master",
+                "from_sha": "aaa", "to_sha": "bbb"}
+
+    config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(50):
+        if sock.exists():
+            break
+        time.sleep(0.05)
+    yield sock, calls
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def _make_nonadmin(tmp_bot_squad: Path) -> None:
+    """Rewrite auth.toml so testuser is NOT a server admin."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+
+
+def test_get_clones_proxies_worker(tmp_bot_squad, monkeypatch, fake_worker_clones):
+    _, calls = fake_worker_clones
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.get("/api/projects/test-project/clones")
+    assert r.status_code == 200, r.text
+    assert r.json()["dev"] == {"present": True}
+    assert calls["clone_status"] == [{"slug": "test-project"}]
+
+
+def test_get_clones_requires_auth(tmp_bot_squad, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/clones")
+    assert r.status_code == 401
+
+
+def test_get_clones_unknown_slug_404(tmp_bot_squad, monkeypatch, fake_worker_clones):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.get("/api/projects/nope/clones")
+    assert r.status_code == 404
+
+
+def test_pull_master_admin_proxies_worker(tmp_bot_squad, monkeypatch, fake_worker_clones):
+    _, calls = fake_worker_clones
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)  # conftest testuser is_admin=true
+        r = client.post("/api/projects/test-project/clones/pull-master")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+    assert calls["pull_master"] == [{"slug": "test-project", "requested_by": "testuser"}]
+
+
+def test_pull_master_requires_admin(tmp_bot_squad, monkeypatch, fake_worker_clones):
+    _make_nonadmin(tmp_bot_squad)
+    _, calls = fake_worker_clones
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.post("/api/projects/test-project/clones/pull-master")
+    assert r.status_code == 403, r.text
+    assert calls["pull_master"] == []  # gate blocks before the worker call

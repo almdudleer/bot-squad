@@ -331,13 +331,28 @@ export function Shell() {
         {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
           <>
             <div className="mc-sidebar-divider" aria-hidden="true" />
-            <ul className="mc-sidebar-nav">
+            {/* T-0318: MOTHERSHIP is now a subsection header (matching the
+                Agents pattern) with its primary destinations as nested rows.
+                T-0170 had collapsed this to a SINGLE link → /m/users, which
+                buried Releases + Global-users two clicks deep behind inline
+                links on the users page. Both are now ≤1 click from the
+                sidebar. */}
+            <div className="mc-sidebar-subsection">Mothership</div>
+            <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
               <li>
                 <NavLink
                   to="/m/users"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  MOTHERSHIP
+                  GLOBAL USERS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to="/m/releases"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  RELEASES
                 </NavLink>
               </li>
             </ul>

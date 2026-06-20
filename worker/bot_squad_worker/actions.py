@@ -603,6 +603,7 @@ _SPAWN_SESSION_REQUIRED = {"slug", "window"}
 # the worker stamps it into the new session md so the tree survives a restart.
 _SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {
     "initial_prompt", "task_id", "initiative", "owner", "parent_sid",
+    "owner_user",  # T-0321: per-user-scoping username
 }
 
 
@@ -631,6 +632,7 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         initiative=params.get("initiative"),
         owner=params.get("owner"),
         parent_sid=params.get("parent_sid"),
+        owner_user=params.get("owner_user"),
     )
 
 

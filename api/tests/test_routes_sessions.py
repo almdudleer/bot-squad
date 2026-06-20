@@ -730,7 +730,7 @@ def test_spawn_routes_to_callers_linux_user(
 
 
 def _write_session_md_full(tmp_bot_squad: Path, sid: str, *, owner: str = "",
-                           status: str = "active") -> None:
+                           status: str = "active", owner_user: str = "") -> None:
     """Drop an owner-stamped session md for the list-filter tests."""
     p = tmp_bot_squad / "data" / "test-project" / "sessions" / f"{sid}.md"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -745,8 +745,106 @@ def _write_session_md_full(tmp_bot_squad: Path, sid: str, *, owner: str = "",
     ]
     if owner:
         parts.append(f"owner: {owner}")
+    if owner_user:
+        parts.append(f"owner_user: {owner_user}")
     parts.extend(["---", ""])
     p.write_text("\n".join(parts))
+
+
+def _auth_aqice_nonadmin(tmp_bot_squad: Path) -> None:
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'aqice = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.aqice]\n'
+        'linux_user = "aqice"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+
+
+def test_pause_owner_user_wins_authoritative(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """T-0321 invariant 1: owner_user is the authoritative scoping match.
+
+    owner is the constant-team SENTINEL, but owner_user=aqice → aqice (non-admin)
+    can pause it. This is exactly the case the old owner-only scoping broke.
+    """
+    sid = "S-almdudleer-feature-p97"
+    _write_session_md_full(tmp_bot_squad, sid, owner="constant-team",
+                           owner_user="aqice")
+    _auth_aqice_nonadmin(tmp_bot_squad)
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(fake_worker_sessions))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    client = TestClient(build_app())
+    client.post("/api/auth/login", json={"username": "aqice", "password": "test"})
+    r = client.post(f"/api/projects/test-project/sessions/{sid}/pause")
+    assert r.status_code == 200, r.text
+
+
+def test_pause_other_owner_user_blocked(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """T-0321 invariant 1: owner_user belonging to someone else → 403 (even if
+    the legacy owner field would have matched the caller)."""
+    sid = "S-almdudleer-feature-p96"
+    _write_session_md_full(tmp_bot_squad, sid, owner="aqice", owner_user="alexey")
+    _auth_aqice_nonadmin(tmp_bot_squad)
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(fake_worker_sessions))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("COOKIE_SECURE", "0")
+    client = TestClient(build_app())
+    client.post("/api/auth/login", json={"username": "aqice", "password": "test"})
+    r = client.post(f"/api/projects/test-project/sessions/{sid}/pause")
+    assert r.status_code == 403, r.text
+    assert "owned by" in r.json()["detail"]
+
+
+def test_spawn_forwards_owner_user_to_worker(tmp_bot_squad: Path, monkeypatch):
+    """T-0321: spawning forwards owner_user (= caller username) to the worker."""
+    import threading
+    import time as _time
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    coord_sock = sock_dir / "worker.sock"
+
+    captured: list[dict] = []
+    app = FastAPI()
+
+    @app.post("/actions/spawn_session")
+    def spawn(params: dict | None = None) -> dict:
+        captured.append(params or {})
+        return {"ok": True, "sid": "S-x-y-p1"}
+
+    cfg = uvicorn.Config(app, uds=str(coord_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if coord_sock.exists():
+            break
+        _time.sleep(0.05)
+    try:
+        with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
+            r = client.post(
+                "/api/projects/test-project/sessions",
+                json={"window": "feature-x"},
+            )
+        assert r.status_code == 200, r.text
+        assert captured, "worker spawn_session was not called"
+        assert captured[0].get("owner_user") == "testuser"
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
 
 
 def test_spawn_forwards_owner_to_worker(tmp_bot_squad: Path, monkeypatch):

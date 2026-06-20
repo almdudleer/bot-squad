@@ -74,6 +74,34 @@ def _read_session_owner(data_dir: Path, slug: str, sid: str) -> str | None:
     return str(owner)
 
 
+def _read_session_owner_user(data_dir: Path, slug: str, sid: str) -> str | None:
+    """Read the SessionMd `owner_user:` field — the human UI username for
+    per-user scoping (T-0321), distinct from `owner` (the constant-team/TL-SID
+    binding sentinel). None if no md or no field (legacy → fall back to owner)."""
+    md = data_dir / slug / "sessions" / f"{sid}.md"
+    if not md.exists():
+        return None
+    try:
+        text = md.read_text()
+    except OSError:
+        return None
+    parsed = parse_or_none(text)
+    if parsed is None:
+        return None
+    ou = parsed[0].get("owner_user")
+    if ou is None or ou == "~" or ou == "":
+        return None
+    return str(ou)
+
+
+def _scope_match(owner_user: str | None, owner: str | None, me: str) -> bool:
+    """T-0321: is this session the caller's? ``owner_user`` (the username) is
+    authoritative when set; legacy sessions without it fall back to ``owner``."""
+    if owner_user:
+        return owner_user == me
+    return (owner or "") == me
+
+
 def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter,
                          data_dir: Path | None = None, slug: str | None = None) -> None:
     """Non-admins can only act on SIDs they own.
@@ -85,6 +113,20 @@ def _check_sid_ownership(sid: str, user: dict, router: WorkerRouter,
     """
     if user.get("is_admin"):
         return
+    # (0) T-0321: owner_user (the dedicated per-user-scoping username) is the
+    # authoritative match when present. Sessions stamped before T-0321 have no
+    # owner_user → fall through to the legacy `owner`-based checks below so
+    # nothing locks out.
+    if data_dir is not None and slug:
+        owner_user = _read_session_owner_user(data_dir, slug, sid)
+        if owner_user is not None:
+            if owner_user == user.get("username"):
+                return
+            raise HTTPException(
+                status_code=403,
+                detail=f"session {sid!r} is owned by {owner_user!r}; "
+                       f"you are {user.get('username')!r}",
+            )
     # (1) SessionMd owner field — authoritative when set.
     if data_dir is not None and slug:
         md_owner = _read_session_owner(data_dir, slug, sid)
@@ -188,7 +230,7 @@ async def list_sessions(
     # Non-admin: drop rows whose owner doesn't match. Missing owner
     # (legacy session) = admin-only. The worker emits "" for missing.
     me = user.get("username") or ""
-    return [r for r in rows if (r.get("owner") or "") == me]
+    return [r for r in rows if _scope_match(r.get("owner_user"), r.get("owner"), me)]
 
 
 @dev_spawn_router.get("/telemetry")
@@ -228,7 +270,11 @@ async def get_telemetry(
     me = user.get("username") or ""
     visible = [
         s for s in sessions
-        if (_read_session_owner(data_dir, slug, s.get("sid", "")) or "") == me
+        if _scope_match(
+            _read_session_owner_user(data_dir, slug, s.get("sid", "")),
+            _read_session_owner(data_dir, slug, s.get("sid", "")),
+            me,
+        )
     ]
     return {"sessions": visible, "quota": quota}
 
@@ -373,6 +419,10 @@ async def spawn_session(
         "slug": slug,
         "window": body.window,
         "owner": user["username"],
+        # T-0321: dedicated per-user-scoping username (owner stays for the
+        # constant-team/binding sentinel; for a direct UI spawn both are the
+        # caller's username).
+        "owner_user": user["username"],
     }
     if body.initial_prompt:
         params["initial_prompt"] = body.initial_prompt

@@ -1647,6 +1647,12 @@ def spawn(
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"spawn: unknown project slug {slug!r}")
 
+    # T-0321: when the caller didn't pass an explicit owner_user (the human
+    # scoping username), derive it from `owner` — so TL-spawned devs and
+    # constant-team sessions still scope to a real user, not the sentinel.
+    if owner_user is None:
+        owner_user = _derive_owner_user(cfg, slug, owner)
+
     # T-0239: enforce the user-set parallel-sessions cap BEFORE any spawn side
     # effect (the task_id marker, tmux session, pane). At/over cap is a
     # capacity-reached refusal so the task stays pending, never a silent drop.
@@ -2081,6 +2087,40 @@ def _enforce_token_cap(cfg: Any) -> None:
             f"quota period (max_total_tokens cap); spawn refused, task stays "
             f"pending until the budget resets (re-anchor)"
         )
+
+
+def _coordinator_user(cfg: Any) -> str:
+    """The configured coordinator UI username (``[admin].coordinator_user``)."""
+    path = Path(_caps_config_dir(cfg)) / "system_settings.toml"
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return ""
+    return str((raw.get("admin") or {}).get("coordinator_user", "") or "")
+
+
+def _derive_owner_user(cfg: Any, slug: str, owner: str | None) -> str | None:
+    """T-0321: derive the human per-user-scoping username when no explicit
+    owner_user was passed. ``owner`` is overloaded:
+      * a plain username  → that username;
+      * ``constant-team`` → the coordinator user (system-managed teams);
+      * a TL-SID (``S-…``) → the TL's own human (its md owner_user/owner),
+        resolved one hop (mirrors the T-0135 API-side hop);
+      * anything else / unresolvable → None (legacy → owner-based scoping).
+    """
+    if not owner or owner == "~":
+        return None
+    if owner == "constant-team":
+        return _coordinator_user(cfg) or None
+    if owner.startswith("S-"):
+        meta = _read_session_metadata(_session_file(cfg.data_dir, slug, owner))
+        if meta:
+            cand = meta.get("owner_user") or meta.get("owner")
+            if (cand and cand != "~" and not str(cand).startswith("S-")
+                    and cand != "constant-team"):
+                return str(cand)
+        return None
+    return owner  # already a username
 
 
 def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:

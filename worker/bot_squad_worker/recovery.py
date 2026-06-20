@@ -100,7 +100,8 @@ def _gather(cfg: Any) -> list[dict]:
             meta = _read_session_metadata(md)
             if not meta or str(meta.get("archived", "")).lower() == "true":
                 continue
-            role = meta.get("role") or _derive_role(meta)
+            role = meta.get("role") or _derive_role(
+                meta.get("window"), meta.get("task_id"), meta.get("initiative"))
             if role != "dev":
                 continue
             task_id = meta.get("task_id")

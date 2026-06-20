@@ -88,6 +88,34 @@ def test_tick_noop_when_disabled(monkeypatch, tmp_path):
     assert out["enabled"] is False
 
 
+def test_gather_derives_role_from_window_and_reads_status(monkeypatch, tmp_path):
+    """Integration: _gather must call _derive_role with the real (window,
+    task_id, initiative) signature and read live status — the mock-based tick
+    tests don't exercise this path."""
+    from bot_squad_worker import recovery as R
+    from bot_squad_worker import sessions as S
+    cfg = _cfg(tmp_path)
+    sess = tmp_path / "data" / "p1" / "sessions"
+    sess.mkdir(parents=True)
+    backlog = tmp_path / "data" / "p1" / "backlog"
+    backlog.mkdir(parents=True)
+    # a marker-less window → dev; bound to an in_progress task; dead pane
+    S._write_session_metadata(sess / "S-u-feat-p9.md", {
+        "sid": "S-u-feat-p9", "status": "active", "window": "feat",
+        "task_id": "T-1", "initiative": "~", "pane_id": "%9"})
+    (backlog / "T-1-feature.md").write_text(
+        "---\nid: T-1\nstatus: in_progress\n---\n# feature\n")
+    monkeypatch.setattr("bot_squad_worker.autonomous.pane_alive", lambda p: False)
+
+    rows = R._gather(cfg)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["role"] == "dev"
+    assert row["pane_live"] is False
+    assert row["task_status"] == "in_progress"
+    assert row["task_id"] == "T-1"
+
+
 def test_tick_routes_respawn_then_park(monkeypatch, tmp_path):
     monkeypatch.setenv("BOT_SQUAD_RECOVERY", "1")
     monkeypatch.setenv("BOT_SQUAD_RESPAWN_MAX", "1")

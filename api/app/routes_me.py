@@ -593,8 +593,10 @@ def get_notifications_resolved(
 async def test_project_tg_chat_id(
     slug: str, request: Request, user: dict = Depends(require_auth)
 ) -> dict:
-    """Ping the RESOLVED chat for this (user, self-server, project). Works today
-    for users with a server/global binding (project override is stubbed)."""
+    """Ping the RESOLVED chat for this (user, self-server, project): the
+    effective chat under the project -> server -> global precedence. The
+    per-project personal override is persisted (T-0218 follow-up) and wins
+    when set, so the ping targets it."""
     resolved = _resolve_notification(request, user, "self", slug)
     chat_id = (resolved["effective"]["tg_chat_id"] or "").strip()
     if not chat_id:

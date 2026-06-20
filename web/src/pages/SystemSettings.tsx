@@ -98,8 +98,12 @@ export function SystemSettings() {
     parallelNum === null
       ? null
       : capSoftWarning(parallelNum, PARALLEL_SESSION_CEILING, "Max parallel sessions");
-  // T-0308: the token meter is a LIFETIME cumulative counter — flag exhaustion.
-  const tokensExhausted =
+  // T-0306: the token cap is enforced at spawn-time as a per-quota-period budget
+  // (output since the last anchor) that FREES on re-anchor. The meter below sums
+  // the LIFETIME cumulative counter — the only token figure the telemetry API
+  // exposes to the FE today — so treat over-cap here as "at/over the budget"
+  // (an upper bound on the per-period figure the cap actually checks).
+  const tokensOverCap =
     util !== null && tokensNum !== null && isOverCap(util.totalTokens, tokensNum);
 
   function load() {
@@ -459,7 +463,8 @@ export function SystemSettings() {
           {/* T-0240: resource caps — Task-Manager-style view + set of the
               parallel-session / token caps, with live server-wide utilization.
               Caps are admin-settable; the worker enforces them at spawn-time
-              (T-0239 slice 2). 0 = unlimited. */}
+              (parallel: T-0239 slice 2; tokens: T-0306, a per-quota-period budget
+              that frees on anchor reset). 0 = unlimited. */}
           <section className="mb-4" data-testid="resource-caps">
             <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
               Resource caps
@@ -472,29 +477,36 @@ export function SystemSettings() {
                 cap={parallelNum ?? 0}
               />
               <CapMeter
-                label="Total tokens (cumulative output · lifetime)"
+                label="Total tokens (output, cumulative)"
                 used={util ? util.totalTokens : null}
                 cap={tokensNum ?? 0}
               />
-              {/* T-0308: the token figure is a LIFETIME, monotonically-growing
-                  counter — it never resets and has no rolling window. So a
-                  nonzero token cap is a ONE-SHOT lifetime budget: once total
-                  output crosses it, the system stays over-cap until an admin
-                  raises (or clears to 0) the cap. State that plainly. */}
+              {/* T-0306: the token cap IS enforced at spawn-time (commit dd55951,
+                  "semantics B") as a budget for the current quota period — output
+                  tokens since the last [quota] anchor — that FREES when the
+                  operator re-anchors (rebases the baseline). The meter above sums
+                  the LIFETIME cumulative output counter (the only token figure the
+                  telemetry API exposes to the FE today), so it is an upper bound on
+                  the per-period budget the cap actually checks. BE follow-up:
+                  surface the since-anchor output total so the bar matches
+                  enforcement exactly. */}
               <small style={{ display: "block", color: "var(--mc-text-dim)", fontSize: "0.68rem" }}>
-                Token usage is <strong>cumulative since install</strong> — it never
-                resets and has no time window. A nonzero token cap is therefore a
-                one-shot lifetime budget, not a rate limit.
+                The token cap is <strong>enforced at spawn-time</strong> as a budget
+                for the current quota period (output tokens since the last anchor)
+                and <strong>frees when the anchor is reset</strong>. The bar shows
+                lifetime cumulative output — an upper bound on the per-period figure
+                the cap checks.
               </small>
-              {tokensExhausted && (
+              {tokensOverCap && (
                 <div
                   className="alert alert-warning py-1 px-2 mt-2 mb-0"
-                  data-testid="cap-tokens-exhausted"
+                  data-testid="cap-tokens-over"
                   style={{ fontSize: "0.7rem" }}
                 >
-                  ⚠ Lifetime token budget exhausted — cumulative output has passed
-                  the cap. Spawns stay blocked until you raise the cap (or set 0 =
-                  unlimited); there is no automatic reset.
+                  ⚠ Cumulative output has passed the cap. Spawns are refused once
+                  the per-period budget (output since the last anchor) reaches the
+                  cap; the budget frees on the next anchor reset, or raise the cap
+                  (0 = unlimited).
                 </div>
               )}
             </div>
@@ -554,8 +566,9 @@ export function SystemSettings() {
             </div>
             <small style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.35rem" }}>
               <strong>0 = unlimited.</strong> Caps the simultaneously-live sessions
-              and aggregate output tokens the system allows. Enforced at spawn-time;
-              restart the worker after saving.{!isAdmin && " Admin-only."}
+              and the per-quota-period output-token budget the system allows. Both
+              are enforced at spawn-time; the token budget frees on anchor reset.
+              Restart the worker after saving.{!isAdmin && " Admin-only."}
             </small>
           </section>
 

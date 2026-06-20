@@ -31,3 +31,13 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # T-0301: every NEW ticket (created on/after the cutoff, default 2026-06-21,
+      # override BOT_SQUAD_PROVENANCE_CUTOFF) must cite a source via a provenance:
+      # field (corpus:<token> | F-NNNN | T-NNNN | stakeholder:YYYY-MM-DD). Forward-
+      # only: the pre-cutoff backlog is grandfathered. See docs/roadmap/provenance.md.
+      - id: backlog-provenance
+        name: backlog ticket provenance (new tickets cite a source)
+        entry: python3 scripts/lint/backlog_provenance.py
+        language: system
+        pass_filenames: false
+        always_run: true

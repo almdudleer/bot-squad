@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  mothershipApi,
   releasesApi,
   type ReleaseEntry,
   type ReleaseTelemetryRow,
@@ -351,14 +352,25 @@ function CutRelease({
   );
 }
 
+/** Tooltip + label shared by the self-install cells. The mothership never
+ *  consumes its own releases (PART 7 / Ch. II), so a "never"-applied row for
+ *  it is expected — not a stale downstream install. T-0315. */
+const SELF_INSTALL_TITLE =
+  "Mothership self-install — does not consume its own releases (does not auto-update)";
+
 function InstallsGrid({
   rows,
   loading,
   error,
+  selfInstallId,
 }: {
   rows: ReleaseTelemetryRow[] | null;
   loading: boolean;
   error: string | null;
+  /** `id` of the mothership's own self-registered server, matched against
+   *  each telemetry row's `install_id`. `null` until the servers list
+   *  resolves (or if it fails) — in which case rows render as before. */
+  selfInstallId: string | null;
 }) {
   return (
     <section style={{ marginTop: "1.5rem" }}>
@@ -388,44 +400,63 @@ function InstallsGrid({
               </tr>
             </thead>
             <tbody>
-              {rows.map((row) => (
-                <tr key={row.install_id}>
-                  <td style={{ fontFamily: "var(--mc-mono)", fontSize: 13 }}>
-                    {row.install_name || row.install_id}
-                  </td>
-                  <td style={{ fontFamily: "var(--mc-mono)", fontSize: 13 }}>
-                    {row.installed_version ?? (
-                      <span style={{ color: "var(--mc-text-dim)" }}>
-                        never
-                      </span>
-                    )}
-                  </td>
-                  <td>
-                    <OutcomeBadge outcome={row.last_apply_outcome} />
-                  </td>
-                  <td
-                    style={{
-                      fontFamily: "var(--mc-mono)",
-                      fontSize: 12,
-                      color: "var(--mc-text-dim)",
-                    }}
-                  >
-                    {row.last_check_at ? fmtCreatedAt(row.last_check_at) : "—"}
-                  </td>
-                  <td>
-                    <code
+              {rows.map((row) => {
+                const isSelf =
+                  selfInstallId !== null && row.install_id === selfInstallId;
+                return (
+                  <tr key={row.install_id}>
+                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: 13 }}>
+                      {row.install_name || row.install_id}
+                      {isSelf && (
+                        <span
+                          className="mc-badge mc-badge-info"
+                          title={SELF_INSTALL_TITLE}
+                          style={{ marginLeft: "0.5rem" }}
+                        >
+                          self
+                        </span>
+                      )}
+                    </td>
+                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: 13 }}>
+                      {row.installed_version ?? (
+                        <span
+                          style={{ color: "var(--mc-text-dim)" }}
+                          title={isSelf ? SELF_INSTALL_TITLE : undefined}
+                        >
+                          {isSelf ? "n/a" : "never"}
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      <OutcomeBadge
+                        outcome={row.last_apply_outcome}
+                        isSelf={isSelf}
+                      />
+                    </td>
+                    <td
                       style={{
                         fontFamily: "var(--mc-mono)",
                         fontSize: 12,
                         color: "var(--mc-text-dim)",
                       }}
-                      title={row.current_git_sha ?? undefined}
                     >
-                      {shortSha(row.current_git_sha)}
-                    </code>
-                  </td>
-                </tr>
-              ))}
+                      {row.last_check_at ? fmtCreatedAt(row.last_check_at) : "—"}
+                    </td>
+                    <td>
+                      <code
+                        style={{
+                          fontFamily: "var(--mc-mono)",
+                          fontSize: 12,
+                          color: "var(--mc-text-dim)",
+                        }}
+                        title={row.current_git_sha ?? undefined}
+                      >
+                        {shortSha(row.current_git_sha)}
+                      </code>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -434,8 +465,24 @@ function InstallsGrid({
   );
 }
 
-function OutcomeBadge({ outcome }: { outcome: string | null }) {
+function OutcomeBadge({
+  outcome,
+  isSelf = false,
+}: {
+  outcome: string | null;
+  isSelf?: boolean;
+}) {
   if (!outcome || outcome === "never") {
+    // The self-install never applies a release by design, so the bare
+    // "never" badge reads as a stale/broken downstream install (T-0315).
+    // Surface a neutral "self" marker instead.
+    if (isSelf) {
+      return (
+        <span className="mc-badge mc-badge-dim" title={SELF_INSTALL_TITLE}>
+          self
+        </span>
+      );
+    }
     return <span className="mc-badge mc-badge-dim">never</span>;
   }
   if (outcome === "success") {
@@ -457,6 +504,11 @@ export function Releases() {
     null,
   );
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
+  // T-0315: the telemetry rows carry no `is_self` flag, so identify the
+  // mothership's own install by cross-referencing the registry (its self
+  // entry's `id` matches the telemetry `install_id`). A lookup failure just
+  // leaves this null — the grid then renders rows exactly as before.
+  const [selfInstallId, setSelfInstallId] = useState<string | null>(null);
 
   const loadReleases = useCallback(async () => {
     setReleasesError(null);
@@ -478,9 +530,21 @@ export function Releases() {
     }
   }, []);
 
+  const loadSelfInstallId = useCallback(async () => {
+    try {
+      const servers = await mothershipApi.listServers();
+      const self = servers.find((s) => s.is_self);
+      setSelfInstallId(self ? self.id : null);
+    } catch {
+      // Best-effort enrichment only — without it the grid still renders,
+      // it just can't mark the self row distinctly. Don't surface an error.
+      setSelfInstallId(null);
+    }
+  }, []);
+
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadReleases(), loadTelemetry()]);
-  }, [loadReleases, loadTelemetry]);
+    await Promise.all([loadReleases(), loadTelemetry(), loadSelfInstallId()]);
+  }, [loadReleases, loadTelemetry, loadSelfInstallId]);
 
   useEffect(() => {
     refreshAll();
@@ -514,6 +578,7 @@ export function Releases() {
         rows={telemetry}
         loading={telemetry === null && !telemetryError}
         error={telemetryError}
+        selfInstallId={selfInstallId}
       />
     </div>
   );

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, DocSummary, DocDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
+import { Markdown } from "../components/Markdown";
 
 export function Docs() {
   const { slug = "" } = useParams();
@@ -372,7 +373,9 @@ export function Docs() {
                 </div>
               </div>
 
-              <pre className="mc-pre">{detail.raw}</pre>
+              {/* T-0275: render the doc body as markdown (frontmatter stripped,
+                  T-/D- mentions linkified) instead of a raw <pre> dump. */}
+              <Markdown source={detail.raw} slug={slug} />
             </>
           )}
 

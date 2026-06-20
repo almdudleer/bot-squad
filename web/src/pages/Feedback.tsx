@@ -4,6 +4,7 @@ import { api, FeedbackFile } from "../api";
 import { Modal } from "../components/Modal";
 
 import { PageHelp } from "../components/PageHelp";
+import { Markdown } from "../components/Markdown";
 interface EditState {
   name: string;
   draft: string;
@@ -164,7 +165,9 @@ export function Feedback() {
               </div>
             </>
           ) : (
-            <pre className="mc-pre">{f.content}</pre>
+            // T-0275: render feedback body as markdown (frontmatter stripped,
+            // T-/D- mentions linkified) instead of a raw <pre> dump.
+            <Markdown source={f.content} slug={slug} />
           )}
         </section>
       ))}

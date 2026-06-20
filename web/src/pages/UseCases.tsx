@@ -4,6 +4,7 @@ import { api, FlowDetail, FlowSummary, UseCaseSummary, UseCaseDetail } from "../
 import { PageHelp } from "../components/PageHelp";
 import { Mermaid, extractMermaid } from "../components/Mermaid";
 import { FlowGraphEditor } from "../components/FlowGraphEditor";
+import { Markdown } from "../components/Markdown";
 
 export function UseCases() {
   const { slug = "" } = useParams();
@@ -238,7 +239,9 @@ export function UseCases() {
                   </button>
                 </div>
               </div>
-              <pre className="mc-pre">{detail.raw}</pre>
+              {/* T-0275: render the use-case body as markdown (frontmatter
+                  stripped, T-/D- mentions linkified) instead of a raw <pre>. */}
+              <Markdown source={detail.raw} slug={slug} />
 
               {/* T-0173: attached user flows */}
               <div className="mt-4">

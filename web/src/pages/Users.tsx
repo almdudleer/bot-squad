@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, UserRow } from "../api";
+import { api, Me, UserRow } from "../api";
 import { Modal } from "../components/Modal";
 
 interface NewUserState {
@@ -33,6 +33,9 @@ function isAccessDeniedError(err: unknown): boolean {
 
 export function Users() {
   const [users, setUsers] = useState<UserRow[] | null>(null);
+  // T-0260: identify the logged-in user so we can guard self-destructive
+  // controls (delete / remove-own-admin) on their own row.
+  const [me, setMe] = useState<Me | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [denied, setDenied] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -67,6 +70,9 @@ export function Users() {
 
   useEffect(() => {
     reload();
+    // T-0260: best-effort fetch of the current user; if it fails we simply
+    // don't apply the self-row guard (controls stay as-is) rather than block.
+    api.me().then(setMe).catch(() => {});
   }, []);
 
   async function submitCreate() {
@@ -135,6 +141,9 @@ export function Users() {
 
   async function toggleAdmin(u: UserRow) {
     const want = !u.is_admin;
+    // T-0260: never let the logged-in user strip their own admin (self-lockout
+    // foot-gun). The UI control is also disabled; this is the defensive guard.
+    if (me && u.username === me.username && !want) return;
     const msg = want
       ? `Grant admin to ${u.username}?`
       : `Remove admin from ${u.username}?`;
@@ -149,6 +158,9 @@ export function Users() {
   }
 
   async function deleteUser(u: UserRow) {
+    // T-0260: never let the logged-in user delete their own account. The UI
+    // control is also disabled; this is the defensive guard.
+    if (me && u.username === me.username) return;
     if (!window.confirm(`Delete user ${u.username}? This cannot be undone.`)) return;
     try {
       await api.deleteUser(u.username);
@@ -207,7 +219,13 @@ export function Users() {
             </tr>
           </thead>
           <tbody>
-            {users.map((u) => (
+            {users.map((u) => {
+              // T-0260: guard self-destructive controls on the logged-in
+              // user's own row. Removing your own admin (the only/last admin)
+              // or deleting your own account is a self-lockout foot-gun.
+              const isSelf = me !== null && u.username === me.username;
+              const removeOwnAdmin = isSelf && u.is_admin;
+              return (
               <tr key={u.username}>
                 <td style={{ fontFamily: "var(--mc-mono)" }}>{u.username}</td>
                 <td style={{ fontFamily: "var(--mc-mono)" }}>{u.linux_user}</td>
@@ -227,6 +245,12 @@ export function Users() {
                       className="btn btn-outline-secondary btn-sm"
                       style={{ fontSize: "0.7rem" }}
                       onClick={() => toggleAdmin(u)}
+                      disabled={removeOwnAdmin}
+                      title={
+                        removeOwnAdmin
+                          ? "You can't remove your own admin access"
+                          : undefined
+                      }
                     >
                       {u.is_admin ? "Remove admin" : "Make admin"}
                     </button>
@@ -243,13 +267,18 @@ export function Users() {
                       className="btn btn-outline-danger btn-sm"
                       style={{ fontSize: "0.7rem" }}
                       onClick={() => deleteUser(u)}
+                      disabled={isSelf}
+                      title={
+                        isSelf ? "You can't delete your own account" : undefined
+                      }
                     >
                       Delete
                     </button>
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       )}

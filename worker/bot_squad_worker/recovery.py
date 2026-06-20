@@ -1,0 +1,184 @@
+"""WS-4 S4 (T-0251) — auto stall-recovery: dead/exited respawn-or-park.
+
+Removes the operator's manual nursing for the most unambiguous failure: a dev
+session whose tmux pane has DIED while its bound task still needs work. We
+respawn a fresh dev for that task (bounded), and once the respawn bound is hit
+we PARK it + notify the operator instead of looping. A dead pane carries NO risk
+of killing live work — the aggressive idle-wedge SIGTERM of *live* sessions is a
+separate, day-1-tuned slice and is NOT in this module.
+
+Conservative recs (G1-G5, operator-approved 2026-06-20): dev-only (coordinators
+self-manage), respawn bound 2 then park, global. Kill-switch
+``BOT_SQUAD_RECOVERY`` defaults **OFF** so it cannot surprise a live run — the
+operator opts in (``BOT_SQUAD_RECOVERY=1``) once the backoff governor has proven
+stable. Respawn goes through the normal spawn admission, so the backoff governor
++ cap still gate it (a respawn won't fire while at effective capacity).
+
+State (respawn counters): ``data/_worker/recovery/state.json`` ``{sid: count}``.
+The tick never raises (mirrors the other scheduler ticks).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+log = logging.getLogger(__name__)
+
+# Canonical task statuses (see reference_task_status_schema).
+ACTIVE_STATUSES = {"open", "in_progress", "reopened"}  # still needs work → recover
+DONE_STATUSES = {"totest", "closed"}                   # deliverable exists → leave to T-0233
+
+
+def recovery_enabled() -> bool:
+    return os.environ.get("BOT_SQUAD_RECOVERY", "0").strip() == "1"
+
+
+def respawn_bound() -> int:
+    try:
+        v = int(os.environ.get("BOT_SQUAD_RESPAWN_MAX", 2))
+    except (TypeError, ValueError):
+        return 2
+    return v if v > 0 else 2
+
+
+# --- pure decision ---------------------------------------------------------
+
+def classify(*, role: str, pane_live: bool, task_status: str,
+             respawn_count: int, bound: int) -> str:
+    """Pure recovery decision → one of none|respawn|park.
+
+    Only acts on a DEAD-pane dev whose task still needs work; a live pane and a
+    done/planned task are both left alone in this slice.
+    """
+    if role != "dev":
+        return "none"
+    if pane_live:
+        return "none"  # live work is never touched here
+    if task_status in ACTIVE_STATUSES:
+        return "respawn" if respawn_count < bound else "park"
+    return "none"
+
+
+# --- state -----------------------------------------------------------------
+
+def _state_path(cfg: Any) -> Path:
+    return cfg.data_dir / "_worker" / "recovery" / "state.json"
+
+
+def _load_state(cfg: Any) -> dict:
+    try:
+        d = json.loads(_state_path(cfg).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(cfg: Any, state: dict) -> None:
+    p = _state_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.parent / (p.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    os.rename(tmp, p)
+
+
+# --- signal gathering (real) -----------------------------------------------
+
+def _gather(cfg: Any) -> list[dict]:
+    """One row per non-archived dev session: {sid, slug, role, pane_live,
+    task_id, task_status}."""
+    from bot_squad_worker.autonomous import pane_alive, read_task_status
+    from bot_squad_worker.sessions import _read_session_metadata, _derive_role
+    rows: list[dict] = []
+    for slug in getattr(cfg, "projects", {}) or {}:
+        sess_dir = cfg.data_dir / slug / "sessions"
+        if not sess_dir.exists():
+            continue
+        for md in sess_dir.glob("*.md"):
+            meta = _read_session_metadata(md)
+            if not meta or str(meta.get("archived", "")).lower() == "true":
+                continue
+            role = meta.get("role") or _derive_role(meta)
+            if role != "dev":
+                continue
+            task_id = meta.get("task_id")
+            if not task_id or task_id == "~":
+                continue
+            pane = str(meta.get("pane_id") or "").strip()
+            pane_live = bool(pane and pane not in ("~", "None") and pane_alive(pane))
+            rows.append({
+                "sid": meta.get("sid"), "slug": slug, "role": role,
+                "pane_live": pane_live, "task_id": task_id,
+                "task_status": read_task_status(cfg, slug, task_id),
+                "window": meta.get("window") or meta.get("window_name") or "",
+                "initiative": meta.get("initiative"),
+            })
+    return rows
+
+
+# --- apply (real, conservative) --------------------------------------------
+
+def _do_respawn(cfg: Any, row: dict) -> None:
+    from bot_squad_worker import sessions as _sessions
+    prompt = (f"You are an auto-respawn for ticket {row['task_id']} — your prior "
+              f"session exited. Re-read the ticket and continue from its last "
+              f"progress note / your last summary. Do not restart finished work.")
+    log.warning("recovery: respawning dead dev %s for %s", row.get("sid"), row["task_id"])
+    _sessions.spawn(
+        cfg, row["slug"], row.get("window") or f"recover-{row['task_id']}",
+        prompt, task_id=row["task_id"], initiative=row.get("initiative"),
+    )
+
+
+def _do_park(cfg: Any, row: dict, reason: str) -> None:
+    from bot_squad_worker import sessions as _sessions
+    log.warning("recovery: parking %s (%s)", row.get("sid"), reason)
+    try:
+        _sessions.suspend(cfg, row["slug"], row["sid"])
+    except Exception:
+        log.exception("recovery: suspend failed for %s", row.get("sid"))
+    try:
+        from bot_squad_worker import intersession as _inter
+        _inter.send(cfg, row["slug"], to="operator",
+                    text=(f"⚠️ recovery PARKED {row.get('sid')} (task {row['task_id']}): "
+                          f"{reason}. Needs a human look — auto-respawn gave up."),
+                    from_sid="S-recovery")
+    except Exception:
+        log.exception("recovery: park notify failed for %s", row.get("sid"))
+
+
+# --- the tick --------------------------------------------------------------
+
+def recovery_tick(cfg: Any, now_epoch: Optional[float] = None) -> dict:
+    if not recovery_enabled():
+        return {"enabled": False, "acted": []}
+    try:
+        return _run(cfg)
+    except Exception:
+        log.exception("recovery_tick error")
+        return {"enabled": True, "acted": [], "error": True}
+
+
+def _run(cfg: Any) -> dict:
+    bound = respawn_bound()
+    state = _load_state(cfg)
+    acted: list = []
+    for row in _gather(cfg):
+        sid = row.get("sid")
+        if not sid:
+            continue
+        count = int(state.get(sid, 0))
+        action = classify(role=row["role"], pane_live=row["pane_live"],
+                          task_status=row["task_status"], respawn_count=count,
+                          bound=bound)
+        if action == "respawn":
+            _do_respawn(cfg, row)
+            state[sid] = count + 1
+            acted.append(("respawn", sid))
+        elif action == "park":
+            _do_park(cfg, row, reason=f"respawn bound {bound} reached")
+            acted.append(("park", sid))
+    _save_state(cfg, state)
+    return {"enabled": True, "acted": acted}

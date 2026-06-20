@@ -459,6 +459,21 @@ def backoff_tick(cfg: Config) -> None:
         log.exception("backoff_tick error")
 
 
+def recovery_tick(cfg: Config) -> None:
+    """WS-4 S4 (T-0251): auto stall-recovery — dead/exited dev respawn-or-park.
+
+    Default OFF (``BOT_SQUAD_RECOVERY=1`` to opt in). Only acts on dead-pane dev
+    sessions whose task still needs work; respawn is bounded then parks +
+    notifies the operator. Never touches live panes. Errors caught so one bad
+    sweep never kills the scheduler.
+    """
+    from bot_squad_worker import recovery as _recovery
+    try:
+        _recovery.recovery_tick(cfg)
+    except Exception:
+        log.exception("recovery_tick error")
+
+
 def oauth_refresh(cfg: Config) -> None:
     """Refresh Claude OAuth credentials. TG-ping on failure only.
 

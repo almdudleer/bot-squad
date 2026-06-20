@@ -16,6 +16,7 @@ from bot_squad_worker.jobs import (
     autoupdate_tick,
     backoff_tick,
     binding_gc_tick,
+    recovery_tick,
     constant_team_tick,
     deploy_monitor_one,
     drift_check_tick,
@@ -235,6 +236,21 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=30,
         args=[cfg],
         id="backoff",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # recovery_tick: WS-4 S4 (T-0251) — auto stall-recovery for dead/exited dev
+    # sessions whose task still needs work. Default OFF (BOT_SQUAD_RECOVERY=1 to
+    # opt in); inert no-op until enabled. 60s is plenty (a dead pane is not
+    # urgent). max_instances=1; the respawn-or-park step never raises.
+    sched.add_job(
+        recovery_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="recovery",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

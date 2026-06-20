@@ -277,3 +277,74 @@ def test_delete_doc_tombstones_id_no_reclaim(tmp_bot_squad: Path, monkeypatch):
         second = _create(client, title="Second").json()["id"]
         assert second != first
         assert int(second.split("-")[1]) > int(first.split("-")[1])
+
+
+# ---------------------------------------------------------------------------
+# T-0283 Pillar-C: docs participate in the cross-store artifact tree.
+# ---------------------------------------------------------------------------
+def test_doc_get_exposes_kind_and_artifact_alias(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Mother").json()["id"]
+        child = _create(client, title="Child", parent_doc_id=mother).json()["id"]
+        got = client.get(f"/api/projects/test-project/docs/{mother}").json()
+    assert got["kind"] == "doc"
+    # additive alias: both keys present, child_artifact_ids is a superset
+    assert set(got["child_doc_ids"]) == {child}
+    assert set(got["child_artifact_ids"]) == {child}
+
+
+def test_doc_children_include_cross_store(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Theme").json()["id"]
+        doc_child = _create(client, title="DocChild", parent_doc_id=mother).json()["id"]
+        # a use-case nested under the doc mother (cross-store)
+        uc_child = client.post(
+            "/api/projects/test-project/use_cases",
+            json={"title": "UC child", "parent_doc_id": mother},
+        ).json()["id"]
+        kids = client.get(f"/api/projects/test-project/docs/{mother}/children").json()
+        by_id = {k["id"]: k for k in kids}
+        # mother GET: child_doc_ids is docs-only; child_artifact_ids is the superset
+        got = client.get(f"/api/projects/test-project/docs/{mother}").json()
+    assert by_id[doc_child]["kind"] == "doc"
+    assert by_id[uc_child]["kind"] == "use_case"
+    assert set(got["child_doc_ids"]) == {doc_child}
+    assert set(got["child_artifact_ids"]) == {doc_child, uc_child}
+
+
+def test_doc_reparent_under_use_case_cross_store(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        uc = client.post(
+            "/api/projects/test-project/use_cases", json={"title": "Mother UC"}
+        ).json()["id"]
+        doc = _create(client, title="Insight").json()["id"]
+        r = client.put(
+            f"/api/projects/test-project/docs/{doc}/parent",
+            json={"parent_doc_id": uc},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["parent_doc_id"] == uc
+        # the UC's cross-store children include this doc
+        kids = client.get(f"/api/projects/test-project/use_cases/{uc}/children").json()
+    assert {k["id"] for k in kids} == {doc}
+
+
+def test_doc_reparent_cross_store_cycle_rejected(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        doc = _create(client, title="D").json()["id"]
+        # a UC nested under the doc
+        uc = client.post(
+            "/api/projects/test-project/use_cases",
+            json={"title": "U", "parent_doc_id": doc},
+        ).json()["id"]
+        # making the doc's parent the UC would close doc -> uc -> doc
+        r = client.put(
+            f"/api/projects/test-project/docs/{doc}/parent",
+            json={"parent_doc_id": uc},
+        )
+    assert r.status_code == 400, r.text
+    assert "cycle" in r.text.lower()

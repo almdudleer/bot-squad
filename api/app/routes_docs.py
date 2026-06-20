@@ -234,20 +234,27 @@ def get_doc(slug: str, doc_id: str, request: Request) -> dict:
     if path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
     out = _parse(path)
-    # T-0234: surface the mother→child relationship on the doc payload.
+    # T-0234: docs-only child ids (back-compat). T-0283: add the cross-store
+    # superset `child_artifact_ids` (doc + use-case + feedback children) and
+    # the node's own `kind` so the FE tree renders without a second lookup.
     out["child_doc_ids"] = [c["id"] for c in _children_of(root, doc_id)]
+    out["kind"] = AN.KIND_DOC
+    out["child_artifact_ids"] = [
+        c["id"] for c in AN.children_of(_project_root(request, slug), doc_id)
+    ]
     return out
 
 
 @router.get("/{doc_id}/children")
 def get_doc_children(slug: str, doc_id: str, request: Request) -> list[dict]:
-    """List the child artifacts attached to a mother doc (T-0234).
+    """List the child artifacts attached to a mother doc.
 
-    A doc with no children (or a non-existent ``parent_doc_id`` target) simply
-    returns ``[]`` — missing parents are tolerated, treated as roots.
+    T-0283: cross-store — returns every artifact (doc / use-case / feedback)
+    whose ``parent_doc_id`` points at this doc, each carrying its ``kind``. A
+    doc with no children returns ``[]``.
     """
     _validate_doc_id(doc_id)
-    return _children_of(_docs_dir(request, slug), doc_id)
+    return AN.children_of(_project_root(request, slug), doc_id)
 
 
 class NewDoc(BaseModel):
@@ -423,18 +430,20 @@ def set_doc_parent(slug: str, doc_id: str, request: Request, body: SetParent,
     if doc_path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
 
+    # T-0283: a doc may nest under ANY artifact (doc / use-case / feedback), so
+    # parent existence + the cycle check resolve cross-store via artifact_nesting.
+    proj_root = _project_root(request, slug)
     new_parent = (body.parent_doc_id or "").strip() or None
     if new_parent is not None:
-        _validate_doc_id(new_parent)
         if new_parent == doc_id:
             raise HTTPException(
                 status_code=400, detail="a doc cannot be its own parent (self-parent)"
             )
-        if _find_doc(root, new_parent) is None:
+        if AN.find_artifact(proj_root, new_parent) is None:
             raise HTTPException(
-                status_code=404, detail=f"parent doc not found: {new_parent}"
+                status_code=404, detail=f"parent artifact not found: {new_parent}"
             )
-        if _would_cycle(root, doc_id, new_parent):
+        if AN.would_cycle(proj_root, doc_id, new_parent):
             raise HTTPException(
                 status_code=400,
                 detail=f"refusing to set parent {new_parent}: would create a cycle",

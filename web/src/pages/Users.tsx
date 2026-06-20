@@ -19,9 +19,22 @@ interface EditLinuxState {
   linux_user: string;
 }
 
+// T-0323: the whole /users router is Depends(require_admin), so a non-admin
+// who direct-navs here gets a 403. We key off the status code (not the body
+// text) so a BE message change doesn't silently break the gate. Mirrors
+// mothership/Users.tsx's isAccessDeniedError helper. call() wraps non-OK
+// responses as ``API error <status>: <body>``.
+function isAccessDeniedError(err: unknown): boolean {
+  if (err instanceof Error) {
+    return /^API error 403\b/.test(err.message);
+  }
+  return false;
+}
+
 export function Users() {
   const [users, setUsers] = useState<UserRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [denied, setDenied] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const [creating, setCreating] = useState<NewUserState | null>(null);
@@ -38,7 +51,18 @@ export function Users() {
 
   function reload() {
     setError(null);
-    api.listUsers().then(setUsers).catch((e) => setError(String(e)));
+    api
+      .listUsers()
+      .then(setUsers)
+      .catch((e) => {
+        // T-0323: render a friendly denied state instead of dumping the raw
+        // "API error 403" string when a non-admin lands here directly.
+        if (isAccessDeniedError(e)) {
+          setDenied(true);
+          return;
+        }
+        setError(String(e));
+      });
   }
 
   useEffect(() => {
@@ -133,6 +157,17 @@ export function Users() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  if (denied) {
+    return (
+      <div className="container py-4" style={{ maxWidth: "860px" }}>
+        <div className="mc-empty" data-testid="users-denied">
+          <div className="mc-empty-icon">◇</div>
+          <div>You don't have permission to view users.</div>
+        </div>
+      </div>
+    );
   }
 
   return (

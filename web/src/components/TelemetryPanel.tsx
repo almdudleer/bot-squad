@@ -12,6 +12,7 @@
  * anchor — the panel says so explicitly rather than faking a number.
  */
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { useApiClient } from "../apiContext";
 import type { TelemetryResponse, TelemetrySession } from "../api";
@@ -23,6 +24,23 @@ function fmtTokens(n: number): string {
   if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e8 ? 0 : 1)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k`;
   return String(n);
+}
+
+// T-0269: a row sampled days ago must not look identical to a fresh live one.
+// Render the worker's `sampled_at` as a relative age + flag staleness so an
+// operator never trusts a stale context%. `ageSec` lets the caller dim/strike.
+const STALE_AFTER_SEC = 60; // > ~6 poll cycles (10s cadence) ⇒ likely stale
+function relativeSampled(raw: string | null | undefined): { label: string; ageSec: number | null } {
+  if (!raw) return { label: "—", ageSec: null };
+  const ts = Date.parse(raw);
+  if (isNaN(ts)) return { label: "—", ageSec: null };
+  const ageSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (ageSec < 60) return { label: `${ageSec}s ago`, ageSec };
+  const m = Math.floor(ageSec / 60);
+  if (m < 60) return { label: `${m}m ago`, ageSec };
+  const h = Math.floor(m / 60);
+  if (h < 24) return { label: `${h}h ago`, ageSec };
+  return { label: `${Math.floor(h / 24)}d ago`, ageSec };
 }
 
 /** Bucket a context % into a badge colour: <80 ok, 80–100 warn, >=100 danger. */
@@ -149,22 +167,51 @@ export function TelemetryPanel({ slug }: { slug: string }) {
               <th style={{ fontWeight: 500, padding: "1px 6px 1px 0" }}>session</th>
               <th style={{ fontWeight: 500, padding: "1px 6px" }}>context (/{ceilingLabel})</th>
               <th style={{ fontWeight: 500, padding: "1px 6px" }}>memory</th>
+              <th style={{ fontWeight: 500, padding: "1px 6px" }}>sampled</th>
             </tr>
           </thead>
           <tbody>
-            {sessions.map((s) => (
-              <tr key={s.sid} style={{ borderTop: "1px solid var(--mc-border)" }}>
-                <td style={{ padding: "3px 6px 3px 0", fontFamily: "var(--mc-mono)", whiteSpace: "nowrap" }}>
-                  {s.rate_limited && <span title="hit a 429">🚫 </span>}
-                  {s.sid}
-                </td>
-                <td style={{ padding: "3px 6px" }}><ContextBar s={s} ceiling={ceiling} /></td>
-                <td style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>
-                  {fmtTokens(s.memory.tokens_est)} tok
-                  <span style={{ color: "var(--mc-muted, #888)" }}> · {s.memory.files}f</span>
-                </td>
-              </tr>
-            ))}
+            {sessions.map((s) => {
+              // T-0269: link the SID to the matching table row below via the
+              // existing ?sid= deep-link (scroll-to + flash) — the same target
+              // the sessions-table SID resolves to, so a hot telemetry row is
+              // now clickable instead of dead plain text.
+              const sampled = relativeSampled(s.sampled_at);
+              const stale = sampled.ageSec != null && sampled.ageSec > STALE_AFTER_SEC;
+              return (
+                <tr key={s.sid} style={{ borderTop: "1px solid var(--mc-border)" }}>
+                  <td style={{ padding: "3px 6px 3px 0", fontFamily: "var(--mc-mono)", whiteSpace: "nowrap" }}>
+                    {s.rate_limited && <span title="hit a 429">🚫 </span>}
+                    <Link
+                      to={{ search: `?sid=${encodeURIComponent(s.sid)}` }}
+                      style={{ color: "var(--mc-accent)", textDecoration: "none" }}
+                      title="Jump to this session in the table below"
+                    >
+                      {s.sid}
+                    </Link>
+                  </td>
+                  <td style={{ padding: "3px 6px" }}><ContextBar s={s} ceiling={ceiling} /></td>
+                  <td style={{ padding: "3px 6px", whiteSpace: "nowrap" }}>
+                    {fmtTokens(s.memory.tokens_est)} tok
+                    <span style={{ color: "var(--mc-muted, #888)" }}> · {s.memory.files}f</span>
+                  </td>
+                  <td
+                    style={{
+                      padding: "3px 6px", whiteSpace: "nowrap",
+                      color: stale ? "var(--mc-warn, #e0a000)" : "var(--mc-muted, #888)",
+                      textDecoration: stale ? "line-through" : undefined,
+                    }}
+                    title={
+                      stale
+                        ? `Stale: last sampled ${sampled.label} (> ${STALE_AFTER_SEC}s) — context% may be out of date`
+                        : `Last sampled ${sampled.label}`
+                    }
+                  >
+                    {sampled.label}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}

@@ -9,6 +9,7 @@ Session ID (SID) format: ``S-<user>-<window>-p<pane_id_no_pct>``
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -1638,6 +1639,9 @@ def spawn(
     # effect (the task_id marker, tmux session, pane). At/over cap is a
     # capacity-reached refusal so the task stays pending, never a silent drop.
     _enforce_parallel_cap(cfg)
+    # T-0306: same for the max_total_tokens budget (output tokens this quota
+    # period). 0 = unlimited; over-budget refuses so the task stays pending.
+    _enforce_token_cap(cfg)
 
     # T-0208: defense-in-depth — tolerate a quoted frontmatter scalar passed
     # through from a ticket (`initiative: "x.md"`). The bsq read_frontmatter
@@ -1985,6 +1989,78 @@ def _enforce_parallel_cap(cfg: Any) -> None:
         f"(rate-limit/usage-limit pressure; hard cap={cap or 'unlimited'}); "
         f"spawn refused, task stays QUEUED, retry on ramp-up"
     )
+
+
+def _anchor_key(cfg: Any) -> str:
+    """The current ``[quota].set_at`` (or '' if unset) — the budget-period key.
+    Re-anchoring (operator changes set_at) rebases the token-budget baseline."""
+    path = Path(_caps_config_dir(cfg)) / "system_settings.toml"
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return ""
+    return str((raw.get("quota") or {}).get("set_at", "") or "")
+
+
+def _project_output_total(cfg: Any) -> int:
+    """Sum ``output_tokens_cum_total`` across every project's ``_quota.json`` —
+    the run-wide cumulative output-token counter the telemetry sampler maintains."""
+    total = 0
+    for slug in getattr(cfg, "projects", {}) or {}:
+        q = cfg.data_dir / slug / "_worker" / "telemetry" / "_quota.json"
+        try:
+            total += int(json.loads(q.read_text()).get("output_tokens_cum_total", 0))
+        except (OSError, ValueError, TypeError):
+            continue
+    return total
+
+
+def _token_baseline_path(cfg: Any) -> Path:
+    return cfg.data_dir / "_worker" / "token_cap" / "baseline.json"
+
+
+def _output_since_anchor(cfg: Any) -> int:
+    """Output tokens since the current quota anchor (T-0306 semantics B).
+
+    Persists a ``{anchor_key, baseline_total}`` and rebases it whenever the
+    ``[quota].set_at`` changes — so the budget frees on re-anchor. Returns
+    ``max(0, current_total - baseline_total)``.
+    """
+    key = _anchor_key(cfg)
+    total = _project_output_total(cfg)
+    p = _token_baseline_path(cfg)
+    try:
+        prev = json.loads(p.read_text())
+    except (OSError, ValueError):
+        prev = {}
+    if prev.get("anchor_key") != key:
+        prev = {"anchor_key": key, "baseline_total": total}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / (p.name + ".tmp")
+        tmp.write_text(json.dumps(prev))
+        os.rename(tmp, p)
+    return max(0, total - int(prev.get("baseline_total", 0)))
+
+
+def _enforce_token_cap(cfg: Any) -> None:
+    """Raise ActionError if spawning would exceed the max_total_tokens budget.
+
+    Budget per quota period (T-0306, operator semantics B): output tokens since
+    the ``[quota]`` anchor vs the ``[caps].max_total_tokens`` cap. ``0`` =
+    unlimited (a no-op). Refusal keeps the task pending (the T-0237 S4 contract),
+    mirroring ``_enforce_parallel_cap``.
+    """
+    cap = _read_caps(_caps_config_dir(cfg))["max_total_tokens"]
+    if cap <= 0:
+        return
+    since = _output_since_anchor(cfg)
+    if since >= cap:
+        from bot_squad_worker.actions import ActionError
+        raise ActionError(
+            f"spawn: token budget reached — {since}/{cap} output tokens this "
+            f"quota period (max_total_tokens cap); spawn refused, task stays "
+            f"pending until the budget resets (re-anchor)"
+        )
 
 
 def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:

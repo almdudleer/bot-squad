@@ -804,6 +804,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         paused_at_meta: Any = None
         archived_flag = False
         owner_meta: str = ""  # T-0080 — UI-username owner stamp; "" = legacy
+        owner_user_meta: str = ""  # T-0321 — per-user-scoping username; "" = legacy
         if existing:
             started_at = existing.get("started_at")
             tid = existing.get("task_id")
@@ -826,6 +827,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             own_val = existing.get("owner")
             if own_val and own_val != "~":
                 owner_meta = str(own_val)
+            ou_val = existing.get("owner_user")
+            if ou_val and ou_val != "~":
+                owner_user_meta = str(ou_val)
             # If the md was resolved via uuid fallback (stale SID after a
             # window rename), mark the stored SID as active too so the
             # suspended-md loop below doesn't double-emit the same session.
@@ -877,6 +881,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "suspended_at": None,
             "archived": archived_flag,
             "owner": owner_meta,
+            "owner_user": owner_user_meta,
             # T-0128: persisted spawn-time parent (the SID that requested this
             # spawn). Empty string when unset (legacy session) — the web tree
             # falls back to the task→initiative→TL heuristic in that case.
@@ -940,6 +945,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             md_archived = str(meta.get("archived", "")).lower() == "true"
             md_owner_val = meta.get("owner")
             md_owner = str(md_owner_val) if (md_owner_val and md_owner_val != "~") else ""
+            md_owner_user_val = meta.get("owner_user")
+            md_owner_user = str(md_owner_user_val) if (md_owner_user_val and md_owner_user_val != "~") else ""
             md_tmux_session_val = meta.get("tmux_session")
             md_tmux_session_raw = (
                 str(md_tmux_session_val)
@@ -1006,6 +1013,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "suspended_at": meta.get("suspended_at"),
                 "archived": md_archived,
                 "owner": md_owner,
+                "owner_user": md_owner_user,
                 # T-0128: persisted spawn-time parent for suspended rows too.
                 "parent_sid": _parent_sid_of(meta),
                 # T-0157: linux user owning this (suspended) session.
@@ -1101,6 +1109,8 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
     # T-0080: preserve owner field across suspend/resume so per-user
     # listing filters keep working after a session is suspended.
     owner_val = existing.get("owner") or "~"
+    # T-0321: same for owner_user (the per-user-scoping username).
+    owner_user_val = existing.get("owner_user") or "~"
     # T-0078: preserve tmux_session across suspend → resume so a stale
     # SessionMd still carries the last-known session name (used by the
     # UI's resurrect affordance and by the one-shot backfill script).
@@ -1118,6 +1128,7 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         "started_at": started_at,
         "suspended_at": now,
         "owner": owner_val,
+        "owner_user": owner_user_val,
         "tmux_session": tmux_sess_val,
     }
     _write_session_metadata(meta_file, meta)
@@ -1595,6 +1606,7 @@ def spawn(
     initiative: str | None = None,
     owner: str | None = None,
     parent_sid: str | None = None,
+    owner_user: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -1711,6 +1723,14 @@ def spawn(
             from bot_squad_worker.actions import ActionError
             raise ActionError(f"spawn: invalid owner {owner!r}")
         env_prefix_parts.append(f"BOT_SQUAD_OWNER={shlex.quote(owner_clean)}")
+    if owner_user:
+        # T-0321: the human UI username for per-user scoping (distinct from
+        # `owner`, which doubles as the constant-team/TL-SID binding sentinel).
+        ou_clean = owner_user.strip()
+        if not ou_clean or not re.match(r"^[A-Za-z0-9_.-]+$", ou_clean):
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(f"spawn: invalid owner_user {owner_user!r}")
+        env_prefix_parts.append(f"BOT_SQUAD_OWNER_USER={shlex.quote(ou_clean)}")
     env_prefix = (" ".join(env_prefix_parts) + " ") if env_prefix_parts else ""
     shell_cmd = f"{env_prefix}claude --dangerously-skip-permissions"
 

@@ -97,7 +97,7 @@ fi
 
 if [ -n "$sid" ] && [ -n "$CLAUDE_SID" ]; then
     mkdir -p "$DATA/sessions"
-    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" TMUX_SESSION="$tmux_session" python3 - <<'PY' 2>/dev/null || true
+    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" OWNER_USER="${BOT_SQUAD_OWNER_USER:-}" TMUX_SESSION="$tmux_session" python3 - <<'PY' 2>/dev/null || true
 import os, time
 from pathlib import Path
 
@@ -109,6 +109,10 @@ cwd        = os.environ["CWD"]
 task_id    = os.environ.get("TASK_ID") or ""
 initiative = os.environ.get("INITIATIVE") or ""
 owner      = os.environ.get("OWNER") or ""
+# T-0321: owner_user is the human UI username used for per-user scoping —
+# a dedicated field separate from `owner` (which doubles as the constant-team /
+# TL-SID binding sentinel). Inline scalar only (T-0075 hook constraint).
+owner_user = os.environ.get("OWNER_USER") or ""
 tmux_session = os.environ.get("TMUX_SESSION") or ""
 window     = sid.rsplit("-p", 1)[0].split("-", 2)[-1] if "-p" in sid else ""
 # T-0157: linux user owning this session = the SID's user segment
@@ -159,6 +163,11 @@ if not owner:
 if owner == "~":
     owner = ""
 
+if not owner_user:
+    owner_user = existing.get("owner_user") or ""
+if owner_user == "~":
+    owner_user = ""
+
 # T-0078: tmux says which tmux session the pane lives in; prefer that, fall
 # back to the md's prior value so an out-of-tmux re-run preserves the field.
 if not tmux_session:
@@ -195,6 +204,7 @@ md_path.write_text(
     f"extra_initiatives: {extra_initiatives}\n"
     f"started_at: {started_at}\n"
     f"owner: {owner or '~'}\n"
+    f"owner_user: {owner_user or '~'}\n"
     f"tmux_session: {tmux_session or '~'}\n"
     f"linux_user: {linux_user or '~'}\n"
     "---\n"

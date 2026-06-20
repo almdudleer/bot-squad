@@ -68,8 +68,11 @@ def test_list_global_users_returns_public_projection(tmp_bot_squad: Path, monkey
         r = client.get("/api/m/users")
     assert r.status_code == 200, r.text
     body = r.json()
-    names = sorted(u["username"] for u in body)
-    assert names == ["alice", "bob"]
+    names = set(u["username"] for u in body)
+    # The minted globals are listed; T-0313 also lazily seeds the local
+    # auth.toml operator (``testuser``) so the directory reflects reality.
+    assert {"alice", "bob"} <= names
+    assert "testuser" in names
     # password_hash is NEVER serialised to the FE.
     for u in body:
         assert "password_hash" not in u

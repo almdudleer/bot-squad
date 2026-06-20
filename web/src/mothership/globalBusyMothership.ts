@@ -13,7 +13,7 @@ import type {
   FanResult,
   ProjectSessions,
 } from "../components/globalBusyHelpers";
-import { api, type Project, type SessionRow } from "../api";
+import type { Project, SessionRow } from "../api";
 
 export async function fanOutInFlight(): Promise<FanResult[]> {
   const servers = await mothershipApi.listServers();
@@ -22,20 +22,16 @@ export async function fanOutInFlight(): Promise<FanResult[]> {
     ready.map((s) => s.id),
     async (serverId): Promise<ProjectSessions[]> => {
       const meta = ready.find((s) => s.id === serverId);
-      // T-0130: the mothership's own self-server entry can't be reached
-      // through the proxy (no peer bearer for itself — 503). Use the
-      // local single-install API directly; the data is the same.
-      const isSelf = meta?.is_self === true;
-      const projects = isSelf
-        ? await api.projects()
-        : await apiFor(serverId).call<Project[]>("/api/projects");
+      // T-0130/T-0312: every ready server — including the mothership's own
+      // self-server entry — is reached through the proxy. The prior is_self
+      // short-circuit to the local single-install API worked around a
+      // self-proxy 503 that WS-3-BE fixed in T-0312, so it is now redundant.
+      const projects = await apiFor(serverId).call<Project[]>("/api/projects");
       const perProject = await Promise.all(
         projects.map(async (p): Promise<ProjectSessions> => {
-          const sessions = isSelf
-            ? await api.sessions(p.slug)
-            : await apiFor(serverId).call<SessionRow[]>(
-                `/api/projects/${encodeURIComponent(p.slug)}/sessions`,
-              );
+          const sessions = await apiFor(serverId).call<SessionRow[]>(
+            `/api/projects/${encodeURIComponent(p.slug)}/sessions`,
+          );
           return {
             serverId,
             serverName: meta?.display_name ?? serverId,

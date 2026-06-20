@@ -679,6 +679,27 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
             continue
 
 
+def _coalesce_write(marker_path: str, token: str) -> None:
+    """T-0287: claim the shared restart-coalesce marker (last writer wins).
+
+    Atomic replace so a concurrent reader never sees a partial token.
+    """
+    p = Path(marker_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.parent / f"{p.name}.tmp.{os.getpid()}"
+    tmp.write_text(token)
+    os.replace(tmp, p)
+
+
+def _coalesce_winner(marker_path: str, token: str) -> bool:
+    """T-0287: True iff ``token`` is still the latest claim — i.e. no later
+    restart superseded it during the debounce window, so this one should fire."""
+    try:
+        return Path(marker_path).read_text().strip() == token
+    except OSError:
+        return False
+
+
 def _build_worker_restart_script(
     worker_dir: Path,
     pip_path: Path,
@@ -688,6 +709,8 @@ def _build_worker_restart_script(
     service: str,
     delay_s: int,
     smoke_attempts: int,
+    coalesce_marker: Path | None = None,
+    token: str = "",
 ) -> str:
     """Render the bash script the detached restart scope runs (T-0181).
 
@@ -705,10 +728,29 @@ def _build_worker_restart_script(
     q = shlex.quote
     wd, pip, sock = q(str(worker_dir)), q(str(pip_path)), q(str(sock_path))
     log, fail, svc = q(str(log_path)), q(str(fail_marker)), q(service)
+    # T-0287: trailing-edge restart coalescing. Claim the shared marker, wait the
+    # debounce window, then proceed ONLY if still the latest claim — a later
+    # deploy's restart supersedes this one and will pick up all synced code, so a
+    # burst of concurrent deploys collapses to a single worker restart. Uses the
+    # worker venv python (bot_squad_worker is editable-installed → importable).
+    py = q(str(worker_dir / ".venv" / "bin" / "python"))
+    coalesce_block = ""
+    if coalesce_marker is not None and token:
+        mk, tok = q(str(coalesce_marker)), q(token)
+        coalesce_block = f"""
+{py} -c "from bot_squad_worker.deploy import _coalesce_write; _coalesce_write({mk}, {tok})" >> "$LOG" 2>&1 || true
+sleep {int(delay_s)}
+if ! {py} -c "import sys; from bot_squad_worker.deploy import _coalesce_winner; sys.exit(0 if _coalesce_winner({mk}, {tok}) else 1)"; then
+  echo "[worker-restart] COALESCED — a newer restart superseded {tok}; skipping (it restarts with all synced code)" >> "$LOG"
+  exit 0
+fi
+"""
+    else:
+        coalesce_block = f"\nsleep {int(delay_s)}\n"
     return f"""
 set -u
 LOG={log}
-sleep {int(delay_s)}
+{coalesce_block}
 echo "[worker-restart] pip guard: install -e {wd}" >> "$LOG"
 if ! {pip} install -e {wd} >> "$LOG" 2>&1; then
   echo "[worker-restart] PIP_GUARD_FAILED — leaving worker on old code, NOT restarting" >> "$LOG"
@@ -779,9 +821,13 @@ def _restart_worker_detached(
     delay_s = int(os.environ.get("BOT_SQUAD_DEPLOY_WORKER_RESTART_DELAY", "5"))
     smoke_attempts = int(os.environ.get("BOT_SQUAD_DEPLOY_WORKER_SMOKE_ATTEMPTS", "10"))
 
+    # T-0287: global (one-worker) coalesce marker + this deploy's queue_id token,
+    # so concurrent deploys' detached restarts collapse to a single restart.
+    coalesce_marker = cfg.data_dir / "_worker" / "restart_coalesce.token"
     script = _build_worker_restart_script(
         worker_dir, pip_path, cfg.sock_path, restart_log, fail_marker,
         service, delay_s, smoke_attempts,
+        coalesce_marker=coalesce_marker, token=str(queue_id or "run"),
     )
     argv = _scope_wrap(["bash", "-c", script], f"bot-squad-worker-restart-{queue_id}")
     log.info(

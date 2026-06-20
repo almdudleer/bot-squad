@@ -104,6 +104,10 @@ export function TaskDetail() {
   const [progressText, setProgressText] = useState("");
   const [progressError, setProgressError] = useState<string | null>(null);
   const [progressSaving, setProgressSaving] = useState(false);
+  // T-0273: comment control matches the board kebab modal — a multi-line
+  // (auto-growing) textarea rather than a single-line input. This ref drives
+  // the auto-grow effect below.
+  const progressRef = useRef<HTMLTextAreaElement>(null);
 
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -227,6 +231,15 @@ export function TaskDetail() {
   useEffect(() => {
     if (editingTitle && titleRef.current) titleRef.current.focus();
   }, [editingTitle]);
+
+  // T-0273: auto-grow the comment textarea to fit its content (and shrink
+  // back to one row when it's cleared after posting).
+  useEffect(() => {
+    const el = progressRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [progressText]);
 
   function composeBody(verbatim: string, context: string, progress: string): string {
     const parts: string[] = [];
@@ -667,15 +680,26 @@ export function TaskDetail() {
 
         <div className="mt-3">
           {progressError && <div className="alert alert-danger py-1 small">{progressError}</div>}
-          <input
-            type="text"
+          <textarea
+            ref={progressRef}
             className="form-control form-control-sm"
             placeholder="Add a comment — recorded in the working log (cap 240 chars)…"
+            rows={2}
             maxLength={240}
+            style={{ resize: "none", overflow: "hidden" }}
             value={progressText}
             onChange={(e) => setProgressText(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); postProgress(); } }}
+            onKeyDown={(e) => {
+              // Enter inserts a newline (multi-line comments); ⌘/Ctrl+Enter posts.
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                postProgress();
+              }
+            }}
           />
+          <div style={{ fontSize: "0.68rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
+            Enter for a new line · ⌘/Ctrl+Enter to post
+          </div>
           <button
             type="button"
             className="btn btn-sm btn-primary mt-2"

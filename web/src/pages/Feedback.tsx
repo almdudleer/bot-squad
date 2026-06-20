@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useOutletContext, useParams, useSearchParams } from "react-router-dom";
 import { api, FeedbackFile, errorDetail } from "../api";
 import { Modal } from "../components/Modal";
-
-import { PageHelp } from "../components/PageHelp";
 import { Markdown } from "../components/Markdown";
-import { ArtifactTreeView, ReparentControl, useArtifacts } from "../components/ArtifactTree";
+import { ReparentControl } from "../components/ArtifactTree";
+import { DocsOutletContext } from "./DocsSection";
 
 interface PromoteState {
   name: string;
@@ -13,13 +12,16 @@ interface PromoteState {
   body: string;
 }
 
+// T-0337: Feedback is now the DETAIL pane of the unified "Docs & Artifacts"
+// view. The shared cross-store tree + filter live in DocsSection; this page
+// reads that tree from the Outlet context and renders only the feedback
+// detail/editor on the right. Deep-link (?fb=<name>) is unchanged.
 export function Feedback() {
   const { slug = "" } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { tree } = useOutletContext<DocsOutletContext>();
 
-  // T-0283 (Pillar C): the left rail is the unified cross-store artifact tree.
-  const tree = useArtifacts(slug, 0);
   const [files, setFiles] = useState<FeedbackFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
@@ -119,108 +121,88 @@ export function Feedback() {
   const childArtifacts = selfId ? (tree.childrenOf.get(selfId) ?? []) : [];
 
   return (
-    <div className="container py-4" style={{ maxWidth: "980px" }}>
-      <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-        User feedback
-        <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
-      </h2>
-      <PageHelp>
-        Raw user feedback collected outside any backlog process. Use <strong>Promote
-        to task</strong> to lift an item into the board with a <code>from:</code> link back.
-        Edit text in place; the file lives at <code>data/&lt;slug&gt;/feedback/</code>. Feedback is a
-        nestable artifact (T-0283) — a theme can mother child evidence across stores.
-      </PageHelp>
-
+    <>
       {error && <div className="alert alert-danger py-1 small">{error}</div>}
       {flash && <div className="alert alert-success py-1 small">{flash}</div>}
 
-      <div className="d-flex gap-4">
-        {/* T-0283: unified cross-store artifact tree (feedback highlighted). */}
-        <div style={{ minWidth: "240px", flex: "0 0 240px" }}>
-          <ArtifactTreeView slug={slug} data={tree} selectedKind="feedback" selectedId={selected} />
-        </div>
+      {files === null && !error && <div className="mc-loading">Loading</div>}
+      {selectedFile === null && files !== null && <div className="text-muted small">Select a feedback item.</div>}
 
-        {/* Detail / editor */}
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {files === null && !error && <div className="mc-loading">Loading</div>}
-          {selectedFile === null && files !== null && <div className="text-muted small">Select a feedback item.</div>}
+      {selectedFile && draft === null && (
+        <>
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <div
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.72rem",
+                color: "var(--mc-text-dim)",
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+              }}
+            >
+              <span title="feedback" style={{ marginRight: "0.3rem" }}>💬</span>
+              {selectedFile.name}
+            </div>
+            <div className="d-flex gap-2">
+              <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(selectedFile.content)}>
+                Edit
+              </button>
+              <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => openPromote(selectedFile)}>
+                Promote to task
+              </button>
+            </div>
+          </div>
 
-          {selectedFile && draft === null && (
-            <>
-              <div className="d-flex justify-content-between align-items-center mb-2">
-                <div
-                  style={{
-                    fontFamily: "var(--mc-mono)",
-                    fontSize: "0.72rem",
-                    color: "var(--mc-text-dim)",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.06em",
-                  }}
-                >
-                  {selectedFile.name}
-                </div>
-                <div className="d-flex gap-2">
-                  <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(selectedFile.content)}>
-                    Edit
-                  </button>
-                  <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => openPromote(selectedFile)}>
-                    Promote to task
-                  </button>
-                </div>
+          {/* T-0283/D-0029: cross-store nesting — set/clear this theme's
+              parent (PUT /feedback/{name}/parent, cycle-safe). */}
+          <ReparentControl
+            slug={slug}
+            data={tree}
+            selfId={selfId}
+            currentParentId={selectedFile.parent_doc_id}
+            busy={busy}
+            onSetParent={setFbParent}
+          />
+          {childArtifacts.length > 0 && (
+            <div className="mb-3">
+              <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>
+                Attached evidence ({childArtifacts.length}):
               </div>
-
-              {/* T-0283/D-0029: cross-store nesting — set/clear this theme's
-                  parent (PUT /feedback/{name}/parent, cycle-safe). */}
-              <ReparentControl
-                slug={slug}
-                data={tree}
-                selfId={selfId}
-                currentParentId={selectedFile.parent_doc_id}
-                busy={busy}
-                onSetParent={setFbParent}
-              />
-              {childArtifacts.length > 0 && (
-                <div className="mb-3">
-                  <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>
-                    Attached evidence ({childArtifacts.length}):
-                  </div>
-                  <div className="d-flex flex-wrap gap-2">
-                    {childArtifacts.map((n) => (
-                      <span key={`${n.kind}:${n.id}`} className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }} title={n.title}>
-                        📎 {n.id}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* T-0275: render feedback body as markdown. */}
-              <Markdown source={selectedFile.content} slug={slug} />
-            </>
+              <div className="d-flex flex-wrap gap-2">
+                {childArtifacts.map((n) => (
+                  <span key={`${n.kind}:${n.id}`} className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }} title={n.title}>
+                    📎 {n.id}
+                  </span>
+                ))}
+              </div>
+            </div>
           )}
 
-          {selectedFile && draft !== null && (
-            <>
-              <textarea
-                className="form-control mb-2"
-                rows={16}
-                value={draft}
-                style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}
-                onChange={(e) => setDraft(e.target.value)}
-                autoFocus
-              />
-              <div className="d-flex gap-2">
-                <button type="button" className="btn btn-primary btn-sm" onClick={saveEdit} disabled={busy}>
-                  {busy ? "Saving…" : "Save"}
-                </button>
-                <button type="button" className="btn btn-secondary btn-sm" onClick={() => setDraft(null)}>
-                  Cancel
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-      </div>
+          {/* T-0275: render feedback body as markdown. */}
+          <Markdown source={selectedFile.content} slug={slug} />
+        </>
+      )}
+
+      {selectedFile && draft !== null && (
+        <>
+          <textarea
+            className="form-control mb-2"
+            rows={16}
+            value={draft}
+            style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}
+            onChange={(e) => setDraft(e.target.value)}
+            autoFocus
+          />
+          <div className="d-flex gap-2">
+            <button type="button" className="btn btn-primary btn-sm" onClick={saveEdit} disabled={busy}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setDraft(null)}>
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
 
       {/* Promote modal */}
       <Modal
@@ -256,6 +238,6 @@ export function Feedback() {
           />
         </div>
       </Modal>
-    </div>
+    </>
   );
 }

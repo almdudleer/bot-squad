@@ -110,9 +110,13 @@ export function App() {
             <Route path="vision" element={<Vision />} />
             <Route path="workflow" element={<Workflow />} />
             {/* T-0235 (Pillar C): User Feedback + Use Cases relocated UNDER
-                the docs section (retired as top-level nav). The DocsSection
-                wrapper renders the sub-nav; the three pages live in its outlet.
-                Old top-level /feedback + /usecases deep-links redirect in. */}
+                the docs section (retired as top-level nav). T-0337 then merged
+                the three former tabs into ONE "Docs & Artifacts" view: the
+                DocsSection wrapper owns the shared rail (type filter + one
+                "+ New" + the cross-store tree) and hands its tree to whichever
+                detail page the sub-route resolves (index=Docs, feedback, usecases)
+                via Outlet context. Old top-level /feedback + /usecases deep-links
+                still redirect in (LegacyDocsRedirect). */}
             <Route path="docs" element={<DocsSection />}>
               <Route index element={<Docs />} />
               <Route path="feedback" element={<Feedback />} />

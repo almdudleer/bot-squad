@@ -15,7 +15,14 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, MeProfile } from "../api";
 
-const PER_SERVER_LINKS: { to: string; label: string; blurb: string }[] = [
+// `soon` rows are not-yet-functional surfaces; render them disabled (no link)
+// so /me doesn't advertise a dead page as a peer of the working settings.
+const PER_SERVER_LINKS: {
+  to: string;
+  label: string;
+  blurb: string;
+  soon?: boolean;
+}[] = [
   {
     to: "/attachment/tg-binding",
     label: "Telegram binding",
@@ -30,6 +37,7 @@ const PER_SERVER_LINKS: { to: string; label: string; blurb: string }[] = [
     to: "/attachment/worker",
     label: "Worker controls",
     blurb: "Manage your own per-user worker on this server.",
+    soon: true, // T-0067: start/stop/logs not wired yet — don't advertise as live
   },
 ];
 
@@ -92,28 +100,62 @@ export function Profile() {
           Per-server settings
         </h3>
         <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "0.5rem" }}>
-          {PER_SERVER_LINKS.map((l) => (
-            <li key={l.to}>
-              <Link
-                to={l.to}
-                style={{
-                  display: "block",
-                  padding: "0.6rem 0.8rem",
-                  border: "1px solid var(--mc-border)",
-                  borderRadius: 3,
-                  textDecoration: "none",
-                  background: "var(--mc-surface)",
-                }}
-              >
+          {PER_SERVER_LINKS.map((l) => {
+            const inner = (
+              <>
                 <div style={{ fontSize: "0.85rem", color: "var(--mc-text)" }}>
-                  {l.label} →
+                  {l.label}
+                  {l.soon ? (
+                    <span
+                      style={{
+                        marginLeft: "0.5rem",
+                        fontSize: "0.62rem",
+                        fontWeight: 600,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.08em",
+                        color: "var(--mc-text-faint)",
+                        border: "1px solid var(--mc-border)",
+                        borderRadius: 3,
+                        padding: "0.05rem 0.3rem",
+                      }}
+                    >
+                      Coming soon
+                    </span>
+                  ) : (
+                    " →"
+                  )}
                 </div>
                 <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
                   {l.blurb}
                 </div>
-              </Link>
-            </li>
-          ))}
+              </>
+            );
+            const boxStyle = {
+              display: "block",
+              padding: "0.6rem 0.8rem",
+              border: "1px solid var(--mc-border)",
+              borderRadius: 3,
+              textDecoration: "none",
+              background: "var(--mc-surface)",
+            } as const;
+            return (
+              <li key={l.to}>
+                {l.soon ? (
+                  // Not yet functional (T-0067) — render disabled, no navigation.
+                  <div
+                    aria-disabled
+                    style={{ ...boxStyle, opacity: 0.6, cursor: "default" }}
+                  >
+                    {inner}
+                  </div>
+                ) : (
+                  <Link to={l.to} style={boxStyle}>
+                    {inner}
+                  </Link>
+                )}
+              </li>
+            );
+          })}
         </ul>
       </section>
     </div>

@@ -26,7 +26,8 @@ export function AttachmentWorker() {
           marginBottom: "1rem",
         }}
       >
-        Start, stop, and view logs for your per-user worker on this server.
+        Start, stop, and view logs for your per-user worker on this server —
+        not yet available.
       </p>
       <div className="alert alert-info" style={{ fontSize: "0.85rem" }}>
         Coming with T-0067 enablement. The per-user worker template + attach

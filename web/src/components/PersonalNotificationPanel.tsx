@@ -13,9 +13,12 @@
  * `GET /me/notifications/resolved` reports (D-0022). Writes go to each level's
  * own route, then we re-read the resolved view.
  *
- * Project-level persistence is a deferred T-0218 follow-up (Team-1): the stub
- * echoes a PUT but does not persist, so after a re-read the project row returns
- * to "Inherited". The panel surfaces that honestly rather than faking a winner.
+ * Project-level persistence is live (Team-1): putProjectTgChatId persists the
+ * per-project personal override (Attachment.project_tg_chat_ids for migrated
+ * attachments, UserMeta map otherwise), the resolved view round-trips it, and
+ * the worker honors project precedence — so a Project override survives a
+ * re-read instead of reverting to "Inherited" (corrected per T-0307/03202ea;
+ * the earlier "stub does not persist" note was a stale-docstring false positive).
  */
 import { useEffect, useState } from "react";
 import { api, NotificationsResolved } from "../api";

@@ -17,6 +17,10 @@ import { useApiClient } from "../apiContext";
 import type { TelemetryResponse, TelemetrySession } from "../api";
 
 function fmtTokens(n: number): string {
+  // T-0267: roll up large values into M/B tiers so multi-million burns are
+  // glanceable — a 7,479,374/hr burn now reads "7.5M" instead of "7479k".
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e11 ? 0 : 1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e8 ? 0 : 1)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k`;
   return String(n);
 }

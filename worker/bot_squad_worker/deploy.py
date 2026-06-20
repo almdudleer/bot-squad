@@ -736,12 +736,16 @@ def _build_worker_restart_script(
     py = q(str(worker_dir / ".venv" / "bin" / "python"))
     coalesce_block = ""
     if coalesce_marker is not None and token:
+        # Pass the marker + token as argv (shell-quoted), NEVER interpolated into
+        # the `python -c` SOURCE — a bare path/UUID there is invalid Python
+        # (`_coalesce_write(/home/..., 1b6a39cf-...)` → SyntaxError) which silently
+        # broke every deploy's worker restart. argv keeps them plain strings.
         mk, tok = q(str(coalesce_marker)), q(token)
         coalesce_block = f"""
-{py} -c "from bot_squad_worker.deploy import _coalesce_write; _coalesce_write({mk}, {tok})" >> "$LOG" 2>&1 || true
+{py} -c "import sys; from bot_squad_worker.deploy import _coalesce_write; _coalesce_write(sys.argv[1], sys.argv[2])" {mk} {tok} >> "$LOG" 2>&1 || true
 sleep {int(delay_s)}
-if ! {py} -c "import sys; from bot_squad_worker.deploy import _coalesce_winner; sys.exit(0 if _coalesce_winner({mk}, {tok}) else 1)"; then
-  echo "[worker-restart] COALESCED — a newer restart superseded {tok}; skipping (it restarts with all synced code)" >> "$LOG"
+if ! {py} -c "import sys; from bot_squad_worker.deploy import _coalesce_winner; sys.exit(0 if _coalesce_winner(sys.argv[1], sys.argv[2]) else 1)" {mk} {tok}; then
+  echo "[worker-restart] COALESCED — a newer restart superseded this claim; skipping (it restarts with all synced code)" >> "$LOG"
   exit 0
 fi
 """

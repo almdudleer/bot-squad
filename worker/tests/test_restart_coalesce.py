@@ -55,6 +55,53 @@ def test_restart_script_includes_coalesce_when_marker_given(tmp_path):
     assert "q42" in script
 
 
+def _coalesce_payloads(script):
+    import re
+    # each `python -c "<payload>"` — payload has no inner double-quotes
+    return re.findall(r'-c "([^"]*)"', script)
+
+
+def test_coalesce_script_payloads_are_valid_python(tmp_path):
+    """Regression: a bare path/UUID interpolated into `python -c` source is
+    invalid Python (`_coalesce_write(/home/..., 1b6a39cf-...)` → SyntaxError),
+    which silently broke every deploy's worker restart."""
+    from bot_squad_worker.deploy import _build_worker_restart_script
+    script = _build_worker_restart_script(
+        tmp_path / "worker", tmp_path / "pip", tmp_path / "w.sock",
+        tmp_path / "r.log", tmp_path / "r.FAIL", "svc.service", 5, 10,
+        coalesce_marker=tmp_path / "_worker" / "restart_coalesce.token",
+        token="1b6a39cf-21d7-4489-94eb-159bc57f72cb",  # realistic queue_id
+    )
+    payloads = [p for p in _coalesce_payloads(script) if "_coalesce" in p]
+    assert payloads, "no python -c coalesce payloads found"
+    for p in payloads:
+        compile(p, "<coalesce>", "exec")  # must not raise SyntaxError
+
+
+def test_coalesce_script_roundtrip_executes(tmp_path):
+    """End-to-end: the generated write+winner payloads actually run and agree."""
+    import subprocess
+    import sys
+    from bot_squad_worker.deploy import _build_worker_restart_script
+    marker = tmp_path / "_worker" / "restart_coalesce.token"
+    token = "1b6a39cf-21d7-4489-94eb-159bc57f72cb"
+    script = _build_worker_restart_script(
+        tmp_path / "worker", tmp_path / "pip", tmp_path / "w.sock",
+        tmp_path / "r.log", tmp_path / "r.FAIL", "svc.service", 5, 10,
+        coalesce_marker=marker, token=token,
+    )
+    payloads = _coalesce_payloads(script)
+    write_py = next(p for p in payloads if "_coalesce_write" in p)
+    win_py = next(p for p in payloads if "_coalesce_winner" in p)
+    # run write (token + marker passed as argv, never injected into source)
+    subprocess.run([sys.executable, "-c", write_py, str(marker), token], check=True)
+    assert marker.read_text().strip() == token
+    # this token is the winner → exit 0
+    assert subprocess.run([sys.executable, "-c", win_py, str(marker), token]).returncode == 0
+    # a stale token is NOT the winner → exit 1
+    assert subprocess.run([sys.executable, "-c", win_py, str(marker), "stale"]).returncode == 1
+
+
 def test_restart_script_plain_sleep_without_marker(tmp_path):
     from bot_squad_worker.deploy import _build_worker_restart_script
     script = _build_worker_restart_script(

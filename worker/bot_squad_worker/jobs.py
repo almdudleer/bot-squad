@@ -309,12 +309,17 @@ def binding_gc_tick(cfg: Config) -> None:
     from bot_squad_worker import sessions as _sessions
     from bot_squad_worker import teams as _teams
     from bot_squad_worker import close_hook as _close_hook
+    from bot_squad_worker import task_gc as _task_gc
 
     passes = [
         ("gc_sessions", _sessions.gc_sessions),
         ("gc_dead_bindings", _sessions.gc_dead_bindings),
         ("gc_stale_bindings", _sessions.gc_stale_bindings),
         ("archive_dead_teammates", _sessions.archive_dead_teammates),
+        # F7: archive throwaway QA tasks (QA-TEST-DELETEME-*) once closed/aged so
+        # they stop leaking onto the board — the task-level analogue of the
+        # T-0233 stale-session reaper in archive_dead_teammates.
+        ("gc_throwaway_tasks", _task_gc.gc_throwaway_tasks),
         ("reconcile_teams", _teams.reconcile_teams),
         # T-0128: backfill parent_sid for legacy / agent-teams-spawned sessions
         # via the team-projection heuristic (fill-once, never overwrites the

@@ -82,6 +82,34 @@ def _seed_connected_server(
     return entry, bearer
 
 
+def _seed_self_server(
+    tmp_bot_squad: Path,
+    *,
+    server_id: str = "srv_self01",
+    base_url: str = "https://mothership.test",
+) -> AttachedServer:
+    """Seed the mothership's OWN ``is_self`` server with NO bearer sidecar.
+
+    The mothership never minted a server_bearer for itself, so the bearers/
+    sidecar file is deliberately absent — proving the self fan-in path needs
+    no bearer (T-0312).
+    """
+    store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    entry = AttachedServer(
+        id=server_id,
+        display_name="This Server",
+        base_url=base_url,
+        owner_user="testuser",
+        created_at=datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        install_state="ready",
+        is_self=True,
+    )
+    store.write([entry])
+    return entry
+
+
 class _Recorder:
     """Captures every upstream call the proxy makes, returns canned responses."""
 
@@ -256,6 +284,60 @@ def test_proxy_forwards_upstream_status_codes(
 
     assert r.status_code == 418
     assert r.json() == {"error": "i'm a teapot"}
+
+
+# ---- is_self server → local fan-in, no bearer (T-0312) ----------------------
+
+
+def test_proxy_self_server_fans_into_local_without_bearer(
+    tmp_bot_squad: Path, monkeypatch
+):
+    """T-0312: the generic proxy resolves the ``is_self`` server LOCALLY (no
+    bearer required) — same data the home view's ``list_server_projects``
+    already fans in — so the cross-server project route never 503s when
+    reached directly for the mothership's own server.
+
+    The self server has no bearer sidecar; the old code read the (missing)
+    bearer and 503'd. The fix dispatches in-process to the local app, so the
+    ``_proxy_client`` upstream hop is never taken (recorder stays empty).
+    """
+    _seed_self_server(tmp_bot_squad, server_id="srv_self01")
+    recorder = _install_mock_upstream(
+        monkeypatch,
+        lambda req: pytest.fail(f"unexpected upstream proxy hop: {req.url}"),
+    )
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        local = client.get("/api/projects")
+        assert local.status_code == 200, local.text
+        r = client.get("/api/m/servers/srv_self01/api/projects")
+
+    assert r.status_code == 200, r.text
+    assert r.json() == local.json()
+    assert recorder.calls == []
+
+
+def test_proxy_self_server_forwards_session_identity(
+    tmp_bot_squad: Path, monkeypatch
+):
+    """T-0312: the self fan-in carries the caller's session so the local
+    routes authenticate as the same user. ``/api/auth/me`` round-trips the
+    logged-in username through the proxy unchanged."""
+    _seed_self_server(tmp_bot_squad, server_id="srv_self02")
+    _install_mock_upstream(
+        monkeypatch,
+        lambda req: pytest.fail(f"unexpected upstream proxy hop: {req.url}"),
+    )
+
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        direct = client.get("/api/auth/me")
+        assert direct.status_code == 200, direct.text
+        via_proxy = client.get("/api/m/servers/srv_self02/api/auth/me")
+
+    assert via_proxy.status_code == 200, via_proxy.text
+    assert via_proxy.json().get("username") == direct.json().get("username")
 
 
 # ---- /servers/{id}/projects (cached + refresh) ------------------------------

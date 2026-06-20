@@ -118,6 +118,45 @@ def test_mothership_on_mounts_servers_empty(tmp_bot_squad: Path, monkeypatch):
     assert "server_bearer_hash" not in self_entry
 
 
+def test_list_global_users_seeds_local_auth_users(tmp_bot_squad: Path, monkeypatch):
+    """T-0313: on a self-dogfooded mothership the GlobalUser registry only
+    ever populated via ``/attach``/migration, so ``GET /api/m/users`` returned
+    ``[]`` even though the operator is logged in and real local users exist.
+
+    Listing now lazily seeds the local ``auth.toml`` users into the registry
+    so the directory reflects reality: the logged-in super-admin appears (as a
+    global admin, mirroring its server-admin role) instead of the misleading
+    "No global users yet" empty state.
+    """
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)  # testuser, is_admin=true in conftest auth.toml
+        r = client.get("/api/m/users")
+    assert r.status_code == 200, r.text
+    users = r.json()
+    by_name = {u["username"]: u for u in users}
+    assert "testuser" in by_name, f"expected seeded operator, got {users}"
+    assert by_name["testuser"]["global_role"] == "global_admin"
+
+
+def test_list_global_users_seed_is_idempotent(tmp_bot_squad: Path, monkeypatch):
+    """The lazy seed must not duplicate a user across repeated reads, and must
+    not clobber an already-established GlobalUser row (e.g. one created via
+    ``/attach`` with its own password hash)."""
+    with _client(tmp_bot_squad, monkeypatch, mothership=True) as client:
+        _login(client)
+        first = client.get("/api/m/users").json()
+        second = client.get("/api/m/users").json()
+    assert [u["username"] for u in first] == [u["username"] for u in second]
+    assert sum(1 for u in second if u["username"] == "testuser") == 1
+
+    # On-disk registry holds exactly one row for the seeded user.
+    from app.mothership_users_store import MothershipUsersStore
+
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    rows = [u for u in store.list_users() if u.username == "testuser"]
+    assert len(rows) == 1
+
+
 def test_self_register_is_idempotent_across_reboots(tmp_bot_squad: Path, monkeypatch):
     """Booting the app twice against the same DATA_DIR yields one self entry,
     not two. Dedup is by ``base_url`` (trailing-slash insensitive)."""

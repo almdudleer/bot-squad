@@ -222,6 +222,31 @@ def list_servers(request: Request, user: dict = Depends(require_auth)) -> list[d
 # ---- T-0066: GlobalUser registry (super-admin cookie auth) ------------------
 
 
+def _seed_local_users(request: Request) -> None:
+    """T-0313: backfill the GlobalUser registry from this install's local
+    ``auth.toml``.
+
+    On a self-dogfooded mothership the registry otherwise only populated via
+    ``/attach`` or the one-shot migration, so ``GET /api/m/users`` showed
+    "No global users yet" to a logged-in operator while real local users
+    existed. The local auth users ARE the seed identities for the mothership's
+    own server, so we upsert them lazily on read — same precedent as the
+    ``is_self`` server auto-registering on the server list. Upsert is
+    idempotent: an already-established GlobalUser (e.g. one created via
+    ``/attach`` with its own password hash) is returned unchanged, never
+    clobbered.
+    """
+    cfg = request.app.state.auth_config
+    store = _users_store(request)
+    for username, password_hash in cfg.users.items():
+        meta = cfg.meta_for(username)
+        store.upsert_user_by_username(
+            username=username,
+            password_hash=password_hash,
+            is_super_admin=meta.is_admin,
+        )
+
+
 @router.get("/users", dependencies=[Depends(_require_super_admin)])
 def list_global_users(request: Request) -> list[dict]:
     """Return the GlobalUser registry, password hashes stripped.
@@ -239,6 +264,7 @@ def list_global_users(request: Request) -> list[dict]:
     computed by walking the per-user attachments dir — cheap at the
     registry sizes we expect (single-digit users × single-digit servers).
     """
+    _seed_local_users(request)
     store = _users_store(request)
     out: list[dict] = []
     for u in store.list_users():
@@ -790,6 +816,44 @@ def _proxy_client(base_url: str) -> httpx.AsyncClient:
     )
 
 
+async def _fan_in_local(request: Request, path: str, body: bytes) -> Response:
+    """Dispatch ``path`` to THIS app in-process (T-0312, self-server fan-in).
+
+    Used by the proxy when the target is the mothership's own ``is_self``
+    server, which has no server_bearer to proxy with. ``httpx.ASGITransport``
+    re-enters ``request.app`` without a socket; the caller's session cookie is
+    forwarded so the local routes authenticate as the same user. The upstream
+    response is relayed verbatim — including any error status — so the FE sees
+    exactly what the single-install API would return.
+    """
+    headers: dict[str, str] = {}
+    cookie = request.headers.get("cookie")
+    if cookie:
+        headers["Cookie"] = cookie
+    ctype = request.headers.get("content-type")
+    if ctype:
+        headers["Content-Type"] = ctype
+    transport = httpx.ASGITransport(app=request.app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://self.local"
+    ) as client:
+        try:
+            upstream = await client.request(
+                request.method,
+                path,
+                content=body or None,
+                headers=headers,
+                params=request.query_params,
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"local dispatch failed: {e}")
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
 @router.get("/servers/{server_id}/projects")
 async def list_server_projects(
     server_id: str,
@@ -881,17 +945,29 @@ async def server_api_proxy(
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
     _require_server_access(server, user)
+    upstream_path = f"/api/{rest}"
+    # Forward the request body verbatim. The FE / single-install API only
+    # ever uses JSON bodies, but we don't decode here — pass-through keeps
+    # the proxy method-agnostic and avoids round-trip encoding bugs.
+    body = await request.body()
+
+    # T-0312: the mothership's OWN ``is_self`` server never minted a
+    # server_bearer, so there is nothing to proxy with — reading the (absent)
+    # bearer made the cross-server project route 503 for the self server even
+    # though its projects render fine on the home view (which fans in via
+    # ``list_server_projects``). Mirror that fan-in for ALL proxied paths:
+    # dispatch in-process to the LOCAL app, forwarding the caller's session
+    # cookie so the local routes authenticate as the same user. ASGITransport
+    # keeps it in-process (no socket / TLS hop, no bearer).
+    if server.is_self:
+        return await _fan_in_local(request, upstream_path, body)
+
     bearer = store.read_server_bearer(server_id)
     if not bearer:
         raise HTTPException(
             status_code=503,
             detail="server bearer not available (server not connected)",
         )
-    upstream_path = f"/api/{rest}"
-    # Forward the request body verbatim. The FE / single-install API only
-    # ever uses JSON bodies, but we don't decode here — pass-through keeps
-    # the proxy method-agnostic and avoids round-trip encoding bugs.
-    body = await request.body()
     headers: dict[str, str] = {"Authorization": f"Bearer {bearer}"}
     ctype = request.headers.get("content-type")
     if ctype:

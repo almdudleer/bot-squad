@@ -87,7 +87,12 @@ function ContextBar({ s, ceiling }: { s: TelemetrySession; ceiling: number }) {
 export function TelemetryPanel({ slug }: { slug: string }) {
   const api = useApiClient();
   const [data, setData] = useState<TelemetryResponse | null>(null);
-  const [collapsed, setCollapsed] = useState(false);
+  // T-0268: default COLLAPSED so this secondary "resource" widget doesn't push
+  // the primary sessions table (and its toolbar) below the fold — the panel
+  // listed every sampled session expanded-by-default, filling a laptop
+  // viewport. The burn/throttle summary stays visible in the header; the toggle
+  // re-expands the per-session rows on demand.
+  const [collapsed, setCollapsed] = useState(true);
 
   useEffect(() => {
     let cancelled = false;

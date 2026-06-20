@@ -142,16 +142,32 @@ export function TelemetryPanel({ slug }: { slug: string }) {
               🚫 rate-limited
             </span>
           )}
-          <span className="mc-badge mc-badge-dim" title="Estimated output-token burn across live sessions">
-            burn {q.burn_tokens_per_hr != null ? `${fmtTokens(Math.round(q.burn_tokens_per_hr))}/hr` : "—"}
+          {/* T-0266: label burn as an INSTANTANEOUS spot estimate, not a stable
+              rate. The backend figure is Δ output-tokens over a ~30-min window
+              ×3600/dt, so it swings sharply (observed 7.5M/hr → 500k/hr between
+              polls) when a session's cumulative counter jumps — e.g. a resume
+              re-reads its transcript. The "~ / spot" wording + tooltip tell the
+              operator not to read it as an actionable rate. True smoothing
+              (EWMA / counter-reset clamp) lives in the backend (telemetry.py
+              compute_burn) and is out of scope for this FE-clarity fix. */}
+          <span
+            className="mc-badge mc-badge-dim"
+            title="Instantaneous output-token burn — a volatile spot estimate (Δ output tokens over a ~30-min window, ×3600). It can swing sharply when a session's cumulative counter jumps (e.g. a resume re-reads its transcript), so treat it as a rough estimate, not a smoothed rate. Set a budget anchor in system_settings [quota] to turn it into an exhaustion projection."
+          >
+            burn {q.burn_tokens_per_hr != null
+              ? <>~{fmtTokens(Math.round(q.burn_tokens_per_hr))}/hr <span style={{ opacity: 0.7 }}>· spot</span></>
+              : "—"}
           </span>
           {q.projected_exhaustion_at ? (
             <span className="mc-badge mc-badge-warn" title="Projected against the operator-set budget anchor">
               exhausts ~{q.projected_exhaustion_at.replace("T", " ").replace("Z", "")} UTC
             </span>
           ) : (
-            <span className="mc-badge mc-badge-dim" title="Set a budget anchor in system_settings [quota] to project exhaustion">
-              projection: anchor unset
+            <span
+              className="mc-badge mc-badge-dim"
+              title="No exhaustion projection: a budget anchor is not set. The burn badge is only an instantaneous spot estimate — set a budget anchor in system_settings [quota] to project exhaustion."
+            >
+              no projection (set budget anchor)
             </span>
           )}
         </div>

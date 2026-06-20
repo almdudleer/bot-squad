@@ -229,9 +229,16 @@ export function Analytics() {
             <StatCard
               label="SESSIONS"
               value={String(data.sessions.total)}
-              sub={`${data.sessions.archived} archived · ${
-                data.sessions.by_status.active ?? 0
-              } active`}
+              // Sub-counts must partition the headline total: status is the
+              // partition axis (active + suspended === total), whereas
+              // `archived` is an orthogonal frontmatter flag (a subset that
+              // mostly overlaps suspended), so it is shown as a parenthetical
+              // annotation rather than a third additive bucket. This keeps the
+              // displayed sub-counts summing to the headline and matches the
+              // "Sessions by status" breakdown below. (T-0256)
+              sub={`${data.sessions.by_status.active ?? 0} active · ${
+                data.sessions.by_status.suspended ?? 0
+              } suspended (${data.sessions.archived} archived)`}
             />
             <StatCard
               label="TICKETS CLOSED"

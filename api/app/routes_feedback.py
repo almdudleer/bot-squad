@@ -52,6 +52,23 @@ def _validate_feedback_name(name: str) -> None:
         raise HTTPException(status_code=400, detail=f"invalid feedback file name: {name!r}")
 
 
+def _resolve_feedback(request: Request, slug: str, fid: str) -> tuple[str, Path]:
+    """Map a feedback artifact id to ``(stem_id, path)``.
+
+    T-0283: the nesting endpoints take the ARTIFACT ID — the filename stem, the
+    same value ``list_feedback`` returns as ``id`` and that cross-store
+    ``parent_doc_id`` refs use. A trailing ``.md`` is tolerated so the legacy
+    ``name`` form works too. No canonical ``F-NNNN`` shortening — the stem IS
+    the id."""
+    stem = fid[:-3] if fid.endswith(".md") else fid
+    if "/" in stem or "\\" in stem or not _FEEDBACK_NAME_RE.match(f"{stem}.md"):
+        raise HTTPException(status_code=400, detail=f"invalid feedback id: {fid!r}")
+    path = _fb_dir(request, slug) / f"{stem}.md"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"feedback not found: {fid}")
+    return stem, path
+
+
 def _validate_content(content: str) -> None:
     if not content:
         raise HTTPException(status_code=400, detail="content must not be empty")
@@ -187,15 +204,12 @@ def promote_feedback(
     return {"ok": True, "task_id": task_id}
 
 
-@router.get("/{name}/children")
-def get_feedback_children(slug: str, name: str, request: Request) -> list[dict]:
+@router.get("/{fid}/children")
+def get_feedback_children(slug: str, fid: str, request: Request) -> list[dict]:
     """Cross-store children of a feedback theme (T-0283): every artifact whose
-    ``parent_doc_id`` points at this feedback item (id = filename stem)."""
-    _validate_feedback_name(name)
-    fb_path = _fb_dir(request, slug) / name
-    if not fb_path.exists():
-        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
-    art_id = name[:-3] if name.endswith(".md") else name
+    ``parent_doc_id`` points at this feedback item. ``fid`` = the artifact id
+    (filename stem) that ``list_feedback`` returns; a trailing ``.md`` is OK."""
+    art_id, _ = _resolve_feedback(request, slug, fid)
     return AN.children_of(_project_root(request, slug), art_id)
 
 
@@ -203,18 +217,17 @@ class SetParent(BaseModel):
     parent_doc_id: str | None = None
 
 
-@router.put("/{name}/parent")
-def set_feedback_parent(slug: str, name: str, request: Request, body: SetParent,
+@router.put("/{fid}/parent")
+def set_feedback_parent(slug: str, fid: str, request: Request, body: SetParent,
                         user: dict = Depends(require_auth)) -> dict:
     """Re-parent (adopt) or clear the parent (disown) of a feedback item across
     the artifact stores (T-0283). Cycle-safe; injects a frontmatter block into a
     legacy raw-markdown feedback file on first nesting, preserving the body."""
-    _validate_feedback_name(name)
     root = _project_root(request, slug)
-    art_id = name[:-3] if name.endswith(".md") else name
+    art_id, _ = _resolve_feedback(request, slug, fid)
     ref = AN.find_artifact(root, art_id)
     if ref is None or ref.kind != AN.KIND_FEEDBACK:
-        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
+        raise HTTPException(status_code=404, detail=f"feedback not found: {fid}")
 
     new_parent = (body.parent_doc_id or "").strip() or None
     if new_parent is not None:

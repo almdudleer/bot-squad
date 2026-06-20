@@ -75,7 +75,14 @@ def _id_from_stem(stem: str) -> str:
 def _ref_for(kind: str, path: Path) -> ArtifactRef:
     meta, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
     stem = path.stem
-    art_id = str(meta.get("id") or _id_from_stem(stem))
+    if kind == KIND_FEEDBACK:
+        # Feedback has no canonical short id and is keyed by FILENAME everywhere
+        # (list/put/promote), so the full stem IS the artifact id. Deriving an
+        # `F-NNNN` prefix here breaks dated names (`F-2026-04-15-...`) and makes
+        # stored parent refs disagree with the children/parent endpoints.
+        art_id = stem
+    else:
+        art_id = str(meta.get("id") or _id_from_stem(stem))
     parent = meta.get("parent_doc_id")
     parent = str(parent).strip() if parent else None
     title = str(meta.get("title") or art_id)

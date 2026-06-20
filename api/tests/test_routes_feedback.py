@@ -342,3 +342,36 @@ def test_set_feedback_parent_cycle_rejected(tmp_bot_squad: Path, monkeypatch):
         )
     assert r.status_code == 400, r.text
     assert "cycle" in r.text.lower()
+
+
+def test_feedback_id_is_full_stem_and_roundtrips(tmp_bot_squad: Path, monkeypatch):
+    """T-0283 regression (WS-2 repro): a dated/sequenced feedback filename's
+    artifact id is the FULL stem (not an F-NNNN prefix), and that one id form
+    round-trips through list -> parent_doc_id ref -> children/parent endpoints
+    (with or without a trailing .md)."""
+    fb = _fb_dir(tmp_bot_squad)
+    (fb / "F-0001-2026-05-18-shared-tree.md").write_text("# Theme\n\nraw\n")
+    full = "F-0001-2026-05-18-shared-tree"
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        rows = c.get("/api/projects/test-project/feedback").json()
+        assert rows[0]["id"] == full  # full stem, not "F-0001"
+        # a doc nests under the feedback theme using list_feedback's id field
+        child = c.post(
+            "/api/projects/test-project/docs",
+            json={"category": "design", "title": "Evidence", "parent_doc_id": full},
+        ).json()["id"]
+        # children endpoint resolves the SAME id (no .md) — WS-2's 400 repro
+        kids = c.get(f"/api/projects/test-project/feedback/{full}/children").json()
+        assert [(k["id"], k["kind"]) for k in kids] == [(child, "doc")]
+        # and the .md form still works (back-compat with the name form)
+        kids2 = c.get(f"/api/projects/test-project/feedback/{full}.md/children").json()
+        assert {k["id"] for k in kids2} == {child}
+        # PUT parent by the bare id
+        mother = _new_doc(c, title="Mother")
+        r = c.put(
+            f"/api/projects/test-project/feedback/{full}/parent",
+            json={"parent_doc_id": mother},
+        )
+        assert r.status_code == 200, r.text
+        rows2 = c.get("/api/projects/test-project/feedback").json()
+    assert next(x["parent_doc_id"] for x in rows2 if x["id"] == full) == mother

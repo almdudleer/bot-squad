@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, DocSummary, DocDetail } from "../api";
+import { api, DocSummary, DocDetail, errorDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
 import { Markdown } from "../components/Markdown";
 
@@ -146,6 +146,31 @@ export function Docs() {
       );
     } catch (e) {
       setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // T-0276: delete a doc. Matches the app's destructive-action pattern
+  // (window.confirm gate, as in Users.tsx) — no new are-you-sure modal. The BE
+  // refuses (409) a mother doc that still has children; surface that detail
+  // (which names the blocking children) inline via errorDetail.
+  async function removeDoc() {
+    if (!selected) return;
+    const id = selected;
+    if (!window.confirm(`Delete ${id}? This cannot be undone (the id is retired, not reused).`)) return;
+    setBusy(true);
+    setError(null);
+    setFlash(null);
+    try {
+      await api.deleteDoc(slug, id);
+      setSelected(null);
+      setDetail(null);
+      setDraft(null);
+      reload();
+      setFlash(`Deleted ${id}.`);
+    } catch (e) {
+      setError(errorDetail(e));
     } finally {
       setBusy(false);
     }
@@ -298,9 +323,14 @@ export function Docs() {
                   {detail.id}
                   <span style={{ color: "var(--mc-text-dim)", marginLeft: "0.5rem" }}>{detail.category}</span>
                 </div>
-                <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(detail.raw)}>
-                  Edit
-                </button>
+                <div className="d-flex gap-2">
+                  <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(detail.raw)}>
+                    Edit
+                  </button>
+                  <button type="button" className="btn btn-outline-danger btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={removeDoc}>
+                    Delete
+                  </button>
+                </div>
               </div>
 
               {/* T-0235: nesting — mother (parent) + attached artifacts (children)

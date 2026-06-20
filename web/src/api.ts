@@ -13,6 +13,25 @@ export function isNotFoundError(err: unknown): boolean {
   return /^API error 404\b/.test(msg);
 }
 
+// T-0276: a call() error message packs the HTTP body as
+// ``API error <status>: <body>`` and FastAPI bodies are ``{"detail": "..."}``.
+// This pulls out the human-readable detail (e.g. the 409 child-guard message
+// that names the blocking children) so pages can surface it inline cleanly,
+// falling back to the raw message for non-FastAPI/non-JSON bodies.
+export function errorDetail(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = msg.match(/^API error \d+: (.*)$/s);
+  if (m) {
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (parsed && typeof parsed.detail === "string") return parsed.detail;
+    } catch {
+      /* body wasn't JSON — fall through to the raw message */
+    }
+  }
+  return msg;
+}
+
 async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     credentials: "include",
@@ -702,6 +721,10 @@ export const api = {
     call<{ ok: boolean; id: string }>(`/api/projects/${slug}/use_cases`, { method: "POST", body: JSON.stringify({ title }) }),
   runUseCase: (slug: string, id: string) =>
     call<{ ok: boolean; id: string; window: string; sid?: string }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/run`, { method: "POST" }),
+  // T-0276: delete a use case (cascades its owned flows subtree on the BE);
+  // UC-NNNN is tombstoned, not reclaimed. 404 if missing.
+  deleteUseCase: (slug: string, id: string) =>
+    call<{ ok: boolean; id: string; deleted: boolean }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`, { method: "DELETE" }),
   // T-0173: user flows attached to a use case.
   flows: (slug: string, ucId: string) =>
     call<FlowSummary[]>(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows`),
@@ -738,6 +761,12 @@ export const api = {
   putDoc: (slug: string, id: string, content: string) =>
     call(`/api/projects/${slug}/docs/${encodeURIComponent(id)}`,
       { method: "PUT", body: JSON.stringify({ content }) }),
+  // T-0276: delete a doc (scrubs ticket related_docs backlinks on the BE).
+  // 409 if it's a mother doc with children (detail names them); D-NNNN is
+  // tombstoned, not reclaimed; 404 if missing.
+  deleteDoc: (slug: string, id: string) =>
+    call<{ ok: boolean; id: string; deleted: boolean }>(`/api/projects/${slug}/docs/${encodeURIComponent(id)}`,
+      { method: "DELETE" }),
   linkDoc: (slug: string, id: string, ticket: string) =>
     call<{ ok: boolean; id: string; ticket: string; linked: boolean }>(
       `/api/projects/${slug}/docs/${encodeURIComponent(id)}/link`,

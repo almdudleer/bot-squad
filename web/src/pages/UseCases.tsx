@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api, FlowDetail, FlowSummary, UseCaseSummary, UseCaseDetail } from "../api";
+import { api, FlowDetail, FlowSummary, UseCaseSummary, UseCaseDetail, errorDetail } from "../api";
 import { PageHelp } from "../components/PageHelp";
 import { Mermaid, extractMermaid } from "../components/Mermaid";
 import { FlowGraphEditor } from "../components/FlowGraphEditor";
@@ -88,6 +88,34 @@ export function UseCases() {
       setFlash("Saved.");
     } catch (e) {
       setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // T-0276: delete a use case (the BE cascades its owned flows subtree).
+  // Matches the app's destructive-action pattern (window.confirm gate, as in
+  // Users.tsx) — no new are-you-sure modal. UC-NNNN is tombstoned, not reused.
+  async function removeUseCase() {
+    if (!selected) return;
+    const id = selected;
+    if (!window.confirm(`Delete ${id} and its flows? This cannot be undone (the id is retired, not reused).`)) return;
+    setBusy(true);
+    setError(null);
+    setFlash(null);
+    try {
+      await api.deleteUseCase(slug, id);
+      setSelected(null);
+      setDetail(null);
+      setDraft(null);
+      setFlows(null);
+      setOpenFlowId(null);
+      setFlowDetail(null);
+      setFlowDraft(null);
+      reload();
+      setFlash(`Deleted ${id}.`);
+    } catch (e) {
+      setError(errorDetail(e));
     } finally {
       setBusy(false);
     }
@@ -236,6 +264,9 @@ export function UseCases() {
                   </button>
                   <button type="button" className="btn btn-primary btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={() => run(detail.id)}>
                     {busy ? "Running…" : "Run test"}
+                  </button>
+                  <button type="button" className="btn btn-outline-danger btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={removeUseCase}>
+                    Delete
                   </button>
                 </div>
               </div>

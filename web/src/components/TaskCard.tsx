@@ -28,6 +28,7 @@ interface TaskCardProps {
 }
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
+  { value: "planned", label: "Planned" },
   { value: "open", label: "Open" },
   { value: "in_progress", label: "In progress" },
   { value: "totest", label: "To Test" },

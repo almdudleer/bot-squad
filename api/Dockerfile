@@ -33,6 +33,11 @@ RUN pip install --no-cache-dir -e ".[dev]" || pip install --no-cache-dir .
 
 COPY api/app /app/app
 COPY --from=web-builder /web/dist /app/web/dist
+# Install bundle served by the mothership at /i/<token>/{install.sh,instructions.md}
+# (routes_mothership._bundle_dir() -> INSTALL_BUNDLE_DIR or /app/scripts/install).
+# Without this the bundle GETs 500 "install bundle missing" on every MOTHERSHIP=1
+# deploy and the multi-server install can't even download the installer (T-0263).
+COPY scripts/install /app/scripts/install
 
 ENV CONFIG_DIR=/config \
     DATA_DIR=/data \

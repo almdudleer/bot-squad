@@ -158,7 +158,7 @@ die_struct() {
   printf '\n' >&2
   printf '============================================================\n' >&2
   printf 'INSTALL FAILED at checkpoint: %s\n' "$cp" >&2
-  printf '------------------------------------------------------------\n' >&2
+  printf '%s\n' '------------------------------------------------------------' >&2  # %s: leading-dash arg is not a printf flag (T-0286)
   printf 'What happened:\n%s\n' "$what" >&2
   printf '\nWhat to do:\n%s\n' "$how" >&2
   printf '\nThen re-run the same command. The installer picks up where it\n' >&2
@@ -187,7 +187,12 @@ post_checkpoint_event() {
   # configured or unreachable; we never fail the install on this.
   local cp="$1" status="$2"
   [[ "$BOTSQUAD_SKIP_MOTHERSHIP" = "1" ]] && return 0
-  [[ "$BOTSQUAD_MOTHERSHIP_URL" = "__MOTHERSHIP_URL__" ]] && return 0
+  # Match the placeholder SHAPE (__*__), never the literal sentinel: the
+  # mothership substitutes __MOTHERSHIP_URL__ everywhere via str.replace, so a
+  # literal "= __MOTHERSHIP_URL__" guard would be rewritten to the real value
+  # and fire exactly when substitution succeeded (T-0279). __*__ contains no
+  # sentinel literal, so substitution leaves it untouched.
+  [[ "$BOTSQUAD_MOTHERSHIP_URL" == __*__ ]] && return 0
   command -v curl >/dev/null 2>&1 || return 0
   command -v jq   >/dev/null 2>&1 || return 0
   local auth_header bearer_file="${BOTSQUAD_STATE_DIR}/server.token"
@@ -1022,7 +1027,7 @@ step_clone_repo() {
     log "repo already present at $BOTSQUAD_INSTALL_DIR (skipping clone)"
     return 0
   fi
-  if [[ "$BOTSQUAD_CLONE_URL" = "__CLONE_URL__" ]]; then
+  if [[ "$BOTSQUAD_CLONE_URL" == __*__ ]]; then  # placeholder shape, not literal (T-0279)
     die_struct clone_repo \
       "BOTSQUAD_CLONE_URL was not substituted by the mothership and no
 override was provided in the environment." \
@@ -1191,7 +1196,7 @@ step_mothership_handshake() {
     log "skipping mothership handshake (BOTSQUAD_SKIP_MOTHERSHIP=1)"
     return 0
   fi
-  if [[ "$BOTSQUAD_INSTALL_TOKEN" = "__INSTALL_TOKEN__" ]] || [[ "$BOTSQUAD_MOTHERSHIP_URL" = "__MOTHERSHIP_URL__" ]]; then
+  if [[ "$BOTSQUAD_INSTALL_TOKEN" == __*__ ]] || [[ "$BOTSQUAD_MOTHERSHIP_URL" == __*__ ]]; then  # placeholder shape, not literal (T-0279)
     die_struct mothership_handshake \
       "Install token / mothership URL were not substituted." \
       "This usually means install.sh was run from the repo directly, not
@@ -1546,7 +1551,7 @@ step_mothership_join() {
 Linux user + role — there is no offline override. Unset
 BOTSQUAD_SKIP_MOTHERSHIP and re-run."
   fi
-  if [[ "$BOTSQUAD_INSTALL_TOKEN" = "__INSTALL_TOKEN__" ]] || [[ "$BOTSQUAD_MOTHERSHIP_URL" = "__MOTHERSHIP_URL__" ]]; then
+  if [[ "$BOTSQUAD_INSTALL_TOKEN" == __*__ ]] || [[ "$BOTSQUAD_MOTHERSHIP_URL" == __*__ ]]; then  # placeholder shape, not literal (T-0279)
     die_struct mothership_join \
       "Invite token / mothership URL were not substituted." \
       "Invite-mode install must be invoked from the mothership-served

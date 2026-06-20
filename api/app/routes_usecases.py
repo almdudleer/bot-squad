@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -154,6 +155,31 @@ def put_use_case(slug: str, uc_id: str, request: Request, body: PutUseCase,
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)
     return {"ok": True, "id": uc_id}
+
+
+@router.delete("/{uc_id}")
+def delete_use_case(slug: str, uc_id: str, request: Request,
+                    user: dict = Depends(require_auth)) -> dict:
+    """Delete a use case (T-0276): remove the ``.md`` and cascade its flows.
+
+    A use case OWNS its user-flows (stored under ``<uc_id>/flows/``); they
+    can't exist without it, so the whole ``<uc_id>/`` subtree is removed with
+    the file. ``uc_id`` is regex-validated (no slashes, can't start with a dot)
+    so the ``root / uc_id`` rmtree can't traverse out of the use-cases dir. The
+    UC-NNNN id is tombstoned (monotonic allocator, never reissued), matching
+    the docs delete contract.
+    """
+    _validate_id(uc_id)
+    root = _uc_dir(request, slug)
+    path = root / f"{uc_id}.md"
+    owned_dir = root / uc_id
+    if not path.exists() and not owned_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"use case not found: {uc_id}")
+    if path.exists():
+        path.unlink()
+    if owned_dir.is_dir():
+        shutil.rmtree(owned_dir)
+    return {"ok": True, "id": uc_id, "deleted": True}
 
 
 def _section(body: str, heading: str) -> str:

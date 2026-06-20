@@ -132,3 +132,43 @@ def test_create_empty_title_rejected(tmp_bot_squad: Path, monkeypatch):
     with _logged_in(tmp_bot_squad, monkeypatch) as c:
         r = c.post("/api/projects/test-project/use_cases", json={"title": "  "})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# DELETE use case (T-0276): remove the file and cascade its owned flows dir.
+# ---------------------------------------------------------------------------
+def test_delete_use_case_removes_file(tmp_bot_squad: Path, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    uc_id = c.post(
+        "/api/projects/test-project/use_cases", json={"title": "Throwaway"}
+    ).json()["id"]
+    r = c.delete(f"/api/projects/test-project/use_cases/{uc_id}")
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True
+    assert c.get(f"/api/projects/test-project/use_cases/{uc_id}").status_code == 404
+
+
+def test_delete_use_case_not_found_404(tmp_bot_squad: Path, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    r = c.delete("/api/projects/test-project/use_cases/UC-9999")
+    assert r.status_code == 404, r.text
+
+
+def test_delete_use_case_cascades_flows(tmp_bot_squad: Path, monkeypatch):
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    uc_id = c.post(
+        "/api/projects/test-project/use_cases", json={"title": "WithFlows"}
+    ).json()["id"]
+    # A use case owns its flows (stored under <uc_id>/flows/). Seed one on disk.
+    flows_dir = tmp_bot_squad / "data" / "test-project" / "use_cases" / uc_id / "flows"
+    flows_dir.mkdir(parents=True, exist_ok=True)
+    (flows_dir / "UF-0001-x.md").write_text(
+        "---\nid: UF-0001\n---\n\nflow\n", encoding="utf-8"
+    )
+    assert c.delete(
+        f"/api/projects/test-project/use_cases/{uc_id}"
+    ).status_code == 200
+    # both the file and the owned flows subtree are gone
+    uc_root = tmp_bot_squad / "data" / "test-project" / "use_cases"
+    assert not (uc_root / f"{uc_id}.md").exists()
+    assert not (uc_root / uc_id).exists()

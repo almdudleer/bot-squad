@@ -205,3 +205,75 @@ def test_set_parent_requires_auth(tmp_bot_squad: Path, monkeypatch):
             json={"parent_doc_id": None},
         )
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# DELETE doc (T-0276): remove file, clean up ticket backlinks, reject a
+# mother doc with children, tombstone the id (no reclaim).
+# ---------------------------------------------------------------------------
+def test_delete_doc_removes_file(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        doc_id = _create(client, title="Throwaway").json()["id"]
+        r = client.delete(f"/api/projects/test-project/docs/{doc_id}")
+        assert r.status_code == 200, r.text
+        assert r.json()["deleted"] is True
+        # gone from get + listing
+        assert client.get(f"/api/projects/test-project/docs/{doc_id}").status_code == 404
+        listing = client.get("/api/projects/test-project/docs").json()
+        assert all(d["id"] != doc_id for d in listing)
+
+
+def test_delete_doc_not_found_404(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        r = client.delete("/api/projects/test-project/docs/D-9999")
+        assert r.status_code == 404, r.text
+
+
+def test_delete_doc_with_children_rejected(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Mother").json()["id"]
+        child = _create(client, title="Child", parent_doc_id=mother).json()["id"]
+        r = client.delete(f"/api/projects/test-project/docs/{mother}")
+        assert r.status_code == 409, r.text
+        assert child in r.text  # the blocking child is named
+        # mother survives the rejected delete
+        assert client.get(f"/api/projects/test-project/docs/{mother}").status_code == 200
+
+
+def test_delete_doc_cleans_up_ticket_backlink(tmp_bot_squad: Path, monkeypatch):
+    # Seed a ticket the doc can link to.
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-0001-sample.md").write_text(
+        "---\nid: T-0001\ntitle: Sample\nstatus: open\nrelated_docs: []\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        doc_id = _create(client, title="Linked").json()["id"]
+        assert client.post(
+            f"/api/projects/test-project/docs/{doc_id}/link",
+            json={"ticket": "T-0001"},
+        ).status_code == 200
+        # delete the doc → its backlink is scrubbed from the ticket's related_docs
+        assert client.delete(
+            f"/api/projects/test-project/docs/{doc_id}"
+        ).status_code == 200
+    text = (backlog / "T-0001-sample.md").read_text(encoding="utf-8")
+    assert doc_id not in text
+
+
+def test_delete_doc_tombstones_id_no_reclaim(tmp_bot_squad: Path, monkeypatch):
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        first = _create(client, title="First").json()["id"]
+        assert client.delete(
+            f"/api/projects/test-project/docs/{first}"
+        ).status_code == 200
+        # the allocator is monotonic — the next id is NOT the reclaimed one
+        second = _create(client, title="Second").json()["id"]
+        assert second != first
+        assert int(second.split("-")[1]) > int(first.split("-")[1])

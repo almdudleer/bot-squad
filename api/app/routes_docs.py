@@ -309,6 +309,48 @@ def create_doc(slug: str, request: Request, body: NewDoc,
             "parent_doc_id": parent_doc_id}
 
 
+@router.delete("/{doc_id}")
+def delete_doc(slug: str, doc_id: str, request: Request,
+               user: dict = Depends(require_auth)) -> dict:
+    """Delete a doc (T-0276): remove the file + scrub its ticket backlinks.
+
+    Refuses (409) to delete a MOTHER doc that still has children, so a subtree
+    is never silently orphaned — the caller must re-parent or delete the
+    children first. The ``D-NNNN`` id is TOMBSTONED, not reclaimed: the
+    per-type atomic allocator is monotonic, so a deleted id is never reissued
+    (no counter rollback, no collision risk).
+    """
+    _validate_doc_id(doc_id)
+    root = _docs_dir(request, slug)
+    path = _find_doc(root, doc_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
+
+    children = _children_of(root, doc_id)
+    if children:
+        child_ids = ", ".join(c["id"] for c in children)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"doc {doc_id} has child docs ({child_ids}) — "
+                "re-parent or delete them first"
+            ),
+        )
+
+    # Scrub the bidirectional mentions: drop this doc from each linked ticket's
+    # related_docs, mirroring unlink_doc's task-side cleanup so no ticket keeps
+    # a dangling related_docs entry.
+    meta = _parse(path)
+    backlog_dir = _backlog_dir(request, slug)
+    for ticket in meta.get("related_tickets") or []:
+        task_path = _find_task_file(backlog_dir, str(ticket))
+        if task_path is not None:
+            _mutate_list_field(task_path, "related_docs", doc_id, add=False)
+
+    path.unlink()
+    return {"ok": True, "id": doc_id, "deleted": True}
+
+
 class PutDoc(BaseModel):
     content: str
 

@@ -15,8 +15,6 @@ import argparse
 import getpass
 import logging
 import os
-import signal
-import sys
 import threading
 from pathlib import Path
 
@@ -129,19 +127,14 @@ def main() -> int:
 
     # T-0119: shutdown event flipped by SIGTERM/SIGINT so in-flight
     # peer_inbox_wait long-polls return early (reason=shutdown) instead of
-    # being SIGKILL'd by systemd 90s later.
+    # being SIGKILL'd by systemd 10s later. T-0284: the event is now flipped by
+    # the uvicorn handle_exit wrapper (_install_graceful_shutdown), NOT a
+    # standalone signal.signal handler — uvicorn overrides those, and a second
+    # handler calling sys.exit(0) mid-async-teardown produced a dirty
+    # status=1/FAILURE exit (which Restart=on-failure would act on). One handler,
+    # one clean exit.
     shutdown_event = threading.Event()
     set_shutdown_event(shutdown_event)
-
-    def _shutdown(*_: object) -> None:
-        log.info("shutdown signal received")
-        shutdown_event.set()
-        if sched is not None:
-            sched.shutdown(wait=False)
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
 
     if mode == "coordinator" and sched is not None:
         def _fix_sock_perms() -> None:

@@ -31,3 +31,31 @@ def test_health_worker_fresh(tmp_bot_squad: Path, monkeypatch) -> None:
     with TestClient(app) as client:
         r = client.get("/api/health")
     assert r.json()["worker"]["alive"] is True
+
+
+def test_health_exposes_git_sha(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0379: /api/health surfaces the image's build sha (BOT_SQUAD_GIT_SHA),
+    so 'is the deployed commit actually running?' is one curl — and the deploy
+    recipe / monitor can assert running==deployed instead of trusting a success
+    report (the stale-image gap that shipped T-0376 unfixed)."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("BOT_SQUAD_GIT_SHA", "abc1234deadbeef")
+    app = build_app()
+    with TestClient(app) as client:
+        r = client.get("/api/health")
+    assert r.json()["git_sha"] == "abc1234deadbeef"
+
+
+def test_health_git_sha_unknown_when_unset(tmp_bot_squad: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.delenv("BOT_SQUAD_GIT_SHA", raising=False)
+    app = build_app()
+    with TestClient(app) as client:
+        r = client.get("/api/health")
+    assert r.json()["git_sha"] == "unknown"

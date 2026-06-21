@@ -1,6 +1,7 @@
 """Health endpoint — surfaces worker liveness via heartbeat freshness."""
 from __future__ import annotations
 
+import os
 import time
 from importlib.metadata import version, PackageNotFoundError
 from pathlib import Path
@@ -32,6 +33,11 @@ def health(request: Request) -> dict:
     return {
         "ok": True,
         "version": _pkg_version(),
+        # T-0379: the git sha baked into this image at build time. Lets the
+        # deploy recipe / monitor (and a human curl) assert that the RUNNING
+        # container is the commit that was deployed — closing the stale-image
+        # gap where a deploy 'succeeded' but shipped an older HEAD.
+        "git_sha": os.environ.get("BOT_SQUAD_GIT_SHA", "unknown"),
         "uptime": time.monotonic() - _STARTED_AT,
         "worker": {"alive": alive, "last_heartbeat": last_hb},
     }

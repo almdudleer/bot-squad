@@ -39,11 +39,18 @@ COPY --from=web-builder /web/dist /app/web/dist
 # deploy and the multi-server install can't even download the installer (T-0263).
 COPY scripts/install /app/scripts/install
 
+# T-0379: bake the deployed git sha into the image so /api/health can report
+# what's actually running (and the recipe can assert running==deployed). Passed
+# by the deploy recipe via `--build-arg GIT_SHA=$(git rev-parse HEAD)`; defaults
+# to "unknown" for local/un-stamped builds.
+ARG GIT_SHA=unknown
+
 ENV CONFIG_DIR=/config \
     DATA_DIR=/data \
     WORKER_SOCK=/data/_sock/worker.sock \
     BUILD_AT_IMPORT=1 \
-    COOKIE_SECURE=1
+    COOKIE_SECURE=1 \
+    BOT_SQUAD_GIT_SHA=${GIT_SHA}
 
 EXPOSE 8000
 # --proxy-headers + --forwarded-allow-ips '*' so Starlette honors traefik's

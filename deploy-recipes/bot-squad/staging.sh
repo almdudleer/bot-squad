@@ -86,6 +86,12 @@ cd "$INSTALL_DIR"
 export TMPDIR="${INSTALL_DIR}/_tmp"
 mkdir -p "$TMPDIR"
 
+# T-0379: stamp the deployed git sha into the image (ARG GIT_SHA → ENV
+# BOT_SQUAD_GIT_SHA, surfaced at /api/health). The install dir is already
+# ff-merged to origin/$DEPLOY_BRANCH above, so its HEAD IS the deployed commit.
+export GIT_SHA="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
+echo "[bot-squad/staging] building image stamped GIT_SHA=$GIT_SHA"
+
 docker compose build || {
     rc=$?
     echo "[bot-squad/staging] WARN: docker compose build rc=$rc; checking whether image was still produced..." >&2
@@ -97,6 +103,19 @@ docker compose build || {
 }
 
 docker compose up -d
+
+# 3b. T-0379: assert the RUNNING container is actually the commit we deployed.
+#     Closes the stale-image gap (a deploy 'succeeded' but shipped an older HEAD
+#     because the build context / timing didn't match the intended commit). The
+#     image bakes BOT_SQUAD_GIT_SHA at build; if the running env doesn't match
+#     $GIT_SHA the recipe FAILS loudly instead of reporting a false success.
+running_sha="$(docker exec bot-squad-api printenv BOT_SQUAD_GIT_SHA 2>/dev/null || true)"
+if [ "$running_sha" != "$GIT_SHA" ]; then
+    echo "[bot-squad/staging] FATAL: running container sha '$running_sha' != deployed sha '$GIT_SHA'" >&2
+    echo "[bot-squad/staging] the image did not pick up the deployed commit — NOT a successful deploy." >&2
+    exit 9
+fi
+echo "[bot-squad/staging] verified running container sha == deployed sha ($GIT_SHA)"
 
 # 4. Worker restart is NOT done here in the recipe. T-0181 moved it into
 #    deploy.run_next, which (on a clean success, when the deploy request set

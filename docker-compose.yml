@@ -5,6 +5,7 @@ services:
       dockerfile: api/Dockerfile
       args:
         VITE_MOTHERSHIP: ${MOTHERSHIP:-0}
+        GIT_SHA: ${GIT_SHA:-unknown}   # T-0379: deploy recipe exports the deployed HEAD
     image: bot-squad-api:latest
     container_name: bot-squad-api
     restart: unless-stopped

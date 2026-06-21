@@ -178,9 +178,13 @@ def test_idle_glob_queue_is_noop(cfg_slug):
 
 
 def test_glob_alert_spawns_triage(cfg_slug):
-    """An alert file present + team below size → exactly one triage spawn."""
+    """An alert file present + team below size → exactly one triage spawn.
+
+    Uses a NON-retired team name (``triage-team``): the retired ``prod-support``
+    name is denylisted by the item-8 guard, so the generic glob-spawn machinery
+    is exercised with a name the guard doesn't suppress."""
     cfg, slug, spawns = cfg_slug
-    _write_initiative(cfg, slug, "prod-support",
+    _write_initiative(cfg, slug, "triage-team",
                       {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
     alerts = cfg.data_dir / slug / "_alerts"
     alerts.mkdir(parents=True, exist_ok=True)
@@ -188,9 +192,54 @@ def test_glob_alert_spawns_triage(cfg_slug):
 
     res = ct.tick(cfg, slug)
     assert len(spawns) == 1
-    assert spawns[0]["initiative"] == "prod-support.md"
+    assert spawns[0]["initiative"] == "triage-team.md"
     assert "alert-1.md" in spawns[0]["prompt"]
     assert res["actions"][0]["action"] == "spawned"
+
+
+def test_retired_user_feedback_not_staffed_even_with_pending_lines(cfg_slug):
+    """Audit item 8 / D6: the cut user-feedback FIREHOSE stays dead. Even if its
+    initiative file (constant_team:true, consume inbox.log) is re-seeded WITH
+    pending lines, tick() refuses to staff it. This code-level denylist is the
+    durable guard the operator asked for — it rides the deploy and survives any
+    data-dir reseed/scaffold, so the firehose can't resurrect after the on-host
+    delete."""
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "user-feedback",
+                      {"constant_team": "true", "team_size": 1,
+                       "consume": "feedback/inbox.log"})
+    fb = cfg.data_dir / slug / "feedback"
+    fb.mkdir(parents=True, exist_ok=True)
+    (fb / "inbox.log").write_text("2026-06-21T00:00:00Z | S-x | resurrect me\n")
+    res = ct.tick(cfg, slug)
+    assert spawns == []
+    assert res["actions"] == []
+
+
+def test_retired_prod_support_not_staffed_with_alerts(cfg_slug):
+    """The prod-support dead loop (consumer wired, no producer) is likewise
+    retired — re-seeding it + an _alerts file does not resurrect it."""
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "prod-support",
+                      {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
+    alerts = cfg.data_dir / slug / "_alerts"
+    alerts.mkdir(parents=True, exist_ok=True)
+    (alerts / "a.md").write_text("boom")
+    ct.tick(cfg, slug)
+    assert spawns == []
+
+
+def test_non_retired_constant_team_still_staffed(cfg_slug):
+    """The guard is TARGETED: a non-retired constant team with the same generic
+    glob consume still spawns — only the named firehose/dead-loop are cut."""
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "triage-team",
+                      {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
+    alerts = cfg.data_dir / slug / "_alerts"
+    alerts.mkdir(parents=True, exist_ok=True)
+    (alerts / "a.md").write_text("boom")
+    ct.tick(cfg, slug)
+    assert len(spawns) == 1
 
 
 def test_always_on_brief_is_keepalive_not_self_archive():
@@ -256,7 +305,7 @@ def test_finished_initiative_skip_strips_prefix(cfg_slug):
 def test_unfinished_initiative_still_spawns_with_finished_file_present(cfg_slug):
     """A different initiative listed as finished must not suppress an active one."""
     cfg, slug, spawns = cfg_slug
-    _write_initiative(cfg, slug, "prod-support",
+    _write_initiative(cfg, slug, "triage-team",
                       {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
     alerts = cfg.data_dir / slug / "_alerts"
     alerts.mkdir(parents=True, exist_ok=True)
@@ -290,12 +339,12 @@ def test_log_queue_advances_cursor(cfg_slug):
     """A .log consume source hands new lines to the dev and advances the cursor
     so the same feedback is not reprocessed on the next tick."""
     cfg, slug, spawns = cfg_slug
-    _write_initiative(cfg, slug, "user-feedback",
+    _write_initiative(cfg, slug, "triage-team",
                       {"constant_team": "true", "team_size": 1,
-                       "consume": "feedback/inbox.log"})
-    fb = cfg.data_dir / slug / "feedback"
+                       "consume": "notes/queue.log"})
+    fb = cfg.data_dir / slug / "notes"
     fb.mkdir(parents=True, exist_ok=True)
-    log = fb / "inbox.log"
+    log = fb / "queue.log"
     log.write_text("2026-06-02T00:00:00Z | S-x | sidebar is confusing\n")
 
     ct.tick(cfg, slug)

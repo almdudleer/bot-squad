@@ -1,7 +1,6 @@
 """Feedback read + write endpoints."""
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from datetime import datetime, timezone
@@ -82,62 +81,6 @@ def _validate_content(content: str) -> None:
         raise HTTPException(status_code=400, detail="content exceeds 200 KB limit")
 
 
-_INBOX_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-
-
-def _materialize_inbox(fb_dir: Path) -> None:
-    """T-0341: reconcile the two feedback stores so submitted feedback is visible.
-
-    ``bsq feedback submit`` appends raw lines to ``feedback/inbox.log``, but the
-    UI (and ``list_feedback``) only surfaced promoted ``F-*.md`` FeedbackFiles —
-    so submissions were invisible and the iteration loop's intake leaked. Here we
-    materialize each inbox.log line into a first-class ``F-*.md`` FeedbackFile so
-    it shows in the UI and is promotable through the existing path. Idempotent:
-    the filename derives from a content hash, so re-listing never duplicates and a
-    line already turned into a file is skipped.
-
-    Line shape: ``<ts> | <sid> | [uc=<id> | ]<text>`` (see bsq cmd_feedback_submit).
-    """
-    log = fb_dir / "inbox.log"
-    if not log.exists():
-        return
-    try:
-        raw_lines = log.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for raw in raw_lines:
-        line = raw.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split("|", 2)]
-        ts = parts[0] if parts else ""
-        sid = parts[1] if len(parts) > 1 else ""
-        text = parts[2] if len(parts) > 2 else line
-        digest = hashlib.sha256(line.encode("utf-8")).hexdigest()[:10]
-        date = ts[:10] if _INBOX_DATE_RE.match(ts) else "queue"
-        name = f"F-{date}-inbox-{digest}.md"
-        if not _FEEDBACK_NAME_RE.match(name):
-            continue  # never write a name the promote/put path would reject
-        path = fb_dir / name
-        if path.exists():
-            continue  # idempotent — already materialized
-        # readable title: drop any leading "[TAG]" prefix, cap length
-        title = re.sub(r"^\[[^\]]*\]\s*", "", text).strip()[:80] or "feedback submission"
-        body = (
-            f"# {title}\n\n"
-            f"Submitted via `bsq feedback` at {ts} by `{sid}`.\n\n"
-            f"{text}\n"
-        )
-        meta = {"source": "inbox.log", "submitted_at": ts, "submitted_by": sid}
-        text_out = AN.with_frontmatter(meta, body)
-        tmp = path.parent / (path.name + ".tmp")
-        try:
-            tmp.write_text(text_out, encoding="utf-8")
-            os.replace(tmp, path)  # atomic; tolerate concurrent identical writes
-        except OSError:
-            continue
-
-
 @router.get("")
 def list_feedback(slug: str, request: Request) -> list[dict]:
     cfg = request.app.state.api_config
@@ -146,8 +89,9 @@ def list_feedback(slug: str, request: Request) -> list[dict]:
     fb_dir = cfg.project_data_dir(slug) / "feedback"
     if not fb_dir.exists():
         return []
-    # T-0341: surface raw `bsq feedback` submissions (inbox.log) as FeedbackFiles.
-    _materialize_inbox(fb_dir)
+    # Audit item 8 (Fork-4): PURE read. `bsq feedback`/voice intake write F-*.md
+    # directly now, so list_feedback no longer materializes inbox.log on read
+    # (the cut side-effecting GET). A stray inbox.log is ignored (not an F-*.md).
     out = []
     for f in sorted(fb_dir.glob("*.md")):
         # T-0283: feedback is a nestable artifact. Surface its artifact `id`

@@ -39,54 +39,25 @@ def test_feedback_lists(tmp_bot_squad: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# T-0341: `bsq feedback` writes to inbox.log; the UI only showed promoted
-# FeedbackFiles → raw submissions were INVISIBLE. list_feedback now materializes
-# each inbox.log line into an idempotent F-*.md so it shows + is promotable.
+# Audit item 8 (Fork-4): `bsq feedback` now writes F-*.md DIRECTLY (host-side),
+# so list_feedback is a PURE read — the old side-effecting inbox.log→F-*.md
+# materialize is cut. A stray inbox.log is ignored, not consumed on read.
 # ---------------------------------------------------------------------------
 
-def test_inbox_log_submissions_surface_in_feedback_list(tmp_bot_squad: Path, monkeypatch):
+def test_list_feedback_is_pure_no_inbox_materialize(tmp_bot_squad: Path, monkeypatch):
     fb = tmp_bot_squad / "data" / "test-project" / "feedback"
     fb.mkdir(parents=True, exist_ok=True)
-    (fb / "inbox.log").write_text(
-        "2026-06-20T23:05:39Z | S-almdudleer-dogfood-p189 | [DOGFOOD] two feedback stores dont connect\n"
-        "2026-06-20T23:06:00Z | S-x-p1 | uc=UC-1 | a second raw submission\n"
-        "\n"  # blank line tolerated
-    )
+    (fb / "inbox.log").write_text("2026-06-20T23:05:39Z | S-x | a stray line\n")
+    (fb / "F-real.md").write_text("# Real\n\nbody\n")
     with _logged_in(tmp_bot_squad, monkeypatch) as c:
         r = c.get("/api/projects/test-project/feedback")
+        r2 = c.get("/api/projects/test-project/feedback")  # twice → still pure
     assert r.status_code == 200
-    bodies = " ".join(i["content"] for i in r.json())
-    assert "two feedback stores dont connect" in bodies
-    assert "a second raw submission" in bodies
-    # materialized as real F-*.md FeedbackFiles (promotable through the same UI)
-    mat = sorted(fb.glob("F-*-inbox-*.md"))
-    assert len(mat) == 2
-    # each materialized name is a valid promotable feedback name
-    from app.routes_feedback import _FEEDBACK_NAME_RE
-    assert all(_FEEDBACK_NAME_RE.match(p.name) for p in mat)
-
-
-def test_inbox_materialization_is_idempotent(tmp_bot_squad: Path, monkeypatch):
-    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
-    fb.mkdir(parents=True, exist_ok=True)
-    (fb / "inbox.log").write_text("2026-06-20T23:05:39Z | S-x | a finding\n")
-    with _logged_in(tmp_bot_squad, monkeypatch) as c:
-        c.get("/api/projects/test-project/feedback")
-        r = c.get("/api/projects/test-project/feedback")  # listed twice
-    assert r.status_code == 200
-    assert len(list(fb.glob("F-*-inbox-*.md"))) == 1  # not duplicated on re-list
-
-
-def test_materialized_inbox_feedback_is_promotable(tmp_bot_squad: Path, monkeypatch):
-    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
-    fb.mkdir(parents=True, exist_ok=True)
-    (fb / "inbox.log").write_text("2026-06-20T23:05:39Z | S-x | promote me please\n")
-    with _logged_in(tmp_bot_squad, monkeypatch) as c:
-        c.get("/api/projects/test-project/feedback")
-        name = next(fb.glob("F-*-inbox-*.md")).name
-        r = c.post(f"/api/projects/test-project/feedback/{name}/promote", json={})
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
+    # the read materialized nothing: no F-*-inbox-*.md was written
+    assert list(fb.glob("F-*-inbox-*.md")) == []
+    # only the genuine F-*.md surfaces; the cut inbox.log is not a feedback file
+    names = {row["name"] for row in r2.json()}
+    assert names == {"F-real.md"}
 
 
 # ---------------------------------------------------------------------------

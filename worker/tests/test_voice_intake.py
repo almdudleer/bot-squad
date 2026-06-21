@@ -55,7 +55,11 @@ def test_extract_voice_author_without_username():
 
 # --- write_voice_feedback --------------------------------------------------
 
-def test_write_voice_feedback_creates_artifact_and_inbox_line(tmp_path):
+def test_write_voice_feedback_creates_artifact_only(tmp_path):
+    """Audit item 8 (Fork-4): the F-*.md FeedbackFile is the single store. The
+    voice writer no longer ALSO appends to feedback/inbox.log — that line-queue
+    + its firehose constant team are cut, so a second write would just resurrect
+    the dead store."""
     cfg = _cfg(tmp_path)
     path = VI.write_voice_feedback(
         cfg, "bot-squad",
@@ -73,10 +77,9 @@ def test_write_voice_feedback_creates_artifact_and_inbox_line(tmp_path):
     assert "lang: ru" in body
     assert "transcription_engine: faster-whisper:small" in body
     assert "хочу тёмную тему" in body
-    # Rides the existing triage loop: a line was appended to inbox.log.
+    # the cut store is NOT resurrected
     inbox = cfg.data_dir / "bot-squad" / "feedback" / "inbox.log"
-    assert inbox.exists()
-    assert "хочу тёмную тему" in inbox.read_text()
+    assert not inbox.exists()
 
 
 # --- download_voice --------------------------------------------------------

@@ -34,6 +34,7 @@ Conventions shared with the other ops shims:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -2388,12 +2389,52 @@ def cmd_scenario_new(args) -> None:
 
 # --------------------------------------------------------------------------
 # feedback verb (T-0154) — friction-submission channel for in-project agents.
-# Appends to data/<slug>/feedback/inbox.log (an append-only line queue the
-# "user-feedback" constant team consumes). --usecase also threads the note into
-# that use case's md so the next testing run sees it (T-0159 integration).
+# Audit item 8 (Fork-4): writes a first-class `F-*.md` FeedbackFile DIRECTLY
+# into data/<slug>/feedback/, replacing the old inbox.log line-queue. The cut
+# removes the "user-feedback" constant-team firehose (auto-ticketed every line,
+# bypassing the operator's Occam prune) and the side-effecting `list_feedback`
+# read-time materialize — the operator's promote/dismiss path is now the single
+# triage gate. --usecase still threads the note into that use case's md so the
+# next testing run sees it (T-0159 integration).
 # --------------------------------------------------------------------------
-def _feedback_log(slug: str) -> Path:
-    return Path(BOT_SQUAD) / "data" / slug / "feedback" / "inbox.log"
+def _feedback_dir(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "feedback"
+
+
+_INBOX_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _render_feedback_md(ts: str, sid: str, text: str, uc: str) -> tuple[str, str]:
+    """Pure renderer → ``(filename, file_content)`` for a submitted note.
+
+    The name is content-hash keyed so an accidental double-submit dedupes; the
+    body carries an H1 title (with any leading ``[TAG]`` stripped) so the API's
+    promote path derives a sensible task title. Frontmatter mirrors the shape
+    the old API-side materializer wrote (``source``/``submitted_at``/
+    ``submitted_by``) plus the optional use-case link. No ``status`` key — its
+    absence means "open/visible" to ``list_feedback`` (item 12 sets a status
+    only on promote/dismiss)."""
+    line = f"{ts} | {sid} | {('uc=' + uc + ' | ') if uc else ''}{text}"
+    digest = hashlib.sha256(line.encode("utf-8")).hexdigest()[:10]
+    date = ts[:10] if _INBOX_DATE_RE.match(ts) else "queue"
+    name = f"F-{date}-bsq-{digest}.md"
+    title = re.sub(r"^\[[^\]]*\]\s*", "", text).strip()[:80] or "feedback submission"
+    fm_lines = [
+        "---",
+        "source: bsq feedback",
+        f"submitted_at: {ts}",
+        f"submitted_by: {sid}",
+    ]
+    if uc:
+        fm_lines.append(f"use_case: {uc}")
+    fm_lines.append("---")
+    content = (
+        "\n".join(fm_lines) + "\n\n"
+        f"# {title}\n\n"
+        f"Submitted via `bsq feedback` at {ts} by `{sid}`.\n\n"
+        f"{text}\n"
+    )
+    return name, content
 
 
 def cmd_feedback_submit(args) -> None:
@@ -2404,14 +2445,17 @@ def cmd_feedback_submit(args) -> None:
     sid = args.sid or my_sid() or "?"
     ts = _utc_now()
     uc = (args.usecase or "").strip()
-    uc_field = f"uc={uc} | " if uc else ""
-    line = f"{ts} | {sid} | {uc_field}{text}\n"
 
-    log_path = _feedback_log(slug)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(line)
-    print(f"feedback queued → {log_path}")
+    name, content = _render_feedback_md(ts, sid, text, uc)
+    fb_dir = _feedback_dir(slug)
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    path = fb_dir / name
+    # atomic dir-write (tmp + replace) so a host-uid submit and a container-uid
+    # promote/dismiss never half-write; identical re-submits overwrite cleanly.
+    tmp = fb_dir / (name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+    print(f"feedback filed → {path}")
 
     if uc:
         try:

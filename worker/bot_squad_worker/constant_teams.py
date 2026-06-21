@@ -59,6 +59,16 @@ _SPAWN_COOLDOWN_SEC = int(os.environ.get("BOT_SQUAD_CONSTANT_TEAM_COOLDOWN", "90
 _MAX_ITEMS_IN_BRIEF = 20
 _LIVE_STATUSES = ("active", "paused")
 
+# Audit item 8 (Fork-4) + D6: these constant-team initiatives are RETIRED — the
+# `user-feedback` firehose (auto-ticketed every inbox.log line, bypassing the
+# operator's Occam prune — "the bullshit generator") and the `prod-support` dead
+# loop (consumer wired, no producer). The on-host delete step removes their
+# initiative files + data stores, but THIS code-level denylist is the durable
+# guard the operator asked for: even if a re-seed/scaffold drops the files back,
+# tick() refuses to staff them, so the firehose can't resurrect. Rides the
+# deploy (not a gitignored data file), so it survives any data-dir reseed.
+_RETIRED_CONSTANT_TEAMS = frozenset({"user-feedback", "prod-support"})
+
 
 # ---------------------------------------------------------------------------
 # Frontmatter (minimal flat parser — no yaml dependency in the worker venv)
@@ -529,6 +539,13 @@ def tick(cfg: Any, slug: str) -> dict:
     for init_path in sorted(init_dir.glob("*.md")):
         fm = _read_frontmatter(init_path)
         if not _truthy(fm.get("constant_team")):
+            continue
+        # D6 guard: a retired firehose/dead-loop initiative never re-staffs, even
+        # if its file was re-seeded after the on-host delete (audit item 8).
+        if init_path.stem in _RETIRED_CONSTANT_TEAMS or \
+                (fm.get("name") or "").strip() in _RETIRED_CONSTANT_TEAMS:
+            log.debug("constant_teams: skipping retired team %s (audit item 8)",
+                      init_path.stem)
             continue
         if init_path.name in finished:
             continue

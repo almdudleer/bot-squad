@@ -2,9 +2,10 @@
 
 A voice note in a project's #feedback topic is downloaded, transcribed (ru/en
 via the transcribe seam), and stored as a first-class feedback artifact: the
-audio blob beside an enriched ``F-*.md`` whose body is the transcript. A line is
-also appended to ``feedback/inbox.log`` so the note rides the EXISTING
-user-feedback triage loop with zero new wiring — no lost commentary.
+audio blob beside an enriched ``F-*.md`` whose body is the transcript. That
+``F-*.md`` is the single feedback store — the operator triages it via the
+promote/dismiss path (audit item 8, Fork-4, cut the inbox.log line-queue +
+its user-feedback firehose).
 """
 from __future__ import annotations
 
@@ -90,12 +91,6 @@ def write_voice_feedback(
         f"{transcript}\n"
     )
     artifact.write_text(fm)
-
-    # Ride the existing triage loop: the user-feedback constant-team consumes
-    # feedback/inbox.log. Format mirrors `bsq feedback`: <ts> | <sid> | <text>.
-    inbox = fb_dir / "inbox.log"
-    with inbox.open("a") as fh:
-        fh.write(f"{ts} | tg-voice:{author} | [voice {duration}s] {transcript}\n")
 
     log.info("voice_intake: wrote %s (%d chars)", artifact.name, len(transcript))
     return artifact

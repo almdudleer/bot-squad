@@ -20,6 +20,7 @@ from bot_squad_worker.sessions import (
     set_drift_paused,
     spawn,
     _append_task_session_history,
+    _live_task_owner,
     _read_session_metadata,
     _write_session_metadata,
 )
@@ -1632,11 +1633,49 @@ def test_spawn_refuses_dup_bind_when_live_owner_exists(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_get_current_user", lambda: "u")
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
     monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    # T-0402: the owner gatekeeps only if its SID is a genuinely live claude
+    # agent — model that so this still tests a real dup-bind refusal (not a
+    # phantom, which T-0402 now correctly lets through).
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {"S-u-existing-p1"})
 
     from bot_squad_worker.actions import ActionError
     with pytest.raises(ActionError, match="already bound to live session"):
         spawn(cfg, "test-project", "w", task_id="T-0009")
     assert new_window_calls == [], "must refuse before opening a tmux window"
+
+
+def test_live_task_owner_ignores_phantom_dead_pane_holder(tmp_path, monkeypatch):
+    """T-0402: a crashed dev's md lingers ``status: active`` with the task still
+    in its md, but its tmux pane is gone (or fell back to a bash shell). Such a
+    PHANTOM holder must NOT gatekeep a rebind — else the task is permanently
+    un-rebindable ('already bound to live session {dead}'), the exact failure
+    this fn's docstring promises to prevent. Only a holder whose SID maps to a
+    live claude agent (``_live_agent_sids``) counts. Mirrors the T-0397
+    ``_count_live_sessions`` reconcile (d0b3cdc)."""
+    import bot_squad_worker.sessions as S
+    sess_dir = tmp_path / "data" / "test-project" / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(
+        sess_dir / "S-u-dead-p1.md",
+        {"sid": "S-u-dead-p1", "task_id": "T-0042", "status": "active"},
+    )
+    # no live agent maps to the holder's SID → it is a phantom, not an owner
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    assert _live_task_owner(tmp_path / "data", "test-project", "T-0042") is None
+
+
+def test_live_task_owner_returns_genuine_live_holder(tmp_path, monkeypatch):
+    """A holder whose SID IS a live claude agent still gatekeeps the rebind —
+    T-0402 must not over-correct and free a task held by a genuinely live dev."""
+    import bot_squad_worker.sessions as S
+    sess_dir = tmp_path / "data" / "test-project" / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(
+        sess_dir / "S-u-live-p1.md",
+        {"sid": "S-u-live-p1", "task_id": "T-0042", "status": "active"},
+    )
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {"S-u-live-p1"})
+    assert _live_task_owner(tmp_path / "data", "test-project", "T-0042") == "S-u-live-p1"
 
 
 def test_spawn_stamps_task_claim_active_in_seed_meta(tmp_path, monkeypatch):

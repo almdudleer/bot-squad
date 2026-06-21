@@ -2005,10 +2005,21 @@ def _live_task_owner(
     """SID of a *live* session (see ``_is_live_holder``) already holding
     ``task_id`` (primary or extras), or None. Suspended/archived holders are
     skipped — they do not gatekeep a rebind under the T-0237 cap.
+
+    T-0402: ``_is_live_holder`` trusts the persisted ``status: active`` alone,
+    but a crashed dev's md lingers ``active`` (gc_sessions can't reconcile an
+    empty-pane_id md — the T-0134 guard). Such a phantom would PERMANENTLY
+    gatekeep its task ('already bound to live session {dead}'), the exact
+    failure this fn promises to prevent. So a holder must ALSO map to a pane
+    running a live claude agent (``_live_agent_sids``) — the same reconcile the
+    T-0397 ``_count_live_sessions`` fix (d0b3cdc) applies to the parallel cap.
+    Computed once per call (a tmux + /proc scan), so the bind path is no longer
+    a pure data op but stays under the claim flock.
     """
     sess_dir = data_dir / slug / "sessions"
     if not sess_dir.exists():
         return None
+    live = _live_agent_sids()
     for md in sorted(sess_dir.glob("*.md")):
         meta = _read_session_metadata(md)
         if meta is None:
@@ -2016,7 +2027,7 @@ def _live_task_owner(
         sid = meta.get("sid", md.stem)
         if exclude_sid and sid == exclude_sid:
             continue
-        if task_id in _full_task_set(meta) and _is_live_holder(meta):
+        if task_id in _full_task_set(meta) and _is_live_holder(meta) and sid in live:
             return sid
     return None
 

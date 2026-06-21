@@ -25,6 +25,27 @@ from bot_squad_worker.sessions import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _all_sessions_live(tmp_path, monkeypatch):
+    """T-0402: ``_live_task_owner`` now intersects holders with live claude
+    agents (``_live_agent_sids``). These binding tests model every written
+    session as a genuinely live agent (their pre-T-0402 assumption), so stub
+    ``_live_agent_sids`` to return every session-md SID under the test data dir.
+    ``_is_live_holder`` still filters suspended/archived holders, so the
+    rebind-when-suspended/archived cases keep passing."""
+    import bot_squad_worker.sessions as S
+
+    def _live() -> set[str]:
+        out: set[str] = set()
+        for md in (tmp_path / "data").glob("*/sessions/*.md"):
+            meta = S._read_session_metadata(md)
+            if meta:
+                out.add(meta.get("sid", md.stem))
+        return out
+
+    monkeypatch.setattr(S, "_live_agent_sids", _live)
+
+
 def _make_cfg(tmp_path: Path) -> types.SimpleNamespace:
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()

@@ -454,6 +454,14 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
                   {tokensErr}
                 </div>
               )}
+              {/* T-0418: arming a token cap auto-anchors its budget period at
+                  save (server-side), so it measures spend since you armed it —
+                  not since run-start — and can't ratchet into a permanent block. */}
+              {!tokensErr && (
+                <div style={{ color: "var(--mc-text-dim)", fontSize: "0.64rem", marginTop: 2, maxWidth: "11.5rem" }}>
+                  Arming a cap auto-anchors its budget period to now — it can't ratchet into a permanent block.
+                </div>
+              )}
             </div>
             <div style={{ alignSelf: "flex-end" }}>
               <button

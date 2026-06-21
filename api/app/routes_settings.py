@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -77,6 +78,27 @@ def _toml_escape(s: str) -> str:
 _MANAGED_SECTIONS = ("tg", "session", "admin", "caps")
 
 
+def _now_iso() -> str:
+    """UTC timestamp for the [quota] anchor (T-0418). String-compared by the
+    worker's _anchor_key, so a stable second-resolution Z form is enough."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_quota(config_dir: Path) -> dict:
+    """The current [quota] anchor dict ({set_at, budget_tokens, ...}) from disk,
+    or {} if unset/unreadable. Read fresh so put_settings sees an operator's
+    deliberate anchor and never clobbers it (T-0418)."""
+    path = config_dir / "system_settings.toml"
+    if not path.exists():
+        return {}
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    q = raw.get("quota")
+    return dict(q) if isinstance(q, dict) else {}
+
+
 def _toml_value(v: object) -> str:
     """Render a scalar TOML value for a preserved (unmanaged) section."""
     if isinstance(v, bool):
@@ -136,7 +158,7 @@ def _read_system_settings(config_dir: Path) -> dict:
     }
 
 
-def _write_system_settings(config_dir: Path, settings: dict) -> None:
+def _write_system_settings(config_dir: Path, settings: dict, quota_override: dict | None = None) -> None:
     out: list[str] = []
     out.append("# bot-squad system settings. Managed by /api/system-settings.")
     out.append("")
@@ -165,6 +187,10 @@ def _write_system_settings(config_dir: Path, settings: dict) -> None:
         existing = tomllib.loads(path.read_text()) if path.exists() else {}
     except (OSError, ValueError):
         existing = {}
+    # T-0418: put_settings may stamp/override the [quota] anchor (token-cap
+    # free) while every OTHER unmanaged section is still preserved verbatim.
+    if quota_override is not None:
+        existing = {**existing, "quota": quota_override}
     for name, body in existing.items():
         if name in _MANAGED_SECTIONS or not isinstance(body, dict):
             continue
@@ -332,6 +358,21 @@ def put_settings(request: Request, payload: dict) -> dict:
                 )
             current["caps"][key] = v
 
+    # T-0418 (PASS-2 P2-20): a token cap with no [quota] anchor is a permanent
+    # ratchet — the worker's _output_since_anchor pins its baseline on the empty
+    # anchor key and only grows, so once it hits max_total_tokens _enforce_token_cap
+    # refuses EVERY spawn forever, with no in-UI free (the only release was a manual
+    # [quota].set_at edit in a different section). So when a token cap is armed (>0)
+    # and no anchor is set yet, auto-stamp [quota].set_at=now: the cap starts a real
+    # budget period and the OPEN names its own free (re-arming re-anchors). A
+    # deliberate operator anchor (set_at already present) is preserved untouched.
+    quota_override: dict | None = None
+    if current["caps"]["max_total_tokens"] > 0:
+        quota = _read_quota(config_dir)
+        if not str(quota.get("set_at", "") or ""):
+            quota["set_at"] = _now_iso()
+            quota_override = quota
+
     # T-0367: validate the bot_token BEFORE any write so the request is atomic —
     # validate-all-then-write. Previously _write_system_settings ran first, so a
     # request mixing a valid change (caps/ttl/...) with an invalid bot_token 400'd
@@ -346,7 +387,7 @@ def put_settings(request: Request, payload: dict) -> dict:
         bot_token_to_write = v
 
     # All inputs validated → persist (system settings, then secrets).
-    _write_system_settings(config_dir, current)
+    _write_system_settings(config_dir, current, quota_override=quota_override)
     if bot_token_to_write is not None:
         sec = _read_secrets(config_dir)
         age_max = int((sec.get("telegram", {}) or {}).get("auth_age_max", 86400))

@@ -476,3 +476,54 @@ def test_put_caps_rejects_non_int(tmp_bot_squad: Path, monkeypatch) -> None:
                        json={"caps": {"max_total_tokens": "lots"}})
     assert r.status_code == 400
     assert "max_total_tokens" in r.text
+
+
+# ---------------------------------------------------------------------------
+# T-0418 (PASS-2 P2-20): a token cap with no [quota] anchor is a permanent
+# ratchet — _output_since_anchor pins its baseline on an empty anchor_key and
+# only grows, so once it hits the cap _enforce_token_cap refuses every spawn
+# forever (the only "free" was a manual [quota].set_at edit in a different
+# section). Arming the cap must auto-stamp the anchor: the OPEN names its free.
+# ---------------------------------------------------------------------------
+
+def test_arming_token_cap_auto_stamps_quota_anchor(tmp_bot_squad: Path, monkeypatch) -> None:
+    """max_total_tokens armed >0 with no prior anchor → [quota].set_at stamped."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"max_total_tokens": 1_000_000}})
+    assert r.status_code == 200, r.text
+    raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
+    set_at = (raw.get("quota") or {}).get("set_at", "")
+    assert set_at, "arming a token cap with no anchor must auto-stamp [quota].set_at"
+
+
+def test_arming_token_cap_preserves_existing_anchor(tmp_bot_squad: Path, monkeypatch) -> None:
+    """An operator-set anchor is NOT clobbered when the cap is (re)saved."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        "[caps]\nmax_parallel_sessions = 0\nmax_total_tokens = 500\n"
+        "[quota]\nbudget_tokens = 900\nset_at = \"2026-01-01T00:00:00Z\"\n"
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"max_total_tokens": 750}})
+    assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert raw["quota"]["set_at"] == "2026-01-01T00:00:00Z", "must not clobber a deliberate anchor"
+    assert raw["quota"]["budget_tokens"] == 900, "must preserve the burndown budget"
+
+
+def test_token_cap_zero_does_not_stamp_anchor(tmp_bot_squad: Path, monkeypatch) -> None:
+    """An unarmed cap (0 = unlimited) creates no anchor — nothing to free."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"max_parallel_sessions": 5, "max_total_tokens": 0}})
+    assert r.status_code == 200, r.text
+    raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
+    assert not (raw.get("quota") or {}).get("set_at", ""), "an unarmed token cap must not stamp an anchor"

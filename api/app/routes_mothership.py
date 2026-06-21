@@ -47,7 +47,7 @@ from app.install_tokens import (
     is_server_bearer,
 )
 from app.auth import verify_password
-from app.mothership_store import MothershipStore
+from app.mothership_store import AttachedServer, MothershipStore
 from app.mothership_users_store import MothershipUsersStore
 from app.roles import GlobalRole
 from app.routes_auth import require_auth
@@ -91,21 +91,50 @@ def _is_global_admin(user: dict) -> bool:
     return user.get("global_role") == GlobalRole.GLOBAL_ADMIN.value
 
 
-def _require_admin_on_self(server, user: dict) -> None:
-    """T-0377: the ``is_self`` ACCESS bypass must NOT confer WRITE/management
-    standing to a non-admin.
+def _can_manage(server, user: dict) -> bool:
+    """Owner-only MANAGEMENT predicate — the single gate (audit Fork-3 SSOT)
+    for server-management writes (invites, grants, delete). D3 (operator
+    2026-06-21): management is owner-only.
 
-    ``_can_access`` / ``_require_owner`` short-circuit on ``is_self`` so every
-    authenticated user can ENTER their own install's self-server. For READ /
-    proxy routes that's safe — they fan IN to the LOCAL api, whose own auth
-    re-applies. But the management + credential-mint routes (invites, grants)
-    mutate the mothership store DIRECTLY with no fan-in, so the bypass let a
-    non-admin e.g. mint an admin-role invite on ``is_self`` = privilege
-    escalation (the T-0376 follow-on). Those actions still require global-admin
-    on the self-server; this raises 403 BEFORE any mutation when they don't.
+    Stricter than ``_can_access`` on purpose: a grantee may ENTER + proxy into a
+    server but must NEVER manage it (no privilege escalation), and a non-owning
+    global-admin has no standing on a PEER server (god-mode removed, T-0221 D2).
+    The ``is_self`` server is the one carve-out — the is_self ACCESS bypass
+    (every user can enter their own install) must not confer WRITE standing, so
+    managing the self-server is a global-admin action (T-0377).
     """
-    if getattr(server, "is_self", False) and not _is_global_admin(user):
-        raise HTTPException(status_code=403, detail="super-admin only on this server")
+    if getattr(server, "is_self", False):
+        return _is_global_admin(user)
+    username = user.get("username")
+    return bool(username) and username == server.owner_user
+
+
+def _require_manage(server, user: dict) -> None:
+    """Raise 403 unless ``user`` may MANAGE ``server`` (see ``_can_manage``)."""
+    if not _can_manage(server, user):
+        raise HTTPException(status_code=403, detail="server owner only")
+
+
+def require_manage(
+    request: Request,
+    server_id: str,
+    user: dict = Depends(require_auth),
+) -> AttachedServer:
+    """Server-resolving management gate (audit Fork-3). A management write route
+    cannot obtain its ``server`` without passing through this dependency, so the
+    owner check is structurally impossible to skip — the SSOT that replaced the
+    scattered ``_require_owner`` / ``_require_admin_on_self`` placements.
+
+    NOTE (flaw-watch): the ``server_id`` parameter name MUST match the route's
+    ``{server_id}`` path param — FastAPI injects path params into dependencies
+    BY NAME, so renaming it would silently feed ``server_id=None`` and turn the
+    gate into a no-op. The enumeration + per-route 403 tests pin this.
+    """
+    server = _store(request).get_server(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    _require_manage(server, user)
+    return server
 
 
 def _has_active_grant(server, username: str | None) -> bool:
@@ -152,24 +181,6 @@ def _require_server_access(server, user: dict) -> None:
     ``_can_access``). Applied to every gated server handler."""
     if not _can_access(server, user):
         raise HTTPException(status_code=403, detail="not authorized for this server")
-
-
-def _require_owner(server, user: dict) -> None:
-    """Raise 403 unless ``user`` OWNS ``server`` (or it is ``is_self``).
-
-    Gate for the grant-lifecycle endpoints: only the owner may add/revoke/list
-    grants. Deliberately STRICTER than ``_can_access`` — a grantee must not be
-    able to re-grant (no privilege escalation), and an admin has no special
-    standing here either.
-    """
-    if getattr(server, "is_self", False):
-        # T-0377: grant management on the self-server is an admin action — the
-        # is_self bypass must not give a non-admin owner standing.
-        _require_admin_on_self(server, user)
-        return
-    if user.get("username") == server.owner_user:
-        return
-    raise HTTPException(status_code=403, detail="server owner only")
 
 
 def _mothership_base_url(request: Request) -> str:
@@ -395,6 +406,7 @@ def create_invite(
     request: Request,
     server_id: str,
     payload: dict,
+    server: AttachedServer = Depends(require_manage),
     user: dict = Depends(require_auth),
 ) -> dict:
     """Mint an invite token tied to an existing server + target Linux user.
@@ -411,13 +423,9 @@ def create_invite(
     + 24h TTL bounds the blast radius if the link leaks.
     """
     store = _store(request)
-    server_entry = store.get_server(server_id)
-    if server_entry is None:
-        raise HTTPException(status_code=404, detail="server not found")
-    _require_server_access(server_entry, user)
-    # T-0377: minting an invite (incl role=admin) is a credential-mint admin
-    # action; the is_self access bypass must not let a non-admin mint one.
-    _require_admin_on_self(server_entry, user)
+    # ``server`` is resolved + owner-gated by ``require_manage`` (audit Fork-3,
+    # D3 owner-only): minting an invite is a management action, so a grantee who
+    # can ENTER the server can no longer mint one.
     target_username = (payload.get("target_username") or "").strip()
     role = (payload.get("role") or "").strip()
     if not target_username:
@@ -463,7 +471,7 @@ def create_invite(
 # ---- T-0221: per-server access grants (owner-only) --------------------------
 # The owner of a server may grant other mothership users explicit, revocable
 # access to see + enter it. Grant management is strictly the owner's — gated by
-# ``_require_owner`` (NOT ``_require_server_access``), so a grantee cannot
+# ``require_manage`` (NOT ``_require_server_access``), so a grantee cannot
 # re-grant and a non-owning admin has no standing.
 
 
@@ -482,15 +490,9 @@ def _active_grants(server) -> list[dict]:
 
 @router.get("/servers/{server_id}/grants")
 def list_grants(
-    request: Request,
     server_id: str,
-    user: dict = Depends(require_auth),
+    server: AttachedServer = Depends(require_manage),
 ) -> dict:
-    store = _store(request)
-    server = store.get_server(server_id)
-    if server is None:
-        raise HTTPException(status_code=404, detail="server not found")
-    _require_owner(server, user)
     return {"server_id": server_id, "grants": _active_grants(server)}
 
 
@@ -499,13 +501,10 @@ def create_grant(
     request: Request,
     server_id: str,
     payload: dict,
+    server: AttachedServer = Depends(require_manage),
     user: dict = Depends(require_auth),
 ) -> dict:
     store = _store(request)
-    server = store.get_server(server_id)
-    if server is None:
-        raise HTTPException(status_code=404, detail="server not found")
-    _require_owner(server, user)
     username = (payload.get("username") or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
@@ -521,13 +520,9 @@ def delete_grant(
     request: Request,
     server_id: str,
     username: str,
-    user: dict = Depends(require_auth),
+    server: AttachedServer = Depends(require_manage),
 ) -> dict:
     store = _store(request)
-    server = store.get_server(server_id)
-    if server is None:
-        raise HTTPException(status_code=404, detail="server not found")
-    _require_owner(server, user)
     updated = store.revoke_grant(server_id, username)
     if updated is None:
         raise HTTPException(status_code=404, detail="server not found")

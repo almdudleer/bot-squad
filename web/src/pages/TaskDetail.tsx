@@ -19,7 +19,8 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
 ];
 
 // T-0238: at-a-glance stage label/colour for the user-facing header pill.
-// Covers every status (incl. planned/closed which aren't in STATUS_OPTIONS).
+// Covers every status (planned…closed) — same set the STATUS_OPTIONS select
+// offers, so the detail header can restage to any stage (incl. Planned, T-0291).
 const STAGE_LABELS: Record<Task["status"], string> = {
   planned: "Planned",
   open: "Open",
@@ -67,6 +68,18 @@ function formatNoteTs(ts: string): string {
   if (!ts) return "";
   const d = new Date(ts);
   return isNaN(d.getTime()) ? ts : d.toLocaleString();
+}
+
+// T-0291: resolve a session's first-touch timestamp for the session-history
+// audit trail. Prefer the persisted `session_history_ts` (stamped at bind time,
+// survives suspend/archive/legacy), then fall back to the live-session
+// `started_at` join, then null (rendered as `—`).
+export function firstTouchTs(
+  sid: string,
+  historyTs: Record<string, string> | null | undefined,
+  liveStartedAt: string | null | undefined,
+): string | null {
+  return historyTs?.[sid] ?? liveStartedAt ?? null;
 }
 
 // T-0238: the user (stakeholder) is the author of comments dropped into the
@@ -917,7 +930,10 @@ export function TaskDetail() {
             <div>
               {(task.session_history ?? []).map((sid, i) => {
                 const row = sessionsBySid[sid];
-                const startedAt = row?.started_at;
+                // T-0291: prefer the persisted first-touch ts (stamped at bind
+                // time, survives suspend/archive) over the live-session
+                // started_at join; only fall back to `—` when neither exists.
+                const firstTouch = firstTouchTs(sid, task.session_history_ts, row?.started_at);
                 return (
                   <div
                     key={`${sid}-${i}`}
@@ -953,13 +969,13 @@ export function TaskDetail() {
                         marginLeft: "auto",
                       }}
                       title={
-                        startedAt
-                          ? `Session started_at: ${startedAt}`
-                          : "Session not in the current registry (suspended/archived/legacy)"
+                        firstTouch
+                          ? `First touched: ${firstTouch}`
+                          : "Session not in the current registry (suspended/archived/legacy) and no persisted first-touch ts"
                       }
                     >
-                      {startedAt
-                        ? new Date(startedAt).toLocaleString()
+                      {firstTouch
+                        ? new Date(firstTouch).toLocaleString()
                         : "—"}
                     </span>
                   </div>

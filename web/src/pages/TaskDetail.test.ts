@@ -12,7 +12,7 @@
  */
 import { describe, expect, test } from "vitest";
 
-import { parseProgressList, STAKEHOLDER_SID } from "./TaskDetail";
+import { parseProgressList, STAKEHOLDER_SID, firstTouchTs } from "./TaskDetail";
 import { countNotes } from "../components/TaskCard";
 
 const FEED = [
@@ -46,6 +46,28 @@ describe("parseProgressList", () => {
     const mine = out.filter((p) => p.sid === STAKEHOLDER_SID);
     expect(mine).toHaveLength(1);
     expect(mine[0].text).toBe("Looks good — ship it.");
+  });
+});
+
+describe("firstTouchTs (T-0291 session-history first-touch resolution)", () => {
+  const TS = { "S-legacy": "2026-06-10T08:00:00Z", "S-live": "2026-06-15T09:00:00Z" };
+
+  test("prefers the persisted ts even when the session is absent from /sessions (legacy)", () => {
+    expect(firstTouchTs("S-legacy", TS, undefined)).toBe("2026-06-10T08:00:00Z");
+  });
+
+  test("persisted ts wins over the live started_at join", () => {
+    expect(firstTouchTs("S-live", TS, "2026-06-22T18:00:00Z")).toBe("2026-06-15T09:00:00Z");
+  });
+
+  test("falls back to live started_at when no persisted ts", () => {
+    expect(firstTouchTs("S-x", TS, "2026-06-22T18:00:00Z")).toBe("2026-06-22T18:00:00Z");
+  });
+
+  test("returns null (renders —) when neither exists", () => {
+    expect(firstTouchTs("S-x", TS, undefined)).toBeNull();
+    expect(firstTouchTs("S-x", null, undefined)).toBeNull();
+    expect(firstTouchTs("S-x", undefined, undefined)).toBeNull();
   });
 });
 

@@ -1354,7 +1354,9 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     return {"ok": True, "sid": new_sid}
 
 
-def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> bool:
+def _append_task_session_history(
+    backlog_dir: Path, task_id: str, sid: str, ts: str | None = None
+) -> bool:
     """T-0105: append `sid` to the task md's `session_history:` frontmatter
     list. Append-only, idempotent (de-duped — if `sid` is already in the
     list, no-op) and atomic (tmp + rename).
@@ -1364,6 +1366,15 @@ def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> b
     pick it up. Block-yaml-format lists written by the api PATCH path
     would be invisible here (same hazard as the existing `blocked_by`
     field — audit Bug #4); inline format is the worker's source of truth.
+
+    T-0291: alongside the SID, stamp a sidecar ``session_history_ts:`` map
+    (``{SID: first-touch-ISO}``) so the UI can show a real first-touch time
+    for a session that has since gone suspended/archived/legacy (the live
+    `/sessions` join would otherwise render `—`). The map is first-touch-wins:
+    because the SID dedup short-circuits below, an existing SID is never
+    re-stamped. It's a parallel block-YAML field read only via the shared
+    pyyaml parser — `session_history` stays the canonical inline SID list.
+    `ts` defaults to now (UTC); callers/tests may pin it.
 
     Creates the field if absent, inserted after ``status:`` for stable
     ordering. Returns True iff the file was modified.
@@ -1387,11 +1398,18 @@ def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> b
 
     existing = _frontmatter.as_list(meta.get("session_history"))
     if sid in existing:
-        return False  # idempotent — de-dup, preserve order
+        return False  # idempotent — de-dup, preserve order (first-touch ts kept)
 
     new_list = existing + [sid]
+    # T-0291: stamp this SID's first-touch ts into the sidecar map.
+    stamp = ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    raw_ts = meta.get("session_history_ts")
+    ts_map = dict(raw_ts) if isinstance(raw_ts, dict) else {}
+    ts_map.setdefault(sid, stamp)  # first-touch wins (sid is new here anyway)
+
     if "session_history" in meta:
         meta["session_history"] = new_list
+        meta["session_history_ts"] = ts_map
     else:
         # Insert after `status` for stable ordering (else append at end).
         rebuilt: dict = {}
@@ -1400,9 +1418,11 @@ def _append_task_session_history(backlog_dir: Path, task_id: str, sid: str) -> b
             rebuilt[k] = v
             if k == "status":
                 rebuilt["session_history"] = new_list
+                rebuilt["session_history_ts"] = ts_map
                 inserted = True
         if not inserted:
             rebuilt["session_history"] = new_list
+            rebuilt["session_history_ts"] = ts_map
         meta = rebuilt
 
     content = _frontmatter.dump(meta, body)

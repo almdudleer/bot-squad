@@ -19,6 +19,7 @@ from bot_squad_worker.sessions import (
     resume,
     set_drift_paused,
     spawn,
+    _append_task_session_history,
     _read_session_metadata,
     _write_session_metadata,
 )
@@ -2909,6 +2910,83 @@ def test_session_history_unbind_rebind_no_dup(tmp_path, monkeypatch):
     # Unbind does NOT touch session_history (it's append-only/forensic).
     unbind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
     assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
+
+
+# ---------------------------------------------------------------------------
+# T-0291: session_history_ts — a sidecar SID→first-touch-ISO map so the UI can
+# show a real first-touch time for suspended/archived/legacy SIDs (instead of
+# `—` when the live-sessions join misses). session_history stays the canonical
+# inline SID list; the ts map is a parallel field, parsed via the shared pyyaml
+# parser (no line-reader sees it).
+# ---------------------------------------------------------------------------
+
+def _read_task_session_history_ts(task_md: Path) -> dict[str, str]:
+    """Parse the `session_history_ts:` sidecar map out of a task md."""
+    from bot_squad_worker import frontmatter as _fm
+    parsed = _fm.parse_or_none(task_md.read_text())
+    assert parsed is not None
+    meta, _ = parsed
+    val = meta.get("session_history_ts")
+    return dict(val) if isinstance(val, dict) else {}
+
+
+def test_session_history_ts_stamped_on_first_append(tmp_path):
+    """The first append of a SID stamps a first-touch ts into session_history_ts."""
+    backlog = tmp_path / "backlog"
+    backlog.mkdir()
+    task_md = backlog / "T-0097-ts.md"
+    task_md.write_text("---\nid: T-0097\ntitle: TS\nstatus: open\n---\n\nbody\n")
+
+    assert _append_task_session_history(backlog, "T-0097", "S-alice-w-p2", ts="2026-06-21T01:00:00Z")
+    assert _read_task_session_history(task_md) == ["S-alice-w-p2"]
+    assert _read_task_session_history_ts(task_md) == {"S-alice-w-p2": "2026-06-21T01:00:00Z"}
+
+
+def test_session_history_ts_first_touch_wins_on_redundant_append(tmp_path):
+    """Re-appending an existing SID is a no-op — the original first-touch ts is
+    preserved (the dedup short-circuits before re-stamping)."""
+    backlog = tmp_path / "backlog"
+    backlog.mkdir()
+    task_md = backlog / "T-0098-ts.md"
+    task_md.write_text("---\nid: T-0098\ntitle: TS\nstatus: open\n---\n\nbody\n")
+
+    assert _append_task_session_history(backlog, "T-0098", "S-alice-w-p2", ts="2026-06-21T01:00:00Z")
+    # second append of the SAME sid with a LATER ts must not overwrite
+    assert not _append_task_session_history(backlog, "T-0098", "S-alice-w-p2", ts="2026-06-21T09:00:00Z")
+    assert _read_task_session_history_ts(task_md) == {"S-alice-w-p2": "2026-06-21T01:00:00Z"}
+
+
+def test_session_history_ts_accumulates_per_sid(tmp_path):
+    """Each distinct SID gets its own first-touch ts; the map accumulates."""
+    backlog = tmp_path / "backlog"
+    backlog.mkdir()
+    task_md = backlog / "T-0099-ts.md"
+    task_md.write_text("---\nid: T-0099\ntitle: TS\nstatus: open\n---\n\nbody\n")
+
+    _append_task_session_history(backlog, "T-0099", "S-alice-w-p2", ts="2026-06-21T01:00:00Z")
+    _append_task_session_history(backlog, "T-0099", "S-bob-w-p3", ts="2026-06-21T02:00:00Z")
+    assert _read_task_session_history(task_md) == ["S-alice-w-p2", "S-bob-w-p3"]
+    assert _read_task_session_history_ts(task_md) == {
+        "S-alice-w-p2": "2026-06-21T01:00:00Z",
+        "S-bob-w-p3": "2026-06-21T02:00:00Z",
+    }
+
+
+def test_session_history_ts_preserved_on_api_patch_roundtrip(tmp_path):
+    """An operator PATCH (merge_task_update) preserves the sidecar ts map —
+    it's an existing-but-unlisted frontmatter key, copied through verbatim."""
+    backlog = tmp_path / "backlog"
+    backlog.mkdir()
+    task_md = backlog / "T-0100-ts.md"
+    task_md.write_text("---\nid: T-0100\ntitle: TS\nstatus: open\n---\n\nbody\n")
+    _append_task_session_history(backlog, "T-0100", "S-alice-w-p2", ts="2026-06-21T01:00:00Z")
+
+    # The API writer lives in the api package; import lazily so this worker test
+    # only exercises it when both packages are importable.
+    pytest.importorskip("app.markdown_writer")
+    from app.markdown_writer import merge_task_update
+    merge_task_update(task_md, {"status": "in_progress"})
+    assert _read_task_session_history_ts(task_md) == {"S-alice-w-p2": "2026-06-21T01:00:00Z"}
 
     # Re-bind same SID — still no dup.
     bind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")

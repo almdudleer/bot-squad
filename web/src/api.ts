@@ -93,6 +93,11 @@ export type Task = {
   // oldest first. Worker stamps on spawn/bind/resume; rendered as a panel
   // on TaskDetail. May be undefined for legacy tasks created before T-0105.
   session_history?: string[];
+  // T-0291: sidecar SID→first-touch-ISO map written alongside each
+  // session_history append, so a suspended/archived/legacy SID still shows a
+  // real first-touch time on TaskDetail instead of `—` when the live-sessions
+  // join misses. Absent for tasks last touched before T-0291.
+  session_history_ts?: Record<string, string> | null;
   path: string;
   created?: string;
   updated?: string;

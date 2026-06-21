@@ -64,7 +64,65 @@ from app.routes_auth import require_auth
 TERMINAL_INSTALL_CHECKPOINT = "print_attach"
 
 
-router = APIRouter(tags=["mothership"], dependencies=[Depends(require_auth)])
+def _seed_local_users_into(app) -> None:
+    """Backfill the GlobalUser registry from this install's local ``auth.toml``,
+    attaching each user to the mothership's own (``is_self``) server.
+
+    T-0313/0317: on a self-dogfooded mothership the registry otherwise only
+    populates via ``/attach`` or the one-shot migration, so ``GET /api/m/users``
+    showed "No global users yet" to a logged-in operator while real local users
+    existed; and each seeded user is attached to the self-server so the
+    directory's ``attached_servers`` tally is a real number.
+
+    item 21 (audit theme-2): this runs ONCE at mothership STARTUP (see
+    ``_mothership_lifespan``) instead of on every ``GET /api/m/users`` — a read
+    must not mutate the store. Idempotent: an already-established GlobalUser is
+    returned unchanged, never clobbered; the self-attachment upsert is a no-op
+    once present.
+    """
+    auth_cfg = getattr(app.state, "auth_config", None)
+    api_cfg = getattr(app.state, "api_config", None)
+    if auth_cfg is None or api_cfg is None:
+        return
+    root = api_cfg.data_dir / "_mothership"
+    users_store = MothershipUsersStore(root)
+    self_server = next(
+        (s for s in MothershipStore(root).list_servers() if s.is_self), None
+    )
+    for username, password_hash in auth_cfg.users.items():
+        meta = auth_cfg.meta_for(username)
+        gu, _ = users_store.upsert_user_by_username(
+            username=username,
+            password_hash=password_hash,
+            is_super_admin=meta.is_admin,
+        )
+        if self_server is not None:
+            users_store.upsert_attachment(
+                global_user_id=gu.id,
+                server_id=self_server.id,
+                server_username=username,
+            )
+
+
+@contextlib.asynccontextmanager
+async def _mothership_lifespan(app):
+    """Mothership-router startup: seed the GlobalUser registry from local
+    auth.toml (item 21) so ``GET /api/m/users`` is a pure read. Best-effort — a
+    backfill failure must never block the mothership from starting (mirrors
+    main.py's ``register_self_if_missing`` OSError tolerance). Runs after
+    main.py's synchronous self-registration, so the ``is_self`` row exists."""
+    try:
+        _seed_local_users_into(app)
+    except OSError:
+        pass
+    yield
+
+
+router = APIRouter(
+    tags=["mothership"],
+    dependencies=[Depends(require_auth)],
+    lifespan=_mothership_lifespan,
+)
 # Bearer-auth surface for the installer script (no session cookie).
 installer_router = APIRouter(tags=["mothership-installer"])
 # No-auth bundle GETs — token in the URL path is the auth.
@@ -271,46 +329,6 @@ def list_servers(request: Request, user: dict = Depends(require_auth)) -> list[d
 # ---- T-0066: GlobalUser registry (super-admin cookie auth) ------------------
 
 
-def _seed_local_users(request: Request) -> None:
-    """T-0313: backfill the GlobalUser registry from this install's local
-    ``auth.toml``.
-
-    On a self-dogfooded mothership the registry otherwise only populated via
-    ``/attach`` or the one-shot migration, so ``GET /api/m/users`` showed
-    "No global users yet" to a logged-in operator while real local users
-    existed. The local auth users ARE the seed identities for the mothership's
-    own server, so we upsert them lazily on read — same precedent as the
-    ``is_self`` server auto-registering on the server list. Upsert is
-    idempotent: an already-established GlobalUser (e.g. one created via
-    ``/attach`` with its own password hash) is returned unchanged, never
-    clobbered.
-
-    T-0317: each seeded user is also attached to the mothership's OWN
-    (``is_self``) server so the directory's ``attached_servers`` count is a
-    real, meaningful number (the operator IS attached to this server) rather
-    than a bare 0 / permanent em-dash. Both upserts are idempotent, so
-    repeated reads neither duplicate nor clobber.
-    """
-    cfg = request.app.state.auth_config
-    store = _users_store(request)
-    self_server = next(
-        (s for s in _store(request).list_servers() if s.is_self), None
-    )
-    for username, password_hash in cfg.users.items():
-        meta = cfg.meta_for(username)
-        gu, _ = store.upsert_user_by_username(
-            username=username,
-            password_hash=password_hash,
-            is_super_admin=meta.is_admin,
-        )
-        if self_server is not None:
-            store.upsert_attachment(
-                global_user_id=gu.id,
-                server_id=self_server.id,
-                server_username=username,
-            )
-
-
 @router.get("/users", dependencies=[Depends(_require_super_admin)])
 def list_global_users(request: Request) -> list[dict]:
     """Return the GlobalUser registry, password hashes stripped.
@@ -327,8 +345,11 @@ def list_global_users(request: Request) -> list[dict]:
     attached-server tally without an N+1 follow-up GET. The count is
     computed by walking the per-user attachments dir — cheap at the
     registry sizes we expect (single-digit users × single-digit servers).
+
+    item 21 (audit theme-2): this is a PURE read — the local-auth.toml backfill
+    that used to run here on every GET now runs once at mothership STARTUP
+    (``_mothership_lifespan`` → ``_seed_local_users_into``).
     """
-    _seed_local_users(request)
     store = _users_store(request)
     out: list[dict] = []
     for u in store.list_users():

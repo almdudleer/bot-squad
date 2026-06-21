@@ -85,6 +85,14 @@ if [ -z "$task_id" ] && [ "${src_window#T-}" != "$src_window" ]; then
     num="$(printf '%s' "$src_window" | sed -E 's/^T-([0-9]+).*$/\1/')"
     [ -n "$num" ] && [ "$num" != "$src_window" ] && task_id="T-$num"
 fi
+# T-0345 / T-0324(H1): a constant-team (queue-consumer / triage) session must
+# NEVER adopt a task_id — it has no single ticket. Drop any stale shared-cwd
+# .claude/task_id marker so its PRIMARY can't cross-wire onto an unrelated newest
+# ticket. This is the SessionStart-marker path that bypassed the bind_task
+# owner=constant-team refusal (the p179→p181 incident).
+if [ "${BOT_SQUAD_OWNER:-}" = "constant-team" ]; then
+    task_id=""
+fi
 
 # T-0078: capture the tmux session this pane lives in. Source of truth for
 # the "copy `tmux a -t …`" affordance and the discoverability story in the

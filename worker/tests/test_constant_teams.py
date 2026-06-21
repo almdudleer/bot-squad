@@ -50,6 +50,42 @@ def _write_initiative(cfg, slug, name, frontmatter: dict) -> Path:
     return p
 
 
+# --- T-0345: the parallel-session cap is backpressure, not an ERROR ----------
+
+def test_spawn_member_treats_cap_as_quiet_backpressure(cfg_slug, monkeypatch, caplog):
+    """At 15/15 the constant tick fired an ERROR+traceback every 60s. The cap is
+    normal backpressure — defer quietly (return None, no ERROR log)."""
+    cfg, slug, _ = cfg_slug
+    from bot_squad_worker.actions import ActionError
+
+    def _capped(*a, **k):
+        raise ActionError(
+            "spawn: capacity reached — 15/15 parallel sessions live "
+            "(max_parallel_sessions cap); spawn refused, task stays pending")
+
+    monkeypatch.setattr(S, "spawn", _capped)
+    with caplog.at_level("DEBUG"):
+        sid = ct._spawn_member(cfg, slug, window="user-feedback",
+                               init_filename="user-feedback.md", brief="b")
+    assert sid is None
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]  # no spam
+
+
+def test_spawn_member_still_errors_on_a_real_failure(cfg_slug, monkeypatch, caplog):
+    """A genuine spawn fault (not the cap) still logs ERROR — we only quiet the cap."""
+    cfg, slug, _ = cfg_slug
+
+    def _boom(*a, **k):
+        raise RuntimeError("tmux new-window failed")
+
+    monkeypatch.setattr(S, "spawn", _boom)
+    with caplog.at_level("ERROR"):
+        sid = ct._spawn_member(cfg, slug, window="user-feedback",
+                               init_filename="user-feedback.md", brief="b")
+    assert sid is None
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
 def test_idle_glob_queue_is_noop(cfg_slug):
     """Empty alert dir → no spawn (the safety property)."""
     cfg, slug, spawns = cfg_slug

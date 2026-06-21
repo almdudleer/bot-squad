@@ -126,34 +126,6 @@ def _find_doc(docs_root: Path, doc_id: str) -> Path | None:
     return None
 
 
-def _parent_of(docs_root: Path, doc_id: str) -> str | None:
-    """The ``parent_doc_id`` of ``doc_id`` on disk, or None (root / missing)."""
-    path = _find_doc(docs_root, doc_id)
-    if path is None:
-        return None
-    return _parse(path).get("parent_doc_id")
-
-
-def _would_cycle(docs_root: Path, doc_id: str, new_parent: str) -> bool:
-    """True if making ``new_parent`` the parent of ``doc_id`` closes a cycle.
-
-    Walk the ancestry chain up from ``new_parent``; if we reach ``doc_id`` the
-    edge would create a cycle. Self-parent (new_parent == doc_id) is the
-    1-level case and is caught immediately. A visited-set guards against any
-    pre-existing loop in the data so the walk always terminates.
-    """
-    if new_parent == doc_id:
-        return True
-    seen: set[str] = set()
-    cur: str | None = new_parent
-    while cur and cur not in seen:
-        if cur == doc_id:
-            return True
-        seen.add(cur)
-        cur = _parent_of(docs_root, cur)
-    return False
-
-
 def _write_frontmatter(path: Path, meta: dict, body: str) -> None:
     fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
     content = f"---\n{fm}---\n\n{body.lstrip(chr(10))}"

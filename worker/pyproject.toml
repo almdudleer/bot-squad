@@ -25,6 +25,16 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]
+# T-0386 / INI-04 Phase 2: optional self-hosted ru/en STT for voice feedback
+# intake. Deliberately NOT a core dependency — transcribe.py lazy-imports it
+# only when voice intake is actually used, so CI and installs that don't enable
+# voice are unaffected (a missing dep degrades gracefully: audio kept + a
+# failure-marked artifact). Provision on-host where voice is wanted:
+#   pip install -e 'worker[voice]'   # in the worker venv
+# then a 1-time model fetch (WhisperModel downloads on first use).
+voice = [
+    "faster-whisper~=1.1",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

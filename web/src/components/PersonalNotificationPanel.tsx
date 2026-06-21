@@ -1,17 +1,22 @@
 /**
- * T-0218 — personal notification 3-level inheritance panel.
+ * T-0218 — personal notification inheritance panel.
  *
  * Distinct from the PROJECT-WIDE Telegram binding above it on the project
  * settings page (that one pings everyone via projects.toml). THIS panel is the
- * logged-in user's *personal* target, which inherits most-specific-wins:
+ * logged-in user's *personal* target, which inherits most-specific-wins.
  *
- *     project  ->  server  ->  global  ->  (project-wide fallback)
- *
- * Each of the 3 levels shows its own raw value, an Inherited-vs-Override badge,
- * and the winning level is highlighted. The user can set / clear / test any
- * level. The FE never computes precedence — it renders whatever
- * `GET /me/notifications/resolved` reports (D-0022). Writes go to each level's
- * own route, then we re-read the resolved view.
+ * T-0338 (reframe single-brain + Occam, 2026-06-21): collapsed the surface from
+ * 3 tiers (global → server → project) to TWO — a **Global default** and a
+ * **per-Project override** — for the single operator. The middle **Server**
+ * tier was redundant machinery (a 3rd chat-id field + Save + Test) that never
+ * mapped to a delivery the operator actually reasons about. It is no longer
+ * offered as a settable level; the Server row appears ONLY as a self-healing
+ * escape hatch when a *legacy* server override is still set (so it stays
+ * visible + clearable), and disappears once cleared. The backend still resolves
+ * project → server → global (FE never computes precedence — it renders
+ * `GET /me/notifications/resolved`, D-0022), so a pre-existing server override
+ * keeps working until cleared. Resolution is channel-agnostic (the worker picks
+ * Telegram vs MAX, T-0247), so collapsing tiers does not touch channel routing.
  *
  * Project-level persistence is live (Team-1): putProjectTgChatId persists the
  * per-project personal override (Attachment.project_tg_chat_ids for migrated
@@ -79,25 +84,36 @@ export function PersonalNotificationPanel({ slug }: { slug: string }) {
     {
       key: "global",
       label: "Global",
-      help: "Your default across every server and project.",
+      help: "Your default — where you get pinged unless a project overrides it.",
       save: (v) => api.putMyTgChatId(v),
       test: () => api.testMyTgChatId(),
     },
+    // T-0338: the Server tier is no longer an offered level (redundant for the
+    // single operator). The RowDef is retained so a LEGACY server override can
+    // still be shown + cleared via the same save/test plumbing; it is filtered
+    // out of the rendered rows unless `resolved.levels.server.set` is true.
     {
       key: "server",
-      label: "Server",
-      help: "Overrides Global for this server only.",
+      label: "Server (legacy)",
+      help: "Legacy server-level override — clear it to fall back to Project/Global.",
       save: (v) => attachmentApi.putTgChatId(serverId, v),
       test: () => attachmentApi.testTgChatId(serverId),
     },
     {
       key: "project",
       label: "Project",
-      help: "Overrides Server/Global for this project only.",
+      help: "Overrides your Global default for this project only.",
       save: (v) => api.putProjectTgChatId(slug, v),
       test: () => api.testProjectTgChatId(slug),
     },
   ];
+
+  // T-0338: default to the two-tier surface (Global default + Project override).
+  // The legacy Server row only appears when an override is actually set there,
+  // so it stays visible/clearable without re-introducing a permanent 3rd tier.
+  const visibleRows = rows.filter(
+    (r) => r.key !== "server" || (resolved?.levels.server.set ?? false),
+  );
 
   async function onSave(row: RowDef) {
     const value = (buf[row.key] ?? "").trim();
@@ -149,9 +165,10 @@ export function PersonalNotificationPanel({ slug }: { slug: string }) {
         Personal notifications <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(you only)</span>
       </h3>
       <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.75rem" }}>
-        Where <em>you</em> get pinged for this project. Inherits most-specific
-        first: <code>project → server → global</code>. Set an override at any
-        level, or clear it (empty + Save) to inherit again. Separate from the
+        Where <em>you</em> get pinged for this project. A <strong>Global</strong>{" "}
+        default applies everywhere; a <strong>Project</strong> override wins for
+        this project only (<code>project → global</code>). Clear an override
+        (empty + Save) to fall back to the default. Separate from the
         project-wide binding above, which notifies everyone.
       </p>
 
@@ -174,7 +191,7 @@ export function PersonalNotificationPanel({ slug }: { slug: string }) {
             {effectiveSummary(resolved)}
           </div>
 
-          {rows.map((row) => {
+          {visibleRows.map((row) => {
             const view = views.find((v) => v.key === row.key)!;
             const rowBusy = busy[row.key] ?? null;
             const value = buf[row.key] ?? "";

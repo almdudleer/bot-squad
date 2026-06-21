@@ -126,32 +126,6 @@ def _find_doc(docs_root: Path, doc_id: str) -> Path | None:
     return None
 
 
-def _iter_doc_paths(docs_root: Path):
-    """Yield every ``D-NNNN-*.md`` path under any category dir."""
-    if not docs_root.exists():
-        return
-    for cdir in sorted(p for p in docs_root.iterdir() if p.is_dir()):
-        for f in sorted(cdir.glob("*.md")):
-            yield f
-
-
-def _children_of(docs_root: Path, doc_id: str) -> list[dict]:
-    """All docs whose ``parent_doc_id`` points at ``doc_id`` (summary shape)."""
-    out = []
-    for f in _iter_doc_paths(docs_root):
-        d = _parse(f)
-        if d.get("parent_doc_id") == doc_id:
-            out.append({
-                "id": d["id"],
-                "title": d.get("title", d["id"]),
-                "category": d["category"],
-                "status": d.get("status", ""),
-                "related_tickets": d.get("related_tickets", []),
-                "parent_doc_id": d.get("parent_doc_id"),
-            })
-    return out
-
-
 def _parent_of(docs_root: Path, doc_id: str) -> str | None:
     """The ``parent_doc_id`` of ``doc_id`` on disk, or None (root / missing)."""
     path = _find_doc(docs_root, doc_id)
@@ -235,14 +209,15 @@ def get_doc(slug: str, doc_id: str, request: Request) -> dict:
     if path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
     out = _parse(path)
-    # T-0234: docs-only child ids (back-compat). T-0283: add the cross-store
-    # superset `child_artifact_ids` (doc + use-case + feedback children) and
-    # the node's own `kind` so the FE tree renders without a second lookup.
-    out["child_doc_ids"] = [c["id"] for c in _children_of(root, doc_id)]
+    # T-0234 / T-0283 / T-0415: ONE cross-store children scan is the single
+    # source. child_artifact_ids is the full set (doc + use-case + feedback
+    # children); child_doc_ids (back-compat for the pre-cross-store FE) is its
+    # kind==doc subset — the docs-only _children_of mirror this replaced ran a
+    # second, redundant scan. `kind` lets the FE tree render without a relookup.
+    children = AN.children_of(_project_root(request, slug), doc_id)
     out["kind"] = AN.KIND_DOC
-    out["child_artifact_ids"] = [
-        c["id"] for c in AN.children_of(_project_root(request, slug), doc_id)
-    ]
+    out["child_artifact_ids"] = [c["id"] for c in children]
+    out["child_doc_ids"] = [c["id"] for c in children if c["kind"] == AN.KIND_DOC]
     return out
 
 
@@ -345,9 +320,9 @@ def delete_doc(slug: str, doc_id: str, request: Request,
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
 
     # Item 5: the orphan guard spans STORES — a doc can mother use-cases /
-    # feedback / other docs (cross-store nesting, T-0283). The docs-only
-    # _children_of missed those, silently orphaning them. AN.children_of walks
-    # every store.
+    # feedback / other docs (cross-store nesting, T-0283). A docs-only scan
+    # would miss those, silently orphaning them. AN.children_of walks every
+    # store.
     children = AN.children_of(_project_root(request, slug), doc_id)
     if children:
         child_ids = ", ".join(c["id"] for c in children)

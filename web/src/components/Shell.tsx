@@ -338,17 +338,12 @@ export function Shell() {
                   DEPLOYMENT QUEUE
                 </NavLink>
               </li>
-              {/* T-0296: per-project dev/prod clone health ("Installation ≠
-                  Project"). Read is any-authed (the admin-only pull-master
-                  action is gated inside the page). */}
-              <li>
-                <NavLink
-                  to={`/p/${slug}/clones`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  CLONES
-                </NavLink>
-              </li>
+              {/* T-0359: CLONES left the rail. It surfaced git/devops plumbing
+                  (ahead/behind/dirty, fs paths, "Installation ≠ Project",
+                  "Admin-only") as a top-level project nav item — sysadmin
+                  internals that loudly re-assert a distinction the operator
+                  product hides. Relocated to a link under Project settings →
+                  Advanced. (T-0296 page unchanged; read still any-authed.) */}
               {/* T-0147: internal-usage analytics dashboard. */}
               <li>
                 <NavLink

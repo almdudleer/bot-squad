@@ -226,6 +226,13 @@ export function ProjectSettings() {
               — view / edit the manuals and role briefings each session receives
               (AGENTS.md, AGENT_INSTRUCTIONS.md, constitution, roles).
             </p>
+            {/* T-0359: dev/prod clone topology — git/devops plumbing, demoted
+                here from the per-project rail. */}
+            <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: 0 }}>
+              <Link to={`/p/${slug}/clones`}>Clones &amp; installation topology</Link>{" "}
+              — dev/prod clone health (ahead/behind, working-tree state, paths).
+              Admin-only actions are gated inside the page.
+            </p>
           </section>
         </>
       )}

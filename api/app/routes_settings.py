@@ -41,7 +41,10 @@ _DEFAULTS = {
     # 0 (or absent) = unlimited, so a fresh/legacy install is uncapped (back-
     # compat). max_parallel_sessions caps simultaneously-live sessions; the
     # token cap bounds aggregate usage (enforced against the telemetry quota).
-    "caps": {"max_parallel_sessions": 0, "max_total_tokens": 0},
+    # T-0408: idle_suspend_sec — the idle-but-live dev suspend window (seconds),
+    # 0/absent = OFF; the worker reads it fresh from [caps] (graduated from the
+    # BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC env dark-ship).
+    "caps": {"max_parallel_sessions": 0, "max_total_tokens": 0, "idle_suspend_sec": 0},
 }
 
 
@@ -154,6 +157,7 @@ def _read_system_settings(config_dir: Path) -> dict:
         "caps": {
             "max_parallel_sessions": _cap("max_parallel_sessions"),
             "max_total_tokens": _cap("max_total_tokens"),
+            "idle_suspend_sec": _cap("idle_suspend_sec"),
         },
     }
 
@@ -177,6 +181,7 @@ def _write_system_settings(config_dir: Path, settings: dict, quota_override: dic
     out.append("[caps]")
     out.append(f"max_parallel_sessions = {int(settings['caps']['max_parallel_sessions'])}")
     out.append(f"max_total_tokens = {int(settings['caps']['max_total_tokens'])}")
+    out.append(f"idle_suspend_sec = {int(settings['caps']['idle_suspend_sec'])}")
     out.append("")
     path = config_dir / "system_settings.toml"
     # T-0368: PRESERVE any top-level section this endpoint doesn't manage (e.g.
@@ -261,6 +266,7 @@ def _shape(config_dir: Path) -> dict:
         "caps": {
             "max_parallel_sessions": s["caps"]["max_parallel_sessions"],
             "max_total_tokens": s["caps"]["max_total_tokens"],
+            "idle_suspend_sec": s["caps"]["idle_suspend_sec"],
         },
     }
 
@@ -349,7 +355,7 @@ def put_settings(request: Request, payload: dict) -> dict:
     # T-0239: resource caps. Each is a non-negative int; 0 = unlimited. Partial
     # updates keep the unspecified cap. bool is rejected (isinstance(True, int)).
     caps_in = (payload.get("caps") or {}) if isinstance(payload.get("caps"), dict) else {}
-    for key in ("max_parallel_sessions", "max_total_tokens"):
+    for key in ("max_parallel_sessions", "max_total_tokens", "idle_suspend_sec"):
         if key in caps_in:
             v = caps_in[key]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:

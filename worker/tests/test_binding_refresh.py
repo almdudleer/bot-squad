@@ -377,6 +377,59 @@ def test_idle_live_dev_spared_when_no_activity_signal(tmp_path, monkeypatch):
     assert res["archived"] == 0
 
 
+def _write_caps(cfg, **caps):
+    """Write a [caps] block to the cfg's system_settings.toml (the dir
+    _caps_config_dir resolves — data_dir.parent/config for this test cfg)."""
+    cfg_dir = cfg.data_dir.parent / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    body = "[caps]\n" + "".join(f"{k} = {v}\n" for k, v in caps.items())
+    (cfg_dir / "system_settings.toml").write_text(body)
+
+
+def test_idle_suspend_sec_reads_from_caps_when_env_unset(tmp_path, monkeypatch):
+    """T-0408: the idle-suspend knob now lives in system_settings [caps]
+    (the System Settings UI), read fresh like the other caps."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
+    _write_caps(cfg, idle_suspend_sec=3600)
+    assert S._session_idle_suspend_sec(cfg) == 3600
+
+
+def test_idle_suspend_sec_caps_zero_or_missing_is_off(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
+    assert S._session_idle_suspend_sec(cfg) == 0.0  # no system_settings.toml
+    _write_caps(cfg, idle_suspend_sec=0)
+    assert S._session_idle_suspend_sec(cfg) == 0.0
+
+
+def test_idle_suspend_sec_positive_env_overrides_caps(tmp_path, monkeypatch):
+    """A positive env var force-overrides (dev/emergency); 0/unset falls through
+    to caps so a leftover dark-ship =0 can't shadow the UI setting."""
+    cfg = _make_cfg(tmp_path)
+    _write_caps(cfg, idle_suspend_sec=3600)
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "1800")
+    assert S._session_idle_suspend_sec(cfg) == 1800
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "0")  # 0 → fall to caps
+    assert S._session_idle_suspend_sec(cfg) == 3600
+
+
+def test_idle_suspend_arm_driven_by_caps(tmp_path, monkeypatch):
+    """End-to-end: knob set ONLY in [caps] (no env) → the idle-suspend arm fires
+    on an idle open-task dev."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    _seed_idle_live_dev(cfg, monkeypatch, status="open")
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
+    _write_caps(cfg, idle_suspend_sec=3600)
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 7200)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    monkeypatch.setattr(S, "suspend", lambda cfg, slug, sid: None)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+
+
 def test_tl_role_is_never_auto_archived(tmp_path):
     cfg = _make_cfg(tmp_path)
     _seed_session(cfg, "S-u-feat-TL-p1", window="feat-TL", task_id="~",

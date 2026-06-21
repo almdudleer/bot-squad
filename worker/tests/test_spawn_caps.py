@@ -69,7 +69,13 @@ def _no_panes(monkeypatch):
 def test_read_caps_defaults_zero_when_missing(tmp_path):
     cfg = _make_cfg(tmp_path)  # no system_settings.toml
     caps = _read_caps(cfg.config_dir)
-    assert caps == {"max_parallel_sessions": 0, "max_total_tokens": 0}
+    # T-0408 added idle_suspend_sec to the caps dict; all default to 0 when the
+    # system_settings.toml file is missing.
+    assert caps == {
+        "max_parallel_sessions": 0,
+        "max_total_tokens": 0,
+        "idle_suspend_sec": 0,
+    }
 
 
 def test_count_live_excludes_suspended_and_archived(tmp_path):

@@ -76,21 +76,35 @@ def session_stale_sec() -> float:
     return val if val > 0 else DEFAULT_SESSION_STALE_SEC
 
 
-def _session_idle_suspend_sec() -> float:
+def _session_idle_suspend_sec(cfg: Any = None) -> float:
     """T-0335 item-10 / Fork-2 Part B: idle-but-live dev suspend window (seconds).
 
-    Reads ``BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC`` each call (env-tunable on a live
-    worker). Ships **DARK** (D2): 0 / unset / garbage ⟹ the idle-suspend arm in
-    ``archive_dead_teammates`` is OFF. The operator opts in by setting e.g.
-    ``43200`` (the roadmap's recommended 12h). Suspend is reversible
-    (the task stays open + re-dispatchable), so a long window is safe to enable.
+    T-0408: the knob now lives in ``system_settings.toml [caps].idle_suspend_sec``
+    (the System Settings UI, written by the API caps PUT, read fresh like the
+    other caps). Ships **DARK** (D2): 0 / absent ⟹ the idle-suspend arm in
+    ``archive_dead_teammates`` is OFF; the operator opts in by setting e.g.
+    ``43200`` (12h). Suspend is reversible (the task stays open +
+    re-dispatchable), so a long window is safe.
+
+    A *positive* ``BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC`` env var force-overrides
+    the cap (dev / emergency escape hatch). An unset / 0 / garbage env falls
+    through to the cap, so a leftover dark-ship ``=0`` in the unit can never
+    shadow the UI setting. ``cfg=None`` (no config to read) ⟹ env-only.
     """
     raw = os.environ.get("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC")
     try:
-        val = float(raw) if raw else 0.0
+        env_val = float(raw) if raw else 0.0
     except ValueError:
-        return 0.0
-    return val if val > 0 else 0.0
+        env_val = 0.0
+    if env_val > 0:
+        return env_val
+    if cfg is not None:
+        try:
+            cap = float(_read_caps(_caps_config_dir(cfg)).get("idle_suspend_sec", 0))
+        except (ValueError, TypeError):
+            return 0.0
+        return cap if cap > 0 else 0.0
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -2069,7 +2083,7 @@ def _read_caps(config_dir: Path) -> dict:
     try:
         raw = tomllib.loads(path.read_text())
     except (OSError, ValueError):
-        return {"max_parallel_sessions": 0, "max_total_tokens": 0}
+        return {"max_parallel_sessions": 0, "max_total_tokens": 0, "idle_suspend_sec": 0}
     caps = raw.get("caps", {}) or {}
 
     def _c(key: str) -> int:
@@ -2082,6 +2096,8 @@ def _read_caps(config_dir: Path) -> dict:
     return {
         "max_parallel_sessions": _c("max_parallel_sessions"),
         "max_total_tokens": _c("max_total_tokens"),
+        # T-0408: idle-but-live suspend window (seconds), 0/absent = OFF.
+        "idle_suspend_sec": _c("idle_suspend_sec"),
     }
 
 
@@ -3618,7 +3634,7 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                 # open — reversible, re-dispatchable to a fresh session
                 # (kill-not-resume); a non-TG long wait reads as idle, which is why
                 # this is opt-in.
-                idle_window = _session_idle_suspend_sec()
+                idle_window = _session_idle_suspend_sec(cfg)
                 # T-0426: never idle-suspend a dev that owns an in_progress
                 # ticket — that strands the ticket (in_progress, owner='-', no
                 # auto-re-dispatch; manually resurrected). in_progress is the

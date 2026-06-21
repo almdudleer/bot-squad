@@ -121,6 +121,29 @@ def test_caps_only_save_needs_no_restart(tmp_bot_squad: Path, monkeypatch) -> No
     assert r.json()["restart_required"] is False
 
 
+def test_caps_idle_suspend_sec_round_trips(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0408: idle_suspend_sec is a [caps] field — PUT persists it, GET returns
+    it, and (fresh-read per tick) it's a caps-only save with no restart."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"idle_suspend_sec": 43200}})
+        assert r.status_code == 200, r.text
+        assert r.json()["restart_required"] is False
+        g = client.get("/api/system-settings")
+    assert g.json()["caps"]["idle_suspend_sec"] == 43200
+
+
+def test_caps_idle_suspend_sec_rejects_negative(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"idle_suspend_sec": -5}})
+    assert r.status_code == 400
+
+
 def test_proxy_url_change_requires_restart(tmp_bot_squad: Path, monkeypatch) -> None:
     _set_env(monkeypatch, tmp_bot_squad)
     with TestClient(build_app()) as client:

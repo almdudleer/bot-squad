@@ -283,27 +283,36 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       >
         <div className="d-flex align-items-center" style={{ gap: "0.5rem", flexWrap: "wrap" }}>
           <strong style={{ fontSize: "0.74rem" }}>Resource caps &amp; budget</strong>
-          {/* T-0389 item 22: live count / hard ceiling + AIMD throttle. */}
-          <span
-            className={`mc-badge ${throttled ? "mc-badge-warn" : "mc-badge-dim"}`}
-            title="Live processes / max simultaneously-live allowed. T-0417: the cap value is shared config, but the live count + enforcement are per-worker-user (this Linux user's worker counts its own sessions). 0 = unlimited."
-          >
-            parallel {parallelText}
-          </span>
-          {throttled && (
-            <span
-              className="mc-badge mc-badge-warn"
-              title="The WS-4 backoff governor has throttled admission below the hard cap (resource pressure / 429s). New spawns admit up to this effective limit until pressure clears."
-            >
-              throttled to {effLimit}
-            </span>
+          {/* T-0428 (dogfood): until the server-wide caps land, show a skeleton
+              instead of flashing a misleading 'parallel ∞' that then jumps to
+              the real 'N/cap'. */}
+          {caps === null ? (
+            <span className="mc-skeleton" style={{ display: "inline-block", width: "9rem", height: "1.1rem" }} aria-label="Loading caps" />
+          ) : (
+            <>
+              {/* T-0389 item 22: live count / hard ceiling + AIMD throttle. */}
+              <span
+                className={`mc-badge ${throttled ? "mc-badge-warn" : "mc-badge-dim"}`}
+                title="Live processes / max simultaneously-live allowed. T-0417: the cap value is shared config, but the live count + enforcement are per-worker-user (this Linux user's worker counts its own sessions). 0 = unlimited."
+              >
+                parallel {parallelText}
+              </span>
+              {throttled && (
+                <span
+                  className="mc-badge mc-badge-warn"
+                  title="The WS-4 backoff governor has throttled admission below the hard cap (resource pressure / 429s). New spawns admit up to this effective limit until pressure clears."
+                >
+                  throttled to {effLimit}
+                </span>
+              )}
+              <span
+                className="mc-badge mc-badge-dim"
+                title="Per-quota-period output-token budget (output since the last anchor). Enforced at spawn-time; frees on anchor reset. 0 = unlimited."
+              >
+                tokens {tokensNum === 0 ? "∞" : tokensNum != null ? fmtTokens(tokensNum) : "—"}
+              </span>
+            </>
           )}
-          <span
-            className="mc-badge mc-badge-dim"
-            title="Per-quota-period output-token budget (output since the last anchor). Enforced at spawn-time; frees on anchor reset. 0 = unlimited."
-          >
-            tokens {tokensNum === 0 ? "∞" : tokensNum != null ? fmtTokens(tokensNum) : "—"}
-          </span>
           {anchorSet ? (
             projection ? (
               <span

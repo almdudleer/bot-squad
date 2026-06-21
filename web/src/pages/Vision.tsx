@@ -56,6 +56,19 @@ export function computeTlBindings(sessions: SessionRow[]): {
 // its frontmatter carries `constant_team: <truthy>`. Parsed FE-side from the
 // already-loaded VisionFile.content (no new endpoint) — mirrors the worker's
 // `_truthy(fm.get("constant_team"))` (constant_teams.py).
+// T-0428 (dogfood): the initiative rows rendered the RAW filename
+// ("initiatives/multi-server-installation-process.md", CSS-uppercased) — a file
+// path, not a name. Strip the "initiatives/" prefix + ".md", dash→space, and
+// titlecase each word, preserving all-caps/numeric tokens (so "INI-01" stays
+// "INI 01", not "Ini 01"). Display-only; the underlying f.name is unchanged.
+export function initiativeDisplayName(name: string): string {
+  const base = name.replace(/^initiatives\//, "").replace(/\.md$/, "");
+  return base
+    .split("-")
+    .map((w) => (/^[A-Z0-9]+$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join(" ");
+}
+
 export function isPersistentInitiative(content: string | undefined | null): boolean {
   if (!content) return false;
   const m = content.match(/^constant_team:\s*(.+?)\s*$/im);
@@ -404,7 +417,7 @@ export function Vision() {
                   style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", textAlign: "left" }}
                   onClick={() => setExpanded((s) => ({ ...s, [f.name]: !s[f.name] }))}
                 >
-                  {isOpen ? "▾" : "▸"} {f.name}
+                  {isOpen ? "▾" : "▸"} {initiativeDisplayName(f.name)}
                 </button>
                 {/* T-0411: surface constant-team initiatives so item-16's
                     staffing kill-switch isn't operating off-screen. */}

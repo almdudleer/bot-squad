@@ -16,7 +16,7 @@
 import { describe, expect, test } from "vitest";
 
 import { SessionRow } from "../api";
-import { computeTlBindings, isPersistentInitiative } from "./Vision";
+import { computeTlBindings, isPersistentInitiative, initiativeDisplayName } from "./Vision";
 
 function tl(overrides: Partial<SessionRow>): SessionRow {
   return {
@@ -140,5 +140,14 @@ describe("isPersistentInitiative", () => {
     expect(isPersistentInitiative("---\nconstant_team: false\n---")).toBe(false);
     expect(isPersistentInitiative("")).toBe(false);
     expect(isPersistentInitiative(undefined)).toBe(false);
+  });
+});
+
+// T-0428 (dogfood): initiative rows render a clean display name.
+describe("initiativeDisplayName", () => {
+  test("strips initiatives/ + .md and titlecases (preserving caps/digit tokens)", () => {
+    expect(initiativeDisplayName("initiatives/multi-server-installation-process.md")).toBe("Multi Server Installation Process");
+    expect(initiativeDisplayName("INI-01-persistent-initiatives.md")).toBe("INI 01 Persistent Initiatives");
+    expect(initiativeDisplayName("operator-ux-and-session-mgmt.md")).toBe("Operator Ux And Session Mgmt");
   });
 });

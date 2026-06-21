@@ -14,6 +14,16 @@ import { LIVE_STATUSES } from "../utils/sessionStatus";
  * date-range controls or drill-downs yet.
  */
 
+// T-0428 (dogfood): a sub-day duration like "0.16d" is hard to read. Show
+// hours under a day (and minutes under an hour), days otherwise.
+function fmtDuration(days: number | null): string {
+  if (days === null) return "—";
+  if (days >= 1) return `${days}d`;
+  const hrs = days * 24;
+  if (hrs >= 1) return `${hrs.toFixed(1)}h`;
+  return `${Math.max(1, Math.round(hrs * 60))}m`;
+}
+
 function fmtRelDays(iso: string | null): string {
   if (!iso) return "—";
   const ts = Date.parse(iso);
@@ -304,15 +314,11 @@ export function Analytics() {
             />
             <StatCard
               label="TIME-TO-CLOSE"
-              value={
-                data.tickets.time_to_close.median_days === null
-                  ? "—"
-                  : `${data.tickets.time_to_close.median_days}d`
-              }
+              value={fmtDuration(data.tickets.time_to_close.median_days)}
               sub={
                 data.tickets.time_to_close.median_days === null
                   ? "no dated closes"
-                  : `median · mean ${data.tickets.time_to_close.mean_days}d (n=${data.tickets.time_to_close.closed_measured})`
+                  : `median · mean ${fmtDuration(data.tickets.time_to_close.mean_days)} (n=${data.tickets.time_to_close.closed_measured})`
               }
             />
           </div>

@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 from app.worker_client import WorkerClient, WorkerError
 
@@ -69,7 +70,7 @@ class StartRequest(BaseModel):
 
 @router.post("/start")
 async def start_autopilot(slug: str, body: StartRequest, request: Request,
-                          user: dict = Depends(require_auth)) -> dict:
+                          user: dict = Depends(require_project_member)) -> dict:  # T-0381
     """Start an autopilot run for a team / session / project target."""
     _check_project(request, slug)
     if body.kind not in ("team", "session", "project"):
@@ -111,7 +112,7 @@ class StopRequest(BaseModel):
 
 @router.post("/stop")
 async def stop_autopilot(slug: str, body: StopRequest, request: Request,
-                         user: dict = Depends(require_auth)) -> dict:
+                         user: dict = Depends(require_project_member)) -> dict:  # T-0381
     """End an autopilot run early (operator cancel, or TL early-exit with reason)."""
     _check_project(request, slug)
     if not (body.key or body.target_sid):

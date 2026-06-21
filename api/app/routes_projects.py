@@ -17,6 +17,7 @@ from app.project_scaffold import (
     scaffold_new_from_scratch,
     scaffold_paths_as_they_are,
 )
+from app.project_authz import require_project_member
 from app.quick_status import aggregate_project_status
 from app.routes_auth import require_admin, require_auth
 from app.worker_client import WorkerClient, WorkerError, WorkerRouter
@@ -573,7 +574,8 @@ async def test_project_tg(
 
 @router.post("/{slug}/deploy", status_code=202)
 async def queue_deploy(
-    slug: str, request: Request, payload: dict, user: dict = Depends(require_auth)
+    slug: str, request: Request, payload: dict,
+    user: dict = Depends(require_project_member),  # T-0381: deploy = privileged
 ) -> dict:
     """Queue a deploy job via the worker's ``deploy`` action.
 
@@ -693,7 +695,12 @@ def get_repo_agents_md(slug: str, request: Request) -> dict:
 
 
 @router.put("/{slug}/repo-agents-md")
-def put_repo_agents_md(slug: str, request: Request, payload: dict) -> dict:
+def put_repo_agents_md(
+    slug: str, request: Request, payload: dict,
+    _perm: dict = Depends(require_project_member),  # T-0381: AGENTS.md is read by
+                                            # every agent each turn — non-admin
+                                            # rewrite = fleet-wide prompt injection.
+) -> dict:
     cfg = request.app.state.api_config
     proj = cfg.project(slug)
     if proj is None:

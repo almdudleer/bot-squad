@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.frontmatter import parse_or_none
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 from app.worker_client import WorkerClient, WorkerError, WorkerRouter
 
@@ -397,7 +398,7 @@ class SpawnRequest(BaseModel):
 @router.post("")
 async def spawn_session(
     slug: str, body: SpawnRequest, request: Request,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: spawns an agent (cost) — project-write gate
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -630,6 +631,7 @@ def _compose_tl_message(slug: str, task_id: Optional[str], instructions: str) ->
 @dev_spawn_router.post("/dev-spawn-request")
 async def dev_spawn_request(
     slug: str, body: DevSpawnRequest, request: Request,
+    _perm: dict = Depends(require_project_member),  # T-0381: triggers agent spawn — project-write gate
 ) -> dict:
     """Delegate a dev-worker spawn to a teamlead via the peer message bus.
 

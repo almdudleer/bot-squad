@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 from app.worker_client import WorkerClient, WorkerError
 
@@ -60,7 +61,10 @@ class EnableRequest(BaseModel):
 
 
 @router.post("/enable")
-async def enable_autonomous(slug: str, body: EnableRequest, request: Request) -> dict:
+async def enable_autonomous(
+    slug: str, body: EnableRequest, request: Request,
+    _perm: dict = Depends(require_project_member),  # T-0381: cost-abuse — project-write gate
+) -> dict:
     """Enable the autonomous orchestrator for a project.
 
     Optionally accepts sleep_start_hour and sleep_end_hour (UTC integers).
@@ -84,7 +88,10 @@ async def enable_autonomous(slug: str, body: EnableRequest, request: Request) ->
 # ---------------------------------------------------------------------------
 
 @router.post("/disable")
-async def disable_autonomous(slug: str, request: Request) -> dict:
+async def disable_autonomous(
+    slug: str, request: Request,
+    _perm: dict = Depends(require_project_member),  # T-0381: project-write gate
+) -> dict:
     """Disable the autonomous orchestrator for a project.
 
     In-flight tasks complete normally; no new tasks will be started.

@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app import artifact_nesting as AN
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 
 router = APIRouter(
@@ -266,7 +267,7 @@ class NewDoc(BaseModel):
 
 @router.post("")
 def create_doc(slug: str, request: Request, body: NewDoc,
-               user: dict = Depends(require_auth)) -> dict:
+               user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Allocate a D-NNNN id atomically and write a stub doc.
 
     Mirrors the worker ``doc_new`` action's storage + frontmatter so a web
@@ -328,7 +329,7 @@ def create_doc(slug: str, request: Request, body: NewDoc,
 
 @router.delete("/{doc_id}")
 def delete_doc(slug: str, doc_id: str, request: Request,
-               user: dict = Depends(require_auth)) -> dict:
+               user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Delete a doc (T-0276): remove the file + scrub its ticket backlinks.
 
     Refuses (409) to delete a MOTHER doc that still has children, so a subtree
@@ -374,7 +375,7 @@ class PutDoc(BaseModel):
 
 @router.put("/{doc_id}")
 def put_doc(slug: str, doc_id: str, request: Request, body: PutDoc,
-            user: dict = Depends(require_auth)) -> dict:
+            user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     _validate_doc_id(doc_id)
     content = body.content or ""
     if not content.strip():
@@ -418,7 +419,7 @@ def _set_scalar_field(path: Path, field: str, value: str | None) -> None:
 
 @router.put("/{doc_id}/parent")
 def set_doc_parent(slug: str, doc_id: str, request: Request, body: SetParent,
-                   user: dict = Depends(require_auth)) -> dict:
+                   user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Re-parent (adopt) or clear the parent (disown) of an existing doc.
 
     Validations: the doc must exist; a non-null parent must exist, must not be
@@ -492,7 +493,7 @@ def _mutate_list_field(path: Path, field: str, value: str, *, add: bool) -> None
 
 @router.post("/{doc_id}/link")
 def link_doc(slug: str, doc_id: str, request: Request, body: LinkBody,
-             user: dict = Depends(require_auth)) -> dict:
+             user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Link a doc ↔ ticket bidirectionally."""
     _validate_doc_id(doc_id)
     ticket = (body.ticket or "").strip()
@@ -513,7 +514,7 @@ def link_doc(slug: str, doc_id: str, request: Request, body: LinkBody,
 
 @router.delete("/{doc_id}/link/{ticket}")
 def unlink_doc(slug: str, doc_id: str, ticket: str, request: Request,
-               user: dict = Depends(require_auth)) -> dict:
+               user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Remove a doc ↔ ticket link from both sides."""
     _validate_doc_id(doc_id)
     if not _TASK_ID_RE.match(ticket):

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app import artifact_nesting as AN
 from app.markdown_writer import slugify, write_task
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 
 router = APIRouter(
@@ -170,7 +171,7 @@ def put_feedback(
     name: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_feedback_name(name)
     content = payload.get("content") or ""
@@ -201,7 +202,7 @@ def promote_feedback(
     name: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_feedback_name(name)
 
@@ -278,7 +279,7 @@ class SetParent(BaseModel):
 
 @router.put("/{fid}/parent")
 def set_feedback_parent(slug: str, fid: str, request: Request, body: SetParent,
-                        user: dict = Depends(require_auth)) -> dict:
+                        user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Re-parent (adopt) or clear the parent (disown) of a feedback item across
     the artifact stores (T-0283). Cycle-safe; injects a frontmatter block into a
     legacy raw-markdown feedback file on first nesting, preserving the body."""

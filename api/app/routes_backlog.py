@@ -15,6 +15,7 @@ from app.markdown_writer import (
     slugify,
     write_task,
 )
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 from app.task_body import compose_body, parse_body, regraft_verbatim
 from app.worker_client import WorkerClient, WorkerError
@@ -175,7 +176,7 @@ def create_task(
     slug: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     title = (payload.get("title") or "").strip()
     if not title:
@@ -240,7 +241,7 @@ def patch_task(
     task_id: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_task_id(task_id)
 
@@ -299,7 +300,7 @@ def patch_task_priority(
     task_id: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Set a task's priority (int sort key for Kanban ordering)."""
     _validate_task_id(task_id)
@@ -323,7 +324,7 @@ def delete_task(
     slug: str,
     task_id: str,
     request: Request,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: destructive — project-write gate
 ) -> dict:
     _validate_task_id(task_id)
 
@@ -339,7 +340,7 @@ def add_comment(
     task_id: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_task_id(task_id)
 
@@ -365,7 +366,7 @@ async def add_progress(
     task_id: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Append a short progress note. Proxies to worker action `task_progress_add`."""
     _validate_task_id(task_id)

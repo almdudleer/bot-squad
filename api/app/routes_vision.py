@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.markdown_writer import slugify
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 
 router = APIRouter(
@@ -178,7 +179,7 @@ def activate_initiative(
     slug: str,
     name: str,
     request: Request,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Add an initiative to the active set."""
     name = _normalize_initiative_basename(name)
@@ -197,7 +198,7 @@ def deactivate_initiative(
     slug: str,
     name: str,
     request: Request,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Remove an initiative from the active set."""
     name = _normalize_initiative_basename(name)
@@ -213,7 +214,7 @@ def mark_initiative_finished(
     slug: str,
     name: str,
     request: Request,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Mark an initiative finished. Auto-deactivates if it was active."""
     name = _normalize_initiative_basename(name)
@@ -236,7 +237,7 @@ def unmark_initiative_finished(
     slug: str,
     name: str,
     request: Request,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Reopen a finished initiative (back to the 'open' state). Doesn't auto-activate."""
     name = _normalize_initiative_basename(name)
@@ -252,7 +253,7 @@ def put_active_initiative(
     slug: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     """Back-compat: replace the active set with a single value (or clear).
 
@@ -277,7 +278,7 @@ def put_vision(
     name: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_vision_name(name)
     content = payload.get("content") or ""
@@ -305,7 +306,7 @@ def post_vision(
     slug: str,
     request: Request,
     payload: dict,
-    user: dict = Depends(require_auth),
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     kind = payload.get("kind")
     if kind != "initiative":

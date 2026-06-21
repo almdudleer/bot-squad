@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app import artifact_nesting as AN
+from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 from app.worker_client import WorkerError
 
@@ -117,7 +118,7 @@ class NewUseCase(BaseModel):
 
 @router.post("")
 def create_use_case(slug: str, request: Request, body: NewUseCase,
-                    user: dict = Depends(require_auth)) -> dict:
+                    user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """T-0174: allocate a UC-NNNN id atomically and write a stub use case.
 
     Replaces hand-typing ``id:`` into the frontmatter (the old flow). The
@@ -172,7 +173,7 @@ def create_use_case(slug: str, request: Request, body: NewUseCase,
 
 @router.put("/{uc_id}")
 def put_use_case(slug: str, uc_id: str, request: Request, body: PutUseCase,
-                 user: dict = Depends(require_auth)) -> dict:
+                 user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     _validate_id(uc_id)
     content = body.content or ""
     if not content.strip():
@@ -191,7 +192,7 @@ def put_use_case(slug: str, uc_id: str, request: Request, body: PutUseCase,
 
 @router.delete("/{uc_id}")
 def delete_use_case(slug: str, uc_id: str, request: Request,
-                    user: dict = Depends(require_auth)) -> dict:
+                    user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Delete a use case (T-0276): remove the ``.md`` and cascade its flows.
 
     A use case OWNS its user-flows (stored under ``<uc_id>/flows/``); they
@@ -228,7 +229,7 @@ class SetParent(BaseModel):
 
 @router.put("/{uc_id}/parent")
 def set_use_case_parent(slug: str, uc_id: str, request: Request, body: SetParent,
-                        user: dict = Depends(require_auth)) -> dict:
+                        user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Re-parent (adopt) or clear the parent (disown) of a use-case across the
     artifact stores (T-0283). Cycle-safe via the shared ancestry walk."""
     _validate_id(uc_id)
@@ -293,7 +294,7 @@ def _compose_run_brief(slug: str, uc: dict) -> str:
 
 @router.post("/{uc_id}/run")
 async def run_use_case(slug: str, uc_id: str, request: Request,
-                       user: dict = Depends(require_auth)) -> dict:
+                       user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Spawn a testing-dev session pre-briefed on this use case."""
     _validate_id(uc_id)
     path = _uc_dir(request, slug) / f"{uc_id}.md"
@@ -411,7 +412,7 @@ class NewFlow(BaseModel):
 
 @router.post("/{uc_id}/flows")
 def create_flow(slug: str, uc_id: str, request: Request, body: NewFlow,
-                user: dict = Depends(require_auth)) -> dict:
+                user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     """Allocate a UF-NNNN id atomically and write a stub flow under a use case.
 
     Mirrors the worker ``flow_new`` action's storage + frontmatter + mermaid
@@ -458,7 +459,7 @@ def create_flow(slug: str, uc_id: str, request: Request, body: NewFlow,
 
 @router.put("/{uc_id}/flows/{flow_id}")
 def put_flow(slug: str, uc_id: str, flow_id: str, request: Request, body: PutUseCase,
-             user: dict = Depends(require_auth)) -> dict:
+             user: dict = Depends(require_project_member)) -> dict:  # T-0381: project-write gate
     _validate_id(uc_id)
     _validate_flow_id(flow_id)
     content = body.content or ""

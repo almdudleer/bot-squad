@@ -700,12 +700,16 @@ def test_spawn_routes_to_callers_linux_user(
     s2, t2 = _spawn_fake(edem_sock, edem_calls)
     try:
         # testuser → linux_user=edem; coordinator is someone else.
+        # T-0381: spawn_session is now admin-gated (require_project_member);
+        # this test verifies WORKER ROUTING (lands on caller's own socket),
+        # which is orthogonal to authz — so the caller is admin here. The
+        # non-admin→403 gate itself is covered by test_project_write_authz.py.
         (tmp_bot_squad / "config" / "auth.toml").write_text(
             '[users]\n'
             'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
             '[user_meta.testuser]\n'
             'linux_user = "edem"\n'
-            'is_admin = false\n'
+            'is_admin = true\n'
             '[session]\nttl = "7d"\n'
         )
         monkeypatch.setenv("BOT_SQUAD_COORDINATOR_USER", "almdudleer")

@@ -243,6 +243,25 @@ def test_delete_doc_with_children_rejected(tmp_bot_squad: Path, monkeypatch):
         assert client.get(f"/api/projects/test-project/docs/{mother}").status_code == 200
 
 
+def test_delete_doc_with_cross_store_child_rejected(tmp_bot_squad: Path, monkeypatch):
+    """Item 5: the orphan guard spans STORES. A doc with a cross-store child (a
+    use-case parented under it) must not be deletable — the docs-only children
+    scan missed it, silently orphaning the use-case."""
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        mother = _create(client, title="Mother").json()["id"]
+        uc = client.post(
+            "/api/projects/test-project/use_cases",
+            json={"title": "UC child", "parent_doc_id": mother},
+        )
+        assert uc.status_code == 200, uc.text
+        uc_id = uc.json()["id"]
+        r = client.delete(f"/api/projects/test-project/docs/{mother}")
+        assert r.status_code == 409, r.text
+        assert uc_id in r.text  # the cross-store child is named
+        assert client.get(f"/api/projects/test-project/docs/{mother}").status_code == 200
+
+
 def test_delete_doc_cleans_up_ticket_backlink(tmp_bot_squad: Path, monkeypatch):
     # Seed a ticket the doc can link to.
     backlog = tmp_bot_squad / "data" / "test-project" / "backlog"

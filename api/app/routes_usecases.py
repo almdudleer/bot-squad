@@ -208,6 +208,20 @@ def delete_use_case(slug: str, uc_id: str, request: Request,
     owned_dir = root / uc_id
     if not path.exists() and not owned_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"use case not found: {uc_id}")
+    # Item 5: refuse if this UC mothers any CROSS-STORE child (a doc / use-case /
+    # feedback parented under it, T-0283) — deleting would silently orphan it.
+    # The owned flows subtree below is a separate cascade (the UC OWNS its flows);
+    # this guards adopted children that live in other stores.
+    children = AN.children_of(_project_root(request, slug), uc_id)
+    if children:
+        child_ids = ", ".join(c["id"] for c in children)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"use case {uc_id} has child artifacts ({child_ids}) — "
+                "re-parent or delete them first"
+            ),
+        )
     if path.exists():
         path.unlink()
     if owned_dir.is_dir():

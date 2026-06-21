@@ -344,13 +344,17 @@ def delete_doc(slug: str, doc_id: str, request: Request,
     if path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
 
-    children = _children_of(root, doc_id)
+    # Item 5: the orphan guard spans STORES — a doc can mother use-cases /
+    # feedback / other docs (cross-store nesting, T-0283). The docs-only
+    # _children_of missed those, silently orphaning them. AN.children_of walks
+    # every store.
+    children = AN.children_of(_project_root(request, slug), doc_id)
     if children:
         child_ids = ", ".join(c["id"] for c in children)
         raise HTTPException(
             status_code=409,
             detail=(
-                f"doc {doc_id} has child docs ({child_ids}) — "
+                f"doc {doc_id} has child artifacts ({child_ids}) — "
                 "re-parent or delete them first"
             ),
         )

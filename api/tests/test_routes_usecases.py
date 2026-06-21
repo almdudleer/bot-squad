@@ -174,6 +174,27 @@ def test_delete_use_case_cascades_flows(tmp_bot_squad: Path, monkeypatch):
     assert not (uc_root / uc_id).exists()
 
 
+def test_delete_use_case_with_cross_store_child_rejected(tmp_bot_squad: Path, monkeypatch):
+    """Item 5: a use-case with a CROSS-STORE child (a doc parented under it)
+    must not be deletable — would silently orphan the child. The UC delete had
+    NO child guard at all (only cascaded its owned flows)."""
+    c = _logged_in(tmp_bot_squad, monkeypatch)
+    uc_id = c.post(
+        "/api/projects/test-project/use_cases", json={"title": "Mother UC"}
+    ).json()["id"]
+    doc = c.post(
+        "/api/projects/test-project/docs",
+        json={"title": "Doc child", "category": "architecture", "parent_doc_id": uc_id},
+    )
+    assert doc.status_code == 200, doc.text
+    doc_id = doc.json()["id"]
+    r = c.delete(f"/api/projects/test-project/use_cases/{uc_id}")
+    assert r.status_code == 409, r.text
+    assert doc_id in r.text
+    # mother survives the rejected delete
+    assert c.get(f"/api/projects/test-project/use_cases/{uc_id}").status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # T-0283 Pillar-C: use-cases as nestable cross-store artifacts.
 # ---------------------------------------------------------------------------

@@ -84,6 +84,7 @@ def _seed_connected_server(
     is_self: bool = False,
     projects_cache: list[dict] | None = None,
     grants: list[dict] | None = None,
+    invites: list[dict] | None = None,
 ) -> tuple[AttachedServer, str]:
     store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
     bearer = mint_server_bearer()
@@ -100,6 +101,7 @@ def _seed_connected_server(
         projects_cache=projects_cache or [],
         is_self=is_self,
         grants=grants or [],
+        invites=invites or [],
     )
     store.write([entry])
     bearers_dir = tmp_bot_squad / "data" / "_mothership" / "bearers"
@@ -339,6 +341,67 @@ def test_revoked_grantee_proxy_forbidden_no_upstream(tmp_bot_squad: Path, monkey
 
     assert r.status_code == 403, r.text
     assert recorder.calls == []
+
+
+# ---- T-0422: invite visibility tracks management (owner), not is_admin -------
+
+
+def _invite(target: str = "newuser") -> dict:
+    return {
+        "hash": "deadbeef",
+        "expires_at": "2030-01-01T00:00:00Z",
+        "target_username": target,
+        "role": "non-admin",
+        "created_by": "testuser",
+        "created_at": "2026-06-19T00:00:00Z",
+    }
+
+
+def _server_in_list(listing: list[dict], server_id: str) -> dict:
+    for s in listing:
+        if s["id"] == server_id:
+            return s
+    raise AssertionError(f"{server_id} not in listing")
+
+
+def test_list_servers_invites_hidden_from_nonowner_admin_grantee(
+    tmp_bot_squad: Path, monkeypatch
+):
+    """An admin who only holds a GRANT on a peer they don't own must NOT see
+    that peer's invite metadata — require_manage already 403s them from minting,
+    so the visibility axis must track the management (owner) axis, not is_admin.
+    """
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=True)
+    _seed_connected_server(
+        tmp_bot_squad,
+        server_id="srv_test01",
+        owner_user="testuser",
+        grants=[_active_grant("intruder")],
+        invites=[_invite()],
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "intruder")
+        listing = client.get("/api/m/servers").json()
+    srv = _server_in_list(listing, "srv_test01")
+    assert "invites" not in srv
+
+
+def test_list_servers_invites_visible_to_owner(tmp_bot_squad: Path, monkeypatch):
+    """The owner still sees their own server's invite metadata (hash stripped)."""
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=False)
+    _seed_connected_server(
+        tmp_bot_squad,
+        server_id="srv_test01",
+        owner_user="testuser",
+        invites=[_invite()],
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "testuser")
+        listing = client.get("/api/m/servers").json()
+    srv = _server_in_list(listing, "srv_test01")
+    assert "invites" in srv
+    assert len(srv["invites"]) == 1
+    assert "hash" not in srv["invites"][0]
 
 
 # ---- is_self server → allowed regardless of owner ---------------------------

@@ -315,12 +315,14 @@ def list_servers(request: Request, user: dict = Depends(require_auth)) -> list[d
     own ``is_self`` entry. There is no global all-servers view; a global admin
     does NOT see others' ungranted servers (god-mode removed, T-0221 D2).
     """
-    # T-0370: invites are admin-only management metadata — scope them so a
-    # non-admin never sees a server's invites (notably the is_self server, which
-    # the is_self bypass makes visible to everyone).
-    include_invites = bool(user.get("is_admin"))
+    # T-0370 / T-0422: invites are MANAGEMENT metadata, so the visibility axis
+    # must track the management axis (owner), not is_admin. Compute per-server
+    # via the require_manage SSOT: an owner sees their server's invites; a
+    # global admin sees the is_self server's invites (the _can_manage carve-out);
+    # a non-owner admin GRANTEE — who require_manage 403s from minting — no
+    # longer sees a peer's invite metadata.
     return [
-        s.to_public(include_invites=include_invites)
+        s.to_public(include_invites=_can_manage(s, user))
         for s in _store(request).list_servers()
         if _can_access(s, user)
     ]

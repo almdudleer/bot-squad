@@ -50,6 +50,87 @@ def _write_initiative(cfg, slug, name, frontmatter: dict) -> Path:
     return p
 
 
+# --- T-0350: reap idle constant-team members once their queue drains ---------
+
+def _member_row(sid, *, window="user-feedback", activity="idle", status="active",
+                owner="constant-team", initiative="user-feedback.md",
+                started_at="2026-06-21T00:00:00Z"):
+    return {"sid": sid, "window": window, "activity": activity, "status": status,
+            "owner": owner, "initiative": initiative, "started_at": started_at}
+
+
+def _setup_uf(cfg, slug, *, inbox_lines: int, cursor: int):
+    """A user-feedback constant team with an inbox.log of N lines + a cursor."""
+    _write_initiative(cfg, slug, "user-feedback", {
+        "constant_team": "true", "consume": "feedback/inbox.log",
+        "team_window": "user-feedback", "team_role": "dev",
+    })
+    fb = cfg.data_dir / slug / "feedback"
+    fb.mkdir(parents=True, exist_ok=True)
+    (fb / "inbox.log").write_text("".join(f"line {i}\n" for i in range(inbox_lines)))
+    ct._save_state(cfg, slug, "user-feedback", {"cursor_lines": cursor, "last_spawn_at": 0})
+
+
+def test_gc_drained_members_reaps_idle_member_when_drained(cfg_slug, monkeypatch):
+    cfg, slug, _ = cfg_slug
+    _setup_uf(cfg, slug, inbox_lines=5, cursor=5)  # drained
+    suspended: list[str] = []
+    monkeypatch.setattr(S, "list_sessions", lambda c, s: [_member_row("S-x-user-feedback-p9")])
+    monkeypatch.setattr(S, "suspend", lambda c, s, sid: suspended.append(sid) or {"ok": True})
+    out = ct.gc_drained_members(cfg, slug, now=2_000_000_000.0)
+    assert suspended == ["S-x-user-feedback-p9"]
+    assert out["reaped"] == ["S-x-user-feedback-p9"]
+
+
+def test_gc_drained_members_spares_running_member(cfg_slug, monkeypatch):
+    cfg, slug, _ = cfg_slug
+    _setup_uf(cfg, slug, inbox_lines=5, cursor=5)  # drained
+    suspended: list[str] = []
+    monkeypatch.setattr(S, "list_sessions",
+                        lambda c, s: [_member_row("S-x-user-feedback-p9", activity="running")])
+    monkeypatch.setattr(S, "suspend", lambda c, s, sid: suspended.append(sid))
+    ct.gc_drained_members(cfg, slug, now=2_000_000_000.0)
+    assert suspended == []  # actively triaging → never interrupted
+
+
+def test_gc_drained_members_spares_when_queue_not_drained(cfg_slug, monkeypatch):
+    cfg, slug, _ = cfg_slug
+    _setup_uf(cfg, slug, inbox_lines=5, cursor=3)  # 2 lines pending
+    suspended: list[str] = []
+    monkeypatch.setattr(S, "list_sessions", lambda c, s: [_member_row("S-x-user-feedback-p9")])
+    monkeypatch.setattr(S, "suspend", lambda c, s, sid: suspended.append(sid))
+    ct.gc_drained_members(cfg, slug, now=2_000_000_000.0)
+    assert suspended == []  # real unprocessed feedback → the member has work
+
+
+def test_gc_drained_members_spares_fresh_member(cfg_slug, monkeypatch):
+    cfg, slug, _ = cfg_slug
+    _setup_uf(cfg, slug, inbox_lines=5, cursor=5)
+    suspended: list[str] = []
+    # started 10s ago — still in the bringup settle window
+    monkeypatch.setattr(S, "list_sessions",
+                        lambda c, s: [_member_row("S-x-user-feedback-p9",
+                                                  started_at="2026-06-21T00:00:00Z")])
+    monkeypatch.setattr(S, "suspend", lambda c, s, sid: suspended.append(sid))
+    # now = started_at + 10s
+    import datetime
+    base = datetime.datetime(2026, 6, 21, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    ct.gc_drained_members(cfg, slug, now=base + 10)
+    assert suspended == []  # too fresh — could be mid-bringup
+
+
+def test_gc_drained_members_ignores_non_constant_team(cfg_slug, monkeypatch):
+    cfg, slug, _ = cfg_slug
+    _setup_uf(cfg, slug, inbox_lines=5, cursor=5)
+    suspended: list[str] = []
+    monkeypatch.setattr(S, "list_sessions",
+                        lambda c, s: [_member_row("S-x-dev-p1", owner="alexey",
+                                                  window="dev", initiative="other.md")])
+    monkeypatch.setattr(S, "suspend", lambda c, s, sid: suspended.append(sid))
+    ct.gc_drained_members(cfg, slug, now=2_000_000_000.0)
+    assert suspended == []  # a real dev is never reaped by this
+
+
 # --- T-0345: the parallel-session cap is backpressure, not an ERROR ----------
 
 def test_spawn_member_treats_cap_as_quiet_backpressure(cfg_slug, monkeypatch, caplog):

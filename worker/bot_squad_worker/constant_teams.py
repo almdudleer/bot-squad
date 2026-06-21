@@ -350,6 +350,103 @@ def _maintain_initiative(cfg: Any, slug: str, init_path: Path, fm: dict) -> list
     return actions
 
 
+# T-0350: a drained idle member must sit idle at least this long before reaping,
+# so a just-spawned member still bringing up / mid-triage is never interrupted.
+_DRAINED_MEMBER_SETTLE_SEC = float(os.environ.get("BOT_SQUAD_DRAINED_MEMBER_SETTLE_SEC") or 120)
+
+
+def _parse_iso_epoch(value: Any) -> float:
+    """Parse an ISO ``...Z`` timestamp to epoch seconds; 0.0 on garbage/missing."""
+    try:
+        from datetime import datetime, timezone
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _queue_drained(cfg: Any, slug: str, init_path: Path, fm: dict) -> bool:
+    """True when a constant team's consume-queue has no unprocessed work.
+
+    ``.log`` → no new lines past the cursor; glob → no matching files. A team with
+    no ``consume`` is always-on (no queue) and never "drains" — those are not
+    demand-driven, so we never reap their members here.
+    """
+    consume = (fm.get("consume") or "").strip()
+    if not consume:
+        return False
+    name = fm.get("name") or init_path.stem
+    state = _load_state(cfg, slug, name)
+    data_dir = cfg.data_dir
+    if consume.endswith(".log"):
+        log_path = data_dir / slug / consume
+        cursor = int(state.get("cursor_lines", 0) or 0)
+        return not _log_new_lines(log_path, cursor)
+    return not _glob_items(data_dir, slug, consume)
+
+
+def gc_drained_members(cfg: Any, slug: str, now: float | None = None) -> dict:
+    """T-0350: close the demand-driven lifecycle — reap an IDLE constant-team
+    member once its consume-queue is DRAINED.
+
+    A triage dev does its work (files/updates tickets) then sits idle at the
+    composer FOREVER: ``gc_tmux_sessions`` spares a live claude pane, and
+    ``archive_dead_teammates`` only catches post-totest / 24h-stale, so an
+    ``owner=constant-team`` session with ``task_id: ~`` has no prompt close. With
+    the queue empty and the member idle past a settle window, it has nothing left
+    to do → suspend it (kills the pane; the now-empty sibling tmux session is then
+    reaped fast by the T-0350 ``gc_tmux_sessions`` short grace). This is the
+    empty-session leak the operator kept killing by hand.
+
+    Conservative: a ``running`` member (mid-triage) and a just-spawned one (within
+    the settle window) are always spared, so live work is never interrupted.
+    """
+    if now is None:
+        now = time.time()
+    from bot_squad_worker import sessions as S
+    init_dir = cfg.data_dir / slug / "vision" / "initiatives"
+    if not init_dir.exists():
+        return {"reaped": []}
+    try:
+        rows = S.list_sessions(cfg, slug)
+    except Exception:  # noqa: BLE001
+        log.exception("constant_teams.gc_drained_members: list_sessions failed for %s", slug)
+        return {"reaped": []}
+
+    reaped: list[str] = []
+    for init_path in sorted(init_dir.glob("*.md")):
+        fm = _read_frontmatter(init_path)
+        if not _truthy(fm.get("constant_team")):
+            continue
+        if not _queue_drained(cfg, slug, init_path, fm):
+            continue  # real unprocessed feedback → members are legitimately busy
+        init_stem = init_path.stem
+        window_prefix = (fm.get("team_window") or fm.get("name") or init_stem)[:40]
+        for r in rows:
+            if r.get("status") not in _LIVE_STATUSES:
+                continue
+            if str(r.get("owner") or "") != "constant-team":
+                continue
+            init_val = Path(str(r.get("initiative") or "")).stem
+            win = str(r.get("window") or "")
+            if not (init_val == init_stem or (window_prefix and win.startswith(window_prefix))):
+                continue
+            if str(r.get("activity") or "") == "running":
+                continue  # actively triaging — never interrupt mid-work
+            if now - _parse_iso_epoch(r.get("started_at")) < _DRAINED_MEMBER_SETTLE_SEC:
+                continue  # too fresh — could be mid-bringup
+            sid = r.get("sid")
+            if not sid:
+                continue
+            try:
+                S.suspend(cfg, slug, sid)
+                reaped.append(sid)
+                log.info("constant_teams: reaped idle drained member %s (team %s)", sid, init_stem)
+            except Exception:  # noqa: BLE001
+                log.exception("constant_teams: reap of idle drained member %s failed", sid)
+    return {"reaped": reaped}
+
+
 def constant_team_stems(cfg: Any, slug: str) -> set[str]:
     """Return the set of initiative stems flagged ``constant_team: true``.
 
@@ -393,4 +490,16 @@ def tick(cfg: Any, slug: str) -> dict:
             all_actions.extend(_maintain_initiative(cfg, slug, init_path, fm))
         except Exception:  # noqa: BLE001
             log.exception("constant_teams: maintain failed for %s/%s", slug, init_path.name)
+
+    # T-0350: close the lifecycle — reap idle members whose queue has drained, so
+    # a finished triage dev doesn't linger idle as an empty session. Runs after
+    # the maintain (spawn) pass so a member spawned THIS tick (fresh) is protected
+    # by the settle window.
+    try:
+        reaped = gc_drained_members(cfg, slug)["reaped"]
+        for sid in reaped:
+            all_actions.append({"action": "reaped_drained_member", "sid": sid})
+    except Exception:  # noqa: BLE001
+        log.exception("constant_teams: gc_drained_members failed for %s", slug)
+
     return {"actions": all_actions}

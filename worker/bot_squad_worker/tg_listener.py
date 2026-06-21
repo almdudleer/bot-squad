@@ -106,7 +106,34 @@ def handle_update(cfg, update: dict) -> dict:
     if reply:
         return _handle_reply(cfg, chat_id, *reply)
 
+    # T-0386 Phase 2: a voice message → transcribe + store as a feedback artifact.
+    if msg.get("voice"):
+        from bot_squad_worker import voice_intake as _vi
+        slug = _slug_for_chat(cfg, chat_id)
+        result = _vi.process_voice(cfg, slug, msg, ts=_msg_ts(msg))
+        return {"ok": result.get("ok", True), "action": "voice", "slug": slug, "result": result}
+
     return {"ok": True, "action": "skip", "reason": "not a reply or command"}
+
+
+def _slug_for_chat(cfg, chat_id: str) -> str:
+    """Resolve the project slug whose tg_chat == chat_id (allowlist already passed)."""
+    for slug, p in cfg.projects.items():
+        if str(getattr(p, "tg_chat", "")) == str(chat_id):
+            return slug
+    return ""
+
+
+def _msg_ts(msg: dict) -> str:
+    """ISO-8601 UTC timestamp for a message — from its TG `date`, else now."""
+    from datetime import datetime, timezone
+    d = msg.get("date")
+    when = (
+        datetime.fromtimestamp(d, tz=timezone.utc)
+        if isinstance(d, (int, float))
+        else datetime.now(timezone.utc)
+    )
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _handle_reply(cfg, chat_id: str, sid: str, text: str) -> dict:

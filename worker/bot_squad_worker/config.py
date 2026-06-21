@@ -146,6 +146,13 @@ class Config:
     max_default_chat_id: str = ""
     max_proxy_url: str = ""
     max_recipient_kind: str = "chat_id"
+    # T-0386: voice-feedback transcription seam (INI-04 Phase 2). engine selects
+    # the STT backend (default self-hosted faster-whisper, config-swappable);
+    # model is the engine-specific model size. Loaded from system_settings.toml
+    # [voice]. faster-whisper is a lazy import — only needed when voice intake is
+    # actually used.
+    voice_engine: str = "faster-whisper"
+    voice_model: str = "small"
 
     @property
     def data_dir(self) -> Path:
@@ -196,6 +203,8 @@ class Config:
         max_default_chat_id = ""
         max_proxy_url = ""
         max_recipient_kind = "chat_id"
+        voice_engine = "faster-whisper"
+        voice_model = "small"
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -210,6 +219,9 @@ class Config:
             max_default_chat_id = str(max_block.get("default_chat_id", max_default_chat_id))
             max_proxy_url = str(max_block.get("proxy_url", max_proxy_url))
             max_recipient_kind = str(max_block.get("recipient_kind", max_recipient_kind))
+            voice_block = sys_raw.get("voice", {}) or {}
+            voice_engine = str(voice_block.get("engine", voice_engine))
+            voice_model = str(voice_block.get("model", voice_model))
 
         return cls(
             config_dir=config_dir,
@@ -226,4 +238,6 @@ class Config:
             max_default_chat_id=max_default_chat_id,
             max_proxy_url=max_proxy_url,
             max_recipient_kind=max_recipient_kind,
+            voice_engine=voice_engine,
+            voice_model=voice_model,
         )

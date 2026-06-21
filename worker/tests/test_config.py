@@ -121,6 +121,23 @@ def test_tg_proxy_url_from_system_settings(tmp_config_dir: Path) -> None:
     assert cfg.tg_proxy_url == "http://153.80.195.83:8888"
 
 
+def test_voice_defaults(tmp_config_dir: Path) -> None:
+    # T-0386: absent [voice] → self-hosted faster-whisper/small defaults.
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.voice_engine == "faster-whisper"
+    assert cfg.voice_model == "small"
+
+
+def test_voice_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0386: admin swaps the STT engine/model via [voice].
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[voice]\nengine = "whisper-api"\nmodel = "large-v3"\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.voice_engine == "whisper-api"
+    assert cfg.voice_model == "large-v3"
+
+
 def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
     # T-0155: admin overrides via [tg] in system_settings.toml.
     (tmp_config_dir / "system_settings.toml").write_text(

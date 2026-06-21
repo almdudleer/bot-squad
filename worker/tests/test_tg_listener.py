@@ -380,3 +380,49 @@ def test_notify_passes_proxy_when_configured(tmp_path):
     with patch("httpx.post", side_effect=fake_post):
         TL._notify(cfg, "12345", "hello")
     assert captured["proxy"] == "socks5://10.0.0.1:1080"
+
+
+# ---------------------------------------------------------------------------
+# T-0386 Phase 2: voice messages route to voice_intake.process_voice
+# ---------------------------------------------------------------------------
+
+def test_handle_update_routes_voice_to_process(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path, tg_chat="-100777")
+    captured = {}
+
+    def fake_process(c, slug, message, *, ts):
+        captured["slug"] = slug
+        captured["file_id"] = message["voice"]["file_id"]
+        captured["ts"] = ts
+        return {"ok": True}
+
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(VI, "process_voice", fake_process)
+
+    update = {
+        "update_id": 5,
+        "message": {
+            "message_id": 9, "date": 1750000000,
+            "chat": {"id": -100777, "type": "supergroup"},
+            "from": {"id": 1, "first_name": "A"},
+            "voice": {"file_id": "VID", "file_unique_id": "u", "duration": 3},
+        },
+    }
+    out = TL.handle_update(cfg, update)
+    assert out["action"] == "voice"
+    assert captured["slug"] == "test-project"
+    assert captured["file_id"] == "VID"
+    assert captured["ts"]  # an ISO timestamp was derived
+
+
+def test_handle_update_voice_not_allowlisted_skipped(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path, tg_chat="-100777")
+    from bot_squad_worker import voice_intake as VI
+    called = []
+    monkeypatch.setattr(VI, "process_voice", lambda *a, **k: called.append(1))
+    update = {"update_id": 6, "message": {
+        "chat": {"id": -999999, "type": "supergroup"},
+        "voice": {"file_id": "X", "duration": 1}}}
+    out = TL.handle_update(cfg, update)
+    assert out["action"] == "skip"
+    assert called == []

@@ -297,10 +297,13 @@ def test_idle_live_dev_not_suspended_when_knob_off(tmp_path, monkeypatch):
 def test_idle_live_dev_suspended_when_knob_set(tmp_path, monkeypatch):
     """Knob>0 + pane idle past the window + not awaiting input → suspend+archive
     with reason idle-suspend; the binding is preserved as last_task_id and the
-    task stays open (re-dispatchable, kill-not-resume)."""
+    task stays open (re-dispatchable, kill-not-resume).
+
+    T-0426: an idle dev on an OPEN (not yet started) task is still reaped — only
+    an in_progress claim is spared (see the in_progress test below)."""
     import time as _time
     cfg = _make_cfg(tmp_path)
-    p = _seed_idle_live_dev(cfg, monkeypatch)
+    p = _seed_idle_live_dev(cfg, monkeypatch, status="open")
     monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "3600")
     monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 7200)
     monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
@@ -316,6 +319,24 @@ def test_idle_live_dev_suspended_when_knob_set(tmp_path, monkeypatch):
     assert meta["last_task_id"] == "T-0001"
     assert meta["task_id"] is None  # "~" round-trips through the serializer as null
     # the task itself is untouched → stays open and re-dispatchable
+    assert S._task_status(cfg.data_dir, "test-project", "T-0001") == "open"
+
+
+def test_idle_live_in_progress_dev_is_spared(tmp_path, monkeypatch):
+    """T-0426: an idle-but-live dev that OWNS an in_progress ticket is NOT
+    idle-suspended — that strands the ticket (in_progress, owner='-', no
+    auto-re-dispatch). in_progress is the explicit 'actively working' claim;
+    only open/planned idle devs are reaped. Even with the knob on + pane idle."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    p = _seed_idle_live_dev(cfg, monkeypatch, status="in_progress")
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "3600")
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 7200)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    meta = S._read_session_metadata(p)
+    assert meta.get("status") != "suspended"
     assert S._task_status(cfg.data_dir, "test-project", "T-0001") == "in_progress"
 
 

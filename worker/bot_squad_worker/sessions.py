@@ -3619,7 +3619,13 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                 # (kill-not-resume); a non-TG long wait reads as idle, which is why
                 # this is opt-in.
                 idle_window = _session_idle_suspend_sec()
-                if idle_window > 0:
+                # T-0426: never idle-suspend a dev that owns an in_progress
+                # ticket — that strands the ticket (in_progress, owner='-', no
+                # auto-re-dispatch; manually resurrected). in_progress is the
+                # explicit "actively working" claim; an idle open/planned/
+                # reopened dev is still reaped (binding→last_task_id,
+                # re-dispatchable). Operator opt-A, the strand-bleed fix.
+                if idle_window > 0 and st != "in_progress":
                     try:
                         from bot_squad_worker import tg_stall as _tg_stall
                         _blocked = _tg_stall.blocked_sids(cfg, slug)

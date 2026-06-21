@@ -96,10 +96,11 @@ def load_state(cfg: Any) -> Optional[dict]:
 
 def save_state(cfg: Any, state: dict) -> None:
     p = _state_path(cfg)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.parent / (p.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    os.rename(tmp, p)
+    # T-0373: unique-tmp atomic write (state file is single-writer — apscheduler
+    # max_instances=1 — so no lock needed, but a unique tmp matches the task-md
+    # writers and is clobber-proof if a tick ever overlaps).
+    from bot_squad_worker.mdlock import atomic_write
+    atomic_write(p, json.dumps(state, indent=1))
 
 
 # --- ceiling + live count --------------------------------------------------

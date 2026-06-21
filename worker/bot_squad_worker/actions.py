@@ -1181,40 +1181,40 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
     path = matches[0]
 
     from datetime import datetime, timezone
-    import os as _os
     import re as _re
     from bot_squad_worker.task_body import append_progress, _sanitize_progress_text
-
-    text_raw = path.read_text()
-    fm_match = _re.match(r"\A---\n(.*?)\n---\n(.*)", text_raw, _re.DOTALL)
-    if not fm_match:
-        raise ActionError(f"task_progress_add: no frontmatter in {path}")
-    fm_block = fm_match.group(1)
-    body = fm_match.group(2).lstrip("\n")
+    from bot_squad_worker.mdlock import task_lock, atomic_write
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        new_body = append_progress(body, ts, sid, text)
-    except ValueError as e:
-        raise ActionError(f"task_progress_add: {e}") from e
+    # T-0373: lock the whole read→modify→write (and unique tmp via atomic_write)
+    # so concurrent progress/comment adds (worker AND api) never lose each other.
+    with task_lock(path):
+        text_raw = path.read_text()
+        fm_match = _re.match(r"\A---\n(.*?)\n---\n(.*)", text_raw, _re.DOTALL)
+        if not fm_match:
+            raise ActionError(f"task_progress_add: no frontmatter in {path}")
+        fm_block = fm_match.group(1)
+        body = fm_match.group(2).lstrip("\n")
 
-    # Update `updated:` in place (or append) without parsing YAML — the same
-    # line-based pattern autonomous._patch_task_file uses.
-    fm_lines = fm_block.splitlines()
-    has_updated = False
-    for i, ln in enumerate(fm_lines):
-        if ln.lstrip().startswith("updated:"):
-            fm_lines[i] = f"updated: {ts}"
-            has_updated = True
-            break
-    if not has_updated:
-        fm_lines.append(f"updated: {ts}")
-    new_fm = "\n".join(fm_lines)
+        try:
+            new_body = append_progress(body, ts, sid, text)
+        except ValueError as e:
+            raise ActionError(f"task_progress_add: {e}") from e
 
-    content = f"---\n{new_fm}\n---\n\n{new_body}"
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    _os.rename(tmp, path)
+        # Update `updated:` in place (or append) without parsing YAML — the same
+        # line-based pattern autonomous._patch_task_file uses.
+        fm_lines = fm_block.splitlines()
+        has_updated = False
+        for i, ln in enumerate(fm_lines):
+            if ln.lstrip().startswith("updated:"):
+                fm_lines[i] = f"updated: {ts}"
+                has_updated = True
+                break
+        if not has_updated:
+            fm_lines.append(f"updated: {ts}")
+        new_fm = "\n".join(fm_lines)
+
+        atomic_write(path, f"---\n{new_fm}\n---\n\n{new_body}")
 
     line = f"- {ts} · {sid} · {_sanitize_progress_text(text)}"
     return {"ok": True, "task_id": task_id, "line_appended": line}

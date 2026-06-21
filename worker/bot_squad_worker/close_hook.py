@@ -65,32 +65,35 @@ def _stakeholder_comments(jsonl_path: Path) -> list[str]:
 
 
 def _append_comments(ticket_path: Path, comments: list[str], sid: str) -> int:
-    """Append comments not already present in the ticket body. Returns count added."""
-    text = ticket_path.read_text(encoding="utf-8", errors="replace")
-    existing = text
-    fresh = []
-    seen = set()
-    for c in comments:
-        key = c[:120]
-        # Skip if a substantial prefix already appears in the ticket (verbatim
-        # request, prior harvest, or a progress note) — avoids re-appending the
-        # same guidance every close.
-        if key in seen or key in existing:
-            continue
-        seen.add(key)
-        fresh.append(c)
-    fresh = fresh[:_MAX_COMMENTS]
-    if not fresh:
-        return 0
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    block = [f"\n{_HARVEST_HEADING}\n"] if _HARVEST_HEADING not in text else ["\n"]
-    for c in fresh:
-        block.append(f"- {ts} · from {sid}: {c}")
-    new_text = text.rstrip("\n") + "\n" + "\n".join(block) + "\n"
-    tmp = ticket_path.parent / (ticket_path.name + ".tmp")
-    tmp.write_text(new_text, encoding="utf-8")
-    os.rename(tmp, ticket_path)
-    return len(fresh)
+    """Append comments not already present in the ticket body. Returns count added.
+
+    T-0373: the read→append→write is locked (cross-process) + uses a unique tmp
+    so it can't lose / be lost-by a concurrent worker or api task-md mutation."""
+    from bot_squad_worker.mdlock import task_lock, atomic_write
+    with task_lock(ticket_path):
+        text = ticket_path.read_text(encoding="utf-8", errors="replace")
+        existing = text
+        fresh = []
+        seen = set()
+        for c in comments:
+            key = c[:120]
+            # Skip if a substantial prefix already appears in the ticket (verbatim
+            # request, prior harvest, or a progress note) — avoids re-appending the
+            # same guidance every close.
+            if key in seen or key in existing:
+                continue
+            seen.add(key)
+            fresh.append(c)
+        fresh = fresh[:_MAX_COMMENTS]
+        if not fresh:
+            return 0
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        block = [f"\n{_HARVEST_HEADING}\n"] if _HARVEST_HEADING not in text else ["\n"]
+        for c in fresh:
+            block.append(f"- {ts} · from {sid}: {c}")
+        new_text = text.rstrip("\n") + "\n" + "\n".join(block) + "\n"
+        atomic_write(ticket_path, new_text)
+        return len(fresh)
 
 
 def harvest_tick(cfg: Any, slug: str) -> dict:

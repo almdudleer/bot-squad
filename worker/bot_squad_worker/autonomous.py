@@ -477,21 +477,26 @@ def _patch_task_file(path: Path, updates: dict, comment: Optional[str]) -> None:
     text. Applies ``updates`` (preserving existing key order), bumps
     ``updated``, then appends the optional orchestrator comment.
     """
-    parsed = _frontmatter.parse_or_none(path.read_text())
-    if parsed is None:
-        return
-    meta, body = parsed
+    # T-0373: lock the read→modify→write + atomic unique-tmp write, so a
+    # concurrent worker/api task-md mutation isn't lost (was a bare, non-atomic
+    # path.write_text — a reader could even see a partial file).
+    from bot_squad_worker.mdlock import task_lock, atomic_write
+    with task_lock(path):
+        parsed = _frontmatter.parse_or_none(path.read_text())
+        if parsed is None:
+            return
+        meta, body = parsed
 
-    for key, val in updates.items():
-        meta[key] = val
-    ts = _now_iso()
-    meta["updated"] = ts
+        for key, val in updates.items():
+            meta[key] = val
+        ts = _now_iso()
+        meta["updated"] = ts
 
-    new_text = _frontmatter.dump(meta, body)
-    if comment:
-        new_text = new_text.rstrip("\n") + f"\n\n---\n\n**[orchestrator {ts}]** {comment}\n"
+        new_text = _frontmatter.dump(meta, body)
+        if comment:
+            new_text = new_text.rstrip("\n") + f"\n\n---\n\n**[orchestrator {ts}]** {comment}\n"
 
-    path.write_text(new_text)
+        atomic_write(path, new_text)
 
 
 # ---------------------------------------------------------------------------

@@ -1552,6 +1552,41 @@ def test_task_progress_add_appends_line(tmp_path, monkeypatch):
     assert "S-test-p1 · shipped the thing" in content
 
 
+def test_task_progress_add_concurrent_no_lost_notes(tmp_path, monkeypatch):
+    """T-0373: N concurrent progress/comment adds all survive — was a shared-tmp +
+    unlocked read-modify-write that lost writes (and 500'd) under contention."""
+    import threading
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    task_path = backlog / "T-0001-foo.md"
+    task_path.write_text("---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n## Progress\n")
+    n = 12
+    barrier = threading.Barrier(n)
+    errors: list = []
+
+    def _w(i: int) -> None:
+        barrier.wait()
+        try:
+            A.dispatch("task_progress_add", {
+                "slug": "test-project", "task_id": "T-0001",
+                "sid": f"S-p{i}", "text": f"concurrent-note-{i}",
+            })
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_w, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"writers raised: {errors!r}"
+    content = task_path.read_text()
+    missing = [i for i in range(n) if f"concurrent-note-{i}" not in content]
+    assert not missing, f"LOST notes: {missing}"
+
+
 def test_task_progress_add_unknown_task_raises(tmp_path, monkeypatch):
     import bot_squad_worker.actions as A
 

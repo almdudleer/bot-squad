@@ -1,15 +1,44 @@
 """Atomic write + frontmatter merge helpers for backlog tasks."""
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import re
+import tempfile
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.frontmatter import dump_frontmatter
 from app.markdown_parser import parse_task
+
+
+# T-0373: cross-process lock for a task-md read-modify-write. The worker and the
+# API mutate the SAME backlog md files from different processes; without a lock
+# they raced (lost updates + a shared `.tmp` clobber that 500'd). Both sides
+# flock the SAME lockfile path (``<task>.md.lock``) so the critical section is
+# mutually exclusive across processes. Mirror this convention in the worker.
+LOCK_SUFFIX = ".lock"
+
+
+@contextlib.contextmanager
+def task_lock(path: Path):
+    """Hold an exclusive cross-process lock for mutating ``path`` (a task md).
+
+    Wrap the entire read→modify→write in this so a concurrent writer (worker or
+    API) can't interleave. The lockfile is ``<path><LOCK_SUFFIX>``; it is created
+    if absent and never deleted (deleting it would reintroduce the race)."""
+    lock_path = path.parent / (path.name + LOCK_SUFFIX)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 # Keys allowed in merge_task_update `updates` dict.
 # T-0038 adds first-class linkage fields: `initiative` (basename under
@@ -35,15 +64,27 @@ def _now_utc_iso() -> str:
 
 
 def write_task(path: Path, frontmatter: dict, body: str) -> None:
-    """Write a task file atomically — .tmp then os.rename."""
+    """Write a task file atomically — UNIQUE tmp then os.replace.
+
+    T-0373: a unique per-writer tmp (``mkstemp``) instead of a shared
+    ``<name>.tmp`` so two concurrent writers never clobber each other's tmp (the
+    shared name 500'd with FileNotFoundError when one writer's rename moved the
+    tmp out from under another)."""
     # Drop None values so missing keys (notably `priority`) don't serialize
     # as `key: null` — keeps frontmatter clean and parser semantics symmetric.
     fm_clean = {k: v for k, v in frontmatter.items() if v is not None}
     fm_str = dump_frontmatter(fm_clean)
     content = f"---\n{fm_str}---\n\n{body}"
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.rename(tmp, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_name, path)  # atomic
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def merge_task_update(path: Path, updates: dict, body: str | None = None) -> dict:
@@ -53,27 +94,30 @@ def merge_task_update(path: Path, updates: dict, body: str | None = None) -> dic
     if bad_keys:
         raise ValueError(f"disallowed update keys: {bad_keys!r}")
 
-    task = parse_task(path)
-    # Build updated frontmatter from existing, minus non-frontmatter keys
-    fm = {k: v for k, v in task.items() if k not in ("body", "path")}
+    # T-0373: lock the whole read→modify→write so a concurrent writer can't
+    # interleave between parse_task and write_task (lost-update race).
+    with task_lock(path):
+        task = parse_task(path)
+        # Build updated frontmatter from existing, minus non-frontmatter keys
+        fm = {k: v for k, v in task.items() if k not in ("body", "path")}
 
-    # Backfill created from mtime if missing
-    if "created" not in fm:
-        mtime = os.stat(path).st_mtime
-        fm["created"] = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        # Backfill created from mtime if missing
+        if "created" not in fm:
+            mtime = os.stat(path).st_mtime
+            fm["created"] = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
 
-    # Apply updates
-    for k, v in updates.items():
-        if k != "body":
-            fm[k] = v
+        # Apply updates
+        for k, v in updates.items():
+            if k != "body":
+                fm[k] = v
 
-    fm["updated"] = _now_utc_iso()
+        fm["updated"] = _now_utc_iso()
 
-    new_body = body if body is not None else task["body"]
-    write_task(path, fm, new_body)
-    return fm
+        new_body = body if body is not None else task["body"]
+        write_task(path, fm, new_body)
+        return fm
 
 
 def append_comment(path: Path, comment_body: str, author: str) -> None:
@@ -81,27 +125,30 @@ def append_comment(path: Path, comment_body: str, author: str) -> None:
     if not comment_body.strip():
         raise ValueError("empty comment body")
 
-    task = parse_task(path)
-    fm = {k: v for k, v in task.items() if k not in ("body", "path")}
-    body = task["body"]
+    # T-0373: lock the read→append→write so concurrent comment-adds all survive
+    # (was: unlocked + shared tmp → 8 concurrent adds, only 2 survived + 500s).
+    with task_lock(path):
+        task = parse_task(path)
+        fm = {k: v for k, v in task.items() if k not in ("body", "path")}
+        body = task["body"]
 
-    # Backfill created if missing
-    if "created" not in fm:
-        mtime = os.stat(path).st_mtime
-        fm["created"] = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-    fm["updated"] = _now_utc_iso()
+        # Backfill created if missing
+        if "created" not in fm:
+            mtime = os.stat(path).st_mtime
+            fm["created"] = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        fm["updated"] = _now_utc_iso()
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    comment_block = f"### {today} {author}\n\n{comment_body.strip()}\n"
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        comment_block = f"### {today} {author}\n\n{comment_body.strip()}\n"
 
-    if "## Comments" in body:
-        body = body.rstrip("\n") + "\n\n" + comment_block
-    else:
-        body = body.rstrip("\n") + "\n\n## Comments\n\n" + comment_block
+        if "## Comments" in body:
+            body = body.rstrip("\n") + "\n\n" + comment_block
+        else:
+            body = body.rstrip("\n") + "\n\n## Comments\n\n" + comment_block
 
-    write_task(path, fm, body)
+        write_task(path, fm, body)
 
 
 def allocate_next_id(backlog_dir: Path) -> str:

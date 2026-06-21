@@ -775,3 +775,36 @@ def test_admin_sees_is_self_invites_without_hash(tmp_bot_squad: Path, monkeypatc
     assert len(self_srv["invites"]) == 1
     assert self_srv["invites"][0]["target_username"] == "bob"
     assert "hash" not in self_srv["invites"][0]
+
+
+# ---- T-0376: POST /servers (register) is super-admin-only (privesc fix) ------
+# create_server mints a LIVE install_token = fleet-attach credential. It was
+# only require_auth, so a non-admin could mint one (privilege escalation). Its
+# sibling install-tokens/mint (same credential, existing server) was already
+# super-admin gated; this closes the asymmetry.
+
+
+def test_nonadmin_cannot_create_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=False)
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "intruder")
+        r = client.post(
+            "/api/m/servers",
+            json={"display_name": "Evil", "base_url": "https://evil.example.com"},
+        )
+    assert r.status_code == 403, r.text
+    assert "install_token" not in r.text  # no credential minted for a non-admin
+
+
+def test_admin_can_create_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=True, intruder_is_admin=False)
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "testuser")
+        r = client.post(
+            "/api/m/servers",
+            json={"display_name": "Prod", "base_url": "https://prod.example.com"},
+        )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["install_token"]  # legit admin path still mints a token
+    assert body["install_url"].endswith("/install.sh")

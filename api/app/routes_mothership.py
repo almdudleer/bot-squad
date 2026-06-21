@@ -333,12 +333,16 @@ def verify_global_user(request: Request, payload: dict) -> dict:
     return user.to_public()
 
 
-@router.post("/servers")
+@router.post("/servers", dependencies=[Depends(_require_super_admin)])
 def create_server(
     request: Request,
     payload: dict,
     user: dict = Depends(require_auth),
 ) -> dict:
+    # T-0376: super-admin only. Registering a server mints a LIVE install_token
+    # (a fleet-attach credential); leaving this at require_auth let a non-admin
+    # mint one = privilege escalation. Mirrors install-tokens/mint, which mints
+    # the same credential for an existing server and was already super-admin.
     display_name = (payload.get("display_name") or "").strip()
     base_url = (payload.get("base_url") or "").strip()
     if not display_name or not base_url:

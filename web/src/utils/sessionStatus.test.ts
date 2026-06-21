@@ -162,6 +162,12 @@ describe("sessionNeedsInput", () => {
     expect(sessionNeedsInput({ status: "suspended" })).toBe(false);
   });
 
+  it("does NOT flag a suspended/dead sid carrying a STALE awaiting_input marker (P2-05 liveness guard)", () => {
+    // item-1 dropped the active-guard; a dead sid with a not-yet-cleared
+    // tg_stall marker must NOT read needs-input forever.
+    expect(sessionNeedsInput({ status: "suspended", awaiting_input: true })).toBe(false);
+  });
+
   it("never flags an archived row even if it would otherwise qualify", () => {
     expect(
       sessionNeedsInput({ status: "paused", archived: true }),

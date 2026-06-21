@@ -140,7 +140,13 @@ export function sessionNeedsInput(
 ): boolean {
   if (!src || src.archived) return false;
   if (src.status === "paused") return true;
-  return src.awaiting_input === true;
+  // P2-05 (FE-guard): awaiting_input is only meaningful for a LIVE (active)
+  // session. A suspended/dead sid can carry a STALE blocked marker (cleared
+  // only by the worker close-on-attach reconcile or the 24h GC), so without
+  // this liveness guard it would read needs-input forever. item-1 dropped the
+  // `status === "active"` guard when it swapped active_at_prompt→awaiting_input;
+  // restore it so a non-live sid never qualifies.
+  return src.status === "active" && src.awaiting_input === true;
 }
 
 // ---------------------------------------------------------------------------

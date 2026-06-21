@@ -153,6 +153,10 @@ class Config:
     # actually used.
     voice_engine: str = "faster-whisper"
     voice_model: str = "small"
+    # T-0386 P2 flag-off-safe kill-switch: voice intake is OFF by default and is
+    # flipped on as part of the 1-time stakeholder TG setup, so deploying the
+    # voice code never silently starts transcribing before setup. [voice].enabled.
+    voice_enabled: bool = False
 
     @property
     def data_dir(self) -> Path:
@@ -205,6 +209,7 @@ class Config:
         max_recipient_kind = "chat_id"
         voice_engine = "faster-whisper"
         voice_model = "small"
+        voice_enabled = False
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -222,6 +227,7 @@ class Config:
             voice_block = sys_raw.get("voice", {}) or {}
             voice_engine = str(voice_block.get("engine", voice_engine))
             voice_model = str(voice_block.get("model", voice_model))
+            voice_enabled = bool(voice_block.get("enabled", voice_enabled))
 
         return cls(
             config_dir=config_dir,
@@ -240,4 +246,5 @@ class Config:
             max_recipient_kind=max_recipient_kind,
             voice_engine=voice_engine,
             voice_model=voice_model,
+            voice_enabled=voice_enabled,
         )

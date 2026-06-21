@@ -126,16 +126,20 @@ def test_voice_defaults(tmp_config_dir: Path) -> None:
     cfg = Config.load(tmp_config_dir)
     assert cfg.voice_engine == "faster-whisper"
     assert cfg.voice_model == "small"
+    # Flag-off-safe: voice intake is DISABLED by default (operator directive) —
+    # enabled at the 1-time stakeholder TG setup, never silently on at deploy.
+    assert cfg.voice_enabled is False
 
 
 def test_voice_from_system_settings(tmp_config_dir: Path) -> None:
-    # T-0386: admin swaps the STT engine/model via [voice].
+    # T-0386: admin swaps the STT engine/model via [voice] + flips the kill-switch.
     (tmp_config_dir / "system_settings.toml").write_text(
-        '[voice]\nengine = "whisper-api"\nmodel = "large-v3"\n'
+        '[voice]\nengine = "whisper-api"\nmodel = "large-v3"\nenabled = true\n'
     )
     cfg = Config.load(tmp_config_dir)
     assert cfg.voice_engine == "whisper-api"
     assert cfg.voice_model == "large-v3"
+    assert cfg.voice_enabled is True
 
 
 def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:

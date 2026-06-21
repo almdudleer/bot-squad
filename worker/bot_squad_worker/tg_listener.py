@@ -107,7 +107,9 @@ def handle_update(cfg, update: dict) -> dict:
         return _handle_reply(cfg, chat_id, *reply)
 
     # T-0386 Phase 2: a voice message → transcribe + store as a feedback artifact.
-    if msg.get("voice"):
+    # Flag-off-safe: gated on [voice].enabled (default off) so deploying the voice
+    # code is a no-op until the 1-time stakeholder TG setup flips it on.
+    if msg.get("voice") and getattr(cfg, "voice_enabled", False):
         from bot_squad_worker import voice_intake as _vi
         slug = _slug_for_chat(cfg, chat_id)
         result = _vi.process_voice(cfg, slug, msg, ts=_msg_ts(msg))

@@ -21,6 +21,7 @@ def _make_cfg(
     bot_token: str = "TESTBOT:TOKEN",
     tg_chat: str = "12345",
     proxy_url: str = "",
+    voice_enabled: bool = False,
 ):
     """Build a minimal config-like namespace for tg_listener tests."""
     data_dir = tmp_path / "data"
@@ -31,6 +32,7 @@ def _make_cfg(
         data_dir=data_dir,
         projects={"test-project": proj},
         tg_proxy_url=proxy_url,
+        voice_enabled=voice_enabled,
     )
 
 
@@ -387,7 +389,7 @@ def test_notify_passes_proxy_when_configured(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_handle_update_routes_voice_to_process(tmp_path, monkeypatch):
-    cfg = _make_cfg(tmp_path, tg_chat="-100777")
+    cfg = _make_cfg(tmp_path, tg_chat="-100777", voice_enabled=True)
     captured = {}
 
     def fake_process(c, slug, message, *, ts):
@@ -415,8 +417,26 @@ def test_handle_update_routes_voice_to_process(tmp_path, monkeypatch):
     assert captured["ts"]  # an ISO timestamp was derived
 
 
+def test_handle_update_voice_disabled_skipped(tmp_path, monkeypatch):
+    """Flag-off-safe (operator directive): with [voice].enabled off (default),
+    a voice message is NOT processed — voice intake is dormant until the
+    stakeholder setup flips it on."""
+    cfg = _make_cfg(tmp_path, tg_chat="-100777", voice_enabled=False)
+    from bot_squad_worker import voice_intake as VI
+    called = []
+    monkeypatch.setattr(VI, "process_voice", lambda *a, **k: called.append(1))
+    update = {"update_id": 7, "message": {
+        "message_id": 9, "date": 1750000000,
+        "chat": {"id": -100777, "type": "supergroup"},
+        "from": {"id": 1, "first_name": "A"},
+        "voice": {"file_id": "VID", "file_unique_id": "u", "duration": 3}}}
+    out = TL.handle_update(cfg, update)
+    assert out["action"] == "skip"
+    assert called == []
+
+
 def test_handle_update_voice_not_allowlisted_skipped(tmp_path, monkeypatch):
-    cfg = _make_cfg(tmp_path, tg_chat="-100777")
+    cfg = _make_cfg(tmp_path, tg_chat="-100777", voice_enabled=True)
     from bot_squad_worker import voice_intake as VI
     called = []
     monkeypatch.setattr(VI, "process_voice", lambda *a, **k: called.append(1))

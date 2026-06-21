@@ -209,6 +209,27 @@ export function ProjectSettings() {
         </>
       )}
 
+      {/* T-0358: agent-instruction editing relocated here as a thin link (it
+          used to be the "AGENT WORKFLOW" nav page — a ~30k-px raw dump of the
+          agents' manuals). The page itself now collapses each manual by
+          default; this is the only nav affordance into it. Admin-leaning
+          internals live under this "Advanced" heading. */}
+      {proj && (
+        <>
+          <hr style={{ borderColor: "var(--mc-border, #333)", margin: "1.5rem 0" }} />
+          <section className="mb-4">
+            <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
+              Advanced
+            </h3>
+            <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.4rem" }}>
+              <Link to={`/p/${slug}/workflow`}>Agent instructions &amp; workflow</Link>{" "}
+              — view / edit the manuals and role briefings each session receives
+              (AGENTS.md, AGENT_INSTRUCTIONS.md, constitution, roles).
+            </p>
+          </section>
+        </>
+      )}
+
       {/* T-0218 — personal (per-user) notification target, inherited
           global → server → project. Distinct from the project-wide binding
           above (which notifies everyone). */}

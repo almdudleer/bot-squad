@@ -325,14 +325,11 @@ export function Shell() {
                   AGENT SESSIONS
                 </NavLink>
               </li>
-              <li>
-                <NavLink
-                  to={`/p/${slug}/workflow`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  AGENT WORKFLOW
-                </NavLink>
-              </li>
+              {/* T-0358: AGENT WORKFLOW left the rail. It was a ~30k-px raw
+                  dump of AGENTS.md + AGENT_INSTRUCTIONS.md (the agents' system
+                  prompt) presented as an operator nav page. Editing those
+                  manuals now lives behind a thin link in Project settings; the
+                  page itself collapses each manual by default. */}
               <li>
                 <NavLink
                   to={`/p/${slug}/runs`}

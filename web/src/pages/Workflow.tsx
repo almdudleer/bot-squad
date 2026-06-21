@@ -168,21 +168,32 @@ export function Workflow() {
   }) {
     const { id, name, label, content } = opts;
     const isEditing = editing?.name === name;
+    // T-0358: collapsed by DEFAULT. These are full agent manuals (AGENTS.md /
+    // AGENT_INSTRUCTIONS.md / constitution) — expanded-by-default they made the
+    // page a ~30k-px scroll. Editing always force-expands so the textarea shows.
+    const isOpen = !!expanded[id] || isEditing;
     return (
-      <section key={id} id={id} className="mb-4">
-        <div className="d-flex justify-content-between align-items-center mb-2">
-          <div
+      <section key={id} id={id} className="mb-3">
+        <div className="d-flex justify-content-between align-items-center">
+          <button
+            type="button"
+            className="btn btn-link p-0"
             style={{
               fontFamily: "var(--mc-mono)",
               fontSize: "0.72rem",
               color: "var(--mc-text-dim)",
               textTransform: "uppercase",
               letterSpacing: "0.06em",
+              textDecoration: "none",
+              textAlign: "left",
             }}
+            aria-expanded={isOpen}
+            onClick={() => setExpanded((s) => ({ ...s, [id]: !s[id] }))}
           >
-            {label} <span style={{ color: "var(--mc-text-mid)" }}>· {name}</span>
-          </div>
-          {!isEditing && (
+            {isOpen ? "▾" : "▸"} {label}{" "}
+            <span style={{ color: "var(--mc-text-mid)" }}>· {name}</span>
+          </button>
+          {isOpen && !isEditing && (
             <button
               type="button"
               className="btn btn-outline-secondary btn-sm"
@@ -193,7 +204,7 @@ export function Workflow() {
             </button>
           )}
         </div>
-        {renderEditor(name, content)}
+        {isOpen && <div className="mt-2">{renderEditor(name, content)}</div>}
       </section>
     );
   }
@@ -276,21 +287,30 @@ export function Workflow() {
     const role: RoleKind = base === "dev" ? "dev" : "teamlead";
     const anchorId = role === "dev" ? "wf-role-dev" : "wf-role-teamlead";
     const isEditing = editing?.name === r.name;
+    // T-0358: role briefings collapse by default too (each is a full role md).
+    const isOpen = !!expanded[anchorId] || isEditing;
     return (
-      <section key={r.name} id={anchorId} className="mb-4">
-        <div className="d-flex justify-content-between align-items-center mb-2">
-          <div
+      <section key={r.name} id={anchorId} className="mb-3">
+        <div className="d-flex justify-content-between align-items-center">
+          <button
+            type="button"
+            className="btn btn-link p-0"
             style={{
               fontFamily: "var(--mc-mono)",
               fontSize: "0.72rem",
               color: "var(--mc-text-dim)",
               textTransform: "uppercase",
               letterSpacing: "0.06em",
+              textDecoration: "none",
+              textAlign: "left",
             }}
+            aria-expanded={isOpen}
+            onClick={() => setExpanded((s) => ({ ...s, [anchorId]: !s[anchorId] }))}
           >
-            Role · {label} <span style={{ color: "var(--mc-text-mid)" }}>· {r.name}</span>
-          </div>
-          {!isEditing && (
+            {isOpen ? "▾" : "▸"} Role · {label}{" "}
+            <span style={{ color: "var(--mc-text-mid)" }}>· {r.name}</span>
+          </button>
+          {isOpen && !isEditing && (
             <button
               type="button"
               className="btn btn-outline-secondary btn-sm"
@@ -301,8 +321,8 @@ export function Workflow() {
             </button>
           )}
         </div>
-        {renderEditor(r.name, r.content)}
-        <div className="mt-2">
+        {isOpen && <div className="mt-2">{renderEditor(r.name, r.content)}</div>}
+        {isOpen && <div className="mt-2">
           {renderCollapsibleRow(
             `${role}-every-turn`,
             "Always-on (every turn, Claude Code native)",
@@ -318,7 +338,7 @@ export function Workflow() {
             "Asked to consult on demand",
             onDemandRefs(role, slug),
           )}
-        </div>
+        </div>}
       </section>
     );
   }

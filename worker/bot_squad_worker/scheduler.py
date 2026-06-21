@@ -120,10 +120,6 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         id="tg_listener",
         replace_existing=True,
     )
-    # autonomous_tick: DISABLED 2026-05-12 — autonomous work is frozen pending
-    # the new operating model. The autonomous module + actions remain on disk
-    # but no background tick fires. Re-enable here when the model is ready.
-
     # autoupdate_tick: poll mothership release feed (T-0083). No-op on the
     # mothership itself (self-exclusion via T-0086). Cadence is configurable
     # via BOT_SQUAD_AUTOUPDATE_INTERVAL_SECONDS (default 900s = 15min).

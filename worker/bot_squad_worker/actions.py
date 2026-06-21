@@ -910,101 +910,6 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Autonomous orchestrator actions (spec #8)
-# ---------------------------------------------------------------------------
-
-_AUTO_STATUS_ALLOWED = {"slug"}
-
-
-def _action_autonomous_status(params: dict[str, Any]) -> dict[str, Any]:
-    """Return the current autonomous orchestrator state for a project.
-
-    Required params: slug
-    Returns: {enabled, status, current_task_id, current_pane_id, last_tick_at,
-              sleep_start_hour, sleep_end_hour, tick_log (last 5)}
-    """
-    extra = set(params) - _AUTO_STATUS_ALLOWED
-    if extra:
-        raise ActionError(f"autonomous_status got unexpected params: {sorted(extra)}")
-    if "slug" not in params:
-        raise ActionError("autonomous_status missing required param: slug")
-
-    cfg = _get_config()
-    slug = params["slug"]
-    if cfg.projects.get(slug) is None:
-        raise ActionError(f"autonomous_status: unknown project slug {slug!r}")
-
-    from bot_squad_worker import autonomous as _auto
-    state = _auto.load_state(cfg, slug)
-    from dataclasses import asdict
-    d = asdict(state)
-    # Return last 5 tick log entries in status (full log via log endpoint)
-    d["tick_log"] = state.tick_log[-5:]
-    return {"ok": True, **d}
-
-
-_AUTO_ENABLE_ALLOWED = {"slug", "sleep_start_hour", "sleep_end_hour"}
-
-
-def _action_autonomous_enable(params: dict[str, Any]) -> dict[str, Any]:
-    """Enable the autonomous orchestrator for a project.
-
-    Required params: slug
-    Optional params: sleep_start_hour (int, default 22), sleep_end_hour (int, default 8)
-    Returns: {ok: true, slug, enabled: true}
-    """
-    extra = set(params) - _AUTO_ENABLE_ALLOWED
-    if extra:
-        raise ActionError(f"autonomous_enable got unexpected params: {sorted(extra)}")
-    if "slug" not in params:
-        raise ActionError("autonomous_enable missing required param: slug")
-
-    cfg = _get_config()
-    slug = params["slug"]
-    if cfg.projects.get(slug) is None:
-        raise ActionError(f"autonomous_enable: unknown project slug {slug!r}")
-
-    from bot_squad_worker import autonomous as _auto
-    state = _auto.load_state(cfg, slug)
-    state.enabled = True
-    if "sleep_start_hour" in params:
-        state.sleep_start_hour = int(params["sleep_start_hour"])
-    if "sleep_end_hour" in params:
-        state.sleep_end_hour = int(params["sleep_end_hour"])
-    _auto.save_state(cfg, state)
-    return {"ok": True, "slug": slug, "enabled": True}
-
-
-_AUTO_DISABLE_ALLOWED = {"slug"}
-
-
-def _action_autonomous_disable(params: dict[str, Any]) -> dict[str, Any]:
-    """Disable the autonomous orchestrator for a project.
-
-    Required params: slug
-    Returns: {ok: true, slug, enabled: false}
-
-    In-flight tasks complete normally; the orchestrator won't start new ones.
-    """
-    extra = set(params) - _AUTO_DISABLE_ALLOWED
-    if extra:
-        raise ActionError(f"autonomous_disable got unexpected params: {sorted(extra)}")
-    if "slug" not in params:
-        raise ActionError("autonomous_disable missing required param: slug")
-
-    cfg = _get_config()
-    slug = params["slug"]
-    if cfg.projects.get(slug) is None:
-        raise ActionError(f"autonomous_disable: unknown project slug {slug!r}")
-
-    from bot_squad_worker import autonomous as _auto
-    state = _auto.load_state(cfg, slug)
-    state.enabled = False
-    _auto.save_state(cfg, state)
-    return {"ok": True, "slug": slug, "enabled": False}
-
-
-# ---------------------------------------------------------------------------
 # Autopilot actions (T-0153) — prompt-driven, time-boxed autonomous runs
 # ---------------------------------------------------------------------------
 
@@ -1329,8 +1234,8 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
         except ValueError as e:
             raise ActionError(f"task_progress_add: {e}") from e
 
-        # Update `updated:` in place (or append) without parsing YAML — the same
-        # line-based pattern autonomous._patch_task_file uses.
+        # Update `updated:` in place (or append) without parsing YAML — a
+        # line-based frontmatter patch.
         fm_lines = fm_block.splitlines()
         has_updated = False
         for i, ln in enumerate(fm_lines):
@@ -2336,9 +2241,6 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "spawn_session": _action_spawn_session,
     "scheduler_state": _action_scheduler_state,
     "inject_input": _action_inject_input,
-    "autonomous_status": _action_autonomous_status,
-    "autonomous_enable": _action_autonomous_enable,
-    "autonomous_disable": _action_autonomous_disable,
     # T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
     "autopilot_start": _action_autopilot_start,
     "autopilot_stop": _action_autopilot_stop,
@@ -2390,7 +2292,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 
 # Mode tags: which worker role is allowed to invoke each action.
 # coordinator_only — needs scheduler / coordinator-only state (TG client,
-#   deploy queue, peer inbox, autonomous orchestrator).
+#   deploy queue, peer inbox, autopilot watchdog).
 # tmux_only — purely tmux/filesystem ops local to a Linux user.
 # both — universally safe (proof-of-life).
 ACTION_MODES: dict[str, str] = {
@@ -2424,9 +2326,6 @@ ACTION_MODES: dict[str, str] = {
     "spawn_session": "tmux_only",
     "scheduler_state": "coordinator_only",
     "inject_input": "tmux_only",
-    "autonomous_status": "coordinator_only",
-    "autonomous_enable": "coordinator_only",
-    "autonomous_disable": "coordinator_only",
     # T-0153: autopilot reads/writes coordinator state (peer bus, spawn, tg,
     # scheduler-coupled watchdog), so coordinator-only like the rest.
     "autopilot_start": "coordinator_only",

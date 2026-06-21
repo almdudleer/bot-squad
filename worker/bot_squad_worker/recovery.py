@@ -44,6 +44,41 @@ def respawn_bound() -> int:
     return v if v > 0 else 2
 
 
+def read_task_status(cfg: Any, slug: str, task_id: str) -> str:
+    """Re-read a backlog task's frontmatter to get its current status.
+
+    Inlined from the (removed) autonomous orchestrator in T-0403 — recovery is
+    the sole remaining consumer. Matches by filename prefix first, then by the
+    ``id`` frontmatter field; returns ``""`` when the task can't be read.
+    """
+    from bot_squad_worker import frontmatter as _frontmatter
+
+    backlog_dir = cfg.data_dir / slug / "backlog"
+    if not backlog_dir.exists():
+        return ""
+
+    def _status(md_file: Path) -> str:
+        try:
+            parsed = _frontmatter.parse_or_none(md_file.read_text())
+        except OSError:
+            return ""
+        if parsed is None:
+            return ""
+        return str(parsed[0].get("status", ""))
+
+    for md_file in backlog_dir.glob("*.md"):
+        if md_file.name.startswith(task_id):
+            return _status(md_file)
+    for md_file in backlog_dir.glob("*.md"):
+        try:
+            parsed = _frontmatter.parse_or_none(md_file.read_text())
+        except OSError:
+            continue
+        if parsed is not None and parsed[0].get("id") == task_id:
+            return str(parsed[0].get("status", ""))
+    return ""
+
+
 # --- pure decision ---------------------------------------------------------
 
 def classify(*, role: str, pane_live: bool, task_status: str,
@@ -90,7 +125,6 @@ def _save_state(cfg: Any, state: dict) -> None:
 def _gather(cfg: Any) -> list[dict]:
     """One row per non-archived dev session: {sid, slug, role, pane_live,
     task_id, task_status}."""
-    from bot_squad_worker.autonomous import read_task_status
     from bot_squad_worker.sessions import (
         _read_session_metadata, _derive_role, live_pane_map)
     pane_map = live_pane_map()  # SID -> live pane, the truth (md pane_id is empty)

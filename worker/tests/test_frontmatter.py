@@ -204,12 +204,15 @@ def test_as_list(value, expected):
 # DoD: a block-style `blocked_by` is read by EVERY worker-side reader
 # ---------------------------------------------------------------------------
 
-def test_dod_block_style_blocked_by_read_by_autonomous_parse_task(tmp_path: Path):
-    from bot_squad_worker import autonomous
+def test_dod_block_style_blocked_by_read_by_shared_parser(tmp_path: Path):
+    # T-0403: autonomous._parse_task was removed with the orchestrator; this
+    # guards the shared pyyaml parser it delegated to (every worker reader uses
+    # it), so a block-style list stays readable.
+    from bot_squad_worker import frontmatter as fm
     p = tmp_path / "T-0062-links.md"
     p.write_text(BLOCK_TASK)
-    task = autonomous._parse_task(p)
-    assert task["blocked_by"] == ["T-0001", "T-0002"]  # pre-T-0075: dropped → ""
+    meta, _body = fm.parse_or_none(p.read_text())
+    assert meta["blocked_by"] == ["T-0001", "T-0002"]  # pre-T-0075: dropped → ""
 
 
 def test_dod_block_style_extra_task_ids_read_by_session_readers(tmp_path: Path):

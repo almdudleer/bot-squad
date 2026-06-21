@@ -1,6 +1,6 @@
 """T-0373: cross-process task-md mutation safety (worker side).
 
-The worker (progress_add / close_hook / backoff / recovery / autonomous) and the
+The worker (progress_add / close_hook / backoff / recovery) and the
 API both read-modify-write the SAME backlog task md files from DIFFERENT
 processes. With no lock + a shared ``<name>.tmp`` they raced: concurrent writes
 were lost and a shared tmp clobber 500'd. This module is the worker half of the

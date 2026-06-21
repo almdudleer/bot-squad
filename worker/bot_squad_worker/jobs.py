@@ -419,21 +419,6 @@ def drift_check_tick(cfg: Config) -> None:
             log.exception("drift_check_tick: unhandled error for project %s", slug)
 
 
-def autonomous_tick(cfg: Config) -> None:
-    """Run one orchestrator tick for every project that has autonomous mode enabled.
-
-    Scheduled every 60 seconds by APScheduler. Per-project exceptions are
-    caught and logged so one bad project doesn't kill the whole sweep.
-    """
-    from bot_squad_worker import autonomous as _auto
-
-    for slug in cfg.projects:
-        try:
-            _auto.tick(cfg, slug)
-        except Exception:
-            log.exception("autonomous_tick: unhandled error for project %s", slug)
-
-
 def autopilot_tick(cfg: Config) -> None:
     """T-0153: per-project autopilot watchdog pass.
 

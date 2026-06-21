@@ -802,47 +802,6 @@ def test_tg_listener_tick_swallows_exceptions(
     tg_listener_tick(cfg)
 
 
-# ---------------------------------------------------------------------------
-# autonomous_tick tests (spec #8)
-# ---------------------------------------------------------------------------
-
-
-def test_autonomous_tick_skips_disabled_project(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """autonomous_tick with a disabled project calls tick() but it is a no-op."""
-    from bot_squad_worker.jobs import autonomous_tick
-    from bot_squad_worker import autonomous as _auto
-
-    proj = _make_project_with_repo(tmp_path)
-    cfg = _make_config_with_project(tmp_path, proj)
-
-    # State defaults to disabled
-    tick_calls: list[Any] = []
-    monkeypatch.setattr(_auto, "tick", lambda c, s: tick_calls.append(s))
-
-    autonomous_tick(cfg)
-
-    # Called once per project
-    assert tick_calls == [proj.slug]
-
-
-def test_autonomous_tick_swallows_exceptions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """autonomous_tick must not propagate per-project exceptions."""
-    from bot_squad_worker.jobs import autonomous_tick
-    from bot_squad_worker import autonomous as _auto
-
-    proj = _make_project_with_repo(tmp_path)
-    cfg = _make_config_with_project(tmp_path, proj)
-
-    monkeypatch.setattr(_auto, "tick", lambda c, s: (_ for _ in ()).throw(RuntimeError("boom")))
-
-    # Must not raise
-    autonomous_tick(cfg)
-
-
 def test_binding_gc_tick_runs_gc_tmux_sessions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

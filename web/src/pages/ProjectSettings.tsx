@@ -233,14 +233,6 @@ export function ProjectSettings() {
               — dev/prod clone health (ahead/behind, working-tree state, paths).
               Admin-only actions are gated inside the page.
             </p>
-            {/* T-0361: Autonomous was an orphan URL (no nav entry). Reach it
-                here; the page collapses to an enable toggle + sleep window
-                while disabled. */}
-            <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: 0 }}>
-              <Link to={`/p/${slug}/autonomous`}>Autonomous</Link>{" "}
-              — one-task-at-a-time orchestrator (off by default; enable + set a
-              sleep window here).
-            </p>
           </section>
         </>
       )}

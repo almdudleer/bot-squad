@@ -453,21 +453,6 @@ export type TickLogEntry = {
   msg: string;
 };
 
-export type AutonomousState = {
-  ok: boolean;
-  slug: string;
-  enabled: boolean;
-  status: "idle" | "working" | "reviewing" | "sleeping";
-  current_task_id: string | null;
-  current_pane_id: string | null;
-  current_started_at: string | null;
-  last_tick_at: string | null;
-  sleep_start_hour: number;
-  sleep_end_hour: number;
-  fail_counts: Record<string, number>;
-  tick_log: TickLogEntry[];
-};
-
 // T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
 export type AutopilotKind = "team" | "session" | "project";
 
@@ -1043,20 +1028,6 @@ export const api = {
       `/api/projects/${slug}/sessions/${encodeURIComponent(claudeUuid)}/messages?limit=${limit}&offset=${offset}${full ? "&full=1" : ""}`
     ),
   scheduler: () => call<SchedulerState>("/api/scheduler"),
-  autonomousStatus: (slug: string) =>
-    call<AutonomousState>(`/api/projects/${slug}/autonomous`),
-  autonomousEnable: (slug: string, sleepStartHour?: number, sleepEndHour?: number) =>
-    call(`/api/projects/${slug}/autonomous/enable`, {
-      method: "POST",
-      body: JSON.stringify({
-        sleep_start_hour: sleepStartHour,
-        sleep_end_hour: sleepEndHour,
-      }),
-    }),
-  autonomousDisable: (slug: string) =>
-    call(`/api/projects/${slug}/autonomous/disable`, { method: "POST" }),
-  autonomousLog: (slug: string) =>
-    call<TickLogEntry[]>(`/api/projects/${slug}/autonomous/log`),
   // T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
   autopilotStatus: (slug: string) =>
     call<AutopilotStatus>(`/api/projects/${slug}/autopilot`),

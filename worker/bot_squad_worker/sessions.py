@@ -1392,7 +1392,7 @@ def _append_task_session_history(
     list, no-op) and atomic (tmp + rename).
 
     Inline-list format: ``session_history: [SID, SID, ...]`` — chosen so
-    the line-based worker readers (sessions/intersession/autonomous) can
+    the line-based worker readers (sessions/intersession) can
     pick it up. Block-yaml-format lists written by the api PATCH path
     would be invisible here (same hazard as the existing `blocked_by`
     field — audit Bug #4); inline format is the worker's source of truth.

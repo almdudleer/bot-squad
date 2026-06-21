@@ -61,8 +61,6 @@ _P = "/api/projects/test-project"
 _PHASE1 = [
     ("post", f"{_P}/deploy", {"target": "staging", "reason": "x"}),
     ("put", f"{_P}/repo-agents-md", {"content": "x"}),          # fleet prompt-injection
-    ("post", f"{_P}/autonomous/enable", {}),
-    ("post", f"{_P}/autonomous/disable", {}),
     ("post", f"{_P}/autopilot/start", {"kind": "project", "prompt": "x"}),
     ("post", f"{_P}/autopilot/stop", {"key": "x"}),
     ("post", f"{_P}/sessions", {"window": "x"}),                # spawn agent

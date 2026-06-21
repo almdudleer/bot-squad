@@ -32,7 +32,6 @@ const Runs = lazy(() => import("./pages/Runs").then((m) => ({ default: m.Runs })
 const RunLog = lazy(() => import("./pages/RunLog").then((m) => ({ default: m.RunLog })));
 const Messages = lazy(() => import("./pages/Messages").then((m) => ({ default: m.Messages })));
 const Scheduler = lazy(() => import("./pages/Scheduler").then((m) => ({ default: m.Scheduler })));
-const Autonomous = lazy(() => import("./pages/Autonomous").then((m) => ({ default: m.Autonomous })));
 const Clones = lazy(() => import("./pages/Clones").then((m) => ({ default: m.Clones })));
 const Workflow = lazy(() => import("./pages/Workflow").then((m) => ({ default: m.Workflow })));
 const Help = lazy(() => import("./pages/Help").then((m) => ({ default: m.Help })));
@@ -137,7 +136,6 @@ export function App() {
             <Route path="runs" element={<Runs />} />
             <Route path="runs/:id" element={<RunLog />} />
             <Route path="sessions/:claude_uuid/messages" element={<Messages />} />
-            <Route path="autonomous" element={<Autonomous />} />
             {/* T-0296: per-project clone health ("Installation ≠ Project"). */}
             <Route path="clones" element={<Clones />} />
           </Route>

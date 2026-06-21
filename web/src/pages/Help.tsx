@@ -54,7 +54,7 @@ export function Help() {
         </p>
         <ul>
           <li><strong>BOT·SQUAD wordmark</strong> (top of sidebar) — returns to the project picker. The LED dot beside it shows worker liveness (green = operational, red = offline).</li>
-          <li><strong>[PROJECT] section</strong> — shown when you are inside a project. Lists the per-project pages (BOARD, VISION, FEEDBACK, SESSIONS, RUNS, AUTONOMOUS). The selected project stays pinned even if you click a [SYSTEM] item.</li>
+          <li><strong>[PROJECT] section</strong> — shown when you are inside a project. Lists the per-project pages (BOARD, VISION, FEEDBACK, SESSIONS, RUNS). The selected project stays pinned even if you click a [SYSTEM] item.</li>
           <li><strong>[SYSTEM] section</strong> — always visible. ALL PROJECTS returns to the picker; SCHEDULER shows worker jobs; HELP is this page.</li>
           <li><strong>Footer</strong> — your username + Sign out.</li>
         </ul>
@@ -265,47 +265,9 @@ git commit -m "feat: concise description of what this branch does"</code></pre>
           <li><strong>Scheduled jobs</strong> — each registered job with its cron/interval trigger and next scheduled run time.</li>
         </ul>
         <p>
-          The scheduler drives autonomous mode ticks, session health checks, and background
+          The scheduler drives autopilot watchdog ticks, session health checks, and background
           maintenance tasks. It refreshes automatically every 30 seconds.
         </p>
-      </section>
-
-      {/* ------------------------------------------------------------------ */}
-      <section className="mc-help-section" id="autonomous">
-        <h2>Autonomous mode</h2>
-        <p>
-          Autonomous mode at <code>/p/&lt;slug&gt;/autonomous</code> allows the orchestrator to
-          work through the backlog without manual session management.
-        </p>
-        <h3>What it does</h3>
-        <ul>
-          <li>Picks the highest-priority <em>open</em> task from the backlog.</li>
-          <li>Spawns a Claude session to implement it.</li>
-          <li>When the session ends, runs a definition-of-done (DOD) review.</li>
-          <li>If passing, marks the task <em>to test</em>; if failing, marks it <em>reopened</em>.</li>
-          <li>Sleeps between configurable UTC hours (default 22:00 – 08:00) — no new tasks are spawned during the sleep window, but in-flight work continues.</li>
-        </ul>
-        <h3>Enabling</h3>
-        <p>
-          Click <strong>Enable</strong>. A confirmation dialog summarises the sleep window.
-          Confirm to start the orchestrator. You will receive Telegram notifications as tasks
-          are started and completed.
-        </p>
-        <h3>Disabling</h3>
-        <p>
-          Click <strong>Disable</strong>. The current in-flight task finishes naturally; no new
-          tasks are picked up after the current one completes.
-        </p>
-        <h3>Sleep window</h3>
-        <p>
-          Edit the <em>Sleep start</em> and <em>Sleep end</em> (UTC hours, 0–23) and click
-          <strong>Save</strong>. The new window takes effect on the next tick.
-        </p>
-        <div className="mc-help-callout">
-          <strong>Caution:</strong> once a task is in-flight (an agent pane is running) it
-          cannot be stopped mid-flight. Disable autonomous mode before the orchestrator picks
-          up the next task if you want to pause cleanly.
-        </div>
       </section>
 
       {/* ------------------------------------------------------------------ */}

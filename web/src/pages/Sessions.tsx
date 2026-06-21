@@ -1116,19 +1116,10 @@ export function Sessions() {
             )}
           </td>
 
-          {/* Window */}
-          <td
-            style={{
-              fontSize: "0.83rem",
-              maxWidth: "14rem",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-            title={s.window}
-          >
-            {s.window}
-          </td>
+          {/* T-0363: Window column cut — the SID already encodes the window
+              (S-<user>-<window>-p<N>), so a separate Window column was a pure
+              duplicate. The full SID (with window) stays in the SID cell + the
+              expandable detail. */}
 
           {/* Attach — T-0141: the copyable command targets the tmux SESSION
               (`tmux a -t <tmux_session>:<window>`), not the SID. Passing the
@@ -1173,7 +1164,7 @@ export function Sessions() {
             <RowActionsMenu actions={rowActions(s)} ariaLabel={`Actions for ${s.sid}`} />
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 10)}
+        {isOpen && renderDetailRow(s, 9)}
       </Fragment>
     );
   }
@@ -1219,7 +1210,7 @@ export function Sessions() {
               {s.sid}
             </code>
           </td>
-          <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
+          {/* T-0363: Window column cut (SID already encodes the window). */}
           {/* T-0347: archived rows are never live → AttachAffordance renders the
               dim placeholder, never a dead `tmux a -t` command. */}
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
@@ -1252,7 +1243,7 @@ export function Sessions() {
             />
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 9)}
+        {isOpen && renderDetailRow(s, 8)}
       </Fragment>
     );
   }
@@ -2106,7 +2097,6 @@ export function Sessions() {
               <tr>
                 <th style={{ width: "1.5rem" }}></th>
                 <th>SID</th>
-                <th>Window</th>
                 <th>Attach</th>
                 <th>Role</th>
                 <th>Target</th>
@@ -2121,7 +2111,7 @@ export function Sessions() {
                 ? groupSessionsByTmux(applySessFilter(boardSessions)).flatMap((g) => {
                     const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                     const nodes: React.ReactNode[] = [
-                      renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed),
+                      renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed),
                     ];
                     if (!collapsed) {
                       for (const { row, level } of buildTmuxGroupTree(g.rows)) {
@@ -2135,11 +2125,11 @@ export function Sessions() {
                   // header marks the owner; tmux lanes nest inside it.
                   groupSessionsByUser(applySessFilter(boardSessions)).flatMap((ug) => {
                     const nodes: React.ReactNode[] = [
-                      renderUserHeaderRow(ug.key, ug.rows, 10),
+                      renderUserHeaderRow(ug.key, ug.rows, 9),
                     ];
                     for (const g of groupSessionsByTmux(ug.rows)) {
                       const collapsed = tmuxLaneCollapsed(g.key, g.rows);
-                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed));
+                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed));
                       if (!collapsed) {
                         for (const { row, level } of buildTmuxGroupTree(g.rows)) {
                           nodes.push(renderSessionRow(row, level));
@@ -2156,7 +2146,7 @@ export function Sessions() {
                       const laneRows = groupSessionsByLane(boardSessions)[lane.key] ?? [];
                       const collapsed = Boolean(collapsedSessLanes[lane.key]);
                       const nodes: React.ReactNode[] = [
-                        renderLaneHeaderRow(lane, laneRows.length, 11),
+                        renderLaneHeaderRow(lane, laneRows.length, 9),
                       ];
                       if (!collapsed) {
                         // Within each initiative lane the tree is also useful — TL at
@@ -2200,7 +2190,6 @@ export function Sessions() {
                 <tr>
                   <th style={{ width: "1.5rem" }}></th>
                   <th>SID</th>
-                  <th>Window</th>
                   <th>Attach</th>
                   <th>Role</th>
                   <th>Target</th>
@@ -2214,7 +2203,7 @@ export function Sessions() {
                   ? groupSessionsByTmux(applySessFilter(archivedSessions)).flatMap((g) => {
                       const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                       const nodes: React.ReactNode[] = [
-                        renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed),
+                        renderTmuxLaneHeaderRow(g.key, g.rows, 8, collapsed),
                       ];
                       if (!collapsed) {
                         for (const s of g.rows) nodes.push(renderArchivedRow(s));
@@ -2230,7 +2219,7 @@ export function Sessions() {
                         // off-by-default so noise-suppression matters more.
                         if (laneRows.length === 0) return [];
                         const nodes: React.ReactNode[] = [
-                          renderLaneHeaderRow(lane, laneRows.length, 9),
+                          renderLaneHeaderRow(lane, laneRows.length, 8),
                         ];
                         if (!collapsed) {
                           for (const s of laneRows) nodes.push(renderArchivedRow(s));

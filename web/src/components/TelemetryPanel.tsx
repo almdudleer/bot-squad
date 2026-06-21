@@ -165,9 +165,12 @@ export function TelemetryPanel({ slug }: { slug: string }) {
           ) : (
             <span
               className="mc-badge mc-badge-dim"
-              title="No exhaustion projection: a budget anchor is not set. The burn badge is only an instantaneous spot estimate — set a budget anchor in system_settings [quota] to project exhaustion."
+              title="No exhaustion projection: a budget anchor is not set (set one in the Resource caps & budget panel). The burn badge is only an instantaneous spot estimate until then."
             >
-              no projection (set budget anchor)
+              {/* T-0363: dropped the "(set budget anchor)" CTA here — the
+                  Resource caps & budget panel owns the single anchor nag, so
+                  the Sessions header no longer double-nags. */}
+              no projection
             </span>
           )}
         </div>

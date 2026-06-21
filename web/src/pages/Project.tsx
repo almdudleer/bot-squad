@@ -256,7 +256,9 @@ export function Project() {
       if (!live) return t;
       return {
         ...t,
-        session: { ...t.session, activity: sessionActivity(live) },
+        // T-0404: also stamp the live awaiting_input so the card can badge a
+        // task whose bound process is blocked on the operator.
+        session: { ...t.session, activity: sessionActivity(live), awaiting_input: live.awaiting_input },
       };
     });
   }, [tasks, sessionsBySid]);

@@ -111,6 +111,9 @@ export type Task = {
     // present it's the canonical display label; when absent the FE
     // falls back to mapping the raw `status` (see utils/sessionStatus).
     activity?: "running" | "idle" | "paused" | "suspended";
+    // T-0404: the board enriches this from the live /sessions join so a card
+    // can show the needs-input pill (sessionNeedsInput) for its bound process.
+    awaiting_input?: boolean | null;
   };
 };
 

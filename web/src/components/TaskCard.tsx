@@ -7,6 +7,7 @@ import {
   sessionActivity,
   sessionGlyph,
   sessionLabel,
+  sessionNeedsInput,
 } from "../utils/sessionStatus";
 import { DRAG_MIME } from "./BoardColumn";
 
@@ -291,6 +292,28 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
             </span>
           );
         })()}
+        {/* T-0404 (PASS-2 P2-07): badge a card whose bound process is blocked
+            waiting on the operator, so the board itself shows WHICH task needs
+            input — not just the Sessions list. Reuses the shared
+            sessionNeedsInput predicate (board enriches task.session with the
+            live awaiting_input). */}
+        {task.session && sessionNeedsInput(task.session) && (
+          <span
+            title="This task's process is waiting on you (blocked on an operator reply)."
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.65rem",
+              color: "var(--mc-amber)",
+              background: "var(--mc-surface-raised)",
+              border: "1px solid var(--mc-amber)",
+              borderRadius: "2px",
+              padding: "0 4px",
+              marginLeft: "0.25rem",
+            }}
+          >
+            ⏳ needs input
+          </span>
+        )}
 {/* Assign-session affordance lives on the task detail page, not the card. */}
       </div>
     </div>

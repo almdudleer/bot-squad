@@ -255,8 +255,21 @@ def patch_task(
     # list of T-NNNN.
     if "initiative" in payload and payload["initiative"] is not None:
         v = payload["initiative"]
-        if not isinstance(v, str) or not _INITIATIVE_BASENAME_RE.match(v):
+        if not isinstance(v, str):
             raise HTTPException(status_code=400, detail=f"invalid initiative basename: {v!r}")
+        # T-0424 fold: accept a bare stem too — canonicalize to the .md FILE form
+        # via the normalize_id SSOT so a bare-stem input stores consistently with
+        # task_new + the initiative file. Empty string stays empty (callers clear
+        # via null, not ""); traversal/garbage still fails the basename regex below.
+        from app.routes_feedback import normalize_id
+        if v.strip():
+            v = f"{normalize_id(v.strip())}.md"
+        if not _INITIATIVE_BASENAME_RE.match(v):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid initiative basename: {payload['initiative']!r}",
+            )
+        payload["initiative"] = v
     if "parent_task" in payload and payload["parent_task"] is not None:
         v = payload["parent_task"]
         if not isinstance(v, str) or not _TASK_ID_RE.match(v):

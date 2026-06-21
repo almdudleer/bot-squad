@@ -234,6 +234,23 @@ def test_patch_task_sets_initiative(tmp_bot_squad: Path, monkeypatch):
     assert r.json()["initiative"] == "multi-server-installation-process.md"
 
 
+def test_patch_task_accepts_bare_initiative_stem(tmp_bot_squad: Path, monkeypatch):
+    """T-0424 fold: PATCH accepts a bare-stem initiative (no .md) and
+    canonicalizes it to the .md FILE form on store — same normalize_id tolerance
+    as task_new + the feedback routes (the umbrella SSOT)."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"initiative": "ui-polish"},
+        )
+    assert r.status_code == 200
+    assert r.json()["initiative"] == "ui-polish.md"
+
+
 def test_patch_task_clears_initiative_with_null(tmp_bot_squad: Path, monkeypatch):
     backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
     (backlog / "T-0001-foo.md").write_text(

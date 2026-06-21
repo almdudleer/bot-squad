@@ -1258,6 +1258,15 @@ _TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
 _TASK_NEW_TITLE_MAX = 240
 
 
+def normalize_id(value: str) -> str:
+    """T-0424 contract (byte-identical to ``api.app.routes_feedback.normalize_id``
+    and the TS mirror in T-0425): strip EXACTLY ONE trailing literal lowercase
+    ``.md``. An entity id never carries its file suffix — compare/key on the
+    stem; case-sensitive (never ``.MD``); not greedy (``x.md.md`` → ``x.md``); no
+    trimming. To hit a FILE, re-add the suffix: ``f"{normalize_id(x)}.md"``."""
+    return value[:-3] if value.endswith(".md") else value
+
+
 def _slugify_title(title: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", title.strip().lower()).strip("-")
     return (s[:60].rstrip("-") or "task")
@@ -1348,7 +1357,14 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
             val = params[opt_key]
             if val is None or (isinstance(val, str) and not val.strip()):
                 continue
-            fm_lines.append(f"{opt_key}: {_yaml_quote(str(val))}")
+            sval = str(val)
+            if opt_key == "initiative":
+                # T-0424 canonicalize-on-store: persist the .md FILE form so a
+                # bare stem matches the initiative file + the FE option.basename
+                # (no false orphan). normalize_id strips one trailing .md, then
+                # we re-add it: both 'ui-polish' and 'ui-polish.md' → 'ui-polish.md'.
+                sval = f"{normalize_id(sval.strip())}.md"
+            fm_lines.append(f"{opt_key}: {_yaml_quote(sval)}")
 
     body = (
         "## Verbatim request\n\n"

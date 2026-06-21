@@ -48,6 +48,18 @@ def _project_root(request: Request, slug: str) -> Path:
     return cfg.project_data_dir(slug)
 
 
+def normalize_id(value: str) -> str:
+    """T-0424 contract: strip EXACTLY ONE trailing literal lowercase ``.md``.
+
+    An entity id never carries its file suffix — ``.md`` is a filesystem
+    presentation detail; compare and key on the stem. Case-sensitive (only a
+    literal ``.md`` is stripped, never ``.MD``); not greedy (``x.md.md`` →
+    ``x.md``); no trimming (callers pre-strip). To hit a FILE, re-add the
+    suffix: ``f"{normalize_id(x)}.md"``. The byte-for-byte TS mirror lives in
+    T-0425 (web TaskDetail initiative match)."""
+    return value[:-3] if value.endswith(".md") else value
+
+
 def _validate_feedback_name(name: str) -> None:
     if not _FEEDBACK_NAME_RE.match(name):
         raise HTTPException(status_code=400, detail=f"invalid feedback file name: {name!r}")
@@ -61,7 +73,7 @@ def _resolve_feedback(request: Request, slug: str, fid: str) -> tuple[str, Path]
     ``parent_doc_id`` refs use. A trailing ``.md`` is tolerated so the legacy
     ``name`` form works too. No canonical ``F-NNNN`` shortening — the stem IS
     the id."""
-    stem = fid[:-3] if fid.endswith(".md") else fid
+    stem = normalize_id(fid)
     if "/" in stem or "\\" in stem or not _FEEDBACK_NAME_RE.match(f"{stem}.md"):
         raise HTTPException(status_code=400, detail=f"invalid feedback id: {fid!r}")
     path = _fb_dir(request, slug) / f"{stem}.md"
@@ -159,13 +171,12 @@ def promote_feedback(
     payload: dict,
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
-    _validate_feedback_name(name)
-
-    fb_dir = _fb_dir(request, slug)
-    fb_path = fb_dir / name
-
-    if not fb_path.exists():
-        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
+    # T-0424: accept the bare `id` list_feedback returns OR the legacy `.md`
+    # name — _resolve_feedback (normalize_id) tolerates both, uniformly with the
+    # sibling nesting routes. `fname` is the canonical F-….md file form used in
+    # every link/`from` reference below.
+    _, fb_path = _resolve_feedback(request, slug, name)
+    fname = fb_path.name
 
     fb_content = fb_path.read_text()
 
@@ -177,7 +188,7 @@ def promote_feedback(
     custom_body = payload.get("body")
 
     # Build task body
-    link = f"[{name}](../feedback/{name})"
+    link = f"[{fname}](../feedback/{fname})"
     if custom_body is not None:
         task_body = f"**From feedback** {link}:\n\n{custom_body}"
     else:
@@ -204,7 +215,7 @@ def promote_feedback(
         "status": "open",
         "created": now,
         "updated": now,
-        "from": name,
+        "from": fname,
     }
     write_task(task_path, fm, task_body)
 
@@ -246,11 +257,9 @@ def dismiss_feedback(
     the DOMINANT operator action per the product-iteration loop (most friction
     notes are cut, not built). Sets ``status: dismissed`` so ``list_feedback``
     default-hides it; the close is explicit and the intake stops leaking."""
-    _validate_feedback_name(name)
-    fb_path = _fb_dir(request, slug) / name
-    if not fb_path.exists():
-        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
-
+    # T-0424: accept bare `id` OR `.md` name via _resolve_feedback (404s if the
+    # file doesn't exist), uniformly with promote + the nesting routes.
+    _, fb_path = _resolve_feedback(request, slug, name)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _set_status_and_append(fb_path, "dismissed", f"\n\n---\nDismissed on {today}.\n")
     return {"ok": True}

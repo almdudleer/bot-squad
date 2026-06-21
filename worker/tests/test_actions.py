@@ -1672,6 +1672,19 @@ def test_task_new_writes_optional_frontmatter_fields(tmp_path, tmp_config_dir, m
     assert 'owner: "alexey"' in body
 
 
+def test_task_new_canonicalizes_bare_initiative_to_md(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0424 canonicalize-on-store: a bare-stem --initiative is persisted in the
+    .md FILE form so it matches the initiative file + the FE option.basename (no
+    false '(not found)'). 'ui-polish' and 'ui-polish.md' both store 'ui-polish.md'."""
+    import bot_squad_worker.actions as A
+
+    _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("task_new", {
+        "slug": "test-project", "title": "bare init", "initiative": "ui-polish",
+    })
+    assert 'initiative: "ui-polish.md"' in Path(out["file_path"]).read_text()
+
+
 def test_task_new_quotes_titles_with_yaml_specials(tmp_path, tmp_config_dir, monkeypatch):
     """Titles with ':' or '#' must not break the YAML frontmatter."""
     import bot_squad_worker.actions as A

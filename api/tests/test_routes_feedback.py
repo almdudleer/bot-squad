@@ -323,6 +323,46 @@ def test_dismiss_requires_auth(tmp_bot_squad: Path, monkeypatch):
     assert r.status_code == 401
 
 
+# ---------------------------------------------------------------------------
+# T-0424: dismiss + promote must accept the BARE `id` list_feedback returns
+# (the stem, no .md), not only the legacy `.md` `name`. normalize_id contract.
+# ---------------------------------------------------------------------------
+
+def test_normalize_id_strips_one_trailing_md():
+    from app.routes_feedback import normalize_id
+    assert normalize_id("F-x") == "F-x"
+    assert normalize_id("F-x.md") == "F-x"
+    assert normalize_id("x.md.md") == "x.md"      # exactly one, not greedy
+    assert normalize_id(".md") == ""
+    assert normalize_id("README.MD") == "README.MD"  # case-sensitive: not stripped
+    assert normalize_id("") == ""
+
+
+def test_dismiss_accepts_bare_id(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    (fb / "F-2026-04-15-id610.md").write_text("# bare\n\nbody\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/feedback/F-2026-04-15-id610/dismiss", json={})
+    assert r.status_code == 200
+    assert _status_of(fb / "F-2026-04-15-id610.md") == "dismissed"
+
+
+def test_promote_accepts_bare_id(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    (fb / "F-2026-04-15-id611.md").write_text("# Promote me\n\nbody\n")
+    (tmp_bot_squad / "data" / "test-project" / "backlog").mkdir(parents=True, exist_ok=True)
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/feedback/F-2026-04-15-id611/promote", json={})
+    assert r.status_code == 200
+    assert _status_of(fb / "F-2026-04-15-id611.md") == "promoted"
+    # the created task's link/`from` must reference the .md FILE form, never the
+    # bare id (which a relative link `../feedback/<id>` would 404 on).
+    task_md = next((tmp_bot_squad / "data" / "test-project" / "backlog").glob("T-*.md"))
+    txt = task_md.read_text()
+    assert "F-2026-04-15-id611.md" in txt
+    assert "(../feedback/F-2026-04-15-id611)" not in txt
+
+
 def test_list_hides_closed_by_default_and_surfaces_status(tmp_bot_squad: Path, monkeypatch):
     fb = tmp_bot_squad / "data" / "test-project" / "feedback"
     (fb / "F-open.md").write_text("# Open\n\nbody\n")

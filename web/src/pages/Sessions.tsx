@@ -627,7 +627,14 @@ export function Sessions() {
     taskId?: string;
     initiative?: string;
   }) {
-    setNewRole(prefill?.role ?? null);
+    // T-0336 (reframe: sessions are system-managed processes): lean the
+    // new-session flow toward the system-managed path. With no explicit role
+    // prefill (the plain "+ New session" entry), default to the delegated dev
+    // flow — the recommended path where the system reuses an existing session
+    // (T-0237/T-0280 reuse-vs-spawn) or delegates a fresh one to a teamlead,
+    // instead of making the operator hand-pick one of five roles. Deep-links
+    // that carry an explicit role still honour it.
+    setNewRole(prefill?.role ?? "dev");
     setNewWindow("");
     setNewPrompt("");
     setNewTaskId(prefill?.taskId ?? "");
@@ -2054,10 +2061,38 @@ export function Sessions() {
         {modalError && <div className="alert alert-danger">{modalError}</div>}
         {modalInfo && <div className="alert alert-success">{modalInfo}</div>}
 
-        {/* Step 1: Role picker — always visible */}
+        {/* T-0336 (reframe: sessions are system-managed processes): nudge the
+            operator toward letting the system manage the session rather than
+            hand-picking a role. The recommended path is the delegated dev flow
+            below (default-selected), which reuses an existing live session
+            (T-0237/T-0280) or delegates a fresh one to a teamlead. */}
+        <div
+          className="mb-3"
+          data-testid="system-managed-nudge"
+          style={{
+            border: "1px solid var(--mc-accent, #2f6feb)",
+            background: "rgba(47, 111, 235, 0.07)",
+            borderRadius: 6,
+            padding: "0.5rem 0.7rem",
+            fontSize: "0.8rem",
+          }}
+        >
+          <strong>Let the system manage it</strong>{" "}
+          <span className="mc-badge mc-badge-ok" style={{ marginLeft: "0.25rem" }}>
+            recommended
+          </span>
+          <div style={{ fontSize: "0.74rem", color: "var(--mc-text-mid)", marginTop: "0.25rem" }}>
+            Sessions are system-managed processes. The recommended path delegates
+            to a teamlead and <strong>reuses an existing live session</strong> when
+            one fits (reuse-vs-spawn) instead of always spawning a fresh pane. Pick
+            a specific role below only if you need to.
+          </div>
+        </div>
+
+        {/* Step 1: Role picker — manual override, demoted below the nudge. */}
         <div className="mb-3">
-          <div style={{ fontSize: "0.85rem", color: "var(--mc-text-mid)", marginBottom: "0.5rem" }}>
-            What kind of session do you want to start?
+          <div style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.5rem" }}>
+            Or pick a specific role manually:
           </div>
           <div className="d-flex gap-2">
             <button
@@ -2085,9 +2120,12 @@ export function Sessions() {
               className={`btn ${newRole === "dev" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
               onClick={() => { setNewRole("dev"); setModalError(null); setModalInfo(null); }}
             >
-              Dev worker
+              Dev worker{" "}
+              <span className="mc-badge mc-badge-ok" style={{ fontWeight: 600 }}>
+                recommended
+              </span>
               <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
-                delegated through a teamlead
+                system-managed — reuse or delegate via a teamlead
               </div>
             </button>
           </div>

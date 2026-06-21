@@ -261,7 +261,7 @@ export function Analytics() {
           </div>
           <div className="mc-an-cards">
             <StatCard
-              label="SESSIONS"
+              label="PROCESSES"
               value={String(data.sessions.total)}
               // Sub-counts partition the headline total along the canonical
               // liveness category (T-0340): live (running|idle|paused) +
@@ -319,7 +319,7 @@ export function Analytics() {
 
           <div className="mc-an-grid">
             <BarChart
-              title="Sessions started / day"
+              title="Processes started / day"
               scope={`last ${data.window_days}d`}
               data={toBars(data.sessions.per_day)}
               color="var(--mc-cyan)"
@@ -350,7 +350,7 @@ export function Analytics() {
               palette={TICKET_PALETTE}
             />
             <StatusBreakdown
-              title="Sessions by liveness"
+              title="Processes by liveness"
               scope="all-time"
               counts={livenessRollup(data.sessions.by_status)}
               palette={SESSION_PALETTE}

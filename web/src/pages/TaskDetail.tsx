@@ -555,7 +555,7 @@ export function TaskDetail() {
               type="button"
               className="btn btn-outline-secondary btn-sm"
               style={{ fontSize: "0.72rem" }}
-              title="Only you edit the ask — sessions record their work in the area below"
+              title="Only you edit the ask — processes record their work in the area below"
               onClick={() => { setVerbatimValue(task.verbatim ?? ""); setEditingVerbatim(true); }}
             >
               Edit
@@ -613,9 +613,9 @@ export function TaskDetail() {
             the zone-tag tooltip rather than hand-holding inline. */}
         <div
           className="mc-zone-tag"
-          title="Where sessions record progress and negotiate the work, and where your comments are recorded — newest first."
+          title="Where processes record progress and negotiate the work, and where your comments are recorded — newest first."
         >
-          💬 Agent working area — working / negotiation log + your comments
+          💬 Process working area — working / negotiation log + your comments
         </div>
 
         {progressEntries.length === 0 && (
@@ -706,7 +706,7 @@ export function TaskDetail() {
               margin: 0,
             }}
           >
-            dev session:
+            dev process:
           </label>
           {(() => {
             // Surface the current binding even if it's not in activeDevs
@@ -732,7 +732,7 @@ export function TaskDetail() {
               {
                 action: true,
                 key: "__new__",
-                label: "+ Create new dev session…",
+                label: "+ Create new dev process…",
                 onSelect: () =>
                   navigate(`/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`),
               },
@@ -746,7 +746,7 @@ export function TaskDetail() {
                 }}
                 disabled={saving}
                 style={{ minWidth: "16rem", maxWidth: "30rem" }}
-                ariaLabel="dev session binding"
+                ariaLabel="dev process binding"
                 options={options}
               />
             );
@@ -811,7 +811,7 @@ export function TaskDetail() {
                 value={contextValue}
                 onChange={(e) => setContextValue(e.target.value)}
                 autoFocus
-                placeholder="Short TL clarification — keep it brief."
+                placeholder="Short clarification — keep it brief."
               />
               <div className="mt-2 d-flex gap-2">
                 <button type="button" className="btn btn-primary btn-sm" onClick={saveContext} disabled={saving}>
@@ -873,7 +873,7 @@ export function TaskDetail() {
             first-touch proxy. */}
         <div>
           <div className="mc-section-title">
-            Session history ({(task.session_history ?? []).length})
+            Process history ({(task.session_history ?? []).length})
           </div>
           {(task.session_history ?? []).length === 0 ? (
             <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>

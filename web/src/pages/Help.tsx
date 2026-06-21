@@ -146,8 +146,9 @@ export function Help() {
       </section>
 
       {/* ------------------------------------------------------------------ */}
+      {/* T-0383: heading uses the process vocab (matches the Processes nav). */}
       <section className="mc-help-section" id="sessions">
-        <h2>Sessions</h2>
+        <h2>Processes</h2>
         <p>
           Sessions are Claude agent processes running inside tmux panes on the server.
           The sessions list at <code>/p/&lt;slug&gt;/sessions</code> shows all active and paused

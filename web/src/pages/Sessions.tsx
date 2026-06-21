@@ -1643,10 +1643,12 @@ export function Sessions() {
                   actions={[
                     {
                       label: "Autopilot…",
-                      onClick: () => openAutopilot({ kind: "team", ref: key, label: `team ${key}` }),
+                      // T-0383: display label uses "group" (process vocab); the
+                      // `kind: "team"` value is API contract (autopilotStart) — unchanged.
+                      onClick: () => openAutopilot({ kind: "team", ref: key, label: `group ${key}` }),
                     },
                   ]}
-                  ariaLabel={`Team actions for ${key}`}
+                  ariaLabel={`Group actions for ${key}`}
                 />
               </div>
             )}
@@ -1825,8 +1827,9 @@ export function Sessions() {
       <PeerInbox slug={slug} username={meUsername} />
       {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-3">
+        {/* T-0383: single-brain process vocab — "Agent sessions" → "Processes". */}
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
-          Agent sessions
+          Processes
           <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
         <button type="button" className="btn btn-primary btn-sm" onClick={() => openModal()}>

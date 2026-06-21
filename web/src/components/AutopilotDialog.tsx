@@ -109,7 +109,7 @@ export function AutopilotDialog({
       {error && <div className="alert alert-danger">{error}</div>}
       {info && <div className="alert alert-success">{info}</div>}
       <div className="mb-2" style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
-        The target {target?.kind} TL receives this brief plainly (live tmux pane +
+        The target {target?.kind} lead process receives this brief plainly (live tmux pane +
         peer inbox). A stall watchdog re-pings if no progress (commits / progress
         notes) is seen within the threshold, and the run auto-ends at the duration —
         notifying you either way. The TL exits early the moment the early-exit
@@ -135,7 +135,7 @@ export function AutopilotDialog({
           rows={5}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder="What should the TL drive autonomously for this run? e.g. 'Clear the operator-ux backlog: pick the highest-priority open ticket, spawn a dev, review + ship, repeat.'"
+          placeholder="What should this process drive autonomously for this run? e.g. 'Clear the operator-ux backlog: pick the highest-priority open ticket, spawn a dev, review + ship, repeat.'"
           autoFocus
         />
       </div>
@@ -147,7 +147,7 @@ export function AutopilotDialog({
           rows={2}
           value={earlyExit}
           onChange={(e) => setEarlyExit(e.target.value)}
-          placeholder="Early-exit condition the TL checks each tick, e.g. 'the backlog has no open tickets left' or 'a deploy fails twice'."
+          placeholder="Early-exit condition the process checks each tick, e.g. 'the backlog has no open tickets left' or 'a deploy fails twice'."
         />
       </div>
 

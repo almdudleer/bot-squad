@@ -284,7 +284,7 @@ export function Vision() {
         {
           action: true,
           key: "__start__",
-          label: "+ Start new TL…",
+          label: "+ Start new lead…",
           onSelect: () => startTeamleadFor(fileName),
         },
       ];
@@ -295,9 +295,9 @@ export function Vision() {
           onChange={(sid) => {
             if (sid) bindInitiativeTo(sid, base);
           }}
-          placeholder="no TL"
-          title="Bind this initiative to an existing TL, or start a new one"
-          ariaLabel={`bind teamlead for ${base}`}
+          placeholder="no lead"
+          title="Bind this initiative to an existing lead process, or start a new one"
+          ariaLabel={`bind lead for ${base}`}
           style={{ minWidth: "10rem", maxWidth: "16rem", fontSize: "0.72rem" }}
         />
       );
@@ -319,7 +319,7 @@ export function Vision() {
               borderRadius: "2px",
               padding: "0 2px 0 4px",
             }}
-            title={`bound TL: ${s.sid}`}
+            title={`bound lead: ${s.sid}`}
           >
             <span
               onClick={(e) => {
@@ -335,7 +335,7 @@ export function Vision() {
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); unbindInitiativeFrom(s.sid, base, s.window); }}
-              title="Unbind this initiative from the teamlead"
+              title="Unbind this initiative from the lead"
               aria-label={`unbind ${base} from ${s.window}`}
               style={{
                 background: "transparent",

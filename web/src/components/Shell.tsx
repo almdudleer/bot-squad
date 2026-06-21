@@ -311,11 +311,12 @@ export function Shell() {
               </li>
             </ul>
 
-            {/* T-0170: AGENTS is a NESTED sub-section under PROJECT, not a
-                peer of it — a quieter, unbracketed header (vs. the bracketed
-                `[ PROJECT ]`). These links are about the agents working this
-                project: sessions, workflow, deploy queue, analytics. */}
-            <div className="mc-sidebar-subsection">Agents</div>
+            {/* T-0170: a NESTED sub-section under PROJECT, not a peer of it — a
+                quieter, unbracketed header (vs. the bracketed `[ PROJECT ]`).
+                T-0383: single-brain process vocab — these are the worker
+                PROCESSES running this project (sessions), plus deploy queue +
+                analytics. */}
+            <div className="mc-sidebar-subsection">Processes</div>
             <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
               <li>
                 <NavLink
@@ -323,7 +324,7 @@ export function Shell() {
                   data-onboarding-anchor="sessions-nav"
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  AGENT SESSIONS
+                  PROCESSES
                 </NavLink>
               </li>
               {/* T-0358: AGENT WORKFLOW left the rail. It was a ~30k-px raw

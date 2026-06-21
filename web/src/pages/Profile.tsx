@@ -32,7 +32,7 @@ const PER_SERVER_LINKS: {
   {
     to: "/attachment/sessions",
     label: "My sessions",
-    blurb: "Your own agent sessions on this server.",
+    blurb: "Your own worker processes on this server.",
   },
 ];
 

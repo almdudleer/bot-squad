@@ -250,7 +250,8 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
               padding: "0 4px",
             }}
           >
-            ⚙ {noteCount} {noteCount === 1 ? "note" : "notes"}
+            {/* T-0366 #7: ⚙ is reserved for settings — notes use 💬. */}
+            💬 {noteCount} {noteCount === 1 ? "note" : "notes"}
           </span>
         )}
         {task.session && (() => {

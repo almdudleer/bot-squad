@@ -500,8 +500,9 @@ export function Vision() {
   return (
     <div className="container py-4" style={{ maxWidth: "860px" }}>
       <div className="d-flex justify-content-between align-items-center mb-4">
+        {/* T-0366 #3: title matches the "Vision" nav label (was "Roadmap"). */}
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
-          Roadmap
+          Vision
           <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
         <button

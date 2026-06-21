@@ -18,30 +18,9 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "closed", label: "Closed" },
 ];
 
-// T-0238: at-a-glance stage label/colour for the user-facing header pill.
-// Covers every status (planned…closed) — same set the STATUS_OPTIONS select
-// offers, so the detail header can restage to any stage (incl. Planned, T-0291).
-const STAGE_LABELS: Record<Task["status"], string> = {
-  planned: "Planned",
-  open: "Open",
-  in_progress: "In progress",
-  totest: "To Test",
-  reopened: "Reopened",
-  closed: "Closed",
-};
-function stageColor(s: Task["status"]): string {
-  switch (s) {
-    case "in_progress":
-      return "var(--mc-cyan)";
-    case "totest":
-    case "reopened":
-      return "var(--mc-amber)";
-    case "closed":
-      return "var(--mc-text-dim)";
-    default:
-      return "var(--mc-text-mid)";
-  }
-}
+// T-0366 #5: the at-a-glance stage label/colour helpers fed the static header
+// pill, which was a redundant third status display — removed. The editable
+// `stage ▾` dropdown (STATUS_OPTIONS) is now the single status surface here.
 
 export type ProgressEntry = { ts: string; sid: string; text: string };
 
@@ -501,24 +480,9 @@ export function TaskDetail() {
               </h4>
             )}
           </div>
-          <span
-            title={`Current stage: ${STAGE_LABELS[statusValue]}`}
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontSize: "0.62rem",
-              textTransform: "uppercase",
-              letterSpacing: "0.06em",
-              color: stageColor(statusValue),
-              background: "var(--mc-surface-raised)",
-              border: `1px solid ${stageColor(statusValue)}`,
-              borderRadius: "2px",
-              padding: "1px 6px",
-              whiteSpace: "nowrap",
-              flexShrink: 0,
-            }}
-          >
-            {STAGE_LABELS[statusValue]}
-          </span>
+          {/* T-0366 #5: the static stage pill was a third redundant status
+              display (alongside the editable `stage ▾` dropdown below + the
+              board column). Cut it — the dropdown is the single source. */}
         </div>
 
         {/* Stage + initiative controls — how the user steers the task. */}
@@ -552,7 +516,7 @@ export function TaskDetail() {
               const orphan: SelectOption | null =
                 task.initiative &&
                 !initiativeOptions.some((i) => i.basename === task.initiative)
-                  ? { value: task.initiative, label: `${task.initiative} (orphan)` }
+                  ? { value: task.initiative, label: `${task.initiative} (not found)` }
                   : null;
               const options: SelectOption[] = [
                 { value: "", label: "— unattached —" },
@@ -581,31 +545,22 @@ export function TaskDetail() {
           </div>
         </div>
 
-        {/* The ask — verbatim, source of truth */}
-        <div className="d-flex justify-content-between align-items-center mb-2">
-          <div className="mc-section-title" style={{ margin: 0, border: "none", padding: 0 }}>
-            The ask — source of truth
-          </div>
+        {/* The ask — verbatim. T-0366 #5: dropped the redundant "The ask —
+            source of truth" title (the zone tag above already labels this zone)
+            and the permanent instructional paragraph (hand-holding for a
+            long-active operator). The Edit affordance stays. */}
+        <div className="d-flex justify-content-end align-items-center mb-2">
           {!editingVerbatim && (
             <button
               type="button"
               className="btn btn-outline-secondary btn-sm"
               style={{ fontSize: "0.72rem" }}
+              title="Only you edit the ask — sessions record their work in the area below"
               onClick={() => { setVerbatimValue(task.verbatim ?? ""); setEditingVerbatim(true); }}
             >
               Edit
             </button>
           )}
-        </div>
-        <div
-          style={{
-            fontSize: "0.7rem",
-            color: "var(--mc-text-dim)",
-            marginBottom: "0.4rem",
-          }}
-        >
-          The anti-broken-phone record. Sessions do not edit this — only you.
-          They record their work and your comments in the working area below.
         </div>
         {editingVerbatim ? (
           <>
@@ -653,16 +608,14 @@ export function TaskDetail() {
           recorded. No new schema field (operator fork 2026-06-19).
           ================================================================== */}
       <div className="mc-task-zone mc-zone-work">
-        <div className="mc-zone-tag">⚙ Agent working area — working / negotiation log + your comments</div>
+        {/* T-0366 #7: ⚙ is reserved for settings — use 💬 for the working/
+            comments log. #5: the permanent instructional paragraph moved into
+            the zone-tag tooltip rather than hand-holding inline. */}
         <div
-          style={{
-            fontSize: "0.7rem",
-            color: "var(--mc-text-dim)",
-            marginBottom: "0.6rem",
-          }}
+          className="mc-zone-tag"
+          title="Where sessions record progress and negotiate the work, and where your comments are recorded — newest first."
         >
-          Where sessions record progress and negotiate the work. Drop a comment
-          here and it's recorded in the same log — newest first.
+          💬 Agent working area — working / negotiation log + your comments
         </div>
 
         {progressEntries.length === 0 && (

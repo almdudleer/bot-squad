@@ -217,12 +217,16 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       });
       setMaxParallel(String(result.caps.max_parallel_sessions));
       setMaxTokens(String(result.caps.max_total_tokens));
-      // T-0389/audit item 15: caps are FRESH-READ at each spawn (sessions.py
-      // _read_caps / _enforce_*_cap), so they take effect immediately — the
-      // generic `restart_required` flag (meaningful for tg/worker-env settings)
-      // is wrong + harmful for a caps-only save. Always report the accurate
-      // no-restart message.
-      setNotice("Saved. New caps apply to the next spawn (no restart needed).");
+      // P2-01-FE: the BE restart_required is now the source of truth (P2-01-BE,
+      // 5bc63ae) — it flags true ONLY for boot-cached fields (bot_token/proxy_url)
+      // and false for a caps-only save (caps are fresh-read per spawn). Trust the
+      // flag again; the item-15 hardcoded 'no restart needed' band-aid that masked
+      // the old unconditional flag is deleted.
+      setNotice(
+        result.restart_required
+          ? "Saved. Restart the worker for these settings to take effect."
+          : "Saved. New caps apply to the next spawn.",
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -458,7 +462,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
                 data-testid="process-cap-save"
                 onClick={save}
                 disabled={saving || !isAdmin || !loaded || parallelErr !== null || tokensErr !== null}
-                title={isAdmin ? "Save caps (server-wide; restart the worker to apply)" : "Admin-only"}
+                title={isAdmin ? "Save caps (server-wide; fresh-read at each spawn — no restart needed)" : "Admin-only"}
               >
                 {saving ? "Saving…" : "Save caps"}
               </button>

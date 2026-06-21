@@ -790,12 +790,15 @@ export function Project() {
         </div>
         <div className="mb-3">
           <label className="form-label">Status</label>
+          {/* T-0389/audit item 20: a brand-new task can only start as Open
+              (default) or Planned — in_progress/totest/reopened/closed are
+              nonsensical at creation (a task no session has touched yet). */}
           <Select
             value={newStatus}
             onChange={(v) => setNewStatus(v as Task["status"])}
             style={{ width: "100%" }}
             ariaLabel="task status"
-            options={COLUMNS.map((c) => ({ value: c, label: COLUMN_LABELS[c] }))}
+            options={(["open", "planned"] as const).map((c) => ({ value: c, label: COLUMN_LABELS[c] }))}
           />
         </div>
       </Modal>

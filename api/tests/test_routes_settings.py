@@ -123,6 +123,26 @@ def test_put_preserves_unmanaged_max_section(tmp_bot_squad: Path, monkeypatch) -
     assert raw["max"]["proxy_url"] == ""
 
 
+def test_put_is_atomic_rejected_request_persists_nothing(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0367: a PUT mixing a VALID change (caps) with an INVALID bot_token must
+    400 and persist NOTHING — caps are spawn-time enforced, so a partial write
+    would silently change the LIVE cap while reporting failure."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg_path = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg_path.write_text("[caps]\nmax_parallel_sessions = 7\nmax_total_tokens = 0\n")
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            "/api/system-settings",
+            json={"caps": {"max_parallel_sessions": 99}, "tg": {"bot_token": 12345}},  # bot_token not a str
+        )
+    assert r.status_code == 400, r.text
+    # NOTHING persisted — the live cap is untouched (still 7, not 99)
+    raw = tomllib.loads(cfg_path.read_text())
+    assert raw["caps"]["max_parallel_sessions"] == 7
+
+
 def test_put_bot_token_writes_secrets(tmp_bot_squad: Path, monkeypatch) -> None:
     # No BOT_SQUAD_SECRETS_KEY (dev / fresh install) → plaintext passthrough.
     monkeypatch.delenv("BOT_SQUAD_SECRETS_KEY", raising=False)

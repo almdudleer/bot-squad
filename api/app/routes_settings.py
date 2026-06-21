@@ -327,15 +327,25 @@ def put_settings(request: Request, payload: dict) -> dict:
                 )
             current["caps"][key] = v
 
-    _write_system_settings(config_dir, current)
-
+    # T-0367: validate the bot_token BEFORE any write so the request is atomic —
+    # validate-all-then-write. Previously _write_system_settings ran first, so a
+    # request mixing a valid change (caps/ttl/...) with an invalid bot_token 400'd
+    # yet silently persisted the other fields — and caps are spawn-time enforced,
+    # so it could change the LIVE session cap while reporting failure. Nothing is
+    # persisted until every field has validated.
+    bot_token_to_write: str | None = None
     if "bot_token" in tg_in:
         v = tg_in["bot_token"]
         if not isinstance(v, str):
             raise HTTPException(status_code=400, detail="tg.bot_token must be a string")
+        bot_token_to_write = v
+
+    # All inputs validated → persist (system settings, then secrets).
+    _write_system_settings(config_dir, current)
+    if bot_token_to_write is not None:
         sec = _read_secrets(config_dir)
         age_max = int((sec.get("telegram", {}) or {}).get("auth_age_max", 86400))
-        _write_secrets(config_dir, v, age_max)
+        _write_secrets(config_dir, bot_token_to_write, age_max)
 
     result = _shape(config_dir)
     result["ok"] = True

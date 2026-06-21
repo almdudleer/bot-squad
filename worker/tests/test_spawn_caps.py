@@ -17,6 +17,7 @@ from bot_squad_worker.actions import ActionError
 from bot_squad_worker.sessions import (
     _count_live_sessions,
     _enforce_parallel_cap,
+    _live_agent_sids,  # real ref — autouse fixture stubs S._live_agent_sids
     _read_caps,
     _write_session_metadata,
 )
@@ -39,10 +40,11 @@ def _set_caps(cfg, *, max_parallel=0, max_tokens=0) -> None:
     )
 
 
-# SID → pane_id registry backing the patched ``live_pane_map`` (T-0397). A
-# session counts as live only if its SID is in here (a genuinely live pane),
-# so ``_live(..., pane=False)`` models a dead-pane ``status: active`` phantom.
-_LIVE_PANES: dict[str, str] = {}
+# SID set backing the patched ``_live_agent_sids`` (T-0397): a session counts
+# toward the cap only if its SID is here (a pane with a LIVE claude process), so
+# ``_live(..., pane=False)`` models a phantom — either a vanished pane OR a
+# dead-claude pane that fell back to a bash shell (both consume no agent slot).
+_LIVE_AGENTS: set[str] = set()
 
 
 def _live(cfg, sid, *, status="active", archived=None, pane=True) -> None:
@@ -52,16 +54,16 @@ def _live(cfg, sid, *, status="active", archived=None, pane=True) -> None:
         meta["archived"] = archived
     _write_session_metadata(cfg.data_dir / "p1" / "sessions" / f"{sid}.md", meta)
     if pane:
-        _LIVE_PANES[sid] = "%0"
+        _LIVE_AGENTS.add(sid)
     else:
-        _LIVE_PANES.pop(sid, None)
+        _LIVE_AGENTS.discard(sid)
 
 
 @pytest.fixture(autouse=True)
 def _no_panes(monkeypatch):
-    _LIVE_PANES.clear()
+    _LIVE_AGENTS.clear()
     monkeypatch.setattr(S, "list_panes", lambda: [])
-    monkeypatch.setattr(S, "live_pane_map", lambda user=None: dict(_LIVE_PANES))
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set(_LIVE_AGENTS))
 
 
 def test_read_caps_defaults_zero_when_missing(tmp_path):
@@ -89,6 +91,28 @@ def test_count_live_drops_phantom_active_without_pane(tmp_path):
     _live(cfg, "S-u-paused-p2", status="paused")                # genuine live pane
     _live(cfg, "S-u-phantom-p3", status="active", pane=False)   # dead pane → phantom
     assert _count_live_sessions(cfg) == 2                       # phantom dropped
+
+
+def test_live_agent_sids_excludes_dead_claude_bash_pane(tmp_path, monkeypatch):
+    """T-0397: when claude exits, its tmux pane routinely lingers as a bash
+    shell. That dead-claude pane still EXISTS (so ``live_pane_map`` would count
+    it) but holds no agent — it must NOT yield a live-agent SID, else it keeps
+    consuming a parallel-cap slot. A pane with a live claude process IS
+    retained, including one briefly running a Bash *tool* child (claude is still
+    alive in its /proc subtree)."""
+    panes = [
+        S.PaneInfo(pane_id="%1", window="alive", pid="111", cwd="/r", command="claude"),
+        S.PaneInfo(pane_id="%2", window="busy", pid="222", cwd="/r", command="bash"),
+        S.PaneInfo(pane_id="%3", window="dead", pid="333", cwd="/r", command="bash"),
+    ]
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+    # %1 (claude foreground) and %2 (claude running a bash tool) have a live
+    # claude in their subtree; %3 (claude exited → bash) does not.
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid: pid in {"111", "222"})
+    # call the REAL function (the autouse fixture stubs S._live_agent_sids); it
+    # resolves list_panes / _pane_has_live_claude from the patched module.
+    assert _live_agent_sids() == {"S-u-alive-p1", "S-u-busy-p2"}
 
 
 def test_enforce_admits_when_phantom_below_cap(tmp_path):

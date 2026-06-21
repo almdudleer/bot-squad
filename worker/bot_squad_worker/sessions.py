@@ -2060,24 +2060,90 @@ def _read_caps(config_dir: Path) -> dict:
     }
 
 
+def _pane_has_live_claude(pane_pid: str) -> bool:
+    """True iff a live ``claude`` process exists in this pane's /proc subtree.
+
+    T-0397: pane EXISTENCE is not agent liveness. When claude exits, its tmux
+    pane routinely lingers as a bash shell — that dead-claude pane holds no
+    agent and must not consume a parallel-cap slot. Conversely a claude session
+    briefly running a Bash *tool* shows ``pane_current_command == bash`` while
+    claude is still alive as the pane's parent, so a foreground-command check
+    would flap; the /proc-subtree walk (mirrors ``_pane_claude_uuid_from_proc``)
+    is the stable signal — claude is found whether idle, busy, or fresh.
+    """
+    try:
+        root = int(pane_pid)
+    except (ValueError, TypeError):
+        return False
+    children: dict[int, list[int]] = {}
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                st = (entry / "status").read_text()
+            except OSError:
+                continue
+            m = re.search(r"^PPid:\s+(\d+)", st, re.M)
+            if m:
+                children.setdefault(int(m.group(1)), []).append(int(entry.name))
+    except OSError:
+        return False
+    queue: list[int] = [root]
+    seen: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            parts = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace").split("\x00")
+        except OSError:
+            parts = []
+        if parts and (parts[0] == "claude" or parts[0].endswith("/claude")):
+            return True
+        queue.extend(children.get(pid, []))
+    return False
+
+
+def _live_agent_sids() -> set[str]:
+    """SIDs whose tmux pane has a LIVE claude process — the real agent sessions
+    the parallel cap should count (T-0397).
+
+    Stricter than ``live_pane_map`` (which keys every pane, including the bash
+    shells that dead-claude panes fall back to): a dead-claude pane consumes no
+    agent slot, so it must not count. Liveness is verified against THIS worker's
+    tmux server (the current linux user); a different user's sessions are
+    reconciled by their own per-user worker and are not visible here.
+    """
+    user = _get_current_user()
+    out: set[str] = set()
+    for p in list_panes():
+        if not _pane_has_live_claude(p.pid):
+            continue
+        try:
+            out.add(compute_sid(user, p.window, p.pane_id))
+        except Exception:
+            continue
+    return out
+
+
 def _count_live_sessions(cfg: Any) -> int:
     """Count live sessions across every registered project — the cap is a
     system-wide resource limit.
 
     T-0397: a session counts only if it is a live-holder (status active/paused,
-    not archived) AND its SID maps to a genuinely live tmux pane. The persisted
-    ``status`` field ALONE is unreliable: ``gc_sessions`` cannot reconcile a
-    dead-pane session whose md ``pane_id`` is empty (routinely empty for live
-    sessions — see ``live_pane_map``), so such phantoms linger as ``active``.
-    Trusting them inflated the count (e.g. 15/15 while only ~9 panes were live)
-    and made ``_enforce_parallel_cap`` silently refuse spawns at a false ceiling.
-    This mirrors ``detector._live_panes`` — pane reconciliation is the SSOT.
-
-    Liveness is verified against THIS worker's tmux server (the current linux
-    user, via ``live_pane_map``); a different user's sessions are reconciled by
-    their own per-user worker and are not visible here.
+    not archived) AND its SID maps to a pane with a live claude agent
+    (``_live_agent_sids``). The persisted ``status`` field ALONE is unreliable:
+    ``gc_sessions`` cannot reconcile a dead session whose md ``pane_id`` is empty
+    (routinely empty for live sessions), so phantoms linger as ``active`` — and
+    even a dead-claude pane that fell back to bash would pass a mere
+    pane-existence check. Trusting them inflated the count (15/15 while only ~9
+    agents were live) and made ``_enforce_parallel_cap`` silently refuse spawns
+    at a false ceiling. ``backoff._live_count`` delegates here, so the AIMD
+    effective_limit and the caps meter (items 7/22) inherit the corrected count.
     """
-    live = live_pane_map()
+    live = _live_agent_sids()
     n = 0
     for slug in getattr(cfg, "projects", {}) or {}:
         sess_dir = cfg.data_dir / slug / "sessions"

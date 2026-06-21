@@ -31,9 +31,9 @@ def _make_cfg(tmp_path: Path, cap: int = 15) -> types.SimpleNamespace:
                                  config_dir=tmp_path / "config")
 
 
-# SID → pane_id registry backing the patched ``live_pane_map`` (T-0397): a
-# session counts as live only if its SID has a genuinely live pane here.
-_LIVE_PANES: dict[str, str] = {}
+# SID set backing the patched ``_live_agent_sids`` (T-0397): a session counts
+# toward the cap only if its SID is here (a pane with a live claude process).
+_LIVE_AGENTS: set[str] = set()
 
 
 def _live(cfg, sid, *, pane=True) -> None:
@@ -41,16 +41,16 @@ def _live(cfg, sid, *, pane=True) -> None:
             "initiative": "~"}
     _write_session_metadata(cfg.data_dir / "p1" / "sessions" / f"{sid}.md", meta)
     if pane:
-        _LIVE_PANES[sid] = "%0"
+        _LIVE_AGENTS.add(sid)
     else:
-        _LIVE_PANES.pop(sid, None)
+        _LIVE_AGENTS.discard(sid)
 
 
 @pytest.fixture(autouse=True)
 def _no_panes(monkeypatch):
-    _LIVE_PANES.clear()
+    _LIVE_AGENTS.clear()
     monkeypatch.setattr(S, "list_panes", lambda: [])
-    monkeypatch.setattr(S, "live_pane_map", lambda user=None: dict(_LIVE_PANES))
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set(_LIVE_AGENTS))
 
 
 def test_backoff_pressure_refuses_below_hard_cap(tmp_path):

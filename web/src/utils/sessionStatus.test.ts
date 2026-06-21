@@ -6,6 +6,7 @@ import {
   operatorWindow,
   prodTeamleadWindow,
   qaWindow,
+  sessionNeedsInput,
   sessionRole,
   sessionRoleLabel,
 } from "./sessionStatus";
@@ -131,5 +132,51 @@ describe("qaWindow / isQaWindow", () => {
     expect(isQaWindow("qa")).toBe(true);
     expect(isQaWindow("vodqa")).toBe(false); // no separator ⟹ not a marker
     expect(isQaWindow("qa-runner")).toBe(false); // marker must be a suffix
+  });
+});
+
+// T-0346 — the per-row "waiting for input" predicate that powers the home
+// needs-input deep-link. Must mirror the project-level quick_status rollup:
+// paused OR active-at-prompt counts as waiting; anything else does not.
+describe("sessionNeedsInput", () => {
+  it("flags a paused (Ctrl-C'd) session", () => {
+    expect(sessionNeedsInput({ status: "paused" })).toBe(true);
+  });
+
+  it("flags an active pane idle at the prompt", () => {
+    expect(
+      sessionNeedsInput({ status: "active", active_at_prompt: true }),
+    ).toBe(true);
+  });
+
+  it("does NOT flag an active pane that is still crunching", () => {
+    expect(
+      sessionNeedsInput({ status: "active", active_at_prompt: false }),
+    ).toBe(false);
+    // active without the flag (pre-T-0046 worker) is treated as crunching.
+    expect(sessionNeedsInput({ status: "active" })).toBe(false);
+  });
+
+  it("does NOT flag suspended sessions", () => {
+    expect(sessionNeedsInput({ status: "suspended" })).toBe(false);
+  });
+
+  it("never flags an archived row even if it would otherwise qualify", () => {
+    expect(
+      sessionNeedsInput({ status: "paused", archived: true }),
+    ).toBe(false);
+    expect(
+      sessionNeedsInput({
+        status: "active",
+        active_at_prompt: true,
+        archived: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("is safe on null/empty input", () => {
+    expect(sessionNeedsInput(null)).toBe(false);
+    expect(sessionNeedsInput(undefined)).toBe(false);
+    expect(sessionNeedsInput({})).toBe(false);
   });
 });

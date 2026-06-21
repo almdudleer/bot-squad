@@ -262,12 +262,29 @@ export function Picker() {
       )}
 
       <div className="row g-3">
-        {projects?.map((p) => (
+        {projects?.map((p) => {
+          // T-0346: a `needs-input` project is the one signal an operator
+          // should act on, but routing it to the board (backlog list) was a
+          // dead-end — it never surfaced WHICH session is blocked or HOW to
+          // respond. Deep-link the whole card (and therefore its pill) straight
+          // to the process view's needs-input landing, which lists the waiting
+          // session(s) + their `tmux a -t` attach command. Other statuses keep
+          // routing to the board as before.
+          const needsInput = p.status === "needs-input";
+          const cardTo = needsInput
+            ? `/p/${p.slug}/sessions?needs_input=1`
+            : `/p/${p.slug}`;
+          return (
           <div className="col-md-4" key={p.slug}>
             <Link
-              to={`/p/${p.slug}`}
+              to={cardTo}
               className="mc-project-card"
               data-onboarding-anchor={p.slug === alienSlug ? "existing-projects" : undefined}
+              title={
+                needsInput
+                  ? "A session is waiting for your input — open it to see what & respond"
+                  : undefined
+              }
             >
               <div className="mc-project-name">{p.display_name}</div>
               <div
@@ -282,16 +299,32 @@ export function Picker() {
                 <span>{p.slug}</span>
                 {p.status && (
                   <span
-                    className={statusBadgeClass(p.status)}
-                    title={p.status_since ? `since ${p.status_since}` : undefined}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "0.3rem",
+                    }}
                   >
-                    {p.status}
+                    {needsInput && (
+                      <span
+                        style={{ fontSize: "0.62rem", color: "var(--mc-text-dim)" }}
+                      >
+                        respond →
+                      </span>
+                    )}
+                    <span
+                      className={statusBadgeClass(p.status)}
+                      title={p.status_since ? `since ${p.status_since}` : undefined}
+                    >
+                      {p.status}
+                    </span>
                   </span>
                 )}
               </div>
             </Link>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       <Modal

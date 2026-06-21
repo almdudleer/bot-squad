@@ -116,6 +116,33 @@ export function livenessLabel(cat: SessionLiveness): string {
 export const LIVE_STATUSES: ReadonlySet<string> = new Set(["active", "paused"]);
 
 // ---------------------------------------------------------------------------
+// T-0346 — per-session "waiting for the operator's input" predicate.
+//
+// The PROJECT-level quick-status rolls up to `needs-input` (quick_status.py /
+// D-0018) when there's no working session but ≥1 session is either `paused`
+// (Ctrl-C'd, pane still open) OR `active_at_prompt` (an active pane idle past
+// IDLE_AT_PROMPT_SECONDS — Claude finished its turn, the human hasn't replied).
+// This is the per-ROW projection of that exact rule, so the home needs-input
+// deep-link can re-derive WHICH sessions are waiting client-side — the project
+// quick-status payload carries only {status, status_since}, not the waiting SID.
+// Keep this in lock-step with quick_status.aggregate_project_status.
+// ---------------------------------------------------------------------------
+export function sessionNeedsInput(
+  src:
+    | {
+        status?: string | null;
+        active_at_prompt?: boolean | null;
+        archived?: boolean | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!src || src.archived) return false;
+  if (src.status === "paused") return true;
+  return src.status === "active" && src.active_at_prompt === true;
+}
+
+// ---------------------------------------------------------------------------
 // T-0141 — authoritative session role.
 //
 // The role was historically inferred client-side as "no task_id ⟹ teamlead",

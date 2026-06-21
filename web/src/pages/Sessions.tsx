@@ -19,6 +19,7 @@ import {
   sessionActivity,
   sessionLabel,
   sessionLiveness,
+  sessionNeedsInput,
   sessionRole,
   sessionRoleLabel,
 } from "../utils/sessionStatus";
@@ -345,6 +346,12 @@ export function Sessions() {
   // T-0232: the view is LIVE-only by default; this toggle reveals the
   // suspended (non-archived) rows on demand without re-cluttering the board.
   const [showSuspended, setShowSuspended] = useState(false);
+
+  // T-0346: when arrived here from a home `needs-input` project card
+  // (?needs_input=1), surface a banner pinpointing the waiting session(s) +
+  // their attach command so the operator goes from the home signal straight to
+  // WHAT needs input — not the generic board. Dismissable for the page life.
+  const [needsInputDismissed, setNeedsInputDismissed] = useState(false);
 
   // T-0099: deep-link target — when the URL carries ?sid=S-..., scroll
   // that row into view, expand its detail row, and flash a transient
@@ -758,6 +765,29 @@ export function Sessions() {
   const liveSessions: SessionRow[] = visibleSessions.filter(isLiveSession);
   const hiddenSuspendedCount = visibleSessions.length - liveSessions.length;
   const boardSessions: SessionRow[] = showSuspended ? visibleSessions : liveSessions;
+
+  // T-0346: needs-input deep-link landing. The home/project card for a
+  // needs-input project routes here with ?needs_input=1; pinpoint the waiting
+  // session(s) — paused or active-at-prompt (sessionNeedsInput mirrors the
+  // project-level quick_status rollup) — so the operator lands on WHAT needs
+  // input + its attach command, not the generic board.
+  const needsInputView = searchParams.get("needs_input") != null;
+  const waitingSessions: SessionRow[] = useMemo(
+    () => (sessions ?? []).filter((s) => !s.archived && sessionNeedsInput(s)),
+    [sessions],
+  );
+  // Reuse the existing ?sid= flash/scroll machinery to jump to a waiting row in
+  // the table while preserving the needs_input param.
+  function jumpToWaiting(sid: string) {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("sid", sid);
+        return next;
+      },
+      { replace: true },
+    );
+  }
 
   // ---------------- Bound-link column ----------------
   // For TL sessions (no task_id): link to the primary initiative on the
@@ -1787,6 +1817,111 @@ export function Sessions() {
             style={{ filter: "invert(1) opacity(0.5)" }}
             onClick={() => setActionError(null)}
           />
+        </div>
+      )}
+
+      {/* T-0346: needs-input deep-link banner. Shown when the operator arrived
+          from a home `needs-input` project card. Lists the waiting session(s)
+          with their attach command (and Resume for paused) so "needs input" on
+          home leads in one click to WHAT needs input + how to respond. */}
+      {needsInputView && !needsInputDismissed && sessions !== null && (
+        <div
+          className="alert alert-warning"
+          role="status"
+          data-testid="needs-input-banner"
+          style={{ borderLeft: "4px solid var(--mc-amber, #fbbf24)" }}
+        >
+          <div className="d-flex justify-content-between align-items-start gap-2">
+            <strong style={{ fontSize: "0.9rem" }}>
+              {waitingSessions.length > 0
+                ? `${waitingSessions.length} session${
+                    waitingSessions.length === 1 ? "" : "s"
+                  } waiting for your input`
+                : "Nothing is waiting for input right now"}
+            </strong>
+            <button
+              type="button"
+              className="btn-close"
+              aria-label="Dismiss"
+              style={{ filter: "invert(1) opacity(0.5)" }}
+              onClick={() => setNeedsInputDismissed(true)}
+            />
+          </div>
+          {waitingSessions.length === 0 ? (
+            <div style={{ fontSize: "0.82rem", marginTop: "0.35rem" }}>
+              This project was flagged <code>needs-input</code>, but no session is
+              currently paused or waiting at a prompt — it may have just been
+              answered.
+            </div>
+          ) : (
+            <div
+              style={{
+                marginTop: "0.5rem",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+              }}
+            >
+              <div style={{ fontSize: "0.8rem", color: "var(--mc-text-mid)" }}>
+                A process finished its turn and needs you. Attach to see the
+                question and reply:
+              </div>
+              {waitingSessions.map((s) => {
+                const paused = s.status === "paused";
+                return (
+                  <div
+                    key={s.sid}
+                    className="d-flex align-items-center justify-content-between flex-wrap gap-2"
+                    style={{
+                      border: "1px solid var(--mc-border)",
+                      borderRadius: "6px",
+                      padding: "0.4rem 0.6rem",
+                      background: "var(--mc-surface-raised)",
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <code style={{ color: "var(--mc-accent)", fontSize: "0.8rem" }}>
+                        {s.window}
+                      </code>
+                      <span
+                        className="mc-badge mc-badge-warn"
+                        style={{ marginLeft: "0.4rem" }}
+                      >
+                        {paused ? "paused" : "at prompt"}
+                      </span>
+                      <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+                        <button
+                          type="button"
+                          className="btn btn-link p-0"
+                          style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }}
+                          onClick={() => jumpToWaiting(s.sid)}
+                          title="Jump to this session in the table"
+                        >
+                          {s.sid}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="d-flex align-items-center gap-2">
+                      <CopyableTmuxAttach
+                        session={s.tmux_session || slug}
+                        window={s.window}
+                        size="md"
+                      />
+                      {paused && (
+                        <button
+                          type="button"
+                          className="btn btn-outline-success btn-sm"
+                          onClick={() => handleResume(s.sid)}
+                        >
+                          Resume
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

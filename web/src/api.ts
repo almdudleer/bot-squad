@@ -271,6 +271,13 @@ export type SessionRow = {
   // UI falls back via `utils/sessionStatus.sessionActivity`.
   activity?: "running" | "idle" | "paused" | "suspended";
   activity_at?: number | null;
+  // T-0046/T-0346: worker-flagged "active pane idle at the prompt" — Claude
+  // finished its turn and the human hasn't replied (jsonl quiet past
+  // IDLE_AT_PROMPT_SECONDS). Feeds the project needs-input rollup
+  // (quick_status.aggregate_project_status) and the per-row
+  // `sessionNeedsInput` predicate that drives the home needs-input deep-link.
+  // Optional: a pre-T-0046 worker omits it (treated as false).
+  active_at_prompt?: boolean | null;
   // T-0232 (Pillar A): worker-stamped liveness — true when the session is
   // alive in tmux (activity ∈ {running, idle}). The sessions VIEW filters on
   // this to show live-only rows; suspended/archived rows are retained in the

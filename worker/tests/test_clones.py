@@ -109,19 +109,50 @@ def test_clone_status_workspace_present(tmp_path: Path):
 
 
 def test_clone_status_last_deploy(tmp_path: Path):
+    """T-0355: last-deploy reads the PROCESSED deploy records
+    (<epoch_ms>-<id>.ok / .fail.<rc>), not runs/*.json (which holds .log files —
+    so the old glob always found nothing → 'No deploys recorded yet')."""
     _, dev, prod = _init_origin_and_clones(tmp_path)
     cfg = _make_cfg(tmp_path, dev, prod)
+    import json
+    processed = cfg.data_dir / "demo" / "_jobs" / "deploy" / "processed"
+    processed.mkdir(parents=True)
+    (processed / "1700000000000-q1.ok").write_text(json.dumps({
+        "queue_id": "q1", "target": "prod", "reason": "ship it", "requested_by": "alice",
+    }))
     runs = cfg.data_dir / "demo" / "_jobs" / "deploy" / "runs"
     runs.mkdir(parents=True)
+    (runs / "q1.log").write_text("build log…")  # a run LOG, not a deploy record
+
+    ld = clones.clone_status(cfg, "demo")["last_deploy"]
+    assert ld is not None, "must surface the processed record (regression: was None)"
+    assert ld["target"] == "prod"
+    assert ld["requested_by"] == "alice"
+    assert ld["run_id"] == "q1"
+    assert ld["ok"] is True
+
+
+def test_clone_status_last_deploy_newest_and_failure(tmp_path: Path):
+    """Newest record wins; a .fail.<rc> record surfaces ok=False + the returncode."""
+    _, dev, prod = _init_origin_and_clones(tmp_path)
+    cfg = _make_cfg(tmp_path, dev, prod)
     import json
-    (runs / "1700000000000-q1.json").write_text(json.dumps({
-        "target": "prod", "reason": "ship it", "requested_by": "alice",
-        "ok": True, "returncode": 0,
-    }))
-    st = clones.clone_status(cfg, "demo")
-    assert st["last_deploy"]["target"] == "prod"
-    assert st["last_deploy"]["requested_by"] == "alice"
-    assert st["last_deploy"]["ok"] is True
+    processed = cfg.data_dir / "demo" / "_jobs" / "deploy" / "processed"
+    processed.mkdir(parents=True)
+    (processed / "1700000000000-q1.ok").write_text(json.dumps({"queue_id": "q1", "target": "prod"}))
+    (processed / "1700000999000-q2.fail.137").write_text(json.dumps({"queue_id": "q2", "target": "staging"}))
+
+    ld = clones.clone_status(cfg, "demo")["last_deploy"]
+    assert ld["run_id"] == "q2"        # newest (epoch-ms prefix)
+    assert ld["target"] == "staging"
+    assert ld["ok"] is False
+    assert ld["returncode"] == 137
+
+
+def test_clone_status_last_deploy_none_when_empty(tmp_path: Path):
+    _, dev, prod = _init_origin_and_clones(tmp_path)
+    cfg = _make_cfg(tmp_path, dev, prod)
+    assert clones.clone_status(cfg, "demo")["last_deploy"] is None
 
 
 def test_pull_master_fast_forwards(tmp_path: Path):

@@ -16,7 +16,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from bot_squad_worker.deploy import _is_clean, _runs_dir
+from bot_squad_worker.deploy import _is_clean, _processed_dir
 
 
 def _git(repo: Path, *args: str) -> tuple[int, str]:
@@ -76,29 +76,48 @@ def _clone_view(repo: Path | None, master_branch: str) -> dict[str, Any]:
 
 
 def _last_deploy(cfg: Any, slug: str) -> dict[str, Any] | None:
-    """Best-effort last-deploy summary from the deploy runs dir (newest file).
+    """Best-effort last-deploy summary from the PROCESSED deploy records (newest).
 
-    Run files are ``<epoch_ms>-<queue_id>.json`` so lexicographic max == newest.
-    Returns ``None`` when nothing has been deployed (dir absent/empty)."""
-    runs = _runs_dir(cfg, slug)
-    if not runs.is_dir():
+    T-0355: deploy records land in ``processed/`` as ``<epoch_ms>-<queue_id>.ok``
+    (success) or ``<epoch_ms>-<queue_id>.fail.<rc>`` (failure) — the JSON deploy
+    job, renamed with an outcome suffix. (``runs/`` holds ``<id>.log`` build logs,
+    NOT records — globbing ``runs/*.json`` there always found nothing, so the UI
+    permanently showed "No deploys recorded yet".) The ``<epoch_ms>-`` prefix
+    makes lexicographic max == newest. Returns ``None`` when nothing's deployed."""
+    processed = _processed_dir(cfg, slug)
+    if not processed.is_dir():
         return None
-    files = sorted(runs.glob("*.json"))
-    if not files:
+    records = [
+        p for p in processed.iterdir()
+        if p.is_file() and (p.name.endswith(".ok") or ".fail" in p.name)
+    ]
+    if not records:
         return None
-    newest = files[-1]
+    newest = max(records, key=lambda p: p.name)
     try:
         data = json.loads(newest.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         data = {}
+    ok = newest.name.endswith(".ok")
+    returncode: int | None = None
+    if not ok and ".fail." in newest.name:
+        try:
+            returncode = int(newest.name.rsplit(".fail.", 1)[1])
+        except (ValueError, IndexError):
+            returncode = None
+    # `at`: prefer the epoch-ms filename prefix, else the file mtime.
+    at = newest.stat().st_mtime
+    prefix = newest.name.split("-", 1)[0]
+    if prefix.isdigit():
+        at = int(prefix) / 1000.0
     return {
-        "run_id": newest.stem,
-        "at": newest.stat().st_mtime,
+        "run_id": data.get("queue_id") or newest.name.split("-", 1)[-1].split(".")[0],
+        "at": at,
         "target": data.get("target"),
         "reason": data.get("reason"),
         "requested_by": data.get("requested_by"),
-        "ok": data.get("ok"),
-        "returncode": data.get("returncode"),
+        "ok": ok,
+        "returncode": returncode,
     }
 
 

@@ -1157,6 +1157,53 @@ def test_gc_tmux_sessions_reaps_empty_idle_sibling(tmp_path, monkeypatch):
     assert killed == ["test-project-ghost"]
 
 
+def test_gc_tmux_sessions_short_grace_for_constant_team(tmp_path, monkeypatch):
+    """T-0350: a demand-driven constant-team sibling (paneless = its triage dev
+    exited) is reaped on a SHORT grace, not the 1h default — so the empty
+    bare-shell doesn't linger for an hour. A normal sibling keeps the long grace."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    import bot_squad_worker.sessions as S
+
+    # Mark user-feedback a constant team (constant_team_stems reads this).
+    initd = cfg.data_dir / "test-project" / "vision" / "initiatives"
+    initd.mkdir(parents=True, exist_ok=True)
+    (initd / "user-feedback.md").write_text(
+        "---\nname: user-feedback\nconstant_team: true\nteam_window: user-feedback\n---\n")
+
+    killed: list[str] = []
+    panes = [
+        PaneInfo(pane_id="%1", window="_init", pid="1", cwd=str(repo),
+                 command="bash", session="test-project-user-feedback"),
+        PaneInfo(pane_id="%2", window="_init", pid="2", cwd=str(repo),
+                 command="bash", session="test-project-feat"),  # normal sibling
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+
+    def fake_run(args, **kwargs):
+        if "list-sessions" in args:
+            return subprocess.CompletedProcess(
+                args, 0,
+                _ls_line("test-project-user-feedback", 1000) + "\n"
+                + _ls_line("test-project-feat", 1000) + "\n", "")
+        if "kill-session" in args:
+            killed.append(args[args.index("-t") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    # 200s after activity: past the constant short grace (120) but well within the
+    # 1h default grace.
+    monkeypatch.setattr(S.time, "time", lambda: 1000 + 200)
+
+    res = S.gc_tmux_sessions(cfg, "test-project")
+    assert "test-project-user-feedback" in res["reaped"]   # demand-driven → fast reap
+    assert "test-project-feat" not in res["reaped"]         # normal → still in grace
+    assert killed == ["test-project-user-feedback"]
+
+
 def test_gc_tmux_sessions_spares_staffed_sibling(tmp_path, monkeypatch):
     """A sibling session with a live claude pane is NEVER reaped, even idle."""
     repo = tmp_path / "repo"

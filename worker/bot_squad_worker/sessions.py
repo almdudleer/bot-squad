@@ -2565,6 +2565,12 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
 # in-flight spawn is well inside this window, so the reaper never races a
 # just-spawned team. Override via env for tests / faster local cleanup.
 _TMUX_GC_IDLE_SEC = float(os.environ.get("BOT_SQUAD_TMUX_GC_IDLE_SEC") or 3600)
+# T-0350: a demand-driven constant-team sibling (user-feedback etc.) whose triage
+# dev has exited is just a lingering empty bare-shell — it has finished its
+# queue and has no reason to wait the full hour. Reap it on a much shorter grace
+# so the empty session doesn't accumulate (the recurring leak the operator kept
+# killing by hand). Still > a spawn settle window so we never race a mid-spawn.
+_CONSTANT_TMUX_GC_IDLE_SEC = float(os.environ.get("BOT_SQUAD_CONSTANT_TMUX_GC_IDLE_SEC") or 120)
 
 
 def gc_tmux_sessions(cfg: Any, slug: str) -> dict:
@@ -2628,6 +2634,13 @@ def gc_tmux_sessions(cfg: Any, slug: str) -> dict:
         # No tmux server / no sessions — nothing to reap.
         return {"ok": True, "reaped": []}
 
+    # T-0350: which sibling stems are demand-driven constant teams (shorter grace).
+    try:
+        from bot_squad_worker.constant_teams import constant_team_stems
+        ct_stems = constant_team_stems(cfg, slug)
+    except Exception:  # noqa: BLE001
+        ct_stems = set()
+
     now = time.time()
     reaped: list[str] = []
     for line in res.stdout.splitlines():
@@ -2645,7 +2658,10 @@ def gc_tmux_sessions(cfg: Any, slug: str) -> dict:
             activity = float(activity_s)
         except (TypeError, ValueError):
             activity = 0.0
-        if now - activity < _TMUX_GC_IDLE_SEC:
+        # T-0350: a finished constant-team sibling reaps fast; everything else
+        # keeps the long grace.
+        grace = _CONSTANT_TMUX_GC_IDLE_SEC if name[len(prefix):] in ct_stems else _TMUX_GC_IDLE_SEC
+        if now - activity < grace:
             continue  # still within the idle grace (e.g. mid-spawn)
         kill = _run(["tmux", "kill-session", "-t", name])
         if kill.returncode == 0:

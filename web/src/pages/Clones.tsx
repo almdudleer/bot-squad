@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, CloneStatus, CloneView, errorDetail } from "../api";
+import { RouteSkeleton } from "../components/RouteSkeleton";
 
 // T-0296: per-project "clones" page — the v0.9 "Installation ≠ Project"
 // legibility deliverable. Surfaces the dev (repo_path) + prod (repo_master)
@@ -217,7 +218,9 @@ export function Clones() {
         </div>
       )}
 
-      {loading && data === null && !error && <div className="mc-loading">Loading</div>}
+      {/* T-0365: meaningful skeleton on first load (the git-measured fields can
+          be slow); the header Refresh button shows "Loading…" during revalidation. */}
+      {loading && data === null && !error && <RouteSkeleton />}
 
       {data && (
         <>

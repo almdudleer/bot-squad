@@ -10,32 +10,39 @@ import {
 } from "react-router-dom";
 import { Login } from "./pages/Login";
 import { HomeRedirect } from "./pages/HomeRedirect";
-import { Project } from "./pages/Project";
-import { ProjectSettings } from "./pages/ProjectSettings";
-import { Vision } from "./pages/Vision";
-import { Feedback } from "./pages/Feedback";
-import { UseCases } from "./pages/UseCases";
-import { Docs } from "./pages/Docs";
-import { DocsSection } from "./pages/DocsSection";
-import { Sessions } from "./pages/Sessions";
-import { Analytics } from "./pages/Analytics";
-import { TaskDetail } from "./pages/TaskDetail";
-import { Runs } from "./pages/Runs";
-import { RunLog } from "./pages/RunLog";
-import { Messages } from "./pages/Messages";
-import { Scheduler } from "./pages/Scheduler";
-import { Autonomous } from "./pages/Autonomous";
-import { Clones } from "./pages/Clones";
-import { Workflow } from "./pages/Workflow";
-import { Help } from "./pages/Help";
-import { Welcome } from "./pages/Welcome";
-import { Users } from "./pages/Users";
-import { SystemSettings } from "./pages/SystemSettings";
-import { Profile } from "./pages/Profile";
-import { AttachmentTgBinding } from "./pages/AttachmentTgBinding";
-import { AttachmentSessions } from "./pages/AttachmentSessions";
-import { AttachmentWorker } from "./pages/AttachmentWorker";
 import { Shell } from "./components/Shell";
+
+// T-0365: code-split the route tree. Only the critical first-paint path stays
+// eager — Login, HomeRedirect (the `/` redirector) and the Shell layout. Every
+// other page is lazy(), so the initial bundle no longer carries Sessions,
+// Analytics, the react-markdown-heavy Docs/TaskDetail, etc. They load on
+// navigation behind the Shell's <Suspense> skeleton. (These are NAMED exports,
+// so each loader maps the name onto `default` for React.lazy.)
+const Project = lazy(() => import("./pages/Project").then((m) => ({ default: m.Project })));
+const ProjectSettings = lazy(() => import("./pages/ProjectSettings").then((m) => ({ default: m.ProjectSettings })));
+const Vision = lazy(() => import("./pages/Vision").then((m) => ({ default: m.Vision })));
+const Feedback = lazy(() => import("./pages/Feedback").then((m) => ({ default: m.Feedback })));
+const UseCases = lazy(() => import("./pages/UseCases").then((m) => ({ default: m.UseCases })));
+const Docs = lazy(() => import("./pages/Docs").then((m) => ({ default: m.Docs })));
+const DocsSection = lazy(() => import("./pages/DocsSection").then((m) => ({ default: m.DocsSection })));
+const Sessions = lazy(() => import("./pages/Sessions").then((m) => ({ default: m.Sessions })));
+const Analytics = lazy(() => import("./pages/Analytics").then((m) => ({ default: m.Analytics })));
+const TaskDetail = lazy(() => import("./pages/TaskDetail").then((m) => ({ default: m.TaskDetail })));
+const Runs = lazy(() => import("./pages/Runs").then((m) => ({ default: m.Runs })));
+const RunLog = lazy(() => import("./pages/RunLog").then((m) => ({ default: m.RunLog })));
+const Messages = lazy(() => import("./pages/Messages").then((m) => ({ default: m.Messages })));
+const Scheduler = lazy(() => import("./pages/Scheduler").then((m) => ({ default: m.Scheduler })));
+const Autonomous = lazy(() => import("./pages/Autonomous").then((m) => ({ default: m.Autonomous })));
+const Clones = lazy(() => import("./pages/Clones").then((m) => ({ default: m.Clones })));
+const Workflow = lazy(() => import("./pages/Workflow").then((m) => ({ default: m.Workflow })));
+const Help = lazy(() => import("./pages/Help").then((m) => ({ default: m.Help })));
+const Welcome = lazy(() => import("./pages/Welcome").then((m) => ({ default: m.Welcome })));
+const Users = lazy(() => import("./pages/Users").then((m) => ({ default: m.Users })));
+const SystemSettings = lazy(() => import("./pages/SystemSettings").then((m) => ({ default: m.SystemSettings })));
+const Profile = lazy(() => import("./pages/Profile").then((m) => ({ default: m.Profile })));
+const AttachmentTgBinding = lazy(() => import("./pages/AttachmentTgBinding").then((m) => ({ default: m.AttachmentTgBinding })));
+const AttachmentSessions = lazy(() => import("./pages/AttachmentSessions").then((m) => ({ default: m.AttachmentSessions })));
+const AttachmentWorker = lazy(() => import("./pages/AttachmentWorker").then((m) => ({ default: m.AttachmentWorker })));
 
 // Mothership centralization layer — docs/architecture/D-0017-mothership-seam.md.
 // Vite inlines VITE_MOTHERSHIP at build time, so the dynamic imports resolve

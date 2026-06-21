@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { api, type Project } from "../api";
+import { api, cachedProjects, type Project } from "../api";
 import { useAnchorRect, anchoredBelowLeft } from "./useAnchorRect";
 
 export function statusBadgeClass(status: string): string {
@@ -25,7 +25,9 @@ export type ProjectSwitcherProps = {
 export function ProjectSwitcher({ slug, onUnpin }: ProjectSwitcherProps) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
-  const [projects, setProjects] = useState<Project[] | null>(null);
+  // T-0365: seed from the shared cache so the dropdown paints its list
+  // instantly on open; the effect below still revalidates in the background.
+  const [projects, setProjects] = useState<Project[] | null>(() => cachedProjects());
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);

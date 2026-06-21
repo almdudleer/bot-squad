@@ -731,10 +731,28 @@ export type PullMasterResult = {
   to_sha?: string | null;
 };
 
+// T-0365: the project list drives the landing Picker, the switch-project
+// dropdown, and HomeRedirect — each fetched /api/projects independently, so the
+// list reloaded (and flashed blank) on every visit. `api.projects()` now
+// populates a module-level cache; consumers seed their initial state from
+// `cachedProjects()` for an instant paint, then call api.projects() to
+// revalidate (stale-while-revalidate). Cleared on logout via clearProjectsCache.
+let _projectsCache: Project[] | null = null;
+export function cachedProjects(): Project[] | null {
+  return _projectsCache;
+}
+export function clearProjectsCache(): void {
+  _projectsCache = null;
+}
+
 export const api = {
   health: () => call("/api/health"),
   me: () => call<Me>("/api/auth/me"),
-  projects: () => call<Project[]>("/api/projects"),
+  projects: () =>
+    call<Project[]>("/api/projects").then((rows) => {
+      _projectsCache = rows;
+      return rows;
+    }),
   // T-0051: the wizard builds the JSON body itself (see
   // pages/projectCreateWizard.ts::payloadFromWizard) so the API
   // helper accepts the body verbatim. Back-compat: the minimal

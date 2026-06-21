@@ -646,6 +646,18 @@ a.active .mc-nav-diamond {
   50%       { opacity: 0.8; }
 }
 
+/* T-0365: skeleton placeholders for lazy-route / data-loading states — a
+   meaningful shape that paints instantly instead of a blank "Loading…". */
+.mc-skeleton {
+  background: var(--mc-surface-raised);
+  border-radius: 4px;
+  animation: mc-skeleton-pulse 1.3s ease-in-out infinite;
+}
+@keyframes mc-skeleton-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.7; }
+}
+
 /* ---- Status badges (rectangular, monospace) -------------- */
 .mc-badge {
   display: inline-flex;

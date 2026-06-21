@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom";
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
+import { RouteSkeleton } from "./RouteSkeleton";
 import { isSuperAdminFromMe, resolveRailContext } from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
@@ -438,8 +439,13 @@ export function Shell() {
       </nav>
 
       {/* ── Main content ──────────────────────────────────── */}
+      {/* T-0365: the route components are lazy-loaded (App.tsx) to shrink the
+          first-paint bundle; this Suspense paints an instant content skeleton
+          while a route chunk loads, instead of a blank frame. */}
       <main className="mc-main">
-        <Outlet />
+        <Suspense fallback={<RouteSkeleton />}>
+          <Outlet />
+        </Suspense>
       </main>
     </div>
   );

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, Project } from "../api";
+import { api, cachedProjects, Project } from "../api";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
 import { Coachmark, Typewriter, markSeen, useOnboardingStep } from "../onboarding";
@@ -71,7 +71,9 @@ export function pickServerOnboardingBeat(opts: {
 }
 
 export function Picker() {
-  const [projects, setProjects] = useState<Project[] | null>(null);
+  // T-0365: seed from the shared project cache for an instant landing paint;
+  // the effect still revalidates via api.projects().
+  const [projects, setProjects] = useState<Project[] | null>(() => cachedProjects());
   const [error, setError] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [creating, setCreating] = useState<ProjectCreateState | null>(null);

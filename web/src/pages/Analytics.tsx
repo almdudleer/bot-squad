@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, type Analytics as AnalyticsData, type DayCount } from "../api";
 import { PageHelp } from "../components/PageHelp";
+import { RouteSkeleton } from "../components/RouteSkeleton";
 import { LIVE_STATUSES } from "../utils/sessionStatus";
 
 /**
@@ -250,9 +251,8 @@ export function Analytics() {
       </PageHelp>
 
       {error && <div className="alert alert-danger">{error}</div>}
-      {data === null && !error && (
-        <div className="mc-loading">Loading analytics</div>
-      )}
+      {/* T-0365: meaningful skeleton while the analytics payload loads. */}
+      {data === null && !error && <RouteSkeleton />}
 
       {data && (
         <>

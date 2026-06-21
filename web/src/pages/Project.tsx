@@ -414,7 +414,20 @@ export function Project() {
     setSaving(true);
     setModalError(null);
     try {
-      await api.patchTask(slug, activeTask.id, { body: editBody });
+      // T-0419: the modal edits ONLY the Context section; recompose the body
+      // with the existing (immutable) Verbatim + Progress so order/content stay
+      // canonical. The backend regraft (T-0289/item-14) is the belt-and-braces
+      // guarantee for Verbatim/Progress; this keeps the FE honest about what it
+      // sends instead of round-tripping the whole raw body.
+      const v = (activeTask.verbatim ?? "").trim();
+      const c = editBody.trim();
+      const pr = (activeTask.progress ?? "").trim();
+      const body = [
+        v ? `## Verbatim request\n\n${v}\n` : "",
+        c ? `## Context\n\n${c}\n` : "",
+        pr ? `## Progress\n\n${pr}\n` : "",
+      ].filter(Boolean).join("\n");
+      await api.patchTask(slug, activeTask.id, { body });
       closeModal();
       reload();
     } catch (e) {
@@ -549,7 +562,12 @@ export function Project() {
       }
     } else if (action.kind === "editBody") {
       setActiveTask(task);
-      setEditBody(task.body);
+      // T-0419: edit the CONTEXT section only. Pre-filling the full raw body
+      // dumped immutable ## Verbatim + the long ## Progress feed into one
+      // textarea — editing those lines then Saving silently no-op'd (the
+      // backend regrafts them, T-0289/item-14). Context is the only editable
+      // section, so offer just that.
+      setEditBody(task.context ?? "");
       setModalError(null);
       setModalKind("editBody");
     } else if (action.kind === "addComment") {
@@ -805,10 +823,12 @@ export function Project() {
         </div>
       </Modal>
 
-      {/* Edit body modal */}
+      {/* Edit context modal (T-0419: Context is the only editable section — the
+          ask/Verbatim is yours-only + the Progress feed is append-only, both
+          regrafted server-side). */}
       <Modal
         open={modalKind === "editBody"}
-        title={`Edit body — ${activeTask?.id ?? ""}`}
+        title={`Edit context — ${activeTask?.id ?? ""}`}
         onClose={closeModal}
         footer={
           <>
@@ -820,11 +840,15 @@ export function Project() {
         }
       >
         {modalError && <div className="alert alert-danger">{modalError}</div>}
+        <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginBottom: "0.4rem" }}>
+          The ask and the working/Progress feed are preserved automatically — edit the Context (TL clarification) here.
+        </div>
         <textarea
           className="form-control"
           rows={8}
           value={editBody}
           onChange={(e) => setEditBody(e.target.value)}
+          placeholder="Short TL clarification — keep it brief."
           autoFocus
         />
       </Modal>

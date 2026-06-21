@@ -180,7 +180,7 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
                   onMouseDown={() => { setMenuOpen(false); onMenuAction(task, { kind }); }}
                 >
                   {kind === "editBody"
-                    ? "Edit body"
+                    ? "Edit context"
                     : kind === "addComment"
                       ? "Add comment"
                       : "Set initiative…"}

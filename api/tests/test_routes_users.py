@@ -118,6 +118,52 @@ def test_create_user_empty(tmp_bot_squad: Path, monkeypatch) -> None:
         assert r.status_code == 400
 
 
+def test_patch_user_is_admin_false_string_does_not_grant(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Footgun: bool("false") is True, so PATCH is_admin="false" used to GRANT
+    admin (privilege escalation via a stringy payload). It must set False."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.post("/api/users", json={"username": "bob", "password": "x"})
+        r = client.patch("/api/users/bob", json={"is_admin": "false"})
+        assert r.status_code == 200, r.text
+        assert r.json()["is_admin"] is False
+    raw = tomllib.loads((tmp_bot_squad / "config" / "auth.toml").read_text())
+    assert raw["user_meta"]["bob"]["is_admin"] is False
+
+
+def test_patch_user_is_admin_true_string_grants(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.post("/api/users", json={"username": "bob", "password": "x"})
+        r = client.patch("/api/users/bob", json={"is_admin": "true"})
+        assert r.status_code == 200, r.text
+        assert r.json()["is_admin"] is True
+
+
+def test_patch_user_is_admin_bogus_400(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        client.post("/api/users", json={"username": "bob", "password": "x"})
+        r = client.patch("/api/users/bob", json={"is_admin": "maybe"})
+        assert r.status_code == 400, r.text
+
+
+def test_create_user_is_admin_false_string(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.post("/api/users", json={"username": "carol", "password": "x", "is_admin": "false"})
+        assert r.status_code == 200, r.text
+        assert r.json()["is_admin"] is False
+
+
 def test_create_user_with_linux_user_and_admin(tmp_bot_squad: Path, monkeypatch) -> None:
     _set_env(monkeypatch, tmp_bot_squad)
     app = build_app()

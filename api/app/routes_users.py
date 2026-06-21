@@ -14,6 +14,27 @@ from app.routes_auth import require_admin
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(require_admin)])
 
 
+def _coerce_bool(value: object, *, field: str = "is_admin") -> bool:
+    """Strict bool for auth-toggle payloads (footgun fix).
+
+    ``bool("false")`` is True (non-empty str), so a stringy ``is_admin="false"``
+    used to silently GRANT admin = privilege escalation. Accept real JSON bools
+    and the common string/int spellings; reject anything ambiguous with 400
+    rather than coerce it true.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):  # bool subclass handled above
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off", ""):
+            return False
+    raise HTTPException(status_code=400, detail=f"{field} must be a boolean")
+
+
 def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -139,7 +160,7 @@ def create_user(request: Request, payload: dict) -> dict:
         raise HTTPException(status_code=400, detail=f"user already exists: {username}")
 
     linux_user = (payload.get("linux_user") or username).strip() or username
-    is_admin = bool(payload.get("is_admin", False))
+    is_admin = _coerce_bool(payload.get("is_admin", False))
 
     new_users = dict(cfg.users)
     new_users[username] = _bcrypt(password)
@@ -170,7 +191,7 @@ def patch_user(username: str, request: Request, payload: dict) -> dict:
             raise HTTPException(status_code=400, detail="linux_user must not be empty")
         new_linux_user = lu
     if "is_admin" in payload:
-        new_is_admin = bool(payload["is_admin"])
+        new_is_admin = _coerce_bool(payload["is_admin"])
 
     new_meta = dict(cfg.user_meta)
     new_meta[username] = UserMeta(

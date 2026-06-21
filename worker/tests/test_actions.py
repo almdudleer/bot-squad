@@ -92,6 +92,8 @@ def test_registry_lists_only_allowed_actions():
         "list_teams", "archive_team", "resurrect_team", "sync_session_name",
         # T-0247: MAX (max.ru) DM channel — mirrors tg_notify.
         "max_notify",
+        # T-0386: per-project forum-topic lifecycle (create-on-project / GC).
+        "provision_project_topics", "gc_project_topics",
     }
 
 
@@ -2025,3 +2027,86 @@ def test_entity_new_unknown_slug_raises(tmp_path, tmp_config_dir, monkeypatch):
     _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
     with pytest.raises(ActionError, match="unknown project slug"):
         A.dispatch("doc_new", {"slug": "no-such", "category": "design", "title": "x"})
+
+
+# ---------------------------------------------------------------------------
+# T-0386 / INI-04 Phase 1: per-project forum-topic routing + provisioning
+# ---------------------------------------------------------------------------
+
+class _FakeForumTg(_FakeTgClient):
+    """Fake TG client that also records forum-topic CRUD."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.created: list[dict] = []
+        self.closed: list[dict] = []
+        self._next_tid = 100
+
+    def create_forum_topic(self, *, chat_id, name) -> int:
+        self._next_tid += 1
+        self.created.append({"chat_id": chat_id, "name": name, "id": self._next_tid})
+        return self._next_tid
+
+    def close_forum_topic(self, *, chat_id, thread_id) -> None:
+        self.closed.append({"chat_id": chat_id, "thread_id": thread_id})
+
+
+def test_tg_notify_topic_class_resolves_to_thread_id(tmp_config_dir, monkeypatch):
+    """A `topic` class param routes the TG send into that class's forum thread."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_topics
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    tg_topics.save(cfg, "test-project", {"deploy_logs": 4242})
+    out = A.dispatch("tg_notify", {"slug": "test-project", "message": "hi", "topic": "deploy_logs"})
+    assert out["ok"] is True
+    assert fake.calls[0]["topic_id"] == 4242
+
+
+def test_provision_project_topics_creates_the_standard_set(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_topics
+
+    fake = _FakeForumTg()
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("provision_project_topics", {"slug": "test-project"})
+    assert out["ok"] is True
+    assert set(out["topics"]) == {"feedback", "deploy_logs", "team_queries"}
+    assert set(out["created"]) == {"feedback", "deploy_logs", "team_queries"}
+    # Persisted so sends can resolve later.
+    assert tg_topics.load(cfg, "test-project") == out["topics"]
+    # Created in the project's supergroup.
+    assert all(c["chat_id"] == "0" for c in fake.created)
+
+
+def test_provision_project_topics_is_idempotent(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    first = A.dispatch("provision_project_topics", {"slug": "test-project"})
+    again = A.dispatch("provision_project_topics", {"slug": "test-project"})
+    assert again["created"] == []                       # nothing new created
+    assert again["topics"] == first["topics"]           # same ids
+    assert len(fake.created) == 3                        # only the first round called the API
+
+
+def test_provision_project_topics_unknown_slug_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="unknown project"):
+        A.dispatch("provision_project_topics", {"slug": "no-such"})
+
+
+def test_gc_project_topics_closes_all(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_topics
+
+    fake = _FakeForumTg()
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    tg_topics.save(cfg, "test-project", {"feedback": 11, "deploy_logs": 22})
+    out = A.dispatch("gc_project_topics", {"slug": "test-project"})
+    assert out["ok"] is True
+    assert set(out["closed"]) == {"feedback", "deploy_logs"}
+    assert {c["thread_id"] for c in fake.closed} == {11, 22}

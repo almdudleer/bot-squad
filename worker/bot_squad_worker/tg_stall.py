@@ -435,7 +435,12 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
 
     body = build_escalation_text(cfg, sid, str(data.get("text", "")), pane.session)
     from bot_squad_worker.actions import _get_tg_client
-    sent = _get_tg_client(cfg).send(chat_id=chat_id, text=body, sid=sid)
+    # T-0386: needs-input escalations land in the project's #team-queries topic.
+    from bot_squad_worker import tg_topics as _tg_topics
+    sent = _get_tg_client(cfg).send(
+        chat_id=chat_id, text=body, sid=sid,
+        topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
+    )
 
     if not sent and getattr(cfg, "tg_bot_token", ""):
         # A token IS configured but the post was suppressed — almost always

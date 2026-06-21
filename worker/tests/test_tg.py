@@ -288,3 +288,51 @@ def test_tg_client_picks_up_configured_quiet_hours(tmp_path: Path) -> None:
     client = TgClient(_Cfg())
     assert client._quiet_start_utc == 22
     assert client._quiet_end_utc == 6
+
+
+# ---------------------------------------------------------------------------
+# T-0386 / INI-04: forum-topic CRUD (createForumTopic / closeForumTopic)
+# ---------------------------------------------------------------------------
+
+def test_create_forum_topic_posts_payload_and_returns_thread_id(tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["url"] = url
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True, "result": {"message_thread_id": 555}}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        tid = client.create_forum_topic(chat_id="-100999", name="🚚 deploy-logs")
+    assert tid == 555
+    assert captured["url"].endswith("/createForumTopic")
+    assert captured["json"] == {"chat_id": "-100999", "name": "🚚 deploy-logs"}
+
+
+def test_create_forum_topic_raises_without_token(tmp_path: Path) -> None:
+    cfg = _FakeCfg(token="", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with pytest.raises(RuntimeError, match="no bot token"):
+        client.create_forum_topic(chat_id="-100999", name="x")
+
+
+def test_close_forum_topic_posts_message_thread_id(tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["url"] = url
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True, "result": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client.close_forum_topic(chat_id="-100999", thread_id=555)
+    assert captured["url"].endswith("/closeForumTopic")
+    assert captured["json"] == {"chat_id": "-100999", "message_thread_id": 555}

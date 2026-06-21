@@ -363,6 +363,20 @@ async def create_project(
     except WorkerError as e:
         log.warning("create_project %s: worker reload_projects failed: %s", slug, e)
 
+    # T-0386 / INI-04: create-on-project provisioning of the per-project forum
+    # topics (#feedback / #deploy-logs / #team-queries). Best-effort and
+    # idempotent — it no-ops when the supergroup (tg_chat) isn't configured yet
+    # (the supergroup is a 1-time manual setup; the operator can re-run the
+    # provision action afterwards). Never blocks project creation.
+    topics_created: list[str] | None = None
+    try:
+        topics_res = await request.app.state.worker_router.coordinator().call_action(
+            "provision_project_topics", {"slug": slug}, timeout=10.0,
+        )
+        topics_created = topics_res.get("created")
+    except WorkerError as e:
+        log.info("create_project %s: forum-topic provisioning skipped: %s", slug, e)
+
     # T-0052: spawn the per-project operator session right after scaffold.
     # Only fires for deep-flow scaffolded creates — the minimal back-compat
     # path (mode=None) leaves the on-disk layout to the caller, so there's
@@ -399,6 +413,7 @@ async def create_project(
         "scaffold": scaffold_summary,
         "operator_sid": operator_sid,
         "spawn_error": spawn_error,
+        "topics_created": topics_created,
     }
 
 

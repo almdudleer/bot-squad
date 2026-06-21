@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 
 # Telegram Bot API base URL.
 _TG_API = "https://api.telegram.org/bot{token}/sendMessage"
+# Generic method endpoint (createForumTopic / closeForumTopic / …).
+_TG_METHOD = "https://api.telegram.org/bot{token}/{method}"
 
 
 class TgClient:
@@ -87,6 +89,44 @@ class TgClient:
         self._post(chat_id=chat_id, text=full_text, topic_id=topic_id)
         self._record(chat_id=chat_id, sid=sid, text=text)
         return True
+
+    # ------------------------------------------------------------------
+    # Forum-topic CRUD (T-0386 / INI-04) — per-project topic provisioning.
+    # ------------------------------------------------------------------
+
+    def create_forum_topic(self, *, chat_id: str, name: str) -> int:
+        """Create a forum topic in ``chat_id`` (a forum-enabled supergroup).
+
+        Returns the new ``message_thread_id``. Raises if no bot token is
+        configured (provisioning is explicit — it must not silently no-op) or
+        on any API error.
+        """
+        if not self._token:
+            raise RuntimeError("tg.create_forum_topic: no bot token configured")
+        data = self._call("createForumTopic", {"chat_id": chat_id, "name": name})
+        return int(data["result"]["message_thread_id"])
+
+    def close_forum_topic(self, *, chat_id: str, thread_id: int) -> None:
+        """Close (archive) a forum topic — the topic-level GC primitive."""
+        if not self._token:
+            raise RuntimeError("tg.close_forum_topic: no bot token configured")
+        self._call(
+            "closeForumTopic",
+            {"chat_id": chat_id, "message_thread_id": int(thread_id)},
+        )
+
+    def _call(self, method: str, payload: dict) -> dict:
+        """POST to an arbitrary Bot API method, honoring the egress proxy."""
+        import httpx  # lazy import — not available in all envs
+
+        url = _TG_METHOD.format(token=self._token, method=method)
+        extra = {"proxy": self._proxy} if self._proxy else {}
+        resp = httpx.post(url, json=payload, timeout=10, **extra)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram API error ({method}): {data}")
+        return data
 
     # ------------------------------------------------------------------
     # Internals

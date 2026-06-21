@@ -38,9 +38,9 @@ class _FakeTg:
     def __init__(self):
         self.sent = []
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False):
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None):
         full = f"[{sid}] {text}" if sid else text
-        self.sent.append({"chat_id": chat_id, "text": full})
+        self.sent.append({"chat_id": chat_id, "text": full, "topic_id": topic_id})
         return True
 
 
@@ -178,6 +178,20 @@ def test_tick_window_hidden_escalates_once(tmp_path, faketg, monkeypatch):
     audit2 = TS.tick(cfg)
     assert audit2["escalated"] == 0
     assert len(faketg.sent) == 1
+
+
+def test_escalation_routes_to_team_queries_topic(tmp_path, faketg, monkeypatch):
+    """T-0386: a needs-input escalation lands in the #team-queries forum topic."""
+    from bot_squad_worker import tg_topics
+    cfg = _make_cfg(tmp_path)
+    tg_topics.save(cfg, "bot-squad", {"team_queries": 3131})
+    TS.mark_blocked(cfg, "bot-squad", DEV, "need prod call")
+    _age_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False)
+
+    TS.tick(cfg)
+    assert len(faketg.sent) == 1
+    assert faketg.sent[0]["topic_id"] == 3131
 
 
 def test_tick_pane_gone_drops_marker(tmp_path, faketg, monkeypatch):

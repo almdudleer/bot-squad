@@ -411,6 +411,7 @@ def test_create_project_round_trip(
             "scaffold": None,
             "operator_sid": None,
             "spawn_error": None,
+            "topics_created": None,
         }
 
         listing = client.get("/api/projects").json()
@@ -482,7 +483,7 @@ def fake_worker_reload(tmp_bot_squad: Path):
 
     import tomllib
 
-    calls: dict[str, list[dict]] = {"reload_projects": [], "peer_send": [], "list_sessions": []}
+    calls: dict[str, list[dict]] = {"reload_projects": [], "peer_send": [], "list_sessions": [], "provision_project_topics": []}
 
     config_dir = tmp_bot_squad / "config"
     known: set[str] = set()
@@ -518,6 +519,11 @@ def fake_worker_reload(tmp_bot_squad: Path):
         calls["list_sessions"].append(params or {})
         return {"sessions": []}
 
+    @fake.post("/actions/provision_project_topics")
+    def provision_project_topics(params: dict | None = None) -> dict:
+        calls["provision_project_topics"].append(params or {})
+        return {"ok": True, "topics": {}, "created": []}
+
     config = uvicorn.Config(fake, uds=str(sock), log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
@@ -551,6 +557,10 @@ def test_create_project_nudges_worker_then_peer_send_succeeds(
 
     # API actually called the worker.
     assert len(calls["reload_projects"]) == 1
+
+    # T-0386: create-on-project provisions the per-project forum topics
+    # (best-effort) for the new slug.
+    assert calls["provision_project_topics"] == [{"slug": "fresh"}]
 
     # And the fake worker now routes peer_send to the fresh slug — proving
     # the in-memory view is up to date (the fixture re-reads projects.toml

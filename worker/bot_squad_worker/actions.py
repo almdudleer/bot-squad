@@ -155,6 +155,9 @@ _TG_NOTIFY_ALLOWED = {
     "slug", "chat_id", "message", "sid", "user", "urgent", "topic_id",
     # T-0241: process→user "needs input" enrichment (tmux-attach command).
     "needs_input", "tmux_session",
+    # T-0386: route by message CLASS (feedback/deploy_logs/team_queries) — the
+    # class resolves to the project's forum thread-id via tg_topics.
+    "topic",
 }
 
 
@@ -204,8 +207,8 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # land in the right forum thread without the caller spelling it out.
     chat_id: str | None = params.get("chat_id") or None
     topic_id: int | None = _coerce_topic_id(params.get("topic_id"))
+    slug: str = params.get("slug") or ""
     if not chat_id:
-        slug: str = params.get("slug") or ""
         if slug:
             project = cfg.projects.get(slug)
             if project is None:
@@ -239,6 +242,14 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # (plus a "reply here works too" hint), reusing the tg_stall escalation
     # composer for a consistent format. Force urgent so the quiet-hours gate
     # never drops a blocked process's input request (T-0188).
+    # T-0386: when a message CLASS is given (and no explicit numeric topic), map
+    # it to the project's forum thread so deploy-logs/team-queries/feedback land
+    # in their own thread. Falls back to the legacy single topic / general feed.
+    topic_class = params.get("topic") or ""
+    if topic_id is None and topic_class and slug:
+        from bot_squad_worker import tg_topics as _tg_topics
+        topic_id = _tg_topics.resolve(cfg, slug, topic_class)
+
     message = params["message"]
     urgent = bool(params.get("urgent", False))
     if bool(params.get("needs_input", False)):
@@ -343,6 +354,75 @@ def _action_max_notify(params: dict[str, Any]) -> dict[str, Any]:
         recipient_kind=params.get("recipient_kind"),
     )
     return {"ok": True, "sent": sent}
+
+
+# ---------------------------------------------------------------------------
+# T-0386 / INI-04 Phase 1: per-project forum-topic provisioning + GC.
+# The supergroup itself is a 1-time MANUAL setup (the Bot API cannot create
+# groups); the bot owns the TOPICS inside it — created on project-create,
+# closed on archive = a closed loop with no orphan topics.
+# ---------------------------------------------------------------------------
+
+_TOPIC_PROVISION_ALLOWED = {"slug"}
+
+
+def _resolve_topic_project(params: dict[str, Any], action: str):
+    """Shared guard: require slug, a known project, and a configured supergroup."""
+    if set(params) - _TOPIC_PROVISION_ALLOWED:
+        raise ActionError(f"{action} got unexpected params: {sorted(set(params) - _TOPIC_PROVISION_ALLOWED)}")
+    slug = params.get("slug") or ""
+    if not slug:
+        raise ActionError(f"{action} missing required param: slug")
+    cfg = _get_config()
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"{action}: unknown project slug {slug!r}")
+    if not getattr(project, "tg_chat", ""):
+        raise ActionError(f"{action}: project {slug!r} has no tg_chat supergroup configured")
+    return cfg, slug, project
+
+
+def _action_provision_project_topics(params: dict[str, Any]) -> dict[str, Any]:
+    """Create the standard forum topics for a project's supergroup (idempotent).
+
+    For each class in ``tg_topics.STANDARD_TOPICS`` not already provisioned,
+    calls ``createForumTopic`` in ``project.tg_chat`` and persists the returned
+    thread-id. Re-running creates only the missing ones. Returns
+    ``{ok, topics: {class: thread_id}, created: [class, …]}``.
+    """
+    from bot_squad_worker import tg_topics
+    cfg, slug, project = _resolve_topic_project(params, "provision_project_topics")
+    existing = tg_topics.load(cfg, slug)
+    tg = _get_tg_client(cfg)
+    created: list[str] = []
+    for cls, title in tg_topics.STANDARD_TOPICS.items():
+        if cls in existing:
+            continue
+        existing[cls] = tg.create_forum_topic(chat_id=project.tg_chat, name=title)
+        created.append(cls)
+    if created:
+        tg_topics.save(cfg, slug, existing)
+    return {"ok": True, "topics": existing, "created": created}
+
+
+def _action_gc_project_topics(params: dict[str, Any]) -> dict[str, Any]:
+    """Close every provisioned forum topic for a project (archive-time GC).
+
+    Best-effort: a per-topic close failure is logged, not fatal, so the GC
+    always makes progress. Returns ``{ok, closed: [class, …]}``.
+    """
+    from bot_squad_worker import tg_topics
+    cfg, slug, project = _resolve_topic_project(params, "gc_project_topics")
+    existing = tg_topics.load(cfg, slug)
+    tg = _get_tg_client(cfg)
+    closed: list[str] = []
+    for cls, tid in existing.items():
+        try:
+            tg.close_forum_topic(chat_id=project.tg_chat, thread_id=tid)
+            closed.append(cls)
+        except Exception:
+            log.exception("gc_project_topics: failed to close %s topic %s", cls, tid)
+    return {"ok": True, "closed": closed}
 
 
 _TG_STALL_CLEAR_REQUIRED = {"slug", "sid"}
@@ -496,11 +576,13 @@ def _action_pause_deploys(params: dict[str, Any]) -> dict[str, Any]:
     meta = _deploy.pause(cfg, slug, params["reason"], params["requested_by"])
 
     if not was_paused:
+        from bot_squad_worker import tg_topics as _tg_topics
         tg = _get_tg_client(cfg)
         tg.send(
             chat_id=project.tg_chat,  # type: ignore[attr-defined]
             text=f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
             sid="deploy_monitor",
+            topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
         )
 
     return {"ok": True, "paused": meta, "was_already_paused": was_paused}
@@ -535,11 +617,13 @@ def _action_resume_deploys(params: dict[str, Any]) -> dict[str, Any]:
 
     if was_paused:
         who = params.get("requested_by") or "?"
+        from bot_squad_worker import tg_topics as _tg_topics
         tg = _get_tg_client(cfg)
         tg.send(
             chat_id=project.tg_chat,  # type: ignore[attr-defined]
             text=f"🟢 deploys resumed for {slug} (by {who})",
             sid="deploy_monitor",
+            topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
         )
 
     return {"ok": True, "was_paused": was_paused}
@@ -2191,6 +2275,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0247: MAX (max.ru) DM channel — mirrors tg_notify.
     "max_notify": _action_max_notify,
     "tg_stall_clear": _action_tg_stall_clear,
+    # T-0386: per-project forum-topic lifecycle (create-on-project / GC-on-archive).
+    "provision_project_topics": _action_provision_project_topics,
+    "gc_project_topics": _action_gc_project_topics,
     "deploy": _action_deploy,
     "clone_status": _action_clone_status,
     "pull_master": _action_pull_master,
@@ -2268,6 +2355,10 @@ ACTION_MODES: dict[str, str] = {
     "tg_notify": "coordinator_only",
     "max_notify": "coordinator_only",
     "tg_stall_clear": "coordinator_only",
+    # T-0386: use the coordinator TG client + project config (single writer of
+    # the per-project topic map) — coordinator-only like the rest of the TG ops.
+    "provision_project_topics": "coordinator_only",
+    "gc_project_topics": "coordinator_only",
     "deploy": "coordinator_only",
     # T-0296: both run on-host git against the project clones (coordinator-side,
     # like deploy) — a tmux-only user-worker has neither the repos nor the right

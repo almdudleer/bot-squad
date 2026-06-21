@@ -1104,3 +1104,45 @@ def test_build_worker_restart_script_has_guard_restart_smoke(tmp_path: Path) -> 
     assert "/install/data/_sock/worker.sock" in script
     # failure paths drop the FAIL marker
     assert "/runs/q.FAIL" in script
+
+
+# ---------------------------------------------------------------------------
+# T-0386 / INI-04 Phase 1: deploy_monitor sends route to the #deploy-logs topic
+# ---------------------------------------------------------------------------
+
+class _RecordingTg:
+    def __init__(self):
+        self.calls = []
+
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None):
+        self.calls.append({"text": text, "topic_id": topic_id})
+        return True
+
+
+def test_deploy_monitor_sends_carry_deploy_logs_topic(tmp_config_dir, tmp_path, monkeypatch):
+    from bot_squad_worker.config import Config
+    from bot_squad_worker import jobs, deploy as _deploy, tg_topics
+    import bot_squad_worker.actions as A
+
+    cfg = Config.load(tmp_config_dir)
+    project = cfg.projects["test-project"]
+    tg_topics.save(cfg, "test-project", {"deploy_logs": 7777})
+
+    qfile = tmp_path / "q.json"
+    qfile.write_text(json.dumps({"target": "staging"}))
+
+    monkeypatch.setattr(_deploy, "list_queued", lambda c, s: [qfile])
+    monkeypatch.setattr(_deploy, "is_paused", lambda c, s: None)
+    monkeypatch.setattr(_deploy, "is_clean_for_target", lambda c, s, t: True)
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        _deploy, "run_next",
+        lambda c, s: SimpleNamespace(ok=True, returncode=0, collapsed_count=1, killed_reason=None),
+    )
+    rec = _RecordingTg()
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: rec)
+
+    jobs._run_project_deploy(cfg, "test-project", project)
+
+    assert rec.calls, "deploy_monitor sent no TG messages"
+    assert all(c["topic_id"] == 7777 for c in rec.calls), rec.calls

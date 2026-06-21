@@ -124,6 +124,10 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     tg = _get_tg_client(cfg)
     chat_id = project.tg_chat  # type: ignore[attr-defined]
     sid = "deploy_monitor"
+    # T-0386: route deploy logs into the project's #deploy-logs forum topic
+    # (None when unprovisioned → the group's general feed, i.e. no regression).
+    from bot_squad_worker import tg_topics as _tg_topics
+    deploy_topic = _tg_topics.resolve(cfg, slug, "deploy_logs")
 
     # Tree is clean — ping at start and at finish. TG outages must not
     # block the deploy itself: api.telegram.org went unreachable from this
@@ -141,7 +145,7 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     # precedent as autoupdate_apply's apply-failure ping.
     def _tg_safe(text: str) -> None:
         try:
-            tg.send(chat_id=chat_id, text=text, sid=sid, urgent=True)
+            tg.send(chat_id=chat_id, text=text, sid=sid, urgent=True, topic_id=deploy_topic)
         except Exception:
             log.exception("deploy_monitor: tg.send failed (non-fatal): %s", text)
 
@@ -192,8 +196,10 @@ def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None
     chat_id = getattr(project, "tg_chat", "") if project else ""
     if chat_id:
         try:
+            from bot_squad_worker import tg_topics as _tg_topics
             _get_tg_client(cfg).send(
-                chat_id=chat_id, text=text, sid="deploy_monitor", urgent=True
+                chat_id=chat_id, text=text, sid="deploy_monitor", urgent=True,
+                topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
             )
         except Exception:
             log.exception("deploy_monitor: operator tg.send failed (non-fatal): %s", text)

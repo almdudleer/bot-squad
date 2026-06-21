@@ -74,7 +74,7 @@ _PHASE2 = [
     ("post", f"{_P}/backlog", {"title": "x"}),
     ("patch", f"{_P}/backlog/T-0001", {"status": "open"}),
     ("patch", f"{_P}/backlog/T-0001/priority", {"priority": 1}),
-    ("post", f"{_P}/backlog/T-0001/comments", {"body": "x"}),
+    # T-0335 item 18: /backlog/{id}/comments route CUT (## Comments channel).
     ("post", f"{_P}/backlog/T-0001/progress", {"text": "x"}),
     ("post", f"{_P}/vision/active_initiatives/foo", {"body": "x"}),
     ("put", f"{_P}/vision/roles/dev", {"body": "x"}),

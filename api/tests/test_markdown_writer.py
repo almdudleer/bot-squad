@@ -11,7 +11,6 @@ import pytest
 
 from app.markdown_writer import (
     allocate_next_id,
-    append_comment,
     merge_task_update,
     slugify,
     write_task,
@@ -222,49 +221,6 @@ def test_merge_heals_block_style_to_inline(tmp_path: Path):
     assert "- T-0001" not in raw
     from app.markdown_parser import parse_task
     assert parse_task(p)["blocked_by"] == ["T-0001", "T-0002"]
-
-
-# ---------------------------------------------------------------------------
-# append_comment
-# ---------------------------------------------------------------------------
-
-def test_append_comment_adds_header_if_missing(tmp_path: Path):
-    p = tmp_path / "T-0020-c.md"
-    write_task(p, {"id": "T-0020", "title": "C", "status": "open"}, "body\n")
-    append_comment(p, "first comment", "alice")
-    text = p.read_text()
-    assert "## Comments" in text
-    assert "first comment" in text
-    assert "alice" in text
-
-
-def test_append_comment_appends_to_existing(tmp_path: Path):
-    p = tmp_path / "T-0021-c.md"
-    write_task(p, {"id": "T-0021", "title": "C", "status": "open"}, "body\n")
-    append_comment(p, "first", "alice")
-    append_comment(p, "second", "bob")
-    text = p.read_text()
-    # Both comments must appear in order
-    pos_first = text.index("first")
-    pos_second = text.index("second")
-    assert pos_first < pos_second
-    assert "bob" in text
-
-
-def test_append_comment_rejects_empty_body(tmp_path: Path):
-    p = tmp_path / "T-0022-c.md"
-    write_task(p, {"id": "T-0022", "title": "C", "status": "open"}, "body\n")
-    with pytest.raises(ValueError, match="empty"):
-        append_comment(p, "   ", "alice")
-
-
-def test_append_comment_bumps_updated(tmp_path: Path):
-    p = tmp_path / "T-0023-c.md"
-    write_task(p, {"id": "T-0023", "title": "C", "status": "open"}, "body\n")
-    from app.markdown_parser import parse_task
-    append_comment(p, "hi", "alice")
-    task = parse_task(p)
-    assert "updated" in task
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from app.markdown_writer import append_comment, merge_task_update, write_task
+from app.markdown_writer import merge_task_update, write_task
 
 
 def _seed(tmp_path: Path) -> Path:
@@ -19,29 +19,9 @@ def _seed(tmp_path: Path) -> Path:
     return p
 
 
-def test_concurrent_append_comment_no_lost_updates(tmp_path: Path):
-    p = _seed(tmp_path)
-    n = 12
-    barrier = threading.Barrier(n)
-    errors: list[Exception] = []
-
-    def worker(i: int) -> None:
-        barrier.wait()  # maximize contention
-        try:
-            append_comment(p, f"unique-comment-{i}", f"author{i}")
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert errors == [], f"writers raised: {errors!r}"
-    text = p.read_text()
-    missing = [i for i in range(n) if f"unique-comment-{i}" not in text]
-    assert not missing, f"LOST comments: {missing}"
+# T-0335 item 18: the append_comment concurrency test was removed with the
+# function it covered (the ## Comments channel is cut). merge_task_update below
+# still exercises the same T-0373 cross-process task_lock invariant.
 
 
 def test_concurrent_merge_update_no_corruption(tmp_path: Path):

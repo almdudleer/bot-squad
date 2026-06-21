@@ -120,35 +120,9 @@ def merge_task_update(path: Path, updates: dict, body: str | None = None) -> dic
         return fm
 
 
-def append_comment(path: Path, comment_body: str, author: str) -> None:
-    """Append a comment to the ## Comments section, creating it if absent."""
-    if not comment_body.strip():
-        raise ValueError("empty comment body")
-
-    # T-0373: lock the read→append→write so concurrent comment-adds all survive
-    # (was: unlocked + shared tmp → 8 concurrent adds, only 2 survived + 500s).
-    with task_lock(path):
-        task = parse_task(path)
-        fm = {k: v for k, v in task.items() if k not in ("body", "path")}
-        body = task["body"]
-
-        # Backfill created if missing
-        if "created" not in fm:
-            mtime = os.stat(path).st_mtime
-            fm["created"] = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
-        fm["updated"] = _now_utc_iso()
-
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        comment_block = f"### {today} {author}\n\n{comment_body.strip()}\n"
-
-        if "## Comments" in body:
-            body = body.rstrip("\n") + "\n\n" + comment_block
-        else:
-            body = body.rstrip("\n") + "\n\n## Comments\n\n" + comment_block
-
-        write_task(path, fm, body)
+# T-0335 item 18: append_comment() removed — the ``## Comments`` channel it wrote
+# was orphaned (its only caller, POST /backlog/{id}/comments, is cut; the board
+# comment kebab posts a Progress note instead).
 
 
 def allocate_next_id(backlog_dir: Path) -> str:

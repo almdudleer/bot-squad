@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.frontmatter import as_list, parse_or_none
 from app.markdown_parser import ParseError, parse_task
 from app.markdown_writer import (
-    append_comment,
     merge_task_update,
     slugify,
     write_task,
@@ -334,30 +333,9 @@ def delete_task(
     return {"ok": True, "deleted_id": task_id}
 
 
-@router.post("/{task_id}/comments")
-def add_comment(
-    slug: str,
-    task_id: str,
-    request: Request,
-    payload: dict,
-    user: dict = Depends(require_project_member),  # T-0381: project-write gate
-) -> dict:
-    _validate_task_id(task_id)
-
-    comment_body = (payload.get("body") or "").strip()
-    if not comment_body:
-        raise HTTPException(status_code=400, detail="comment body must not be empty")
-
-    backlog_dir = _backlog_dir(request, slug)
-    path = _find_task_file(backlog_dir, task_id)
-
-    author = user.get("username", "unknown")
-    try:
-        append_comment(path, comment_body, author)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return _enrich_with_sections(parse_task(path))
+# T-0335 item 18: POST /{task_id}/comments removed — the ``## Comments`` channel
+# was orphaned (zero FE callers after the board kebab repointed to a Progress
+# note). The progress feed below is the single comment channel now.
 
 
 @router.post("/{task_id}/progress")

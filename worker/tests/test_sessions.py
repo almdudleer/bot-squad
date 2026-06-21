@@ -1597,6 +1597,79 @@ def test_spawn_does_not_clobber_existing_initiative(tmp_path, monkeypatch):
     assert "initiative: different.md" not in txt
 
 
+# ---------------------------------------------------------------------------
+# Item 3 (audit Fork-2 Part A): spawn refuses the dup-bind AT THE OPEN under the
+# .task-claim.lock + stamps the claim so GC drops to a crash-only backstop.
+# ---------------------------------------------------------------------------
+
+def test_spawn_refuses_dup_bind_when_live_owner_exists(tmp_path, monkeypatch):
+    """A task already held by a LIVE session must not be bound again — spawn
+    refuses BEFORE opening a tmux window (no wasted session), closing the
+    dup-bind TOCTOU at the open rather than via gc_stale_bindings."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    (backlog / "T-0009-foo.md").write_text("---\nid: T-0009\ntitle: Foo\nstatus: open\n---\n\nbody\n")
+    sess_dir = cfg.data_dir / "test-project" / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(
+        sess_dir / "S-u-existing-p1.md",
+        {"sid": "S-u-existing-p1", "task_id": "T-0009", "status": "active"},
+    )
+
+    new_window_calls: list = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            new_window_calls.append(args)
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    from bot_squad_worker.actions import ActionError
+    with pytest.raises(ActionError, match="already bound to live session"):
+        spawn(cfg, "test-project", "w", task_id="T-0009")
+    assert new_window_calls == [], "must refuse before opening a tmux window"
+
+
+def test_spawn_stamps_task_claim_active_in_seed_meta(tmp_path, monkeypatch):
+    """A successful spawn stamps task_id+status:active in the new session's seed
+    meta so it is IMMEDIATELY a live task owner — no TOCTOU window before the
+    SessionStart hook runs (the differentiator that demotes GC to crash-only)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    (backlog / "T-0010-foo.md").write_text("---\nid: T-0010\ntitle: Foo\nstatus: open\n---\n\nbody\n")
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%2|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", task_id="T-0010")
+
+    seed = _read_session_metadata(
+        cfg.data_dir / "test-project" / "sessions" / "S-u-w-p2.md"
+    )
+    assert seed is not None
+    assert seed.get("task_id") == "T-0010"
+    assert str(seed.get("status")).lower() == "active"
+
+
 def test_strip_surrounding_quotes():
     """T-0208: strip ONE layer of matching surrounding single/double quotes."""
     import bot_squad_worker.sessions as S

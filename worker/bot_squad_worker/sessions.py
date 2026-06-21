@@ -1706,6 +1706,31 @@ def spawn(
     cwd = str(project.repo_path)
     user = _get_current_user()
 
+    # Item 3 (audit Fork-2 Part A): claim the task under bind_task's
+    # ``.task-claim.lock`` for the WHOLE spawn span (check → spawn → seed-meta
+    # stamp) so a concurrent spawn for the SAME task can't interleave and
+    # double-bind. Refuse at the OPEN if a live session already owns it (before
+    # writing the marker / opening a tmux window — no wasted session). The lock
+    # is held until the seed-meta stamp below makes the new session a live owner,
+    # then closed (closing the fd releases the flock); on any error path the
+    # frame unwinds and CPython drops + closes the fd, releasing the lock. This
+    # converts gc_stale_bindings from correctness-critical to a crash-only
+    # backstop (see its docstring).
+    _claim_fd = None
+    if task_id:
+        _claim_backlog = cfg.data_dir / slug / "backlog"
+        _claim_backlog.mkdir(parents=True, exist_ok=True)
+        _claim_fd = open(_claim_backlog / ".task-claim.lock", "w")
+        fcntl.flock(_claim_fd, fcntl.LOCK_EX)
+        _claim_live = _live_task_owner(cfg.data_dir, slug, task_id.strip())
+        if _claim_live is not None:
+            _claim_fd.close()
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(
+                f"spawn: task {task_id.strip()} already bound to live session "
+                f"{_claim_live}; refusing dup-bind"
+            )
+
     # Drop the task_id marker so SessionStart picks it up.
     if task_id:
         marker_dir = project.repo_path / ".claude"
@@ -1804,26 +1829,40 @@ def spawn(
     # the hook's `tmux display-message #S` read against the live pane will
     # converge on the same string. pane.session would also work but legacy
     # 5-field tmux output drops it.
-    try:
-        seed_meta_file = _session_file(cfg.data_dir, slug, new_sid)
-        seed_meta = _read_session_metadata(seed_meta_file) or {}
-        seed_meta.setdefault("sid", new_sid)
-        seed_meta["tmux_session"] = target_session
-        # T-0157: stamp the spawning linux user so the SessionMd carries an
-        # explicit user mark (the SID prefix already encodes it, but the field
-        # makes per-user listing/grouping robust to SID rotation).
-        seed_meta.setdefault("linux_user", user)
-        # T-0128: stamp the requesting session's SID as parent_sid so the
-        # session-tree survives worker restart without the heuristic. Only
-        # when provided and non-self; never clobber an already-set value.
-        if parent_sid:
-            ps = str(parent_sid).strip()
-            if ps and ps != "~" and ps != new_sid and not seed_meta.get("parent_sid"):
-                seed_meta["parent_sid"] = ps
+    seed_meta_file = _session_file(cfg.data_dir, slug, new_sid)
+    seed_meta = _read_session_metadata(seed_meta_file) or {}
+    seed_meta.setdefault("sid", new_sid)
+    seed_meta["tmux_session"] = target_session
+    # T-0157: stamp the spawning linux user so the SessionMd carries an
+    # explicit user mark (the SID prefix already encodes it, but the field
+    # makes per-user listing/grouping robust to SID rotation).
+    seed_meta.setdefault("linux_user", user)
+    # T-0128: stamp the requesting session's SID as parent_sid so the
+    # session-tree survives worker restart without the heuristic. Only
+    # when provided and non-self; never clobber an already-set value.
+    if parent_sid:
+        ps = str(parent_sid).strip()
+        if ps and ps != "~" and ps != new_sid and not seed_meta.get("parent_sid"):
+            seed_meta["parent_sid"] = ps
+    if task_id:
+        # Item 3: stamp the claim so the new session is IMMEDIATELY a live task
+        # owner (before the SessionStart hook runs), closing the dup-bind TOCTOU.
+        # This write is correctness-critical under the claim lock — it MUST raise
+        # on failure (a swallowed error silently reopens the race), so it is NOT
+        # wrapped in the best-effort OSError guard the no-task path keeps.
+        seed_meta["task_id"] = task_id.strip()
+        seed_meta["status"] = "active"
         _write_session_metadata(seed_meta_file, seed_meta)
-    except OSError:
-        # Best-effort: the hook will populate the field next time it fires.
-        pass
+        # Now a live owner — release the claim flock (closing the fd unlocks).
+        if _claim_fd is not None:
+            _claim_fd.close()
+            _claim_fd = None
+    else:
+        try:
+            _write_session_metadata(seed_meta_file, seed_meta)
+        except OSError:
+            # Best-effort: the hook will populate the field next time it fires.
+            pass
 
     # T-0105: stamp the freshly-spawned SID into the task md's
     # session_history list so the task carries forensics for *every*
@@ -2883,6 +2922,13 @@ def dedup_sessions(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
 
 def gc_stale_bindings(cfg: Any, slug: str) -> dict:
     """T-0073: strip stale primary ``task_id`` from sessions losing a dup race.
+
+    Item 3 (audit Fork-2 Part A): this is now a CRASH-ONLY BACKSTOP, not the
+    primary dup-bind defence. ``spawn`` refuses a dup-bind at the open under the
+    ``.task-claim.lock`` and stamps ``task_id+status:active`` so a fresh session
+    is immediately a live owner — so a >1-claimant group can only arise from a
+    crash between the claim check and the stamp (or legacy pre-Item-3 data), not
+    from a normal concurrent spawn. Kept as defence-in-depth.
 
     For each ``task_id`` claimed by >1 SessionMd (under the current linux
     user's prefix), picks the winner = (live pane AND latest ``started_at``)

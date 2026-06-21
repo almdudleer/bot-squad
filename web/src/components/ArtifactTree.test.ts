@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildArtifactIndex, kindRoute, seedCollapsed, sortSections, ArtifactNode } from "./ArtifactTree";
+import { buildArtifactIndex, kindRoute, seedCollapsed, sortSections, sectionRank, feedbackTitle, ArtifactNode } from "./ArtifactTree";
 
 // T-0283 (Pillar C / D-0029): the cross-store nesting tree is the core of the
 // ticket. These lock the uniform tree logic across the three stores.
@@ -51,10 +51,33 @@ describe("buildArtifactIndex — cross-store nesting", () => {
   });
 });
 
-describe("sortSections — doc categories first, store sections last (T-0352)", () => {
-  it("sorts doc categories alphabetically, then use cases, then feedback last", () => {
-    expect(sortSections(["feedback", "runbook", "use cases", "design", "architecture"]))
-      .toEqual(["architecture", "design", "runbook", "use cases", "feedback"]);
+describe("sortSections — operator-facing first, agent-internal then stores last (T-0352/T-0364)", () => {
+  it("ranks operator-facing categories first, agent-internal specs after, stores last", () => {
+    // runbook/support/operator are operator-facing (rank 0); architecture/design
+    // /roadmap are agent-internal (rank 1); use cases (2); feedback (3).
+    expect(sortSections(["feedback", "runbook", "use cases", "design", "architecture", "support", "roadmap"]))
+      .toEqual(["runbook", "support", "architecture", "design", "roadmap", "use cases", "feedback"]);
+  });
+});
+
+describe("sectionRank — deprioritize agent-internal specs (T-0364)", () => {
+  it("operator-facing < agent-internal < use cases < feedback", () => {
+    expect(sectionRank("support")).toBe(0);
+    expect(sectionRank("runbook")).toBe(0);
+    expect(sectionRank("design")).toBe(1);
+    expect(sectionRank("roadmap")).toBe(1);
+    expect(sectionRank("architecture")).toBe(1);
+    expect(sectionRank("use cases")).toBe(2);
+    expect(sectionRank("feedback")).toBe(3);
+  });
+});
+
+describe("feedbackTitle — no double-render of the slug (T-0364)", () => {
+  it("returns the first markdown heading as the title", () => {
+    expect(feedbackTitle("F-0001-x.md", "# Shared-tree commit races\nbody")).toBe("Shared-tree commit races");
+  });
+  it("returns '' (not the de-slugged filename) when there is no heading — id renders alone", () => {
+    expect(feedbackTitle("F-2026-06-02-inbox-62e1f0b77f.md", "just prose, no heading")).toBe("");
   });
 });
 

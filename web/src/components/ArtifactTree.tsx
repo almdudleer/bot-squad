@@ -18,13 +18,26 @@ export function seedCollapsed(
   return out;
 }
 
-// Doc categories first (alphabetical), then the two store sections last so the
-// legacy docs view stays familiar. Shared by the view + tests.
+// T-0364: agent-internal spec categories (design specs, roadmap, architecture
+// refactor guidance) crowd out the operator-facing docs (support, runbook,
+// operator, …). Rank operator-facing categories first, agent-internal specs
+// after them, then the use-cases + feedback stores last. Combined with
+// collapse-by-default this deprioritizes the agent-internal wall without
+// hiding it. Adjust by editing this set.
+const AGENT_INTERNAL_CATEGORIES = new Set(["design", "roadmap", "architecture"]);
+export function sectionRank(section: string): number {
+  if (section === "feedback") return 3;
+  if (section === "use cases") return 2;
+  if (AGENT_INTERNAL_CATEGORIES.has(section)) return 1;
+  return 0; // operator-facing doc categories
+}
+
+// Operator-facing doc categories first (alpha), then agent-internal specs
+// (alpha), then the use-case + feedback stores last. Shared by the view + tests.
 export function sortSections(sections: string[]): string[] {
-  const tail = ["use cases", "feedback"];
   return [...sections].sort((a, b) => {
-    const ai = tail.indexOf(a), bi = tail.indexOf(b);
-    if (ai !== -1 || bi !== -1) return (ai === -1 ? -1 : ai) - (bi === -1 ? -1 : bi);
+    const ra = sectionRank(a), rb = sectionRank(b);
+    if (ra !== rb) return ra - rb;
     return a.localeCompare(b);
   });
 }
@@ -66,11 +79,15 @@ export function kindRoute(slug: string, node: ArtifactNode): string {
   return `${base}?doc=${v}`;
 }
 
-function feedbackTitle(name: string, content: string): string {
+// T-0364: a feedback theme's display title is its first `# heading`, if any.
+// When there's none we return "" rather than a de-slugged filename — that
+// fallback just echoed the id line in the tree (e.g. id
+// `F-2026-06-02-inbox-62e1f0b77f` + title `F 2026 06 02 inbox 62e1f0b77f`), a
+// pure double-render. An empty title makes the tree render the id alone.
+export function feedbackTitle(_name: string, content: string): string {
   const m = content.match(/^#\s+(.+)$/m);
   if (m) return m[1].trim();
-  // F-0001-2026-05-18-shared-tree-commit-races.md -> readable-ish fallback
-  return name.replace(/\.md$/, "").replace(/[-_]/g, " ");
+  return "";
 }
 
 export type ArtifactIndex = {
@@ -208,8 +225,12 @@ function TreeNode({
             {" "}📎{kids.length}
           </span>
         )}
-        <br />
-        <span style={{ color: "var(--mc-text-dim)", fontSize: "0.7rem" }}>{node.title}</span>
+        {node.title && (
+          <>
+            <br />
+            <span style={{ color: "var(--mc-text-dim)", fontSize: "0.7rem" }}>{node.title}</span>
+          </>
+        )}
       </Link>
       {kids.length > 0 && (
         <ul className="list-unstyled m-0 mt-1">

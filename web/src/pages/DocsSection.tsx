@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Outlet, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactKind } from "../api";
 import { PageHelp } from "../components/PageHelp";
@@ -6,6 +6,7 @@ import {
   ArtifactTreeData,
   ArtifactTreeView,
   buildArtifactIndex,
+  sortSections,
   useArtifacts,
 } from "../components/ArtifactTree";
 
@@ -85,6 +86,16 @@ export function DocsSection() {
     filter === "all"
       ? tree
       : { ...buildArtifactIndex(filteredNodes ?? []), nodes: filteredNodes, error: tree.error, reload: tree.reload };
+
+  // T-0364: the merged "All" view was a ~6600px flat wall (every group
+  // expanded). Start ALL groups collapsed in the All view so the page opens as
+  // a compact, counted index — operator-facing categories first (sortSections),
+  // agent-internal specs + feedback below. A single-kind filter stays expanded
+  // (the user explicitly narrowed to that kind).
+  const allCollapsedSections = useMemo(
+    () => sortSections([...view.rootsBySection.keys()]),
+    [view.rootsBySection],
+  );
 
   function pickNew(kind: "doc" | "use_case") {
     setNewOpen(false);
@@ -222,18 +233,18 @@ export function DocsSection() {
             ))}
           </div>
 
-          {/* T-0352: in the mixed "All" view, start the feedback section
-              collapsed so its ~33 F-* roots don't bury docs/use-cases. When the
-              rail is filtered to a single kind the user asked for it, so nothing
-              starts collapsed. `key={filter}` remounts the tree on a filter
-              switch, re-seeding the collapse defaults. */}
+          {/* T-0352/T-0364: in the mixed "All" view start EVERY group collapsed
+              (was just feedback) so the page opens as a compact counted index
+              instead of a ~6600px wall. A single-kind filter stays expanded (the
+              user narrowed to that kind). `key={filter}` remounts the tree on a
+              filter switch, re-seeding the collapse defaults. */}
           <ArtifactTreeView
             key={filter}
             slug={slug}
             data={view}
             selectedKind={selectedKind}
             selectedId={selectedId}
-            defaultCollapsedSections={filter === "all" ? ["feedback"] : []}
+            defaultCollapsedSections={filter === "all" ? allCollapsedSections : []}
           />
         </div>
 

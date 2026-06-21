@@ -288,7 +288,11 @@ def test_tg_notify_needs_input_appends_tmux_attach(tmp_config_dir, monkeypatch):
     text = fake.calls[0]["text"]
     assert "Which DB should I use?" in text
     assert "tmux attach -t bot-squad-roles" in text
-    assert "Reply" in text  # replying in TG must still work
+    # P2-03: MAX is send-only (no ingest) — the footer points at attach/board,
+    # NOT a false "reply to this message" promise. build_escalation_text now
+    # carries the "To answer:" affordance (locked by test_tg_stall.py).
+    assert "To answer:" in text
+    assert "Reply to this message" not in text
 
 
 def test_tg_notify_needs_input_forces_urgent(tmp_config_dir, monkeypatch):

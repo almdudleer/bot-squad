@@ -9,7 +9,14 @@
  * (T-0239 slice 2).
  */
 import { SessionRow, TelemetryResponse } from "../api";
-import { isLiveSession } from "./Sessions";
+// T-0339: read the liveness predicate straight off the canonical
+// `sessionLiveness` helper (utils/sessionStatus) rather than `isLiveSession`
+// from Sessions.tsx. `isLiveSession` is only the boolean projection of
+// `sessionLiveness` (T-0340), and importing it pulled the whole Sessions page
+// into this helper — creating a Sessions → ResourceCapsPanel → resourceCaps →
+// Sessions import cycle once the caps panel mounts in the process view. Reading
+// the shared util keeps the predicate identical with no cycle.
+import { sessionLiveness } from "../utils/sessionStatus";
 
 // 0 (or absent) = unlimited, matching the T-0239 API contract.
 export const UNLIMITED = 0;
@@ -99,7 +106,8 @@ export function aggregateUtilization(
   let liveSessions = 0;
   let totalTokens = 0;
   for (const p of perProject) {
-    if (p.sessions) liveSessions += p.sessions.filter(isLiveSession).length;
+    if (p.sessions)
+      liveSessions += p.sessions.filter((s) => sessionLiveness(s) === "live").length;
     if (p.telemetry) totalTokens += p.telemetry.quota.output_tokens_cum_total ?? 0;
   }
   return { liveSessions, totalTokens };

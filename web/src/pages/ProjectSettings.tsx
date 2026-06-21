@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { api, ProjectDetail } from "../api";
 import { PersonalNotificationPanel } from "../components/PersonalNotificationPanel";
 
@@ -183,6 +183,30 @@ export function ProjectSettings() {
             Test ping uses the <em>saved</em> binding — save first, then test.
           </small>
         </section>
+      )}
+
+      {/* T-0339: caps/budget reference. Resource caps are a server-wide policy
+          (not per-project), but the operator-facing read+set home now lives in
+          this project's process (sessions) view — so point there from settings
+          instead of leaving caps unmentioned here. */}
+      {proj && (
+        <>
+          <hr style={{ borderColor: "var(--mc-border, #333)", margin: "1.5rem 0" }} />
+          <section className="mb-4">
+            <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
+              Resource caps &amp; budget
+            </h3>
+            <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.5rem" }}>
+              Caps (max parallel sessions + the per-quota-period output-token
+              budget) are a <strong>server-wide</strong> policy the worker
+              enforces at spawn-time. The operator-facing read+set controls — and
+              the budget-anchor status — live in this project&apos;s{" "}
+              <Link to={`/p/${slug}/sessions`}>process view</Link> (the
+              Agent-sessions page, the Task-Manager home). The underlying
+              enforcement config is in <Link to="/system-settings">System Settings</Link>.
+            </p>
+          </section>
+        </>
       )}
 
       {/* T-0218 — personal (per-user) notification target, inherited

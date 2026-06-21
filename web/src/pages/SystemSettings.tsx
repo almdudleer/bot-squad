@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, SystemSettings as Settings } from "../api";
 import { Modal } from "../components/Modal";
+// T-0339: CapMeter moved to the shared ResourceCapsPanel so the admin caps view
+// and the new process-view caps panel render the SAME bar (no drift).
+import { CapMeter } from "../components/ResourceCapsPanel";
 import { Coachmark } from "../onboarding";
 import {
   PARALLEL_SESSION_CEILING,
@@ -11,58 +14,11 @@ import {
   capSoftWarning,
   isOverCap,
   sanitizeCapInput,
-  utilizationRatio,
 } from "./resourceCaps";
 
 const TTL_RE = /^\d+[smhd]$/;
 // T-0194: socks5(h)/http(s) — mirrors the API's _PROXY_RE. Empty = direct.
 const PROXY_RE = /^(socks5h?|https?):\/\/.+/i;
-
-// T-0240: Task-Manager-style utilization meter — current usage vs the configured
-// cap. `used === null` while utilization is still loading; an unlimited cap (0)
-// renders no bar fill and an "Unlimited" target.
-function CapMeter({
-  label,
-  used,
-  cap,
-  format = (n: number) => n.toLocaleString(),
-}: {
-  label: string;
-  used: number | null;
-  cap: number;
-  format?: (n: number) => string;
-}) {
-  const ratio = used === null ? null : utilizationRatio(used, cap);
-  const over = used !== null && isOverCap(used, cap);
-  const fill = ratio === null ? 0 : Math.min(100, ratio * 100);
-  const barColor = over
-    ? "var(--mc-accent-danger, #d33)"
-    : fill >= 80
-      ? "var(--mc-accent-warn, #e0a000)"
-      : "var(--mc-accent, #2f6feb)";
-  return (
-    <div style={{ marginBottom: "0.6rem" }}>
-      <div
-        className="d-flex justify-content-between"
-        style={{ fontSize: "0.72rem", marginBottom: 3 }}
-      >
-        <span style={{ color: "var(--mc-text-mid)" }}>{label}</span>
-        <span style={{ fontFamily: "var(--mc-mono)", color: over ? "var(--mc-accent-danger, #d33)" : "var(--mc-text-mid)" }}>
-          {used === null ? "—" : format(used)} / {cap === 0 ? "Unlimited" : format(cap)}
-        </span>
-      </div>
-      <div
-        style={{
-          position: "relative", height: 8, borderRadius: 2,
-          background: "var(--mc-border)", overflow: "hidden",
-        }}
-        title={cap === 0 ? "Unlimited (no cap)" : `${used ?? "—"} of ${cap}`}
-      >
-        <div style={{ position: "absolute", inset: 0, width: `${fill}%`, background: barColor }} />
-      </div>
-    </div>
-  );
-}
 
 export function SystemSettings() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -569,6 +525,15 @@ export function SystemSettings() {
               and the per-quota-period output-token budget the system allows. Both
               are enforced at spawn-time; the token budget frees on anchor reset.
               Restart the worker after saving.{!isAdmin && " Admin-only."}
+            </small>
+            {/* T-0339: caps are now also surfaced + settable in each project's
+                process (sessions) view — the operator's Task-Manager home per
+                the reframe. This admin page remains the underlying enforcement
+                config. */}
+            <small style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
+              These caps (and the budget-anchor status) are also surfaced and
+              settable in each project&apos;s <strong>process view</strong> (the
+              Agent-sessions page) — the operator-facing Task-Manager home.
             </small>
           </section>
 

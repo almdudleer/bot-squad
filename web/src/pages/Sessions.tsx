@@ -25,6 +25,7 @@ import {
 
 import { PageHelp } from "../components/PageHelp";
 import { PeerInbox } from "../components/PeerInbox";
+import { ResourceCapsPanel } from "../components/ResourceCapsPanel";
 import { TelemetryPanel } from "../components/TelemetryPanel";
 import { uiSidFor } from "../peerInbox";
 // ---------------------------------------------------------------------------
@@ -1734,6 +1735,13 @@ export function Sessions() {
           for live sessions. Relocated here from the board page (it's per-session
           resource data, a natural fit alongside the sessions list). */}
       <TelemetryPanel slug={slug} />
+
+      {/* T-0339 (reframe Pillar A item 5 + T-0306): consolidated caps/budget
+          control — the operator's Task-Manager limits surfaced RIGHT IN the
+          process view where you watch and constrain the brain, instead of buried
+          in server admin. Read+set affordance here; server-level enforcement
+          (worker spawn-time checks) stays the source of truth underneath. */}
+      <ResourceCapsPanel slug={slug} />
 
       {/* T-0006: post-spawn toast. Dismisses on click of the close button,
           stays sticky until then so the user has time to copy the command. */}

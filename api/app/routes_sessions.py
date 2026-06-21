@@ -331,22 +331,42 @@ async def suspend_session(
 # POST /api/projects/{slug}/sessions/{sid}/resume
 # ---------------------------------------------------------------------------
 
+class ResumeRequest(BaseModel):
+    # T-0407: thread the reused task straight through resume so a session
+    # adopts it as PRIMARY in ONE round-trip. The worker resume action adopts an
+    # EMPTY primary as task_id (T-0166) and delivers initial_prompt as the brief;
+    # both optional, so a bare resume (no body) behaves exactly as before.
+    task_id: Optional[str] = None
+    initial_prompt: Optional[str] = None
+
+
 @router.post("/{sid}/resume")
 async def resume_session(
     slug: str, sid: str, request: Request,
+    body: ResumeRequest = ResumeRequest(),
     user: dict = Depends(require_auth),
 ) -> dict:
     """Resume a paused or suspended Claude session.
 
     For paused with live pane: clears paused flag.
     For suspended or zombie: spawns new tmux window with ``claude --resume``.
+
+    T-0407: an optional ``task_id`` (+ ``initial_prompt`` brief) is forwarded to
+    the worker, which adopts an empty primary as that task (T-0166) — so reusing
+    a session onto a new task is one round-trip with the task as PRIMARY, instead
+    of a resume + a separate bind_task that only appended to extra_task_ids.
     """
     _check_project(request, slug)
     wrouter = _router(request)
     _check_sid_ownership(sid, user, wrouter, _data_dir(request), slug)
+    params: dict = {"slug": slug, "sid": sid}
+    if body.task_id:
+        params["task_id"] = body.task_id
+    if body.initial_prompt:
+        params["initial_prompt"] = body.initial_prompt
     client = wrouter.for_sid(sid)
     try:
-        return await client.call_action("resume_session", {"slug": slug, "sid": sid})
+        return await client.call_action("resume_session", params)
     except WorkerError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

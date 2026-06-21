@@ -976,8 +976,18 @@ export const api = {
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`, { method: "POST" }),
   suspendSession: (slug: string, sid: string) =>
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/suspend`, { method: "POST" }),
-  resumeSession: (slug: string, sid: string) =>
-    call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/resume`, { method: "POST" }),
+  // T-0407: optionally thread the reused task (+ a brief) through resume so the
+  // session adopts it as PRIMARY in one round-trip (the worker adopts an empty
+  // primary as task_id, T-0166). A bare resume sends an empty body — unchanged.
+  resumeSession: (
+    slug: string,
+    sid: string,
+    opts?: { task_id?: string; initial_prompt?: string },
+  ) =>
+    call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/resume`, {
+      method: "POST",
+      body: JSON.stringify(opts ?? {}),
+    }),
   spawnSession: (slug: string, window: string, initial_prompt?: string, task_id?: string, initiative?: string) =>
     call(`/api/projects/${slug}/sessions`, {
       method: "POST",

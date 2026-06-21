@@ -296,6 +296,83 @@ def test_resume_session_worker_502(tmp_bot_squad: Path, monkeypatch, fake_worker
     assert r.status_code == 502
 
 
+def test_resume_forwards_task_id_and_prompt_to_worker(tmp_bot_squad: Path, monkeypatch):
+    """T-0407: /resume forwards task_id + initial_prompt to the worker resume
+    action (which adopts an empty primary as task_id, T-0166, and delivers the
+    prompt) — so reusing a session onto a new task is ONE round-trip with the
+    task as PRIMARY, replacing the resume + separate bind_task (which only
+    appended to extra_task_ids and left the old binding primary)."""
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    coord_sock = sock_dir / "worker.sock"
+
+    captured: list[dict] = []
+    app = FastAPI()
+
+    @app.post("/actions/resume_session")
+    def resume(params: dict | None = None) -> dict:
+        captured.append(params or {})
+        return {"ok": True, "sid": "S-almdudleer-spec5-p2"}
+
+    cfg = uvicorn.Config(app, uds=str(coord_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if coord_sock.exists():
+            break
+        time.sleep(0.05)
+    try:
+        with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
+            r = client.post(
+                "/api/projects/test-project/sessions/S-almdudleer-spec5-p2/resume",
+                json={"task_id": "T-0042", "initial_prompt": "Work T-0042 now."},
+            )
+        assert r.status_code == 200, r.text
+        assert captured, "worker resume_session was not called"
+        assert captured[0].get("task_id") == "T-0042"
+        assert captured[0].get("initial_prompt") == "Work T-0042 now."
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
+def test_resume_bare_omits_task_id(tmp_bot_squad: Path, monkeypatch):
+    """A bare resume (no body) must NOT send task_id/initial_prompt — the worker
+    leaves an existing primary untouched, but we also don't want to forward
+    empty keys that could confuse the allowlist."""
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    coord_sock = sock_dir / "worker.sock"
+
+    captured: list[dict] = []
+    app = FastAPI()
+
+    @app.post("/actions/resume_session")
+    def resume(params: dict | None = None) -> dict:
+        captured.append(params or {})
+        return {"ok": True, "sid": "S-almdudleer-spec5-p2"}
+
+    cfg = uvicorn.Config(app, uds=str(coord_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if coord_sock.exists():
+            break
+        time.sleep(0.05)
+    try:
+        with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
+            r = client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/resume")
+        assert r.status_code == 200, r.text
+        assert captured, "worker resume_session was not called"
+        assert "task_id" not in captured[0]
+        assert "initial_prompt" not in captured[0]
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
 # ---------------------------------------------------------------------------
 # POST /api/projects/{slug}/sessions  (spawn)
 # ---------------------------------------------------------------------------

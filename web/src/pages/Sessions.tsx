@@ -621,14 +621,16 @@ export function Sessions() {
   // modal was opened to STAFF `newTaskId` (the reuse-candidate list is fetched
   // for it), but resume_session alone keeps the session's OLD binding — so the
   // operator's intent ("this session now works THIS task") silently dropped.
-  // Bind the new task via the existing bind_task action (no backend change). If
-  // newTaskId is absent (a bare resume), behave exactly as before.
+  // T-0407: forward the task straight through resume — the worker adopts an
+  // empty primary as task_id (T-0166), so the reused session works THIS task as
+  // its PRIMARY in ONE round-trip. (The old path resumed then bind_task'd, which
+  // only appended to extra_task_ids, left the old binding primary, and could
+  // fail "not a dev session" on a suspended resume.) A bare resume is unchanged.
   async function handleResumeFromModal(sid: string) {
     setReuseError(null);
     setResumingSid(sid);
     try {
-      await api.resumeSession(slug, sid);
-      if (newTaskId) await api.bindTask(slug, sid, newTaskId);
+      await api.resumeSession(slug, sid, newTaskId ? { task_id: newTaskId } : undefined);
       setModalOpen(false);
       load();
     } catch (e: unknown) {

@@ -19,7 +19,7 @@ PKG = Path(bot_squad_worker.__file__).parent
 # only when a new GROUP sender is introduced.
 RAW_TG_SEND_ALLOWED = {
     "actions.py",       # the _send_stakeholder_dm SSOT itself + pause/resume (#deploy-logs) + per-user peer tg-mirror
-    "jobs.py",          # deploy events + _alert_operators (#deploy-logs) + oauth_refresh system alert
+    "jobs.py",          # routine #deploy-logs deploy events + oauth_refresh system alert (KILLED alert routes via SSOT, P2-04)
     "autopilot.py",     # autopilot run status -> project group
     "autonomous.py",    # autonomous run status -> project group
     "voice_intake.py",  # voice-note confirmation -> #feedback topic
@@ -42,6 +42,21 @@ def test_personal_pagers_route_through_ssot():
         assert "_send_stakeholder_dm" in src, f"{mod} must page via the SSOT"
         assert "_get_tg_client" not in src, f"{mod} re-scattered a raw TG sender"
         assert "TgClient(" not in src, f"{mod} re-scattered a raw TG sender"
+
+
+def test_deploy_killed_alert_routes_through_ssot():
+    """P2-04: the loud deploy-KILLED operator alert must page via the SSOT.
+
+    jobs.py legitimately keeps raw GROUP senders (routine #deploy-logs events,
+    the oauth_refresh system alert), so it stays in RAW_TG_SEND_ALLOWED — but the
+    KILLED alert is a personal page on this DPI-blocked host and must not raw-send
+    (it silently dropped before). This locks _alert_operators onto the SSOT.
+    """
+    src = (PKG / "jobs.py").read_text()
+    assert "_send_stakeholder_dm" in src, (
+        "jobs.py deploy-KILLED alert must route through actions._send_stakeholder_dm "
+        "(MAX-primary), not a raw TG send that drops on this DPI-blocked host"
+    )
 
 
 def test_no_unsanctioned_raw_tg_sender():

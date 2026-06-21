@@ -572,6 +572,60 @@ def test_deploy_monitor_watchdog_fires_targeted_operator_alert(
     assert all("KILLED" in t for _, t in peers)
 
 
+def test_deploy_monitor_watchdog_alert_routes_max_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-04: the deploy-KILLED alert routes through the _send_stakeholder_dm SSOT
+    (MAX-primary on this DPI-blocked host), not a raw TG send that silently drops.
+
+    MAX carries the loud KILLED alert; TG is only a best-effort #deploy-logs
+    group-record. Previously _alert_operators raw-sent to TG and the wedged-build
+    alert vanished on this host.
+    """
+    import dataclasses
+    import types
+
+    from bot_squad_worker import deploy as _deploy
+    from bot_squad_worker.jobs import deploy_monitor_one
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = dataclasses.replace(
+        _make_config_with_project(tmp_path, proj),
+        max_default_chat_id="MAXID", max_recipient_kind="chat_id",
+    )
+    _hang_recipe(cfg, proj.slug)
+    _deploy.enqueue(cfg, proj.slug, "staging", "wedge", "pytest")
+
+    from bot_squad_worker import actions as A
+    max_calls: list[dict] = []
+    tg_calls: list[dict] = []
+    monkeypatch.setattr(A, "_MAX", types.SimpleNamespace(
+        send=lambda **k: (max_calls.append(k) or True)))
+    monkeypatch.setattr(A, "_TG", types.SimpleNamespace(
+        send=lambda **k: (tg_calls.append(k) or True)))
+
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as IS
+    monkeypatch.setattr(S, "list_sessions", lambda _cfg, _slug: [])
+    monkeypatch.setattr(
+        IS, "send",
+        lambda *a, **k: {"ok": True},
+    )
+
+    deploy_monitor_one(cfg, proj.slug)
+
+    # MAX (primary) carried the loud KILLED alert — it was NOT silently dropped.
+    kill_max = [c for c in max_calls if "KILLED" in c["text"]]
+    assert kill_max and kill_max[0]["chat_id"] == "MAXID"
+    assert all(c["urgent"] is True for c in kill_max)
+    # TG only as a best-effort #deploy-logs group-record (never the primary page).
+    assert all(c["chat_id"] == proj.tg_chat for c in tg_calls)
+
+
 def test_deploy_monitor_reaps_orphan_with_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

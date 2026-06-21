@@ -335,12 +335,14 @@ def _redirect_to_upstream(
 # ---------------------------------------------------------------------------
 
 def build_escalation_text(cfg: Any, sid: str, text: str, session_name: str) -> str:
-    """Body for the escalation TG (the TgClient adds the ``[<SID>]`` prefix).
+    """Body for the escalation page (the client adds the ``[<SID>]`` prefix).
 
-    Includes a remote-control footer: the configured URL when set, otherwise a
-    ``tmux attach`` hint. Always tells the stakeholder he can just reply.
+    Points to the WORKING answer affordances — a remote-control / ``tmux attach``
+    footer plus the project board / #team-queries. It must NOT promise an inline
+    reply: the human channel here is MAX, which is send-only (no ingest), so
+    "reply to this message" would be a false affordance (P2-03).
     """
-    lines = [f"🔔 {text}".rstrip(), "", "↩️ Reply to this message to answer in the tmux session."]
+    lines = [f"🔔 {text}".rstrip(), ""]
     url = getattr(cfg, "tg_remote_control_url", "") or ""
     if url:
         try:
@@ -350,6 +352,7 @@ def build_escalation_text(cfg: Any, sid: str, text: str, session_name: str) -> s
         lines.append(f"🖥 Remote-control (Claude app): {url}")
     elif session_name:
         lines.append(f"🖥 Remote-control: tmux attach -t {session_name}")
+    lines.append("💬 To answer: attach above, or post on the board / #team-queries.")
     return "\n".join(lines)
 
 

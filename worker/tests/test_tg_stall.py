@@ -170,7 +170,9 @@ def test_tick_window_hidden_escalates_once(tmp_path, faketg, monkeypatch):
     msg = faketg.sent[0]["text"]
     assert msg.startswith(f"[{DEV}]")          # reply-routing prefix
     assert "need prod call" in msg
-    assert "Reply to this message" in msg       # reply-bridge hint
+    # P2-03: MAX is send-only (no ingest) — no false "reply to this" promise.
+    assert "Reply to this message" not in msg
+    assert "#team-queries" in msg               # points to a REAL answer channel
     assert "Remote-control" in msg              # /remote-control footer
     assert json.loads(TS._marker_path(cfg, "bot-squad", DEV).read_text())["escalated"] is True
 
@@ -252,7 +254,9 @@ def test_escalation_text_tmux_fallback(tmp_path):
     cfg = _make_cfg(tmp_path, remote_url="")
     body = TS.build_escalation_text(cfg, DEV, "need call", "bot-squad")
     assert "tmux attach -t bot-squad" in body
-    assert "Reply to this message" in body
+    # P2-03: no false reply promise — point to real answer channels instead.
+    assert "Reply to this message" not in body
+    assert "#team-queries" in body
 
 
 def test_escalation_text_configured_url_substitutes_sid(tmp_path):

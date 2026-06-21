@@ -215,23 +215,27 @@ def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None
     """Loud, TARGETED deploy alert (T-0212) — never a broadcast.
 
     Two targeted channels, mirroring the telemetry alert guardrail (T-0210):
-      1. urgent TG to the project's single bound chat (``tg_chat``) — one chat,
-         urgent so the quiet-hours gate can't drop a wedged-build alert;
+      1. an urgent personal page via the _send_stakeholder_dm SSOT (P2-04) —
+         MAX-primary on this DPI-blocked host (a raw TG send silently dropped the
+         wedged-build alert here), with a best-effort #deploy-logs group-record;
+         urgent so the quiet-hours gate can't drop it;
       2. a peer_send to each operator-role SID for the project.
-    Both are best-effort; a TG outage or a missing operator pane never raises.
+    Both are best-effort; a channel outage or a missing operator pane never raises.
     """
-    from bot_squad_worker.actions import _get_tg_client
+    from bot_squad_worker.actions import _send_stakeholder_dm
 
     chat_id = getattr(project, "tg_chat", "") if project else ""
     if chat_id:
         try:
             from bot_squad_worker import tg_topics as _tg_topics
-            _get_tg_client(cfg).send(
-                chat_id=chat_id, text=text, sid="deploy_monitor", urgent=True,
-                topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
+            _send_stakeholder_dm(
+                cfg, message=text, sid="deploy_monitor", urgent=True,
+                tg_chat_id=chat_id,
+                tg_topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
+                group_record=True,
             )
         except Exception:
-            log.exception("deploy_monitor: operator tg.send failed (non-fatal): %s", text)
+            log.exception("deploy_monitor: operator alert failed (non-fatal): %s", text)
     try:
         _peer_to_operators(cfg, slug, text)
     except Exception:

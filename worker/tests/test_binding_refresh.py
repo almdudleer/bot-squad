@@ -273,6 +273,89 @@ def test_same_tick_close_then_trim(tmp_path, monkeypatch):
     assert meta["last_task_id"] == "T-0001"
 
 
+# --- T-0335 item-10: idle-but-live dev suspend (Fork-2 Part B, DARK by default) ---
+
+def _seed_idle_live_dev(cfg, monkeypatch, *, status="in_progress"):
+    _seed_task(cfg, "T-0001", status)
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                      claude_uuid="u" * 8)
+    _live_feat_dev_pane(monkeypatch)
+    return p
+
+
+def test_idle_live_dev_not_suspended_when_knob_off(tmp_path, monkeypatch):
+    """Default (knob unset/0) → the idle-suspend arm is dark; an idle in-progress
+    dev is left running (ships DARK per D2)."""
+    cfg = _make_cfg(tmp_path)
+    _seed_idle_live_dev(cfg, monkeypatch)
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: 0.0)  # ancient → idle
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
+def test_idle_live_dev_suspended_when_knob_set(tmp_path, monkeypatch):
+    """Knob>0 + pane idle past the window + not awaiting input → suspend+archive
+    with reason idle-suspend; the binding is preserved as last_task_id and the
+    task stays open (re-dispatchable, kill-not-resume)."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    p = _seed_idle_live_dev(cfg, monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "3600")
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 7200)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda cfg, slug, sid: suspended.append(sid))
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    assert suspended == ["S-u-feat-dev-p1"]
+    meta = S._read_session_metadata(p)
+    assert meta["status"] == "suspended"
+    assert meta["archive_reason"] == "auto-archive:idle-suspend"
+    assert meta["last_task_id"] == "T-0001"
+    assert meta["task_id"] is None  # "~" round-trips through the serializer as null
+    # the task itself is untouched → stays open and re-dispatchable
+    assert S._task_status(cfg.data_dir, "test-project", "T-0001") == "in_progress"
+
+
+def test_idle_live_dev_spared_when_awaiting_input(tmp_path, monkeypatch):
+    """A dev blocked on TG input (blocked_sids) is NOT idle-leaking — spared."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    _seed_idle_live_dev(cfg, monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "3600")
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 7200)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids",
+                        lambda cfg, slug: {"S-u-feat-dev-p1"})
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
+def test_idle_live_dev_spared_when_pane_busy(tmp_path, monkeypatch):
+    """Fresh jsonl activity → not idle → spared even with the knob on."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    _seed_idle_live_dev(cfg, monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "3600")
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time())
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
+def test_idle_live_dev_spared_when_no_activity_signal(tmp_path, monkeypatch):
+    """No transcript yet (activity None, e.g. a freshly spawned pane) → spared,
+    never suspend a session whose age we cannot positively establish."""
+    cfg = _make_cfg(tmp_path)
+    _seed_idle_live_dev(cfg, monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", "3600")
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: None)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
 def test_tl_role_is_never_auto_archived(tmp_path):
     cfg = _make_cfg(tmp_path)
     _seed_session(cfg, "S-u-feat-TL-p1", window="feat-TL", task_id="~",

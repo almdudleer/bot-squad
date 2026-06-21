@@ -76,6 +76,23 @@ def session_stale_sec() -> float:
     return val if val > 0 else DEFAULT_SESSION_STALE_SEC
 
 
+def _session_idle_suspend_sec() -> float:
+    """T-0335 item-10 / Fork-2 Part B: idle-but-live dev suspend window (seconds).
+
+    Reads ``BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC`` each call (env-tunable on a live
+    worker). Ships **DARK** (D2): 0 / unset / garbage ⟹ the idle-suspend arm in
+    ``archive_dead_teammates`` is OFF. The operator opts in by setting e.g.
+    ``43200`` (the roadmap's recommended 12h). Suspend is reversible
+    (the task stays open + re-dispatchable), so a long window is safe to enable.
+    """
+    raw = os.environ.get("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC")
+    try:
+        val = float(raw) if raw else 0.0
+    except ValueError:
+        return 0.0
+    return val if val > 0 else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -3415,6 +3432,30 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                     )
                     if activity_at is None or (now_epoch - activity_at) >= IDLE_AT_PROMPT_SECONDS:
                         reason = "live-last-closed"
+            if reason is None:
+                # T-0335 item-10 (Fork-2 Part B): an idle-but-live dev — pane gone
+                # quiet past the suspend window — is suspended so it stops holding
+                # a slot, even with work still open. Ships DARK (window 0 = OFF).
+                # Spared when it is awaiting TG input (blocked_sids: a real "waiting
+                # on you" signal, not a leak) or its pane is still active. A session
+                # with no transcript activity signal is spared (age unknowable). The
+                # task binding is preserved as last_task_id below and the task stays
+                # open — reversible, re-dispatchable to a fresh session
+                # (kill-not-resume); a non-TG long wait reads as idle, which is why
+                # this is opt-in.
+                idle_window = _session_idle_suspend_sec()
+                if idle_window > 0:
+                    try:
+                        from bot_squad_worker import tg_stall as _tg_stall
+                        _blocked = _tg_stall.blocked_sids(cfg, slug)
+                    except Exception:  # noqa: BLE001 — never let it wedge the sweep
+                        _blocked = set()
+                    if sid not in _blocked:
+                        activity_at = _pane_activity_at(
+                            str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
+                        )
+                        if activity_at is not None and (now_epoch - activity_at) >= idle_window:
+                            reason = "idle-suspend"
         else:
             # Exited dev: archive when delivered or orphaned.
             if not has_task:

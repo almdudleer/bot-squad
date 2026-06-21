@@ -2085,21 +2085,15 @@ def _read_caps(config_dir: Path) -> dict:
     }
 
 
-def _pane_has_live_claude(pane_pid: str) -> bool:
-    """True iff a live ``claude`` process exists in this pane's /proc subtree.
+def _proc_children_map() -> dict[int, list[int]]:
+    """Build the ``PPid -> [child pids]`` map from a SINGLE /proc scan.
 
-    T-0397: pane EXISTENCE is not agent liveness. When claude exits, its tmux
-    pane routinely lingers as a bash shell — that dead-claude pane holds no
-    agent and must not consume a parallel-cap slot. Conversely a claude session
-    briefly running a Bash *tool* shows ``pane_current_command == bash`` while
-    claude is still alive as the pane's parent, so a foreground-command check
-    would flap; the /proc-subtree walk (mirrors ``_pane_claude_uuid_from_proc``)
-    is the stable signal — claude is found whether idle, busy, or fresh.
+    T-0416: the per-pane liveness walk used to rebuild this from a full /proc
+    iteration on EVERY ``_pane_has_live_claude`` call, so a single
+    ``caps_utilization`` (the FE polls it per project) cost
+    projects × panes × a full-/proc scan. Build it ONCE per live-count pass and
+    hand it to each pane's subtree walk. Returns ``{}`` if /proc is unreadable.
     """
-    try:
-        root = int(pane_pid)
-    except (ValueError, TypeError):
-        return False
     children: dict[int, list[int]] = {}
     try:
         for entry in Path("/proc").iterdir():
@@ -2113,7 +2107,32 @@ def _pane_has_live_claude(pane_pid: str) -> bool:
             if m:
                 children.setdefault(int(m.group(1)), []).append(int(entry.name))
     except OSError:
+        return {}
+    return children
+
+
+def _pane_has_live_claude(pane_pid: str, children: dict[int, list[int]] | None = None) -> bool:
+    """True iff a live ``claude`` process exists in this pane's /proc subtree.
+
+    T-0397: pane EXISTENCE is not agent liveness. When claude exits, its tmux
+    pane routinely lingers as a bash shell — that dead-claude pane holds no
+    agent and must not consume a parallel-cap slot. Conversely a claude session
+    briefly running a Bash *tool* shows ``pane_current_command == bash`` while
+    claude is still alive as the pane's parent, so a foreground-command check
+    would flap; the /proc-subtree walk (mirrors ``_pane_claude_uuid_from_proc``)
+    is the stable signal — claude is found whether idle, busy, or fresh.
+
+    T-0416: ``children`` is the prebuilt ``_proc_children_map()``. The hot caller
+    (``_live_agent_sids``) builds it ONCE and passes it for every pane; standalone
+    callers omit it and one is built on demand (so this never rebuilds per pane in
+    the live-count path).
+    """
+    try:
+        root = int(pane_pid)
+    except (ValueError, TypeError):
         return False
+    if children is None:
+        children = _proc_children_map()
     queue: list[int] = [root]
     seen: set[int] = set()
     while queue:
@@ -2140,11 +2159,15 @@ def _live_agent_sids() -> set[str]:
     agent slot, so it must not count. Liveness is verified against THIS worker's
     tmux server (the current linux user); a different user's sessions are
     reconciled by their own per-user worker and are not visible here.
+
+    T-0416: the /proc children-map is built ONCE here and reused for every pane's
+    subtree walk, instead of a full /proc rescan per pane.
     """
     user = _get_current_user()
+    children = _proc_children_map()
     out: set[str] = set()
     for p in list_panes():
-        if not _pane_has_live_claude(p.pid):
+        if not _pane_has_live_claude(p.pid, children):
             continue
         try:
             out.add(compute_sid(user, p.window, p.pane_id))

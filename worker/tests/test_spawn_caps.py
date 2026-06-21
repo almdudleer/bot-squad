@@ -109,10 +109,33 @@ def test_live_agent_sids_excludes_dead_claude_bash_pane(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "list_panes", lambda: panes)
     # %1 (claude foreground) and %2 (claude running a bash tool) have a live
     # claude in their subtree; %3 (claude exited → bash) does not.
-    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid: pid in {"111", "222"})
+    # T-0416: _live_agent_sids now passes a prebuilt children-map as a 2nd arg.
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, children=None: pid in {"111", "222"})
     # call the REAL function (the autouse fixture stubs S._live_agent_sids); it
     # resolves list_panes / _pane_has_live_claude from the patched module.
     assert _live_agent_sids() == {"S-u-alive-p1", "S-u-busy-p2"}
+
+
+def test_live_agent_sids_builds_proc_map_once(tmp_path, monkeypatch):
+    """T-0416: the /proc children-map is built ONCE per live-count pass, not
+    rebuilt per pane — caps_utilization is FE-polled per project, so a per-pane
+    full-/proc rescan was projects × panes × scan. Assert one build for N panes."""
+    panes = [
+        S.PaneInfo(pane_id="%1", window="a", pid="111", cwd="/r", command="claude"),
+        S.PaneInfo(pane_id="%2", window="b", pid="222", cwd="/r", command="claude"),
+        S.PaneInfo(pane_id="%3", window="c", pid="333", cwd="/r", command="claude"),
+    ]
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+    builds = {"n": 0}
+
+    def _counting_map():
+        builds["n"] += 1
+        return {}
+
+    monkeypatch.setattr(S, "_proc_children_map", _counting_map)
+    _live_agent_sids()
+    assert builds["n"] == 1, f"expected ONE /proc map build for {len(panes)} panes, got {builds['n']}"
 
 
 def test_enforce_admits_when_phantom_below_cap(tmp_path):

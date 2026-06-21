@@ -1835,11 +1835,7 @@ export function Sessions() {
   }
 
   return (
-    // T-0431: the PeerInbox FAB is fixed bottom-right; at narrow widths (~390px)
-    // it overlapped the last table row's ATTACH tap target (F-2026-06-21-inbox-
-    // 02d3cb26cc). Reserve bottom clearance so the last row always scrolls above
-    // the FAB band. Harmless on desktop (the FAB sits in the wide right margin).
-    <div className="container py-4" style={{ paddingBottom: "5rem" }}>
+    <div className="container py-4">
       {/* T-0127: in-UI peer-reply inbox (coexists with the TG mirror). */}
       <PeerInbox slug={slug} username={meUsername} />
       {/* Header */}
@@ -2766,6 +2762,16 @@ export function Sessions() {
         onClose={() => setAutopilotOpen(false)}
         onStarted={() => load()}
       />
+
+      {/* T-0431: the PeerInbox FAB is fixed bottom-right; at narrow widths
+          (~390px) it overlapped the last table row's ATTACH tap target
+          (F-2026-06-21-inbox-02d3cb26cc). An in-flow spacer reserves bottom
+          clearance so the last row always scrolls above the FAB band. NOTE: a
+          paddingBottom on the .container is futile — Bootstrap's `.py-4` sets
+          `padding-bottom: 1.5rem !important`, which an inline style can't beat;
+          a real element is the robust fix. Harmless on desktop (FAB sits in the
+          wide right margin). */}
+      <div aria-hidden style={{ height: "5rem" }} />
     </div>
   );
 }

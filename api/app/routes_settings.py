@@ -249,6 +249,11 @@ def get_settings(request: Request) -> dict:
 def put_settings(request: Request, payload: dict) -> dict:
     config_dir: Path = request.app.state.api_config.config_dir
     current = _read_system_settings(config_dir)
+    # PASS-2 P2-01-BE: only a BOOT-CACHED field change needs a worker restart.
+    # tg.proxy_url is read once at listener/worker boot; capture its old value
+    # now (before validation overwrites it) to detect a real change. Caps + ttl +
+    # quiet_hours + coordinator are fresh-read per spawn/tick → no restart.
+    old_proxy_url = str((current.get("tg") or {}).get("proxy_url") or "")
 
     tg_in = (payload.get("tg") or {}) if isinstance(payload.get("tg"), dict) else {}
     sess_in = (
@@ -349,5 +354,13 @@ def put_settings(request: Request, payload: dict) -> dict:
 
     result = _shape(config_dir)
     result["ok"] = True
-    result["restart_required"] = True
+    # PASS-2 P2-01-BE: restart_required iff a boot-cached field actually changed.
+    # bot_token is write-only (the FE never receives it, so a provided value is a
+    # new token); proxy_url is shown + resent by the System-Settings form, so
+    # compare to the pre-write value. Everything else is fresh-read → no restart,
+    # so a caps-only save reports False and the two caps editors stop contradicting.
+    boot_cached_changed = ("bot_token" in tg_in) or (
+        "proxy_url" in tg_in and str(tg_in["proxy_url"]).strip() != old_proxy_url
+    )
+    result["restart_required"] = bool(boot_cached_changed)
     return result

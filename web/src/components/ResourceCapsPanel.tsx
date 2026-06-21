@@ -26,7 +26,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { api } from "../api";
-import type { TelemetryQuota } from "../api";
+import type { TelemetryQuota, TelemetryCaps } from "../api";
 import {
   PARALLEL_SESSION_CEILING,
   ProjectUtilization,
@@ -120,6 +120,10 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   const [isAdmin, setIsAdmin] = useState(false);
   const [util, setUtil] = useState<{ liveSessions: number; totalTokens: number } | null>(null);
   const [quota, setQuota] = useState<TelemetryQuota | null>(null);
+  // T-0389/audit items 7+22: the ENFORCED caps (server-wide) ride /telemetry —
+  // available on mount (no lazy fan-out needed), drive the live-utilization
+  // strip ('12/15, throttled to 8') + the token meter (output_since_anchor).
+  const [caps, setCaps] = useState<TelemetryCaps | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -160,7 +164,10 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
     api
       .telemetry(slug)
       .then((d) => {
-        if (alive) setQuota(d.quota ?? null);
+        if (alive) {
+          setQuota(d.quota ?? null);
+          setCaps(d.caps ?? null); // server-wide enforced caps (items 7+22)
+        }
       })
       .catch(() => {
         /* no telemetry yet — anchor status shows "unknown/none" */
@@ -227,6 +234,20 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   const projection = fmtStamp(quota?.projected_exhaustion_at);
   const burn = quota?.burn_tokens_per_hr;
 
+  // T-0389 items 22+7: derive the live utilization + AIMD throttle from the
+  // server-wide enforced caps. hardCap=0 means unlimited; effective_limit below
+  // hardCap means the WS-4 backoff governor has throttled admission ('… → 8').
+  const hardCap = caps?.max_parallel_sessions ?? parallelNum ?? 0;
+  const effLimit = caps?.effective_limit ?? 0;
+  const liveCount = caps?.live_sessions;
+  const throttled = effLimit > 0 && hardCap > 0 && effLimit < hardCap;
+  const parallelText =
+    liveCount != null
+      ? `${liveCount}/${hardCap === 0 ? "∞" : hardCap}`
+      : hardCap === 0
+        ? "∞"
+        : String(hardCap);
+
   return (
     <div
       className="mc-card"
@@ -246,12 +267,21 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       >
         <div className="d-flex align-items-center" style={{ gap: "0.5rem", flexWrap: "wrap" }}>
           <strong style={{ fontSize: "0.74rem" }}>Resource caps &amp; budget</strong>
+          {/* T-0389 item 22: live count / hard ceiling + AIMD throttle. */}
           <span
-            className="mc-badge mc-badge-dim"
-            title="Max simultaneously-live sessions the system allows. Enforced at spawn-time, server-wide. 0 = unlimited."
+            className={`mc-badge ${throttled ? "mc-badge-warn" : "mc-badge-dim"}`}
+            title="Live processes / max simultaneously-live the system allows (server-wide, enforced at spawn-time). 0 = unlimited."
           >
-            parallel {parallelNum === 0 ? "∞" : parallelNum ?? "—"}
+            parallel {parallelText}
           </span>
+          {throttled && (
+            <span
+              className="mc-badge mc-badge-warn"
+              title="The WS-4 backoff governor has throttled admission below the hard cap (resource pressure / 429s). New spawns admit up to this effective limit until pressure clears."
+            >
+              throttled to {effLimit}
+            </span>
+          )}
           <span
             className="mc-badge mc-badge-dim"
             title="Per-quota-period output-token budget (output since the last anchor). Enforced at spawn-time; frees on anchor reset. 0 = unlimited."
@@ -304,17 +334,21 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
             </div>
           )}
 
-          {/* Task-Manager meters — server-wide live usage vs the cap. */}
+          {/* Task-Manager meters — the ENFORCED server-wide numbers (T-0389
+              items 7+22): live count vs the cap, and output_since_anchor (the
+              actual enforced numerator) vs the token budget — NOT the cumulative
+              total that's never what's enforced. Falls back to the FE
+              aggregation if the worker didn't supply caps. */}
           <div style={{ maxWidth: "26rem", marginBottom: "0.6rem" }}>
             <CapMeter
               label="Parallel sessions (live, server-wide)"
-              used={util ? util.liveSessions : null}
-              cap={parallelNum ?? 0}
+              used={caps?.live_sessions ?? (util ? util.liveSessions : null)}
+              cap={caps?.max_parallel_sessions ?? parallelNum ?? 0}
             />
             <CapMeter
-              label="Total tokens (output, cumulative)"
-              used={util ? util.totalTokens : null}
-              cap={tokensNum ?? 0}
+              label="Output tokens this quota period (enforced vs budget)"
+              used={caps?.output_since_anchor ?? (util ? util.totalTokens : null)}
+              cap={caps?.max_total_tokens ?? tokensNum ?? 0}
               format={fmtTokens}
             />
           </div>

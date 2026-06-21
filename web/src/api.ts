@@ -370,9 +370,22 @@ export type TelemetryQuota = {
   sampled_at?: string;
 };
 
+// T-0389/audit items 7+22 (backend 4da24e7): the ENFORCED caps ride /telemetry
+// under a top-level `caps` object (server-wide; the same in every project's
+// payload). Empty {} when the worker is dead. Drives the caps strip
+// ('12/15, throttled to 8') + the token meter (output_since_anchor / cap).
+export type TelemetryCaps = {
+  max_parallel_sessions?: number; // hard ceiling, 0 = unlimited
+  effective_limit?: number;       // AIMD-depressed ceiling; 0 = unlimited
+  live_sessions?: number;         // current live count (numerator vs ceiling)
+  max_total_tokens?: number;      // token budget per quota period, 0 = unlimited
+  output_since_anchor?: number;   // ENFORCED token meter numerator
+};
+
 export type TelemetryResponse = {
   sessions: TelemetrySession[];
   quota: TelemetryQuota;
+  caps?: TelemetryCaps;
 };
 
 // T-0280: one weighed reuse-vs-spawn candidate (worker dispatch_decision /

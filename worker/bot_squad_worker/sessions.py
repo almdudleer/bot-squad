@@ -2106,6 +2106,38 @@ def _enforce_parallel_cap(cfg: Any) -> None:
     )
 
 
+def caps_utilization(cfg: Any) -> dict:
+    """The live, ENFORCED resource-cap utilization for the UI meter (T-0335
+    items 7 + 22).
+
+    Returns the exact numbers spawn admission gates on — so the meter measures
+    what is actually enforced, not a parallel estimate. All system-wide (caps
+    are a global resource limit):
+
+      max_parallel_sessions : hard concurrency ceiling (0 = unlimited)
+      effective_limit       : ceiling depressed by the AIMD backoff governor
+                              ("12/15, throttled to 8"); the 10_000 unlimited
+                              sentinel is normalised to 0 so the wire uses the
+                              same 0=unlimited convention as the cap
+      live_sessions         : sessions currently counted against the ceiling
+      max_total_tokens      : output-token budget per quota period (0 = unlimited)
+      output_since_anchor   : output tokens spent since the [quota] anchor (the
+                              number enforced against max_total_tokens, item 7)
+    """
+    from bot_squad_worker import backoff as _backoff
+    caps = _read_caps(_caps_config_dir(cfg))
+    effective = _backoff.effective_limit(cfg)
+    if caps["max_parallel_sessions"] == 0 and effective >= _backoff._UNLIMITED:
+        effective = 0  # unlimited + no pressure → 0 on the wire (not the sentinel)
+    return {
+        "max_parallel_sessions": caps["max_parallel_sessions"],
+        "effective_limit": effective,
+        "live_sessions": _count_live_sessions(cfg),
+        "max_total_tokens": caps["max_total_tokens"],
+        "output_since_anchor": _output_since_anchor(cfg),
+    }
+
+
 def _anchor_key(cfg: Any) -> str:
     """The current ``[quota].set_at`` (or '' if unset) — the budget-period key.
     Re-anchoring (operator changes set_at) rebases the token-budget baseline."""

@@ -255,15 +255,19 @@ async def get_telemetry(
         result = await client.call_action("telemetry_get", {"slug": slug}, timeout=5.0)
     except WorkerError as e:
         log.warning("telemetry_get for %s failed: %s", slug, e)
-        return {"sessions": [], "quota": {}}
+        return {"sessions": [], "quota": {}, "caps": {}}
     except Exception as e:
         log.warning("telemetry_get for %s crashed: %s", slug, e)
-        return {"sessions": [], "quota": {}}
+        return {"sessions": [], "quota": {}, "caps": {}}
 
     sessions = result.get("sessions", [])
     quota = result.get("quota", {})
+    # T-0335 items 7 + 22: enforced caps utilization (system-wide cap config +
+    # live counts + token totals — no per-user secret, same as quota), shown to
+    # everyone so the UI meter measures the number spawn actually enforces.
+    caps = result.get("caps", {})
     if user.get("is_admin"):
-        return {"sessions": sessions, "quota": quota}
+        return {"sessions": sessions, "quota": quota, "caps": caps}
     # Non-admin owner gate: telemetry records don't carry the UI `owner`, so
     # join back to the SessionMd owner by sid (same rule as list_sessions —
     # missing owner = admin-only).
@@ -277,7 +281,7 @@ async def get_telemetry(
             me,
         )
     ]
-    return {"sessions": visible, "quota": quota}
+    return {"sessions": visible, "quota": quota, "caps": caps}
 
 
 # ---------------------------------------------------------------------------

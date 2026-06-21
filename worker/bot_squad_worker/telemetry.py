@@ -817,7 +817,16 @@ def read_telemetry(cfg: Any, slug: str) -> dict:
         k: v for k, v in quota.items()
         if k not in ("samples", "last_alert", "alert_fired_at")
     }
-    return {"sessions": sessions, "quota": quota_wire}
+    # T-0335 items 7 + 22: the ENFORCED, system-wide caps utilization (live count
+    # vs effective limit; output_since_anchor vs the token budget) so the UI meter
+    # measures exactly what spawn admission gates on, not a parallel estimate.
+    from bot_squad_worker import sessions as _sessions
+    try:
+        caps = _sessions.caps_utilization(cfg)
+    except Exception:  # noqa: BLE001 — telemetry read must never hard-fail on caps
+        log.exception("read_telemetry: caps_utilization failed for %s", slug)
+        caps = {}
+    return {"sessions": sessions, "quota": quota_wire, "caps": caps}
 
 
 def tick(cfg: Any) -> None:

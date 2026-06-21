@@ -64,6 +64,13 @@ def fake_worker_sessions(tmp_bot_squad: Path):
                 "throttled": False,
                 "rate_limit_429": {"count": 0, "last_at": None},
             },
+            "caps": {
+                "max_parallel_sessions": 15,
+                "effective_limit": 8,
+                "live_sessions": 12,
+                "max_total_tokens": 1_000_000,
+                "output_since_anchor": 250_000,
+            },
         }
 
     @fake.post("/actions/pause_session")
@@ -154,6 +161,11 @@ def test_get_telemetry_success(tmp_bot_squad: Path, monkeypatch, fake_worker_ses
     assert data["sessions"][0]["context"]["pct"] == 84.0
     assert data["quota"]["burn_tokens_per_hr"] == 7200.0
     assert data["quota"]["throttled"] is False
+    # T-0335 items 7 + 22: the enforced caps block passes through to the UI meter.
+    assert data["caps"]["max_parallel_sessions"] == 15
+    assert data["caps"]["effective_limit"] == 8
+    assert data["caps"]["live_sessions"] == 12
+    assert data["caps"]["output_since_anchor"] == 250_000
 
 
 def test_get_telemetry_requires_auth(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
@@ -175,7 +187,7 @@ def test_get_telemetry_dead_worker_returns_empty(
     with _client_logged_in(tmp_bot_squad, monkeypatch, broken_sock) as client:
         r = client.get("/api/projects/test-project/telemetry")
     assert r.status_code == 200
-    assert r.json() == {"sessions": [], "quota": {}}
+    assert r.json() == {"sessions": [], "quota": {}, "caps": {}}
 
 
 # ---------------------------------------------------------------------------

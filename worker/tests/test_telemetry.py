@@ -341,6 +341,19 @@ def test_read_telemetry_returns_sessions_and_quota_without_internal_fields(tmp_p
     assert "burn_tokens_per_hr" in wire["quota"]
 
 
+def test_read_telemetry_includes_enforced_caps_block(tmp_path, fake_session):
+    """T-0335 items 7 + 22: read_telemetry surfaces the ENFORCED caps
+    utilization so the UI meter measures what spawn actually gates on."""
+    cfg = _make_cfg(tmp_path)
+    wire = T.read_telemetry(cfg, "proj")
+    assert "caps" in wire
+    caps = wire["caps"]
+    for key in ("max_parallel_sessions", "effective_limit", "live_sessions",
+                "max_total_tokens", "output_since_anchor"):
+        assert key in caps
+        assert isinstance(caps[key], int)
+
+
 # ---------------------------------------------------------------------------
 # T-0332: over-firing fixes — debounce, quiet-hours urgency, fresh-429 suppress
 # ---------------------------------------------------------------------------

@@ -1189,6 +1189,7 @@ export type ProjectApi = Pick<
   | "pauseSession"
   | "suspendSession"
   | "resumeSession"
+  | "bindTask"
   | "archiveSession"
   | "unarchiveSession"
   | "spawnSession"

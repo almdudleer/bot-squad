@@ -521,6 +521,13 @@ export function apiFor(serverId: string): ServerApi {
         `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/resume`,
         { method: "POST" },
       ),
+    // T-0389/audit item 6: bindTask is now on the shared ProjectApi surface so
+    // the reuse/resume flow can thread the new task into the session.
+    bindTask: (slug, sid, task_id) =>
+      fwd<{ ok: boolean; sid: string; task_id: string; extras: string[] }>(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/bind/task`,
+        { method: "POST", body: JSON.stringify({ task_id }) },
+      ),
     archiveSession: (slug, sid) =>
       fwd<{ ok: boolean; sid: string; archived: boolean }>(
         `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/archive`,

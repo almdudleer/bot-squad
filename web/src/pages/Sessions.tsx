@@ -616,11 +616,18 @@ export function Sessions() {
 
   // T-0280: resume an existing live pro instead of spawning a fresh one.
   // Calls the existing resume endpoint, then closes the modal + reloads.
+  // T-0389/audit item 6: thread the NEW task into the reused session. The reuse
+  // modal was opened to STAFF `newTaskId` (the reuse-candidate list is fetched
+  // for it), but resume_session alone keeps the session's OLD binding — so the
+  // operator's intent ("this session now works THIS task") silently dropped.
+  // Bind the new task via the existing bind_task action (no backend change). If
+  // newTaskId is absent (a bare resume), behave exactly as before.
   async function handleResumeFromModal(sid: string) {
     setReuseError(null);
     setResumingSid(sid);
     try {
       await api.resumeSession(slug, sid);
+      if (newTaskId) await api.bindTask(slug, sid, newTaskId);
       setModalOpen(false);
       load();
     } catch (e: unknown) {

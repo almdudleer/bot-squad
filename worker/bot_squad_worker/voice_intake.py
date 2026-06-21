@@ -22,6 +22,10 @@ log = logging.getLogger(__name__)
 # over-long note is rejected pre-download and a runaway decode is time-boxed.
 _DEFAULT_MAX_DURATION_SEC = 300
 _DEFAULT_TRANSCRIBE_TIMEOUT_SEC = 120
+# T-0433 P3: how long an un-triaged voice blob survives in feedback/_audio/ before
+# the age backstop reaps it. A triaged (promoted/dismissed) note's audio is reaped
+# immediately regardless. 0 disables the age backstop (triage-only GC).
+_DEFAULT_AUDIO_RETENTION_DAYS = 30
 
 
 def extract_voice(message: dict) -> dict[str, Any] | None:
@@ -264,3 +268,69 @@ def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = ""
         A._get_tg_client(cfg).send(chat_id=chat_id, text=text, sid="voice_intake", topic_id=topic)
     except Exception:  # noqa: BLE001
         log.exception("voice_intake: confirmation send failed")
+
+
+def gc_audio(cfg: Any, slug: str) -> dict[str, Any]:
+    """Retention GC for ``feedback/_audio/`` blobs (T-0433 P3).
+
+    PRIMARY trigger: a blob whose ``F-*.md`` is promoted/dismissed (the operator
+    triaged it) is reaped — the audio is only needed while the note awaits review
+    (audit item-12 close-state). BACKSTOP: a blob older than
+    ``voice_audio_retention_days`` (an orphan, or a never-handled note) is reaped
+    so ``_audio`` can't grow unbounded. An OPEN note's audio survives until it is
+    actually handled. ``retention_days <= 0`` disables the age backstop.
+    """
+    import time
+    from bot_squad_worker import frontmatter as _fm
+
+    audio_dir = _audio_dir(cfg, slug)
+    if not audio_dir.exists():
+        return {"slug": slug, "removed": 0, "removed_files": []}
+    retention_days = int(getattr(cfg, "voice_audio_retention_days", _DEFAULT_AUDIO_RETENTION_DAYS) or 0)
+
+    # Classify blobs by their referencing F-*.md: terminal (triaged → reap now) vs
+    # tracked-open (an OPEN note → keep until handled, never age-reaped) vs orphan
+    # (no artifact → age backstop only).
+    terminal_blobs: set[str] = set()
+    tracked_blobs: set[str] = set()
+    fb_dir = _feedback_dir(cfg, slug)
+    for md in fb_dir.glob("F-*.md"):
+        try:
+            parsed = _fm.parse_or_none(md.read_text())
+        except OSError:
+            continue
+        if parsed is None:
+            continue
+        meta = parsed[0]
+        ref = str(meta.get("audio_ref", "") or "")
+        if not ref:
+            continue
+        name = Path(ref).name
+        tracked_blobs.add(name)
+        if str(meta.get("status", "") or "") in ("promoted", "dismissed"):
+            terminal_blobs.add(name)
+
+    now = time.time()
+    removed: list[str] = []
+    for blob in sorted(audio_dir.glob("*.oga")):
+        if blob.name in terminal_blobs:
+            triaged, aged = True, False
+        elif blob.name in tracked_blobs:
+            # An OPEN note's audio is the evidence — keep it until the operator
+            # triages (promote/dismiss); the age backstop does NOT apply.
+            continue
+        else:
+            triaged = False
+            try:
+                aged = retention_days > 0 and (now - blob.stat().st_mtime) > retention_days * 86400
+            except OSError:
+                continue
+        if triaged or aged:
+            try:
+                blob.unlink()
+                removed.append(blob.name)
+            except OSError:
+                log.warning("voice_intake: gc_audio could not unlink %s", blob)
+    if removed:
+        log.info("voice_intake: gc_audio reaped %d blob(s) in %s", len(removed), slug)
+    return {"slug": slug, "removed": len(removed), "removed_files": removed}

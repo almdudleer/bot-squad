@@ -839,3 +839,42 @@ def test_binding_gc_tick_swallows_gc_tmux_exceptions(
     )
     # Must not raise.
     binding_gc_tick(cfg)
+
+
+def test_voice_audio_gc_tick_runs_gc_audio_per_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0433 P3: voice_audio_gc_tick must call voice_intake.gc_audio per project
+    so triaged/aged audio blobs are reaped."""
+    from bot_squad_worker.jobs import voice_audio_gc_tick
+    from bot_squad_worker import voice_intake as _vi
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    gc_calls: list[str] = []
+    monkeypatch.setattr(
+        _vi, "gc_audio",
+        lambda c, s: gc_calls.append(s) or {"slug": s, "removed": 0, "removed_files": []},
+    )
+
+    voice_audio_gc_tick(cfg)
+    assert gc_calls == [proj.slug]
+
+
+def test_voice_audio_gc_tick_swallows_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing gc_audio pass must not kill the sweep."""
+    from bot_squad_worker.jobs import voice_audio_gc_tick
+    from bot_squad_worker import voice_intake as _vi
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    monkeypatch.setattr(
+        _vi, "gc_audio",
+        lambda c, s: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    # Must not raise.
+    voice_audio_gc_tick(cfg)

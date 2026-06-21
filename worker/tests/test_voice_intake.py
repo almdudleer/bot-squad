@@ -242,6 +242,78 @@ def test_process_voice_transcribe_timeout_unblocks_and_flags(tmp_path, monkeypat
     assert len(list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))) == 1
 
 
+# --- gc_audio (P3 retention) -----------------------------------------------
+
+def _audio_blob(cfg, name: str, *, age_days: float = 0.0):
+    import os, time
+    d = _cfg_audio(cfg)
+    p = d / name
+    p.write_bytes(b"OGG")
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(p, (old, old))
+    return p
+
+
+def _voice_artifact(cfg, *, uid: str, status: str | None):
+    """Write an F-*-voice-*.md referencing the blob, with optional close-state."""
+    fb = _cfg(cfg).data_dir if False else None  # noqa (keep linter calm)
+    from bot_squad_worker import voice_intake as _VI
+    fbd = _VI._feedback_dir(cfg, "bot-squad"); fbd.mkdir(parents=True, exist_ok=True)
+    st = f"status: {status}\n" if status else ""
+    (fbd / f"F-2026-06-21-voice-{uid}.md").write_text(
+        f"---\nsource: voice\naudio_ref: feedback/_audio/{uid}.oga\n{st}---\n\n# voice\n\nbody\n"
+    )
+
+
+def test_gc_audio_reaps_triaged_keeps_open(tmp_path):
+    """T-0433 P3: a blob whose F-*.md is promoted/dismissed (triaged) is reaped
+    PROMPTLY; an un-triaged (open) note's audio SURVIVES regardless of age until
+    it's actually handled (close-state is the primary trigger, audit-item-12)."""
+    from bot_squad_worker import voice_intake as _VI
+    cfg = _cfg(tmp_path)
+    cfg.voice_audio_retention_days = 30
+    _audio_blob(cfg, "prom.oga"); _voice_artifact(cfg, uid="prom", status="promoted")
+    _audio_blob(cfg, "dism.oga"); _voice_artifact(cfg, uid="dism", status="dismissed")
+    _audio_blob(cfg, "open.oga", age_days=99); _voice_artifact(cfg, uid="open", status=None)
+
+    res = _VI.gc_audio(cfg, "bot-squad")
+
+    d = _VI._audio_dir(cfg, "bot-squad")
+    assert not (d / "prom.oga").exists(), "promoted note's audio should be reaped"
+    assert not (d / "dism.oga").exists(), "dismissed note's audio should be reaped"
+    assert (d / "open.oga").exists(), "an OPEN note's audio must survive (even old) until triaged"
+    assert res["removed"] == 2
+
+
+def test_gc_audio_age_backstop_reaps_old_orphan(tmp_path):
+    """Backstop: a blob older than retention_days with NO (or still-open) artifact
+    is reaped so _audio can't grow unbounded from abandoned/orphaned notes."""
+    from bot_squad_worker import voice_intake as _VI
+    cfg = _cfg(tmp_path)
+    cfg.voice_audio_retention_days = 30
+    _audio_blob(cfg, "orphan-old.oga", age_days=45)   # no artifact at all
+    _audio_blob(cfg, "orphan-new.oga", age_days=2)    # young orphan → keep
+
+    res = _VI.gc_audio(cfg, "bot-squad")
+
+    d = _VI._audio_dir(cfg, "bot-squad")
+    assert not (d / "orphan-old.oga").exists(), "aged orphan should be reaped (backstop)"
+    assert (d / "orphan-new.oga").exists(), "young orphan should survive"
+    assert res["removed"] == 1
+
+
+def test_gc_audio_zero_retention_keeps_open_orphans(tmp_path):
+    """retention_days=0 disables the age backstop — only triaged notes are reaped."""
+    from bot_squad_worker import voice_intake as _VI
+    cfg = _cfg(tmp_path)
+    cfg.voice_audio_retention_days = 0
+    _audio_blob(cfg, "ancient.oga", age_days=999)  # orphan, no artifact
+    res = _VI.gc_audio(cfg, "bot-squad")
+    assert (_VI._audio_dir(cfg, "bot-squad") / "ancient.oga").exists()
+    assert res["removed"] == 0
+
+
 def test_process_voice_transcription_failure_still_stores_audio(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     from bot_squad_worker import voice_intake as _VI, transcribe as _T, actions as A

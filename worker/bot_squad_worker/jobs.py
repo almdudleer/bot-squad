@@ -419,6 +419,23 @@ def drift_check_tick(cfg: Config) -> None:
             log.exception("drift_check_tick: unhandled error for project %s", slug)
 
 
+def voice_audio_gc_tick(cfg: Config) -> None:
+    """T-0433 P3: per-project retention GC for voice-note audio blobs.
+
+    Reaps ``feedback/_audio/`` blobs whose F-*.md was promoted/dismissed (triaged)
+    and ages out abandoned orphans, so the audio store can't grow unbounded.
+    Low-frequency + idempotent; per-project errors are caught so one bad project
+    never kills the sweep.
+    """
+    from bot_squad_worker import voice_intake as _vi
+
+    for slug in cfg.projects:
+        try:
+            _vi.gc_audio(cfg, slug)
+        except Exception:
+            log.exception("voice_audio_gc_tick: unhandled error for project %s", slug)
+
+
 def autopilot_tick(cfg: Config) -> None:
     """T-0153: per-project autopilot watchdog pass.
 

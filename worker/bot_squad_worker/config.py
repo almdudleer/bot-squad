@@ -164,6 +164,10 @@ class Config:
     # without a deploy. 0 disables that guard.
     voice_max_duration_sec: int = 300
     voice_transcribe_timeout_sec: int = 120
+    # T-0433 P3: un-triaged voice-audio blob retention (days). A triaged
+    # (promoted/dismissed) note's audio is reaped immediately; this age backstop
+    # reaps abandoned/orphan blobs. 0 = triage-only GC.
+    voice_audio_retention_days: int = 30
 
     @property
     def data_dir(self) -> Path:
@@ -219,6 +223,7 @@ class Config:
         voice_enabled = False
         voice_max_duration_sec = 300
         voice_transcribe_timeout_sec = 120
+        voice_audio_retention_days = 30
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -239,6 +244,7 @@ class Config:
             voice_enabled = bool(voice_block.get("enabled", voice_enabled))
             voice_max_duration_sec = int(voice_block.get("max_duration_sec", voice_max_duration_sec))
             voice_transcribe_timeout_sec = int(voice_block.get("transcribe_timeout_sec", voice_transcribe_timeout_sec))
+            voice_audio_retention_days = int(voice_block.get("audio_retention_days", voice_audio_retention_days))
 
         return cls(
             config_dir=config_dir,
@@ -260,4 +266,5 @@ class Config:
             voice_enabled=voice_enabled,
             voice_max_duration_sec=voice_max_duration_sec,
             voice_transcribe_timeout_sec=voice_transcribe_timeout_sec,
+            voice_audio_retention_days=voice_audio_retention_days,
         )

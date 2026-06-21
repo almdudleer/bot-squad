@@ -26,6 +26,7 @@ from bot_squad_worker.jobs import (
     telemetry_tick,
     tg_listener_tick,
     tg_stall_tick,
+    voice_audio_gc_tick,
 )
 
 if TYPE_CHECKING:
@@ -157,6 +158,18 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="telemetry",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # voice_audio_gc_tick: T-0433 P3 — reap triaged/aged voice-note audio blobs so
+    # feedback/_audio can't grow unbounded. Low-frequency (every 6h); idempotent.
+    sched.add_job(
+        voice_audio_gc_tick,
+        "interval",
+        hours=6,
+        args=[cfg],
+        id="voice_audio_gc",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

@@ -559,7 +559,10 @@ export type SystemSettings = {
   // spawn-time. 0 = unlimited (fresh/legacy install stays uncapped).
   // max_parallel_sessions caps simultaneously-live sessions; max_total_tokens
   // bounds aggregate usage (against the telemetry quota).
-  caps: { max_parallel_sessions: number; max_total_tokens: number };
+  // T-0408: idle_suspend_sec = suspend an idle-but-live dev after N seconds to
+  // reclaim a slot (0 = OFF; in_progress devs are spared, T-0426). Optional for
+  // a pre-T-0408 API.
+  caps: { max_parallel_sessions: number; max_total_tokens: number; idle_suspend_sec?: number };
 };
 
 export type PutSystemSettingsBody = {
@@ -573,7 +576,7 @@ export type PutSystemSettingsBody = {
   session?: { ttl?: string };
   admin?: { coordinator_user?: string };
   // T-0240: partial update OK — an omitted cap keeps its current value.
-  caps?: { max_parallel_sessions?: number; max_total_tokens?: number };
+  caps?: { max_parallel_sessions?: number; max_total_tokens?: number; idle_suspend_sec?: number };
 };
 
 export type PutSystemSettingsResult = SystemSettings & {

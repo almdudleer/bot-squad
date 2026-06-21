@@ -116,6 +116,8 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   // an explicit "0" (= unlimited) — mirrors SystemSettings (T-0310).
   const [maxParallel, setMaxParallel] = useState<string>("0");
   const [maxTokens, setMaxTokens] = useState<string>("0");
+  // T-0408: idle-suspend window (seconds; 0 = OFF).
+  const [maxIdleSec, setMaxIdleSec] = useState<string>("0");
   const [loaded, setLoaded] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [util, setUtil] = useState<{ liveSessions: number; totalTokens: number } | null>(null);
@@ -131,8 +133,10 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
 
   const parallelNum = maxParallel.trim() === "" ? null : Number.parseInt(maxParallel, 10);
   const tokensNum = maxTokens.trim() === "" ? null : Number.parseInt(maxTokens, 10);
+  const idleNum = maxIdleSec.trim() === "" ? null : Number.parseInt(maxIdleSec, 10);
   const parallelErr = capInputError(maxParallel, "Max parallel sessions");
   const tokensErr = capInputError(maxTokens, "Max total tokens");
+  const idleErr = capInputError(maxIdleSec, "Idle-suspend window");
   const parallelWarn =
     parallelNum === null
       ? null
@@ -147,6 +151,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
         if (!alive) return;
         setMaxParallel(String(s.caps.max_parallel_sessions));
         setMaxTokens(String(s.caps.max_total_tokens));
+        setMaxIdleSec(String(s.caps.idle_suspend_sec ?? 0));
         setLoaded(true);
       })
       .catch(() => {
@@ -204,7 +209,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   async function save() {
     setNotice(null);
     setError(null);
-    const capErr = parallelErr ?? tokensErr;
+    const capErr = parallelErr ?? tokensErr ?? idleErr;
     if (capErr !== null) {
       setError(capErr);
       return;
@@ -213,10 +218,11 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
     try {
       // Caps-only partial update — leaves tg/session/admin settings untouched.
       const result = await api.putSystemSettings({
-        caps: { max_parallel_sessions: parallelNum ?? 0, max_total_tokens: tokensNum ?? 0 },
+        caps: { max_parallel_sessions: parallelNum ?? 0, max_total_tokens: tokensNum ?? 0, idle_suspend_sec: idleNum ?? 0 },
       });
       setMaxParallel(String(result.caps.max_parallel_sessions));
       setMaxTokens(String(result.caps.max_total_tokens));
+      setMaxIdleSec(String(result.caps.idle_suspend_sec ?? 0));
       // P2-01-FE: the BE restart_required is now the source of truth (P2-01-BE,
       // 5bc63ae) — it flags true ONLY for boot-cached fields (bot_token/proxy_url)
       // and false for a caps-only save (caps are fresh-read per spawn). Trust the
@@ -465,13 +471,40 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
                 </div>
               )}
             </div>
+            {/* T-0408: idle-suspend window. */}
+            <div>
+              <label htmlFor="pc-cap-idle" className="form-label" style={{ fontSize: "0.7rem" }}>
+                Idle-suspend window (sec)
+              </label>
+              <input
+                id="pc-cap-idle"
+                type="text"
+                inputMode="numeric"
+                className="form-control form-control-sm"
+                data-testid="process-cap-idle"
+                value={maxIdleSec}
+                disabled={!isAdmin || !loaded}
+                aria-invalid={idleErr !== null}
+                onChange={(e) => setMaxIdleSec(sanitizeCapInput(e.target.value))}
+                style={{ width: "9rem" }}
+              />
+              {idleErr ? (
+                <div style={{ color: "var(--mc-accent-danger, #d33)", fontSize: "0.66rem", marginTop: 2, maxWidth: "11.5rem" }}>
+                  {idleErr}
+                </div>
+              ) : (
+                <div style={{ color: "var(--mc-text-dim)", fontSize: "0.64rem", marginTop: 2, maxWidth: "11.5rem" }}>
+                  0 = off. 12h = 43200. Suspends an idle-but-live dev to reclaim a slot; in-progress devs are spared.
+                </div>
+              )}
+            </div>
             <div style={{ alignSelf: "flex-end" }}>
               <button
                 type="button"
                 className="btn btn-primary btn-sm"
                 data-testid="process-cap-save"
                 onClick={save}
-                disabled={saving || !isAdmin || !loaded || parallelErr !== null || tokensErr !== null}
+                disabled={saving || !isAdmin || !loaded || parallelErr !== null || tokensErr !== null || idleErr !== null}
                 title={isAdmin ? "Save caps (server-wide; fresh-read at each spawn — no restart needed)" : "Admin-only"}
               >
                 {saving ? "Saving…" : "Save caps"}

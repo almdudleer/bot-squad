@@ -1,7 +1,12 @@
 """Tests for app.task_body — three-section schema parse/compose/append."""
 from __future__ import annotations
 
-from app.task_body import append_progress, compose_body, parse_body
+from app.task_body import (
+    append_progress,
+    compose_body,
+    parse_body,
+    regraft_progress,
+)
 
 
 def test_parse_full_body():
@@ -110,3 +115,40 @@ def test_append_progress_empty_text_raises():
     import pytest
     with pytest.raises(ValueError):
         append_progress("## Verbatim request\n\nv\n", "T1", "S1", "   ")
+
+
+# --- T-0335 item-14: regraft_progress (append-only Progress is on-disk SSOT) --
+
+def test_regraft_progress_restores_on_disk_feed():
+    """A body edit that rewrites Progress is forced back to the on-disk feed;
+    other sections (Context) keep the caller's edit."""
+    original = (
+        "## Verbatim request\n\nV\n\n## Context\n\nold\n\n"
+        "## Progress\n\n- T1 · S1 · real note\n"
+    )
+    edited = (
+        "## Verbatim request\n\nV\n\n## Context\n\nNEW context\n\n"
+        "## Progress\n\n- forged · fake · agent rewrite\n"
+    )
+    out = regraft_progress(original, edited)
+    sections = parse_body(out)
+    assert "real note" in sections["progress"]
+    assert "forged" not in sections["progress"]
+    assert sections["context"] == "NEW context"
+
+
+def test_regraft_progress_reappends_when_caller_drops_it():
+    """A body that drops the Progress heading must not lose the feed."""
+    original = "## Verbatim request\n\nV\n\n## Progress\n\n- T1 · S1 · keep me\n"
+    edited = "## Verbatim request\n\nV\n\n## Context\n\nc\n"
+    out = regraft_progress(original, edited)
+    assert "keep me" in parse_body(out)["progress"]
+    assert "c" in parse_body(out)["context"]
+
+
+def test_regraft_progress_noop_when_original_has_none():
+    """No on-disk Progress → nothing to protect, caller's body is untouched."""
+    original = "## Verbatim request\n\nV\n\n## Context\n\nc\n"
+    edited = "## Verbatim request\n\nV\n\n## Progress\n\n- new · feed · x\n"
+    out = regraft_progress(original, edited)
+    assert "new · feed · x" in parse_body(out)["progress"]

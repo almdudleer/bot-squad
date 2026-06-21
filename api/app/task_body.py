@@ -98,6 +98,41 @@ def regraft_verbatim(original_body: str, new_body: str) -> str:
     return new_body[:new[0]] + orig_block + "\n\n" + new_body[new[1]:].lstrip("\n")
 
 
+_PROGRESS_HEADING_RE = re.compile(r"(?im)^##\s+progress\s*$")
+
+
+def _progress_span(body: str) -> tuple[int, int] | None:
+    """Char span of the ``## Progress`` section — its heading through just
+    before the NEXT ``## `` heading (or EOF). ``None`` if absent."""
+    m = _PROGRESS_HEADING_RE.search(body)
+    if m is None:
+        return None
+    nxt = _ANY_H2_RE.search(body, m.end())
+    return m.start(), (nxt.start() if nxt else len(body))
+
+
+def regraft_progress(original_body: str, new_body: str) -> str:
+    """Return ``new_body`` with its ``## Progress`` section forced back to
+    ``original_body``'s (T-0335 item-14).
+
+    Progress is an append-only audit feed (T-0238) whose SSOT is on disk — a
+    board "Edit body" PATCH must never rewrite or drop it. Mirrors
+    :func:`regraft_verbatim`: the splice is raw-text and scoped strictly to the
+    Progress heading, so every OTHER section the caller submitted (Verbatim,
+    Context, non-canonical sections) is preserved exactly. If the original had
+    no Progress section there is nothing to protect; if ``new_body`` dropped the
+    heading, the original feed is re-appended at the end.
+    """
+    orig = _progress_span(original_body)
+    if orig is None:
+        return new_body
+    orig_block = original_body[orig[0]:orig[1]].rstrip("\n")
+    new = _progress_span(new_body)
+    if new is None:
+        return new_body.rstrip("\n") + "\n\n" + orig_block + "\n"
+    return new_body[:new[0]] + orig_block + "\n\n" + new_body[new[1]:].lstrip("\n")
+
+
 def compose_body(verbatim: str, context: str, progress: str) -> str:
     """Emit canonical body. Empty sections are skipped entirely."""
     parts: list[str] = []

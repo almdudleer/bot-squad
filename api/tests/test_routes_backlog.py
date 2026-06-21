@@ -809,3 +809,45 @@ def test_patch_body_non_canonical_sections_survive(tmp_bot_squad: Path, monkeypa
     assert "SACRED" in verbatim and "TAMPER" not in verbatim
     assert "new dod text" in verbatim
     assert "## Finding" in verbatim
+
+
+# ---------------------------------------------------------------------------
+# T-0335 item-14: PATCH body must regraft the append-only ## Progress feed
+# (Progress is the on-disk SSOT — an "Edit body" must never rewrite history).
+# ---------------------------------------------------------------------------
+def test_patch_body_cannot_overwrite_progress(tmp_bot_squad: Path, monkeypatch):
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    original = (
+        "## Verbatim request\n\nV\n\n## Context\n\nctx\n\n"
+        "## Progress\n\n- T1 · S1 · real progress note\n"
+    )
+    tid = _create_with_body(client, original)
+
+    tampered = (
+        "## Verbatim request\n\nV\n\n## Context\n\nedited ctx\n\n"
+        "## Progress\n\n- forged · agent · rewritten history\n"
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}", json={"body": tampered}
+    )
+    assert r.status_code == 200, r.text
+    got = r.json()
+    # the append-only feed is preserved; the context edit still lands.
+    assert "real progress note" in got["progress"]
+    assert "rewritten history" not in got["progress"]
+    assert "edited ctx" in got["context"]
+
+
+def test_patch_body_preserves_progress_when_omitted(tmp_bot_squad: Path, monkeypatch):
+    """A body that drops the Progress heading must not lose the feed."""
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    tid = _create_with_body(
+        client,
+        "## Verbatim request\n\nV\n\n## Progress\n\n- T1 · S1 · keep this note\n",
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}",
+        json={"body": "## Verbatim request\n\nV\n\n## Context\n\nonly ctx now\n"},
+    )
+    assert r.status_code == 200, r.text
+    assert "keep this note" in r.json()["progress"]

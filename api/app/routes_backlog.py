@@ -16,7 +16,7 @@ from app.markdown_writer import (
 )
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
-from app.task_body import compose_body, parse_body, regraft_verbatim
+from app.task_body import compose_body, parse_body, regraft_progress, regraft_verbatim
 from app.worker_client import WorkerClient, WorkerError
 
 log = logging.getLogger(__name__)
@@ -281,10 +281,13 @@ def patch_task(
     updates = {k: v for k, v in payload.items() if k in allowed}
     body = payload.get("body")
     if body is not None:
-        # T-0289: `## Verbatim request` is human-only — a body replace must
-        # never clobber it. Re-graft the on-disk verbatim section over whatever
-        # the caller sent; every other section in `body` is preserved as-is.
-        body = regraft_verbatim(parse_task(path)["body"], body)
+        # T-0289 + T-0335 item-14: `## Verbatim request` (human-only) and
+        # `## Progress` (append-only audit feed, on-disk SSOT) must never be
+        # clobbered by a body replace. Re-graft both on-disk sections over
+        # whatever the caller sent; every other section in `body` is preserved.
+        on_disk = parse_task(path)["body"]
+        body = regraft_verbatim(on_disk, body)
+        body = regraft_progress(on_disk, body)
     try:
         merge_task_update(path, updates, body=body)
     except ValueError as e:

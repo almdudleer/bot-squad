@@ -101,13 +101,27 @@ def test_paused_takes_priority_over_suspended():
 
 
 # ---------------------------------------------------------------------------
-# T-0046: active-at-prompt rolls active sessions into needs-input.
+# T-0375 (Option A, supersedes T-0046): needs-input is driven by the PRECISE
+# awaiting_input signal (sid in tg_stall.blocked_sids — the agent actually
+# peer_send'd the operator), NOT the coarse active_at_prompt heuristic. An
+# idle-at-prompt autonomous dev parked at ❯ never decays, so it is idle/done
+# (reapable), not needs-input. See docs/architecture/D-0018.
 # ---------------------------------------------------------------------------
 
-def test_active_at_prompt_alone_yields_needs_input():
-    """An active session that's been quiet past the worker's threshold —
-    worker flagged active_at_prompt=True — flips the project to needs-input."""
-    rows = [_row("active", started_at="2026-05-14T09:00:00Z", active_at_prompt=True)]
+def test_active_at_prompt_not_blocked_is_idle():
+    """T-0375 repro: active_at_prompt=True but awaiting_input=False (parked at
+    the prompt, not actually waiting on a human) → idle, NOT needs-input."""
+    rows = [_row("active", started_at="2026-05-14T09:00:00Z",
+                 active_at_prompt=True, awaiting_input=False)]
+    out = aggregate_project_status(rows)
+    assert out["status"] == "idle"
+
+
+def test_awaiting_input_yields_needs_input():
+    """A session the worker flagged awaiting_input=True (peer_send'd the
+    operator, blocked on a reply) → needs-input."""
+    rows = [_row("active", started_at="2026-05-14T09:00:00Z",
+                 active_at_prompt=True, awaiting_input=True)]
     out = aggregate_project_status(rows)
     assert out["status"] == "needs-input"
     assert out["status_since"] == "2026-05-14T09:00:00Z"
@@ -134,16 +148,18 @@ def test_mixed_active_at_prompt_and_crunching_is_working():
     assert out["status_since"] == "2026-05-14T10:00:00Z"
 
 
-def test_active_at_prompt_plus_paused_uses_max_timestamp():
-    """needs-input status_since folds paused_at + at-prompt started_at."""
+def test_paused_plus_unblocked_at_prompt_is_needs_input_from_paused():
+    """T-0375: paused still yields needs-input; the active_at_prompt row (now
+    idle, not blocked) does NOT contribute — so status_since is the paused_at,
+    not the at-prompt started_at."""
     rows = [
-        _row("active", started_at="2026-05-14T15:00:00Z", active_at_prompt=True, sid="a"),
+        _row("active", started_at="2026-05-14T15:00:00Z", active_at_prompt=True,
+             awaiting_input=False, sid="a"),
         _row("paused", paused_at="2026-05-14T11:00:00Z", sid="b"),
     ]
     out = aggregate_project_status(rows)
     assert out["status"] == "needs-input"
-    # max across paused_at and at-prompt started_at.
-    assert out["status_since"] == "2026-05-14T15:00:00Z"
+    assert out["status_since"] == "2026-05-14T11:00:00Z"  # paused, not the idle at-prompt
 
 
 def test_missing_active_at_prompt_key_treated_as_false():

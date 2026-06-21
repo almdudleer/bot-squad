@@ -4,12 +4,19 @@ The canonical contract — see docs/architecture/D-0018-quick-status.md — deri
 single string per project from its session rows:
 
     working      = at least one `active` session genuinely crunching
-                   (active AND NOT active_at_prompt)
+                   (active AND NOT active_at_prompt AND NOT awaiting_input)
     needs-input  = no working, at least one `paused` (Ctrl-C'd) OR
-                   `active_at_prompt` (active pane idle past the
-                   IDLE_AT_PROMPT_SECONDS threshold — Claude finished
-                   its turn, human hasn't replied) — T-0046
-    idle         = otherwise (only suspended, or zero sessions)
+                   `awaiting_input` (the worker's PRECISE signal: sid in
+                   tg_stall.blocked_sids — the agent peer_send'd the operator
+                   and is blocked on a reply) — T-0375 Option A
+    idle         = otherwise (only suspended, zero sessions, OR active sessions
+                   merely idle-at-prompt but NOT blocked: an autonomous dev
+                   parked at ❯ is idle/done + reapable, not awaiting a human)
+
+    T-0375 supersedes T-0046: `active_at_prompt` no longer drives needs-input
+    (it never decays, so a finished dev parked at the prompt left the project
+    pill stuck on needs-input forever). It still excludes a session from
+    "working". The precise `awaiting_input` flag is the canonical signal.
 
 T-0025's mothership cache and T-0008's picker dropdown both consume this
 contract verbatim. Mapping is pure over the list_sessions row shape, so it
@@ -53,29 +60,38 @@ def aggregate_project_status(rows: list[dict]) -> dict:
     Returns: {"status": "working|needs-input|idle", "status_since": ISO|None}
     """
     actives = [r for r in rows if r.get("status") == "active"]
-    # T-0046: split `active` into genuinely-crunching vs at-prompt-idle. Only
-    # the crunching subset counts as "working"; the idle-at-prompt rows roll
-    # into needs-input alongside paused sessions.
-    workings = [r for r in actives if not r.get("active_at_prompt")]
+    # T-0046/T-0375: a session is "working" only if it's genuinely crunching —
+    # active, NOT idle-at-prompt, and NOT blocked awaiting input. The idle-at-
+    # prompt and blocked rows fall out of "working" below.
+    workings = [
+        r for r in actives
+        if not r.get("active_at_prompt") and not r.get("awaiting_input")
+    ]
     if workings:
         return {
             "status": "working",
             "status_since": _max_ts(workings, "started_at"),
         }
 
+    # T-0375 (Option A — supersedes T-0046): needs-input is driven by the
+    # PRECISE awaiting_input signal (sid in tg_stall.blocked_sids — the agent
+    # actually peer_send'd the operator and is blocked on a reply), plus paused
+    # (Ctrl-C'd) sessions. NOT the coarse `active_at_prompt` heuristic, which
+    # never decays: an idle-at-prompt autonomous dev parked at ❯ is idle/done
+    # (and reapable), not awaiting a human. See docs/architecture/D-0018.
     pauseds = [r for r in rows if r.get("status") == "paused"]
-    at_prompts = [r for r in actives if r.get("active_at_prompt")]
-    if pauseds or at_prompts:
-        # `paused_at` is the canonical needs-input timestamp; at-prompt rows
-        # don't carry a dedicated "idle-since" ISO so fall back to their
-        # `started_at`. _max_ts skips missing/non-string values.
+    blocked = [r for r in rows if r.get("awaiting_input")]
+    if pauseds or blocked:
+        # `paused_at` is the canonical needs-input timestamp; a blocked row that
+        # isn't paused falls back to its `started_at`. _max_ts-style skip of
+        # missing/non-string values.
         candidates: list[str] = []
         for r in pauseds:
             v = r.get("paused_at")
             if v and isinstance(v, str):
                 candidates.append(v)
-        for r in at_prompts:
-            v = r.get("started_at")
+        for r in blocked:
+            v = r.get("paused_at") or r.get("started_at")
             if v and isinstance(v, str):
                 candidates.append(v)
         return {

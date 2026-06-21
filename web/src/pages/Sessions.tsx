@@ -1835,7 +1835,11 @@ export function Sessions() {
   }
 
   return (
-    <div className="container py-4">
+    // T-0431: the PeerInbox FAB is fixed bottom-right; at narrow widths (~390px)
+    // it overlapped the last table row's ATTACH tap target (F-2026-06-21-inbox-
+    // 02d3cb26cc). Reserve bottom clearance so the last row always scrolls above
+    // the FAB band. Harmless on desktop (the FAB sits in the wide right margin).
+    <div className="container py-4" style={{ paddingBottom: "5rem" }}>
       {/* T-0127: in-UI peer-reply inbox (coexists with the TG mirror). */}
       <PeerInbox slug={slug} username={meUsername} />
       {/* Header */}

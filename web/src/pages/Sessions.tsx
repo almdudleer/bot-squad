@@ -401,10 +401,11 @@ export function Sessions() {
   // Row expansion (click-through cwd / metadata detail) and archived
   // section toggle.
   const [expandedSids, setExpandedSids] = useState<Set<string>>(new Set());
-  const [showArchived, setShowArchived] = useState(false);
-  // T-0232: the view is LIVE-only by default; this toggle reveals the
-  // suspended (non-archived) rows on demand without re-cluttering the board.
-  const [showSuspended, setShowSuspended] = useState(false);
+  // T-0389/audit item 19: ONE dead-tail escape hatch. The board is LIVE-only by
+  // default; a single "history" toggle reveals BOTH the suspended (non-archived)
+  // rows inline AND the archived section — replacing the old pair of separate
+  // controls (a `showSuspended` button + a `showArchived` <details>).
+  const [showHistory, setShowHistory] = useState(false);
 
   // T-0346: when arrived here from a home `needs-input` project card
   // (?needs_input=1), surface a banner pinpointing the waiting session(s) +
@@ -764,9 +765,10 @@ export function Sessions() {
 
     flashedSidRef.current = targetSid;
 
-    // Drop any filter that would hide the row.
+    // Drop any filter that would hide the row. T-0389 item 19: a suspended OR
+    // archived target is revealed by the single history toggle.
     setFilterInit("");
-    if (found.archived) setShowArchived(true);
+    if (found.archived || found.status === "suspended") setShowHistory(true);
     if (groupBy === "initiative") {
       const primary = (found.initiative ?? "").trim();
       const extras = (found.extra_initiatives ?? []).filter((i) => i && i !== "~");
@@ -830,7 +832,9 @@ export function Sessions() {
   // the toggle is on, in which case it falls back to all non-archived rows.
   const liveSessions: SessionRow[] = visibleSessions.filter(isLiveSession);
   const hiddenSuspendedCount = visibleSessions.length - liveSessions.length;
-  const boardSessions: SessionRow[] = showSuspended ? visibleSessions : liveSessions;
+  // T-0389 item 19: one history toggle reveals suspended (inline) + archived.
+  const hiddenHistoryCount = hiddenSuspendedCount + archivedSessions.length;
+  const boardSessions: SessionRow[] = showHistory ? visibleSessions : liveSessions;
 
   // T-0346: needs-input deep-link landing. The home/project card for a
   // needs-input project routes here with ?needs_input=1; pinpoint the waiting
@@ -2056,24 +2060,25 @@ export function Sessions() {
               </button>
             ))}
           </div>
-          {/* T-0232: the board is live-only by default. When suspended
-              (non-archived) rows are being hidden, surface a subtle count +
-              toggle so they stay reachable without re-cluttering the view. */}
-          {(hiddenSuspendedCount > 0 || showSuspended) && (
+          {/* T-0232 / T-0389 item 19: the board is live-only by default. ONE
+              history toggle reveals the dead tail — suspended rows (inline) AND
+              the archived section — so they stay reachable without two separate
+              escape hatches. */}
+          {(hiddenHistoryCount > 0 || showHistory) && (
             <button
               type="button"
-              className={`btn btn-sm ${showSuspended ? "btn-secondary" : "btn-outline-secondary"}`}
+              className={`btn btn-sm ${showHistory ? "btn-secondary" : "btn-outline-secondary"}`}
               style={{ fontSize: "0.72rem", padding: "0.15rem 0.55rem" }}
-              onClick={() => setShowSuspended((v) => !v)}
+              onClick={() => setShowHistory((v) => !v)}
               title={
-                showSuspended
-                  ? "Hide suspended sessions (show live only)"
-                  : "Reveal suspended (non-archived) sessions"
+                showHistory
+                  ? "Hide history (show live sessions only)"
+                  : "Reveal history — suspended + archived sessions"
               }
             >
-              {showSuspended
-                ? "hide suspended"
-                : `${hiddenSuspendedCount} suspended hidden — show`}
+              {showHistory
+                ? "hide history"
+                : `${hiddenHistoryCount} in history — show`}
             </button>
           )}
           <div className="d-flex align-items-center gap-2 ms-auto">
@@ -2173,17 +2178,16 @@ export function Sessions() {
         </div>
       )}
 
-      {/* Archived section — collapsible, off by default. */}
-      {sessions !== null && archivedSessions.length > 0 && (
-        <details
+      {/* Archived section — revealed by the SAME single history toggle as the
+          suspended rows (T-0389 item 19: one escape hatch, not a separate
+          <details> disclosure). */}
+      {sessions !== null && archivedSessions.length > 0 && showHistory && (
+        <div
           className="mt-3"
-          open={showArchived}
-          onToggle={(e) => setShowArchived((e.target as HTMLDetailsElement).open)}
           style={{ borderTop: "1px solid var(--mc-border)", paddingTop: "0.5rem" }}
         >
-          <summary
+          <div
             style={{
-              cursor: "pointer",
               fontFamily: "var(--mc-mono)",
               fontSize: "0.74rem",
               color: "var(--mc-text-dim)",
@@ -2193,7 +2197,7 @@ export function Sessions() {
             }}
           >
             Archived ({archivedSessions.length})
-          </summary>
+          </div>
           <div className="table-responsive mt-2">
             <table className="table table-hover align-middle" style={{ opacity: 0.85 }}>
               <thead>
@@ -2239,7 +2243,7 @@ export function Sessions() {
               </tbody>
             </table>
           </div>
-        </details>
+        </div>
       )}
 
       {/* New session modal */}

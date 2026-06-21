@@ -222,7 +222,19 @@ export function DocsSection() {
             ))}
           </div>
 
-          <ArtifactTreeView slug={slug} data={view} selectedKind={selectedKind} selectedId={selectedId} />
+          {/* T-0352: in the mixed "All" view, start the feedback section
+              collapsed so its ~33 F-* roots don't bury docs/use-cases. When the
+              rail is filtered to a single kind the user asked for it, so nothing
+              starts collapsed. `key={filter}` remounts the tree on a filter
+              switch, re-seeding the collapse defaults. */}
+          <ArtifactTreeView
+            key={filter}
+            slug={slug}
+            data={view}
+            selectedKind={selectedKind}
+            selectedId={selectedId}
+            defaultCollapsedSections={filter === "all" ? ["feedback"] : []}
+          />
         </div>
 
         {/* Detail pane — the active kind's page renders here, reading the shared

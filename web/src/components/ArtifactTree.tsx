@@ -2,6 +2,33 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ArtifactKind } from "../api";
 
+// T-0352 (ui-polish / dogfood D-0033): in the merged "All" view the ~33
+// materialized feedback (F-*) roots dominate the rail and bury the docs. The
+// tree sections are now collapsible; the caller seeds which sections start
+// collapsed (feedback, in the All view) via `defaultCollapsedSections`. This
+// pure seed builder maps each visible section to its initial collapsed flag —
+// extracted so the default policy is unit-testable without a DOM.
+export function seedCollapsed(
+  sections: string[],
+  defaultCollapsed: string[],
+): Record<string, boolean> {
+  const def = new Set(defaultCollapsed);
+  const out: Record<string, boolean> = {};
+  for (const s of sections) out[s] = def.has(s);
+  return out;
+}
+
+// Doc categories first (alphabetical), then the two store sections last so the
+// legacy docs view stays familiar. Shared by the view + tests.
+export function sortSections(sections: string[]): string[] {
+  const tail = ["use cases", "feedback"];
+  return [...sections].sort((a, b) => {
+    const ai = tail.indexOf(a), bi = tail.indexOf(b);
+    if (ai !== -1 || bi !== -1) return (ai === -1 ? -1 : ai) - (bi === -1 ? -1 : bi);
+    return a.localeCompare(b);
+  });
+}
+
 // T-0283 (Pillar C / D-0029): the unified cross-store artifact tree. Docs,
 // use-cases and feedback are all nestable artifacts joined by a single
 // `parent_doc_id` edge that may cross stores (a UC mother can have doc
@@ -198,36 +225,74 @@ function TreeNode({
 // The shared left-rail tree: root artifacts grouped by section (doc categories,
 // then use-cases, then feedback), each recursing its cross-store children.
 export function ArtifactTreeView({
-  slug, data, selectedKind, selectedId,
+  slug, data, selectedKind, selectedId, defaultCollapsedSections = [],
 }: {
   slug: string;
   data: ArtifactTreeData;
   selectedKind: ArtifactKind;
   selectedId: string | null;
+  // T-0352: sections that should start collapsed (e.g. ["feedback"] in the
+  // mixed All view so the F-* wall doesn't bury docs). Empty when the rail is
+  // filtered to a single kind — the user explicitly asked for that kind.
+  defaultCollapsedSections?: string[];
 }) {
+  const sections = useMemo(
+    () => sortSections([...data.rootsBySection.keys()]),
+    [data.rootsBySection],
+  );
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() =>
+    seedCollapsed(sections, defaultCollapsedSections),
+  );
+  // Seed the default collapsed flag for any section that appears after the
+  // async store load — without clobbering the user's manual toggles. (On a
+  // filter change the parent remounts this view via `key`, resetting toggles.)
+  useEffect(() => {
+    setCollapsed((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const s of sections) {
+        if (!(s in next)) { next[s] = defaultCollapsedSections.includes(s); changed = true; }
+      }
+      return changed ? next : prev;
+    });
+  }, [sections, defaultCollapsedSections]);
+
   if (data.error) return <div className="alert alert-danger py-1 small">{data.error}</div>;
   if (data.nodes === null) return <div className="mc-loading">Loading</div>;
   if (data.nodes.length === 0) return <div className="text-muted small">No artifacts yet.</div>;
-  // Doc categories first (alphabetical), then the two store sections last so the
-  // legacy docs view stays familiar.
-  const sections = [...data.rootsBySection.keys()].sort((a, b) => {
-    const tail = ["use cases", "feedback"];
-    const ai = tail.indexOf(a), bi = tail.indexOf(b);
-    if (ai !== -1 || bi !== -1) return (ai === -1 ? -1 : ai) - (bi === -1 ? -1 : bi);
-    return a.localeCompare(b);
-  });
+
   return (
     <>
-      {sections.map((sec) => (
-        <div key={sec} className="mb-2">
-          <div className="mc-sidebar-subsection" style={{ marginTop: 0 }}>{sec}</div>
-          <ul className="list-unstyled m-0">
-            {data.rootsBySection.get(sec)!.map((n) => (
-              <TreeNode key={`${n.kind}:${n.id}`} slug={slug} node={n} data={data} selectedKind={selectedKind} selectedId={selectedId} level={0} />
-            ))}
-          </ul>
-        </div>
-      ))}
+      {sections.map((sec) => {
+        const roots = data.rootsBySection.get(sec)!;
+        const isCollapsed = collapsed[sec] ?? false;
+        return (
+          <div key={sec} className="mb-2">
+            <button
+              type="button"
+              className="mc-sidebar-subsection w-100 text-start d-flex align-items-center"
+              style={{ marginTop: 0, background: "none", border: "none", cursor: "pointer", padding: 0 }}
+              aria-expanded={!isCollapsed}
+              onClick={() => setCollapsed((c) => ({ ...c, [sec]: !isCollapsed }))}
+            >
+              <span style={{ width: "0.9rem", display: "inline-block", color: "var(--mc-text-dim)" }}>
+                {isCollapsed ? "▸" : "▾"}
+              </span>
+              {sec}
+              <span style={{ color: "var(--mc-text-dim)", marginLeft: "0.35rem", fontWeight: 400 }}>
+                ({roots.length})
+              </span>
+            </button>
+            {!isCollapsed && (
+              <ul className="list-unstyled m-0">
+                {roots.map((n) => (
+                  <TreeNode key={`${n.kind}:${n.id}`} slug={slug} node={n} data={data} selectedKind={selectedKind} selectedId={selectedId} level={0} />
+                ))}
+              </ul>
+            )}
+          </div>
+        );
+      })}
     </>
   );
 }

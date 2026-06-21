@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildArtifactIndex, kindRoute, ArtifactNode } from "./ArtifactTree";
+import { buildArtifactIndex, kindRoute, seedCollapsed, sortSections, ArtifactNode } from "./ArtifactTree";
 
 // T-0283 (Pillar C / D-0029): the cross-store nesting tree is the core of the
 // ticket. These lock the uniform tree logic across the three stores.
@@ -48,6 +48,33 @@ describe("buildArtifactIndex — cross-store nesting", () => {
     // but D-1 may be re-parented under F-1's... no: F-1 is its descendant. D-1's
     // options exclude D-1 + F-1, leaving UC-1.
     expect(idx.parentOptions("D-1").map((n) => n.id)).toEqual(["UC-1"]);
+  });
+});
+
+describe("sortSections — doc categories first, store sections last (T-0352)", () => {
+  it("sorts doc categories alphabetically, then use cases, then feedback last", () => {
+    expect(sortSections(["feedback", "runbook", "use cases", "design", "architecture"]))
+      .toEqual(["architecture", "design", "runbook", "use cases", "feedback"]);
+  });
+});
+
+describe("seedCollapsed — default section collapse policy (T-0352)", () => {
+  it("collapses the feedback section by default in the mixed All view (the F-* wall fix)", () => {
+    const sections = sortSections(["design", "architecture", "feedback"]);
+    expect(seedCollapsed(sections, ["feedback"])).toEqual({
+      architecture: false,
+      design: false,
+      feedback: true,
+    });
+  });
+
+  it("collapses nothing when no defaults are given (single-kind filter — user asked for it)", () => {
+    expect(seedCollapsed(["feedback"], [])).toEqual({ feedback: false });
+  });
+
+  it("only marks sections that are actually present", () => {
+    // a default naming an absent section never invents a key
+    expect(seedCollapsed(["design"], ["feedback"])).toEqual({ design: false });
   });
 });
 

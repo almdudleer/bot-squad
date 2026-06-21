@@ -182,3 +182,64 @@ def test_peer_inbox_wait_worker_502(tmp_bot_squad: Path, monkeypatch):
             json={"timeout": 1},
         )
     assert r.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# T-0384: peer inbox read/wait are SID-owner-scoped (a caller can't drain /
+# long-poll another session's inbox). send stays anti-impersonation only.
+# ---------------------------------------------------------------------------
+
+def _make_nonadmin(tmp_bot_squad: Path) -> None:
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+
+
+def _write_session_md(tmp_bot_squad: Path, sid: str, owner_user: str) -> None:
+    sdir = tmp_bot_squad / "data" / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / f"{sid}.md").write_text(
+        f"---\nsid: {sid}\nstatus: active\nwindow: w\ncwd: /tmp/r\n"
+        f"claude_uuid: ~\ntask_id: ~\nowner_user: {owner_user}\nowner: {owner_user}\n---\n"
+    )
+
+
+_OTHER = "S-someoneelse-feat-p1"
+_OWN = "S-testuser-feat-p9"
+
+
+def test_peer_inbox_read_blocks_nonowner(tmp_bot_squad: Path, monkeypatch, fake_worker_peer: Path):
+    _make_nonadmin(tmp_bot_squad)
+    _write_session_md(tmp_bot_squad, _OTHER, "someoneelse")
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_peer) as client:
+        r = client.post(f"/api/projects/test-project/peer/{_OTHER}/read")
+    assert r.status_code == 403, r.text
+
+
+def test_peer_inbox_wait_blocks_nonowner(tmp_bot_squad: Path, monkeypatch, fake_worker_peer: Path):
+    _make_nonadmin(tmp_bot_squad)
+    _write_session_md(tmp_bot_squad, _OTHER, "someoneelse")
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_peer) as client:
+        r = client.post(f"/api/projects/test-project/peer/{_OTHER}/wait", json={"timeout": 0})
+    assert r.status_code == 403, r.text
+
+
+def test_peer_inbox_read_allows_owner(tmp_bot_squad: Path, monkeypatch, fake_worker_peer: Path):
+    _make_nonadmin(tmp_bot_squad)
+    _write_session_md(tmp_bot_squad, _OWN, "testuser")
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_peer) as client:
+        r = client.post(f"/api/projects/test-project/peer/{_OWN}/read")
+    assert r.status_code == 200, r.text
+
+
+def test_peer_inbox_read_admin_bypasses_ownership(tmp_bot_squad: Path, monkeypatch, fake_worker_peer: Path):
+    # conftest testuser is admin → may read any session's inbox.
+    _write_session_md(tmp_bot_squad, _OTHER, "someoneelse")
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_peer) as client:
+        r = client.post(f"/api/projects/test-project/peer/{_OTHER}/read")
+    assert r.status_code == 200, r.text

@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.routes_auth import require_auth
+from app.routes_sessions import _check_sid_ownership
 from app.worker_client import WorkerClient, WorkerError
 
 log = logging.getLogger(__name__)
@@ -81,9 +82,21 @@ async def peer_send(slug: str, body: SendBody, request: Request, user: dict = De
 
 
 @router.post("/{sid}/read")
-async def peer_inbox_read(slug: str, sid: str, request: Request) -> dict:
-    """Drain new inbox messages since the last read."""
+async def peer_inbox_read(
+    slug: str, sid: str, request: Request, user: dict = Depends(require_auth)
+) -> dict:
+    """Drain new inbox messages since the last read.
+
+    T-0384: ``read`` ADVANCES the seen offset, so an arbitrary caller draining
+    someone else's inbox both leaks messages AND makes the real owner miss
+    them. Scope to the SID owner (admin bypasses) — same helper as the session
+    lifecycle ops.
+    """
     _check_project(request, slug)
+    _check_sid_ownership(
+        sid, user, request.app.state.worker_router,
+        request.app.state.api_config.data_dir, slug,
+    )
     client = _worker(request)
     try:
         return await client.call_action("peer_inbox_read", {"slug": slug, "sid": sid})
@@ -92,13 +105,23 @@ async def peer_inbox_read(slug: str, sid: str, request: Request) -> dict:
 
 
 @router.post("/{sid}/wait")
-async def peer_inbox_wait(slug: str, sid: str, body: WaitBody, request: Request) -> dict:
+async def peer_inbox_wait(
+    slug: str, sid: str, body: WaitBody, request: Request,
+    user: dict = Depends(require_auth),
+) -> dict:
     """Long-poll until inbox grows past the seen offset, or timeout (<=1800s).
 
     Uses a dedicated long-timeout httpx client so the proxy hop doesn't drop
     the connection before the worker returns.
+
+    T-0384: scope to the SID owner (admin bypasses) so a caller can't long-poll
+    another session's incoming messages.
     """
     _check_project(request, slug)
+    _check_sid_ownership(
+        sid, user, request.app.state.worker_router,
+        request.app.state.api_config.data_dir, slug,
+    )
     timeout = max(0.0, min(float(body.timeout), 1800.0))
     # peer_inbox_wait is coordinator-only — inbox lives there.
     sock_path = request.app.state.worker_router.coordinator().sock_path

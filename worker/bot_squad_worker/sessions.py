@@ -3198,15 +3198,21 @@ def gc_stale_bindings(cfg: Any, slug: str) -> dict:
                 details.append({
                     "sid": sid, "task_id": task_id, "winner": winner_sid,
                     "stripped": True, "archived_already": True,
+                    "was_live": sid in live_sids,
                 })
                 continue
             meta["last_task_id"] = meta.get("task_id")
             meta["task_id"] = "~"
             meta["archive_reason"] = "stale-binding"
             _write_session_metadata(md, meta, atomic=True)
+            # T-0227: was_live distinguishes the genuine CONCURRENT-LIVE dup (the
+            # T-0218 race — the stripped loser is still running claude against the
+            # shared worktree = a co-edit hazard the operator must kill) from the
+            # crash-only case (a dead-pane md the backstop silently cleans up).
             details.append({
                 "sid": sid, "task_id": task_id, "winner": winner_sid,
                 "stripped": True, "archived_already": False,
+                "was_live": sid in live_sids,
             })
 
     return {"ok": True, "scanned": scanned, "stripped": len(details), "details": details}

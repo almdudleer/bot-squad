@@ -3419,6 +3419,39 @@ def test_gc_stale_bindings_picks_live_winner(tmp_path, monkeypatch):
     assert loser_meta["task_id"] is None  # ~ → parsed as None
     assert loser_meta["last_task_id"] == "T-0026"
     assert loser_meta["archive_reason"] == "stale-binding"
+    # T-0227: the loser was a DEAD-pane (suspended) → crash-only strip, NOT a live
+    # race → was_live False → binding_gc_tick stays silent (no operator alert).
+    assert result["details"][0]["was_live"] is False
+
+
+def test_gc_stale_bindings_flags_live_loser_for_surface(tmp_path, monkeypatch):
+    """T-0227: when BOTH dup claimants are LIVE (the real concurrent-spawn race,
+    not a crash artifact), the stripped loser is flagged was_live=True so
+    binding_gc_tick surfaces it — that loser is still running claude against the
+    shared worktree (the co-edit hazard) until the operator kills it."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    # BOTH live: winner (later started) %5/multi_server, loser (earlier) %60/dev.
+    monkeypatch.setattr(S, "list_panes", lambda: [
+        _fake_pane(pane_id="%5", window="multi_server"),
+        _fake_pane(pane_id="%60", window="dev"),
+    ])
+    sess = tmp_path / "data" / "test-project" / "sessions"
+    _write_session_metadata(sess / "S-testuser-multi_server-p5.md", {
+        "sid": "S-testuser-multi_server-p5", "status": "active",
+        "task_id": "T-0026", "started_at": "2026-05-20T10:00:00Z"})
+    _write_session_metadata(sess / "S-testuser-dev-p60.md", {
+        "sid": "S-testuser-dev-p60", "status": "active",
+        "task_id": "T-0026", "started_at": "2026-05-15T11:18:04Z"})
+
+    result = S.gc_stale_bindings(cfg, "test-project")
+    assert result["stripped"] == 1
+    d = result["details"][0]
+    assert d["sid"] == "S-testuser-dev-p60"
+    assert d["winner"] == "S-testuser-multi_server-p5"
+    assert d["was_live"] is True  # the genuine concurrent-live race → surfaceable
 
 
 def test_gc_stale_bindings_no_dup_is_noop(tmp_path, monkeypatch):

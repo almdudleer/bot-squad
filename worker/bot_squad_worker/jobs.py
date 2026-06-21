@@ -376,9 +376,38 @@ def binding_gc_tick(cfg: Config) -> None:
     for slug in cfg.projects:
         for name, fn in passes:
             try:
-                fn(cfg, slug)
+                res = fn(cfg, slug)
+                if name == "gc_stale_bindings":
+                    _surface_live_dup_reconciles(cfg, slug, res)
             except Exception:
                 log.exception("binding_gc_tick: %s failed for %s", name, slug)
+
+
+def _surface_live_dup_reconciles(cfg: Config, slug: str, result: object) -> None:
+    """T-0227: gc_stale_bindings auto-reconciles >1 sessions claiming one task_id,
+    but SILENTLY — fine for the crash-only case (a dead-pane md). When the loser
+    was LIVE, though, two sessions genuinely raced onto the task (the T-0218
+    hazard): stripping the loser's binding does NOT stop its process — it keeps
+    running claude against the SHARED worktree (the co-edit damage vector). Alert
+    the operator to kill the rogue session. Best-effort; never raises into the tick.
+    """
+    if not isinstance(result, dict):
+        return
+    project = cfg.projects.get(slug)
+    for d in result.get("details", []):
+        if not d.get("was_live"):
+            continue
+        try:
+            _alert_operators(
+                cfg, slug, project,
+                f"⚠️ duplicate-spawn auto-reconciled — {slug}/{d.get('task_id')}: two "
+                f"LIVE sessions raced onto one task. Kept {d.get('winner')}; unbound "
+                f"{d.get('sid')}, but that session is STILL RUNNING against the shared "
+                f"worktree (co-edit hazard). Kill {d.get('sid')} — it no longer holds "
+                f"the task.")
+        except Exception:
+            log.exception("binding_gc_tick: live-dup surface failed for %s/%s",
+                          slug, d.get("task_id"))
 
 
 def telemetry_tick(cfg: Config) -> None:

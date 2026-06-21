@@ -878,3 +878,39 @@ def test_voice_audio_gc_tick_swallows_exceptions(
     )
     # Must not raise.
     voice_audio_gc_tick(cfg)
+
+
+def test_surface_live_dup_reconciles_alerts_only_on_live_loser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0227: binding_gc_tick surfaces a gc_stale_bindings reconcile to the
+    operator ONLY when the stripped loser was LIVE (a genuine concurrent-spawn
+    race — the rogue session is still running). A crash-only strip (was_live
+    False) stays silent."""
+    from bot_squad_worker.jobs import _surface_live_dup_reconciles
+    from bot_squad_worker import jobs as J
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    alerts: list[str] = []
+    monkeypatch.setattr(J, "_alert_operators", lambda c, s, p, text: alerts.append(text))
+
+    # Live loser → one alert that names the task + the rogue SID + "kill".
+    _surface_live_dup_reconciles(cfg, proj.slug, {"details": [
+        {"sid": "S-u-dev-p60", "task_id": "T-0026", "winner": "S-u-a-p5", "was_live": True},
+    ]})
+    assert len(alerts) == 1
+    assert "T-0026" in alerts[0] and "S-u-dev-p60" in alerts[0] and "Kill" in alerts[0]
+
+    # Crash-only strip (was_live False) → silent.
+    alerts.clear()
+    _surface_live_dup_reconciles(cfg, proj.slug, {"details": [
+        {"sid": "S-u-x-p1", "task_id": "T-0026", "winner": "S-u-a-p5", "was_live": False},
+    ]})
+    assert alerts == []
+
+    # Non-dict / no details → no raise, no alert.
+    _surface_live_dup_reconciles(cfg, proj.slug, None)
+    _surface_live_dup_reconciles(cfg, proj.slug, {})
+    assert alerts == []

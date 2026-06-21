@@ -808,3 +808,77 @@ def test_admin_can_create_server(tmp_bot_squad: Path, monkeypatch):
     body = r.json()
     assert body["install_token"]  # legit admin path still mints a token
     assert body["install_url"].endswith("/install.sh")
+
+
+# ---- T-0377: is_self ACCESS bypass must NOT confer write/management standing --
+# _can_access / _require_owner short-circuit on is_self (every user can ENTER
+# their own install's self-server). For READ/proxy that's fine (local-api auth
+# re-applies on fan-in), but the management/credential-mint routes (invites,
+# grants) mutate the mothership store DIRECTLY with no fan-in — so a non-admin
+# passing the is_self gate could mint an admin-role invite = privilege escalation.
+# Owner is deliberately someone_else: the bug is the is_self bypass, not ownership.
+
+
+def test_nonadmin_cannot_create_invite_on_self_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=False)
+    _seed_connected_server(
+        tmp_bot_squad, server_id="srv_self", owner_user="someone_else", is_self=True
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "intruder")
+        r = client.post(
+            "/api/m/servers/srv_self/invites",
+            json={"target_username": "bob", "role": "admin"},  # valid payload
+        )
+    # Must be denied BEFORE minting — a 400 (past the gate) is the bug.
+    assert r.status_code == 403, r.text
+    assert "invite_token" not in r.text
+
+
+def test_admin_can_create_invite_on_self_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=True, intruder_is_admin=False)
+    _seed_connected_server(
+        tmp_bot_squad, server_id="srv_self", owner_user="someone_else", is_self=True
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "testuser")
+        r = client.post(
+            "/api/m/servers/srv_self/invites",
+            json={"target_username": "bob", "role": "non-admin"},
+        )
+    assert r.status_code == 200, r.text  # legit install-admin invite still works
+    assert r.json()["invite_token"]
+
+
+def test_nonadmin_cannot_create_grant_on_self_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=False)
+    _seed_connected_server(
+        tmp_bot_squad, server_id="srv_self", owner_user="someone_else", is_self=True
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "intruder")
+        r = client.post("/api/m/servers/srv_self/grants", json={"username": "bob"})
+    assert r.status_code == 403, r.text
+
+
+def test_nonadmin_cannot_list_grants_on_self_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=False)
+    _seed_connected_server(
+        tmp_bot_squad, server_id="srv_self", owner_user="someone_else", is_self=True
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "intruder")
+        r = client.get("/api/m/servers/srv_self/grants")
+    assert r.status_code == 403, r.text
+
+
+def test_admin_can_manage_grants_on_self_server(tmp_bot_squad: Path, monkeypatch):
+    _write_auth(tmp_bot_squad, testuser_is_admin=True, intruder_is_admin=False)
+    _seed_connected_server(
+        tmp_bot_squad, server_id="srv_self", owner_user="someone_else", is_self=True
+    )
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "testuser")
+        assert client.get("/api/m/servers/srv_self/grants").status_code == 200
+        r = client.post("/api/m/servers/srv_self/grants", json={"username": "bob"})
+    assert r.status_code == 200, r.text

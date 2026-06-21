@@ -86,6 +86,28 @@ def _require_super_admin(user: dict = Depends(require_auth)) -> dict:
     return user
 
 
+def _is_global_admin(user: dict) -> bool:
+    """Same super-admin predicate as ``_require_super_admin`` (T-0216 global_role)."""
+    return user.get("global_role") == GlobalRole.GLOBAL_ADMIN.value
+
+
+def _require_admin_on_self(server, user: dict) -> None:
+    """T-0377: the ``is_self`` ACCESS bypass must NOT confer WRITE/management
+    standing to a non-admin.
+
+    ``_can_access`` / ``_require_owner`` short-circuit on ``is_self`` so every
+    authenticated user can ENTER their own install's self-server. For READ /
+    proxy routes that's safe — they fan IN to the LOCAL api, whose own auth
+    re-applies. But the management + credential-mint routes (invites, grants)
+    mutate the mothership store DIRECTLY with no fan-in, so the bypass let a
+    non-admin e.g. mint an admin-role invite on ``is_self`` = privilege
+    escalation (the T-0376 follow-on). Those actions still require global-admin
+    on the self-server; this raises 403 BEFORE any mutation when they don't.
+    """
+    if getattr(server, "is_self", False) and not _is_global_admin(user):
+        raise HTTPException(status_code=403, detail="super-admin only on this server")
+
+
 def _has_active_grant(server, username: str | None) -> bool:
     """True iff ``username`` holds a non-revoked grant on ``server``.
 
@@ -141,6 +163,9 @@ def _require_owner(server, user: dict) -> None:
     standing here either.
     """
     if getattr(server, "is_self", False):
+        # T-0377: grant management on the self-server is an admin action — the
+        # is_self bypass must not give a non-admin owner standing.
+        _require_admin_on_self(server, user)
         return
     if user.get("username") == server.owner_user:
         return
@@ -390,6 +415,9 @@ def create_invite(
     if server_entry is None:
         raise HTTPException(status_code=404, detail="server not found")
     _require_server_access(server_entry, user)
+    # T-0377: minting an invite (incl role=admin) is a credential-mint admin
+    # action; the is_self access bypass must not let a non-admin mint one.
+    _require_admin_on_self(server_entry, user)
     target_username = (payload.get("target_username") or "").strip()
     role = (payload.get("role") or "").strip()
     if not target_username:

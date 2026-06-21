@@ -825,8 +825,11 @@ export const api = {
     }),
   deleteTask: (slug: string, id: string) =>
     call(`/api/projects/${slug}/backlog/${id}`, { method: "DELETE" }),
-  addComment: (slug: string, id: string, body: string) =>
-    call<Task>(`/api/projects/${slug}/backlog/${id}/comments`, { method: "POST", body: JSON.stringify({ body }) }),
+  // T-0389/audit item 18: the `## Comments` channel is cut. addComment had ZERO
+  // callers (the board "add comment" kebab posts a Progress note via addProgress,
+  // T-0238) and the appended ## Comments section was rendered nowhere — comments
+  // vanished into a dead md section. Removed; backend /comments route removal
+  // coordinated with Team-1.
   addProgress: (slug: string, id: string, sid: string, text: string) =>
     call<{ ok: boolean; task_id: string; line_appended: string }>(
       `/api/projects/${slug}/backlog/${id}/progress`,
@@ -1182,7 +1185,6 @@ export type ProjectApi = Pick<
   | "patchTask"
   | "patchTaskPriority"
   | "deleteTask"
-  | "addComment"
   | "addProgress"
   | "pauseSession"
   | "suspendSession"

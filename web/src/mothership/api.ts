@@ -499,11 +499,8 @@ export function apiFor(serverId: string): ServerApi {
       }),
     deleteTask: (slug, id) =>
       fwd(`/api/projects/${slug}/backlog/${id}`, { method: "DELETE" }),
-    addComment: (slug, id, body) =>
-      fwd<Task>(`/api/projects/${slug}/backlog/${id}/comments`, {
-        method: "POST",
-        body: JSON.stringify({ body }),
-      }),
+    // T-0389/audit item 18: `## Comments` channel cut (dead addComment + orphaned
+    // /comments route). The board comment kebab posts a Progress note instead.
     addProgress: (slug, id, sid, text) =>
       fwd<{ ok: boolean; task_id: string; line_appended: string }>(
         `/api/projects/${slug}/backlog/${id}/progress`,

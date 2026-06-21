@@ -271,6 +271,86 @@ def test_pause_session_worker_502(tmp_bot_squad: Path, monkeypatch, fake_worker_
 
 
 # ---------------------------------------------------------------------------
+# POST / DELETE /api/projects/{slug}/sessions/{sid}/pin  (T-0437)
+# ---------------------------------------------------------------------------
+
+def test_pin_session_success(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["pinned"] is True
+    assert data["sid"] == "S-almdudleer-spec5-p2"
+    assert data["pinned_by"] == "testuser"
+    assert data["pinned_at"]  # iso timestamp stamped
+
+
+def test_pin_then_list_stamps_pinned(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    """A pinned session surfaces with pinned/pinned_by/pinned_at on the list —
+    one fetch feeds both the Processes view and the Board card."""
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+        r = client.get("/api/projects/test-project/sessions")
+    assert r.status_code == 200
+    row = r.json()[0]
+    assert row["sid"] == "S-almdudleer-spec5-p2"
+    assert row["pinned"] is True
+    assert row["pinned_by"] == "testuser"
+    assert row["pinned_at"]
+
+
+def test_list_unpinned_default_false(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.get("/api/projects/test-project/sessions")
+    assert r.status_code == 200
+    row = r.json()[0]
+    assert row["pinned"] is False
+    assert "pinned_by" not in row
+
+
+def test_unpin_session_success(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+        r = client.delete("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+        assert r.status_code == 200, r.text
+        assert r.json()["pinned"] is False
+        assert r.json()["was_pinned"] is True
+        # And the list no longer flags it.
+        row = client.get("/api/projects/test-project/sessions").json()[0]
+    assert row["pinned"] is False
+
+
+def test_unpin_idempotent_when_not_pinned(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.delete("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+    assert r.status_code == 200
+    assert r.json()["was_pinned"] is False
+
+
+def test_pin_requires_auth(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    with _anon_client(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+    assert r.status_code == 401
+
+
+def test_pin_requires_admin_403_for_nonadmin(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    """T-0381: pin is a project WRITE → gated by require_project_member
+    (admin-only today). A non-admin gets 403, not a silent pin."""
+    _set_auth_with_meta(tmp_bot_squad, is_admin=False, linux_user="tu")
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+    assert r.status_code == 403
+
+
+def test_unpin_requires_admin_403_for_nonadmin(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
+    _set_auth_with_meta(tmp_bot_squad, is_admin=False, linux_user="tu")
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.delete("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
+    assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
 # POST /api/projects/{slug}/sessions/{sid}/resume
 # ---------------------------------------------------------------------------
 

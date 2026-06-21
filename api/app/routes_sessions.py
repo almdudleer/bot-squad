@@ -9,6 +9,7 @@ Phase 2 multi-user: session ops route through the WorkerRouter:
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import logging
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app import pins_store
 from app.frontmatter import parse_or_none
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
@@ -224,8 +226,18 @@ async def list_sessions(
                 merged[sid] = row
 
     rows = list(merged.values())
+    # T-0437: stamp the per-project pin signal onto each row so the Processes
+    # view can surface pinned sessions distinctly and the Board card can show a
+    # 📌 marker — both read off this ONE list (no extra fetch). Pins are an
+    # API-side store; the worker doesn't know about them.
+    pins = pins_store.load(_data_dir(request), slug)
     for r in rows:
         r["live"] = _is_live(r.get("activity"))  # T-0232
+        meta = pins.get(r.get("sid"))
+        r["pinned"] = meta is not None
+        if meta is not None:
+            r["pinned_by"] = meta.get("by")
+            r["pinned_at"] = meta.get("at")
     if user.get("is_admin"):
         return rows
     # Non-admin: drop rows whose owner doesn't match. Missing owner
@@ -302,6 +314,44 @@ async def pause_session(
         return await client.call_action("pause_session", {"slug": slug, "sid": sid})
     except WorkerError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# POST / DELETE /api/projects/{slug}/sessions/{sid}/pin  (T-0437)
+# ---------------------------------------------------------------------------
+#
+# Pin = a user signal ("I'm working closely with this session"). It is a hint
+# surfaced in the UI; it does NOT change orchestration. Pins are per-project
+# (the brain is per-project) and stored API-side (pins_store) — no worker hop.
+#
+# Authz: a pin mutates per-project state, so it goes through the project-WRITE
+# SSOT (require_project_member, T-0381) — admin-only today, same as every other
+# project write. Reads (the pinned flag on the sessions list) stay broad.
+
+@router.post("/{sid}/pin")
+async def pin_session(
+    slug: str, sid: str, request: Request,
+    user: dict = Depends(require_project_member),
+) -> dict:
+    """Pin a session within the project. Idempotent."""
+    _check_project(request, slug)
+    at = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = pins_store.pin(
+        _data_dir(request), slug, sid, by=user.get("username") or "", at=at,
+    )
+    return {"ok": True, "sid": sid, "pinned": True,
+            "pinned_by": meta["by"], "pinned_at": meta["at"]}
+
+
+@router.delete("/{sid}/pin")
+async def unpin_session(
+    slug: str, sid: str, request: Request,
+    user: dict = Depends(require_project_member),
+) -> dict:
+    """Unpin a session within the project. Idempotent."""
+    _check_project(request, slug)
+    was_pinned = pins_store.unpin(_data_dir(request), slug, sid)
+    return {"ok": True, "sid": sid, "pinned": False, "was_pinned": was_pinned}
 
 
 # ---------------------------------------------------------------------------

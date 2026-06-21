@@ -117,21 +117,22 @@ export const LIVE_STATUSES: ReadonlySet<string> = new Set(["active", "paused"]);
 
 // ---------------------------------------------------------------------------
 // T-0346 — per-session "waiting for the operator's input" predicate.
-//
-// The PROJECT-level quick-status rolls up to `needs-input` (quick_status.py /
-// D-0018) when there's no working session but ≥1 session is either `paused`
-// (Ctrl-C'd, pane still open) OR `active_at_prompt` (an active pane idle past
-// IDLE_AT_PROMPT_SECONDS — Claude finished its turn, the human hasn't replied).
-// This is the per-ROW projection of that exact rule, so the home needs-input
-// deep-link can re-derive WHICH sessions are waiting client-side — the project
-// quick-status payload carries only {status, status_since}, not the waiting SID.
-// Keep this in lock-step with quick_status.aggregate_project_status.
+// T-0375 / audit item 1 (Fork-1 CLOSE 1): re-aligned with the backend canonical
+// signal. The PROJECT-level quick-status (quick_status.py) rolls up to
+// `needs-input` when there's no working session but ≥1 session is either
+// `paused` (Ctrl-C'd, pane still open) OR `awaiting_input` (the PRECISE signal:
+// sid in tg_stall.blocked_sids — the agent peer_send'd the operator and is
+// blocked on a reply). T-0375 dropped the coarse `active_at_prompt` heuristic
+// (it never decayed → a finished autonomous dev parked at ❯ stuck the pill on
+// needs-input forever). This per-ROW mirror MUST match: paused OR awaiting_input
+// — the row-mirror had drifted, still reading active_at_prompt. Keep in
+// lock-step with quick_status.aggregate_project_status.
 // ---------------------------------------------------------------------------
 export function sessionNeedsInput(
   src:
     | {
         status?: string | null;
-        active_at_prompt?: boolean | null;
+        awaiting_input?: boolean | null;
         archived?: boolean | null;
       }
     | null
@@ -139,7 +140,7 @@ export function sessionNeedsInput(
 ): boolean {
   if (!src || src.archived) return false;
   if (src.status === "paused") return true;
-  return src.status === "active" && src.active_at_prompt === true;
+  return src.awaiting_input === true;
 }
 
 // ---------------------------------------------------------------------------

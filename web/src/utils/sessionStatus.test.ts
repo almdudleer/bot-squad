@@ -143,17 +143,18 @@ describe("sessionNeedsInput", () => {
     expect(sessionNeedsInput({ status: "paused" })).toBe(true);
   });
 
-  it("flags an active pane idle at the prompt", () => {
+  it("flags an active session blocked awaiting operator input (T-0375 canonical signal)", () => {
     expect(
-      sessionNeedsInput({ status: "active", active_at_prompt: true }),
+      sessionNeedsInput({ status: "active", awaiting_input: true }),
     ).toBe(true);
   });
 
-  it("does NOT flag an active pane that is still crunching", () => {
+  it("does NOT flag a merely idle-at-prompt active pane (T-0375 dropped active_at_prompt)", () => {
+    // active_at_prompt no longer drives needs-input — a finished autonomous dev
+    // parked at ❯ but NOT blocked must read as idle, not needs-input.
     expect(
-      sessionNeedsInput({ status: "active", active_at_prompt: false }),
+      sessionNeedsInput({ status: "active", awaiting_input: false }),
     ).toBe(false);
-    // active without the flag (pre-T-0046 worker) is treated as crunching.
     expect(sessionNeedsInput({ status: "active" })).toBe(false);
   });
 
@@ -168,7 +169,7 @@ describe("sessionNeedsInput", () => {
     expect(
       sessionNeedsInput({
         status: "active",
-        active_at_prompt: true,
+        awaiting_input: true,
         archived: true,
       }),
     ).toBe(false);

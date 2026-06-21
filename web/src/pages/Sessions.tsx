@@ -827,8 +827,8 @@ export function Sessions() {
 
   // T-0346: needs-input deep-link landing. The home/project card for a
   // needs-input project routes here with ?needs_input=1; pinpoint the waiting
-  // session(s) — paused or active-at-prompt (sessionNeedsInput mirrors the
-  // project-level quick_status rollup) — so the operator lands on WHAT needs
+  // session(s) — paused or awaiting_input (sessionNeedsInput mirrors the
+  // project-level quick_status rollup, T-0375 canonical) — so the operator lands on WHAT needs
   // input + its attach command, not the generic board.
   const needsInputView = searchParams.get("needs_input") != null;
   const waitingSessions: SessionRow[] = useMemo(

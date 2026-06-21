@@ -42,7 +42,10 @@ export function DocsSection() {
   const [searchParams] = useSearchParams();
 
   // The ONE cross-store artifact tree the whole section shares.
-  const tree = useArtifacts(slug, 0);
+  // item-12: feedback default-hides closed (promoted/dismissed); this toggle
+  // re-fetches the tree with them included so closed items stay reviewable.
+  const [showClosedFeedback, setShowClosedFeedback] = useState(false);
+  const tree = useArtifacts(slug, 0, showClosedFeedback);
 
   const [filter, setFilter] = useState<FilterKind>("all");
 
@@ -232,6 +235,22 @@ export function DocsSection() {
               </button>
             ))}
           </div>
+
+          {/* item-12: reveal closed (promoted/dismissed) feedback, hidden by
+              default. Shown when feedback is in view (All or Feedback filter). */}
+          {(filter === "all" || filter === "feedback") && (
+            <label
+              className="d-flex align-items-center gap-1 mb-2"
+              style={{ fontSize: "0.66rem", color: "var(--mc-text-dim)", cursor: "pointer" }}
+            >
+              <input
+                type="checkbox"
+                checked={showClosedFeedback}
+                onChange={(e) => setShowClosedFeedback(e.target.checked)}
+              />
+              Show closed feedback (promoted / dismissed)
+            </label>
+          )}
 
           {/* T-0352/T-0364: in the mixed "All" view start EVERY group collapsed
               (was just feedback) so the page opens as a compact counted index

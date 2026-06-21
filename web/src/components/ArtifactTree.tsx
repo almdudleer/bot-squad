@@ -61,6 +61,9 @@ export type ArtifactNode = {
   routeId: string;
   // Left-rail grouping header for ROOT nodes (doc category, or the store name).
   section: string;
+  // item-12: close-state for feedback nodes (promoted/dismissed) → small badge
+  // when "Show closed" is on. Absent/"" for open items + non-feedback kinds.
+  status?: string;
 };
 
 const KIND_ICON: Record<ArtifactKind, string> = {
@@ -153,7 +156,7 @@ export function buildArtifactIndex(nodes: ArtifactNode[]): ArtifactIndex {
 
 // Load + index all three stores into one cross-store node set. `reloadKey`
 // bumps re-fetch after a mutation.
-export function useArtifacts(slug: string, reloadKey: number): ArtifactTreeData {
+export function useArtifacts(slug: string, reloadKey: number, includeClosedFeedback = false): ArtifactTreeData {
   const [nodes, setNodes] = useState<ArtifactNode[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
@@ -162,7 +165,9 @@ export function useArtifacts(slug: string, reloadKey: number): ArtifactTreeData 
     let alive = true;
     setNodes(null);
     setError(null);
-    Promise.allSettled([api.docs(slug), api.useCases(slug), api.feedback(slug)])
+    // item-12: feedback default-hides closed (promoted/dismissed); the rail's
+    // "Show closed" toggle re-fetches with them included.
+    Promise.allSettled([api.docs(slug), api.useCases(slug), api.feedback(slug, includeClosedFeedback)])
       .then(([docsR, ucR, fbR]) => {
         if (!alive) return;
         const out: ArtifactNode[] = [];
@@ -177,7 +182,7 @@ export function useArtifacts(slug: string, reloadKey: number): ArtifactTreeData 
         if (fbR.status === "fulfilled") {
           for (const f of fbR.value) {
             const id = f.id ?? f.name.replace(/\.md$/, "");
-            out.push({ id, title: feedbackTitle(f.name, f.content), kind: "feedback", parent_doc_id: f.parent_doc_id ?? null, routeId: f.name, section: "feedback" });
+            out.push({ id, title: feedbackTitle(f.name, f.content), kind: "feedback", parent_doc_id: f.parent_doc_id ?? null, routeId: f.name, section: "feedback", status: f.status });
           }
         }
         // Surface a store error only if EVERY store failed (one being slow/empty
@@ -187,7 +192,7 @@ export function useArtifacts(slug: string, reloadKey: number): ArtifactTreeData 
         setNodes(out);
       });
     return () => { alive = false; };
-  }, [slug, reloadKey, tick]);
+  }, [slug, reloadKey, tick, includeClosedFeedback]);
 
   const index = useMemo(() => buildArtifactIndex(nodes ?? []), [nodes]);
 
@@ -223,6 +228,19 @@ function TreeNode({
         {kids.length > 0 && (
           <span style={{ color: "var(--mc-text-dim)", fontSize: "0.68rem" }} title={`${kids.length} attached`}>
             {" "}📎{kids.length}
+          </span>
+        )}
+        {/* item-12: close-state badge on feedback nodes (only visible when
+            "Show closed" reveals them). */}
+        {(node.status === "promoted" || node.status === "dismissed") && (
+          <span
+            style={{
+              marginLeft: "0.3rem", fontSize: "0.6rem", padding: "0 3px", borderRadius: "2px",
+              color: node.status === "promoted" ? "var(--mc-green)" : "var(--mc-text-dim)",
+              border: `1px solid ${node.status === "promoted" ? "var(--mc-green)" : "var(--mc-border)"}`,
+            }}
+          >
+            {node.status}
           </span>
         )}
         {node.title && (

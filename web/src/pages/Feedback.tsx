@@ -99,6 +99,28 @@ export function Feedback() {
     setPromoteError(null);
   }
 
+  // item-12 (Fork-4 close): dismiss is the DOMINANT operator action on a
+  // feedback item (most evidence is acknowledged + dropped, not promoted to a
+  // task). Owner-gated POST → the BE sets status:dismissed; the item then
+  // default-hides from the rail. Refetch both the page files + the shared tree.
+  async function handleDismiss(f: FeedbackFile) {
+    if (!window.confirm(`Dismiss "${f.name}"? It's kept on disk (status: dismissed) but hidden from the default list.`)) return;
+    setBusy(true);
+    setError(null);
+    setFlash(null);
+    try {
+      await api.dismissFeedback(slug, f.name);
+      setSelected(null);
+      reloadFiles();
+      tree.reload();
+      setFlash(`Dismissed ${f.name}.`);
+    } catch (e) {
+      setError(errorDetail(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function submitPromote() {
     if (!promoting) return;
     if (!promoting.title.trim()) { setPromoteError("Title is required"); return; }
@@ -142,6 +164,13 @@ export function Feedback() {
             >
               <span title="feedback" style={{ marginRight: "0.3rem" }}>💬</span>
               {selectedFile.name}
+              {/* item-12: close-state badge (promoted=green / dismissed=grey). */}
+              {selectedFile.status === "promoted" && (
+                <span className="mc-badge mc-badge-ok" style={{ marginLeft: "0.4rem" }}>promoted</span>
+              )}
+              {selectedFile.status === "dismissed" && (
+                <span className="mc-badge mc-badge-dim" style={{ marginLeft: "0.4rem" }}>dismissed</span>
+              )}
             </div>
             <div className="d-flex gap-2">
               <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(selectedFile.content)}>
@@ -150,6 +179,13 @@ export function Feedback() {
               <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => openPromote(selectedFile)}>
                 Promote to task
               </button>
+              {/* item-12: dismiss = the dominant operator action (acknowledge +
+                  drop without making a task). Hidden once already closed. */}
+              {selectedFile.status !== "dismissed" && selectedFile.status !== "promoted" && (
+                <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={() => handleDismiss(selectedFile)}>
+                  Dismiss
+                </button>
+              )}
             </div>
           </div>
 

@@ -176,6 +176,10 @@ export type FeedbackFile = {
   id?: string;
   parent_doc_id?: string | null;
   kind?: ArtifactKind;
+  // item-12: close-state. The BE returns 'open' | 'promoted' | 'dismissed'
+  // (absent → open). Closed items are hidden from GET /feedback unless
+  // include_closed=true.
+  status?: "open" | "promoted" | "dismissed" | string;
 };
 
 export type UseCaseSummary = {
@@ -796,7 +800,10 @@ export const api = {
   backlog: (slug: string) =>
     call<Task[]>(`/api/projects/${slug}/backlog`).then((tasks) => tasks.map(normalizeTask)),
   vision: (slug: string) => call<VisionFile[]>(`/api/projects/${slug}/vision`),
-  feedback: (slug: string) => call<FeedbackFile[]>(`/api/projects/${slug}/feedback`),
+  // item-12: GET /feedback default-HIDES closed (promoted/dismissed) items;
+  // pass includeClosed for the 'Show closed' toggle.
+  feedback: (slug: string, includeClosed = false) =>
+    call<FeedbackFile[]>(`/api/projects/${slug}/feedback${includeClosed ? "?include_closed=true" : ""}`),
   analytics: (slug: string) => call<Analytics>(`/api/projects/${slug}/analytics`),
   // T-0296: per-project clone health read-model ("Installation != Project").
   // Proxies the worker `clone_status` action (only the worker has on-host git
@@ -854,6 +861,10 @@ export const api = {
     call(`/api/projects/${slug}/feedback/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   promoteFeedback: (slug: string, name: string, title?: string, body?: string) =>
     call<{ task_id: string }>(`/api/projects/${slug}/feedback/${name}/promote`, { method: "POST", body: JSON.stringify({ title, body }) }),
+  // item-12: owner-gated close — sets status:dismissed (kept on disk, hidden
+  // from the default list). The dominant operator action on a feedback item.
+  dismissFeedback: (slug: string, name: string) =>
+    call<{ ok: boolean }>(`/api/projects/${slug}/feedback/${encodeURIComponent(name)}/dismiss`, { method: "POST" }),
   // T-0283/D-0029: feedback themes are nestable cross-store artifacts. List a
   // theme's children (evidence docs etc.) and adopt/disown the theme by setting
   // its parent_doc_id (keyed by filename `name`; the parent is any artifact id).

@@ -174,6 +174,74 @@ def test_process_voice_download_failure_confirms_resend(tmp_path, monkeypatch):
     assert "resend" in sent[0]["text"].lower()
 
 
+def test_process_voice_rejects_over_cap_before_download(tmp_path, monkeypatch):
+    """T-0433 P2: a voice note longer than voice_max_duration_sec is rejected
+    BEFORE any download/transcribe (TG gives voice.duration without a fetch), so a
+    huge note never hits the proxy/disk/poll-loop. The stakeholder is confirmed
+    ('too long, split') and nothing is transcribed or written."""
+    cfg = _cfg(tmp_path)
+    cfg.voice_max_duration_sec = 60
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T, tg_topics, actions as A
+
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+
+    # download/transcribe must NOT be reached.
+    def boom_download(c, file_id, dest):
+        raise AssertionError("download_voice called for an over-cap note")
+    monkeypatch.setattr(_VI, "download_voice", boom_download)
+    def boom_transcribe(p, **kw):
+        raise AssertionError("transcribe called for an over-cap note")
+    monkeypatch.setattr(_T, "transcribe", boom_transcribe)
+
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    out = _VI.process_voice(cfg, "bot-squad", _voice_msg(voice={
+        "file_id": "big", "file_unique_id": "big", "duration": 600, "mime_type": "audio/ogg"}),
+        ts="2026-06-21T13:00:00Z")
+
+    assert out["ok"] is False and out["reason"] == "too_long"
+    # Confirmed back into #feedback, mentioning the cap, asking to split.
+    assert sent and sent[0]["topic_id"] == 9001
+    assert "too long" in sent[0]["text"].lower() and "split" in sent[0]["text"].lower()
+    # Nothing written: no audio blob, no artifact.
+    assert not (_VI._audio_dir(cfg, "bot-squad") / "big.oga").exists()
+    assert not list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))
+
+
+def test_process_voice_transcribe_timeout_unblocks_and_flags(tmp_path, monkeypatch):
+    """T-0433 P2: process_voice runs inside the tg_listener getUpdates poll loop,
+    so a runaway transcription must NOT block it indefinitely. A decode exceeding
+    voice_transcribe_timeout_sec is abandoned (the note is still saved + flagged,
+    like any transcribe failure) and process_voice RETURNS promptly instead of
+    waiting for the slow decode."""
+    cfg = _cfg(tmp_path)
+    cfg.voice_transcribe_timeout_sec = 0.3
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T, actions as A
+    import time as _time
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+
+    def slow_transcribe(p, **kw):
+        _time.sleep(5)  # far longer than the 0.3s timeout
+        return {"text": "never returned in time", "lang": "ru"}
+    monkeypatch.setattr(_T, "transcribe", slow_transcribe)
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(send=lambda **k: True))
+
+    started = _time.monotonic()
+    out = _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-06-21T13:00:00Z")
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 3, f"process_voice blocked {elapsed:.1f}s on a slow decode (timeout not enforced)"
+    assert out["ok"] is False and out["reason"] in ("transcription_timeout", "transcription_failed")
+    # The note is not lost: audio stored + an artifact written.
+    assert (_VI._audio_dir(cfg, "bot-squad") / "uniq1.oga").exists()
+    assert len(list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))) == 1
+
+
 def test_process_voice_transcription_failure_still_stores_audio(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     from bot_squad_worker import voice_intake as _VI, transcribe as _T, actions as A

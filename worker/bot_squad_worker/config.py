@@ -157,6 +157,13 @@ class Config:
     # flipped on as part of the 1-time stakeholder TG setup, so deploying the
     # voice code never silently starts transcribing before setup. [voice].enabled.
     voice_enabled: bool = False
+    # T-0433 P2: caps that keep a voice note from blocking the tg_listener poll
+    # loop. max_duration_sec rejects an over-long note BEFORE download/transcribe
+    # (TG gives voice.duration without a fetch); transcribe_timeout_sec abandons a
+    # runaway decode so process_voice returns promptly. Both [voice], tunable
+    # without a deploy. 0 disables that guard.
+    voice_max_duration_sec: int = 300
+    voice_transcribe_timeout_sec: int = 120
 
     @property
     def data_dir(self) -> Path:
@@ -210,6 +217,8 @@ class Config:
         voice_engine = "faster-whisper"
         voice_model = "small"
         voice_enabled = False
+        voice_max_duration_sec = 300
+        voice_transcribe_timeout_sec = 120
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -228,6 +237,8 @@ class Config:
             voice_engine = str(voice_block.get("engine", voice_engine))
             voice_model = str(voice_block.get("model", voice_model))
             voice_enabled = bool(voice_block.get("enabled", voice_enabled))
+            voice_max_duration_sec = int(voice_block.get("max_duration_sec", voice_max_duration_sec))
+            voice_transcribe_timeout_sec = int(voice_block.get("transcribe_timeout_sec", voice_transcribe_timeout_sec))
 
         return cls(
             config_dir=config_dir,
@@ -247,4 +258,6 @@ class Config:
             voice_engine=voice_engine,
             voice_model=voice_model,
             voice_enabled=voice_enabled,
+            voice_max_duration_sec=voice_max_duration_sec,
+            voice_transcribe_timeout_sec=voice_transcribe_timeout_sec,
         )

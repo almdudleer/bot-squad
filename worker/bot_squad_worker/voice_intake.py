@@ -9,12 +9,19 @@ its user-feedback firehose).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import logging
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# T-0433 P2: fallback caps when cfg doesn't carry them (older config). The
+# tg_listener runs process_voice synchronously in its getUpdates poll loop, so an
+# over-long note is rejected pre-download and a runaway decode is time-boxed.
+_DEFAULT_MAX_DURATION_SEC = 300
+_DEFAULT_TRANSCRIBE_TIMEOUT_SEC = 120
 
 
 def extract_voice(message: dict) -> dict[str, Any] | None:
@@ -126,17 +133,52 @@ def download_voice(cfg: Any, file_id: str, dest_path: Path) -> Path:
     return dest_path
 
 
+def _transcribe_with_timeout(dest: Path, *, engine: str, model: str, timeout_sec: float) -> dict[str, Any]:
+    """Run the (synchronous, CPU-bound) transcribe seam with a wall-clock ceiling.
+
+    T-0433 P2: process_voice runs inside the tg_listener getUpdates poll loop, so
+    a runaway decode would stall inbound TG for the whole install. We bound the
+    CALLER: submit to a 1-worker pool and ``result(timeout)``; on timeout we stop
+    waiting (``shutdown(wait=False)`` — the abandoned decode thread lingers but
+    never blocks the poll loop) and raise TimeoutError, which the caller treats as
+    a transcription failure (the audio is still saved + flagged). ``timeout_sec``
+    <= 0 disables the ceiling. True off-loop transcription is a follow-up.
+    """
+    from bot_squad_worker import transcribe as _transcribe
+
+    if timeout_sec and timeout_sec > 0:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(_transcribe.transcribe, dest, engine=engine, model=model, lang_hint=None)
+        try:
+            return fut.result(timeout=timeout_sec)
+        finally:
+            ex.shutdown(wait=False)
+    return _transcribe.transcribe(dest, engine=engine, model=model, lang_hint=None)
+
+
 def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, Any]:
     """Full intake: download → transcribe → artifact → confirm into #feedback.
 
     A transcription failure does NOT lose the note: the audio is still stored and
     an artifact is written with a failure marker, flagged for triage.
-    """
-    from bot_squad_worker import transcribe as _transcribe
 
+    T-0433 P2: runs synchronously in the tg_listener poll loop, so an over-cap note
+    is rejected BEFORE download (cheap pre-fetch duration check) and a runaway
+    decode is time-boxed — neither blocks inbound TG.
+    """
     v = extract_voice(message)
     if not v:
         return {"ok": True, "action": "skip", "reason": "no voice"}
+
+    # Cap BEFORE download/transcribe: TG carries voice.duration without a fetch, so
+    # a huge note never hits the proxy/disk/decode. Confirm + bail (no artifact —
+    # nothing was transcribed). 0 = no cap.
+    max_dur = int(getattr(cfg, "voice_max_duration_sec", _DEFAULT_MAX_DURATION_SEC) or 0)
+    if max_dur > 0 and v["duration"] > max_dur:
+        log.info("voice_intake: rejecting over-cap note (%ds > %ds) from %s",
+                 v["duration"], max_dur, v["author"])
+        _confirm(cfg, slug, v, outcome="too_long")
+        return {"ok": False, "reason": "too_long", "duration": v["duration"]}
 
     dest = _audio_dir(cfg, slug) / f"{v['file_unique_id']}.oga"
     try:
@@ -151,13 +193,20 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
     audio_ref = f"feedback/_audio/{v['file_unique_id']}.oga"
     engine = getattr(cfg, "voice_engine", "faster-whisper")
     model = getattr(cfg, "voice_model", "small")
+    timeout_sec = float(getattr(cfg, "voice_transcribe_timeout_sec", _DEFAULT_TRANSCRIBE_TIMEOUT_SEC) or 0)
 
-    failed = False
+    failed = timed_out = False
     try:
-        res = _transcribe.transcribe(dest, engine=engine, model=model, lang_hint=None)
+        res = _transcribe_with_timeout(dest, engine=engine, model=model, timeout_sec=timeout_sec)
         transcript = (res.get("text") or "").strip()
         lang = res.get("lang")
         used_engine = res.get("engine") or engine
+    except concurrent.futures.TimeoutError:
+        log.warning("voice_intake: transcription timed out (>%ss) for %s", timeout_sec, audio_ref)
+        failed = timed_out = True
+        transcript = f"[transcription timed out after {timeout_sec}s — audio saved for manual review]"
+        lang = None
+        used_engine = engine
     except Exception as e:  # noqa: BLE001
         log.exception("voice_intake: transcription failed for %s", audio_ref)
         failed = True
@@ -178,7 +227,8 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
     )
 
     if failed:
-        return {"ok": False, "reason": "transcription_failed", "artifact": str(artifact)}
+        reason = "transcription_timeout" if timed_out else "transcription_failed"
+        return {"ok": False, "reason": reason, "artifact": str(artifact)}
     return {"ok": True, "artifact": str(artifact), "lang": lang}
 
 
@@ -197,7 +247,12 @@ def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = ""
             return
         topic = tg_topics.resolve(cfg, slug, "feedback")
         duration = v["duration"]
-        if outcome == "download_failed":
+        if outcome == "too_long":
+            # T-0433 P2: rejected pre-download for exceeding the duration cap.
+            cap = int(getattr(cfg, "voice_max_duration_sec", _DEFAULT_MAX_DURATION_SEC) or 0)
+            text = (f"⚠️ voice note too long ({duration}s > {cap}s cap) — please split "
+                    f"into shorter notes.")
+        elif outcome == "download_failed":
             text = (f"⚠️ couldn't fetch your voice note ({duration}s) — the TG file "
                     f"download failed (proxy?). Please resend.")
         elif outcome == "transcribe_failed":

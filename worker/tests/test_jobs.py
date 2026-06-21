@@ -524,6 +524,35 @@ def test_deploy_monitor_per_project_isolation(
     assert len(list((b_base / "processed").glob("*.ok"))) == 1
 
 
+def test_deploy_monitor_reconciles_finished_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0243: deploy_monitor_one reconciles a FINISHED-but-orphaned processing
+    marker (rc sentinel present, _finish lost to a worker-restart race) to
+    processed/.ok — BEFORE the age-fail reaper, so a stranded SUCCESS lands as
+    .ok, not .fail.ORPHAN. (Also exercises the deploy_monitor_one wiring.)"""
+    import json
+    from bot_squad_worker import deploy as _deploy
+    from bot_squad_worker.jobs import deploy_monitor_one
+
+    cfg, proj_a, _proj_b = _two_project_config(tmp_path)
+    fake_tg = _FakeTgClient()
+    from bot_squad_worker import actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
+
+    base = cfg.data_dir / proj_a.slug / "_jobs" / "deploy"
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-orphanwin.json"
+    f.write_text(json.dumps({"queue_id": "orphanwin", "target": "staging"}))
+    _deploy._record_run_rc(cfg, proj_a.slug, "orphanwin", 0)  # finished rc=0, move lost
+
+    deploy_monitor_one(cfg, proj_a.slug)
+
+    assert list(proc.glob("*.json")) == []  # reconciled out of processing
+    assert (base / "processed" / "1700000000000-orphanwin.ok").exists()
+
+
 def test_deploy_monitor_watchdog_fires_targeted_operator_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

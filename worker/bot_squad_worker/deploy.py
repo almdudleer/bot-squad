@@ -562,9 +562,12 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     recipe = _recipe_path(cfg, slug, target)
     if not recipe.exists():
         log.warning("deploy.run_next: recipe missing: %s", recipe)
+        _record_run_rc(cfg, slug, queue_id, 99)
         _finish(cfg, slug, processing_file, queue_id, rc=99)
         for pf in collapsed_processing:
-            _finish(cfg, slug, pf, _queue_id_of(pf), rc=99)
+            qid_c = _queue_id_of(pf)
+            _record_run_rc(cfg, slug, qid_c, 99)
+            _finish(cfg, slug, pf, qid_c, rc=99)
         log_path.write_text(f"recipe not found: {recipe}\n")
         return DeployResult(
             ok=False, returncode=99, queue_id=queue_id, log_path=log_path,
@@ -602,9 +605,15 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         recipe, repo, log_path, timeout_s, no_progress_s, queue_id
     )
 
+    # T-0243: record the terminal rc BEFORE the _finish move, for the winner and
+    # every collapsed qid, so a worker restart racing this finalization can't
+    # strand a FINISHED job — the reconcile pass replays the move from the sentinel.
+    _record_run_rc(cfg, slug, queue_id, rc)
     _finish(cfg, slug, processing_file, queue_id, rc=rc)
     for pf in collapsed_processing:
-        _finish(cfg, slug, pf, _queue_id_of(pf), rc=rc)
+        qid_c = _queue_id_of(pf)
+        _record_run_rc(cfg, slug, qid_c, rc)
+        _finish(cfg, slug, pf, qid_c, rc=rc)
     ok = rc == 0
     log.info(
         "deploy.run_next: %s/%s finished rc=%d killed=%s (collapsed=%d)",
@@ -966,6 +975,77 @@ def _restart_worker_detached(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+def _run_rc_path(cfg: "Config", slug: str, queue_id: str) -> Path:
+    return _runs_dir(cfg, slug) / f"{queue_id}.rc"
+
+
+def _record_run_rc(cfg: "Config", slug: str, queue_id: str, rc: int) -> None:
+    """T-0243: durably record a run's TERMINAL rc next to its log, the instant the
+    recipe returns — BEFORE run_next's ``_finish`` move. If a worker restart then
+    SIGTERMs run_next before/ mid-``_finish`` (the orphan race), this sentinel
+    survives so the reconcile pass can land the marker on its ACTUAL outcome
+    instead of letting the age-fail reaper blindly mark a SUCCESS as .fail.ORPHAN.
+    Best-effort + atomic (tmp+rename); a write failure never breaks the deploy."""
+    try:
+        p = _run_rc_path(cfg, slug, queue_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".rc.tmp")
+        tmp.write_text(str(int(rc)))
+        tmp.replace(p)
+    except OSError:
+        log.warning("deploy._record_run_rc: could not persist rc for %s/%s", slug, queue_id)
+
+
+def _read_run_rc(cfg: "Config", slug: str, queue_id: str) -> int | None:
+    """The recorded terminal rc for ``queue_id``, or None when absent/unreadable
+    (no sentinel yet ⇒ the run hasn't terminated — leave it in-flight)."""
+    try:
+        return int(_run_rc_path(cfg, slug, queue_id).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def reconcile_finished_orphans(cfg: "Config", slug: str) -> list[dict]:
+    """T-0243: reconcile FINISHED-but-orphaned ``processing/`` markers to their
+    ACTUAL recorded rc.
+
+    A run can complete (rc recorded via ``_record_run_rc``) yet have its
+    ``_finish`` move interrupted by a worker restart racing run_next's
+    finalization (aggravated by a same-target deploy collapsing onto it). The
+    marker then lingers in ``processing/``. This pass — run on worker /
+    deploy_monitor startup AND each monitor tick, BEFORE the age-fail
+    ``reap_orphans`` — moves any such marker to ``processed/.ok`` (rc=0) or
+    ``.fail.<rc>`` (rc!=0) per its sentinel, so a SUCCESS is never blindly
+    age-failed and the queue reconciles to truth. A marker with no sentinel yet
+    (genuinely in-flight) is left untouched — never reap a live build.
+
+    Collapsed-pair: run_next records a sentinel per collapsed qid, so each
+    orphaned marker reconciles independently to the surviving run's rc.
+
+    Returns one info dict per reconciled marker (queue_id / rc / target)."""
+    processing_dir = _processing_dir(cfg, slug)
+    if not processing_dir.exists():
+        return []
+    reconciled: list[dict] = []
+    for f in sorted(processing_dir.glob("*.json")):
+        qid = _queue_id_of(f)
+        rc = _read_run_rc(cfg, slug, qid)
+        if rc is None:
+            continue  # no terminal rc → still in-flight, leave for the deploy / age-reaper
+        try:
+            payload = json.loads(f.read_text())
+        except Exception:  # noqa: BLE001
+            payload = {}
+        _finish(cfg, slug, f, qid, rc=rc)
+        log.warning(
+            "deploy.reconcile_finished_orphans: %s reconciled orphaned job %s "
+            "(recorded rc=%d, target=%s) → processed/%s",
+            slug, qid, rc, payload.get("target"), ".ok" if rc == 0 else f".fail.{rc}",
+        )
+        reconciled.append({"queue_id": qid, "rc": rc, "target": payload.get("target")})
+    return reconciled
 
 
 def reap_orphans(cfg: "Config", slug: str, max_age_seconds: int | None = None) -> list[dict]:

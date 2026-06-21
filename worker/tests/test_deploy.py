@@ -844,6 +844,104 @@ def test_reap_orphans_ignores_fresh_processing(tmp_path: Path) -> None:
     assert len(list(proc_dir.glob("*.json"))) == 1
 
 
+# ---------------------------------------------------------------------------
+# T-0243: reconcile FINISHED-but-orphaned processing/ markers to their ACTUAL
+# recorded rc (a worker restart raced run_next's _finish move). A durable
+# runs/<qid>.rc sentinel is written when the run terminates; the reconcile reads
+# it and moves the marker to processed/.ok (rc=0) / .fail.<rc> — NOT blindly
+# age-failed. An in-flight run (no sentinel yet) is left alone.
+# ---------------------------------------------------------------------------
+
+def _deploy_base(cfg, slug):
+    return cfg.data_dir / slug / "_jobs" / "deploy"
+
+
+def test_record_and_read_run_rc_roundtrip(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _record_run_rc, _read_run_rc
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    assert _read_run_rc(cfg, proj.slug, "qid-1") is None  # absent → None
+    _record_run_rc(cfg, proj.slug, "qid-1", 0)
+    _record_run_rc(cfg, proj.slug, "qid-2", 7)
+    assert _read_run_rc(cfg, proj.slug, "qid-1") == 0
+    assert _read_run_rc(cfg, proj.slug, "qid-2") == 7
+
+
+def test_reconcile_finished_orphan_rc0_to_ok(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _record_run_rc, reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-win.json"
+    f.write_text(json.dumps({"queue_id": "win", "target": "staging"}))
+    _record_run_rc(cfg, proj.slug, "win", 0)  # run finished rc=0, _finish was interrupted
+
+    out = reconcile_finished_orphans(cfg, proj.slug)
+
+    assert [o["queue_id"] for o in out] == ["win"]
+    assert [o["rc"] for o in out] == [0]
+    assert not f.exists()  # moved out of processing
+    assert (base / "processed" / "1700000000000-win.ok").exists()
+
+
+def test_reconcile_finished_orphan_nonzero_to_fail(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _record_run_rc, reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-bad.json"
+    f.write_text(json.dumps({"queue_id": "bad", "target": "staging"}))
+    _record_run_rc(cfg, proj.slug, "bad", 2)
+
+    reconcile_finished_orphans(cfg, proj.slug)
+
+    assert (base / "processed" / "1700000000000-bad.fail.2").exists()
+    assert not f.exists()
+
+
+def test_reconcile_leaves_in_flight_run_with_no_rc(tmp_path: Path) -> None:
+    """No terminal rc yet (build still running) → never reconciled/reaped."""
+    from bot_squad_worker.deploy import reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-live.json"
+    f.write_text(json.dumps({"queue_id": "live", "target": "staging"}))
+
+    out = reconcile_finished_orphans(cfg, proj.slug)
+
+    assert out == []
+    assert f.exists()  # left in processing
+
+
+def test_reconcile_collapsed_pair_both_reconciled(tmp_path: Path) -> None:
+    """Collapsed-pair: run_next records an rc sentinel per collapsed qid, so both
+    orphaned markers reconcile to the surviving run's rc."""
+    from bot_squad_worker.deploy import _record_run_rc, reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    for qid in ("winner", "collapsed"):
+        (proc / f"1700000000000-{qid}.json").write_text(
+            json.dumps({"queue_id": qid, "target": "staging"})
+        )
+        _record_run_rc(cfg, proj.slug, qid, 0)
+
+    out = reconcile_finished_orphans(cfg, proj.slug)
+
+    assert sorted(o["queue_id"] for o in out) == ["collapsed", "winner"]
+    assert (base / "processed" / "1700000000000-winner.ok").exists()
+    assert (base / "processed" / "1700000000000-collapsed.ok").exists()
+
+
 def test_surface_worker_restart_fails_reports_and_tombstones(tmp_path: Path) -> None:
     """T-0335 item-13 (Fork-5): the .worker-restart.FAIL marker — written by a
     failed detached restart but never read by jobs.py — is surfaced exactly once

@@ -47,6 +47,19 @@ def deploy_monitor_one(cfg: Config, slug: str) -> None:
     project = cfg.projects.get(slug)
     if project is None:
         return
+    # T-0243: reconcile FINISHED-but-orphaned processing/ markers to their ACTUAL
+    # recorded rc FIRST — so a deploy that succeeded but lost its _finish move to
+    # a worker-restart race lands in processed/.ok, instead of being blindly
+    # age-failed by the reaper below. Runs every tick (incl. the post-restart
+    # startup tick), guarded separately.
+    try:
+        from bot_squad_worker import deploy as _deploy
+        reconciled = _deploy.reconcile_finished_orphans(cfg, slug)
+        if reconciled:
+            log.info("deploy_monitor: %s reconciled %d finished orphan(s): %s",
+                     slug, len(reconciled), [r["queue_id"] for r in reconciled])
+    except Exception:
+        log.exception("deploy_monitor: orphan reconcile failed for %s", slug)
     try:
         _reap_project_orphans(cfg, slug, project)
     except Exception:

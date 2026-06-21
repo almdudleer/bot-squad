@@ -382,8 +382,9 @@ def test_apply_happy_path_updates_install_and_stamps_state(install_ctx, monkeypa
     entry = _make_entry("v2026.05.16.2", sha)
 
     _install_fake_download(monkeypatch, tar_bytes)
-    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
     monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: entry["git_sha"])
 
     result = apply_mod.apply(cfg, entry)
 
@@ -424,8 +425,9 @@ def test_apply_happy_path_schedules_worker_restart(install_ctx, monkeypatch):
     entry = _make_entry("v2026.05.16.2", sha)
 
     _install_fake_download(monkeypatch, tar_bytes)
-    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
     monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: entry["git_sha"])
 
     # Spy on the helper directly — replacing subprocess.Popen would also
     # neuter the rsync/extract subprocess calls inside apply.
@@ -554,7 +556,7 @@ def test_build_failure_rolls_back_and_brings_prior_containers_back(install_ctx, 
     entry = _make_entry("v2026.05.16.2", sha)
     _install_fake_download(monkeypatch, tar_bytes)
 
-    def boom_build(cfg):  # noqa: ARG001
+    def boom_build(cfg, git_sha=None):  # noqa: ARG001
         raise RuntimeError("simulated docker build failure")
     monkeypatch.setattr(apply_mod, "_docker_compose_up_build", boom_build)
 
@@ -586,7 +588,7 @@ def test_smoke_failure_rolls_back_and_brings_prior_containers_back(install_ctx, 
     sha = hashlib.sha256(tar_bytes).hexdigest()
     entry = _make_entry("v2026.05.16.2", sha)
     _install_fake_download(monkeypatch, tar_bytes)
-    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
 
     def boom_smoke(url):  # noqa: ARG001
         raise RuntimeError("simulated smoke failure")
@@ -616,6 +618,82 @@ def test_smoke_failure_rolls_back_and_brings_prior_containers_back(install_ctx, 
     state = poller.load_state(cfg)
     assert state["last_apply_outcome"] == "failed:smoke"
     assert restart_calls == [], "apply failure must NOT schedule a worker restart"
+
+
+# ---------------------------------------------------------------------------
+# T-0379: release-apply stamps + asserts the released git sha (consumer path
+# mirror of staging.sh's running==deployed gate).
+# ---------------------------------------------------------------------------
+
+
+def test_docker_compose_up_build_exports_git_sha(install_ctx, monkeypatch):
+    """The build passes GIT_SHA so the image bakes BOT_SQUAD_GIT_SHA."""
+    cfg = install_ctx["cfg"]
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "built"
+        stderr = ""
+
+    def fake_run(args, **kw):  # noqa: ANN001
+        captured["env"] = kw.get("env", {})
+        return _Proc()
+
+    monkeypatch.setattr(apply_mod.subprocess, "run", fake_run)
+    apply_mod._docker_compose_up_build(cfg, git_sha="deadbeefcafe")
+    assert captured["env"].get("GIT_SHA") == "deadbeefcafe"
+
+
+def test_apply_git_sha_mismatch_rolls_back(install_ctx, monkeypatch):
+    """If the running container's sha != the released sha, apply must FAIL
+    (step git_sha_verify), restore the snapshot + bring prior containers back —
+    a build that didn't pick up the released source can't report success."""
+    cfg = install_ctx["cfg"]
+    install = install_ctx["install"]
+    _pre_stamp(cfg, "v2026.05.16.1")
+
+    tar_bytes = _make_tarball("v2026.05.16.2")
+    sha = hashlib.sha256(tar_bytes).hexdigest()
+    entry = _make_entry("v2026.05.16.2", sha)  # entry["git_sha"] is 40 chars
+    _install_fake_download(monkeypatch, tar_bytes)
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
+    monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    # Running container reports a DIFFERENT sha than the release.
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: "wrongshawrongsha")
+
+    no_build_calls: list[Any] = []
+    monkeypatch.setattr(
+        apply_mod, "_docker_compose_up_no_build",
+        lambda cfg: no_build_calls.append(1) or "ok",
+    )
+
+    result = apply_mod.apply(cfg, entry)
+
+    assert result.ok is False
+    assert result.failed_step == "git_sha_verify"
+    # Rolled back to the prior install:
+    assert (install / "api" / "main.py").read_text() == "# initial main\n"
+    assert len(no_build_calls) == 1
+    assert poller.load_state(cfg)["last_apply_outcome"] == "failed:git_sha_verify"
+
+
+def test_apply_git_sha_match_succeeds(install_ctx, monkeypatch):
+    """Running sha == released sha → apply succeeds normally."""
+    cfg = install_ctx["cfg"]
+    _pre_stamp(cfg, "v2026.05.16.1")
+    tar_bytes = _make_tarball("v2026.05.16.2")
+    sha = hashlib.sha256(tar_bytes).hexdigest()
+    entry = _make_entry("v2026.05.16.2", sha)
+    _install_fake_download(monkeypatch, tar_bytes)
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
+    monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: entry["git_sha"])
+    monkeypatch.setattr(apply_mod, "_schedule_worker_restart", lambda *a, **kw: None)
+
+    result = apply_mod.apply(cfg, entry)
+    assert result.ok is True
+    assert poller.load_state(cfg)["last_apply_outcome"] == "success"
 
 
 # ---------------------------------------------------------------------------
@@ -688,8 +766,9 @@ def test_success_clears_prior_alert(install_ctx, monkeypatch):
     sha = hashlib.sha256(tar_bytes).hexdigest()
     entry = _make_entry("v2026.05.16.2", sha)
     _install_fake_download(monkeypatch, tar_bytes)
-    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
     monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: entry["git_sha"])
 
     result = apply_mod.apply(cfg, entry)
 
@@ -768,8 +847,9 @@ def test_drain_one_processes_oldest_and_removes_queue_file(install_ctx, monkeypa
     _os.utime(f2, (2000, 2000))
 
     _install_fake_download(monkeypatch, tar_bytes)
-    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
     monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: entry["git_sha"])
 
     result = apply_mod.drain_one(cfg)
 

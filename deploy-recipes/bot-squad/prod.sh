@@ -127,6 +127,12 @@ if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
     exit 5
 fi
 
+# T-0379: the released git sha is recorded in the manifest entry below; the
+# CONSUMER apply path (worker/bot_squad_worker/autoupdate_apply.py) builds the
+# image with GIT_SHA=<this> and ASSERTS the running container == the released
+# sha before reporting success (rolls back on mismatch). That's where the
+# running==released gate lives — prod.sh only cuts the artifact, it never runs a
+# container, so the staging.sh-style assertion has no container to check here.
 GIT_SHA=$(git rev-parse HEAD)
 
 # ---------------------------------------------------------------------------

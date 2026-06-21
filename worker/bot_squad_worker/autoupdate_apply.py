@@ -356,11 +356,20 @@ def _extract(tarball: Path, dest: Path) -> None:
         )
 
 
-def _docker_compose_up_build(cfg: Any) -> str:
+def _docker_compose_up_build(cfg: Any, git_sha: Optional[str] = None) -> str:
     """Run ``docker compose up -d --build`` in the install root. Returns the
-    tail of combined stdout/stderr (best-effort context for alerts)."""
+    tail of combined stdout/stderr (best-effort context for alerts).
+
+    T-0379: when ``git_sha`` is given (the released commit from the manifest
+    entry), export it as the ``GIT_SHA`` build-arg so the image bakes
+    ``BOT_SQUAD_GIT_SHA`` (surfaced at /api/health). The caller then asserts the
+    running container == the released sha — the consumer-path mirror of
+    ``deploy-recipes/bot-squad/staging.sh``'s running==deployed gate, so a build
+    that didn't pick up the released source can't silently report success."""
     root = install_root(cfg)
     env = {**os.environ, "TMPDIR": str(root / "_tmp")}
+    if git_sha:
+        env["GIT_SHA"] = git_sha
     (root / "_tmp").mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         ["docker", "compose", "up", "-d", "--build"],
@@ -375,6 +384,22 @@ def _docker_compose_up_build(cfg: Any) -> str:
             f"docker compose up --build failed (rc={proc.returncode})\n{_tail(out)}"
         )
     return _tail(out)
+
+
+def _running_git_sha(cfg: Any) -> str:
+    """The ``BOT_SQUAD_GIT_SHA`` baked into the RUNNING api container, or ``""``
+    if unreadable. T-0379: used to assert the just-built container is the
+    released commit. Best-effort — a read failure yields "" (→ mismatch → the
+    apply rolls back rather than trusting an unverifiable build)."""
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", "bot-squad-api", "printenv", "BOT_SQUAD_GIT_SHA"],
+            cwd=str(install_root(cfg)),
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:  # noqa: BLE001 — never let the check itself wedge apply
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def _docker_compose_up_no_build(cfg: Any) -> str:
@@ -657,9 +682,9 @@ def apply(cfg: Any, entry: dict) -> ApplyResult:
             _safe_restore(cfg, snap, version)
             return _finish_failure(cfg, version, "extract", f"{type(e).__name__}: {e}")
 
-        # ---- 5. docker compose up -d --build
+        # ---- 5. docker compose up -d --build (stamp the released sha — T-0379)
         try:
-            _docker_compose_up_build(cfg)
+            _docker_compose_up_build(cfg, git_sha=entry.get("git_sha"))
         except Exception as e:
             _safe_restore(cfg, snap, version)
             _docker_compose_up_no_build(cfg)  # bring prior containers back
@@ -672,6 +697,21 @@ def apply(cfg: Any, entry: dict) -> ApplyResult:
             _safe_restore(cfg, snap, version)
             _docker_compose_up_no_build(cfg)  # bring prior containers back
             return _finish_failure(cfg, version, "smoke", f"{type(e).__name__}: {e}")
+
+        # ---- 6b. T-0379: assert the RUNNING container is the released commit.
+        # The consumer-path mirror of staging.sh's running==deployed gate: a
+        # build that didn't pick up the released source (cache/context drift)
+        # must NOT report success — roll back instead of shipping stale.
+        expected_git_sha = entry.get("git_sha")
+        if expected_git_sha:
+            running_sha = _running_git_sha(cfg)
+            if running_sha != expected_git_sha:
+                _safe_restore(cfg, snap, version)
+                _docker_compose_up_no_build(cfg)  # bring prior containers back
+                return _finish_failure(
+                    cfg, version, "git_sha_verify",
+                    f"running={running_sha!r} != released={expected_git_sha!r}",
+                )
 
         # ---- 7. success bookkeeping
         new_state = _poller.load_state(cfg)

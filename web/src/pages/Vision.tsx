@@ -52,6 +52,18 @@ export function computeTlBindings(sessions: SessionRow[]): {
   return { tlsByInitiative, candidateTls };
 }
 
+// T-0411 (PASS-2 P2-13): an initiative is a PERSISTENT constant-team job when
+// its frontmatter carries `constant_team: <truthy>`. Parsed FE-side from the
+// already-loaded VisionFile.content (no new endpoint) — mirrors the worker's
+// `_truthy(fm.get("constant_team"))` (constant_teams.py).
+export function isPersistentInitiative(content: string | undefined | null): boolean {
+  if (!content) return false;
+  const m = content.match(/^constant_team:\s*(.+?)\s*$/im);
+  if (!m) return false;
+  const v = m[1].trim().toLowerCase().replace(/^["']|["']$/g, "");
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+}
+
 export function Vision() {
   const { slug = "" } = useParams();
   const navigate = useNavigate();
@@ -394,6 +406,17 @@ export function Vision() {
                 >
                   {isOpen ? "▾" : "▸"} {f.name}
                 </button>
+                {/* T-0411: surface constant-team initiatives so item-16's
+                    staffing kill-switch isn't operating off-screen. */}
+                {isPersistentInitiative(f.content) && (
+                  <span
+                    className="mc-badge mc-badge-info"
+                    style={{ fontSize: "0.6rem" }}
+                    title="Persistent constant-team initiative — staffed continuously; it doesn't reach a normal 'finished' state."
+                  >
+                    PERSISTENT
+                  </span>
+                )}
                 <div className="d-flex gap-2 align-items-center flex-wrap">
                   {opts.kind === "active" && renderTlBindings(base, f.name)}
                   {opts.kind === "active" && (
@@ -411,8 +434,14 @@ export function Vision() {
                         className="btn btn-outline-secondary btn-sm"
                         style={{ fontSize: "0.72rem" }}
                         onClick={() => markFinished(f)}
+                        title={isPersistentInitiative(f.content)
+                          ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
+                          : undefined}
                       >
-                        Mark finished
+                        {/* T-0410: a persistent constant-team has no real
+                            'finished' state — relabel its worker-stopping
+                            control so marking it finished isn't a category error. */}
+                        {isPersistentInitiative(f.content) ? "Stop staffing / Retire" : "Mark finished"}
                       </button>
                     </>
                   )}
@@ -431,8 +460,14 @@ export function Vision() {
                         className="btn btn-outline-secondary btn-sm"
                         style={{ fontSize: "0.72rem" }}
                         onClick={() => markFinished(f)}
+                        title={isPersistentInitiative(f.content)
+                          ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
+                          : undefined}
                       >
-                        Mark finished
+                        {/* T-0410: a persistent constant-team has no real
+                            'finished' state — relabel its worker-stopping
+                            control so marking it finished isn't a category error. */}
+                        {isPersistentInitiative(f.content) ? "Stop staffing / Retire" : "Mark finished"}
                       </button>
                     </>
                   )}

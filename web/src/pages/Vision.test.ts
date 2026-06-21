@@ -16,7 +16,7 @@
 import { describe, expect, test } from "vitest";
 
 import { SessionRow } from "../api";
-import { computeTlBindings } from "./Vision";
+import { computeTlBindings, isPersistentInitiative } from "./Vision";
 
 function tl(overrides: Partial<SessionRow>): SessionRow {
   return {
@@ -123,5 +123,22 @@ describe("computeTlBindings", () => {
       "S-paused",
       "S-susp",
     ]);
+  });
+});
+
+// T-0411 (PASS-2 P2-13): a constant-team initiative is flagged PERSISTENT,
+// parsed FE-side from the frontmatter (mirrors worker _truthy(constant_team)).
+describe("isPersistentInitiative", () => {
+  test("true for constant_team: true (+ yes/1/on, quoted)", () => {
+    expect(isPersistentInitiative("---\nconstant_team: true\n---\nbody")).toBe(true);
+    expect(isPersistentInitiative("---\nconstant_team: yes\n---")).toBe(true);
+    expect(isPersistentInitiative("---\nconstant_team: 1\n---")).toBe(true);
+    expect(isPersistentInitiative("---\nconstant_team: 'true'\n---")).toBe(true);
+  });
+  test("false for absent / falsey", () => {
+    expect(isPersistentInitiative("---\nactive: true\n---")).toBe(false);
+    expect(isPersistentInitiative("---\nconstant_team: false\n---")).toBe(false);
+    expect(isPersistentInitiative("")).toBe(false);
+    expect(isPersistentInitiative(undefined)).toBe(false);
   });
 });

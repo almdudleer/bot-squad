@@ -23,10 +23,14 @@ def build_app() -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
+        # T-0335 item-13: frozen-at-boot git_sha lets a deploy detect that the
+        # running worker is on stale code (running_sha != deployed_sha).
+        from bot_squad_worker.deploy import boot_git_sha
         return {
             "ok": True,
             "version": _pkg_version(),
             "uptime": time.monotonic() - started,
+            "git_sha": boot_git_sha(),
         }
 
     @app.post("/actions/{name}")

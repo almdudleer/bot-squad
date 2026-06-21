@@ -51,6 +51,14 @@ def deploy_monitor_one(cfg: Config, slug: str) -> None:
         _reap_project_orphans(cfg, slug, project)
     except Exception:
         log.exception("deploy_monitor: orphan reap failed for %s", slug)
+    # T-0335 item-13: surface failed detached worker-restarts. Runs BEFORE the
+    # deploy stage's empty-queue early-return so a FAIL marker is alerted even
+    # when nothing is queued — a failed auto-restart otherwise left the worker
+    # silently on old code with no alert.
+    try:
+        _surface_worker_restart_fails(cfg, slug, project)
+    except Exception:
+        log.exception("deploy_monitor: worker-restart FAIL surface failed for %s", slug)
     try:
         _run_project_deploy(cfg, slug, project)
     except Exception:
@@ -76,6 +84,27 @@ def _reap_project_orphans(cfg: Config, slug: str, project: object) -> None:
             f"{orphan.get('queue_id')} sat in processing/ for {hrs:.1f}h "
             f"(crashed/killed run, never finished) → swept to "
             f"processed/.fail.{_deploy.RC_ORPHAN}. The queue is now unblocked.",
+        )
+
+
+def _surface_worker_restart_fails(cfg: Config, slug: str, project: object) -> None:
+    """Alert the operator about any failed detached worker-restart (T-0335 #13).
+
+    ``deploy.surface_worker_restart_fails`` finds + tombstones each
+    ``.worker-restart.FAIL`` marker (so it alerts exactly once); we turn each
+    into a TARGETED operator alert — a failed auto-restart means the worker is
+    still on OLD code and needs a hand-restart.
+    """
+    from bot_squad_worker import deploy as _deploy
+
+    for fail in _deploy.surface_worker_restart_fails(cfg, slug):
+        tail = (fail.get("tail") or "").strip()
+        _alert_operators(
+            cfg, slug, project,
+            f"⚠️ worker-restart FAILED — {slug} deploy {fail.get('queue_id')}: the "
+            f"post-deploy worker restart did not complete, so the worker is still "
+            f"running OLD code. Restart by hand: systemctl --user restart "
+            f"bot-squad-worker.service\n\nlog tail:\n{tail}",
         )
 
 

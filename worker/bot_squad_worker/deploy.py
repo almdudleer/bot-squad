@@ -71,6 +71,89 @@ RC_ORPHAN = 126        # stale-orphan reaper: file stranded in processing/ swept
 
 
 # ---------------------------------------------------------------------------
+# git-sha helpers (T-0335 item-13, Fork-5: detect running != deployed worker)
+# ---------------------------------------------------------------------------
+
+def _git_head_sha(root: Path) -> str:
+    """``git -C <root> rev-parse HEAD`` (40-hex), or "" if it can't be read."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — git absent / not a repo / timeout
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _install_root() -> Path:
+    """The install tree the worker package is editable-installed from.
+
+    ``.../worker/bot_squad_worker/deploy.py`` → ``parents[2]`` is the repo root
+    (the git tree the deploy recipe ff-merges into).
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+_BOOT_GIT_SHA: str | None = None
+
+
+def boot_git_sha() -> str:
+    """The HEAD sha of the install tree captured at worker boot, then frozen.
+
+    Computed once and cached: even after a deploy ff-merges the install dir the
+    RUNNING worker keeps reporting this boot sha — the signal that the live
+    process is on stale code until it is restarted. Surfaced at the worker's
+    ``/health`` and compared against the live (post-merge) deployed sha to
+    decide whether a ``worker/``-touching deploy needs an auto-restart (Fork-5).
+    """
+    global _BOOT_GIT_SHA
+    if _BOOT_GIT_SHA is None:
+        _BOOT_GIT_SHA = _git_head_sha(_install_root())
+    return _BOOT_GIT_SHA
+
+
+def _worker_subtree_changed(root: Path, a: str, b: str) -> bool:
+    """True iff the ``worker/`` subtree differs between commits ``a`` and ``b``.
+
+    The ``-- worker/`` path-spec is correct ONLY while the worker process imports
+    nothing first-party from outside ``worker/`` — if the worker ever imports
+    shared code living elsewhere in the repo, widen this path-spec or a relevant
+    change won't trigger the restart. ``git diff --quiet`` exits 1 on differences,
+    0 when identical; any other code (bad rev, git error) → treat as "unknown,
+    don't auto-fire" so a flaky probe never bounces the worker.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "diff", "--quiet", a, b, "--", "worker/"],
+            capture_output=True, timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return out.returncode == 1
+
+
+def _worker_needs_restart(cfg: "Config") -> bool:
+    """Fork-5 auto-restart predicate: the running worker is on stale code that a
+    just-deployed ``worker/`` change would update.
+
+    True iff the frozen boot sha differs from the live (post-ff-merge) deployed
+    sha AND the ``worker/`` subtree changed between them. Kill-switch
+    ``BOT_SQUAD_DEPLOY_AUTO_RESTART=0`` forces it OFF (the only mitigation for a
+    cross-project SIGTERM on a busy multi-project host; the deploy build itself
+    is already scope-isolated by T-0213).
+    """
+    if os.environ.get("BOT_SQUAD_DEPLOY_AUTO_RESTART", "1").strip() == "0":
+        return False
+    root = _install_root()
+    running = boot_git_sha()
+    deployed = _git_head_sha(root)
+    if not running or not deployed or running == deployed:
+        return False
+    return _worker_subtree_changed(root, running, deployed)
+
+
+# ---------------------------------------------------------------------------
 # systemd-scope detach (T-0213)
 # ---------------------------------------------------------------------------
 #
@@ -534,9 +617,25 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     # worker this code runs under — see _restart_worker_detached. Best-effort:
     # a launch failure is logged but never flips the deploy's own outcome (the
     # build + install sync already succeeded; the operator can restart by hand).
-    if ok and payload.get("restart_worker"):
+    # T-0335 item-13 (Fork-5): besides the explicit FORCE flag (D5), auto-fire
+    # the restart when a clean deploy actually changed the worker/ subtree out
+    # from under the running (stale-code) worker — closing the "deploy succeeded
+    # but the worker kept running old code" gap. Kill-switch:
+    # BOT_SQUAD_DEPLOY_AUTO_RESTART=0.
+    forced = bool(payload.get("restart_worker"))
+    auto = False
+    if ok and not forced:
         try:
-            _restart_worker_detached(cfg, slug, queue_id, payload.get("reason", ""))
+            auto = _worker_needs_restart(cfg)
+        except Exception:
+            log.exception("deploy.run_next: %s/%s auto-restart probe failed", slug, target)
+            auto = False
+    if ok and (forced or auto):
+        reason = payload.get("reason", "")
+        if auto and not forced:
+            reason = f"auto-restart: worker/ changed — {reason}".strip()
+        try:
+            _restart_worker_detached(cfg, slug, queue_id, reason)
         except Exception:
             log.exception(
                 "deploy.run_next: %s/%s post-deploy worker restart launch failed "
@@ -711,6 +810,7 @@ def _build_worker_restart_script(
     smoke_attempts: int,
     coalesce_marker: Path | None = None,
     token: str = "",
+    expected_sha: str = "",
 ) -> str:
     """Render the bash script the detached restart scope runs (T-0181).
 
@@ -751,6 +851,21 @@ fi
 """
     else:
         coalesce_block = f"\nsleep {int(delay_s)}\n"
+    # T-0335 item-13 (Fork-5): assert the restarted worker came back on the
+    # DEPLOYED sha. $resp holds the last (healthy) /health body, which carries
+    # "git_sha":"<sha>". The expected sha is shell-quoted into EXPECTED_SHA and
+    # matched with a bash `case` glob — NEVER interpolated into python -c source
+    # (the T-0287 lesson). Empty expected_sha (legacy/forced path) skips the
+    # assertion so a non-sha-stamped install still restarts.
+    sha_assert_block = ""
+    if expected_sha:
+        exp = q(expected_sha)
+        sha_assert_block = f"""EXPECTED_SHA={exp}
+case "$resp" in
+  *'"git_sha":"'"$EXPECTED_SHA"'"'*) echo "[worker-restart] git_sha verified: $EXPECTED_SHA" >> "$LOG";;
+  *) echo "[worker-restart] GIT_SHA_MISMATCH — worker did not come back on the deployed sha $EXPECTED_SHA" >> "$LOG"; : > {fail}; exit 1;;
+esac
+"""
     return f"""
 set -u
 LOG={log}
@@ -779,7 +894,7 @@ if [ "$ok" != 1 ]; then
   : > {fail}
   exit 1
 fi
-act=$(curl -sS --max-time 5 --unix-socket {sock} -X POST -H 'Content-Type: application/json' -d '{{}}' http://w/actions/scheduler_state 2>/dev/null || true)
+{sha_assert_block}act=$(curl -sS --max-time 5 --unix-socket {sock} -X POST -H 'Content-Type: application/json' -d '{{}}' http://w/actions/scheduler_state 2>/dev/null || true)
 echo "[worker-restart] scheduler_state: $act" >> "$LOG"
 case "$act" in
   *worker_started_at*) echo "[worker-restart] WORKER_RESTART_OK" >> "$LOG"; exit 0;;
@@ -828,10 +943,15 @@ def _restart_worker_detached(
     # T-0287: global (one-worker) coalesce marker + this deploy's queue_id token,
     # so concurrent deploys' detached restarts collapse to a single restart.
     coalesce_marker = cfg.data_dir / "_worker" / "restart_coalesce.token"
+    # T-0335 item-13: the live (post-ff-merge) HEAD sha is the sha the restarted
+    # worker must come back on; the smoke asserts it. "" when the tree has no git
+    # (the assertion is then skipped — the restart still proceeds).
+    expected_sha = _git_head_sha(install_root)
     script = _build_worker_restart_script(
         worker_dir, pip_path, cfg.sock_path, restart_log, fail_marker,
         service, delay_s, smoke_attempts,
         coalesce_marker=coalesce_marker, token=str(queue_id or "run"),
+        expected_sha=expected_sha,
     )
     argv = _scope_wrap(["bash", "-c", script], f"bot-squad-worker-restart-{queue_id}")
     log.info(
@@ -896,6 +1016,42 @@ def reap_orphans(cfg: "Config", slug: str, max_age_seconds: int | None = None) -
             "reason": payload.get("reason"),
         })
     return reaped
+
+
+def surface_worker_restart_fails(cfg: "Config", slug: str) -> list[dict]:
+    """Surface — once — any ``.worker-restart.FAIL`` marker the detached restart
+    left behind (T-0335 item-13, Fork-5).
+
+    ``_restart_worker_detached`` writes ``runs/<id>.worker-restart.FAIL`` on a
+    pip-guard / restart / smoke failure, but nothing ever read it: a failed
+    auto-restart left the worker silently on OLD code with no alert (the actual
+    leak Fork-5 closes). This scans for those markers, returns one alert dict per
+    marker (queue_id + the log tail for context), and TOMBSTONES each to
+    ``.FAIL.alerted`` so the next tick doesn't re-alert. The caller raises the
+    operator alert. Best-effort + never raises — a surface error must not wedge
+    the monitor.
+    """
+    runs = _runs_dir(cfg, slug)
+    if not runs.exists():
+        return []
+    out: list[dict] = []
+    for marker in sorted(runs.glob("*.worker-restart.FAIL")):
+        qid = marker.name[: -len(".worker-restart.FAIL")]
+        tail = ""
+        log_path = runs / f"{qid}.worker-restart.log"
+        try:
+            if log_path.exists():
+                tail = "".join(log_path.read_text(errors="replace").splitlines(keepends=True)[-12:])
+        except OSError:
+            tail = ""
+        try:
+            marker.rename(marker.parent / (marker.name + ".alerted"))
+        except OSError:
+            # Couldn't tombstone — skip rather than risk re-alerting every tick.
+            log.exception("deploy.surface_worker_restart_fails: tombstone failed for %s", marker)
+            continue
+        out.append({"queue_id": qid, "tail": tail})
+    return out
 
 
 # ---------------------------------------------------------------------------

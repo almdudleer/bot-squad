@@ -17,6 +17,17 @@ def test_health_endpoint():
     assert "uptime" in body
 
 
+def test_health_reports_frozen_boot_git_sha():
+    """T-0335 item-13 (Fork-5): /health carries the worker's frozen-at-boot
+    git_sha so a deploy can detect running != deployed worker code."""
+    app = build_app()
+    with TestClient(app) as client:
+        r = client.get("/health")
+    body = r.json()
+    assert "git_sha" in body
+    assert isinstance(body["git_sha"], str)
+
+
 def test_actions_noop():
     app = build_app()
     with TestClient(app) as client:

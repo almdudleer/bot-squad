@@ -844,6 +844,40 @@ def test_reap_orphans_ignores_fresh_processing(tmp_path: Path) -> None:
     assert len(list(proc_dir.glob("*.json"))) == 1
 
 
+def test_surface_worker_restart_fails_reports_and_tombstones(tmp_path: Path) -> None:
+    """T-0335 item-13 (Fork-5): the .worker-restart.FAIL marker — written by a
+    failed detached restart but never read by jobs.py — is surfaced exactly once
+    and tombstoned so it doesn't re-alert every tick."""
+    from bot_squad_worker.deploy import surface_worker_restart_fails, _runs_dir
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    runs = _runs_dir(cfg, proj.slug)
+    runs.mkdir(parents=True, exist_ok=True)
+    marker = runs / "abc123.worker-restart.FAIL"
+    marker.write_text("")
+    (runs / "abc123.worker-restart.log").write_text(
+        "[worker-restart] SMOKE_HEALTH_FAILED — worker did not answer /health\n")
+
+    out = surface_worker_restart_fails(cfg, proj.slug)
+    assert len(out) == 1
+    assert out[0]["queue_id"] == "abc123"
+    assert "SMOKE_HEALTH_FAILED" in out[0]["tail"]
+    # tombstoned → the FAIL marker is gone, an .alerted marker remains
+    assert not marker.exists()
+    assert (runs / "abc123.worker-restart.FAIL.alerted").exists()
+
+    # second pass is a no-op — no duplicate alert
+    assert surface_worker_restart_fails(cfg, proj.slug) == []
+
+
+def test_surface_worker_restart_fails_empty_when_none(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import surface_worker_restart_fails
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    assert surface_worker_restart_fails(cfg, proj.slug) == []
+
+
 def test_is_clean_for_target_deploy_clone_ignores_dev_state(tmp_path: Path) -> None:
     """T-0225: for a deploy-clone project, NEITHER a dirty dev tree NOR unpushed
     dev commits gate the pre-ping cleanliness check — origin is the SSOT, so one
@@ -1104,6 +1138,126 @@ def test_build_worker_restart_script_has_guard_restart_smoke(tmp_path: Path) -> 
     assert "/install/data/_sock/worker.sock" in script
     # failure paths drop the FAIL marker
     assert "/runs/q.FAIL" in script
+
+
+# ---------------------------------------------------------------------------
+# T-0335 item-13 (Fork-5): auto-detect worker/ change → restart → sha verify
+# ---------------------------------------------------------------------------
+
+def test_worker_needs_restart_true_on_worker_subtree_change(monkeypatch) -> None:
+    import bot_squad_worker.deploy as d
+    monkeypatch.delenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", raising=False)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: "b" * 40)
+    monkeypatch.setattr(d, "_worker_subtree_changed", lambda root, a, b: True)
+    assert d._worker_needs_restart(_make_config_only(monkeypatch)) is True
+
+
+def test_worker_needs_restart_false_when_subtree_unchanged(monkeypatch) -> None:
+    import bot_squad_worker.deploy as d
+    monkeypatch.delenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", raising=False)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: "b" * 40)
+    monkeypatch.setattr(d, "_worker_subtree_changed", lambda root, a, b: False)
+    assert d._worker_needs_restart(_make_config_only(monkeypatch)) is False
+
+
+def test_worker_needs_restart_false_when_sha_equal(monkeypatch) -> None:
+    import bot_squad_worker.deploy as d
+    monkeypatch.delenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", raising=False)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: "a" * 40)  # running == deployed
+    called = {"subtree": False}
+    monkeypatch.setattr(d, "_worker_subtree_changed",
+                        lambda root, a, b: called.__setitem__("subtree", True) or True)
+    assert d._worker_needs_restart(_make_config_only(monkeypatch)) is False
+    assert called["subtree"] is False  # short-circuits before the diff
+
+
+def test_worker_needs_restart_kill_switch(monkeypatch) -> None:
+    import bot_squad_worker.deploy as d
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", "0")
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: "b" * 40)
+    monkeypatch.setattr(d, "_worker_subtree_changed", lambda root, a, b: True)
+    assert d._worker_needs_restart(_make_config_only(monkeypatch)) is False
+
+
+def _make_config_only(monkeypatch):
+    from types import SimpleNamespace
+    return SimpleNamespace()
+
+
+def test_run_next_auto_restarts_on_worker_change_without_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fork-5: even with restart_worker NOT forced, a clean deploy whose worker/
+    subtree changed auto-fires the restart."""
+    import bot_squad_worker.deploy as d
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "worker change", "user")  # flag OFF
+
+    monkeypatch.setattr(d, "_worker_needs_restart", lambda c: True)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append((a, k)))
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+    assert len(calls) == 1  # auto-fired
+
+
+def test_run_next_no_auto_restart_when_worker_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "docs only", "user")  # flag OFF
+
+    monkeypatch.setattr(d, "_worker_needs_restart", lambda c: False)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+    assert calls == []
+
+
+def test_build_worker_restart_script_asserts_deployed_sha(tmp_path: Path) -> None:
+    """13d: when an expected (deployed) sha is given, the smoke asserts the
+    worker came back on it; the sha is shell-quoted, never python -c source."""
+    from bot_squad_worker.deploy import _build_worker_restart_script
+    sha = "c0ffee" + "0" * 34
+    script = _build_worker_restart_script(
+        worker_dir=Path("/install/worker"),
+        pip_path=Path("/install/worker/.venv/bin/pip"),
+        sock_path=Path("/install/data/_sock/worker.sock"),
+        log_path=Path("/runs/q.log"),
+        fail_marker=Path("/runs/q.FAIL"),
+        service="bot-squad-worker.service",
+        delay_s=5,
+        smoke_attempts=10,
+        expected_sha=sha,
+    )
+    assert "git_sha" in script
+    assert sha in script
+    assert "GIT_SHA_MISMATCH" in script
+
+
+def test_build_worker_restart_script_no_sha_assert_without_expected(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _build_worker_restart_script
+    script = _build_worker_restart_script(
+        worker_dir=Path("/install/worker"),
+        pip_path=Path("/install/worker/.venv/bin/pip"),
+        sock_path=Path("/install/data/_sock/worker.sock"),
+        log_path=Path("/runs/q.log"),
+        fail_marker=Path("/runs/q.FAIL"),
+        service="bot-squad-worker.service",
+        delay_s=5,
+        smoke_attempts=10,
+    )
+    assert "GIT_SHA_MISMATCH" not in script
 
 
 # ---------------------------------------------------------------------------

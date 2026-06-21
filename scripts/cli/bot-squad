@@ -104,6 +104,7 @@ PY
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "0"
   },
+  "enabledMcpjsonServers": ["playwright"],
   "hooks": {
     "SessionStart": [
       {
@@ -129,7 +130,36 @@ PY
   }
 }
 EOF
-        echo "Written: $settings_path (3 hooks: SessionStart, UserPromptSubmit, Stop; native agent-teams off — T-0148)"
+        echo "Written: $settings_path (3 hooks: SessionStart, UserPromptSubmit, Stop; native agent-teams off — T-0148; Playwright MCP pre-approved — T-0255)"
+    fi
+
+    # .mcp.json — Playwright MCP server (T-0255). Tracked (NOT under the
+    # gitignored .claude/), so it rides git into every clone; the approval to
+    # load it lives in .claude/settings.json above (enabledMcpjsonServers). A
+    # session launched with --dangerously-skip-permissions does NOT auto-trust
+    # project .mcp.json servers, so the approval must be planted, not implied.
+    # Headless + --no-sandbox so it runs as the non-root user worker; browsers
+    # resolve from the default ~/.cache/ms-playwright (a fresh host may need a
+    # one-time `npx playwright install chromium`). Write only on first init.
+    local mcp_path="$repo/.mcp.json"
+    if [ ! -e "$mcp_path" ]; then
+        cat > "$mcp_path" <<'EOF'
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@0.0.76",
+        "--headless",
+        "--isolated",
+        "--no-sandbox"
+      ]
+    }
+  }
+}
+EOF
+        echo "Written: $mcp_path (Playwright MCP — T-0255)"
     fi
 
     if [ ! -e "$repo/ops/bot-squad" ]; then

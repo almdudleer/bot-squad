@@ -1830,6 +1830,9 @@ def test_initiative_new_two_digit_pad(tmp_path, tmp_config_dir, monkeypatch):
     body = p.read_text()
     assert "id: INI-01" in body
     assert "name: " in body
+    # T-0421: no vestigial status: frontmatter — lifecycle is the
+    # active_/finished_initiatives sidecars, not a per-file status field.
+    assert "status:" not in body
 
 
 def test_doc_new_self_heals_against_manual_file(tmp_path, tmp_config_dir, monkeypatch):

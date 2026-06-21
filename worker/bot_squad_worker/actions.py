@@ -1566,10 +1566,12 @@ def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
     new_id = idalloc.allocate_id(cfg.data_dir, slug, "initiative")
     file_path = init_dir / f"{new_id}-{_slugify_title(name)}.md"
 
+    # T-0421: no status: key — initiative lifecycle is the
+    # active_/finished_initiatives sidecar sets (vision/), not a per-file
+    # field nobody reads (it only drifted from the sidecars).
     fm = "\n".join([
         f"id: {new_id}",
         f"name: {_yaml_quote(name)}",
-        "status: open",
         f"created: {_now_iso()}",
     ])
     content = f"---\n{fm}\n---\n\n# {name}\n\n(filed via initiative_new)\n"

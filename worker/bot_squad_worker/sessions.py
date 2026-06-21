@@ -2061,8 +2061,23 @@ def _read_caps(config_dir: Path) -> dict:
 
 
 def _count_live_sessions(cfg: Any) -> int:
-    """Count live sessions (status active/paused, not archived) across every
-    registered project — the cap is a system-wide resource limit."""
+    """Count live sessions across every registered project — the cap is a
+    system-wide resource limit.
+
+    T-0397: a session counts only if it is a live-holder (status active/paused,
+    not archived) AND its SID maps to a genuinely live tmux pane. The persisted
+    ``status`` field ALONE is unreliable: ``gc_sessions`` cannot reconcile a
+    dead-pane session whose md ``pane_id`` is empty (routinely empty for live
+    sessions — see ``live_pane_map``), so such phantoms linger as ``active``.
+    Trusting them inflated the count (e.g. 15/15 while only ~9 panes were live)
+    and made ``_enforce_parallel_cap`` silently refuse spawns at a false ceiling.
+    This mirrors ``detector._live_panes`` — pane reconciliation is the SSOT.
+
+    Liveness is verified against THIS worker's tmux server (the current linux
+    user, via ``live_pane_map``); a different user's sessions are reconciled by
+    their own per-user worker and are not visible here.
+    """
+    live = live_pane_map()
     n = 0
     for slug in getattr(cfg, "projects", {}) or {}:
         sess_dir = cfg.data_dir / slug / "sessions"
@@ -2070,7 +2085,7 @@ def _count_live_sessions(cfg: Any) -> int:
             continue
         for md in sess_dir.glob("*.md"):
             meta = _read_session_metadata(md)
-            if meta and _is_live_holder(meta):
+            if meta and _is_live_holder(meta) and meta.get("sid", md.stem) in live:
                 n += 1
     return n
 

@@ -39,17 +39,29 @@ def _set_caps(cfg, *, max_parallel=0, max_tokens=0) -> None:
     )
 
 
-def _live(cfg, sid, *, status="active", archived=None) -> None:
+# SID → pane_id registry backing the patched ``live_pane_map`` (T-0397). A
+# session counts as live only if its SID is in here (a genuinely live pane),
+# so ``_live(..., pane=False)`` models a dead-pane ``status: active`` phantom.
+_LIVE_PANES: dict[str, str] = {}
+
+
+def _live(cfg, sid, *, status="active", archived=None, pane=True) -> None:
     meta = {"sid": sid, "status": status, "window": "w", "task_id": "~",
             "initiative": "~"}
     if archived is not None:
         meta["archived"] = archived
     _write_session_metadata(cfg.data_dir / "p1" / "sessions" / f"{sid}.md", meta)
+    if pane:
+        _LIVE_PANES[sid] = "%0"
+    else:
+        _LIVE_PANES.pop(sid, None)
 
 
 @pytest.fixture(autouse=True)
 def _no_panes(monkeypatch):
+    _LIVE_PANES.clear()
     monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(S, "live_pane_map", lambda user=None: dict(_LIVE_PANES))
 
 
 def test_read_caps_defaults_zero_when_missing(tmp_path):
@@ -65,6 +77,28 @@ def test_count_live_excludes_suspended_and_archived(tmp_path):
     _live(cfg, "S-u-c-p3", status="suspended")             # not counted
     _live(cfg, "S-u-d-p4", status="active", archived="true")  # not counted
     assert _count_live_sessions(cfg) == 2
+
+
+def test_count_live_drops_phantom_active_without_pane(tmp_path):
+    """T-0397: a session marked ``status: active`` whose tmux pane is DEAD (no
+    live pane for its SID) is a phantom — it must NOT count toward the parallel
+    cap. Trusting md status alone let ~6 dead-pane sessions inflate
+    ``live_sessions`` to 15/15 and silently refuse spawns at a false ceiling."""
+    cfg = _make_cfg(tmp_path)
+    _live(cfg, "S-u-live-p1", status="active")                  # genuine live pane
+    _live(cfg, "S-u-paused-p2", status="paused")                # genuine live pane
+    _live(cfg, "S-u-phantom-p3", status="active", pane=False)   # dead pane → phantom
+    assert _count_live_sessions(cfg) == 2                       # phantom dropped
+
+
+def test_enforce_admits_when_phantom_below_cap(tmp_path):
+    """The FUNCTIONAL bug: a phantom dead-pane ``active`` md must not consume a
+    cap slot. With cap=2, one real-live + one phantom is 1 real < 2 → admit."""
+    cfg = _make_cfg(tmp_path)
+    _set_caps(cfg, max_parallel=2)
+    _live(cfg, "S-u-live-p1", status="active")
+    _live(cfg, "S-u-phantom-p2", status="active", pane=False)
+    _enforce_parallel_cap(cfg)  # 1 real live < 2 → must NOT raise
 
 
 def test_enforce_refuses_at_cap(tmp_path):

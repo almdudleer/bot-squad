@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Routes, Route, Link, useParams } from "react-router-dom";
+import { Routes, Route, Link, useParams, useNavigate } from "react-router-dom";
 import {
   mothershipApi,
   type AttachedServer,
@@ -13,9 +13,8 @@ import { AllProjects, projectCardLinkFor, statusBadgeClass } from "./AllProjects
 import { AddServerWizard } from "./AddServerWizard";
 import { MothershipProject } from "./MothershipProject";
 import { Releases } from "./Releases";
-import { Users } from "./Users";
+import { Users, canManageGrants } from "./Users";
 import { api } from "../api";
-import { isSuperAdminFromMe } from "../components/sidebarHelpers";
 
 /**
  * T-0013: Chapter I §8 specifies that the mothership add-server flow
@@ -161,6 +160,7 @@ function DetailRow({ label, children }: { label: string; children: React.ReactNo
  */
 function ServerDetail({ server }: { server: AttachedServer }) {
   const id = server.id;
+  const navigate = useNavigate();
   const [projects, setProjects] = useState<ServerProject[]>(
     server.projects_cache ?? [],
   );
@@ -169,6 +169,12 @@ function ServerDetail({ server }: { server: AttachedServer }) {
   // the grants section rather than surfacing an error (mirrors listGrants'
   // _require_owner contract in routes_mothership.py).
   const [grants, setGrants] = useState<Grant[] | null>(null);
+  // T-0414: the viewer's username drives the OWNER-ONLY deregister
+  // affordance, mirroring the BE `require_manage` SSOT. A failed /api/me
+  // falls back to undefined → not manageable (the safe no-god-mode default).
+  const [username, setUsername] = useState<string | undefined>(undefined);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -185,6 +191,27 @@ function ServerDetail({ server }: { server: AttachedServer }) {
     };
   }, [id]);
 
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getMyProfile()
+      .then((me) => {
+        if (!cancelled) setUsername(me?.username);
+      })
+      .catch(() => {
+        if (!cancelled) setUsername(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // T-0414: reuse the BE-mirroring owner predicate (canManageGrants). The
+  // self-server returns true here but the BE 409s its delete (it self-
+  // resurrects) — we surface that 409 inline rather than pre-hiding, so the
+  // guard stays visible.
+  const canManage = canManageGrants(server, username);
+
   async function onRefreshProjects() {
     setRefreshing(true);
     try {
@@ -196,14 +223,68 @@ function ServerDetail({ server }: { server: AttachedServer }) {
     }
   }
 
+  async function onDeregister() {
+    // Destructive + irreversible: the registry row, stored bearer, and
+    // checkpoint log are swept (T-0412). Gate behind an explicit confirm.
+    const ok = globalThis.confirm(
+      `Deregister "${server.display_name}"?\n\nThis removes the server from the ` +
+        `mothership registry along with its stored bearer and install history. ` +
+        `This cannot be undone.`,
+    );
+    if (!ok) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await mothershipApi.deleteServer(id);
+      // Row is gone from the registry; leave the now-dangling detail view
+      // for the fleet console where the row has disappeared.
+      navigate("/m");
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : String(err));
+      setDeleting(false);
+    }
+  }
+
   return (
     <div className="container py-4" style={{ maxWidth: 720 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div className="mc-section-title">Mothership · server detail</div>
-        <span className={installStateBadge(server.install_state)}>
-          {server.install_state}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          <span className={installStateBadge(server.install_state)}>
+            {server.install_state}
+          </span>
+          {/* T-0414: owner-gated deregister (the FE close for createServer).
+              Reuses canManageGrants — the same BE-mirroring owner predicate
+              the grants UI uses. Destructive, so it's styled as a danger
+              affordance + guarded by a confirm dialog in onDeregister. */}
+          {canManage && (
+            <button
+              type="button"
+              onClick={onDeregister}
+              disabled={deleting}
+              className="mc-badge mc-badge-danger"
+              data-testid="deregister-server"
+              style={{
+                padding: "2px 12px",
+                cursor: deleting ? "wait" : "pointer",
+                background: "transparent",
+                fontSize: 11,
+              }}
+            >
+              {deleting ? "deregistering…" : "deregister"}
+            </button>
+          )}
+        </div>
       </div>
+
+      {deleteError && (
+        <div
+          className="mc-badge mc-badge-danger"
+          style={{ marginTop: "0.6rem", display: "inline-block" }}
+        >
+          {deleteError}
+        </div>
+      )}
 
       <h2 style={{ fontSize: "1.15rem", margin: "0.75rem 0 0.25rem" }}>
         {server.display_name}
@@ -326,7 +407,7 @@ function ServerDetail({ server }: { server: AttachedServer }) {
         </section>
       )}
 
-      <InviteUserPanel serverId={id} />
+      <InviteUserPanel server={server} />
     </div>
   );
 }
@@ -476,22 +557,31 @@ function ServerProgress() {
         </ul>
       )}
 
-      {id && <InviteUserPanel serverId={id} />}
+      {/* T-0413: the invite panel is owner-gated via canManageGrants, which
+          needs the resolved server (owner_user). For a freshly-minted server
+          not yet in the registry cache, `server` is briefly null and the
+          panel is withheld — a transient, safe omission (the BE would 403 a
+          non-owner mint anyway). */}
+      {server && <InviteUserPanel server={server} />}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// T-0125: per-server "invite a user" surface. Mounts inside ServerProgress
-// so the inviter can mint + watch the same checkpoint stream they're
-// already on. Super-admin gate: the mothership router itself is gated on
-// VITE_MOTHERSHIP, but the create_invite endpoint is auth'd (not super-
-// admin gated server-side as of T-0026), so we double-up the gate on the
-// FE by checking /api/me. `isSuperAdminFromMe` falls back to `is_admin`
-// pre-T-0066.
+// T-0125 / T-0413: per-server "invite a user" surface. Mounts inside
+// ServerDetail/ServerProgress so the inviter can mint + watch the same
+// checkpoint stream they're already on.
+//
+// T-0413 gate fix: the BE create_invite is owner-gated via the
+// `require_manage` SSOT (T-0390) — a non-owner admin 403s the mint. The old
+// FE gate was the pre-T-0026 super-admin predicate (isSuperAdminFromMe), so a
+// non-owner super-admin was SHOWN the form yet the mint 403'd. We now gate on
+// canManageGrants (username === server.owner_user), the SAME owner predicate
+// the grants UI uses, collapsing to ONE FE owner predicate that mirrors the
+// BE boundary.
 // ---------------------------------------------------------------------------
 
-function InviteUserPanel({ serverId }: { serverId: string }) {
+function InviteUserPanel({ server }: { server: AttachedServer }) {
   const [allowed, setAllowed] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -500,7 +590,7 @@ function InviteUserPanel({ serverId }: { serverId: string }) {
       .getMyProfile()
       .then((me) => {
         if (cancelled) return;
-        setAllowed(isSuperAdminFromMe(me));
+        setAllowed(canManageGrants(server, me?.username));
       })
       .catch(() => {
         // Treat fetch failure as "not allowed" — the panel is hidden, the
@@ -510,10 +600,10 @@ function InviteUserPanel({ serverId }: { serverId: string }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [server]);
 
   if (!allowed) return null;
-  return <InviteUserForm serverId={serverId} />;
+  return <InviteUserForm serverId={server.id} />;
 }
 
 function InviteUserForm({ serverId }: { serverId: string }) {

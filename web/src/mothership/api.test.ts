@@ -349,6 +349,66 @@ describe("mothershipApi.createServer (install-token mint)", () => {
   });
 });
 
+// T-0414: deregister affordance. The BE DELETE /api/m/servers/{id} (T-0412)
+// is the close for register_server; the FE handle must hit that path with
+// method DELETE, return the {removed} envelope, and invalidate the servers
+// cache so the row vanishes from the next listServers() without a hard
+// reload. is_self → 409 (surfaced as an `API error 409` rejection), the BE
+// guard against deleting the self-server.
+describe("mothershipApi.deleteServer (T-0414)", () => {
+  beforeEach(() => invalidateServersCache());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    invalidateServersCache();
+  });
+
+  test("DELETEs /api/m/servers/<id> and returns the {removed} envelope", async () => {
+    const spy = mockFetchSequence([{ json: async () => ({ removed: "srv_x" }) }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    const out = await mothershipApi.deleteServer("srv_x");
+    expect(out).toEqual({ removed: "srv_x" });
+    expect(spy).toHaveBeenCalledWith(
+      "/api/m/servers/srv_x",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  test("URL-encodes the server id", async () => {
+    const spy = mockFetchSequence([{ json: async () => ({ removed: "srv/odd" }) }]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await mothershipApi.deleteServer("srv/odd");
+    expect((spy as FetchSpy).mock.calls[0][0]).toBe("/api/m/servers/srv%2Fodd");
+  });
+
+  test("invalidates the servers cache so the next list re-fetches", async () => {
+    const spy = mockFetchSequence([
+      // initial list populates the cache
+      { json: async () => [{ id: "srv_x", install_state: "ready" }] },
+      // DELETE
+      { json: async () => ({ removed: "srv_x" }) },
+      // re-list after invalidation: row is gone
+      { json: async () => [] },
+    ]);
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    await mothershipApi.listServers();
+    await mothershipApi.deleteServer("srv_x");
+    const after = await mothershipApi.listServers();
+    expect(after).toEqual([]);
+    // Three fetches: initial list, DELETE, re-list (cache was invalidated).
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+
+  test("is_self 409 surfaces as an `API error 409` rejection", async () => {
+    globalThis.fetch = mockFetchSequence([
+      { ok: false, status: 409, text: async () => "cannot delete the mothership's own (is_self) server" },
+    ]) as unknown as typeof fetch;
+    await expect(mothershipApi.deleteServer("srv_self")).rejects.toThrow(/API error 409/);
+  });
+});
+
 describe("mothershipApi.refreshProjects", () => {
   test("POSTs to /api/m/servers/<id>/projects/refresh", async () => {
     const spy = mockFetchSequence([

@@ -295,6 +295,20 @@ export const mothershipApi = {
       },
     ),
 
+  /** T-0414: deregister (delete) a server — the close for `createServer`.
+   *  Owner-gated on the BE via the `require_manage` SSOT (T-0390/T-0412),
+   *  so a non-owner 403s and the `is_self` self-server 409s (it self-
+   *  resurrects on next boot). Invalidates the servers cache so the row
+   *  disappears from the next `listServers()` without a hard reload. */
+  deleteServer: async (serverId: string): Promise<{ removed: string }> => {
+    const out = await call<{ removed: string }>(
+      `/api/m/servers/${encodeURIComponent(serverId)}`,
+      { method: "DELETE" },
+    );
+    invalidateServersCache();
+    return out;
+  },
+
   /** T-0113: list every GlobalUser. Super-admin only (403 otherwise) — the
    *  Users page surfaces the 403 as a "super-admin only" empty state. */
   listUsers: () => call<GlobalUser[]>("/api/m/users"),

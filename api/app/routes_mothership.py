@@ -55,6 +55,15 @@ from app.routes_auth import require_auth
 
 # ---- routers ----------------------------------------------------------------
 # Cookie-auth surface for the logged-in mothership user.
+# Fork-6 READY: the terminal checkpoint of a FRESH install (the last step of
+# ``INSTALL_STEPS`` in scripts/install/install.sh). When the installer reports
+# this checkpoint as ``done`` it has finished — the server moves to ``ready``.
+# CONTRACT: this MUST equal install.sh's ``INSTALL_STEPS`` terminal step (and
+# must NOT be the invite path's ``print_join_attach``). Pinned by
+# test_mothership_install_state.py::test_terminal_constant_matches_install_sh_contract.
+TERMINAL_INSTALL_CHECKPOINT = "print_attach"
+
+
 router = APIRouter(tags=["mothership"], dependencies=[Depends(require_auth)])
 # Bearer-auth surface for the installer script (no session cookie).
 installer_router = APIRouter(tags=["mothership-installer"])
@@ -797,6 +806,16 @@ def installer_checkpoint(
     store = _store(request)
     stamped = store.append_checkpoint(server_id, event)
     store.touch_last_seen(server_id)
+    # Fork-6 READY: the installer's TERMINAL checkpoint closes the install
+    # lifecycle — move the registry row connected|failed → ready (the state the
+    # FE gates cross-server fan-out on). Gated on the exact (checkpoint, status)
+    # pair; mark_install_state no-ops on any other current state so a replayed
+    # terminal report or a stray report can't regress/over-promote. Only the
+    # fresh-install terminal (TERMINAL_INSTALL_CHECKPOINT) fires — the invite
+    # path's print_join_attach is deliberately excluded (it joins an existing,
+    # already-ready server).
+    if checkpoint == TERMINAL_INSTALL_CHECKPOINT and status == "done":
+        store.mark_install_state(server_id, "ready", allowed_from={"connected", "failed"})
     _broadcast(server_id, stamped)
     return Response(status_code=204)
 

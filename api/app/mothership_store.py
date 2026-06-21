@@ -258,6 +258,39 @@ class MothershipStore:
             self.write(servers)
         return entry, token
 
+    def mark_install_state(
+        self,
+        server_id: str,
+        new_state: str,
+        *,
+        allowed_from: set[str],
+    ) -> AttachedServer | None:
+        """Transition a server's ``install_state`` — the close for the
+        install lifecycle (audit Fork-6 READY).
+
+        Transitions to ``new_state`` ONLY when the current state is in
+        ``allowed_from`` (a small explicit FSM guard). When the current state is
+        NOT in ``allowed_from`` this is a safe no-op — the unchanged entry is
+        returned (so re-reporting a terminal checkpoint on an already-``ready``
+        server, or a stray report on a ``pending`` server, neither errors nor
+        regresses the state). Returns ``None`` if no such server.
+
+        The canonical use is ``connected|failed → ready`` on the installer's
+        terminal checkpoint (``failed → ready`` covers an installer rerun that
+        recovers after a mid-install failure).
+        """
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                if s.install_state not in allowed_from:
+                    return s
+                servers[i] = replace(s, install_state=new_state)
+                self.write(servers)
+                return servers[i]
+        return None
+
     def remove_server(self, server_id: str) -> bool:
         """Delete a server from the registry — the close for ``register_server``
         (audit Fork-6 DEREGISTER).

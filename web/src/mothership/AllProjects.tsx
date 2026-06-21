@@ -7,30 +7,20 @@ import {
   type FanOutResult,
   type ServerProject,
 } from "./api";
-import { api } from "../api";
-import { Modal } from "../components/Modal";
 import { Coachmark } from "../onboarding";
 import { STEP_9_3_BULLETS, STEP_9_3_TITLE } from "../onboarding/copy";
 
-function deriveSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^[^a-z]+/, "")
-    .replace(/-+$/g, "");
-}
-
-interface NewProjectState {
-  display_name: string;
-  slug: string;
-  slug_touched: boolean;
-  repo_path: string;
-}
-
 /**
- * Cross-server all-projects view (T-0025). Mounted at /m on the mothership
- * build, and at / on the mothership build via App.tsx's VITE_MOTHERSHIP swap
- * (per docs/architecture/D-0017-mothership-seam.md).
+ * Fleet / servers overview (T-0025; reframed by T-0357). Mounted at the `/m`
+ * index on the mothership build (per docs/architecture/D-0017-mothership-seam.md).
+ *
+ * T-0357 (de-fleet the chrome): this used to be a SECOND project picker — a flat
+ * grid of every project across every server, duplicating the `/` Picker for the
+ * self server's projects (the dogfood T-0331 "two doors" incoherence). It is
+ * reframed into a SERVERS overview: one row per attached server (state +
+ * reachability + project count), drill into a server → its projects → operate.
+ * `/` is now the ONLY project-operate door; this is the fleet/admin surface.
+ * Project creation moved to the `/` Picker's wizard; server-add stays here.
  *
  * Quick-status enum (working|needs-input|idle) is locked here as the canonical
  * shape — coordinated with the multi_server TL on 2026-05-14. T-0016 will
@@ -241,10 +231,6 @@ export function serverHeaderLabel(server: AttachedServer): {
 export function AllProjects() {
   const [sections, setSections] = useState<ServerSection[] | null>(null);
   const [topError, setTopError] = useState<string | null>(null);
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [creating, setCreating] = useState<NewProjectState | null>(null);
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [createSaving, setCreateSaving] = useState(false);
   // T-0342: ids of stale install cards the operator dismissed (persisted).
   const [dismissed, setDismissed] = useState<Set<string>>(() =>
     loadDismissedInstalls(),
@@ -257,25 +243,6 @@ export function AllProjects() {
       persistDismissedInstalls(next);
       return next;
     });
-  }
-
-  function reload() {
-    setTopError(null);
-    setSections(null);
-    (async () => {
-      try {
-        const servers = await mothershipApi.listServers();
-        const readyIds = servers
-          .filter((s) => s.install_state === "ready")
-          .map((s) => s.id);
-        const fanResults = await fanOut(readyIds, (id) =>
-          mothershipApi.projectsFor(id),
-        );
-        setSections(buildSections(servers, fanResults));
-      } catch (e) {
-        setTopError(e instanceof Error ? e.message : String(e));
-      }
-    })();
   }
 
   useEffect(() => {
@@ -298,46 +265,18 @@ export function AllProjects() {
         setTopError(e instanceof Error ? e.message : String(e));
       }
     })();
-    api.me().then((m) => setIsAdmin(Boolean(m.is_admin))).catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
 
-  async function submitCreate() {
-    if (!creating) return;
-    if (!creating.display_name.trim() || !creating.slug.trim()) {
-      setCreateError("display name and slug required");
-      return;
-    }
-    setCreateSaving(true);
-    setCreateError(null);
-    try {
-      // T-0051: createProject now takes the JSON body directly. The
-      // mothership AllProjects view only uses the minimal back-compat
-      // shape (no mode field); the deep wizard lives on the per-server
-      // Picker (see pages/Picker.tsx).
-      const body: Record<string, unknown> = {
-        slug: creating.slug.trim(),
-        display_name: creating.display_name.trim(),
-      };
-      const repo = creating.repo_path.trim();
-      if (repo) body.repo_path = repo;
-      await api.createProject(body);
-      setCreating(null);
-      reload();
-    } catch (e) {
-      setCreateError(String(e));
-    } finally {
-      setCreateSaving(false);
-    }
-  }
-
   return (
-    <div className="container py-4" style={{ maxWidth: "1100px" }}>
+    <div className="container py-4" style={{ maxWidth: "900px" }}>
       {/* §9.3 spotlight — single coachmark, three bullets. Auto-gated to
           mothership builds by virtue of living in this module (App.tsx
-          lazy-imports it only when VITE_MOTHERSHIP === "1"). */}
+          lazy-imports it only when VITE_MOTHERSHIP === "1"). Re-anchored by
+          T-0357 to the sidebar's ▦ "Fleet / admin" icon (the old FLEET nav
+          item it pointed at is gone). */}
       <Coachmark
         stepId="srv.9_3.cross_server"
         title={STEP_9_3_TITLE}
@@ -352,38 +291,24 @@ export function AllProjects() {
         }
       />
 
-      <div className="d-flex align-items-center justify-content-between gap-2 mb-4">
+      <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
         <div className="mc-section-title" style={{ margin: 0 }}>
-          All projects
+          Servers
         </div>
-        <div className="d-flex align-items-center gap-2">
-          {isAdmin && (
-            <button
-              type="button"
-              className="btn btn-outline-primary btn-sm"
-              style={{ fontSize: "0.72rem" }}
-              data-onboarding-anchor="create-project"
-              onClick={() =>
-                setCreating({
-                  display_name: "",
-                  slug: "",
-                  slug_touched: false,
-                  repo_path: "",
-                })
-              }
-            >
-              + New project
-            </button>
-          )}
-          <Link
-            to="/m/servers/add"
-            className="mc-badge mc-badge-info"
-            style={{ textDecoration: "none", padding: "6px 14px" }}
-          >
-            + Add server
-          </Link>
-        </div>
+        <Link
+          to="/m/servers/add"
+          className="mc-badge mc-badge-info"
+          style={{ textDecoration: "none", padding: "6px 14px" }}
+        >
+          + Add server
+        </Link>
       </div>
+      {/* T-0357: `/` is the project-operate door; this fleet view is about
+          servers. Drill into a server to reach its projects. */}
+      <p style={{ color: "var(--mc-text-dim)", fontSize: 12, marginBottom: "1.25rem" }}>
+        The fleet of attached servers. Open a server to see its projects and
+        drill in to operate one.
+      </p>
 
       {topError && <div className="alert alert-danger">{topError}</div>}
 
@@ -408,11 +333,11 @@ export function AllProjects() {
       )}
 
       {!topError && sections !== null && sections.length > 0 && (
-        <div style={{ display: "grid", gap: "1.25rem" }}>
+        <div style={{ display: "grid", gap: "0.6rem" }}>
           {sections
             .filter((section) => !dismissed.has(section.server.id))
             .map((section) => (
-              <ServerSectionView
+              <ServerRow
                 key={section.server.id}
                 section={section}
                 onDismiss={() => dismissInstall(section.server.id)}
@@ -420,108 +345,55 @@ export function AllProjects() {
             ))}
         </div>
       )}
-
-      <Modal
-        open={creating !== null}
-        title="New project (this server)"
-        onClose={() => setCreating(null)}
-        footer={
-          <>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setCreating(null)}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={submitCreate}
-              disabled={createSaving}
-            >
-              {createSaving ? "Creating…" : "Create"}
-            </button>
-          </>
-        }
-      >
-        {createError && <div className="alert alert-danger">{createError}</div>}
-        <div className="mb-3">
-          <label className="form-label">Display name *</label>
-          <input
-            className="form-control"
-            value={creating?.display_name ?? ""}
-            onChange={(e) => {
-              if (!creating) return;
-              const display_name = e.target.value;
-              setCreating({
-                ...creating,
-                display_name,
-                slug: creating.slug_touched
-                  ? creating.slug
-                  : deriveSlug(display_name),
-              });
-            }}
-            autoFocus
-          />
-        </div>
-        <div className="mb-3">
-          <label className="form-label">Slug *</label>
-          <input
-            className="form-control"
-            style={{ fontFamily: "var(--mc-mono)" }}
-            value={creating?.slug ?? ""}
-            onChange={(e) =>
-              creating &&
-              setCreating({ ...creating, slug: e.target.value, slug_touched: true })
-            }
-            placeholder="lowercase, letters/digits/-/_"
-          />
-        </div>
-        <div className="mb-3">
-          <label className="form-label">Repo path</label>
-          <input
-            className="form-control"
-            style={{ fontFamily: "var(--mc-mono)" }}
-            value={creating?.repo_path ?? ""}
-            onChange={(e) =>
-              creating && setCreating({ ...creating, repo_path: e.target.value })
-            }
-            placeholder="optional — fill in projects.toml later"
-          />
-        </div>
-      </Modal>
     </div>
   );
 }
 
-function ServerSectionView({
+/** T-0357: a server is reachable only when its fan-out result resolved ok. */
+function projectCountLabel(section: ServerSection): string {
+  if (section.kind === "installing") return "";
+  if (!section.result || !section.result.ok) return "unreachable";
+  const n = section.result.data.length;
+  return `${n} project${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * One server in the fleet overview (T-0357). The whole row drills into the
+ * server-detail view (`/m/servers/:id`), where its projects live and link
+ * through to operate. Replaces the old ServerSectionView, which rendered every
+ * project inline as a second project picker.
+ */
+function ServerRow({
   section,
   onDismiss,
 }: {
   section: ServerSection;
   onDismiss: () => void;
 }) {
-  const { server, kind, result } = section;
+  const { server, kind } = section;
   const label = serverHeaderLabel(server);
   const stalled = kind === "installing" && isStaleInstall(server);
+  const count = projectCountLabel(section);
   return (
-    <section
+    <Link
+      to={`/m/servers/${encodeURIComponent(server.id)}`}
       data-testid={server.is_self ? "server-self" : "server-peer"}
       style={{
+        display: "block",
         border: "1px solid var(--mc-border)",
         borderRadius: 4,
-        padding: "0.75rem 1rem",
+        padding: "0.7rem 1rem",
         background: "var(--mc-surface)",
+        textDecoration: "none",
+        color: "inherit",
       }}
     >
-      <header
+      <div
         style={{
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
           gap: "0.5rem",
-          marginBottom: "0.75rem",
           flexWrap: "wrap",
         }}
       >
@@ -548,15 +420,22 @@ function ServerSectionView({
             </span>
           )}
         </div>
-        <div
-          style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
-        >
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+          {count && (
+            <span style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
+              {count}
+            </span>
+          )}
           <ServerHeaderBadge section={section} stalled={stalled} />
           {stalled && (
             <button
               type="button"
               data-testid={`dismiss-install-${server.id}`}
-              onClick={onDismiss}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onDismiss();
+              }}
               title="Dismiss this stalled install card"
               aria-label="Dismiss"
               className="btn btn-sm btn-outline-secondary"
@@ -566,15 +445,19 @@ function ServerSectionView({
             </button>
           )}
         </div>
-      </header>
-      <InstallTokenRow server={server} />
-      <ServerSectionBody
-        server={server}
-        kind={kind}
-        result={result}
-        stalled={stalled}
-      />
-    </section>
+      </div>
+      <div style={{ marginTop: "0.4rem" }}>
+        <InstallTokenRow server={server} />
+        {kind === "installing" && (
+          <div style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
+            {stalled
+              ? "Install appears stalled — no progress in over 30 min."
+              : "Install hasn’t finished yet."}{" "}
+            <span style={{ color: "var(--mc-cyan)" }}>watch progress →</span>
+          </div>
+        )}
+      </div>
+    </Link>
   );
 }
 
@@ -634,83 +517,6 @@ function ServerHeaderBadge({
     >
       unreachable
     </span>
-  );
-}
-
-function ServerSectionBody({
-  server,
-  kind,
-  result,
-  stalled = false,
-}: {
-  server: AttachedServer;
-  kind: ServerSection["kind"];
-  result: FanOutResult<ServerProject[]> | null;
-  stalled?: boolean;
-}) {
-  if (kind === "installing") {
-    return (
-      <div style={{ color: "var(--mc-text-dim)", fontSize: 13 }}>
-        {stalled
-          ? "Install appears stalled — no progress in over 30 min."
-          : "Install hasn’t finished yet."}{" "}
-        <Link to={`/m/servers/${encodeURIComponent(server.id)}`}>
-          watch progress →
-        </Link>
-      </div>
-    );
-  }
-  if (!result || !result.ok) {
-    return (
-      <div style={{ color: "var(--mc-text-dim)", fontSize: 13 }}>
-        {(result && !result.ok && result.error) ||
-          "Unable to reach this server."}
-      </div>
-    );
-  }
-  if (result.data.length === 0) {
-    return (
-      <div style={{ color: "var(--mc-text-dim)", fontSize: 13 }}>
-        No projects on this server yet.
-      </div>
-    );
-  }
-  return (
-    <div className="row g-2">
-      {result.data.map((p) => {
-        const card = (
-          <div className="mc-project-card" style={{ cursor: "pointer" }}>
-            <div className="mc-project-name">{p.display_name}</div>
-            <div
-              className="mc-project-slug"
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: "0.5rem",
-              }}
-            >
-              <span>{p.slug}</span>
-              <span className={statusBadgeClass(p.status)}>{p.status}</span>
-            </div>
-          </div>
-        );
-        // T-0068: peer-server cards now link to the cross-server board
-        // route. The self-server keeps its short `/p/:slug` URL so
-        // bookmarks/deep-links from the single-install era still resolve.
-        const to = projectCardLinkFor(server, p.slug);
-        return (
-          <div className="col-md-4" key={p.slug}>
-            <Link
-              to={to}
-              style={{ textDecoration: "none", color: "inherit" }}
-            >
-              {card}
-            </Link>
-          </div>
-        );
-      })}
-    </div>
   );
 }
 

@@ -3,7 +3,7 @@ import { Link, NavLink, Outlet, useParams, useLocation } from "react-router-dom"
 import { api } from "../api";
 import { AutoupdatePill } from "./AutoupdatePill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
-import { isSuperAdminFromMe } from "./sidebarHelpers";
+import { isSuperAdminFromMe, resolveRailContext } from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
@@ -71,6 +71,19 @@ export function Shell() {
   // Display slug: URL takes precedence; otherwise the pinned slug
   const slug = urlSlug ?? pinnedSlug;
   const hasProject = Boolean(slug);
+
+  // T-0357 (de-fleet the chrome). Fleet/admin chrome belongs to super-admins on
+  // a mothership build only; a non-admin / single-project operator must see ZERO
+  // fleet chrome — pure single-brain. `railContext` then guarantees the
+  // per-project rail and the fleet/admin rail are NEVER shown at the same time
+  // (the dogfood T-0331 incoherence: a pin leaked the watchrobot rail over the
+  // cross-server fleet body on `/m/*`).
+  const isFleetCapable = IS_MOTHERSHIP_BUILD && isSuperAdmin;
+  const railContext = resolveRailContext({
+    pathname: location.pathname,
+    hasProject,
+    isFleetCapable,
+  });
 
   // Poll the health endpoint every 30 s — kept only for the username fallback
   // now that the worker-status pill is gone (T-0167 removed the OPERATIONAL
@@ -175,6 +188,27 @@ export function Shell() {
           <div className="mc-sidebar-header-top">
             <Link to="/" className="mc-wordmark">BOT·SQUAD</Link>
             <div className="mc-sidebar-header-icons">
+              {/* T-0357: the ONLY door from a project's brain into the fleet/
+                  admin area. FLEET used to be a peer nav item at the bottom of
+                  EVERY per-project rail (it advertised the fleet from inside a
+                  single brain — the dogfood T-0331 incoherence). It is demoted
+                  to this single, visually-separate header affordance, gated on
+                  super-admin + mothership so a plain operator never sees it. */}
+              {isFleetCapable && (
+                <NavLink
+                  to="/m"
+                  className={({ isActive }) =>
+                    isActive
+                      ? "mc-sidebar-fleet-icon active"
+                      : "mc-sidebar-fleet-icon"
+                  }
+                  aria-label="Fleet / admin"
+                  title="Fleet / admin"
+                  data-onboarding-anchor="all-projects-nav"
+                >
+                  ▦
+                </NavLink>
+              )}
               {/* T-0170: server settings reached via a gear here, parallel to
                   the per-project settings gear (T-0167). Admin-gated because
                   /system-settings is server-admin only; non-admins never see
@@ -215,8 +249,10 @@ export function Shell() {
           {!IS_MOTHERSHIP_BUILD && <AutoupdatePill />}
         </div>
 
-        {/* Project section — shows pinned project even on global routes */}
-        {hasProject && slug && (
+        {/* Project section — shows pinned project even on global routes, but
+            NOT in the fleet/admin area (T-0357: railContext keeps the
+            per-project rail and the admin rail mutually exclusive). */}
+        {railContext === "project" && slug && (
           <>
             <div className="mc-sidebar-section">Project</div>
             <div className="mc-sidebar-project">
@@ -330,56 +366,45 @@ export function Shell() {
           </>
         )}
 
-        {/* FLEET — T-0336 (reframe-operator-paradigm). bot-squad reads as a
-            single project brain operated by one operator, NOT a fleet console.
-            So the multi-server mothership area is DEMOTED from an always-on
-            subsection (GLOBAL USERS + RELEASES shown on every page, incl.
-            inside a single project — the dogfood T-0331 INCOHERENCE) to a
-            single admin "FLEET" entry. Its children (Global Users / Releases /
-            servers / add-server, via the AllProjects console at the `/m` index)
-            surface as a CONTEXTUAL sub-nav only while the operator is inside
-            the fleet area (`/m/*`). Tree-shaken out of detach bundles via the
-            VITE_MOTHERSHIP literal gate; further gated on super-admin so global
-            members never see it. (Was T-0170/T-0318: the always-on MOTHERSHIP
-            subsection.) */}
-        {IS_MOTHERSHIP_BUILD && isSuperAdmin && (
+        {/* FLEET/ADMIN RAIL — T-0357 (de-fleet the chrome). When the operator is
+            in the fleet/admin area (`/m/*`), the sidebar swaps the per-project
+            rail for THIS admin rail — it is about the FLEET (servers + global
+            concerns), not about any one project. This replaces both (a) the old
+            always-on FLEET nav item that bolted onto every per-project rail and
+            (b) the leaked watchrobot project rail that used to sit over the
+            cross-server fleet body (the dogfood T-0331 incoherence). Reached via
+            the header ▦ "Fleet / admin" affordance; gated on super-admin +
+            mothership build via railContext === "fleet". */}
+        {railContext === "fleet" && (
           <>
-            <div className="mc-sidebar-divider" aria-hidden="true" />
+            <div className="mc-sidebar-section">Fleet</div>
             <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
                   to="/m"
+                  end
                   className={({ isActive }) => (isActive ? "active" : undefined)}
                 >
-                  FLEET
+                  SERVERS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to="/m/users"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  GLOBAL USERS
+                </NavLink>
+              </li>
+              <li>
+                <NavLink
+                  to="/m/releases"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  RELEASES
                 </NavLink>
               </li>
             </ul>
-            {(location.pathname === "/m" ||
-              location.pathname.startsWith("/m/")) && (
-              <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
-                <li>
-                  <NavLink
-                    to="/m/users"
-                    className={({ isActive }) =>
-                      isActive ? "active" : undefined
-                    }
-                  >
-                    GLOBAL USERS
-                  </NavLink>
-                </li>
-                <li>
-                  <NavLink
-                    to="/m/releases"
-                    className={({ isActive }) =>
-                      isActive ? "active" : undefined
-                    }
-                  >
-                    RELEASES
-                  </NavLink>
-                </li>
-              </ul>
-            )}
           </>
         )}
 

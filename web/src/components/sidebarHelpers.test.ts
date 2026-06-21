@@ -3,11 +3,74 @@ import { describe, expect, test } from "vitest";
 import {
   SELF_SERVER_ID,
   SERVER_PICKER_STORAGE_KEY,
+  isFleetArea,
   isSuperAdminFromMe,
   readAttachmentServerId,
   resolveInitialPickedServer,
+  resolveRailContext,
   type PickerCandidate,
 } from "./sidebarHelpers";
+
+describe("isFleetArea (T-0357)", () => {
+  test("matches the /m index and any /m/* sub-route", () => {
+    expect(isFleetArea("/m")).toBe(true);
+    expect(isFleetArea("/m/users")).toBe(true);
+    expect(isFleetArea("/m/releases")).toBe(true);
+    expect(isFleetArea("/m/servers/srv_x/p/foo")).toBe(true);
+  });
+
+  test("does NOT match project / global routes that merely start with /m", () => {
+    // Guard against a loose startsWith('/m') prefix bug: /me, /members, /p/m
+    // are not the fleet area.
+    expect(isFleetArea("/")).toBe(false);
+    expect(isFleetArea("/me")).toBe(false);
+    expect(isFleetArea("/members")).toBe(false);
+    expect(isFleetArea("/p/watchrobot")).toBe(false);
+    expect(isFleetArea("/p/m")).toBe(false);
+  });
+});
+
+describe("resolveRailContext (T-0357 — never show fleet + project chrome at once)", () => {
+  test("fleet-capable super-admin in the fleet area → 'fleet' rail (even with a pin)", () => {
+    // The incoherence #3 fix: a pinned project no longer leaks the per-project
+    // rail over the cross-server fleet body.
+    expect(
+      resolveRailContext({ pathname: "/m", hasProject: true, isFleetCapable: true }),
+    ).toBe("fleet");
+    expect(
+      resolveRailContext({ pathname: "/m/users", hasProject: true, isFleetCapable: true }),
+    ).toBe("fleet");
+  });
+
+  test("fleet-capable super-admin inside a project → 'project' rail", () => {
+    expect(
+      resolveRailContext({ pathname: "/p/watchrobot", hasProject: true, isFleetCapable: true }),
+    ).toBe("project");
+  });
+
+  test("GUARD 1: a non-fleet-capable operator NEVER lands in 'fleet' — pure single-brain", () => {
+    // Even if somehow at /m, a non-super-admin sees no admin rail. With a pin
+    // they keep their project rail; without one, nothing.
+    expect(
+      resolveRailContext({ pathname: "/m", hasProject: true, isFleetCapable: false }),
+    ).toBe("project");
+    expect(
+      resolveRailContext({ pathname: "/m", hasProject: false, isFleetCapable: false }),
+    ).toBe("none");
+    expect(
+      resolveRailContext({ pathname: "/p/watchrobot", hasProject: true, isFleetCapable: false }),
+    ).toBe("project");
+  });
+
+  test("no project + not the fleet area → 'none' (the / picker renders no rail)", () => {
+    expect(
+      resolveRailContext({ pathname: "/", hasProject: false, isFleetCapable: true }),
+    ).toBe("none");
+    expect(
+      resolveRailContext({ pathname: "/help", hasProject: false, isFleetCapable: false }),
+    ).toBe("none");
+  });
+});
 
 describe("isSuperAdminFromMe (T-0062 with T-0066 fallback)", () => {
   test("explicit is_super_admin=true wins regardless of is_admin", () => {

@@ -6,8 +6,11 @@
 
 export const STEP_9_3_TITLE = "Mothership perks";
 
+// T-0357: re-worded off the retired "ALL PROJECTS" cross-server picker. The
+// fleet view is now a SERVERS overview (the ▦ "Fleet / admin" door); you pick a
+// project to operate from Home (`/`).
 export const STEP_9_3_BULLETS: ReadonlyArray<string> = [
-  "All your servers, one list — open ALL PROJECTS to fan out across everything attached.",
+  "Every attached server in one fleet view — open a server to drill into its projects.",
   "Quick project switcher — the sidebar dropdown carries live status for every project.",
   "@bot_squad_bot routes notifications from every attached server to one TG chat.",
   "Preferences sync across servers (coming soon).",

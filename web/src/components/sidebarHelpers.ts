@@ -34,6 +34,44 @@ export function isSuperAdminFromMe(me: MeLike | null | undefined): boolean {
   return Boolean(me.is_admin);
 }
 
+/**
+ * T-0357 — which sidebar rail the Shell renders. The single-brain reconcile
+ * requires that "fleet/admin" chrome and "this project's brain" chrome are
+ * NEVER shown at the same time (the dogfood T-0331 incoherence: a pinned
+ * project's rail leaked over the cross-server fleet body on `/m/*`).
+ *
+ *   • "fleet"   — the admin/fleet area (`/m/*`): render the admin rail
+ *                 (Fleet / Global Users / Releases), NOT the per-project rail.
+ *   • "project" — a project is in scope (URL slug or a pin) and we are NOT in
+ *                 the fleet area: render the per-project rail.
+ *   • "none"    — no project and not the fleet area (the `/` picker, /help on a
+ *                 fresh install): render neither rail.
+ */
+export type RailContext = "project" | "fleet" | "none";
+
+/** True for the mothership admin area: the `/m` index and any `/m/*` sub-route.
+ *  Deliberately exact (=== "/m") or slash-prefixed ("/m/") so sibling routes
+ *  that merely start with the letters `/m` (/me, /members, /p/m) don't match. */
+export function isFleetArea(pathname: string): boolean {
+  return pathname === "/m" || pathname.startsWith("/m/");
+}
+
+/**
+ * Decide the rail context. `isFleetCapable` = mothership build AND super-admin;
+ * a non-admin / single-project operator is never fleet-capable, so they can
+ * NEVER land in "fleet" — they only ever see "project" or "none" (pure
+ * single-brain, T-0357 guard 1).
+ */
+export function resolveRailContext(opts: {
+  pathname: string;
+  hasProject: boolean;
+  isFleetCapable: boolean;
+}): RailContext {
+  if (opts.isFleetCapable && isFleetArea(opts.pathname)) return "fleet";
+  if (opts.hasProject) return "project";
+  return "none";
+}
+
 /** T-0060 — localStorage key for the server picker selection. Scoped per
  *  installation; in a multi-user context the key would also be per-user,
  *  but the cookie session already isolates browsers. */

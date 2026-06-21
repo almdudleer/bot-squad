@@ -9,7 +9,7 @@ import {
   type MintedInvite,
   type ServerProject,
 } from "./api";
-import { AllProjects } from "./AllProjects";
+import { AllProjects, projectCardLinkFor, statusBadgeClass } from "./AllProjects";
 import { AddServerWizard } from "./AddServerWizard";
 import { MothershipProject } from "./MothershipProject";
 import { Releases } from "./Releases";
@@ -264,7 +264,11 @@ function ServerDetail({ server }: { server: AttachedServer }) {
             {projects.map((p) => (
               <li key={p.slug}>
                 <Link
-                  to={`/m/servers/${encodeURIComponent(id)}/p/${encodeURIComponent(p.slug)}`}
+                  // T-0357: drill server→project→operate. Self-server projects
+                  // route to the real operate door (`/p/:slug`); peer projects
+                  // go through the cross-server proxy view. projectCardLinkFor
+                  // is the single place that decision lives (mirrors AllProjects).
+                  to={projectCardLinkFor(server, p.slug)}
                   style={{
                     display: "grid",
                     gridTemplateColumns: "1fr auto",
@@ -282,7 +286,7 @@ function ServerDetail({ server }: { server: AttachedServer }) {
                       {p.slug}
                     </code>
                   </span>
-                  <span className="mc-badge mc-badge-info" style={{ fontSize: 11 }}>
+                  <span className={statusBadgeClass(p.status)} style={{ fontSize: 11 }}>
                     {p.status}
                   </span>
                 </Link>

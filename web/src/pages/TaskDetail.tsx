@@ -8,6 +8,7 @@ import {
   sessionGlyph,
   sessionLabel,
 } from "../utils/sessionStatus";
+import { normalizeId } from "../utils/normalizeId";
 
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "planned", label: "Planned" },
@@ -513,9 +514,17 @@ export function TaskDetail() {
               initiative:
             </label>
             {(() => {
+              // T-0425: compare task.initiative against the option basenames via
+              // the shared normalize_id contract (strip one trailing .md), so a
+              // bare-stem binding ("ui-polish") matches its ".md" option
+              // ("ui-polish.md") instead of being false-flagged "(not found)".
+              const matched = task.initiative
+                ? initiativeOptions.find(
+                    (i) => normalizeId(i.basename) === normalizeId(task.initiative),
+                  )
+                : undefined;
               const orphan: SelectOption | null =
-                task.initiative &&
-                !initiativeOptions.some((i) => i.basename === task.initiative)
+                task.initiative && !matched
                   ? { value: task.initiative, label: `${task.initiative} (not found)` }
                   : null;
               const options: SelectOption[] = [
@@ -533,7 +542,10 @@ export function TaskDetail() {
               return (
                 <Select
                   id="task-initiative"
-                  value={task.initiative ?? ""}
+                  // Use the matched option's exact basename so the Select
+                  // highlights the bound initiative regardless of the stored
+                  // id-form; fall back to the raw value (orphan) or unattached.
+                  value={matched ? matched.basename : (task.initiative ?? "")}
                   onChange={(v) => saveInitiative(v || null)}
                   disabled={saving}
                   style={{ minWidth: "14rem", maxWidth: "26rem" }}

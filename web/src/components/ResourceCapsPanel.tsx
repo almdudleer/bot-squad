@@ -210,11 +210,12 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       });
       setMaxParallel(String(result.caps.max_parallel_sessions));
       setMaxTokens(String(result.caps.max_total_tokens));
-      setNotice(
-        result.restart_required
-          ? "Saved. Restart the worker for the new caps to take effect."
-          : "Saved.",
-      );
+      // T-0389/audit item 15: caps are FRESH-READ at each spawn (sessions.py
+      // _read_caps / _enforce_*_cap), so they take effect immediately — the
+      // generic `restart_required` flag (meaningful for tg/worker-env settings)
+      // is wrong + harmful for a caps-only save. Always report the accurate
+      // no-restart message.
+      setNotice("Saved. New caps apply to the next spawn (no restart needed).");
     } catch (e) {
       setError(String(e));
     } finally {

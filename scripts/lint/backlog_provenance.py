@@ -44,7 +44,7 @@ _TOKEN_RE = re.compile(
     r"\A(?:"
     r"corpus:[a-z0-9][a-z0-9-]*"
     r"|F-\d+"
-    r"|T-\d{4}"
+    r"|T-\d{4,}"  # T-0371: ids cross 9999
     r"|stakeholder:\d{4}-\d{2}-\d{2}"
     r")\Z"
 )

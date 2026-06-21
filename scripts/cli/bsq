@@ -2187,9 +2187,9 @@ def cmd_doc_link(args) -> None:
     slug = resolve_slug()
     doc_id = args.doc_id.upper()
     ticket = args.ticket.upper()
-    if not re.match(r"^D-\d{4}$", doc_id):
+    if not re.match(r"^D-\d{4,}$", doc_id):  # T-0371: ids cross 9999
         die(f"invalid doc id: {doc_id!r} (expect D-NNNN)")
-    if not re.match(r"^T-\d{4}$", ticket):
+    if not re.match(r"^T-\d{4,}$", ticket):  # T-0371
         die(f"invalid ticket id: {ticket!r} (expect T-NNNN)")
     doc_path = _find_doc_file(slug, doc_id)
     if doc_path is None:

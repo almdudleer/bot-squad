@@ -334,7 +334,7 @@ import json  # noqa: E402
 
 # T-0180: flows use the "UF-" (user-flow) prefix, deliberately distinct from
 # curated feedback's "F-" (feedback/F-NNNN-*.md) so a bare id is never ambiguous.
-_FLOW_ID_RE = re.compile(r"^UF-\d{4}$")
+_FLOW_ID_RE = re.compile(r"^UF-\d{4,}$")  # T-0371: ids cross 9999
 
 
 def _slugify(s: str, max_len: int = 60) -> str:

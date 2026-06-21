@@ -68,7 +68,7 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
 
 def _id_from_stem(stem: str) -> str:
     """``D-0001-some-slug`` -> ``D-0001``; ``UC-0002`` / ``F-x`` -> unchanged."""
-    m = re.match(r"^([A-Za-z]+-\d{4})(?:-.*)?$", stem)
+    m = re.match(r"^([A-Za-z]+-\d{4,})(?:-.*)?$", stem)  # T-0371: ids cross 9999
     return m.group(1) if m else stem
 
 

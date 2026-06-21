@@ -35,7 +35,7 @@ def _invalid_status_detail(value: object) -> str:
     return f"invalid status: {value!r} — must be one of {{{canon}}}"
 
 
-_TASK_ID_RE = re.compile(r"^T-\d{4}$")
+_TASK_ID_RE = re.compile(r"^T-\d{4,}$")  # T-0371: \d{4,} — ids cross the 9999 ceiling
 
 # T-0038: optional linkage fields settable via PATCH alongside title/status.
 # T-0172: `related_docs` (list of D-NNNN) — the ticket→doc half of the
@@ -43,7 +43,7 @@ _TASK_ID_RE = re.compile(r"^T-\d{4}$")
 # which keeps both sides in sync; this key lets the UI edit it directly too.
 _LINKAGE_PATCH_KEYS = frozenset({"initiative", "parent_task", "blocked_by", "related_docs"})
 
-_DOC_ID_RE = re.compile(r"^D-\d{4}$")
+_DOC_ID_RE = re.compile(r"^D-\d{4,}$")  # T-0371
 
 # Permissive — basename of a vision/initiatives/<name> .md file. Empty string
 # allowed (callers must pass null to clear, not empty).

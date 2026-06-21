@@ -38,9 +38,9 @@ router = APIRouter(
 )
 
 _MAX_CONTENT_BYTES = 200 * 1024
-_DOC_ID_RE = re.compile(r"^D-\d{4}$")
+_DOC_ID_RE = re.compile(r"^D-\d{4,}$")  # T-0371: ids cross 9999
 _CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_TASK_ID_RE = re.compile(r"^T-\d{4}$")
+_TASK_ID_RE = re.compile(r"^T-\d{4,}$")  # T-0371
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)\Z", re.DOTALL)
 
 # Initial category set (T-0172 DoD). Extensible: any on-disk category dir is

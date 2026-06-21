@@ -56,7 +56,7 @@ _ALLOWED_UPDATE_KEYS = frozenset({
     "related_docs",
 })
 
-_TASK_ID_RE = re.compile(r"^T-(\d{4})-")
+_TASK_ID_RE = re.compile(r"^T-(\d{4,})-")  # T-0371: ids cross the 9999 ceiling
 
 
 def _now_utc_iso() -> str:

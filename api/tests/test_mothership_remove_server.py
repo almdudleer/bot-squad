@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from app.install_tokens import hash_token, mint_server_bearer
 from app.main import build_app
 from app.mothership_store import AttachedServer, MothershipStore
+from app.mothership_users_store import MothershipUsersStore
 
 
 _BCRYPT_TEST = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"
@@ -115,6 +116,46 @@ def test_remove_server_leaves_other_rows(tmp_bot_squad: Path):
     assert [s.id for s in store.list_servers()] == ["srv_b"]
 
 
+# ---- users store: remove_attachments_for_server (T-0412) --------------------
+
+
+def _seed_attachments(tmp_bot_squad: Path) -> MothershipUsersStore:
+    """Two GlobalUsers each attached to the kill target + a survivor server."""
+    ustore = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    for gid in ("gu_alice", "gu_bob"):
+        ustore.upsert_attachment(
+            global_user_id=gid, server_id="srv_kill", server_username=gid)
+        ustore.upsert_attachment(
+            global_user_id=gid, server_id="srv_keep", server_username=gid)
+    return ustore
+
+
+def test_remove_attachments_for_server_sweeps_all_users(tmp_bot_squad: Path):
+    ustore = _seed_attachments(tmp_bot_squad)
+    assert ustore.get_attachment("gu_alice", "srv_kill") is not None
+    assert ustore.get_attachment("gu_bob", "srv_kill") is not None
+
+    removed = ustore.remove_attachments_for_server("srv_kill")
+
+    assert removed == 2
+    # target attachments gone for every user
+    assert ustore.get_attachment("gu_alice", "srv_kill") is None
+    assert ustore.get_attachment("gu_bob", "srv_kill") is None
+    # survivor server untouched
+    assert ustore.get_attachment("gu_alice", "srv_keep") is not None
+    assert ustore.get_attachment("gu_bob", "srv_keep") is not None
+
+
+def test_remove_attachments_for_server_idempotent_and_no_dir(tmp_bot_squad: Path):
+    # no attachments dir at all -> 0, no crash
+    ustore = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    assert ustore.remove_attachments_for_server("srv_kill") == 0
+    # second call after a real sweep returns 0
+    _seed_attachments(tmp_bot_squad)
+    assert ustore.remove_attachments_for_server("srv_kill") == 2
+    assert ustore.remove_attachments_for_server("srv_kill") == 0
+
+
 # ---- route: owner-gated DELETE, refuses is_self -----------------------------
 
 
@@ -128,6 +169,24 @@ def test_owner_can_delete_peer_server(tmp_bot_squad: Path, monkeypatch):
         # gone from the owner's list
         listing = client.get("/api/m/servers").json()
     assert all(s["id"] != "srv_test01" for s in listing)
+
+
+def test_delete_server_sweeps_attachment_rows(tmp_bot_squad: Path, monkeypatch):
+    """T-0412: DELETE closes the per-user side of the loop too."""
+    _write_auth(tmp_bot_squad)
+    _seed(tmp_bot_squad, server_id="srv_test01", owner_user="testuser")
+    ustore = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    ustore.upsert_attachment(
+        global_user_id="gu_alice", server_id="srv_test01", server_username="alice")
+    ustore.upsert_attachment(
+        global_user_id="gu_alice", server_id="srv_other", server_username="alice")
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "testuser")
+        r = client.delete("/api/m/servers/srv_test01")
+        assert r.status_code == 200, r.text
+    # the deregistered server's attachment is gone; the unrelated one survives
+    assert ustore.get_attachment("gu_alice", "srv_test01") is None
+    assert ustore.get_attachment("gu_alice", "srv_other") is not None
 
 
 def test_non_owner_cannot_delete_server(tmp_bot_squad: Path, monkeypatch):

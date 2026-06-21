@@ -444,7 +444,9 @@ def delete_server(
     (T-0390) — routing this destructive op through anything else would be the
     next ``is_self`` privesc. REFUSES the ``is_self`` row: it self-resurrects via
     ``register_self_if_missing`` on next boot, so deleting it is pointless +
-    confusing. ``remove_server`` sweeps the row + bearer sidecar + checkpoint log.
+    confusing. ``remove_server`` sweeps the row + bearer sidecar + checkpoint log;
+    then ``remove_attachments_for_server`` drops every GlobalUser's attachment
+    sidecar (T-0412) so attached_servers doesn't stay inflated post-deregister.
     """
     if server.is_self:
         raise HTTPException(
@@ -455,6 +457,10 @@ def delete_server(
         # require_manage already resolved the server, so a False is a race
         # (a concurrent delete burned it first). Treat as already-gone.
         raise HTTPException(status_code=404, detail="server not found")
+    # Close the per-user side of the loop: the registry row is gone, but every
+    # attached GlobalUser still holds a dangling attachments/<gid>/<id>.json
+    # (inflating attached_servers). remove_server has no reach there (T-0412).
+    _users_store(request).remove_attachments_for_server(server_id)
     return {"removed": server_id}
 
 

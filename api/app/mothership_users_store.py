@@ -315,6 +315,36 @@ class MothershipUsersStore:
             os.rename(tmp, path)
             return entry, created
 
+    def remove_attachments_for_server(self, server_id: str) -> int:
+        """Delete every GlobalUser's Attachment to ``server_id`` — the close for
+        ``upsert_attachment`` when a server is deregistered (T-0412).
+
+        ``MothershipStore.remove_server`` sweeps the registry row + bearer +
+        checkpoints, but the per-user ``attachments/<gid>/<server_id>.json``
+        sidecars have no owner there; after a DELETE every attached GlobalUser
+        would keep a dangling row and ``attached_servers`` would stay inflated.
+        Iterates each user's attachment dir and unlinks the matching file
+        (avoiding glob so a server_id with glob metacharacters can't slip the
+        sweep). Returns the count removed (idempotent — a second call returns 0).
+        """
+        removed = 0
+        with self._lock:
+            base = self.root / "attachments"
+            if not base.is_dir():
+                return 0
+            for user_dir in base.iterdir():
+                if not user_dir.is_dir():
+                    continue
+                path = user_dir / f"{server_id}.json"
+                if not path.is_file():
+                    continue
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
+
     def touch_last_seen(self, global_user_id: str, server_id: str) -> Attachment | None:
         with self._lock:
             existing = self.get_attachment(global_user_id, server_id)

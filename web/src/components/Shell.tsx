@@ -311,12 +311,13 @@ export function Shell() {
               </li>
             </ul>
 
-            {/* T-0170: a NESTED sub-section under PROJECT, not a peer of it — a
-                quieter, unbracketed header (vs. the bracketed `[ PROJECT ]`).
-                T-0383: single-brain process vocab — these are the worker
-                PROCESSES running this project (sessions), plus deploy queue +
-                analytics. */}
-            <div className="mc-sidebar-subsection">Processes</div>
+            {/* T-0170: a NESTED sub-section under PROJECT (quieter, indented vs.
+                the bracketed `[ PROJECT ]`) grouping the worker-PROCESS views:
+                the process list + its deploy queue + analytics.
+                T-0385: collapsed the redundant "Processes" section header — after
+                the T-0383 rename it exactly duplicated the "PROCESSES" nav item
+                below it (the dup label dogfood flagged). The nested indent still
+                groups these items; no header label needed. */}
             <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
               <li>
                 <NavLink

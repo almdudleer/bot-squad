@@ -180,7 +180,8 @@ export function TelemetryPanel({ slug }: { slug: string }) {
           style={{ fontSize: "0.68rem", textDecoration: "none" }}
           onClick={() => setCollapsed((c) => !c)}
         >
-          {collapsed ? `▸ ${sessions.length} sessions` : "▾ hide"}
+          {/* T-0385: process vocab (T-0383 sweep residual). */}
+          {collapsed ? `▸ ${sessions.length} processes` : "▾ hide"}
         </button>
       </div>
 

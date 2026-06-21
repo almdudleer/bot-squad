@@ -220,6 +220,9 @@ def get_analytics(request: Request, slug: str) -> dict:
         "slug": slug,
         "generated_at": now.isoformat(),
         "window_days": _WINDOW_DAYS,
+        # T-0360: expose the deploys/week trailing-window length so the FE can
+        # label that chart's scope explicitly (it differs from window_days).
+        "deploy_weeks": _DEPLOY_WEEKS,
         "sessions": _sessions_stats(data_dir, today),
         "tickets": _tickets_stats(data_dir, today),
         "deploys": _deploys_stats(data_dir),

@@ -53,22 +53,38 @@ function StatCard({
   );
 }
 
+// T-0360: per-widget time-scope label. The page mixed three time semantics
+// (all-time totals, a 14d day window, an 8-week deploy window) under one global
+// "last 14d window" header — misleading. Each widget now states its own scope.
+function ScopeLabel({ scope }: { scope: string }) {
+  return (
+    <span
+      style={{ fontFamily: "var(--mc-mono)", fontSize: "0.64rem", color: "var(--mc-text-dim)", fontWeight: 400 }}
+      title="Time scope of this widget"
+    >
+      {scope}
+    </span>
+  );
+}
+
 /** Vertical bar chart over a day/week series. */
 function BarChart({
   title,
   data,
   color = "var(--mc-cyan)",
+  scope,
 }: {
   title: string;
   data: { label: string; value: number; tip: string }[];
   color?: string;
+  scope?: string;
 }) {
   const max = Math.max(1, ...data.map((d) => d.value));
   const total = data.reduce((a, d) => a + d.value, 0);
   return (
     <div className="mc-an-chart">
       <div className="mc-an-chart-head">
-        <span>{title}</span>
+        <span>{title}{scope && <> · <ScopeLabel scope={scope} /></>}</span>
         <span className="mc-an-chart-total">{total} total</span>
       </div>
       <div className="mc-an-bars">
@@ -97,17 +113,19 @@ function StatusBreakdown({
   title,
   counts,
   palette,
+  scope,
 }: {
   title: string;
   counts: Record<string, number>;
   palette: Record<string, string>;
+  scope?: string;
 }) {
   const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
   const max = Math.max(1, ...entries.map(([, c]) => c));
   return (
     <div className="mc-an-chart">
       <div className="mc-an-chart-head">
-        <span>{title}</span>
+        <span>{title}{scope && <> · <ScopeLabel scope={scope} /></>}</span>
       </div>
       <div className="mc-an-status-list">
         {entries.length === 0 && <div className="mc-an-card-sub">no data</div>}
@@ -219,24 +237,16 @@ export function Analytics() {
             / {slug}
           </span>
         </h2>
-        {data && (
-          <span
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontSize: "0.72rem",
-              color: "var(--mc-text-dim)",
-            }}
-          >
-            last {data.window_days}d window
-          </span>
-        )}
       </div>
 
       <PageHelp>
         Internal-usage analytics for bot-squad itself — sessions, ticket flow,
         and deploys computed server-side from this project&apos;s data dir.
-        Numbers are live (recomputed each load); the day/week charts cover a
-        trailing window.
+        Each widget states its own time scope: the headline cards + status
+        breakdowns are <strong>all-time</strong>; the day charts cover the last{" "}
+        {data?.window_days ?? 14} days; the deploys chart the last{" "}
+        {data?.deploy_weeks ?? 8} weeks. (T-0360: these used to sit under one
+        misleading &quot;last 14d&quot; label.)
       </PageHelp>
 
       {error && <div className="alert alert-danger">{error}</div>}
@@ -246,6 +256,9 @@ export function Analytics() {
 
       {data && (
         <>
+          <div style={{ fontFamily: "var(--mc-mono)", fontSize: "0.66rem", color: "var(--mc-text-dim)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "0.4rem" }}>
+            All-time totals
+          </div>
           <div className="mc-an-cards">
             <StatCard
               label="SESSIONS"
@@ -307,16 +320,19 @@ export function Analytics() {
           <div className="mc-an-grid">
             <BarChart
               title="Sessions started / day"
+              scope={`last ${data.window_days}d`}
               data={toBars(data.sessions.per_day)}
               color="var(--mc-cyan)"
             />
             <BarChart
               title="Tickets closed / day"
+              scope={`last ${data.window_days}d`}
               data={toBars(data.tickets.closed_per_day)}
               color="var(--mc-green)"
             />
             <BarChart
               title="Deploys / week"
+              scope={`last ${data.deploy_weeks ?? 8} weeks`}
               data={data.deploys.per_week.map((w) => ({
                 label: w.week.replace(/^\d+-/, ""),
                 value: w.ok + w.fail,
@@ -329,11 +345,13 @@ export function Analytics() {
           <div className="mc-an-grid">
             <StatusBreakdown
               title="Tickets by status"
+              scope="all-time"
               counts={data.tickets.by_status}
               palette={TICKET_PALETTE}
             />
             <StatusBreakdown
               title="Sessions by liveness"
+              scope="all-time"
               counts={livenessRollup(data.sessions.by_status)}
               palette={SESSION_PALETTE}
             />

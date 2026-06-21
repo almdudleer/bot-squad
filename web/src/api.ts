@@ -655,6 +655,9 @@ export type Analytics = {
   slug: string;
   generated_at: string;
   window_days: number;
+  // T-0360: trailing-week count for the deploys/week chart (differs from
+  // window_days). Optional so a pre-T-0360 API doesn't break the type.
+  deploy_weeks?: number;
   sessions: {
     total: number;
     archived: number;

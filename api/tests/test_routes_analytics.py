@@ -95,6 +95,10 @@ def test_analytics_aggregates(tmp_bot_squad, monkeypatch):
     assert body["deploys"]["fail"] == 1
     assert body["deploys"]["success_rate"] == round(2 / 3, 3)
     assert body["deploys"]["last_deploy_at"] is not None
+    # T-0360: the per-widget time scopes are exposed so the FE can label each
+    # widget explicitly (day window vs deploy-week window differ).
+    assert body["window_days"] == 14
+    assert body["deploy_weeks"] == 8
 
 
 def test_analytics_empty_project_is_zeroed(tmp_bot_squad, monkeypatch):

@@ -168,6 +168,37 @@ def _dep_callables(route: APIRoute) -> set:
     return out
 
 
+def _routes_with_full_paths(app) -> list[tuple[str, APIRoute]]:
+    """Yield ``(full_path, APIRoute)`` for every routed endpoint, descending
+    FastAPI 0.137's lazy ``_IncludedRouter`` include-wrappers.
+
+    T-0395: this FastAPI version does NOT flatten included routers into
+    ``app.routes`` — it appends opaque ``_IncludedRouter`` placeholders. A naive
+    ``for r in app.routes: isinstance(r, APIRoute)`` sweep therefore sees ZERO
+    routed endpoints and this whole guard passed VACUOUSLY (it was asserting
+    nothing). We walk into ``original_router`` and rebuild full paths from each
+    include's ``include_context.prefix`` so the guard actually enumerates the
+    routes the running app serves. The per-route ``Depends(require_project_member)``
+    gates live in ``route.dependant``, so they survive this walk.
+    """
+    out: list[tuple[str, APIRoute]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def walk(router, prefix: str) -> None:
+        key = (id(router), prefix)
+        if key in seen:
+            return
+        seen.add(key)
+        for r in getattr(router, "routes", []):
+            if type(r).__name__ == "_IncludedRouter":
+                walk(r.original_router, prefix + r.include_context.prefix)
+            elif isinstance(r, APIRoute):
+                out.append((prefix + r.path, r))
+
+    walk(app.router, "")
+    return out
+
+
 def test_no_project_write_route_is_require_auth_only(tmp_bot_squad, monkeypatch):
     monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
     monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
@@ -175,20 +206,27 @@ def test_no_project_write_route_is_require_auth_only(tmp_bot_squad, monkeypatch)
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("COOKIE_SECURE", "0")
     app = build_app()
+    project_write = [
+        (path, route)
+        for path, route in _routes_with_full_paths(app)
+        if (route.methods & _WRITE_METHODS) and path.startswith("/api/projects/{slug}")
+    ]
+    # T-0395 anti-vacuity meta-assert: if the route walker ever stops seeing the
+    # real routes (e.g. a FastAPI internals change), this guard must FAIL loud
+    # rather than silently enumerate nothing and pass. There are ~51 today.
+    assert len(project_write) >= 20, (
+        f"project-write guard enumerated only {len(project_write)} routes — the "
+        "route walker is no longer seeing the real routes (the guard would be "
+        "vacuous). Fix _routes_with_full_paths before trusting this assertion."
+    )
     ungated = []
-    for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        if not (route.methods & _WRITE_METHODS):
-            continue
-        if not route.path.startswith("/api/projects/{slug}"):
-            continue
-        if route.path in _ALLOWLIST:
+    for path, route in project_write:
+        if path in _ALLOWLIST:
             continue
         deps = _dep_callables(route)
         if require_project_member not in deps and require_admin not in deps:
             for m in sorted(route.methods & _WRITE_METHODS):
-                ungated.append(f"{m} {route.path}")
+                ungated.append(f"{m} {path}")
     assert not ungated, (
         "project-write routes gated by require_auth only (gate with "
         "require_project_member or allowlist with a reason):\n" + "\n".join(sorted(ungated))

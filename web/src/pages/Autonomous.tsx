@@ -130,21 +130,27 @@ export function Autonomous() {
 
   return (
     <div className="container py-4">
-      {/* Page header */}
+      {/* Page header. T-0361: renamed "Autonomous team" → "Autonomous"
+          (processes framing, no team vocab). The live status badge +
+          auto-refresh readout only make sense once the feature is ON — while
+          disabled the page collapses to just the enable toggle + sleep window
+          (no dead "idle / — / — / no" chrome). */}
       <div className="d-flex justify-content-between align-items-center mb-1">
         <div className="d-flex align-items-center gap-3">
-          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Autonomous team</h2>
-          {state && <StatusBadge status={state.status} />}
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Autonomous</h2>
+          {state && isEnabled && <StatusBadge status={state.status} />}
         </div>
         <div className="d-flex align-items-center gap-2">
-          <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
-            auto-refresh 15s
-            {lastRefresh && (
-              <span style={{ marginLeft: "0.4rem" }}>
-                · {lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-              </span>
-            )}
-          </span>
+          {isEnabled && (
+            <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
+              auto-refresh 15s
+              {lastRefresh && (
+                <span style={{ marginLeft: "0.4rem" }}>
+                  · {lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                </span>
+              )}
+            </span>
+          )}
           {state && (
             isEnabled ? (
               <button
@@ -192,6 +198,12 @@ export function Autonomous() {
 
       {state !== null && (
         <>
+          {/* T-0361: the live status surface (working banner + the four stat
+              cards) only renders once the feature is ENABLED. While disabled
+              these were all dead chrome ("idle / — / — / no") that duplicated
+              the header badge + the Enable toggle. */}
+          {isEnabled && (
+          <>
           {/* Working banner */}
           {state.status === "working" && state.current_task_id && (
             <div className="alert alert-primary d-flex align-items-center gap-2 mb-4">
@@ -272,8 +284,12 @@ export function Autonomous() {
               </div>
             </div>
           </div>
+          </>
+          )}
 
-          {/* Settings card */}
+          {/* Settings card — always available (you set the sleep window before
+              enabling). T-0361: this + the Enable toggle are the entire surface
+              while disabled. */}
           <div className="card mb-4">
             <div className="card-header">Sleep window settings</div>
             <div className="card-body">
@@ -323,7 +339,8 @@ export function Autonomous() {
             </div>
           </div>
 
-          {/* Tick log */}
+          {/* Tick log — only meaningful once enabled (T-0361). */}
+          {isEnabled && (
           <div className="card">
             <div
               className="card-header d-flex justify-content-between align-items-center"
@@ -359,6 +376,7 @@ export function Autonomous() {
               )}
             </div>
           </div>
+          )}
         </>
       )}
 

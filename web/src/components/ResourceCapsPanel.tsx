@@ -240,7 +240,13 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   const hardCap = caps?.max_parallel_sessions ?? parallelNum ?? 0;
   const effLimit = caps?.effective_limit ?? 0;
   const liveCount = caps?.live_sessions;
-  const throttled = effLimit > 0 && hardCap > 0 && effLimit < hardCap;
+  // P2-02: hardCap==0 means UNLIMITED (∞), not "no throttle". The shipped
+  // default is caps 0/0 with backoff ON, so the AIMD governor can depress an
+  // otherwise-unlimited ceiling to a finite effective_limit — that IS a throttle
+  // and must be visible. Treat hardCap 0 as Infinity so the badge renders
+  // whenever a finite effective_limit sits below the (possibly ∞) ceiling.
+  // (effective_limit 0 = unlimited/no pressure → not throttled.)
+  const throttled = effLimit > 0 && effLimit < (hardCap || Infinity);
   const parallelText =
     liveCount != null
       ? `${liveCount}/${hardCap === 0 ? "∞" : hardCap}`

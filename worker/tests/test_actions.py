@@ -1967,6 +1967,23 @@ def test_provision_project_topics_unknown_slug_raises(tmp_config_dir, monkeypatc
         A.dispatch("provision_project_topics", {"slug": "no-such"})
 
 
+def test_provision_project_topics_no_tg_chat_raises(tmp_config_dir, monkeypatch):
+    """T-0386 flag-off-safe: a fresh / DM-only project with no supergroup
+    configured raises a CLEAR error (not a malformed empty-chat_id API call) —
+    the create_project hook catches it best-effort so provisioning is skipped,
+    never blocking project creation."""
+    import dataclasses
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    proj = dataclasses.replace(cfg.projects["test-project"], tg_chat="")
+    monkeypatch.setattr(A, "_get_config",
+                        lambda: dataclasses.replace(cfg, projects={"test-project": proj}))
+    with pytest.raises(ActionError, match="no tg_chat supergroup"):
+        A.dispatch("provision_project_topics", {"slug": "test-project"})
+    assert fake.created == []  # no API call attempted with an empty chat_id
+
+
 def test_gc_project_topics_closes_all(tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
     from bot_squad_worker import tg_topics

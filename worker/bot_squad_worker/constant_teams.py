@@ -102,6 +102,32 @@ def _truthy(value: Any) -> bool:
 # State (cursor + cooldown)
 # ---------------------------------------------------------------------------
 
+def _read_finished_initiatives(cfg: Any, slug: str) -> set[str]:
+    """Basenames (``<name>.md``) of initiatives marked finished via the API.
+
+    Mirrors ``routes_vision._read_finished_initiatives``: one name per line in
+    ``vision/finished_initiatives``, stripping a legacy ``initiatives/`` prefix.
+    T-0335 item-16: a finished constant-team initiative must stop being
+    re-staffed by :func:`tick`.
+    """
+    p = cfg.data_dir / slug / "vision" / "finished_initiatives"
+    if not p.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        lines = p.read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("initiatives/"):
+            line = line[len("initiatives/"):]
+        out.add(line)
+    return out
+
+
 def _state_dir(cfg: Any, slug: str) -> Path:
     return cfg.data_dir / slug / "_worker" / "constant_teams"
 
@@ -481,10 +507,15 @@ def tick(cfg: Any, slug: str) -> dict:
     if not init_dir.exists():
         return {"actions": []}
 
+    # T-0335 item-16: a shipped/archived initiative stops re-staffing its team.
+    finished = _read_finished_initiatives(cfg, slug)
+
     all_actions: list[dict] = []
     for init_path in sorted(init_dir.glob("*.md")):
         fm = _read_frontmatter(init_path)
         if not _truthy(fm.get("constant_team")):
+            continue
+        if init_path.name in finished:
             continue
         try:
             all_actions.extend(_maintain_initiative(cfg, slug, init_path, fm))

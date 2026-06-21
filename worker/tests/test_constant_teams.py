@@ -193,6 +193,59 @@ def test_glob_alert_spawns_triage(cfg_slug):
     assert res["actions"][0]["action"] == "spawned"
 
 
+def test_finished_initiative_skipped(cfg_slug):
+    """T-0335 item-16: a constant-team initiative whose basename is in
+    ``vision/finished_initiatives`` is skipped by tick() — no re-staffing even
+    with pending work, so a shipped initiative stops resurrecting its team."""
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "prod-support",
+                      {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
+    alerts = cfg.data_dir / slug / "_alerts"
+    alerts.mkdir(parents=True, exist_ok=True)
+    (alerts / "alert-1.md").write_text("# DB latency spike\n500ms p99")
+
+    # Mark it finished (basename-with-.md, the format _read_finished writes).
+    fin = cfg.data_dir / slug / "vision" / "finished_initiatives"
+    fin.write_text("prod-support.md\n")
+
+    res = ct.tick(cfg, slug)
+    assert spawns == []
+    assert res["actions"] == []
+
+
+def test_finished_initiative_skip_strips_prefix(cfg_slug):
+    """The finished file may carry the legacy ``initiatives/`` prefix; tick()
+    must still match it against the bare basename."""
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "prod-support",
+                      {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
+    alerts = cfg.data_dir / slug / "_alerts"
+    alerts.mkdir(parents=True, exist_ok=True)
+    (alerts / "alert-1.md").write_text("boom")
+
+    fin = cfg.data_dir / slug / "vision" / "finished_initiatives"
+    fin.write_text("initiatives/prod-support.md\n")
+
+    ct.tick(cfg, slug)
+    assert spawns == []
+
+
+def test_unfinished_initiative_still_spawns_with_finished_file_present(cfg_slug):
+    """A different initiative listed as finished must not suppress an active one."""
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "prod-support",
+                      {"constant_team": "true", "team_size": 1, "consume": "_alerts/*.md"})
+    alerts = cfg.data_dir / slug / "_alerts"
+    alerts.mkdir(parents=True, exist_ok=True)
+    (alerts / "alert-1.md").write_text("boom")
+
+    fin = cfg.data_dir / slug / "vision" / "finished_initiatives"
+    fin.write_text("some-other-initiative.md\n")
+
+    ct.tick(cfg, slug)
+    assert len(spawns) == 1
+
+
 def test_at_capacity_no_spawn(cfg_slug, monkeypatch):
     """A live member already on the initiative → no further spawn (gating)."""
     cfg, slug, spawns = cfg_slug

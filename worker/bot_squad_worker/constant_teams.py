@@ -255,6 +255,22 @@ def _compose_brief(
 
     extra = f"\n\nInitiative guidance:\n{triage_prompt.strip()}" if triage_prompt.strip() else ""
 
+    # T-0335 item-17: a demand-driven team (glob/log) drains its queue and exits;
+    # an always-on keep-alive team (no consume) has no queue and must persist as a
+    # standing loop — telling it to auto-archive would let the keep-alive respawn
+    # a churn of short-lived sessions.
+    if consume_kind == "none":
+        exit_rule = (
+            "This is a STANDING keep-alive loop — there is no queue to drain. "
+            "Keep running the initiative's cycle and do not self-archive; leave "
+            "the session live so the keep-alive does not respawn a duplicate."
+        )
+    else:
+        exit_rule = (
+            "When the queue is drained, you're done — your session auto-archives. "
+            "No need to keep a session idling."
+        )
+
     return (
         f"You are a CONSTANT-TEAM {role} for the '{name}' initiative.\n"
         f"Mission: {mission}\n"
@@ -265,8 +281,7 @@ def _compose_brief(
         f"vision/initiatives/{name}.md for the full mission.\n"
         f"- Track everything on bot-squad tickets (`bsq ticket note`), never in "
         f"superpowers docs. Commit only with `bsq commit`.\n"
-        f"- When the queue is drained, you're done — your session auto-archives. "
-        f"No need to keep a session idling.{extra}\n\n"
+        f"- {exit_rule}{extra}\n\n"
         f"Run `bsq --help` for the verb reference."
     )
 

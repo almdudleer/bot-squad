@@ -193,6 +193,29 @@ def test_glob_alert_spawns_triage(cfg_slug):
     assert res["actions"][0]["action"] == "spawned"
 
 
+def test_always_on_brief_is_keepalive_not_self_archive():
+    """T-0335 item-17: an always-on (no-consume) keep-alive team has no queue to
+    drain, so its brief must NOT tell the session to auto-archive when drained —
+    it must persist as a standing loop. The drained→archive rule is correct only
+    for demand-driven (glob/log) teams."""
+    brief = ct._compose_brief(
+        name="dogfood-loop", mission="continuously dogfood the product",
+        role="dev", items=[], triage_prompt="", consume_kind="none",
+    )
+    low = brief.lower()
+    assert "auto-archive" not in low and "auto archives" not in low
+    assert "standing" in low or "keep-alive" in low or "do not self-archive" in low
+
+
+def test_demand_driven_brief_still_self_archives():
+    """The glob/log brief keeps the drained→auto-archive rule (regression guard)."""
+    brief = ct._compose_brief(
+        name="prod-support", mission="triage alerts", role="dev",
+        items=["_alerts/a.md"], triage_prompt="", consume_kind="glob",
+    )
+    assert "auto-archive" in brief.lower()
+
+
 def test_finished_initiative_skipped(cfg_slug):
     """T-0335 item-16: a constant-team initiative whose basename is in
     ``vision/finished_initiatives`` is skipped by tick() — no re-staffing even

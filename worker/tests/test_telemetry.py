@@ -415,6 +415,32 @@ def test_urgent_context_triggers_autocompact_not_a_human_ping(tmp_path, fake_ses
     assert calls == []  # human got nothing
 
 
+def test_memory_alert_does_not_ping_the_human(tmp_path, fake_session, monkeypatch):
+    """T-0387: memory-footprint is a ROUTINE resource alert — it must NOT ping
+    the human (same closed-loop rule as T-0333 context). It stays an internal
+    operator/TL advisory: the human channel is silent, the agents still get it."""
+    cfg = _make_cfg(tmp_path)
+    calls = _capture_human_tg(monkeypatch)
+    fake_session["rows"].append({
+        "sid": "S-almdudleer-operator-p1", "status": "active",
+        "claude_uuid": "op-uuid", "linux_user": "almdudleer",
+        "role": "operator", "task_id": None, "tmux_session": "proj",
+    })
+    import bot_squad_worker.teams as _teams
+    monkeypatch.setattr(_teams, "tl_for_sid",
+                        lambda cfg, slug, sid: "S-almdudleer-TL-p9")
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    (f.parent / "memory").mkdir()
+    (f.parent / "memory" / "MEMORY.md").write_text("m" * 200_000)  # over the warn line
+    T.sample(cfg, "proj")
+    # The human is NOT pinged about routine memory footprint:
+    assert [c for c in calls if "memory footprint" in c["text"].lower()] == []
+    # ...but the internal operator/TL advisory is still delivered:
+    assert any("memory footprint high" in text for _, text in fake_session["sent"])
+
+
 def test_fresh_tail_read_does_not_redetect_429(tmp_path, fake_session, monkeypatch):
     """A 429 already in the tail at first-sample (e.g. after a compact spawns a new
     transcript) must NOT be re-counted — only 429s on the incremental read are new."""

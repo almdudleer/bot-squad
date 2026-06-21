@@ -664,11 +664,14 @@ def _fire_alerts(
 
         mem_key = f"memory:{mem_new}"
         if crossed(last.get("memory", "none"), mem_new) and cooldown_ok(fired, mem_key, now):
+            # T-0387: routine resource alert — operator/TL advisory only, NEVER
+            # the human (humans only for decisions; same closed-loop as T-0333).
             _alert_session(
                 cfg, slug, sid, operator_sids,
                 f"🧠 memory footprint high — {sid} ~{rec['memory']['tokens_est']:,} tok "
                 f"across {rec['memory']['files']} files. Consider pruning.",
                 urgent=alert_urgent("memory", mem_new),
+                human=False,
             )
             fired[mem_key] = now
             changed = True
@@ -724,16 +727,23 @@ def _fire_alerts(
 
 def _alert_session(
     cfg: Any, slug: str, sid: str, operator_sids: list[str], text: str,
-    urgent: bool = True,
+    urgent: bool = True, human: bool = True,
 ) -> None:
     """Alert the operator SID(s) + the session's TL about a per-session crossing.
 
     All delivery is targeted (specific SIDs), plus the single human TG chat.
     The affected session itself is NOT pinged (it already sees its own context
     in-pane; pinging it would be the self-interrupt the guardrail forbids).
+
+    T-0387: pass ``human=False`` for ROUTINE resource alerts (e.g. memory
+    footprint) — they reach the operator/TL SIDs as a system-internal advisory
+    but must NOT ping the human (closed-loop rule: humans only for decisions,
+    same doctrine as T-0333 context auto-compact). Decision alerts (quota/
+    throttle) keep ``human=True``.
     """
     from bot_squad_worker import teams as _teams
-    _human_tg(cfg, slug, text, urgent=urgent)
+    if human:
+        _human_tg(cfg, slug, text, urgent=urgent)
     targets: list[str] = list(operator_sids)
     tl = _teams.tl_for_sid(cfg, slug, sid)
     if tl:

@@ -80,9 +80,18 @@ def test_coalesce_script_payloads_are_valid_python(tmp_path):
 
 def test_coalesce_script_roundtrip_executes(tmp_path):
     """End-to-end: the generated write+winner payloads actually run and agree."""
+    import os
     import subprocess
     import sys
+    from pathlib import Path
+    import bot_squad_worker
     from bot_squad_worker.deploy import _build_worker_restart_script
+    # T-0380: the `python -c` children import bot_squad_worker — give them a
+    # PYTHONPATH to the package root so the test passes regardless of cwd (the
+    # full-suite run from the repo root otherwise ModuleNotFoundError'd; it only
+    # passed when pytest ran from worker/).
+    _pkg_root = str(Path(bot_squad_worker.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": _pkg_root + os.pathsep + os.environ.get("PYTHONPATH", "")}
     marker = tmp_path / "_worker" / "restart_coalesce.token"
     token = "1b6a39cf-21d7-4489-94eb-159bc57f72cb"
     script = _build_worker_restart_script(
@@ -94,12 +103,12 @@ def test_coalesce_script_roundtrip_executes(tmp_path):
     write_py = next(p for p in payloads if "_coalesce_write" in p)
     win_py = next(p for p in payloads if "_coalesce_winner" in p)
     # run write (token + marker passed as argv, never injected into source)
-    subprocess.run([sys.executable, "-c", write_py, str(marker), token], check=True)
+    subprocess.run([sys.executable, "-c", write_py, str(marker), token], check=True, env=env)
     assert marker.read_text().strip() == token
     # this token is the winner → exit 0
-    assert subprocess.run([sys.executable, "-c", win_py, str(marker), token]).returncode == 0
+    assert subprocess.run([sys.executable, "-c", win_py, str(marker), token], env=env).returncode == 0
     # a stale token is NOT the winner → exit 1
-    assert subprocess.run([sys.executable, "-c", win_py, str(marker), "stale"]).returncode == 1
+    assert subprocess.run([sys.executable, "-c", win_py, str(marker), "stale"], env=env).returncode == 1
 
 
 def test_restart_script_plain_sleep_without_marker(tmp_path):

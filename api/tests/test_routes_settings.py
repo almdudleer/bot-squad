@@ -101,6 +101,28 @@ def test_put_writes_settings_and_creates_file(tmp_bot_squad: Path, monkeypatch) 
     assert raw["session"]["ttl"] == "14d"
 
 
+def test_put_preserves_unmanaged_max_section(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0368: a settings save must NOT drop the [max] section (or any section
+    this endpoint doesn't manage) — else operator->stakeholder DMs revert to
+    TG-only (the T-0247 regression) on the next worker restart."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg_path = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg_path.write_text(
+        '[tg]\nquiet_hours_start_utc = 22\nquiet_hours_end_utc = 4\n\n'
+        '[max]\ndefault_chat_id = "211170965"\nrecipient_kind = "chat_id"\nproxy_url = ""\n'
+    )
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put("/api/system-settings", json={"tg": {"quiet_hours_start_utc": 18}})
+    assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg_path.read_text())
+    assert raw["tg"]["quiet_hours_start_utc"] == 18            # managed change applied
+    assert raw["max"]["default_chat_id"] == "211170965"        # unmanaged section PRESERVED
+    assert raw["max"]["recipient_kind"] == "chat_id"
+    assert raw["max"]["proxy_url"] == ""
+
+
 def test_put_bot_token_writes_secrets(tmp_bot_squad: Path, monkeypatch) -> None:
     # No BOT_SQUAD_SECRETS_KEY (dev / fresh install) → plaintext passthrough.
     monkeypatch.delenv("BOT_SQUAD_SECRETS_KEY", raising=False)

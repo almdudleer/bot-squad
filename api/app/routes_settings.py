@@ -72,6 +72,22 @@ def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+# Sections this endpoint hand-emits; everything else in the file is preserved
+# verbatim on write (T-0368).
+_MANAGED_SECTIONS = ("tg", "session", "admin", "caps")
+
+
+def _toml_value(v: object) -> str:
+    """Render a scalar TOML value for a preserved (unmanaged) section."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    return f'"{_toml_escape(str(v))}"'
+
+
 def _read_system_settings(config_dir: Path) -> dict:
     path = config_dir / "system_settings.toml"
     if not path.exists():
@@ -141,6 +157,21 @@ def _write_system_settings(config_dir: Path, settings: dict) -> None:
     out.append(f"max_total_tokens = {int(settings['caps']['max_total_tokens'])}")
     out.append("")
     path = config_dir / "system_settings.toml"
+    # T-0368: PRESERVE any top-level section this endpoint doesn't manage (e.g.
+    # [max], the T-0247 MAX-DM recipient) — this writer hand-emits only the
+    # managed sections, so without this a settings save silently DROPPED [max]
+    # and reverted operator->stakeholder DMs to TG-only on the next worker reload.
+    try:
+        existing = tomllib.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError):
+        existing = {}
+    for name, body in existing.items():
+        if name in _MANAGED_SECTIONS or not isinstance(body, dict):
+            continue
+        out.append(f"[{name}]")
+        for key, value in body.items():
+            out.append(f"{key} = {_toml_value(value)}")
+        out.append("")
     tmp = path.with_suffix(".toml.tmp")
     tmp.write_text("\n".join(out))
     os.rename(tmp, path)

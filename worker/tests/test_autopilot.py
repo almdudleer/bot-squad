@@ -135,3 +135,29 @@ def test_start_rejects_bad_kind_and_empty_prompt(cfg_slug):
         ap.start(cfg, slug, kind="bogus", ref=FAKE, prompt="p")
     with pytest.raises(ActionError):
         ap.start(cfg, slug, kind="session", ref=FAKE, prompt="   ")
+
+
+def test_notify_stakeholder_routes_max_primary(tmp_path: Path, monkeypatch):
+    """P2-08: autopilot's stakeholder page routes through the _send_stakeholder_dm
+    SSOT (MAX-primary on this DPI-blocked host) + a #team-queries group-record,
+    not a raw TG send that silently drops here."""
+    import dataclasses
+    import types
+    from bot_squad_worker import actions as A, tg_topics
+
+    project = _make_project_with_repo(tmp_path)
+    cfg = dataclasses.replace(
+        _make_config_with_project(tmp_path, project),
+        max_default_chat_id="MAXID", max_recipient_kind="chat_id",
+    )
+    tg_topics.save(cfg, project.slug, {"team_queries": 777})
+    max_calls: list[dict] = []
+    tg_calls: list[dict] = []
+    monkeypatch.setattr(A, "_MAX", types.SimpleNamespace(send=lambda **k: (max_calls.append(k) or True)))
+    monkeypatch.setattr(A, "_TG", types.SimpleNamespace(send=lambda **k: (tg_calls.append(k) or True)))
+
+    ap._notify_stakeholder(cfg, project.slug, "autopilot parked the run")
+
+    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
+    assert "autopilot parked the run" in max_calls[0]["text"]
+    assert len(tg_calls) == 1 and tg_calls[0]["topic_id"] == 777

@@ -540,7 +540,8 @@ def oauth_refresh(cfg: Config) -> None:
     returns ok=False.
     """
     from bot_squad_worker.refresh_oauth import refresh_oauth as _refresh
-    from bot_squad_worker.actions import _get_tg_client
+    from bot_squad_worker.actions import _send_stakeholder_dm
+    from bot_squad_worker import tg_topics as _tg_topics
 
     try:
         result = _refresh(cfg)
@@ -549,17 +550,19 @@ def oauth_refresh(cfg: Config) -> None:
         result = {"ok": False, "action": "failed", "detail": str(e)}
 
     if not result.get("ok"):
-        tg = _get_tg_client(cfg)
         detail = result.get("detail", "unknown error")
-        for slug, project in cfg.projects.items():
-            # urgent=True (T-0193, mirrors the T-0188 deploy fix at jobs.py:98):
-            # an oauth-refresh failure is a P1 SYSTEM alert — once creds expire
-            # every session breaks — so it must bypass the quiet-hours gate
-            # instead of being silently dropped 22-04 UTC.
-            tg.send(
-                chat_id=project.tg_chat,
-                text=f"❌ oauth_refresh FAILED: {detail}",
-                sid="oauth_refresh",
-                urgent=True,
-            )
-            break  # ping only the first project (single TG chat for now)
+        # An oauth-refresh failure is a P1 SYSTEM page — once creds expire every
+        # session breaks. Route via the _send_stakeholder_dm SSOT (P2-08):
+        # MAX-primary on this DPI-blocked host (a raw TG send was silently
+        # dropped here), urgent so the quiet-hours gate can't drop it, with a
+        # best-effort #team-queries group-record on the first project's chat.
+        slug, project = next(iter(cfg.projects.items()), ("", None))
+        _send_stakeholder_dm(
+            cfg,
+            message=f"❌ oauth_refresh FAILED: {detail}",
+            sid="oauth_refresh",
+            urgent=True,
+            tg_chat_id=getattr(project, "tg_chat", "") if project else "",
+            tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries") if slug else None,
+            group_record=bool(getattr(project, "tg_chat", "") if project else ""),
+        )

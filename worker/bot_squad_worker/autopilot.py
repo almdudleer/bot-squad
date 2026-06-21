@@ -224,13 +224,22 @@ def _deliver(cfg: Any, slug: str, target_sid: str, text: str) -> dict:
 
 
 def _notify_stakeholder(cfg: Any, slug: str, text: str) -> None:
-    """Best-effort Telegram ping to the project's stakeholder chat."""
+    """Best-effort stakeholder page via the _send_stakeholder_dm SSOT (P2-08).
+
+    MAX-primary on this DPI-blocked host — a raw TG send silently dropped this
+    page here — with a best-effort #team-queries group-record.
+    """
     try:
-        from bot_squad_worker.actions import _get_tg_client
+        from bot_squad_worker.actions import _send_stakeholder_dm
+        from bot_squad_worker import tg_topics as _tg_topics
         project = cfg.projects.get(slug)
-        if project is None or not getattr(project, "tg_chat", ""):
-            return
-        _get_tg_client(cfg).send(chat_id=project.tg_chat, text=text, sid="autopilot")
+        chat_id = getattr(project, "tg_chat", "") if project else ""
+        _send_stakeholder_dm(
+            cfg, message=text, sid="autopilot",
+            tg_chat_id=chat_id,
+            tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
+            group_record=bool(chat_id),
+        )
     except Exception:  # noqa: BLE001
         log.exception("autopilot: stakeholder notify failed for %s", slug)
 

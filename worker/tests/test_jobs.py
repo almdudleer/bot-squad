@@ -731,6 +731,40 @@ def test_oauth_refresh_failure_ping_is_urgent(
     )
 
 
+def test_oauth_refresh_failure_routes_max_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-08: the oauth_refresh P1 system page routes through the SSOT
+    (MAX-primary on this DPI-blocked host), not a raw TG send that drops here."""
+    import dataclasses
+    import types
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = dataclasses.replace(
+        _make_config_with_project(tmp_path, proj),
+        max_default_chat_id="MAXID", max_recipient_kind="chat_id",
+    )
+
+    from bot_squad_worker import actions as A
+    max_calls: list[dict] = []
+    tg_calls: list[dict] = []
+    monkeypatch.setattr(A, "_MAX", types.SimpleNamespace(
+        send=lambda **k: (max_calls.append(k) or True)))
+    monkeypatch.setattr(A, "_TG", types.SimpleNamespace(
+        send=lambda **k: (tg_calls.append(k) or True)))
+
+    import bot_squad_worker.refresh_oauth as RO
+    monkeypatch.setattr(RO, "refresh_oauth", lambda _cfg: {"ok": False, "action": "failed", "detail": "creds expired"})
+
+    oauth_refresh(cfg)
+
+    # MAX (primary) carried the urgent FAILED page — not silently dropped on TG.
+    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
+    assert max_calls[0]["urgent"] is True and "creds expired" in max_calls[0]["text"]
+    # TG only as a best-effort #team-queries group-record.
+    assert all(c["chat_id"] == proj.tg_chat for c in tg_calls)
+
+
 # ---------------------------------------------------------------------------
 # tg_listener_tick tests (spec #7)
 # ---------------------------------------------------------------------------

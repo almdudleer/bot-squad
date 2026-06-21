@@ -103,7 +103,10 @@ export function Coachmark({
 
   return (
     <div className="bs-coachmark-root" role="dialog" aria-label={title}>
-      <div className="bs-coachmark-backdrop" onClick={dismiss} />
+      {/* T-0349: passive dim layer (pointer-events:none in CSS) — it no longer
+          intercepts clicks, so it carries no onClick. Dismiss is via the "Got
+          it" button below or the Escape handler. */}
+      <div className="bs-coachmark-backdrop" />
       <div className="bs-coachmark-card card shadow" style={cardStyle}>
         <div className="card-body">
           <div className="card-title fw-semibold mb-2">{title}</div>

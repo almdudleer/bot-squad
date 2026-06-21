@@ -48,6 +48,28 @@ function statusBadgeClass(status: string): string {
   }
 }
 
+// T-0349: which server-view onboarding beat (if any) the Picker should show.
+// Encodes two invariants the single-brain landing must hold:
+//   1. AT MOST ONE beat at a time — never the old 3-popover stack.
+//   2. Onboarding fires ONLY on a genuinely-empty install. An active operator
+//      who already runs projects sees NONE — his project cards are foregrounded
+//      instead of buried under "create your first project" / "other people's
+//      projects" first-run spotlights that contradict the fact he operates them.
+// Order on an empty install: help spotlight first, then (admin-only) the
+// create-project prompt once help is dismissed.
+export type ServerOnboardingBeat = "help" | "create" | null;
+export function pickServerOnboardingBeat(opts: {
+  isEmptyInstall: boolean;
+  isAdmin: boolean;
+  helpVisible: boolean;
+  createVisible: boolean;
+}): ServerOnboardingBeat {
+  if (!opts.isEmptyInstall) return null;
+  if (opts.helpVisible) return "help";
+  if (opts.isAdmin && opts.createVisible) return "create";
+  return null;
+}
+
 export function Picker() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,12 +88,27 @@ export function Picker() {
   const [rationaleText, setRationaleText] = useState<string | null>(null);
   const [rationaleError, setRationaleError] = useState<string | null>(null);
 
-  // T-0018 / §9.4: the slug of the first project on the picker that hosts a
-  // session NOT prefixed with the current user's `S-<linux_user>-…` SID.
-  // When set, the §9.4 Coachmark mounts on that card; when null, the beat is
-  // suppressed (sole-creator / empty installation never sees the spotlight).
-  const [alienSlug, setAlienSlug] = useState<string | null>(null);
-  const existingStep = useOnboardingStep("srv.9_4.existing_projects");
+  // T-0349: the §9 server-view onboarding is gated to a GENUINELY-EMPTY install
+  // and shown one beat at a time. The single-brain operator already runs
+  // projects — landing on the Picker, his own project cards must be foregrounded,
+  // not buried under stacked first-run spotlights ("create your first project",
+  // "other people's projects") that contradict the fact that he operates them.
+  // The §9.4 "other people's projects" discovery beat (and its per-project
+  // sessions fan-out) is dropped entirely: it mislabelled the operator's OWN
+  // projects as belonging to others whenever any session in them was owned by a
+  // different linux user.
+  const helpStep = useOnboardingStep("srv.9_1.help_spotlight");
+  const createStep = useOnboardingStep("srv.9_6.project_create");
+  // Genuinely-empty install = the only state that should see onboarding. While
+  // projects load (null) we show nothing rather than flash a first-run beat.
+  const isEmptyInstall = projects !== null && projects.length === 0;
+  // Show AT MOST ONE beat at a time (see pickServerOnboardingBeat).
+  const activeBeat = pickServerOnboardingBeat({
+    isEmptyInstall,
+    isAdmin,
+    helpVisible: helpStep.visible,
+    createVisible: createStep.visible,
+  });
 
   function reload() {
     api.projects().then(setProjects).catch((e) => setError(String(e)));
@@ -133,74 +170,41 @@ export function Picker() {
       .catch((e) => setRationaleError(String(e)));
   }
 
-  // Alien-detection scan: only runs while §9.4 is still pending (gated on
-  // existingStep.visible) so dismissing the coachmark also stops the
-  // per-project sessions fan-out on subsequent Picker visits. Stops on first
-  // alien match — typical onboarding hits it in the first project.
-  useEffect(() => {
-    if (!existingStep.visible) return;
-    if (!projects || projects.length === 0) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const me = await api.me();
-        if (cancelled) return;
-        const myPrefix = `S-${me.linux_user}-`;
-        for (const p of projects) {
-          if (cancelled) return;
-          try {
-            const rows = await api.sessions(p.slug);
-            if (cancelled) return;
-            const alien = rows.find(
-              (s) => !s.archived && !s.sid.startsWith(myPrefix),
-            );
-            if (alien) {
-              setAlienSlug(p.slug);
-              return;
-            }
-          } catch {
-            /* permission denied / unreachable — skip this project */
-          }
-        }
-      } catch {
-        /* anonymous / me lookup failed — bail */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [projects, existingStep.visible]);
-
   return (
     <div className="container py-4" style={{ maxWidth: "900px" }}>
-      {/* §9.1 — first onboarding beat for a fresh server-view visit. Anchors
-          on the sidebar HELP link via the data-onboarding-anchor convention
-          (see Shell.tsx); future §9.2..9.6 beats reuse the same attribute. */}
-      <Coachmark
-        stepId="srv.9_1.help_spotlight"
-        title="Need a hand?"
-        anchorSelector='[data-onboarding-anchor="help-nav"]'
-        placement="right"
-        body={
-          <Typewriter
-            text="You can always see the tmux cheatsheet here."
-            trailing={
-              <>
-                {" "}
-                <Link to="/help#tmux-cheatsheet">Open it →</Link>
-              </>
-            }
-          />
-        }
-      />
+      {/* §9.1 — first onboarding beat, shown only on a genuinely-empty install
+          (see activeBeat above). Anchors on the sidebar HELP link via the
+          data-onboarding-anchor convention (see Shell.tsx). One beat renders at
+          a time; this one yields to §9.6 once dismissed. */}
+      {activeBeat === "help" && (
+        <Coachmark
+          stepId="srv.9_1.help_spotlight"
+          title="Need a hand?"
+          anchorSelector='[data-onboarding-anchor="help-nav"]'
+          placement="right"
+          body={
+            <Typewriter
+              text="You can always see the tmux cheatsheet here."
+              trailing={
+                <>
+                  {" "}
+                  <Link to="/help#tmux-cheatsheet">Open it →</Link>
+                </>
+              }
+            />
+          }
+        />
+      )}
 
       {/* §9.6 — closing beat. Anchors on the admin-only "+ New project"
           button (mounted below). `final` flips the dismiss to write
           __skip_all__ so any future-added §9.x beat doesn't re-trigger the
-          tour for users who already finished it. The spotlight just points;
-          clicking it does NOT open the modal — the user clicks the button
-          themselves (per T-0022 DoD note). */}
-      {isAdmin && (
+          tour for users who already finished it. Only shown on an empty install
+          and only after §9.1 is dismissed (activeBeat sequencing) — never nag a
+          single-brain operator who already runs projects to "create his first".
+          The spotlight just points; clicking it does NOT open the modal — the
+          user clicks the button themselves (per T-0022 DoD note). */}
+      {activeBeat === "create" && (
         <Coachmark
           stepId="srv.9_6.project_create"
           title="Create your first project"
@@ -208,28 +212,6 @@ export function Picker() {
           placement="bottom"
           final
           body={<>Create your first project here.</>}
-        />
-      )}
-
-      {/* §9.4 — discovery spotlight on the first non-self project. Only
-          mounts when alien-detection found one (see useEffect above); on a
-          sole-creator or empty installation this is silent. The CTA points
-          at the project's sessions list, where every row carries the
-          copyable `tmux a -t` shipped by T-0006. */}
-      {alienSlug && (
-        <Coachmark
-          stepId="srv.9_4.existing_projects"
-          title="Other people's projects"
-          anchorSelector='[data-onboarding-anchor="existing-projects"]'
-          placement="bottom"
-          body={
-            <>
-              There are already projects from other people on this server. You can
-              open any of them and inspect their sessions — every session row has a
-              copyable <code>tmux a -t</code> you can run over SSH to attach.{" "}
-              <Link to={`/p/${alienSlug}/sessions`}>Open the sessions list →</Link>
-            </>
-          }
         />
       )}
 
@@ -279,7 +261,6 @@ export function Picker() {
             <Link
               to={cardTo}
               className="mc-project-card"
-              data-onboarding-anchor={p.slug === alienSlug ? "existing-projects" : undefined}
               title={
                 needsInput
                   ? "A session is waiting for your input — open it to see what & respond"

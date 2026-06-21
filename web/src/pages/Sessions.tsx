@@ -200,6 +200,47 @@ export function isLiveSession(s: SessionRow): boolean {
   return sessionLiveness(s) === "live";
 }
 
+// T-0347: the per-row tmux-attach affordance. Only a LIVE session has a tmux
+// pane to attach to — a suspended/archived row has none, and offering the copy
+// there emitted a broken `tmux a -t …:<window>` that never attached (it ties to
+// the unified liveness vocab, T-0340). Non-live rows get a dim placeholder so
+// the column stays aligned and reads "nothing to attach to" rather than handing
+// the operator a dead command.
+function AttachAffordance({
+  s,
+  slug,
+  iconOnly,
+  size,
+}: {
+  s: SessionRow;
+  slug: string;
+  iconOnly?: boolean;
+  size?: "sm" | "md";
+}) {
+  if (!isLiveSession(s)) {
+    return (
+      <span
+        title="No live tmux session to attach to"
+        style={{
+          color: "var(--mc-text-dim)",
+          fontFamily: "var(--mc-mono)",
+          fontSize: "0.74rem",
+        }}
+      >
+        —
+      </span>
+    );
+  }
+  return (
+    <CopyableTmuxAttach
+      session={s.tmux_session || slug}
+      window={s.window}
+      iconOnly={iconOnly}
+      size={size}
+    />
+  );
+}
+
 export function buildSessionTree(
   rows: SessionRow[],
   taskInitiative: Map<string, string>,
@@ -1048,9 +1089,10 @@ export function Sessions() {
 
           {/* Attach — T-0141: the copyable command targets the tmux SESSION
               (`tmux a -t <tmux_session>:<window>`), not the SID. Passing the
-              SID built `tmux a -t S-…:<window>` which never attached. */}
+              SID built `tmux a -t S-…:<window>` which never attached.
+              T-0347: gated to live sessions via AttachAffordance. */}
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            <CopyableTmuxAttach session={s.tmux_session || slug} window={s.window} iconOnly />
+            <AttachAffordance s={s} slug={slug} iconOnly />
           </td>
 
           {/* Role — T-0141: worker-derived, no longer "task-less ⟹ TL". */}
@@ -1132,8 +1174,10 @@ export function Sessions() {
             </code>
           </td>
           <td style={{ fontSize: "0.83rem", color: "var(--mc-text-dim)" }}>{s.window}</td>
+          {/* T-0347: archived rows are never live → AttachAffordance renders the
+              dim placeholder, never a dead `tmux a -t` command. */}
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            <CopyableTmuxAttach session={s.tmux_session || slug} window={s.window} iconOnly />
+            <AttachAffordance s={s} slug={slug} iconOnly />
           </td>
           <td>
             <RoleBadge row={s} dim />
@@ -1902,11 +1946,9 @@ export function Sessions() {
                       </div>
                     </div>
                     <div className="d-flex align-items-center gap-2">
-                      <CopyableTmuxAttach
-                        session={s.tmux_session || slug}
-                        window={s.window}
-                        size="md"
-                      />
+                      {/* T-0347: gated to live sessions (these are always live by
+                          construction — paused/at-prompt — but stay consistent). */}
+                      <AttachAffordance s={s} slug={slug} size="md" />
                       {paused && (
                         <button
                           type="button"

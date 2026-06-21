@@ -1778,11 +1778,16 @@ hr { border-color: var(--mc-border); opacity: 1; }
   z-index: 1500;
   pointer-events: none;
 }
+/* T-0349: the backdrop is a passive dim layer only — it must NOT capture
+   pointer events. A spotlight coachmark sits ON TOP of the working UI (project
+   cards, the needs-input badge); a click-blocking scrim turned those into an
+   interaction-blocker until the coachmark was manually dismissed. Dismiss is
+   now via the card's "Got it" button or Escape, never a backdrop click. */
 .bs-coachmark-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  pointer-events: auto;
+  background: rgba(0, 0, 0, 0.32);
+  pointer-events: none;
 }
 .bs-coachmark-card {
   pointer-events: auto;

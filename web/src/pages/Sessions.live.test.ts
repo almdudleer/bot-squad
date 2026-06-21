@@ -68,3 +68,31 @@ describe("isLiveSession", () => {
     expect(isLiveSession(row({ activity: "suspended", status: "suspended" }))).toBe(false);
   });
 });
+
+// T-0347: the per-row tmux-attach affordance (AttachAffordance) gates on this
+// exact predicate — only a LIVE session has a tmux pane to attach to. A
+// suspended/archived row offered a broken `tmux a -t …:<window>` that never
+// attached, so those rows now render a dim "—" placeholder instead. This pins
+// the gating decision for the three call-site row shapes so a regression that
+// re-enables the copy on dead rows trips here.
+describe("T-0347 — attach affordance is offered only for live rows", () => {
+  const offerAttach = (s: Parameters<typeof isLiveSession>[0]) => isLiveSession(s);
+
+  test("live operator row → attach offered", () => {
+    expect(
+      offerAttach(row({ status: "active", activity: "running", live: true, tmux_session: "bot-squad", window: "operator" })),
+    ).toBe(true);
+  });
+
+  test("suspended worker row (no live pane) → attach NOT offered", () => {
+    expect(
+      offerAttach(row({ status: "suspended", activity: "suspended", live: false, tmux_session: "" })),
+    ).toBe(false);
+  });
+
+  test("archived row → attach NOT offered", () => {
+    expect(
+      offerAttach(row({ status: "suspended", activity: "suspended", archived: true, tmux_session: "" })),
+    ).toBe(false);
+  });
+});

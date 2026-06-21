@@ -273,8 +273,10 @@ def test_alert_file_roundtrip(install_ctx, monkeypatch):
     good_entry = _make_entry("v2026.05.16.3", good_sha)
 
     _install_fake_download(monkeypatch, good_bytes)
-    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg: "ok")
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
     monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    # T-0379: success path now asserts running==released sha.
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: good_entry["git_sha"])
 
     result = apply_mod.apply(cfg, good_entry)
     assert result.ok is True

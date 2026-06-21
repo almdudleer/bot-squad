@@ -572,13 +572,20 @@ def _notify_failure(cfg: Any, *, version: str, step: str, log_tail: str) -> None
         return
 
     try:
-        from bot_squad_worker.tg import TgClient
-        TgClient(cfg).send(
-            chat_id=chat_id,
-            text=text,
+        # T-0394: page the human via the _send_stakeholder_dm SSOT — MAX-primary
+        # (TG is DPI-blocked here), TG failover, + a best-effort #team-queries
+        # group-record. Apply failure is urgent (bypasses quiet hours per spec).
+        from bot_squad_worker.actions import _send_stakeholder_dm
+        from bot_squad_worker import tg_topics as _tg_topics
+        _send_stakeholder_dm(
+            cfg,
+            message=text,
             sid="",
             user="",
-            urgent=True,  # apply failure bypasses quiet hours per spec
+            urgent=True,
+            tg_chat_id=chat_id,
+            tg_topic_id=_tg_topics.resolve(cfg, "bot-squad", "team_queries"),
+            group_record=True,
         )
     except Exception:
         log.exception(

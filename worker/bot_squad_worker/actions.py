@@ -262,37 +262,81 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         )
         urgent = True
 
-    # T-0247: channel-aware stakeholder DM. This install's working human channel
-    # is MAX (TG is DPI-blocked and only limps via proxy), so when [max].
-    # default_chat_id is configured the DEFAULT stakeholder DM goes via MAX as
-    # PRIMARY — same quiet-hours/debounce/SID-prefix (MaxClient mirrors TgClient).
-    # TG remains the fallback when MAX is unconfigured OR errors. An EXPLICIT
-    # chat_id/topic_id is a TG group/forum target (MAX has no such binding), so
-    # those always stay on TG.
+    # An EXPLICIT chat_id/topic_id is a TG group/forum target (MAX has no such
+    # binding), so those stay on TG. This decision is computed from the RAW
+    # params (NOT the resolved topic_id / topic-class) — a topic-class must never
+    # disqualify MAX-primary (T-0386 flaw-watch). Delivery itself is the
+    # _send_stakeholder_dm SSOT (T-0394).
     explicit_tg_target = bool(params.get("chat_id")) or (params.get("topic_id") not in (None, ""))
+    return _send_stakeholder_dm(
+        cfg,
+        message=message,
+        sid=params.get("sid", ""),
+        user=params.get("user", ""),
+        urgent=urgent,
+        tg_chat_id=chat_id,
+        tg_topic_id=topic_id,
+        prefer_tg=explicit_tg_target,
+    )
+
+
+def _send_stakeholder_dm(
+    cfg: Any,
+    *,
+    message: str,
+    sid: str = "",
+    user: str = "",
+    urgent: bool = False,
+    tg_chat_id: str = "",
+    tg_topic_id: int | None = None,
+    prefer_tg: bool = False,
+    group_record: bool = False,
+) -> dict[str, Any]:
+    """SSOT for paging the human (T-0247 channel logic, T-0394 dedupe).
+
+    This install's working human channel is MAX (TG is DPI-blocked and only limps
+    via proxy), so when ``[max].default_chat_id`` is configured the page goes via
+    MAX as PRIMARY (same quiet-hours/debounce/SID-prefix). TG is the FAILOVER when
+    MAX is unconfigured OR errors (D1: failover-only, never a broadcast).
+    ``prefer_tg`` forces TG (an explicit group/forum target MAX can't honor).
+
+    ``group_record=True`` (the personal pagers): on MAX-primary delivery, ALSO
+    leave a best-effort post in the TG group ``tg_chat_id`` (thread
+    ``tg_topic_id``, typically #team-queries) — a GROUP-RECORD, not a second
+    personal ping (D1). Never raises on the group-record path.
+
+    Returns ``{ok, sent, channel}`` — the channel that delivered the page.
+    """
     max_chat = getattr(cfg, "max_default_chat_id", "") or ""
-    if max_chat and not explicit_tg_target:
+    if max_chat and not prefer_tg:
         try:
             sent = _get_max_client(cfg).send(
                 chat_id=max_chat,
                 text=message,
-                sid=params.get("sid", ""),
-                user=params.get("user", ""),
+                sid=sid,
+                user=user,
                 urgent=urgent,
                 recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
             )
+            if group_record and tg_chat_id:
+                try:
+                    _get_tg_client(cfg).send(
+                        chat_id=tg_chat_id, text=message, sid=sid, user=user,
+                        urgent=urgent, topic_id=tg_topic_id,
+                    )
+                except Exception:
+                    log.exception("_send_stakeholder_dm: group-record post failed (non-fatal)")
             return {"ok": True, "sent": sent, "channel": "max"}
         except Exception:
-            log.exception("tg_notify: MAX delivery failed — falling back to TG")
+            log.exception("_send_stakeholder_dm: MAX delivery failed — failing over to TG")
 
-    tg = _get_tg_client(cfg)
-    sent = tg.send(
-        chat_id=chat_id,
+    sent = _get_tg_client(cfg).send(
+        chat_id=tg_chat_id,
         text=message,
-        sid=params.get("sid", ""),
-        user=params.get("user", ""),
+        sid=sid,
+        user=user,
         urgent=urgent,
-        topic_id=topic_id,
+        topic_id=tg_topic_id,
     )
     return {"ok": True, "sent": sent, "channel": "tg"}
 

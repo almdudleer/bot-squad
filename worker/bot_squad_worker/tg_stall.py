@@ -434,13 +434,17 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
         return False
 
     body = build_escalation_text(cfg, sid, str(data.get("text", "")), pane.session)
-    from bot_squad_worker.actions import _get_tg_client
-    # T-0386: needs-input escalations land in the project's #team-queries topic.
+    # T-0394: page the human via the _send_stakeholder_dm SSOT — MAX-primary
+    # (TG is DPI-blocked on this host), TG failover, + a best-effort group-record.
+    # T-0386: the group target is the project's #team-queries forum topic.
+    from bot_squad_worker.actions import _send_stakeholder_dm
     from bot_squad_worker import tg_topics as _tg_topics
-    sent = _get_tg_client(cfg).send(
-        chat_id=chat_id, text=body, sid=sid,
-        topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
+    result = _send_stakeholder_dm(
+        cfg, message=body, sid=sid, tg_chat_id=chat_id,
+        tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
+        group_record=True,
     )
+    sent = result["sent"]
 
     if not sent and getattr(cfg, "tg_bot_token", ""):
         # A token IS configured but the post was suppressed — almost always

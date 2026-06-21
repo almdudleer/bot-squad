@@ -585,15 +585,22 @@ def _human_tg(cfg: Any, slug: str, text: str, urgent: bool = True) -> None:
     crossings (compact-now / quota-EOD / 429) urgent, so warn/memory alerts are
     quiet-hours-respecting and stop spamming the stakeholder overnight.
     """
-    from bot_squad_worker.actions import _get_tg_client
+    # T-0394: page the human via the _send_stakeholder_dm SSOT — MAX-primary
+    # (TG is DPI-blocked here), TG failover, + best-effort #team-queries record.
+    from bot_squad_worker.actions import _send_stakeholder_dm
+    from bot_squad_worker import tg_topics as _tg_topics
     project = cfg.projects.get(slug)
     chat_id = getattr(project, "tg_chat", "") if project else ""
     if not chat_id:
         return
     try:
-        _get_tg_client(cfg).send(chat_id=chat_id, text=text, sid="telemetry", urgent=urgent)
+        _send_stakeholder_dm(
+            cfg, message=text, sid="telemetry", urgent=urgent,
+            tg_chat_id=chat_id, tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
+            group_record=True,
+        )
     except Exception:
-        log.exception("telemetry: human tg.send failed (non-fatal): %s", text)
+        log.exception("telemetry: human page failed (non-fatal): %s", text)
 
 
 def _peer_to(cfg: Any, slug: str, sid: str, text: str) -> None:

@@ -2110,3 +2110,60 @@ def test_gc_project_topics_closes_all(tmp_config_dir, monkeypatch):
     assert out["ok"] is True
     assert set(out["closed"]) == {"feedback", "deploy_logs"}
     assert {c["thread_id"] for c in fake.closed} == {11, 22}
+
+
+# ---------------------------------------------------------------------------
+# T-0394 / Audit Item 2: _send_stakeholder_dm SSOT helper (MAX-primary/failover
+# + best-effort #team-queries group-record). The 3 personal pagers route here.
+# ---------------------------------------------------------------------------
+
+def test_send_stakeholder_dm_max_primary(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A._send_stakeholder_dm(A._get_config(), message="page", sid="S-x-p1", tg_chat_id="-100")
+    assert out["channel"] == "max" and out["sent"] is True
+    assert len(fake_max.calls) == 1 and len(fake_tg.calls) == 0  # no group-record by default
+
+
+def test_send_stakeholder_dm_prefer_tg_skips_max(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A._send_stakeholder_dm(A._get_config(), message="grp", tg_chat_id="-100", tg_topic_id=5, prefer_tg=True)
+    assert out["channel"] == "tg"
+    assert len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
+    assert fake_tg.calls[0]["topic_id"] == 5
+
+
+def test_send_stakeholder_dm_tg_when_max_unconfigured(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A._send_stakeholder_dm(A._get_config(), message="hi", tg_chat_id="-100")
+    assert out["channel"] == "tg" and len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
+
+
+def test_send_stakeholder_dm_group_record_on_max(tmp_config_dir, monkeypatch):
+    """D1: MAX-primary delivery ALSO leaves a best-effort group-record in TG."""
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A._send_stakeholder_dm(A._get_config(), message="needs you", sid="S-x-p1",
+                                 tg_chat_id="-100", tg_topic_id=77, group_record=True)
+    assert out["channel"] == "max"
+    assert len(fake_max.calls) == 1            # personal ping via MAX
+    assert len(fake_tg.calls) == 1             # best-effort group-record
+    assert fake_tg.calls[0]["topic_id"] == 77  # into #team-queries
+
+
+def test_send_stakeholder_dm_failover_to_tg(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    class _BoomMax:
+        def send(self, **kw):
+            raise RuntimeError("max down")
+
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir, max_client=_BoomMax())
+    out = A._send_stakeholder_dm(A._get_config(), message="hi", tg_chat_id="-100", group_record=True)
+    assert out["channel"] == "tg" and len(fake_tg.calls) == 1

@@ -456,3 +456,18 @@ def test_fresh_tail_read_does_not_redetect_429(tmp_path, fake_session, monkeypat
     quota = json.loads((cfg.data_dir / "proj" / "_worker" / "telemetry"
                         / "_quota.json").read_text())
     assert quota["rate_limit_429"]["count"] == 0
+
+
+def test_human_tg_routes_max_primary_with_group_record(tmp_path, monkeypatch):
+    """T-0394: telemetry human pages route via the _send_stakeholder_dm SSOT —
+    MAX-primary (TG DPI-blocked here) + best-effort #team-queries group-record."""
+    import dataclasses, types
+    from bot_squad_worker import actions as A, tg_topics
+    cfg = dataclasses.replace(_make_cfg(tmp_path), max_default_chat_id="MAXID", max_recipient_kind="chat_id")
+    tg_topics.save(cfg, "proj", {"team_queries": 555})
+    max_calls, tg_calls = [], []
+    monkeypatch.setattr(A, "_MAX", types.SimpleNamespace(send=lambda **k: (max_calls.append(k) or True)))
+    monkeypatch.setattr(A, "_TG", types.SimpleNamespace(send=lambda **k: (tg_calls.append(k) or True)))
+    T._human_tg(cfg, "proj", "quota almost out", urgent=True)
+    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
+    assert len(tg_calls) == 1 and tg_calls[0]["topic_id"] == 555

@@ -145,10 +145,10 @@ class _FakeTgClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False) -> bool:
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None) -> bool:
         self.calls.append({
             "chat_id": chat_id, "text": text,
-            "sid": sid, "user": user, "urgent": urgent,
+            "sid": sid, "user": user, "urgent": urgent, "topic_id": topic_id,
         })
         return True
 
@@ -163,9 +163,10 @@ def test_notify_failure_sends_tg_with_structured_body(install_ctx, monkeypatch):
     cfg = install_ctx["cfg"]
     fake = _FakeTgClient()
 
-    # Patch TgClient at the symbol the lazy import resolves to.
-    import bot_squad_worker.tg as tg_mod
-    monkeypatch.setattr(tg_mod, "TgClient", lambda c: fake)
+    # T-0394: _notify_failure now pages via the _send_stakeholder_dm SSOT; with
+    # MAX unconfigured it takes the TG path. Mock the TG client at that seam.
+    import bot_squad_worker.actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: fake)
 
     apply_mod._notify_failure(
         cfg,
@@ -194,12 +195,11 @@ def test_notify_failure_swallows_tg_errors(install_ctx, monkeypatch, caplog):
     cfg = install_ctx["cfg"]
 
     class _BoomClient:
-        def __init__(self, *a, **kw): pass
         def send(self, **kw):
             raise RuntimeError("TG API exploded")
 
-    import bot_squad_worker.tg as tg_mod
-    monkeypatch.setattr(tg_mod, "TgClient", _BoomClient)
+    import bot_squad_worker.actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: _BoomClient())
 
     # Must not raise.
     apply_mod._notify_failure(cfg, version="v1", step="smoke", log_tail="x")
@@ -217,16 +217,37 @@ def test_notify_failure_no_chat_id_is_banner_only(install_ctx, monkeypatch, capl
     called = {"n": 0}
 
     class _ShouldNotBeUsed:
-        def __init__(self, *a, **kw): pass
         def send(self, **kw):
             called["n"] += 1
             return True
 
-    import bot_squad_worker.tg as tg_mod
-    monkeypatch.setattr(tg_mod, "TgClient", _ShouldNotBeUsed)
+    import bot_squad_worker.actions as A
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: _ShouldNotBeUsed())
+    monkeypatch.setattr(A, "_get_max_client", lambda c: _ShouldNotBeUsed())
 
     apply_mod._notify_failure(cfg, version="v1", step="smoke", log_tail="x")
     assert called["n"] == 0, "no chat → no send attempt"
+
+
+def test_notify_failure_max_primary_with_group_record(install_ctx, monkeypatch):
+    """T-0394: with MAX configured, the apply-failure page goes via MAX (primary)
+    + leaves a best-effort #team-queries group-record in TG."""
+    cfg = install_ctx["cfg"]
+    cfg.max_default_chat_id = "MAXID"
+    cfg.max_recipient_kind = "chat_id"
+    from bot_squad_worker import tg_topics
+    tg_topics.save(cfg, "bot-squad", {"team_queries": 808})
+
+    import bot_squad_worker.actions as A
+    max_calls, tg_calls = [], []
+    monkeypatch.setattr(A, "_get_max_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: (max_calls.append(k) or True)))
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: (tg_calls.append(k) or True)))
+
+    apply_mod._notify_failure(cfg, version="v9", step="build", log_tail="boom")
+    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
+    assert len(tg_calls) == 1 and tg_calls[0]["topic_id"] == 808
 
 
 def test_install_identifier_falls_back_to_env(install_ctx, monkeypatch):

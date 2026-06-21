@@ -18,15 +18,15 @@ function relTime(iso: string | null | undefined): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function duration(start: string | null, end: string | null): string {
-  if (!start || !end) return "—";
-  const s = Date.parse(start);
-  const e = Date.parse(end);
-  if (isNaN(s) || isNaN(e)) return "—";
-  const diff = Math.floor((e - s) / 1000);
-  if (diff < 0) return "—";
-  if (diff < 60) return `${diff}s`;
-  return `${Math.floor(diff / 60)}m ${diff % 60}s`;
+// T-0362: requested_by is stored as the raw requester SID
+// (S-<user>-<window>-p<N>). Humanize it to "<window> (<user>)" for the table;
+// the full SID stays in the cell's title tooltip. Non-SID values pass through.
+export function humanizeRequester(raw: string): string {
+  if (!raw) return "—";
+  const m = raw.match(/^S-([^-]+)-(.+)-p\d+$/);
+  if (!m) return raw;
+  const [, user, window] = m;
+  return `${window} (${user})`;
 }
 
 function StatusBadge({ status }: { status: RunRow["status"] }) {
@@ -41,13 +41,6 @@ function StatusBadge({ status }: { status: RunRow["status"] }) {
       {status}
     </span>
   );
-}
-
-function TargetBadge({ target }: { target: string }) {
-  const cls = target === "staging" ? "mc-badge-info"
-            : target === "prod"    ? "mc-badge-danger"
-            : "mc-badge-dim";
-  return <span className={`mc-badge ${cls}`}>{target}</span>;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,14 +118,16 @@ export function Runs() {
             <table className="table table-hover table-sm align-middle">
               <thead>
                 <tr>
+                  {/* T-0362: cut dead/dup columns — Target (constant: this
+                      install deploys staging-only), Started (an mtime proxy
+                      that duplicated Queued), and Duration (no precise start is
+                      stored, so it was always "—"/bogus). Full detail lives in
+                      the per-run log. */}
                   <th style={{ width: "6rem" }}>ID</th>
-                  <th>Target</th>
                   <th>Status</th>
                   <th>Reason</th>
                   <th>Requested by</th>
                   <th>Queued</th>
-                  <th>Started</th>
-                  <th>Duration</th>
                   <th></th>
                 </tr>
               </thead>
@@ -144,7 +139,6 @@ export function Runs() {
                         {r.id.slice(0, 8)}
                       </code>
                     </td>
-                    <td><TargetBadge target={r.target} /></td>
                     <td><StatusBadge status={r.status} /></td>
                     <td
                       className="text-truncate"
@@ -153,19 +147,14 @@ export function Runs() {
                     >
                       {r.reason || <span style={{ color: "var(--mc-text-dim)" }}>—</span>}
                     </td>
-                    <td>
-                      <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
-                        {r.requested_by || "—"}
-                      </code>
+                    <td
+                      style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}
+                      title={r.requested_by || undefined}
+                    >
+                      {humanizeRequester(r.requested_by)}
                     </td>
                     <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
                       {relTime(r.queued_at)}
-                    </td>
-                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
-                      {relTime(r.started_at)}
-                    </td>
-                    <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
-                      {duration(r.started_at, r.ended_at)}
                     </td>
                     <td>
                       <Link

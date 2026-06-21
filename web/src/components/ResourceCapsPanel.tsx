@@ -280,7 +280,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
           {/* T-0389 item 22: live count / hard ceiling + AIMD throttle. */}
           <span
             className={`mc-badge ${throttled ? "mc-badge-warn" : "mc-badge-dim"}`}
-            title="Live processes / max simultaneously-live the system allows (server-wide, enforced at spawn-time). 0 = unlimited."
+            title="Live processes / max simultaneously-live allowed. T-0417: the cap value is shared config, but the live count + enforcement are per-worker-user (this Linux user's worker counts its own sessions). 0 = unlimited."
           >
             parallel {parallelText}
           </span>
@@ -351,7 +351,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
               aggregation if the worker didn't supply caps. */}
           <div style={{ maxWidth: "26rem", marginBottom: "0.6rem" }}>
             <CapMeter
-              label="Parallel sessions (live, server-wide)"
+              label="Parallel sessions (live, this worker-user)"
               used={caps?.live_sessions ?? (util ? util.liveSessions : null)}
               cap={caps?.max_parallel_sessions ?? parallelNum ?? 0}
             />
@@ -374,8 +374,10 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
           >
             <div>
               <strong>Resource caps</strong> are the hard limits the system enforces at
-              spawn-time (server-wide): max live sessions + a per-quota-period output-token
-              budget. <strong>0 = unlimited.</strong>
+              spawn-time: max live sessions + a per-quota-period output-token budget. The
+              cap values are shared config; the live session count + enforcement are
+              <strong> per-worker-user</strong> (each Linux user's worker counts its own).{" "}
+              <strong>0 = unlimited.</strong>
             </div>
             <div style={{ marginTop: "0.25rem" }}>
               The <strong>budget anchor</strong> is the baseline both the token cap and the

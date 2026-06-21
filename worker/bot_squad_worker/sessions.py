@@ -2177,8 +2177,19 @@ def _live_agent_sids() -> set[str]:
 
 
 def _count_live_sessions(cfg: Any) -> int:
-    """Count live sessions across every registered project — the cap is a
-    system-wide resource limit.
+    """Count THIS worker-user's live sessions across every registered project.
+
+    T-0417 (scope honesty): the cap VALUE is shared config (one
+    ``[caps]`` block in system_settings.toml), but enforcement is
+    PER-WORKER-USER. Each linux_user runs its own worker (the T-0157 multi-user
+    substrate) and counts only sessions whose SID maps to a live claude pane on
+    ITS OWN tmux server (``_live_agent_sids``). A session owned by another
+    linux_user is in the shared-data-dir md scan but NOT in ``live``, so it is
+    not counted here — that user's own worker enforces the cap against it. The
+    cap is therefore a per-worker-user concurrency limit, not a single global
+    host ceiling; the docstring, the caps meter label, and this enforcement now
+    agree (pre-T-0417 the code claimed "system-wide" while only ever counting one
+    user, so a cross-user session was silently dropped → under-enforcement).
 
     T-0397: a session counts only if it is a live-holder (status active/paused,
     not archived) AND its SID maps to a pane with a live claude agent
@@ -2240,15 +2251,18 @@ def caps_utilization(cfg: Any) -> dict:
     items 7 + 22).
 
     Returns the exact numbers spawn admission gates on — so the meter measures
-    what is actually enforced, not a parallel estimate. All system-wide (caps
-    are a global resource limit):
+    what is actually enforced, not a parallel estimate. The cap VALUES are shared
+    config; the LIVE count (and thus enforcement) is per-worker-user (T-0417 —
+    each linux_user's worker counts its own live sessions, see
+    ``_count_live_sessions``):
 
-      max_parallel_sessions : hard concurrency ceiling (0 = unlimited)
+      max_parallel_sessions : hard concurrency ceiling (0 = unlimited); shared cap
+                              value, enforced per-worker-user
       effective_limit       : ceiling depressed by the AIMD backoff governor
                               ("12/15, throttled to 8"); the 10_000 unlimited
                               sentinel is normalised to 0 so the wire uses the
                               same 0=unlimited convention as the cap
-      live_sessions         : sessions currently counted against the ceiling
+      live_sessions         : THIS worker-user's sessions counted against the ceiling
       max_total_tokens      : output-token budget per quota period (0 = unlimited)
       output_since_anchor   : output tokens spent since the [quota] anchor (the
                               number enforced against max_total_tokens, item 7)

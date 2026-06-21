@@ -150,6 +150,30 @@ def test_process_voice_end_to_end(tmp_path, monkeypatch):
     assert sent and sent[0]["topic_id"] == 9001
 
 
+def test_process_voice_download_failure_confirms_resend(tmp_path, monkeypatch):
+    """Hardening: a download failure (e.g. a flaky TG proxy on this DPI-blocked
+    host) must NOT silently drop the note — confirm back into #feedback so the
+    stakeholder knows to resend, instead of zero acknowledgement."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, tg_topics, actions as A
+
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+
+    def boom_download(c, file_id, dest):
+        raise RuntimeError("proxy timeout")
+    monkeypatch.setattr(_VI, "download_voice", boom_download)
+
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    out = _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-06-21T13:00:00Z")
+    assert out["ok"] is False and out["reason"] == "download_failed"
+    # Not silent: a confirm went back into #feedback asking to resend.
+    assert sent and sent[0]["topic_id"] == 9001
+    assert "resend" in sent[0]["text"].lower()
+
+
 def test_process_voice_transcription_failure_still_stores_audio(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     from bot_squad_worker import voice_intake as _VI, transcribe as _T, actions as A

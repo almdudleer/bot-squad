@@ -143,6 +143,9 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
         download_voice(cfg, v["file_id"], dest)
     except Exception as e:  # noqa: BLE001
         log.exception("voice_intake: download failed for %s", v["file_id"])
+        # Don't silently drop the note — on this DPI host the TG file fetch can
+        # fail transiently (proxy). Tell the stakeholder so they can resend.
+        _confirm(cfg, slug, v, outcome="download_failed")
         return {"ok": False, "reason": "download_failed", "error": str(e)}
 
     audio_ref = f"feedback/_audio/{v['file_unique_id']}.oga"
@@ -168,15 +171,24 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
         author=v["author"], author_id=v["author_id"], duration=v["duration"],
         lang=lang, engine=used_engine, ts=ts,
     )
-    _confirm(cfg, slug, v, transcript, failed)
+    _confirm(
+        cfg, slug, v,
+        outcome="transcribe_failed" if failed else "ok",
+        transcript=transcript,
+    )
 
     if failed:
         return {"ok": False, "reason": "transcription_failed", "artifact": str(artifact)}
     return {"ok": True, "artifact": str(artifact), "lang": lang}
 
 
-def _confirm(cfg: Any, slug: str, v: dict, transcript: str, failed: bool) -> None:
-    """Post a confirmation back into the project's #feedback topic (best-effort)."""
+def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = "") -> None:
+    """Post a confirmation back into the project's #feedback topic (best-effort).
+
+    ``outcome`` ∈ {"ok", "transcribe_failed", "download_failed"} — so the
+    stakeholder always gets an acknowledgement, including when the TG file fetch
+    fails (proxy hiccup on this DPI host) and there's nothing else to show.
+    """
     try:
         from bot_squad_worker import actions as A, tg_topics
         project = cfg.projects.get(slug)
@@ -184,12 +196,16 @@ def _confirm(cfg: Any, slug: str, v: dict, transcript: str, failed: bool) -> Non
         if not chat_id:
             return
         topic = tg_topics.resolve(cfg, slug, "feedback")
-        if failed:
-            text = (f"⚠️ got your voice note ({v['duration']}s) but transcription "
+        duration = v["duration"]
+        if outcome == "download_failed":
+            text = (f"⚠️ couldn't fetch your voice note ({duration}s) — the TG file "
+                    f"download failed (proxy?). Please resend.")
+        elif outcome == "transcribe_failed":
+            text = (f"⚠️ got your voice note ({duration}s) but transcription "
                     f"failed — audio saved & flagged for triage.")
         else:
             snippet = transcript[:140] + ("…" if len(transcript) > 140 else "")
-            text = f"✅ got your voice note ({v['duration']}s): {snippet}"
+            text = f"✅ got your voice note ({duration}s): {snippet}"
         A._get_tg_client(cfg).send(chat_id=chat_id, text=text, sid="voice_intake", topic_id=topic)
     except Exception:  # noqa: BLE001
         log.exception("voice_intake: confirmation send failed")

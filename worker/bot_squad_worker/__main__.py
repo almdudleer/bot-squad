@@ -122,6 +122,15 @@ def main() -> int:
         sched.start()
         set_scheduler(sched)
         log.info("scheduler started")
+        # T-0433 P1: if voice intake is ENABLED but its STT backend isn't installed
+        # (the deploy/provision gap), warn LOUDLY in the journal now rather than
+        # silently no-op the first voice note. Log-only (no TG page → no per-restart
+        # spam); the coordinator is where tg_listener_tick runs voice intake.
+        try:
+            from bot_squad_worker import voice_intake as _voice_intake
+            _voice_intake.log_voice_readiness(cfg)
+        except Exception:
+            log.exception("voice readiness check failed (non-fatal)")
 
     app = build_app()
 

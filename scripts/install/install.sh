@@ -1282,6 +1282,17 @@ step_python_venv() {
     || die_struct python_venv "pip install -e worker failed." \
        "Run '$venv/bin/pip install -e $BOTSQUAD_INSTALL_DIR/worker' manually
 to see the exact pip error."
+  # T-0433 P1: OPTIONAL voice-intake STT backend (faster-whisper + model prefetch).
+  # OFF by default so non-voice installs aren't bloated with the heavy dep; opt in
+  # with BOTSQUAD_INSTALL_VOICE=1. Also runnable standalone later via
+  # scripts/install/provision-voice.sh (a deploy does NOT re-pip the worker venv,
+  # so a voice host re-runs it after a faster-whisper bump).
+  if [[ "${BOTSQUAD_INSTALL_VOICE:-0}" == "1" ]]; then
+    echo "[install] provisioning voice STT backend (BOTSQUAD_INSTALL_VOICE=1)…"
+    bash "$BOTSQUAD_INSTALL_DIR/scripts/install/provision-voice.sh" "$BOTSQUAD_INSTALL_DIR" \
+      || die_struct python_venv "voice provisioning failed." \
+         "Re-run scripts/install/provision-voice.sh manually, or unset BOTSQUAD_INSTALL_VOICE to skip voice."
+  fi
 }
 
 step_systemd_unit() {

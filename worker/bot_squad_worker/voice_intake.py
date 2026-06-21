@@ -334,3 +334,43 @@ def gc_audio(cfg: Any, slug: str) -> dict[str, Any]:
     if removed:
         log.info("voice_intake: gc_audio reaped %d blob(s) in %s", len(removed), slug)
     return {"slug": slug, "removed": len(removed), "removed_files": removed}
+
+
+def voice_ready(cfg: Any) -> dict[str, Any]:
+    """Whether the configured STT backend is actually installed in this worker
+    venv (T-0433 P1).
+
+    The [voice] extra (faster-whisper) is NOT a core dependency and is NOT
+    installed by the base worker install or synced by a deploy — so a fresh
+    deploy can have voice ENABLED yet no backend, silently no-opping every note.
+    This lets the worker detect that at boot. Uses find_spec (no heavy import).
+    """
+    import importlib.util
+
+    engine = getattr(cfg, "voice_engine", "faster-whisper")
+    if engine == "faster-whisper":
+        if importlib.util.find_spec("faster_whisper") is None:
+            return {"ready": False, "engine": engine,
+                    "reason": "faster-whisper not installed in the worker venv — run "
+                              "scripts/install/provision-voice.sh"}
+        return {"ready": True, "engine": engine, "reason": "ok"}
+    # Non-faster-whisper engines (e.g. a cloud STT) are the operator's to
+    # provision; the lazy import in transcribe surfaces a clear error if absent.
+    return {"ready": True, "engine": engine, "reason": "non-faster-whisper engine (unchecked)"}
+
+
+def log_voice_readiness(cfg: Any) -> dict[str, Any]:
+    """At worker startup: if voice is ENABLED but its STT backend isn't installed,
+    log LOUDLY so it fails at boot, not silently at the first voice note (T-0433
+    P1). A no-op when voice is disabled (the default)."""
+    if not getattr(cfg, "voice_enabled", False):
+        return {"ready": True, "checked": False, "reason": "voice disabled"}
+    res = voice_ready(cfg)
+    res["checked"] = True
+    if not res["ready"]:
+        log.warning(
+            "voice intake is ENABLED but NOT READY: %s. Voice notes will no-op "
+            "(audio saved + flagged) until the backend is provisioned.", res["reason"])
+    else:
+        log.info("voice intake ready (engine=%s).", res["engine"])
+    return res

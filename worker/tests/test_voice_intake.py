@@ -242,6 +242,53 @@ def test_process_voice_transcribe_timeout_unblocks_and_flags(tmp_path, monkeypat
     assert len(list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))) == 1
 
 
+# --- voice_ready / readiness (P1) ------------------------------------------
+
+def test_voice_ready_false_when_faster_whisper_missing(tmp_path, monkeypatch):
+    """T-0433 P1: voice_ready reports NOT-ready when the faster-whisper backend
+    isn't installed in the worker venv (the deploy-provisioning gap), so the
+    worker can warn at boot instead of silently no-opping at the first note."""
+    from bot_squad_worker import voice_intake as _VI
+    import importlib.util
+    cfg = _cfg(tmp_path)
+    cfg.voice_engine = "faster-whisper"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    res = _VI.voice_ready(cfg)
+    assert res["ready"] is False
+    assert "provision" in res["reason"].lower() or "faster-whisper" in res["reason"].lower()
+
+
+def test_voice_ready_true_when_backend_present(tmp_path, monkeypatch):
+    from bot_squad_worker import voice_intake as _VI
+    import importlib.util
+    cfg = _cfg(tmp_path)
+    cfg.voice_engine = "faster-whisper"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    assert _VI.voice_ready(cfg)["ready"] is True
+
+
+def test_log_voice_readiness_noop_when_disabled(tmp_path):
+    from bot_squad_worker import voice_intake as _VI
+    cfg = _cfg(tmp_path)
+    cfg.voice_enabled = False
+    res = _VI.log_voice_readiness(cfg)
+    assert res["checked"] is False
+
+
+def test_log_voice_readiness_warns_when_enabled_unready(tmp_path, monkeypatch, caplog):
+    """Enabled + backend missing → a LOUD warning at startup (fail loud, not silent)."""
+    import logging, importlib.util
+    from bot_squad_worker import voice_intake as _VI
+    cfg = _cfg(tmp_path)
+    cfg.voice_enabled = True
+    cfg.voice_engine = "faster-whisper"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with caplog.at_level(logging.WARNING):
+        res = _VI.log_voice_readiness(cfg)
+    assert res["checked"] is True and res["ready"] is False
+    assert any("ENABLED" in r.message and "READY" in r.message.upper() for r in caplog.records)
+
+
 # --- gc_audio (P3 retention) -----------------------------------------------
 
 def _audio_blob(cfg, name: str, *, age_days: float = 0.0):

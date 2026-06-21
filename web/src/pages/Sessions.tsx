@@ -65,6 +65,24 @@ function StatusBadge({ row }: { row: SessionRow }) {
   );
 }
 
+// T-0285: explicit "this one is waiting on you" badge, driven by the worker's
+// `awaiting_input` flag (the tg_stall blocked marker — agent peer_send'd an
+// operator and got no reply). Amber, distinct from the activity StatusBadge so
+// a blocked-but-still-"running" pane is glanceable. Renders nothing when not
+// blocked, so callers can drop it inline next to the status with no layout cost.
+function AwaitingInputBadge({ row }: { row: SessionRow }) {
+  if (!row.awaiting_input) return null;
+  return (
+    <span
+      className="mc-badge mc-badge-warn"
+      title="Waiting on you — this session pinged the operator and hasn't had a reply (tg_stall blocked marker)."
+      style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem" }}
+    >
+      ⏳ Awaiting input
+    </span>
+  );
+}
+
 // T-0141: role badge keyed off the worker-derived `role` (falls back to the
 // legacy task_id inference for a pre-T-0141 worker). Teamlead = green,
 // operator = amber, dev = blue. T-0197: prod-teamlead = red (prod caution),
@@ -938,6 +956,31 @@ export function Sessions() {
           >
             <dt>SID</dt>
             <dd style={{ margin: 0, wordBreak: "break-all", color: "var(--mc-text)" }}>{s.sid}</dd>
+            {/* T-0281: surface role + what this process is bound to (task /
+                initiative) right in the process panel, so one place answers
+                "what is this process and what is it working on". */}
+            <dt>role</dt>
+            <dd style={{ margin: 0, color: "var(--mc-text)" }}>{sessionRoleLabel(sessionRole(s))}</dd>
+            <dt>task</dt>
+            <dd style={{ margin: 0, color: "var(--mc-text)" }}>
+              {s.task_id && s.task_id !== "~"
+                ? [s.task_id, ...(s.extra_task_ids ?? [])].join(", ")
+                : "—"}
+            </dd>
+            <dt>initiative</dt>
+            <dd style={{ margin: 0, color: "var(--mc-text)" }}>
+              {s.initiative && s.initiative !== "~"
+                ? [s.initiative, ...(s.extra_initiatives ?? [])].join(", ")
+                : "—"}
+            </dd>
+            {s.awaiting_input && (
+              <>
+                <dt>awaiting input</dt>
+                <dd style={{ margin: 0, color: "var(--mc-amber)" }}>
+                  ⏳ waiting on operator reply
+                </dd>
+              </>
+            )}
             <dt>cwd</dt>
             <dd
               style={{ margin: 0, wordBreak: "break-all", color: "var(--mc-text)" }}
@@ -1105,7 +1148,10 @@ export function Sessions() {
 
           {/* Status */}
           <td>
-            <StatusBadge row={s} />
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "0.35rem" }}>
+              <StatusBadge row={s} />
+              <AwaitingInputBadge row={s} />
+            </div>
           </td>
 
           {/* Started */}

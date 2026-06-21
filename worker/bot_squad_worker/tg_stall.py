@@ -89,6 +89,37 @@ def mark_blocked(cfg: Any, slug: str, sid: str, text: str) -> None:
     log.info("tg_stall: marked %s blocked on operator (slug=%s)", sid, slug)
 
 
+def blocked_sids(cfg: Any, slug: str) -> set[str]:
+    """T-0285: the set of SIDs with an active stall marker — i.e. blocked
+    waiting on the operator (they ``peer_send``-ed an operator-role session and
+    haven't been replied to). Surfaced on the sessions payload as a per-session
+    ``awaiting_input`` flag so the UI can glance "this one is waiting on you".
+
+    Honors the same ``_MARKER_TTL_SEC`` the GC uses, so a stale marker left by a
+    dead session doesn't show forever. Best-effort: any read error → empty set.
+    """
+    out: set[str] = set()
+    try:
+        entries = list(_stall_dir(cfg, slug).glob("*.json"))
+    except OSError:
+        return out
+    now = time.time()
+    for p in entries:
+        m = _read(p)
+        if not m:
+            continue
+        since = m.get("since")
+        try:
+            if since is not None and (now - float(since)) > _MARKER_TTL_SEC:
+                continue
+        except (TypeError, ValueError):
+            pass
+        sid = m.get("sid") or p.stem
+        if sid:
+            out.add(str(sid))
+    return out
+
+
 def clear_blocked(cfg: Any, slug: str, sid: str) -> bool:
     """Remove ``sid``'s stall marker. Returns True if one existed."""
     if not sid:

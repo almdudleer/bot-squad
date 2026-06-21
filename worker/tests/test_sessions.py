@@ -226,6 +226,61 @@ def test_list_sessions_active_pane(tmp_path, monkeypatch):
     assert rows[0]["initiative"] == ""
 
 
+def test_list_sessions_stamps_awaiting_input_from_tg_stall(tmp_path, monkeypatch):
+    """T-0285: each row carries an `awaiting_input` flag derived from the
+    tg_stall blocked-marker set; True only for the blocked SID."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    fake_pane_output = f"%2|w1|1234|{repo}|claude\n%3|w2|1235|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.tg_stall as TS
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(TS, "blocked_sids", lambda cfg, slug: {"S-testuser-w1-p2"})
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows}
+    assert by_sid["S-testuser-w1-p2"]["awaiting_input"] is True
+    assert by_sid["S-testuser-w2-p3"]["awaiting_input"] is False
+
+
+def test_list_sessions_awaiting_input_defaults_false_on_watchdog_error(tmp_path, monkeypatch):
+    """If the tg_stall lookup raises, the flag is a safe False — never wedges
+    the list."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    fake_pane_output = f"%2|w1|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.tg_stall as TS
+
+    def boom(*a, **k):
+        raise RuntimeError("watchdog down")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(TS, "blocked_sids", boom)
+
+    rows = list_sessions(cfg, "test-project")
+    assert rows[0]["awaiting_input"] is False
+
+
 def test_list_sessions_operator_pane_in_workspace_parent(tmp_path, monkeypatch):
     """T-0003: operator pane lives in repo_workspace (parent of dev clone).
 

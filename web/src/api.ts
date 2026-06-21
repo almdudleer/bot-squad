@@ -283,6 +283,12 @@ export type SessionRow = {
   // `sessionNeedsInput` predicate that drives the home needs-input deep-link.
   // Optional: a pre-T-0046 worker omits it (treated as false).
   active_at_prompt?: boolean | null;
+  // T-0285: explicit "blocked waiting on the operator" flag, sourced from the
+  // tg_stall blocked marker (the agent peer_send-ed an operator and got no
+  // reply). Distinct from the `active_at_prompt`/`sessionNeedsInput` heuristic —
+  // this is the precise "this one is waiting on you" signal. Optional: a
+  // pre-T-0285 worker omits it (treated as false).
+  awaiting_input?: boolean | null;
   // T-0232 (Pillar A): worker-stamped liveness — true when the session is
   // alive in tmux (activity ∈ {running, idle}). The sessions VIEW filters on
   // this to show live-only rows; suspended/archived rows are retained in the

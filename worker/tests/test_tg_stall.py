@@ -421,3 +421,46 @@ def test_tick_redirect_bus_failure_leaves_marker_pending(tmp_path, faketg, monke
     assert faketg.sent == []
     # Marker stays pending (un-escalated) so a later tick retries the redirect.
     assert json.loads(TS._marker_path(cfg, "bot-squad", DEV).read_text())["escalated"] is False
+
+
+# ---------------------------------------------------------------------------
+# T-0285: blocked_sids — the set surfaced as a per-session awaiting_input flag.
+# ---------------------------------------------------------------------------
+
+def test_blocked_sids_empty_when_no_markers(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert TS.blocked_sids(cfg, "bot-squad") == set()
+
+
+def test_blocked_sids_includes_active_markers(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "need your call")
+    TS.mark_blocked(cfg, "bot-squad", OP, "blocked too")
+    assert TS.blocked_sids(cfg, "bot-squad") == {DEV, OP}
+
+
+def test_blocked_sids_still_reports_an_escalated_marker(tmp_path, faketg, monkeypatch):
+    """An escalated (one-shot TG-pinged) marker still means the agent is
+    waiting — it should remain in the awaiting-input set until cleared."""
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    _age_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False)  # not watched → escalates via TG
+    TS.tick(cfg)
+    assert json.loads(TS._marker_path(cfg, "bot-squad", DEV).read_text())["escalated"] is True
+    assert DEV in TS.blocked_sids(cfg, "bot-squad")
+
+
+def test_blocked_sids_drops_stale_marker_past_ttl(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    _age_marker(cfg, DEV, TS._MARKER_TTL_SEC + 60)
+    assert TS.blocked_sids(cfg, "bot-squad") == set()
+
+
+def test_blocked_sids_cleared_marker_drops_out(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    assert DEV in TS.blocked_sids(cfg, "bot-squad")
+    TS.clear_blocked(cfg, "bot-squad", DEV)
+    assert TS.blocked_sids(cfg, "bot-squad") == set()

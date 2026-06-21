@@ -1023,6 +1023,19 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "tmux_session": md_tmux_session,
             })
 
+    # T-0285: stamp an explicit awaiting-input flag from the tg_stall blocked
+    # markers (the agent peer_send-ed an operator and is waiting on a reply).
+    # This is the precise "this one is waiting on you" signal — distinct from
+    # the T-0346 paused/idle-at-prompt heuristic. Best-effort; the import is
+    # lazy because tg_stall imports sessions back (cycle-safe at call time).
+    try:
+        from bot_squad_worker import tg_stall as _tg_stall
+        _blocked = _tg_stall.blocked_sids(cfg, slug)
+    except Exception:  # noqa: BLE001 — never let the watchdog wedge the list
+        _blocked = set()
+    for _r in rows:
+        _r["awaiting_input"] = _r.get("sid") in _blocked
+
     return rows
 
 

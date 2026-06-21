@@ -401,6 +401,33 @@ def create_server(
     }
 
 
+@router.delete("/servers/{server_id}")
+def delete_server(
+    request: Request,
+    server_id: str,
+    server: AttachedServer = Depends(require_manage),
+) -> dict:
+    """Deregister a server — the close for ``register_server`` (audit Fork-6).
+
+    register opened the loop; nothing closed it, so orphan / wrong-host /
+    abandoned rows were immortal. Owner-gated via the ``require_manage`` SSOT
+    (T-0390) — routing this destructive op through anything else would be the
+    next ``is_self`` privesc. REFUSES the ``is_self`` row: it self-resurrects via
+    ``register_self_if_missing`` on next boot, so deleting it is pointless +
+    confusing. ``remove_server`` sweeps the row + bearer sidecar + checkpoint log.
+    """
+    if server.is_self:
+        raise HTTPException(
+            status_code=409,
+            detail="cannot delete the mothership's own (is_self) server",
+        )
+    if not _store(request).remove_server(server_id):
+        # require_manage already resolved the server, so a False is a race
+        # (a concurrent delete burned it first). Treat as already-gone.
+        raise HTTPException(status_code=404, detail="server not found")
+    return {"removed": server_id}
+
+
 @router.post("/servers/{server_id}/invites")
 def create_invite(
     request: Request,

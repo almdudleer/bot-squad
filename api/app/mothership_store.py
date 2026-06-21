@@ -258,6 +258,31 @@ class MothershipStore:
             self.write(servers)
         return entry, token
 
+    def remove_server(self, server_id: str) -> bool:
+        """Delete a server from the registry — the close for ``register_server``
+        (audit Fork-6 DEREGISTER).
+
+        Sweeps the registry row, the bearer sidecar, and the per-server
+        checkpoint log (every malloc names its free). Returns ``True`` if a row
+        was removed, ``False`` if no such server (idempotent — a second call
+        returns ``False``).
+
+        NOTE: refusing the ``is_self`` row is the CALLER's job — it
+        self-resurrects via ``register_self_if_missing`` on next boot, so
+        deleting it here would just churn the registry.
+        """
+        with self._lock:
+            servers = self.list_servers()
+            remaining = [s for s in servers if s.id != server_id]
+            if len(remaining) == len(servers):
+                return False
+            self.write(remaining)
+        # The registry row is gone, so a leftover sidecar/log can no longer
+        # authorize anything; clean them best-effort OUTSIDE the registry lock.
+        self.forget_server_bearer(server_id)
+        self._remove_checkpoints(server_id)
+        return True
+
     def register_self_if_missing(
         self,
         *,
@@ -752,6 +777,14 @@ class MothershipStore:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(stamped) + "\n")
         return stamped
+
+    def _remove_checkpoints(self, server_id: str) -> None:
+        """Delete a server's checkpoint log (part of ``remove_server``'s sweep)."""
+        path = self._checkpoints_dir() / f"{server_id}.jsonl"
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
     def read_checkpoints(self, server_id: str) -> list[dict]:
         path = self._checkpoints_dir() / f"{server_id}.jsonl"

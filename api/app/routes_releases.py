@@ -122,7 +122,13 @@ def get_latest(request: Request) -> dict:
 
 # Register the tarball route BEFORE the catch-all ``/{version}`` so
 # ``_files`` is never swallowed by the version param.
-@router.get("/_files/{filename}", name="releases_file")
+# T-0369: response_model=None — with `from __future__ import annotations` the
+# `-> FileResponse` return annotation is a ForwardRef FastAPI tried to build a
+# response-model JSON schema for → /openapi.json 500'd. FileResponse is a Response
+# class, not a model; response_class declares it, response_model=None disables the
+# (broken) inference.
+@router.get("/_files/{filename}", name="releases_file",
+            response_class=FileResponse, response_model=None)
 def get_tarball(request: Request, filename: str) -> FileResponse:
     # Defensive: refuse path traversal and non-tar.gz names. Manifest
     # entries always end in ``.tar.gz`` (per T-0081); anything else is

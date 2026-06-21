@@ -188,7 +188,11 @@ def build_app() -> FastAPI:
         from fastapi.responses import FileResponse
         from fastapi import HTTPException as _HE
 
-        @app.get("/{full_path:path}")
+        # T-0369: response_model=None — the `-> FileResponse` return annotation is
+        # a ForwardRef under `from __future__ import annotations`; without this
+        # FastAPI tries to build a response-model schema for it and /openapi.json
+        # 500s. FileResponse is a Response class, not a model.
+        @app.get("/{full_path:path}", response_class=FileResponse, response_model=None)
         def spa(full_path: str) -> FileResponse:
             # Don't intercept /api routes (already routed above).
             if full_path.startswith("api"):

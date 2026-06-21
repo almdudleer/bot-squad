@@ -114,17 +114,23 @@ class AttachedServer:
     # deserialise unchanged via the known-field splat in ``list_servers``.
     grants: list[dict] = field(default_factory=list)
 
-    def to_public(self) -> dict:
+    def to_public(self, include_invites: bool = False) -> dict:
         d = asdict(self)
         d.pop("install_token_hash", None)
         d.pop("server_bearer_hash", None)
-        # Invite hashes are credentials too — strip them from the public
-        # projection. We surface only the non-secret fields so the wizard
-        # can render a "this server's outstanding invites" list.
-        d["invites"] = [
-            {k: v for k, v in inv.items() if k != "hash"}
-            for inv in d.get("invites", [])
-        ]
+        # T-0370: outstanding invites (target_username/role/created_by/expiry) are
+        # admin-management metadata, NOT public. The is_self server is visible to
+        # EVERY user (the is_self bypass in _can_access), so leaving invites in the
+        # default projection leaked them to any non-admin. Surface them (hash
+        # stripped — hashes are credentials) only when the caller is an admin;
+        # otherwise drop the field entirely. Mirrors the grants handling below.
+        if include_invites:
+            d["invites"] = [
+                {k: v for k, v in inv.items() if k != "hash"}
+                for inv in d.get("invites", [])
+            ]
+        else:
+            d.pop("invites", None)
         # Grants are NOT in the public projection: exposing them here would
         # leak who-else-has-access to every grantee that can list the server.
         # The owner reads them via the dedicated owner-only GET

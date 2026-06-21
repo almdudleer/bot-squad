@@ -212,8 +212,12 @@ def list_servers(request: Request, user: dict = Depends(require_auth)) -> list[d
     own ``is_self`` entry. There is no global all-servers view; a global admin
     does NOT see others' ungranted servers (god-mode removed, T-0221 D2).
     """
+    # T-0370: invites are admin-only management metadata — scope them so a
+    # non-admin never sees a server's invites (notably the is_self server, which
+    # the is_self bypass makes visible to everyone).
+    include_invites = bool(user.get("is_admin"))
     return [
-        s.to_public()
+        s.to_public(include_invites=include_invites)
         for s in _store(request).list_servers()
         if _can_access(s, user)
     ]

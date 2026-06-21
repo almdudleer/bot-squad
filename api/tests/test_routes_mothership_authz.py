@@ -733,3 +733,45 @@ def test_old_servers_json_without_grants_loads(tmp_bot_squad: Path, monkeypatch)
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client, "testuser")
         assert _list_ids(client, include_self=False) == {"srv_legacy"}
+
+
+# ---- T-0370: invites must not leak to a non-admin (is_self bypass) -----------
+
+def _seed_self_with_invite(tmp_bot_squad: Path) -> None:
+    store = MothershipStore(tmp_bot_squad / "data" / "_mothership")
+    inv = {
+        "hash": "deadbeef", "target_username": "bob", "role": "dev",
+        "created_by": "testuser", "expires_at": "2099-01-01T00:00:00Z",
+    }
+    store.write([AttachedServer(
+        id="srv_self", display_name="self", base_url="https://self.example.com",
+        owner_user="testuser",
+        created_at="2026-01-01T00:00:00Z", install_state="connected",
+        is_self=True, invites=[inv],
+    )])
+
+
+def test_non_admin_does_not_see_is_self_invites(tmp_bot_squad: Path, monkeypatch):
+    """A non-admin can SEE the is_self server (is_self bypass) but its outstanding
+    invites (target_username/role/created_by/expiry) must NOT be exposed."""
+    _write_auth(tmp_bot_squad, testuser_is_admin=False, intruder_is_admin=False)
+    _seed_self_with_invite(tmp_bot_squad)
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "intruder")
+        r = client.get("/api/m/servers")
+    assert r.status_code == 200
+    self_srv = next(s for s in r.json() if s["id"] == "srv_self")
+    assert self_srv.get("invites", []) == []  # no invite metadata leaked
+
+
+def test_admin_sees_is_self_invites_without_hash(tmp_bot_squad: Path, monkeypatch):
+    """An admin still sees the invites (hash-stripped) — scoped, not removed."""
+    _write_auth(tmp_bot_squad, testuser_is_admin=True, intruder_is_admin=False)
+    _seed_self_with_invite(tmp_bot_squad)
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client, "testuser")
+        r = client.get("/api/m/servers")
+    self_srv = next(s for s in r.json() if s["id"] == "srv_self")
+    assert len(self_srv["invites"]) == 1
+    assert self_srv["invites"][0]["target_username"] == "bob"
+    assert "hash" not in self_srv["invites"][0]

@@ -107,6 +107,21 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
                 extra_initiatives=[i for i in (meta.get("extra_initiatives") or []) if i and i != "~"],
             )
             live = S._is_live_holder(meta)
+            # T-0430: short-circuit the expensive per-session work
+            # (_pane_activity_at + the _session_context_pct disk JSON read) for
+            # candidates that can NEVER be an eligible reuse target — only a LIVE
+            # dev qualifies. A cheap rejected-stub keeps the (FE-ignored) rejected
+            # list semantically intact; role-before-live matches the original
+            # ladder precedence. Collapses O(all-sessions-ever) → O(live).
+            if role != "dev" or not live:
+                candidates.append({
+                    "sid": sid, "role": role, "live": live, "idle": False,
+                    "initiative_match": False, "context_pct": 0,
+                    "eligible": False,
+                    "reject": "not-a-dev" if role != "dev" else "not-live",
+                })
+                continue
+
             act = S._pane_activity_at(
                 str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
             )
@@ -115,11 +130,7 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
             pct = _session_context_pct(cfg, slug, sid)
 
             reject: str | None = None
-            if role != "dev":
-                reject = "not-a-dev"
-            elif not live:
-                reject = "not-live"
-            elif not idle:
+            if not idle:
                 reject = "busy"
             elif not init_match:
                 reject = "initiative-mismatch" if task_init else "task-has-no-initiative"

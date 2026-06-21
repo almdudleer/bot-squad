@@ -155,6 +155,34 @@ def test_suspended_session_is_not_reused(tmp_path):
     assert res["decision"] == "spawn"
 
 
+def test_decide_dispatch_skips_context_read_for_dead_sessions(tmp_path, monkeypatch):
+    """T-0430: only a LIVE dev can be a reuse target, so the expensive
+    _session_context_pct (disk JSON read) must be skipped for dead/non-live
+    candidates. A project with N dead + 1 live session does EXACTLY 1 context
+    read — not N+1 — and still reuses the live dev (behaviour unchanged)."""
+    import bot_squad_worker.dispatch as D
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-live-dev-p1", window="live-dev", initiative="alpha.md")
+    _set_context_pct(cfg, "S-u-live-dev-p1", 10.0)
+    for i in range(5):
+        _make_session(cfg, f"S-u-dead-p{i}", window=f"dead{i}",
+                      initiative="alpha.md", status="suspended")
+        # lower pct (more "headroom") but dead → must be ignored, never reused.
+        _set_context_pct(cfg, f"S-u-dead-p{i}", 5.0)
+
+    reads: list[str] = []
+    real = D._session_context_pct
+    monkeypatch.setattr(
+        D, "_session_context_pct",
+        lambda c, s, sid: (reads.append(sid), real(c, s, sid))[1],
+    )
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["decision"] == "reuse"
+    assert res["target_sid"] == "S-u-live-dev-p1"
+    assert reads == ["S-u-live-dev-p1"]  # the 5 dead sessions never get a context read
+
+
 def test_tie_break_prefers_lowest_context_pct(tmp_path):
     cfg = _make_cfg(tmp_path)
     _make_task(cfg, "T-0009", initiative="alpha.md")

@@ -92,6 +92,13 @@ def list_feedback(slug: str, request: Request) -> list[dict]:
     # Audit item 8 (Fork-4): PURE read. `bsq feedback`/voice intake write F-*.md
     # directly now, so list_feedback no longer materializes inbox.log on read
     # (the cut side-effecting GET). A stray inbox.log is ignored (not an F-*.md).
+    #
+    # Audit item 12 (Fork-4 close): default-hide CLOSED feedback (promoted /
+    # dismissed) so the intake stops leaking forever; ?include_closed=true shows
+    # all. Each row surfaces `status` (absent frontmatter → "open"/visible).
+    include_closed = (request.query_params.get("include_closed") or "").lower() in (
+        "1", "true", "yes",
+    )
     out = []
     for f in sorted(fb_dir.glob("*.md")):
         # T-0283: feedback is a nestable artifact. Surface its artifact `id`
@@ -99,12 +106,16 @@ def list_feedback(slug: str, request: Request) -> list[dict]:
         # stripped) so the editor never round-trips the nesting block. Legacy
         # files have no frontmatter, so body == the whole file (unchanged).
         meta, body = AN.split_frontmatter(f.read_text(encoding="utf-8"))
+        status = str(meta.get("status") or "open")
+        if not include_closed and status in ("promoted", "dismissed"):
+            continue
         ref = AN.ref_for_path(AN.KIND_FEEDBACK, f)
         out.append({
             "name": f.name,
             "id": ref.id,
             "parent_doc_id": ref.parent_doc_id,
             "content": body,
+            "status": status,
         })
     return out
 
@@ -197,15 +208,52 @@ def promote_feedback(
     }
     write_task(task_path, fm, task_body)
 
-    # Append footer to feedback file
+    # Item 12 (Fork-4 close): mark the feedback CLOSED (status: promoted) and
+    # record the task link footer in ONE atomic write. Cross-container uid
+    # (flaw-watch): `bsq` writes F-*.md at the host uid, this runs at the
+    # container uid — an in-place append can EACCES, but a tmp-write + os.replace
+    # only needs dir-write, so it works regardless of who owns the file.
     footer = (
         f"\n\n---\n"
         f"Promoted to backlog task [{task_id}](../backlog/{filename}) on {today}.\n"
     )
-    with open(fb_path, "a", encoding="utf-8") as f:
-        f.write(footer)
+    _set_status_and_append(fb_path, "promoted", footer)
 
     return {"ok": True, "task_id": task_id}
+
+
+def _set_status_and_append(fb_path: Path, status: str, footer: str) -> None:
+    """Fold a ``status`` frontmatter set + a body footer into a single atomic
+    tmp-write+os.replace (see the cross-container-uid note above). A legacy
+    feedback file (no frontmatter) gains a frontmatter block, same as the
+    put/parent paths (T-0283)."""
+    meta, body = AN.split_frontmatter(fb_path.read_text(encoding="utf-8"))
+    meta["status"] = status
+    new_text = AN.with_frontmatter(meta, body + footer)
+    tmp = fb_path.parent / (fb_path.name + ".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, fb_path)
+
+
+@router.post("/{name}/dismiss")
+def dismiss_feedback(
+    slug: str,
+    name: str,
+    request: Request,
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
+) -> dict:
+    """Item 12 (Fork-4 close): dismiss a feedback item without promoting it —
+    the DOMINANT operator action per the product-iteration loop (most friction
+    notes are cut, not built). Sets ``status: dismissed`` so ``list_feedback``
+    default-hides it; the close is explicit and the intake stops leaking."""
+    _validate_feedback_name(name)
+    fb_path = _fb_dir(request, slug) / name
+    if not fb_path.exists():
+        raise HTTPException(status_code=404, detail=f"feedback file not found: {name}")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _set_status_and_append(fb_path, "dismissed", f"\n\n---\nDismissed on {today}.\n")
+    return {"ok": True}
 
 
 @router.get("/{fid}/children")

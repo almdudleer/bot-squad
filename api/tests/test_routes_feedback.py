@@ -269,6 +269,79 @@ def test_promote_requires_auth(tmp_bot_squad: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Audit item 12 (Fork-4 close): feedback gets a close state. promote→promoted,
+# a new owner-gated dismiss→dismissed (cut is the dominant operator action), and
+# list_feedback default-hides closed items so the queue stops leaking forever.
+# Cross-container uid (Fork-4 flaw-watch): the host-uid `bsq` writes F-*.md and
+# the container-uid API mutates it — so the status+footer fold is ONE atomic
+# tmp-write+os.replace (a dir-write rename), never an in-place append (EACCES).
+# ---------------------------------------------------------------------------
+
+def _status_of(path: Path) -> str:
+    from app import artifact_nesting as AN
+    meta, _ = AN.split_frontmatter(path.read_text())
+    return str(meta.get("status") or "open")
+
+
+def test_promote_sets_status_promoted_and_keeps_footer(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    (fb / "F-2026-04-15-id600.md").write_text("# Needs dark mode\n\nbody\n")
+    (tmp_bot_squad / "data" / "test-project" / "backlog").mkdir(parents=True, exist_ok=True)
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/feedback/F-2026-04-15-id600.md/promote", json={})
+    assert r.status_code == 200
+    f = fb / "F-2026-04-15-id600.md"
+    assert _status_of(f) == "promoted"
+    assert "Promoted to backlog task" in f.read_text()
+    # the fold left no stray tmp file behind (atomic replace)
+    assert list(fb.glob("*.tmp")) == []
+
+
+def test_dismiss_sets_status_dismissed(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    (fb / "F-2026-04-15-id601.md").write_text("# Wont do\n\nbody\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/feedback/F-2026-04-15-id601.md/dismiss", json={})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    f = fb / "F-2026-04-15-id601.md"
+    assert _status_of(f) == "dismissed"
+    assert list(fb.glob("*.tmp")) == []
+
+
+def test_dismiss_not_found(tmp_bot_squad: Path, monkeypatch):
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/feedback/F-nope.md/dismiss", json={})
+    assert r.status_code == 404
+
+
+def test_dismiss_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    (fb / "F-2026-04-15-id602.md").write_text("# x\n")
+    with _anon(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/feedback/F-2026-04-15-id602.md/dismiss", json={})
+    assert r.status_code == 401
+
+
+def test_list_hides_closed_by_default_and_surfaces_status(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    (fb / "F-open.md").write_text("# Open\n\nbody\n")
+    (fb / "F-promoted.md").write_text("---\nstatus: promoted\n---\n\n# Done\n")
+    (fb / "F-dismissed.md").write_text("---\nstatus: dismissed\n---\n\n# Cut\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        default_rows = c.get("/api/projects/test-project/feedback").json()
+        all_rows = c.get("/api/projects/test-project/feedback?include_closed=true").json()
+    # default: only the open item, and it carries an explicit status field
+    by_name = {r["name"]: r for r in default_rows}
+    assert set(by_name) == {"F-open.md"}
+    assert by_name["F-open.md"]["status"] == "open"
+    # include_closed: all three, statuses surfaced
+    all_by = {r["name"]: r["status"] for r in all_rows}
+    assert all_by == {"F-open.md": "open", "F-promoted.md": "promoted",
+                      "F-dismissed.md": "dismissed"}
+
+
+# ---------------------------------------------------------------------------
 # T-0283 Pillar-C: feedback as nestable cross-store artifacts.
 # ---------------------------------------------------------------------------
 def _fb_dir(tmp_bot_squad: Path) -> Path:

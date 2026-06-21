@@ -80,7 +80,12 @@ def aggregate_project_status(rows: list[dict]) -> dict:
     # never decays: an idle-at-prompt autonomous dev parked at ❯ is idle/done
     # (and reapable), not awaiting a human. See docs/architecture/D-0018.
     pauseds = [r for r in rows if r.get("status") == "paused"]
-    blocked = [r for r in rows if r.get("awaiting_input")]
+    # P2-05 liveness guard: a stall marker only drives the pill when its session
+    # is still LIVE (active). A suspended sid whose marker lingers within the 24h
+    # TTL must not pin the project to needs-input forever. Mirrors the FE
+    # row-mirror's active-guard (p208 aef0729). A paused+blocked session still
+    # reaches needs-input via `pauseds` above, so nothing is lost here.
+    blocked = [r for r in rows if r.get("awaiting_input") and r.get("status") == "active"]
     if pauseds or blocked:
         # `paused_at` is the canonical needs-input timestamp; a blocked row that
         # isn't paused falls back to its `started_at`. _max_ts-style skip of

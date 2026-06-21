@@ -254,6 +254,47 @@ def test_list_sessions_stamps_awaiting_input_from_tg_stall(tmp_path, monkeypatch
     assert by_sid["S-testuser-w2-p3"]["awaiting_input"] is False
 
 
+def test_list_sessions_close_on_attach_clears_resumed_marker(tmp_path, monkeypatch):
+    """P2-05-BE: a blocked, live (active) session that the close-on-attach
+    reconcile resolves (clear_if_resumed → True) has its awaiting_input flipped
+    back to False in the same list_sessions pass — even though it's still in the
+    blocked_sids set at the top of the pass. The reconcile is only attempted for
+    blocked active rows (w2 is not blocked → never probed)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    fake_pane_output = f"%2|w1|1234|{repo}|claude\n%3|w2|1235|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.tg_stall as TS
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(TS, "blocked_sids", lambda cfg, slug: {"S-testuser-w1-p2"})
+
+    resumed = "S-testuser-w1-p2"
+    probed: list[str] = []
+
+    def fake_clear_if_resumed(cfg, slug, sid, activity_at):
+        probed.append(sid)
+        return sid == resumed
+
+    monkeypatch.setattr(TS, "clear_if_resumed", fake_clear_if_resumed)
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows}
+    # Only the blocked row is probed; the resolved marker flips the flag off.
+    assert probed == [resumed]
+    assert by_sid["S-testuser-w1-p2"]["awaiting_input"] is False
+    assert by_sid["S-testuser-w2-p3"]["awaiting_input"] is False
+
+
 def test_list_sessions_awaiting_input_defaults_false_on_watchdog_error(tmp_path, monkeypatch):
     """If the tg_stall lookup raises, the flag is a safe False — never wedges
     the list."""

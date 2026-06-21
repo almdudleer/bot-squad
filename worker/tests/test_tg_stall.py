@@ -95,6 +95,49 @@ def test_clear_blocked(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# P2-05-BE: close-on-attach reconcile — clear a marker when the agent resumes
+# crunching after the block (operator attached-and-typed, which the peer_send /
+# user_prompt_submit clear paths miss on the DPI/MAX host).
+# ---------------------------------------------------------------------------
+
+def _marker_since(cfg, sid):
+    return json.loads(TS._marker_path(cfg, "bot-squad", sid).read_text())["since"]
+
+
+def test_clear_if_resumed_clears_on_new_activity_after_block(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "need prod call")
+    since = _marker_since(cfg, DEV)
+    # Genuinely-new jsonl activity well after the block → the agent resumed.
+    assert TS.clear_if_resumed(cfg, "bot-squad", DEV, since + 600) is True
+    assert not TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+def test_clear_if_resumed_keeps_marker_within_grace(tmp_path):
+    """The agent's OWN peer_send write lands at ~since; it must not self-clear
+    the marker it just set."""
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    since = _marker_since(cfg, DEV)
+    assert TS.clear_if_resumed(cfg, "bot-squad", DEV, since + 5) is False
+    assert TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+def test_clear_if_resumed_no_marker_returns_false(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert TS.clear_if_resumed(cfg, "bot-squad", DEV, time.time()) is False
+
+
+def test_clear_if_resumed_none_activity_leaves_marker(tmp_path):
+    """No measurable activity timestamp → can't tell resume from idle; the
+    marker is left untouched (keeps the existing-tests-green None contract)."""
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    assert TS.clear_if_resumed(cfg, "bot-squad", DEV, None) is False
+    assert TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+# ---------------------------------------------------------------------------
 # on_peer_send mark/clear (scenario steps 3, 8)
 # ---------------------------------------------------------------------------
 

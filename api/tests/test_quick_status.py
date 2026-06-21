@@ -127,6 +127,16 @@ def test_awaiting_input_yields_needs_input():
     assert out["status_since"] == "2026-05-14T09:00:00Z"
 
 
+def test_suspended_with_stale_awaiting_marker_is_idle_not_needs_input():
+    """P2-05-BE liveness guard: a SUSPENDED session whose tg_stall marker still
+    lingers (within the 24h TTL) carries awaiting_input=True on its row, but it
+    is not live — it must NOT pin the project pill to needs-input. Mirrors the
+    FE row-mirror active-guard (p208 aef0729)."""
+    rows = [_row("suspended", suspended_at="2026-05-14T09:00:00Z",
+                 awaiting_input=True)]
+    assert aggregate_project_status(rows)["status"] == "idle"
+
+
 def test_active_not_at_prompt_is_working():
     """Plain active (worker didn't flag at-prompt) remains working."""
     rows = [_row("active", started_at="2026-05-14T09:00:00Z", active_at_prompt=False)]

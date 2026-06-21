@@ -1051,7 +1051,21 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
     except Exception:  # noqa: BLE001 — never let the watchdog wedge the list
         _blocked = set()
     for _r in rows:
-        _r["awaiting_input"] = _r.get("sid") in _blocked
+        sid = _r.get("sid")
+        blocked = sid in _blocked
+        # P2-05: close-on-attach reconcile. A blocked, LIVE (active) session that
+        # has resumed crunching (new jsonl activity after the block) got its
+        # answer — the operator attached-and-typed, which the peer_send /
+        # user_prompt_submit clear paths miss on the DPI/MAX host. Clear the
+        # stale marker here so awaiting_input decays instead of sticking for the
+        # 24h TTL. Only attempted for blocked active rows; best-effort.
+        if blocked and _r.get("status") == "active":
+            try:
+                if _tg_stall.clear_if_resumed(cfg, slug, sid, _r.get("activity_at")):
+                    blocked = False
+            except Exception:  # noqa: BLE001 — never let the reconcile wedge the list
+                pass
+        _r["awaiting_input"] = blocked
 
     return rows
 

@@ -136,6 +136,41 @@ def clear_blocked(cfg: Any, slug: str, sid: str) -> bool:
         return False
 
 
+# P2-05: grace margin so an agent's OWN peer_send write — which lands at
+# ~`since` — never self-clears the marker it just set. Mirrors sessions'
+# RUNNING_THRESHOLD_SEC without importing it (would form a back-cycle).
+_RESUME_GRACE_SEC = 30.0
+
+
+def clear_if_resumed(cfg: Any, slug: str, sid: str, activity_at: Optional[float]) -> bool:
+    """P2-05: close-on-attach reconcile.
+
+    If ``sid`` has a stall marker but its pane has produced genuinely-new jsonl
+    activity *after* the block was recorded, the agent resumed work — i.e. it
+    got its answer. On the DPI/MAX host the operator answers by attaching to the
+    pane and typing, which the ``peer_send`` / ``user_prompt_submit`` clear
+    paths miss, so the marker would otherwise stick until the 24h TTL. Clear it.
+    Returns True iff a marker existed and was cleared.
+
+    ``activity_at`` is the pane's latest jsonl/heartbeat epoch (None if unknown
+    — then we can't tell resume from idle, so the marker is left untouched). The
+    ``_RESUME_GRACE_SEC`` margin ensures the agent's own peer_send write (which
+    lands at ~``since``) doesn't self-clear the marker it just created.
+    """
+    if not sid or activity_at is None:
+        return False
+    m = _read(_marker_path(cfg, slug, sid))
+    if not m:
+        return False
+    try:
+        since = float(m.get("since"))
+    except (TypeError, ValueError):
+        return False
+    if activity_at <= since + _RESUME_GRACE_SEC:
+        return False
+    return clear_blocked(cfg, slug, sid)
+
+
 def on_peer_send(cfg: Any, slug: str, from_sid: str, recipient_sids: list[str]) -> None:
     """React to a ``peer_send`` for the stall-watchdog (best-effort).
 

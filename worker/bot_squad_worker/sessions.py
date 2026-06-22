@@ -1042,6 +1042,11 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "extra_initiatives": md_extra_inits,
                 "paused_at": meta.get("paused_at"),
                 "suspended_at": meta.get("suspended_at"),
+                # T-0444: surface WHY/WHO an auto-close happened so the Processes
+                # status badge can make a surprise auto-cleanup visible. Absent
+                # on user/API suspends + legacy rows (badge shows nothing extra).
+                "suspend_source": meta.get("suspend_source"),
+                "suspend_reason": meta.get("suspend_reason"),
                 "archived": md_archived,
                 "owner": md_owner,
                 "owner_user": md_owner_user,
@@ -1123,11 +1128,17 @@ def pause(cfg: Any, slug: str, sid: str) -> dict:
     return {"ok": True, "paused": True}
 
 
-def suspend(cfg: Any, slug: str, sid: str) -> dict:
+def suspend(cfg: Any, slug: str, sid: str, *,
+            source: str | None = None, reason: str | None = None) -> dict:
     """Suspend a Claude session — close the pane to free resources.
 
     The registry md is preserved (with claude_uuid). Use resume() to
     resurrect: a new tmux window is spawned with ``claude --resume <uuid>``.
+
+    T-0444: callers that auto-close a session (e.g. the constant-team drained-
+    member reaper) pass ``source``/``reason`` so the close is VISIBLE on the
+    Processes status badge. A user/API suspend omits them (the operator did it
+    themselves — no surprise to surface), leaving the md without those keys.
     """
     project = cfg.projects.get(slug)
     if project is None:
@@ -1154,6 +1165,9 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         existing.setdefault("started_at", "~")
         existing.setdefault("task_id", "~")
         existing.setdefault("claude_uuid", existing.get("claude_uuid", "~"))
+        if source:  # T-0444: visible-close stamp on the auto-close path
+            existing["suspend_source"] = source
+            existing["suspend_reason"] = reason or source
         _write_session_metadata(meta_file, existing)
         return {"ok": True, "suspended": True, "already_gone": True}
 
@@ -1189,6 +1203,9 @@ def suspend(cfg: Any, slug: str, sid: str) -> dict:
         "owner_user": owner_user_val,
         "tmux_session": tmux_sess_val,
     }
+    if source:  # T-0444: visible-close stamp on the auto-close path
+        meta["suspend_source"] = source
+        meta["suspend_reason"] = reason or source
     _write_session_metadata(meta_file, meta)
 
     # Graceful exit then force-kill if needed.
@@ -2869,6 +2886,11 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
             continue
         meta["status"] = "suspended"
         meta["suspended_at"] = now
+        # T-0444: stamp WHY + WHO closed this so the auto-cleanup is VISIBLE on
+        # the Processes status badge (the doctrine's "visible close"). This path
+        # is the silent idle/no-pane suspend that "ships dark" today.
+        meta["suspend_source"] = "gc_sessions"
+        meta["suspend_reason"] = "auto-suspended: no live tmux pane"
         _write_session_metadata(md, meta, atomic=True)
         repaired.append(sid)
     return {"ok": True, "scanned": scanned, "repaired": len(repaired), "sids": repaired}
@@ -3152,6 +3174,9 @@ def dedup_sessions(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
             if meta.get("status") == "active":
                 meta["status"] = "suspended"
                 meta.setdefault("suspended_at", now)
+                # T-0444: visible-close stamp (symmetry with gc_sessions).
+                meta["suspend_source"] = "merge"
+                meta["suspend_reason"] = f"merged into {keeper}"
             meta["archive_reason"] = f"merged-into:{keeper}"
             _write_session_metadata(md, meta, atomic=True)
             # T-0447 (#4): merged-away loser is historical — free its sidecars.

@@ -74,11 +74,17 @@ def _setup_uf(cfg, slug, *, inbox_lines: int, cursor: int):
 def test_gc_drained_members_reaps_idle_member_when_drained(cfg_slug, monkeypatch):
     cfg, slug, _ = cfg_slug
     _setup_uf(cfg, slug, inbox_lines=5, cursor=5)  # drained
-    suspended: list[str] = []
+    suspended: list[tuple] = []
     monkeypatch.setattr(S, "list_sessions", lambda c, s: [_member_row("S-x-user-feedback-p9")])
-    monkeypatch.setattr(S, "suspend", lambda c, s, sid: suspended.append(sid) or {"ok": True})
+    # T-0444: the reaper now passes a visible-close source/reason through suspend.
+    monkeypatch.setattr(
+        S, "suspend",
+        lambda c, s, sid, *, source=None, reason=None: suspended.append((sid, source, reason)) or {"ok": True},
+    )
     out = ct.gc_drained_members(cfg, slug, now=2_000_000_000.0)
-    assert suspended == ["S-x-user-feedback-p9"]
+    assert [s[0] for s in suspended] == ["S-x-user-feedback-p9"]
+    assert suspended[0][1] == "gc_drained_member"  # T-0444 source stamp
+    assert suspended[0][2]  # a human reason was provided
     assert out["reaped"] == ["S-x-user-feedback-p9"]
 
 

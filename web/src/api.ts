@@ -356,6 +356,12 @@ export type SessionRow = {
   pinned?: boolean;
   pinned_by?: string | null;
   pinned_at?: string | null;
+  // T-0444: WHY/WHO an auto-close happened, stamped by the worker on every
+  // auto-suspend path (gc_sessions idle/no-pane, gc_drained_member, merge) so
+  // the Processes status badge can make surprise auto-cleanup VISIBLE ("visible
+  // close"). Absent on user/API suspends + legacy rows.
+  suspend_source?: string | null;
+  suspend_reason?: string | null;
 };
 
 // T-0210: per-session resource telemetry record (worker-sampled).

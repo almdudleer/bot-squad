@@ -57,10 +57,22 @@ function StatusBadge({ row }: { row: SessionRow }) {
     );
   }
   // suspended (or anything unknown)
+  // T-0444: when the worker stamped WHY an auto-close happened, surface it next
+  // to the suspended badge so a surprise auto-cleanup is visible (not silent).
+  // Absent on user/API suspends + legacy rows → badge unchanged.
+  const reason = row.suspend_reason;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", opacity: 0.7 }}>
       <span className="mc-dot mc-dot-idle" />
       <span className="mc-badge mc-badge-dim">{sessionLabel(a)}</span>
+      {reason && (
+        <span
+          title={row.suspend_source ? `${reason} (${row.suspend_source})` : reason}
+          style={{ fontSize: "0.66rem", color: "var(--mc-text-dim)", fontStyle: "italic" }}
+        >
+          · {reason}
+        </span>
+      )}
     </span>
   );
 }

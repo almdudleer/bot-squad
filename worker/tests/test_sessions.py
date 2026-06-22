@@ -3271,6 +3271,44 @@ def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
     # T-0077: started_at + claude_uuid preserved so the session is resurrectable.
     assert after["started_at"] == "2026-05-15T11:18:04Z"
     assert after["claude_uuid"] == "uuid-zombie"
+    # T-0444: the auto-close stamps WHY/WHO so the badge can surface it.
+    assert after["suspend_source"] == "gc_sessions"
+    assert "no live tmux pane" in after["suspend_reason"]
+
+
+def test_suspend_stamps_source_reason_when_provided(tmp_path, monkeypatch):
+    """T-0444: an auto-close caller (e.g. the drained-member reaper) passes
+    source/reason → stamped on the md; a bare suspend leaves them absent."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])  # no live pane → normalise path
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-feedback-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-feedback-p9", "status": "active",
+        "task_id": "~", "claude_uuid": "uuid-x",
+    })
+
+    S.suspend(cfg, "test-project", "S-testuser-feedback-p9",
+              source="gc_drained_member", reason="queue drained")
+    after = _read_session_metadata(md)
+    assert after["status"] == "suspended"
+    assert after["suspend_source"] == "gc_drained_member"
+    assert after["suspend_reason"] == "queue drained"
+
+    # Bare suspend (user/API path) must NOT stamp a source.
+    md2 = sessions_dir / "S-testuser-feedback-p10.md"
+    _write_session_metadata(md2, {
+        "sid": "S-testuser-feedback-p10", "status": "active",
+        "task_id": "~", "claude_uuid": "uuid-y",
+    })
+    S.suspend(cfg, "test-project", "S-testuser-feedback-p10")
+    after2 = _read_session_metadata(md2)
+    assert after2["status"] == "suspended"
+    assert "suspend_source" not in after2
 
 
 def test_gc_sessions_skips_missing_pane_id_unverifiable(tmp_path, monkeypatch):

@@ -493,7 +493,10 @@ def gc_drained_members(cfg: Any, slug: str, now: float | None = None) -> dict:
             if not sid:
                 continue
             try:
-                S.suspend(cfg, slug, sid)
+                # T-0444: stamp the close so the auto-reap is visible on the
+                # Processes badge (this is exactly the "ships dark" cleanup).
+                S.suspend(cfg, slug, sid, source="gc_drained_member",
+                          reason="auto-suspended: consume-queue drained, member idle")
                 reaped.append(sid)
                 log.info("constant_teams: reaped idle drained member %s (team %s)", sid, init_stem)
             except Exception:  # noqa: BLE001

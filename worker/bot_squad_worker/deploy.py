@@ -145,12 +145,45 @@ def _worker_needs_restart(cfg: "Config") -> bool:
     """
     if os.environ.get("BOT_SQUAD_DEPLOY_AUTO_RESTART", "1").strip() == "0":
         return False
+    return _worker_subtree_changed_since_boot(cfg)
+
+
+def _worker_subtree_changed_since_boot(cfg: "Config") -> bool:
+    """The no-worker-change skip gate (kill-switch independent): True iff the
+    running worker's frozen boot sha differs from the live (post-ff-merge)
+    deployed sha AND the ``worker/`` subtree changed between them — i.e. there is
+    genuinely new worker code for a restart to load."""
     root = _install_root()
     running = boot_git_sha()
     deployed = _git_head_sha(root)
     if not running or not deployed or running == deployed:
         return False
     return _worker_subtree_changed(root, running, deployed)
+
+
+def _should_restart_worker(cfg: "Config", *, ok: bool, forced: bool) -> bool:
+    """T-0305 part-a: decide whether a finished deploy should bounce the worker.
+
+    The restart fires ONLY on a clean deploy that genuinely changed the
+    ``worker/`` subtree (the no-worker-change skip gate) — for BOTH an explicit
+    ``restart_worker:true`` (``forced``) and the Fork-5 auto-detect. A
+    no-worker-change deploy never bounces the worker, eliminating the ~6min
+    SIGTERM cadence that was churning the inbox-wait long-polls.
+
+    ``forced`` overrides the ``BOT_SQUAD_DEPLOY_AUTO_RESTART=0`` kill-switch (an
+    explicit ask wins) but STILL requires a real worker/ change; the auto path
+    honors the kill-switch."""
+    if not ok:
+        return False
+    try:
+        if not _worker_subtree_changed_since_boot(cfg):
+            return False
+    except Exception:  # noqa: BLE001 — a flaky git probe never bounces the worker
+        log.exception("deploy._should_restart_worker: worker-change probe failed")
+        return False
+    if forced:
+        return True
+    return os.environ.get("BOT_SQUAD_DEPLOY_AUTO_RESTART", "1").strip() != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -632,17 +665,10 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     # but the worker kept running old code" gap. Kill-switch:
     # BOT_SQUAD_DEPLOY_AUTO_RESTART=0.
     forced = bool(payload.get("restart_worker"))
-    auto = False
-    if ok and not forced:
-        try:
-            auto = _worker_needs_restart(cfg)
-        except Exception:
-            log.exception("deploy.run_next: %s/%s auto-restart probe failed", slug, target)
-            auto = False
-    if ok and (forced or auto):
+    if _should_restart_worker(cfg, ok=ok, forced=forced):
         reason = payload.get("reason", "")
-        if auto and not forced:
-            reason = f"auto-restart: worker/ changed — {reason}".strip()
+        tag = "restart_worker" if forced else "auto-restart: worker/ changed"
+        reason = f"{tag} — {reason}".strip(" —")
         try:
             _restart_worker_detached(cfg, slug, queue_id, reason)
         except Exception:

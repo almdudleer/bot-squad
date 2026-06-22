@@ -1134,6 +1134,8 @@ def test_run_next_triggers_restart_on_success_when_flag_on(
         cfg, proj.slug, "staging", "worker change", "user", restart_worker=True
     )
 
+    # T-0305 part-a: forced now also requires a real worker/ change — model one.
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
     calls: list = []
     monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
     result = run_next(cfg, proj.slug)
@@ -1160,6 +1162,84 @@ def test_run_next_no_restart_on_recipe_failure(
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is False
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# T-0305 part-a: a forced restart_worker:true now ALSO honors the
+# no-worker-change skip gate — a deploy that doesn't touch worker/ never bounces
+# the worker (kills the ~6min SIGTERM cadence churning the inbox-wait long-polls).
+# ---------------------------------------------------------------------------
+
+def test_should_restart_worker_skips_when_no_worker_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
+    # NEITHER forced nor auto restarts when worker/ is unchanged.
+    assert d._should_restart_worker(cfg, ok=True, forced=True) is False
+    assert d._should_restart_worker(cfg, ok=True, forced=False) is False
+
+
+def test_should_restart_worker_forced_fires_on_worker_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
+    assert d._should_restart_worker(cfg, ok=True, forced=True) is True
+
+
+def test_should_restart_worker_auto_fires_on_change_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
+    monkeypatch.delenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", raising=False)
+    assert d._should_restart_worker(cfg, ok=True, forced=False) is True
+
+
+def test_should_restart_worker_killswitch_blocks_auto_not_forced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill-switch disables the AUTO restart; an explicit forced restart
+    still overrides it — but BOTH still require an actual worker/ change."""
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", "0")
+    assert d._should_restart_worker(cfg, ok=True, forced=False) is False
+    assert d._should_restart_worker(cfg, ok=True, forced=True) is True
+
+
+def test_should_restart_worker_never_on_failed_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
+    assert d._should_restart_worker(cfg, ok=False, forced=True) is False
+
+
+def test_run_next_no_restart_forced_but_no_worker_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0305 part-a integration: restart_worker:true on a deploy that did NOT
+    change worker/ does NOT bounce the worker."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "api-only change", "user", restart_worker=True)
+
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+    assert calls == []  # no worker change → no restart, even forced
 
 
 def test_restart_worker_detached_skips_without_scope(
@@ -1297,7 +1377,10 @@ def test_run_next_auto_restarts_on_worker_change_without_flag(
     _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
     enqueue(cfg, proj.slug, "staging", "worker change", "user")  # flag OFF
 
-    monkeypatch.setattr(d, "_worker_needs_restart", lambda c: True)
+    # T-0305 part-a: the auto path keys on the worker-change gate (kill-switch
+    # default ON) — model a real worker/ change.
+    monkeypatch.delenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", raising=False)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     calls: list = []
     monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append((a, k)))
     result = run_next(cfg, proj.slug)

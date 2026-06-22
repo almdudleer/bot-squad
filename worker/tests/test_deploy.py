@@ -15,10 +15,14 @@ import pytest
 from bot_squad_worker.config import Config, Project
 from bot_squad_worker.deploy import (
     DeployResult,
+    _processed_dir,
+    _processing_dir,
     _recipe_path,
+    _runs_dir,
     _tracked_recipe_path,
     enqueue,
     list_queued,
+    prune_processed_runs,
     run_next,
 )
 
@@ -1481,3 +1485,105 @@ def test_deploy_monitor_sends_carry_deploy_logs_topic(tmp_config_dir, tmp_path, 
 
     assert rec.calls, "deploy_monitor sent no TG messages"
     assert all(c["topic_id"] == 7777 for c in rec.calls), rec.calls
+
+
+# ---------------------------------------------------------------------------
+# next-wave #11 (T-0451): keep-last-N retention reaper for processed/ + runs/.
+# processed/ files are "<epoch_ms>-<uuid>.ok|fail.<rc>" (chronologically
+# sortable); runs/ files are "<uuid>.*" (NOT sortable → retention is tied to
+# the processed keep-set by queue_id). NEVER prune an in-flight (processing/)
+# job; keep-last-N preserves recent forensics; never raises.
+# ---------------------------------------------------------------------------
+
+
+def _seed_processed_job(cfg, slug: str, ts_ms: int, uuid_str: str, *, rc: int = 0) -> str:
+    """Create one terminal processed/ marker + its runs/ artifacts. Returns uuid."""
+    processed = _processed_dir(cfg, slug)
+    runs = _runs_dir(cfg, slug)
+    processed.mkdir(parents=True, exist_ok=True)
+    runs.mkdir(parents=True, exist_ok=True)
+    suffix = "ok" if rc == 0 else f"fail.{rc}"
+    (processed / f"{ts_ms}-{uuid_str}.{suffix}").write_text("{}")
+    (runs / f"{uuid_str}.log").write_text("build log")
+    (runs / f"{uuid_str}.rc").write_text(str(rc))
+    return uuid_str
+
+
+def test_prune_keeps_last_n_processed(tmp_path: Path) -> None:
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    slug = proj.slug
+    for i in range(5):
+        _seed_processed_job(cfg, slug, 1_700_000_000_000 + i, f"uuid{i}")
+
+    res = prune_processed_runs(cfg, slug, keep_last_n=2)
+
+    processed = _processed_dir(cfg, slug)
+    runs = _runs_dir(cfg, slug)
+    remaining_processed = sorted(p.name for p in processed.glob("*"))
+    # newest two jobs survive (uuid3, uuid4); older three pruned
+    assert remaining_processed == [
+        "1700000000003-uuid3.ok",
+        "1700000000004-uuid4.ok",
+    ], remaining_processed
+    assert res["processed_pruned"] == 3
+    # runs tied to kept qids survive; the rest pruned
+    remaining_runs = sorted(p.name for p in runs.glob("*"))
+    assert remaining_runs == ["uuid3.log", "uuid3.rc", "uuid4.log", "uuid4.rc"], remaining_runs
+    assert res["runs_pruned"] == 6  # 3 jobs * 2 artifacts
+
+
+def test_prune_protects_in_flight(tmp_path: Path) -> None:
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    slug = proj.slug
+    # an OLD job that is still running: it has runs/ artifacts + a processing/ marker
+    processing = _processing_dir(cfg, slug)
+    processing.mkdir(parents=True, exist_ok=True)
+    (processing / "1700000000000-live.json").write_text("{}")
+    runs = _runs_dir(cfg, slug)
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "live.log").write_text("in flight")
+    # plus newer terminal jobs that would push the live one past the horizon
+    for i in range(1, 4):
+        _seed_processed_job(cfg, slug, 1_700_000_000_000 + i, f"uuid{i}")
+
+    prune_processed_runs(cfg, slug, keep_last_n=1)
+
+    # the in-flight job's runs artifact must survive despite keep_last_n=1
+    assert (runs / "live.log").exists()
+
+
+def test_prune_disabled_when_n_non_positive(tmp_path: Path) -> None:
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    slug = proj.slug
+    for i in range(3):
+        _seed_processed_job(cfg, slug, 1_700_000_000_000 + i, f"uuid{i}")
+
+    res = prune_processed_runs(cfg, slug, keep_last_n=0)
+
+    assert res["processed_pruned"] == 0 and res["runs_pruned"] == 0
+    assert len(list(_processed_dir(cfg, slug).glob("*"))) == 3
+
+
+def test_prune_never_raises_on_missing_dirs(tmp_path: Path) -> None:
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    # no _jobs/deploy dirs exist yet
+    res = prune_processed_runs(cfg, proj.slug, keep_last_n=5)
+    assert res["processed_pruned"] == 0 and res["runs_pruned"] == 0
+
+
+def test_prune_env_default(tmp_path: Path, monkeypatch) -> None:
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    slug = proj.slug
+    for i in range(4):
+        _seed_processed_job(cfg, slug, 1_700_000_000_000 + i, f"uuid{i}")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_RETENTION_N", "1")
+
+    res = prune_processed_runs(cfg, slug)  # N from env
+
+    assert res["processed_pruned"] == 3
+    assert len(list(_processed_dir(cfg, slug).glob("*"))) == 1

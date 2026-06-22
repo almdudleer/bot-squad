@@ -76,6 +76,19 @@ def deploy_monitor_one(cfg: Config, slug: str) -> None:
         _run_project_deploy(cfg, slug, project)
     except Exception:
         log.exception("deploy_monitor: deploy run failed for %s", slug)
+    # next-wave #11 (T-0451): keep-last-N retention prune of the deploy job
+    # archive (processed/ + runs/ only ever grow). Separately guarded + never
+    # raises, so a prune error can't skip a deploy or wedge the monitor.
+    try:
+        from bot_squad_worker import deploy as _deploy
+        pruned = _deploy.prune_processed_runs(cfg, slug)
+        if pruned.get("processed_pruned") or pruned.get("runs_pruned"):
+            log.info(
+                "deploy_monitor: %s pruned deploy archive (processed=%d, runs=%d, kept=%d)",
+                slug, pruned["processed_pruned"], pruned["runs_pruned"], pruned["kept"],
+            )
+    except Exception:
+        log.exception("deploy_monitor: deploy archive prune failed for %s", slug)
 
 
 def _reap_project_orphans(cfg: Config, slug: str, project: object) -> None:

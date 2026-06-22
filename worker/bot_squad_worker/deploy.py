@@ -69,6 +69,12 @@ RC_TIMEOUT = 124       # hard wall-clock backstop tripped (build ran too long)
 RC_NO_PROGRESS = 125   # no-progress watchdog: zero run-log output for N minutes
 RC_ORPHAN = 126        # stale-orphan reaper: file stranded in processing/ swept
 
+# next-wave #11 (T-0451): keep-last-N retention horizon for the deploy job
+# archive (processed/ + runs/). Override via BOT_SQUAD_DEPLOY_RETENTION_N; a
+# value <= 0 disables pruning. Keep-last-N (NOT age-prune) so recent forensics
+# survive.
+DEFAULT_RETENTION_N = 50
+
 
 # ---------------------------------------------------------------------------
 # git-sha helpers (T-0335 item-13, Fork-5: detect running != deployed worker)
@@ -1122,6 +1128,103 @@ def reap_orphans(cfg: "Config", slug: str, max_age_seconds: int | None = None) -
             "reason": payload.get("reason"),
         })
     return reaped
+
+
+def prune_processed_runs(
+    cfg: "Config", slug: str, keep_last_n: int | None = None
+) -> dict:
+    """Keep-last-N retention reaper for the deploy job archive (next-wave #11).
+
+    ``processed/`` and ``runs/`` only ever GROW — ``_finish`` MOVES each terminal
+    job's queue file into ``processed/<epoch_ms>-<uuid>.ok|.fail.<rc>`` and
+    run_next drops per-job artifacts (``<uuid>.log`` / ``.rc`` /
+    ``.worker-restart.log`` …) into ``runs/``, but nothing ever prunes them (live:
+    processed=164, runs=185 since May). This keeps the N most-RECENT jobs and
+    unlinks the rest, so recent deploy FORENSICS survive — keep-last-N,
+    deliberately NOT an age-prune.
+
+    Recency order comes from the ``processed/`` filenames' monotonic
+    ``<epoch_ms>`` prefix (runs/ files are ``<uuid>.*`` and carry no timestamp, so
+    runs retention is TIED to the processed keep-set by queue_id). A queue_id
+    still present in ``processing/`` (an in-flight build) is NEVER pruned — its
+    runs log is being written right now. Best-effort + never raises: a prune
+    error must not wedge the monitor.
+
+    ``keep_last_n`` defaults to ``BOT_SQUAD_DEPLOY_RETENTION_N`` (``DEFAULT_RETENTION_N``);
+    a value <= 0 disables pruning. Returns
+    ``{processed_pruned, runs_pruned, kept}``.
+    """
+    result = {"processed_pruned": 0, "runs_pruned": 0, "kept": 0}
+    if keep_last_n is None:
+        try:
+            keep_last_n = int(
+                os.environ.get("BOT_SQUAD_DEPLOY_RETENTION_N", str(DEFAULT_RETENTION_N))
+            )
+        except ValueError:
+            keep_last_n = DEFAULT_RETENTION_N
+    if keep_last_n <= 0:
+        return result  # pruning disabled
+
+    try:
+        processed_dir = _processed_dir(cfg, slug)
+        runs_dir = _runs_dir(cfg, slug)
+        processing_dir = _processing_dir(cfg, slug)
+
+        # Never prune an in-flight job (its marker is still in processing/).
+        in_flight: set[str] = set()
+        if processing_dir.exists():
+            for f in processing_dir.glob("*.json"):
+                in_flight.add(_queue_id_of(f))  # the bare uuid
+
+        # processed/ names: "<epoch_ms>-<uuid>.ok" / "<epoch_ms>-<uuid>.fail.<rc>".
+        # Sort by the epoch_ms prefix (chronological); the last N are the keepers.
+        def _ts_of(f: Path) -> int:
+            ts, _, _ = f.name.split(".", 1)[0].partition("-")
+            try:
+                return int(ts)
+            except ValueError:
+                return 0
+
+        def _qid_of(f: Path) -> str:
+            _, _, qid = f.name.split(".", 1)[0].partition("-")
+            return qid
+
+        processed_files = (
+            sorted((f for f in processed_dir.iterdir() if f.is_file()), key=_ts_of)
+            if processed_dir.exists()
+            else []
+        )
+        keepers = processed_files[-keep_last_n:] if keep_last_n else []
+        keep_qids = in_flight | {_qid_of(f) for f in keepers}
+        result["kept"] = len(keep_qids)
+
+        # Prune older processed/ markers (but never an in-flight one).
+        for f in processed_files[: max(0, len(processed_files) - keep_last_n)]:
+            if _qid_of(f) in in_flight:
+                continue
+            try:
+                f.unlink()
+                result["processed_pruned"] += 1
+            except OSError:
+                pass
+
+        # Prune runs/ artifacts whose queue_id is not a keeper. runs names are
+        # "<uuid>.<ext...>"; the uuid carries no dots so split on the first '.'.
+        if runs_dir.exists():
+            for f in runs_dir.iterdir():
+                if not f.is_file():
+                    continue
+                qid = f.name.split(".", 1)[0]
+                if qid in keep_qids:
+                    continue
+                try:
+                    f.unlink()
+                    result["runs_pruned"] += 1
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 — retention must never wedge the monitor
+        log.exception("deploy.prune_processed_runs: prune failed for %s", slug)
+    return result
 
 
 def surface_worker_restart_fails(cfg: "Config", slug: str) -> list[dict]:

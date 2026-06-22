@@ -17,7 +17,7 @@ Config lives in the initiative's own frontmatter (``vision/initiatives/<x>.md``)
     name: prod-support
     constant_team: true
     team_size: 1                 # max concurrent triage sessions
-    consume: _alerts/*.md        # work source (see below); omit => always-on
+    consume: _alerts/*.md        # work source (REQUIRED — see below)
     team_role: dev               # role contract for spawned sessions
     team_window: prod-support    # tmux window prefix (default: initiative stem)
     triage_prompt: >             # optional extra brief text
@@ -32,8 +32,11 @@ Config lives in the initiative's own frontmatter (``vision/initiatives/<x>.md``)
   * **log file** (``feedback/inbox.log``) — an append-only line queue. Pending =
     lines past a persisted cursor. The tick reads the new lines, advances the
     cursor, and hands those lines to the spawned dev in its brief.
-  * **omitted** — an always-on team: the tick tops the roster up to
-    ``team_size`` live members regardless of any queue.
+
+``consume`` is REQUIRED: a constant team is always demand-driven. The old
+"omit => always-on" keep-alive mode is RETIRED (T-0457 / T-0423 Fork-A: "no
+no-consume team can exist") — a constant_team with no consume source is a
+misconfig the tick warns about and skips.
 
 State (cursor + per-team spawn cooldown) lives under
 ``data/<slug>/_worker/constant_teams/``. A 60s scheduler tick
@@ -243,6 +246,9 @@ def _compose_brief(
             if len(items) > len(shown) else ""
         work_block = f"\n\nPENDING WORK ({len(items)} item(s)):\n{bullets}{more}"
 
+    # consume_kind is always a demand-driven mode here ("glob" or "log") — the
+    # always-on (no-consume) mode is retired (T-0457), so _maintain_initiative
+    # never composes a brief for it.
     if consume_kind == "glob":
         consume_rule = (
             "Each pending item is a FILE. For each: investigate, then either fix "
@@ -250,36 +256,22 @@ def _compose_brief(
             "action — never hand-pick a T-id), then DELETE the file so it is not "
             "reprocessed. Drain the whole queue before you exit."
         )
-    elif consume_kind == "log":
+    else:  # "log"
         consume_rule = (
             "The pending work is feedback entries (shown above). For each: decide "
             "if it's actionable; if so, file a backlog ticket via `task_new` and "
             "note the ticket id back. The cursor has already advanced, so these "
             "lines won't be re-shown — capture everything now."
         )
-    else:
-        consume_rule = (
-            "This is an always-on team. Pull the next piece of standing work for "
-            "this initiative, drive it, and log progress on its ticket."
-        )
 
     extra = f"\n\nInitiative guidance:\n{triage_prompt.strip()}" if triage_prompt.strip() else ""
 
-    # T-0335 item-17: a demand-driven team (glob/log) drains its queue and exits;
-    # an always-on keep-alive team (no consume) has no queue and must persist as a
-    # standing loop — telling it to auto-archive would let the keep-alive respawn
-    # a churn of short-lived sessions.
-    if consume_kind == "none":
-        exit_rule = (
-            "This is a STANDING keep-alive loop — there is no queue to drain. "
-            "Keep running the initiative's cycle and do not self-archive; leave "
-            "the session live so the keep-alive does not respawn a duplicate."
-        )
-    else:
-        exit_rule = (
-            "When the queue is drained, you're done — your session auto-archives. "
-            "No need to keep a session idling."
-        )
+    # A demand-driven team drains its queue and exits — there is no always-on
+    # keep-alive variant anymore (T-0457).
+    exit_rule = (
+        "When the queue is drained, you're done — your session auto-archives. "
+        "No need to keep a session idling."
+    )
 
     return (
         f"You are a CONSTANT-TEAM {role} for the '{name}' initiative.\n"
@@ -352,8 +344,17 @@ def _maintain_initiative(cfg: Any, slug: str, init_path: Path, fm: dict) -> list
 
     # ---- resolve pending work + compose brief ----
     if not consume:
-        consume_kind, items, advance_cursor = "none", [], None
-        to_spawn = capacity
+        # T-0457 (next-wave #7 / T-0423 Fork-A): the always-on (no-consume) mode is
+        # RETIRED — "no no-consume team can exist". A constant_team with no consume
+        # source is a misconfig; staffing it would run an unbounded standing loop
+        # that respawns short-lived sessions. Fail closed: warn and spawn nothing.
+        log.warning(
+            "constant_teams: %s/%s is constant_team:true but has no `consume` "
+            "source — the always-on keep-alive mode is retired (T-0423 Fork-A). "
+            "Skipping (spawning nothing); add a glob or .log consume source.",
+            slug, init_stem,
+        )
+        return actions
     elif consume.endswith(".log"):
         consume_kind = "log"
         log_path = data_dir / slug / consume
@@ -419,9 +420,11 @@ def _parse_iso_epoch(value: Any) -> float:
 def _queue_drained(cfg: Any, slug: str, init_path: Path, fm: dict) -> bool:
     """True when a constant team's consume-queue has no unprocessed work.
 
-    ``.log`` → no new lines past the cursor; glob → no matching files. A team with
-    no ``consume`` is always-on (no queue) and never "drains" — those are not
-    demand-driven, so we never reap their members here.
+    ``.log`` → no new lines past the cursor; glob → no matching files. The
+    always-on (no-consume) mode is retired (T-0457), so a no-consume team is never
+    staffed; this guard remains only as legacy straggler-safety — if some pre-cut
+    member still lingers, treat it as never-drained (conservative: don't reap a
+    member we can no longer reason about a queue for).
     """
     consume = (fm.get("consume") or "").strip()
     if not consume:

@@ -242,18 +242,22 @@ def test_non_retired_constant_team_still_staffed(cfg_slug):
     assert len(spawns) == 1
 
 
-def test_always_on_brief_is_keepalive_not_self_archive():
-    """T-0335 item-17: an always-on (no-consume) keep-alive team has no queue to
-    drain, so its brief must NOT tell the session to auto-archive when drained —
-    it must persist as a standing loop. The drained→archive rule is correct only
-    for demand-driven (glob/log) teams."""
-    brief = ct._compose_brief(
-        name="dogfood-loop", mission="continuously dogfood the product",
-        role="dev", items=[], triage_prompt="", consume_kind="none",
-    )
-    low = brief.lower()
-    assert "auto-archive" not in low and "auto archives" not in low
-    assert "standing" in low or "keep-alive" in low or "do not self-archive" in low
+def test_no_consume_constant_team_is_retired(cfg_slug, caplog):
+    """T-0457 (next-wave #7 / T-0423 Fork-A): the always-on (no-consume) keep-alive
+    mode is RETIRED — 'no no-consume team can exist'. A constant_team initiative
+    with no `consume` source is now a MISCONFIG: tick() spawns NOTHING and logs a
+    warning, instead of running an unbounded standing loop that respawns churn."""
+    import logging
+
+    cfg, slug, spawns = cfg_slug
+    _write_initiative(cfg, slug, "standing-loop",
+                      {"constant_team": "true", "team_size": 1})
+    with caplog.at_level(logging.WARNING):
+        res = ct.tick(cfg, slug)
+    assert spawns == []
+    assert res["actions"] == []
+    assert any("consume" in r.message.lower() for r in caplog.records), \
+        "a no-consume constant team must log a misconfig warning"
 
 
 def test_demand_driven_brief_still_self_archives():

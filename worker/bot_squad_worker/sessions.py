@@ -2288,12 +2288,20 @@ def caps_utilization(cfg: Any) -> dict:
     effective = _backoff.effective_limit(cfg)
     if caps["max_parallel_sessions"] == 0 and effective >= _backoff._UNLIMITED:
         effective = 0  # unlimited + no pressure → 0 on the wire (not the sentinel)
+    # T-0448 (#5): pass the ALREADY-persisted backoff explainer through so the
+    # FE "throttled to N" badge can say WHY (reason) and SINCE-WHEN (pressure/
+    # ramp timestamps) instead of a static generic tooltip. Pure passthrough —
+    # graceful None on cold start / disabled (load_state → None).
+    bstate = _backoff.load_state(cfg) or {}
     return {
         "max_parallel_sessions": caps["max_parallel_sessions"],
         "effective_limit": effective,
         "live_sessions": _count_live_sessions(cfg),
         "max_total_tokens": caps["max_total_tokens"],
         "output_since_anchor": _output_since_anchor(cfg),
+        "backoff_reason": bstate.get("reason"),
+        "backoff_last_pressure_at": bstate.get("last_pressure_at"),
+        "backoff_last_ramp_at": bstate.get("last_ramp_at"),
     }
 
 

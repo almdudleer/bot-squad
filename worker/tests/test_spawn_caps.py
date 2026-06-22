@@ -226,3 +226,36 @@ def test_caps_utilization_reflects_backoff_throttle(tmp_path, monkeypatch):
     out = _S.caps_utilization(cfg)
     assert out["effective_limit"] == 8
     assert out["max_parallel_sessions"] == 15
+
+
+# ── T-0448 (#5): caps_utilization passes the backoff explainer through ────────
+
+def test_caps_utilization_surfaces_backoff_reason_and_timing(tmp_path, monkeypatch):
+    """Under pressure, the meter carries the ALREADY-persisted backoff
+    reason + pressure/ramp timestamps so the 'throttled to N' badge can
+    explain WHY (pure passthrough — no new computation)."""
+    from bot_squad_worker import sessions as _S, backoff as _backoff
+    cfg = _make_cfg(tmp_path)
+    _set_caps(cfg, max_parallel=15, max_tokens=0)
+    _backoff.save_state(cfg, {
+        "effective_limit": 8,
+        "last_pressure_at": 1_700_000_000.0,
+        "last_ramp_at": 1_700_000_050.0,
+        "reason": "pressure: 2 session(s) limited -> decrease to 8",
+    })
+    out = _S.caps_utilization(cfg)
+    assert out["backoff_reason"] == "pressure: 2 session(s) limited -> decrease to 8"
+    assert out["backoff_last_pressure_at"] == 1_700_000_000.0
+    assert out["backoff_last_ramp_at"] == 1_700_000_050.0
+
+
+def test_caps_utilization_backoff_fields_graceful_on_coldstart(tmp_path):
+    """No backoff state yet (cold start) → the explainer fields are present
+    and None, never a KeyError."""
+    from bot_squad_worker.sessions import caps_utilization
+    cfg = _make_cfg(tmp_path)
+    _set_caps(cfg, max_parallel=15, max_tokens=0)
+    out = caps_utilization(cfg)
+    assert out["backoff_reason"] is None
+    assert out["backoff_last_pressure_at"] is None
+    assert out["backoff_last_ramp_at"] is None

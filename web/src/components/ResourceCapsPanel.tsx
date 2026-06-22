@@ -300,7 +300,17 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
               {throttled && (
                 <span
                   className="mc-badge mc-badge-warn"
-                  title="The WS-4 backoff governor has throttled admission below the hard cap (resource pressure / 429s). New spawns admit up to this effective limit until pressure clears."
+                  title={
+                    // T-0448 (#5): prefer the live backoff reason so the throttle
+                    // is self-explaining; fall back to the generic blurb.
+                    caps?.backoff_reason
+                      ? `Backoff: ${caps.backoff_reason}${
+                          caps.backoff_last_pressure_at
+                            ? ` (last pressure ${new Date(caps.backoff_last_pressure_at * 1000).toISOString()})`
+                            : ""
+                        }`
+                      : "The WS-4 backoff governor has throttled admission below the hard cap (resource pressure / 429s). New spawns admit up to this effective limit until pressure clears."
+                  }
                 >
                   throttled to {effLimit}
                 </span>

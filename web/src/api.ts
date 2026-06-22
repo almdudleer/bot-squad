@@ -399,6 +399,11 @@ export type TelemetryCaps = {
   live_sessions?: number;         // current live count (numerator vs ceiling)
   max_total_tokens?: number;      // token budget per quota period, 0 = unlimited
   output_since_anchor?: number;   // ENFORCED token meter numerator
+  // T-0448 (#5): the AIMD backoff explainer (passthrough of persisted state) so
+  // the 'throttled to N' badge can say WHY + since-when. null/absent = cold/disabled.
+  backoff_reason?: string | null;            // e.g. 'pressure: 2 session(s) limited -> decrease to 8'
+  backoff_last_pressure_at?: number | null;  // epoch secs of last pressure step
+  backoff_last_ramp_at?: number | null;      // epoch secs of last ramp step
 };
 
 export type TelemetryResponse = {

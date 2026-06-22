@@ -520,6 +520,18 @@ export function apiFor(serverId: string): ServerApi {
         `/api/projects/${slug}/backlog/${id}/progress`,
         { method: "POST", body: JSON.stringify({ sid, text }) },
       ),
+    // T-0437: pin/unpin proxied to the attached server like the other session
+    // ops.
+    pinSession: (slug, sid) =>
+      fwd<{ ok: boolean; sid: string; pinned: boolean; pinned_by: string; pinned_at: string }>(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pin`,
+        { method: "POST" },
+      ),
+    unpinSession: (slug, sid) =>
+      fwd<{ ok: boolean; sid: string; pinned: boolean; was_pinned: boolean }>(
+        `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pin`,
+        { method: "DELETE" },
+      ),
     pauseSession: (slug, sid) =>
       fwd(
         `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`,

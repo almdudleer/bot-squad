@@ -258,7 +258,14 @@ export function Project() {
         ...t,
         // T-0404: also stamp the live awaiting_input so the card can badge a
         // task whose bound process is blocked on the operator.
-        session: { ...t.session, activity: sessionActivity(live), awaiting_input: live.awaiting_input },
+        // T-0437: stamp the live pin signal so the card can show a 📌 marker.
+        session: {
+          ...t.session,
+          activity: sessionActivity(live),
+          awaiting_input: live.awaiting_input,
+          pinned: live.pinned,
+          pinned_by: live.pinned_by,
+        },
       };
     });
   }, [tasks, sessionsBySid]);

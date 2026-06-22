@@ -263,10 +263,14 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
           // falls back to mapping the raw md `status` otherwise.
           const act = sessionActivity(task.session);
           const green = isRunning(act);
+          // T-0437: mark the bound-session chip when the user has pinned that
+          // session ("working closely with this one"). Read-only here — the
+          // pin/unpin toggle lives in the Processes view.
+          const pinned = !!task.session.pinned;
           return (
             <span
               data-no-nav
-              title={`${act} session ${task.session.sid} — click to view`}
+              title={`${act} session ${task.session.sid}${pinned ? " · 📌 pinned" : ""} — click to view`}
               onClick={(e) => {
                 e.stopPropagation();
                 // T-0099: deep-link to the bound session's row.
@@ -288,6 +292,7 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
                 cursor: "pointer",
               }}
             >
+              {pinned && <span style={{ marginRight: "2px" }}>📌</span>}
               {sessionGlyph(act)} {sessionLabel(act)}
             </span>
           );

@@ -114,6 +114,10 @@ export type Task = {
     // T-0404: the board enriches this from the live /sessions join so a card
     // can show the needs-input pill (sessionNeedsInput) for its bound process.
     awaiting_input?: boolean | null;
+    // T-0437: the board enriches this from the same /sessions join so a card
+    // can show a 📌 marker when its bound session is pinned.
+    pinned?: boolean;
+    pinned_by?: string | null;
   };
 };
 
@@ -344,6 +348,14 @@ export type SessionRow = {
   // (and agent-teams-spawned devs until the worker backfill fills it), in
   // which case the tree falls back to the heuristic.
   parent_sid?: string;
+  // T-0437: per-project pin signal — a user marked this session as one they're
+  // working closely with. Stamped onto each row by the API from the per-project
+  // pin store (it does NOT change orchestration; it's a hint). The Processes
+  // view surfaces pinned rows in a distinct section + badge, and the Board card
+  // shows a 📌 marker on its bound session. Absent ⟹ not pinned.
+  pinned?: boolean;
+  pinned_by?: string | null;
+  pinned_at?: string | null;
 };
 
 // T-0210: per-session resource telemetry record (worker-sampled).
@@ -972,6 +984,20 @@ export const api = {
     call<ReuseDecision>(
       `/api/projects/${slug}/sessions/reuse-candidates?task=${encodeURIComponent(task)}`,
     ),
+  // T-0437: pin/unpin a session within the project (admin-gated server-side via
+  // require_project_member). The pin is a user signal surfaced in the UI; it
+  // does NOT change orchestration. Pins are per-project and stamped back onto
+  // the sessions list (pinned/pinned_by/pinned_at) on the next poll.
+  pinSession: (slug: string, sid: string) =>
+    call<{ ok: boolean; sid: string; pinned: boolean; pinned_by: string; pinned_at: string }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pin`,
+      { method: "POST" },
+    ),
+  unpinSession: (slug: string, sid: string) =>
+    call<{ ok: boolean; sid: string; pinned: boolean; was_pinned: boolean }>(
+      `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pin`,
+      { method: "DELETE" },
+    ),
   pauseSession: (slug: string, sid: string) =>
     call(`/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/pause`, { method: "POST" }),
   suspendSession: (slug: string, sid: string) =>
@@ -1197,6 +1223,8 @@ export type ProjectApi = Pick<
   | "patchTaskPriority"
   | "deleteTask"
   | "addProgress"
+  | "pinSession"
+  | "unpinSession"
   | "pauseSession"
   | "suspendSession"
   | "resumeSession"

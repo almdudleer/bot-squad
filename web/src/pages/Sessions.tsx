@@ -583,6 +583,20 @@ export function Sessions() {
     }
   }
 
+  // T-0437: pin/unpin a session within the project. The pin is a user signal
+  // (surfaced in the Pinned section + a 📌 badge here and on the Board card); it
+  // does NOT change orchestration. Reload so the pinned flag re-stamps.
+  async function handleTogglePin(s: SessionRow) {
+    setActionError(null);
+    try {
+      if (s.pinned) await api.unpinSession(slug, s.sid);
+      else await api.pinSession(slug, s.sid);
+      load();
+    } catch (e: unknown) {
+      setActionError(String(e));
+    }
+  }
+
   // T-0280: fetch the reuse-vs-spawn recommendation for the dev form's
   // selected task so we can offer "resume before spawn". Keyed on the task
   // (the worker derives its initiative); cleared when no task is picked.
@@ -827,6 +841,15 @@ export function Sessions() {
   const visibleSessions: SessionRow[] = (sessions ?? []).filter((s) => !s.archived);
   const archivedSessions: SessionRow[] = (sessions ?? []).filter((s) => !!s.archived);
 
+  // T-0437: pinned sessions surface in a distinct section ABOVE the full tree —
+  // the tree itself stays UNCHANGED (it's the parallelism-observability view the
+  // stakeholder wanted kept). A pinned row therefore appears in both: called out
+  // here, and in context below. Non-archived only (a pin on an archived session
+  // is stale); sorted by most-recently-pinned first.
+  const pinnedSessions: SessionRow[] = visibleSessions
+    .filter((s) => s.pinned)
+    .sort((a, b) => (b.pinned_at ?? "").localeCompare(a.pinned_at ?? ""));
+
   // T-0232 (Pillar A): the main board shows LIVE-only rows (alive in tmux —
   // running/idle/paused). Suspended (non-archived) rows are retained in the
   // registry but dropped from the default view; the `showSuspended` toggle
@@ -1028,6 +1051,15 @@ export function Sessions() {
   function rowActions(s: SessionRow): RowAction[] {
     const isSuspended = s.status === "suspended";
     const acts: RowAction[] = [];
+    // T-0437: pin/unpin sits at the top — it's the "I'm working closely with
+    // this one" signal that drives the Pinned section + the Board-card marker.
+    acts.push({
+      label: s.pinned ? "Unpin" : "Pin",
+      onClick: () => handleTogglePin(s),
+      title: s.pinned
+        ? "Remove the pin (it stops surfacing in the Pinned section)"
+        : "Pin this session — surface it distinctly + mark its Board card",
+    });
     if (s.status === "active") {
       acts.push({ label: "Pause", onClick: () => handlePause(s.sid), variant: "warning" });
       acts.push({ label: "Suspend", onClick: () => handleSuspend(s.sid) });
@@ -1113,6 +1145,15 @@ export function Sessions() {
                 }}
               >
                 └
+              </span>
+            )}
+            {/* T-0437: pin marker — a session the user works closely with. */}
+            {s.pinned && (
+              <span
+                title={s.pinned_by ? `Pinned by ${s.pinned_by}` : "Pinned"}
+                style={{ marginRight: "0.3rem", fontSize: "0.72rem" }}
+              >
+                📌
               </span>
             )}
             {s.claude_uuid ? (
@@ -2102,6 +2143,56 @@ export function Sessions() {
                 { value: SESS_UNATTACHED, label: "(unattached)" },
               ]}
             />
+          </div>
+        </div>
+      )}
+
+      {/* T-0437: Pinned section — sessions the user works closely with, called
+          out above the full tree. The tree below is unchanged (observability of
+          real parallelism), so a pinned row shows here AND in its tree position.
+          Reuses renderSessionRow so the anatomy (📌 marker, Unpin action) is
+          identical; rendered flat at level 0. */}
+      {sessions !== null && pinnedSessions.length > 0 && (
+        <div
+          className="mb-3"
+          style={{
+            border: "1px solid var(--mc-border)",
+            borderRadius: "0.4rem",
+            padding: "0.4rem 0.6rem",
+            background: "rgba(250, 204, 21, 0.04)",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: "var(--mc-mono)",
+              fontSize: "0.74rem",
+              color: "var(--mc-text-dim)",
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+              padding: "0.15rem 0 0.35rem",
+            }}
+          >
+            📌 Pinned ({pinnedSessions.length})
+          </div>
+          <div className="table-responsive">
+            <table className="table table-hover align-middle mb-0">
+              <thead>
+                <tr>
+                  <th style={{ width: "1.5rem" }}></th>
+                  <th>SID</th>
+                  <th>Attach</th>
+                  <th>Role</th>
+                  <th>Target</th>
+                  <th>Status</th>
+                  <th>Started</th>
+                  <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {pinnedSessions.map((s) => renderSessionRow(s, 0))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}

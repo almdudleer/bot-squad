@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -282,6 +283,15 @@ class DeployResult:
     # None on a normal exit (success OR an honest non-zero recipe rc). Lets the
     # caller fire the loud, TARGETED operator alert only for a wedged build.
     killed_reason: str | None = None
+    # T-0446 (next-wave #2): the commit sha this run actually shipped (parsed
+    # from the run log's sha-assert / release line; "" when the recipe emits
+    # none) — so the terminal #deploy-logs ping echoes WHICH commit deployed.
+    resolved_sha: str = ""
+    # The post-deploy worker-restart decision, surfaced so the terminal status
+    # explains the (async, detached) restart instead of a green "release
+    # deployed" preceding the bounce → the T-0436 false stale-worker panic. One
+    # of: "fired" | "skipped: no worker change" | "skipped: deploy failed".
+    worker_restart_status: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +478,30 @@ def is_clean_for_target(cfg: "Config", slug: str, target: str) -> bool:
     if not _is_clean(edit_repo):
         return False
     return not _local_only_commits(edit_repo)
+
+
+_RESOLVED_SHA_RE = re.compile(r"deployed sha \(([0-9a-fA-F]{7,40})\)")
+_RELEASE_SHA_RE = re.compile(r"release deployed:\s*([0-9a-fA-F]{7,40})")
+
+
+def _parse_resolved_sha(log_path: "Path | None") -> str:
+    """T-0446: the commit sha a finished run shipped, recovered from its run log.
+
+    Prefers the sha-assert line (``deployed sha (<40hex>)`` — the full sha the
+    recipe verified the running artifact against), falling back to the
+    ``release deployed: <sha>`` line. "" when the recipe emits neither or the log
+    is unreadable (best-effort; the terminal status just omits the sha then)."""
+    if log_path is None:
+        return ""
+    try:
+        text = log_path.read_text()
+    except OSError:
+        return ""
+    matches = _RESOLVED_SHA_RE.findall(text)
+    if matches:
+        return matches[-1]
+    rel = _RELEASE_SHA_RE.findall(text)
+    return rel[-1] if rel else ""
 
 
 def run_next(cfg: "Config", slug: str) -> DeployResult | None:
@@ -671,7 +705,8 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     # but the worker kept running old code" gap. Kill-switch:
     # BOT_SQUAD_DEPLOY_AUTO_RESTART=0.
     forced = bool(payload.get("restart_worker"))
-    if _should_restart_worker(cfg, ok=ok, forced=forced):
+    will_restart = _should_restart_worker(cfg, ok=ok, forced=forced)
+    if will_restart:
         reason = payload.get("reason", "")
         tag = "restart_worker" if forced else "auto-restart: worker/ changed"
         reason = f"{tag} — {reason}".strip(" —")
@@ -682,11 +717,19 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
                 "deploy.run_next: %s/%s post-deploy worker restart launch failed "
                 "(deploy itself succeeded — restart the worker manually)", slug, target,
             )
+    # T-0446: surface which commit shipped + the worker-restart decision so the
+    # terminal #deploy-logs ping is self-explaining (no false stale-worker panic).
+    worker_restart_status = (
+        "fired" if will_restart
+        else ("skipped: deploy failed" if not ok else "skipped: no worker change")
+    )
     return DeployResult(
         ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
         collapsed_count=1 + len(collapsed_processing),
         collapsed_reasons=tuple(collapsed_reasons),
         killed_reason=killed_reason,
+        resolved_sha=_parse_resolved_sha(log_path),
+        worker_restart_status=worker_restart_status,
     )
 
 

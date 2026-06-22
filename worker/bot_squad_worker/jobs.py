@@ -218,7 +218,14 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
         else ""
     )
     if result.ok:
-        _tg_safe(f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){suffix}")
+        # T-0446: echo WHICH commit shipped + the worker-restart decision, so a
+        # green SUCCESS that precedes the async detached restart is self-explaining
+        # (no false stale-worker panic — the T-0436 operational residue).
+        sha = f" @{result.resolved_sha[:12]}" if result.resolved_sha else ""
+        wr = f" — worker restart: {result.worker_restart_status}" if result.worker_restart_status else ""
+        _tg_safe(
+            f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}"
+        )
     elif result.killed_reason:
         # A watchdog (not the recipe) killed this build — the loud, TARGETED
         # operator alert path (T-0212), not the routine project-channel ping.

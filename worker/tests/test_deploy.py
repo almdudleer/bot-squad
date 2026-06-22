@@ -1246,6 +1246,76 @@ def test_run_next_no_restart_forced_but_no_worker_change(
     assert calls == []  # no worker change → no restart, even forced
 
 
+# ---------------------------------------------------------------------------
+# T-0446 / next-wave #2: surface the resolved sha + worker-restart decision on
+# the DeployResult so the terminal #deploy-logs ping echoes which commit shipped
+# and whether the worker bounced (kills the T-0436 false-stale-worker panic).
+# ---------------------------------------------------------------------------
+
+def test_parse_resolved_sha_from_run_log(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _parse_resolved_sha
+    log = tmp_path / "x.log"
+    log.write_text(
+        "#22 building\n"
+        "[bot-squad/staging] verified running container sha == deployed sha "
+        "(64d42f0b76e65f38ea5a4f118392ee166464cf42)\n"
+        "[bot-squad/staging] release deployed: 64d42f0\n"
+    )
+    assert _parse_resolved_sha(log) == "64d42f0b76e65f38ea5a4f118392ee166464cf42"
+
+
+def test_parse_resolved_sha_falls_back_to_release_line(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _parse_resolved_sha
+    log = tmp_path / "x.log"
+    log.write_text("[watchrobot/staging] release deployed: abc1234def5678\n")
+    assert _parse_resolved_sha(log) == "abc1234def5678"
+
+
+def test_parse_resolved_sha_empty_when_no_marker_or_missing(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import _parse_resolved_sha
+    log = tmp_path / "x.log"
+    log.write_text("just build output, no sha line\n")
+    assert _parse_resolved_sha(log) == ""
+    assert _parse_resolved_sha(tmp_path / "nope.log") == ""
+
+
+def test_run_next_sets_resolved_sha_and_worker_restart_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    recipe_dir = cfg.data_dir / proj.slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / "staging.sh"
+    recipe.write_text(
+        "#!/usr/bin/env bash\nset -e\n"
+        "echo 'verified running container sha == deployed sha (abcdef1234567)'\nexit 0\n"
+    )
+    recipe.chmod(0o755)
+    enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: None)
+
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+    assert result.resolved_sha == "abcdef1234567"
+    assert result.worker_restart_status == "fired"
+
+
+def test_run_next_worker_restart_status_skipped_no_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "api-only", "user", restart_worker=True)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: False)
+    result = run_next(cfg, proj.slug)
+    assert result.worker_restart_status == "skipped: no worker change"
+
+
 def test_restart_worker_detached_skips_without_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

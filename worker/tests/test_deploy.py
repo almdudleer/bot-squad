@@ -1546,7 +1546,10 @@ def test_deploy_monitor_sends_carry_deploy_logs_topic(tmp_config_dir, tmp_path, 
     from types import SimpleNamespace
     monkeypatch.setattr(
         _deploy, "run_next",
-        lambda c, s: SimpleNamespace(ok=True, returncode=0, collapsed_count=1, killed_reason=None),
+        lambda c, s: SimpleNamespace(
+            ok=True, returncode=0, collapsed_count=1, killed_reason=None,
+            resolved_sha="", worker_restart_status="",  # T-0446: terminal-ping fields
+        ),
     )
     rec = _RecordingTg()
     monkeypatch.setattr(A, "_get_tg_client", lambda c: rec)

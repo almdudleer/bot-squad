@@ -51,6 +51,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from bot_squad_worker.actions import normalize_id
+
 log = logging.getLogger(__name__)
 
 # Tool-use names whose ``file_path`` input we treat as a "write" for off-task
@@ -84,11 +86,17 @@ _OFF_RAMP_FOOTER = (
 
 
 def _initiative_stem(value: str | None) -> str:
-    """Normalise an initiative ref (``foo.md`` / ``foo`` / ``~``) to its bare stem."""
+    """Normalise an initiative ref (``foo.md`` / ``foo`` / ``~``) to its bare stem.
+
+    The ``.md``-strip is delegated to the shared ``actions.normalize_id`` (the
+    T-0424 byte-identical id-normalization contract) so the strip rule lives in
+    exactly one place; this wrapper only adds the ``~``/empty/whitespace
+    handling that an initiative ref needs but a bare id does not.
+    """
     v = (value or "").strip()
     if not v or v == "~":
         return ""
-    return v[:-3] if v.endswith(".md") else v
+    return normalize_id(v)
 
 
 def _is_constant_team(row: dict, const_stems: set[str]) -> bool:

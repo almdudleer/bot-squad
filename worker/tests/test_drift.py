@@ -338,3 +338,36 @@ def test_reopened_ticket_still_nudges(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+
+
+# ── T-0449 (#6): _initiative_stem DRY-delegates the .md-strip to normalize_id ──
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("foo.md", "foo"),       # strip exactly one trailing .md
+        ("foo", "foo"),          # bare stem unchanged
+        ("~", ""),               # YAML null sentinel → empty
+        ("", ""),                # empty → empty
+        (None, ""),              # None → empty
+        ("  bar.md  ", "bar"),   # surrounding whitespace trimmed, then stripped
+        ("x.md.md", "x.md"),     # not greedy (one suffix only)
+        ("a.MD", "a.MD"),        # case-sensitive: .MD is NOT stripped
+    ],
+)
+def test_initiative_stem_behaviour_unchanged(raw, expected):
+    assert drift._initiative_stem(raw) == expected
+
+
+def test_initiative_stem_delegates_to_normalize_id(monkeypatch):
+    """The .md-strip must route through the shared normalize_id (no inline dup)."""
+    calls = []
+
+    def _spy(value):
+        calls.append(value)
+        return "SENTINEL"
+
+    monkeypatch.setattr(drift, "normalize_id", _spy)
+    out = drift._initiative_stem("anything.md")
+    assert out == "SENTINEL"
+    assert calls == ["anything.md"]

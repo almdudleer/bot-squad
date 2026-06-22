@@ -26,10 +26,34 @@ def health(request: Request) -> dict:
     heartbeat: Path = request.app.state.heartbeat_path
     alive = False
     last_hb = None
+    worker_sha = None
     if heartbeat.exists():
         last_hb = heartbeat.stat().st_mtime
         # Worker writes every 60s; >5min stale = dead.
         alive = (time.time() - last_hb) < 300
+        # T-0456: the worker writes its boot_git_sha as the heartbeat body so we
+        # can detect API/worker sha drift here (an empty body = a pre-T-0456 worker
+        # or a sha-lookup fallback — treated as unknown, never a false drift).
+        try:
+            worker_sha = heartbeat.read_text().strip() or None
+        except OSError:
+            worker_sha = None
+
+    api_sha = os.environ.get("BOT_SQUAD_GIT_SHA", "unknown")
+
+    worker: dict = {"alive": alive, "last_heartbeat": last_hb, "git_sha": worker_sha}
+    # T-0456: FAILURE-ONLY health signal — worker.health is present ONLY when there
+    # is a real problem (no green noise). A dead heartbeat is the actionable signal
+    # on its own; sha drift is only meaningful while the worker is alive (a dead
+    # worker's last-written sha tells us nothing). Drift needs BOTH shas known.
+    problems = []
+    if not alive:
+        problems.append("dead_heartbeat")
+    elif worker_sha and api_sha and api_sha != "unknown" and worker_sha != api_sha:
+        problems.append("sha_drift")
+    if problems:
+        worker["health"] = problems
+
     return {
         "ok": True,
         "version": _pkg_version(),
@@ -37,7 +61,7 @@ def health(request: Request) -> dict:
         # deploy recipe / monitor (and a human curl) assert that the RUNNING
         # container is the commit that was deployed — closing the stale-image
         # gap where a deploy 'succeeded' but shipped an older HEAD.
-        "git_sha": os.environ.get("BOT_SQUAD_GIT_SHA", "unknown"),
+        "git_sha": api_sha,
         "uptime": time.monotonic() - _STARTED_AT,
-        "worker": {"alive": alive, "last_heartbeat": last_hb},
+        "worker": worker,
     }

@@ -126,6 +126,50 @@ def test_heartbeat_updates_mtime(tmp_config_dir: Path) -> None:
     assert new > old
 
 
+def test_heartbeat_writes_boot_sha(tmp_config_dir: Path, monkeypatch) -> None:
+    """T-0456: the heartbeat carries the worker's boot_git_sha as its body so the
+    API health endpoint can detect API/worker sha drift at runtime."""
+    import bot_squad_worker.deploy as D
+
+    monkeypatch.setattr(D, "boot_git_sha", lambda: "deadbeefcafe123")
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat(cfg)
+    assert cfg.heartbeat_path.read_text().strip() == "deadbeefcafe123"
+
+
+def test_heartbeat_sha_write_still_freshens_mtime(tmp_config_dir: Path, monkeypatch) -> None:
+    """Writing the sha must NOT break the mtime-based liveness signal."""
+    import os
+
+    import bot_squad_worker.deploy as D
+
+    monkeypatch.setattr(D, "boot_git_sha", lambda: "abc123")
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.heartbeat_path.write_text("stale\n")
+    old = os.path.getmtime(cfg.heartbeat_path)
+    time.sleep(0.05)
+    heartbeat(cfg)
+    assert os.path.getmtime(cfg.heartbeat_path) > old
+
+
+def test_heartbeat_falls_back_to_empty_on_sha_error(tmp_config_dir: Path, monkeypatch) -> None:
+    """A boot_git_sha lookup failure must NOT lose the liveness signal — the file
+    is still (re)written so the API sees a fresh heartbeat."""
+    import bot_squad_worker.deploy as D
+
+    def _boom() -> str:
+        raise RuntimeError("git missing")
+
+    monkeypatch.setattr(D, "boot_git_sha", _boom)
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat(cfg)
+    assert cfg.heartbeat_path.exists()
+    assert cfg.heartbeat_path.read_text().strip() == ""
+
+
 # ---------------------------------------------------------------------------
 # deploy_monitor tests
 # ---------------------------------------------------------------------------

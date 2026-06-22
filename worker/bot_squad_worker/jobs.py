@@ -13,9 +13,27 @@ log = logging.getLogger(__name__)
 
 
 def heartbeat(cfg: Config) -> None:
-    """Touch heartbeat file so the API can show worker liveness."""
+    """Write the worker's boot git_sha into the heartbeat file so the API can show
+    worker liveness AND detect API/worker sha drift at runtime (T-0456).
+
+    The mtime still freshens on every write, so the existing >300s-stale liveness
+    check is unchanged. The sha lookup is guarded: a missing-git edge falls back to
+    an empty body rather than losing the heartbeat (liveness must survive). The
+    write is atomic (tmp + os.replace) so the API never reads a torn body.
+    """
+    import os
+
     cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.heartbeat_path.touch()
+    try:
+        from bot_squad_worker.deploy import boot_git_sha
+
+        sha = (boot_git_sha() or "").strip()
+    except Exception:
+        log.exception("heartbeat: boot_git_sha lookup failed; writing empty body")
+        sha = ""
+    tmp = cfg.heartbeat_path.with_name(cfg.heartbeat_path.name + ".tmp")
+    tmp.write_text(sha + "\n")
+    os.replace(tmp, cfg.heartbeat_path)
 
 
 def deploy_monitor(cfg: Config) -> None:

@@ -27,6 +27,20 @@
 #      from the worktree, so whatever else is staged is ignored — absorb-proof
 #      by construction. `bsq commit` always uses this form.
 #
+#      CAVEAT — same-FILE co-edit (the partial-hunk case): a pathspec commit
+#      protects OTHER files, but it snapshots the WHOLE worktree version of each
+#      named path. So if a peer is editing the SAME file you are, your
+#      `safe-commit -- that_file.py` still sweeps THEIR hunks in it. The fix is
+#      the per-session hunk-isolated commit (T-0215), which commits only your
+#      own baseline→current hunks via `git apply --cached` onto a temp index:
+#          bsq edit-begin <files>          # snapshot baseline BEFORE you edit
+#          ...edit...
+#          bsq commit --hunks -- <files>   # commits ONLY your hunks
+#      Post-hoc fallback (you forgot edit-begin): build a patch of only your
+#      hunks and `git apply --cached --recount` it, then run THIS wrapper with
+#      no pathspec to commit the staged index as-is. See AGENT_INSTRUCTIONS.md
+#      "Concurrent-commit safety" for the full recipe.
+#
 # Overrides:
 #   BOT_SQUAD_ALLOW_COMMIT_ALL=1   permit `-a`/`--all` (single-tenant clone,
 #                                  you own every pending change).

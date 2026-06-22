@@ -241,7 +241,26 @@ export function Picker() {
       {projects !== null && projects.length === 0 && (
         <div className="mc-empty">
           <div className="mc-empty-icon">◯</div>
-          <div>No projects configured.</div>
+          {/* T-0437/next-wave fork-A: a bare "No projects configured" was a
+              dead-end for a non-admin (project creation is admin-provisioned —
+              the intended model). Explain WHO provisions, so it reads as "by
+              design", not "broken". Admins get pointed at the create affordance. */}
+          {isAdmin ? (
+            <>
+              <div>No projects yet.</div>
+              <div style={{ marginTop: "0.4rem", fontSize: "0.85rem", color: "var(--mc-text-dim)", maxWidth: "32rem" }}>
+                Use <strong>+ New project</strong> above to create one.
+              </div>
+            </>
+          ) : (
+            <>
+              <div>No projects yet.</div>
+              <div style={{ marginTop: "0.4rem", fontSize: "0.85rem", color: "var(--mc-text-dim)", maxWidth: "32rem" }}>
+                Projects are provisioned by an admin/operator — ask yours to set
+                one up, then it&apos;ll appear here.
+              </div>
+            </>
+          )}
         </div>
       )}
 

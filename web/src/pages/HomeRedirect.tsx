@@ -10,13 +10,17 @@ const PINNED_PROJECT_KEY = "bot-squad:last-project";
  * HomeRedirect — the landing route `/` (T-0336, reframe-operator-paradigm).
  *
  * bot-squad IS a single project brain operated by one operator, NOT a fleet
- * console. So `/` resolves to the project's process/Task-Manager (sessions)
- * view — "what's running / what needs me" — instead of the cross-server
- * mothership AllProjects console (which is demoted to the admin `/m/` area).
+ * console. So `/` resolves to the project's Task-Manager BOARD — tasks are the
+ * core entity and the Board is the Task-Manager skeleton — instead of the
+ * cross-server mothership AllProjects console (demoted to the admin `/m/` area).
+ *
+ * T-0437/next-wave fork-B: after the Board+Processes un-merge (the merge was
+ * reverted — Processes stays a separate observability view), the canonical
+ * project landing is the BOARD (`/p/:slug` index = Project), NOT `/sessions`.
  *
  * Resolution order:
- *   1. A pinned project (localStorage) → that project's sessions view.
- *   2. Exactly one project on the install → straight into its brain.
+ *   1. A pinned project (localStorage) → that project's board.
+ *   2. Exactly one project on the install → straight into its brain (board).
  *   3. Zero or many projects with no pin → the LOCAL single-server project
  *      picker (a plain project list, NOT the cross-server fleet console).
  *   4. API unreachable → the Picker (it surfaces the error inline).
@@ -53,7 +57,7 @@ export function HomeRedirect() {
   }, [pinned]);
 
   if (pinned) {
-    return <Navigate to={`/p/${pinned}/sessions`} replace />;
+    return <Navigate to={`/p/${pinned}`} replace />;
   }
   if (failed) {
     return <Picker />;
@@ -62,7 +66,7 @@ export function HomeRedirect() {
     return <div className="mc-loading">Loading…</div>;
   }
   if (projects.length === 1) {
-    return <Navigate to={`/p/${projects[0].slug}/sessions`} replace />;
+    return <Navigate to={`/p/${projects[0].slug}`} replace />;
   }
   // Zero or many projects, no pin → local project list (not the fleet console).
   return <Picker />;

@@ -446,3 +446,80 @@ def test_handle_update_voice_not_allowlisted_skipped(tmp_path, monkeypatch):
     out = TL.handle_update(cfg, update)
     assert out["action"] == "skip"
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# next-wave #13 (T-0453): poll-health signal. poll_updates used to return []
+# on BOTH no-mail and network error (silent fail on the primary operator
+# channel on a DPI-blocked host). It now records last_ok_poll_at on success
+# and last_error/last_error_at on a network error to _worker/tg_poll_health.json
+# — so an operator (later, a FE pill) can tell "no mail" from "egress broken".
+# ---------------------------------------------------------------------------
+import json as _json
+
+
+def _health(cfg) -> dict:
+    p = TL._poll_health_path(cfg)
+    return _json.loads(p.read_text()) if p.exists() else {}
+
+
+def test_poll_records_ok_on_success(tmp_path):
+    cfg = _make_cfg(tmp_path)
+
+    def fake_get(url, params=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"result": []}
+        return resp
+
+    with patch("httpx.get", side_effect=fake_get):
+        TL.poll_updates(cfg, 0, timeout=1)
+
+    h = _health(cfg)
+    assert h.get("last_ok_poll_at")          # stamped
+    assert not h.get("last_error")           # no error recorded
+
+
+def test_poll_records_error_on_network_failure(tmp_path):
+    import httpx
+    cfg = _make_cfg(tmp_path)
+
+    def fake_get(url, params=None, timeout=None):
+        raise httpx.ConnectError("egress blocked")
+
+    with patch("httpx.get", side_effect=fake_get):
+        out = TL.poll_updates(cfg, 0, timeout=1)
+
+    assert out == []                          # still swallows → returns []
+    h = _health(cfg)
+    assert h.get("last_error")                # the error is now visible
+    assert "egress blocked" in h["last_error"]
+    assert h.get("last_error_at")
+
+
+def test_poll_no_token_writes_no_health(tmp_path):
+    cfg = _make_cfg(tmp_path, bot_token="")
+    TL.poll_updates(cfg, 0, timeout=1)
+    assert not TL._poll_health_path(cfg).exists()   # disabled, not "broken"
+
+
+def test_poll_ok_preserved_across_later_error(tmp_path):
+    import httpx
+    cfg = _make_cfg(tmp_path)
+
+    def ok_get(url, params=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"result": []}
+        return resp
+
+    with patch("httpx.get", side_effect=ok_get):
+        TL.poll_updates(cfg, 0, timeout=1)
+    ok_at = _health(cfg)["last_ok_poll_at"]
+
+    with patch("httpx.get", side_effect=lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("boom"))):
+        TL.poll_updates(cfg, 0, timeout=1)
+
+    h = _health(cfg)
+    assert h["last_ok_poll_at"] == ok_at      # last good poll still visible
+    assert h.get("last_error")                # alongside the new error

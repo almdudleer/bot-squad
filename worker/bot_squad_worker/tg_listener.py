@@ -22,6 +22,47 @@ def _last_update_id_path(cfg) -> Path:
     return cfg.data_dir / "_worker" / "tg_last_update_id"
 
 
+def _poll_health_path(cfg) -> Path:
+    return cfg.data_dir / "_worker" / "tg_poll_health.json"
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _record_poll_health(cfg, *, ok: bool, error: str = "") -> None:
+    """Persist TG poll health so an operator can tell 'no mail' from an egress
+    error (next-wave #13). On a successful poll stamp ``last_ok_poll_at``; on a
+    network error stamp ``last_error`` + ``last_error_at`` WITHOUT clearing the
+    last-good timestamp (so 'last ok 10m ago, erroring since' is visible).
+    Best-effort + atomic (tmp+replace); never raises — a health-write failure
+    must not break polling."""
+    import json
+    import os
+    try:
+        p = _poll_health_path(cfg)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            state = json.loads(p.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        now = _now_iso()
+        if ok:
+            state["last_ok_poll_at"] = now
+            state["last_error"] = ""
+        else:
+            state["last_error"] = error
+            state["last_error_at"] = now
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def _read_last_update_id(cfg) -> int:
     p = _last_update_id_path(cfg)
     if not p.exists():
@@ -54,8 +95,14 @@ def poll_updates(cfg, last_update_id: int, timeout: int = 25) -> list[dict]:
     try:
         r = httpx.get(url, params=params, timeout=timeout + 5, **extra)
         r.raise_for_status()
-        return r.json().get("result", [])
-    except (httpx.HTTPError, ValueError):
+        result = r.json().get("result", [])
+        _record_poll_health(cfg, ok=True)
+        return result
+    except (httpx.HTTPError, ValueError) as e:
+        # next-wave #13: don't swallow the error SILENTLY — record it so the
+        # operator can distinguish a DPI/egress failure from a genuine no-mail
+        # poll. Still returns [] so one bad poll never poisons the offset.
+        _record_poll_health(cfg, ok=False, error=repr(e))
         return []
 
 

@@ -548,6 +548,40 @@ def test_config_repo_for_target_prefers_deploy_clone(tmp_path: Path) -> None:
     assert proj.uses_deploy_clone("staging") is True
 
 
+def test_resolve_target_sha_returns_origin_branch_tip(tmp_path: Path) -> None:
+    """T-0458: the enqueue echo resolves origin/<deploy_branch> in the editing clone."""
+    from bot_squad_worker.deploy import resolve_target_sha
+
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)  # origin/bot_squad/dev == HEAD
+
+    sha = resolve_target_sha(cfg, proj.slug, "staging")
+    assert sha == _head(proj.repo_path)  # full 40-hex of the to-be-built commit
+
+
+def test_resolve_target_sha_empty_on_missing_origin_ref(tmp_path: Path) -> None:
+    """No origin attached → no origin/<branch> ref → "" (best-effort, never raises)."""
+    from bot_squad_worker.deploy import resolve_target_sha
+
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    # deliberately do NOT attach an origin
+
+    assert resolve_target_sha(cfg, proj.slug, "staging") == ""
+
+
+def test_resolve_target_sha_empty_on_unknown_slug_or_target(tmp_path: Path) -> None:
+    from bot_squad_worker.deploy import resolve_target_sha
+
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+
+    assert resolve_target_sha(cfg, "no-such-slug", "staging") == ""
+    assert resolve_target_sha(cfg, proj.slug, "prod") == ""  # not a deploy_target
+
+
 def test_run_next_provisions_deploy_clone_on_first_deploy(tmp_path: Path) -> None:
     proj = _make_deploy_project(tmp_path)
     cfg = _make_config(tmp_path, proj)

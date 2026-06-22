@@ -822,6 +822,37 @@ def test_deploy_action_enqueues(tmp_path, monkeypatch):
     assert out["ok"] is True
     assert "queue_id" in out
     assert "queued_at" in out
+    # T-0458: the response echoes the to-be-built sha (origin/<branch> tip).
+    # This fixture attaches no origin, so the key is present but "" (best-effort).
+    assert "target_sha" in out
+
+
+def test_deploy_action_echoes_target_sha(tmp_path, monkeypatch):
+    """T-0458: with an origin attached, the deploy action echoes the to-be-built sha."""
+    import subprocess
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import deploy as _deploy
+
+    cfg, repo = _make_deploy_config(tmp_path)
+    # attach a bare origin whose tip == repo HEAD on the deploy branch
+    subprocess.run(["git", "branch", "-M", "bot_squad/dev"], cwd=str(repo), check=True)
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=str(repo), check=True)
+    subprocess.run(["git", "push", "-q", "origin", "bot_squad/dev"], cwd=str(repo), check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    out = A.dispatch("deploy", {
+        "slug": "deploy-test",
+        "target": "staging",
+        "reason": "smoke test",
+        "requested_by": "pytest",
+    })
+    assert out["ok"] is True
+    assert out["target_sha"] == head
 
 
 def test_deploy_action_rejects_bad_target(tmp_path, monkeypatch):

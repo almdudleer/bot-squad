@@ -437,6 +437,36 @@ def enqueue(
     return queue_id
 
 
+def resolve_target_sha(cfg: "Config", slug: str, target: str) -> str:
+    """Best-effort: the commit a deploy of ``slug``/``target`` WOULD ship now.
+
+    T-0458 (T-0446 C6.4 residual): the deploy clone is force-synced to
+    ``origin/<deploy_branch>``, so the to-be-built commit is that ref as
+    currently known to the editing clone. This is an ENQUEUE-time echo — no
+    network fetch (the recipe re-fetches origin at build time, and the
+    authoritative resolved sha is re-parsed from the build log for the terminal
+    #deploy-logs ping, T-0446). Returns a 40-hex sha, or "" if it can't be read
+    (unknown slug/target, no origin ref, git error) — never raises.
+    """
+    project = cfg.projects.get(slug)
+    if project is None or target not in project.deploy_targets:
+        return ""
+    edit_repo = project.editing_repo_for_target(target)
+    ref = f"origin/{project.deploy_branch}"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(edit_repo), "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
 def list_queued(cfg: "Config", slug: str) -> list[Path]:
     """Return queue files sorted oldest-first."""
     queue_dir = _queue_dir(cfg, slug)

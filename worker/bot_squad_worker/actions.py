@@ -608,8 +608,18 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
     except ValueError as e:
         raise ActionError(f"deploy: {e}") from e
 
+    # T-0458: echo the to-be-built commit (origin/<deploy_branch> tip) so the
+    # requester sees WHICH commit this deploy will ship up front. Best-effort —
+    # "" if it can't be resolved; the authoritative sha is re-parsed post-build.
+    target_sha = _deploy.resolve_target_sha(cfg, slug, target)
+
     import time as _time
-    return {"ok": True, "queue_id": queue_id, "queued_at": _time.time()}
+    return {
+        "ok": True,
+        "queue_id": queue_id,
+        "queued_at": _time.time(),
+        "target_sha": target_sha,
+    }
 
 
 _PAUSE_DEPLOYS_REQUIRED = {"slug", "reason", "requested_by"}

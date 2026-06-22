@@ -613,6 +613,25 @@ export type AutoupdateAlert = {
   force_command: string;
 };
 
+// T-0456: /api/health worker-liveness channel. `worker.health` is FAILURE-ONLY
+// — present (non-empty) ONLY when there's a problem; absent/empty when healthy
+// (no green noise). Flags: 'dead_heartbeat' (worker hb missing/>300s stale) and
+// 'sha_drift' (worker boot sha != API image sha). git_sha is the worker's
+// frozen-at-boot sha (null until a worker built with the sha-writing heartbeat
+// restarts). All fields optional so a pre-T-0456 API doesn't break the type.
+export type HealthResponse = {
+  ok?: boolean;
+  version?: string;
+  git_sha?: string | null;
+  uptime?: number;
+  worker?: {
+    alive?: boolean;
+    last_heartbeat?: number | null;
+    git_sha?: string | null;
+    health?: string[];
+  };
+};
+
 export type AutoupdateStatus = {
   installed_version: string | null;
   last_check_at: string | null;
@@ -771,7 +790,8 @@ export function clearProjectsCache(): void {
 }
 
 export const api = {
-  health: () => call("/api/health"),
+  // T-0456: typed so the worker-health pill can read worker.health/git_sha.
+  health: () => call<HealthResponse>("/api/health"),
   me: () => call<Me>("/api/auth/me"),
   projects: () =>
     call<Project[]>("/api/projects").then((rows) => {

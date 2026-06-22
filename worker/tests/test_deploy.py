@@ -1474,6 +1474,77 @@ def _make_config_only(monkeypatch):
     return SimpleNamespace()
 
 
+# ---------------------------------------------------------------------------
+# T-0461: eager boot_git_sha freeze (the lazy-first-call hazard)
+# ---------------------------------------------------------------------------
+
+def _init_repo_at(root: Path, content: str) -> str:
+    """Init a git repo at ``root`` with one commit; return its full 40-hex HEAD."""
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(root), check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=str(root), check=True)
+    (root / "f.txt").write_text(content)
+    subprocess.run(["git", "add", "f.txt"], cwd=str(root), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", content], cwd=str(root), check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _commit_move(root: Path, content: str) -> str:
+    """Add a commit to simulate a deploy ff-sync moving the install tree; return new HEAD."""
+    (root / "f.txt").write_text(content)
+    subprocess.run(["git", "add", "f.txt"], cwd=str(root), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", content], cwd=str(root), check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_freeze_boot_git_sha_is_eager_and_immune_to_tree_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE T-0461 fix: freeze at startup captures the loaded sha; a later deploy
+    ff-sync of the install tree must NOT change what boot_git_sha() reports."""
+    import bot_squad_worker.deploy as d
+    monkeypatch.setattr(d, "_BOOT_GIT_SHA", None)
+    root = tmp_path / "install"
+    sha_a = _init_repo_at(root, "boot-time code")
+    monkeypatch.setattr(d, "_install_root", lambda: root)
+
+    # Startup eagerly freezes to the sha the process actually loaded.
+    assert d.freeze_boot_git_sha() == sha_a
+
+    # A deploy ff-syncs the install tree to a NEW commit (process NOT restarted).
+    sha_b = _commit_move(root, "post-deploy code")
+    assert sha_b != sha_a
+
+    # boot_git_sha must still report the boot-time sha, never the moved tree.
+    assert d.boot_git_sha() == sha_a
+    # Idempotent: re-freezing is a no-op, returns the same value.
+    assert d.freeze_boot_git_sha() == sha_a
+
+
+def test_boot_git_sha_hazard_without_eager_freeze_captures_moved_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression doc: WHY the eager freeze matters. If boot_git_sha() is first
+    called only AFTER a tree move (no startup freeze), it captures the MOVED sha
+    — a commit the running process never loaded. This is the T-0461 lie that the
+    startup freeze_boot_git_sha() call prevents."""
+    import bot_squad_worker.deploy as d
+    monkeypatch.setattr(d, "_BOOT_GIT_SHA", None)
+    root = tmp_path / "install"
+    sha_a = _init_repo_at(root, "boot-time code")
+    monkeypatch.setattr(d, "_install_root", lambda: root)
+
+    # No eager freeze; tree moves before the first boot_git_sha() call.
+    sha_b = _commit_move(root, "post-deploy code")
+    assert d.boot_git_sha() == sha_b  # captures B (never loaded) — the hazard
+    assert sha_b != sha_a
+
+
 def test_run_next_auto_restarts_on_worker_change_without_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

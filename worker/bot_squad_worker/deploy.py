@@ -120,6 +120,24 @@ def boot_git_sha() -> str:
     return _BOOT_GIT_SHA
 
 
+def freeze_boot_git_sha() -> str:
+    """Eagerly capture + freeze the boot sha at worker STARTUP and return it.
+
+    T-0461: ``boot_git_sha()`` is computed lazily on first call. If that first
+    call happens only AFTER a sibling deploy has ff-synced the install tree (e.g.
+    a /health hit or a deploy restart-check), it freezes to a sha the running
+    process NEVER loaded — and the Fork-5/T-0445 ``_worker_needs_restart`` gate
+    then compares boot==deployed and SKIPS a needed restart, leaving the worker
+    on stale code while ``/health`` reports the new sha. Calling this ONCE in
+    worker startup (before the scheduler + HTTP server accept work, and before
+    any deploy can move the tree) guarantees the boot sha reflects the commit the
+    process actually loaded. Idempotent: a later call returns the frozen value.
+    """
+    sha = boot_git_sha()
+    log.info("boot_git_sha frozen at startup: %s", sha or "(unknown)")
+    return sha
+
+
 def _worker_subtree_changed(root: Path, a: str, b: str) -> bool:
     """True iff the ``worker/`` subtree differs between commits ``a`` and ``b``.
 

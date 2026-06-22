@@ -97,6 +97,13 @@ def main() -> int:
     set_config(cfg)
     log.info("loaded config: %d project(s)", len(cfg.projects))
 
+    # T-0461: eagerly freeze the boot sha NOW — before the scheduler/HTTP server
+    # accept work and before any deploy can ff-sync the install tree. A lazy
+    # first-call freeze can capture a post-sync sha the process never loaded,
+    # fooling the Fork-5/T-0445 auto-restart-skip into leaving stale code live.
+    from bot_squad_worker import deploy as _deploy
+    _deploy.freeze_boot_git_sha()
+
     # T-0086 integration check: warn early if mothership flag and prod
     # deploy_targets disagree for bot-squad itself.
     log.info(

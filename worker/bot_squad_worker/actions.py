@@ -431,22 +431,33 @@ def _action_provision_project_topics(params: dict[str, Any]) -> dict[str, Any]:
 
     For each class in ``tg_topics.STANDARD_TOPICS`` not already provisioned,
     calls ``createForumTopic`` in ``project.tg_chat`` and persists the returned
-    thread-id. Re-running creates only the missing ones. Returns
-    ``{ok, topics: {class: thread_id}, created: [class, …]}``.
+    thread-id. Re-running creates only the missing ones. Best-effort per-topic
+    (matching gc): a single create failure is logged + skipped, never fatal.
+    Returns ``{ok, topics: {class: thread_id}, created: [...], failed: [...]}``.
     """
     from bot_squad_worker import tg_topics
     cfg, slug, project = _resolve_topic_project(params, "provision_project_topics")
     existing = tg_topics.load(cfg, slug)
     tg = _get_tg_client(cfg)
     created: list[str] = []
+    failed: list[str] = []
+    # T-0442: per-topic try + INCREMENTAL save (parity with _action_gc_project_topics).
+    # Saving once AFTER the loop meant a mid-loop createForumTopic failure propagated
+    # and LOST every thread-id already created this run — so a retry re-created them,
+    # orphaning + duplicating the TG threads. Now a partial failure persists what
+    # succeeded; the retry only creates the still-missing classes.
     for cls, title in tg_topics.STANDARD_TOPICS.items():
         if cls in existing:
             continue
-        existing[cls] = tg.create_forum_topic(chat_id=project.tg_chat, name=title)
+        try:
+            existing[cls] = tg.create_forum_topic(chat_id=project.tg_chat, name=title)
+        except Exception:
+            log.exception("provision_project_topics: failed to create %s topic (slug=%s)", cls, slug)
+            failed.append(cls)
+            continue
         created.append(cls)
-    if created:
         tg_topics.save(cfg, slug, existing)
-    return {"ok": True, "topics": existing, "created": created}
+    return {"ok": True, "topics": existing, "created": created, "failed": failed}
 
 
 def _action_gc_project_topics(params: dict[str, Any]) -> dict[str, Any]:

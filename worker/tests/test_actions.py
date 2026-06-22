@@ -1959,6 +1959,50 @@ def test_provision_project_topics_is_idempotent(tmp_config_dir, monkeypatch):
     assert len(fake.created) == 3                        # only the first round called the API
 
 
+def test_provision_project_topics_partial_failure_persists_created(tmp_config_dir, monkeypatch):
+    """T-0442: a mid-loop createForumTopic failure must NOT lose the topics already
+    created. Persist incrementally + per-topic try (matching gc's resilience at
+    :468), so a retry creates only the still-missing classes instead of orphaning
+    the created TG threads and duplicating them."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_topics
+
+    class _FlakyForumTg(_FakeForumTg):
+        def __init__(self, fail_after: int) -> None:
+            super().__init__()
+            self._fail_after = fail_after
+            self._n = 0
+
+        def create_forum_topic(self, *, chat_id, name) -> int:
+            self._n += 1
+            if self._n > self._fail_after:
+                raise RuntimeError("TG flaked mid-provision")
+            return super().create_forum_topic(chat_id=chat_id, name=name)
+
+    # 1st create succeeds, the rest raise.
+    fake = _FlakyForumTg(fail_after=1)
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+
+    # Best-effort: does NOT propagate the create failure...
+    out = A.dispatch("provision_project_topics", {"slug": "test-project"})
+    persisted = tg_topics.load(cfg, "test-project")
+    # ...and the one it managed to create IS persisted (not lost).
+    assert len(persisted) == 1 and len(out["created"]) == 1
+    first_class = out["created"][0]
+    first_tid = persisted[first_class]
+
+    # Retry with a healthy client → creates ONLY the still-missing classes, and
+    # never re-creates (duplicates) the one that survived round 1.
+    fake2 = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake2)
+    out2 = A.dispatch("provision_project_topics", {"slug": "test-project"})
+    final = tg_topics.load(cfg, "test-project")
+    assert set(final) == {"feedback", "deploy_logs", "team_queries"}
+    assert final[first_class] == first_tid          # original id preserved, not recreated
+    assert first_class not in out2["created"]        # retry skipped the survivor
+    assert len(fake2.created) == 2                    # only the 2 missing were created
+
+
 def test_provision_project_topics_unknown_slug_raises(tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 

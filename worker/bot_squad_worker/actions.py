@@ -403,8 +403,15 @@ def _action_max_notify(params: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # T-0386 / INI-04 Phase 1: per-project forum-topic provisioning + GC.
 # The supergroup itself is a 1-time MANUAL setup (the Bot API cannot create
-# groups); the bot owns the TOPICS inside it — created on project-create,
-# closed on archive = a closed loop with no orphan topics.
+# groups); the bot owns the TOPICS inside it — created on project-create
+# (provision_project_topics, wired at routes_projects.py).
+#
+# NOTE (next-wave #15, T-0450): the GC half (gc_project_topics) is a DORMANT
+# primitive, NOT an active closed loop. There is no project archive/delete
+# route and nothing in production calls it, so "topics closed on archive"
+# cannot happen today — it awaits a project-archive concept (directional fork
+# in the T-0438 ranked backlog). Until then gc_project_topics is dead-but-ready
+# and deliberately NOT advertised as a loop that closes.
 # ---------------------------------------------------------------------------
 
 _TOPIC_PROVISION_ALLOWED = {"slug"}
@@ -461,7 +468,14 @@ def _action_provision_project_topics(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _action_gc_project_topics(params: dict[str, Any]) -> dict[str, Any]:
-    """Close every provisioned forum topic for a project (archive-time GC).
+    """Close every provisioned forum topic for a project.
+
+    DORMANT primitive (next-wave #15, T-0450): intended as the archive-time GC
+    for a project's topics, but no project archive/delete route exists and
+    nothing in production calls this today — so it is NOT a live closed loop,
+    just a ready action awaiting a project-archive concept. Wire it the moment
+    archival lands; until then it is dead-but-ready, not a "no orphan topics"
+    guarantee.
 
     Best-effort: a per-topic close failure is logged, not fatal, so the GC
     always makes progress. Returns ``{ok, closed: [class, …]}``.

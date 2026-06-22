@@ -10,7 +10,7 @@ Verbs:
   bsq inbox wait  [--timeout N]     opt-in long-poll (the bg-watcher mode)
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
   bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
-  bsq task new <title>             allocate next T-NNNN + stub (atomic — T-0174)
+  bsq task new <title> --provenance <src>  allocate next T-NNNN + stub (atomic — T-0174; --provenance REQUIRED)
   bsq doc new <category> <title>   allocate next D-NNNN + stub doc (T-0172)
   bsq uc new <title>               allocate next UC-NNNN + stub use case
   bsq flow new <uc-id> <title>     allocate next UF-NNNN + stub flow (T-0173)
@@ -2087,15 +2087,70 @@ def cmd_ticket_note(args) -> None:
 # hand-picked ids anywhere — that was the root cause of the collision
 # incidents (T-0042 / T-0114 / T-0120).
 # --------------------------------------------------------------------------
+# next-wave #14 (T-0452): provenance gate at ticket-creation time. The grammar
+# MUST stay byte-compatible with the post-hoc SSOT lint
+# scripts/lint/backlog_provenance.py (test_bsq_task_provenance asserts they
+# agree). Allowed tokens (comma-separated list permitted):
+#   corpus:<token> | F-NNNN | T-NNNN | stakeholder:YYYY-MM-DD
+_PROVENANCE_TOKEN_RE = re.compile(
+    r"\A(?:"
+    r"corpus:[a-z0-9][a-z0-9-]*"
+    r"|F-\d+"
+    r"|T-\d{4,}"
+    r"|stakeholder:\d{4}-\d{2}-\d{2}"
+    r")\Z"
+)
+_PROVENANCE_HELP = (
+    "corpus:<token> | F-NNNN | T-NNNN | stakeholder:YYYY-MM-DD "
+    "(comma-separated list allowed)"
+)
+
+
+def _provenance_valid(value: str) -> bool:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    return bool(parts) and all(_PROVENANCE_TOKEN_RE.match(p) for p in parts)
+
+
+def _stamp_provenance(text: str, value: str) -> str:
+    """Insert/replace ``provenance: <value>`` in a ticket's YAML frontmatter.
+
+    Pure function (testable). Drops any existing ``provenance:`` line and appends
+    the new one as the last frontmatter key; if the doc has no frontmatter block
+    a minimal one is prepended.
+    """
+    m = re.match(r"\A(---\n)(.*?)(\n---\n)(.*)\Z", text, re.DOTALL)
+    if not m:
+        return f"---\nprovenance: {value}\n---\n\n{text}"
+    head, fm, close, rest = m.groups()
+    fm_lines = [ln for ln in fm.split("\n") if not re.match(r"\s*provenance\s*:", ln)]
+    fm_lines.append(f"provenance: {value}")
+    return head + "\n".join(fm_lines) + close + rest
+
+
 def cmd_task_new(args) -> None:
     slug = resolve_slug()
+    prov = (getattr(args, "provenance", None) or "").strip()
+    if not prov:
+        die("task new requires --provenance (alias --source): cite the source so "
+            "the ticket isn't minted sourceless.\n"
+            f"  allowed: {_PROVENANCE_HELP}\n"
+            "  see data/<slug>/docs/roadmap/provenance.md")
+    if not _provenance_valid(prov):
+        die(f"task new: invalid --provenance {prov!r}\n  allowed: {_PROVENANCE_HELP}")
     params = {"slug": slug, "title": args.title}
     for k in ("initiative", "priority", "owner"):
         v = getattr(args, k, None)
         if v:
             params[k] = v
     res = post("task_new", params)
-    print(f"{res['id']}  ->  {res['file_path']}")
+    # Stamp provenance into the freshly-created ticket — close the loop at the
+    # OPEN (the tree-scan lint stays as the backstop).
+    path = Path(res["file_path"])
+    try:
+        _write_atomic(path, _stamp_provenance(path.read_text(encoding="utf-8"), prov))
+    except OSError as e:
+        die(f"task new: created {res['id']} but failed to stamp provenance: {e}")
+    print(f"{res['id']}  ->  {res['file_path']}  (provenance: {prov})")
 
 
 def cmd_doc_new(args) -> None:
@@ -2829,6 +2884,11 @@ def build_parser() -> argparse.ArgumentParser:
     tn_sub = tn.add_subparsers(dest="sub", required=True)
     tnn = tn_sub.add_parser("new", help="allocate the next T-NNNN + write a stub ticket")
     tnn.add_argument("title", help="single-line ticket title")
+    tnn.add_argument(
+        "--provenance", "--source", dest="provenance", required=True,
+        help="REQUIRED ticket source (next-wave #14): "
+             "corpus:<token> | F-NNNN | T-NNNN | stakeholder:YYYY-MM-DD (comma-separated)",
+    )
     tnn.add_argument("--initiative", help="initiative basename, e.g. operator-ux-and-session-mgmt.md")
     tnn.add_argument("--priority", help="priority value (frontmatter, verbatim)")
     tnn.add_argument("--owner", help="owner role/name (frontmatter)")

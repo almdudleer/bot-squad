@@ -128,6 +128,13 @@ def list_feedback(slug: str, request: Request) -> list[dict]:
             "parent_doc_id": ref.parent_doc_id,
             "content": body,
             "status": status,
+            # next-wave #12 (T-0454): surface the voice-intake self-identifying
+            # fields so a voice note is distinguishable from typed feedback at the
+            # row level (None when absent — legacy/manual feedback is unchanged).
+            # The audio FileResponse route + player are deferred (YAGNI).
+            "source": meta.get("source"),
+            "channel": meta.get("channel"),
+            "audio_ref": meta.get("audio_ref"),
         })
     return out
 

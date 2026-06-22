@@ -61,6 +61,40 @@ def test_list_feedback_is_pure_no_inbox_materialize(tmp_bot_squad: Path, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# next-wave #12 (T-0454): a feedback row surfaces source/channel/audio_ref so
+# voice notes self-identify in the list (voice_intake writes those into the
+# F-*.md frontmatter). Legacy/manual feedback with no frontmatter → None.
+# ---------------------------------------------------------------------------
+
+def test_feedback_row_surfaces_source_channel_audio_ref(tmp_bot_squad: Path, monkeypatch):
+    fb = tmp_bot_squad / "data" / "test-project" / "feedback"
+    fb.mkdir(parents=True, exist_ok=True)
+    (fb / "F-2026-06-22-voice-abc.md").write_text(
+        "---\n"
+        "source: voice\n"
+        "channel: tg\n"
+        "audio_ref: feedback/_audio/xyz.oga\n"
+        "submitted_at: 2026-06-22T00:00:00Z\n"
+        "---\n\n"
+        "# Voice note\n\ntranscript body\n"
+    )
+    (fb / "F-legacy.md").write_text("# Legacy\n\nplain body\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/feedback")
+    assert r.status_code == 200
+    rows = {row["name"]: row for row in r.json()}
+    v = rows["F-2026-06-22-voice-abc.md"]
+    assert v["source"] == "voice"
+    assert v["channel"] == "tg"
+    assert v["audio_ref"] == "feedback/_audio/xyz.oga"
+    # legacy / manual feedback (no frontmatter) self-identifies as nothing
+    leg = rows["F-legacy.md"]
+    assert leg["source"] is None
+    assert leg["channel"] is None
+    assert leg["audio_ref"] is None
+
+
+# ---------------------------------------------------------------------------
 # PUT /api/projects/{slug}/feedback/{name}
 # ---------------------------------------------------------------------------
 

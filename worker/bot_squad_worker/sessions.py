@@ -2567,6 +2567,30 @@ def set_drift_paused(cfg: Any, slug: str, sid: str, paused: bool) -> dict:
     return {"ok": True, "sid": meta.get("sid", sid), "drift_paused": bool(paused)}
 
 
+def _reap_session_sidecars(cfg: Any, slug: str, sid: str) -> list[str]:
+    """T-0447 (#4): cascade-free a session's per-SID sidecar scratch when it
+    becomes archived/historical — the peer-bus ``_chat`` triple (inbox/seen/
+    heartbeat) and the ``_worker/telemetry/<sid>.json`` sample. Without this the
+    session md is freed on archive but its sidecars leak forever (a malloc with
+    no free that grows one set per session). Each owner module reaps its own
+    files; this only orchestrates at the archive chokepoint. NEVER raises (a
+    reap must not block the archive). Returns the removed paths."""
+    removed: list[str] = []
+    try:
+        from bot_squad_worker import intersession as _intersession
+        removed.extend(_intersession.reap_chat_sidecars(cfg, slug, sid))
+    except Exception:  # belt-and-braces over the helper's own guard
+        pass
+    try:
+        from bot_squad_worker import telemetry as _telemetry
+        rec = _telemetry.reap_record(cfg, slug, sid)
+        if rec is not None:
+            removed.append(str(rec))
+    except Exception:
+        pass
+    return removed
+
+
 def archive_session(cfg: Any, slug: str, sid: str) -> dict:
     """Mark a session as archived in its frontmatter.
 
@@ -2607,6 +2631,8 @@ def archive_session(cfg: Any, slug: str, sid: str) -> dict:
     meta["status"] = "suspended"
     meta["archived"] = "true"
     _write_session_metadata(meta_file, meta)
+    # T-0447 (#4): the session is now historical — free its per-SID sidecars.
+    _reap_session_sidecars(cfg, slug, sid)
     return {"ok": True, "sid": sid, "archived": True}
 
 
@@ -3128,6 +3154,8 @@ def dedup_sessions(cfg: Any, slug: str, *, dry_run: bool = True) -> dict:
                 meta.setdefault("suspended_at", now)
             meta["archive_reason"] = f"merged-into:{keeper}"
             _write_session_metadata(md, meta, atomic=True)
+            # T-0447 (#4): merged-away loser is historical — free its sidecars.
+            _reap_session_sidecars(cfg, slug, loser)
 
     merges = [
         {"loser": loser, "keeper": keeper, "mode": mode}

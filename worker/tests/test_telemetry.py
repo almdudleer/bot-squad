@@ -484,3 +484,25 @@ def test_human_tg_routes_max_primary_with_group_record(tmp_path, monkeypatch):
     T._human_tg(cfg, "proj", "quota almost out", urgent=True)
     assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
     assert len(tg_calls) == 1 and tg_calls[0]["topic_id"] == 555
+
+
+# ── T-0447 (#4): cascade-reap the per-SID telemetry sample on archive ─────────
+
+def test_reap_record_removes_sample(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    p = T._record_path(cfg, "proj", "S-x")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{}")
+    out = T.reap_record(cfg, "proj", "S-x")
+    assert out == p
+    assert not p.exists()
+
+
+def test_reap_record_missing_is_none(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert T.reap_record(cfg, "proj", "S-ghost") is None
+
+
+def test_reap_record_empty_sid_is_none(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert T.reap_record(cfg, "proj", "") is None

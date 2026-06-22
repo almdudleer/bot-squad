@@ -4414,3 +4414,82 @@ def test_suspended_legacy_empty_cwd_no_false_positive(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["role"] == "teamlead"
     assert not rows[0].get("role_cwd_mismatch")
+
+
+# ── T-0447 (#4): archiving/merging a session cascade-frees its sidecars ────────
+
+def _seed_sidecars(tmp_path, slug, sid):
+    """Create the full per-SID sidecar set (peer-bus triple + telemetry json)."""
+    chat = tmp_path / "data" / slug / "_chat"
+    chat.mkdir(parents=True, exist_ok=True)
+    (chat / f"inbox-{sid}.log").write_text("hi\n")
+    (chat / f"seen-{sid}").write_text("0")
+    (chat / f"heartbeat-{sid}").write_text("")
+    tel = tmp_path / "data" / slug / "_worker" / "telemetry"
+    tel.mkdir(parents=True, exist_ok=True)
+    (tel / f"{sid}.json").write_text("{}")
+    return chat, tel
+
+
+def _sidecars_present(chat, tel, sid):
+    return (
+        (chat / f"inbox-{sid}.log").exists()
+        or (chat / f"seen-{sid}").exists()
+        or (chat / f"heartbeat-{sid}").exists()
+        or (tel / f"{sid}.json").exists()
+    )
+
+
+def test_archive_session_cascade_reaps_sidecars(tmp_path, monkeypatch):
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    slug = "test-project"
+    sid = "S-testuser-feat-p1"
+    sess = tmp_path / "data" / slug / "sessions" / f"{sid}.md"
+    sess.write_text(f"---\nsid: {sid}\nstatus: suspended\npane_id: '%9'\n---\n")
+    chat, tel = _seed_sidecars(tmp_path, slug, sid)
+    assert _sidecars_present(chat, tel, sid)
+
+    res = S.archive_session(cfg, slug, sid)
+    assert res["archived"] is True
+    assert not _sidecars_present(chat, tel, sid), "all sidecars must be freed on archive"
+
+
+def test_archive_session_reap_partial_set_no_error(tmp_path, monkeypatch):
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    slug = "test-project"
+    sid = "S-testuser-nosidecars-p2"
+    sess = tmp_path / "data" / slug / "sessions" / f"{sid}.md"
+    sess.write_text(f"---\nsid: {sid}\nstatus: suspended\npane_id: '%8'\n---\n")
+    # No sidecars seeded at all → archive must still succeed cleanly.
+    res = S.archive_session(cfg, slug, sid)
+    assert res["archived"] is True
+
+
+def test_dedup_sessions_reaps_loser_sidecars(tmp_path, monkeypatch):
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    slug = "test-project"
+    sdir = tmp_path / "data" / slug / "sessions"
+    uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    keeper = "S-testuser-feat-p10"
+    loser = "S-testuser-feat-p9"
+    (sdir / f"{keeper}.md").write_text(
+        f"---\nsid: {keeper}\nstatus: suspended\nclaude_uuid: {uuid}\n"
+        f"started_at: 2026-06-21T10:00:00Z\n---\n")
+    (sdir / f"{loser}.md").write_text(
+        f"---\nsid: {loser}\nstatus: suspended\nclaude_uuid: {uuid}\n"
+        f"started_at: 2026-06-20T10:00:00Z\n---\n")
+    chat, tel = _seed_sidecars(tmp_path, slug, loser)
+
+    res = S.dedup_sessions(cfg, slug, dry_run=False)
+    assert res["merged_count"] == 1
+    assert res["merges"][0]["loser"] == loser
+    assert not _sidecars_present(chat, tel, loser), "merged-away loser's sidecars must be freed"

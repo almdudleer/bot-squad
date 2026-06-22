@@ -295,6 +295,23 @@ def _quota_path(cfg: Any, slug: str) -> Path:
     return _telemetry_dir(cfg, slug) / "_quota.json"
 
 
+def reap_record(cfg: Any, slug: str, sid: str) -> Path | None:
+    """T-0447 (#4): remove a session's per-SID telemetry sample json once the
+    session is archived/historical (the sampler only ever writes live sessions,
+    so an archived session's record is pure dead weight). NEVER raises; returns
+    the removed Path, or None if there was nothing to remove."""
+    if not sid:
+        return None
+    p = _record_path(cfg, slug, sid)
+    try:
+        if p.exists():
+            p.unlink()
+            return p
+    except OSError:
+        log.warning("reap_record: failed to remove %s", p, exc_info=True)
+    return None
+
+
 def _read_json(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())

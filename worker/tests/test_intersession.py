@@ -273,3 +273,43 @@ def test_send_scopes_role_fanout_to_sender_user(tmp_path):
     _write_user_session(tmp_path, "p", "S-bob-dev-p4", task_id="T-2")
     out = I.send(cfg, "p", "S-alice-tl-p1", "dev", "ping")
     assert out["delivered_to"] == ["S-alice-dev-p2"]
+
+
+# ── T-0447 (#4): cascade-reap the per-SID peer-bus _chat triple on archive ────
+
+def _chat(tmp_path, slug="p"):
+    return tmp_path / "data" / slug / "_chat"
+
+
+def test_reap_chat_sidecars_removes_triple(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    chat = _chat(tmp_path)
+    chat.mkdir(parents=True)
+    sid = "S-to"
+    (chat / f"inbox-{sid}.log").write_text("hi\n")
+    (chat / f"seen-{sid}").write_text("0")
+    (chat / f"heartbeat-{sid}").write_text("")
+    removed = I.reap_chat_sidecars(cfg, "p", sid)
+    assert len(removed) == 3
+    assert not (chat / f"inbox-{sid}.log").exists()
+    assert not (chat / f"seen-{sid}").exists()
+    assert not (chat / f"heartbeat-{sid}").exists()
+
+
+def test_reap_chat_sidecars_partial_missing_and_idempotent(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    # No _chat dir at all → no error, nothing removed.
+    assert I.reap_chat_sidecars(cfg, "p", "S-none") == []
+    # Only the inbox present (lazy-created triple).
+    chat = _chat(tmp_path)
+    chat.mkdir(parents=True)
+    (chat / "inbox-S-solo.log").write_text("x")
+    removed = I.reap_chat_sidecars(cfg, "p", "S-solo")
+    assert len(removed) == 1
+    # Re-run is a no-op (idempotent).
+    assert I.reap_chat_sidecars(cfg, "p", "S-solo") == []
+
+
+def test_reap_chat_sidecars_empty_sid_noop(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert I.reap_chat_sidecars(cfg, "p", "") == []

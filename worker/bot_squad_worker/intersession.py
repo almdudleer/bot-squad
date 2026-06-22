@@ -191,6 +191,38 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def reap_chat_sidecars(cfg: Any, slug: str, sid: str) -> list[str]:
+    """T-0447 (#4): free a session's per-SID peer-bus scratch once it is
+    archived/historical.
+
+    Removes ``inbox-<sid>.log``, ``seen-<sid>`` and ``heartbeat-<sid>`` under
+    ``data/<slug>/_chat`` — the malloc-with-no-free that otherwise grows one
+    triple per session forever. Counterpart to ``rebind_sid`` (which renames the
+    triple): this is the terminal free.
+
+    NEVER raises (a reap failure must not wedge the archive) and never creates
+    the ``_chat`` dir: if it doesn't exist there's nothing to reap. Missing
+    files are skipped (the triple is created lazily, so not all three always
+    exist). Returns the list of paths actually removed (empty on no-op / re-run,
+    so it's idempotent).
+    """
+    removed: list[str] = []
+    if not sid:
+        return removed
+    chat = Path(cfg.data_dir) / slug / "_chat"
+    if not chat.exists():
+        return removed
+    for name in (f"inbox-{sid}.log", f"seen-{sid}", f"heartbeat-{sid}"):
+        p = chat / name
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        except OSError:
+            log.warning("reap_chat_sidecars: failed to remove %s", p, exc_info=True)
+    return removed
+
+
 def rebind_sid(cfg: Any, slug: str, old_sid: str, new_sid: str) -> dict:
     """T-0072: atomically rename a peer-bus triple from ``old_sid`` to ``new_sid``.
 

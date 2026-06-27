@@ -1206,6 +1206,24 @@ def reap_orphans(cfg: "Config", slug: str, max_age_seconds: int | None = None) -
             payload = json.loads(f.read_text())
         except Exception:
             payload = {}
+        # T-0520: defer to the .rc sentinel before age-failing. A restart_worker
+        # deploy can FINISH (rc recorded by _record_run_rc) yet lose its _finish
+        # move to the self-restart SIGTERM, stranding a sentineled marker here.
+        # That's reconcile_finished_orphans' job; but if reconcile was skipped or
+        # raised this tick, a blind RC_ORPHAN stamp would mis-record a genuine
+        # SUCCESS as a crashed orphan (and fire a false alert). Record the TRUE
+        # recorded outcome instead, and do NOT count it as a reaped orphan — so
+        # "never RC_ORPHAN-on-success" holds independent of monitor tick ordering.
+        recorded_rc = _read_run_rc(cfg, slug, qid)
+        if recorded_rc is not None:
+            _finish(cfg, slug, f, qid, rc=recorded_rc)
+            log.warning(
+                "deploy.reap_orphans: %s stale job %s carried recorded rc=%d "
+                "(finished but _finish lost to a restart race) — recorded TRUE "
+                "outcome processed/%s, NOT age-failed as RC_ORPHAN",
+                slug, qid, recorded_rc, ".ok" if recorded_rc == 0 else f".fail.{recorded_rc}",
+            )
+            continue
         _finish(cfg, slug, f, qid, rc=RC_ORPHAN)
         log.error(
             "deploy.reap_orphans: %s swept stale processing job %s "

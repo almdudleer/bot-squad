@@ -883,6 +883,99 @@ def test_reap_orphans_ignores_fresh_processing(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# T-0520: a restart_worker=true deploy that SUCCEEDED but lost its _finish move
+# to the self-restart SIGTERM leaves a marker stranded in processing/ WITH a
+# success .rc sentinel. The age-fail reaper must DEFER to that sentinel and
+# record the TRUE outcome (.ok / .fail.<rc>) — never blindly stamp RC_ORPHAN on
+# a genuine SUCCESS — so the guarantee holds even if the reconcile pass is
+# skipped/fails (defense-in-depth, independent of monitor tick ordering).
+# ---------------------------------------------------------------------------
+
+
+def test_reap_orphans_records_true_success_not_orphan_when_sentinel_present(
+    tmp_path: Path,
+) -> None:
+    import os
+    import time as _time
+    from bot_squad_worker.deploy import RC_ORPHAN, reap_orphans, _record_run_rc
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = cfg.data_dir / proj.slug / "_jobs" / "deploy"
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    qid = "deadbeef-success"
+    marker = proc / f"1700000000000-{qid}.json"
+    marker.write_text(json.dumps({"queue_id": qid, "target": "staging"}))
+    _record_run_rc(cfg, proj.slug, qid, 0)  # finished rc=0; _finish lost to restart
+    old = _time.time() - 3 * 3600  # stale: reconcile never got to it
+    os.utime(marker, (old, old))
+
+    reaped = reap_orphans(cfg, proj.slug)  # default max-age 7200s
+
+    processed = base / "processed"
+    assert (processed / f"1700000000000-{qid}.ok").exists()
+    assert list(processed.glob(f"*.fail.{RC_ORPHAN}")) == []
+    assert list(proc.glob("*.json")) == []
+    # a recorded success is NOT a crashed orphan → no false "🧟 reaped" alert
+    assert reaped == []
+
+
+def test_reap_orphans_records_true_fail_not_orphan_when_sentinel_present(
+    tmp_path: Path,
+) -> None:
+    import os
+    import time as _time
+    from bot_squad_worker.deploy import RC_ORPHAN, reap_orphans, _record_run_rc
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = cfg.data_dir / proj.slug / "_jobs" / "deploy"
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    qid = "deadbeef-fail"
+    marker = proc / f"1700000000000-{qid}.json"
+    marker.write_text(json.dumps({"queue_id": qid, "target": "staging"}))
+    _record_run_rc(cfg, proj.slug, qid, 2)  # finished rc=2 (real failure)
+    old = _time.time() - 3 * 3600
+    os.utime(marker, (old, old))
+
+    reaped = reap_orphans(cfg, proj.slug)
+
+    processed = base / "processed"
+    assert (processed / f"1700000000000-{qid}.fail.2").exists()
+    assert list(processed.glob(f"*.fail.{RC_ORPHAN}")) == []
+    assert list(proc.glob("*.json")) == []
+    assert reaped == []
+
+
+def test_reap_orphans_still_orphans_when_no_sentinel(tmp_path: Path) -> None:
+    """A stale marker with NO .rc sentinel (a genuinely crashed/killed run that
+    never recorded an outcome) is still age-failed to RC_ORPHAN — the reaper's
+    original behaviour is preserved for true orphans."""
+    import os
+    import time as _time
+    from bot_squad_worker.deploy import RC_ORPHAN, reap_orphans
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = cfg.data_dir / proj.slug / "_jobs" / "deploy"
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    qid = "deadbeef-crashed"
+    marker = proc / f"1700000000000-{qid}.json"
+    marker.write_text(json.dumps({"queue_id": qid, "target": "staging"}))
+    old = _time.time() - 3 * 3600
+    os.utime(marker, (old, old))
+
+    reaped = reap_orphans(cfg, proj.slug)
+
+    processed = base / "processed"
+    assert (processed / f"1700000000000-{qid}.fail.{RC_ORPHAN}").exists()
+    assert [r["queue_id"] for r in reaped] == [qid]
+
+
+# ---------------------------------------------------------------------------
 # T-0243: reconcile FINISHED-but-orphaned processing/ markers to their ACTUAL
 # recorded rc (a worker restart raced run_next's _finish move). A durable
 # runs/<qid>.rc sentinel is written when the run terminates; the reconcile reads
@@ -1182,6 +1275,38 @@ def test_run_next_triggers_restart_on_success_when_flag_on(
     # _restart_worker_detached(cfg, slug, queue_id, reason)
     assert calls[0][1] == proj.slug
     assert calls[0][2] == queue_id
+
+
+def test_run_next_records_ok_before_self_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0520: bookkeeping must happen-BEFORE the self-restart. We capture the
+    processing/ + processed/ state at the instant the (detached) restart is
+    triggered and assert the .ok marker is already on disk and the processing/
+    entry is already gone — so the restart's SIGTERM can never strand the run."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
+
+    seen: dict = {}
+
+    def _capture(_cfg, _slug, _qid, _reason) -> None:
+        seen["ok"] = sorted(p.name for p in _processed_dir(cfg, proj.slug).glob("*.ok"))
+        seen["processing"] = sorted(
+            p.name for p in _processing_dir(cfg, proj.slug).glob("*.json")
+        )
+
+    monkeypatch.setattr(d, "_restart_worker_detached", _capture)
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.ok is True
+    # .ok recorded AND processing/ emptied before the restart was triggered.
+    assert len(seen["ok"]) == 1
+    assert seen["processing"] == []
 
 
 def test_run_next_no_restart_on_recipe_failure(

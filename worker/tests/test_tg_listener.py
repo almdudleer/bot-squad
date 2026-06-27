@@ -691,24 +691,38 @@ def test_handle_update_unquoted_no_identity_still_skips(tmp_path, monkeypatch):
 
 
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
+    """T-0513: the picker now routes through the channel abstraction (was a raw
+    httpx sendMessage). The keyboard must reach the TG client via the channel,
+    with the interactive-reply flags (urgent, no SID prefix, no debounce)."""
+    import bot_squad_worker.actions as A
     cfg = _make_multi_cfg(tmp_path, chat="111")
-    captured = {}
+    calls: list[dict] = []
 
-    def fake_post(url, data=None, json=None, timeout=None, **kw):
-        captured["url"] = url
-        captured["payload"] = json if json is not None else data
-        return MagicMock()
+    class _FakeTg:
+        def send(self, **kw):
+            calls.append(kw)
+            return True
 
-    with patch("httpx.post", side_effect=fake_post):
-        TL._ask_which_project(cfg, "111")
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: _FakeTg())
+    # A raw sendMessage would be a regression of the migration — fail loud if so.
+    monkeypatch.setattr(
+        "httpx.post",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("raw httpx.post — must route via the channel")
+        ),
+    )
 
-    payload = captured["payload"]
+    TL._ask_which_project(cfg, "111")
+
+    assert calls, "picker did not route through the channel"
+    kw = calls[-1]
     # A reply-keyboard whose buttons send "/project <slug>" as a normal message
     # (so it arrives under allowed_updates:["message"], no poll-contract change).
-    markup = payload["reply_markup"] if isinstance(payload.get("reply_markup"), dict) else _json.loads(payload["reply_markup"])
+    markup = kw["reply_markup"]
     btn_texts = [btn["text"] for row in markup["keyboard"] for btn in row]
     assert "/project alpha" in btn_texts
     assert "/project beta" in btn_texts
+    assert kw["urgent"] is True and kw["sid"] == "" and kw["debounce"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -832,17 +846,80 @@ def test_poll_updates_omits_proxy_when_not_configured(tmp_path):
     assert captured.get("called") is True
 
 
-def test_notify_passes_proxy_when_configured(tmp_path):
+def test_notify_passes_proxy_when_configured(tmp_path, monkeypatch):
+    """T-0513: _notify routes through the channel; the egress proxy now lives in
+    tg.py (via the channel→TgClient), not a raw httpx in _notify. End-to-end: a
+    configured proxy still reaches httpx.post, and the body carries no SID prefix.
+    """
+    from bot_squad_worker.tg import TgClient
+    import bot_squad_worker.actions as A
+
+    monkeypatch.setenv("BOT_SQUAD_DISABLE_QUIET_HOURS", "1")
     cfg = _make_cfg(tmp_path, proxy_url="socks5://10.0.0.1:1080")
+    # Build a real TgClient from this cfg so the proxy + payload assembly is the
+    # genuine production path; route the channel singleton at it for this test.
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: TgClient(cfg))
     captured: dict = {}
 
-    def fake_post(url, data=None, timeout=None, proxy=None):
+    def fake_post(url, json=None, timeout=None, proxy=None):  # noqa: A002
         captured["proxy"] = proxy
-        return MagicMock()
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
 
     with patch("httpx.post", side_effect=fake_post):
         TL._notify(cfg, "12345", "hello")
     assert captured["proxy"] == "socks5://10.0.0.1:1080"
+    assert captured["json"]["text"] == "hello"  # no [SID] prefix on command replies
+
+
+def test_notify_routes_through_channel(tmp_path, monkeypatch):
+    """_notify delegates to the channel with the interactive-reply flags."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    calls: list[dict] = []
+
+    class _FakeTg:
+        def send(self, **kw):
+            calls.append(kw)
+            return True
+
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _FakeTg())
+    monkeypatch.setattr(
+        "httpx.post",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("raw httpx.post — must route via the channel")
+        ),
+    )
+    TL._notify(cfg, "12345", "hi there")
+    assert calls and calls[-1]["text"] == "hi there"
+    assert calls[-1]["urgent"] is True and calls[-1]["sid"] == ""
+    assert calls[-1]["debounce"] is False
+
+
+def test_notify_noop_without_token(tmp_path, monkeypatch):
+    """No bot token → _notify is a silent no-op (no channel call)."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path, bot_token="")
+    monkeypatch.setattr(
+        A, "_get_tg_client",
+        lambda _c: (_ for _ in ()).throw(AssertionError("must not build a client")),
+    )
+    TL._notify(cfg, "12345", "x")  # must not raise / must not send
+
+
+def test_notify_swallows_transport_error(tmp_path, monkeypatch):
+    """A messenger outage must not break inbound command handling."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+
+    class _BoomTg:
+        def send(self, **kw):
+            raise RuntimeError("egress blocked")
+
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())
+    TL._notify(cfg, "12345", "x")  # must not raise
 
 
 # ---------------------------------------------------------------------------

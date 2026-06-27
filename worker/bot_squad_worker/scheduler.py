@@ -10,6 +10,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from bot_squad_worker.config import Config
 from bot_squad_worker import autoupdate as _autoupdate
+from bot_squad_worker.operator_redrive import operator_tick
 from bot_squad_worker.jobs import (
     autopilot_tick,
     autoupdate_apply_tick,
@@ -292,6 +293,27 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="park",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # operator_tick: T-0474 / M2-F2.1 — operator re-drive cadence. Respawns the
+    # operator (with its standing 'clear the backlog' task) whenever a project's
+    # backlog has pending work AND the user has not paused AND no operator is
+    # currently live — the continuity mechanism that keeps the operator
+    # continuously scheduled WITHOUT a persistent session (clarification-01).
+    # Continue-vs-respawn rides dispatch.live_operator_sids (the T-0472 one-
+    # operator seam); a paused project or a spawn deferred under capacity/quota
+    # backpressure ("stalls out of time") re-drives nothing. Kill switch:
+    # BOT_SQUAD_OPERATOR_REDRIVE=0. max_instances=1 + coalesce keeps overlapping
+    # ticks from racing the spawn path; idempotent so a missed run is harmless.
+    sched.add_job(
+        operator_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="operator_redrive",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

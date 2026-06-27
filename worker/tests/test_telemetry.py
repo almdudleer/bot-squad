@@ -147,6 +147,27 @@ def test_memory_stats_missing_dir_is_zero(tmp_path: Path):
     assert T.memory_stats(tmp_path / "nope") == {"files": 0, "bytes": 0, "tokens_est": 0}
 
 
+def test_shared_memory_stats_counts_project_dev_clone_memory(tmp_path: Path):
+    """T-0502: the SHARED, git-ignored project memory dir is counted from the
+    project's repo_path (dev clone) — distinct from the per-session dir."""
+    cfg = _make_cfg(tmp_path)  # repo_path = tmp_path / "repo"
+    mem = tmp_path / "repo" / "memory"
+    mem.mkdir(parents=True)
+    (mem / "MEMORY.md").write_text("x" * 400)
+    (mem / "fact.md").write_text("y" * 400)
+    (mem / "ignore.txt").write_text("z" * 4000)  # non-.md, not counted
+    assert T.shared_memory_stats(cfg, "proj") == {
+        "files": 2, "bytes": 800, "tokens_est": 200,
+    }
+
+
+def test_shared_memory_stats_unknown_slug_or_missing_dir_is_zero(tmp_path: Path):
+    cfg = _make_cfg(tmp_path)
+    zero = {"files": 0, "bytes": 0, "tokens_est": 0}
+    assert T.shared_memory_stats(cfg, "no-such-slug") == zero  # unknown project
+    assert T.shared_memory_stats(cfg, "proj") == zero  # dir absent
+
+
 def test_compute_burn_over_window():
     # +3600 tokens over 1800s = 7200 tok/hr
     assert T.compute_burn([[0, 1000], [1800, 4600]]) == pytest.approx(7200.0)
@@ -361,6 +382,16 @@ def test_read_telemetry_returns_sessions_and_quota_without_internal_fields(tmp_p
     assert "samples" not in wire["quota"]
     assert "last_alert" not in wire["quota"]
     assert "burn_tokens_per_hr" in wire["quota"]
+
+
+def test_read_telemetry_includes_shared_memory_block(tmp_path, fake_session):
+    """T-0502: read_telemetry surfaces the project-level shared memory count."""
+    cfg = _make_cfg(tmp_path)
+    mem = (tmp_path / "repo" / "memory")
+    mem.mkdir(parents=True)
+    (mem / "MEMORY.md").write_text("m" * 400)
+    wire = T.read_telemetry(cfg, "proj")
+    assert wire["shared_memory"] == {"files": 1, "bytes": 400, "tokens_est": 100}
 
 
 def test_read_telemetry_includes_enforced_caps_block(tmp_path, fake_session):

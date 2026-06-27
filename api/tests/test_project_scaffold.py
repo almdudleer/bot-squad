@@ -483,3 +483,95 @@ def test_new_from_scratch_seeds_vision_roles(tmp_path: Path) -> None:
     )
 
     _assert_roles_seeded(install_data, "fresh")
+
+
+# ---------------------------------------------------------------------------
+# T-0502 — shared git-ignored project memory dir
+# ---------------------------------------------------------------------------
+
+
+def _assert_memory_seeded(clone: Path, slug: str) -> None:
+    """A shared ``<clone>/memory/`` dir + MEMORY.md index is planted, the dir
+    is excluded via the LOCAL git exclude (never the tracked .gitignore), and
+    an agent-written fact file inside it is genuinely git-ignored."""
+    mem = clone / "memory"
+    index = mem / "MEMORY.md"
+    assert mem.is_dir(), f"{mem} not seeded"
+    assert index.is_file(), f"{index} missing"
+    body = index.read_text()
+    assert slug in body  # index is project-scoped
+    assert "git-IGNORED" in body and "D-0041" in body  # documents shared/ignored contract
+
+    # Local exclude carries the entry; tracked .gitignore is untouched.
+    exclude = clone / ".git" / "info" / "exclude"
+    assert "/memory/" in exclude.read_text().splitlines()
+    assert not (clone / ".gitignore").exists() or "memory" not in (
+        clone / ".gitignore"
+    ).read_text()
+
+    # An agent can write into it AND git ignores what they wrote.
+    (mem / "fact.md").write_text("we chose X over Y because…")
+    porcelain = subprocess.run(
+        ["git", "-C", str(clone), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "memory/" not in porcelain, f"memory not git-ignored: {porcelain!r}"
+
+
+def test_new_from_scratch_seeds_shared_memory(tmp_path: Path) -> None:
+    install_data = tmp_path / "install" / "data"
+    (install_data / "fresh").mkdir(parents=True)
+    mother = tmp_path / "home" / "fresh"
+
+    scaffold_new_from_scratch(
+        slug="fresh",
+        mother_dir=mother,
+        git_remote=None,
+        install_data_dir=install_data,
+    )
+
+    # Both clones (dev tree is the one telemetry counts, master for symmetry).
+    _assert_memory_seeded(mother / "dev", "fresh")
+    _assert_memory_seeded(mother / "master", "fresh")
+
+
+def test_paths_as_they_are_seeds_shared_memory(tmp_path: Path) -> None:
+    install_data = tmp_path / "install" / "data"
+    (install_data / "myproj").mkdir(parents=True)
+    existing_dev = tmp_path / "elsewhere" / "dev"
+    existing_master = tmp_path / "elsewhere" / "master"
+    _git_init(existing_dev)
+    _git_init(existing_master)
+
+    mother = tmp_path / "home" / "myproj"
+    scaffold_paths_as_they_are(
+        slug="myproj",
+        mother_dir=mother,
+        repo_path=existing_dev,
+        repo_master=existing_master,
+        install_data_dir=install_data,
+    )
+
+    _assert_memory_seeded(existing_dev, "myproj")
+    _assert_memory_seeded(existing_master, "myproj")
+
+
+def test_seed_memory_preserves_existing_index(tmp_path: Path) -> None:
+    """Re-scaffolding (or seeding a clone that already accumulated memory)
+    must NOT clobber an existing MEMORY.md, and the exclude stays idempotent
+    (no duplicate entry)."""
+    from app.project_scaffold import _seed_memory
+
+    clone = tmp_path / "clone"
+    _git_init(clone)
+    mem = clone / "memory"
+    mem.mkdir()
+    (mem / "MEMORY.md").write_text("PRIOR CONTENT — keep me")
+
+    assert _seed_memory(clone, "proj") is False  # preserved, not re-seeded
+    assert (mem / "MEMORY.md").read_text() == "PRIOR CONTENT — keep me"
+
+    # Idempotent exclude: a second call adds no duplicate "/memory/" line.
+    _seed_memory(clone, "proj")
+    exclude_lines = (clone / ".git" / "info" / "exclude").read_text().splitlines()
+    assert exclude_lines.count("/memory/") == 1

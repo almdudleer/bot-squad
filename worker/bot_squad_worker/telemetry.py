@@ -26,8 +26,13 @@ Research (full notes on the ticket) bottomed out three data sources:
   budget anchor in ``system_settings.toml [quota]``. The 429 throttle flag is
   surfaced regardless.
 
-* **Memory usage** — per agent, the project memory dir (``memory/*.md`` +
-  ``MEMORY.md``): file count + byte size + a ~bytes/4 token estimate.
+* **Memory usage** — per agent, the per-session memory dir next to the
+  transcript (``memory/*.md`` + ``MEMORY.md``): file count + byte size + a
+  ~bytes/4 token estimate. T-0502 adds a project-level count of the SHARED,
+  git-ignored ``<dev-clone>/memory`` dir (``shared_memory_stats``), surfaced
+  on ``read_telemetry`` — the memory substrate shared across all
+  sessions/users of the project (see D-0041), distinct from the per-session
+  dir above.
 
 All alerts are SYSTEM pings → ``urgent=True`` so the quiet-hours gate (17–05
 UTC) can't silently drop them, and they fire only when a threshold is *newly
@@ -255,6 +260,21 @@ def memory_stats(memory_dir: Path) -> dict:
             except OSError:
                 continue
     return {"files": files, "bytes": total, "tokens_est": total // 4}
+
+
+def shared_memory_stats(cfg: Any, slug: str) -> dict:
+    """Count the SHARED, git-ignored project memory dir (``<dev-clone>/memory``).
+
+    T-0502: distinct from the per-session ``~/.claude`` memory counted in
+    ``_sample_one`` — this is the PROJECT-level dir shared by all
+    sessions/users of the project (the dev tree is shared across linux users),
+    scaffolded by ``project_scaffold._seed_memory`` and described in D-0041.
+    Resolved from the project's ``repo_path`` (the dev clone). Unknown slug /
+    missing dir → zeroes, like ``memory_stats``."""
+    proj = (getattr(cfg, "projects", {}) or {}).get(slug)
+    if proj is None:
+        return {"files": 0, "bytes": 0, "tokens_est": 0}
+    return memory_stats(Path(proj.repo_path) / "memory")
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +867,19 @@ def read_telemetry(cfg: Any, slug: str) -> dict:
     except Exception:  # noqa: BLE001 — telemetry read must never hard-fail on caps
         log.exception("read_telemetry: caps_utilization failed for %s", slug)
         caps = {}
-    return {"sessions": sessions, "quota": quota_wire, "caps": caps}
+    # T-0502: project-level shared memory dir count (distinct from each
+    # session's per-transcript memory carried in its record).
+    try:
+        shared_memory = shared_memory_stats(cfg, slug)
+    except Exception:  # noqa: BLE001 — telemetry read must never hard-fail
+        log.exception("read_telemetry: shared_memory_stats failed for %s", slug)
+        shared_memory = {"files": 0, "bytes": 0, "tokens_est": 0}
+    return {
+        "sessions": sessions,
+        "quota": quota_wire,
+        "caps": caps,
+        "shared_memory": shared_memory,
+    }
 
 
 def tick(cfg: Any) -> None:

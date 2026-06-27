@@ -122,6 +122,76 @@ def _link_ops(clone: Path, install_data_dir: Path, slug: str) -> tuple[bool, str
     return True, f"{link} -> {target}"
 
 
+# T-0502 — shared, git-ignored project memory dir. A `memory/` dir planted
+# INSIDE each clone, shared by ALL sessions/users of the project (the dev tree
+# is shared across linux users), git-IGNORED so its scratch never enters git
+# history or ships in the product. See docs/architecture/D-0041 (the
+# "Memory" substrate) for the read/write contract this scaffold realises.
+_MEMORY_DIRNAME = "memory"
+_MEMORY_INDEX_NAME = "MEMORY.md"
+
+
+def _render_memory_index(slug: str) -> str:
+    """The MEMORY.md index stub seeded into a fresh `memory/` dir.
+
+    Mirrors D-0041: this dir is SHARED across sessions/users of the project,
+    git-ignored, and disposable (never gated by review). Each entry is a
+    one-line pointer to a fact file, same shape as the framework's own
+    memory index."""
+    return (
+        f"# Project memory — {slug}\n"
+        "\n"
+        "Shared, git-IGNORED scratch for ALL sessions/users of this project\n"
+        "(the dev tree is shared across linux users). Append decisions,\n"
+        "findings, and gotchas here so the next session sees them; index each\n"
+        "as a one-line pointer below. NOT shipped, NOT git-tracked, never\n"
+        "gated by review. See docs/architecture/D-0041 (the Memory substrate).\n"
+        "\n"
+        "_(no entries yet)_\n"
+    )
+
+
+def _git_ignore_local(clone: Path, entry: str) -> None:
+    """Idempotently add ``entry`` to the clone's LOCAL git exclude.
+
+    Uses ``.git/info/exclude`` (per-clone, never committed) rather than the
+    tracked ``.gitignore`` so we never modify a file the project owns — the
+    git-ignore lands the same way the per-clone ``.claude/`` symlinks do.
+    Best-effort: a worktree-pointer ``.git`` (a file, not a dir) or a
+    non-repo clone is skipped silently — the memory dir still exists, it just
+    isn't excluded, which is harmless for a fresh scaffold."""
+    git_dir = clone / ".git"
+    if not git_dir.is_dir():
+        return
+    info = git_dir / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    exclude = info / "exclude"
+    existing = exclude.read_text() if exclude.exists() else ""
+    if entry in existing.splitlines():
+        return
+    sep = "" if (not existing or existing.endswith("\n")) else "\n"
+    with exclude.open("a") as fh:
+        fh.write(f"{sep}{entry}\n")
+
+
+def _seed_memory(clone: Path, slug: str) -> bool:
+    """Plant a shared, git-ignored ``<clone>/memory/`` dir + MEMORY.md index.
+
+    Returns True when a fresh index was seeded, False when an existing
+    ``memory/MEMORY.md`` was preserved (we never clobber accumulated memory).
+    The local git-exclude entry is (re)asserted idempotently either way so the
+    dir stays out of git regardless of seed order."""
+    mem_dir = clone / _MEMORY_DIRNAME
+    index = mem_dir / _MEMORY_INDEX_NAME
+    seeded = False
+    if not index.exists():
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(index, _render_memory_index(slug))
+        seeded = True
+    _git_ignore_local(clone, f"/{_MEMORY_DIRNAME}/")
+    return seeded
+
+
 def _run_git(cwd: Path, *args: str) -> None:
     """Run a git command, raising ScaffoldError with stderr on failure.
 
@@ -182,6 +252,7 @@ def scaffold_paths_as_they_are(
         for clone in (repo_path, repo_master):
             linked, _note = _link_ops(clone, install_data_dir, slug)
             (ops_linked if linked else ops_skipped).append(clone / "ops")
+            _seed_memory(clone, slug)  # T-0502 shared git-ignored memory dir
 
         toml_text = render_per_project_toml(
             slug, repo_path, repo_master, mother_dir
@@ -270,6 +341,7 @@ def scaffold_new_from_scratch(
         for clone in (dev, master):
             linked, _note = _link_ops(clone, install_data_dir, slug)
             (ops_linked if linked else ops_skipped).append(clone / "ops")
+            _seed_memory(clone, slug)  # T-0502 shared git-ignored memory dir
 
         toml_text = render_per_project_toml(slug, dev, master, mother_dir)
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)
@@ -358,6 +430,7 @@ def scaffold_attach_destructive(
         for clone in (dev, master):
             linked, _note = _link_ops(clone, install_data_dir, slug)
             (ops_linked if linked else ops_skipped).append(clone / "ops")
+            _seed_memory(clone, slug)  # T-0502 shared git-ignored memory dir
 
         toml_text = render_per_project_toml(slug, dev, master, mother_dir)
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)

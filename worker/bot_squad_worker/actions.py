@@ -1480,7 +1480,11 @@ def _action_operator_state_doc(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _TASK_NEW_REQUIRED = {"slug", "title"}
-_TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
+# T-0519: ``provenance`` is accepted (and required at the gate below) so a direct
+# caller of this action can no longer mint a sourceless ticket. Kept out of
+# _REQUIRED so the gate can raise a specific provenance error instead of the
+# generic "missing required params" one.
+_TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner", "provenance"}
 _TASK_NEW_TITLE_MAX = 240
 
 
@@ -1558,6 +1562,22 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     if len(title) > _TASK_NEW_TITLE_MAX:
         raise ActionError(f"task_new: title too long (max {_TASK_NEW_TITLE_MAX})")
 
+    # T-0519: provenance gate. New tickets are always post-cutoff, so provenance
+    # is always required here (the 95 pre-cutoff tickets stay grandfathered by
+    # the lint's cutoff, untouched). Validate against the canonical grammar
+    # mirror so a direct action caller gets the same gate as `bsq task new`.
+    from bot_squad_worker import provenance as _prov
+    prov = params.get("provenance")
+    prov = str(prov).strip() if prov is not None else ""
+    if not prov:
+        raise ActionError(
+            f"task_new requires provenance (cite the source) — allowed: {_prov.ALLOWED_HELP}"
+        )
+    if not _prov.provenance_valid(prov):
+        raise ActionError(
+            f"task_new: invalid provenance {prov!r} — allowed: {_prov.ALLOWED_HELP}"
+        )
+
     cfg = _get_config()
     if cfg.projects.get(slug) is None:
         raise ActionError(f"task_new: unknown project slug {slug!r}")
@@ -1577,6 +1597,7 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
         f"title: {_yaml_quote(title)}",
         "status: planned",
         f"created: {ts}",
+        f"provenance: {prov}",  # T-0519: validated above; stamp at creation
     ]
     for opt_key in ("initiative", "priority", "owner"):
         if opt_key in params:

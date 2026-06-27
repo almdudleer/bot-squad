@@ -1638,7 +1638,7 @@ def test_task_new_empty_backlog_allocates_t0001(tmp_path, tmp_config_dir, monkey
     import bot_squad_worker.actions as A
 
     backlog = _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
-    out = A.dispatch("task_new", {"slug": "test-project", "title": "first task"})
+    out = A.dispatch("task_new", {"slug": "test-project", "title": "first task", "provenance": "T-0519"})
     assert out["ok"] is True
     assert out["id"] == "T-0001"
     p = Path(out["file_path"])
@@ -1659,7 +1659,7 @@ def test_task_new_returns_t0134_for_existing_133(tmp_path, tmp_config_dir, monke
     # Seed T-0001..T-0133 as empty stubs — only the filename matters for max-id.
     for i in range(1, 134):
         (backlog / f"T-{i:04d}-seed.md").write_text("---\nid: T-XXXX\n---\n")
-    out = A.dispatch("task_new", {"slug": "test-project", "title": "next one"})
+    out = A.dispatch("task_new", {"slug": "test-project", "title": "next one", "provenance": "T-0519"})
     assert out["id"] == "T-0134"
     assert Path(out["file_path"]).name == "T-0134-next-one.md"
 
@@ -1674,7 +1674,7 @@ def test_task_new_concurrent_threads_get_distinct_ids(tmp_path, tmp_config_dir, 
     def _alloc(i: int) -> dict:
         return A.dispatch(
             "task_new",
-            {"slug": "test-project", "title": f"concurrent task {i}"},
+            {"slug": "test-project", "title": f"concurrent task {i}", "provenance": "T-0519"},
         )
 
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -1704,6 +1704,7 @@ def test_task_new_writes_optional_frontmatter_fields(tmp_path, tmp_config_dir, m
     out = A.dispatch("task_new", {
         "slug": "test-project",
         "title": "with extras",
+        "provenance": "T-0519",
         "initiative": "multi-server-installation-process.md",
         "priority": "P1",
         "owner": "alexey",
@@ -1722,7 +1723,7 @@ def test_task_new_canonicalizes_bare_initiative_to_md(tmp_path, tmp_config_dir, 
 
     _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
     out = A.dispatch("task_new", {
-        "slug": "test-project", "title": "bare init", "initiative": "ui-polish",
+        "slug": "test-project", "title": "bare init", "provenance": "T-0519", "initiative": "ui-polish",
     })
     assert 'initiative: "ui-polish.md"' in Path(out["file_path"]).read_text()
 
@@ -1733,7 +1734,7 @@ def test_task_new_quotes_titles_with_yaml_specials(tmp_path, tmp_config_dir, mon
 
     _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
     title = 'Fix: cache miss in #ingest path'
-    out = A.dispatch("task_new", {"slug": "test-project", "title": title})
+    out = A.dispatch("task_new", {"slug": "test-project", "title": title, "provenance": "T-0519"})
     body = Path(out["file_path"]).read_text()
     # Pull the title line out, parse with tomllib? No — frontmatter is YAML;
     # just confirm the quoted form is what we wrote.
@@ -1771,7 +1772,7 @@ def test_task_new_unknown_slug_raises(tmp_path, tmp_config_dir, monkeypatch):
 
     _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
     with pytest.raises(ActionError, match="unknown project slug"):
-        A.dispatch("task_new", {"slug": "no-such", "title": "x"})
+        A.dispatch("task_new", {"slug": "no-such", "title": "x", "provenance": "T-0519"})
 
 
 def test_task_new_uses_shared_counter(tmp_path, tmp_config_dir, monkeypatch):
@@ -1780,10 +1781,10 @@ def test_task_new_uses_shared_counter(tmp_path, tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 
     _setup_task_new(tmp_path, tmp_config_dir, monkeypatch)
-    A.dispatch("task_new", {"slug": "test-project", "title": "one"})
+    A.dispatch("task_new", {"slug": "test-project", "title": "one", "provenance": "T-0519"})
     counter = tmp_path / "data" / "test-project" / "_counters" / "task.txt"
     assert counter.read_text().strip() == "1"
-    A.dispatch("task_new", {"slug": "test-project", "title": "two"})
+    A.dispatch("task_new", {"slug": "test-project", "title": "two", "provenance": "T-0519"})
     assert counter.read_text().strip() == "2"
 
 

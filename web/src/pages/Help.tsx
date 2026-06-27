@@ -67,14 +67,27 @@ export function Help() {
       <section className="mc-help-section" id="backlog">
         <h2>Backlog board</h2>
         <p>
-          The board at <code>/p/&lt;project&gt;</code> shows all tasks grouped into four columns:
+          The board at <code>/p/&lt;project&gt;</code> presents the canonical task
+          lifecycle as <strong>four states</strong> — <strong>Backlog → In progress →
+          Validating → Done</strong> — shown as the overview strip above the columns.
+          Each state groups one or more of the richer internal statuses the system
+          tracks underneath:
         </p>
         <ul>
-          <li><strong>Open</strong> — ready to be picked up by an agent or the stakeholder.</li>
-          <li><strong>To Test</strong> — implementation complete; needs review / QA.</li>
-          <li><strong>Reopened</strong> — was closed, but a follow-up issue was found.</li>
-          <li><strong>Closed</strong> — done and merged to production.</li>
+          <li><strong>Backlog</strong> — queued, not yet being worked. Internal statuses:{" "}
+            <em>Planned</em> (drafted, not yet ready), <em>Open</em> (ready to pick up), and{" "}
+            <em>Reopened</em> (was closed, but a follow-up issue was found).</li>
+          <li><strong>In progress</strong> — actively being worked by an agent. Internal status:{" "}
+            <em>In progress</em>.</li>
+          <li><strong>Validating</strong> — implementation complete; needs review / QA. Internal
+            status: <em>To Test</em>.</li>
+          <li><strong>Done</strong> — finished and merged. Internal status: <em>Closed</em>.</li>
         </ul>
+        <p>
+          The four canonical states are the conceptual model; the internal statuses are a
+          non-destructive refinement (no task is renamed). <strong>Drag</strong> a card
+          between columns to change its internal status.
+        </p>
         <h3>Adding a task</h3>
         <p>
           Click <strong>+ New task</strong> (top-right of the board). Fill in a title (required),

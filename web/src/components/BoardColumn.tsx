@@ -5,6 +5,11 @@ import { TaskCard, MenuAction } from "./TaskCard";
 interface BoardColumnProps {
   title: string;
   status: Task["status"];
+  // T-0479: the canonical 4-state label this internal column rolls up into
+  // (e.g. "Backlog" for planned/open/reopened). Rendered as a small kicker
+  // above the column title so the board presents the canonical model while
+  // keeping the richer internal statuses. Omitted on the collapsed rail strip.
+  canonical?: string;
   tasks: Task[];
   slug: string;
   onMenuAction: (task: Task, action: MenuAction) => void;
@@ -39,6 +44,7 @@ export function sortByPriority(tasks: Task[]): Task[] {
 export function BoardColumn({
   title,
   status,
+  canonical,
   tasks,
   slug,
   onMenuAction,
@@ -147,6 +153,9 @@ export function BoardColumn({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {canonical && (
+        <div className="mc-board-canonical-kicker">{canonical}</div>
+      )}
       <div
         className="mc-board-col-header"
         onClick={railMode === "expanded" ? onToggleRail : undefined}

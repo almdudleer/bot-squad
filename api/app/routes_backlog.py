@@ -26,6 +26,10 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
+# The six internal statuses are the SSOT for what a task may be. They are a
+# refinement of the stakeholder's canonical 4-state model (backlog/in-progress/
+# validating/done) — see app.canonical_status for the non-destructive mapping
+# layer (T-0479) and docs/design/status-canonical-mapping.md.
 _VALID_STATUSES = {"planned", "open", "in_progress", "totest", "reopened", "closed"}
 
 

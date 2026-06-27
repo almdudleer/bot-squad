@@ -1185,6 +1185,49 @@ pre.bg-light {
 }
 
 /* ---- Task board ------------------------------------------ */
+/* T-0479: canonical 4-state overview strip + per-column canonical kicker.
+   The board surfaces the stakeholder's model (backlog → in-progress →
+   validating → done) on top of the richer 6 internal statuses. */
+.mc-canon-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.25rem 0 0.75rem;
+  font-family: var(--mc-mono);
+}
+.mc-canon-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--mc-cyan);
+  font-weight: 700;
+}
+.mc-canon-pill-count {
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  background: var(--mc-surface-raised);
+  border: 1px solid var(--mc-border-strong);
+  border-radius: 2px;
+  padding: 1px 6px;
+}
+.mc-canon-pill-arrow {
+  color: var(--mc-text-faint);
+  margin: 0 0.15rem;
+  font-weight: 400;
+}
+.mc-board-canonical-kicker {
+  font-family: var(--mc-mono);
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--mc-text-faint);
+  font-weight: 700;
+  margin-bottom: 0.2rem;
+}
 .mc-board-col-header {
   font-family: var(--mc-mono);
   font-size: 0.66rem;

@@ -20,7 +20,17 @@ import {
 } from "../onboarding/copy";
 
 import { PageHelp } from "../components/PageHelp";
-const COLUMNS = ["planned", "open", "in_progress", "totest", "reopened", "closed"] as const;
+import {
+  CANONICAL_LABELS,
+  CANONICAL_STATE,
+  CANONICAL_STATES,
+  type CanonicalState,
+} from "../canonicalStatus";
+// T-0479: column order tracks the canonical 4-state model (backlog →
+// in-progress → validating → done), so the internal statuses that roll up into
+// the same canonical state sit adjacent. backlog = planned/open/reopened;
+// in-progress = in_progress; validating = totest; done = closed.
+const COLUMNS = ["planned", "open", "reopened", "in_progress", "totest", "closed"] as const;
 const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
   planned: "Planned",
   open: "Open",
@@ -32,6 +42,40 @@ const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
 // T-0058: the two "rail" columns — render as a thin drop-strip by default,
 // expand on click. Only one is expanded at a time (other auto-collapses).
 const RAIL_STATUSES: ReadonlySet<typeof COLUMNS[number]> = new Set(["planned", "closed"]);
+
+// T-0479: tally the visible tasks into the canonical 4 states.
+function canonicalCounts(tasks: Task[]): Record<CanonicalState, number> {
+  const acc: Record<CanonicalState, number> = {
+    backlog: 0,
+    "in-progress": 0,
+    validating: 0,
+    done: 0,
+  };
+  for (const t of tasks) {
+    const cs = CANONICAL_STATE[t.status as keyof typeof CANONICAL_STATE];
+    if (cs) acc[cs] += 1;
+  }
+  return acc;
+}
+
+// T-0479: the canonical 4-state overview strip shown above the board. Presents
+// the stakeholder's model (backlog → in-progress → validating → done) with the
+// internal statuses grouped beneath it in the columns themselves.
+function CanonicalSummary({ counts }: { counts: Record<CanonicalState, number> }) {
+  return (
+    <div className="mc-canon-summary" role="list" aria-label="Canonical task states">
+      {CANONICAL_STATES.map((cs, i) => (
+        <div key={cs} className="mc-canon-pill" role="listitem">
+          <span className="mc-canon-pill-label">{CANONICAL_LABELS[cs]}</span>
+          <span className="mc-canon-pill-count">{counts[cs]}</span>
+          {i < CANONICAL_STATES.length - 1 && (
+            <span className="mc-canon-pill-arrow" aria-hidden>→</span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 type ModalKind = "create" | "editBody" | "addComment" | "setInitiative" | null;
 type GroupBy = "none" | "initiative";
@@ -661,9 +705,11 @@ export function Project() {
         onClose={() => setAutopilotOpen(false)}
       />
       <PageHelp>
-        Open work for this project across six statuses (Planned → Closed). <strong>Drag</strong> a card
-        to change status, <strong>click</strong> a card for full detail, or <strong>⋯</strong>
-        for the quick menu (status / edit body / comment / delete).
+        Open work for this project across the canonical lifecycle — <strong>Backlog →
+        In progress → Validating → Done</strong> (the overview strip), refined into six
+        internal statuses in the columns. <strong>Drag</strong> a card to change status,
+        <strong>click</strong> a card for full detail, or <strong>⋯</strong> for the quick
+        menu (status / edit body / comment / delete).
       </PageHelp>
 
       {/* T-0230: resource telemetry panel relocated to the Agent sessions page. */}
@@ -719,6 +765,11 @@ export function Project() {
         </div>
       </div>
 
+      {groupBy === "none" && (
+        // T-0479: the canonical 4-state model (backlog → in-progress →
+        // validating → done) surfaced above the richer 6-status columns.
+        <CanonicalSummary counts={canonicalCounts(ungroupedTasks)} />
+      )}
       {groupBy === "none" ? (
         viewMode === "board" ? (
           <div className="mc-board-row mt-1">
@@ -727,6 +778,7 @@ export function Project() {
                 key={c}
                 title={COLUMN_LABELS[c]}
                 status={c}
+                canonical={CANONICAL_LABELS[CANONICAL_STATE[c]]}
                 tasks={grouped[c]}
                 slug={slug}
                 onMenuAction={handleMenuAction}
@@ -1110,7 +1162,7 @@ function InitiativeLane({
             color: "var(--mc-text-dim)",
             marginLeft: "0.5rem",
           }}
-          title="planned / open / in-progress / to-test / reopened / closed"
+          title="planned / open / reopened / in-progress / to-test / closed"
         >
           {COLUMNS.map((c) => `${counts[c]}`).join(" / ")}
         </span>
@@ -1132,6 +1184,7 @@ function InitiativeLane({
               key={c}
               title={COLUMN_LABELS[c]}
               status={c}
+              canonical={CANONICAL_LABELS[CANONICAL_STATE[c]]}
               tasks={grouped[c]}
               slug={slug}
               onMenuAction={onMenuAction}
@@ -1188,6 +1241,7 @@ function ListBoard({ tasks, slug, onMenuAction, hideInitiative = false }: ListBo
         const sorted = sortByPriority(grouped[c]);
         return (
           <div key={c} className="mb-3">
+            <div className="mc-board-canonical-kicker">{CANONICAL_LABELS[CANONICAL_STATE[c]]}</div>
             <div className="mc-board-col-header" style={{ marginBottom: "0.35rem" }}>
               <span>{COLUMN_LABELS[c]}</span>
               <span className="mc-board-count">{sorted.length}</span>

@@ -2398,6 +2398,130 @@ def cmd_guidance_search(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# task search / similar (T-0486, Process Paradigm M4/F4.2) — surface backlog
+# tickets similar to a free-text input or a seed ticket, so a task-ingest
+# session can decide clarify-vs-create (append to an existing task vs mint a
+# new one). The ranking lives in the pure ``task_search`` helper module (kept
+# out of this co-edit hotspot + unit-testable); here we only read the backlog
+# into Ticket records, call rank(), and render. Append-to-existing is the
+# existing `bsq ticket note <id>`; create-new is `bsq task new` — the `dup`
+# flag is the signal that says which branch the ingest session should take.
+# --------------------------------------------------------------------------
+# Max matched-tokens shown per candidate in the human render (JSON keeps all).
+_MATCHED_SHOWN = 12
+
+
+def _load_task_search():
+    """Load the sibling ``task_search.py`` helper relative to this script
+    (robust under the ~/.local/bin/bsq symlink — mirrors how the tests load
+    bsq itself, no reliance on sys.path/cwd)."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    p = Path(__file__).resolve().parent / "task_search.py"
+    if "bsq_task_search" in sys.modules:
+        return sys.modules["bsq_task_search"]
+    loader = SourceFileLoader("bsq_task_search", str(p))
+    spec = importlib.util.spec_from_loader("bsq_task_search", loader)
+    mod = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: dataclass() under `from __future__ import annotations`
+    # looks the module up in sys.modules to resolve string annotations.
+    sys.modules["bsq_task_search"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def _load_backlog_tickets(slug: str) -> list:
+    """Read every backlog ticket into ``task_search.Ticket`` records
+    (id/title/status from frontmatter, body = md minus frontmatter)."""
+    ts = _load_task_search()
+    out = []
+    for p in sorted(backlog_dir(slug).glob("T-*.md")):
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fm = read_frontmatter(p)
+        body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
+        tid = fm.get("id") or p.stem.split("-")[0] + "-" + p.stem.split("-")[1]
+        out.append(ts.Ticket(
+            id=str(tid).strip(),
+            title=str(fm.get("title") or p.stem),
+            body=body,
+            status=str(fm.get("status") or ""),
+        ))
+    return out
+
+
+def _render_candidates(slug: str, query: str, cands: list, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({
+            "query": query,
+            "candidates": [
+                {"id": c.id, "title": c.title, "status": c.status,
+                 "score": c.score, "matched": c.matched, "dup": c.dup}
+                for c in cands
+            ],
+        }))
+        return
+    if not cands:
+        print(f"(no similar backlog tasks for: {query!r} — looks like a NEW task)")
+        return
+    print(f"similar backlog tasks for [{query}] — top {len(cands)}:\n")
+    for c in cands:
+        flag = "  ⚠ likely duplicate" if c.dup else ""
+        st = f" · {c.status}" if c.status else ""
+        print(f"• {c.id}  (score {c.score}{st}){flag}")
+        print(f"    {c.title}")
+        # Cap the human-readable matched list: a ticket-seeded `similar --from
+        # <id>` query carries the whole body, so an uncapped list dumps 80+
+        # tokens of noise. JSON output (above) keeps the full set for machine
+        # consumers; humans just need the gist of why it matched.
+        shown = c.matched[:_MATCHED_SHOWN]
+        more = len(c.matched) - len(shown)
+        tail = f" (+{more} more)" if more > 0 else ""
+        print(f"    matched: {', '.join(shown)}{tail}\n")
+    if any(c.dup for c in cands):
+        print("⚠ likely-duplicate hit(s) above — consider CLARIFYING the existing "
+              "task (`bsq ticket note <id> ...`) instead of creating a new one.")
+
+
+def cmd_task_search(args) -> None:
+    slug = resolve_slug()
+    query = " ".join(args.query).strip()
+    if not query:
+        die("task search needs a query, e.g. `bsq task search deploy precheck dirty`")
+    ts = _load_task_search()
+    cands = ts.rank(query, _load_backlog_tickets(slug), limit=args.limit)
+    _render_candidates(slug, query, cands, args.json)
+
+
+def cmd_task_similar(args) -> None:
+    slug = resolve_slug()
+    seed = (args.from_ or "").strip()
+    if not seed:
+        die("task similar needs --from <id-or-text>")
+    ts = _load_task_search()
+    tickets = _load_backlog_tickets(slug)
+    exclude_id = None
+    query = seed
+    # If --from looks like a ticket id and resolves, seed from its title+body
+    # (and exclude it from its own results).
+    if re.fullmatch(r"[Tt]-\d+", seed):
+        tid = seed.upper()
+        match = next((t for t in tickets if t.id == tid), None)
+        if match is None:
+            die(f"task similar: ticket {tid} not found (use free text with --from "
+                f"to search by description instead)")
+        exclude_id = tid
+        query = f"{match.title} {match.body}"
+        label = f"{tid} ({match.title})"
+    else:
+        label = repr(seed)
+    cands = ts.rank(query, tickets, exclude_id=exclude_id, limit=args.limit)
+    _render_candidates(slug, label, cands, args.json)
+
+
+# --------------------------------------------------------------------------
 # ticket verbs (T-0152) — make bot-squad-ticket-bound work feel native so
 # sessions stop wandering into ~/.claude/superpowers/* docs to track work.
 # --------------------------------------------------------------------------
@@ -3332,6 +3456,22 @@ def build_parser() -> argparse.ArgumentParser:
     tnn.add_argument("--priority", help="priority value (frontmatter, verbatim)")
     tnn.add_argument("--owner", help="owner role/name (frontmatter)")
     tnn.set_defaults(func=cmd_task_new)
+    # task search / similar (T-0486) — dedupe / clarify-vs-create tooling.
+    tns = tn_sub.add_parser(
+        "search",
+        help="surface backlog tasks similar to a free-text query (dedupe / clarify-vs-create)")
+    tns.add_argument("query", nargs="+", help="free-text query, e.g. deploy precheck dirty")
+    tns.add_argument("--limit", type=int, default=10, help="max candidates (default 10)")
+    tns.add_argument("--json", action="store_true", help="raw JSON output (for ingest sessions)")
+    tns.set_defaults(func=cmd_task_search)
+    tnsi = tn_sub.add_parser(
+        "similar",
+        help="rank tasks similar to a seed ticket id or free text (--from)")
+    tnsi.add_argument("--from", dest="from_", required=True,
+                      help="seed: a ticket id (e.g. T-0225, excluded from results) or free text")
+    tnsi.add_argument("--limit", type=int, default=10, help="max candidates (default 10)")
+    tnsi.add_argument("--json", action="store_true", help="raw JSON output (for ingest sessions)")
+    tnsi.set_defaults(func=cmd_task_similar)
 
     # docs (T-0172 docs system): new / list / link / sync. `doc` + `docs` both work.
     dn = sub.add_parser("doc", aliases=["docs"], help="project docs (T-0172): new / list / link / sync")

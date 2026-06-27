@@ -828,6 +828,37 @@ def test_patch_body_non_canonical_sections_survive(tmp_bot_squad: Path, monkeypa
     assert "## Finding" in verbatim
 
 
+# T-0481 / M3+M8: frontmatter-only write paths must leave the body (hence
+# Verbatim) untouched. Together with the body-replace tests above + the
+# append_progress tests in test_task_body, this proves Verbatim is read-only
+# across EVERY task write path (status/linkage PATCH, priority PATCH, body PATCH,
+# progress append). merge_task_update(body=None) keeps the on-disk body verbatim.
+def test_status_patch_does_not_touch_verbatim(tmp_bot_squad: Path, monkeypatch):
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    tid = _create_with_body(
+        client, "## Verbatim request\n\nSACRED WORDS\n\n## Context\n\nc\n"
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}", json={"status": "in_progress"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["verbatim"] == "SACRED WORDS"
+    assert r.json()["status"] == "in_progress"
+
+
+def test_priority_patch_does_not_touch_verbatim(tmp_bot_squad: Path, monkeypatch):
+    client = _client_logged_in(tmp_bot_squad, monkeypatch)
+    tid = _create_with_body(
+        client, "## Verbatim request\n\nSACRED WORDS\n\n## Context\n\nc\n"
+    )
+    r = client.patch(
+        f"/api/projects/test-project/backlog/{tid}/priority", json={"priority": 7}
+    )
+    assert r.status_code == 200, r.text
+    # The priority-patch response is section-enriched; verbatim must be intact.
+    assert r.json()["verbatim"] == "SACRED WORDS"
+
+
 # ---------------------------------------------------------------------------
 # T-0335 item-14: PATCH body must regraft the append-only ## Progress feed
 # (Progress is the on-disk SSOT — an "Edit body" must never rewrite history).

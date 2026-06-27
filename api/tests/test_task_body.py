@@ -6,6 +6,7 @@ from app.task_body import (
     compose_body,
     parse_body,
     regraft_progress,
+    regraft_verbatim,
 )
 
 
@@ -152,3 +153,49 @@ def test_regraft_progress_noop_when_original_has_none():
     edited = "## Verbatim request\n\nV\n\n## Progress\n\n- new · feed · x\n"
     out = regraft_progress(original, edited)
     assert "new · feed · x" in parse_body(out)["progress"]
+
+
+# --- T-0481 / M3+M8: regraft_verbatim (Verbatim is human-only — read-only on
+# every body write). These mirror the regraft_progress unit tests and pin the
+# function's branches directly (previously covered only via PATCH integration).
+
+def test_regraft_verbatim_restores_original():
+    """A body edit that rewrites Verbatim is forced back to the on-disk words;
+    other sections (Context) keep the caller's edit."""
+    original = "## Verbatim request\n\nSTAKEHOLDER WORDS\n\n## Context\n\nold\n"
+    edited = "## Verbatim request\n\nHIJACKED by an agent\n\n## Context\n\nNEW context\n"
+    out = regraft_verbatim(original, edited)
+    sections = parse_body(out)
+    assert sections["verbatim"] == "STAKEHOLDER WORDS"
+    assert "HIJACKED" not in out
+    assert sections["context"] == "NEW context"
+
+
+def test_regraft_verbatim_reappends_when_caller_drops_it():
+    """A body that drops the Verbatim heading must not lose it — the original
+    section is re-prepended."""
+    original = "## Verbatim request\n\nKEEP THIS\n\n## Context\n\nc\n"
+    edited = "## Context\n\nonly context now\n"
+    out = regraft_verbatim(original, edited)
+    sections = parse_body(out)
+    assert sections["verbatim"] == "KEEP THIS"
+    assert sections["context"] == "only context now"
+
+
+def test_regraft_verbatim_noop_when_original_has_none():
+    """No on-disk Verbatim → nothing to protect, caller's body is untouched
+    (legacy/QA tickets without a canonical Verbatim section)."""
+    original = "## Context\n\nc\n"
+    edited = "## Verbatim request\n\nadded by caller\n\n## Context\n\nc\n"
+    out = regraft_verbatim(original, edited)
+    assert parse_body(out)["verbatim"] == "added by caller"
+
+
+def test_regraft_verbatim_preserves_non_canonical_sections():
+    """Re-grafting Verbatim must not mangle non-canonical sections (Finding/DoD
+    on QA tickets): the DoD edit lands, only Verbatim is forced back."""
+    original = "## Verbatim request\n\nSACRED\n\n## Finding\n\nbug\n\n## DoD\n\nold dod\n"
+    edited = "## Verbatim request\n\nTAMPER\n\n## Finding\n\nbug\n\n## DoD\n\nnew dod\n"
+    out = regraft_verbatim(original, edited)
+    assert "SACRED" in out and "TAMPER" not in out
+    assert "new dod" in out and "## Finding" in out

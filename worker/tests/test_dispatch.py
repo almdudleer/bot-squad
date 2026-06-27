@@ -230,6 +230,108 @@ def test_missing_telemetry_record_treated_as_headroom(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# T-0468 — the reuse-vs-spawn decision CONSUMES the exit-resume hint
+# ---------------------------------------------------------------------------
+
+def _stamp_hint(cfg, sid, *, recommended=False, reason="r", when="w", summary="s"):
+    """Add a T-0468 exit-resume hint (flat keys) to an existing session md."""
+    p = cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+    meta = S._read_session_metadata(p)
+    meta["resume_recommended"] = recommended
+    meta["resume_hint_reason"] = reason
+    meta["resume_hint_when"] = when
+    meta["last_work_summary"] = summary
+    _write_session_metadata(p, meta)
+
+
+def test_decide_dispatch_surfaces_resume_hint_same_initiative(tmp_path):
+    """An EXITED same-initiative dev with a hint is surfaced in resume_hints, so
+    the operator can state resume-vs-fresh — the DoD 'consumes the hint'."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev",
+                  initiative="alpha.md", status="suspended")
+    _stamp_hint(cfg, "S-u-d1-dev-p1", summary="dev on T-0001 — reached totest")
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert len(res["resume_hints"]) == 1
+    h = res["resume_hints"][0]
+    assert h["sid"] == "S-u-d1-dev-p1"
+    assert h["initiative_match"] is True
+    assert h["resume_recommended"] is False
+    assert h["last_work_summary"] == "dev on T-0001 — reached totest"
+
+
+def test_decide_dispatch_hint_held_task_surfaced_even_when_skipped_as_candidate(tmp_path):
+    """A suspended session that RAN this exact task (e.g. it was reopened) is the
+    most relevant resume target — its hint must surface even though the session
+    is skipped as a reuse candidate (it 'holds' the task)."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0009",
+                  initiative="alpha.md", status="suspended")
+    _stamp_hint(cfg, "S-u-d1-dev-p1")
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert [h["sid"] for h in res["resume_hints"]] == ["S-u-d1-dev-p1"]
+    assert res["resume_hints"][0]["held_task"] is True
+
+
+def test_decide_dispatch_recommended_resume_hint_steers_spawn_reason(tmp_path):
+    """When no live reuse target exists but an exited session RECOMMENDS resume
+    (work in flight), the spawn reason points the operator at --resume."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev",
+                  initiative="alpha.md", status="suspended")
+    _stamp_hint(cfg, "S-u-d1-dev-p1", recommended=True)
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["decision"] == "spawn"
+    assert "S-u-d1-dev-p1" in res["reason"]
+    assert "--resume" in res["reason"]
+
+
+def test_decide_dispatch_ignores_hint_on_different_initiative(tmp_path):
+    """An exited session on a DIFFERENT initiative is not relevant to this task —
+    its hint is not surfaced."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev",
+                  initiative="beta.md", status="suspended")
+    _stamp_hint(cfg, "S-u-d1-dev-p1")
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["resume_hints"] == []
+
+
+def test_decide_dispatch_ignores_hint_on_live_session(tmp_path):
+    """A LIVE session is handled by the reuse heuristic, not the resume-hint path
+    (the hint is about EXITED sessions). A stray hint on a live md is ignored."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev",
+                  initiative="alpha.md", status="active")
+    _stamp_hint(cfg, "S-u-d1-dev-p1")
+    _set_context_pct(cfg, "S-u-d1-dev-p1", 10.0)
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["resume_hints"] == []
+    assert res["decision"] == "reuse"  # still a valid live reuse target
+
+
+def test_decide_dispatch_no_hint_field_absent(tmp_path):
+    """A session md with no hint stamped contributes nothing to resume_hints."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev",
+                  initiative="alpha.md", status="suspended")
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["resume_hints"] == []
+
+
+# ---------------------------------------------------------------------------
 # T-0472 — operator as transient dispatcher: standing task + one-per-project
 # ---------------------------------------------------------------------------
 

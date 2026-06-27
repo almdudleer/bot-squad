@@ -120,6 +120,91 @@ def exit_due(idle_age: float | None, grace: int) -> bool:
     return idle_age >= grace
 
 
+# --- T-0468 / M1-F1.5: exit-resume hint -------------------------------------
+#
+# SOURCE-VERBATIM Part A: *"The sessions can search the exited sessions history,
+# but full conversation reread (e.g. via --resume) is discouraged in many cases.
+# In fact on exit the sessions should state whether and when it will be better to
+# resume this session rather than starting a new one from documented progress."*
+#
+# A graceful exit fires ONLY when work is DONE (terminal task / empty backlog),
+# so BY CONSTRUCTION the deliverable already exists and is documented (committed
+# code + progress notes for a dev/TL; the backlog artifact for an operator) and
+# the exited session's history stays searchable. The uniform lifecycle keeps
+# continuity in those ARTIFACTS, not in a kept-alive conversation — a fresh
+# session (or the operator's artifact-driven respawn, :mod:`operator_redrive`,
+# which RESPAWNS from the backlog, never resumes) plans from the deliverable. So
+# at a clean work-done exit ``claude --resume`` (a full conversation reread) buys
+# little and costs a whole context reload: ``resume_recommended`` is False, and
+# the hint states the narrow ``when`` under which a human should still prefer it.
+#
+# The hint is general (a future non-graceful exit path could pass a non-terminal
+# status — work INTERRUPTED, the deliverable does NOT yet capture it — and then
+# resume DOES beat fresh): ``compute_resume_hint`` returns True for that branch,
+# so the policy is genuinely two-valued, not a constant.
+
+
+def _last_work_summary(role: str, task_id: Any, task_status: str) -> str:
+    """A short, factual record of what the session last did — the one
+    continuity breadcrumb EXIT can honestly stamp (the record-free exit can't
+    re-ask the session for a narrative, so this is derived, not authored)."""
+    if role == "operator":
+        return "operator — backlog cleared (no actionable task left)"
+    if task_id and task_id != "~":
+        return f"{role} on {task_id} — reached {task_status or 'done'}"
+    return f"{role} — work done"
+
+
+def compute_resume_hint(role: str, task_id: Any, task_status: str,
+                        last_work_summary: str) -> dict:
+    """The exit-resume hint: whether/when resuming THIS session beats a fresh
+    start from documented progress (SOURCE-VERBATIM Part A).
+
+    Policy — resume is DISCOURAGED after a documented-done exit (the deliverable
+    is the source of truth and the history stays searchable); it is only
+    RECOMMENDED when the session exits with work still in flight that the
+    deliverable does not yet capture. Returns the four DoD fields.
+    """
+    documented_done = role == "operator" or (task_status in DONE_STATUSES)
+    if role == "operator":
+        reason = (
+            "operator exited on an empty backlog; it is re-driven FRESH from the "
+            "backlog artifact when work lands (operator_redrive respawns, it does "
+            "not resume), so resuming this conversation adds nothing."
+        )
+        when = (
+            "not needed for continuity — the next operator respawns from the "
+            "backlog; resume only to audit THIS run's orchestration reasoning."
+        )
+    elif documented_done:
+        reason = (
+            f"work committed and reported (status {task_status or 'done'}); the "
+            "deliverable + progress notes are the source of truth and the session "
+            "history stays searchable, so a fresh session plans from the "
+            "deliverable — a full --resume reread is discouraged."
+        )
+        when = (
+            f"resume only if {task_id} is REOPENED and you need in-context "
+            "reasoning the commit + progress notes don't capture; otherwise start "
+            "fresh from the deliverable and search the exited history."
+        )
+    else:
+        # Work interrupted (a non-terminal status reaching an exit path): the
+        # deliverable does NOT yet capture the in-context state, so resume wins.
+        reason = (
+            f"session exited with work still in progress (status "
+            f"{task_status or 'unknown'}); resuming preserves in-context state "
+            "not yet in the deliverable."
+        )
+        when = "resume now — before starting any fresh session on this work."
+    return {
+        "resume_recommended": not documented_done,
+        "reason": reason,
+        "when": when,
+        "last_work_summary": last_work_summary,
+    }
+
+
 # --- side-effecting seam (monkeypatched in tests) ---------------------------
 
 def _suspend(cfg: Any, slug: str, sid: str) -> None:
@@ -128,6 +213,28 @@ def _suspend(cfg: Any, slug: str, sid: str) -> None:
     (T-0444)."""
     sessions.suspend(cfg, slug, sid, source="graceful-exit",
                      reason="work done — graceful exit (T-0465)")
+
+
+def _stamp_resume_hint(cfg: Any, slug: str, sid: str, role: str,
+                       task_id: Any, task_status: str) -> dict:
+    """Stamp the T-0468 exit-resume hint onto the just-suspended session md.
+
+    Stored as FLAT frontmatter scalars (mirroring suspend_source/reason, T-0444)
+    — the line-oriented frontmatter round-trips bool + colon-strings safely, a
+    nested dict does not. Stamped AFTER ``_suspend`` because ``sessions.suspend``
+    rebuilds the md (a fresh dict) on the live-pane path and would drop a
+    stamp-before. ``decide_dispatch`` reads these keys back. Best-effort: a stamp
+    failure must never undo the exit (the session is already suspended)."""
+    hint = compute_resume_hint(
+        role, task_id, task_status, _last_work_summary(role, task_id, task_status))
+    meta_file = sessions._session_file(cfg.data_dir, slug, sid)
+    existing = sessions._read_session_metadata(meta_file) or {}
+    existing["resume_recommended"] = hint["resume_recommended"]
+    existing["resume_hint_reason"] = hint["reason"]
+    existing["resume_hint_when"] = hint["when"]
+    existing["last_work_summary"] = hint["last_work_summary"]
+    sessions._write_session_metadata(meta_file, existing, atomic=True)
+    return hint
 
 
 def _idle_age(row: dict, user_home: str, now: float) -> float | None:
@@ -187,6 +294,13 @@ def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bo
     except Exception:
         log.exception("graceful_exit: suspend failed for %s (will retry)", sid)
         return False
+    # T-0468: stamp the exit-resume hint onto the now-suspended md so the
+    # operator's reuse-vs-spawn decision can state resume-vs-fresh. Best-effort —
+    # the session is already exited; a stamp failure must not flip the result.
+    try:
+        _stamp_resume_hint(cfg, slug, sid, role, task_id, task_status)
+    except Exception:
+        log.exception("graceful_exit: resume-hint stamp failed for %s", sid)
     log.info("graceful_exit: %s (%s) work done — suspended (no relaunch)", sid, role)
     return True
 

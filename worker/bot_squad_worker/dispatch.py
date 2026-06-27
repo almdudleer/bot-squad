@@ -174,6 +174,21 @@ def _task_initiative(matches) -> str | None:
     return init
 
 
+def _resume_hint(meta: dict) -> dict | None:
+    """The T-0468 exit-resume hint a graceful exit stamped on a session md, or
+    None when absent. Flat keys mirror the ``graceful_exit._stamp_resume_hint``
+    stamp (a nested dict is unsafe in the line-oriented frontmatter). Presence is
+    keyed on ``resume_recommended`` — the one field every stamp writes."""
+    if meta is None or "resume_recommended" not in meta:
+        return None
+    return {
+        "resume_recommended": bool(meta.get("resume_recommended")),
+        "reason": meta.get("resume_hint_reason") or "",
+        "when": meta.get("resume_hint_when") or "",
+        "last_work_summary": meta.get("last_work_summary") or "",
+    }
+
+
 def _session_context_pct(cfg: Any, slug: str, sid: str) -> float:
     """A session's last-sampled context-usage %, or 0.0 when no telemetry record
     exists yet (a brand-new session is assumed to have full headroom)."""
@@ -211,12 +226,32 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
 
     sess_dir = data_dir / slug / "sessions"
     candidates: list[dict] = []
+    resume_hints: list[dict] = []
     if sess_dir.exists():
         for md in sorted(sess_dir.glob("*.md")):
             meta = S._read_session_metadata(md)
             if meta is None:
                 continue
             sid = meta.get("sid", md.stem)
+
+            # T-0468: surface the exit-resume hint from EXITED (non-live)
+            # sessions whose history bears on this task — same initiative, or
+            # they ran this exact task (a reopened task's best resume target is
+            # the session that did it). This is how the reuse-vs-spawn decision
+            # "consumes the hint": the operator sees, per relevant exited
+            # session, whether/when resuming it beats a fresh start. Computed
+            # BEFORE the holds-this-task skip below (else a same-task exited
+            # session would be dropped — and it is the most relevant hint).
+            hint = _resume_hint(meta)
+            if hint is not None and not S._is_live_holder(meta):
+                held_task = task_id in S._full_task_set(meta)
+                init_match = bool(task_init) and task_init in S._full_initiative_set(meta)
+                if held_task or init_match:
+                    resume_hints.append({
+                        "sid": sid, "initiative_match": init_match,
+                        "held_task": held_task, **hint,
+                    })
+
             # A session already holding this task is the binding itself, not a
             # reuse target — skip it.
             if task_id in S._full_task_set(meta):
@@ -283,6 +318,17 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
                 f"spawn: no idle same-initiative ({task_init}) dev with context "
                 f"headroom (< {threshold}%)"
             )
+        # T-0468: when no LIVE reuse target exists but an EXITED session
+        # recommends resuming it (work was in flight, not documented-done), point
+        # the operator at `claude --resume` instead of a fresh spawn — the one
+        # case where resuming an exited session genuinely beats starting fresh.
+        recommend = [h for h in resume_hints if h.get("resume_recommended")]
+        if recommend:
+            sids = ", ".join(h["sid"] for h in recommend)
+            reason += (
+                f"; but exited session(s) {sids} recommend --resume "
+                "(see resume_hints)"
+            )
 
     return {
         "ok": True,
@@ -292,4 +338,5 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
         "target_sid": target,
         "reason": reason,
         "candidates": candidates,
+        "resume_hints": resume_hints,
     }

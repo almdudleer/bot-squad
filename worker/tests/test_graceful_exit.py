@@ -256,6 +256,72 @@ def test_operator_totest_task_still_pending(tmp_path, seams):
     assert seams["calls"]["suspend"] == []
 
 
+# --- T-0468: exit-resume hint (whether/when resume beats a fresh start) ------
+
+def test_compute_resume_hint_dev_done_discourages_resume():
+    """A documented-done dev exit: resume NOT recommended (deliverable is the
+    source of truth + history searchable), with a reopen-only `when`."""
+    h = GE.compute_resume_hint("dev", "T-0042", "totest", "dev on T-0042 — reached totest")
+    assert h["resume_recommended"] is False
+    assert "discouraged" in h["reason"]
+    assert "REOPENED" in h["when"]
+    assert h["last_work_summary"] == "dev on T-0042 — reached totest"
+
+
+def test_compute_resume_hint_operator_discourages_resume():
+    """An operator empty-backlog exit: re-driven fresh from the backlog
+    (operator_redrive respawns, not resumes) → resume not recommended."""
+    h = GE.compute_resume_hint("operator", None, "", "operator — backlog cleared")
+    assert h["resume_recommended"] is False
+    assert "respawn" in h["reason"].lower()
+
+
+def test_compute_resume_hint_in_flight_recommends_resume():
+    """A NON-terminal status (work interrupted, deliverable doesn't capture it):
+    resume DOES beat fresh — the policy is genuinely two-valued."""
+    for st in ("in_progress", "open", "reopened"):
+        h = GE.compute_resume_hint("dev", "T-0042", st, "s")
+        assert h["resume_recommended"] is True, st
+        assert "resume now" in h["when"].lower()
+
+
+def test_last_work_summary_by_role():
+    assert "backlog cleared" in GE._last_work_summary("operator", None, "")
+    assert GE._last_work_summary("dev", "T-0042", "totest") == "dev on T-0042 — reached totest"
+    assert GE._last_work_summary("dev", "~", "") == "dev — work done"
+
+
+def test_maybe_exit_stamps_resume_hint_on_md(tmp_path, seams):
+    """On a graceful exit the four DoD hint fields are WRITTEN to the session md
+    (read back from disk — the suspend seam is stubbed, so this proves the stamp
+    is a distinct step, not a side effect of suspend)."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is True
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resume_recommended"] is False
+    assert meta["resume_hint_reason"]
+    assert meta["resume_hint_when"]
+    assert meta["last_work_summary"] == "dev on T-0042 — reached totest"
+
+
+def test_maybe_exit_stamp_failure_does_not_undo_exit(tmp_path, seams, monkeypatch):
+    """The stamp is best-effort: if it raises, the session is still reported
+    suspended (it already exited — a stamp failure must not flip the result)."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    monkeypatch.setattr(GE, "_stamp_resume_hint",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+
+
 # --- gates ------------------------------------------------------------------
 
 def test_kill_switch_disables_exit(tmp_path, seams, monkeypatch):

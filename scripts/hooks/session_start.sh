@@ -587,6 +587,7 @@ if [ -n "$active_init" ] && [ -f "$DATA/vision/initiatives/$active_init" ]; then
     echo "- Your initiative    : $DATA/vision/initiatives/$active_init  (your bound scope)"
 fi
 echo "- Constitution       : $DATA/vision/constitution.md  (governance — consult when in doubt)"
+echo "- Knowledge home rule: framework how-to -> skills; project-specific -> project docs ($DATA/docs/architecture/D-0040); what goes in memory vs files vs tasks ($DATA/docs/architecture/D-0041)"
 echo "- Full briefing      : run \`bsq brief\`  (product + team protocol + role contract + your bindings)"
 
 # Phase 9: surface extra bindings (multi-task devs, multi-initiative TLs).

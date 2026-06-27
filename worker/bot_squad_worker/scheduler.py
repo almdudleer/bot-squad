@@ -22,6 +22,7 @@ from bot_squad_worker.jobs import (
     constant_team_tick,
     deploy_monitor_one,
     drift_check_tick,
+    graceful_exit_tick,
     heartbeat,
     idle_timeout_tick,
     oauth_refresh,
@@ -176,6 +177,25 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="idle_timeout",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # graceful_exit_tick: T-0465 / M1-F1.2 — the uniform lifecycle's work-done →
+    # graceful-exit path. Suspends (NO relaunch) an active session whose
+    # assignment is DONE — a task-bound role whose task reached totest/closed, or
+    # an operator whose backlog is empty — once it has gone quiet (post-done
+    # grace) and its pane is idle/composer-ready. Sibling of idle_timeout (its own
+    # 60s job): the two cover the two "never block indefinitely" outcomes
+    # (done→exit / waiting→recycle). No-op under BOT_SQUAD_GRACEFUL_EXIT=0.
+    # max_instances=1 + coalesce; idempotent (a suspended session is skipped next
+    # pass).
+    sched.add_job(
+        graceful_exit_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="graceful_exit",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

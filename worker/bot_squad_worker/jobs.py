@@ -503,6 +503,23 @@ def idle_timeout_tick(cfg: Config) -> None:
         log.exception("idle_timeout_tick error")
 
 
+def graceful_exit_tick(cfg: Config) -> None:
+    """T-0465 / M1-F1.2: the uniform lifecycle's work-done → graceful-exit path.
+
+    Suspends (NO relaunch) any active session whose assignment is DONE — a
+    task-bound role whose task reached ``totest``/``closed``, or an operator whose
+    backlog is empty — once it has gone quiet (post-done grace) and its pane is
+    idle/composer-ready. Sibling of idle_timeout_tick (its own 60s job). No-op
+    under ``BOT_SQUAD_GRACEFUL_EXIT=0``. The sweep swallows per-session/per-project
+    errors so one bad session never kills it.
+    """
+    from bot_squad_worker import graceful_exit as _graceful_exit
+    try:
+        _graceful_exit.tick(cfg)
+    except Exception:
+        log.exception("graceful_exit_tick error")
+
+
 def drift_check_tick(cfg: Config) -> None:
     """T-0149: per-project drift-enforcement pass.
 

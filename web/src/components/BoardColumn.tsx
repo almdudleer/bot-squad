@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { Task } from "../api";
-import { TaskCard, MenuAction } from "./TaskCard";
+import { TaskCard, MenuAction, SubtaskRow } from "./TaskCard";
 
 interface BoardColumnProps {
   title: string;
@@ -22,6 +22,14 @@ interface BoardColumnProps {
   onToggleRail?: () => void;
   // T-0096: forwarded to every TaskCard rendered by this column.
   hideInitiative?: boolean;
+  // T-0512 (M9): subtask nesting. `nestedChildIds` are task ids that render
+  // ONLY beneath their parent (suppressed as top-level cards here, even when
+  // their own status would land them in this column). `subtasksByParent` maps a
+  // parent id → its subtasks (any status), rendered as compact rows under the
+  // parent card. Both are computed by the parent (Project.tsx) from the visible
+  // task set so a child whose parent isn't visible still shows standalone.
+  nestedChildIds?: ReadonlySet<string>;
+  subtasksByParent?: Record<string, Task[]>;
 }
 
 const DRAG_MIME = "application/x-bot-squad-task";
@@ -53,12 +61,19 @@ export function BoardColumn({
   railMode = null,
   onToggleRail,
   hideInitiative = false,
+  nestedChildIds,
+  subtasksByParent,
 }: BoardColumnProps) {
   const [isOver, setIsOver] = useState(false);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
 
-  const sorted = sortByPriority(tasks);
+  // T-0512: suppress subtasks whose parent is visible — they render nested
+  // under the parent, not as standalone top-level cards in this column.
+  const topLevel = nestedChildIds && nestedChildIds.size > 0
+    ? tasks.filter((t) => !nestedChildIds.has(t.id))
+    : tasks;
+  const sorted = sortByPriority(topLevel);
   const isCollapsed = railMode === "collapsed";
 
   function parsePayload(e: React.DragEvent<HTMLDivElement>): { id: string; fromStatus: Task["status"] } | null {
@@ -127,7 +142,7 @@ export function BoardColumn({
         onClick={onToggleRail}
         role="button"
         tabIndex={0}
-        aria-label={`Expand ${title} column (${tasks.length} cards)`}
+        aria-label={`Expand ${title} column (${sorted.length} cards)`}
         title={`Expand ${title}`}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -139,7 +154,7 @@ export function BoardColumn({
         <div className="mc-board-rail-inner">
           <span className="mc-board-rail-chevron" aria-hidden>▸</span>
           <span className="mc-board-rail-label">{title}</span>
-          <span className="mc-board-rail-count">{tasks.length}</span>
+          <span className="mc-board-rail-count">{sorted.length}</span>
         </div>
       </div>
     );
@@ -166,20 +181,32 @@ export function BoardColumn({
           <span className="mc-board-rail-chevron-inline" aria-hidden>▾</span>
         )}
         <span>{title}</span>
-        <span className="mc-board-count">{tasks.length}</span>
+        <span className="mc-board-count">{sorted.length}</span>
       </div>
       {sorted.length === 0 && (
         <div className="mc-empty-col">▢ empty</div>
       )}
-      {sorted.map((t, i) => (
-        <div
-          key={t.id}
-          ref={(el) => { cardRefs.current[i] = el; }}
-        >
-          {showIndicatorAt(i) && <DropIndicator />}
-          <TaskCard task={t} slug={slug} onMenuAction={onMenuAction} hideInitiative={hideInitiative} />
-        </div>
-      ))}
+      {sorted.map((t, i) => {
+        const kids = subtasksByParent?.[t.id];
+        return (
+          <div
+            key={t.id}
+            ref={(el) => { cardRefs.current[i] = el; }}
+          >
+            {showIndicatorAt(i) && <DropIndicator />}
+            <TaskCard task={t} slug={slug} onMenuAction={onMenuAction} hideInitiative={hideInitiative} />
+            {/* T-0512 (M9): nest this parent's subtasks directly beneath it,
+                grouped under the parent regardless of each child's own status. */}
+            {kids && kids.length > 0 && (
+              <div className="mc-subtask-group" style={{ marginBottom: "0.4rem" }}>
+                {sortByPriority(kids).map((k) => (
+                  <SubtaskRow key={k.id} task={k} slug={slug} />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
       {showIndicatorAt(sorted.length) && <DropIndicator />}
     </div>
   );

@@ -10,6 +10,7 @@ from app.canonical_status import (
     CANONICAL_STATE,
     CANONICAL_STATES,
     canonical_of,
+    derive_parent_status,
 )
 from app.routes_backlog import _VALID_STATUSES
 
@@ -52,3 +53,57 @@ def test_canonical_of_helper_and_unknown_raises():
         pass
     else:  # pragma: no cover - guard
         raise AssertionError("expected KeyError for unknown status")
+
+
+# ---------------------------------------------------------------------------
+# T-0512 (M9 / Part A): parent-abstract status derivation
+# ---------------------------------------------------------------------------
+
+def test_derive_no_children_is_none():
+    # A task with no subtasks is NOT abstract — it was never split.
+    assert derive_parent_status([]) is None
+    # ...and ignoring garbage that leaves nothing usable behaves the same.
+    assert derive_parent_status(["bogus", "also-bad"]) is None
+
+
+def test_derive_all_done_is_done():
+    assert derive_parent_status(["closed", "closed"]) == "done"
+
+
+def test_derive_done_only_when_every_child_done():
+    # SOURCE-VERBATIM Part A: dependent on actual work — one unfinished subtask
+    # keeps the abstract parent out of "done".
+    assert derive_parent_status(["closed", "open"]) == "in-progress"
+    assert derive_parent_status(["closed", "in_progress"]) == "in-progress"
+
+
+def test_derive_all_backlog_is_backlog():
+    # Nothing started yet → the parent is still in backlog.
+    assert derive_parent_status(["planned", "open", "reopened"]) == "backlog"
+
+
+def test_derive_any_started_is_in_progress():
+    assert derive_parent_status(["open", "in_progress"]) == "in-progress"
+    # A started+finished mix is still in-progress (not all done).
+    assert derive_parent_status(["open", "closed"]) == "in-progress"
+
+
+def test_derive_validating_when_all_work_complete():
+    # All subtasks are validating-or-done (build finished, >=1 still verifying).
+    assert derive_parent_status(["totest", "totest"]) == "validating"
+    assert derive_parent_status(["totest", "closed"]) == "validating"
+    # ...but an in-progress sibling drops it back to in-progress.
+    assert derive_parent_status(["totest", "in_progress"]) == "in-progress"
+
+
+def test_derive_ignores_unknown_child_status_but_uses_the_rest():
+    assert derive_parent_status(["closed", "garbage"]) == "done"
+
+
+def test_derive_range_is_canonical_states():
+    # Whatever the mix, the derived value is always a real canonical state.
+    for combo in (
+        ["open"], ["in_progress"], ["totest"], ["closed"],
+        ["open", "closed"], ["totest", "closed"], ["planned", "in_progress"],
+    ):
+        assert derive_parent_status(combo) in CANONICAL_STATES

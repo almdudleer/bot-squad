@@ -3,6 +3,11 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isNotFoundError, SessionRow, Task, VisionFile } from "../api";
 import { Select, type SelectOption } from "../components/Select";
 import {
+  CANONICAL_LABELS,
+  CANONICAL_STATE,
+  deriveParentStatus,
+} from "../canonicalStatus";
+import {
   isRunning,
   sessionActivity,
   sessionGlyph,
@@ -117,6 +122,11 @@ export function TaskDetail() {
   // T-0172: related docs (ticket→doc half of the bidirectional mention).
   const [docToLink, setDocToLink] = useState("");
 
+  // T-0512 (M9): this task's subtasks (children whose parent_task === id),
+  // loaded from the children endpoint. When non-empty the task is ABSTRACT —
+  // its status is derived from these (see canonicalStatus.deriveParentStatus).
+  const [children, setChildren] = useState<Task[]>([]);
+
   function loadTask() {
     setError(null);
     setLoadState("loading");
@@ -159,6 +169,10 @@ export function TaskDetail() {
             ),
           )
           .catch(() => setInitiatives([]));
+        // T-0512 (M9): load this task's subtasks for the Subtasks panel.
+        api.children(slug, id)
+          .then(setChildren)
+          .catch(() => setChildren([]));
       })
       .catch((e) => {
         if (isNotFoundError(e)) { setLoadState("not_found"); return; }
@@ -556,6 +570,68 @@ export function TaskDetail() {
             })()}
           </div>
         </div>
+
+        {/* T-0512 (M9 / Part A): Subtasks. When a task is split into subtasks it
+            becomes ABSTRACT — its status is derived from its children's work
+            ("dependent on actual work being done in terms of its subtasks").
+            Show the derived canonical state + the list of subtasks. */}
+        {children.length > 0 && (() => {
+          const derived = deriveParentStatus(children.map((c) => c.status));
+          return (
+            <div className="mb-3" style={{ fontSize: "0.78rem" }}>
+              <div
+                className="d-flex align-items-center gap-2 mb-2"
+                style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)" }}
+              >
+                <span>⛓ subtasks ({children.length}):</span>
+                {derived && (
+                  <span
+                    title="Abstract task — status derived from its subtasks"
+                    style={{
+                      color: "var(--mc-text-mid)",
+                      border: "1px solid var(--mc-border)",
+                      borderRadius: "2px",
+                      padding: "0 5px",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.05em",
+                      fontSize: "0.62rem",
+                    }}
+                  >
+                    {CANONICAL_LABELS[derived]}
+                  </span>
+                )}
+              </div>
+              <div>
+                {children.map((c) => (
+                  <div
+                    key={c.id}
+                    onClick={() => navigate(`/p/${slug}/t/${c.id}`)}
+                    title={`${c.id} — open subtask`}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.5rem",
+                      padding: "0.25rem 0.4rem",
+                      cursor: "pointer",
+                      borderLeft: "2px solid var(--mc-border)",
+                      marginBottom: "0.2rem",
+                    }}
+                  >
+                    <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.68rem", color: "var(--mc-text-dim)" }}>
+                      {c.id}
+                    </span>
+                    <span style={{ flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {c.title}
+                    </span>
+                    <span style={{ fontFamily: "var(--mc-mono)", fontSize: "0.62rem", color: "var(--mc-text-dim)" }}>
+                      {CANONICAL_LABELS[CANONICAL_STATE[c.status]]}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* The ask — verbatim. T-0366 #5: dropped the redundant "The ask —
             source of truth" title (the zone tag above already labels this zone)

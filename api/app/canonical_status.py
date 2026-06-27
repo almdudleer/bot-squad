@@ -45,3 +45,39 @@ def canonical_of(status: str) -> str:
     """Map an internal status to its canonical state. Raises KeyError on an
     unknown status so callers fail loudly rather than silently mis-bucket."""
     return CANONICAL_STATE[status]
+
+
+# T-0512 (Process Paradigm M9 / Part A). When a task is split into subtasks it
+# becomes ABSTRACT: its progress is no longer set independently but DERIVED from
+# the work being done in its children — "the task becomes more abstract and
+# dependent on actual work being done in terms of its subtasks"
+# (SOURCE-VERBATIM Part A). The derivation is a pure rollup over the children's
+# canonical states, with this intuitive (epic-on-a-board) semantics:
+#
+#   - all children done             -> done       (every subtask finished)
+#   - all children validating/done  -> validating (work complete, >=1 verifying)
+#   - any subtask started           -> in-progress (some work underway)
+#   - none started (all backlog)    -> backlog
+#
+# i.e. the parent is only "done" when ALL children are done, and only "backlog"
+# when NONE has started; anything in between rolls up to in-progress (or
+# validating once all the building is finished). A task with NO children is not
+# abstract — it was never split — so the derivation returns ``None`` and the
+# parent keeps its own on-disk status.
+def derive_parent_status(child_statuses) -> str | None:
+    """Roll a parent's canonical state up from its children's INTERNAL statuses.
+
+    Unknown/garbage child statuses are ignored (defensive — the backlog parser
+    does not validate status). Returns a canonical state, or ``None`` when there
+    are no usable children.
+    """
+    canon = [CANONICAL_STATE[s] for s in child_statuses if s in CANONICAL_STATE]
+    if not canon:
+        return None
+    if all(c == "done" for c in canon):
+        return "done"
+    if all(c in ("validating", "done") for c in canon):
+        return "validating"
+    if any(c in ("in-progress", "validating", "done") for c in canon):
+        return "in-progress"
+    return "backlog"

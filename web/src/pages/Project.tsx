@@ -43,6 +43,28 @@ const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
 // expand on click. Only one is expanded at a time (other auto-collapses).
 const RAIL_STATUSES: ReadonlySet<typeof COLUMNS[number]> = new Set(["planned", "closed"]);
 
+// T-0512 (M9 / Part A): subtask nesting. A task whose `parent_task` points at
+// another VISIBLE task renders nested under that parent (and is suppressed as a
+// top-level card). A child whose parent isn't in the current view (filtered out
+// / orphaned) keeps showing standalone. Returns the parent→children map and the
+// set of child ids to suppress at top level.
+export function buildNesting(tasks: Task[]): {
+  subtasksByParent: Record<string, Task[]>;
+  nestedChildIds: Set<string>;
+} {
+  const visibleIds = new Set(tasks.map((t) => t.id));
+  const subtasksByParent: Record<string, Task[]> = {};
+  const nestedChildIds = new Set<string>();
+  for (const t of tasks) {
+    const parent = (t.parent_task ?? "").trim();
+    if (parent && visibleIds.has(parent)) {
+      (subtasksByParent[parent] ||= []).push(t);
+      nestedChildIds.add(t.id);
+    }
+  }
+  return { subtasksByParent, nestedChildIds };
+}
+
 // T-0479: tally the visible tasks into the canonical 4 states.
 function canonicalCounts(tasks: Task[]): Record<CanonicalState, number> {
   const acc: Record<CanonicalState, number> = {
@@ -403,6 +425,8 @@ export function Project() {
       grouped[t.status].push(t);
     }
   }
+  // T-0512 (M9): subtask nesting for the ungrouped board.
+  const ungroupedNesting = buildNesting(ungroupedTasks);
 
   // T-0272: group-by-initiative previously rendered every lane (incl. all
   // the `done` and empty ones) as a full expanded 6-col board — a wall of
@@ -791,6 +815,8 @@ export function Project() {
                 }
                 onToggleRail={RAIL_STATUSES.has(c) ? () => toggleRail(c) : undefined}
                 hideInitiative={hideInitiativeChip}
+                nestedChildIds={ungroupedNesting.nestedChildIds}
+                subtasksByParent={ungroupedNesting.subtasksByParent}
               />
             ))}
           </div>
@@ -1087,6 +1113,8 @@ function InitiativeLane({
       grouped[t.status].push(t);
     }
   }
+  // T-0512 (M9): subtask nesting within this lane's task set.
+  const nesting = buildNesting(tasks);
 
   const isUnattached = meta.key === UNATTACHED;
   const titleClickable = !isUnattached;
@@ -1197,6 +1225,8 @@ function InitiativeLane({
               }
               onToggleRail={RAIL_STATUSES.has(c) ? () => onToggleRail(c) : undefined}
               hideInitiative
+              nestedChildIds={nesting.nestedChildIds}
+              subtasksByParent={nesting.subtasksByParent}
             />
           ))}
         </div>

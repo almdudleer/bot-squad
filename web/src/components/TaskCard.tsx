@@ -1,6 +1,11 @@
 import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task } from "../api";
+import {
+  CANONICAL_LABELS,
+  CANONICAL_STATE,
+  type CanonicalState,
+} from "../canonicalStatus";
 import { relativeTime } from "../utils/relativeTime";
 import {
   isRunning,
@@ -47,6 +52,15 @@ export function countNotes(progress: string | undefined): number {
     .split("\n")
     .filter((ln) => ln.trim().startsWith("- ")).length;
 }
+
+// T-0512 (M9): per-canonical-state dot colour, shared by the abstract-parent
+// badge and the nested subtask rows so the board reads consistently.
+const CANONICAL_DOT: Record<CanonicalState, string> = {
+  backlog: "var(--mc-text-dim)",
+  "in-progress": "var(--mc-amber, #fbbf24)",
+  validating: "var(--mc-amber, #fbbf24)",
+  done: "var(--mc-accent-success, #4ade80)",
+};
 
 export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: TaskCardProps) {
   const navigate = useNavigate();
@@ -211,6 +225,34 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
       <div className="mc-task-title">{task.title}</div>
       <div className="mc-task-meta">
         {updated && <span>{updated}</span>}
+        {/* T-0512 (M9 / Part A): a task split into subtasks is ABSTRACT — its
+            status is no longer set independently but DERIVED from its children
+            ("dependent on actual work being done in terms of its subtasks").
+            Surface the derived canonical state + subtask count so the board
+            shows the parent reflecting its children. */}
+        {!!task.child_count && task.child_count > 0 && (() => {
+          const derived = (task.derived_status ?? null) as CanonicalState | null;
+          const dot = derived ? CANONICAL_DOT[derived] : "var(--mc-text-dim)";
+          const label = derived ? CANONICAL_LABELS[derived] : "—";
+          return (
+            <span
+              title={`Abstract task — derived from ${task.child_count} subtask${
+                task.child_count === 1 ? "" : "s"
+              }: ${label}`}
+              style={{
+                fontFamily: "var(--mc-mono)",
+                fontSize: "0.65rem",
+                color: dot,
+                background: "var(--mc-surface-raised)",
+                border: `1px solid ${dot}`,
+                borderRadius: "2px",
+                padding: "0 4px",
+              }}
+            >
+              ⛓ {label} · {task.child_count} subtask{task.child_count === 1 ? "" : "s"}
+            </span>
+          );
+        })()}
         {/* T-0038 stakeholder follow-up #3: surface the bound initiative on
             every card. Click-through goes to the roadmap. Active/draft/done
             tag lives on the swimlane header, not here — keep card noise
@@ -321,6 +363,71 @@ export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: T
         )}
 {/* Assign-session affordance lives on the task detail page, not the card. */}
       </div>
+    </div>
+  );
+}
+
+// T-0512 (M9): a compact row for a subtask rendered NESTED beneath its parent
+// card on the board. Because a parent's children may sit in different status
+// columns, the nested row carries its OWN canonical-state dot so its progress
+// is legible out of column context. Click-through opens the subtask detail.
+export function SubtaskRow({ task, slug }: { task: Task; slug: string }) {
+  const navigate = useNavigate();
+  const canonical = CANONICAL_STATE[task.status];
+  const dot = CANONICAL_DOT[canonical];
+  return (
+    <div
+      className="mc-subtask-row"
+      onClick={() => navigate(`/p/${slug}/t/${task.id}`)}
+      title={`${task.id} · ${CANONICAL_LABELS[canonical]} — open subtask`}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "0.4rem",
+        padding: "0.2rem 0.4rem 0.2rem 0.85rem",
+        cursor: "pointer",
+        fontSize: "0.72rem",
+        borderLeft: "2px solid var(--mc-border)",
+        marginLeft: "0.35rem",
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          flex: "0 0 auto",
+          width: "7px",
+          height: "7px",
+          borderRadius: "50%",
+          background: dot,
+        }}
+      />
+      <span
+        className="mc-task-id"
+        style={{ flex: "0 0 auto", fontSize: "0.65rem" }}
+      >
+        {task.id}
+      </span>
+      <span
+        style={{
+          flex: "1 1 auto",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          color: "var(--mc-text-mid)",
+        }}
+      >
+        {task.title}
+      </span>
+      <span
+        style={{
+          flex: "0 0 auto",
+          fontFamily: "var(--mc-mono)",
+          fontSize: "0.6rem",
+          color: dot,
+        }}
+      >
+        {CANONICAL_LABELS[canonical]}
+      </span>
     </div>
   );
 }

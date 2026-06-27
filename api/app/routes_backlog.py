@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.canonical_status import derive_parent_status
 from app.frontmatter import as_list, parse_or_none
 from app.markdown_parser import ParseError, parse_task
 from app.markdown_writer import (
@@ -119,6 +120,29 @@ def _session_map_by_task(sessions_dir: Path) -> dict[str, dict]:
     return out
 
 
+def _stamp_parent_derivation(tasks: list[dict]) -> None:
+    """T-0512 (M9 / Part A): mark every task that has subtasks as an abstract
+    parent and derive its canonical state from its children.
+
+    A subtask is any task whose ``parent_task`` points at this task's id. For
+    each parent we stamp ``child_count`` and ``derived_status`` (canonical 4-state
+    rollup — see ``canonical_status.derive_parent_status``). Tasks without
+    children are left untouched (not abstract). Mutates in place.
+    """
+    child_statuses: dict[str, list[str]] = {}
+    for t in tasks:
+        parent = str(t.get("parent_task") or "").strip()
+        if parent:
+            child_statuses.setdefault(parent, []).append(str(t.get("status") or ""))
+    by_id = {t.get("id"): t for t in tasks}
+    for parent_id, statuses in child_statuses.items():
+        parent = by_id.get(parent_id)
+        if parent is None:
+            continue  # dangling parent_task ref — child renders standalone
+        parent["child_count"] = len(statuses)
+        parent["derived_status"] = derive_parent_status(statuses)
+
+
 @router.get("")
 def list_backlog(slug: str, request: Request) -> list[dict]:
     cfg = request.app.state.api_config
@@ -142,7 +166,44 @@ def list_backlog(slug: str, request: Request) -> list[dict]:
             t["session"] = sess
         _enrich_with_sections(t)
         tasks.append(t)
+    _stamp_parent_derivation(tasks)
     return tasks
+
+
+@router.get("/{task_id}/children")
+def list_children(slug: str, task_id: str, request: Request) -> list[dict]:
+    """T-0512 (M9): list the subtasks of a task — every backlog task whose
+    ``parent_task`` points at ``task_id``.
+
+    404s if the parent task itself does not exist. Rows carry the same shape as
+    ``list_backlog`` (enriched sections + bound-session info) so the FE can
+    render them with the same card/affordances. Ordered by priority then id is
+    left to the caller — here we return them in filename order (stable).
+    """
+    _validate_task_id(task_id)
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
+    project_data = cfg.project_data_dir(slug)
+    backlog_dir = project_data / "backlog"
+    # 404 cleanly if the parent task does not exist (so a stale link is loud).
+    _find_task_file(backlog_dir, task_id)
+    session_map = _session_map_by_task(project_data / "sessions")
+    children: list[dict] = []
+    for f in sorted(backlog_dir.glob("*.md")):
+        try:
+            t = parse_task(f)
+        except ParseError as e:
+            log.warning("backlog parse error %s: %s", f, e)
+            continue
+        if str(t.get("parent_task") or "").strip() != task_id:
+            continue
+        sess = session_map.get(t.get("id", ""))
+        if sess:
+            t["session"] = sess
+        _enrich_with_sections(t)
+        children.append(t)
+    return children
 
 
 def _validate_priority(value: object) -> int:

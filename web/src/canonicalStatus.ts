@@ -39,3 +39,23 @@ export const CANONICAL_LABELS: Record<CanonicalState, string> = {
 export function canonicalOf(status: Task["status"]): CanonicalState {
   return CANONICAL_STATE[status];
 }
+
+// T-0512 (Process Paradigm M9 / Part A). When a task is split into subtasks it
+// becomes ABSTRACT: its progress is derived from its children — "the task
+// becomes more abstract and dependent on actual work being done in terms of its
+// subtasks" (SOURCE-VERBATIM Part A). Pure rollup over the children's canonical
+// states (SSOT mirrored in api/app/canonical_status.derive_parent_status):
+//   all done → done; all validating/done → validating; any started →
+//   in-progress; none started → backlog. No children → null (not abstract).
+// Unknown child statuses are ignored (defensive).
+export function deriveParentStatus(childStatuses: string[]): CanonicalState | null {
+  const canon = childStatuses
+    .filter((s): s is Task["status"] => s in CANONICAL_STATE)
+    .map((s) => CANONICAL_STATE[s]);
+  if (canon.length === 0) return null;
+  if (canon.every((c) => c === "done")) return "done";
+  if (canon.every((c) => c === "validating" || c === "done")) return "validating";
+  if (canon.some((c) => c === "in-progress" || c === "validating" || c === "done"))
+    return "in-progress";
+  return "backlog";
+}

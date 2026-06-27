@@ -899,3 +899,73 @@ def test_patch_body_preserves_progress_when_omitted(tmp_bot_squad: Path, monkeyp
     )
     assert r.status_code == 200, r.text
     assert "keep this note" in r.json()["progress"]
+
+
+# ---------------------------------------------------------------------------
+# T-0512 (M9 / Part A): children endpoint + parent-abstract derivation
+# ---------------------------------------------------------------------------
+def _write_task(backlog: Path, tid: str, status: str, parent: str | None = None) -> None:
+    fm = f"---\nid: {tid}\ntitle: {tid}\nstatus: {status}\n"
+    if parent is not None:
+        fm += f"parent_task: {parent}\n"
+    fm += "---\n\nbody\n"
+    (backlog / f"{tid}-x.md").write_text(fm)
+
+
+def test_children_endpoint_lists_subtasks(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_task(backlog, "T-0001", "in_progress")          # parent
+    _write_task(backlog, "T-0002", "open", parent="T-0001")  # child
+    _write_task(backlog, "T-0003", "closed", parent="T-0001")  # child
+    _write_task(backlog, "T-0004", "open")                  # unrelated
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog/T-0001/children")
+    assert r.status_code == 200, r.text
+    ids = {c["id"] for c in r.json()}
+    assert ids == {"T-0002", "T-0003"}
+
+
+def test_children_endpoint_empty_for_leaf(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_task(backlog, "T-0001", "open")
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog/T-0001/children")
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+
+def test_children_endpoint_404_for_missing_parent(tmp_bot_squad: Path, monkeypatch):
+    (tmp_bot_squad / "data" / "test-project" / "backlog")  # ensure project exists
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog/T-9999/children")
+    assert r.status_code == 404
+
+
+def test_backlog_list_stamps_derived_parent_status(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    # Parent with one open + one closed child → "in-progress" (not all done).
+    _write_task(backlog, "T-0001", "open")
+    _write_task(backlog, "T-0002", "open", parent="T-0001")
+    _write_task(backlog, "T-0003", "closed", parent="T-0001")
+    # A leaf task carries no derivation fields.
+    _write_task(backlog, "T-0004", "open")
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog")
+    assert r.status_code == 200, r.text
+    by_id = {t["id"]: t for t in r.json()}
+    assert by_id["T-0001"]["child_count"] == 2
+    assert by_id["T-0001"]["derived_status"] == "in-progress"
+    # leaf + children themselves are not abstract parents
+    assert "derived_status" not in by_id["T-0004"]
+    assert "derived_status" not in by_id["T-0002"]
+
+
+def test_backlog_list_derives_done_when_all_children_done(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_task(backlog, "T-0001", "in_progress")
+    _write_task(backlog, "T-0002", "closed", parent="T-0001")
+    _write_task(backlog, "T-0003", "closed", parent="T-0001")
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog")
+    by_id = {t["id"]: t for t in r.json()}
+    assert by_id["T-0001"]["derived_status"] == "done"

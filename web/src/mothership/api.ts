@@ -486,6 +486,8 @@ export function apiFor(serverId: string): ServerApi {
     // singleton in `web/src/api.ts` — keep them in sync when adding new
     // upstream endpoints.
     backlog: (slug) => fwd<Task[]>(`/api/projects/${slug}/backlog`),
+    // T-0512 (M9): subtasks of a task (parent_task === id).
+    children: (slug, id) => fwd<Task[]>(`/api/projects/${slug}/backlog/${id}/children`),
     vision: (slug) => fwd<VisionFile[]>(`/api/projects/${slug}/vision`),
     sessions: (slug) => fwd<SessionRow[]>(`/api/projects/${slug}/sessions`),
     telemetry: (slug) => fwd<TelemetryResponse>(`/api/projects/${slug}/telemetry`),

@@ -22,6 +22,7 @@ RAW_TG_SEND_ALLOWED = {
     "actions.py",       # the _send_stakeholder_dm SSOT itself + pause/resume (#deploy-logs, topic_id) + per-user peer tg-mirror
     "jobs.py",          # routine #deploy-logs deploy events (topic_id); KILLED alert + oauth_refresh now route via SSOT (P2-04/P2-08)
     "voice_intake.py",  # voice-note confirmation -> #feedback topic (topic_id)
+    "channels.py",      # T-0490: the channel abstraction (TgChannel wraps _get_tg_client); sends are via self._client(), and TgChannel.send forwards topic_id= for group deploy posts — not a hidden personal pager
 }
 # The TG/MAX client classes themselves.
 CLIENT_MODULES = {"tg.py", "max.py"}

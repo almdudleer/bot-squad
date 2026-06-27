@@ -161,8 +161,8 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     success/fail follow-up (root cause of the deploy_monitor spam reported
     2026-05-18). Dirty-deferred state is logged, not pinged.
     """
+    from bot_squad_worker import channels as _channels
     from bot_squad_worker import deploy as _deploy
-    from bot_squad_worker.actions import _get_tg_client
 
     queued = _deploy.list_queued(cfg, slug)
     if not queued:
@@ -194,7 +194,10 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
         log.info("deploy_monitor: %s/%s deferred — tree dirty", slug, target)
         return
 
-    tg = _get_tg_client(cfg)
+    # T-0490: deploy notifications are a TECHNICAL DELIVERY routed through the
+    # channel abstraction (not a direct tg.send). The factory picks the impl per
+    # project — TG today; adding MAX/mail needs no change here.
+    channel = _channels.get_channel(cfg, project=slug)
     chat_id = project.tg_chat  # type: ignore[attr-defined]
     sid = "deploy_monitor"
     # T-0386: route deploy logs into the project's #deploy-logs forum topic
@@ -218,9 +221,9 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     # precedent as autoupdate_apply's apply-failure ping.
     def _tg_safe(text: str) -> None:
         try:
-            tg.send(chat_id=chat_id, text=text, sid=sid, urgent=True, topic_id=deploy_topic)
+            channel.send(text, chat_id=chat_id, sid=sid, urgent=True, topic_id=deploy_topic)
         except Exception:
-            log.exception("deploy_monitor: tg.send failed (non-fatal): %s", text)
+            log.exception("deploy_monitor: channel.send failed (non-fatal): %s", text)
 
     _tg_safe(f"🚚 starting deploy for {slug}/{target}")
 

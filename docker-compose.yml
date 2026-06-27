@@ -8,6 +8,12 @@ services:
         GIT_SHA: ${GIT_SHA:-unknown}   # T-0379: deploy recipe exports the deployed HEAD
     image: bot-squad-api:latest
     container_name: bot-squad-api
+    # T-0488: publish the API on host localhost ONLY (not via traefik) so the
+    # worker (host systemd service) can reach the user-recognition endpoint
+    # internally; least-exposure, token-gated (WORKER_API_TOKEN). Pairs with the
+    # worker unit's MOTHERSHIP_BASE_URL=http://127.0.0.1:8099 override.
+    ports:
+      - "127.0.0.1:8099:8000"
     restart: unless-stopped
     user: "${UID:-1000}:${GID:-1000}"
     env_file: .env

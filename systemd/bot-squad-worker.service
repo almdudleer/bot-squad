@@ -18,6 +18,13 @@ EnvironmentFile=-/home/www/bot-squad/.env
 # for this user. Per-user workers (other Linux users) use the separate
 # bot-squad-user-worker.service template.
 Environment=BOT_SQUAD_MODE=coordinator
+# T-0488: worker-scoped override of MOTHERSHIP_BASE_URL so the worker reaches the
+# localhost-only user-recognition API (compose publishes 127.0.0.1:8099). Placed
+# AFTER EnvironmentFile so it wins even if .env later sets MOTHERSHIP_BASE_URL
+# (which is the API container's PUBLIC self-URL and must stay distinct). Pairs with
+# .env WORKER_API_TOKEN (operator-provisioned) to activate TG-sender->GlobalUser
+# linkage at deploy #4; fail-safe no-op until all three are present.
+Environment=MOTHERSHIP_BASE_URL=http://127.0.0.1:8099
 # T-0194 (2026-06-03): the blunt global HTTPS_PROXY lift-and-shift (which proxied
 # ALL worker HTTPS to work around the Telegram DPI-block, T-0192) was REMOVED here
 # once the durable, TG-ONLY primitive landed: tg.py + tg_listener now honour

@@ -56,13 +56,18 @@ def test_autocompact_enabled_default_on_kill_switch_off(monkeypatch):
 
 @pytest.fixture
 def harness(monkeypatch):
-    """Stub pane resolution / capture / inject so no tmux is touched."""
+    """Stub pane resolution / capture / inject so no tmux is touched.
+
+    These exercise the legacy Claude ``/compact`` path + the safety gates shared
+    by both strategies, so we pin ``compact_mode`` to ``claude`` (the T-0467
+    write-to-artifact handoff has its own suite in test_compact_handoff.py)."""
     sent: list[str] = []
     state = {"pane": "%9", "buf": "❯ ready\n"}
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))
     monkeypatch.setattr(A, "autocompact_enabled", lambda: True)
+    monkeypatch.setattr(A, "compact_mode", lambda: "claude")
     return {"sent": sent, "state": state}
 
 

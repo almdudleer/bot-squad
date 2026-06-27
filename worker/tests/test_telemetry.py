@@ -266,6 +266,28 @@ def test_sample_incremental_accrues_output_and_carries_context(tmp_path, fake_se
     assert rec2["output_tokens_cum"] == 1000
 
 
+def test_sample_carries_compact_phase_across_ticks(tmp_path, fake_session):
+    # T-0467: the compact handoff state machine spans ticks — _sample_one must
+    # carry rec['compact'] forward (like alert_fired_at), else the 'writing'
+    # phase is lost between samples and a handoff can never finalize.
+    cfg = _make_cfg(tmp_path)
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    T.sample(cfg, "proj")
+    rec_path = (cfg.data_dir / "proj" / "_worker" / "telemetry"
+                / "S-almdudleer-dev-p5.json")
+    rec = json.loads(rec_path.read_text())
+    rec["compact"] = {"phase": "writing", "armed_at": 1.0, "arm_mtime": 0.0,
+                      "artifact_path": "/x/T-0001.md"}
+    rec_path.write_text(json.dumps(rec))
+
+    # next tick (no new transcript lines) must preserve the compact phase
+    T.sample(cfg, "proj")
+    rec2 = json.loads(rec_path.read_text())
+    assert rec2["compact"]["phase"] == "writing"
+    assert rec2["compact"]["artifact_path"] == "/x/T-0001.md"
+
+
 def test_context_alert_fires_once_per_crossing(tmp_path, fake_session):
     cfg = _make_cfg(tmp_path)
     f = _write_transcript(fake_session["home"], fake_session["uuid"],

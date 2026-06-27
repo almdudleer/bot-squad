@@ -551,6 +551,10 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
         # uuid) so the debounce survives the transcript rotation that re-arms the
         # crossing. (T-0332)
         "alert_fired_at": prev.get("alert_fired_at") or {},
+        # T-0467: the universal-compact handoff state machine spans ticks
+        # ({phase: writing, armed_at, arm_mtime, artifact_path, ...}); carry it
+        # forward so ARM on one tick can FINALIZE on a later one.
+        "compact": prev.get("compact") or {},
     }
     _write_json(_record_path(cfg, slug, sid), rec)
     return rec

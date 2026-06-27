@@ -23,6 +23,7 @@ from bot_squad_worker.assignment import (
     RoutineAssignment,
     TaskAssignment,
     for_task,
+    role_artifact,
 )
 
 
@@ -42,6 +43,57 @@ def test_artifact_write_is_a_full_replace(tmp_path: Path):
     art.write("first")
     art.write("second")
     assert art.read() == "second"
+
+
+# --- role_artifact: the role-agnostic compact destination (T-0467) --------
+
+def test_role_artifact_for_a_dev_is_the_task_sidecar(tmp_path: Path):
+    # A task-bound session (dev) writes its forward-state into the SAME T-0463
+    # sidecar that holds its result — no second store.
+    data_dir = tmp_path / "data"
+    art = role_artifact(data_dir, "bot-squad", role="dev",
+                        sid="S-u-dev-p5", task_id="T-0042")
+    assert isinstance(art, Artifact)
+    assert art.path == data_dir / "bot-squad" / "artifacts" / "T-0042.md"
+
+
+def test_role_artifact_for_an_operator_is_the_state_doc_seam(tmp_path: Path):
+    # The operator has no task; its role artifact is the state-doc the full
+    # schema of which T-0473 fills — T-0467 wires the resolver to its path.
+    data_dir = tmp_path / "data"
+    art = role_artifact(data_dir, "bot-squad", role="operator",
+                        sid="S-u-operator-p1", task_id=None)
+    assert isinstance(art, Artifact)
+    assert art.path == data_dir / "bot-squad" / "artifacts" / "operator-state.md"
+
+
+def test_role_artifact_task_id_wins_over_role(tmp_path: Path):
+    # task-binding is authoritative: even a non-dev role with a task writes the
+    # task sidecar (keeps the destination unambiguous).
+    data_dir = tmp_path / "data"
+    art = role_artifact(data_dir, "bot-squad", role="teamlead",
+                        sid="S-u-tl-p2", task_id="T-0099")
+    assert art.path == data_dir / "bot-squad" / "artifacts" / "T-0099.md"
+
+
+def test_role_artifact_generic_role_is_a_per_session_file(tmp_path: Path):
+    # Any other transient role with no task still resolves to a stable per-role
+    # artifact (role-agnostic — no role is left without a compact destination).
+    data_dir = tmp_path / "data"
+    art = role_artifact(data_dir, "bot-squad", role="user",
+                        sid="S-almdudleer-user-p7", task_id=None)
+    assert isinstance(art, Artifact)
+    # path is deterministic + filesystem-safe and scoped to the sid tail
+    assert art.path.parent == data_dir / "bot-squad" / "artifacts"
+    assert art.path.name.startswith("role-user-")
+    assert art.path.suffix == ".md"
+
+
+def test_role_artifact_unknown_role_no_task_is_none(tmp_path: Path):
+    # No role + no task → nothing to write into; caller falls back to /compact.
+    data_dir = tmp_path / "data"
+    assert role_artifact(data_dir, "bot-squad", role="", sid="S-x", task_id=None) is None
+    assert role_artifact(data_dir, "bot-squad", role="", sid="S-x", task_id="~") is None
 
 
 # --- TaskAssignment conforms to the 4 primitives --------------------------

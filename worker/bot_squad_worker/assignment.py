@@ -263,3 +263,54 @@ class RoutineAssignment(Assignment):
 def for_task(data_dir: Path | str, slug: str, task_id: str) -> TaskAssignment:
     """Build the assignment for a backlog task."""
     return TaskAssignment(data_dir, slug, task_id)
+
+
+# --- role artifact: the role-agnostic compact destination (T-0467) --------
+
+# Fixed filename for the operator's role artifact (the state-doc). T-0473 owns
+# its SCHEMA (priorities / happening / delivered / next / tracked-issues) and the
+# read-only transparency exposure; T-0467 only wires the resolver to this path so
+# every role-artifact lives under ``artifacts/`` for mechanism consistency.
+OPERATOR_STATE_ARTIFACT = "operator-state.md"
+
+_ARTIFACTS_SUBDIR = "artifacts"
+
+
+def _safe_component(s: str) -> str:
+    """Filesystem-safe slug for an arbitrary id (sid) → ``[A-Za-z0-9._-]``."""
+    return "".join(c if (c.isalnum() or c in "._-") else "-" for c in (s or "")).strip("-") or "anon"
+
+
+def role_artifact(
+    data_dir: Path | str, slug: str, *, role: str | None,
+    sid: str | None, task_id: str | None,
+) -> Artifact | None:
+    """Resolve the role artifact a session writes its forward-state into.
+
+    The universal-autocompact handoff (T-0467) asks a session to "write
+    everything down" into THIS artifact, then clears + relaunches a fresh
+    incarnation that boots from it. The destination is role-agnostic and always
+    the ONE reusable ``Artifact`` seam (no second store):
+
+      * a task-bound session (a dev — task-binding is authoritative) → the T-0463
+        task sidecar ``artifacts/<task_id>.md`` (same sink as its result);
+      * an operator → ``artifacts/operator-state.md`` (the state-doc seam; schema
+        = T-0473);
+      * any other role with no task → a stable per-session
+        ``artifacts/role-<role>-<sid>.md`` so no transient role is left without a
+        compact destination;
+      * no role AND no task → ``None`` (caller falls back to Claude's /compact).
+
+    Returns an :class:`Artifact` (or ``None``); does not touch the filesystem.
+    """
+    data_dir = Path(data_dir)
+    artifacts = data_dir / slug / _ARTIFACTS_SUBDIR
+    tid = (task_id or "").strip()
+    if tid and tid != "~":
+        return Artifact(artifacts / f"{tid}.md")
+    role = (role or "").strip()
+    if role == "operator":
+        return Artifact(artifacts / OPERATOR_STATE_ARTIFACT)
+    if role:
+        return Artifact(artifacts / f"role-{_safe_component(role)}-{_safe_component(sid or '')}.md")
+    return None

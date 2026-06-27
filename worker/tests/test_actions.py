@@ -63,6 +63,8 @@ def test_registry_lists_only_allowed_actions():
         "task_progress_add",
         # T-0463: assignment-interface write-result primitive (F1.1-d).
         "assignment_write_result",
+        # T-0467: universal-compact role-agnostic forward-state save (F1.4).
+        "compact_write_state",
         # T-0042: atomic T-NNNN allocator.
         "task_new",
         # T-0174: generalized atomic allocator across all entity types.

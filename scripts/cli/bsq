@@ -23,6 +23,7 @@ Verbs:
   bsq team resurrect <sid>          bring a session back (unarchive + resume)
   bsq team rename <sid> <name>      rename a session (tmux + UI + registry sync)
   bsq compact [--sid SID]           send /compact to a session (self by default)
+  bsq compact-save "<state>"        write your forward-state to your role artifact (compact handoff)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
 
 Conventions shared with the other ops shims:
@@ -1522,6 +1523,21 @@ def cmd_compact(args) -> None:
     print(f"/compact sent to {sid} (pane {res.get('pane_id')})")
 
 
+def cmd_compact_save(args) -> None:
+    """T-0467: write this session's full forward-state into its role artifact.
+
+    The "write everything down" half of the universal compact — call this when
+    the system asks you to hand off before being relaunched fresh. Role-agnostic:
+    the worker resolves your role artifact (dev = task sidecar, operator =
+    state-doc) from your session md, so you don't pass an assignment id."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    res = post("compact_write_state", {"slug": slug, "sid": sid,
+                                       "content": args.content})
+    print(f"forward-state saved → {res.get('artifact_path')} "
+          f"({res.get('bytes_written')} bytes, role {res.get('role')})")
+
+
 def sessions_dir(slug: str) -> Path:
     return Path(BOT_SQUAD) / "data" / slug / "sessions"
 
@@ -2975,6 +2991,14 @@ def build_parser() -> argparse.ArgumentParser:
     cp = sub.add_parser("compact", help="send /compact to a session (self by default)")
     cp.add_argument("--sid", help="target SID (default: this session)")
     cp.set_defaults(func=cmd_compact)
+
+    # compact-save (T-0467) — write this session's forward-state to its role artifact
+    cs = sub.add_parser(
+        "compact-save",
+        help="write your full forward-state to your role artifact (compact handoff)")
+    cs.add_argument("content", help="your complete forward-state markdown")
+    cs.add_argument("--sid", help="session SID (default: derived from tmux)")
+    cs.set_defaults(func=cmd_compact_save)
 
     # edit-begin (T-0215) — snapshot a baseline for a later `commit --hunks`
     eb = sub.add_parser(

@@ -1339,6 +1339,75 @@ def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_COMPACT_WRITE_STATE_REQUIRED = {"slug", "sid", "content"}
+_COMPACT_WRITE_STATE_ALLOWED = _COMPACT_WRITE_STATE_REQUIRED
+
+
+def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
+    """Write a session's full forward-state into its ROLE artifact (T-0467, F1.4).
+
+    The "write everything down" half of the universal compact: on context-full /
+    timeout the session is asked to dump its complete forward-state so a fresh
+    incarnation can boot from it. Role-agnostic — unlike ``assignment_write_result``
+    (which needs an assignment_id), this resolves the session's role + task from
+    its session md so a *task-less* role (e.g. the operator) can save too. Backed
+    by the SAME reusable ``Artifact`` seam (no second store).
+
+    A dev's role artifact IS its T-0463 result sidecar; an operator's is the
+    state-doc (``artifacts/operator-state.md``, schema = T-0473).
+
+    Required params: slug, sid, content
+    Returns: {ok, role, assignment_id, artifact_path, bytes_written}
+    """
+    extra = set(params) - _COMPACT_WRITE_STATE_ALLOWED
+    if extra:
+        raise ActionError(f"compact_write_state got unexpected params: {sorted(extra)}")
+    missing = _COMPACT_WRITE_STATE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"compact_write_state missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    sid = params["sid"]
+    content = params["content"]
+
+    if not isinstance(content, str) or not content.strip():
+        raise ActionError("compact_write_state: empty content")
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"compact_write_state: unknown project slug {slug!r}")
+
+    from bot_squad_worker import sessions as _sessions
+    from bot_squad_worker.assignment import compose_result_body, role_artifact
+
+    meta = _sessions._read_session_metadata(
+        _sessions._session_file(cfg.data_dir, slug, sid))
+    if meta is None:
+        raise ActionError(f"compact_write_state: no session md for sid {sid!r}")
+
+    task_id = meta.get("task_id")
+    role = meta.get("role") or _sessions._derive_role(
+        meta.get("window"), task_id, meta.get("initiative"))
+
+    art = role_artifact(cfg.data_dir, slug, role=role, sid=sid, task_id=task_id)
+    if art is None:
+        raise ActionError(
+            f"compact_write_state: no role artifact for sid {sid!r} (role {role!r})")
+
+    task_bound = bool(task_id) and task_id != "~"
+    assignment_id = task_id if task_bound else (role or sid)
+    kind = "task" if task_bound else (role or "compact")
+    art.write(compose_result_body(assignment_id, kind, content, sid=sid))
+
+    body = art.read()
+    return {
+        "ok": True,
+        "role": role,
+        "assignment_id": assignment_id,
+        "artifact_path": str(art.path),
+        "bytes_written": len(body.encode("utf-8")),
+    }
+
+
 _TASK_NEW_REQUIRED = {"slug", "title"}
 _TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
 _TASK_NEW_TITLE_MAX = 240
@@ -2355,6 +2424,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "task_progress_add": _action_task_progress_add,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
     "assignment_write_result": _action_assignment_write_result,
+    # T-0467: universal-compact "write everything down" — role-agnostic save of
+    # a session's forward-state into its role artifact (F1.4).
+    "compact_write_state": _action_compact_write_state,
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
     "doc_new": _action_doc_new,
@@ -2445,6 +2517,10 @@ ACTION_MODES: dict[str, str] = {
     # coordinator writer, like task_progress_add. Dev sessions reach it via the
     # API / coordinator socket.
     "assignment_write_result": "coordinator_only",
+    # T-0467: writes the shared install data dir (artifacts/) + reads session md
+    # — single coordinator writer, like assignment_write_result. Sessions reach
+    # it via `bsq compact-save` (the coordinator socket).
+    "compact_write_state": "coordinator_only",
     "task_new": "coordinator_only",
     "doc_new": "coordinator_only",
     "uc_new": "coordinator_only",

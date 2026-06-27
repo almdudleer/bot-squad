@@ -343,21 +343,13 @@ def _ask_which_project(cfg, chat_id: str) -> None:
         "one_time_keyboard": True,
         "resize_keyboard": True,
     }
-    url = f"https://api.telegram.org/bot{cfg.tg_bot_token}/sendMessage"
-    extra = _proxy_kwargs(cfg)
-    try:
-        httpx.post(
-            url,
-            json={
-                "chat_id": chat_id,
-                "text": "Which project are you talking to? Pick one:",
-                "reply_markup": reply_markup,
-            },
-            timeout=10,
-            **extra,
-        )
-    except httpx.HTTPError:
-        pass
+    # T-0513: route through the channel abstraction (was a raw httpx sendMessage
+    # that bypassed get_channel). Interactive group reply → urgent=True (don't
+    # quiet-hours-drop the picker a user just triggered), sid="" (no prefix),
+    # debounce=False (offer the picker every time it's needed). Best-effort: a
+    # messenger outage must not break inbound routing (channel.send raises).
+    _channel_notify(cfg, chat_id, "Which project are you talking to? Pick one:",
+                    reply_markup=reply_markup)
 
 
 def _handle_project(cfg, chat_id: str, gid: str, args: str) -> dict:
@@ -541,14 +533,39 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
 
 
 def _notify(cfg, chat_id: str, message: str) -> None:
-    """Lightweight outbound message -- bypass debounce, no SID prefix."""
+    """Lightweight outbound command reply -- no SID prefix, no debounce.
+
+    T-0513: routes through the channel abstraction (``channels.get_channel``)
+    instead of a raw httpx ``sendMessage`` that bypassed it. The egress proxy,
+    token gate, and quiet-hours policy now live in one place (tg.py via the
+    channel), not duplicated here.
+    """
+    _channel_notify(cfg, chat_id, message)
+
+
+def _channel_notify(
+    cfg, chat_id: str, message: str, *, reply_markup: dict | None = None
+) -> None:
+    """Send an interactive group reply via the channel abstraction (T-0513).
+
+    These are replies to a user actively messaging the bot in its project
+    group, so: ``urgent=True`` (never quiet-hours-drop a reply the user just
+    asked for), ``sid=""`` (no ``[SID]`` prefix), ``debounce=False`` (echo every
+    time, not once per 60s). Best-effort — ``channel.send`` raises on a
+    transport/API error and an outage must not break inbound command handling.
+    """
     if not cfg.tg_bot_token:
         return
-    url = f"https://api.telegram.org/bot{cfg.tg_bot_token}/sendMessage"
-    extra = _proxy_kwargs(cfg)
+    from bot_squad_worker import channels as _channels
+
+    extra: dict[str, Any] = {"debounce": False}
+    if reply_markup is not None:
+        extra["reply_markup"] = reply_markup
     try:
-        httpx.post(url, data={"chat_id": chat_id, "text": message}, timeout=10, **extra)
-    except httpx.HTTPError:
+        _channels.get_channel(cfg, project=_slug_for_chat(cfg, chat_id)).send(
+            message, chat_id=chat_id, sid="", urgent=True, **extra
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never break inbound routing
         pass
 
 

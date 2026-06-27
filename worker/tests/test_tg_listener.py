@@ -640,6 +640,7 @@ def test_handle_update_unquoted_sticky_routes_to_pinned(tmp_path, monkeypatch):
     # The user's pinned project is beta — even though the message arrived in
     # alpha's chat, sticky routing wins (hardwired, voice-04).
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
 
     update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "do the thing"}}
     result = TL.handle_update(cfg, update)
@@ -656,6 +657,7 @@ def test_handle_update_unquoted_switch_reroutes(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     pinned = {"slug": "alpha"}
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: pinned["slug"])
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
 
     u1 = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "m1"}}
     assert TL.handle_update(cfg, u1)["slug"] == "alpha"
@@ -688,6 +690,90 @@ def test_handle_update_unquoted_no_identity_still_skips(tmp_path, monkeypatch):
     update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "hi"}}
     result = TL.handle_update(cfg, update)
     assert result["action"] == "skip"
+
+
+# ---------------------------------------------------------------------------
+# T-0485: firehose ingest — wire the unquoted message to a (continued-or-
+# spawned) user-conversation session via ensure_user_conversation.
+# ---------------------------------------------------------------------------
+
+
+def _dated_msg(text="do the thing", chat_id=111, date=1_700_000_000):
+    return {"chat": {"id": chat_id}, "from": _from(), "text": text, "date": date}
+
+
+def test_handle_update_unquoted_routes_to_user_conversation(tmp_path, monkeypatch):
+    """An unquoted message from a recognized user reaches a user-conversation
+    session via ensure_user_conversation(slug, global_user_id, message_ref),
+    where message_ref points at the just-appended store record (its timestamp =
+    its key in the (slug,gid) thread)."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
+    calls = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: calls.append((slug, gid, ref)))
+
+    msg = _dated_msg()
+    update = {"update_id": 1, "message": msg}
+    result = TL.handle_update(cfg, update)
+
+    assert result["action"] == "route" and result["slug"] == "beta"
+    # The wiring fired once with (routed slug, gid, message_ref=store-record ts).
+    assert calls == [("beta", "gu_1", TL._msg_ts(msg))]
+
+
+def test_handle_update_unquoted_burst_routes_to_one_session(tmp_path, monkeypatch):
+    """A burst from the same user routes every message to ONE attendant — each
+    call carries the same (slug, gid), so ensure_user_conversation's idempotent
+    single-attendant reuse keeps it one session (no fan-out)."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
+    routed = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: routed.append((slug, gid)))
+
+    for i, txt in enumerate(["problem 1", "problem 2", "problem 3"]):
+        TL.handle_update(cfg, {"update_id": i, "message": _dated_msg(text=txt)})
+
+    # Every message in the burst targets the same (slug, gid) attendant key.
+    assert routed == [("beta", "gu_1")] * 3
+
+
+def test_ensure_user_conversation_dispatches_action(tmp_path, monkeypatch):
+    """The helper dispatches the ensure_user_conversation worker action with
+    exactly (slug, global_user_id, message_ref)."""
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    captured = {}
+    monkeypatch.setattr(A, "dispatch",
+                        lambda name, params: captured.update(name=name, params=params)
+                        or {"ok": True, "sid": "S-x", "spawned": True})
+
+    TL._ensure_user_conversation(cfg, "beta", "gu_1", "2026-06-27T00:00:00Z")
+
+    assert captured["name"] == "ensure_user_conversation"
+    assert captured["params"] == {
+        "slug": "beta", "global_user_id": "gu_1",
+        "message_ref": "2026-06-27T00:00:00Z",
+    }
+
+
+def test_ensure_user_conversation_best_effort_swallows(tmp_path, monkeypatch):
+    """A spawn/pane hiccup must never break inbound routing — the message is
+    already durable in the store (T-0489), so the helper swallows and returns
+    None rather than propagating."""
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(A, "dispatch",
+                        lambda name, params: (_ for _ in ()).throw(A.ActionError("no pane")))
+
+    assert TL._ensure_user_conversation(cfg, "beta", "gu_1", "ref") is None
 
 
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):

@@ -374,6 +374,36 @@ def _handle_project(cfg, chat_id: str, gid: str, args: str) -> dict:
     return {"ok": True, "action": "project_set", "slug": slug}
 
 
+def _ensure_user_conversation(
+    cfg, slug: str, gid: str, message_ref: str
+) -> Optional[dict]:
+    """T-0485 (M4 firehose intake): route an unquoted dump to a (continued-or-
+    spawned) user-conversation session via the ``ensure_user_conversation``
+    worker action (T-0478). The action is idempotent + single-attendant per
+    ``(slug, gid)`` (keyed on the live tmux pane), so a burst of messages routes
+    to the EXISTING session rather than fanning out into N spawns; a brand-new
+    user gets a user-conversation role session that records the verbatim
+    request->task and notifies the operator.
+
+    ``message_ref`` is a POINTER to the just-appended T-0489 store record (its
+    timestamp = its key in the ``(slug, gid)`` thread), surfaced in the session's
+    boot prompt — the session reads the full dump from the store SSOT, not a raw
+    blob passed inline.
+
+    Best-effort: the message is already durable in the conversation store
+    (T-0489), so a spawn/pane hiccup must NEVER fail inbound routing — we swallow
+    and return ``None``."""
+    from bot_squad_worker import actions as A
+    try:
+        return A.dispatch("ensure_user_conversation", {
+            "slug": slug,
+            "global_user_id": gid,
+            "message_ref": message_ref,
+        })
+    except Exception:  # noqa: BLE001 — best-effort; never break inbound routing
+        return None
+
+
 def _handle_unquoted(cfg, chat_id: str, gid: str, msg: dict) -> dict:
     """An unquoted (non-reply, non-command) message. Sticky-route it to the
     user's pinned project; ask which project when unset. Unrecognized senders
@@ -382,6 +412,12 @@ def _handle_unquoted(cfg, chat_id: str, gid: str, msg: dict) -> dict:
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
     sticky = get_current_project(cfg, gid)
     if sticky:
+        # T-0485: hand the dump to a (continued-or-spawned) user-conversation
+        # session. message_ref points at the just-appended store record (its
+        # timestamp keys it in the (slug,gid) thread) so the session reads the
+        # dump from the store SSOT, not the raw blob.
+        message_ref = _msg_ts(msg)
+        _ensure_user_conversation(cfg, sticky, gid, message_ref)
         return {"ok": True, "action": "route", "slug": sticky}
     _ask_which_project(cfg, chat_id)
     return {"ok": True, "action": "ask_project"}

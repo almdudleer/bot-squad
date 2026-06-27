@@ -167,6 +167,142 @@ def count_pending_backlog(cfg: Any, slug: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# T-0475 — operator pacing: parallelism + best-effort weekly-quota target
+# ---------------------------------------------------------------------------
+# clarification-03: "orchestrating the sessions according to parallelism and
+# token usage constraints; ideally ... weekly quota utilization constraints/
+# targets IF we can get this info."
+#
+# The operator is an LLM session — it paces its OWN dispatching from its brief.
+# This module exposes the pacing SIGNALS it should honor; the hard parallelism
+# ceiling is still enforced at spawn (_enforce_parallel_cap, T-0239) and the
+# re-drive defers under that backpressure. We surface:
+#   * max_in_progress  — the parallelism cap (pace.py SSOT, TL-B / T-0482)
+#   * in_progress      — current load (board tasks at status in_progress)
+#   * weekly_target_pct— OPTIONAL utilization target (system_settings [operator])
+#   * burn_tokens_per_hr / remaining_tokens — best-effort from telemetry's quota
+#     estimate (Max weekly TOTAL is NOT queryable, telemetry.py — so the % target
+#     is ADVISORY, never a hard block; degrade gracefully when no signal).
+
+def _in_progress_count(cfg: Any, slug: str) -> int:
+    """Board tasks currently at ``status: in_progress`` (the load measured against
+    ``max_in_progress``). Non-archived top-level ``backlog/*.md`` only."""
+    from bot_squad_worker import frontmatter as _fm
+
+    backlog = cfg.data_dir / slug / "backlog"
+    if not backlog.exists():
+        return 0
+    n = 0
+    for md in sorted(backlog.glob("*.md")):
+        try:
+            parsed = _fm.parse_or_none(md.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if not parsed:
+            continue
+        meta = (parsed[0] or {})
+        if str(meta.get("archived", "")).strip().lower() in ("true", "yes", "1", "on"):
+            continue
+        if str(meta.get("status", "")).strip().lower() == "in_progress":
+            n += 1
+    return n
+
+
+def _system_settings_path(cfg: Any) -> Optional[Path]:
+    """Best-effort locate ``system_settings.toml`` — ``cfg.config_dir`` if present,
+    else the conventional install path. None if neither is usable."""
+    cdir = getattr(cfg, "config_dir", None)
+    if cdir:
+        p = Path(cdir) / "system_settings.toml"
+        if p.exists():
+            return p
+    p = Path("/home/www/bot-squad/config/system_settings.toml")
+    return p if p.exists() else None
+
+
+def weekly_quota_target_pct(cfg: Any) -> Optional[float]:
+    """The operator's OPTIONAL weekly quota-utilization target (percent, e.g.
+    ``20.0``), read best-effort from ``system_settings.toml`` ``[operator]
+    .weekly_quota_target_pct``. None when unset/unreadable — the target is
+    explicitly conditional ("IF we can get this info"), so absence is normal."""
+    import tomllib
+
+    p = _system_settings_path(cfg)
+    if p is None:
+        return None
+    try:
+        data = tomllib.loads(p.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    v = ((data.get("operator") or {}).get("weekly_quota_target_pct"))
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _burn_signal(cfg: Any, slug: str) -> dict:
+    """Best-effort read of telemetry's quota estimate (``_telemetry/_quota.json``):
+    ``{burn_tokens_per_hr, remaining_tokens, rate_limit_429}``. All-None when no
+    signal exists yet (Max remaining is never authoritative — estimate only)."""
+    q = cfg.data_dir / slug / "_telemetry" / "_quota.json"
+    try:
+        data = json.loads(q.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"burn_tokens_per_hr": None, "remaining_tokens": None, "rate_limit_429": 0}
+    rl = data.get("rate_limit_429") or {}
+    return {
+        "burn_tokens_per_hr": data.get("burn_tokens_per_hr"),
+        "remaining_tokens": data.get("remaining_tokens"),
+        "rate_limit_429": int(rl.get("count", 0)) if isinstance(rl, dict) else 0,
+    }
+
+
+def pacing_status(cfg: Any, slug: str) -> dict:
+    """The operator's pacing dashboard — the signals it honors when deciding how
+    many sessions to run (T-0475 / F2.6). Composed from the parallelism cap
+    (pace.py SSOT), current load, the optional weekly target, and the best-effort
+    burn estimate. ``recommendation`` is the one-word steer for the operator brief:
+
+      * ``throttle``  — at/over the parallelism cap OR rate-limit 429s seen:
+                        stop dispatching new sessions, let in-flight drain.
+      * ``advisory``  — a weekly target is set but the weekly total isn't knowable
+                        (best-effort): pace by judgement toward the target %.
+      * ``ok``        — under cap, no target/pressure: dispatch freely.
+
+    Always safe + total (never raises): every signal degrades to None/0 so the
+    operator still gets a usable dashboard on a fresh project with no telemetry."""
+    from bot_squad_worker import pace as _pace
+
+    try:
+        cap = _pace.max_in_progress(cfg, slug)  # 0 = unlimited
+    except Exception:  # noqa: BLE001 — pacing must never break the tick
+        cap = 0
+    in_prog = _in_progress_count(cfg, slug)
+    at_cap = cap > 0 and in_prog >= cap
+    target = weekly_quota_target_pct(cfg)
+    burn = _burn_signal(cfg, slug)
+
+    if at_cap or burn["rate_limit_429"] > 0:
+        rec = "throttle"
+    elif target is not None:
+        rec = "advisory"
+    else:
+        rec = "ok"
+
+    return {
+        "max_in_progress": cap,            # 0 = unlimited
+        "in_progress": in_prog,
+        "at_cap": at_cap,
+        "weekly_target_pct": target,       # None = unset (optional)
+        "burn_tokens_per_hr": burn["burn_tokens_per_hr"],
+        "remaining_tokens": burn["remaining_tokens"],  # estimate, may be None
+        "rate_limit_429": burn["rate_limit_429"],
+        "recommendation": rec,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Re-drive (spawn) — purely scheduler-internal
 # ---------------------------------------------------------------------------
 

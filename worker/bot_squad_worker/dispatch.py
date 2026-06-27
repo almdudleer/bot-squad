@@ -75,8 +75,13 @@ def operator_standing_task() -> str:
         "and corrects you, but you do NOT wait on user input — when on, you "
         "always drive the backlog forward: triage and prioritise open tasks, and "
         "dispatch sessions to clear them, orchestrating per the parallelism + "
-        "token/quota constraints. An empty backlog (nothing actionable left) is "
-        "the only idle state; otherwise there is always a next move to make."
+        "token/quota constraints. PACING (T-0475): honor your pacing signals — "
+        "stay within max_in_progress, THROTTLE (let in-flight drain, don't "
+        "dispatch new) when at the cap or seeing rate-limit/429 pressure, and "
+        "when a weekly quota-utilization target is set treat it as ADVISORY "
+        "(pace by judgement toward it — the weekly total is not precisely "
+        "knowable). An empty backlog (nothing actionable left) is the only idle "
+        "state; otherwise there is always a next move to make."
     )
 
 

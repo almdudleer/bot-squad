@@ -135,6 +135,17 @@ def build_app() -> FastAPI:
         # They must register BEFORE the SPA catch-all below.
         app.include_router(mothership_bundle_router)
 
+        # T-0489: TG conversation history (per project+user). Mothership-only —
+        # the user-communication module is centralized here (voice-04) and keys
+        # on the mothership global_user_id (T-0488). Worker-token write surface
+        # + session-auth read surface, both under /api/m.
+        from app.routes_conversations import (
+            router as conversations_router,
+            worker_router as conversations_worker_router,
+        )
+        app.include_router(conversations_router, prefix="/api/m")
+        app.include_router(conversations_worker_router, prefix="/api/m")
+
         # T-0055: self-register this mothership in its own registry on boot so
         # the unified all-projects view at `/` has a row for "this server"
         # without waiting for an admin to manually add it. Idempotent — dedup

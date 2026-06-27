@@ -377,6 +377,112 @@ def test_handle_update_links_sender_and_records_identity(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# T-0489: conversation history append. Each inbound TG user message is recorded
+# to the API conversation store (single-writer = API), keyed by
+# (slug, global_user_id). Env-gated + best-effort so inbound routing is never
+# blocked by a record failure.
+# ---------------------------------------------------------------------------
+
+
+def test_append_conversation_posts(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    msg = {"from": _from(), "text": "deploy please", "date": 1750000000}
+    with patch("httpx.post", side_effect=fake_post):
+        ok = TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert ok is True
+    assert captured["url"] == "https://mship.test/api/m/conversations/test-project/gu_abc/messages"
+    assert captured["json"]["author"] == "user"
+    assert captured["json"]["text"] == "deploy please"
+    assert captured["json"]["timestamp"]  # an ISO ts derived from the TG date
+    assert captured["json"]["attachments"] == []
+    assert captured["headers"]["Authorization"] == "Bearer WTOKEN"
+
+
+def test_append_conversation_captures_voice_attachment(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    msg = {"from": _from(), "voice": {"file_id": "VID", "duration": 3}}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert captured["json"]["attachments"] == [{"type": "voice", "file_id": "VID"}]
+
+
+def test_append_conversation_noop_without_env(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch, base=None, token=None)
+    msg = {"from": _from(), "text": "hi"}
+    with patch("httpx.post", side_effect=AssertionError("must not POST")):
+        assert TL.append_conversation(cfg, "test-project", "gu_abc", msg) is None
+
+
+def test_append_conversation_noop_without_gid(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    msg = {"from": _from(), "text": "hi"}
+    with patch("httpx.post", side_effect=AssertionError("must not POST")):
+        assert TL.append_conversation(cfg, "test-project", "", msg) is None
+
+
+def test_append_conversation_swallows_http_error(tmp_path, monkeypatch):
+    import httpx
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    msg = {"from": _from(), "text": "hi"}
+    with patch("httpx.post", side_effect=httpx.ConnectError("down")):
+        assert TL.append_conversation(cfg, "test-project", "gu_abc", msg) is None
+
+
+def test_handle_update_records_conversation(tmp_path, monkeypatch):
+    """An inbound message with a recognized sender is recorded to the store."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    monkeypatch.setattr(
+        TL, "resolve_or_link_sender",
+        lambda c, m, slug: {"global_user_id": "gu_zzz", "created": False, "slug": slug},
+    )
+    recorded = []
+    monkeypatch.setattr(
+        TL, "append_conversation",
+        lambda c, slug, gid, msg: recorded.append((slug, gid, msg.get("text"))),
+    )
+    update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
+    TL.handle_update(cfg, update)
+    assert recorded == [("test-project", "gu_zzz", "hello")]
+
+
+def test_handle_update_no_record_without_identity(tmp_path, monkeypatch):
+    """No recognized sender (linkage off / failed) => nothing recorded."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    monkeypatch.setattr(TL, "resolve_or_link_sender", lambda c, m, slug: None)
+    called = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, msg: called.append(1))
+    update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hi"}}
+    TL.handle_update(cfg, update)
+    assert called == []
+
+
+# ---------------------------------------------------------------------------
 # tick
 # ---------------------------------------------------------------------------
 

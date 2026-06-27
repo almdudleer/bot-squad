@@ -200,6 +200,63 @@ def resolve_or_link_sender(cfg, msg: dict, slug: str = "") -> Optional[dict]:
     }
 
 
+def _msg_attachments(msg: dict) -> list[dict]:
+    """Light attachment descriptors for the conversation record. We keep just
+    enough to know an attachment was present (type + file_id) — the binary lives
+    in TG, not the thread. Voice is the live case (T-0386); photos/documents are
+    recorded generically so the thread isn't silently lossy."""
+    out: list[dict] = []
+    voice = msg.get("voice")
+    if isinstance(voice, dict) and voice.get("file_id"):
+        out.append({"type": "voice", "file_id": voice["file_id"]})
+    doc = msg.get("document")
+    if isinstance(doc, dict) and doc.get("file_id"):
+        out.append({"type": "document", "file_id": doc["file_id"]})
+    if msg.get("photo"):
+        out.append({"type": "photo"})
+    return out
+
+
+def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optional[bool]:
+    """T-0489: record one inbound TG user message to the per-(project, user)
+    conversation history store — the durable thread "we can always look up"
+    (voice-04), the continuity substrate across session recycles.
+
+    The API owns the store (single-writer); the worker POSTs to the token-gated
+    append endpoint over the same worker->API path T-0488 established (httpx,
+    base=MOTHERSHIP_BASE_URL, Bearer=WORKER_API_TOKEN) — NOT through the TG
+    egress proxy (this is a local-API call, not Telegram traffic).
+
+    Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
+    ``global_user_id``, or the API base / worker token aren't configured — so a
+    record failure NEVER blocks inbound routing. Returns ``True`` on a recorded
+    append."""
+    gid = str(global_user_id or "").strip()
+    if not gid or not str(slug or ""):
+        return None
+    base = _api_base_url()
+    token = _worker_api_token()
+    if not base or not token:
+        return None
+    url = f"{base}/api/m/conversations/{slug}/{gid}/messages"
+    try:
+        r = httpx.post(
+            url,
+            json={
+                "author": "user",
+                "text": msg.get("text") or "",
+                "attachments": _msg_attachments(msg),
+                "timestamp": _msg_ts(msg),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return True
+
+
 def handle_update(cfg, update: dict) -> dict:
     """Dispatch one update. Returns a small audit dict."""
     msg = update.get("message")
@@ -221,6 +278,14 @@ def handle_update(cfg, update: dict) -> dict:
     # blocked by linkage. Surfaced on the audit dict as (slug, global_user_id)
     # for the downstream user-conversation seam.
     identity = resolve_or_link_sender(cfg, msg, slug)
+
+    # T-0489: record EVERY inbound user message to the conversation history store
+    # (the durable thread, voice-04) before routing — so the record is complete
+    # regardless of how (or whether) the message routes below. Best-effort +
+    # env-gated; only when the sender is a recognized GlobalUser (no gid => no
+    # anchor to key the thread on).
+    if identity and identity.get("global_user_id"):
+        append_conversation(cfg, slug, identity["global_user_id"], msg)
 
     slash = extract_slash_command(msg)
     if slash:

@@ -1,0 +1,132 @@
+"""T-0489: per-(project, user) conversation history store.
+
+A dedicated, file-backed store for the full TG user-conversation thread — the
+durable record (like the Claude jsonl session files) that survives session
+recycles and feeds the user-conversation seam (M5-T8/T9). Keyed by
+(project_slug, global_user_id); append-only, paginated list + text search.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from app import conversation_store as CS
+
+
+def test_list_missing_returns_empty(tmp_path: Path):
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["total"] == 0
+    assert out["messages"] == []
+
+
+def test_append_then_list_roundtrip(tmp_path: Path):
+    rec = CS.append(
+        tmp_path, "proj", "gu_abc",
+        author="user", text="hello there",
+        timestamp="2026-06-27T00:00:00Z",
+    )
+    assert rec["author"] == "user"
+    assert rec["text"] == "hello there"
+    assert rec["timestamp"] == "2026-06-27T00:00:00Z"
+    assert rec["attachments"] == []
+
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["total"] == 1
+    assert out["messages"][0]["text"] == "hello there"
+
+
+def test_append_defaults_timestamp_when_absent(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi")
+    assert rec["timestamp"]  # an ISO timestamp was stamped
+
+
+def test_append_preserves_attachments(tmp_path: Path):
+    atts = [{"type": "voice", "file_id": "VID"}]
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="", attachments=atts)
+    assert rec["attachments"] == atts
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["attachments"] == atts
+
+
+def test_messages_are_chronological_append_order(tmp_path: Path):
+    for i in range(5):
+        CS.append(tmp_path, "proj", "gu_abc", author="user", text=f"m{i}",
+                  timestamp=f"2026-06-27T00:00:0{i}Z")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert [m["text"] for m in out["messages"]] == ["m0", "m1", "m2", "m3", "m4"]
+
+
+def test_pagination_offset_and_limit(tmp_path: Path):
+    for i in range(10):
+        CS.append(tmp_path, "proj", "gu_abc", author="user", text=f"m{i}")
+    page = CS.list_messages(tmp_path, "proj", "gu_abc", limit=3, offset=2)
+    assert page["total"] == 10           # total is the full count, not the page size
+    assert page["limit"] == 3
+    assert page["offset"] == 2
+    assert [m["text"] for m in page["messages"]] == ["m2", "m3", "m4"]
+
+
+def test_offset_past_end_returns_empty_page(tmp_path: Path):
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="only")
+    page = CS.list_messages(tmp_path, "proj", "gu_abc", limit=10, offset=50)
+    assert page["total"] == 1
+    assert page["messages"] == []
+
+
+def test_search_filters_case_insensitively(tmp_path: Path):
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="Deploy the worker")
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="unrelated chatter")
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="please DEPLOY again")
+    out = CS.search(tmp_path, "proj", "gu_abc", "deploy")
+    assert out["total"] == 2
+    assert [m["text"] for m in out["messages"]] == ["Deploy the worker", "please DEPLOY again"]
+
+
+def test_search_paginates_matches(tmp_path: Path):
+    for i in range(6):
+        CS.append(tmp_path, "proj", "gu_abc", author="user", text=f"deploy {i}")
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="noise")
+    out = CS.search(tmp_path, "proj", "gu_abc", "deploy", limit=2, offset=1)
+    assert out["total"] == 6
+    assert [m["text"] for m in out["messages"]] == ["deploy 1", "deploy 2"]
+
+
+def test_thread_is_scoped_per_project_and_user(tmp_path: Path):
+    CS.append(tmp_path, "proj-a", "gu_1", author="user", text="a1")
+    CS.append(tmp_path, "proj-b", "gu_1", author="user", text="b1")
+    CS.append(tmp_path, "proj-a", "gu_2", author="user", text="a2-other-user")
+
+    assert [m["text"] for m in CS.list_messages(tmp_path, "proj-a", "gu_1")["messages"]] == ["a1"]
+    assert [m["text"] for m in CS.list_messages(tmp_path, "proj-b", "gu_1")["messages"]] == ["b1"]
+    assert [m["text"] for m in CS.list_messages(tmp_path, "proj-a", "gu_2")["messages"]] == ["a2-other-user"]
+
+
+def test_survives_recycle_durable_on_disk(tmp_path: Path):
+    """The store IS the durable record: a fresh process (no in-memory state)
+    reads back everything written before — this is the continuity substrate."""
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="before recycle",
+              timestamp="2026-06-27T00:00:00Z")
+    # Simulate a recycle: nothing cached; read straight off disk by path.
+    assert CS.conv_path(tmp_path, "proj", "gu_abc").exists()
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["total"] == 1
+    assert out["messages"][0]["text"] == "before recycle"
+
+
+def test_corrupt_line_is_skipped_not_fatal(tmp_path: Path):
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="good")
+    p = CS.conv_path(tmp_path, "proj", "gu_abc")
+    with p.open("a", encoding="utf-8") as f:
+        f.write("{not json\n")
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="after")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert [m["text"] for m in out["messages"]] == ["good", "after"]
+
+
+@pytest.mark.parametrize("bad", ["../escape", "a/b", "..", "", "a\\b"])
+def test_path_traversal_segments_rejected(tmp_path: Path, bad: str):
+    with pytest.raises(ValueError):
+        CS.append(tmp_path, bad, "gu_abc", author="user", text="x")
+    with pytest.raises(ValueError):
+        CS.list_messages(tmp_path, "proj", bad)

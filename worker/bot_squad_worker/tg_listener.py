@@ -127,7 +127,7 @@ def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
     parts = text.split(None, 1)
     cmd = parts[0].lstrip("/").split("@")[0]   # strip @botname if present
     args = parts[1] if len(parts) > 1 else ""
-    if cmd not in {"sessions", "say", "help"}:
+    if cmd not in {"sessions", "say", "help", "project"}:
         return None
     return (cmd, args)
 
@@ -257,6 +257,133 @@ def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optio
     return True
 
 
+# ---- T-0492: hardwired project routing --------------------------------------
+# A user pins a CURRENT project (a button / ``/project <slug>``); subsequent
+# unquoted messages sticky-route to it; the bot ASKS which project when unset
+# (voice-04: "the bot should be hardwired to ask the user which project he's
+# talking to"). The pin is owned by the API (single-writer = pins_store); the
+# worker reads/sets it through the token-gated routing endpoints, env-gated +
+# best-effort so a routing-store outage never crashes inbound handling.
+
+
+def _routing_url(base: str, global_user_id: str) -> str:
+    return f"{base}/api/m/conversations/routing/{global_user_id}/current-project"
+
+
+def get_current_project(cfg, global_user_id: str) -> Optional[str]:
+    """The user's pinned current-project slug, or ``None`` when unset / the
+    routing store is unreachable / linkage isn't configured (best-effort)."""
+    gid = str(global_user_id or "").strip()
+    if not gid:
+        return None
+    base = _api_base_url()
+    token = _worker_api_token()
+    if not base or not token:
+        return None
+    try:
+        r = httpx.get(
+            _routing_url(base, gid),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if isinstance(data, dict):
+        slug = data.get("slug")
+        return str(slug) if slug else None
+    return None
+
+
+def set_current_project(cfg, global_user_id: str, slug: str) -> Optional[bool]:
+    """Pin (or switch) the user's current project via the API. Returns ``True``
+    on success, ``None`` on a no-op / failure (best-effort + env-gated)."""
+    gid = str(global_user_id or "").strip()
+    if not gid or not str(slug or ""):
+        return None
+    base = _api_base_url()
+    token = _worker_api_token()
+    if not base or not token:
+        return None
+    try:
+        r = httpx.post(
+            _routing_url(base, gid),
+            json={"slug": slug},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return True
+
+
+def _ask_which_project(cfg, chat_id: str) -> None:
+    """Hardwired 'which project?' prompt — a reply-keyboard listing every
+    project. Each button sends ``/project <slug>`` as a NORMAL message, so the
+    selection arrives under ``allowed_updates:["message"]`` (no poll-contract
+    change; mirrors the voice-intake constraint). Best-effort."""
+    if not cfg.tg_bot_token:
+        return
+    keyboard = [[{"text": f"/project {slug}"}] for slug in cfg.projects]
+    reply_markup = {
+        "keyboard": keyboard,
+        "one_time_keyboard": True,
+        "resize_keyboard": True,
+    }
+    url = f"https://api.telegram.org/bot{cfg.tg_bot_token}/sendMessage"
+    extra = _proxy_kwargs(cfg)
+    try:
+        httpx.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": "Which project are you talking to? Pick one:",
+                "reply_markup": reply_markup,
+            },
+            timeout=10,
+            **extra,
+        )
+    except httpx.HTTPError:
+        pass
+
+
+def _handle_project(cfg, chat_id: str, gid: str, args: str) -> dict:
+    """``/project [slug]`` — pin/switch the current project, or (no arg / unknown
+    slug) re-offer the picker."""
+    if not gid:
+        _notify(cfg, chat_id, "Couldn't identify you yet — try again in a moment.")
+        return {"ok": False, "action": "project_no_identity"}
+    slug = args.strip()
+    if not slug:
+        _ask_which_project(cfg, chat_id)
+        return {"ok": True, "action": "ask_project"}
+    if slug not in cfg.projects:
+        _notify(cfg, chat_id, f"Unknown project: {slug}")
+        _ask_which_project(cfg, chat_id)
+        return {"ok": False, "action": "project_unknown", "slug": slug}
+    ok = set_current_project(cfg, gid, slug)
+    if not ok:
+        _notify(cfg, chat_id, f"Couldn't switch to {slug} right now — try again.")
+        return {"ok": False, "action": "project_set_failed", "slug": slug}
+    _notify(cfg, chat_id, f"You're on project {slug}. Messages now go there.")
+    return {"ok": True, "action": "project_set", "slug": slug}
+
+
+def _handle_unquoted(cfg, chat_id: str, gid: str, msg: dict) -> dict:
+    """An unquoted (non-reply, non-command) message. Sticky-route it to the
+    user's pinned project; ask which project when unset. Unrecognized senders
+    keep the pre-T-0492 skip behavior (no identity to anchor routing on)."""
+    if not gid:
+        return {"ok": True, "action": "skip", "reason": "not a reply or command"}
+    sticky = get_current_project(cfg, gid)
+    if sticky:
+        return {"ok": True, "action": "route", "slug": sticky}
+    _ask_which_project(cfg, chat_id)
+    return {"ok": True, "action": "ask_project"}
+
+
 def handle_update(cfg, update: dict) -> dict:
     """Dispatch one update. Returns a small audit dict."""
     msg = update.get("message")
@@ -284,12 +411,19 @@ def handle_update(cfg, update: dict) -> dict:
     # regardless of how (or whether) the message routes below. Best-effort +
     # env-gated; only when the sender is a recognized GlobalUser (no gid => no
     # anchor to key the thread on).
-    if identity and identity.get("global_user_id"):
-        append_conversation(cfg, slug, identity["global_user_id"], msg)
+    gid = identity.get("global_user_id") if identity else ""
+    if gid:
+        append_conversation(cfg, slug, gid, msg)
 
     slash = extract_slash_command(msg)
     if slash:
-        result = _handle_slash(cfg, chat_id, *slash)
+        cmd, args = slash
+        # T-0492: /project pins/switches the user's current project (needs the
+        # sender identity, which _handle_slash doesn't carry) — route it here.
+        if cmd == "project":
+            result = _handle_project(cfg, chat_id, gid, args)
+        else:
+            result = _handle_slash(cfg, chat_id, cmd, args)
     else:
         reply = extract_reply_target(msg)
         if reply:
@@ -303,7 +437,10 @@ def handle_update(cfg, update: dict) -> dict:
             r = _vi.process_voice(cfg, slug, msg, ts=_msg_ts(msg))
             result = {"ok": r.get("ok", True), "action": "voice", "slug": slug, "result": r}
         else:
-            result = {"ok": True, "action": "skip", "reason": "not a reply or command"}
+            # T-0492: an unquoted message sticky-routes to the user's pinned
+            # project (asks which when unset). Unrecognized senders keep the
+            # pre-T-0492 skip.
+            result = _handle_unquoted(cfg, chat_id, gid, msg)
 
     if identity and identity.get("global_user_id"):
         result.setdefault("global_user_id", identity["global_user_id"])

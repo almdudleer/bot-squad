@@ -126,6 +126,63 @@ def test_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     assert [m["text"] for m in body["messages"]] == ["deploy now", "DEPLOY tomorrow"]
 
 
+# ---------------------------------------------------------------------------
+# T-0492: per-(user, server) current-project routing endpoints (worker-token).
+# The worker reads/sets the user's sticky project through the API (single-writer
+# = API, pins_store). Slug is validated against the project registry.
+# ---------------------------------------------------------------------------
+
+ROUTING = "/api/m/conversations/routing/gu_abc/current-project"
+
+
+def test_worker_set_current_project_persists(tmp_bot_squad: Path, monkeypatch):
+    from app import pins_store
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.post(ROUTING, json={"slug": "test-project"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["slug"] == "test-project"
+    assert pins_store.get_current_project(tmp_bot_squad / "data", "gu_abc") == "test-project"
+
+
+def test_worker_set_current_project_unknown_slug_is_400(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.post(ROUTING, json={"slug": "no-such-project"}, headers=_worker_auth())
+    assert r.status_code == 400
+
+
+def test_worker_set_current_project_missing_slug_is_400(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.post(ROUTING, json={}, headers=_worker_auth())
+    assert r.status_code == 400
+
+
+def test_worker_set_current_project_requires_token(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.post(ROUTING, json={"slug": "test-project"})
+    assert r.status_code == 401
+
+
+def test_worker_get_current_project_unset_is_null(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.get(ROUTING, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["slug"] is None
+
+
+def test_worker_get_current_project_after_set(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    client.post(ROUTING, json={"slug": "test-project"}, headers=_worker_auth())
+    r = client.get(ROUTING, headers=_worker_auth())
+    assert r.status_code == 200
+    assert r.json()["slug"] == "test-project"
+
+
+def test_worker_get_current_project_requires_token(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.get(ROUTING)
+    assert r.status_code == 401
+
+
 def test_endpoints_absent_when_not_mothership(tmp_bot_squad: Path, monkeypatch):
     """Detach build (MOTHERSHIP unset): the conversation routes never mount."""
     monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))

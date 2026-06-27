@@ -17,11 +17,18 @@ user-communication module is centralized on the mothership (voice-04), and the
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app import conversation_store as CS
+from app import pins_store
 from app.routes_auth import require_auth
 from app.routes_mothership import _authenticate_worker
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # Session-auth read surface.
 router = APIRouter(
@@ -61,6 +68,35 @@ def append_message(slug: str, global_user_id: str, request: Request, payload: di
         # An unsafe slug / global_user_id segment.
         raise HTTPException(status_code=400, detail=str(e))
     return record
+
+
+# ---- T-0492: per-(user, server) current-project routing (worker-token) -------
+# The same user-communication module owns conversation history AND the hardwired
+# routing of unquoted messages to a user's pinned project (voice-04). The worker
+# reads/sets the pin through these endpoints; single-writer = API (pins_store).
+
+
+@worker_router.post("/routing/{global_user_id}/current-project")
+def set_current_project(global_user_id: str, request: Request, payload: dict) -> dict:
+    """Pin (or switch) the user's current project. Worker-only. ``slug`` must be
+    a known project (validated against the registry, so a typo can't strand the
+    user on a non-existent project). Returns the stored ``{slug, at}`` record."""
+    _authenticate_worker(request)
+    slug = str(payload.get("slug") or "").strip()
+    if not slug:
+        raise HTTPException(status_code=400, detail="slug required")
+    cfg = request.app.state.api_config
+    if cfg.project(slug) is None:
+        raise HTTPException(status_code=400, detail=f"unknown project: {slug}")
+    return pins_store.set_current_project(cfg.data_dir, global_user_id, slug, at=_now_iso())
+
+
+@worker_router.get("/routing/{global_user_id}/current-project")
+def get_current_project(global_user_id: str, request: Request) -> dict:
+    """The user's current pinned project slug (``null`` when unset). Worker-only."""
+    _authenticate_worker(request)
+    cfg = request.app.state.api_config
+    return {"slug": pins_store.get_current_project(cfg.data_dir, global_user_id)}
 
 
 @router.get("/{slug}/{global_user_id}/messages")

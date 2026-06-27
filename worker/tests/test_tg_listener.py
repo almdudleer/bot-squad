@@ -364,16 +364,23 @@ def test_resolve_or_link_does_not_use_tg_proxy(tmp_path, monkeypatch):
 
 
 def test_handle_update_links_sender_and_records_identity(tmp_path, monkeypatch):
-    """handle_update resolves the sender and surfaces (slug, global_user_id)."""
+    """handle_update resolves the sender and surfaces (slug, global_user_id).
+
+    T-0492: a recognized sender's unquoted message no longer just 'skips' — with
+    no current project pinned it asks which project. The identity-surfacing
+    invariant (global_user_id on the result) still holds."""
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     monkeypatch.setattr(
         TL, "resolve_or_link_sender",
         lambda c, m, slug: {"global_user_id": "gu_zzz", "created": True, "slug": slug},
     )
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: None)
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
     result = TL.handle_update(cfg, update)
-    assert result["action"] == "skip"          # plain message still routes as before
-    assert result["global_user_id"] == "gu_zzz"  # ...but the sender is now recognized
+    assert result["action"] == "ask_project"     # recognized + unpinned -> asks
+    assert result["global_user_id"] == "gu_zzz"  # identity still surfaced
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +487,200 @@ def test_handle_update_no_record_without_identity(tmp_path, monkeypatch):
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hi"}}
     TL.handle_update(cfg, update)
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# T-0492: hardwired project routing. A user pins a current project (button /
+# /project <slug>); subsequent unquoted messages sticky-route to it; the bot
+# ASKS which project when unset. The pin is read/written through the API
+# (single-writer = API, pins_store), env-gated + best-effort.
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_cfg(tmp_path, *, chat="111"):
+    cfg = _make_cfg(tmp_path, tg_chat=chat)
+    cfg.projects = {
+        "alpha": types.SimpleNamespace(tg_chat="111"),
+        "beta": types.SimpleNamespace(tg_chat="222"),
+    }
+    return cfg
+
+
+def test_extract_slash_command_project():
+    assert TL.extract_slash_command(_slash_message("/project beta")) == ("project", "beta")
+    assert TL.extract_slash_command(_slash_message("/project")) == ("project", "")
+
+
+def test_get_current_project_http(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"slug": "beta"}
+        return resp
+
+    with patch("httpx.get", side_effect=fake_get):
+        assert TL.get_current_project(cfg, "gu_1") == "beta"
+    assert captured["url"] == "https://mship.test/api/m/conversations/routing/gu_1/current-project"
+
+
+def test_get_current_project_noop_without_env(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path)
+    _link_env(monkeypatch, base=None, token=None)
+    with patch("httpx.get", side_effect=AssertionError("must not GET")):
+        assert TL.get_current_project(cfg, "gu_1") is None
+
+
+def test_set_current_project_http(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"slug": "beta", "at": "t"}
+        return resp
+
+    with patch("httpx.post", side_effect=fake_post):
+        assert TL.set_current_project(cfg, "gu_1", "beta") is True
+    assert captured["url"] == "https://mship.test/api/m/conversations/routing/gu_1/current-project"
+    assert captured["json"] == {"slug": "beta"}
+
+
+def test_handle_update_project_command_pins(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    set_calls = []
+    monkeypatch.setattr(TL, "set_current_project",
+                        lambda c, gid, slug: set_calls.append((gid, slug)) or True)
+    notify = []
+    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notify.append(text))
+
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project beta"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "project_set"
+    assert result["slug"] == "beta"
+    assert set_calls == [("gu_1", "beta")]
+    assert any("beta" in t for t in notify)  # "you're on project beta"
+
+
+def test_handle_update_project_command_unknown_slug(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "set_current_project",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not set")))
+    asks = []
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: asks.append(chat))
+    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: None)
+
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project ghost"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "project_unknown"
+    assert asks == ["111"]  # re-offered the picker
+
+
+def test_handle_update_project_command_no_args_asks(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    asks = []
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: asks.append(chat))
+
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "ask_project"
+    assert asks == ["111"]
+
+
+def test_handle_update_unquoted_sticky_routes_to_pinned(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    # The user's pinned project is beta — even though the message arrived in
+    # alpha's chat, sticky routing wins (hardwired, voice-04).
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
+
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "do the thing"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "route"
+    assert result["slug"] == "beta"
+    assert result["global_user_id"] == "gu_1"
+
+
+def test_handle_update_unquoted_switch_reroutes(tmp_path, monkeypatch):
+    """pin -> route -> switch -> route: the second message follows the switch."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    pinned = {"slug": "alpha"}
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: pinned["slug"])
+
+    u1 = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "m1"}}
+    assert TL.handle_update(cfg, u1)["slug"] == "alpha"
+    pinned["slug"] = "beta"  # user switched
+    u2 = {"update_id": 2, "message": {"chat": {"id": 111}, "from": _from(), "text": "m2"}}
+    assert TL.handle_update(cfg, u2)["slug"] == "beta"
+
+
+def test_handle_update_unquoted_unset_asks(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
+    asks = []
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: asks.append(chat))
+
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "hi there"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "ask_project"
+    assert asks == ["111"]
+
+
+def test_handle_update_unquoted_no_identity_still_skips(tmp_path, monkeypatch):
+    """No recognized sender (linkage off) => old skip behavior, no routing."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender", lambda c, m, slug: None)
+    monkeypatch.setattr(TL, "get_current_project",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not route")))
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "hi"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "skip"
+
+
+def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    captured = {}
+
+    def fake_post(url, data=None, json=None, timeout=None, **kw):
+        captured["url"] = url
+        captured["payload"] = json if json is not None else data
+        return MagicMock()
+
+    with patch("httpx.post", side_effect=fake_post):
+        TL._ask_which_project(cfg, "111")
+
+    payload = captured["payload"]
+    # A reply-keyboard whose buttons send "/project <slug>" as a normal message
+    # (so it arrives under allowed_updates:["message"], no poll-contract change).
+    markup = payload["reply_markup"] if isinstance(payload.get("reply_markup"), dict) else _json.loads(payload["reply_markup"])
+    btn_texts = [btn["text"] for row in markup["keyboard"] for btn in row]
+    assert "/project alpha" in btn_texts
+    assert "/project beta" in btn_texts
 
 
 # ---------------------------------------------------------------------------

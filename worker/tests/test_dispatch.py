@@ -224,3 +224,110 @@ def test_missing_telemetry_record_treated_as_headroom(tmp_path):
     res = decide_dispatch(cfg, "test-project", "T-0009")
     assert res["decision"] == "reuse"
     assert res["target_sid"] == "S-u-d1-dev-p1"
+
+
+# ---------------------------------------------------------------------------
+# T-0472 — operator as transient dispatcher: standing task + one-per-project
+# ---------------------------------------------------------------------------
+
+from bot_squad_worker.dispatch import live_operator_sids, operator_standing_task
+
+
+def test_operator_standing_task_is_backlog_clearing_directive():
+    """The standing task (clarification-03) must be a backlog-clearing directive
+    that does NOT rely on user input, and must name the orchestration
+    constraints (parallelism + token/quota)."""
+    txt = operator_standing_task().lower()
+    assert "backlog" in txt
+    assert "parallel" in txt
+    assert "token" in txt or "quota" in txt
+    # user-facing but NOT user-reliant
+    assert "wait" in txt or "not" in txt
+
+
+def test_live_operator_sids_finds_live_operator(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-operator-p1", window="operator")
+    assert live_operator_sids(cfg, "test-project") == ["S-u-operator-p1"]
+
+
+def test_live_operator_sids_window_suffix_match(tmp_path):
+    """A ``<x>-operator`` window also derives the operator role."""
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-demo-operator-p2", window="demo-operator")
+    assert live_operator_sids(cfg, "test-project") == ["S-u-demo-operator-p2"]
+
+
+def test_live_operator_sids_excludes_dev_and_tl(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev")
+    _make_session(cfg, "S-u-x-tl-p2", window="x-tl")
+    assert live_operator_sids(cfg, "test-project") == []
+
+
+def test_live_operator_sids_excludes_archived_and_suspended(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-op-archived-p1", window="operator",
+                  status="active", archived="true")
+    _make_session(cfg, "S-u-op-suspended-p2", window="operator",
+                  status="suspended")
+    assert live_operator_sids(cfg, "test-project") == []
+
+
+def test_live_operator_sids_includes_paused(tmp_path):
+    """A paused operator is still a live holder — it counts toward the
+    one-per-project invariant (a re-drive should continue it, not duplicate)."""
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-operator-p1", window="operator", status="paused")
+    assert live_operator_sids(cfg, "test-project") == ["S-u-operator-p1"]
+
+
+def test_live_operator_sids_empty_when_no_sessions_dir(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    import shutil
+    shutil.rmtree(cfg.data_dir / "test-project" / "sessions")
+    assert live_operator_sids(cfg, "test-project") == []
+
+
+# --- spawn-time enforcement of exactly-one-operator (guard in actions) ------
+
+def test_spawn_session_blocks_second_operator(tmp_path, monkeypatch):
+    """``spawn_session`` for an operator window is refused when a live operator
+    already holds the project — exactly one operator per project (T-0472)."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-operator-p1", window="operator")
+
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    called = {"spawn": False}
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: called.__setitem__("spawn", True))
+
+    with pytest.raises(ActionError, match="operator already running"):
+        A._action_spawn_session({"slug": "test-project", "window": "operator"})
+    assert called["spawn"] is False  # guard fired BEFORE reaching the spawn
+
+
+def test_spawn_session_allows_first_operator(tmp_path, monkeypatch):
+    """With no live operator, an operator spawn proceeds to ``sessions.spawn``."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: {"ok": True, "sid": "S-new"})
+
+    res = A._action_spawn_session({"slug": "test-project", "window": "operator"})
+    assert res == {"ok": True, "sid": "S-new"}
+
+
+def test_spawn_session_dev_unaffected_by_operator_guard(tmp_path, monkeypatch):
+    """A dev spawn is never blocked by the operator guard, even with a live
+    operator present."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-operator-p1", window="operator")
+
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: {"ok": True, "sid": "S-dev"})
+
+    res = A._action_spawn_session({"slug": "test-project", "window": "feature-x"})
+    assert res == {"ok": True, "sid": "S-dev"}

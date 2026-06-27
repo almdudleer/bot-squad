@@ -185,7 +185,13 @@ def _load_operator_brief(cfg: ApiConfig, slug: str) -> str:
             "contract (vision/roles/operator.md). Pull other docs (tickets, "
             "initiatives, AGENT_INSTRUCTIONS.md) only when you need them rather "
             "than holding them in context.\n\n"
-            "First actions: run `bsq brief`, then `bsq inbox check`."
+            "You are a transient DISPATCHER, not a persistent chat: when on, your "
+            "standing task is to clear the backlog autonomously — don't wait on "
+            "the user (they check in and correct you), drive open tasks forward "
+            "within the parallelism + token constraints. Full contract in your "
+            "role doc.\n\n"
+            "First actions: run `bsq brief`, then `bsq inbox check`, then start "
+            "clearing the backlog."
         )
     return _OPERATOR_PLACEHOLDER.format(slug=slug)
 

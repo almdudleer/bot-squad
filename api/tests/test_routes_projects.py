@@ -1173,6 +1173,9 @@ def test_operator_brief_points_to_bsq_brief_instead_of_inlining_role_doc(tmp_pat
     assert "bsq brief" in brief        # the on-demand pointer
     assert sentinel not in brief       # the bulk role doc is NOT inlined
     assert len(brief) < 1000           # lean vs the ~5KB inline baseline
+    # T-0472: the brief nudges the operator to its standing task — clear the
+    # backlog autonomously, without waiting on user input.
+    assert "backlog" in brief.lower()
 
 
 # ---------------------------------------------------------------------------

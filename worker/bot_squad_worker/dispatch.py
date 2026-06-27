@@ -44,6 +44,69 @@ def reuse_max_context_pct() -> float:
     return val if val > 0 else DEFAULT_REUSE_MAX_CONTEXT_PCT
 
 
+# ---------------------------------------------------------------------------
+# T-0472 — operator as a transient per-project DISPATCHER
+#
+# The operator rides the SAME universal lifecycle as every role (NOT a persistent
+# session): user-facing (the user checks in + corrects) but never reliant on user
+# input. When on it ALWAYS has one standing task — clear the backlog — and exactly
+# one operator drives a project at a time. The two pure helpers below are the
+# seams those invariants ride on: ``operator_standing_task`` is the SSOT for the
+# directive text (spawn brief + T-0474 re-drive inject the SAME task), and
+# ``live_operator_sids`` answers "is an operator already on?" for the
+# one-per-project guard (T-0472) and the re-drive continue-vs-respawn (T-0474).
+# ---------------------------------------------------------------------------
+
+def operator_standing_task() -> str:
+    """The operator's STANDING TASK — the one directive it ALWAYS has when on
+    (clarification-03: "when on it always has a task to clear the backlog,
+    orchestrating the sessions according to parallelism and token usage
+    constraints").
+
+    The operator is user-facing — the user checks in and corrects it — but does
+    NOT rely on user input: when running it autonomously drives the backlog to
+    empty, dispatching sessions within the parallelism + token/quota constraints.
+    SSOT for the directive text so the spawn brief and the re-drive cadence
+    (T-0474's scheduler tick) inject the identical standing task; the full how-to
+    lives in the role contract (``vision/roles/operator.md``).
+    """
+    return (
+        "Your standing task: clear the backlog autonomously. The user checks in "
+        "and corrects you, but you do NOT wait on user input — when on, you "
+        "always drive the backlog forward: triage and prioritise open tasks, and "
+        "dispatch sessions to clear them, orchestrating per the parallelism + "
+        "token/quota constraints. An empty backlog (nothing actionable left) is "
+        "the only idle state; otherwise there is always a next move to make."
+    )
+
+
+def live_operator_sids(cfg: Any, slug: str) -> list[str]:
+    """SIDs of LIVE operator sessions for ``slug`` (status active/paused, not
+    archived). Pure read of session mds — no tmux — mirroring
+    :func:`decide_dispatch`'s session scan.
+
+    The seam behind two M2 invariants: (1) exactly-one-operator-per-project
+    enforcement at spawn time (T-0472 — a non-empty result blocks a second
+    operator), and (2) the re-drive cadence's continue-vs-respawn decision
+    (T-0474 — non-empty ⇒ an operator is already on; empty ⇒ the project has no
+    operator driving the backlog, so re-drive should spawn one).
+    """
+    sess_dir = cfg.data_dir / slug / "sessions"
+    out: list[str] = []
+    if not sess_dir.exists():
+        return out
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = S._read_session_metadata(md)
+        if meta is None or not S._is_live_holder(meta):
+            continue
+        role = S._derive_role(
+            meta.get("window"), meta.get("task_id"), meta.get("initiative"),
+        )
+        if role == "operator":
+            out.append(meta.get("sid", md.stem))
+    return out
+
+
 def _task_initiative(matches) -> str | None:
     """The bound initiative of a task md (None if unbound / placeholder)."""
     meta = S._read_session_metadata(matches[0])

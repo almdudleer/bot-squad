@@ -15,6 +15,13 @@ checked up front, the mother dir is created last so it can be removed
 on rollback if a later step fails. Existing user dirs (`repo_path`,
 `repo_master`) are never deleted by scaffolding — ops symlinks plant
 themselves only if `<clone>/ops` does not already exist.
+
+Per-clone seeding planted by the scaffolders (all idempotent / non-clobbering):
+  * `ops` symlink  -> the per-slug PROJECT DATA dir (`_link_ops`). T-0505:
+    data + ops tooling only; FRAMEWORK knowledge ships via skills now.
+  * `memory/`      -> shared, git-ignored project memory (`_seed_memory`, T-0502).
+  * `.claude/`     -> project-level Claude settings + lifecycle hooks
+                      (`_seed_claude`, T-0501), git-ignored per-clone.
 """
 from __future__ import annotations
 
@@ -113,6 +120,19 @@ def _link_ops(clone: Path, install_data_dir: Path, slug: str) -> tuple[bool, str
     we leave it alone and return linked=False with a note explaining why
     — clobbering a real `ops/` dir (signal-tracker's layout has one with
     its own contents) would be much worse than skipping the convenience.
+
+    T-0505 (voice-06) — scope of this link is now PROJECT DATA only. It
+    exposes the per-slug data dir the worker + sessions read/write (backlog,
+    sessions, vision, docs, scenarios, teams) plus the convenience ops tooling
+    (``ops/bot-squad-bin/...``). It is NO LONGER the delivery path for
+    FRAMEWORK knowledge (how to be a dev/TL/operator, CLI recipes, lifecycle
+    rules): that now ships as the 8 ``framework-skills/`` skills, auto-loaded
+    per-clone via the gitignored ``.claude/skills`` symlink (see
+    ``reference_framework_skills_home`` / D-0040), so a session gets its
+    operating-model knowledge from skills with no dependence on this link.
+    The link is therefore PHASE-retired for framework knowledge (its gate —
+    skills shipped, M7-T1/T6 / T-0499+T-0504 — is satisfied) and KEPT for
+    project data; "project stuff stays project stuff, managed via bot-squad."
     """
     target = (install_data_dir / slug).resolve()
     link = clone / "ops"

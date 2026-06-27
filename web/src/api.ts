@@ -86,6 +86,13 @@ export type Task = {
   initiative?: string | null;
   parent_task?: string | null;
   blocked_by?: string[] | null;
+  // T-0512 (M9 / Part A): when a task is split into subtasks it becomes an
+  // ABSTRACT parent. The /backlog list stamps `child_count` (how many subtasks
+  // point here via parent_task) and `derived_status` (the parent's canonical
+  // state rolled up from its children — see canonicalStatus.deriveParentStatus).
+  // Absent on leaf tasks (a task with no children is not abstract).
+  child_count?: number;
+  derived_status?: "backlog" | "in-progress" | "validating" | "done" | null;
   // T-0172: ticket→doc mentions (list of D-NNNN). Kept in sync with each
   // doc's `related_tickets` by the docs link/unlink endpoints.
   related_docs?: string[] | null;
@@ -845,6 +852,12 @@ export const api = {
     }),
   backlog: (slug: string) =>
     call<Task[]>(`/api/projects/${slug}/backlog`).then((tasks) => tasks.map(normalizeTask)),
+  // T-0512 (M9): list the subtasks of a task (every task whose parent_task ===
+  // id). 404s if the parent doesn't exist. Rows share the Task shape.
+  children: (slug: string, id: string) =>
+    call<Task[]>(`/api/projects/${slug}/backlog/${id}/children`).then((tasks) =>
+      tasks.map(normalizeTask),
+    ),
   vision: (slug: string) => call<VisionFile[]>(`/api/projects/${slug}/vision`),
   // item-12: GET /feedback default-HIDES closed (promoted/dismissed) items;
   // pass includeClosed for the 'Show closed' toggle.
@@ -1245,6 +1258,7 @@ export const api = {
 export type ProjectApi = Pick<
   typeof api,
   | "backlog"
+  | "children"
   | "vision"
   | "sessions"
   | "telemetry"

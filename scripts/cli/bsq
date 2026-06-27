@@ -956,8 +956,12 @@ Why you (overlap with your prior work): {overlap}
   paths/rules is stale, re-read AGENT_INSTRUCTIONS.md ({ai_path}).
 - Track ALL work on the ticket: `bsq ticket note <id> <text>` / `bsq ticket
   update <id> <status>`. Never plan into superpowers/* docs (T-0152).
+- ANCHOR ON THE ASK (T-0483): read the new ticket's `## Verbatim request` FIRST —
+  that exact stakeholder string (relayed once, no paraphrase) is your target;
+  keep work anchored to it and don't let it drift as context accumulates. It is
+  HUMAN-ONLY — never edit it.
 - Verify MANUAL-FIRST (T-0158): write the user scenario, walk it through, then
-  automate. The 'Verbatim request' section of a ticket is HUMAN-ONLY.
+  automate.
 - Git: edit the shared tree on bot_squad/dev (no worktree/stash). Commit ONLY
   with `bsq commit -m <msg> --ack <explicit files>`; never wide-add, never push
   or merge — your TL reviews + deploys.
@@ -1169,8 +1173,14 @@ You are a bot-squad {role} session assigned {primary}{bundle_note}
 The full scope+DoD of each assigned ticket is INLINED below — this brief is
 self-contained, but FIRST also read AGENT_INSTRUCTIONS.md ({ai_path}) for
 paths/git-rules and your initiative file{f' ({init_path})' if init_path else ''}.
-The 'Verbatim request — source of truth' section of any ticket is HUMAN-ONLY —
-never edit it.
+
+START HERE — ANCHOR ON THE ASK (T-0483): read {primary}'s `## Verbatim request`
+below FIRST. That exact string is your target. It was recorded once, verbatim,
+from the stakeholder so it reaches you WITHOUT paraphrase loss — that is the
+whole point of the task: it defeats broken-telephone. Keep your work anchored to
+it; don't let the target drift to the evolved mental model your accumulated
+context will suggest (re-read it whenever you compact). It is the source of truth
+and HUMAN-ONLY — never edit it.
 
 == ASSIGNED TICKET(S) ==
 {ticket_blocks}
@@ -1200,8 +1210,10 @@ never edit it.
    never rewrite pushed history (revert to undo), never push or merge — your
    {('TL' if role == 'dev' else 'reviewer')} reviews and deploys.
 4. STAY ON TASK (T-0149). A drift-check tick monitors time-since-commit and
-   time-since-progress-note. Come back to the DoD regularly; if you defer or
-   descope anything, record WHY via `bsq ticket note` — don't silently drift.
+   time-since-progress-note. Re-read {primary}'s `## Verbatim request` as your
+   anchor — that stated ask is the target, NOT the evolved model your context
+   suggests (T-0483). Come back to the DoD regularly; if you defer or descope
+   anything, record WHY via `bsq ticket note` — don't silently drift.
 5. REPORT READY. When a ticket's DoD (incl. manual walkthrough) is green:
    `bsq ticket update <id> totest`, `bsq ticket note <id> '<summary>'`, then
    `bsq peer send {report_to} 'READY <id> — <summary>'`.

@@ -531,6 +531,19 @@ if [ "$HOOK_SOURCE" = "resume" ] || [ "$HOOK_SOURCE" = "compact" ]; then
     ROLE_UC="$(printf '%s' "$ROLE" | tr '[:lower:]' '[:upper:]')"
     print_section "BOT-SQUAD — ${HOOK_SOURCE} (orientation unchanged)"
     echo "You are ${sid:-this session} — role: ${ROLE_UC}${task_id:+, task ${task_id}}."
+    # T-0507 anti-drift: a compact/resume fires precisely when context has
+    # accumulated — the exact moment the stakeholder warned the target can
+    # silently shift ("the target ... should not be shifted by ... if they
+    # accumulate some context", Part B). Re-anchor task-bound sessions on the
+    # STATED ask. Gated on task_id so task-less sessions (operator/TL) skip it.
+    if [ -n "$task_id" ]; then
+        echo
+        echo "ANTI-DRIFT CHECK (${task_id}) — context just grew; re-anchor on the STATED ask:"
+        echo "  Re-read ${task_id}'s \`## Verbatim request\` — that string is your target, not the"
+        echo "  evolved mental model your accumulated context suggests. Ask yourself: is what I'm"
+        echo "  doing now still targeting ${task_id}? Has scope shifted? If it drifted, return to"
+        echo "  the ask (or \`bsq ticket note ${task_id}\` WHY you defer). See the bot-squad-provenance skill."
+    fi
     echo "Message bus = \`bsq\`: \`bsq inbox check\` drains mail; \`bsq peer send <to> \"…\"\` sends."
     echo
     echo "Your role contract, AGENT_INSTRUCTIONS.md and the team protocol are UNCHANGED"

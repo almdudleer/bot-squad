@@ -5,11 +5,13 @@ description: Use whenever you hit a sub-question, ambiguity, or decision point i
 
 # Autonomous when grounded — decide, don't block
 
-## The principle (clarification-04 / 05, verbatim)
+## The principle (stakeholder verbatim)
 
-> "Decide sub-questions yourself, ground in quotes, don't block on the user." — clarification-04
+> "you don't really need my decisions, I gave you full understanding of what I want, expansive guidance on that... so drive the team autonomously — this concept on guidance should be one of the core concepts for bot-squad, because often claude starts asking clarifying questions even though it has full objectives picture... these questions are not important, you can make them yourself; important that the option that you choose is grounded on some of my direct guidance, quotes." — clarification-04 (verbatim)
 
-> "Ask ONLY if real AND ungroundable AND non-trivial AND important; weigh cost-of-mistake (this project = low → full speed)." — clarification-05
+> "if any agent comes to conclusion that this hole is real, the decision can't really be grounded in quotes, AND the decision is not trivial AND an important one, then by all means it should ask. The problem is right now you tend to ask obvious choice or unimportant stuff." — clarification-05 (verbatim)
+
+> "on this project the cost of mistake on your side is low... we will just fix it if you make a wrong call, so don't worry, drive on full speed [...] maybe we need to teach bot-squad agents to clarify the cost of mistake beforehand, to choose autonomous vs cautious." — clarification-05 (verbatim)
 
 Blocking on the stakeholder for things you could ground or reverse is the failure mode. Default to deciding and moving.
 

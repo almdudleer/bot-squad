@@ -18,15 +18,29 @@ This is a **core concept of bot-squad** (clarification-04), enforced framework-w
 1. **Linkable → do it.** An action that contributes to a stated ask — even an unspecific one ("make it modern", "make it faster") — IS grounded. Unspecific guidance leaves creative space; fill it. Do NOT refuse work just because it wasn't named literally.
 2. **Not linkable → don't invent it.** An action that's merely "logical" or "nice to have" but traces to no ask is **product management — the stakeholder's job, not yours.** Don't build it. Surface it instead: file a ticket (`bsq task new`) or `bsq feedback submit`.
 
-## Before you build, ask: what ask does this trace to?
+## The grounding-check — at MAJOR decisions, NOT pedantically
+
+Run this check at **major decision points** — starting a feature, adding a surface/button/endpoint, choosing scope, a refactor. **Not** every line, every helper, every keystroke. Don't narrate "this trace to…" for routine implementation of an already-grounded ask; that's the pedantry the stakeholder explicitly does NOT want. The check is: *for this MAJOR move, what ask does it trace to?*
 
 - Name the source: a ticket's `## Verbatim request`, an initiative, a `bsq guidance search` hit, or a direct message. If you can name it (specific OR a contributing piece of an unspecific direction), proceed.
 - Can't name one? It's invented. Stop and surface it — don't ship it.
-- Record the link: tickets carry verbatim asks; cite the source in your work (provenance note / commit message). The `scripts/lint/backlog_provenance.py` lint backs this.
+- Record the link: cite the source in your work (provenance note / commit message).
 
-## Don't let context drift your target
+## Provenance on tasks is enforced (live)
 
-As a session accumulates context, the target can silently shift toward whatever's locally interesting. Re-anchor on the **initial** ask regularly. If you're deferring or descoping it, record WHY (`bsq ticket note`) — don't drift silently. (The drift-check tick watches for this.)
+Every new ticket carries a source: `bsq task new` **requires** `--provenance` (e.g. `--provenance corpus:<token>` or a feedback id), and `scripts/lint/backlog_provenance.py` (pre-commit + CI) rejects tickets without it. So the chain is durable: action → ticket → its verbatim ask. When you file work outside your scope, attach the provenance just like any ticket.
+
+## Anti-drift — keep targeting the STATED ask
+
+> "they should probably be prompted good for them to not forget to check whether the things they are doing are targeted at something that I asked... the target that they pursue should not be shifted by, for example, if they accumulate some context. So they should be focused on the initial thing that I asked them to do." — Part B (verbatim)
+
+As a session accumulates context, the target silently shifts toward whatever's locally interesting. Counter it with a **periodic self-check** — at each major checkpoint (a milestone, before a new sub-thread, after a long detour):
+
+1. **Re-surface the verbatim ask.** Re-read your task's `## Verbatim request` (and the bound initiative). That string — not your evolved mental model — is the target.
+2. **Ask: is what I'm doing now still targeting that ask? Has scope shifted?** If your current work no longer maps to the verbatim ask, you've drifted.
+3. **If you drifted:** stop, return to the stated ask. If you're deliberately deferring/descoping it, record WHY (`bsq ticket note`) — never drift silently.
+
+This is a *target*-drift check (am I still building the asked thing), distinct from the harness drift-check tick (time-since-commit/progress) — both run; this one is yours to self-apply.
 
 ## Rationalizations — STOP
 

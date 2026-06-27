@@ -741,6 +741,33 @@ export type Analytics = {
   };
 };
 
+// T-0511 (M11-F11.4): the unified read-only system-transparency surface — the
+// operator state-doc + session tree + backlog + quota, in one read, so a fresh
+// operator/stakeholder can see where the system IS without talking to anyone.
+export type Transparency = {
+  slug: string;
+  operator_state: {
+    exists: boolean;
+    content: string | null;
+    updated_at: number | null;
+    path: string;
+  };
+  sessions: SessionRow[];
+  backlog: {
+    counts: Record<string, number>;
+    tasks: Task[];
+  };
+  quota: {
+    max_in_progress: number; // 0 = unlimited
+    in_progress: number;
+    paused: boolean;
+    initiatives: Record<
+      string,
+      { weight: number; priority: number; paused: boolean }
+    >;
+  };
+};
+
 // T-0296: per-project clone health read-model ("Installation != Project").
 // `dev` is the repo_path (working) clone, `prod` is the repo_master clone.
 // A clone may be unconfigured (no second clone) → {configured:false}; present
@@ -864,6 +891,10 @@ export const api = {
   feedback: (slug: string, includeClosed = false) =>
     call<FeedbackFile[]>(`/api/projects/${slug}/feedback${includeClosed ? "?include_closed=true" : ""}`),
   analytics: (slug: string) => call<Analytics>(`/api/projects/${slug}/analytics`),
+  // T-0511 (M11-F11.4): unified read-only system-state view. Used by the flat
+  // `api` (like analytics) — single-install, not proxied through mothership.
+  transparency: (slug: string) =>
+    call<Transparency>(`/api/projects/${slug}/transparency`),
   // T-0296: per-project clone health read-model ("Installation != Project").
   // Proxies the worker `clone_status` action (only the worker has on-host git
   // access to the clones). Read-only; any authed user may view.

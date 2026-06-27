@@ -362,6 +362,18 @@ export function Shell() {
                   ANALYTICS
                 </NavLink>
               </li>
+              {/* T-0511 (M11-F11.4): unified read-only system-state view —
+                  operator state-doc + session tree + backlog + quota in one
+                  place, readable without talking to the operator. */}
+              <li>
+                <NavLink
+                  to={`/p/${slug}/transparency`}
+                  data-onboarding-anchor="transparency-nav"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  SYSTEM STATE
+                </NavLink>
+              </li>
             </ul>
           </>
         )}

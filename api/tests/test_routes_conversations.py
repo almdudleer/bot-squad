@@ -113,6 +113,50 @@ def test_list_returns_paginated_thread(tmp_bot_squad: Path, monkeypatch):
     assert [m["text"] for m in body["messages"]] == ["m1", "m2"]
 
 
+def _make_nonadmin(tmp_bot_squad: Path) -> None:
+    """Rewrite auth.toml so ``testuser`` is a project-LIMITED (non-admin) user.
+
+    Today the only privilege tier modelled at project scope is the global
+    admin/member role (no per-project membership store yet — see
+    ``app.project_authz``), so a non-admin IS the "project-limited user" of
+    voice-04: they have access to no project's private conversation content."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+
+
+def test_list_nonadmin_denied_cross_project_content(tmp_bot_squad: Path, monkeypatch):
+    """T-0493 / voice-04 privacy: a project-limited (non-admin) user must NOT
+    be able to read another project's conversation thread. require_auth-only
+    leaked ANY project's content to ANY authed user; the read is now
+    project-access-gated -> 403 (no content served)."""
+    _make_nonadmin(tmp_bot_squad)
+    client = _client(tmp_bot_squad, monkeypatch)
+    # Seed content the limited user must NOT see.
+    CS.append(tmp_bot_squad / "data", "test-project", "gu_abc", author="user", text="secret thread")
+    _login(client)
+    r = client.get(AUTH_CONV)
+    assert r.status_code == 403, r.text
+    # The private content must not leak in the denied response.
+    assert "secret thread" not in r.text
+
+
+def test_list_admin_allowed(tmp_bot_squad: Path, monkeypatch):
+    """The admin (conftest default) passes the project-access gate and reads
+    the thread — gating must not break the legitimate read path."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    CS.append(tmp_bot_squad / "data", "test-project", "gu_abc", author="user", text="hello")
+    _login(client)
+    r = client.get(AUTH_CONV)
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 1
+
+
 def test_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     d = tmp_bot_squad / "data"

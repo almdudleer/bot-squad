@@ -128,6 +128,10 @@ router = APIRouter(
 installer_router = APIRouter(tags=["mothership-installer"])
 # No-auth bundle GETs — token in the URL path is the auth.
 bundle_router = APIRouter(tags=["mothership-bundle"])
+# T-0529: worker-token surface under a dedicated /worker prefix (-> /api/m/worker/*)
+# so the public traefik router can exclude all worker-only routes (option-C
+# least-exposure). Token-gated per-handler by _authenticate_worker (fails closed).
+worker_router = APIRouter(prefix="/worker", tags=["mothership-worker"])
 
 
 def _store(request: Request) -> MothershipStore:
@@ -405,7 +409,7 @@ def verify_global_user(request: Request, payload: dict) -> dict:
 # ---- T-0488: TG sender -> GlobalUser linkage (single bot user recognition) ----
 
 
-@installer_router.post("/tg/resolve-or-link")
+@worker_router.post("/tg/resolve-or-link")
 def tg_resolve_or_link(request: Request, payload: dict) -> dict:
     """Resolve an inbound Telegram sender to its cross-server GlobalUser, minting
     one on first contact. Called by the worker (``tg_listener``) on the inbound

@@ -186,7 +186,7 @@ def resolve_or_link_sender(cfg, msg: dict, slug: str = "") -> Optional[dict]:
     token = _worker_api_token()
     if not base or not token:
         return None
-    url = f"{base}/api/m/tg/resolve-or-link"
+    url = f"{base}/api/m/worker/tg/resolve-or-link"  # T-0529: /worker prefix (localhost-only)
     try:
         r = httpx.post(
             url,
@@ -249,7 +249,7 @@ def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optio
     token = _worker_api_token()
     if not base or not token:
         return None
-    url = f"{base}/api/m/conversations/{slug}/{gid}/messages"
+    url = f"{base}/api/m/worker/conversations/{slug}/{gid}/messages"  # T-0529: /worker prefix
     try:
         r = httpx.post(
             url,
@@ -278,7 +278,7 @@ def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optio
 
 
 def _routing_url(base: str, global_user_id: str) -> str:
-    return f"{base}/api/m/conversations/routing/{global_user_id}/current-project"
+    return f"{base}/api/m/worker/routing/{global_user_id}/current-project"  # T-0529: /worker prefix
 
 
 def get_current_project(cfg, global_user_id: str) -> Optional[str]:

@@ -37,14 +37,19 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 # Worker-token write surface (no session cookie); token checked per-handler.
-worker_router = APIRouter(prefix="/conversations", tags=["conversations-worker"])
+# T-0529: mounted under a dedicated /worker prefix (-> /api/m/worker/*) so the
+# public traefik router can exclude all worker-token routes (option-C
+# least-exposure) WITHOUT touching the session-auth /conversations read surface,
+# which must stay public for the UI. (A bare /conversations prefix shared the
+# path with the auth GET, so a PathPrefix exclusion couldn't separate them.)
+worker_router = APIRouter(prefix="/worker", tags=["conversations-worker"])
 
 
 def _data_dir(request: Request):
     return request.app.state.api_config.data_dir
 
 
-@worker_router.post("/{slug}/{global_user_id}/messages")
+@worker_router.post("/conversations/{slug}/{global_user_id}/messages")
 def append_message(slug: str, global_user_id: str, request: Request, payload: dict) -> dict:
     """Append one message to the (slug, global_user_id) thread. Worker-only.
 

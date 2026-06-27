@@ -131,9 +131,13 @@ def build_app() -> FastAPI:
             router as mothership_router,
             installer_router as mothership_installer_router,
             bundle_router as mothership_bundle_router,
+            worker_router as mothership_worker_router,
         )
         app.include_router(mothership_router, prefix="/api/m")
         app.include_router(mothership_installer_router, prefix="/api/m")
+        # T-0529: worker-token routes under /api/m/worker/* (traefik-excluded
+        # from the public router; reachable only on the localhost API port).
+        app.include_router(mothership_worker_router, prefix="/api/m")
         # Bundle GETs sit at root: /i/<token>/install.sh + instructions.md.
         # They must register BEFORE the SPA catch-all below.
         app.include_router(mothership_bundle_router)

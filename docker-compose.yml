@@ -42,7 +42,9 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=avo_backend"
       # Primary host: the single-install playground.
-      - "traefik.http.routers.bot-squad.rule=Host(`bot-squad.${DOMAIN}`)"
+      # T-0529: exclude worker-token routes (/api/m/worker/*) from the PUBLIC
+      # router — they're reachable only on the localhost API port (option-C).
+      - "traefik.http.routers.bot-squad.rule=Host(`bot-squad.${DOMAIN}`) && !PathPrefix(`/api/m/worker`)"
       - "traefik.http.routers.bot-squad.entrypoints=websecure"
       - "traefik.http.routers.bot-squad.tls.certresolver=le"
       - "traefik.http.services.bot-squad.loadbalancer.server.port=8000"
@@ -50,7 +52,7 @@ services:
       # when MOTHERSHIP=1 in .env. Both hosts hit the same backend; the
       # FE mothership chunks are gated by build flag, not host header.
       # Detach later by removing this router + setting MOTHERSHIP=0.
-      - "traefik.http.routers.bot-squad-mothership.rule=Host(`staging.botsquad.dev`) || Host(`botsquad.dev`)"
+      - "traefik.http.routers.bot-squad-mothership.rule=(Host(`staging.botsquad.dev`) || Host(`botsquad.dev`)) && !PathPrefix(`/api/m/worker`)"
       - "traefik.http.routers.bot-squad-mothership.entrypoints=websecure"
       - "traefik.http.routers.bot-squad-mothership.tls.certresolver=le"
       - "traefik.http.routers.bot-squad-mothership.service=bot-squad"

@@ -22,6 +22,7 @@ from bot_squad_worker.jobs import (
     deploy_monitor_one,
     drift_check_tick,
     heartbeat,
+    idle_timeout_tick,
     oauth_refresh,
     telemetry_tick,
     tg_listener_tick,
@@ -158,6 +159,22 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="telemetry",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # idle_timeout_tick: T-0466 / M1-F1.3 — ~1h cache-window recycle of stale
+    # waiting sessions (record-and-exit via the universal-compact handoff) +
+    # postpone / auto-postpone protocol. Sibling of telemetry (its own 60s job so
+    # a slow transcript read can't delay it); the 60s cadence drives the in-flight
+    # handoff finalize promptly while the recycle window itself is ~1h. No-op under
+    # BOT_SQUAD_IDLE_TIMEOUT=0. max_instances=1 + coalesce; idempotent.
+    sched.add_job(
+        idle_timeout_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="idle_timeout",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

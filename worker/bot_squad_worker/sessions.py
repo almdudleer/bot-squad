@@ -2584,6 +2584,55 @@ def set_drift_paused(cfg: Any, slug: str, sid: str, paused: bool) -> dict:
     return {"ok": True, "sid": meta.get("sid", sid), "drift_paused": bool(paused)}
 
 
+def set_idle_postpone(cfg: Any, slug: str, sid: str,
+                      seconds: int | None = None, reason: str | None = None) -> dict:
+    """T-0466: defer this session's next cache-window recycle (``bsq postpone``).
+
+    Stamps ``idle_postpone_until`` on the SessionMd so ``idle_timeout`` skips the
+    session until that deadline. The default deferral is one full window
+    (``idle_timeout_sec``); pass ``seconds`` to declare a bounded wait with a
+    known ETA (the stakeholder's "expected to finish within known time
+    boundaries", e.g. a long build). Repeatable indefinitely — each call just
+    pushes the deadline forward. Resolves the md by SID with the rename-tolerant
+    claude_uuid fallback, mirroring :func:`set_drift_paused`.
+
+    Returns ``{ok, sid, postpone_until, seconds}``.
+    """
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker import idle_timeout as _idle
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"set_idle_postpone: unknown project slug {slug!r}")
+
+    window = _idle.idle_timeout_sec()
+    try:
+        secs = int(seconds) if seconds is not None else window
+    except (TypeError, ValueError):
+        raise ActionError("set_idle_postpone: 'seconds' must be an integer")
+    if secs <= 0:
+        raise ActionError("set_idle_postpone: 'seconds' must be positive")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    md_path = _find_session_md(sessions_dir, sid, None)
+    if md_path is None:
+        raise ActionError(f"set_idle_postpone: no session metadata for SID {sid!r}")
+    meta = _read_session_metadata(md_path)
+    if meta is None:
+        raise ActionError(f"set_idle_postpone: unreadable session metadata for SID {sid!r}")
+
+    until = time.time() + secs
+    until_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
+    meta["idle_postpone_until"] = until_iso
+    if reason:
+        meta["idle_postpone_reason"] = reason
+    else:
+        meta.pop("idle_postpone_reason", None)
+    _write_session_metadata(md_path, meta, atomic=True)
+    return {"ok": True, "sid": meta.get("sid", sid),
+            "postpone_until": until_iso, "seconds": secs}
+
+
 def _reap_session_sidecars(cfg: Any, slug: str, sid: str) -> list[str]:
     """T-0447 (#4): cascade-free a session's per-SID sidecar scratch when it
     becomes archived/historical — the peer-bus ``_chat`` triple (inbox/seen/

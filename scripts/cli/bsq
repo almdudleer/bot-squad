@@ -24,6 +24,7 @@ Verbs:
   bsq team rename <sid> <name>      rename a session (tmux + UI + registry sync)
   bsq compact [--sid SID]           send /compact to a session (self by default)
   bsq compact-save "<state>"        write your forward-state to your role artifact (compact handoff)
+  bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
 
 Conventions shared with the other ops shims:
@@ -1559,6 +1560,25 @@ def cmd_operator_state(args) -> None:
               "`bsq compact-save \"<filled state-doc>\"`.")
 
 
+def cmd_postpone(args) -> None:
+    """T-0466: defer this session's next ~1h cache-window recycle.
+
+    A stale *waiting* session is asked at the cache-invalidation window to record
+    its forward-state and exit. Run this to be left running one more window
+    instead — repeatable indefinitely. Pass ``--for <seconds>`` to declare a
+    bounded wait with a known ETA (e.g. you're watching a long build)."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    params = {"slug": slug, "sid": sid}
+    if getattr(args, "seconds", None) is not None:
+        params["seconds"] = args.seconds
+    if getattr(args, "reason", None):
+        params["reason"] = args.reason
+    res = post("idle_postpone", params)
+    print(f"recycle postponed for {res.get('sid', sid)} until "
+          f"{res.get('postpone_until')} (+{res.get('seconds')}s)")
+
+
 def sessions_dir(slug: str) -> Path:
     return Path(BOT_SQUAD) / "data" / slug / "sessions"
 
@@ -3020,6 +3040,17 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("content", help="your complete forward-state markdown")
     cs.add_argument("--sid", help="session SID (default: derived from tmux)")
     cs.set_defaults(func=cmd_compact_save)
+
+    # postpone (T-0466) — defer this session's next ~1h cache-window recycle
+    pp = sub.add_parser(
+        "postpone",
+        help="defer your ~1h cache-window recycle one window (repeatable); "
+             "--for <secs> for a bounded wait (e.g. a long build)")
+    pp.add_argument("--for", dest="seconds", type=int,
+                    help="deferral length in seconds (default: one idle window)")
+    pp.add_argument("--reason", help="why you're postponing (optional note)")
+    pp.add_argument("--sid", help="session SID (default: derived from tmux)")
+    pp.set_defaults(func=cmd_postpone)
 
     # operator-state (T-0473) — read the operator's future-focused state-doc
     os_ = sub.add_parser(

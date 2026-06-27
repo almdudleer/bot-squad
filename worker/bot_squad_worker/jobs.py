@@ -485,6 +485,24 @@ def telemetry_tick(cfg: Config) -> None:
         log.exception("telemetry_tick error")
 
 
+def idle_timeout_tick(cfg: Config) -> None:
+    """T-0466 / M1-F1.3: ~1h cache-window idle/waiting-session recycle.
+
+    Sibling of telemetry_tick (its own 60s job). Recycles sessions that have
+    been *waiting* (no Claude turn ⇒ cold subscription cache) past the idle
+    window — asking them to record forward-state + exit via the universal-compact
+    handoff — while honoring per-session postpone + auto-postpone on tracked long
+    bounded jobs. No-op under ``BOT_SQUAD_IDLE_TIMEOUT=0``. Self-contained; the
+    sweep swallows per-session/per-project errors so one bad session never kills
+    it.
+    """
+    from bot_squad_worker import idle_timeout as _idle_timeout
+    try:
+        _idle_timeout.tick(cfg)
+    except Exception:
+        log.exception("idle_timeout_tick error")
+
+
 def drift_check_tick(cfg: Config) -> None:
     """T-0149: per-project drift-enforcement pass.
 

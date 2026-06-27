@@ -854,6 +854,23 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     from bot_squad_worker import sessions as _sessions
+
+    # T-0472: exactly one operator per project. The operator is a transient
+    # dispatcher on the universal lifecycle — a second concurrent operator would
+    # double-drive the backlog. Block a spawn whose window derives the operator
+    # role when a live operator already holds this project. (A re-drive after the
+    # prior incarnation exits sees no live operator and proceeds — see
+    # dispatch.live_operator_sids.) Guard lives here, above sessions.spawn, so it
+    # covers BOTH the API auto-spawn-on-create and `bsq spawn --window operator`.
+    if _sessions._derive_role(params["window"], None, None) == "operator":
+        from bot_squad_worker import dispatch as _dispatch
+        existing = _dispatch.live_operator_sids(cfg, params["slug"])
+        if existing:
+            raise ActionError(
+                f"operator already running for {params['slug']!r}: {existing[0]} "
+                "— exactly one operator per project (T-0472)"
+            )
+
     return _sessions.spawn(
         cfg,
         params["slug"],
@@ -1891,6 +1908,36 @@ def _action_set_drift_paused(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.set_drift_paused(cfg, params["slug"], params["sid"], params["paused"])
 
 
+_IDLE_POSTPONE_REQUIRED = {"slug", "sid"}
+_IDLE_POSTPONE_ALLOWED = _IDLE_POSTPONE_REQUIRED | {"seconds", "reason"}
+
+
+def _action_idle_postpone(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0466: defer this session's next ~1h cache-window recycle (``bsq postpone``).
+
+    Required params: slug, sid. Optional: seconds (deferral length; default = one
+    full idle window), reason. Returns {ok, sid, postpone_until, seconds}.
+    Backs the postpone protocol — a stale waiting session asks to be left running
+    one more window, repeatable indefinitely; pass ``seconds`` to declare a
+    bounded wait with a known ETA (e.g. a long build). ``tmux_only`` — it writes
+    only its OWN SessionMd frontmatter (filesystem-local), like set_drift_paused.
+    """
+    extra = set(params) - _IDLE_POSTPONE_ALLOWED
+    if extra:
+        raise ActionError(f"idle_postpone got unexpected params: {sorted(extra)}")
+    missing = _IDLE_POSTPONE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"idle_postpone missing required params: {sorted(missing)}")
+    seconds = params.get("seconds")
+    if seconds is not None and not isinstance(seconds, int):
+        raise ActionError("idle_postpone: 'seconds' must be an integer")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.set_idle_postpone(cfg, params["slug"], params["sid"],
+                                       seconds=seconds, reason=params.get("reason"))
+
+
 _BIND_INITIATIVE_REQUIRED = {"slug", "sid", "initiative"}
 _BIND_INITIATIVE_ALLOWED = _BIND_INITIATIVE_REQUIRED
 
@@ -2484,6 +2531,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "dispatch_decision": _action_dispatch_decision,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
+    # T-0466: per-session cache-window recycle postpone (bsq postpone).
+    "idle_postpone": _action_idle_postpone,
     "unbind_task": _action_unbind_task,
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
@@ -2581,6 +2630,10 @@ ACTION_MODES: dict[str, str] = {
     # it writes only its own SessionMd frontmatter (filesystem-local), so
     # tmux_only (no coordinator privilege required).
     "set_drift_paused": "tmux_only",
+    # T-0466: a session postpones its OWN cache-window recycle by stamping its
+    # own SessionMd frontmatter (filesystem-local) — tmux_only, like the drift
+    # off-ramp; no coordinator privilege required.
+    "idle_postpone": "tmux_only",
     "unbind_task": "coordinator_only",
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",

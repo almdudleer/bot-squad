@@ -77,6 +77,8 @@ def test_registry_lists_only_allowed_actions():
         "dispatch_decision",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
+        # T-0466: per-session ~1h cache-window recycle postpone (bsq postpone).
+        "idle_postpone",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
         "unbind_task", "unbind_initiative",
         "archive_session", "unarchive_session",

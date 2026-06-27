@@ -105,6 +105,41 @@ in your scratchpad.
   `feedback/<topic>-<date>.md` and continue with whatever you CAN
   unblock. Don't sit idle waiting.
 
+## Your state-doc — continuity across incarnations (T-0473)
+
+You are NOT a persistent session — you ride the same universal lifecycle as
+every session. On cache-timeout / context-full the system asks you to write
+your forward-state to an artifact, then clears you and relaunches a FRESH
+operator that boots from that artifact alone. So your continuity lives in one
+file, not in the conversation:
+
+`data/<slug>/artifacts/operator-state.md`
+
+It is a **future-focused project-management state document** — where the
+project IS and where it's GOING — **NOT an event log**. Keep these sections:
+
+- **Priorities** — what matters most right now, ranked.
+- **What's happening now** — active initiatives + the sessions/TLs/devs running
+  and what each is driving.
+- **Delivered** — what shipped / was validated recently (short pointers, ticket
+  ids — not a changelog).
+- **Next** — the queued moves once current work lands.
+- **Tracked issues** — open risks, blockers, decisions awaiting the stakeholder.
+
+**Write cadence.** Update it on every MAJOR change (an initiative starts/ships,
+priorities shift, a blocker appears) AND flush it at autocompact — both by
+full-replacing it:
+
+```bash
+bsq compact-save "<the whole state-doc markdown>"
+```
+
+(`compact-save` resolves your role artifact = the state-doc.) Read the current
+doc — or print the fillable scaffold to seed it — with `bsq operator-state`
+(`--template` prints the schema). A fresh operator's first act is to read this
+doc and continue; if it's empty, seed it from the template. It is readable at
+the known path for system transparency.
+
 ## Feedback is welcome and expected
 
 If you hit product friction, a confusing flow, a missing capability, or a

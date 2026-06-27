@@ -141,10 +141,16 @@ def composer_ready(buf: str) -> bool:
 
 # --- prompts (the "ask the session to write everything down" + the reload) --
 
-def handoff_prompt(artifact_path: str) -> str:
+def handoff_prompt(artifact_path: str, role: str | None = None) -> str:
     """The COMPACT HANDOFF — ask the session to dump its full forward-state into
-    its role artifact, then signal done. The system relaunches it fresh after."""
-    return (
+    its role artifact, then signal done. The system relaunches it fresh after.
+
+    ``role`` grafts role-specific shape guidance onto the generic handoff (T-0473:
+    an operator must write the future-focused state-doc schema, not a free dump).
+    The graft is a PURE ADDITION — for any role with no
+    :func:`assignment.role_compact_guidance` (dev/teamlead/None) the returned
+    prompt is byte-identical to the role-agnostic T-0467 handoff."""
+    base = (
         "⏳ CONTEXT FULL — COMPACT HANDOFF. Per the process-paradigm lifecycle you "
         "are about to be relaunched as a FRESH incarnation with an EMPTY context. "
         "NOTHING from this conversation survives EXCEPT what you write to your role "
@@ -158,6 +164,8 @@ def handoff_prompt(artifact_path: str) -> str:
         f"(It full-replaces your role artifact at {artifact_path}.) After it "
         "returns ok, reply: HANDOFF WRITTEN. The system then relaunches you fresh."
     )
+    guidance = assignment.role_compact_guidance(role)
+    return base + ("\n\n" + guidance if guidance else "")
 
 
 def boot_prompt_from_artifact(*, role: str | None, assignment_id: str | None,
@@ -207,9 +215,9 @@ def _send_compact(sid: str) -> None:
     _action_inject_input({"sid": sid, "text": "/compact"})
 
 
-def _inject_handoff(sid: str, artifact_path: str) -> None:
+def _inject_handoff(sid: str, artifact_path: str, role: str | None = None) -> None:
     from bot_squad_worker.actions import _action_inject_input
-    _action_inject_input({"sid": sid, "text": handoff_prompt(artifact_path)})
+    _action_inject_input({"sid": sid, "text": handoff_prompt(artifact_path, role)})
 
 
 def _artifact_mtime(path: str | None) -> float:
@@ -400,7 +408,7 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
         artifact_path, role, assignment_id = _resolve_role_artifact(cfg, slug, rec)
         if artifact_path:
             try:
-                _inject_handoff(sid, artifact_path)
+                _inject_handoff(sid, artifact_path, role)
             except Exception:
                 log.exception("autocompact: handoff inject failed for %s (will "
                               "retry)", sid)

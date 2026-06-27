@@ -20,10 +20,13 @@ import pytest
 from bot_squad_worker.assignment import (
     Artifact,
     Assignment,
+    OPERATOR_STATE_SECTIONS,
     RoutineAssignment,
     TaskAssignment,
     for_task,
+    operator_state_template,
     role_artifact,
+    role_compact_guidance,
 )
 
 
@@ -94,6 +97,58 @@ def test_role_artifact_unknown_role_no_task_is_none(tmp_path: Path):
     data_dir = tmp_path / "data"
     assert role_artifact(data_dir, "bot-squad", role="", sid="S-x", task_id=None) is None
     assert role_artifact(data_dir, "bot-squad", role="", sid="S-x", task_id="~") is None
+
+
+# --- operator state-doc schema + template (T-0473 / M2-F2.1) --------------
+# The operator's role artifact is a FUTURE-FOCUSED project-management state
+# document (priorities / what's happening / delivered / next / tracked-issues),
+# explicitly NOT an event log. T-0467 wired the path (artifacts/operator-state.md);
+# T-0473 owns its SCHEMA + the guidance that makes a session write the right shape.
+
+def test_operator_state_sections_are_the_five_future_focused_buckets():
+    titles = [t for (t, _desc) in OPERATOR_STATE_SECTIONS]
+    # the five buckets named in the T-0473 verbatim, in priority-first order
+    assert titles == [
+        "Priorities",
+        "What's happening now",
+        "Delivered",
+        "Next",
+        "Tracked issues",
+    ]
+
+
+def test_operator_state_template_is_a_fillable_scaffold_with_every_section():
+    doc = operator_state_template()
+    assert isinstance(doc, str) and doc.strip()
+    # every schema section appears as a markdown heading the operator fills
+    for title, _desc in OPERATOR_STATE_SECTIONS:
+        assert f"## {title}" in doc
+    # it is future-focused, not an event log — say so in the scaffold
+    assert "event log" in doc.lower()
+
+
+def test_operator_state_template_embeds_the_slug_when_given():
+    assert "acme-app" in operator_state_template("acme-app")
+
+
+def test_role_compact_guidance_for_operator_carries_the_schema():
+    g = role_compact_guidance("operator")
+    assert isinstance(g, str) and g.strip()
+    # so an operator at autocompact writes the right shape even from a degraded
+    # context: the guidance names the schema sections
+    for title, _desc in OPERATOR_STATE_SECTIONS:
+        assert title in g
+    # and reminds it is future-focused, not a chat/event dump
+    assert "event log" in g.lower()
+
+
+def test_role_compact_guidance_is_empty_for_non_operator_roles():
+    # dev / teamlead / unknown / none → the generic "write everything" handoff
+    # already fits; no extra schema to graft on.
+    assert role_compact_guidance("dev") == ""
+    assert role_compact_guidance("teamlead") == ""
+    assert role_compact_guidance("") == ""
+    assert role_compact_guidance(None) == ""
 
 
 # --- TaskAssignment conforms to the 4 primitives --------------------------

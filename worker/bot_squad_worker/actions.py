@@ -1408,6 +1408,49 @@ def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_OPERATOR_STATE_DOC_REQUIRED = {"slug"}
+_OPERATOR_STATE_DOC_ALLOWED = _OPERATOR_STATE_DOC_REQUIRED
+
+
+def _action_operator_state_doc(params: dict[str, Any]) -> dict[str, Any]:
+    """Read the operator's state-doc — the read-only transparency primitive
+    (T-0473, M2-F2.1; M11-T4 consumes it later).
+
+    The operator's role artifact is a FUTURE-FOCUSED project-management state
+    document at the well-known path ``artifacts/operator-state.md`` (written via
+    ``compact_write_state``). This action only READS it (never writes) and always
+    returns the fillable schema template, so a fresh operator can boot from the
+    doc or seed it from the scaffold.
+
+    Required params: slug
+    Returns: {ok, path, exists, content, template}
+    """
+    extra = set(params) - _OPERATOR_STATE_DOC_ALLOWED
+    if extra:
+        raise ActionError(f"operator_state_doc got unexpected params: {sorted(extra)}")
+    missing = _OPERATOR_STATE_DOC_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"operator_state_doc missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"operator_state_doc: unknown project slug {slug!r}")
+
+    from bot_squad_worker.assignment import (
+        _ARTIFACTS_SUBDIR, OPERATOR_STATE_ARTIFACT, Artifact,
+        operator_state_template)
+
+    art = Artifact(cfg.data_dir / slug / _ARTIFACTS_SUBDIR / OPERATOR_STATE_ARTIFACT)
+    return {
+        "ok": True,
+        "path": str(art.path),
+        "exists": art.exists(),
+        "content": art.read(),
+        "template": operator_state_template(slug),
+    }
+
+
 _TASK_NEW_REQUIRED = {"slug", "title"}
 _TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
 _TASK_NEW_TITLE_MAX = 240
@@ -2427,6 +2470,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0467: universal-compact "write everything down" — role-agnostic save of
     # a session's forward-state into its role artifact (F1.4).
     "compact_write_state": _action_compact_write_state,
+    # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).
+    "operator_state_doc": _action_operator_state_doc,
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
     "doc_new": _action_doc_new,
@@ -2521,6 +2566,10 @@ ACTION_MODES: dict[str, str] = {
     # — single coordinator writer, like assignment_write_result. Sessions reach
     # it via `bsq compact-save` (the coordinator socket).
     "compact_write_state": "coordinator_only",
+    # T-0473: reads the shared install data dir (artifacts/operator-state.md) —
+    # single coordinator reader, like compact_write_state. The operator reaches
+    # it via `bsq operator-state`.
+    "operator_state_doc": "coordinator_only",
     "task_new": "coordinator_only",
     "doc_new": "coordinator_only",
     "uc_new": "coordinator_only",

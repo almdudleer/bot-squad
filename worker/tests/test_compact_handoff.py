@@ -163,6 +163,54 @@ def test_compact_write_state_registered_with_a_mode():
     assert "compact_write_state" in ACTION_MODES
 
 
+# --- operator_state_doc action: read-only transparency (T-0473 / DoD-3) -----
+
+def test_operator_state_doc_reports_not_yet_created(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    _cfg, data_dir = _make_cfg(tmp_path, monkeypatch, sid="S-x-p1",
+                               window="operator", task_id=None)
+    out = ACT.dispatch("operator_state_doc", {"slug": "bot-squad"})
+    art = data_dir / "bot-squad" / "artifacts" / "operator-state.md"
+    assert out["exists"] is False
+    assert out["path"] == str(art)
+    assert out["content"] == ""
+    # a fillable scaffold is always offered so a fresh operator can seed it
+    assert "## Priorities" in out["template"]
+
+
+def test_operator_state_doc_reads_the_written_doc(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    _cfg, _data = _make_cfg(tmp_path, monkeypatch, sid=sid, window="operator",
+                            task_id=None)
+    ACT.dispatch("compact_write_state", {
+        "slug": "bot-squad", "sid": sid,
+        "content": "priorities: ship M2; happening: T-0473 in flight"})
+    out = ACT.dispatch("operator_state_doc", {"slug": "bot-squad"})
+    assert out["exists"] is True
+    assert "T-0473 in flight" in out["content"]
+
+
+def test_operator_state_doc_unknown_slug_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    _make_cfg(tmp_path, monkeypatch, sid="S-x-p1", window="operator", task_id=None)
+    with pytest.raises(ACT.ActionError, match="unknown project"):
+        ACT.dispatch("operator_state_doc", {"slug": "ghost"})
+
+
+def test_operator_state_doc_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    _make_cfg(tmp_path, monkeypatch, sid="S-x-p1", window="operator", task_id=None)
+    with pytest.raises(ACT.ActionError, match="unexpected"):
+        ACT.dispatch("operator_state_doc", {"slug": "bot-squad", "nope": 1})
+
+
+def test_operator_state_doc_registered_read_mode():
+    from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
+    assert "operator_state_doc" in ACTION_REGISTRY
+    assert ACTION_MODES["operator_state_doc"] == "coordinator_only"
+
+
 # --- boot_prompt_from_artifact: the reusable reload path (shared w/ T-0471) --
 
 def test_boot_prompt_names_the_artifact_as_only_memory():
@@ -185,6 +233,28 @@ def test_boot_prompt_handles_a_taskless_role():
     assert "operator" in prompt.lower()
 
 
+# --- handoff_prompt role-aware shape guidance (T-0473) ----------------------
+
+def test_handoff_prompt_appends_operator_state_doc_schema():
+    from bot_squad_worker.assignment import OPERATOR_STATE_SECTIONS
+    p = A.handoff_prompt("/data/bot-squad/artifacts/operator-state.md", "operator")
+    # the operator handoff carries the future-focused schema so it writes the
+    # right shape even from a degraded context
+    for title, _hint in OPERATOR_STATE_SECTIONS:
+        assert title in p
+    assert "event log" in p.lower()
+    # still the universal handoff underneath
+    assert "compact-save" in p
+
+
+def test_handoff_prompt_is_byte_identical_for_non_operator_roles():
+    # backward-compat guard: the T-0467 dev/task handoff must not shift a byte.
+    base = A.handoff_prompt("/art/T-0042.md")
+    assert A.handoff_prompt("/art/T-0042.md", None) == base
+    assert A.handoff_prompt("/art/T-0042.md", "dev") == base
+    assert A.handoff_prompt("/art/T-0042.md", "teamlead") == base
+
+
 # --- the 2-phase compact state machine --------------------------------------
 
 @pytest.fixture
@@ -196,7 +266,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: calls["compact"].append(sid))
-    monkeypatch.setattr(A, "_inject_handoff", lambda sid, art_path: calls["handoff"].append((sid, art_path)))
+    monkeypatch.setattr(A, "_inject_handoff", lambda sid, art_path, role=None: calls["handoff"].append((sid, art_path, role)))
     monkeypatch.setattr(A, "_suspend_session", lambda cfg, slug, sid: calls["suspend"].append(sid))
     monkeypatch.setattr(A, "_relaunch_from_artifact",
                         lambda cfg, slug, rec, art_path: calls["spawn"].append((rec["sid"], art_path)))
@@ -221,7 +291,8 @@ def test_arm_injects_handoff_and_stamps_phase_not_compact(harness):
     rec = _rec()
     assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1000.0) is True
     # asked the session to write everything down — NOT Claude's /compact
-    assert harness["calls"]["handoff"] == [(rec["sid"], "/art/T-0042.md")]
+    # the resolved role rides along so the handoff can shape the artifact (T-0473)
+    assert harness["calls"]["handoff"] == [(rec["sid"], "/art/T-0042.md", "dev")]
     assert harness["calls"]["compact"] == []
     assert rec["compact"]["phase"] == "writing"
     assert rec["compact"]["armed_at"] == 1000.0

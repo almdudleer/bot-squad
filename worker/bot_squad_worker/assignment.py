@@ -276,6 +276,99 @@ OPERATOR_STATE_ARTIFACT = "operator-state.md"
 _ARTIFACTS_SUBDIR = "artifacts"
 
 
+# --- operator state-doc schema (T-0473 / M2-F2.1) -------------------------
+#
+#   "The operator's artifact is a project-management state document (priorities /
+#    what's happening / delivered / next / tracked-issues — NOT an event log)."
+#   — T-0473 verbatim (clarification-01 + voice-03/voice-09).
+#
+# This is the schema for ``operator-state.md``: a FUTURE-FOCUSED state document a
+# fresh operator boots from and continues. It is NOT a chronological event log —
+# it captures where the project IS and where it's GOING, not what happened when.
+# (assignment_id / kind / sid / updated provenance is added by
+# :func:`compose_result_body` when the doc is saved through the artifact seam.)
+
+#: (title, what-goes-here) for each section, in the priority-first reading order
+#: a successor operator needs.
+OPERATOR_STATE_SECTIONS: list[tuple[str, str]] = [
+    ("Priorities", "What matters most right now, ranked — the focus a successor "
+                   "should pick up first."),
+    ("What's happening now", "Active initiatives + the sessions/TLs/devs running "
+                             "and what each is driving."),
+    ("Delivered", "What has shipped / been validated recently — short pointers "
+                  "(ticket ids), enough to know what's DONE. Not a changelog."),
+    ("Next", "The queued moves once current work lands — what to dispatch next "
+             "and why."),
+    ("Tracked issues", "Open risks, blockers, decisions awaiting the stakeholder, "
+                       "things to keep an eye on."),
+]
+
+
+def operator_state_template(slug: str | None = None) -> str:
+    """A fillable scaffold for the operator state-doc — the future-focused PM
+    document a fresh operator reads and continues from.
+
+    Returns markdown with one ``## <section>`` heading per
+    :data:`OPERATOR_STATE_SECTIONS`, each carrying a one-line hint of what to
+    write there. The operator replaces the hints with real state; saving it
+    through the artifact seam (``bsq compact-save`` / ``compact_write_state``)
+    full-replaces ``artifacts/operator-state.md`` and stamps the provenance
+    header.
+    """
+    head = f"# Operator state — {slug}" if slug else "# Operator state"
+    lines = [
+        head,
+        "",
+        "_Future-focused project-management state — where the project IS and "
+        "where it's GOING. NOT an event log._",
+        "",
+    ]
+    for title, hint in OPERATOR_STATE_SECTIONS:
+        lines += [f"## {title}", "", f"<!-- {hint} -->", ""]
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+_OPERATOR_HOW_TO = (
+    "You are working the OPERATOR role. Your continuity artifact is a "
+    "FUTURE-FOCUSED project-management state document at "
+    "``artifacts/operator-state.md`` — priorities / what's happening now / "
+    "delivered / next / tracked-issues, NOT an event log. Keep it current: update "
+    "it on every MAJOR change (an initiative starts/ships, priorities shift, a "
+    "blocker appears) and flush it on autocompact, by full-replacing it via "
+    "``bsq compact-save \"<the whole state-doc>\"``. A fresh operator boots from "
+    "this doc ALONE and continues — so write what your successor needs to keep "
+    "going, not what happened."
+)
+
+
+def operator_how_to() -> str:
+    """The operator role's how-to (primitive (a)-style guidance). Mirrors
+    :data:`_TASK_HOW_TO` but for the task-less operator role."""
+    return _OPERATOR_HOW_TO
+
+
+def role_compact_guidance(role: str | None) -> str:
+    """Extra, role-specific guidance grafted onto the universal compact handoff
+    (T-0467) so a role writes its artifact in the RIGHT shape.
+
+    The generic handoff just says "write everything down" — fine for a dev whose
+    artifact is a free-form forward-state. The **operator**, though, must write
+    the FUTURE-FOCUSED state-doc schema (T-0473), so its compact carries the
+    section list even from a degraded context. Every other role → ``""`` (the
+    caller appends nothing, keeping the handoff byte-identical).
+    """
+    if (role or "").strip() == "operator":
+        sects = "\n".join(f"  - {t}: {hint}" for t, hint in OPERATOR_STATE_SECTIONS)
+        return (
+            "You are the OPERATOR — your artifact is the FUTURE-FOCUSED "
+            "project-management state-doc, NOT an event log. Structure it as:\n"
+            f"{sects}\n"
+            "Write where the project IS and where it's GOING so a fresh operator "
+            "continues from this doc alone."
+        )
+    return ""
+
+
 def _safe_component(s: str) -> str:
     """Filesystem-safe slug for an arbitrary id (sid) → ``[A-Za-z0-9._-]``."""
     return "".join(c if (c.isalnum() or c in "._-") else "-" for c in (s or "")).strip("-") or "anon"

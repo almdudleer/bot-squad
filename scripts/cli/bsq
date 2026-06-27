@@ -1538,6 +1538,27 @@ def cmd_compact_save(args) -> None:
           f"({res.get('bytes_written')} bytes, role {res.get('role')})")
 
 
+def cmd_operator_state(args) -> None:
+    """T-0473: read the operator's FUTURE-FOCUSED state-doc (transparency, DoD-3).
+
+    The operator's continuity artifact is a project-management state document
+    (priorities / what's happening / delivered / next / tracked-issues — NOT an
+    event log) at ``artifacts/operator-state.md``. A fresh operator boots from it.
+    This verb READS it (or, with ``--template``, prints the scaffold to fill +
+    save via ``bsq compact-save``)."""
+    slug = resolve_slug()
+    res = post("operator_state_doc", {"slug": slug})
+    if getattr(args, "template", False):
+        sys.stdout.write(res.get("template", ""))
+        return
+    if res.get("exists"):
+        sys.stdout.write(res.get("content", ""))
+    else:
+        print(f"operator state-doc not created yet → {res.get('path')}")
+        print("seed it: `bsq operator-state --template` to see the schema, then "
+              "`bsq compact-save \"<filled state-doc>\"`.")
+
+
 def sessions_dir(slug: str) -> Path:
     return Path(BOT_SQUAD) / "data" / slug / "sessions"
 
@@ -2999,6 +3020,14 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("content", help="your complete forward-state markdown")
     cs.add_argument("--sid", help="session SID (default: derived from tmux)")
     cs.set_defaults(func=cmd_compact_save)
+
+    # operator-state (T-0473) — read the operator's future-focused state-doc
+    os_ = sub.add_parser(
+        "operator-state",
+        help="read the operator's state-doc (transparency); --template prints the scaffold")
+    os_.add_argument("--template", action="store_true",
+                     help="print the fillable schema scaffold instead of the current doc")
+    os_.set_defaults(func=cmd_operator_state)
 
     # edit-begin (T-0215) — snapshot a baseline for a later `commit --hunks`
     eb = sub.add_parser(

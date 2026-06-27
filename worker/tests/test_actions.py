@@ -65,6 +65,8 @@ def test_registry_lists_only_allowed_actions():
         "assignment_write_result",
         # T-0467: universal-compact role-agnostic forward-state save (F1.4).
         "compact_write_state",
+        # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).
+        "operator_state_doc",
         # T-0042: atomic T-NNNN allocator.
         "task_new",
         # T-0174: generalized atomic allocator across all entity types.

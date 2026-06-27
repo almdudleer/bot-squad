@@ -262,6 +262,9 @@ def test_handle_update_skips_plain_message(tmp_path):
 
 
 def _link_env(monkeypatch, base="https://mship.test", token="WTOKEN"):
+    # T-0527: clear the dedicated var so these tests exercise the
+    # MOTHERSHIP_BASE_URL fallback path explicitly (precedence tested below).
+    monkeypatch.delenv("WORKER_API_BASE_URL", raising=False)
     if base is None:
         monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
     else:
@@ -270,6 +273,31 @@ def _link_env(monkeypatch, base="https://mship.test", token="WTOKEN"):
         monkeypatch.delenv("WORKER_API_TOKEN", raising=False)
     else:
         monkeypatch.setenv("WORKER_API_TOKEN", token)
+
+
+def test_api_base_url_prefers_dedicated_worker_var(monkeypatch):
+    """T-0527: WORKER_API_BASE_URL wins over MOTHERSHIP_BASE_URL (the latter is
+    the API container's public self-URL and collides in the shared .env)."""
+    from bot_squad_worker import tg_listener as TL
+    monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://botsquad.dev")
+    monkeypatch.setenv("WORKER_API_BASE_URL", "http://127.0.0.1:8099/")
+    assert TL._api_base_url() == "http://127.0.0.1:8099"
+
+
+def test_api_base_url_falls_back_to_mothership(monkeypatch):
+    """T-0527: with no dedicated var, fall back to MOTHERSHIP_BASE_URL."""
+    from bot_squad_worker import tg_listener as TL
+    monkeypatch.delenv("WORKER_API_BASE_URL", raising=False)
+    monkeypatch.setenv("MOTHERSHIP_BASE_URL", "https://mship.test/")
+    assert TL._api_base_url() == "https://mship.test"
+
+
+def test_api_base_url_empty_when_neither_set(monkeypatch):
+    """T-0527: no var set → empty → linkage no-ops (inbound never blocked)."""
+    from bot_squad_worker import tg_listener as TL
+    monkeypatch.delenv("WORKER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
+    assert TL._api_base_url() == ""
 
 
 def test_resolve_or_link_sender_first_contact_posts(tmp_path, monkeypatch):

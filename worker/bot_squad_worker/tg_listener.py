@@ -133,11 +133,22 @@ def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
 
 
 def _api_base_url() -> str:
-    """T-0488: base URL of the mothership API the worker links TG senders against.
-    Read from ``MOTHERSHIP_BASE_URL`` (never hardcoded) so the same code points
-    at the public traefik URL today OR a localhost-only port later with no code
-    change. Empty when unset → linkage is a no-op."""
-    return (os.environ.get("MOTHERSHIP_BASE_URL") or "").rstrip("/")
+    """Base URL of the mothership API the worker links TG senders against.
+
+    T-0527: read a DEDICATED ``WORKER_API_BASE_URL`` first, falling back to
+    ``MOTHERSHIP_BASE_URL``. T-0488 originally overloaded ``MOTHERSHIP_BASE_URL``
+    for the worker's localhost API target, but that collides with the API
+    container's OWN ``MOTHERSHIP_BASE_URL`` (its public mothership self-URL) in
+    the shared ``.env`` — and on this host the worker's ``.env`` load wins over
+    the systemd ``Environment=`` override regardless of textual order, so the
+    override never took effect (worker kept calling the public URL). A dedicated
+    var set ONLY in ``.env`` (``WORKER_API_BASE_URL=http://127.0.0.1:8099``) has
+    no such conflict. Empty when neither is set → linkage is a no-op."""
+    return (
+        os.environ.get("WORKER_API_BASE_URL")
+        or os.environ.get("MOTHERSHIP_BASE_URL")
+        or ""
+    ).rstrip("/")
 
 
 def _worker_api_token() -> str:

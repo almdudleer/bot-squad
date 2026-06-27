@@ -76,6 +76,9 @@ def _env(monkeypatch):
     monkeypatch.setattr(S, "_get_user_home", lambda: "/home/u")
     # default: idle (no recent transcript activity)
     monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: None)
+    # default: no live tmux panes — keeps the live_operator_sids tmux scan
+    # (T-0523) hermetic; tests that exercise it override list_panes explicitly.
+    monkeypatch.setattr(S, "list_panes", lambda: [])
 
 
 # --- the heuristic table ---
@@ -289,6 +292,74 @@ def test_live_operator_sids_empty_when_no_sessions_dir(tmp_path):
     assert live_operator_sids(cfg, "test-project") == []
 
 
+# --- T-0523: the canonical/unregistered operator (live pane, NO session md) --
+# The canonical operator p5 runs in a live `bot-squad-operator` window but has no
+# session md (predates spawn-registration). live_operator_sids must ALSO scan
+# live claude panes (scoped to the project's tmux session) via the same
+# `_derive_role` SSOT, else the re-drive gate misfires and spawns a duplicate.
+
+def _pane(window, *, pane_id="%5", pid="999", session="test-project"):
+    return S.PaneInfo(pane_id=pane_id, window=window, pid=pid, cwd="/tmp",
+                      command="claude", session=session)
+
+
+def test_live_operator_sids_finds_unregistered_canonical_operator_via_tmux(tmp_path, monkeypatch):
+    """A live `bot-squad-operator` window with NO session md is recognized."""
+    cfg = _make_cfg(tmp_path)  # no session mds written
+    monkeypatch.setattr(S, "list_panes", lambda: [_pane("bot-squad-operator")])
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: True)
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    assert live_operator_sids(cfg, "test-project") == ["S-u-bot-squad-operator-p5"]
+
+
+def test_live_operator_sids_tmux_scan_both_window_namings(tmp_path, monkeypatch):
+    """Both the canonical `bot-squad-operator` and the newer `operator` naming
+    derive the operator role via the one identity SSOT."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [_pane("operator", pane_id="%9")])
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: True)
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    assert live_operator_sids(cfg, "test-project") == ["S-u-operator-p9"]
+
+
+def test_live_operator_sids_tmux_scan_scoped_to_project_session(tmp_path, monkeypatch):
+    """An operator pane in ANOTHER project's tmux session must not leak in."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes",
+                        lambda: [_pane("operator", session="other-project")])
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: True)
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    assert live_operator_sids(cfg, "test-project") == []
+
+
+def test_live_operator_sids_tmux_scan_ignores_dead_claude_pane(tmp_path, monkeypatch):
+    """A pane whose claude process has exited (fell back to a shell) is not a
+    live operator."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [_pane("operator")])
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: False)
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    assert live_operator_sids(cfg, "test-project") == []
+
+
+def test_live_operator_sids_tmux_scan_ignores_non_operator_window(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [_pane("feature-x")])
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: True)
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    assert live_operator_sids(cfg, "test-project") == []
+
+
+def test_live_operator_sids_dedups_md_and_tmux(tmp_path, monkeypatch):
+    """A registered operator that ALSO has a live pane is returned exactly once."""
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-operator-p1", window="operator")
+    monkeypatch.setattr(S, "list_panes", lambda: [_pane("operator", pane_id="%1")])
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: True)
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    assert live_operator_sids(cfg, "test-project") == ["S-u-operator-p1"]
+
+
 # --- spawn-time enforcement of exactly-one-operator (guard in actions) ------
 
 def test_spawn_session_blocks_second_operator(tmp_path, monkeypatch):
@@ -330,4 +401,48 @@ def test_spawn_session_dev_unaffected_by_operator_guard(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "spawn", lambda *a, **k: {"ok": True, "sid": "S-dev"})
 
     res = A._action_spawn_session({"slug": "test-project", "window": "feature-x"})
+    assert res == {"ok": True, "sid": "S-dev"}
+
+
+# --- T-0523: operator-dispatches-only — an operator spawn must not bind a dev
+# ticket (the operator orchestrates and spawns devs; voice-03). -------------
+
+def test_spawn_session_operator_rejects_dev_task_bind(tmp_path, monkeypatch):
+    """An operator-window spawn carrying a dev ``task_id`` is refused at the
+    spawn seam — the operator orchestrates, it never self-claims a dev ticket."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    called = {"spawn": False}
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: called.__setitem__("spawn", True))
+
+    with pytest.raises(ActionError, match="must not bind a dev task"):
+        A._action_spawn_session(
+            {"slug": "test-project", "window": "operator", "task_id": "T-0465"})
+    assert called["spawn"] is False  # guard fired BEFORE reaching the spawn
+
+
+def test_spawn_session_operator_placeholder_task_id_allowed(tmp_path, monkeypatch):
+    """The ``~`` unset sentinel is not a real bind — an operator spawn carrying
+    it proceeds (it is just the registry's absent marker)."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: {"ok": True, "sid": "S-op"})
+
+    res = A._action_spawn_session(
+        {"slug": "test-project", "window": "operator", "task_id": "~"})
+    assert res == {"ok": True, "sid": "S-op"}
+
+
+def test_spawn_session_dev_with_task_id_unaffected(tmp_path, monkeypatch):
+    """A dev spawn WITH a ``task_id`` is normal — the operator-only guard must
+    not touch it."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: {"ok": True, "sid": "S-dev"})
+
+    res = A._action_spawn_session(
+        {"slug": "test-project", "window": "feature-x", "task_id": "T-0465"})
     assert res == {"ok": True, "sid": "S-dev"}

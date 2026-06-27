@@ -863,6 +863,17 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
     # dispatch.live_operator_sids.) Guard lives here, above sessions.spawn, so it
     # covers BOTH the API auto-spawn-on-create and `bsq spawn --window operator`.
     if _sessions._derive_role(params["window"], None, None) == "operator":
+        # T-0523: operator-dispatches-only. The operator ORCHESTRATES — it spawns
+        # devs for tickets and must NEVER self-claim/bind a dev assignment
+        # (voice-03; the live regression had a re-driven operator bind & race a
+        # dev ticket). Reject an operator spawn that carries a real task_id bind.
+        # `~` is the registry's "unset" sentinel and is not a real binding.
+        tid = params.get("task_id")
+        if tid and tid != "~":
+            raise ActionError(
+                f"operator spawn must not bind a dev task ({tid!r}) — the "
+                "operator orchestrates and spawns devs for tickets (T-0523)"
+            )
         from bot_squad_worker import dispatch as _dispatch
         existing = _dispatch.live_operator_sids(cfg, params["slug"])
         if existing:

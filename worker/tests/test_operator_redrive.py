@@ -23,6 +23,10 @@ from bot_squad_worker import dispatch
 from bot_squad_worker.actions import ActionError
 from tests.test_jobs import _make_config_with_project, _make_project_with_repo
 
+# The real detector, captured before any per-test fixture stubs it — used by the
+# T-0523 end-to-end no-dup test to exercise the live-pane scan for real.
+_REAL_LIVE_OPERATOR_SIDS = dispatch.live_operator_sids
+
 
 @pytest.fixture
 def cfg_slug(tmp_path: Path, monkeypatch):
@@ -110,6 +114,30 @@ def test_live_operator_continues_no_respawn(cfg_slug, monkeypatch):
     assert res["action"] == "continue"
     assert res["operator"] == "S-existing"
     assert spawns == []
+
+
+def test_canonical_operator_no_md_continues_no_dup(cfg_slug, monkeypatch):
+    """T-0523 end-to-end: the canonical operator runs in a live
+    ``bot-squad-operator`` window with NO session md. The REAL (un-mocked)
+    ``live_operator_sids`` must recognize it via the live-pane scan, so the
+    re-drive tick CONTINUES instead of spawning a DUPLICATE operator."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+    # Restore the real detector (the fixture stubs it to "no operator").
+    monkeypatch.setattr(dispatch, "live_operator_sids", _REAL_LIVE_OPERATOR_SIDS)
+    # A live canonical operator pane in THIS project's tmux session, no md.
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda *a, **k: True)
+    monkeypatch.setattr(S, "list_panes", lambda: [
+        S.PaneInfo(pane_id="%5", window="bot-squad-operator", pid="999",
+                   cwd="/tmp", command="claude", session=slug),
+    ])
+
+    res = ord_.tick(cfg, slug)
+    assert res["action"] == "continue"
+    assert res["operator"] == "S-u-bot-squad-operator-p5"
+    assert spawns == []  # NO duplicate operator spawned
 
 
 # --- empty backlog is the only idle state -----------------------------------

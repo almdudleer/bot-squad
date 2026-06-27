@@ -81,29 +81,82 @@ def operator_standing_task() -> str:
 
 
 def live_operator_sids(cfg: Any, slug: str) -> list[str]:
-    """SIDs of LIVE operator sessions for ``slug`` (status active/paused, not
-    archived). Pure read of session mds — no tmux — mirroring
-    :func:`decide_dispatch`'s session scan.
+    """SIDs of LIVE operator sessions for ``slug``.
 
-    The seam behind two M2 invariants: (1) exactly-one-operator-per-project
-    enforcement at spawn time (T-0472 — a non-empty result blocks a second
-    operator), and (2) the re-drive cadence's continue-vs-respawn decision
-    (T-0474 — non-empty ⇒ an operator is already on; empty ⇒ the project has no
-    operator driving the backlog, so re-drive should spawn one).
+    The ONE operator-identity SSOT (T-0523) behind two M2 invariants: (1)
+    exactly-one-operator-per-project enforcement at spawn time (T-0472 — a
+    non-empty result blocks a second operator), and (2) the re-drive cadence's
+    continue-vs-respawn decision (T-0474 — non-empty ⇒ an operator is already on;
+    empty ⇒ the project has no operator driving the backlog, so re-drive spawns
+    one). Both consumers read THIS function — no divergent identity logic.
+
+    Detection is a UNION of two scans, both keyed off the same window→role SSOT
+    (:func:`sessions._derive_role`, which matches BOTH the canonical
+    ``bot-squad-operator`` and the newer ``operator`` window namings):
+
+    1. **Registered sessions** — a live-holder (status active/paused, not
+       archived) session md whose window derives the operator role.
+    2. **Canonical / unregistered operator** (T-0523) — a LIVE claude pane in an
+       operator window that has NO session md. The canonical operator predates
+       spawn-registration and runs in a ``bot-squad-operator`` window with no md,
+       so the md-only scan missed it and the re-drive gate misfired → a DUPLICATE
+       operator. The tmux scan is scoped to THIS project's tmux session
+       (``pane.session == slug``) so another project's operator never leaks in.
     """
-    sess_dir = cfg.data_dir / slug / "sessions"
     out: list[str] = []
-    if not sess_dir.exists():
-        return out
-    for md in sorted(sess_dir.glob("*.md")):
-        meta = S._read_session_metadata(md)
-        if meta is None or not S._is_live_holder(meta):
+    seen: set[str] = set()
+
+    # (1) Registered operator sessions — pure read of session mds.
+    sess_dir = cfg.data_dir / slug / "sessions"
+    if sess_dir.exists():
+        for md in sorted(sess_dir.glob("*.md")):
+            meta = S._read_session_metadata(md)
+            if meta is None or not S._is_live_holder(meta):
+                continue
+            role = S._derive_role(
+                meta.get("window"), meta.get("task_id"), meta.get("initiative"),
+            )
+            if role == "operator":
+                sid = meta.get("sid", md.stem)
+                if sid not in seen:
+                    seen.add(sid)
+                    out.append(sid)
+
+    # (2) Canonical / unregistered operator — live claude pane, no session md.
+    out.extend(_live_operator_sids_from_tmux(slug, seen))
+    return out
+
+
+def _live_operator_sids_from_tmux(slug: str, seen: set[str]) -> list[str]:
+    """Operator SIDs discovered from LIVE claude tmux panes for ``slug`` whose
+    window derives the operator role (T-0523). Scoped to the project's tmux
+    session (``pane.session == slug``); mutates ``seen`` for cross-scan dedup.
+
+    Tolerant of a missing/broken tmux server (``list_panes`` returns ``[]``).
+    """
+    try:
+        panes = S.list_panes()
+    except Exception:  # noqa: BLE001 — never let a tmux hiccup break the gate
+        return []
+    if not panes:
+        return []
+    user = S._get_current_user()
+    children = S._proc_children_map()
+    out: list[str] = []
+    for p in panes:
+        if p.session != slug:
             continue
-        role = S._derive_role(
-            meta.get("window"), meta.get("task_id"), meta.get("initiative"),
-        )
-        if role == "operator":
-            out.append(meta.get("sid", md.stem))
+        if S._derive_role(p.window, None, None) != "operator":
+            continue
+        if not S._pane_has_live_claude(p.pid, children):
+            continue
+        try:
+            sid = S.compute_sid(user, p.window, p.pane_id)
+        except Exception:  # noqa: BLE001
+            continue
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
     return out
 
 

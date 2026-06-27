@@ -173,6 +173,22 @@ def main() -> int:
             run_date=datetime.now(timezone.utc) + timedelta(seconds=1),
             id="fix_sock_perms",
         )
+
+        # T-0471 (M1/F1.8): boot-time crash reconcile. A session that died
+        # ungracefully (server restart, OOM, killed pane) never got to run the
+        # graceful autocompact handoff — its md still says `active` but its pane
+        # is gone. Detect those across ALL roles and re-drive each from its role
+        # artifact + task state. One-shot, a few seconds after boot so the socket
+        # is already up when the recovered sessions come online. Gated by
+        # BOT_SQUAD_BOOT_RECONCILE (default ON); never raises.
+        from bot_squad_worker.recovery import boot_reconcile
+        sched.add_job(
+            boot_reconcile,
+            "date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=3),
+            args=[cfg],
+            id="boot_reconcile",
+        )
     elif mode == "user-worker":
         # Best-effort: set group ownership on the per-user socket so the API
         # container (which runs as group www) can connect.

@@ -1,11 +1,13 @@
-"""T-0251 (WS-4 S4): auto stall-recovery — dead/exited respawn-or-park slice.
+"""Crash recovery for ungraceful exits — dead/orphaned session reconcile.
 
-Safe slice first: a dev session whose tmux pane is DEAD while its task still
-needs work → auto-respawn (bounded), then PARK + notify once the bound is hit.
-A dead pane carries no risk of killing live work (the aggressive idle-wedge
-SIGTERM of LIVE sessions is a separate, day-1-tuned slice). Conservative recs
-(G1-G5): dev-only, respawn bound 2 then park, ``BOT_SQUAD_RECOVERY`` kill-switch
-(default OFF so it can't surprise a live run until the operator enables it).
+T-0251 (WS-4 S4) shipped the dev-only slice. T-0471 (Process Paradigm M1/F1.8)
+generalizes it: EVERY role is recovered, a BOOT-TIME reconcile pass runs on
+worker startup, and a crashed role is re-driven from its ROLE ARTIFACT + task
+state via the graceful-compact reload path (NOT from lost in-context work).
+
+Crash signature = md ``status: active`` + DEAD pane. A gracefully-suspended
+session (``status: suspended``) is intent, not a crash, and is left alone — that
+distinction is what makes recovery safe to run alongside the graceful compact.
 """
 from __future__ import annotations
 
@@ -24,11 +26,11 @@ def _cfg(tmp_path):
     return types.SimpleNamespace(projects={"p1": object()}, data_dir=tmp_path / "data")
 
 
-# --- kill-switch -----------------------------------------------------------
+# --- kill-switches ---------------------------------------------------------
 
 def test_recovery_disabled_by_default(monkeypatch):
     monkeypatch.delenv("BOT_SQUAD_RECOVERY", raising=False)
-    assert R.recovery_enabled() is False  # default OFF — opt-in for a live run
+    assert R.recovery_enabled() is False  # periodic tick: opt-in for a live run
 
 
 def test_recovery_enabled_when_set(monkeypatch):
@@ -36,86 +38,130 @@ def test_recovery_enabled_when_set(monkeypatch):
     assert R.recovery_enabled() is True
 
 
-# --- pure classify ---------------------------------------------------------
+def test_boot_reconcile_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_BOOT_RECONCILE", raising=False)
+    assert R.boot_reconcile_enabled() is True  # crash recovery on restart = default ON
 
-def test_classify_non_dev_is_none():
-    assert R.classify(role="teamlead", pane_live=False, task_status=ACTIVE,
-                      respawn_count=0, bound=2) == "none"
 
+def test_boot_reconcile_disabled_when_zero(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_BOOT_RECONCILE", "0")
+    assert R.boot_reconcile_enabled() is False
+
+
+# --- pure classify (role-agnostic now) -------------------------------------
 
 def test_classify_live_pane_is_none():
-    # this slice never touches a LIVE pane (wedge-SIGTERM is a separate slice)
-    assert R.classify(role="dev", pane_live=True, task_status=ACTIVE,
+    # live work is never touched here (idle-wedge SIGTERM is a separate slice)
+    assert R.classify(pane_live=True, task_status=ACTIVE, has_artifact=True,
                       respawn_count=0, bound=2) == "none"
 
 
 def test_classify_dead_pane_active_task_respawns():
-    assert R.classify(role="dev", pane_live=False, task_status=ACTIVE,
+    assert R.classify(pane_live=False, task_status=ACTIVE, has_artifact=False,
                       respawn_count=0, bound=2) == "respawn"
-    assert R.classify(role="dev", pane_live=False, task_status="reopened",
+    assert R.classify(pane_live=False, task_status="reopened", has_artifact=False,
                       respawn_count=1, bound=2) == "respawn"
 
 
+def test_classify_dead_pane_artifact_no_task_respawns():
+    # an operator/TL with no task but a written role artifact still recovers
+    assert R.classify(pane_live=False, task_status="", has_artifact=True,
+                      respawn_count=0, bound=2) == "respawn"
+
+
 def test_classify_dead_pane_respawn_bound_parks():
-    assert R.classify(role="dev", pane_live=False, task_status=ACTIVE,
+    assert R.classify(pane_live=False, task_status=ACTIVE, has_artifact=False,
                       respawn_count=2, bound=2) == "park"
 
 
 def test_classify_dead_pane_done_task_is_none():
-    # deliverable exists → leave to T-0233 stale-archive, don't respawn
-    assert R.classify(role="dev", pane_live=False, task_status=DONE,
+    # deliverable exists → leave to stale-archive, even with an artifact present
+    assert R.classify(pane_live=False, task_status=DONE, has_artifact=True,
                       respawn_count=0, bound=2) == "none"
-    assert R.classify(role="dev", pane_live=False, task_status="totest",
-                      respawn_count=0, bound=2) == "none"
-
-
-def test_classify_dead_pane_planned_task_is_none():
-    # never started → normal dispatch picks it up, nothing in-flight to recover
-    assert R.classify(role="dev", pane_live=False, task_status="planned",
+    assert R.classify(pane_live=False, task_status="totest", has_artifact=False,
                       respawn_count=0, bound=2) == "none"
 
 
-# --- tick dispatch (injected handlers, no real side effects) ---------------
+def test_classify_dead_pane_no_state_is_none():
+    # never started + nothing written → nothing in-flight to recover
+    assert R.classify(pane_live=False, task_status="planned", has_artifact=False,
+                      respawn_count=0, bound=2) == "none"
+    assert R.classify(pane_live=False, task_status="", has_artifact=False,
+                      respawn_count=0, bound=2) == "none"
+
+
+# --- gather: crash signature + artifact resolution -------------------------
+
+def _seed(tmp_path, sid, *, status, role, task_id="~", pane_id="%1"):
+    from bot_squad_worker import sessions as S
+    sess = tmp_path / "data" / "p1" / "sessions"
+    sess.mkdir(parents=True, exist_ok=True)
+    S._write_session_metadata(sess / f"{sid}.md", {
+        "sid": sid, "status": status, "window": role, "task_id": task_id,
+        "initiative": "~", "role": role, "pane_id": pane_id})
+
+
+def test_gather_selects_crashed_skips_graceful_and_live(monkeypatch, tmp_path):
+    """_gather picks only the crash signature (md active + dead pane), across all
+    roles; a suspended (graceful) or live session is excluded."""
+    from bot_squad_worker import sessions as S
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
+
+    _seed(tmp_path, "S-u-crashed-p1", status="active", role="dev", task_id="T-1")
+    (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
+    (artifacts / "T-1.md").write_text("# forward-state\n")
+    _seed(tmp_path, "S-u-op-p2", status="active", role="operator", pane_id="%2")
+    (artifacts / "operator-state.md").write_text("# op state\n")
+    _seed(tmp_path, "S-u-graceful-p3", status="suspended", role="dev",
+          task_id="T-1", pane_id="%3")
+    _seed(tmp_path, "S-u-live-p4", status="active", role="dev", task_id="T-1",
+          pane_id="%4")
+
+    # only the live session has a live pane
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {"S-u-live-p4": "%4"})
+
+    rows = {r["sid"]: r for r in R._gather(cfg)}
+    # graceful (suspended) is excluded outright; the live one is gathered but
+    # flagged pane_live (classify then leaves it alone) — gather is the single
+    # status filter, classify is the single liveness gate.
+    assert "S-u-graceful-p3" not in rows
+    assert set(rows) == {"S-u-crashed-p1", "S-u-op-p2", "S-u-live-p4"}
+    assert rows["S-u-live-p4"]["pane_live"] is True
+    assert rows["S-u-crashed-p1"]["pane_live"] is False
+    assert rows["S-u-crashed-p1"]["task_status"] == "in_progress"
+    assert rows["S-u-crashed-p1"]["has_artifact"] is True
+    assert rows["S-u-crashed-p1"]["artifact_path"].endswith("/artifacts/T-1.md")
+    # operator (no task) resolves to its state-doc artifact
+    assert rows["S-u-op-p2"]["has_artifact"] is True
+    assert rows["S-u-op-p2"]["artifact_path"].endswith("/artifacts/operator-state.md")
+
+
+def test_gather_no_artifact_when_file_absent(monkeypatch, tmp_path):
+    from bot_squad_worker import sessions as S
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    _seed(tmp_path, "S-u-c-p1", status="active", role="dev", task_id="T-9")
+    (backlog / "T-9.md").write_text("---\nid: T-9\nstatus: in_progress\n---\n# f\n")
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    rows = R._gather(cfg)
+    assert len(rows) == 1
+    assert rows[0]["has_artifact"] is False  # no artifact written yet
+
+
+# --- tick dispatch ---------------------------------------------------------
 
 def test_tick_noop_when_disabled(monkeypatch, tmp_path):
     monkeypatch.delenv("BOT_SQUAD_RECOVERY", raising=False)
     called = []
     monkeypatch.setattr(R, "_gather", lambda cfg: [{"sid": "S-d-p1", "slug": "p1",
-        "role": "dev", "pane_live": False, "task_id": "T-1", "task_status": ACTIVE}])
+        "role": "dev", "pane_live": False, "task_id": "T-1", "task_status": ACTIVE,
+        "has_artifact": False}])
     monkeypatch.setattr(R, "_do_respawn", lambda *a, **k: called.append("respawn"))
-    out = R.recovery_tick(tmp_path and _cfg(tmp_path))
+    out = R.recovery_tick(_cfg(tmp_path))
     assert called == []
     assert out["enabled"] is False
-
-
-def test_gather_derives_role_from_window_and_reads_status(monkeypatch, tmp_path):
-    """Integration: _gather must call _derive_role with the real (window,
-    task_id, initiative) signature and read live status — the mock-based tick
-    tests don't exercise this path."""
-    from bot_squad_worker import recovery as R
-    from bot_squad_worker import sessions as S
-    cfg = _cfg(tmp_path)
-    sess = tmp_path / "data" / "p1" / "sessions"
-    sess.mkdir(parents=True)
-    backlog = tmp_path / "data" / "p1" / "backlog"
-    backlog.mkdir(parents=True)
-    # a marker-less window → dev; bound to an in_progress task; dead pane
-    S._write_session_metadata(sess / "S-u-feat-p9.md", {
-        "sid": "S-u-feat-p9", "status": "active", "window": "feat",
-        "task_id": "T-1", "initiative": "~", "pane_id": "%9"})
-    (backlog / "T-1-feature.md").write_text(
-        "---\nid: T-1\nstatus: in_progress\n---\n# feature\n")
-    # pane_live is now resolved via live_pane_map (real panes); force "no live
-    # pane" deterministically so this dead-pane case is independent of tmux.
-    monkeypatch.setattr("bot_squad_worker.sessions.list_panes", lambda: [])
-
-    rows = R._gather(cfg)
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["role"] == "dev"
-    assert row["pane_live"] is False
-    assert row["task_status"] == "in_progress"
-    assert row["task_id"] == "T-1"
 
 
 def test_tick_routes_respawn_then_park(monkeypatch, tmp_path):
@@ -123,14 +169,82 @@ def test_tick_routes_respawn_then_park(monkeypatch, tmp_path):
     monkeypatch.setenv("BOT_SQUAD_RESPAWN_MAX", "1")
     cfg = _cfg(tmp_path)
     rows = [{"sid": "S-d-p1", "slug": "p1", "role": "dev", "pane_live": False,
-             "task_id": "T-1", "task_status": ACTIVE}]
+             "task_id": "T-1", "task_status": ACTIVE, "has_artifact": False}]
     monkeypatch.setattr(R, "_gather", lambda c: rows)
     actions = []
     monkeypatch.setattr(R, "_do_respawn", lambda c, row: actions.append(("respawn", row["sid"])))
     monkeypatch.setattr(R, "_do_park", lambda c, row, reason: actions.append(("park", row["sid"])))
 
-    # first tick: respawn_count 0 < bound 1 -> respawn (count becomes 1)
-    R.recovery_tick(cfg)
-    # second tick: respawn_count 1 >= bound 1 -> park
-    R.recovery_tick(cfg)
+    R.recovery_tick(cfg)  # count 0 < bound 1 -> respawn (count -> 1)
+    R.recovery_tick(cfg)  # count 1 >= bound 1 -> park
     assert actions == [("respawn", "S-d-p1"), ("park", "S-d-p1")]
+
+
+def test_run_counts_failed_respawn_toward_bound(monkeypatch, tmp_path):
+    """A respawn that THROWS still counts toward the bound (so a perpetually
+    failing recovery eventually parks instead of looping)."""
+    monkeypatch.setenv("BOT_SQUAD_RECOVERY", "1")
+    monkeypatch.setenv("BOT_SQUAD_RESPAWN_MAX", "1")
+    cfg = _cfg(tmp_path)
+    rows = [{"sid": "S-d-p1", "slug": "p1", "role": "dev", "pane_live": False,
+             "task_id": "T-1", "task_status": ACTIVE, "has_artifact": False}]
+    monkeypatch.setattr(R, "_gather", lambda c: rows)
+    parks = []
+    def _boom(c, row):
+        raise RuntimeError("spawn failed")
+    monkeypatch.setattr(R, "_do_respawn", _boom)
+    monkeypatch.setattr(R, "_do_park", lambda c, row, reason: parks.append(row["sid"]))
+    out1 = R.recovery_tick(cfg)
+    assert out1["acted"] == [("respawn-failed", "S-d-p1")]
+    out2 = R.recovery_tick(cfg)  # count now 1 >= bound 1 -> park
+    assert parks == ["S-d-p1"]
+
+
+# --- boot reconcile: the ungraceful-death + boot integration (DoD) ----------
+
+def test_boot_reconcile_redrives_crash_from_artifact_and_archives(monkeypatch, tmp_path):
+    """DoD: simulate an ungraceful death (md active + dead pane) + a worker boot.
+    boot_reconcile must run EVEN with the periodic BOT_SQUAD_RECOVERY switch OFF,
+    re-drive the crashed session from its role artifact (via the graceful-compact
+    reload path), re-bound to the same task, and archive the dead predecessor.
+    A gracefully-suspended sibling must be untouched."""
+    from bot_squad_worker import sessions as S
+    monkeypatch.delenv("BOT_SQUAD_RECOVERY", raising=False)       # periodic OFF
+    monkeypatch.delenv("BOT_SQUAD_BOOT_RECONCILE", raising=False)  # boot default ON
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
+
+    _seed(tmp_path, "S-u-crashed-p1", status="active", role="dev", task_id="T-1")
+    (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
+    (artifacts / "T-1.md").write_text("# forward-state\nDONE x NEXT y\n")
+    _seed(tmp_path, "S-u-graceful-p3", status="suspended", role="dev",
+          task_id="T-1", pane_id="%3")
+
+    spawns, archives = [], []
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})  # all panes dead
+    monkeypatch.setattr(S, "spawn",
+        lambda cfg, slug, window, prompt, **kw: spawns.append(
+            {"window": window, "prompt": prompt, "kw": kw}) or {"ok": True})
+    monkeypatch.setattr(S, "archive_session",
+        lambda cfg, slug, sid: archives.append(sid) or {"ok": True})
+
+    out = R.boot_reconcile(cfg)
+
+    assert out["enabled"] is True and out["source"] == "boot" and out["boot"] is True
+    assert out["acted"] == [("respawn", "S-u-crashed-p1")]  # graceful NOT recovered
+    # re-driven from the artifact (boot prompt names the artifact path), same task
+    assert len(spawns) == 1
+    assert "artifacts/T-1.md" in spawns[0]["prompt"]
+    assert spawns[0]["kw"].get("task_id") == "T-1"
+    # dead predecessor retired so the next boot won't recover it again
+    assert archives == ["S-u-crashed-p1"]
+
+
+def test_boot_reconcile_disabled_is_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOT_SQUAD_BOOT_RECONCILE", "0")
+    called = []
+    monkeypatch.setattr(R, "_gather", lambda cfg: called.append("gathered") or [])
+    out = R.boot_reconcile(_cfg(tmp_path))
+    assert out["enabled"] is False
+    assert called == []  # short-circuits before touching any session

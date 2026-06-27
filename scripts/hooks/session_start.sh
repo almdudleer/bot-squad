@@ -591,7 +591,7 @@ if [ -n "${BOT_SQUAD_INITIATIVE:-}" ]; then
 fi
 
 print_section "ORIENTATION — read on demand (not piped in every turn, to keep context lean)"
-echo "- Your role contract : $DATA/vision/roles/$ROLE.md"
+echo "- Your role contract : $BOT_SQUAD/api/app/resources/roles/$ROLE.md  (git-tracked SSOT — what your spawn brief uses; T-0198)"
 echo "  (your rules — read on your FIRST action if this session wasn't spawned with a brief)"
 echo "- AGENT_INSTRUCTIONS  : $DATA/AGENT_INSTRUCTIONS.md  (recipes/paths — open on the specific need)"
 if [ -n "$active_init" ] && [ -f "$DATA/vision/initiatives/$active_init" ]; then

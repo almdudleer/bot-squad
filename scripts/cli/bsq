@@ -1215,6 +1215,21 @@ def cmd_expert_find(args) -> None:
 
 _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
                "operator": "operator.md"}
+
+
+def _roles_ssot_dir() -> Path:
+    """T-0198: the git-tracked role-contract SSOT (``api/app/resources/roles``).
+
+    The spawn assembler (``_assemble_prompt``) and ``bsq brief`` read role
+    contracts from HERE — NOT the per-project live copy
+    (``data/<slug>/vision/roles``), which is seeded once at scaffold by
+    ``project_scaffold._seed_vision_roles`` and then drifts (the role-doc-drift
+    bug). Reading the SSOT makes editing the git-tracked contract in ONE place
+    what a spawned session actually receives — no dual-edit. The live copy is
+    Vision-tab / onboarding DISPLAY only; per-project role edits via the Vision
+    tab are intentionally NOT authoritative for the assembler (decision: not a
+    supported feature — see docs/architecture/D-0043)."""
+    return Path(BOT_SQUAD) / "api" / "app" / "resources" / "roles"
 _KW_STOP = {"the", "and", "for", "with", "from", "into", "via", "not", "per",
             "fix", "add", "new", "use", "all", "any", "out", "off", "more"}
 
@@ -1256,7 +1271,7 @@ def _assemble_prompt(slug: str, tickets: list[str], paths: dict[str, Path],
     """
     primary = tickets[0]
     role = role if role in _ROLE_FILES else "dev"
-    roles_dir = Path(BOT_SQUAD) / "data" / slug / "vision" / "roles"
+    roles_dir = _roles_ssot_dir()  # T-0198: git-tracked SSOT, not the drifting live copy
     role_path = roles_dir / _ROLE_FILES[role]
     role_text = role_path.read_text(encoding="utf-8", errors="replace").strip() \
         if role_path.exists() else "(role file missing)"
@@ -1410,7 +1425,7 @@ def cmd_brief(args) -> None:
 
     _emit("PRODUCT", data / "vision" / "product.md")
     _emit("TEAM PROTOCOL", data / "vision" / "team_protocol.md")
-    _emit(f"YOUR ROLE CONTRACT ({role_file})", data / "vision" / "roles" / role_file)
+    _emit(f"YOUR ROLE CONTRACT ({role_file})", _roles_ssot_dir() / role_file)  # T-0198: SSOT
 
     # Bindings from the session md (primary + extras).
     if sid:
@@ -2656,14 +2671,23 @@ def cmd_task_new(args) -> None:
         v = getattr(args, k, None)
         if v:
             params[k] = v
-    res = post("task_new", params)
-    # Stamp provenance into the freshly-created ticket — close the loop at the
-    # OPEN (the tree-scan lint stays as the backstop).
-    path = Path(res["file_path"])
+    # T-0519: pass the (client-validated) provenance INTO the action so the
+    # worker requires+validates+stamps it at the gate. Fall back to the legacy
+    # post-hoc stamp for a pre-T-0519 worker that doesn't yet accept the param
+    # (deploy-ordering shim — bsq is instant-live, the worker gate rides a
+    # deploy; this keeps `bsq task new` working against both. Remove the
+    # fallback once the gate is everywhere).
     try:
-        _write_atomic(path, _stamp_provenance(path.read_text(encoding="utf-8"), prov))
-    except OSError as e:
-        die(f"task new: created {res['id']} but failed to stamp provenance: {e}")
+        res = post("task_new", {**params, "provenance": prov}, fatal=False)
+    except WorkerError as e:
+        if "unexpected params" not in str(e):
+            die(str(e))
+        res = post("task_new", params)
+        path = Path(res["file_path"])
+        try:
+            _write_atomic(path, _stamp_provenance(path.read_text(encoding="utf-8"), prov))
+        except OSError as ex:
+            die(f"task new: created {res['id']} but failed to stamp provenance: {ex}")
     print(f"{res['id']}  ->  {res['file_path']}  (provenance: {prov})")
 
 

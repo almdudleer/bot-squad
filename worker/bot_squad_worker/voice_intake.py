@@ -233,6 +233,22 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
     if failed:
         reason = "transcription_timeout" if timed_out else "transcription_failed"
         return {"ok": False, "reason": reason, "artifact": str(artifact)}
+
+    # T-0526: also record the transcript into the per-(slug, global_user_id)
+    # conversation history store (T-0489) — not ONLY the F-*.md feedback artifact
+    # — so voice joins the durable conversation thread (the continuity substrate,
+    # voice-04). Reuses tg_listener's identity + append (same worker->localhost-API
+    # path, T-0529 /worker prefix). Best-effort + env-gated: never blocks intake.
+    try:
+        from bot_squad_worker import tg_listener as _tl
+        ident = _tl.resolve_or_link_sender(cfg, message, slug)
+        if ident and ident.get("global_user_id"):
+            conv_msg = dict(message)
+            conv_msg["text"] = transcript  # voice has no text; the transcript IS the message
+            _tl.append_conversation(cfg, slug, ident["global_user_id"], conv_msg)
+    except Exception:  # noqa: BLE001
+        log.debug("voice_intake: conversation-store append skipped (non-fatal)", exc_info=True)
+
     return {"ok": True, "artifact": str(artifact), "lang": lang}
 
 

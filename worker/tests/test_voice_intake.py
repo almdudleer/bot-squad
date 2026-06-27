@@ -150,6 +150,36 @@ def test_process_voice_end_to_end(tmp_path, monkeypatch):
     assert sent and sent[0]["topic_id"] == 9001
 
 
+def test_process_voice_records_transcript_to_conversation_store(tmp_path, monkeypatch):
+    """T-0526: a successful transcript is ALSO appended to the per-(slug,
+    global_user_id) conversation store (not only the F-*.md artifact), reusing
+    tg_listener's identity + append (best-effort)."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import (
+        voice_intake as _VI, transcribe as _T, tg_topics, actions as A,
+        tg_listener as _TL,
+    )
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    monkeypatch.setattr(_T, "transcribe", lambda p, **kw: {"text": "dark mode please", "lang": "en", "engine": "faster-whisper:small"})
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(send=lambda **kw: True))
+
+    # Stub identity resolution + capture the conversation-store append.
+    monkeypatch.setattr(_TL, "resolve_or_link_sender",
+                        lambda c, m, s: {"global_user_id": "gu_voice", "created": False, "slug": s})
+    captured = {}
+    monkeypatch.setattr(_TL, "append_conversation",
+                        lambda c, slug, gid, msg: captured.update(slug=slug, gid=gid, text=msg.get("text")) or True)
+
+    out = _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-06-21T13:00:00Z")
+    assert out["ok"] is True
+    # The transcript (not the empty voice 'text') landed in the conversation store.
+    assert captured == {"slug": "bot-squad", "gid": "gu_voice", "text": "dark mode please"}
+
+
 def test_process_voice_download_failure_confirms_resend(tmp_path, monkeypatch):
     """Hardening: a download failure (e.g. a flaky TG proxy on this DPI-blocked
     host) must NOT silently drop the note — confirm back into #feedback so the

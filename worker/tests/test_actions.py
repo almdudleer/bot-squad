@@ -2128,6 +2128,25 @@ def test_send_stakeholder_dm_group_record_on_max(tmp_config_dir, monkeypatch):
     assert fake_tg.calls[0]["topic_id"] == 77  # into #team-queries
 
 
+def test_send_stakeholder_dm_group_record_failure_is_non_fatal(tmp_config_dir, monkeypatch):
+    """T-0533: a failing best-effort group-record post (e.g. TG DPI-block) must
+    NOT break the page — MAX already delivered above; the failure is swallowed
+    (now logged at DEBUG, not ERROR-per-page)."""
+    import bot_squad_worker.actions as A
+
+    class _BoomTg:
+        def send(self, **kw):
+            raise RuntimeError("tg DPI-block / ConnectTimeout")
+
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())  # group-record post raises
+    out = A._send_stakeholder_dm(A._get_config(), message="needs you", sid="S-x-p1",
+                                 tg_chat_id="-100", tg_topic_id=77, group_record=True)
+    assert out["channel"] == "max" and out.get("sent")  # page delivered; failure non-fatal
+    assert len(fake_max.calls) == 1
+
+
 def test_send_stakeholder_dm_failover_to_tg(tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 

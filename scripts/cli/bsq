@@ -417,6 +417,129 @@ def cmd_peer_send(args) -> None:
         print(f"no live pane (will read on next check): {', '.join(skipped)}")
 
 
+# --------------------------------------------------------------------------
+# sync — synchronous inter-session channel (T-0498, M6/F6.2)
+# --------------------------------------------------------------------------
+# request -> ack -> both enter -> live 2-way `send`, closing on exit/timeout.
+# Built on the async substrate (D-0037): the handshake notices + messages ride
+# the durable inbox bus, and `bsq` additionally injects them straight into the
+# peer's terminal (the "talking directly without interruptions" delivery).
+def _sync_deliver(notify: dict | None) -> None:
+    """Best-effort: drop a sync notify line into the peer's terminal pane.
+
+    The durable copy already landed in the peer's inbox (the worker action used
+    intersession.send); this is the live terminal delivery. A peer with no live
+    pane (suspended / non-tmux) just reads it on its next `bsq inbox check`.
+    """
+    if not notify or not notify.get("sid"):
+        return
+    rsid = notify["sid"]
+    try:
+        post("inject_input", {"sid": rsid, "text": notify["text"]}, fatal=False)
+        print(f"delivered to {rsid}'s terminal")
+    except WorkerError:
+        print(f"no live pane for {rsid} (will read on next inbox check)")
+
+
+def cmd_sync_request(args) -> None:
+    slug = resolve_slug()
+    from_sid = require_sid(args.from_sid)
+    params = {"slug": slug, "from_sid": from_sid, "to": args.to}
+    if args.reason:
+        params["reason"] = args.reason
+    if args.ttl is not None:
+        params["ttl"] = float(args.ttl)
+    res = post("sync_request", params)
+    cid = res["channel_id"]
+    print(f"sync channel {cid} requested with {res['responder']} (status: {res['status']})")
+    print(f"  peer acks with: bsq sync ack {cid}")
+    if not args.no_signal:
+        _sync_deliver(res.get("notify"))
+
+
+def cmd_sync_ack(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    res = post("sync_ack", {"slug": slug, "sid": sid, "channel_id": args.channel_id})
+    cid = args.channel_id
+    print(f"acked {cid} (status: {res['status']}) — now enter: bsq sync enter {cid}")
+    if not args.no_signal:
+        _sync_deliver(res.get("notify"))
+
+
+def cmd_sync_enter(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    res = post("sync_enter", {"slug": slug, "sid": sid, "channel_id": args.channel_id})
+    cid = args.channel_id
+    if res.get("both_in"):
+        print(f"entered {cid} — channel OPEN with {res['peer']}. "
+              f"Send with: bsq sync send {cid} <text>")
+    else:
+        print(f"entered {cid} (status: {res['status']}) — waiting for {res['peer']} to enter")
+    if not args.no_signal:
+        _sync_deliver(res.get("notify"))
+
+
+def cmd_sync_send(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    text = " ".join(args.text).strip()
+    if not text:
+        die("sync send: empty message")
+    res = post("sync_send",
+               {"slug": slug, "sid": sid, "channel_id": args.channel_id, "text": text})
+    print(f"sent to {res['peer']} on {args.channel_id}")
+    if not args.no_signal:
+        _sync_deliver(res.get("notify"))
+
+
+def cmd_sync_exit(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(args.sid)
+    params = {"slug": slug, "sid": sid, "channel_id": args.channel_id}
+    if args.reason:
+        params["reason"] = args.reason
+    res = post("sync_exit", params)
+    print(f"left {args.channel_id} (status: {res['status']}, "
+          f"reason: {res.get('closed_reason')})")
+    if not args.no_signal:
+        _sync_deliver(res.get("notify"))
+
+
+def cmd_sync_status(args) -> None:
+    slug = resolve_slug()
+    if args.channel_id:
+        res = post("sync_status", {"slug": slug, "channel_id": args.channel_id})
+        if args.json:
+            print(json.dumps(res))
+            return
+        line = (f"{res['channel_id']}: {res['status']}  "
+                f"requester={res['requester']} responder={res['responder']} "
+                f"entered={res.get('entered')}")
+        if res.get("closed_reason"):
+            line += f" closed_reason={res['closed_reason']}"
+        print(line)
+        return
+    params = {"slug": slug}
+    if not args.all:
+        params["sid"] = require_sid(args.sid)
+    res = post("sync_status", params)
+    if args.json:
+        print(json.dumps(res))
+        return
+    chans = res.get("channels", [])
+    if not chans:
+        print("(no sync channels)")
+        return
+    for c in chans:
+        line = (f"{c['channel_id']}: {c['status']}  "
+                f"requester={c['requester']} responder={c['responder']}")
+        if c.get("closed_reason"):
+            line += f" closed_reason={c['closed_reason']}"
+        print(line)
+
+
 def cmd_spawn(args) -> None:
     slug = resolve_slug()
     ticket = args.ticket.strip()
@@ -1626,6 +1749,204 @@ def cmd_drift_status(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# T-0482: user-controlled execution pace (Process Paradigm M3 / F3.4).
+#
+# The user surface for the pace-control config the operator consumes
+# (`worker/bot_squad_worker/pace.py` is the worker-side SSOT). This verb writes
+# the SAME per-project JSON the worker reads (`_worker/pace/pace.json`) directly
+# — no worker action, so it never co-edits the single-owner actions.py / closed
+# allowlist. Global pause delegates to the operator_redrive flag file (the one
+# pause SSOT the re-drive cadence already honors).
+#
+# Storage shape mirrors pace.py: {max_in_progress:int, initiatives:{<.md>:{weight,
+# priority,paused}}}. Display applies the same defaults pace.read_config does.
+# --------------------------------------------------------------------------
+_PACE_DEFAULT_WEIGHT = 1.0
+_PACE_DEFAULT_PRIORITY = 0
+
+
+def _pace_dir(slug: str) -> Path:
+    return Path(BOT_SQUAD) / "data" / slug / "_worker" / "pace"
+
+
+def _pace_config_path(slug: str) -> Path:
+    return _pace_dir(slug) / "pace.json"
+
+
+def _pace_redrive_flag(slug: str) -> Path:
+    # SAME path operator_redrive._pause_flag_path writes/reads (single pause SSOT).
+    return Path(BOT_SQUAD) / "data" / slug / "_worker" / "operator_redrive" / "operator_paused.flag"
+
+
+def _pace_normalize_initiative(name: str) -> str:
+    """Canonical key = the .md basename form (matches task `initiative:` field).
+    Mirrors pace.normalize_initiative so both sides address one initiative id."""
+    base = Path(str(name).strip()).name
+    if base.lower().endswith(".md"):
+        base = base[:-3]
+    return f"{base}.md" if base else ""
+
+
+def _pace_load_raw(slug: str) -> dict:
+    p = _pace_config_path(slug)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _pace_save_raw(slug: str, data: dict) -> None:
+    d = _pace_dir(slug)
+    d.mkdir(parents=True, exist_ok=True)
+    p = _pace_config_path(slug)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    os.replace(tmp, p)
+
+
+def _pace_norm_entry(body: dict) -> dict:
+    body = body if isinstance(body, dict) else {}
+
+    def _f(v, d):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return d
+
+    def _i(v, d):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return d
+
+    return {
+        "weight": _f(body.get("weight"), _PACE_DEFAULT_WEIGHT),
+        "priority": _i(body.get("priority"), _PACE_DEFAULT_PRIORITY),
+        "paused": str(body.get("paused", "")).strip().lower() in ("true", "yes", "1", "on")
+        if not isinstance(body.get("paused"), bool) else body.get("paused"),
+    }
+
+
+def _pace_initiatives(raw: dict) -> dict:
+    out: dict = {}
+    src = raw.get("initiatives")
+    if isinstance(src, dict):
+        for name, body in src.items():
+            key = _pace_normalize_initiative(name)
+            if key:
+                out[key] = _pace_norm_entry(body)
+    return out
+
+
+def cmd_pace_show(args) -> None:
+    """T-0482: print the project's pace-control config (the user's pace surface)."""
+    slug = resolve_slug()
+    raw = _pace_load_raw(slug)
+    try:
+        mip = max(0, int(raw.get("max_in_progress", 0)))
+    except (TypeError, ValueError):
+        mip = 0
+    paused = _pace_redrive_flag(slug).exists()
+    inits = _pace_initiatives(raw)
+    print(f"pace control for {slug}:")
+    print(f"  max_in_progress: {mip if mip else '0 (unlimited)'}")
+    print(f"  paused (global): {'yes' if paused else 'no'}")
+    if inits:
+        print("  initiatives:")
+        for key in sorted(inits):
+            e = inits[key]
+            print(f"    {key}  weight={e['weight']} priority={e['priority']} "
+                  f"paused={'yes' if e['paused'] else 'no'}")
+    else:
+        print("  initiatives: (none)")
+
+
+def cmd_pace_set(args) -> None:
+    """T-0482: set the global max-in-progress ceiling (0 = unlimited)."""
+    slug = resolve_slug()
+    if args.max_in_progress is None:
+        die("nothing to set — pass --max-in-progress N")
+    n = max(0, int(args.max_in_progress))
+    raw = _pace_load_raw(slug)
+    raw["max_in_progress"] = n
+    _pace_save_raw(slug, raw)
+    print(f"pace[{slug}]: max_in_progress = {n if n else '0 (unlimited)'}")
+
+
+def cmd_pace_initiative(args) -> None:
+    """T-0482: set a per-initiative weight / priority / pause (steer the order)."""
+    slug = resolve_slug()
+    key = _pace_normalize_initiative(args.name)
+    if not key:
+        die("initiative name must be non-empty")
+    if args.weight is None and args.priority is None and not args.pause and not args.resume:
+        die("nothing to set — pass --weight / --priority / --pause / --resume")
+    if args.pause and args.resume:
+        die("--pause and --resume are mutually exclusive")
+    raw = _pace_load_raw(slug)
+    inits = _pace_initiatives(raw)
+    entry = inits.get(key, {
+        "weight": _PACE_DEFAULT_WEIGHT, "priority": _PACE_DEFAULT_PRIORITY, "paused": False})
+    if args.weight is not None:
+        entry["weight"] = float(args.weight)
+    if args.priority is not None:
+        entry["priority"] = int(args.priority)
+    if args.pause:
+        entry["paused"] = True
+    if args.resume:
+        entry["paused"] = False
+    inits[key] = entry
+    raw["initiatives"] = inits
+    _pace_save_raw(slug, raw)
+    print(f"pace[{slug}]: {key}  weight={entry['weight']} priority={entry['priority']} "
+          f"paused={'yes' if entry['paused'] else 'no'}")
+
+
+def cmd_pace_clear(args) -> None:
+    """T-0482: drop one initiative's pace entry (revert it to defaults)."""
+    slug = resolve_slug()
+    key = _pace_normalize_initiative(args.name)
+    raw = _pace_load_raw(slug)
+    inits = _pace_initiatives(raw)
+    if key not in inits:
+        print(f"pace[{slug}]: no entry for {key} (already at defaults)")
+        return
+    del inits[key]
+    raw["initiatives"] = inits
+    _pace_save_raw(slug, raw)
+    print(f"pace[{slug}]: cleared {key}")
+
+
+def cmd_pace_pause(args) -> None:
+    """T-0482: GLOBAL operator pause — stop the re-drive from starting new work.
+    Writes the SAME flag operator_redrive.is_paused honors (single pause SSOT)."""
+    slug = resolve_slug()
+    flag = _pace_redrive_flag(slug)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"paused_by": require_sid(getattr(args, "sid", None)) or "user",
+            "reason": getattr(args, "reason", "") or "", "paused_at": time.time()}
+    tmp = flag.with_suffix(".flag.tmp")
+    tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(tmp, flag)
+    print(f"pace[{slug}]: PAUSED — operator re-drive stops starting new work "
+          f"(resume with `bsq pace resume`)")
+
+
+def cmd_pace_resume(args) -> None:
+    """T-0482: clear the GLOBAL operator pause."""
+    slug = resolve_slug()
+    flag = _pace_redrive_flag(slug)
+    if flag.exists():
+        flag.unlink()
+        print(f"pace[{slug}]: RESUMED — operator re-drive may start new work")
+    else:
+        print(f"pace[{slug}]: not paused (nothing to resume)")
+
+
+# --------------------------------------------------------------------------
 # T-0215: per-session hunk-isolated commits for co-edited files.
 #
 # The shared clone has one working tree + one `.git/index` across ~10 sessions.
@@ -2788,6 +3109,55 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip the 'check mail' tmux nudge")
     dp.set_defaults(func=cmd_dispatch)
 
+    # sync (T-0498) — synchronous inter-session channel: request -> ack ->
+    # enter -> live 2-way send; closes on exit/timeout.
+    sy = sub.add_parser("sync",
+                        help="synchronous inter-session channel (request/ack/enter/send/exit/status)")
+    sy_sub = sy.add_subparsers(dest="sub", required=True)
+
+    syr = sy_sub.add_parser("request", help="request a sync channel with another session")
+    syr.add_argument("to", help="target SID to talk to")
+    syr.add_argument("--reason", help="why you want to talk (shown to the peer)")
+    syr.add_argument("--ttl", type=float,
+                     help="idle seconds before the channel auto-closes (default 3600)")
+    syr.add_argument("--from", dest="from_sid", help="override sender SID")
+    syr.add_argument("--no-signal", action="store_true",
+                     help="skip the live terminal nudge (durable inbox still written)")
+    syr.set_defaults(func=cmd_sync_request)
+
+    sya = sy_sub.add_parser("ack", help="ack a pending request (responder only) when ready")
+    sya.add_argument("channel_id", help="the SC-NNN channel id")
+    sya.add_argument("--sid", help="override this session's SID")
+    sya.add_argument("--no-signal", action="store_true", help="skip the live terminal nudge")
+    sya.set_defaults(func=cmd_sync_ack)
+
+    sye = sy_sub.add_parser("enter", help="enter an acked channel (opens once both enter)")
+    sye.add_argument("channel_id", help="the SC-NNN channel id")
+    sye.add_argument("--sid", help="override this session's SID")
+    sye.add_argument("--no-signal", action="store_true", help="skip the live terminal nudge")
+    sye.set_defaults(func=cmd_sync_enter)
+
+    sys_ = sy_sub.add_parser("send", help="send a live message to the other member")
+    sys_.add_argument("channel_id", help="the SC-NNN channel id")
+    sys_.add_argument("text", nargs="+", help="message text")
+    sys_.add_argument("--sid", help="override this session's SID")
+    sys_.add_argument("--no-signal", action="store_true", help="skip the live terminal nudge")
+    sys_.set_defaults(func=cmd_sync_send)
+
+    syx = sy_sub.add_parser("exit", help="leave the channel (closes it, notifies the peer)")
+    syx.add_argument("channel_id", help="the SC-NNN channel id")
+    syx.add_argument("--reason", help="why you're leaving")
+    syx.add_argument("--sid", help="override this session's SID")
+    syx.add_argument("--no-signal", action="store_true", help="skip the live terminal nudge")
+    syx.set_defaults(func=cmd_sync_exit)
+
+    syt = sy_sub.add_parser("status", help="show a channel by id, or your channels")
+    syt.add_argument("channel_id", nargs="?", help="the SC-NNN channel id (omit to list)")
+    syt.add_argument("--sid", help="override this session's SID (list mode)")
+    syt.add_argument("--all", action="store_true", help="list ALL channels, not just yours")
+    syt.add_argument("--json", action="store_true", help="raw JSON output")
+    syt.set_defaults(func=cmd_sync_status)
+
     # tg (T-0155) — explicit stakeholder DM; the only agent-initiated TG path.
     tg = sub.add_parser("tg", help="Telegram: explicitly DM the stakeholder")
     tg_sub = tg.add_subparsers(dest="sub", required=True)
@@ -3081,6 +3451,34 @@ def build_parser() -> argparse.ArgumentParser:
     eb.set_defaults(func=cmd_edit_begin)
 
     # commit
+    # T-0482: user-controlled execution pace (Process Paradigm M3 / F3.4).
+    pace = sub.add_parser(
+        "pace",
+        help="user-controlled execution pace: show / set / initiative / pause / resume")
+    pace_sub = pace.add_subparsers(dest="sub", required=True)
+    pcs = pace_sub.add_parser("show", help="print this project's pace-control config")
+    pcs.set_defaults(func=cmd_pace_show)
+    pcset = pace_sub.add_parser("set", help="set the global max-in-progress ceiling (0=unlimited)")
+    pcset.add_argument("--max-in-progress", type=int, default=None,
+                       help="max tasks kept in the in_progress board state (0 = unlimited)")
+    pcset.set_defaults(func=cmd_pace_set)
+    pci = pace_sub.add_parser("initiative", help="steer one initiative's weight / priority / pause")
+    pci.add_argument("name", help="initiative basename (e.g. process-paradigm or process-paradigm.md)")
+    pci.add_argument("--weight", type=float, default=None, help="relative drain weight (default 1.0)")
+    pci.add_argument("--priority", type=int, default=None, help="order rank, higher = sooner (default 0)")
+    pci.add_argument("--pause", action="store_true", help="pause just this initiative's tasks")
+    pci.add_argument("--resume", action="store_true", help="resume this initiative's tasks")
+    pci.set_defaults(func=cmd_pace_initiative)
+    pcc = pace_sub.add_parser("clear", help="drop one initiative's pace entry (revert to defaults)")
+    pcc.add_argument("name", help="initiative basename")
+    pcc.set_defaults(func=cmd_pace_clear)
+    pcp = pace_sub.add_parser("pause", help="GLOBAL pause — stop the operator re-drive starting new work")
+    pcp.add_argument("--reason", default="", help="optional note recorded with the pause")
+    pcp.add_argument("--sid", help="attributing SID (default: derived from tmux)")
+    pcp.set_defaults(func=cmd_pace_pause)
+    pcr = pace_sub.add_parser("resume", help="clear the GLOBAL operator pause")
+    pcr.set_defaults(func=cmd_pace_resume)
+
     cm = sub.add_parser("commit", help="stage explicit paths + safe-commit")
     cm.add_argument("-m", "--message", required=True, help="commit message")
     cm.add_argument("--ack", action="store_true",

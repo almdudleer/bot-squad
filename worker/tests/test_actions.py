@@ -60,6 +60,9 @@ def test_registry_lists_only_allowed_actions():
         # T-0153: autopilot — prompt-driven, time-boxed autonomous runs.
         "autopilot_start", "autopilot_stop", "autopilot_status",
         "peer_send", "peer_inbox_read", "peer_inbox_wait",
+        # T-0498 (M6/F6.2): synchronous inter-session channel handshake + send.
+        "sync_request", "sync_ack", "sync_enter", "sync_send",
+        "sync_exit", "sync_status",
         "task_progress_add",
         # T-0463: assignment-interface write-result primitive (F1.1-d).
         "assignment_write_result",

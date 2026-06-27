@@ -404,23 +404,109 @@ def _ensure_user_conversation(
         return None
 
 
-def _handle_unquoted(cfg, chat_id: str, gid: str, msg: dict) -> dict:
-    """An unquoted (non-reply, non-command) message. Sticky-route it to the
-    user's pinned project; ask which project when unset. Unrecognized senders
-    keep the pre-T-0492 skip behavior (no identity to anchor routing on)."""
+# ---- T-0494: misattribution guard ------------------------------------------
+# A pinned user may write a message that EXPLICITLY targets a DIFFERENT project
+# than the pinned one ("in bot-squad I see ...", voice-02). We must not silently
+# file + route it under the pinned project. We detect the explicit mention at
+# the intake layer (lightweight; the deep intent analysis lives in the session)
+# and offer a reroute-confirm BEFORE committing the slug — so a genuine "I meant
+# alpha" isn't silently recorded + routed under the pinned beta. A reroute is
+# only offered to a target the user may access (privacy/scoping, T-0493/M5-T6).
+
+_CROSS_PROJECT_CUE = r"(?:in|on|for|about|regarding|project)"
+
+
+def _slug_mention_re(slug: str):
+    """A regex matching an EXPLICIT mention of ``slug`` as a routing target: a
+    targeting cue word (in/on/for/about/regarding/project) immediately followed
+    by the slug, tolerating the slug's dashes typed as spaces ("bot-squad" ~
+    "bot squad", voice-02)."""
+    body = r"[\s-]+".join(re.escape(p) for p in slug.split("-"))
+    return re.compile(rf"\b{_CROSS_PROJECT_CUE}\s+{body}\b", re.IGNORECASE)
+
+
+def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
+    """Return a registered project slug (≠ ``current``) the message EXPLICITLY
+    targets, else ``None``. Conservative (cue-prefixed mention) to avoid
+    false-positive reroutes on incidental mentions — the deep intent analysis
+    stays in the session."""
+    t = text or ""
+    for slug in cfg.projects:
+        if slug == current:
+            continue
+        if _slug_mention_re(slug).search(t):
+            return slug
+    return None
+
+
+def _user_can_access_project(cfg, gid: str, slug: str) -> bool:
+    """T-0494 reroute scoping: a reroute is only OFFERED for a target the user
+    may access. Today every project registered on THIS install is routable;
+    deeper per-user grant enforcement (M5-T6 / the project-scoped read, T-0493)
+    lives downstream. Kept as a seam so the offer respects access."""
+    return slug in cfg.projects
+
+
+def _offer_reroute(cfg, chat_id: str, target: str, current: str) -> None:
+    """Offer a reroute-confirm: two normal-message buttons (switch to the
+    detected target, or keep the current project) so the choice arrives under
+    allowed_updates:["message"] (no poll-contract change; mirrors the picker).
+    Best-effort — a messenger outage must not break inbound handling."""
+    if not cfg.tg_bot_token:
+        return
+    keyboard = [[{"text": f"/project {target}"}], [{"text": f"/project {current}"}]]
+    reply_markup = {
+        "keyboard": keyboard,
+        "one_time_keyboard": True,
+        "resize_keyboard": True,
+    }
+    _channel_notify(
+        cfg, chat_id,
+        f"This looks like it's about '{target}', but you're on '{current}'. "
+        f"Reroute to '{target}', or keep '{current}'?",
+        reply_markup=reply_markup,
+    )
+
+
+def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
+    """An unquoted (non-reply, non-command) message — the firehose dump path.
+
+    Resolves the PROJECT-OF-RECORD (the pinned project is the routing authority,
+    T-0492; the chat slug is incidental) and lands BOTH the durable record
+    (T-0489) and the attending user-conversation session (T-0485/T-0478) on that
+    SAME project, so the dump isn't lost to a session reading a different thread.
+    Asks which project when unpinned; offers a reroute-confirm when the message
+    explicitly targets a different accessible project (T-0494). Unrecognized
+    senders keep the pre-T-0492 skip (no identity to anchor routing on)."""
     if not gid:
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
     sticky = get_current_project(cfg, gid)
-    if sticky:
-        # T-0485: hand the dump to a (continued-or-spawned) user-conversation
-        # session. message_ref points at the just-appended store record (its
-        # timestamp keys it in the (slug,gid) thread) so the session reads the
-        # dump from the store SSOT, not the raw blob.
-        message_ref = _msg_ts(msg)
-        _ensure_user_conversation(cfg, sticky, gid, message_ref)
-        return {"ok": True, "action": "route", "slug": sticky}
-    _ask_which_project(cfg, chat_id)
-    return {"ok": True, "action": "ask_project"}
+    if not sticky:
+        # Unpinned: hardwired ask (voice-04). Record under the chat's project so
+        # the message isn't lost while we wait for the pin.
+        append_conversation(cfg, chat_slug, gid, msg)
+        _ask_which_project(cfg, chat_id)
+        return {"ok": True, "action": "ask_project"}
+
+    # The pinned project is the project-of-record.
+    por = sticky
+
+    # T-0494: an explicit mention of a DIFFERENT accessible project → flag the
+    # mismatch + offer a reroute-confirm BEFORE committing the slug (no record,
+    # no routing until the user confirms the target).
+    target = _detect_cross_project_target(cfg, msg.get("text", ""), por)
+    if target and target != por and _user_can_access_project(cfg, gid, target):
+        _offer_reroute(cfg, chat_id, target, por)
+        return {"ok": True, "action": "reroute_confirm", "slug": por, "target": target}
+
+    # T-0489 + T-0485: record the dump under the project-of-record, then hand it
+    # to the (continued-or-spawned) user-conversation session on the SAME
+    # project. message_ref points at that just-appended store record (its
+    # timestamp keys it in the (por, gid) thread).
+    append_conversation(cfg, por, gid, msg)
+    message_ref = _msg_ts(msg)
+    _ensure_user_conversation(cfg, por, gid, message_ref)
+    return {"ok": True, "action": "route", "slug": por}
 
 
 def handle_update(cfg, update: dict) -> dict:
@@ -437,49 +523,51 @@ def handle_update(cfg, update: dict) -> dict:
     if chat_id not in allowed_chats:
         return {"ok": True, "action": "skip", "reason": f"chat {chat_id} not allowlisted"}
 
-    slug = _slug_for_chat(cfg, chat_id)
+    chat_slug = _slug_for_chat(cfg, chat_id)
 
     # T-0488: recognize the TG sender as a cross-server GlobalUser (link on first
     # contact). Best-effort + env-gated, so inbound routing below is never
     # blocked by linkage. Surfaced on the audit dict as (slug, global_user_id)
     # for the downstream user-conversation seam.
-    identity = resolve_or_link_sender(cfg, msg, slug)
-
-    # T-0489: record EVERY inbound user message to the conversation history store
-    # (the durable thread, voice-04) before routing — so the record is complete
-    # regardless of how (or whether) the message routes below. Best-effort +
-    # env-gated; only when the sender is a recognized GlobalUser (no gid => no
-    # anchor to key the thread on).
+    identity = resolve_or_link_sender(cfg, msg, chat_slug)
     gid = identity.get("global_user_id") if identity else ""
-    if gid:
-        append_conversation(cfg, slug, gid, msg)
 
     slash = extract_slash_command(msg)
-    if slash:
-        cmd, args = slash
-        # T-0492: /project pins/switches the user's current project (needs the
-        # sender identity, which _handle_slash doesn't carry) — route it here.
-        if cmd == "project":
-            result = _handle_project(cfg, chat_id, gid, args)
-        else:
-            result = _handle_slash(cfg, chat_id, cmd, args)
-    else:
-        reply = extract_reply_target(msg)
-        if reply:
+    reply = extract_reply_target(msg) if not slash else None
+    # T-0386 Phase 2: a voice message → transcribe + store as a feedback artifact.
+    # Flag-off-safe: gated on [voice].enabled (default off) so deploying the
+    # voice code is a no-op until the 1-time stakeholder TG setup flips it on.
+    is_voice = bool(
+        not slash and not reply
+        and msg.get("voice") and getattr(cfg, "voice_enabled", False)
+    )
+
+    if slash or reply or is_voice:
+        # T-0489: record slash/reply/voice under the chat's project — the slug is
+        # incidental for these (they don't sticky-route). The unquoted firehose
+        # path (below) resolves the project-of-record itself and records there,
+        # so its dump + attending session land on the SAME project (TL-D, T-0492).
+        if gid:
+            append_conversation(cfg, chat_slug, gid, msg)
+        if slash:
+            cmd, args = slash
+            # T-0492: /project pins/switches the user's current project (needs
+            # the sender identity, which _handle_slash doesn't carry).
+            if cmd == "project":
+                result = _handle_project(cfg, chat_id, gid, args)
+            else:
+                result = _handle_slash(cfg, chat_id, cmd, args)
+        elif reply:
             result = _handle_reply(cfg, chat_id, *reply)
-        # T-0386 Phase 2: a voice message → transcribe + store as a feedback
-        # artifact. Flag-off-safe: gated on [voice].enabled (default off) so
-        # deploying the voice code is a no-op until the 1-time stakeholder TG
-        # setup flips it on.
-        elif msg.get("voice") and getattr(cfg, "voice_enabled", False):
+        else:  # voice
             from bot_squad_worker import voice_intake as _vi
-            r = _vi.process_voice(cfg, slug, msg, ts=_msg_ts(msg))
-            result = {"ok": r.get("ok", True), "action": "voice", "slug": slug, "result": r}
-        else:
-            # T-0492: an unquoted message sticky-routes to the user's pinned
-            # project (asks which when unset). Unrecognized senders keep the
-            # pre-T-0492 skip.
-            result = _handle_unquoted(cfg, chat_id, gid, msg)
+            r = _vi.process_voice(cfg, chat_slug, msg, ts=_msg_ts(msg))
+            result = {"ok": r.get("ok", True), "action": "voice", "slug": chat_slug, "result": r}
+    else:
+        # T-0485/T-0494: the unquoted firehose path owns its own record (under
+        # the project-of-record) so the dump and the user-conversation session
+        # land on the same project.
+        result = _handle_unquoted(cfg, chat_id, chat_slug, gid, msg)
 
     if identity and identity.get("global_user_id"):
         result.setdefault("global_user_id", identity["global_user_id"])

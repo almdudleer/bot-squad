@@ -776,6 +776,138 @@ def test_ensure_user_conversation_best_effort_swallows(tmp_path, monkeypatch):
     assert TL._ensure_user_conversation(cfg, "beta", "gu_1", "ref") is None
 
 
+# ---------------------------------------------------------------------------
+# T-0494: misattribution guard — a message explicitly targeting a different
+# (accessible) project than the pinned one triggers a reroute-confirm offer
+# (not a silent misroute).
+# ---------------------------------------------------------------------------
+
+
+def test_detect_cross_project_target_explicit_mention(tmp_path):
+    cfg = _make_multi_cfg(tmp_path)  # projects: alpha, beta
+    # "in beta I see ..." while pinned to alpha -> target beta.
+    assert TL._detect_cross_project_target(cfg, "in beta I see a bug", "alpha") == "beta"
+    # cue synonyms.
+    assert TL._detect_cross_project_target(cfg, "regarding beta: broken", "alpha") == "beta"
+
+
+def test_detect_cross_project_target_dash_space_tolerant(tmp_path):
+    cfg = _make_multi_cfg(tmp_path)
+    cfg.projects = {
+        "alpha": types.SimpleNamespace(tg_chat="111"),
+        "bot-squad": types.SimpleNamespace(tg_chat="222"),
+    }
+    # The slug's dash may be typed as a space (voice-02: "in bot-squad I see").
+    assert TL._detect_cross_project_target(cfg, "in bot squad I see X", "alpha") == "bot-squad"
+    assert TL._detect_cross_project_target(cfg, "in bot-squad I see X", "alpha") == "bot-squad"
+
+
+def test_detect_cross_project_target_no_false_positive(tmp_path):
+    cfg = _make_multi_cfg(tmp_path)
+    # No cue + slug == the pinned one, or an incidental mention without a cue.
+    assert TL._detect_cross_project_target(cfg, "fix the deploy timeout", "alpha") is None
+    assert TL._detect_cross_project_target(cfg, "in alpha I see a bug", "alpha") is None
+    # An incidental mid-sentence mention without a targeting cue is not a target.
+    assert TL._detect_cross_project_target(cfg, "the alpha build mentions beta colors", "alpha") is None
+
+
+def test_handle_update_unquoted_cross_project_offers_reroute(tmp_path, monkeypatch):
+    """A message explicitly targeting another project is NOT silently routed to
+    the pinned project — a reroute-confirm is offered, and ensure is NOT called."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")  # pinned alpha
+    offers, ensures = [], []
+    monkeypatch.setattr(TL, "_offer_reroute",
+                        lambda c, chat, target, current: offers.append((target, current)))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: ensures.append(a))
+
+    msg = _dated_msg(text="in beta I see the buttons overlap")
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "reroute_confirm"
+    assert result["target"] == "beta" and result["slug"] == "alpha"
+    assert offers == [("beta", "alpha")]
+    assert ensures == []  # NOT silently routed to the pinned project
+
+
+def test_handle_update_unquoted_cross_project_respects_access(tmp_path, monkeypatch):
+    """A reroute is only offered for a target the user may access; when access is
+    denied the message falls through to normal pinned-project routing."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    monkeypatch.setattr(TL, "_user_can_access_project", lambda c, gid, slug: False)
+    offers, ensures = [], []
+    monkeypatch.setattr(TL, "_offer_reroute",
+                        lambda c, chat, target, current: offers.append((target, current)))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+
+    msg = _dated_msg(text="in beta I see the buttons overlap")
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    # Inaccessible target -> no reroute offer, normal route to the pinned project.
+    assert result["action"] == "route" and result["slug"] == "alpha"
+    assert offers == []
+    assert ensures == [("alpha", "gu_1")]
+
+
+def test_handle_update_unquoted_no_cross_mention_routes_normally(tmp_path, monkeypatch):
+    """No explicit cross-project mention -> ordinary T-0485 routing, no offer."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    offers, ensures = [], []
+    monkeypatch.setattr(TL, "_offer_reroute",
+                        lambda *a, **k: offers.append(a))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+
+    msg = _dated_msg(text="fix the deploy timeout bug")
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route" and result["slug"] == "alpha"
+    assert offers == [] and ensures == [("alpha", "gu_1")]
+
+
+def test_offer_reroute_sends_confirm_keyboard(tmp_path, monkeypatch):
+    """The reroute offer routes through the channel abstraction with both
+    choices as normal-message buttons (switch to target / keep current), with
+    the interactive-reply flags."""
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    calls: list[dict] = []
+
+    class _FakeTg:
+        def send(self, **kw):
+            calls.append(kw)
+            return True
+
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: _FakeTg())
+    monkeypatch.setattr(
+        "httpx.post",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("raw httpx.post — must route via the channel")),
+    )
+
+    TL._offer_reroute(cfg, "111", "beta", "alpha")
+
+    assert calls, "reroute offer did not route through the channel"
+    kw = calls[-1]
+    btn_texts = [btn["text"] for row in kw["reply_markup"]["keyboard"] for btn in row]
+    assert "/project beta" in btn_texts   # switch to the detected target
+    assert "/project alpha" in btn_texts  # keep the current project
+    assert kw["urgent"] is True and kw["sid"] == "" and kw["debounce"] is False
+
+
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
     """T-0513: the picker now routes through the channel abstraction (was a raw
     httpx sendMessage). The keyboard must reach the TG client via the channel,

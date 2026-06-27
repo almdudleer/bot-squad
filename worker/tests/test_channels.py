@@ -131,6 +131,46 @@ def test_tg_channel_delegates_to_tgclient(fake_clients):
     ]
 
 
+class _FakeTgClientOpt:
+    """TG client fake that also accepts the T-0513 optional knobs."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def send(self, *, chat_id, text, sid="", user="", urgent=False,
+             topic_id=None, debounce=True, reply_markup=None):
+        self.calls.append(dict(chat_id=chat_id, text=text, sid=sid, user=user,
+                               urgent=urgent, topic_id=topic_id,
+                               debounce=debounce, reply_markup=reply_markup))
+        return True
+
+
+def test_tg_channel_forwards_reply_markup_and_debounce(monkeypatch):
+    """T-0513: a caller's reply_markup + debounce ride through to the client."""
+    import bot_squad_worker.actions as A
+
+    ftg = _FakeTgClientOpt()
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: ftg)
+    c = channels.get_channel(_FakeCfg(), name="tg")
+    markup = {"keyboard": [[{"text": "/project a"}]]}
+    c.send("pick", chat_id="C1", sid="", urgent=True,
+           debounce=False, reply_markup=markup)
+    assert ftg.calls[-1]["reply_markup"] == markup
+    assert ftg.calls[-1]["debounce"] is False
+
+
+def test_tg_channel_omits_optional_knobs_when_absent(fake_clients):
+    """Without the T-0513 extras, the client is called with the legacy shape
+    (no reply_markup/debounce kwargs) — so existing fixed-signature clients and
+    the deploy-notify path are unchanged."""
+    ftg, _ = fake_clients  # _FakeTgClient has NO debounce/reply_markup params
+    c = channels.get_channel(_FakeCfg(), name="tg")
+    # Would TypeError if TgChannel passed debounce=/reply_markup= unconditionally.
+    assert c.send("hi", chat_id="C1", urgent=True, topic_id=3) is True
+    assert ftg.calls[-1] == dict(chat_id="C1", text="hi", sid="", user="",
+                                 urgent=True, topic_id=3)
+
+
 def test_tg_channel_fetches_client_per_send(monkeypatch):
     """A monkeypatch installed AFTER the channel is built still takes effect."""
     import bot_squad_worker.actions as A

@@ -122,6 +122,16 @@ class TgChannel(Channel):
         topic_id: int | None = None,
         **extra: Any,
     ) -> bool:
+        # T-0513: forward TG-specific optional knobs only when a caller passes
+        # them, so the default send shape (and the existing test fakes' fixed
+        # signatures) stay unchanged. ``reply_markup`` carries a TG keyboard;
+        # ``debounce=False`` lets interactive command replies (tg_listener) echo
+        # every time instead of being collapsed by the 60s same-payload cooldown.
+        opt: dict[str, Any] = {}
+        if "reply_markup" in extra:
+            opt["reply_markup"] = extra["reply_markup"]
+        if "debounce" in extra:
+            opt["debounce"] = extra["debounce"]
         return self._client().send(
             chat_id=chat_id,
             text=text,
@@ -129,6 +139,7 @@ class TgChannel(Channel):
             user=user,
             urgent=urgent,
             topic_id=topic_id,
+            **opt,
         )
 
 

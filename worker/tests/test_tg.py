@@ -154,6 +154,75 @@ def test_send_omits_topic_id_when_none(tmp_path: Path) -> None:
     assert mock_post.call_args.kwargs.get("topic_id") is None
 
 
+# ---------------------------------------------------------------------------
+# T-0513: debounce opt-out + reply_markup pass-through (interactive command
+# replies routed via the channel must echo every time and carry a keyboard).
+# ---------------------------------------------------------------------------
+
+def test_debounce_false_sends_same_payload_every_time(tmp_path: Path) -> None:
+    """debounce=False bypasses the same-payload cooldown (and records nothing)."""
+    client, mock_post = _make_client_with_mock_post(tmp_path)
+    assert client.send(chat_id="123", text="hi", debounce=False) is True
+    assert client.send(chat_id="123", text="hi", debounce=False) is True
+    assert mock_post.call_count == 2
+    # No debounce file recorded → a later default send is also not debounced.
+    assert not client._debounce_path("123", "", "hi").exists()
+
+
+def test_debounce_default_still_collapses(tmp_path: Path) -> None:
+    """Regression: omitting debounce keeps the historical 60s cooldown."""
+    client, mock_post = _make_client_with_mock_post(tmp_path)
+    client.send(chat_id="123", text="hi")
+    assert client.send(chat_id="123", text="hi") is False
+    assert mock_post.call_count == 1
+
+
+def test_send_passes_reply_markup_to_post(tmp_path: Path) -> None:
+    client, mock_post = _make_client_with_mock_post(tmp_path)
+    markup = {"keyboard": [[{"text": "/project a"}]]}
+    client.send(chat_id="123", text="pick", reply_markup=markup)
+    assert mock_post.call_args.kwargs["reply_markup"] == markup
+
+
+def test_send_omits_reply_markup_when_none(tmp_path: Path) -> None:
+    client, mock_post = _make_client_with_mock_post(tmp_path)
+    client.send(chat_id="123", text="hi")
+    assert mock_post.call_args.kwargs.get("reply_markup") is None
+
+
+def test_post_includes_reply_markup_in_payload(tmp_path: Path) -> None:
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    markup = {"keyboard": [[{"text": "/project a"}]], "one_time_keyboard": True}
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["payload"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="-100999", text="pick", reply_markup=markup)
+    assert captured["payload"]["reply_markup"] == markup
+
+
+def test_post_omits_reply_markup_when_none(tmp_path: Path) -> None:
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["payload"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="123", text="body")
+    assert "reply_markup" not in captured["payload"]
+
+
 def test_post_includes_message_thread_id_when_topic_set(tmp_path: Path) -> None:
     """_post must put message_thread_id in the Telegram payload when topic given."""
     captured: dict = {}

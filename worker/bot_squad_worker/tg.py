@@ -58,6 +58,8 @@ class TgClient:
         user: str = "",
         urgent: bool = False,
         topic_id: int | None = None,
+        debounce: bool = True,
+        reply_markup: dict | None = None,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -71,6 +73,13 @@ class TgClient:
         ``topic_id`` (T-0156): when ``chat_id`` is a forum-enabled group,
         delivers into the given forum thread via ``message_thread_id``.
         ``None`` posts to the group's general feed (or a normal DM).
+
+        ``debounce=False`` (T-0513): skip the same-payload cooldown — used by
+        interactive command replies (``tg_listener._notify`` /
+        ``_ask_which_project``) that must echo every time the user types, not
+        once per 60s. ``reply_markup`` (T-0513) carries a TG keyboard/inline
+        markup verbatim into the send (e.g. the project-picker keyboard);
+        ``None`` sends a plain message unchanged.
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
@@ -82,12 +91,15 @@ class TgClient:
 
         full_text = _prefix(text, sid=sid, user=user)
 
-        if self._debounced(chat_id=chat_id, sid=sid, text=text):
+        if debounce and self._debounced(chat_id=chat_id, sid=sid, text=text):
             log.debug("tg.send: debounced (same payload within %ds)", self._cooldown)
             return False
 
-        self._post(chat_id=chat_id, text=full_text, topic_id=topic_id)
-        self._record(chat_id=chat_id, sid=sid, text=text)
+        self._post(
+            chat_id=chat_id, text=full_text, topic_id=topic_id, reply_markup=reply_markup
+        )
+        if debounce:
+            self._record(chat_id=chat_id, sid=sid, text=text)
         return True
 
     # ------------------------------------------------------------------
@@ -149,13 +161,22 @@ class TgClient:
         p = self._debounce_path(chat_id, sid, text)
         p.touch()
 
-    def _post(self, *, chat_id: str, text: str, topic_id: int | None = None) -> None:
+    def _post(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        topic_id: int | None = None,
+        reply_markup: dict | None = None,
+    ) -> None:
         import httpx  # lazy import — not available in all envs
 
         url = _TG_API.format(token=self._token)
         payload: dict = {"chat_id": chat_id, "text": text}
         if topic_id is not None:
             payload["message_thread_id"] = topic_id
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         # T-0194: pass proxy= only when configured, so the no-proxy call shape
         # (and httpx trust_env) is unchanged.
         extra = {"proxy": self._proxy} if self._proxy else {}

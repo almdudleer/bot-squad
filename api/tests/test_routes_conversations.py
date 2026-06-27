@@ -48,7 +48,8 @@ def _login(client: TestClient) -> None:
     assert r.status_code == 200, r.text
 
 
-CONV = "/api/m/conversations/test-project/gu_abc/messages"
+CONV = "/api/m/worker/conversations/test-project/gu_abc/messages"  # T-0529 worker POST
+AUTH_CONV = "/api/m/conversations/test-project/gu_abc/messages"  # session-auth GET (stays public)
 
 
 def test_worker_append_persists_message(tmp_bot_squad: Path, monkeypatch):
@@ -95,7 +96,7 @@ def test_worker_append_missing_text_is_400(tmp_bot_squad: Path, monkeypatch):
 
 def test_list_requires_auth(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
-    r = client.get(CONV)
+    r = client.get(AUTH_CONV)
     assert r.status_code == 401
 
 
@@ -105,7 +106,7 @@ def test_list_returns_paginated_thread(tmp_bot_squad: Path, monkeypatch):
         CS.append(tmp_bot_squad / "data", "test-project", "gu_abc",
                   author="user", text=f"m{i}")
     _login(client)
-    r = client.get(CONV, params={"limit": 2, "offset": 1})
+    r = client.get(AUTH_CONV, params={"limit": 2, "offset": 1})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["total"] == 5
@@ -119,7 +120,7 @@ def test_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     CS.append(d, "test-project", "gu_abc", author="user", text="something else")
     CS.append(d, "test-project", "gu_abc", author="user", text="DEPLOY tomorrow")
     _login(client)
-    r = client.get(CONV, params={"q": "deploy"})
+    r = client.get(AUTH_CONV, params={"q": "deploy"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["total"] == 2
@@ -132,7 +133,7 @@ def test_list_search_filters(tmp_bot_squad: Path, monkeypatch):
 # = API, pins_store). Slug is validated against the project registry.
 # ---------------------------------------------------------------------------
 
-ROUTING = "/api/m/conversations/routing/gu_abc/current-project"
+ROUTING = "/api/m/worker/routing/gu_abc/current-project"  # T-0529 worker-token
 
 
 def test_worker_set_current_project_persists(tmp_bot_squad: Path, monkeypatch):

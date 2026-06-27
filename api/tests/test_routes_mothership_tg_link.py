@@ -46,7 +46,7 @@ def _auth(token: str = WORKER_TOKEN) -> dict:
 def test_first_contact_creates_and_links(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     r = client.post(
-        "/api/m/tg/resolve-or-link",
+        "/api/m/worker/tg/resolve-or-link",
         json={"tg_user_id": "555123", "display_name": "Alexey", "slug": "test-project"},
         headers=_auth(),
     )
@@ -67,11 +67,11 @@ def test_first_contact_creates_and_links(tmp_bot_squad: Path, monkeypatch):
 def test_subsequent_message_is_recognized(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     first = client.post(
-        "/api/m/tg/resolve-or-link",
+        "/api/m/worker/tg/resolve-or-link",
         json={"tg_user_id": "555123"}, headers=_auth(),
     ).json()
     second = client.post(
-        "/api/m/tg/resolve-or-link",
+        "/api/m/worker/tg/resolve-or-link",
         json={"tg_user_id": "555123"}, headers=_auth(),
     )
     assert second.status_code == 200
@@ -82,14 +82,14 @@ def test_subsequent_message_is_recognized(tmp_bot_squad: Path, monkeypatch):
 
 def test_missing_bearer_is_401(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
-    r = client.post("/api/m/tg/resolve-or-link", json={"tg_user_id": "1"})
+    r = client.post("/api/m/worker/tg/resolve-or-link", json={"tg_user_id": "1"})
     assert r.status_code == 401
 
 
 def test_wrong_bearer_is_401(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     r = client.post(
-        "/api/m/tg/resolve-or-link",
+        "/api/m/worker/tg/resolve-or-link",
         json={"tg_user_id": "1"}, headers=_auth("not-the-token"),
     )
     assert r.status_code == 401
@@ -100,7 +100,7 @@ def test_unconfigured_token_fails_closed(tmp_bot_squad: Path, monkeypatch):
     never run open. Defense against shipping the code before the secret."""
     client = _client(tmp_bot_squad, monkeypatch, worker_token=None)
     r = client.post(
-        "/api/m/tg/resolve-or-link",
+        "/api/m/worker/tg/resolve-or-link",
         json={"tg_user_id": "1"}, headers=_auth("anything"),
     )
     assert r.status_code == 401
@@ -109,6 +109,6 @@ def test_unconfigured_token_fails_closed(tmp_bot_squad: Path, monkeypatch):
 def test_missing_tg_user_id_is_400(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     r = client.post(
-        "/api/m/tg/resolve-or-link", json={"display_name": "x"}, headers=_auth(),
+        "/api/m/worker/tg/resolve-or-link", json={"display_name": "x"}, headers=_auth(),
     )
     assert r.status_code == 400

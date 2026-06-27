@@ -321,7 +321,7 @@ def test_resolve_or_link_sender_first_contact_posts(tmp_path, monkeypatch):
     assert identity["global_user_id"] == "gu_abc"
     assert identity["created"] is True
     assert identity["slug"] == "test-project"
-    assert captured["url"] == "https://mship.test/api/m/tg/resolve-or-link"
+    assert captured["url"] == "https://mship.test/api/m/worker/tg/resolve-or-link"
     assert captured["json"]["tg_user_id"] == "555123"
     assert captured["json"]["slug"] == "test-project"
     assert captured["json"]["display_name"] == "Alexey S"
@@ -437,7 +437,7 @@ def test_append_conversation_posts(tmp_path, monkeypatch):
         ok = TL.append_conversation(cfg, "test-project", "gu_abc", msg)
 
     assert ok is True
-    assert captured["url"] == "https://mship.test/api/m/conversations/test-project/gu_abc/messages"
+    assert captured["url"] == "https://mship.test/api/m/worker/conversations/test-project/gu_abc/messages"
     assert captured["json"]["author"] == "user"
     assert captured["json"]["text"] == "deploy please"
     assert captured["json"]["timestamp"]  # an ISO ts derived from the TG date
@@ -553,7 +553,7 @@ def test_get_current_project_http(tmp_path, monkeypatch):
 
     with patch("httpx.get", side_effect=fake_get):
         assert TL.get_current_project(cfg, "gu_1") == "beta"
-    assert captured["url"] == "https://mship.test/api/m/conversations/routing/gu_1/current-project"
+    assert captured["url"] == "https://mship.test/api/m/worker/routing/gu_1/current-project"
 
 
 def test_get_current_project_noop_without_env(tmp_path, monkeypatch):
@@ -578,7 +578,7 @@ def test_set_current_project_http(tmp_path, monkeypatch):
 
     with patch("httpx.post", side_effect=fake_post):
         assert TL.set_current_project(cfg, "gu_1", "beta") is True
-    assert captured["url"] == "https://mship.test/api/m/conversations/routing/gu_1/current-project"
+    assert captured["url"] == "https://mship.test/api/m/worker/routing/gu_1/current-project"
     assert captured["json"] == {"slug": "beta"}
 
 

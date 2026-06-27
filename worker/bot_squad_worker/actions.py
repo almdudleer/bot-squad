@@ -1288,6 +1288,57 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "task_id": task_id, "line_appended": line}
 
 
+_ASSIGNMENT_WRITE_RESULT_REQUIRED = {"slug", "assignment_id", "content", "sid"}
+_ASSIGNMENT_WRITE_RESULT_ALLOWED = _ASSIGNMENT_WRITE_RESULT_REQUIRED
+
+
+def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
+    """Write a session's RESULT back into its assignment artifact (T-0463, F1.1-d).
+
+    The write-result primitive of the assignment interface — persists the
+    work-product into an in-system artifact so it survives outside the disposable
+    Claude jsonl. Backed by the ONE reusable ``Artifact`` seam (T-0467/T-0473
+    extend it). Task assignments only today; routine assignments land in M1-T2.
+
+    Required params: slug, assignment_id, content, sid
+    Returns: {ok, assignment_id, kind, artifact_path, bytes_written}
+    """
+    extra = set(params) - _ASSIGNMENT_WRITE_RESULT_ALLOWED
+    if extra:
+        raise ActionError(f"assignment_write_result got unexpected params: {sorted(extra)}")
+    missing = _ASSIGNMENT_WRITE_RESULT_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"assignment_write_result missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    assignment_id = params["assignment_id"]
+    content = params["content"]
+    sid = params["sid"]
+
+    if not isinstance(content, str) or not content.strip():
+        raise ActionError("assignment_write_result: empty content")
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"assignment_write_result: unknown project slug {slug!r}")
+
+    from bot_squad_worker.assignment import for_task
+
+    assignment = for_task(cfg.data_dir, slug, assignment_id)
+    try:
+        art = assignment.write_result(content, sid=sid)
+    except ValueError as e:
+        raise ActionError(f"assignment_write_result: {e}") from e
+
+    body = art.read()
+    return {
+        "ok": True,
+        "assignment_id": assignment_id,
+        "kind": assignment.kind,
+        "artifact_path": str(art.path),
+        "bytes_written": len(body.encode("utf-8")),
+    }
+
+
 _TASK_NEW_REQUIRED = {"slug", "title"}
 _TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner"}
 _TASK_NEW_TITLE_MAX = 240
@@ -2302,6 +2353,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "peer_inbox_read": _action_peer_inbox_read,
     "peer_inbox_wait": _action_peer_inbox_wait,
     "task_progress_add": _action_task_progress_add,
+    # T-0463: assignment-interface write-result primitive (F1.1-d).
+    "assignment_write_result": _action_assignment_write_result,
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
     "doc_new": _action_doc_new,
@@ -2388,6 +2441,10 @@ ACTION_MODES: dict[str, str] = {
     "peer_inbox_read": "coordinator_only",
     "peer_inbox_wait": "coordinator_only",
     "task_progress_add": "coordinator_only",
+    # T-0463: writes the shared install data dir (artifacts/) — single
+    # coordinator writer, like task_progress_add. Dev sessions reach it via the
+    # API / coordinator socket.
+    "assignment_write_result": "coordinator_only",
     "task_new": "coordinator_only",
     "doc_new": "coordinator_only",
     "uc_new": "coordinator_only",

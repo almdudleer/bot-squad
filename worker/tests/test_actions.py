@@ -61,6 +61,8 @@ def test_registry_lists_only_allowed_actions():
         "autopilot_start", "autopilot_stop", "autopilot_status",
         "peer_send", "peer_inbox_read", "peer_inbox_wait",
         "task_progress_add",
+        # T-0463: assignment-interface write-result primitive (F1.1-d).
+        "assignment_write_result",
         # T-0042: atomic T-NNNN allocator.
         "task_new",
         # T-0174: generalized atomic allocator across all entity types.

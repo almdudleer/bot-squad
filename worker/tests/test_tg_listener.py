@@ -36,6 +36,10 @@ def _make_cfg(
     )
 
 
+def _from(uid=555123, first="Alexey", last="S", username="alx") -> dict:
+    return {"id": uid, "first_name": first, "last_name": last, "username": username}
+
+
 def _reply_message(sid: str, reply_text: str, chat_id: int = 12345) -> dict:
     """Build a fake TG message that is a reply to a worker notification."""
     return {
@@ -248,6 +252,128 @@ def test_handle_update_skips_plain_message(tmp_path):
     update = {"update_id": 7, "message": msg}
     result = TL.handle_update(cfg, update)
     assert result["action"] == "skip"
+
+
+# ---------------------------------------------------------------------------
+# T-0488: TG sender -> mothership GlobalUser linkage (single bot user recognition)
+# resolve_or_link_sender posts to the API (single-writer owns the registry write);
+# env-gated + best-effort so inbound routing is never blocked.
+# ---------------------------------------------------------------------------
+
+
+def _link_env(monkeypatch, base="https://mship.test", token="WTOKEN"):
+    if base is None:
+        monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("MOTHERSHIP_BASE_URL", base)
+    if token is None:
+        monkeypatch.delenv("WORKER_API_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("WORKER_API_TOKEN", token)
+
+
+def test_resolve_or_link_sender_first_contact_posts(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"global_user_id": "gu_abc", "created": True, "slug": "test-project"}
+        return resp
+
+    msg = {"from": _from(), "text": "hi", "chat": {"id": 12345}}
+    with patch("httpx.post", side_effect=fake_post):
+        identity = TL.resolve_or_link_sender(cfg, msg, "test-project")
+
+    assert identity["global_user_id"] == "gu_abc"
+    assert identity["created"] is True
+    assert identity["slug"] == "test-project"
+    assert captured["url"] == "https://mship.test/api/m/tg/resolve-or-link"
+    assert captured["json"]["tg_user_id"] == "555123"
+    assert captured["json"]["slug"] == "test-project"
+    assert captured["json"]["display_name"] == "Alexey S"
+    assert captured["headers"]["Authorization"] == "Bearer WTOKEN"
+
+
+def test_resolve_or_link_sender_recognized_subsequent(tmp_path, monkeypatch):
+    """A returning sender resolves to the same GlobalUser, created=False."""
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"global_user_id": "gu_abc", "created": False, "slug": ""}
+        return resp
+
+    msg = {"from": _from(), "text": "again"}
+    with patch("httpx.post", side_effect=fake_post):
+        identity = TL.resolve_or_link_sender(cfg, msg, "")
+    assert identity["global_user_id"] == "gu_abc"
+    assert identity["created"] is False
+
+
+def test_resolve_or_link_sender_noop_without_env(tmp_path, monkeypatch):
+    """No API base / token configured => no-op (no HTTP), returns None."""
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch, base=None, token=None)
+    msg = {"from": _from(), "text": "hi"}
+    with patch("httpx.post", side_effect=AssertionError("must not POST")):
+        assert TL.resolve_or_link_sender(cfg, msg, "test-project") is None
+
+
+def test_resolve_or_link_sender_noop_without_sender(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    msg = {"text": "no from field"}
+    with patch("httpx.post", side_effect=AssertionError("must not POST")):
+        assert TL.resolve_or_link_sender(cfg, msg, "test-project") is None
+
+
+def test_resolve_or_link_sender_swallows_http_error(tmp_path, monkeypatch):
+    """A link failure must not propagate — inbound routing keeps working."""
+    import httpx
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    msg = {"from": _from(), "text": "hi"}
+    with patch("httpx.post", side_effect=httpx.ConnectError("down")):
+        assert TL.resolve_or_link_sender(cfg, msg, "test-project") is None
+
+
+def test_resolve_or_link_does_not_use_tg_proxy(tmp_path, monkeypatch):
+    """The local-API call is NOT TG egress — it must not route via tg_proxy_url
+    (a proxy kwarg would TypeError this signature)."""
+    cfg = _make_cfg(tmp_path, proxy_url="socks5://10.0.0.1:1080")
+    _link_env(monkeypatch)
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"global_user_id": "gu_x", "created": True}
+        return resp
+
+    msg = {"from": _from(), "text": "hi"}
+    with patch("httpx.post", side_effect=fake_post):
+        identity = TL.resolve_or_link_sender(cfg, msg, "test-project")
+    assert identity["global_user_id"] == "gu_x"
+
+
+def test_handle_update_links_sender_and_records_identity(tmp_path, monkeypatch):
+    """handle_update resolves the sender and surfaces (slug, global_user_id)."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    monkeypatch.setattr(
+        TL, "resolve_or_link_sender",
+        lambda c, m, slug: {"global_user_id": "gu_zzz", "created": True, "slug": slug},
+    )
+    update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "skip"          # plain message still routes as before
+    assert result["global_user_id"] == "gu_zzz"  # ...but the sender is now recognized
 
 
 # ---------------------------------------------------------------------------

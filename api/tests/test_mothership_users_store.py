@@ -165,3 +165,53 @@ def test_touch_last_seen_updates_timestamp(tmp_path: Path) -> None:
 def test_touch_last_seen_unknown_pair_is_noop(tmp_path: Path) -> None:
     store = MothershipUsersStore(tmp_path / "_mothership")
     assert store.touch_last_seen("gu_nope", "srv_nope") is None
+
+
+# ---- T-0488: TG sender -> GlobalUser linkage (single bot user recognition) ----
+
+
+def test_resolve_or_link_tg_user_first_contact_creates(tmp_path: Path) -> None:
+    """First contact from a TG sender mints a GlobalUser carrying its tg_user_id."""
+    store = MothershipUsersStore(tmp_path / "_mothership")
+    user, created = store.resolve_or_link_tg_user(
+        tg_user_id="555123", display_name="Alexey S"
+    )
+    assert created is True
+    assert isinstance(user, GlobalUser)
+    assert user.id.startswith("gu_")
+    assert user.tg_user_id == "555123"
+    assert user.display_name == "Alexey S"
+    # The link is durable across a fresh store handle (separate "server").
+    reloaded = MothershipUsersStore(tmp_path / "_mothership")
+    assert reloaded.user_by_tg_user_id("555123") is not None
+    assert reloaded.user_by_tg_user_id("555123").id == user.id
+
+
+def test_resolve_or_link_tg_user_recognized_on_subsequent(tmp_path: Path) -> None:
+    """A second message from the same TG sender is recognized — same GlobalUser,
+    no new mint, and the recognition holds across servers (cross-server registry)."""
+    store = MothershipUsersStore(tmp_path / "_mothership")
+    first, created1 = store.resolve_or_link_tg_user(tg_user_id="555123")
+    assert created1 is True
+
+    # Recognition as seen from ANOTHER server (a fresh store over the same
+    # cross-server registry) returns the same identity without re-minting.
+    other_server_view = MothershipUsersStore(tmp_path / "_mothership")
+    second, created2 = other_server_view.resolve_or_link_tg_user(tg_user_id="555123")
+    assert created2 is False
+    assert second.id == first.id
+    assert len(store.list_users()) == 1
+
+
+def test_user_by_tg_user_id_unknown_returns_none(tmp_path: Path) -> None:
+    store = MothershipUsersStore(tmp_path / "_mothership")
+    assert store.user_by_tg_user_id("does-not-exist") is None
+
+
+def test_tg_user_id_roundtrips_through_list(tmp_path: Path) -> None:
+    """tg_user_id survives the on-disk serialize/deserialize cycle."""
+    store = MothershipUsersStore(tmp_path / "_mothership")
+    store.resolve_or_link_tg_user(tg_user_id="999", display_name="Z")
+    reloaded = MothershipUsersStore(tmp_path / "_mothership").list_users()
+    assert len(reloaded) == 1
+    assert reloaded[0].tg_user_id == "999"

@@ -54,6 +54,12 @@ class GlobalUser:
     # T-0216 Phase A: explicit global-scope role replaces the overloaded
     # is_super_admin bool. is_super_admin survives as a derived compat property.
     global_role: GlobalRole = GlobalRole.GLOBAL_MEMBER
+    # T-0488: the Telegram sender id (message["from"]["id"]) this GlobalUser was
+    # linked from on first contact with @bot_squad_bot. Empty for accounts that
+    # never originated from / were claimed via TG. The reverse index
+    # (tg_user_id -> GlobalUser) lives on this field — the registry is the
+    # cross-server identity store, so the link is recognized on every server.
+    tg_user_id: str = ""
 
     @property
     def is_super_admin(self) -> bool:
@@ -163,6 +169,19 @@ class MothershipUsersStore:
                 return u
         return None
 
+    def user_by_tg_user_id(self, tg_user_id: str) -> GlobalUser | None:
+        """T-0488 reverse lookup: the GlobalUser linked to a Telegram sender id,
+        or ``None`` when no account has claimed it. Lockless read (atomic rename
+        gives a torn-write-free snapshot). An empty ``tg_user_id`` never matches
+        an un-linked account (whose stored ``tg_user_id`` is also empty)."""
+        wanted = str(tg_user_id or "")
+        if not wanted:
+            return None
+        for u in self.list_users():
+            if u.tg_user_id == wanted:
+                return u
+        return None
+
     # ---- user mutations -----------------------------------------------------
 
     def create_user(
@@ -226,6 +245,50 @@ class MothershipUsersStore:
                 email=email,
                 timezone=timezone_name,
                 global_role=global_role_for(is_super_admin),
+            )
+            users.append(entry)
+            self._write_users(users)
+            return entry, True
+
+    def resolve_or_link_tg_user(
+        self,
+        *,
+        tg_user_id: str,
+        display_name: str = "",
+    ) -> tuple[GlobalUser, bool]:
+        """T-0488: resolve a Telegram sender to its GlobalUser, minting one on
+        first contact. Returns ``(user, created)``.
+
+        - Recognized (``tg_user_id`` already linked): return the existing
+          GlobalUser unchanged, ``created=False`` — recognition holds across
+          every server because the registry IS the cross-server identity store.
+        - First contact: mint a passwordless, TG-originated GlobalUser keyed by
+          ``tg_user_id`` (no password login — auth is the TG account), and
+          return ``created=True``.
+
+        Single-writer-per-store: this is the ONLY linkage write, and it runs
+        under the shared mutation lock, so two concurrent first-contact messages
+        from the same sender can't double-mint. The worker never writes the
+        registry directly — it calls the API, which owns this method.
+        """
+        tg_id = str(tg_user_id or "")
+        if not tg_id:
+            raise ValueError("tg_user_id is required")
+        with self._lock:
+            users = self.list_users()
+            for existing in users:
+                if existing.tg_user_id == tg_id:
+                    return existing, False
+            # Synthetic, collision-free username per TG sender; the human-facing
+            # label rides display_name. password_hash is empty: there is no
+            # password login for a TG-originated identity.
+            entry = GlobalUser(
+                id=_mint_global_user_id(),
+                username=f"tg:{tg_id}",
+                password_hash="",
+                created_at=_utc_now_iso(),
+                display_name=display_name,
+                tg_user_id=tg_id,
             )
             users.append(entry)
             self._write_users(users)

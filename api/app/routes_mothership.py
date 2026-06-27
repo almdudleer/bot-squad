@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import os
+import secrets
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -401,6 +402,41 @@ def verify_global_user(request: Request, payload: dict) -> dict:
     return user.to_public()
 
 
+# ---- T-0488: TG sender -> GlobalUser linkage (single bot user recognition) ----
+
+
+@installer_router.post("/tg/resolve-or-link")
+def tg_resolve_or_link(request: Request, payload: dict) -> dict:
+    """Resolve an inbound Telegram sender to its cross-server GlobalUser, minting
+    one on first contact. Called by the worker (``tg_listener``) on the inbound
+    TG path; token-gated by ``WORKER_API_TOKEN`` (see ``_authenticate_worker``).
+
+    Single-writer-per-store: the API owns this write under the store's mutation
+    lock — the worker only READS the ``_mothership`` registry, never writes it,
+    so two installs (or two messages) can't race a double-mint.
+
+    Body: ``{tg_user_id, display_name?, slug?}`` (``tg_user_id`` required).
+    Returns the resolved identity ``(slug, global_user_id)`` + the ``created``
+    flag + the GlobalUser public projection, so the caller can anchor the
+    downstream user-conversation on (slug, global_user_id)."""
+    _authenticate_worker(request)
+    tg_user_id = str(payload.get("tg_user_id") or "").strip()
+    if not tg_user_id:
+        raise HTTPException(status_code=400, detail="tg_user_id required")
+    slug = str(payload.get("slug") or "")
+    display_name = str(payload.get("display_name") or "")
+    store = _users_store(request)
+    user, created = store.resolve_or_link_tg_user(
+        tg_user_id=tg_user_id, display_name=display_name,
+    )
+    return {
+        "global_user_id": user.id,
+        "created": created,
+        "slug": slug,
+        "user": user.to_public(),
+    }
+
+
 @router.post("/servers", dependencies=[Depends(_require_super_admin)])
 def create_server(
     request: Request,
@@ -728,6 +764,26 @@ def _extract_bearer(request: Request) -> str:
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     return auth.split(" ", 1)[1].strip()
+
+
+def _authenticate_worker(request: Request) -> None:
+    """T-0488: gate the worker->API TG-linkage call with the shared-secret
+    ``WORKER_API_TOKEN`` (Bearer). FAILS CLOSED: an unset/empty token rejects
+    every request (so shipping the endpoint before the secret is provisioned can
+    never leave it open — T-0179-style secrets ordering), as does a missing or
+    mismatched Bearer. Constant-time compare; 401 on any failure.
+
+    This is a SEPARATE trust path from ``_authenticate_installer`` (install_token
+    / server_bearer): the local worker has no server bearer on the is_self row,
+    so it presents this shared secret instead. The base URL + exposure
+    (public-traefik vs localhost-only) are deploy-time config; the gate is
+    identical either way (defense-in-depth even behind a localhost-only port)."""
+    expected = (os.environ.get("WORKER_API_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=401, detail="worker token not configured")
+    bearer = _extract_bearer(request)  # 401 when the header is absent/malformed
+    if not secrets.compare_digest(bearer, expected):
+        raise HTTPException(status_code=401, detail="invalid worker token")
 
 
 def _authenticate_installer(request: Request) -> tuple[str, str]:

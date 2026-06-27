@@ -1,6 +1,7 @@
 """Listen for Telegram updates and route replies into sessions."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -131,6 +132,74 @@ def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
     return (cmd, args)
 
 
+def _api_base_url() -> str:
+    """T-0488: base URL of the mothership API the worker links TG senders against.
+    Read from ``MOTHERSHIP_BASE_URL`` (never hardcoded) so the same code points
+    at the public traefik URL today OR a localhost-only port later with no code
+    change. Empty when unset → linkage is a no-op."""
+    return (os.environ.get("MOTHERSHIP_BASE_URL") or "").rstrip("/")
+
+
+def _worker_api_token() -> str:
+    """T-0488: the shared-secret Bearer the worker presents to the token-gated
+    linkage endpoint. From ``WORKER_API_TOKEN``; empty when unset → no-op."""
+    return (os.environ.get("WORKER_API_TOKEN") or "").strip()
+
+
+def _sender_display_name(frm: dict) -> str:
+    """Human label for a TG sender: ``first last`` if present, else username."""
+    name = " ".join(p for p in (frm.get("first_name"), frm.get("last_name")) if p).strip()
+    return name or str(frm.get("username") or "")
+
+
+def resolve_or_link_sender(cfg, msg: dict, slug: str = "") -> Optional[dict]:
+    """T-0488: recognize the inbound TG sender as a cross-server mothership
+    GlobalUser, linking it on first contact.
+
+    The API owns the GlobalUser registry (single-writer-per-store); the worker
+    only READS ``_mothership`` elsewhere and never writes it. So this calls the
+    token-gated ``POST /api/m/tg/resolve-or-link`` endpoint (httpx, mirroring the
+    autoupdate worker->API precedent) — NOT through the TG egress proxy, this is
+    a local-API call, not Telegram traffic.
+
+    Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
+    sender id, or when the API base URL / worker token aren't configured — so a
+    misconfigured or pre-secret deploy never blocks inbound routing. On success
+    returns the resolved identity ``{global_user_id, created, slug}`` for the
+    downstream user-conversation seam (anchored on ``(slug, global_user_id)``)."""
+    frm = msg.get("from") or {}
+    tg_user_id = str(frm.get("id") or "").strip()
+    if not tg_user_id:
+        return None
+    base = _api_base_url()
+    token = _worker_api_token()
+    if not base or not token:
+        return None
+    url = f"{base}/api/m/tg/resolve-or-link"
+    try:
+        r = httpx.post(
+            url,
+            json={
+                "tg_user_id": tg_user_id,
+                "display_name": _sender_display_name(frm),
+                "slug": slug,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("global_user_id"):
+        return None
+    return {
+        "global_user_id": data["global_user_id"],
+        "created": bool(data.get("created", False)),
+        "slug": slug,
+    }
+
+
 def handle_update(cfg, update: dict) -> dict:
     """Dispatch one update. Returns a small audit dict."""
     msg = update.get("message")
@@ -145,24 +214,35 @@ def handle_update(cfg, update: dict) -> dict:
     if chat_id not in allowed_chats:
         return {"ok": True, "action": "skip", "reason": f"chat {chat_id} not allowlisted"}
 
+    slug = _slug_for_chat(cfg, chat_id)
+
+    # T-0488: recognize the TG sender as a cross-server GlobalUser (link on first
+    # contact). Best-effort + env-gated, so inbound routing below is never
+    # blocked by linkage. Surfaced on the audit dict as (slug, global_user_id)
+    # for the downstream user-conversation seam.
+    identity = resolve_or_link_sender(cfg, msg, slug)
+
     slash = extract_slash_command(msg)
     if slash:
-        return _handle_slash(cfg, chat_id, *slash)
+        result = _handle_slash(cfg, chat_id, *slash)
+    else:
+        reply = extract_reply_target(msg)
+        if reply:
+            result = _handle_reply(cfg, chat_id, *reply)
+        # T-0386 Phase 2: a voice message → transcribe + store as a feedback
+        # artifact. Flag-off-safe: gated on [voice].enabled (default off) so
+        # deploying the voice code is a no-op until the 1-time stakeholder TG
+        # setup flips it on.
+        elif msg.get("voice") and getattr(cfg, "voice_enabled", False):
+            from bot_squad_worker import voice_intake as _vi
+            r = _vi.process_voice(cfg, slug, msg, ts=_msg_ts(msg))
+            result = {"ok": r.get("ok", True), "action": "voice", "slug": slug, "result": r}
+        else:
+            result = {"ok": True, "action": "skip", "reason": "not a reply or command"}
 
-    reply = extract_reply_target(msg)
-    if reply:
-        return _handle_reply(cfg, chat_id, *reply)
-
-    # T-0386 Phase 2: a voice message → transcribe + store as a feedback artifact.
-    # Flag-off-safe: gated on [voice].enabled (default off) so deploying the voice
-    # code is a no-op until the 1-time stakeholder TG setup flips it on.
-    if msg.get("voice") and getattr(cfg, "voice_enabled", False):
-        from bot_squad_worker import voice_intake as _vi
-        slug = _slug_for_chat(cfg, chat_id)
-        result = _vi.process_voice(cfg, slug, msg, ts=_msg_ts(msg))
-        return {"ok": result.get("ok", True), "action": "voice", "slug": slug, "result": result}
-
-    return {"ok": True, "action": "skip", "reason": "not a reply or command"}
+    if identity and identity.get("global_user_id"):
+        result.setdefault("global_user_id", identity["global_user_id"])
+    return result
 
 
 def _slug_for_chat(cfg, chat_id: str) -> str:

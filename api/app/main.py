@@ -153,6 +153,12 @@ def build_app() -> FastAPI:
         app.include_router(conversations_router, prefix="/api/m")
         app.include_router(conversations_worker_router, prefix="/api/m")
 
+        # T-0496: per-project user GROUPS (role / access scope / prompt) +
+        # UI-managed membership. Mothership-only (membership keys on the
+        # mothership global_user_id). Project-access-gated; admins manage.
+        from app.routes_project_groups import router as project_groups_router
+        app.include_router(project_groups_router, prefix="/api/m")
+
         # T-0055: self-register this mothership in its own registry on boot so
         # the unified all-projects view at `/` has a row for "this server"
         # without waiting for an admin to manually add it. Idempotent — dedup

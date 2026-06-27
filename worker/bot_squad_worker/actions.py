@@ -1833,6 +1833,179 @@ def _action_peer_inbox_wait(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# T-0498 (M6/F6.2): synchronous inter-session channel — request -> ack ->
+# enter -> live 2-way send, closing on exit/timeout. A thin handshake layer on
+# top of the verified async substrate (D-0037); each action maps to one
+# sync_channel function. SyncError is surfaced as an ActionError so the CLI
+# gets a clean 4xx instead of a 500.
+# ---------------------------------------------------------------------------
+
+def _sync_call(fn, *args, **kwargs) -> dict[str, Any]:
+    from bot_squad_worker import sync_channel as _sc
+    try:
+        return fn(_sc, *args, **kwargs)
+    except _sc.SyncError as e:
+        raise ActionError(str(e)) from e
+
+
+_SYNC_REQUEST_REQUIRED = {"slug", "from_sid", "to"}
+_SYNC_REQUEST_ALLOWED = _SYNC_REQUEST_REQUIRED | {"reason", "ttl"}
+
+
+def _action_sync_request(params: dict[str, Any]) -> dict[str, Any]:
+    """Request a synchronous channel with another session.
+
+    Required params: slug, from_sid, to
+    Optional params: reason, ttl (idle seconds; default 3600)
+    Returns: {ok, channel_id, status, requester, responder, notify}
+    """
+    extra = set(params) - _SYNC_REQUEST_ALLOWED
+    if extra:
+        raise ActionError(f"sync_request got unexpected params: {sorted(extra)}")
+    missing = _SYNC_REQUEST_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_request missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    kw: dict[str, Any] = {}
+    if params.get("reason"):
+        kw["reason"] = params["reason"]
+    if params.get("ttl") is not None:
+        kw["ttl"] = float(params["ttl"])
+    return _sync_call(
+        lambda sc: sc.request(cfg, params["slug"], params["from_sid"], params["to"], **kw)
+    )
+
+
+_SYNC_ACK_REQUIRED = {"slug", "sid", "channel_id"}
+_SYNC_ACK_ALLOWED = _SYNC_ACK_REQUIRED
+
+
+def _action_sync_ack(params: dict[str, Any]) -> dict[str, Any]:
+    """Ack a pending sync-channel request (responder only).
+
+    Required params: slug, sid, channel_id
+    Returns: {ok, status, notify, ...}
+    """
+    extra = set(params) - _SYNC_ACK_ALLOWED
+    if extra:
+        raise ActionError(f"sync_ack got unexpected params: {sorted(extra)}")
+    missing = _SYNC_ACK_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_ack missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    return _sync_call(
+        lambda sc: sc.ack(cfg, params["slug"], params["sid"], params["channel_id"])
+    )
+
+
+_SYNC_ENTER_REQUIRED = {"slug", "sid", "channel_id"}
+_SYNC_ENTER_ALLOWED = _SYNC_ENTER_REQUIRED
+
+
+def _action_sync_enter(params: dict[str, Any]) -> dict[str, Any]:
+    """Enter an acked sync channel (opens once both members enter).
+
+    Required params: slug, sid, channel_id
+    Returns: {ok, status, both_in, peer, notify, ...}
+    """
+    extra = set(params) - _SYNC_ENTER_ALLOWED
+    if extra:
+        raise ActionError(f"sync_enter got unexpected params: {sorted(extra)}")
+    missing = _SYNC_ENTER_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_enter missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    return _sync_call(
+        lambda sc: sc.enter(cfg, params["slug"], params["sid"], params["channel_id"])
+    )
+
+
+_SYNC_SEND_REQUIRED = {"slug", "sid", "channel_id", "text"}
+_SYNC_SEND_ALLOWED = _SYNC_SEND_REQUIRED
+
+
+def _action_sync_send(params: dict[str, Any]) -> dict[str, Any]:
+    """Send a live message to the other member of an open sync channel.
+
+    Required params: slug, sid, channel_id, text
+    Returns: {ok, peer, line, notify, ...}
+    """
+    extra = set(params) - _SYNC_SEND_ALLOWED
+    if extra:
+        raise ActionError(f"sync_send got unexpected params: {sorted(extra)}")
+    missing = _SYNC_SEND_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_send missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    return _sync_call(
+        lambda sc: sc.send(
+            cfg, params["slug"], params["sid"], params["channel_id"], params["text"]
+        )
+    )
+
+
+_SYNC_EXIT_REQUIRED = {"slug", "sid", "channel_id"}
+_SYNC_EXIT_ALLOWED = _SYNC_EXIT_REQUIRED | {"reason"}
+
+
+def _action_sync_exit(params: dict[str, Any]) -> dict[str, Any]:
+    """Leave a sync channel — closes it and notifies the peer.
+
+    Required params: slug, sid, channel_id
+    Optional params: reason
+    Returns: {ok, status, closed_reason, notify, ...}
+    """
+    extra = set(params) - _SYNC_EXIT_ALLOWED
+    if extra:
+        raise ActionError(f"sync_exit got unexpected params: {sorted(extra)}")
+    missing = _SYNC_EXIT_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_exit missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    kw: dict[str, Any] = {}
+    if params.get("reason"):
+        kw["reason"] = params["reason"]
+    return _sync_call(
+        lambda sc: sc.exit_channel(
+            cfg, params["slug"], params["sid"], params["channel_id"], **kw
+        )
+    )
+
+
+_SYNC_STATUS_REQUIRED = {"slug"}
+_SYNC_STATUS_ALLOWED = _SYNC_STATUS_REQUIRED | {"channel_id", "sid"}
+
+
+def _action_sync_status(params: dict[str, Any]) -> dict[str, Any]:
+    """Report a sync channel by id, or every channel a sid is in.
+
+    Required params: slug
+    Optional params: channel_id (one channel) or sid (list channels for a sid)
+    Returns: {ok, ...channel} or {ok, channels: [...]}
+    """
+    extra = set(params) - _SYNC_STATUS_ALLOWED
+    if extra:
+        raise ActionError(f"sync_status got unexpected params: {sorted(extra)}")
+    missing = _SYNC_STATUS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"sync_status missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    return _sync_call(
+        lambda sc: sc.status(
+            cfg, params["slug"],
+            channel_id=params.get("channel_id"),
+            sid=params.get("sid"),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase 9: bind_task / bind_initiative — append to a session's extras
 # ---------------------------------------------------------------------------
 
@@ -2511,6 +2684,13 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "peer_send": _action_peer_send,
     "peer_inbox_read": _action_peer_inbox_read,
     "peer_inbox_wait": _action_peer_inbox_wait,
+    # T-0498 (M6/F6.2): synchronous inter-session channel handshake + live send.
+    "sync_request": _action_sync_request,
+    "sync_ack": _action_sync_ack,
+    "sync_enter": _action_sync_enter,
+    "sync_send": _action_sync_send,
+    "sync_exit": _action_sync_exit,
+    "sync_status": _action_sync_status,
     "task_progress_add": _action_task_progress_add,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
     "assignment_write_result": _action_assignment_write_result,
@@ -2606,6 +2786,16 @@ ACTION_MODES: dict[str, str] = {
     "peer_send": "coordinator_only",
     "peer_inbox_read": "coordinator_only",
     "peer_inbox_wait": "coordinator_only",
+    # T-0498: writes the shared install data dir (_chat/sync) + reuses
+    # intersession.send for delivery — single coordinator writer, like the peer
+    # actions. Sessions reach it via `bsq sync` (the coordinator socket); the
+    # live-pane terminal delivery is the CLI's job (the tmux_only inject_input).
+    "sync_request": "coordinator_only",
+    "sync_ack": "coordinator_only",
+    "sync_enter": "coordinator_only",
+    "sync_send": "coordinator_only",
+    "sync_exit": "coordinator_only",
+    "sync_status": "coordinator_only",
     "task_progress_add": "coordinator_only",
     # T-0463: writes the shared install data dir (artifacts/) — single
     # coordinator writer, like task_progress_add. Dev sessions reach it via the

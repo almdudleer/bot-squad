@@ -367,6 +367,12 @@ def binding_gc_tick(cfg: Config) -> None:
     Ordered passes per tick (gc + reconcile, then T-0151 guidance harvest):
       1. ``gc_sessions`` — flip ``status: active`` SessionMds with no live pane
          to ``status: suspended`` so the on-disk graph matches reality.
+      1b. ``reconcile_primary_from_history`` (T-0525) — repair a cross-wired /
+         unbound LIVE session primary from the authoritative ticket
+         ``session_history`` (the in-place repair ``bind_task`` can't do). Runs
+         before the dead/stale passes so a primary cross-wired onto a closed
+         ticket is rewritten to its real home rather than stripped, and the
+         downstream passes see a consistent primary (no oscillation).
       2. ``gc_dead_bindings`` (T-0142) — refresh bindings from disk: strip
          ``task_id`` for closed/missing tasks and ``initiative`` for missing
          initiative files (fixes suspended devs showing stale task_ids).
@@ -406,6 +412,12 @@ def binding_gc_tick(cfg: Config) -> None:
 
     passes = [
         ("gc_sessions", _sessions.gc_sessions),
+        # T-0525: repair a cross-wired / unbound LIVE session primary from the
+        # authoritative ticket session_history BEFORE the dead/stale passes run —
+        # so a primary cross-wired onto a closed ticket is rewritten to its real
+        # home here instead of being stripped, and the downstream passes see a
+        # consistent primary (stops the reconciler oscillation the ramp surfaced).
+        ("reconcile_primary_from_history", _sessions.reconcile_primary_from_history),
         ("gc_dead_bindings", _sessions.gc_dead_bindings),
         ("gc_stale_bindings", _sessions.gc_stale_bindings),
         ("archive_dead_teammates", _sessions.archive_dead_teammates),

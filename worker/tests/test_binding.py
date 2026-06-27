@@ -235,6 +235,35 @@ def test_bind_task_rejects_tl_session(tmp_path):
         bind_task(cfg, "test-project", "S-u-tl-p0", "T-0001")
 
 
+def test_bind_task_adopts_empty_primary_for_dev(tmp_path):
+    """T-0525: an unbound DEV session (primary stripped/cross-wired to empty by
+    the spawn-marker race) is repaired in place — bind_task SETS the primary
+    instead of refusing or appending to extras (the old append-only path couldn't
+    fix a corrupted/empty primary)."""
+    cfg = _make_cfg(tmp_path)
+    sess_md = _make_dev_session(cfg, "S-u-w-p1", task_id="~")  # unbound dev
+    _make_task(cfg, "T-0001")
+
+    result = bind_task(cfg, "test-project", "S-u-w-p1", "T-0001")
+    assert result["ok"] is True
+    assert result["primary_set"] is True
+    meta = _read_session_metadata(sess_md)
+    assert meta["task_id"] == "T-0001"
+    assert meta.get("extra_task_ids") in (None, [], )
+
+
+def test_bind_task_empty_primary_respects_cap(tmp_path):
+    """Adopting an empty primary still honours the 1-live-holder cap — if the
+    task is already held by a live session, the adopt refuses (no double-bind)."""
+    cfg = _make_cfg(tmp_path)
+    _make_dev_session(cfg, "S-u-w-p1", task_id="~")        # unbound dev
+    _make_dev_session(cfg, "S-u-w-p2", task_id="T-0001")   # live holder of T-0001
+    _make_task(cfg, "T-0001")
+
+    with pytest.raises(ActionError, match="capacity reached"):
+        bind_task(cfg, "test-project", "S-u-w-p1", "T-0001")
+
+
 def test_bind_task_rejects_unknown_task(tmp_path):
     cfg = _make_cfg(tmp_path)
     _make_dev_session(cfg, "S-u-w-p1", task_id="T-0001")

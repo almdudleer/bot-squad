@@ -1280,17 +1280,22 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # attach extras to. Only fills an EMPTY primary — an expert still holding an
     # active task keeps it (the new ticket lands in extra_task_ids via bind).
     cur_primary = meta.get("task_id")
+    adopt_task_id: str | None = None
     if task_id and (not cur_primary or cur_primary == "~"):
         meta["task_id"] = task_id
-        # Drop the marker the SessionStart hook reads first, so its rewrite
-        # stamps the same primary (mirrors spawn()'s contract).
+        # T-0525: carry the adopted primary to the resumed claude via the
+        # per-process BOT_SQUAD_TASK_ID env (set on the launch command below),
+        # NOT the shared `.claude/task_id` marker — same concurrent-clobber race
+        # spawn() fixed. Best-effort remove any stale marker so an env-less
+        # reader can't pick up old residue.
+        adopt_task_id = task_id.strip()
         try:
-            marker_dir = Path(cwd) / ".claude"
-            marker_dir.mkdir(parents=True, exist_ok=True)
-            (marker_dir / "task_id").write_text(task_id.strip())
+            stale_marker = Path(cwd) / ".claude" / "task_id"
+            if stale_marker.exists():
+                stale_marker.unlink()
         except OSError:
             # Best-effort: meta["task_id"] above is the source of truth; the
-            # hook preserves it via existing.get("task_id") when no marker.
+            # hook preserves it via existing.get("task_id") when no marker/env.
             pass
     # T-0001: resurrect into the same tmux session the spawn put us in.
     # A TL spawned with an initiative lives in `<slug>-<initiative-stem>`;
@@ -1339,6 +1344,12 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
         cmd = f"claude --dangerously-skip-permissions --resume {claude_uuid}"
     else:
         cmd = "claude --dangerously-skip-permissions"
+    # T-0525: when this resume ADOPTS a primary (T-0166 expert-rebind), carry it
+    # to the new claude via the per-process env channel so a concurrent spawn
+    # can't clobber it (the shared-marker race). Non-adopt resumes keep their
+    # primary via --resume + the hook's existing-md fallback, no env needed.
+    if adopt_task_id:
+        cmd = f"BOT_SQUAD_TASK_ID={shlex.quote(adopt_task_id)} {cmd}"
 
     result = _run([
         "tmux", "new-window", "-d",
@@ -1793,11 +1804,24 @@ def spawn(
                 f"{_claim_live}; refusing dup-bind"
             )
 
-    # Drop the task_id marker so SessionStart picks it up.
+    # T-0525: the task_id is carried to the new claude via a PER-PROCESS env var
+    # (BOT_SQUAD_TASK_ID, set in the launch command below) — NOT the old shared
+    # `<repo>/.claude/task_id` marker. That marker was a single mutable file in
+    # the SHARED working tree: under concurrent (cross-cluster) spawns, spawn B's
+    # write clobbered spawn A's before A's SessionStart hook read it, cross-wiring
+    # A's PRIMARY binding to B's task. The env is per-process, so concurrent
+    # spawns share no mutable binding state and cannot clobber each other. We also
+    # best-effort REMOVE any stale marker a pre-fix deploy (or an external claude)
+    # may have left, so an env-less reader can't be poisoned by old residue.
     if task_id:
-        marker_dir = project.repo_path / ".claude"
-        marker_dir.mkdir(parents=True, exist_ok=True)
-        (marker_dir / "task_id").write_text(task_id.strip())
+        try:
+            stale_marker = project.repo_path / ".claude" / "task_id"
+            if stale_marker.exists():
+                stale_marker.unlink()
+        except OSError:
+            # Best-effort: the env channel is authoritative; a lingering marker is
+            # ignored by the env-first hook for every worker spawn anyway.
+            pass
 
     # T-0038: when both a task and an initiative are known at spawn time,
     # stamp the initiative onto the task md so it's queryable without grep
@@ -1833,6 +1857,12 @@ def spawn(
     # BOT_SQUAD_OWNER (T-0080): per-session owner stamp picked up by the
     # SessionStart hook and written into the SessionMd frontmatter.
     env_prefix_parts: list[str] = []
+    # T-0525: per-process task binding channel. The SessionStart hook reads
+    # BOT_SQUAD_TASK_ID in preference to the (now-unused) shared marker, so
+    # concurrent spawns can't cross-wire each other's primary. Mirrors the
+    # BOT_SQUAD_INITIATIVE / BOT_SQUAD_OWNER passthrough below.
+    if task_id:
+        env_prefix_parts.append(f"BOT_SQUAD_TASK_ID={shlex.quote(task_id.strip())}")
     if initiative:
         # Basic safety: only basename, must end .md, no slashes/..
         clean = initiative.strip()
@@ -2460,8 +2490,19 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         )
 
     primary = meta.get("task_id")
-    if not primary or primary == "~":
-        raise ActionError(f"bind_task: session {sid!r} is not a dev session (no primary task_id)")
+    primary_empty = not primary or primary == "~"
+    if primary_empty:
+        # T-0525: an empty primary is either a legitimately task-less TL/operator
+        # (refuse — they never hold a single ticket) OR an unbound/mis-bound DEV
+        # whose primary the spawn-marker race left empty. For a dev we ADOPT
+        # task_id as the PRIMARY below (the in-place repair the old append-only
+        # path couldn't do), so an unbound session is fixable via the action, not
+        # only a hand-edit. Role is resolved from the window marker (T-0175).
+        role = _derive_role(meta.get("window"), primary, meta.get("initiative"))
+        if role != "dev":
+            raise ActionError(
+                f"bind_task: session {sid!r} is not a dev session (no primary task_id)"
+            )
 
     backlog_dir = data_dir / slug / "backlog"
     matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
@@ -2503,11 +2544,18 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         # extras growing) isn't clobbered by our stale snapshot — last write
         # wins on lost-update otherwise.
         meta = _read_session_metadata(meta_file) or meta
-        extras = list(meta.get("extra_task_ids") or [])
-        extras = [t for t in extras if t and t != "~"]
-        if task_id not in extras:
-            extras.append(task_id)
-        meta["extra_task_ids"] = extras
+        extras = [t for t in (meta.get("extra_task_ids") or []) if t and t != "~"]
+        cur_primary = meta.get("task_id")
+        if not cur_primary or cur_primary == "~":
+            # T-0525: ADOPT as PRIMARY — repair an unbound dev in place. Re-checked
+            # under the lock so the primary-vs-extra decision is race-safe.
+            meta["task_id"] = task_id
+            primary_set = True
+        else:
+            if task_id not in extras:
+                extras.append(task_id)
+            meta["extra_task_ids"] = extras
+            primary_set = False
         _write_session_metadata(meta_file, meta)
     # flock released on close
 
@@ -2549,7 +2597,8 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         # Peer notify is best-effort; the binding itself is the source of truth.
         pass
 
-    return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras}
+    return {"ok": True, "sid": sid, "task_id": task_id, "extras": extras,
+            "primary_set": primary_set}
 
 
 def set_drift_paused(cfg: Any, slug: str, sid: str, paused: bool) -> dict:
@@ -3469,6 +3518,145 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
         "corrected": corrected,
         "details": details,
     }
+
+
+def reconcile_primary_from_history(cfg: Any, slug: str) -> dict:
+    """T-0525: deterministically repair a cross-wired / unbound LIVE session
+    primary from the authoritative ticket ``session_history``.
+
+    THE INVARIANT this stands on: ``spawn`` appends the new SID to the INTENDED
+    ticket's ``session_history`` with the correct task_id (a worker-side write,
+    immune to the shared-marker race). So a ticket's ``session_history`` is the
+    SSOT of "which session was spawned/bound for me"; the session-md ``task_id``
+    primary is the unreliable artifact (the SessionStart hook could stamp it from
+    a clobbered marker — the pre-fix cross-wire). This pass reconciles the
+    artifact back to the SSOT — the in-place primary repair ``bind_task`` cannot
+    do (it only appends extras).
+
+    Rules, per LIVE session (a pane exists for its SID; suspended/archived rows
+    are history and belong to ``gc_dead_bindings``) under the current user prefix:
+
+      * Compute the session's HOME tickets = open-ish tickets whose
+        ``session_history`` lists this SID, EXCLUDING tickets already bound as
+        ``extra_task_ids`` (those are legitimate extra bindings, not the primary)
+        and the current primary.
+      * The current primary is CONSISTENT iff its ticket's ``session_history``
+        lists this SID. If consistent, leave it.
+      * If the primary is a PHANTOM claimant (not listed by its own ticket) OR
+        empty, and there is EXACTLY ONE home candidate, rewrite the primary to it
+        (cross-wire repair / unbound adopt). Zero or multiple candidates →
+        ambiguous, leave for the other passes (no guessing).
+      * Independently, clear a ``last_task_id`` that points at a ticket whose
+        ``session_history`` does NOT list this SID — false residue that feeds the
+        reconciler oscillation the incident reported.
+
+    TL/operator-role windows never adopt a task primary (they are legitimately
+    task-less). Idempotent and convergent: after a rewrite the primary is listed
+    by its own ticket, so the next pass is a no-op (no flip-flop).
+
+    Runs BEFORE ``gc_dead_bindings`` / ``gc_stale_bindings`` in the tick so the
+    corrected, consistent primary informs those passes (and a primary cross-wired
+    onto a CLOSED ticket is repaired here before gc_dead_bindings would strip it).
+
+    Returns ``{"ok": True, "scanned": N, "rewritten": K, "details": [...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"reconcile_primary_from_history: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    backlog_dir = cfg.data_dir / slug / "backlog"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "rewritten": 0, "details": []}
+
+    user = _get_current_user()
+    user_prefix = f"S-{user}-"
+    live_sids = {compute_sid(user, p.window, p.pane_id) for p in list_panes()}
+    LIVE_STATUSES = {"open", "in_progress", "totest", "reopened", "planned"}
+
+    # Index every backlog ticket → (status, set(session_history SIDs)). Built once
+    # so the per-session scan is a cheap dict lookup. Keyed by the ticket's `id`
+    # frontmatter (the canonical T-NNNN), which is what session primaries hold.
+    ticket_hist: dict[str, tuple[str, set[str]]] = {}
+    if backlog_dir.exists():
+        for tmd in sorted(backlog_dir.glob("*.md")):
+            try:
+                parsed = _frontmatter.parse_or_none(tmd.read_text())
+            except OSError:
+                continue
+            if parsed is None:
+                continue
+            tmeta = parsed[0]
+            tid = str(tmeta.get("id") or "").strip()
+            if not tid:
+                continue
+            status = str(tmeta.get("status") or "").strip()
+            hist = set(_frontmatter.as_list(tmeta.get("session_history")))
+            ticket_hist[tid] = (status, hist)
+
+    scanned = 0
+    details: list[dict] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        if not md.stem.startswith(user_prefix):
+            continue
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        sid = meta.get("sid", md.stem)
+        # Only LIVE sessions — a suspended/archived row is a historical record
+        # owned by gc_dead_bindings; rewriting it would fight that pass.
+        if sid not in live_sids:
+            continue
+        # A TL/operator window must never adopt a single-ticket primary.
+        role = _derive_role(meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+        if role != "dev":
+            continue
+
+        primary = meta.get("task_id")
+        primary = primary if (primary and primary != "~") else None
+        extras = {t for t in (meta.get("extra_task_ids") or []) if t and t != "~"}
+        changed = False
+
+        primary_consistent = (
+            primary is not None
+            and primary in ticket_hist
+            and sid in ticket_hist[primary][1]
+        )
+
+        if not primary_consistent:
+            candidates = [
+                tid for tid, (st, hist) in ticket_hist.items()
+                if sid in hist and tid not in extras and tid != primary
+                and st in LIVE_STATUSES
+            ]
+            if len(candidates) == 1:
+                new_primary = candidates[0]
+                meta["task_id"] = new_primary
+                changed = True
+                details.append({
+                    "sid": sid,
+                    "old_primary": primary or "~",
+                    "new_primary": new_primary,
+                    "reason": "adopt-from-history" if primary is None else "rewrite-crosswired",
+                })
+
+        # Clear false last_task_id residue (oscillation feeder).
+        ltid = meta.get("last_task_id")
+        if ltid and ltid != "~":
+            lt_hist = ticket_hist.get(ltid, ("", set()))[1]
+            if sid not in lt_hist:
+                meta["last_task_id"] = "~"
+                changed = True
+                details.append({"sid": sid, "cleared_last_task_id": ltid})
+
+        if changed:
+            _write_session_metadata(md, meta, atomic=True)
+
+    rewritten = len([d for d in details if "new_primary" in d])
+    return {"ok": True, "scanned": scanned, "rewritten": rewritten, "details": details}
 
 
 def gc_dead_bindings(cfg: Any, slug: str) -> dict:

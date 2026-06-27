@@ -2270,20 +2270,27 @@ def test_deliver_prompt_raises_when_never_submitted(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _resume_fake_run(repo, new_pane="%20", window="expert"):
-    """A minimal tmux fake for a no-prompt resurrect (new window + one pane)."""
+    """A minimal tmux fake for a no-prompt resurrect (new window + one pane).
+
+    Records the launched ``bash -lc`` command string on ``fake_run.launched`` so
+    a test can assert the per-process env prefix (T-0525 BOT_SQUAD_TASK_ID)."""
     new_window_called = [False]
+    launched: list[str] = []
 
     def fake_run(args, **kwargs):
         if "capture-pane" in args:
             return _CP(args, "❯ \n")
         if "new-window" in args:
             new_window_called[0] = True
+            if "-lc" in args:
+                launched.append(args[args.index("-lc") + 1])
             return _CP(args)
         if "list-panes" in args:
             if new_window_called[0]:
                 return _CP(args, f"{new_pane}|{window}|4250|{repo}|claude\n")
             return _CP(args)
         return _CP(args)
+    fake_run.launched = launched
     return fake_run
 
 
@@ -2357,7 +2364,8 @@ def test_resume_adopts_primary_when_session_has_none(tmp_path, monkeypatch):
     })
 
     import bot_squad_worker.sessions as S
-    monkeypatch.setattr(S, "_run", _resume_fake_run(repo, new_pane="%20"))
+    fake = _resume_fake_run(repo, new_pane="%20")
+    monkeypatch.setattr(S, "_run", fake)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
     monkeypatch.setattr(S.time, "sleep", lambda x: None)
@@ -2368,8 +2376,11 @@ def test_resume_adopts_primary_when_session_has_none(tmp_path, monkeypatch):
     assert meta["task_id"] == "T-0002", "resumed session should adopt the new primary"
     # Pre-existing extras preserved (T-0165 too).
     assert "T-0050" in (meta.get("extra_task_ids") or [])
-    # Marker dropped so the SessionStart hook stamps the same primary.
-    assert (repo / ".claude" / "task_id").read_text().strip() == "T-0002"
+    # T-0525: the adopted primary now rides the PER-PROCESS env channel
+    # (BOT_SQUAD_TASK_ID), not the shared `.claude/task_id` marker — so a
+    # concurrent spawn can't clobber it. The race-prone marker is NOT written.
+    assert any("BOT_SQUAD_TASK_ID=T-0002" in c for c in fake.launched)
+    assert not (repo / ".claude" / "task_id").exists()
 
 
 def test_resume_does_not_overwrite_existing_primary(tmp_path, monkeypatch):

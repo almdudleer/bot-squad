@@ -77,7 +77,18 @@ sid="$("$BOT_SQUAD/scripts/hooks/hook_my_sid.sh" 2>/dev/null || echo "")"
 task_id=""
 src_window=""
 [ -n "$sid" ] && src_window="$(printf '%s' "$sid" | sed -E 's/^S-[^-]+-(.*)-p[0-9]+$/\1/')"
-if [ -f "$PWD/.claude/task_id" ]; then
+# T-0525: per-process spawn binding channel. The worker spawn launch command
+# sets BOT_SQUAD_TASK_ID in THIS claude's environment; read it in preference to
+# the shared `.claude/task_id` marker. That marker was a single mutable file in
+# the SHARED working tree — under concurrent (cross-cluster) spawns, spawn B's
+# write clobbered spawn A's before A's hook read it, cross-wiring A's PRIMARY
+# binding to B's task. An env var is per-process and cannot be clobbered. Purely
+# ADDITIVE: env-less flows (legacy resume, manual claude) fall through to the
+# marker/window resolution below exactly as before.
+if [ -n "${BOT_SQUAD_TASK_ID:-}" ]; then
+    task_id="$(printf '%s' "$BOT_SQUAD_TASK_ID" | tr -d '[:space:]')"
+fi
+if [ -z "$task_id" ] && [ -f "$PWD/.claude/task_id" ]; then
     task_id="$(tr -d '[:space:]' < "$PWD/.claude/task_id" 2>/dev/null || echo "")"
 fi
 if [ -z "$task_id" ] && [ "${src_window#T-}" != "$src_window" ]; then

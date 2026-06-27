@@ -325,7 +325,17 @@ def _send_stakeholder_dm(
                         urgent=urgent, topic_id=tg_topic_id,
                     )
                 except Exception:
-                    log.exception("_send_stakeholder_dm: group-record post failed (non-fatal)")
+                    # T-0533: DEBUG, not ERROR. This TG #team-queries record is
+                    # best-effort (the page already delivered via MAX above); on a
+                    # DPI-blocked install it ConnectTimeouts on EVERY stakeholder
+                    # page, which spammed an ERROR+traceback per page. Keep the
+                    # detail at DEBUG (exc_info) so reachable installs can still
+                    # diagnose a genuine failure without flooding normal logs.
+                    log.debug(
+                        "_send_stakeholder_dm: group-record post failed "
+                        "(non-fatal; e.g. TG unreachable / DPI-block)",
+                        exc_info=True,
+                    )
             return {"ok": True, "sent": sent, "channel": "max"}
         except Exception:
             log.exception("_send_stakeholder_dm: MAX delivery failed — failing over to TG")

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app import conversation_store as CS
 from app import pins_store
+from app.project_authz import require_project_read
 from app.routes_auth import require_auth
 from app.routes_mothership import _authenticate_worker
 
@@ -104,7 +105,10 @@ def get_current_project(global_user_id: str, request: Request) -> dict:
     return {"slug": pins_store.get_current_project(cfg.data_dir, global_user_id)}
 
 
-@router.get("/{slug}/{global_user_id}/messages")
+@router.get(
+    "/{slug}/{global_user_id}/messages",
+    dependencies=[Depends(require_project_read)],
+)
 def list_conversation(
     slug: str,
     global_user_id: str,
@@ -114,7 +118,16 @@ def list_conversation(
     q: str = Query(default=""),
 ) -> dict:
     """Paginated thread lookup. With ``q`` set, returns only records whose text
-    contains it (case-insensitive); otherwise the full chronological thread."""
+    contains it (case-insensitive); otherwise the full chronological thread.
+
+    T-0493 / voice-04 privacy: the thread is per-user PRIVATE content, so the
+    read is project-access-gated (``require_project_read``) — a project-limited
+    user requesting another project's conversation gets 403, never the content.
+    The conversation is scoped to exactly ONE project (the ``slug`` path key,
+    stored under ``data/<slug>/``); this guarantees the read cannot cross slugs
+    for a project-limited user. (Binding a live conversational SESSION object to
+    one project is the T-0478 seam — deferred; this enforces the DATA-access
+    privacy guarantee now.)"""
     try:
         if q:
             return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset)

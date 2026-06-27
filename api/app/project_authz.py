@@ -49,3 +49,29 @@ def require_project_member(slug: str, user: dict = Depends(require_auth)) -> dic
         status_code=403,
         detail=f"project {slug!r} writes require admin",
     )
+
+
+def require_project_read(slug: str, user: dict = Depends(require_auth)) -> dict:
+    """Gate a project-PRIVATE READ route: 403 unless the caller may read
+    ``slug``'s private content (T-0493).
+
+    Distinct from project content reads (backlog/docs/vision) which stay broad:
+    a conversational thread is per-user PRIVATE content, and voice-04 requires
+    that a project-limited user can never be served another project's
+    conversation ("a cross-project session talking to a project-limited user
+    would break privacy"). So this read is access-gated, deny-by-default.
+
+    Same enforceable tier as the write gate TODAY — global admin only, since no
+    per-project membership store exists yet (see the module docstring). When
+    per-project roles land (T-0216), grant a project's MEMBERS read access HERE
+    (members read; the stricter owner/admin set still writes via
+    ``require_project_member``) and every gated read route inherits it. Kept a
+    separate dependency from ``require_project_member`` precisely so reads and
+    writes can diverge at that extension point without disentangling callers.
+    """
+    if user.get("is_admin"):
+        return user
+    raise HTTPException(
+        status_code=403,
+        detail=f"project {slug!r} conversation is private",
+    )

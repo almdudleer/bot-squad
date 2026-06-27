@@ -575,3 +575,116 @@ def test_seed_memory_preserves_existing_index(tmp_path: Path) -> None:
     _seed_memory(clone, "proj")
     exclude_lines = (clone / ".git" / "info" / "exclude").read_text().splitlines()
     assert exclude_lines.count("/memory/") == 1
+
+
+# ---------------------------------------------------------------------------
+# T-0501 — project-level Claude settings + lifecycle hooks seeding
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402  (local to the T-0501 block, mirrors module style)
+
+
+def _fake_install_with_stub_hook(tmp_path: Path):
+    """A fake install root whose ``scripts/hooks/session_start.sh`` is a stub
+    that records its cwd + stdin — lets us prove the seeded settings actually
+    FIRE the hook from a scaffolded clone without dragging in the real 31KB
+    SSOT script + a full install. Returns (install_data_dir, marker_path)."""
+    root = tmp_path / "install"
+    hooks = root / "scripts" / "hooks"
+    hooks.mkdir(parents=True)
+    marker = tmp_path / "hook-fired.txt"
+    stub = hooks / "session_start.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "cwd=$PWD bot_squad=$BOT_SQUAD stdin=$(cat)" > "{marker}"\n'
+    )
+    stub.chmod(0o755)
+    return root / "data", marker
+
+
+def test_new_from_scratch_seeds_claude_settings_and_hooks(tmp_path: Path) -> None:
+    install_data, _marker = _fake_install_with_stub_hook(tmp_path)
+    (install_data / "fresh").mkdir(parents=True)
+    mother = tmp_path / "home" / "fresh"
+
+    scaffold_new_from_scratch(
+        slug="fresh",
+        mother_dir=mother,
+        git_remote=None,
+        install_data_dir=install_data,
+    )
+
+    for clone in (mother / "dev", mother / "master"):
+        settings_path = clone / ".claude" / "settings.json"
+        assert settings_path.is_file(), f"{settings_path} not seeded"
+        settings = json.loads(settings_path.read_text())
+
+        # All three lifecycle hook events wired, paths DERIVED from the install
+        # location (not hardcoded to /home/www/bot-squad).
+        install_root = install_data.parent
+        for event, script in (
+            ("SessionStart", "session_start.sh"),
+            ("UserPromptSubmit", "user_prompt_submit.sh"),
+            ("Stop", "stop.sh"),
+        ):
+            cmd = settings["hooks"][event][0]["hooks"][0]["command"]
+            assert cmd == str(install_root / "scripts" / "hooks" / script)
+            assert "/home/www/bot-squad" not in cmd  # not hardcoded
+        # BOT_SQUAD env pinned to THIS install so the hook resolves config/data.
+        assert settings["env"]["BOT_SQUAD"] == str(install_root)
+
+        # settings.local.json stub seeded; .claude git-ignored per-clone (local
+        # exclude, not the tracked .gitignore).
+        assert (clone / ".claude" / "settings.local.json").is_file()
+        assert "/.claude/" in (
+            clone / ".git" / "info" / "exclude"
+        ).read_text().splitlines()
+
+
+def test_seeded_settings_actually_fire_the_hook_from_clone_cwd(tmp_path: Path) -> None:
+    """End-to-end wiring: the SessionStart command in the seeded settings,
+    executed from the clone, runs and sees the clone as its cwd — which is how
+    the real hook resolves the project slug (cwd vs config/projects.toml)."""
+    install_data, marker = _fake_install_with_stub_hook(tmp_path)
+    (install_data / "fresh").mkdir(parents=True)
+    mother = tmp_path / "home" / "fresh"
+    scaffold_new_from_scratch(
+        slug="fresh",
+        mother_dir=mother,
+        git_remote=None,
+        install_data_dir=install_data,
+    )
+    dev = mother / "dev"
+    settings = json.loads((dev / ".claude" / "settings.json").read_text())
+    cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+
+    env = {**os.environ, "BOT_SQUAD": settings["env"]["BOT_SQUAD"]}
+    subprocess.run(
+        ["bash", cmd], cwd=str(dev), env=env,
+        input='{"source":"startup","session_id":""}',
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    fired = marker.read_text()
+    # Hook fired AND saw the clone as cwd → the real hook can resolve slug from it.
+    assert f"cwd={dev}" in fired
+    assert f"bot_squad={install_data.parent}" in fired
+
+
+def test_seed_claude_preserves_existing_settings(tmp_path: Path) -> None:
+    """A project that already has its own .claude/settings.json is left alone
+    (voice-07: non-bot-squad dirs unaffected); exclude stays idempotent."""
+    from app.project_scaffold import _seed_claude
+
+    clone = tmp_path / "clone"
+    _git_init(clone)
+    claude = clone / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text('{"mine": true}')
+
+    install_data = tmp_path / "install" / "data"
+    assert _seed_claude(clone, install_data) is False  # preserved
+    assert json.loads((claude / "settings.json").read_text()) == {"mine": True}
+
+    _seed_claude(clone, install_data)  # idempotent exclude
+    excl = (clone / ".git" / "info" / "exclude").read_text().splitlines()
+    assert excl.count("/.claude/") == 1

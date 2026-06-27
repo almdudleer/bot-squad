@@ -19,6 +19,7 @@ themselves only if `<clone>/ops` does not already exist.
 from __future__ import annotations
 
 import errno
+import json
 import os
 import shutil
 import subprocess
@@ -192,6 +193,99 @@ def _seed_memory(clone: Path, slug: str) -> bool:
     return seeded
 
 
+# T-0501 — project-level Claude settings + lifecycle hooks. voice-07: put the
+# hooks at the PROJECT level (not user level) so wiring a project in gives it
+# everything the lifecycle needs and non-bot-squad dirs stay untouched. The
+# bot-squad clones today carry a hand-written `.claude/settings.json` whose
+# hook commands are hardcoded to `/home/www/bot-squad/scripts/hooks/...`; we
+# seed the same shape but with paths DERIVED from the install location so a
+# non-default install is portable. The hooks themselves are the SSOT scripts
+# shipped with the install — we only point each new clone at them.
+_CLAUDE_DIRNAME = ".claude"
+# (Claude Code hook event -> the install hook script that handles it.)
+_LIFECYCLE_HOOKS = (
+    ("SessionStart", "session_start.sh"),
+    ("UserPromptSubmit", "user_prompt_submit.sh"),
+    ("Stop", "stop.sh"),
+)
+
+
+def _install_root(install_data_dir: Path) -> Path:
+    """The install root for an ``install_data_dir`` (``<root>/data``).
+
+    Mirrors the worker's ``Config.data_dir = config_dir.parent / "data"`` and
+    the hook's ``BOT_SQUAD=<root>`` default — the hook scripts + config live
+    under ``<root>/{scripts,config}``."""
+    return install_data_dir.parent
+
+
+def _hooks_dir(install_data_dir: Path) -> Path:
+    return _install_root(install_data_dir) / "scripts" / "hooks"
+
+
+def _render_claude_settings(install_data_dir: Path) -> str:
+    """The project-level ``.claude/settings.json`` body.
+
+    Same shape as bot-squad's own committed settings (env flag, playwright MCP,
+    the three lifecycle hooks, baseline tool permissions) but with the hook
+    command paths + ``BOT_SQUAD`` env derived from the install location instead
+    of hardcoded — so the hook resolves the project slug from cwd against the
+    right install's ``config/projects.toml`` regardless of where it lives."""
+    root = _install_root(install_data_dir)
+    hooks_dir = _hooks_dir(install_data_dir)
+    settings = {
+        "env": {
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "0",
+            # The hook scripts read BOT_SQUAD to find config/ + data/; pin it to
+            # THIS install so a non-default install path still resolves.
+            "BOT_SQUAD": str(root),
+        },
+        "enabledMcpjsonServers": ["playwright"],
+        "hooks": {
+            event: [
+                {"hooks": [{"type": "command", "command": str(hooks_dir / script)}]}
+            ]
+            for event, script in _LIFECYCLE_HOOKS
+        },
+        "permissions": {"allow": ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]},
+    }
+    return json.dumps(settings, indent=2) + "\n"
+
+
+def _render_claude_local_settings() -> str:
+    """A minimal ``settings.local.json`` stub (per-clone, git-ignored).
+
+    Kept tiny on purpose — Claude Code appends runtime grants here. We only
+    seed the MCP enable so playwright is usable from a fresh clone; the allow
+    list starts empty."""
+    return json.dumps(
+        {"enabledMcpjsonServers": ["playwright"], "permissions": {"allow": []}},
+        indent=2,
+    ) + "\n"
+
+
+def _seed_claude(clone: Path, install_data_dir: Path) -> bool:
+    """Seed ``<clone>/.claude/settings.json`` (+ ``settings.local.json``) with
+    the project-level lifecycle hooks, git-ignored per-clone.
+
+    Returns True when settings were freshly seeded, False when an existing
+    ``settings.json`` was preserved — we never overwrite a project's own Claude
+    config (voice-07: non-bot-squad dirs unaffected). The local git-exclude
+    entry is asserted idempotently either way."""
+    claude_dir = clone / _CLAUDE_DIRNAME
+    settings = claude_dir / "settings.json"
+    seeded = False
+    if not settings.exists():
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(settings, _render_claude_settings(install_data_dir))
+        local = claude_dir / "settings.local.json"
+        if not local.exists():
+            _atomic_write_text(local, _render_claude_local_settings())
+        seeded = True
+    _git_ignore_local(clone, f"/{_CLAUDE_DIRNAME}/")
+    return seeded
+
+
 def _run_git(cwd: Path, *args: str) -> None:
     """Run a git command, raising ScaffoldError with stderr on failure.
 
@@ -253,6 +347,7 @@ def scaffold_paths_as_they_are(
             linked, _note = _link_ops(clone, install_data_dir, slug)
             (ops_linked if linked else ops_skipped).append(clone / "ops")
             _seed_memory(clone, slug)  # T-0502 shared git-ignored memory dir
+            _seed_claude(clone, install_data_dir)  # T-0501 project-level Claude settings + hooks
 
         toml_text = render_per_project_toml(
             slug, repo_path, repo_master, mother_dir
@@ -342,6 +437,7 @@ def scaffold_new_from_scratch(
             linked, _note = _link_ops(clone, install_data_dir, slug)
             (ops_linked if linked else ops_skipped).append(clone / "ops")
             _seed_memory(clone, slug)  # T-0502 shared git-ignored memory dir
+            _seed_claude(clone, install_data_dir)  # T-0501 project-level Claude settings + hooks
 
         toml_text = render_per_project_toml(slug, dev, master, mother_dir)
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)
@@ -431,6 +527,7 @@ def scaffold_attach_destructive(
             linked, _note = _link_ops(clone, install_data_dir, slug)
             (ops_linked if linked else ops_skipped).append(clone / "ops")
             _seed_memory(clone, slug)  # T-0502 shared git-ignored memory dir
+            _seed_claude(clone, install_data_dir)  # T-0501 project-level Claude settings + hooks
 
         toml_text = render_per_project_toml(slug, dev, master, mother_dir)
         _atomic_write_text(mother_dir / ".bot-squad.toml", toml_text)

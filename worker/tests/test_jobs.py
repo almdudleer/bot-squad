@@ -896,6 +896,27 @@ def test_binding_gc_tick_runs_gc_tmux_sessions(
     assert gc_calls == [proj.slug]
 
 
+def test_binding_gc_tick_runs_gc_stale_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0484: binding_gc_tick must invoke gc_stale_tasks per project so the
+    age-based task-cleanup pass runs alongside the throwaway GC."""
+    from bot_squad_worker.jobs import binding_gc_tick
+    from bot_squad_worker import task_gc as _task_gc
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    stale_calls: list[str] = []
+    monkeypatch.setattr(
+        _task_gc, "gc_stale_tasks",
+        lambda c, s: stale_calls.append(s) or {"archived": []},
+    )
+
+    binding_gc_tick(cfg)
+    assert stale_calls == [proj.slug]
+
+
 def test_binding_gc_tick_swallows_gc_tmux_exceptions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

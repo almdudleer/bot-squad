@@ -410,6 +410,10 @@ def binding_gc_tick(cfg: Config) -> None:
         # they stop leaking onto the board — the task-level analogue of the
         # T-0233 stale-session reaper in archive_dead_teammates.
         ("gc_throwaway_tasks", _task_gc.gc_throwaway_tasks),
+        # T-0484: general age-based cleanup — archive stale/abandoned tasks
+        # (inactive + past the long grace) off-board to backlog/_gc/ (reversible),
+        # generalizing the throwaway GC into the real task-cleanup process.
+        ("gc_stale_tasks", _task_gc.gc_stale_tasks),
         ("reconcile_teams", _teams.reconcile_teams),
         # T-0128: backfill parent_sid for legacy / agent-teams-spawned sessions
         # via the team-projection heuristic (fill-once, never overwrites the

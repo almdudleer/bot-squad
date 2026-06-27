@@ -906,6 +906,119 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# ensure_user_conversation action (T-0478, M2/F2.4)
+# ---------------------------------------------------------------------------
+
+_ENSURE_UCONV_REQUIRED = {"slug", "global_user_id"}
+_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref"}
+
+
+def _user_conversation_boot_prompt(
+    slug: str, global_user_id: str, message_ref: str | None
+) -> str:
+    """The initial prompt a freshly-spawned user-conversation session boots on.
+
+    Unlike a dev brief (task-centric, assembled by `bsq spawn`), a user-
+    conversation session holds no ticket — it attends a thread. So we orient it
+    explicitly: run `bsq brief` for its full role contract (now resolved to
+    user-conversation.md), then read its thread + the new inbound message. The
+    behavioural mandate (verbatim-into-tasks, notify-operator, unrestricted)
+    lives in the role contract; this prompt points at it and supplies the
+    per-session context (which user, which message)."""
+    new_msg = ""
+    if message_ref and str(message_ref).strip():
+        new_msg = (
+            "\nThe message that triggered this spawn:\n"
+            f"  {str(message_ref).strip()}\n"
+        )
+    return f"""\
+You are a USER-CONVERSATION session (system-controlled), spawned on incoming
+user mail for project `{slug}`, attending the user `{global_user_id}`.
+
+FIRST run `bsq brief` to load your full role contract (user-conversation.md) +
+the product/protocol. Your mandate, in short:
+  - Read this user's conversation thread (your durable memory) before replying:
+    GET /api/conversations/{slug}/{global_user_id}/messages
+  - Talk to the user; reply by appending to that same thread
+    (author "session:<your-sid>") — the comms layer relays it back to them.
+  - When the user ASKS FOR WORK, record it VERBATIM into a backlog task: mint
+    the id via the `task_new` worker action (never hand-pick T-NNNN), then paste
+    their EXACT words into the task's `## Verbatim request` (M8 — never
+    paraphrase) and stamp provenance back to this user + message.
+  - NOTIFY THE OPERATOR after recording (`bsq peer send <operator-sid> "<task
+    id> — <one-liner>"`); the operator dispatches the build, not you.
+  - You are UNRESTRICTED: you may spawn an operator/TL/ad-hoc session or fix
+    things yourself in service of the user's ask.
+{new_msg}"""
+
+
+def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
+    """Ensure a live user-conversation session is attending ``(slug,
+    global_user_id)``; spawn one on incoming user mail if none is running.
+
+    This is the M5-firehose seam (T-0478): the comms/intake side (Cluster D)
+    resolves the inbound TG sender to a ``global_user_id`` (T-0488), appends the
+    message to the conversation store (T-0489), then calls THIS to make sure a
+    session is attending that thread.
+
+    Idempotent single-attendant: if a live user-conversation session already
+    holds this user, the new message is routed to it (best-effort pane nudge)
+    rather than spawning a duplicate — so a burst of messages does not fan out
+    into N sessions.
+
+    Required params: slug, global_user_id
+    Optional params: message_ref (a reference/snippet of the inbound message,
+                     surfaced in the boot prompt; the session reads the full
+                     thread from the store).
+    Returns: {ok, sid, spawned: bool}
+    """
+    extra = set(params) - _ENSURE_UCONV_ALLOWED
+    if extra:
+        raise ActionError(
+            f"ensure_user_conversation got unexpected params: {sorted(extra)}")
+    missing = _ENSURE_UCONV_REQUIRED - set(params)
+    if missing:
+        raise ActionError(
+            f"ensure_user_conversation missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"ensure_user_conversation: unknown project slug {slug!r}")
+    gid = params["global_user_id"]
+    message_ref = params.get("message_ref")
+
+    # Reuse: a live attendant already holds this (slug, gid) → route to it.
+    existing = _sessions.live_user_conversation_sid(cfg, slug, gid)
+    if existing is not None:
+        if message_ref and str(message_ref).strip():
+            # Best-effort wake — the attendant re-reads its thread for the new
+            # message. A pane-timing hiccup must never fail the ensure (the
+            # message is already durable in the store).
+            try:
+                _action_inject_input({
+                    "sid": existing,
+                    "text": ("A new message arrived in your user-conversation "
+                             "thread — read it and respond."),
+                })
+            except ActionError:
+                pass
+        return {"ok": True, "sid": existing, "spawned": False}
+
+    # Spawn: no live attendant → open one in a gid-keyed user-conversation window.
+    window = _sessions.user_conversation_window(gid)  # validates gid
+    result = _sessions.spawn(
+        cfg,
+        slug,
+        window,
+        _user_conversation_boot_prompt(slug, gid, message_ref),
+    )
+    return {"ok": True, "sid": result["sid"], "spawned": True}
+
+
+# ---------------------------------------------------------------------------
 # Scheduler state action (spec #6)
 # ---------------------------------------------------------------------------
 
@@ -2717,6 +2830,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "suspend_session": _action_suspend_session,
     "resume_session": _action_resume_session,
     "spawn_session": _action_spawn_session,
+    # T-0478 (M2/F2.4): ensure a user-conversation session attends a user.
+    "ensure_user_conversation": _action_ensure_user_conversation,
     "scheduler_state": _action_scheduler_state,
     "inject_input": _action_inject_input,
     # T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
@@ -2818,6 +2933,7 @@ ACTION_MODES: dict[str, str] = {
     "suspend_session": "tmux_only",
     "resume_session": "tmux_only",
     "spawn_session": "tmux_only",
+    "ensure_user_conversation": "tmux_only",
     "scheduler_state": "coordinator_only",
     "inject_input": "tmux_only",
     # T-0153: autopilot reads/writes coordinator state (peer bus, spawn, tg,

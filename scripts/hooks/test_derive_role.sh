@@ -39,6 +39,12 @@ CASES=(
     "signal_tracker_qa	qa"
     "vodqa	dev"                                            # no separator ⟹ dev
     "qa-runner	dev"                                        # marker must be a suffix
+    "user-conversation	user-conversation"                  # T-0478 intake session
+    "user_conversation	user-conversation"                  # underscore inner sep
+    "gu_a1b2c3-user-conversation	user-conversation"        # gid-prefixed window
+    "gu_qa-user-conversation	user-conversation"            # gid containing 'qa' ⟹ still user-conversation (suffix wins)
+    "user-conversation-extra	dev"                          # marker must be a suffix
+    "conversation	dev"                                     # 'user' stem required
 )
 
 fail=0

@@ -3812,6 +3812,79 @@ def test_derive_role_qa_false_positive_suffix_is_dev():
     assert _derive_role("qa-runner", "~", "~") == "dev"  # marker must be a suffix
 
 
+# ---------------------------------------------------------------------------
+# T-0478 — user-conversation as a first-class system-spawned role.
+# ---------------------------------------------------------------------------
+
+def test_derive_role_user_conversation_window_markers():
+    from bot_squad_worker.sessions import _derive_role
+    for win in (
+        "user-conversation",
+        "user_conversation",
+        "USER-CONVERSATION",
+        "gu_a1b2c3-user-conversation",   # gid-prefixed (the real spawn shape)
+        "gu_deadbeef_user_conversation",  # underscore separators throughout
+    ):
+        assert _derive_role(win, None, None) == "user-conversation", win
+
+
+def test_derive_role_user_conversation_suffix_wins_over_gid_content():
+    """A gid that itself contains another marker (e.g. `qa`) must NOT flip the
+    role — the `user-conversation` suffix is authoritative."""
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("gu_qa-user-conversation", "~", "~") == "user-conversation"
+    assert _derive_role("gu_tl-user-conversation", "~", "~") == "user-conversation"
+
+
+def test_derive_role_user_conversation_false_positive_is_dev():
+    """The marker must be a suffix and carry the `user` stem."""
+    from bot_squad_worker.sessions import _derive_role
+    assert _derive_role("user-conversation-extra", "~", "~") == "dev"  # not a suffix
+    assert _derive_role("conversation", "~", "~") == "dev"  # no `user` stem
+
+
+def test_user_conversation_window_builds_and_validates():
+    from bot_squad_worker.sessions import user_conversation_window
+    from bot_squad_worker.actions import ActionError
+    assert user_conversation_window("gu_a1b2c3") == "gu_a1b2c3-user-conversation"
+    # Reject anything that isn't a single safe segment (shell/tmux/path safety).
+    for bad in ("", "gu a", "gu;rm", "../x", "a/b", "$(x)"):
+        with pytest.raises(ActionError):
+            user_conversation_window(bad)
+
+
+def test_live_user_conversation_sid_matches_live_attendant(tmp_path, monkeypatch):
+    """live_user_conversation_sid finds the attendant by LIVE PANE (window +
+    live claude), scoped to the project, independent of md-status timing."""
+    import types
+    import bot_squad_worker.sessions as S
+
+    cfg = types.SimpleNamespace(data_dir=tmp_path / "data")
+    gid = "gu_a1b2c3"
+    win = S.user_conversation_window(gid)
+    other_win = S.user_conversation_window("gu_other")
+    panes = [
+        types.SimpleNamespace(window=win, pane_id="%7", pid=701, session="tp"),
+        # Same window but ANOTHER project's tmux session — must not leak in.
+        types.SimpleNamespace(window=win, pane_id="%9", pid=901, session="elsewhere"),
+        # A different user's attendant.
+        types.SimpleNamespace(window=other_win, pane_id="%8", pid=801, session="tp"),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, ch: True)
+    assert S.live_user_conversation_sid(cfg, "tp", gid) == f"S-u-{win}-p7"
+
+    # No live claude in the pane ⟹ no attendant (a dead pane never pins a user).
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, ch: False)
+    assert S.live_user_conversation_sid(cfg, "tp", gid) is None
+
+    # No matching window at all ⟹ None.
+    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, ch: True)
+    assert S.live_user_conversation_sid(cfg, "tp", "gu_nobody") is None
+
+
 def test_list_sessions_emits_role_for_active_and_suspended(tmp_path, monkeypatch):
     """list_sessions stamps an authoritative `role` on every row."""
     repo = tmp_path / "repo"

@@ -417,6 +417,13 @@ _OPERATOR_WINDOW_RE = re.compile(r"(?:^|[-_])operator$", re.IGNORECASE)
 # `-tl`), so genuine dev-side prod-ops TLs stay `teamlead`.
 _PROD_TL_WINDOW_RE = re.compile(r"(?:^|[-_])prod[-_](?:tl|teamlead)$", re.IGNORECASE)
 _QA_WINDOW_RE = re.compile(r"(?:^|[-_])qa$", re.IGNORECASE)
+# T-0478 (M2/F2.4): system-controlled user-conversation session spawned on
+# incoming user mail. The window encodes the user (`<gu_id>-user-conversation`)
+# but always ends in the `user-conversation` marker, so the gid prefix never
+# changes the derived role. The suffix is disjoint from every other marker
+# above (ends in "conversation", not tl/qa/operator), so precedence among them
+# is irrelevant.
+_USERCONV_WINDOW_RE = re.compile(r"(?:^|[-_])user[-_]conversation$", re.IGNORECASE)
 
 # T-0176 #3: grouping bucket for sessions with no live tmux session — keeps the
 # sessions-list grouping honest against `tmux list-sessions`.
@@ -440,8 +447,10 @@ def _derive_role(
          → ``prod-teamlead`` (T-0197 — BEFORE plain TL, since a prod-tl window
          also ends in `tl`)
       3. qa window marker (`qa`, `<x>-qa`) → ``qa`` (T-0197)
-      4. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
-      5. default → ``dev``
+      4. user-conversation marker (`user-conversation`, `<gu_id>-user-conversation`)
+         → ``user-conversation`` (T-0478 — the system-spawned intake session)
+      5. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
+      6. default → ``dev``
 
     T-0175: ``task_id`` / ``initiative`` (and their ``extra_*`` lists) no longer
     influence the role — they are accepted for call-site compatibility but a
@@ -458,6 +467,8 @@ def _derive_role(
         return "prod-teamlead"
     if _QA_WINDOW_RE.search(w):
         return "qa"
+    if _USERCONV_WINDOW_RE.search(w):
+        return "user-conversation"
     if _TL_WINDOW_RE.search(w):
         return "teamlead"
     return "dev"
@@ -2104,6 +2115,75 @@ def _live_task_owner(
             continue
         if task_id in _full_task_set(meta) and _is_live_holder(meta) and sid in live:
             return sid
+    return None
+
+
+# T-0478 (M2/F2.4): user-conversation session identity helpers. A user-
+# conversation session is keyed on its (slug, global_user_id) pair; the gid is
+# carried IN the tmux window (`<gid>-user-conversation`) so the session is
+# self-identifying from its SID alone — no md field that the SessionStart hook
+# could drop. `ensure_user_conversation` (actions.py) computes the expected
+# window for a known gid and matches it, so the gid is never parsed back OUT of
+# the window (robust regardless of gid content).
+_GLOBAL_USER_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def user_conversation_window(global_user_id: str) -> str:
+    """The tmux window name for ``global_user_id``'s user-conversation session.
+
+    Always ends in the ``user-conversation`` marker so ``_derive_role`` maps it
+    to the user-conversation role regardless of the gid prefix. Raises on a gid
+    that isn't a single safe segment (so a crafted value can't smuggle a shell /
+    tmux metacharacter into the spawn command or a path).
+    """
+    gid = str(global_user_id or "").strip()
+    if not _GLOBAL_USER_ID_RE.match(gid):
+        from bot_squad_worker.actions import ActionError
+        raise ActionError(f"invalid global_user_id {global_user_id!r}")
+    return f"{gid}-user-conversation"
+
+
+def live_user_conversation_sid(
+    cfg: Any, slug: str, global_user_id: str
+) -> str | None:
+    """SID of the LIVE user-conversation session attending ``(slug,
+    global_user_id)``, or None when none is running.
+
+    The single-attendant invariant behind ``ensure_user_conversation``: a
+    non-None result means the user already has a live attendant, so a new
+    inbound message is routed to it rather than spawning a duplicate.
+
+    Detection is a LIVE-PANE scan (mirroring
+    :func:`dispatch._live_operator_sids_from_tmux`), NOT an md-status scan: a
+    freshly-spawned task-less session's seed md carries no ``status: active``
+    until the SessionStart hook / gc_sessions stamps it, so an md-status lookup
+    would miss a just-spawned attendant and let a second near-simultaneous
+    message spawn a duplicate. Keying on the live tmux pane (window matches AND
+    a live claude agent runs in it) is timing-independent and reflects the
+    process truth. Scoped to this project's tmux session (``pane.session ==
+    slug``) so another project's attendant never leaks in. Tolerant of a
+    missing/broken tmux server (``list_panes`` → ``[]`` → None).
+    """
+    want = user_conversation_window(global_user_id)
+    try:
+        panes = list_panes()
+    except Exception:  # noqa: BLE001 — a tmux hiccup must not break the gate
+        return None
+    if not panes:
+        return None
+    user = _get_current_user()
+    children = _proc_children_map()
+    for p in panes:
+        if p.session != slug:
+            continue
+        if (p.window or "").strip() != want:
+            continue
+        if not _pane_has_live_claude(p.pid, children):
+            continue
+        try:
+            return compute_sid(user, p.window, p.pane_id)
+        except Exception:  # noqa: BLE001
+            return None
     return None
 
 

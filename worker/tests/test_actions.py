@@ -56,6 +56,8 @@ def test_registry_lists_only_allowed_actions():
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",
         "spawn_session",
+        # T-0478 (M2/F2.4): user-conversation intake-session ensure/spawn.
+        "ensure_user_conversation",
         "scheduler_state", "inject_input",
         # T-0153: autopilot — prompt-driven, time-boxed autonomous runs.
         "autopilot_start", "autopilot_stop", "autopilot_status",
@@ -1105,6 +1107,121 @@ def test_spawn_session_action_threads_parent_sid(tmp_path, monkeypatch):
     })
     assert result["ok"] is True
     assert captured.get("parent_sid") == "S-x-tl-p0"
+
+
+# ---------------------------------------------------------------------------
+# ensure_user_conversation action tests (T-0478, M2/F2.4)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_user_conversation_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("ensure_user_conversation", {
+            "slug": "test-project", "global_user_id": "gu_a1", "evil": "x"})
+
+
+def test_ensure_user_conversation_missing_required(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("ensure_user_conversation", {"slug": "test-project"})
+
+
+def test_ensure_user_conversation_spawns_when_none_live(tmp_path, monkeypatch):
+    """No live attendant ⟹ spawn one in a gid-keyed user-conversation window
+    that derives the user-conversation role, with the boot prompt threaded."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured.update(slug=slug, window=window, initial_prompt=initial_prompt)
+        return {"ok": True, "sid": f"S-u-{window}-p3"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "please add dark mode",
+    })
+    assert result["ok"] is True
+    assert result["spawned"] is True
+    assert captured["window"] == "gu_a1b2c3-user-conversation"
+    # The window must derive the new role (end-to-end with _derive_role).
+    assert S._derive_role(captured["window"], None, None) == "user-conversation"
+    # Boot prompt orients the session: brief + verbatim mandate + the message.
+    assert "bsq brief" in captured["initial_prompt"]
+    assert "VERBATIM" in captured["initial_prompt"]
+    assert "please add dark mode" in captured["initial_prompt"]
+    assert result["sid"] == "S-u-gu_a1b2c3-user-conversation-p3"
+
+
+def test_ensure_user_conversation_reuses_live_attendant(tmp_path, monkeypatch):
+    """A live attendant ⟹ route to it (best-effort wake), never spawn a dup."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_a1b2c3-user-conversation-p9"
+
+    def boom_spawn(*a, **k):
+        raise AssertionError("must NOT spawn when an attendant is already live")
+
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: existing)
+    monkeypatch.setattr(S, "spawn", boom_spawn)
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "another message",
+    })
+    assert result == {"ok": True, "sid": existing, "spawned": False}
+    assert nudged["sid"] == existing  # the live attendant was nudged
+
+
+def test_ensure_user_conversation_reuse_survives_nudge_failure(tmp_path, monkeypatch):
+    """A pane-timing hiccup on the wake nudge must not fail the ensure (the
+    message is already durable in the store)."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_x-user-conversation-p1"
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: existing)
+
+    def boom_inject(params):
+        raise ActionError("no live pane")
+
+    monkeypatch.setattr(A, "_action_inject_input", boom_inject)
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_x", "message_ref": "hi"})
+    assert result == {"ok": True, "sid": existing, "spawned": False}
+
+
+def test_ensure_user_conversation_unknown_slug(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unknown project"):
+        A.dispatch("ensure_user_conversation", {
+            "slug": "nope", "global_user_id": "gu_a1"})
+
+
+def test_ensure_user_conversation_validates_gid(tmp_path, monkeypatch):
+    """A crafted gid can't smuggle a shell/tmux metacharacter into the spawn."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    with pytest.raises(ActionError, match="invalid global_user_id"):
+        A.dispatch("ensure_user_conversation", {
+            "slug": "test-project", "global_user_id": "gu;rm -rf /"})
 
 
 def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):

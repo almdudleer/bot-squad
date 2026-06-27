@@ -14,12 +14,14 @@
 #   _OPERATOR_WINDOW_RE = (?:^|[-_])operator$
 #   _PROD_TL_WINDOW_RE  = (?:^|[-_])prod[-_](?:tl|teamlead)$
 #   _QA_WINDOW_RE       = (?:^|[-_])qa$
+#   _USERCONV_WINDOW_RE = (?:^|[-_])user[-_]conversation$
 #   _TL_WINDOW_RE       = (?:^|[-_])(?:tl|teamlead)$
 #     1. operator window marker (operator, <x>-operator)        → operator
 #     2. prod-TL window marker (prod-tl, <x>_prod_teamlead, …)  → prod-teamlead
 #     3. qa window marker (qa, <x>-qa)                          → qa
-#     4. teamlead/tl window marker (<x>-TL, <x>_teamlead, …)    → teamlead
-#     5. default — incl. task-less / marker-less sessions       → dev
+#     4. user-conversation marker (<gu_id>-user-conversation)   → user-conversation
+#     5. teamlead/tl window marker (<x>-TL, <x>_teamlead, …)    → teamlead
+#     6. default — incl. task-less / marker-less sessions       → dev
 #
 # The prod-TL arm MUST precede the plain-TL arm (T-0197): a `…-prod-tl` window
 # also ends in `tl`, so plain-TL precedence would otherwise swallow it. A
@@ -40,6 +42,8 @@ bsq_derive_role() {
             printf 'prod-teamlead' ;;
         qa|*[-_]qa)
             printf 'qa' ;;
+        user-conversation|user_conversation|*[-_]user-conversation|*[-_]user_conversation)
+            printf 'user-conversation' ;;
         tl|teamlead|*[-_]tl|*[-_]teamlead)
             printf 'teamlead' ;;
         *)

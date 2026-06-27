@@ -1214,7 +1214,9 @@ def cmd_expert_find(args) -> None:
 
 
 _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
-               "operator": "operator.md"}
+               "operator": "operator.md",
+               # T-0478: user-conversation intake session role contract.
+               "user-conversation": "user-conversation.md"}
 
 
 def _roles_ssot_dir() -> Path:
@@ -1383,6 +1385,10 @@ def _role_from_sid(sid: str | None) -> str:
     window = (m.group(1) if m else sid).lower()
     if window == "operator" or re.search(r"[-_]operator$", window):
         return "operator"
+    # T-0478: system-spawned user-conversation intake session. Its window is
+    # `<gu_id>-user-conversation`, so match the suffix (gid prefix is ignored).
+    if window == "user-conversation" or re.search(r"[-_]user[-_]conversation$", window):
+        return "user-conversation"
     if window in ("tl", "teamlead") or re.search(r"[-_](tl|teamlead)$", window):
         return "teamlead"
     return "dev"

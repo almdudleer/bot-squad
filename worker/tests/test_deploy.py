@@ -1890,3 +1890,81 @@ def test_prune_env_default(tmp_path: Path, monkeypatch) -> None:
 
     assert res["processed_pruned"] == 3
     assert len(list(_processed_dir(cfg, slug).glob("*"))) == 1
+
+
+# ---- T-0528: log-evidence recovery of the no-.rc finalization-orphan ----------
+# The #10/#12 orphan: an EXTERNAL `systemctl restart bot-squad-worker` SIGTERM'd
+# run_next AFTER the recipe logged "release deployed" but BEFORE _record_run_rc.
+# No .rc was written, so the sentinel-only reconciler skipped it and the operator
+# had to hand-finalize. Recover it from log evidence (release line) once the
+# runner is demonstrably gone (marker stale past the orphan grace).
+
+
+def test_reconcile_norc_orphan_with_release_log_finalizes_success(tmp_path: Path) -> None:
+    import os
+    from bot_squad_worker.deploy import reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-orphan.json"
+    f.write_text(json.dumps({"queue_id": "orphan", "target": "staging"}))
+    runs = _runs_dir(cfg, proj.slug)
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "orphan.log").write_text("building...\nrelease deployed: abc1234def5678\n")
+    old = time.time() - 100000  # runner long gone (>> grace)
+    os.utime(f, (old, old))
+
+    out = reconcile_finished_orphans(cfg, proj.slug)
+
+    assert [o["queue_id"] for o in out] == ["orphan"]
+    assert [o["rc"] for o in out] == [0]
+    assert (base / "processed" / "1700000000000-orphan.ok").exists()
+    assert not f.exists()
+
+
+def test_reconcile_norc_release_log_but_fresh_left_inflight(tmp_path: Path) -> None:
+    # A fresh no-.rc marker may still be a LIVE run mid-finalization (run_next
+    # records its .rc microseconds after the release line) — never finalize it
+    # out from under a live runner.
+    from bot_squad_worker.deploy import reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-fresh.json"
+    f.write_text(json.dumps({"queue_id": "fresh", "target": "staging"}))
+    runs = _runs_dir(cfg, proj.slug)
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "fresh.log").write_text("release deployed: abc1234\n")  # mtime≈now (fresh)
+
+    out = reconcile_finished_orphans(cfg, proj.slug)
+
+    assert out == []
+    assert f.exists()
+
+
+def test_reconcile_norc_no_release_log_left_inflight(tmp_path: Path) -> None:
+    # Stale no-.rc marker whose log has NO release line never demonstrably
+    # succeeded → NOT log-recovered (left for the age-fail reaper).
+    import os
+    from bot_squad_worker.deploy import reconcile_finished_orphans
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    base = _deploy_base(cfg, proj.slug)
+    proc = base / "processing"
+    proc.mkdir(parents=True, exist_ok=True)
+    f = proc / "1700000000000-building.json"
+    f.write_text(json.dumps({"queue_id": "building", "target": "staging"}))
+    runs = _runs_dir(cfg, proj.slug)
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "building.log").write_text("Step 5/12 : COPY web/ .\n")  # mid-build
+    old = time.time() - 100000
+    os.utime(f, (old, old))
+
+    out = reconcile_finished_orphans(cfg, proj.slug)
+
+    assert out == []
+    assert f.exists()

@@ -1151,12 +1151,34 @@ def reconcile_finished_orphans(cfg: "Config", slug: str) -> list[dict]:
     processing_dir = _processing_dir(cfg, slug)
     if not processing_dir.exists():
         return []
+    # T-0528: a marker can also be orphaned with NO .rc sentinel — when an
+    # EXTERNAL `systemctl restart bot-squad-worker` SIGTERMs run_next AFTER the
+    # recipe logged its success ("release deployed: <sha>") but BEFORE
+    # _record_run_rc. No happens-before ordering in run_next defends against an
+    # arbitrary outside SIGTERM, so recover such a marker from LOG EVIDENCE: its
+    # run-log carries the release line AND it has sat past the orphan grace (a
+    # live run records its .rc microseconds after that line, so a stale no-.rc
+    # marker that STILL shows success can only be the dead-runner orphan — never
+    # a build mid-finalization). This is the #10/#12 orphan the operator had to
+    # hand-finalize.
+    grace = int(os.environ.get("BOT_SQUAD_DEPLOY_ORPHAN_GRACE", "120"))
     reconciled: list[dict] = []
     for f in sorted(processing_dir.glob("*.json")):
         qid = _queue_id_of(f)
         rc = _read_run_rc(cfg, slug, qid)
+        recovered = False
         if rc is None:
-            continue  # no terminal rc → still in-flight, leave for the deploy / age-reaper
+            log_path = _runs_dir(cfg, slug) / f"{qid}.log"
+            try:
+                age = time.time() - f.stat().st_mtime
+            except OSError:
+                continue
+            if age >= grace and _parse_resolved_sha(log_path):
+                rc = 0
+                recovered = True
+                _record_run_rc(cfg, slug, qid, 0)  # persist for idempotency/audit
+            else:
+                continue  # genuinely in-flight (or crashed w/o success) → leave it
         try:
             payload = json.loads(f.read_text())
         except Exception:  # noqa: BLE001
@@ -1164,10 +1186,14 @@ def reconcile_finished_orphans(cfg: "Config", slug: str) -> list[dict]:
         _finish(cfg, slug, f, qid, rc=rc)
         log.warning(
             "deploy.reconcile_finished_orphans: %s reconciled orphaned job %s "
-            "(recorded rc=%d, target=%s) → processed/%s",
-            slug, qid, rc, payload.get("target"), ".ok" if rc == 0 else f".fail.{rc}",
+            "(%s rc=%d, target=%s) → processed/%s",
+            slug, qid, "log-recovered" if recovered else "recorded", rc,
+            payload.get("target"), ".ok" if rc == 0 else f".fail.{rc}",
         )
-        reconciled.append({"queue_id": qid, "rc": rc, "target": payload.get("target")})
+        reconciled.append({
+            "queue_id": qid, "rc": rc, "target": payload.get("target"),
+            "recovered": recovered,
+        })
     return reconciled
 
 

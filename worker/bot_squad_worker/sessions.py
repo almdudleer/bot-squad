@@ -2139,6 +2139,34 @@ def _is_live_holder(meta: dict) -> bool:
     return str(meta.get("status", "")).lower() in ("active", "paused")
 
 
+# T-0524: roles that ride the universal session lifecycle as always-on
+# COORDINATION (the operator + team-leads), NOT the disposable leaf-dev workload
+# the parallel cap is meant to govern. Counting them conflated the coordination
+# layer with leaf devs: a healthy org (1 operator + N TLs + a few devs)
+# false-fulled with almost no actual devs live, throttling the very spawn the
+# F2.7 ramp wanted (TL-A: refused at 19/19 then 12/6 with few real devs live).
+# ``prod-teamlead`` is a teamlead variant, so it is coordination too. ``qa`` /
+# ``user-conversation`` stay COUNTED — they are transient workers that burn a
+# Claude session, so excluding them would risk over-spawn (conservative: only
+# stop counting the few always-on coordinators).
+_COORDINATION_ROLES = frozenset({"operator", "teamlead", "prod-teamlead"})
+
+
+def _counts_against_dev_cap(meta: dict) -> bool:
+    """Whether a session consumes a slot of the LEAF-DEV parallel cap (T-0524).
+
+    True only when the session is BOTH a live holder (status active/paused, not
+    archived/suspended — so reaper-lag on dead/archived/suspended rows can never
+    inflate the count) AND a leaf-dev role (NOT an always-on coordinator). The
+    CALLER additionally requires the SID to map to a live claude pane
+    (``_live_agent_sids``) — the T-0397/T-0402 reconcile that drops a crashed
+    dev whose md still reads ``active``.
+    """
+    if not _is_live_holder(meta):
+        return False
+    return _role_of(meta) not in _COORDINATION_ROLES
+
+
 def _live_task_owner(
     data_dir: Path, slug: str, task_id: str, *, exclude_sid: str | None = None
 ) -> str | None:
@@ -2416,6 +2444,14 @@ def _count_live_sessions(cfg: Any) -> int:
     agents were live) and made ``_enforce_parallel_cap`` silently refuse spawns
     at a false ceiling. ``backoff._live_count`` delegates here, so the AIMD
     effective_limit and the caps meter (items 7/22) inherit the corrected count.
+
+    T-0524: the cap governs the disposable LEAF-DEV workload, so always-on
+    COORDINATION sessions (operator + team-leads, see ``_counts_against_dev_cap``
+    / ``_COORDINATION_ROLES``) are NOT counted. Conflating them with leaf devs
+    false-fulled a healthy org (1 operator + N TLs + a few devs) with almost no
+    actual devs live, throttling the F2.7 ramp. Combined with the live-holder +
+    live-pane gates above, the count reflects ACTUAL leaf-dev load — not the
+    coordination layer, and not reaper-lag on dead/archived/suspended rows.
     """
     live = _live_agent_sids()
     n = 0
@@ -2425,7 +2461,7 @@ def _count_live_sessions(cfg: Any) -> int:
             continue
         for md in sess_dir.glob("*.md"):
             meta = _read_session_metadata(md)
-            if meta and _is_live_holder(meta) and meta.get("sid", md.stem) in live:
+            if meta and _counts_against_dev_cap(meta) and meta.get("sid", md.stem) in live:
                 n += 1
     return n
 

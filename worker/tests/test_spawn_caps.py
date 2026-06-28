@@ -47,8 +47,10 @@ def _set_caps(cfg, *, max_parallel=0, max_tokens=0) -> None:
 _LIVE_AGENTS: set[str] = set()
 
 
-def _live(cfg, sid, *, status="active", archived=None, pane=True) -> None:
-    meta = {"sid": sid, "status": status, "window": "w", "task_id": "~",
+def _live(cfg, sid, *, status="active", archived=None, pane=True, window="w") -> None:
+    # window drives the derived role (T-0524): "w" → leaf-dev; an operator/TL
+    # window marker → an always-on coordinator that does NOT consume the dev cap.
+    meta = {"sid": sid, "status": status, "window": window, "task_id": "~",
             "initiative": "~"}
     if archived is not None:
         meta["archived"] = archived
@@ -85,6 +87,64 @@ def test_count_live_excludes_suspended_and_archived(tmp_path):
     _live(cfg, "S-u-c-p3", status="suspended")             # not counted
     _live(cfg, "S-u-d-p4", status="active", archived="true")  # not counted
     assert _count_live_sessions(cfg) == 2
+
+
+def test_count_live_excludes_coordinators(tmp_path):
+    """T-0524 (DoD a): the parallel cap governs the disposable LEAF-DEV workload,
+    not the always-on coordination layer. An operator + N team-leads ride the
+    universal lifecycle but must NOT consume the dev cap, so only leaf devs count."""
+    cfg = _make_cfg(tmp_path)
+    _live(cfg, "S-u-op-p1", window="p1-operator")        # coordinator → not counted
+    _live(cfg, "S-u-tl-p2", window="p1-TL")              # coordinator → not counted
+    _live(cfg, "S-u-tl-p3", window="p1_teamlead")        # coordinator → not counted
+    _live(cfg, "S-u-ptl-p4", window="p1-prod-tl")        # coordinator → not counted
+    _live(cfg, "S-u-dev-p5", window="feature-x")         # leaf dev → counted
+    _live(cfg, "S-u-dev-p6", window="w")                 # leaf dev → counted
+    assert _count_live_sessions(cfg) == 2
+
+
+def test_enforce_admits_coordinator_cluster_with_few_devs(tmp_path):
+    """T-0524 (DoD a, the headline false-full): a healthy org (1 operator + 3 TLs
+    + 1 dev) all live must NOT false-full at cap=5 — only the single leaf dev
+    counts (1 < 5), so the F2.7 ramp can keep spawning devs."""
+    cfg = _make_cfg(tmp_path)
+    _set_caps(cfg, max_parallel=5)
+    _live(cfg, "S-u-op-p1", window="p1-operator")
+    _live(cfg, "S-u-tl-p2", window="p1-TL")
+    _live(cfg, "S-u-tl-p3", window="p1-TL")
+    _live(cfg, "S-u-tl-p4", window="p1-TL")
+    _live(cfg, "S-u-dev-p5", window="feature-x")
+    _enforce_parallel_cap(cfg)  # 1 leaf dev < 5 → must NOT raise
+
+
+def test_count_live_archived_churn_does_not_false_full(tmp_path):
+    """T-0524 (DoD b): under rapid spawn/exit churn the reaper lags, so
+    archived/suspended/dead dev mds linger. They must NOT inflate the count at
+    enforcement time — only LIVE-holder leaf devs (live pane) count, regardless
+    of reaper lag."""
+    cfg = _make_cfg(tmp_path)
+    _set_caps(cfg, max_parallel=3)
+    _live(cfg, "S-u-live-p1", window="feature-a")                       # counts
+    for i in range(6):  # churn of dead/archived/suspended dev rows the reaper hasn't reaped
+        _live(cfg, f"S-u-arch-{i}", window="feature-b", archived="true")
+    _live(cfg, "S-u-susp-p9", window="feature-c", status="suspended")   # not counted
+    _live(cfg, "S-u-dead-p10", window="feature-d", pane=False)          # dead pane → phantom
+    assert _count_live_sessions(cfg) == 1
+    _enforce_parallel_cap(cfg)  # 1 live leaf dev < 3 → must NOT raise
+
+
+def test_hard_ceiling_holds_for_leaf_devs(tmp_path):
+    """T-0524 (DoD c): the hard ceiling still bounds the LEAF-DEV load — no
+    over-spawn regression. At cap=2 with 2 live devs (plus uncounted
+    coordinators), admission still refuses."""
+    cfg = _make_cfg(tmp_path)
+    _set_caps(cfg, max_parallel=2)
+    _live(cfg, "S-u-op-p1", window="p1-operator")   # uncounted
+    _live(cfg, "S-u-tl-p2", window="p1-TL")         # uncounted
+    _live(cfg, "S-u-dev-p3", window="feature-x")    # counts
+    _live(cfg, "S-u-dev-p4", window="feature-y")    # counts → 2/2
+    with pytest.raises(ActionError, match="capacity reached"):
+        _enforce_parallel_cap(cfg)
 
 
 def test_count_live_drops_phantom_active_without_pane(tmp_path):

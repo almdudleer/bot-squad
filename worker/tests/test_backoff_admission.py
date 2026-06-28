@@ -36,8 +36,8 @@ def _make_cfg(tmp_path: Path, cap: int = 15) -> types.SimpleNamespace:
 _LIVE_AGENTS: set[str] = set()
 
 
-def _live(cfg, sid, *, pane=True) -> None:
-    meta = {"sid": sid, "status": "active", "window": "w", "task_id": "~",
+def _live(cfg, sid, *, pane=True, window="w") -> None:
+    meta = {"sid": sid, "status": "active", "window": window, "task_id": "~",
             "initiative": "~"}
     _write_session_metadata(cfg.data_dir / "p1" / "sessions" / f"{sid}.md", meta)
     if pane:
@@ -80,6 +80,20 @@ def test_under_effective_allows(tmp_path):
     for i in range(3):  # 3 < 5
         _live(cfg, f"S-u-x-p{i}")
     _enforce_parallel_cap(cfg)  # no raise
+
+
+def test_backoff_effective_excludes_coordinators(tmp_path):
+    """T-0524: the AIMD effective-concurrency count also governs LEAF-DEV load.
+    With effective depressed to 2, a cluster of 1 operator + 2 TLs + 1 dev must
+    NOT false-full — only the single leaf dev counts (1 < 2 effective)."""
+    cfg = _make_cfg(tmp_path, cap=15)
+    B.save_state(cfg, {"effective_limit": 2, "last_pressure_at": 0,
+                       "last_ramp_at": 0, "reason": "pressure"})
+    _live(cfg, "S-u-op-p1", window="p1-operator")
+    _live(cfg, "S-u-tl-p2", window="p1-TL")
+    _live(cfg, "S-u-tl-p3", window="p1-TL")
+    _live(cfg, "S-u-dev-p4", window="feature-x")
+    _enforce_parallel_cap(cfg)  # 1 leaf dev < 2 effective → no raise
 
 
 def test_kill_switch_restores_cap_only(tmp_path, monkeypatch):

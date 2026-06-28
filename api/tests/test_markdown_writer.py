@@ -177,6 +177,22 @@ def test_merge_task_update_clears_initiative_with_none(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# T-0480 — `kind` is a first-class task field (kind: initiative)
+# ---------------------------------------------------------------------------
+
+def test_merge_task_update_accepts_kind(tmp_path: Path):
+    """T-0480: an initiative is a task marked `kind: initiative`; the field is
+    patchable through the shared writer like any other linkage field."""
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0070-kind.md"
+    write_task(p, {"id": "T-0070", "title": "X", "status": "open"}, "body\n")
+    merge_task_update(p, {"kind": "initiative"})
+    task = parse_task(p)
+    assert task["kind"] == "initiative"
+
+
+# ---------------------------------------------------------------------------
 # T-0105 — session_history is allowed through merge_task_update
 # ---------------------------------------------------------------------------
 

@@ -50,6 +50,9 @@ def task_lock(path: Path):
 _ALLOWED_UPDATE_KEYS = frozenset({
     "title", "status", "body", "priority",
     "initiative", "parent_task", "blocked_by",
+    # T-0480: `kind` marks an initiative-task (`kind: initiative`); absent ==
+    # a normal task. The explicit mark behind initiative-as-special-task.
+    "kind",
     "session_history",
     # T-0172: ticket→doc mentions (list of D-NNNN). Kept in sync with each
     # doc's `related_tickets` by routes_docs link/unlink.

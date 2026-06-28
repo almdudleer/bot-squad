@@ -129,6 +129,49 @@ def test_create_and_patch_planned_status(tmp_bot_squad: Path, monkeypatch):
         assert r.json()["status"] == "planned"
 
 
+# ---------------------------------------------------------------------------
+# T-0480 — `kind: initiative` is settable on create + patch
+# ---------------------------------------------------------------------------
+
+def test_create_task_with_kind_initiative(tmp_bot_squad: Path, monkeypatch):
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/backlog",
+            json={"title": "An initiative", "kind": "initiative"},
+        )
+    assert r.status_code == 200
+    assert r.json()["kind"] == "initiative"
+
+
+def test_patch_task_set_kind_initiative(tmp_bot_squad: Path, monkeypatch):
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/backlog",
+            json={"title": "Promote me"},
+        )
+        tid = r.json()["id"]
+        r = client.patch(
+            f"/api/projects/test-project/backlog/{tid}",
+            json={"kind": "initiative"},
+        )
+        assert r.status_code == 200
+        assert r.json()["kind"] == "initiative"
+
+
+def test_patch_task_invalid_kind_rejected(tmp_bot_squad: Path, monkeypatch):
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.post(
+            "/api/projects/test-project/backlog",
+            json={"title": "X"},
+        )
+        tid = r.json()["id"]
+        r = client.patch(
+            f"/api/projects/test-project/backlog/{tid}",
+            json={"kind": "bogus"},
+        )
+        assert r.status_code == 400
+
+
 def test_create_task_requires_auth(tmp_bot_squad: Path, monkeypatch):
     with _anon_client(tmp_bot_squad, monkeypatch) as client:
         r = client.post(

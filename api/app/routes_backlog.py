@@ -54,6 +54,11 @@ _DOC_ID_RE = re.compile(r"^D-\d{4,}$")  # T-0371
 # allowed (callers must pass null to clear, not empty).
 _INITIATIVE_BASENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.md$")
 
+# T-0480: `kind` marks an initiative-task. Absent == a normal task; we don't
+# over-model — only these two values are accepted (the design reserves the
+# enum but ships just task|initiative).
+_VALID_KINDS = frozenset({"task", "initiative"})
+
 
 def _backlog_dir(request: Request, slug: str) -> Path:
     cfg = request.app.state.api_config
@@ -248,6 +253,10 @@ def create_task(
     status = payload.get("status", "open")
     if status not in _VALID_STATUSES:
         raise HTTPException(status_code=400, detail=_invalid_status_detail(status))
+    # T-0480: optional `kind` (task|initiative). Absent == normal task.
+    kind = payload.get("kind")
+    if kind is not None and kind not in _VALID_KINDS:
+        raise HTTPException(status_code=400, detail=f"invalid kind: {kind!r} — must be one of {sorted(_VALID_KINDS)}")
     # Phase 7: prefer `verbatim_request` (composed into canonical body).
     # Fall back to legacy `body` (stored as-is — caller knows the convention).
     verbatim_request = payload.get("verbatim_request")
@@ -293,6 +302,8 @@ def create_task(
         # admin-only when filtering eventually lands. None gets
         # dropped by write_task — only emit owner: if known.
         "owner": user.get("username") or None,
+        # T-0480: None drops out via write_task — only stamp kind when set.
+        "kind": kind,
     }
     write_task(path, fm, body)
 
@@ -313,6 +324,9 @@ def patch_task(
         raise HTTPException(status_code=400, detail=_invalid_status_detail(payload["status"]))
     if "title" in payload and not (payload.get("title") or "").strip():
         raise HTTPException(status_code=400, detail="title must not be empty")
+    # T-0480: `kind` (task|initiative). null clears it (write_task drops None).
+    if "kind" in payload and payload["kind"] is not None and payload["kind"] not in _VALID_KINDS:
+        raise HTTPException(status_code=400, detail=f"invalid kind: {payload['kind']!r} — must be one of {sorted(_VALID_KINDS)}")
 
     # T-0038: validate linkage fields if provided. `null` clears the field
     # (write_task drops None entries). String must look like a vision/
@@ -355,7 +369,7 @@ def patch_task(
     backlog_dir = _backlog_dir(request, slug)
     path = _find_task_file(backlog_dir, task_id)
 
-    allowed = {"title", "status"} | _LINKAGE_PATCH_KEYS
+    allowed = {"title", "status", "kind"} | _LINKAGE_PATCH_KEYS
     updates = {k: v for k, v in payload.items() if k in allowed}
     body = payload.get("body")
     if body is not None:

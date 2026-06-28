@@ -95,6 +95,88 @@ def test_vision_non_initiative_tasks_not_listed(tmp_bot_squad: Path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# T-0480 Phase-3b-1: writers operate on the kind:initiative TASK (status/body),
+# not the legacy vision file — so they survive 3b-2 archival.
+# ---------------------------------------------------------------------------
+import json as _json
+
+
+def _seed_initiative(tmp_bot_squad: Path, tid: str, stem: str, status: str = "open",
+                     body: str = "init body\n") -> Path:
+    """A kind:initiative task + the alias index entry the resolver needs."""
+    proj = tmp_bot_squad / "data" / "test-project"
+    backlog = proj / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    p = backlog / f"{tid}-{stem}.md"
+    p.write_text(
+        f"---\nid: {tid}\ntitle: \"{stem}\"\nstatus: {status}\n"
+        f"kind: initiative\nprovenance: \"T-0480\"\naka: [{stem}]\n---\n\n{body}",
+        encoding="utf-8")
+    vision = proj / "vision"
+    vision.mkdir(parents=True, exist_ok=True)
+    (vision / "initiative_aliases.json").write_text(_json.dumps({stem: tid}), encoding="utf-8")
+    return p
+
+
+def _status_of(path: Path) -> str:
+    for line in path.read_text().splitlines():
+        if line.startswith("status:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def test_activate_sets_task_in_progress(tmp_bot_squad: Path, monkeypatch):
+    task = _seed_initiative(tmp_bot_squad, "T-0556", "ui-polish", status="open")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/vision/active_initiatives/ui-polish.md")
+    assert r.status_code == 200
+    assert _status_of(task) == "in_progress"
+
+
+def test_finished_sets_task_closed(tmp_bot_squad: Path, monkeypatch):
+    task = _seed_initiative(tmp_bot_squad, "T-0556", "ui-polish", status="in_progress")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/vision/finished_initiatives/ui-polish.md")
+    assert r.status_code == 200
+    assert _status_of(task) == "closed"
+
+
+def test_deactivate_sets_task_open(tmp_bot_squad: Path, monkeypatch):
+    task = _seed_initiative(tmp_bot_squad, "T-0556", "ui-polish", status="in_progress")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.delete("/api/projects/test-project/vision/active_initiatives/ui-polish.md")
+    assert r.status_code == 200
+    assert _status_of(task) == "open"
+
+
+def test_put_initiative_updates_task_body_not_file(tmp_bot_squad: Path, monkeypatch):
+    task = _seed_initiative(tmp_bot_squad, "T-0556", "ui-polish", body="old body\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.put("/api/projects/test-project/vision/initiatives/ui-polish.md",
+                  json={"content": "NEW initiative body\n"})
+    assert r.status_code == 200
+    assert "NEW initiative body" in task.read_text()
+    # no legacy file was created
+    assert not (tmp_bot_squad / "data" / "test-project" / "vision" / "initiatives" / "ui-polish.md").exists()
+
+
+def test_post_creates_initiative_task(tmp_bot_squad: Path, monkeypatch):
+    (tmp_bot_squad / "data" / "test-project" / "backlog").mkdir(parents=True, exist_ok=True)
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.post("/api/projects/test-project/vision",
+                   json={"kind": "initiative", "name": "Shiny New Initiative", "content": "# Shiny\n"})
+    assert r.status_code == 200
+    tid = r.json().get("task_id")
+    assert tid and tid.startswith("T-")
+    created = list((tmp_bot_squad / "data" / "test-project" / "backlog").glob(f"{tid}-*.md"))
+    assert len(created) == 1
+    txt = created[0].read_text()
+    assert "kind: initiative" in txt
+    # NOT written as a legacy vision file
+    assert not (tmp_bot_squad / "data" / "test-project" / "vision" / "initiatives").exists()
+
+
+# ---------------------------------------------------------------------------
 # Existing read test
 # ---------------------------------------------------------------------------
 
@@ -222,47 +304,47 @@ def test_put_vision_requires_auth(tmp_bot_squad: Path, monkeypatch):
 # POST /api/projects/{slug}/vision — new initiative
 # ---------------------------------------------------------------------------
 
-def test_post_initiative_creates_file(tmp_bot_squad: Path, monkeypatch):
-    vision = tmp_bot_squad / "data" / "test-project" / "vision"
+def test_post_initiative_creates_task(tmp_bot_squad: Path, monkeypatch):
+    """T-0480 3b-1: creating an initiative mints a kind:initiative TASK, not a
+    vision file."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
     with _logged_in(tmp_bot_squad, monkeypatch) as c:
         r = c.post(
             "/api/projects/test-project/vision",
             json={"kind": "initiative", "name": "My Initiative", "content": "# My Initiative\n"},
         )
     assert r.status_code == 200
-    data = r.json()
-    assert data["ok"] is True
-    assert "name" in data
-    # File should exist
-    init_dir = vision / "initiatives"
-    assert init_dir.exists()
-    assert any(init_dir.glob("*.md"))
+    tid = r.json()["task_id"]
+    created = list(backlog.glob(f"{tid}-*.md"))
+    assert len(created) == 1 and "kind: initiative" in created[0].read_text()
+    # NOT a legacy vision file
+    assert not (tmp_bot_squad / "data" / "test-project" / "vision" / "initiatives").exists()
 
 
 def test_post_initiative_default_content(tmp_bot_squad: Path, monkeypatch):
-    vision = tmp_bot_squad / "data" / "test-project" / "vision"
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
     with _logged_in(tmp_bot_squad, monkeypatch) as c:
         r = c.post(
             "/api/projects/test-project/vision",
             json={"kind": "initiative", "name": "Auto Content"},
         )
     assert r.status_code == 200
-    init_dir = vision / "initiatives"
-    files = list(init_dir.glob("*.md"))
-    assert len(files) == 1
-    assert "Auto Content" in files[0].read_text()
+    tid = r.json()["task_id"]
+    body = list(backlog.glob(f"{tid}-*.md"))[0].read_text()
+    assert "Auto Content" in body  # default content `# {name}` lands in the task body
 
 
-def test_post_initiative_409_on_collision(tmp_bot_squad: Path, monkeypatch):
-    vision = tmp_bot_squad / "data" / "test-project" / "vision"
-    (vision / "initiatives").mkdir()
-    (vision / "initiatives" / "my-init.md").write_text("# existing\n")
+def test_post_initiative_no_collision_distinct_ids(tmp_bot_squad: Path, monkeypatch):
+    """Same-named initiatives no longer 409 — each mints a distinct task id."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
     with _logged_in(tmp_bot_squad, monkeypatch) as c:
-        r = c.post(
-            "/api/projects/test-project/vision",
-            json={"kind": "initiative", "name": "My Init"},
-        )
-    assert r.status_code == 409
+        r1 = c.post("/api/projects/test-project/vision", json={"kind": "initiative", "name": "My Init"})
+        r2 = c.post("/api/projects/test-project/vision", json={"kind": "initiative", "name": "My Init"})
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["task_id"] != r2.json()["task_id"]
 
 
 def test_post_initiative_requires_auth(tmp_bot_squad: Path, monkeypatch):

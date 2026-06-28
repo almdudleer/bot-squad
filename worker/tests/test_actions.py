@@ -2059,20 +2059,24 @@ def test_flow_new_rejects_bad_uc_id(tmp_path, tmp_config_dir, monkeypatch):
         })
 
 
-def test_initiative_new_two_digit_pad(tmp_path, tmp_config_dir, monkeypatch):
+def test_initiative_new_mints_kind_initiative_task(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0480 3b-1: initiative_new mints a kind:initiative TASK (in backlog),
+    not a legacy vision/initiatives file — initiatives ARE tasks now."""
     import bot_squad_worker.actions as A
 
     proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
     out = A.dispatch("initiative_new", {"slug": "test-project", "name": "Billing Revamp"})
-    assert out["id"] == "INI-01"
+    assert out["id"].startswith("T-")          # a real task id, not INI-NN
+    assert out["kind"] == "initiative"
     p = Path(out["file_path"])
-    assert p == proj / "vision" / "initiatives" / "INI-01-billing-revamp.md"
+    assert p.parent == proj / "backlog"        # lands in the task store
     body = p.read_text()
-    assert "id: INI-01" in body
-    assert "name: " in body
-    # T-0421: no vestigial status: frontmatter — lifecycle is the
-    # active_/finished_initiatives sidecars, not a per-file status field.
-    assert "status:" not in body
+    assert f"id: {out['id']}" in body
+    assert "kind: initiative" in body
+    assert "status: open" in body
+    assert "provenance:" in body               # post-cutoff task → needs provenance
+    # NOT written as a legacy vision file
+    assert not (proj / "vision" / "initiatives").exists()
 
 
 def test_doc_new_self_heals_against_manual_file(tmp_path, tmp_config_dir, monkeypatch):

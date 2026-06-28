@@ -226,6 +226,46 @@ def _normalize_initiative_basename(name: str) -> str:
     return name
 
 
+def _find_initiative_task(request: Request, slug: str, name: str):
+    """T-0480 Phase-3b-1: resolve an initiative basename to its kind:initiative
+    backlog task file (so writers act on the TASK, surviving 3b-2 archival), or
+    None if it isn't a migrated/created initiative. Tries the alias index first,
+    then falls back to an aka scan (covers tasks not yet in the index, e.g.
+    UI-created initiatives)."""
+    from app.initiative_resolver import normalize_ref, resolve_initiative_ref
+    from app.markdown_parser import ParseError, parse_task
+
+    cfg = request.app.state.api_config
+    backlog = cfg.project_data_dir(slug) / "backlog"
+    tid = resolve_initiative_ref(cfg.data_dir, slug, name)
+    if tid:
+        for f in sorted(backlog.glob(f"{tid}-*.md")):
+            return f
+        direct = backlog / f"{tid}.md"
+        if direct.exists():
+            return direct
+    want = normalize_ref(name)
+    if backlog.is_dir():
+        for f in sorted(backlog.glob("T-*.md")):
+            try:
+                t = parse_task(f)
+            except (ParseError, OSError):
+                continue
+            if t.get("kind") != "initiative":
+                continue
+            aka = t.get("aka") or []
+            if isinstance(aka, str):
+                aka = [aka]
+            if want in {normalize_ref(a) for a in aka}:
+                return f
+    return None
+
+
+def _set_initiative_status(task_path, status: str) -> None:
+    from app.markdown_writer import merge_task_update
+    merge_task_update(task_path, {"status": status})
+
+
 @router.post("/active_initiatives/{name}")
 def activate_initiative(
     slug: str,
@@ -233,8 +273,13 @@ def activate_initiative(
     request: Request,
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
-    """Add an initiative to the active set."""
+    """Mark an initiative active. T-0480 3b-1: active == task status in_progress."""
     name = _normalize_initiative_basename(name)
+    task = _find_initiative_task(request, slug, name)
+    if task is not None:
+        _set_initiative_status(task, "in_progress")
+        return {"ok": True, "active": [name]}
+    # legacy fallback: a non-migrated dir initiative still uses the sidecar
     vision_dir = _vision_dir(request, slug)
     target = vision_dir / "initiatives" / name
     if not target.exists():
@@ -252,8 +297,12 @@ def deactivate_initiative(
     request: Request,
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
-    """Remove an initiative from the active set."""
+    """Deactivate an initiative. T-0480 3b-1: active→open on the task."""
     name = _normalize_initiative_basename(name)
+    task = _find_initiative_task(request, slug, name)
+    if task is not None:
+        _set_initiative_status(task, "open")
+        return {"ok": True, "active": []}
     vision_dir = _vision_dir(request, slug)
     active = _read_active_initiatives(vision_dir)
     active.discard(name)
@@ -268,8 +317,12 @@ def mark_initiative_finished(
     request: Request,
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
-    """Mark an initiative finished. Auto-deactivates if it was active."""
+    """Mark an initiative finished. T-0480 3b-1: finished == task status closed."""
     name = _normalize_initiative_basename(name)
+    task = _find_initiative_task(request, slug, name)
+    if task is not None:
+        _set_initiative_status(task, "closed")
+        return {"ok": True, "finished": [name], "active": []}
     vision_dir = _vision_dir(request, slug)
     target = vision_dir / "initiatives" / name
     if not target.exists():
@@ -291,8 +344,12 @@ def unmark_initiative_finished(
     request: Request,
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
-    """Reopen a finished initiative (back to the 'open' state). Doesn't auto-activate."""
+    """Reopen a finished initiative (back to 'open'). T-0480 3b-1: closed→open."""
     name = _normalize_initiative_basename(name)
+    task = _find_initiative_task(request, slug, name)
+    if task is not None:
+        _set_initiative_status(task, "open")
+        return {"ok": True, "finished": []}
     vision_dir = _vision_dir(request, slug)
     finished = _read_finished_initiatives(vision_dir)
     finished.discard(name)
@@ -317,6 +374,10 @@ def put_active_initiative(
         _write_active_initiatives(vision_dir, set())
         return {"ok": True, "active": []}
     name = _normalize_initiative_basename(name)
+    task = _find_initiative_task(request, slug, name)
+    if task is not None:
+        _set_initiative_status(task, "in_progress")
+        return {"ok": True, "active": [name]}
     target = vision_dir / "initiatives" / name
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"initiative not found: {name}")
@@ -335,6 +396,15 @@ def put_vision(
     _validate_vision_name(name)
     content = payload.get("content") or ""
     _validate_content(content)
+
+    # T-0480 3b-1: editing an initiative's content writes its TASK body, not the
+    # legacy file (so it survives 3b-2 archival).
+    if name.startswith("initiatives/"):
+        task = _find_initiative_task(request, slug, name[len("initiatives/"):])
+        if task is not None:
+            from app.markdown_writer import merge_task_update
+            merge_task_update(task, {}, body=content)
+            return {"ok": True}
 
     vision_dir = _vision_dir(request, slug)
     if name == _AGENT_INSTRUCTIONS_FILENAME:
@@ -374,18 +444,30 @@ def post_vision(
 
     _validate_content(content)
 
-    vision_dir = _vision_dir(request, slug)
-    initiatives_dir = vision_dir / "initiatives"
-    initiatives_dir.mkdir(parents=True, exist_ok=True)
+    # T-0480 3b-1: a new initiative is a kind:initiative TASK, not a vision file.
+    from datetime import datetime, timezone
 
-    filename = slugify(name) + ".md"
-    path = initiatives_dir / filename
+    from app import idalloc
+    from app.markdown_writer import write_task
 
-    if path.exists():
-        raise HTTPException(status_code=409, detail=f"initiative already exists: {filename}")
-
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.rename(tmp, path)
-
-    return {"ok": True, "name": f"initiatives/{filename}"}
+    cfg = request.app.state.api_config
+    stem = slugify(name)
+    tid = idalloc.allocate_id(cfg.data_dir, slug, "task")
+    backlog = cfg.project_data_dir(slug) / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fm = {
+        "id": tid,
+        "title": name,
+        "status": "open",
+        "kind": "initiative",
+        "priority": 0,
+        "created": now,
+        # a human creating an initiative in the UI IS the stakeholder directing it
+        "provenance": f"stakeholder:{now[:10]}",
+        "aka": [stem],
+        "owner": user.get("username") or None,
+    }
+    path = backlog / f"{tid}-{stem}.md"
+    write_task(path, fm, content)
+    return {"ok": True, "task_id": tid, "name": f"initiatives/{stem}.md"}

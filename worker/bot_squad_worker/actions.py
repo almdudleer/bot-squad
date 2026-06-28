@@ -2213,7 +2213,7 @@ def _action_flow_new(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _INITIATIVE_NEW_REQUIRED = {"slug", "name"}
-_INITIATIVE_NEW_ALLOWED = _INITIATIVE_NEW_REQUIRED
+_INITIATIVE_NEW_ALLOWED = _INITIATIVE_NEW_REQUIRED | {"provenance"}
 
 
 def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
@@ -2233,22 +2233,42 @@ def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
     )
     name = _require_str(params, "name", "initiative_new")
 
-    init_dir = cfg.data_dir / slug / "vision" / "initiatives"
-    init_dir.mkdir(parents=True, exist_ok=True)
-    new_id = idalloc.allocate_id(cfg.data_dir, slug, "initiative")
-    file_path = init_dir / f"{new_id}-{_slugify_title(name)}.md"
+    # T-0480 3b-1: an initiative IS a task marked kind:initiative — mint a
+    # kind:initiative TASK in the backlog, not a legacy vision/initiatives file.
+    # Provenance: an initiative is stakeholder-directed; accept an explicit
+    # token, else stamp stakeholder:<today> (post-cutoff task → lint needs one).
+    prov = params.get("provenance")
+    prov = str(prov).strip() if prov is not None else ""
+    if prov:
+        from bot_squad_worker import provenance as _prov
+        if not _prov.provenance_valid(prov):
+            raise ActionError(
+                f"initiative_new: invalid provenance {prov!r} — allowed: {_prov.ALLOWED_HELP}"
+            )
 
-    # T-0421: no status: key — initiative lifecycle is the
-    # active_/finished_initiatives sidecar sets (vision/), not a per-file
-    # field nobody reads (it only drifted from the sidecars).
+    ts = _now_iso()
+    if not prov:
+        prov = f"stakeholder:{ts[:10]}"
+
+    backlog_dir = cfg.data_dir / slug / "backlog"
+    backlog_dir.mkdir(parents=True, exist_ok=True)
+    new_id = idalloc.allocate_id(cfg.data_dir, slug, "task")
+    stem = _slugify_title(name)
+    file_path = backlog_dir / f"{new_id}-{stem}.md"
+
     fm = "\n".join([
         f"id: {new_id}",
-        f"name: {_yaml_quote(name)}",
-        f"created: {_now_iso()}",
+        f"title: {_yaml_quote(name)}",
+        "status: open",
+        "kind: initiative",
+        "priority: 0",
+        f"created: {ts}",
+        f"provenance: {prov}",
+        f"aka: [{stem}]",
     ])
     content = f"---\n{fm}\n---\n\n# {name}\n\n(filed via initiative_new)\n"
     _atomic_write_new(file_path, content)
-    return {"ok": True, "id": new_id, "file_path": str(file_path)}
+    return {"ok": True, "id": new_id, "kind": "initiative", "file_path": str(file_path)}
 
 
 _PEER_INBOX_WAIT_REQUIRED = {"slug", "sid", "timeout"}

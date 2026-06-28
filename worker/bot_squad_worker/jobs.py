@@ -535,6 +535,26 @@ def graceful_exit_tick(cfg: Config) -> None:
         log.exception("graceful_exit_tick error")
 
 
+def input_flush_tick(cfg: Config) -> None:
+    """T-0469 / M1-F1.6: deferred-delivery pass for the input multiplexer.
+
+    Re-attempts delivery of any per-sid input queue that was DEFERRED because
+    the composer was busy (user mid-typing or Claude mid-generation) at write
+    time. Once the composer frees up, this drains + delivers the batch without
+    needing a fresh write. Idempotent — an empty or still-busy queue is a no-op
+    / re-deferred. No-op under ``BOT_SQUAD_INPUT_MUX=0``. Self-contained; errors
+    are swallowed so one bad queue never kills the sweep.
+    """
+    import os
+    if os.environ.get("BOT_SQUAD_INPUT_MUX") == "0":
+        return
+    from bot_squad_worker import input_mux as _im
+    try:
+        _im.flush_pending(cfg.data_dir)
+    except Exception:
+        log.exception("input_flush_tick error")
+
+
 def drift_check_tick(cfg: Config) -> None:
     """T-0149: per-project drift-enforcement pass.
 

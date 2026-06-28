@@ -1868,6 +1868,30 @@ def cmd_write(args) -> None:
     print(f"wrote to {args.sid}{suffix}")
 
 
+def cmd_send_input(args) -> None:
+    """T-0469 (M1/F1.6): multiplexed, queue-backed write to a session's channel.
+
+    The agent-facing input channel. Unlike ``bsq write`` (the raw inject_input
+    primitive), this QUEUES the write (never rejected), COALESCES concurrent
+    callers into one batched delivery with author captions, and DEFERS delivery
+    while the user is live-typing / Claude is mid-generation — so other inputs
+    never mix with the user's composer text. Agents call this instead of raw
+    send-keys. The author caption defaults to THIS session's SID."""
+    author = args.author or my_sid() or "system"
+    res = post("send_input", {"sid": args.sid, "text": args.text,
+                              "author": author})
+    delivered = res.get("delivered", 0)
+    queued = res.get("queued")
+    if delivered:
+        print(f"sent to {args.sid}: {delivered} message(s) delivered "
+              f"(author={author})")
+    elif res.get("deferred"):
+        print(f"queued for {args.sid} (depth {queued}, author={author}) — "
+              f"deferred: {res.get('reason')} (delivers when composer is ready)")
+    else:
+        print(f"queued for {args.sid} (depth {queued}, author={author})")
+
+
 def cmd_user_session(args) -> None:
     """T-0508 (M11/F11.1, AP#3): launch (or reuse) a dedicated user session.
 
@@ -3810,6 +3834,18 @@ def build_parser() -> argparse.ArgumentParser:
     wr.add_argument("sid", help="target session SID to write into")
     wr.add_argument("text", help="text to inject into the target composer")
     wr.set_defaults(func=cmd_write)
+
+    # send-input (T-0469, M1/F1.6) — multiplexed, queue-backed input channel
+    si = sub.add_parser(
+        "send-input",
+        help="multiplexed write to a session: QUEUE the input (never rejected), "
+             "coalesce concurrent writes into one captioned batch, and defer "
+             "while the user is live-typing — agents use this, not raw send-keys")
+    si.add_argument("sid", help="target session SID to send input to")
+    si.add_argument("text", help="text to enqueue for the target's composer")
+    si.add_argument("--author", default=None,
+                    help="caption for who wrote this (default: this session's SID)")
+    si.set_defaults(func=cmd_send_input)
 
     # user-session (T-0508, M11/F11.1 AP#3) — launch/reuse a dedicated user session
     us = sub.add_parser(

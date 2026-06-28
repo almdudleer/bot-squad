@@ -59,6 +59,8 @@ def test_registry_lists_only_allowed_actions():
         # T-0478 (M2/F2.4): user-conversation intake-session ensure/spawn.
         "ensure_user_conversation",
         "scheduler_state", "inject_input",
+        # T-0469 (M1/F1.6): multiplexed queue-backed input channel.
+        "send_input",
         # T-0153: autopilot — prompt-driven, time-boxed autonomous runs.
         "autopilot_start", "autopilot_stop", "autopilot_status",
         "peer_send", "peer_inbox_read", "peer_inbox_wait",

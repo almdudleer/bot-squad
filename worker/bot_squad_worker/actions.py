@@ -1120,6 +1120,68 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# send_input action (T-0469, M1/F1.6) — multiplexed, queue-backed input
+# ---------------------------------------------------------------------------
+#
+# The agent-facing channel. Where ``inject_input`` is the raw primitive (one
+# Enter per line, used internally for the check-mail nudge / /compact), agents
+# write to a session via ``send_input``: writes are QUEUED (never rejected),
+# COALESCED across concurrent callers, delivered BATCHED with author captions,
+# and DEFERRED whenever the composer is busy so live user-typed text is never
+# clobbered (T-0469 / voice-10 / SOURCE-VERBATIM Part A).
+
+_SEND_INPUT_REQUIRED = {"sid", "text"}
+_SEND_INPUT_ALLOWED = _SEND_INPUT_REQUIRED | {"author"}
+
+
+def _send_input_pane_lookup(sid: str) -> str | None:
+    """Resolve a live pane_id for ``sid`` the same way inject_input does.
+
+    (list_panes + compute_sid — the per-user-worker tmux view, not autocompact's
+    coordinator-side live_pane_map.)
+    """
+    from bot_squad_worker import sessions as S
+    user = S._get_current_user()
+    for p in S.list_panes():
+        if S.compute_sid(user, p.window, p.pane_id) == sid:
+            return p.pane_id
+    return None
+
+
+def _action_send_input(params: dict[str, Any]) -> dict[str, Any]:
+    """Enqueue input to a target session, then flush (coalesced + captioned).
+
+    Required params: sid, text. Optional: author (caption; default "system").
+    Returns: {ok, queued, delivered, deferred, reason}. A concurrent write is
+    never rejected — it queues and is delivered on this or a later flush.
+    """
+    extra = set(params) - _SEND_INPUT_ALLOWED
+    if extra:
+        raise ActionError(f"send_input got unexpected params: {sorted(extra)}")
+    missing = _SEND_INPUT_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"send_input missing required params: {sorted(missing)}")
+
+    sid = params["sid"]
+    text = params["text"]
+    if not text.strip():
+        raise ActionError("send_input: empty text")
+    author = params.get("author") or "system"
+
+    from bot_squad_worker import input_mux
+    cfg = _get_config()
+    queued = input_mux.enqueue(cfg.data_dir, sid, text, author)
+    res = input_mux.flush(cfg.data_dir, sid, pane_lookup=_send_input_pane_lookup)
+    return {
+        "ok": True,
+        "queued": queued,
+        "delivered": res.get("delivered", 0),
+        "deferred": bool(res.get("deferred")),
+        "reason": res.get("reason"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Autopilot actions (T-0153) — prompt-driven, time-boxed autonomous runs
 # ---------------------------------------------------------------------------
 
@@ -2973,6 +3035,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "ensure_user_conversation": _action_ensure_user_conversation,
     "scheduler_state": _action_scheduler_state,
     "inject_input": _action_inject_input,
+    # T-0469 (M1/F1.6): multiplexed queue-backed input (coalesce + caption +
+    # defer-on-busy). Agents write via `bsq send-input`, not raw send-keys.
+    "send_input": _action_send_input,
     # T-0153: autopilot — prompt-driven, time-boxed autonomous runs per target.
     "autopilot_start": _action_autopilot_start,
     "autopilot_stop": _action_autopilot_stop,
@@ -3080,6 +3145,9 @@ ACTION_MODES: dict[str, str] = {
     "ensure_user_conversation": "tmux_only",
     "scheduler_state": "coordinator_only",
     "inject_input": "tmux_only",
+    # T-0469: enqueues + delivers to a LOCAL pane (list_panes/compute_sid), same
+    # per-user tmux view as inject_input → tmux_only.
+    "send_input": "tmux_only",
     # T-0153: autopilot reads/writes coordinator state (peer bus, spawn, tg,
     # scheduler-coupled watchdog), so coordinator-only like the rest.
     "autopilot_start": "coordinator_only",

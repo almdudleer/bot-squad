@@ -26,6 +26,7 @@ from bot_squad_worker.jobs import (
     graceful_exit_tick,
     heartbeat,
     idle_timeout_tick,
+    input_flush_tick,
     oauth_refresh,
     telemetry_tick,
     tg_listener_tick,
@@ -197,6 +198,22 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="graceful_exit",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # input_flush_tick: T-0469 / M1-F1.6 — deferred-delivery pass for the input
+    # multiplexer. Re-attempts delivery of per-sid input queues that were
+    # deferred because the composer was busy (user mid-typing / mid-generation)
+    # at write time, so a batch lands once the composer frees up without needing
+    # a fresh write. No-op under BOT_SQUAD_INPUT_MUX=0. max_instances=1 +
+    # coalesce; idempotent (still-busy queue re-defers, empty queue no-ops).
+    sched.add_job(
+        input_flush_tick,
+        "interval",
+        seconds=15,
+        args=[cfg],
+        id="input_flush",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

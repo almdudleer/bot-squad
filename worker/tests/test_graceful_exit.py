@@ -69,6 +69,19 @@ def test_work_done_no_signal_session_never_done():
     assert GE.work_done("teamlead", "~", "", pending_backlog=0) is False
 
 
+def test_work_done_dev_not_special_cased_among_task_bound_roles():
+    """T-0477 / F2.3: dev rides the SAME universal lifecycle — its graceful-exit
+    done-signal is the GENERIC task-bound path (terminal task status), with NO
+    dev-specific branch. For identical (task_id, status) inputs, 'dev' must yield
+    the SAME work_done verdict as any other task-bound role. Operator is excluded
+    on purpose: it is legitimately backlog-keyed (role-routing, not exemption).
+    If a future edit re-introduced an `if role == 'dev'` exemption, this goes red."""
+    for st in ("totest", "closed", "in_progress", "open", "reopened", ""):
+        dev = GE.work_done("dev", "T-0477", st, pending_backlog=7)
+        for other in ("teamlead", "qa", "prod-teamlead", "some-future-role"):
+            assert GE.work_done(other, "T-0477", st, pending_backlog=7) is dev
+
+
 def test_exit_due_grace():
     assert GE.exit_due(180, 180) is True
     assert GE.exit_due(181, 180) is True

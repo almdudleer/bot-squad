@@ -6,6 +6,20 @@ set -uo pipefail
 mkdir -p .claude
 touch .claude/last_user_prompt_ts
 
+# T-0470 (M1/F1.7): a prompt was submitted → a turn is in progress, so this
+# session is NOT idle. Stamp the per-SID `.active` lifecycle marker so the
+# lifecycle engine's hook-driven stall clock reads 0 while the turn runs (a
+# `.active` newer than the Stop marker = busy). Per-SID (per-pane), mirroring
+# the Stop hook + lifecycle_events.marker_path. Best-effort; never fail the hook.
+{
+    _bsq="${BOT_SQUAD:-/home/www/bot-squad}"
+    _sid=$("$_bsq/scripts/hooks/hook_my_sid.sh" 2>/dev/null) || _sid=""
+    if [ -n "$_sid" ]; then
+        mkdir -p .claude/bsq_lifecycle 2>/dev/null \
+            && : > ".claude/bsq_lifecycle/${_sid}.active" 2>/dev/null || true
+    fi
+} >/dev/null 2>&1 || true
+
 # T-0155: a prompt was submitted into this pane — whoever was blocked here just
 # got input (typically the stakeholder replying in tmux). Cancel any pending TG
 # stall escalation for this session. Best-effort: never fail the hook.

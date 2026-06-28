@@ -50,7 +50,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from bot_squad_worker import autocompact, sessions
+from bot_squad_worker import autocompact, lifecycle_events, sessions
 
 log = logging.getLogger(__name__)
 
@@ -214,12 +214,24 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
 
 
 def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None:
-    """Seconds since the session's last Claude turn (jsonl mtime), or None.
+    """Seconds since the session went idle, or None when unknowable.
 
-    Deliberately jsonl-only (NOT the row's heartbeat-folded ``activity_at``) —
-    see the module docstring on THE IDLE CLOCK.
+    T-0470 (M1/F1.7): PRIMARY source is the HOOK-emitted stall signal — the
+    Stop-hook ``<cwd>/.claude/bsq_lifecycle/<sid>.stop`` marker stamped the
+    moment the turn ended (≈ the subscription cache anchor). This is the "operate
+    cohesively with the hooks" path: the timeout decision reads a signal EMITTED
+    at the lifecycle transition rather than re-deriving it from a side-effect.
+
+    FALLBACK (no hook marker yet — a pre-hook or brand-new session) is the
+    legacy jsonl mtime via ``_pane_activity_at``, so nothing regresses before the
+    Stop hook has fired once. Still jsonl-only (NOT the heartbeat-folded
+    ``activity_at``) — see the module docstring on THE IDLE CLOCK.
     """
     cwd = str(row.get("cwd") or meta.get("cwd") or "")
+    sid = row.get("sid") or meta.get("sid") or ""
+    hook_age = lifecycle_events.hook_idle_age(cwd, sid, now)
+    if hook_age is not None:
+        return hook_age
     claude_uuid = row.get("claude_uuid") or meta.get("claude_uuid")
     at = sessions._pane_activity_at(cwd, claude_uuid, user_home)
     if at is None:
@@ -257,6 +269,10 @@ def _arm(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path, now: flo
     meta["idle_recycle_arm_mtime"] = autocompact._artifact_mtime(artifact_path)
     meta["idle_recycle_artifact"] = artifact_path
     sessions._write_session_metadata(md_path, meta, atomic=True)
+    # T-0470: the stall crossed the window → record the timeout lifecycle event on
+    # the unified surface for operator measurement (best-effort, never raises).
+    lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
+                          now=now, reason="idle_window", artifact=artifact_path)
     log.info("idle_timeout: armed cache-window handoff for %s → %s", sid, artifact_path)
     return True
 
@@ -316,6 +332,9 @@ def _finalize(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float) ->
         log.exception("idle_timeout: relaunch failed for %s after clear", sid)
         autocompact._alert_orphaned_handoff(cfg, slug, sid, repr(e))
         return False
+    # T-0470: a cache-window recycle finalized → record it on the unified surface.
+    lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_RECYCLED,
+                          now=now, cause="idle_timeout", artifact=artifact_path)
     log.info("idle_timeout: cache-window recycle complete for %s — relaunched fresh "
              "from %s", sid, artifact_path)
     return True

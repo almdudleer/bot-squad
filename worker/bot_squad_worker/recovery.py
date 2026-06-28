@@ -246,6 +246,12 @@ def _do_respawn(cfg: Any, row: dict) -> None:
             prompt, task_id=task_id, initiative=row.get("initiative"),
         )
     if sid:
+        # T-0470: a crashed session was re-driven → record the recycle on the
+        # unified lifecycle surface (operator measurement), before retiring the
+        # dead predecessor. Best-effort; never raises.
+        from bot_squad_worker import lifecycle_events as _lc
+        _lc.emit(cfg, slug, sid, _lc.SESSION_RECYCLED, cause="recovery",
+                 role=row.get("role"), task_id=row.get("task_id"))
         _retire_dead(cfg, slug, sid)
 
 

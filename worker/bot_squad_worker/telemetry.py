@@ -874,11 +874,22 @@ def read_telemetry(cfg: Any, slug: str) -> dict:
     except Exception:  # noqa: BLE001 — telemetry read must never hard-fail
         log.exception("read_telemetry: shared_memory_stats failed for %s", slug)
         shared_memory = {"files": 0, "bytes": 0, "tokens_est": 0}
+    # T-0470: hook-driven lifecycle measurement — per-live-session
+    # stall/timeout/recycle event summary (last-ts + counts per kind), the
+    # operator-facing surface of the unified hook/event signals.
+    from bot_squad_worker import lifecycle_events as _lc
+    try:
+        lifecycle = {sid: s for sid, s in _lc.summarize(cfg, slug).items()
+                     if sid in live}
+    except Exception:  # noqa: BLE001 — telemetry read must never hard-fail
+        log.exception("read_telemetry: lifecycle summarize failed for %s", slug)
+        lifecycle = {}
     return {
         "sessions": sessions,
         "quota": quota_wire,
         "caps": caps,
         "shared_memory": shared_memory,
+        "lifecycle": lifecycle,
     }
 
 

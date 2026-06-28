@@ -559,3 +559,18 @@ def test_reap_record_missing_is_none(tmp_path):
 def test_reap_record_empty_sid_is_none(tmp_path):
     cfg = _make_cfg(tmp_path)
     assert T.reap_record(cfg, "proj", "") is None
+
+
+def test_read_telemetry_includes_lifecycle_block(tmp_path, fake_session):
+    """T-0470: read_telemetry surfaces the hook-driven lifecycle event summary
+    (stall/timeout/recycle), filtered to genuinely-live sessions."""
+    from bot_squad_worker import lifecycle_events as LE
+    cfg = _make_cfg(tmp_path)
+    LE.emit(cfg, "proj", "S-almdudleer-dev-p5", LE.SESSION_TIMEOUT, now=1.0)
+    LE.emit(cfg, "proj", "S-almdudleer-dev-p5", LE.SESSION_RECYCLED, now=2.0)
+    LE.emit(cfg, "proj", "S-ghost-dead-p9", LE.SESSION_RECYCLED, now=3.0)  # not live
+    wire = T.read_telemetry(cfg, "proj")
+    assert "lifecycle" in wire
+    assert set(wire["lifecycle"]) == {"S-almdudleer-dev-p5"}  # ghost filtered out
+    lc = wire["lifecycle"]["S-almdudleer-dev-p5"]
+    assert lc["counts"] == {LE.SESSION_TIMEOUT: 1, LE.SESSION_RECYCLED: 1}

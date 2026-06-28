@@ -21,6 +21,7 @@ import pytest
 
 from bot_squad_worker import autocompact as A
 from bot_squad_worker import idle_timeout as IT
+from bot_squad_worker import lifecycle_events as LE
 from bot_squad_worker import sessions as S
 
 
@@ -389,3 +390,68 @@ def test_tick_recycles_active_skips_suspended(tmp_path, seams, monkeypatch):
     monkeypatch.setattr(S, "_get_current_user", lambda: "almdudleer")
     IT.tick(cfg)
     assert seams["calls"]["handoff"] == [(sid, "/art/T-0042.md", "dev")]
+
+
+# --- T-0470: hook-driven idle clock + emitted lifecycle events ---------------
+
+def test_idle_age_reads_hook_signal_over_jsonl(tmp_path, seams):
+    """The timeout decision reads the HOOK Stop-marker, not the jsonl mtime."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    repo = data.parent / "repo"
+    # jsonl says FRESH (10s — not due); hook Stop-marker says idle 4000s (> 1h).
+    seams["state"]["idle_age"] = 10.0
+    LE.touch_marker(str(repo), sid, LE.MARKER_STOP)
+    import os
+    anchor = time.time() - 4000
+    os.utime(LE.marker_path(str(repo), sid, LE.MARKER_STOP), (anchor, anchor))
+    row = _row(sid, cwd_repo=repo)
+    # Despite the fresh jsonl, the hook signal drives the decision → it ARMS.
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["handoff"] == [(sid, "/art/T-0042.md", "dev")]
+
+
+def test_active_marker_keeps_session_busy(tmp_path, seams):
+    """A .active marker newer than .stop = turn in progress → NOT due."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    repo = data.parent / "repo"
+    seams["state"]["idle_age"] = 10.0  # jsonl irrelevant once a hook signal exists
+    import os
+    LE.touch_marker(str(repo), sid, LE.MARKER_STOP)
+    anchor = time.time() - 4000
+    os.utime(LE.marker_path(str(repo), sid, LE.MARKER_STOP), (anchor, anchor))
+    LE.touch_marker(str(repo), sid, LE.MARKER_ACTIVE)  # newer → busy
+    row = _row(sid, cwd_repo=repo)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["handoff"] == []
+
+
+def test_arm_emits_session_timeout_event(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    doc = LE.read_events(cfg, "bot-squad", sid)
+    assert doc.get("counts", {}).get(LE.SESSION_TIMEOUT) == 1
+    assert doc["last"][LE.SESSION_TIMEOUT]["reason"] == "idle_window"
+
+
+def test_finalize_emits_session_recycled_event(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          extra_md={"idle_recycle_phase": "writing",
+                                    "idle_recycle_armed_at": armed,
+                                    "idle_recycle_arm_mtime": 100.0,
+                                    "idle_recycle_artifact": "/art/T-0042.md"})
+    seams["state"]["artifact_mtime"] = 150.0
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    doc = LE.read_events(cfg, "bot-squad", sid)
+    assert doc.get("counts", {}).get(LE.SESSION_RECYCLED) == 1
+    assert doc["last"][LE.SESSION_RECYCLED]["cause"] == "idle_timeout"

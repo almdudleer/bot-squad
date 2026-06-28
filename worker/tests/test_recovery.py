@@ -248,3 +248,22 @@ def test_boot_reconcile_disabled_is_noop(monkeypatch, tmp_path):
     out = R.boot_reconcile(_cfg(tmp_path))
     assert out["enabled"] is False
     assert called == []  # short-circuits before touching any session
+
+
+# --- T-0470: a crash respawn records a session_recycled lifecycle event ------
+
+def test_do_respawn_emits_session_recycled(monkeypatch, tmp_path):
+    """recovery feeds the unified lifecycle surface: re-driving a crashed
+    session records a session_recycled event for operator measurement."""
+    from bot_squad_worker import autocompact as A
+    from bot_squad_worker import lifecycle_events as LE
+    cfg = _cfg(tmp_path)
+    row = {"sid": "S-u-crashed-p1", "slug": "p1", "role": "dev",
+           "task_id": "T-1", "window": "w", "initiative": None,
+           "has_artifact": True, "artifact_path": "/art/T-1.md"}
+    monkeypatch.setattr(A, "_relaunch_from_artifact", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(R, "_retire_dead", lambda *a, **k: None)
+    R._do_respawn(cfg, row)
+    doc = LE.read_events(cfg, "p1", "S-u-crashed-p1")
+    assert doc.get("counts", {}).get(LE.SESSION_RECYCLED) == 1
+    assert doc["last"][LE.SESSION_RECYCLED]["cause"] == "recovery"

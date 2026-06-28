@@ -16,6 +16,7 @@ Verbs:
   bsq flow new <uc-id> <title>     allocate next UF-NNNN + stub flow (T-0173)
   bsq initiative new <name>        allocate next INI-NN + stub initiative
   bsq spawn <ticket> [--bundle ids] spawn a dev session (auto-resumes an expert)
+  bsq cluster-launch <seed>        seed a problem → suggest a similar cluster → launch ONE bundled session (T-0487)
   bsq expert find <ticket>          rank resumable 'pro' sessions for a ticket
   bsq team status                   list this project's sessions
   bsq team list                     list persisted Team rosters (T-0142)
@@ -2765,6 +2766,153 @@ def cmd_task_similar(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# cluster-launch (T-0487, Process Paradigm M4 / F4.3) — "I see this problem,
+# find other similar problems in the same area, launch a session that fixes all
+# of them" (voice-01). A THIN orchestration verb over two existing primitives:
+#   1. B's similarity ranker (task_search.rank, T-0486) → the similar set
+#   2. `bsq spawn --bundle` (T-0160) → ONE dev bound to the whole set
+# No new ranking, no worker action (so it rides no deploy/worker-restart — the
+# verb is instantly live via the bsq symlink). The only added logic is below:
+# normalize the seed id + pick the default cluster, then an operator-confirm
+# gate before launch. The cluster is a SUGGESTION the operator ratifies/prunes,
+# never an auto-launch (M4 [OPEN] decision: session-driven, NOT a classifier).
+# --------------------------------------------------------------------------
+def _norm_task_id(tid: str) -> str:
+    """Normalize a task id for matching/globbing. The .md-vs-stem ambiguity
+    (recurring bot-squad bug class) bites here because ``find_ticket`` globs
+    ``<id>-*.md`` — a passed-in ``T-0487.md`` would glob ``T-0487.md-*.md`` and
+    miss. Strip a trailing ``.md`` and uppercase the ``T-`` prefix; leave the
+    zero-padding intact (ids are ``T-NNNN``)."""
+    tid = tid.strip()
+    if tid.lower().endswith(".md"):
+        tid = tid[:-3].strip()
+    if tid[:2].lower() == "t-":
+        tid = "T-" + tid[2:]
+    return tid
+
+
+def _filter_cluster(candidates, *, min_score=1, limit=5, include_closed=False):
+    """From ranked ``task_search.Candidate`` records (already similarity-sorted),
+    pick the DEFAULT cluster to bundle with the seed. Drops CLOSED tasks (you
+    bundle fixable problems, not done ones) unless ``include_closed``, keeps
+    ``score >= min_score``, caps at ``limit``. Preserves the input similarity
+    order (never re-sorts). Returns the kept Candidate list."""
+    out = []
+    for c in candidates:
+        if c.score < min_score:
+            continue
+        if not include_closed and (c.status or "").strip().lower() == "closed":
+            continue
+        out.append(c)
+        if len(out) >= max(0, limit):
+            break
+    return out
+
+
+def cmd_cluster_launch(args) -> None:
+    slug = resolve_slug()
+    seed = _norm_task_id(args.seed)
+    if not re.fullmatch(r"T-\d+", seed):
+        die("cluster-launch needs a seed TICKET id, e.g. `bsq cluster-launch T-0487`")
+    find_ticket(slug, seed)  # existence check (dies w/ a clear msg if absent)
+
+    ts = _load_task_search()
+    tickets = _load_backlog_tickets(slug)
+    seed_t = next((t for t in tickets if t.id == seed), None)
+    if seed_t is None:
+        die(f"cluster-launch: seed {seed} has no readable backlog md")
+
+    # Reuse B's ranker with the SAME seed as `bsq task similar` (title+body),
+    # over a generous candidate window; our selection then narrows it.
+    query = f"{seed_t.title} {seed_t.body}"
+    ranked = ts.rank(query, tickets, exclude_id=seed, limit=max(args.limit * 4, 40))
+    by_id = {c.id: c for c in ranked}
+
+    if args.pick:
+        # Operator-curated cluster: take exactly these ids (each validated to
+        # exist). A picked id that the ranker also surfaced keeps its score; a
+        # picked id outside the similar set is still allowed (operator knows a
+        # related task the lightweight ranker missed) — shown with score 0.
+        cluster = []
+        for raw in args.pick.split(","):
+            pid = _norm_task_id(raw)
+            if not pid or pid == seed:
+                continue
+            find_ticket(slug, pid)  # dies if a picked id doesn't exist
+            c = by_id.get(pid)
+            if c is None:
+                pt = next((t for t in tickets if t.id == pid), None)
+                c = ts.Candidate(id=pid, title=(pt.title if pt else pid),
+                                 status=(pt.status if pt else ""),
+                                 score=0, matched=[], dup=False)
+            if pid not in {x.id for x in cluster}:
+                cluster.append(c)
+    else:
+        cluster = _filter_cluster(
+            ranked, min_score=args.min_score, limit=args.limit,
+            include_closed=args.include_closed)
+
+    # --- present the proposed cluster (seed -> cluster) ---
+    print(f"Seed: {seed}  {seed_t.title}")
+    if not cluster:
+        print("\n(no similar OPEN tasks found in the same area — nothing to bundle."
+              f"\n launch the seed alone with `bsq spawn {seed}`, or widen with"
+              " `--include-closed` / lower `--min-score`.)")
+        return
+    print(f"\nProposed cluster — ONE session would be bound to these "
+          f"{len(cluster) + 1} tasks (seed + {len(cluster)} similar):\n")
+    print(f"  • {seed}   {seed_t.title}   [SEED]")
+    for c in cluster:
+        sc = f" score {c.score}" if c.score else ""
+        st = f" · {c.status}" if c.status else ""
+        meta = f"  ({sc.strip()}{st})" if (sc or st) else ""
+        mt = f"\n      matched: {', '.join(c.matched[:8])}" if c.matched else ""
+        print(f"  • {c.id}{meta}  {c.title}{mt}")
+
+    bundle_ids = [seed] + [c.id for c in cluster]
+
+    if args.dry_run:
+        print("\n(dry-run — not launching. Re-run without --dry-run to launch.)")
+        return
+
+    # --- operator-confirm gate (cluster -> single bundled session) ---
+    if not args.yes:
+        if sys.stdin.isatty():
+            try:
+                resp = input(
+                    f"\nLaunch ONE bundled session on these {len(bundle_ids)} "
+                    f"tasks? [y/N] ").strip().lower()
+            except EOFError:
+                resp = ""
+            if resp not in ("y", "yes"):
+                print("aborted — no session launched.")
+                return
+        else:
+            # Fail CLOSED on a non-TTY: never launch a session unratified.
+            print(f"\nOperator confirmation required. Re-run with --yes to launch "
+                  f"ONE session bound to: {', '.join(bundle_ids)}")
+            return
+
+    # --- launch via the existing spawn --bundle path (reuse, do NOT rebuild) ---
+    spawn_args = argparse.Namespace(
+        ticket=seed,
+        bundle=",".join(bundle_ids),
+        window=args.window,
+        initiative=args.initiative,
+        owner=args.owner,
+        role=args.role,
+        prompt=None,
+        prompt_file=None,
+        fresh=args.fresh,
+        resume_sid=None,
+        dry_run=args.spawn_dry_run,
+    )
+    print(f"\nLaunching ONE session bound to {len(bundle_ids)} tasks: "
+          f"{', '.join(bundle_ids)}")
+    cmd_spawn(spawn_args)
+
+
+# --------------------------------------------------------------------------
 # ticket verbs (T-0152) — make bot-squad-ticket-bound work feel native so
 # sessions stop wandering into ~/.claude/superpowers/* docs to track work.
 # --------------------------------------------------------------------------
@@ -3564,6 +3712,38 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true",
                     help="print the resume/spawn decision + params without acting")
     sp.set_defaults(func=cmd_spawn)
+
+    # cluster-launch (T-0487, M4/F4.3): from a SEED problem, suggest the related
+    # cluster (reuse task_search) and launch ONE bundled session (reuse spawn
+    # --bundle). Operator confirms before launch.
+    cl = sub.add_parser(
+        "cluster-launch",
+        help="seed a problem → suggest a similar cluster → launch ONE bundled session (T-0487)")
+    cl.add_argument("seed", help="seed ticket id, e.g. T-0487 (the observed problem)")
+    cl.add_argument("--limit", type=int, default=5,
+                    help="max similar tasks in the auto-cluster (default 5)")
+    cl.add_argument("--min-score", type=int, default=1, dest="min_score",
+                    help="similarity score floor for the auto-cluster (default 1)")
+    cl.add_argument("--include-closed", action="store_true", dest="include_closed",
+                    help="keep CLOSED tasks in the cluster (default: drop them)")
+    cl.add_argument("--pick", metavar="IDS",
+                    help="operator-curated cluster: comma-separated ids to bundle "
+                         "(overrides the auto-cluster; each must exist)")
+    cl.add_argument("--yes", "-y", action="store_true",
+                    help="skip the confirm prompt and launch (default: confirm first)")
+    cl.add_argument("--dry-run", action="store_true",
+                    help="show the proposed cluster only; never launch")
+    cl.add_argument("--spawn-dry-run", action="store_true", dest="spawn_dry_run",
+                    help="confirm + reach spawn, but print the spawn plan instead of spawning")
+    # spawn pass-throughs
+    cl.add_argument("--role", default="dev", choices=["dev", "tl", "teamlead", "operator"],
+                    help="role contract for the launched session (default dev)")
+    cl.add_argument("--window", help="tmux window name (default: seed feature slug)")
+    cl.add_argument("--initiative", help="initiative md (default: from seed frontmatter)")
+    cl.add_argument("--owner", help="UI username to stamp on the session")
+    cl.add_argument("--fresh", action="store_true",
+                    help="force a fresh spawn (skip the expert-resume scan)")
+    cl.set_defaults(func=cmd_cluster_launch)
 
     # expert (T-0150: find a resumable 'pro' session for a ticket)
     ex = sub.add_parser("expert", help="find an existing expert session to resume (T-0150)")

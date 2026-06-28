@@ -118,9 +118,10 @@ def live_operator_sids(cfg: Any, slug: str) -> list[str]:
             meta = S._read_session_metadata(md)
             if meta is None or not S._is_live_holder(meta):
                 continue
-            role = S._derive_role(
-                meta.get("window"), meta.get("task_id"), meta.get("initiative"),
-            )
+            # T-0509: honor a stored ``role`` (a user session morphed to
+            # operator stamps it without renaming its window), so the singleton
+            # guard sees morphed operators too.
+            role = S._role_of(meta)
             if role == "operator":
                 sid = meta.get("sid", md.stem)
                 if sid not in seen:
@@ -257,8 +258,8 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
             if task_id in S._full_task_set(meta):
                 continue
 
-            role = S._derive_role(
-                meta.get("window"), meta.get("task_id"), meta.get("initiative"),
+            role = S._role_of(  # T-0509: honor a morph stamp (non-dev ⇒ not a reuse target)
+                meta,
                 extra_task_ids=[t for t in (meta.get("extra_task_ids") or []) if t and t != "~"],
                 extra_initiatives=[i for i in (meta.get("extra_initiatives") or []) if i and i != "~"],
             )

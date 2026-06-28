@@ -474,6 +474,53 @@ def _derive_role(
     return "dev"
 
 
+# T-0509 (M11/F11.2): the roles a USER-launched session may MORPH into. A
+# user-launched session is a USER session by default but may "take on a task and
+# become dev, spawn teammates and become teamlead, or become operator if there's
+# no operator working right now -- sessions are transient, system is persistent"
+# (clarification-03 / voice-09).
+MORPH_ROLES = ("dev", "teamlead", "operator")
+
+
+def _role_of(
+    meta: dict | None,
+    *,
+    window: str | None = None,
+    task_id: str | None = None,
+    initiative: str | None = None,
+    extra_task_ids: list | None = None,
+    extra_initiatives: list | None = None,
+) -> str:
+    """Canonical session role: an explicit stored ``role`` (stamped by
+    ``bsq morph``, T-0509) OVERRIDES the window-derived role; otherwise derive
+    from the window marker via :func:`_derive_role`.
+
+    A user session that morphs (user→dev/teamlead/operator) stamps ``role`` on
+    its md WITHOUT renaming its tmux window — renaming would rotate the peer-bus
+    SID (the address frozen at the filename), so the morph must be truly
+    in-place. This centralizes the ``meta.get("role") or _derive_role(...)``
+    idiom already used by idle_timeout / graceful_exit / recovery, so the
+    override is honored uniformly: the role badge (list_sessions), the
+    operator-singleton guard (live_operator_sids) and the reconciler dev-gates.
+
+    An absent / ``~`` stamp falls through to derivation, so legacy mds (which
+    never carried a ``role`` field) are unchanged. The explicit ``window`` /
+    ``task_id`` / ``initiative`` kwargs let a live-pane caller pass the live
+    tmux window instead of the persisted one.
+    """
+    m = meta or {}
+    stored = m.get("role")
+    if stored and stored != "~":
+        return str(stored)
+    return _derive_role(
+        window if window is not None else m.get("window"),
+        task_id if task_id is not None else m.get("task_id"),
+        initiative if initiative is not None else m.get("initiative"),
+        extra_task_ids=extra_task_ids,
+        extra_initiatives=extra_initiatives,
+    )
+
+
 def _cwd_matches_repo(
     cwd: Path | str | None,
     repo_path: Path,
@@ -905,8 +952,10 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "activity_at": activity_at,
             "active_at_prompt": active_at_prompt,
             # T-0141: authoritative role — no longer "task-less ⟹ teamlead".
-            "role": _derive_role(
-                pane.window, task_id, initiative,
+            # T-0509: a stored morph ``role`` overrides the window-derived role.
+            "role": _role_of(
+                existing or {},
+                window=pane.window, task_id=task_id, initiative=initiative,
                 extra_task_ids=extra_task_ids,
                 extra_initiatives=extra_initiatives,
             ),
@@ -1004,8 +1053,13 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 else _NO_TMUX_SESSION
             )
             # T-0141: authoritative role for suspended rows too.
-            md_role = _derive_role(
-                meta.get("window", ""), md_task_id, md_initiative,
+            # T-0509: a stored morph ``role`` overrides the window-derived role
+            # (the cwd-mismatch neutralization below still guards an elevated
+            # role whose persisted cwd doesn't belong to the project).
+            md_role = _role_of(
+                meta,
+                window=meta.get("window", ""), task_id=md_task_id,
+                initiative=md_initiative,
                 extra_task_ids=md_extra_tids,
                 extra_initiatives=md_extra_inits,
             )
@@ -2578,7 +2632,7 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         # task_id as the PRIMARY below (the in-place repair the old append-only
         # path couldn't do), so an unbound session is fixable via the action, not
         # only a hand-edit. Role is resolved from the window marker (T-0175).
-        role = _derive_role(meta.get("window"), primary, meta.get("initiative"))
+        role = _role_of(meta, task_id=primary)  # T-0509: honor a morph stamp
         if role != "dev":
             raise ActionError(
                 f"bind_task: session {sid!r} is not a dev session (no primary task_id)"
@@ -2760,6 +2814,126 @@ def set_idle_postpone(cfg: Any, slug: str, sid: str,
     _write_session_metadata(md_path, meta, atomic=True)
     return {"ok": True, "sid": meta.get("sid", sid),
             "postpone_until": until_iso, "seconds": secs}
+
+
+def morph_session(cfg: Any, slug: str, sid: str, role: str, *,
+                  task_id: str | None = None, initiative: str | None = None,
+                  window: str | None = None, cwd: str | None = None,
+                  claude_uuid: str | None = None) -> dict:
+    """T-0509 (M11/F11.2): MORPH a user session's role IN PLACE.
+
+    "by default a user-launched claude session should always be [a user session],
+    however, it can take on a task and become dev, spawn teammates and become
+    teamlead, or become operator if there's no operator working right now --
+    sessions are transient, system is persistent" (clarification-03 / voice-09).
+
+    Stamps ``role`` (+ task_id / initiative) onto the session md WITHOUT renaming
+    the tmux window — so the peer-bus SID (the address frozen at the md filename)
+    is untouched and the morph is truly in-place. The stored ``role`` is then
+    honored everywhere via :func:`_role_of` (role badge, operator-singleton
+    guard, reconciler dev-gates). Resolves the md rename-tolerantly (SID, then
+    claude_uuid); for an UNREGISTERED manually-launched user session (no md yet)
+    it UPSERTS one from the live-pane fields the caller passes.
+
+    Guards:
+      * ``role`` ∈ :data:`MORPH_ROLES` (``dev`` | ``teamlead`` | ``operator``).
+      * ``operator`` morph is refused when another operator already holds the
+        project — the one-operator-per-project singleton via the operator-identity
+        SSOT (:func:`dispatch.live_operator_sids`, minus self — T-0472/T-0523).
+      * an ``operator`` must NOT carry a dev task (it orchestrates and spawns
+        devs for tickets, never self-binds a ticket — T-0523); its primary
+        task is cleared on morph.
+
+    Returns ``{ok, sid, role, task_id, initiative, created}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"morph: unknown project slug {slug!r}")
+
+    role = (role or "").strip().lower()
+    if role not in MORPH_ROLES:
+        raise ActionError(
+            f"morph: role must be one of {sorted(MORPH_ROLES)} (got {role!r})"
+        )
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    md_path = _find_session_md(sessions_dir, sid, claude_uuid)
+    created = md_path is None
+    if md_path is None:
+        # Unregistered, manually-launched user session — create its md from the
+        # live-pane identity fields the CLI passed (it computed `sid` from the
+        # same pane). Seed identity only; role/task/initiative are set below.
+        md_path = _session_file(cfg.data_dir, slug, sid)
+        meta: dict = {
+            "sid": sid,
+            "status": "active",
+            "window": window or "~",
+            "cwd": cwd or "~",
+            "claude_uuid": claude_uuid or "~",
+            "task_id": "~",
+            "initiative": "~",
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    else:
+        meta = _read_session_metadata(md_path) or {}
+        if not meta:
+            raise ActionError(f"morph: unreadable session metadata for SID {sid!r}")
+        # Refresh the rename-variant identity fields the caller can supply.
+        if window:
+            meta["window"] = window
+        if cwd and not (meta.get("cwd") and meta["cwd"] != "~"):
+            meta["cwd"] = cwd
+        if claude_uuid and not (meta.get("claude_uuid") and meta["claude_uuid"] != "~"):
+            meta["claude_uuid"] = claude_uuid
+
+    if role == "operator":
+        # T-0523: the operator orchestrates — it must never self-claim a dev
+        # assignment. Reject a task bind (the `~` sentinel is not a real bind).
+        if task_id and task_id != "~":
+            raise ActionError(
+                "morph: operator must not bind a dev task — the operator "
+                "orchestrates and spawns devs for tickets (T-0523)"
+            )
+        # T-0472: exactly one operator per project. Check the operator-identity
+        # SSOT, EXCLUDING this session (a re-morph of an already-operator session
+        # is a no-op, not a duplicate).
+        from bot_squad_worker import dispatch as _dispatch
+        self_ids = {sid, meta.get("sid")}
+        others = [
+            s for s in _dispatch.live_operator_sids(cfg, slug) if s not in self_ids
+        ]
+        if others:
+            raise ActionError(
+                f"morph: operator already running for {slug!r}: {others[0]} "
+                "— exactly one operator per project (T-0472)"
+            )
+
+    meta["role"] = role
+    # Task / initiative metadata. The operator never holds a single ticket (its
+    # standing task is "clear the backlog"), so clear any primary on that morph;
+    # dev / teamlead adopt what the caller passed.
+    if role == "operator":
+        meta["task_id"] = "~"
+    elif task_id is not None:
+        meta["task_id"] = task_id or "~"
+    if initiative is not None:
+        meta["initiative"] = initiative or "~"
+
+    _write_session_metadata(md_path, meta, atomic=True)
+
+    def _norm(v):
+        return None if (v is None or v == "~") else v
+
+    return {
+        "ok": True,
+        "sid": meta.get("sid", sid),
+        "role": role,
+        "task_id": _norm(meta.get("task_id")),
+        "initiative": _norm(meta.get("initiative")),
+        "created": created,
+    }
 
 
 def _reap_session_sidecars(cfg: Any, slug: str, sid: str) -> list[str]:
@@ -3543,9 +3717,7 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
             continue
         scanned += 1
         sid = meta.get("sid", md.stem)
-        role = _derive_role(
-            meta.get("window"), meta.get("task_id"), meta.get("initiative")
-        )
+        role = _role_of(meta)  # T-0509: honor a morph stamp
         tid = meta.get("task_id")
         is_dev = bool(tid and tid != "~")
 
@@ -3691,7 +3863,7 @@ def reconcile_primary_from_history(cfg: Any, slug: str) -> dict:
         if sid not in live_sids:
             continue
         # A TL/operator window must never adopt a single-ticket primary.
-        role = _derive_role(meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+        role = _role_of(meta)  # T-0509: honor a morph stamp
         if role != "dev":
             continue
 
@@ -3970,8 +4142,8 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
         if str(meta.get("archived", "")).lower() == "true":
             continue
         sid = meta.get("sid", md.stem)
-        role = _derive_role(
-            meta.get("window"), meta.get("task_id"), meta.get("initiative"),
+        role = _role_of(  # T-0509: honor a morph stamp
+            meta,
             extra_task_ids=[t for t in (meta.get("extra_task_ids") or []) if t and t != "~"],
             extra_initiatives=[i for i in (meta.get("extra_initiatives") or []) if i and i != "~"],
         )

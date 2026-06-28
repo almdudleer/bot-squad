@@ -86,6 +86,8 @@ def test_registry_lists_only_allowed_actions():
         "set_drift_paused",
         # T-0466: per-session ~1h cache-window recycle postpone (bsq postpone).
         "idle_postpone",
+        # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
+        "morph_session",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
         "unbind_task", "unbind_initiative",
         "archive_session", "unarchive_session",
@@ -2277,3 +2279,63 @@ def test_send_stakeholder_dm_failover_to_tg(tmp_config_dir, monkeypatch):
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir, max_client=_BoomMax())
     out = A._send_stakeholder_dm(A._get_config(), message="hi", tg_chat_id="-100", group_record=True)
     assert out["channel"] == "tg" and len(fake_tg.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# T-0509 (M11/F11.2): morph_session action — user-session role morph.
+# ---------------------------------------------------------------------------
+
+def _seed_user_session(cfg, repo, sid, *, window="claude"):
+    from bot_squad_worker.sessions import _write_session_metadata
+    md = cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+    _write_session_metadata(md, {
+        "sid": sid, "status": "active", "window": window, "cwd": str(repo),
+        "claude_uuid": "u-" + sid[-2:], "task_id": "~", "initiative": "~",
+        "started_at": "2026-06-28T00:00:00Z",
+    })
+    return md
+
+
+def test_morph_session_action_to_dev(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    _seed_user_session(cfg, repo, "S-u-claude-p1")
+
+    out = A.dispatch("morph_session", {
+        "slug": "test-project", "sid": "S-u-claude-p1",
+        "role": "dev", "task_id": "T-0042",
+    })
+    assert out["ok"] and out["role"] == "dev" and out["task_id"] == "T-0042"
+
+
+def test_morph_session_action_operator_singleton(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    _seed_user_session(cfg, repo, "S-u-operator-p9", window="operator")
+    _seed_user_session(cfg, repo, "S-u-claude-p1")
+
+    with pytest.raises(ActionError, match="operator already running"):
+        A.dispatch("morph_session", {
+            "slug": "test-project", "sid": "S-u-claude-p1", "role": "operator",
+        })
+
+
+def test_morph_session_action_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("morph_session", {
+            "slug": "test-project", "sid": "S-u-claude-p1", "role": "dev",
+            "bogus": 1,
+        })
+
+
+def test_morph_session_action_requires_role(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("morph_session", {"slug": "test-project", "sid": "S-u-claude-p1"})

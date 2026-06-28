@@ -2339,6 +2339,48 @@ def _action_idle_postpone(params: dict[str, Any]) -> dict[str, Any]:
                                        seconds=seconds, reason=params.get("reason"))
 
 
+_MORPH_SESSION_REQUIRED = {"slug", "sid", "role"}
+_MORPH_SESSION_ALLOWED = _MORPH_SESSION_REQUIRED | {
+    "task_id", "initiative", "window", "cwd", "claude_uuid",
+}
+
+
+def _action_morph_session(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0509 (M11/F11.2): morph a user session's role IN PLACE.
+
+    A user-launched session is a USER session by default but may morph: take a
+    task → ``dev``; spawn teammates → ``teamlead``; become ``operator`` iff none
+    is running ("sessions are transient, system is persistent"). Stamps the
+    ``role`` (+ task_id / initiative) on the session md without renaming the
+    tmux window, so the peer-bus SID is untouched. ``operator`` morph is gated
+    by the one-per-project singleton (T-0472/T-0523).
+
+    Required params: slug, sid, role (``dev`` | ``teamlead`` | ``operator``).
+    Optional: task_id, initiative, window, cwd, claude_uuid (the last three let
+    the CLI seed an md for an unregistered, manually-launched user session).
+    Returns {ok, sid, role, task_id, initiative, created}. ``tmux_only`` — it
+    writes only its OWN SessionMd frontmatter (filesystem-local), like
+    set_drift_paused / idle_postpone.
+    """
+    extra = set(params) - _MORPH_SESSION_ALLOWED
+    if extra:
+        raise ActionError(f"morph_session got unexpected params: {sorted(extra)}")
+    missing = _MORPH_SESSION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"morph_session missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.morph_session(
+        cfg, params["slug"], params["sid"], params["role"],
+        task_id=params.get("task_id"),
+        initiative=params.get("initiative"),
+        window=params.get("window"),
+        cwd=params.get("cwd"),
+        claude_uuid=params.get("claude_uuid"),
+    )
+
+
 _BIND_INITIATIVE_REQUIRED = {"slug", "sid", "initiative"}
 _BIND_INITIATIVE_ALLOWED = _BIND_INITIATIVE_REQUIRED
 
@@ -2946,6 +2988,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "set_drift_paused": _action_set_drift_paused,
     # T-0466: per-session cache-window recycle postpone (bsq postpone).
     "idle_postpone": _action_idle_postpone,
+    # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
+    "morph_session": _action_morph_session,
     "unbind_task": _action_unbind_task,
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
@@ -3063,6 +3107,10 @@ ACTION_MODES: dict[str, str] = {
     # own SessionMd frontmatter (filesystem-local) — tmux_only, like the drift
     # off-ramp; no coordinator privilege required.
     "idle_postpone": "tmux_only",
+    # T-0509: a user session morphs its OWN role by stamping its own SessionMd
+    # frontmatter (filesystem-local) — tmux_only, like idle_postpone. The
+    # operator-singleton guard reads mds + a tmux pane scan, both user-local.
+    "morph_session": "tmux_only",
     "unbind_task": "coordinator_only",
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",

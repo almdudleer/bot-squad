@@ -147,10 +147,8 @@ def reconcile_teams(cfg: Any, slug: str) -> dict:
         teammates: list[str] = []
         archived_members: list[str] = []
         for sid, meta in members:
-            role = _sessions._derive_role(
-                meta.get("window"),
-                meta.get("task_id"),
-                meta.get("initiative"),
+            role = _sessions._role_of(  # T-0509: honor a morph stamp
+                meta,
                 extra_task_ids=[
                     t for t in (meta.get("extra_task_ids") or []) if t and t != "~"
                 ],

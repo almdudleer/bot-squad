@@ -4615,3 +4615,156 @@ def test_dedup_sessions_reaps_loser_sidecars(tmp_path, monkeypatch):
     assert res["merged_count"] == 1
     assert res["merges"][0]["loser"] == loser
     assert not _sidecars_present(chat, tel, loser), "merged-away loser's sidecars must be freed"
+
+
+# ---------------------------------------------------------------------------
+# T-0509 (M11/F11.2): user-session role MORPHING — user → dev / teamlead /
+# operator IN PLACE. "sessions are transient, system is persistent."
+# ---------------------------------------------------------------------------
+
+def _morph_cfg(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    cfg = _make_cfg(tmp_path, repo)
+    (cfg.data_dir / "test-project" / "sessions").mkdir(parents=True, exist_ok=True)
+    return cfg, repo
+
+
+def _write_user_session(cfg, repo, sid, *, window="claude", status="active"):
+    md = cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+    _write_session_metadata(md, {
+        "sid": sid, "status": status, "window": window, "cwd": str(repo),
+        "claude_uuid": "u-" + sid[-2:], "task_id": "~", "initiative": "~",
+        "started_at": "2026-06-28T00:00:00Z",
+    })
+    return md
+
+
+def test_role_of_stored_role_overrides_window():
+    """T-0509: an explicit stored ``role`` wins over the window-derived role."""
+    import bot_squad_worker.sessions as S
+    # window 'claude' would derive 'dev', but a stored operator role overrides.
+    assert S._role_of({"window": "claude", "role": "operator"}) == "operator"
+    assert S._role_of({"window": "x-dev", "role": "teamlead"}) == "teamlead"
+
+
+def test_role_of_unset_falls_through_to_derive():
+    """No stored role (absent / ``~``) ⇒ derive from the window marker."""
+    import bot_squad_worker.sessions as S
+    assert S._role_of({"window": "x-tl"}) == "teamlead"
+    assert S._role_of({"window": "x-operator", "role": "~"}) == "operator"
+    assert S._role_of({"window": "claude"}) == "dev"
+
+
+def test_morph_user_to_dev_sets_role_and_task(tmp_path):
+    """user → dev (on taking a task): stamps role=dev + the primary task_id."""
+    import bot_squad_worker.sessions as S
+    cfg, repo = _morph_cfg(tmp_path)
+    md = _write_user_session(cfg, repo, "S-alice-claude-p1")
+
+    res = S.morph_session(cfg, "test-project", "S-alice-claude-p1", "dev",
+                          task_id="T-0042")
+    assert res["ok"] and res["role"] == "dev" and res["task_id"] == "T-0042"
+    meta = _read_session_metadata(md)
+    assert meta["role"] == "dev" and meta["task_id"] == "T-0042"
+    # role is now honored by the canonical read.
+    assert S._role_of(meta) == "dev"
+
+
+def test_morph_user_to_teamlead(tmp_path):
+    """user → team-lead (on spawning teammates): stamps role=teamlead."""
+    import bot_squad_worker.sessions as S
+    cfg, repo = _morph_cfg(tmp_path)
+    md = _write_user_session(cfg, repo, "S-alice-claude-p1")
+
+    res = S.morph_session(cfg, "test-project", "S-alice-claude-p1", "teamlead",
+                          initiative="process-paradigm.md")
+    assert res["role"] == "teamlead" and res["initiative"] == "process-paradigm.md"
+    meta = _read_session_metadata(md)
+    assert S._role_of(meta) == "teamlead"
+
+
+def test_morph_user_to_operator_clears_task(tmp_path, monkeypatch):
+    """user → operator (none running): stamps role=operator + clears any task
+    (the operator never holds a single ticket)."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "list_panes", lambda: [])  # no canonical operator
+    cfg, repo = _morph_cfg(tmp_path)
+    md = _write_user_session(cfg, repo, "S-alice-claude-p1")
+    # even if it carried a stray task, operator morph clears it.
+    meta0 = _read_session_metadata(md); meta0["task_id"] = "T-0001"
+    _write_session_metadata(md, meta0)
+
+    res = S.morph_session(cfg, "test-project", "S-alice-claude-p1", "operator")
+    assert res["role"] == "operator" and res["task_id"] is None
+    meta = _read_session_metadata(md)
+    assert meta["role"] == "operator"
+    # operator-identity SSOT now sees it.
+    from bot_squad_worker.dispatch import live_operator_sids
+    assert "S-alice-claude-p1" in live_operator_sids(cfg, "test-project")
+
+
+def test_morph_operator_refused_when_one_running(tmp_path, monkeypatch):
+    """Operator singleton (T-0472): a second operator morph is refused while a
+    live operator already holds the project."""
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.actions import ActionError
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg, repo = _morph_cfg(tmp_path)
+    # an existing live operator (registered).
+    _write_user_session(cfg, repo, "S-alice-operator-p9", window="operator")
+    _write_user_session(cfg, repo, "S-bob-claude-p1")
+
+    with pytest.raises(ActionError, match="operator already running"):
+        S.morph_session(cfg, "test-project", "S-bob-claude-p1", "operator")
+
+
+def test_morph_operator_re_morph_excludes_self(tmp_path, monkeypatch):
+    """Re-morphing the SAME session to operator is a no-op, not a duplicate —
+    the singleton check excludes self."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg, repo = _morph_cfg(tmp_path)
+    md = _write_user_session(cfg, repo, "S-alice-claude-p1")
+    S.morph_session(cfg, "test-project", "S-alice-claude-p1", "operator")
+    # second morph by the same session must still succeed.
+    res = S.morph_session(cfg, "test-project", "S-alice-claude-p1", "operator")
+    assert res["role"] == "operator"
+
+
+def test_morph_operator_rejects_dev_task(tmp_path, monkeypatch):
+    """T-0523: an operator orchestrates and must never self-bind a dev task."""
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.actions import ActionError
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg, repo = _morph_cfg(tmp_path)
+    _write_user_session(cfg, repo, "S-alice-claude-p1")
+    with pytest.raises(ActionError, match="must not bind a dev task"):
+        S.morph_session(cfg, "test-project", "S-alice-claude-p1", "operator",
+                        task_id="T-0042")
+
+
+def test_morph_rejects_unknown_role(tmp_path):
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.actions import ActionError
+    cfg, repo = _morph_cfg(tmp_path)
+    _write_user_session(cfg, repo, "S-alice-claude-p1")
+    with pytest.raises(ActionError, match="role must be one of"):
+        S.morph_session(cfg, "test-project", "S-alice-claude-p1", "qa")
+
+
+def test_morph_upserts_md_for_unregistered_session(tmp_path):
+    """A manually-launched user session has NO md yet — morph creates it from
+    the live-pane fields the CLI passes."""
+    import bot_squad_worker.sessions as S
+    cfg, repo = _morph_cfg(tmp_path)
+    sid = "S-alice-claude-p7"
+    md = cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+    assert not md.exists()
+
+    res = S.morph_session(cfg, "test-project", sid, "dev", task_id="T-0042",
+                          window="claude", cwd=str(repo), claude_uuid="uu-7")
+    assert res["created"] is True and res["role"] == "dev"
+    meta = _read_session_metadata(md)
+    assert meta["role"] == "dev" and meta["task_id"] == "T-0042"
+    assert meta["window"] == "claude" and meta["claude_uuid"] == "uu-7"

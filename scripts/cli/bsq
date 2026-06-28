@@ -1785,6 +1785,75 @@ def cmd_postpone(args) -> None:
           f"{res.get('postpone_until')} (+{res.get('seconds')}s)")
 
 
+_MORPH_ROLE_ALIASES = {
+    "dev": "dev",
+    "tl": "teamlead", "teamlead": "teamlead", "team-lead": "teamlead",
+    "op": "operator", "operator": "operator",
+}
+
+
+def _normalize_morph_role(raw: str) -> str:
+    role = _MORPH_ROLE_ALIASES.get((raw or "").strip().lower())
+    if role is None:
+        die(f"--role must be one of dev|tl|operator (got {raw!r})")
+    return role
+
+
+def _my_pane_fields() -> "tuple[str | None, str | None]":
+    """Current tmux pane's (window, cwd) — used to seed an md for an
+    unregistered, manually-launched user session that has none yet."""
+    if not os.environ.get("TMUX"):
+        return None, None
+    target = ["-t", os.environ["TMUX_PANE"]] if os.environ.get("TMUX_PANE") else []
+    try:
+        window = subprocess.run(
+            ["tmux", "display-message", "-p", *target, "-F", "#W"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        window = re.sub(r"[^A-Za-z0-9_-]", "_", window) or None
+        cwd = subprocess.run(
+            ["tmux", "display-message", "-p", *target, "-F", "#{pane_current_path}"],
+            capture_output=True, text=True,
+        ).stdout.strip() or None
+        return window, cwd
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+
+def cmd_morph(args) -> None:
+    """T-0509 (M11/F11.2): MORPH this user session's role in place.
+
+    A user-launched claude session is a USER session by default; it can take on
+    a task and become a dev, spawn teammates and become a team-lead, or become
+    the operator if none is running ("sessions are transient, system is
+    persistent"). Updates this session's role/task/initiative metadata in place
+    — the peer-bus SID is unchanged (no window rename). ``--role operator`` is
+    refused when an operator already holds the project."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    role = _normalize_morph_role(args.role)
+    params = {"slug": slug, "sid": sid, "role": role}
+    if getattr(args, "task", None):
+        params["task_id"] = args.task
+    if getattr(args, "initiative", None):
+        params["initiative"] = args.initiative
+    # Seed the live-pane identity so the worker can upsert an md for an
+    # unregistered (manually-launched) user session.
+    win, cwd = _my_pane_fields()
+    if win:
+        params["window"] = win
+    if cwd:
+        params["cwd"] = cwd
+    res = post("morph_session", params)
+    bits = [f"role={res.get('role')}"]
+    if res.get("task_id"):
+        bits.append(f"task={res.get('task_id')}")
+    if res.get("initiative"):
+        bits.append(f"initiative={res.get('initiative')}")
+    suffix = " (registered new session md)" if res.get("created") else ""
+    print(f"morphed {res.get('sid', sid)}: {', '.join(bits)}{suffix}")
+
+
 def sessions_dir(slug: str) -> Path:
     return Path(BOT_SQUAD) / "data" / slug / "sessions"
 
@@ -3688,6 +3757,18 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--reason", help="why you're postponing (optional note)")
     pp.add_argument("--sid", help="session SID (default: derived from tmux)")
     pp.set_defaults(func=cmd_postpone)
+
+    # morph (T-0509, M11/F11.2) — morph THIS user session's role in place
+    mo = sub.add_parser(
+        "morph",
+        help="morph THIS user session's role in place: --role dev (take a "
+             "task) | tl (spawn teammates) | operator (iff none running)")
+    mo.add_argument("--role", required=True,
+                    help="target role: dev | tl | operator")
+    mo.add_argument("--task", help="task id to take on (for --role dev)")
+    mo.add_argument("--initiative", help="initiative to bind (for --role tl/dev)")
+    mo.add_argument("--sid", help="session SID (default: derived from tmux)")
+    mo.set_defaults(func=cmd_morph)
 
     # operator-state (T-0473) — read the operator's future-focused state-doc
     os_ = sub.add_parser(

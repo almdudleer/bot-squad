@@ -82,6 +82,30 @@ def test_write_voice_feedback_creates_artifact_only(tmp_path):
     assert not inbox.exists()
 
 
+def test_write_voice_feedback_emits_valid_provenance(tmp_path):
+    """T-0521: the voice-intake artifact must carry a provenance value that the
+    canonical grammar accepts (worker.provenance == scripts/lint/backlog_provenance).
+    A voice note IS a dated stakeholder/user directive, so the valid token is
+    ``stakeholder:<submitted-date>`` — NOT the free-form 'INI-04 voice intake'
+    string the lint rejects (it surfaced as the T-0536/0537/0538 offenders when an
+    intake session mirrored that shape into a backlog task)."""
+    from bot_squad_worker import provenance as P, frontmatter as _fm
+
+    cfg = _cfg(tmp_path)
+    path = VI.write_voice_feedback(
+        cfg, "bot-squad",
+        transcript="hello",
+        audio_ref="feedback/_audio/uniq1.oga",
+        author="Alexey (@almdudleer)", author_id=30719523,
+        duration=7, lang="en", engine="faster-whisper:small",
+        ts="2026-06-21T13:00:00Z",
+    )
+    meta = _fm.parse_or_none(path.read_text())[0]
+    prov = str(meta["provenance"])
+    assert P.provenance_valid(prov), f"voice provenance {prov!r} rejected by the grammar"
+    assert prov == "stakeholder:2026-06-21"
+
+
 # --- download_voice --------------------------------------------------------
 
 def test_download_voice_getfile_then_fetch_bytes(tmp_path, monkeypatch):

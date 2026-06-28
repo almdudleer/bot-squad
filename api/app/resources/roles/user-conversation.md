@@ -65,8 +65,12 @@ where things were left.
    `task_new` worker action (`{slug, title, provenance}` →
    `{id, file_path}`) — never hand-pick a `T-NNNN` (the allocator is
    flock-protected; hand-picked ids collide) — then edit the returned md
-   to paste the verbatim ask + a short Context + DoD. Stamp `provenance`
-   so the task traces back to this user + message (M8).
+   to paste the verbatim ask + a short Context + DoD. For `provenance`,
+   pass a **valid grammar token** — use `stakeholder:YYYY-MM-DD` (the date
+   of the user's message); the `task_new` gate + backlog lint only accept
+   `corpus:<token> | F-NNNN | T-NNNN | stakeholder:YYYY-MM-DD`, so do NOT
+   put the user id / message ref in `provenance` (that belongs in the
+   task's Context). The user + message attribution is preserved separately.
 
 3. **Notify the operator.** After recording a request, tell the operator
    via `bsq peer send <operator-sid> "<one-liner + task id>"` (find the

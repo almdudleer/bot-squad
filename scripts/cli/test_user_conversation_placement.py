@@ -60,6 +60,20 @@ def test_contract_guarantees_no_long_request_is_dropped():
     ), "contract must say a long request becomes a task or initiative"
 
 
+def test_provenance_guidance_uses_a_valid_grammar_token():
+    """T-0521: the 'record verbatim' recipe must tell the attendant to stamp a
+    provenance value the task_new gate + backlog lint accept (stakeholder:DATE),
+    NOT a free-form 'traces back to this user + message' string. That ambiguous
+    wording led intake sessions to mint invalid-provenance tasks (the T-0536/
+    0537/0538 offenders); the gate (T-0519) now rejects such values, so the
+    contract must steer the attendant to the valid token form."""
+    doc = _doc()
+    assert "stakeholder:" in doc, (
+        "contract must show the valid stakeholder:DATE provenance token")
+    assert "traces back to this user + message" not in doc, (
+        "the ambiguous wording that produced invalid provenance must be gone")
+
+
 def test_thread_recipe_gives_concrete_base_and_bearer():
     """T-0543: the read/append recipes must spell out the API base + Bearer so an
     attendant doesn't waste turns trying :8080 / X-API-Key dead-ends (T-0542

@@ -96,7 +96,12 @@ def write_voice_feedback(
         f"audio_duration_sec: {duration}\n"
         f"lang: {lang_str}\n"
         f"transcription_engine: {engine}\n"
-        'provenance: "INI-04 voice intake"\n'
+        # T-0521: a voice note is a dated stakeholder/user directive, so provenance
+        # is a VALID grammar token (worker.provenance / backlog_provenance lint) —
+        # ``stakeholder:<submitted-date>``. The free-form "INI-04 voice intake"
+        # string the lint rejects was the shape that leaked into the T-0536/0537/0538
+        # backlog offenders; the user/author ref already lives in author/author_id.
+        f"provenance: stakeholder:{date}\n"
         "---\n\n"
         f"# Voice note from {author} ({duration}s, {lang_str})\n\n"
         f"{transcript}\n"

@@ -1854,6 +1854,38 @@ def cmd_morph(args) -> None:
     print(f"morphed {res.get('sid', sid)}: {', '.join(bits)}{suffix}")
 
 
+def cmd_write(args) -> None:
+    """T-0508 (M11/F11.1, AP#2): attach-and-write to ANY session.
+
+    The second point of access — most often the operator dropping a line into a
+    running session. Wraps the live ``inject_input`` primitive (the same
+    mechanism behind the peer-bus "check mail" nudge), so the target pane
+    receives ``text`` as composer input. The target SID is explicit (you are
+    writing to ANOTHER session), never derived from this pane."""
+    res = post("inject_input", {"sid": args.sid, "text": args.text})
+    n = res.get("lines_sent")
+    suffix = f" ({n} line(s))" if n is not None else ""
+    print(f"wrote to {args.sid}{suffix}")
+
+
+def cmd_user_session(args) -> None:
+    """T-0508 (M11/F11.1, AP#3): launch (or reuse) a dedicated user session.
+
+    The third point of access — a global user gets a conversational attendant
+    for a project. Idempotent per ``(slug, global_user_id)``: an already-live
+    attendant is reused (``spawned:false``), never fanned out into a duplicate
+    (T-0478). With ``--message`` the inbound reference is surfaced in the boot
+    prompt; the session reads the full thread from the conversation store."""
+    slug = args.slug or resolve_slug()
+    params = {"slug": slug, "global_user_id": args.global_user_id}
+    if getattr(args, "message", None):
+        params["message_ref"] = args.message
+    res = post("ensure_user_conversation", params)
+    sid = res.get("sid")
+    verb = "launched" if res.get("spawned") else "reused"
+    print(f"{verb} user session {sid} for {args.global_user_id} (slug={slug})")
+
+
 def sessions_dir(slug: str) -> Path:
     return Path(BOT_SQUAD) / "data" / slug / "sessions"
 
@@ -3769,6 +3801,27 @@ def build_parser() -> argparse.ArgumentParser:
     mo.add_argument("--initiative", help="initiative to bind (for --role tl/dev)")
     mo.add_argument("--sid", help="session SID (default: derived from tmux)")
     mo.set_defaults(func=cmd_morph)
+
+    # write (T-0508, M11/F11.1 AP#2) — attach-and-write to ANY session
+    wr = sub.add_parser(
+        "write",
+        help="attach-and-write to any session: inject TEXT into SID's composer "
+             "(most often the operator dropping a line into a running session)")
+    wr.add_argument("sid", help="target session SID to write into")
+    wr.add_argument("text", help="text to inject into the target composer")
+    wr.set_defaults(func=cmd_write)
+
+    # user-session (T-0508, M11/F11.1 AP#3) — launch/reuse a dedicated user session
+    us = sub.add_parser(
+        "user-session",
+        help="launch (or reuse) a dedicated user-conversation session for a "
+             "global user; idempotent per (slug,global_user_id) — no fan-out")
+    us.add_argument("slug", nargs="?", default=None,
+                    help="project slug (default: derived from cwd)")
+    us.add_argument("global_user_id", help="global user id (gu_...)")
+    us.add_argument("--message",
+                    help="inbound message reference/snippet for the boot prompt")
+    us.set_defaults(func=cmd_user_session)
 
     # operator-state (T-0473) — read the operator's future-focused state-doc
     os_ = sub.add_parser(

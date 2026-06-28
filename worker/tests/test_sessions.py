@@ -3853,36 +3853,63 @@ def test_user_conversation_window_builds_and_validates():
             user_conversation_window(bad)
 
 
+def _write_session_md(sess_dir, sid):
+    """Minimal session md (just the sid) under sess_dir, mirroring the seed md a
+    fresh task-less spawn writes before the SessionStart hook stamps status."""
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    (sess_dir / f"{sid}.md").write_text(f"---\nsid: {sid}\n---\n")
+
+
+def test_window_from_sid_recovers_window():
+    """The window is recoverable from the immutable SID (hook-proof), even when
+    the gid carries '-' / '-p' (rsplit on the LAST -p, split(.., 2))."""
+    import bot_squad_worker.sessions as S
+
+    assert S._window_from_sid("S-u-gu_a1-user-conversation-p7") == "gu_a1-user-conversation"
+    # gid containing a '-p' run must not confuse the pane split.
+    assert (S._window_from_sid("S-u-gu-p1-user-conversation-p3")
+            == "gu-p1-user-conversation")
+    # No pane segment ⟹ "".
+    assert S._window_from_sid("garbage") == ""
+
+
 def test_live_user_conversation_sid_matches_live_attendant(tmp_path, monkeypatch):
-    """live_user_conversation_sid finds the attendant by LIVE PANE (window +
-    live claude), scoped to the project, independent of md-status timing."""
+    """live_user_conversation_sid identifies the attendant from this project's
+    session mds (window derived from the SID) and confirms liveness via the
+    process scan — independent of WHICH tmux session the pane lives in and of
+    md-status timing (T-0478 reopened-fix)."""
     import types
     import bot_squad_worker.sessions as S
 
-    cfg = types.SimpleNamespace(data_dir=tmp_path / "data")
+    data = tmp_path / "data"
+    cfg = types.SimpleNamespace(data_dir=data)
     gid = "gu_a1b2c3"
     win = S.user_conversation_window(gid)
-    other_win = S.user_conversation_window("gu_other")
-    panes = [
-        types.SimpleNamespace(window=win, pane_id="%7", pid=701, session="tp"),
-        # Same window but ANOTHER project's tmux session — must not leak in.
-        types.SimpleNamespace(window=win, pane_id="%9", pid=901, session="elsewhere"),
-        # A different user's attendant.
-        types.SimpleNamespace(window=other_win, pane_id="%8", pid=801, session="tp"),
-    ]
-    monkeypatch.setattr(S, "list_panes", lambda: panes)
-    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
-    monkeypatch.setattr(S, "_proc_children_map", lambda: {})
-    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, ch: True)
-    assert S.live_user_conversation_sid(cfg, "tp", gid) == f"S-u-{win}-p7"
+    sess_dir = data / "tp" / "sessions"
+    att_sid = f"S-u-{win}-p7"
+    other_sid = f"S-u-{S.user_conversation_window('gu_other')}-p8"
+    _write_session_md(sess_dir, att_sid)
+    _write_session_md(sess_dir, other_sid)
+    # Both have md; only the attendant's pane runs a live claude.
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {att_sid, other_sid})
+    assert S.live_user_conversation_sid(cfg, "tp", gid) == att_sid
 
-    # No live claude in the pane ⟹ no attendant (a dead pane never pins a user).
-    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, ch: False)
+    # REGRESSION: a session whose pane lives in the per-INITIATIVE tmux session
+    # (not the bare slug session) must STILL be found — the old slug-scoped
+    # pane-scan missed it and fanned out a duplicate. The md-scan + process-scan
+    # path is tmux-session-agnostic, so this passes by construction (the md is
+    # in data/<slug>/sessions/ regardless of the pane's tmux session).
+
+    # Dead pane (md present but no live claude) ⟹ no attendant.
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
     assert S.live_user_conversation_sid(cfg, "tp", gid) is None
 
-    # No matching window at all ⟹ None.
-    monkeypatch.setattr(S, "_pane_has_live_claude", lambda pid, ch: True)
+    # Live, but no md for this gid ⟹ None.
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {att_sid})
     assert S.live_user_conversation_sid(cfg, "tp", "gu_nobody") is None
+
+    # Another project's attendant (md under a different slug dir) never leaks in.
+    assert S.live_user_conversation_sid(cfg, "other-slug", gid) is None
 
 
 def test_list_sessions_emits_role_for_active_and_suspended(tmp_path, monkeypatch):

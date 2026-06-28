@@ -2197,6 +2197,22 @@ def user_conversation_window(global_user_id: str) -> str:
     return f"{gid}-user-conversation"
 
 
+def _window_from_sid(sid: str) -> str:
+    """The tmux window embedded in a SID ``S-<user>-<window>-p<pane>``.
+
+    Mirrors the SessionStart hook's derivation
+    (``sid.rsplit("-p", 1)[0].split("-", 2)[-1]``) so a user-conversation
+    session is identified by its IMMUTABLE SID alone — no md field the hook
+    could drop. ``rsplit`` on the LAST ``-p`` and ``split(.., 2)`` tolerate
+    ``-`` / ``-p`` inside the window (e.g. a gid carrying them). Returns "" when
+    the SID has no ``-p`` pane segment.
+    """
+    s = str(sid or "")
+    if "-p" not in s:
+        return ""
+    return s.rsplit("-p", 1)[0].split("-", 2)[-1]
+
+
 def live_user_conversation_sid(
     cfg: Any, slug: str, global_user_id: str
 ) -> str | None:
@@ -2207,37 +2223,39 @@ def live_user_conversation_sid(
     non-None result means the user already has a live attendant, so a new
     inbound message is routed to it rather than spawning a duplicate.
 
-    Detection is a LIVE-PANE scan (mirroring
-    :func:`dispatch._live_operator_sids_from_tmux`), NOT an md-status scan: a
-    freshly-spawned task-less session's seed md carries no ``status: active``
-    until the SessionStart hook / gc_sessions stamps it, so an md-status lookup
-    would miss a just-spawned attendant and let a second near-simultaneous
-    message spawn a duplicate. Keying on the live tmux pane (window matches AND
-    a live claude agent runs in it) is timing-independent and reflects the
-    process truth. Scoped to this project's tmux session (``pane.session ==
-    slug``) so another project's attendant never leaks in. Tolerant of a
-    missing/broken tmux server (``list_panes`` → ``[]`` → None).
+    T-0478 (REOPENED) fix — this used to be a LIVE-PANE scan scoped to
+    ``pane.session == slug``. That scoping was a structural dup-spawn bug:
+    spawns land the window in the per-INITIATIVE sibling tmux session
+    (``<slug>-<initiative-stem>``, see :func:`_tmux_session_name`), never the
+    bare ``slug`` session, so the reuse match could NEVER fire and every
+    inbound message fanned out a fresh attendant. We now scan this project's
+    session mds (``data/<slug>/sessions/*.md`` — inherently project-scoped, and
+    catching attendants in ANY tmux session) and identify the attendant by the
+    window derived from each md's immutable ``sid`` (hook-proof; no custom md
+    field). Liveness is confirmed against the real process via
+    :func:`_live_agent_sids` (a pane+/proc scan, NOT tmux-session-scoped, NOT
+    the md ``status`` field — a just-spawned task-less seed md has no
+    ``status: active`` yet, so an md-status gate would reopen the very race the
+    per-(slug,gid) flock in ``_action_ensure_user_conversation`` closes).
+    Tolerant of a missing sessions dir / broken tmux server (→ None).
     """
-    want = user_conversation_window(global_user_id)
+    want = user_conversation_window(global_user_id)  # validates gid
+    sess_dir = Path(cfg.data_dir) / slug / "sessions"
+    if not sess_dir.exists():
+        return None
     try:
-        panes = list_panes()
+        live = _live_agent_sids()
     except Exception:  # noqa: BLE001 — a tmux hiccup must not break the gate
         return None
-    if not panes:
-        return None
-    user = _get_current_user()
-    children = _proc_children_map()
-    for p in panes:
-        if p.session != slug:
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None:
             continue
-        if (p.window or "").strip() != want:
+        sid = str(meta.get("sid") or md.stem)
+        if _window_from_sid(sid) != want:
             continue
-        if not _pane_has_live_claude(p.pid, children):
-            continue
-        try:
-            return compute_sid(user, p.window, p.pane_id)
-        except Exception:  # noqa: BLE001
-            return None
+        if sid in live:
+            return sid
     return None
 
 

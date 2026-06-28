@@ -1228,6 +1228,61 @@ def test_ensure_user_conversation_validates_gid(tmp_path, monkeypatch):
             "slug": "test-project", "global_user_id": "gu;rm -rf /"})
 
 
+def test_ensure_user_conversation_concurrent_no_fanout(tmp_path, monkeypatch):
+    """T-0478 (REOPENED) regression: two RAPID/CONCURRENT ensure calls for the
+    SAME (slug, gid) must yield EXACTLY ONE spawned attendant + one md — the
+    per-(slug,gid) flock serializes check-and-spawn and the rewritten md-scan
+    reuse lets the second call find the first's just-spawned session. Before the
+    fix this fanned out two sessions (and two duplicate verbatim tickets) for a
+    single user's burst. The fake spawn widens the check→spawn window with a
+    sleep, so without the flock both threads would spawn and this test fails."""
+    import threading
+    import time as _time
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    sess_dir = cfg.data_dir / "test-project" / "sessions"
+    live: set[str] = set()
+    spawn_calls: list[str] = []
+    lk = threading.Lock()
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        # Mirror real spawn: write the seed md + mark the pane live so the reuse
+        # md-scan can find a JUST-spawned attendant; the sleep widens the race.
+        with lk:
+            n = len(spawn_calls) + 1
+            spawn_calls.append(window)
+        _time.sleep(0.05)
+        sid = f"S-u-{window}-p{n}"
+        (sess_dir / f"{sid}.md").write_text(f"---\nsid: {sid}\n---\n")
+        live.add(sid)
+        return {"ok": True, "sid": sid}
+
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set(live))
+    monkeypatch.setattr(A, "_action_inject_input", lambda params: {"ok": True})
+
+    results: dict[int, dict] = {}
+
+    def call(idx):
+        results[idx] = A.dispatch("ensure_user_conversation", {
+            "slug": "test-project", "global_user_id": "gu_race",
+            "message_ref": f"msg{idx}"})
+
+    t1 = threading.Thread(target=call, args=(1,))
+    t2 = threading.Thread(target=call, args=(2,))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert len(spawn_calls) == 1, f"fan-out: spawned {len(spawn_calls)} times"
+    sids = {results[1]["sid"], results[2]["sid"]}
+    assert len(sids) == 1, f"two different attendants: {sids}"
+    assert sorted([results[1]["spawned"], results[2]["spawned"]]) == [False, True]
+    mds = [p for p in sess_dir.glob("*.md")
+           if S._window_from_sid(p.stem) == "gu_race-user-conversation"]
+    assert len(mds) == 1, f"expected 1 user-conversation md, got {len(mds)}"
+
+
 def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):
     """T-0150: resume_session must accept the optional initial_prompt param and
     pass it through to sessions.resume (so a resumed expert gets a delta brief)."""

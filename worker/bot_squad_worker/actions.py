@@ -15,6 +15,7 @@ tmux_only, or both. The dispatcher checks the running worker's mode
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -990,32 +991,55 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
     gid = params["global_user_id"]
     message_ref = params.get("message_ref")
 
-    # Reuse: a live attendant already holds this (slug, gid) → route to it.
-    existing = _sessions.live_user_conversation_sid(cfg, slug, gid)
-    if existing is not None:
-        if message_ref and str(message_ref).strip():
-            # Best-effort wake — the attendant re-reads its thread for the new
-            # message. A pane-timing hiccup must never fail the ensure (the
-            # message is already durable in the store).
-            try:
-                _action_inject_input({
-                    "sid": existing,
-                    "text": ("A new message arrived in your user-conversation "
-                             "thread — read it and respond."),
-                })
-            except ActionError:
-                pass
-        return {"ok": True, "sid": existing, "spawned": False}
+    # Validate the gid up front (raises on a crafted value): it is both the
+    # spawn window AND the per-(slug,gid) lock-file segment below, so it must be
+    # a single safe path/shell segment before either side effect.
+    window = _sessions.user_conversation_window(gid)
 
-    # Spawn: no live attendant → open one in a gid-keyed user-conversation window.
-    window = _sessions.user_conversation_window(gid)  # validates gid
-    result = _sessions.spawn(
-        cfg,
-        slug,
-        window,
-        _user_conversation_boot_prompt(slug, gid, message_ref),
-    )
-    return {"ok": True, "sid": result["sid"], "spawned": True}
+    # T-0478 (REOPENED) fix — serialize the WHOLE check-and-spawn under a
+    # per-(slug,gid) flock. Without it, two near-simultaneous inbound messages
+    # for the SAME user both read "no live attendant" before either spawns, and
+    # each spawns one → a duplicate session + duplicate verbatim ticket per
+    # message (the observed fan-out). The lock is per-gid (the filename carries
+    # the validated gid) so different users never contend, mirroring spawn()'s
+    # ``.task-claim.lock`` pattern. The flock closes the TOCTOU; the rewritten
+    # ``live_user_conversation_sid`` (md-scan, not slug-scoped pane-scan) closes
+    # the structural miss — BOTH are required (a flock around the old broken
+    # reuse check would still fan out, since the check never matched).
+    sess_dir = cfg.data_dir / slug / "sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    claim_fd = open(sess_dir / f".uconv-claim-{gid}.lock", "w")
+    try:
+        fcntl.flock(claim_fd, fcntl.LOCK_EX)
+
+        # Reuse: a live attendant already holds this (slug, gid) → route to it.
+        existing = _sessions.live_user_conversation_sid(cfg, slug, gid)
+        if existing is not None:
+            if message_ref and str(message_ref).strip():
+                # Best-effort wake — the attendant re-reads its thread for the
+                # new message. A pane-timing hiccup must never fail the ensure
+                # (the message is already durable in the store).
+                try:
+                    _action_inject_input({
+                        "sid": existing,
+                        "text": ("A new message arrived in your user-"
+                                 "conversation thread — read it and respond."),
+                    })
+                except ActionError:
+                    pass
+            return {"ok": True, "sid": existing, "spawned": False}
+
+        # Spawn: no live attendant → open one in the gid-keyed window.
+        result = _sessions.spawn(
+            cfg,
+            slug,
+            window,
+            _user_conversation_boot_prompt(slug, gid, message_ref),
+        )
+        return {"ok": True, "sid": result["sid"], "spawned": True}
+    finally:
+        # Closing the fd releases the flock (also on the spawn error path).
+        claim_fd.close()
 
 
 # ---------------------------------------------------------------------------

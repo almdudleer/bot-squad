@@ -177,6 +177,18 @@ def _read_sidecar(root: Path, name: str) -> set:
         return set()
 
 
+def _load_existing_alias_index(root: Path) -> dict:
+    """The on-disk alias index (the migration record). Used both to MERGE on
+    re-apply and as the idempotency guard (an initiative already present here is
+    NOT re-migrated — important now that originals are KEPT in the default move)."""
+    p = root / "vision" / "initiative_aliases.json"
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
 def _read_counter(root: Path) -> int:
     p = root / "_counters" / "task.txt"
     try:
@@ -227,22 +239,36 @@ def build_plan(data_dir, slug: str) -> dict:
     counter_before = _read_counter(root)
     base = max(counter_before, _scan_max_task_id(backlog_dir))
 
+    # Idempotency: skip any initiative already recorded in the on-disk alias
+    # index (a prior --apply). Needed because the default move KEEPS originals,
+    # so naive enumeration alone would re-migrate on a second run.
+    existing_index = _load_existing_alias_index(root)
+    existing_keys = {normalize_ref(str(k)) for k in existing_index}
+
     ordered = _collect_initiative_files(root)
     initiatives: list[dict] = []
+    already_migrated: list[str] = []
     alias_index: dict[str, str] = {}
-    for i, path in enumerate(ordered):
+    allocated = 0
+    for path in ordered:
         d = derive_initiative(path)
+        keys = {normalize_ref(k) for k in d["alias_keys"]}
+        if keys & existing_keys:
+            already_migrated.append(d["stem"])
+            continue
         # record the original location relative to the project root so apply +
         # rollback move it back correctly (vision/initiatives/ OR vision/ root).
         d["src_relpath"] = str(path.relative_to(root))
-        new_id = f"T-{base + 1 + i:04d}"
+        new_id = f"T-{base + 1 + allocated:04d}"
+        allocated += 1
         d["new_id"] = new_id
         d["status"] = derive_status(d["file"], active, finished)
         for key in d["alias_keys"]:
             alias_index[normalize_ref(key)] = new_id
         initiatives.append(d)
 
-    children = _child_reparent_plan(backlog_dir, alias_index)
+    # child reparent resolves against the FULL (existing + new) alias map
+    children = _child_reparent_plan(backlog_dir, {**existing_index, **alias_index})
 
     return {
         "ticket": "T-0480",
@@ -250,6 +276,7 @@ def build_plan(data_dir, slug: str) -> dict:
         "data_dir": str(data_dir),
         "counter_before": counter_before,
         "count": len(initiatives),
+        "already_migrated": already_migrated,
         "migrate_last": _MIGRATE_LAST,
         "initiatives": [
             {k: v for k, v in d.items() if k != "body"} for d in initiatives
@@ -330,54 +357,63 @@ def _write_counter(root: Path, value: int) -> None:
 # --- run / apply / rollback -------------------------------------------------
 
 def run(data_dir, slug: str, *, apply: bool = False, manifest_out=None,
-        backfill_children: bool = False) -> dict:
-    """Build the plan; with apply=True execute it (write tasks, archive
-    originals, write alias index, optionally reparent children). Always writes
-    the manifest (the dry-run manifest IS the operator-review artifact)."""
+        backfill_children: bool = False, archive_originals: bool = False) -> dict:
+    """Build the plan; with apply=True execute it. DEFAULT is the pure-data move
+    (operator-approved): create the kind:initiative tasks + alias index +
+    (optional) child reparent, but KEEP the originals in place so the
+    un-converted live readers keep working. ``archive_originals=True`` is the
+    later Phase-3 cutover step (move originals to _migrated/). Always writes the
+    manifest (the dry-run manifest IS the operator-review artifact)."""
     root = _root(data_dir, slug)
     plan = build_plan(data_dir, slug)
     full = plan.pop("_full")
+    existing_index = _load_existing_alias_index(root)
+    merged_index = {**existing_index, **plan["alias_index"]}
 
     actions: list[dict] = []
     if apply and full:
         backlog_dir = root / "backlog"
         backlog_dir.mkdir(parents=True, exist_ok=True)
         migrated_dir = root / "vision" / "initiatives" / "_migrated"
-        migrated_dir.mkdir(parents=True, exist_ok=True)
+        if archive_originals:
+            migrated_dir.mkdir(parents=True, exist_ok=True)
 
         for d in full:
             filename = f"{d['new_id']}-{_slugify(d['title'])}.md"
             dest = backlog_dir / filename
             dest.write_text(_dump_initiative_task(d), encoding="utf-8")
-            orig = root / d["src_relpath"]
-            archived = migrated_dir / d["file"]
-            if orig.exists():
-                shutil.move(str(orig), str(archived))
+            archived = False
+            if archive_originals:
+                orig = root / d["src_relpath"]
+                if orig.exists():
+                    shutil.move(str(orig), str(migrated_dir / d["file"]))
+                    archived = True
             actions.append({
                 "new_id": d["new_id"], "task_file": filename,
                 "archived_from": d["file"], "src_relpath": d["src_relpath"],
-                "old_id": d["old_id"],
+                "archived": archived, "old_id": d["old_id"],
             })
 
         # advance the counter to the highest id we just allocated
         highest = max(int(d["new_id"][2:]) for d in full)
         _write_counter(root, highest)
 
-        # write the alias index the resolver reads
+        # write the MERGED alias index (existing + new) the resolver reads
         alias_path = root / "vision" / "initiative_aliases.json"
-        alias_path.write_text(json.dumps(plan["alias_index"], indent=2, ensure_ascii=False),
+        alias_path.write_text(json.dumps(merged_index, indent=2, ensure_ascii=False),
                               encoding="utf-8")
 
         if backfill_children:
             actions.append({"backfill_children": _backfill_children(
-                backlog_dir, plan["alias_index"])})
+                backlog_dir, merged_index)})
 
     plan["applied"] = apply
     plan["actions"] = actions
 
-    # default manifest location
+    # default manifest location (NOT under _migrated/ — that dir only exists when
+    # archiving; the manifest must land regardless so rollback can find it)
     if manifest_out is None and apply:
-        manifest_out = root / "vision" / "initiatives" / "_migrated" / "manifest.json"
+        manifest_out = root / "vision" / "initiative_migration_manifest.json"
     if manifest_out is not None:
         mp = Path(manifest_out)
         mp.parent.mkdir(parents=True, exist_ok=True)
@@ -450,6 +486,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--apply", action="store_true", help="execute (default: dry-run)")
     ap.add_argument("--backfill-children", action="store_true",
                     help="also stamp parent_task on child tasks (staged)")
+    ap.add_argument("--archive-originals", action="store_true",
+                    help="Phase-3 cutover: MOVE migrated originals to _migrated/ "
+                         "(default keeps them so un-converted readers still work)")
     ap.add_argument("--manifest-out", default=None, help="write the manifest here")
     ap.add_argument("--rollback", default=None, help="reverse a prior apply from its manifest.json")
     args = ap.parse_args(argv)
@@ -460,7 +499,8 @@ def main(argv: list[str]) -> int:
         return 0
 
     plan = run(args.data_dir, args.slug, apply=args.apply,
-               manifest_out=args.manifest_out, backfill_children=args.backfill_children)
+               manifest_out=args.manifest_out, backfill_children=args.backfill_children,
+               archive_originals=args.archive_originals)
     mode = "APPLIED" if args.apply else "DRY-RUN (no data moved)"
     print(f"=== migrate_initiatives_to_tasks: {mode} ===")
     print(f"initiatives: {plan['count']}  counter_before: {plan['counter_before']}  "

@@ -183,7 +183,7 @@ def test_includes_extra_root_initiative_ini04(tmp_path: Path):
 def test_apply_archives_root_initiative(tmp_path: Path):
     root = _mk(tmp_path, initiatives={"ui-polish.md": BARE}, active=["ui-polish.md"], counter=543)
     (root / "vision" / INI04_NAME).write_text(INI04_BODY, encoding="utf-8")
-    run(tmp_path, SLUG, apply=True)
+    run(tmp_path, SLUG, apply=True, archive_originals=True)
     # the root-level original is archived under _migrated/ (not deleted)
     assert (root / "vision" / "initiatives" / "_migrated" / INI04_NAME).exists()
     assert not (root / "vision" / INI04_NAME).exists()
@@ -207,33 +207,47 @@ def test_dry_run_writes_no_task_files_no_counter_bump(tmp_path: Path):
     assert m["count"] == 1
 
 
-def test_apply_creates_tasks_moves_originals_writes_index(tmp_path: Path):
+def test_apply_default_keeps_originals_writes_index(tmp_path: Path):
+    """Pure-data-move (operator-approved default): create the kind:initiative
+    tasks + alias index, but DO NOT archive originals — so the un-converted live
+    readers (routes_vision) keep working off the still-present files."""
     root = _mk(tmp_path, initiatives={
         "ui-polish.md": BARE,
         "INI-01-persistent-initiatives.md": FM_INIT,
     }, active=["ui-polish.md"], counter=543)
     run(tmp_path, SLUG, apply=True)
-    # two initiative-tasks now in backlog, each kind: initiative
     created = list((root / "backlog").glob("T-05*.md"))
     assert len(created) == 2
     assert all("kind: initiative" in p.read_text() for p in created)
-    # originals archived (not deleted) under _migrated/
-    assert (root / "vision" / "initiatives" / "_migrated" / "ui-polish.md").exists()
-    assert not (root / "vision" / "initiatives" / "ui-polish.md").exists()
+    # originals STAY in place (NOT archived) by default
+    assert (root / "vision" / "initiatives" / "ui-polish.md").exists()
+    assert not (root / "vision" / "initiatives" / "_migrated").exists()
     # alias index written and resolves
     idx = json.loads((root / "vision" / "initiative_aliases.json").read_text())
     assert "ui-polish" in idx
-    # counter advanced by 2
     assert (root / "_counters" / "task.txt").read_text().strip() == "545"
 
 
-def test_apply_is_idempotent(tmp_path: Path):
+def test_apply_archive_flag_moves_originals(tmp_path: Path):
+    """--archive-originals (Phase-3 cutover) moves originals to _migrated/."""
+    root = _mk(tmp_path, initiatives={"ui-polish.md": BARE}, active=["ui-polish.md"], counter=543)
+    run(tmp_path, SLUG, apply=True, archive_originals=True)
+    assert (root / "vision" / "initiatives" / "_migrated" / "ui-polish.md").exists()
+    assert not (root / "vision" / "initiatives" / "ui-polish.md").exists()
+
+
+def test_apply_is_idempotent_via_alias_index(tmp_path: Path):
+    """With originals KEPT (default), a 2nd --apply must still be a no-op —
+    idempotency comes from the on-disk alias index, not from moved originals."""
     root = _mk(tmp_path, initiatives={"ui-polish.md": BARE}, active=["ui-polish.md"], counter=543)
     run(tmp_path, SLUG, apply=True)
     after_first = sorted(p.name for p in (root / "backlog").glob("T-*.md"))
     counter_first = (root / "_counters" / "task.txt").read_text().strip()
-    # a second apply must NOT re-migrate (originals already archived → nothing to do)
+    idx_first = (root / "vision" / "initiative_aliases.json").read_text()
+    # original still present → naive enumeration would re-migrate; the index guard prevents it
+    assert (root / "vision" / "initiatives" / "ui-polish.md").exists()
     run(tmp_path, SLUG, apply=True)
     after_second = sorted(p.name for p in (root / "backlog").glob("T-*.md"))
-    assert after_first == after_second
+    assert after_first == after_second  # no duplicate task
     assert (root / "_counters" / "task.txt").read_text().strip() == counter_first
+    assert (root / "vision" / "initiative_aliases.json").read_text() == idx_first  # index unchanged

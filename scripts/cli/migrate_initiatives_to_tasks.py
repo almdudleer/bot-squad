@@ -46,6 +46,15 @@ DEFAULT_SLUG = "bot-squad"
 # process-paradigm binds 50+ live tickets — migrate it LAST (D-0038 §5).
 _MIGRATE_LAST = "process-paradigm"
 
+# T-0480 D-B (operator 2026-06-28): a small number of REAL shipped initiatives
+# live at the vision/ ROOT instead of vision/initiatives/. Enumerate them too —
+# but EXPLICITLY by exact name, so the neighbouring source docs
+# (INI-XX-process-paradigm-SOURCE-VERBATIM.md, INI-process-paradigm-STRUCTURED.md)
+# are NOT swept in.
+_EXTRA_ROOT_INITIATIVES = (
+    "INI-04-structured-stakeholder-comms-2026-06-21.md",
+)
+
 _FM_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)", re.DOTALL)
 _H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.M)
 _INI_PREFIX_RE = re.compile(r"^(INI-\d+)")
@@ -187,12 +196,19 @@ def _scan_max_task_id(backlog_dir: Path) -> int:
     return mx
 
 
-def _ordered_initiative_files(initiatives_dir: Path) -> list[Path]:
+def _collect_initiative_files(root: Path) -> list[Path]:
+    """All migratable initiative files: vision/initiatives/*.md PLUS the
+    explicit vision/-root initiatives (D-B). process-paradigm LAST; everything
+    else alphabetical by stem."""
+    initiatives_dir = root / "vision" / "initiatives"
     files = [
         p for p in initiatives_dir.glob("*.md")
         if p.is_file() and p.parent.name != "_migrated"
     ]
-    # process-paradigm LAST; everything else alphabetical by stem.
+    for name in _EXTRA_ROOT_INITIATIVES:
+        extra = root / "vision" / name
+        if extra.is_file():
+            files.append(extra)
     return sorted(files, key=lambda p: (1 if p.stem == _MIGRATE_LAST else 0, p.stem))
 
 
@@ -203,7 +219,6 @@ def build_plan(data_dir, slug: str) -> dict:
     allocating ids (ids are PROJECTED from the counter). This is the artifact the
     operator reviews at the Phase-2 gate."""
     root = _root(data_dir, slug)
-    initiatives_dir = root / "vision" / "initiatives"
     backlog_dir = root / "backlog"
 
     active = _read_sidecar(root, "active_initiatives")
@@ -212,11 +227,14 @@ def build_plan(data_dir, slug: str) -> dict:
     counter_before = _read_counter(root)
     base = max(counter_before, _scan_max_task_id(backlog_dir))
 
-    ordered = _ordered_initiative_files(initiatives_dir)
+    ordered = _collect_initiative_files(root)
     initiatives: list[dict] = []
     alias_index: dict[str, str] = {}
     for i, path in enumerate(ordered):
         d = derive_initiative(path)
+        # record the original location relative to the project root so apply +
+        # rollback move it back correctly (vision/initiatives/ OR vision/ root).
+        d["src_relpath"] = str(path.relative_to(root))
         new_id = f"T-{base + 1 + i:04d}"
         d["new_id"] = new_id
         d["status"] = derive_status(d["file"], active, finished)
@@ -331,13 +349,14 @@ def run(data_dir, slug: str, *, apply: bool = False, manifest_out=None,
             filename = f"{d['new_id']}-{_slugify(d['title'])}.md"
             dest = backlog_dir / filename
             dest.write_text(_dump_initiative_task(d), encoding="utf-8")
-            orig = root / "vision" / "initiatives" / d["file"]
+            orig = root / d["src_relpath"]
             archived = migrated_dir / d["file"]
             if orig.exists():
                 shutil.move(str(orig), str(archived))
             actions.append({
                 "new_id": d["new_id"], "task_file": filename,
-                "archived_from": d["file"], "old_id": d["old_id"],
+                "archived_from": d["file"], "src_relpath": d["src_relpath"],
+                "old_id": d["old_id"],
             })
 
         # advance the counter to the highest id we just allocated
@@ -408,7 +427,9 @@ def rollback(manifest_path) -> dict:
         if "task_file" not in a:
             continue
         archived = migrated_dir / a["archived_from"]
-        orig = root / "vision" / "initiatives" / a["archived_from"]
+        # restore to the ORIGINAL location (vision/initiatives/ or vision/ root)
+        orig = root / a.get("src_relpath", f"vision/initiatives/{a['archived_from']}")
+        orig.parent.mkdir(parents=True, exist_ok=True)
         if archived.exists():
             shutil.move(str(archived), str(orig))
         tf = backlog_dir / a["task_file"]

@@ -153,6 +153,42 @@ def test_plan_alias_index_and_child_match_vs_phantom(tmp_path: Path):
     assert ch["unmatched_refs"].get("maintenance") == 1
 
 
+# --- D-B: INI-04 lives at vision/ ROOT and must be included -----------------
+
+INI04_NAME = "INI-04-structured-stakeholder-comms-2026-06-21.md"
+INI04_BODY = "# INI-04 — Structured stakeholder comms\n\nstakeholder 2026-06-21 body\n"
+
+
+def test_includes_extra_root_initiative_ini04(tmp_path: Path):
+    root = _mk(tmp_path, initiatives={
+        "ui-polish.md": BARE,
+        "process-paradigm.md": "# Process Paradigm\n\nbinds many\n",
+    }, active=["ui-polish.md"], counter=543)
+    # INI-04 sits at vision/ ROOT, NOT in vision/initiatives/
+    (root / "vision" / INI04_NAME).write_text(INI04_BODY, encoding="utf-8")
+    # a neighbouring source doc that must NOT be swept in
+    (root / "vision" / "INI-XX-process-paradigm-SOURCE-VERBATIM.md").write_text("# src\n", encoding="utf-8")
+    plan = build_plan(tmp_path, SLUG)
+    stems = [i["stem"] for i in plan["initiatives"]]
+    assert "INI-04-structured-stakeholder-comms-2026-06-21" in stems
+    assert "INI-XX-process-paradigm-SOURCE-VERBATIM" not in stems  # source doc excluded
+    assert plan["count"] == 3
+    # process-paradigm still migrates LAST
+    assert plan["initiatives"][-1]["stem"] == "process-paradigm"
+    ini04 = next(i for i in plan["initiatives"] if i["stem"].startswith("INI-04"))
+    assert ini04["old_id"] == "INI-04"
+    assert "INI-04" in plan["alias_index"]
+
+
+def test_apply_archives_root_initiative(tmp_path: Path):
+    root = _mk(tmp_path, initiatives={"ui-polish.md": BARE}, active=["ui-polish.md"], counter=543)
+    (root / "vision" / INI04_NAME).write_text(INI04_BODY, encoding="utf-8")
+    run(tmp_path, SLUG, apply=True)
+    # the root-level original is archived under _migrated/ (not deleted)
+    assert (root / "vision" / "initiatives" / "_migrated" / INI04_NAME).exists()
+    assert not (root / "vision" / INI04_NAME).exists()
+
+
 # --- run: dry-run writes nothing; apply is idempotent -----------------------
 
 def test_dry_run_writes_no_task_files_no_counter_bump(tmp_path: Path):

@@ -23,6 +23,7 @@ from bot_squad_worker.assignment import (
     OPERATOR_STATE_SECTIONS,
     RoutineAssignment,
     TaskAssignment,
+    for_routine,
     for_task,
     operator_state_template,
     role_artifact,
@@ -226,24 +227,57 @@ def test_for_task_factory_builds_a_task_assignment(tmp_path: Path):
     assert isinstance(a, Assignment)
 
 
-# --- RoutineAssignment is a conformance STUB (filled by M1-T2) -------------
+# --- RoutineAssignment conforms (T-0464 / M1-T2) --------------------------
 
 def test_routine_is_an_assignment_subclass():
     assert issubclass(RoutineAssignment, Assignment)
 
 
-def test_routine_read_text_is_a_stub_pointing_at_m1t2():
-    r = RoutineAssignment("R-0001")
+def test_routine_assignment_id_and_kind(tmp_path: Path):
+    r = RoutineAssignment(tmp_path / "data", "bot-squad", "R-0001")
     assert r.assignment_id == "R-0001"
     assert r.kind == "routine"
-    with pytest.raises(NotImplementedError, match="M1-T2"):
+
+
+def test_routine_read_text_reads_its_store_md(tmp_path: Path):
+    # T-0464: read_text returns the routine's declared instruction/rule md.
+    data_dir = tmp_path / "data"
+    routines = data_dir / "bot-squad" / "routines"
+    routines.mkdir(parents=True)
+    (routines / "R-0001-daily-digest.md").write_text("---\nid: R-0001\n---\n\ndo the thing\n")
+    r = RoutineAssignment(data_dir, "bot-squad", "R-0001")
+    assert "do the thing" in r.read_text()
+
+
+def test_routine_read_text_missing_raises(tmp_path: Path):
+    r = RoutineAssignment(tmp_path / "data", "bot-squad", "R-9999")
+    with pytest.raises(FileNotFoundError, match="R-9999"):
         r.read_text()
 
 
-def test_routine_write_result_is_a_stub_pointing_at_m1t2():
-    r = RoutineAssignment("R-0001")
-    with pytest.raises(NotImplementedError, match="M1-T2"):
-        r.write_result("anything")
+def test_routine_result_artifact_is_the_one_seam(tmp_path: Path):
+    # write-result lands in the SAME artifacts/ seam tasks use — no second store.
+    data_dir = tmp_path / "data"
+    r = RoutineAssignment(data_dir, "bot-squad", "R-0007")
+    art = r.result_artifact()
+    assert isinstance(art, Artifact)
+    assert art.path == data_dir / "bot-squad" / "artifacts" / "R-0007.md"
+
+
+def test_routine_write_result_round_trips(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    r = RoutineAssignment(data_dir, "bot-squad", "R-0007")
+    art = r.write_result("the digest output", sid="S-x-routine-p9")
+    body = art.read()
+    assert "the digest output" in body
+    assert "assignment: R-0007" in body
+    assert "kind: routine" in body
+
+
+def test_for_routine_factory(tmp_path: Path):
+    r = for_routine(tmp_path / "data", "bot-squad", "R-0003")
+    assert isinstance(r, RoutineAssignment)
+    assert r.assignment_id == "R-0003"
 
 
 # --- assignment_write_result worker action --------------------------------
@@ -347,8 +381,92 @@ def test_action_write_result_empty_content_raises(tmp_path, monkeypatch):
         })
 
 
+def test_action_write_result_kind_routine_writes_routine_artifact(tmp_path, monkeypatch):
+    # T-0464: the write-result action is the ONE seam for BOTH task and routine
+    # assignments. kind=routine routes to the routine assignment + artifact.
+    import bot_squad_worker.actions as A
+
+    _cfg, data_dir = _make_action_cfg(tmp_path, monkeypatch)
+    routines = data_dir / "bot-squad" / "routines"
+    routines.mkdir(parents=True)
+    (routines / "R-0001-digest.md").write_text("---\nid: R-0001\n---\n\ndo the work\n")
+    out = A.dispatch("assignment_write_result", {
+        "slug": "bot-squad", "assignment_id": "R-0001",
+        "content": "the routine output", "sid": "S-x-rt-p1", "kind": "routine",
+    })
+    assert out["ok"] is True
+    assert out["kind"] == "routine"
+    art_path = data_dir / "bot-squad" / "artifacts" / "R-0001.md"
+    assert out["artifact_path"] == str(art_path)
+    assert "the routine output" in art_path.read_text()
+
+
+def test_action_write_result_defaults_to_task_kind(tmp_path, monkeypatch):
+    # back-compat: no kind param -> task assignment (existing callers unchanged).
+    import bot_squad_worker.actions as A
+
+    _cfg, data_dir = _make_action_cfg(tmp_path, monkeypatch)
+    out = A.dispatch("assignment_write_result", {
+        "slug": "bot-squad", "assignment_id": "T-0042",
+        "content": "x", "sid": "S-x-p1",
+    })
+    assert out["kind"] == "task"
+
+
 def test_action_is_registered_with_a_mode(tmp_path):
     from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
 
     assert "assignment_write_result" in ACTION_REGISTRY
     assert "assignment_write_result" in ACTION_MODES
+
+
+# --- routine_declare / routine_list worker actions (T-0464) ----------------
+
+def test_action_routine_declare_and_list(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _cfg, data_dir = _make_action_cfg(tmp_path, monkeypatch)
+    out = A.dispatch("routine_declare", {
+        "slug": "bot-squad",
+        "instruction": "summarize the day",
+        "schedule": "0 9 * * *",
+        "title": "Daily digest",
+        "provenance": "stakeholder:2026-06-27",
+    })
+    assert out["ok"] is True
+    assert out["id"] == "R-0001"
+    assert Path(out["file_path"]).exists()
+
+    listed = A.dispatch("routine_list", {"slug": "bot-squad"})
+    assert [r["id"] for r in listed["routines"]] == ["R-0001"]
+    assert listed["routines"][0]["schedule"] == "0 9 * * *"
+
+
+def test_action_routine_declare_bad_cron_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    with pytest.raises(A.ActionError, match="cron|schedule|invalid"):
+        A.dispatch("routine_declare", {
+            "slug": "bot-squad", "instruction": "x", "schedule": "nonsense",
+            "provenance": "stakeholder:2026-06-27",
+        })
+
+
+def test_action_routine_declare_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    with pytest.raises(A.ActionError, match="unexpected"):
+        A.dispatch("routine_declare", {
+            "slug": "bot-squad", "instruction": "x", "schedule": "* * * * *",
+            "provenance": "stakeholder:2026-06-27", "bogus": 1,
+        })
+
+
+def test_action_routine_declare_missing_params_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    with pytest.raises(A.ActionError, match="missing required"):
+        A.dispatch("routine_declare", {"slug": "bot-squad"})

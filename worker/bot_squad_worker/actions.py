@@ -1440,7 +1440,9 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _ASSIGNMENT_WRITE_RESULT_REQUIRED = {"slug", "assignment_id", "content", "sid"}
-_ASSIGNMENT_WRITE_RESULT_ALLOWED = _ASSIGNMENT_WRITE_RESULT_REQUIRED
+# T-0464: optional ``kind`` selects the assignment implementer (task default,
+# routine for routine-spawned sessions) — the ONE write-result seam serves both.
+_ASSIGNMENT_WRITE_RESULT_ALLOWED = _ASSIGNMENT_WRITE_RESULT_REQUIRED | {"kind"}
 
 
 def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
@@ -1449,9 +1451,11 @@ def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
     The write-result primitive of the assignment interface — persists the
     work-product into an in-system artifact so it survives outside the disposable
     Claude jsonl. Backed by the ONE reusable ``Artifact`` seam (T-0467/T-0473
-    extend it). Task assignments only today; routine assignments land in M1-T2.
+    extend it). Serves BOTH assignment kinds: ``kind=task`` (default) and
+    ``kind=routine`` (T-0464, routine-spawned sessions).
 
     Required params: slug, assignment_id, content, sid
+    Optional params: kind ("task" | "routine", default "task")
     Returns: {ok, assignment_id, kind, artifact_path, bytes_written}
     """
     extra = set(params) - _ASSIGNMENT_WRITE_RESULT_ALLOWED
@@ -1466,15 +1470,21 @@ def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
     assignment_id = params["assignment_id"]
     content = params["content"]
     sid = params["sid"]
+    kind = str(params.get("kind", "task") or "task").strip().lower()
 
     if not isinstance(content, str) or not content.strip():
         raise ActionError("assignment_write_result: empty content")
     if cfg.projects.get(slug) is None:
         raise ActionError(f"assignment_write_result: unknown project slug {slug!r}")
 
-    from bot_squad_worker.assignment import for_task
+    from bot_squad_worker.assignment import for_routine, for_task
 
-    assignment = for_task(cfg.data_dir, slug, assignment_id)
+    if kind == "routine":
+        assignment = for_routine(cfg.data_dir, slug, assignment_id)
+    elif kind == "task":
+        assignment = for_task(cfg.data_dir, slug, assignment_id)
+    else:
+        raise ActionError(f"assignment_write_result: unknown kind {kind!r} (task|routine)")
     try:
         art = assignment.write_result(content, sid=sid)
     except ValueError as e:
@@ -1488,6 +1498,69 @@ def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
         "artifact_path": str(art.path),
         "bytes_written": len(body.encode("utf-8")),
     }
+
+
+# ---------------------------------------------------------------------------
+# T-0464 / M1-F1.1: Routines — declare + list (the firing tick lives in
+# routines.routine_tick, wired into scheduler.py). A Routine is the SECOND thing
+# implementing the assignment interface: a declared rule (instruction + a
+# schedule trigger) that spawns a session per due tick.
+# ---------------------------------------------------------------------------
+
+_ROUTINE_DECLARE_REQUIRED = {"slug", "instruction", "schedule"}
+_ROUTINE_DECLARE_ALLOWED = _ROUTINE_DECLARE_REQUIRED | {"title", "trigger", "provenance"}
+
+
+def _action_routine_declare(params: dict[str, Any]) -> dict[str, Any]:
+    """Declare + persist a Routine in the project store (T-0464).
+
+    Required params: slug, instruction, schedule (a 5-field cron expression)
+    Optional params: title, trigger ("schedule", default), provenance
+    Returns: {ok, id, file_path, next_run_at}
+    """
+    extra = set(params) - _ROUTINE_DECLARE_ALLOWED
+    if extra:
+        raise ActionError(f"routine_declare got unexpected params: {sorted(extra)}")
+    missing = _ROUTINE_DECLARE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"routine_declare missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import routines as _routines
+
+    cfg = _get_config()
+    try:
+        return _routines.declare(
+            cfg, params["slug"],
+            instruction=params["instruction"],
+            schedule=params["schedule"],
+            title=params.get("title"),
+            trigger=params.get("trigger", "schedule") or "schedule",
+            provenance=params.get("provenance"),
+        )
+    except _routines.RoutineError as e:
+        raise ActionError(f"routine_declare: {e}") from e
+
+
+_ROUTINE_LIST_REQUIRED = {"slug"}
+_ROUTINE_LIST_ALLOWED = _ROUTINE_LIST_REQUIRED
+
+
+def _action_routine_list(params: dict[str, Any]) -> dict[str, Any]:
+    """List declared Routines for a project (T-0464). Returns {ok, routines:[...]}."""
+    extra = set(params) - _ROUTINE_LIST_ALLOWED
+    if extra:
+        raise ActionError(f"routine_list got unexpected params: {sorted(extra)}")
+    missing = _ROUTINE_LIST_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"routine_list missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import routines as _routines
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"routine_list: unknown project slug {slug!r}")
+    return {"ok": True, "routines": _routines.list_routines(cfg, slug)}
 
 
 _COMPACT_WRITE_STATE_REQUIRED = {"slug", "sid", "content"}
@@ -2851,6 +2924,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "task_progress_add": _action_task_progress_add,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
     "assignment_write_result": _action_assignment_write_result,
+    # T-0464: Routines — declare + list (firing tick = routines.routine_tick).
+    "routine_declare": _action_routine_declare,
+    "routine_list": _action_routine_list,
     # T-0467: universal-compact "write everything down" — role-agnostic save of
     # a session's forward-state into its role artifact (F1.4).
     "compact_write_state": _action_compact_write_state,
@@ -2959,6 +3035,11 @@ ACTION_MODES: dict[str, str] = {
     # coordinator writer, like task_progress_add. Dev sessions reach it via the
     # API / coordinator socket.
     "assignment_write_result": "coordinator_only",
+    # T-0464: writes/reads the shared install data dir (routines/) + allocates a
+    # shared counter id — single coordinator writer, like task_new. Sessions reach
+    # it via `bsq routine ...` (the coordinator socket).
+    "routine_declare": "coordinator_only",
+    "routine_list": "coordinator_only",
     # T-0467: writes the shared install data dir (artifacts/) + reads session md
     # — single coordinator writer, like assignment_write_result. Sessions reach
     # it via `bsq compact-save` (the coordinator socket).

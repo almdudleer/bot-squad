@@ -75,6 +75,11 @@ ENTITY_TYPES: dict[str, EntityType] = {
     # slug-named (non-numeric) and are ignored by the scan, so new ones start
     # at INI-01 while old ones keep working.
     "initiative": EntityType("initiative", "INI", 2, "vision/initiatives", False),
+    # T-0464: Routines (Process Paradigm M1) — a declared rule that spawns a
+    # session on a trigger (schedule first). Stored as md under
+    # data/<slug>/routines/<R-NNNN>-*.md (non-recursive scan), keyed off its own
+    # counter, prefix "R-".
+    "routine": EntityType("routine", "R", 4, "routines", False),
 }
 
 

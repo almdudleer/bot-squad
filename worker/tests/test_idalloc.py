@@ -15,6 +15,15 @@ def test_format_id_per_type():
     assert idalloc.format_id("uc", 1) == "UC-0001"
     assert idalloc.format_id("flow", 1234) == "UF-1234"  # T-0180: user-flow prefix
     assert idalloc.format_id("initiative", 3) == "INI-03"
+    assert idalloc.format_id("routine", 7) == "R-0007"  # T-0464: routine type
+
+
+def test_routine_allocates_and_scans_its_subdir(tmp_path):
+    # T-0464: routines live under data/<slug>/routines/<R-NNNN>-*.md (non-recursive).
+    assert idalloc.allocate_id(tmp_path, "p", "routine") == "R-0001"
+    (tmp_path / "p" / "routines").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "p" / "routines" / "R-0050-x.md").write_text("x")
+    assert idalloc.allocate_id(tmp_path, "p", "routine") == "R-0051"
 
 
 def test_unknown_type_raises():

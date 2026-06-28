@@ -68,6 +68,8 @@ def test_registry_lists_only_allowed_actions():
         "task_progress_add",
         # T-0463: assignment-interface write-result primitive (F1.1-d).
         "assignment_write_result",
+        # T-0464: Routines — declare + list (M1-F1.1).
+        "routine_declare", "routine_list",
         # T-0467: universal-compact role-agnostic forward-state save (F1.4).
         "compact_write_state",
         # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).

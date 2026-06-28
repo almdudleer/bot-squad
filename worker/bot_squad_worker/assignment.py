@@ -57,8 +57,11 @@ _TASK_HOW_TO = (
 )
 
 _ROUTINE_HOW_TO = (
-    "You are working a ROUTINE assignment — a rule that spawns work on an event "
-    "(e.g. a schedule). [M1-T2: routine conformance is a stub today.]"
+    "You are working a ROUTINE assignment — a rule that, on a trigger (a schedule, "
+    "or generally any integration event), spawned THIS session to do work per its "
+    "instruction. Read the instruction (the routine's text), do the work staying "
+    "targeted at it, and WRITE YOUR RESULT BACK via the write-result primitive so "
+    "the work-product survives this session — do not leave it only in the chat log."
 )
 
 
@@ -223,20 +226,31 @@ class TaskAssignment(Assignment):
         return Artifact(self._data_dir / self._slug / "artifacts" / f"{self._task_id}.md")
 
 
-# --- Routine conformance STUB (filled by M1-T2) ---------------------------
+# --- Routine conforms (T-0464 / M1-T2) ------------------------------------
 
 class RoutineAssignment(Assignment):
     """A Routine as an assignment — the SECOND thing implementing the interface.
 
-    STUB: the conformance slot is reserved here so the interface has two
-    implementers per Part A, but the routine seam (event/schedule rules that
-    spawn sessions) lands in M1-T2. read_text / result_artifact raise
-    ``NotImplementedError`` until then.
+    A Routine is a declared rule (instruction + a trigger; the simplest trigger
+    is a schedule) that spawns a session to do work per its instruction. As an
+    assignment it exposes the same 4 primitives Tasks do:
+
+    (a) how_to_prompt = the routine how-to; (b) id = ``R-NNNN``;
+    (c) read_text = the routine's declared md (its instruction/rule) under
+        ``data/<slug>/routines/<routine_id>-*.md``;
+    (d) write_result = the ONE reusable ``Artifact`` seam at
+        ``data/<slug>/artifacts/<routine_id>.md`` — the SAME sink Tasks use, not
+        a second store.
+
+    The routine ENTITY (declare/list/schedule/trigger + the spawning tick) lives
+    in ``routines.py``; this class is only the assignment-interface face of it.
     """
 
     kind = "routine"
 
-    def __init__(self, routine_id: str):
+    def __init__(self, data_dir: Path | str, slug: str, routine_id: str):
+        self._data_dir = Path(data_dir)
+        self._slug = slug
         self._routine_id = routine_id
 
     @property
@@ -247,15 +261,20 @@ class RoutineAssignment(Assignment):
     def how_to_prompt(self) -> str:
         return _ROUTINE_HOW_TO
 
+    def _routine_md(self) -> Path:
+        routines = self._data_dir / self._slug / "routines"
+        matches = sorted(routines.glob(f"{self._routine_id}-*.md"))
+        if not matches:
+            raise FileNotFoundError(
+                f"assignment: routine not found: {self._routine_id} (slug {self._slug})"
+            )
+        return matches[0]
+
     def read_text(self) -> str:
-        raise NotImplementedError(
-            "RoutineAssignment.read_text is a conformance stub — implemented by M1-T2"
-        )
+        return self._routine_md().read_text(encoding="utf-8")
 
     def result_artifact(self) -> Artifact:
-        raise NotImplementedError(
-            "RoutineAssignment.result_artifact is a conformance stub — implemented by M1-T2"
-        )
+        return Artifact(self._data_dir / self._slug / "artifacts" / f"{self._routine_id}.md")
 
 
 # --- factory --------------------------------------------------------------
@@ -263,6 +282,11 @@ class RoutineAssignment(Assignment):
 def for_task(data_dir: Path | str, slug: str, task_id: str) -> TaskAssignment:
     """Build the assignment for a backlog task."""
     return TaskAssignment(data_dir, slug, task_id)
+
+
+def for_routine(data_dir: Path | str, slug: str, routine_id: str) -> RoutineAssignment:
+    """Build the assignment for a declared routine."""
+    return RoutineAssignment(data_dir, slug, routine_id)
 
 
 # --- role artifact: the role-agnostic compact destination (T-0467) --------

@@ -1716,6 +1716,56 @@ def cmd_operator_state(args) -> None:
               "`bsq compact-save \"<filled state-doc>\"`.")
 
 
+def cmd_routine_declare(args) -> None:
+    """T-0464: declare a Routine — a rule (instruction + schedule trigger) that
+    spawns a session to do work per its instruction each time the schedule fires.
+
+    The schedule is a standard 5-field cron expression (UTC), e.g.
+    ``"0 9 * * *"`` (daily 09:00) or ``"*/15 * * * *"`` (every 15 min). The
+    routine is persisted in the project store and fires on the worker's routine
+    tick — exactly one session per due tick."""
+    slug = resolve_slug()
+    params = {"slug": slug, "instruction": args.instruction, "schedule": args.schedule}
+    if getattr(args, "title", None):
+        params["title"] = args.title
+    if getattr(args, "trigger", None):
+        params["trigger"] = args.trigger
+    if getattr(args, "provenance", None):
+        params["provenance"] = args.provenance
+    res = post("routine_declare", params)
+    print(f"{res['id']}  ->  {res['file_path']}  (next run: {res.get('next_run_at')})")
+
+
+def cmd_routine_list(args) -> None:
+    """T-0464: list declared Routines for this project."""
+    slug = resolve_slug()
+    res = post("routine_list", {"slug": slug})
+    routines = res.get("routines", [])
+    if not routines:
+        print("no routines declared. `bsq routine declare --help` to add one.")
+        return
+    for r in routines:
+        print(f"{r['id']}  [{r.get('status')}]  {r.get('trigger')}:{r.get('schedule')}  "
+              f"next={r.get('next_run_at')}  {r.get('title','')}")
+
+
+def cmd_assignment_write_result(args) -> None:
+    """T-0463/T-0464: write your session's RESULT back into your assignment's
+    artifact so the work-product survives this disposable session.
+
+    Works for both assignment kinds: a TASK (default) and a ROUTINE
+    (``--kind routine``). The artifact is the ONE reusable seam at
+    ``artifacts/<assignment-id>.md``."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    params = {"slug": slug, "assignment_id": args.id, "content": args.content, "sid": sid}
+    if getattr(args, "kind", None):
+        params["kind"] = args.kind
+    res = post("assignment_write_result", params)
+    print(f"result written → {res.get('artifact_path')} "
+          f"({res.get('bytes_written')} bytes, kind {res.get('kind')})")
+
+
 def cmd_postpone(args) -> None:
     """T-0466: defer this session's next ~1h cache-window recycle.
 
@@ -3592,6 +3642,41 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("content", help="your complete forward-state markdown")
     cs.add_argument("--sid", help="session SID (default: derived from tmux)")
     cs.set_defaults(func=cmd_compact_save)
+
+    # routine (T-0464) — declare / list Routines (rule -> spawns a session on a schedule)
+    rt = sub.add_parser(
+        "routine",
+        help="routines: declare / list (a rule + schedule that spawns a session)")
+    rt_sub = rt.add_subparsers(dest="sub", required=True)
+    rtd = rt_sub.add_parser(
+        "declare",
+        help="declare a routine: an instruction + a cron schedule that spawns a "
+             "session per due tick")
+    rtd.add_argument("instruction", help="what the spawned session should do")
+    rtd.add_argument("--schedule", required=True,
+                     help="5-field cron expr in UTC, e.g. '0 9 * * *' (daily 09:00) "
+                          "or '*/15 * * * *' (every 15 min)")
+    rtd.add_argument("--title", help="short title (default: first line of instruction)")
+    rtd.add_argument("--trigger", default="schedule",
+                     help="trigger type (only 'schedule' today)")
+    rtd.add_argument("--provenance", "--source", dest="provenance",
+                     help="cite the source (stakeholder:DATE / feedback id / ...)")
+    rtd.set_defaults(func=cmd_routine_declare)
+    rtl = rt_sub.add_parser("list", help="list declared routines")
+    rtl.set_defaults(func=cmd_routine_list)
+
+    # assignment-write-result (T-0463/T-0464) — write your result to your artifact
+    awr = sub.add_parser(
+        "assignment-write-result",
+        help="write your session's RESULT into your assignment artifact "
+             "(task or --kind routine)")
+    awr.add_argument("content", help="your result markdown")
+    awr.add_argument("--id", required=True, dest="id",
+                     help="assignment id (T-NNNN task or R-NNNN routine)")
+    awr.add_argument("--kind", choices=["task", "routine"], default="task",
+                     help="assignment kind (default: task)")
+    awr.add_argument("--sid", help="session SID (default: derived from tmux)")
+    awr.set_defaults(func=cmd_assignment_write_result)
 
     # postpone (T-0466) — defer this session's next ~1h cache-window recycle
     pp = sub.add_parser(

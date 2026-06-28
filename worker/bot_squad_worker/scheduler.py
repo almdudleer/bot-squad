@@ -11,6 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from bot_squad_worker.config import Config
 from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.operator_redrive import operator_tick
+from bot_squad_worker.routines import routine_tick
 from bot_squad_worker.jobs import (
     autopilot_tick,
     autoupdate_apply_tick,
@@ -334,6 +335,25 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="operator_redrive",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # routine_tick: T-0464 / M1-F1.1 — fire DUE Routines (declared rule +
+    # schedule trigger) → spawn one session per due tick to do the routine's work
+    # per its instruction. Built on this existing tick, NOT a new daemon (grounded
+    # in "simplest condition is schedule" + reuse of scheduler.py). 60s cadence is
+    # the resolution of the schedule trigger; each tick advances next_run_at past
+    # now so a routine fires exactly once per due tick. max_instances=1 + coalesce
+    # keep overlapping ticks from racing the spawn path; idempotent (a missed run
+    # just fires on the next tick). Kill switch: BOT_SQUAD_ROUTINES=0.
+    sched.add_job(
+        routine_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="routines",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

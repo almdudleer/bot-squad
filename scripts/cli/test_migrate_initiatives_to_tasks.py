@@ -236,6 +236,41 @@ def test_apply_archive_flag_moves_originals(tmp_path: Path):
     assert not (root / "vision" / "initiatives" / "ui-polish.md").exists()
 
 
+def test_archive_only_moves_already_migrated_originals(tmp_path: Path):
+    """3b-2: archival must run even when there are NO new initiatives to migrate
+    (the create loop is a no-op on the already-migrated tree, but the originals
+    still need moving)."""
+    root = _mk(tmp_path, initiatives={
+        "ui-polish.md": BARE,
+        "INI-01-persistent-initiatives.md": FM_INIT,
+    }, active=["ui-polish.md"], counter=543)
+    run(tmp_path, SLUG, apply=True)  # migrate, originals KEPT
+    assert (root / "vision" / "initiatives" / "ui-polish.md").exists()
+    # second pass: nothing new to migrate, but --archive-originals moves them
+    run(tmp_path, SLUG, apply=True, archive_originals=True)
+    mig = root / "vision" / "initiatives" / "_migrated"
+    assert (mig / "ui-polish.md").exists()
+    assert (mig / "INI-01-persistent-initiatives.md").exists()
+    assert not (root / "vision" / "initiatives" / "ui-polish.md").exists()
+    # tasks untouched (no duplicate creation)
+    assert len(list((root / "backlog").glob("T-05*.md"))) == 2
+    # the active_initiatives sidecar is retired too (lifecycle is task status now)
+    assert (mig / "active_initiatives").exists()
+    assert not (root / "vision" / "active_initiatives").exists()
+
+
+def test_archive_leaves_non_initiative_files(tmp_path: Path):
+    """Archival must NOT move product.md / constitution.md / source docs — only
+    files whose stem is a migrated initiative alias."""
+    root = _mk(tmp_path, initiatives={"ui-polish.md": BARE}, active=["ui-polish.md"], counter=543)
+    (root / "vision" / "product.md").write_text("# product\n")
+    (root / "vision" / "INI-XX-source-verbatim.md").write_text("# src\n")
+    run(tmp_path, SLUG, apply=True)
+    run(tmp_path, SLUG, apply=True, archive_originals=True)
+    assert (root / "vision" / "product.md").exists()
+    assert (root / "vision" / "INI-XX-source-verbatim.md").exists()
+
+
 def test_apply_is_idempotent_via_alias_index(tmp_path: Path):
     """With originals KEPT (default), a 2nd --apply must still be a no-op —
     idempotency comes from the on-disk alias index, not from moved originals."""

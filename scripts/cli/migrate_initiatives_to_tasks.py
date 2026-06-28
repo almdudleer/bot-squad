@@ -374,24 +374,15 @@ def run(data_dir, slug: str, *, apply: bool = False, manifest_out=None,
     if apply and full:
         backlog_dir = root / "backlog"
         backlog_dir.mkdir(parents=True, exist_ok=True)
-        migrated_dir = root / "vision" / "initiatives" / "_migrated"
-        if archive_originals:
-            migrated_dir.mkdir(parents=True, exist_ok=True)
 
         for d in full:
             filename = f"{d['new_id']}-{_slugify(d['title'])}.md"
             dest = backlog_dir / filename
             dest.write_text(_dump_initiative_task(d), encoding="utf-8")
-            archived = False
-            if archive_originals:
-                orig = root / d["src_relpath"]
-                if orig.exists():
-                    shutil.move(str(orig), str(migrated_dir / d["file"]))
-                    archived = True
             actions.append({
                 "new_id": d["new_id"], "task_file": filename,
                 "archived_from": d["file"], "src_relpath": d["src_relpath"],
-                "archived": archived, "old_id": d["old_id"],
+                "old_id": d["old_id"],
             })
 
         # advance the counter to the highest id we just allocated
@@ -406,6 +397,11 @@ def run(data_dir, slug: str, *, apply: bool = False, manifest_out=None,
         if backfill_children:
             actions.append({"backfill_children": _backfill_children(
                 backlog_dir, merged_index)})
+
+    # 3b-2: archival is an INDEPENDENT pass (driven by the alias index) so it
+    # runs even on an already-migrated tree where there is nothing new to create.
+    if apply and archive_originals:
+        actions.append({"archived_originals": _archive_originals(root)})
 
     plan["applied"] = apply
     plan["actions"] = actions
@@ -448,6 +444,38 @@ def _backfill_children(backlog_dir: Path, alias_index: dict) -> dict:
         f.write_text(f"---\n{block}\n---\n{m.group(2)}", encoding="utf-8")
         done += 1
     return {"reparented": done}
+
+
+def _archive_originals(root: Path) -> list[str]:
+    """3b-2: move every legacy initiative file whose stem is a MIGRATED alias to
+    vision/initiatives/_migrated/. Driven by the on-disk alias index, so it runs
+    even when there is nothing new to migrate (already-migrated tree). Scans both
+    vision/initiatives/ and the vision/ root (where INI-04 lived). NEVER touches
+    product.md / constitution.md / source docs — their stems aren't aliases."""
+    stems = {normalize_ref(str(k)) for k in _load_existing_alias_index(root)}
+    if not stems:
+        return []
+    migrated_dir = root / "vision" / "initiatives" / "_migrated"
+    moved: list[str] = []
+    for d in (root / "vision" / "initiatives", root / "vision"):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.md")):
+            if f.parent.name == "_migrated" or not f.is_file():
+                continue
+            if f.stem in stems:
+                migrated_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(migrated_dir / f.name))
+                moved.append(f.name)
+    # retire the active_/finished_initiatives sidecars — lifecycle is task status
+    # now (3a reads active/finished from the task), so they are vestigial.
+    for sidecar in ("active_initiatives", "finished_initiatives"):
+        sp = root / "vision" / sidecar
+        if sp.is_file():
+            migrated_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(sp), str(migrated_dir / sidecar))
+            moved.append(sidecar)
+    return moved
 
 
 def rollback(manifest_path) -> dict:

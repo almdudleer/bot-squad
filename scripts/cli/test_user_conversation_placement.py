@@ -58,3 +58,12 @@ def test_contract_guarantees_no_long_request_is_dropped():
     assert ("task or initiative" in doc) or (
         "task/initiative" in doc
     ), "contract must say a long request becomes a task or initiative"
+
+
+def test_thread_recipe_gives_concrete_base_and_bearer():
+    """T-0543: the read/append recipes must spell out the API base + Bearer so an
+    attendant doesn't waste turns trying :8080 / X-API-Key dead-ends (T-0542
+    dogfood)."""
+    doc = _doc()
+    assert "127.0.0.1:8099" in doc, "recipe must give the concrete API base"
+    assert "authorization: bearer" in doc, "recipe must show the Bearer auth header"

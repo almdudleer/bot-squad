@@ -45,6 +45,11 @@ where things were left.
   `author: "session:<your-sid>"`; the comms layer relays thread writebacks
   to the user's messenger. (Worker-token append endpoint:
   `POST /api/m/worker/conversations/<slug>/<global_user_id>/messages`.)
+- **Concrete form (both endpoints):** API base is `http://127.0.0.1:8099`; auth
+  header is `Authorization: Bearer <WORKER_API_TOKEN>` (the token is
+  `WORKER_API_TOKEN` in the install `.env`, e.g. `/home/www/<slug>/.env`). E.g.
+  read: `curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8099/api/m/worker/conversations/<slug>/<gid>/messages`.
+  (NOT `:8080`, NOT an `X-API-Key` header — those don't work.)
 
 ## What you do
 

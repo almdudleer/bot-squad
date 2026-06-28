@@ -26,6 +26,75 @@ def _anon(tmp_bot_squad: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# T-0480 Phase-3a: list_vision surfaces kind:initiative TASKS as initiatives
+# (so the Vision view survives once legacy vision/initiatives/ files archive)
+# ---------------------------------------------------------------------------
+
+def _write_initiative_task(backlog: Path, tid: str, stem: str, status: str,
+                           title: str = "T", body: str = "init body\n",
+                           aka: str | None = None) -> None:
+    aka = aka if aka is not None else stem
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / f"{tid}-{stem}.md").write_text(
+        f"---\nid: {tid}\ntitle: \"{title}\"\nstatus: {status}\n"
+        f"kind: initiative\naka: [{aka}]\n---\n\n{body}",
+        encoding="utf-8",
+    )
+
+
+def test_vision_surfaces_kind_initiative_tasks(tmp_bot_squad: Path, monkeypatch):
+    """A kind:initiative task appears as an initiatives/ entry even with NO
+    legacy file present (3b-safety: survives original archival)."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_initiative_task(backlog, "T-0556", "ui-polish", "in_progress", body="polish things\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    assert r.status_code == 200
+    entry = next((x for x in r.json() if x["name"] == "initiatives/ui-polish.md"), None)
+    assert entry is not None, "kind:initiative task not surfaced as an initiative"
+    assert entry["active"] is True            # in_progress → active
+    assert entry.get("finished") is False
+    assert "polish things" in entry["content"]
+    assert entry.get("task_id") == "T-0556"
+
+
+def test_vision_finished_initiative_task(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_initiative_task(backlog, "T-0559", "process-paradigm", "closed")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    entry = next(x for x in r.json() if x["name"] == "initiatives/process-paradigm.md")
+    assert entry["finished"] is True
+    assert entry["active"] is False
+
+
+def test_vision_dedupes_task_against_dir(tmp_bot_squad: Path, monkeypatch):
+    """During the 3a transition both the task AND the legacy dir file exist —
+    the initiative must appear exactly ONCE (sourced from the task)."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_initiative_task(backlog, "T-0556", "ui-polish", "in_progress")
+    vision = tmp_bot_squad / "data" / "test-project" / "vision"
+    (vision / "initiatives").mkdir(parents=True, exist_ok=True)
+    (vision / "initiatives" / "ui-polish.md").write_text("# legacy ui-polish\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    matches = [x for x in r.json() if x["name"] == "initiatives/ui-polish.md"]
+    assert len(matches) == 1, f"expected 1 entry, got {len(matches)} (no dedup)"
+    assert matches[0].get("task_id") == "T-0556"  # the task wins
+
+
+def test_vision_non_initiative_tasks_not_listed(tmp_bot_squad: Path, monkeypatch):
+    """A normal task (no kind:initiative) must NOT leak into the vision list."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-0001-normal.md").write_text(
+        "---\nid: T-0001\ntitle: normal\nstatus: open\n---\n\nbody\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    assert not any(x["name"].startswith("initiatives/") for x in r.json())
+
+
+# ---------------------------------------------------------------------------
 # Existing read test
 # ---------------------------------------------------------------------------
 

@@ -121,6 +121,43 @@ def _write_finished_initiatives(vision_dir: Path, names: set[str]) -> None:
     os.rename(tmp, p)
 
 
+def _initiative_entries_from_tasks(project_data_dir: Path) -> list[dict]:
+    """T-0480 Phase-3a: kind:initiative TASKS are the initiatives now. Surface
+    each as a vision-list initiative entry (keyed by its legacy basename stem,
+    from ``aka``, so existing web links/keys keep working). active/finished are
+    derived from the task status — replacing the active_/finished_initiatives
+    sidecars. This is what lets the Vision view survive once the legacy
+    vision/initiatives/ files are archived (3b)."""
+    from app.markdown_parser import ParseError, parse_task
+
+    backlog = project_data_dir / "backlog"
+    out: list[dict] = []
+    if not backlog.is_dir():
+        return out
+    for f in sorted(backlog.glob("T-*.md")):
+        try:
+            t = parse_task(f)
+        except (ParseError, OSError):
+            continue
+        if t.get("kind") != "initiative":
+            continue
+        aka = t.get("aka") or []
+        if isinstance(aka, str):
+            aka = [aka]
+        # legacy basename stem = the filename-stem alias (last aka), else the id
+        stem = aka[-1] if aka else t.get("id")
+        status = t.get("status")
+        out.append({
+            "name": f"initiatives/{stem}.md",
+            "content": t.get("body", ""),
+            "active": status == "in_progress",
+            "finished": status == "closed",
+            "task_id": t.get("id"),
+            "kind": "initiative",
+        })
+    return out
+
+
 @router.get("")
 def list_vision(slug: str, request: Request) -> list[dict]:
     cfg = request.app.state.api_config
@@ -138,16 +175,31 @@ def list_vision(slug: str, request: Request) -> list[dict]:
             "content": agent_instructions.read_text(),
             "active": False,
         })
+    # T-0480 Phase-3a: kind:initiative tasks ARE the initiatives now — surface
+    # them first, then dedup the legacy vision/ files against them (during the
+    # transition both exist; after 3b archival only the tasks remain).
+    init_entries = _initiative_entries_from_tasks(project_data_dir)
+    out.extend(init_entries)
+    task_stems = {
+        e["name"][len("initiatives/"):-len(".md")]
+        for e in init_entries
+        if e["name"].startswith("initiatives/") and e["name"].endswith(".md")
+    }
     if not vision_dir.exists():
         return out
     # Top-level *.md (product.md, constitution.md). Skip _archive/ entirely.
+    # Dedup: a root-located initiative (e.g. INI-04) already surfaced via its task.
     for f in sorted(vision_dir.glob("*.md")):
+        if f.stem in task_stems:
+            continue
         out.append({"name": f.name, "content": f.read_text(), "active": False})
     active_set = _read_active_initiatives(vision_dir)
     finished_set = _read_finished_initiatives(vision_dir)
     initiatives_dir = vision_dir / "initiatives"
     if initiatives_dir.exists():
         for f in sorted(initiatives_dir.glob("*.md")):
+            if f.stem in task_stems:
+                continue  # already surfaced via its kind:initiative task (dedup)
             out.append({
                 "name": f"initiatives/{f.name}",
                 "content": f.read_text(),

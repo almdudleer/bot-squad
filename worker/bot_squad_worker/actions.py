@@ -1761,6 +1761,133 @@ def _action_operator_state_doc(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# T-0522 (M2 follow-up to T-0474): user-facing operator re-drive pause toggle.
+# Thin coordinator-side wrappers over the EXISTING operator_redrive helpers
+# (pause/resume/is_paused) — the flag + its semantics live in that module
+# (T-0474, TL-owned); these only expose the toggle to `bsq operator ...`.
+# Mirrors the pause_deploys/resume_deploys pair.
+# ---------------------------------------------------------------------------
+
+_OPERATOR_PAUSE_REQUIRED = {"slug"}
+_OPERATOR_PAUSE_ALLOWED = _OPERATOR_PAUSE_REQUIRED | {"reason", "requested_by"}
+
+
+def _action_operator_pause(params: dict[str, Any]) -> dict[str, Any]:
+    """Pause the operator re-drive for a project — the user-facing toggle that
+    stops the 60s re-drive tick from respawning the operator (T-0474).
+
+    Wraps ``operator_redrive.pause`` (presence of ``operator_paused.flag`` =
+    paused); idempotent. Required params: slug. Optional: reason, requested_by.
+    Returns: {ok, paused: <meta>, was_already_paused: bool}.
+    """
+    extra = set(params) - _OPERATOR_PAUSE_ALLOWED
+    if extra:
+        raise ActionError(f"operator_pause got unexpected params: {sorted(extra)}")
+    missing = _OPERATOR_PAUSE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"operator_pause missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"operator_pause: unknown project slug {slug!r}")
+
+    from bot_squad_worker import operator_redrive as _ord
+    was_already_paused = _ord.is_paused(cfg, slug)
+    meta = _ord.pause(
+        cfg, slug,
+        by=params.get("requested_by") or "user",
+        reason=params.get("reason") or "",
+    )
+    return {"ok": True, "paused": meta, "was_already_paused": was_already_paused}
+
+
+_OPERATOR_RESUME_REQUIRED = {"slug"}
+_OPERATOR_RESUME_ALLOWED = _OPERATOR_RESUME_REQUIRED | {"requested_by"}
+
+
+def _action_operator_resume(params: dict[str, Any]) -> dict[str, Any]:
+    """Resume a paused operator re-drive. No-op (idempotent) if not paused.
+
+    Wraps ``operator_redrive.resume``. Required params: slug. Optional:
+    requested_by. Returns: {ok, was_paused: bool}.
+    """
+    extra = set(params) - _OPERATOR_RESUME_ALLOWED
+    if extra:
+        raise ActionError(f"operator_resume got unexpected params: {sorted(extra)}")
+    missing = _OPERATOR_RESUME_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"operator_resume missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"operator_resume: unknown project slug {slug!r}")
+
+    from bot_squad_worker import operator_redrive as _ord
+    was_paused = _ord.resume(cfg, slug)
+    return {"ok": True, "was_paused": was_paused}
+
+
+_OPERATOR_STATUS_REQUIRED = {"slug"}
+_OPERATOR_STATUS_ALLOWED = _OPERATOR_STATUS_REQUIRED
+
+
+def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
+    """Report the operator re-drive state for a project: paused-vs-driving.
+
+    Composed READ-only from the PUBLIC operator_redrive helpers (``is_paused`` +
+    ``count_pending_backlog``) and the one-operator detector
+    (``dispatch.live_operator_sids``) — no write, no edit to the T-0474 module.
+
+    ``state`` is the one-word steer:
+      * ``paused``             — user paused; re-drive is off.
+      * ``driving``            — an operator is currently live.
+      * ``pending-redrive``    — backlog has work but no live operator (between
+                                 re-drives / waiting on spawn capacity).
+      * ``idle-empty-backlog`` — nothing to clear; the only idle state.
+
+    Required params: slug. Returns: {ok, paused, state, live_operators,
+    pending_backlog}.
+    """
+    extra = set(params) - _OPERATOR_STATUS_ALLOWED
+    if extra:
+        raise ActionError(f"operator_status got unexpected params: {sorted(extra)}")
+    missing = _OPERATOR_STATUS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"operator_status missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"operator_status: unknown project slug {slug!r}")
+
+    from bot_squad_worker import operator_redrive as _ord
+    from bot_squad_worker import dispatch as _dispatch
+
+    paused = _ord.is_paused(cfg, slug)
+    live = _dispatch.live_operator_sids(cfg, slug)
+    pending = _ord.count_pending_backlog(cfg, slug)
+
+    if paused:
+        state = "paused"
+    elif live:
+        state = "driving"
+    elif pending > 0:
+        state = "pending-redrive"
+    else:
+        state = "idle-empty-backlog"
+
+    return {
+        "ok": True,
+        "paused": paused,
+        "state": state,
+        "live_operators": live,
+        "pending_backlog": pending,
+    }
+
+
 _TASK_NEW_REQUIRED = {"slug", "title"}
 # T-0519: ``provenance`` is accepted (and required at the gate below) so a direct
 # caller of this action can no longer mint a sourceless ticket. Kept out of
@@ -3063,6 +3190,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "compact_write_state": _action_compact_write_state,
     # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).
     "operator_state_doc": _action_operator_state_doc,
+    # T-0522: user-facing operator re-drive pause toggle (wraps T-0474 helpers).
+    "operator_pause": _action_operator_pause,
+    "operator_resume": _action_operator_resume,
+    "operator_status": _action_operator_status,
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
     "doc_new": _action_doc_new,
@@ -3184,6 +3315,12 @@ ACTION_MODES: dict[str, str] = {
     # single coordinator reader, like compact_write_state. The operator reaches
     # it via `bsq operator-state`.
     "operator_state_doc": "coordinator_only",
+    # T-0522: toggle/read the per-project operator re-drive pause flag under the
+    # shared install data dir (_worker/operator_redrive/) + read the live-operator
+    # detector — coordinator-only, like the rest of the project-state ops.
+    "operator_pause": "coordinator_only",
+    "operator_resume": "coordinator_only",
+    "operator_status": "coordinator_only",
     "task_new": "coordinator_only",
     "doc_new": "coordinator_only",
     "uc_new": "coordinator_only",

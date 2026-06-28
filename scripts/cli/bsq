@@ -1716,6 +1716,53 @@ def cmd_operator_state(args) -> None:
               "`bsq compact-save \"<filled state-doc>\"`.")
 
 
+def cmd_operator_pause(args) -> None:
+    """T-0522: pause the operator re-drive — the user-facing toggle that stops the
+    60s tick (T-0474) from respawning the operator to clear the backlog. Re-drive
+    stays off until `bsq operator resume`. Idempotent."""
+    slug = resolve_slug()
+    params = {"slug": slug}
+    if getattr(args, "reason", None):
+        params["reason"] = args.reason
+    res = post("operator_pause", params)
+    if res.get("was_already_paused"):
+        print(f"operator re-drive already paused for {slug} (no-op)")
+        return
+    meta = res.get("paused") or {}
+    reason = meta.get("reason")
+    print(f"⏸  operator re-drive paused for {slug}"
+          + (f" — {reason}" if reason else ""))
+
+
+def cmd_operator_resume(args) -> None:
+    """T-0522: resume a paused operator re-drive. No-op if it wasn't paused."""
+    slug = resolve_slug()
+    res = post("operator_resume", {"slug": slug})
+    if res.get("was_paused"):
+        print(f"▶  operator re-drive resumed for {slug}")
+    else:
+        print(f"operator re-drive was not paused for {slug} (no-op)")
+
+
+def cmd_operator_status(args) -> None:
+    """T-0522: show whether the operator re-drive is paused vs driving."""
+    slug = resolve_slug()
+    res = post("operator_status", {"slug": slug})
+    pending = res.get("pending_backlog")
+    if res.get("paused"):
+        print(f"operator re-drive: ⏸ PAUSED for {slug} ({pending} pending)")
+        return
+    live = res.get("live_operators") or []
+    if live:
+        print(f"operator re-drive: ▶ DRIVING for {slug} "
+              f"(operator {live[0]}, {pending} pending)")
+    elif pending and pending > 0:
+        print(f"operator re-drive: ⏳ pending re-drive for {slug} "
+              f"({pending} pending, no live operator)")
+    else:
+        print(f"operator re-drive: idle for {slug} (empty backlog)")
+
+
 def cmd_routine_declare(args) -> None:
     """T-0464: declare a Routine — a rule (instruction + schedule trigger) that
     spawns a session to do work per its instruction each time the schedule fires.
@@ -3866,6 +3913,20 @@ def build_parser() -> argparse.ArgumentParser:
     os_.add_argument("--template", action="store_true",
                      help="print the fillable schema scaffold instead of the current doc")
     os_.set_defaults(func=cmd_operator_state)
+
+    # operator (T-0522) — user-facing toggle for the operator re-drive (T-0474):
+    # pause / resume / status (paused-vs-driving).
+    op = sub.add_parser(
+        "operator",
+        help="operator re-drive control: pause / resume / status (T-0474 toggle)")
+    op_sub = op.add_subparsers(dest="sub", required=True)
+    opp = op_sub.add_parser("pause", help="stop re-driving the operator until resumed")
+    opp.add_argument("--reason", help="why you're pausing (recorded on the flag)")
+    opp.set_defaults(func=cmd_operator_pause)
+    opr = op_sub.add_parser("resume", help="resume the operator re-drive")
+    opr.set_defaults(func=cmd_operator_resume)
+    ops = op_sub.add_parser("status", help="show whether re-drive is paused vs driving")
+    ops.set_defaults(func=cmd_operator_status)
 
     # edit-begin (T-0215) — snapshot a baseline for a later `commit --hunks`
     eb = sub.add_parser(

@@ -76,6 +76,8 @@ def test_registry_lists_only_allowed_actions():
         "compact_write_state",
         # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).
         "operator_state_doc",
+        # T-0522: user-facing operator re-drive pause toggle (T-0474 follow-up).
+        "operator_pause", "operator_resume", "operator_status",
         # T-0042: atomic T-NNNN allocator.
         "task_new",
         # T-0174: generalized atomic allocator across all entity types.

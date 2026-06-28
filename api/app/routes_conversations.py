@@ -76,6 +76,33 @@ def append_message(slug: str, global_user_id: str, request: Request, payload: di
     return record
 
 
+@worker_router.get("/conversations/{slug}/{global_user_id}/messages")
+def worker_list_conversation(
+    slug: str,
+    global_user_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    q: str = Query(default=""),
+) -> dict:
+    """Worker-token READ of the (slug, global_user_id) thread (T-0542).
+
+    The worker-side counterpart to the session-auth ``list_conversation``: a
+    user-conversation ATTENDANT runs in worker context (it holds the
+    ``WORKER_API_TOKEN``, not a user JWT), so it cannot use the session-auth
+    read surface to review its OWN thread — before this it had to reach into the
+    store JSONL directly (an architectural wart). Same store call + pagination/
+    search as the session read; token-gated by the shared worker secret (fails
+    closed when unset), the established worker->API trust path."""
+    _authenticate_worker(request)
+    try:
+        if q:
+            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset)
+        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ---- T-0492: per-(user, server) current-project routing (worker-token) -------
 # The same user-communication module owns conversation history AND the hardwired
 # routing of unquoted messages to a user's pinned project (voice-04). The worker

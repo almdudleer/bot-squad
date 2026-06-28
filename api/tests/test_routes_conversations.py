@@ -240,3 +240,50 @@ def test_endpoints_absent_when_not_mothership(tmp_bot_squad: Path, monkeypatch):
     client = TestClient(build_app())
     r = client.post(CONV, json={"author": "user", "text": "x"}, headers=_worker_auth())
     assert r.status_code == 404
+
+
+# ---- T-0542: worker-token READ of a thread (attendant reads its own thread) --
+# A user-conversation ATTENDANT runs in worker context (it holds the
+# WORKER_API_TOKEN, not a user JWT), so it cannot use the session-auth GET to
+# review its own thread — before T-0542 it had to reach into the store JSONL
+# directly. This worker-token GET is the supported read path.
+
+
+def test_worker_list_returns_thread(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    d = tmp_bot_squad / "data"
+    CS.append(d, "test-project", "gu_abc", author="user", text="m1")
+    CS.append(d, "test-project", "gu_abc", author="session:S-x", text="m2")
+    r = client.get(CONV, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [m["text"] for m in body["messages"]] == ["m1", "m2"]
+
+
+def test_worker_list_missing_bearer_is_401(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.get(CONV)
+    assert r.status_code == 401
+
+
+def test_worker_list_wrong_bearer_is_401(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.get(CONV, headers=_worker_auth("nope"))
+    assert r.status_code == 401
+
+
+def test_worker_list_unconfigured_token_fails_closed(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch, worker_token=None)
+    r = client.get(CONV, headers=_worker_auth("anything"))
+    assert r.status_code == 401
+
+
+def test_worker_list_search_filters(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    d = tmp_bot_squad / "data"
+    CS.append(d, "test-project", "gu_abc", author="user", text="deploy now")
+    CS.append(d, "test-project", "gu_abc", author="user", text="something else")
+    CS.append(d, "test-project", "gu_abc", author="user", text="DEPLOY tomorrow")
+    r = client.get(CONV, params={"q": "deploy"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert [m["text"] for m in r.json()["messages"]] == ["deploy now", "DEPLOY tomorrow"]

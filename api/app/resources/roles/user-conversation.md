@@ -32,10 +32,15 @@ look up." It is your continuity across recycles: a previous attendant may
 have terminated, but the thread lives on, so **read it first** to pick up
 where things were left.
 
-- **Read the thread:** `GET /api/conversations/<slug>/<global_user_id>/messages`
-  (paginated; `?q=` to search). Records are `{timestamp, author, text,
+- **Read the thread:** worker-token GET
+  `/api/m/worker/conversations/<slug>/<global_user_id>/messages` (paginated;
+  `?q=` to search; auth with the `WORKER_API_TOKEN` from the install `.env`,
+  same Bearer you use to append). Records are `{timestamp, author, text,
   attachments}`; `author` is `"user"` for inbound, `"session:<sid>"` for an
-  attendant's writeback.
+  attendant's writeback. (You run in WORKER context — you have the worker token,
+  not a user JWT — so use this `/worker/` read path, NOT the session-auth
+  `/api/m/conversations/...` UI surface. Fallback if the API is unreachable:
+  read the store JSONL directly under `data/_mothership/conversations/<slug>/<global_user_id>.jsonl`.)
 - **Reply to the user:** append your reply to the same thread with
   `author: "session:<your-sid>"`; the comms layer relays thread writebacks
   to the user's messenger. (Worker-token append endpoint:

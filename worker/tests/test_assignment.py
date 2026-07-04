@@ -93,6 +93,34 @@ def test_role_artifact_generic_role_is_a_per_session_file(tmp_path: Path):
     assert art.path.suffix == ".md"
 
 
+def test_role_artifact_redrive_converges_on_one_file(tmp_path: Path):
+    # T-0573: a re-driven role session (same assignment/window, NEW pane → a
+    # new SID differing only in the trailing -pNNN) must resolve to the SAME
+    # artifact as its predecessor — keyed by the window-base, not the full SID,
+    # so ~1h re-drives converge on one file instead of minting a chain.
+    data_dir = tmp_path / "data"
+    first = role_artifact(data_dir, "watchrobot", role="dev",
+                          sid="S-almdudleer-prod-hotfixes-p100", task_id=None)
+    redrive = role_artifact(data_dir, "watchrobot", role="dev",
+                            sid="S-almdudleer-prod-hotfixes-p356", task_id=None)
+    assert first.path == redrive.path
+    assert first.path == (data_dir / "watchrobot" / "artifacts"
+                          / "role-dev-S-almdudleer-prod-hotfixes.md")
+
+
+def test_role_artifact_window_base_strips_only_trailing_pane(tmp_path: Path):
+    # Only a trailing -p<digits> pane tail is a pane marker; a "-p<word>" inside
+    # the window name (e.g. "my-project") must survive, and a SID with no pane
+    # tail is used as-is.
+    data_dir = tmp_path / "data"
+    art = role_artifact(data_dir, "bot-squad", role="user",
+                        sid="S-u-my-project", task_id=None)
+    assert art.path.name == "role-user-S-u-my-project.md"
+    art2 = role_artifact(data_dir, "bot-squad", role="user",
+                         sid="S-u-my-project-p12", task_id=None)
+    assert art2.path.name == "role-user-S-u-my-project.md"
+
+
 def test_role_artifact_unknown_role_no_task_is_none(tmp_path: Path):
     # No role + no task → nothing to write into; caller falls back to /compact.
     data_dir = tmp_path / "data"

@@ -38,6 +38,7 @@ import abc
 import contextlib
 import fcntl
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -398,6 +399,16 @@ def _safe_component(s: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "-" for c in (s or "")).strip("-") or "anon"
 
 
+def _window_base(sid: str) -> str:
+    """The re-drive-stable base of a SID: ``S-<user>-<window>`` without the
+    trailing ``-p<pane>``. Only a trailing ``-p<digits>`` is a pane marker —
+    a ``-p<word>`` inside the window name survives (T-0573)."""
+    return _PANE_TAIL_RE.sub("", str(sid or ""))
+
+
+_PANE_TAIL_RE = re.compile(r"-p\d+$")
+
+
 def role_artifact(
     data_dir: Path | str, slug: str, *, role: str | None,
     sid: str | None, task_id: str | None,
@@ -413,9 +424,11 @@ def role_artifact(
         task sidecar ``artifacts/<task_id>.md`` (same sink as its result);
       * an operator → ``artifacts/operator-state.md`` (the state-doc seam; schema
         = T-0473);
-      * any other role with no task → a stable per-session
-        ``artifacts/role-<role>-<sid>.md`` so no transient role is left without a
-        compact destination;
+      * any other role with no task → a stable per-assignment
+        ``artifacts/role-<role>-<window-base>.md`` (the SID minus its ``-pNNN``
+        pane tail) so no transient role is left without a compact destination
+        AND every ~1h re-drive of the same assignment converges on the SAME
+        file instead of minting a new one per pane incarnation (T-0573);
       * no role AND no task → ``None`` (caller falls back to Claude's /compact).
 
     Returns an :class:`Artifact` (or ``None``); does not touch the filesystem.
@@ -429,5 +442,5 @@ def role_artifact(
     if role == "operator":
         return Artifact(artifacts / OPERATOR_STATE_ARTIFACT)
     if role:
-        return Artifact(artifacts / f"role-{_safe_component(role)}-{_safe_component(sid or '')}.md")
+        return Artifact(artifacts / f"role-{_safe_component(role)}-{_safe_component(_window_base(sid or ''))}.md")
     return None

@@ -53,6 +53,19 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   ids collide. Don't expand your own scope.
 - The stakeholder might connect to your session in tmux and respond to 
   your questions, give clarifications, additional instructions, etc.
+  **Capture what they say ON THE TICKET the moment it happens** — a
+  clarification/decision/answer via `bsq ticket note <id>` (longer additions
+  under `## Context`), a NEW ask via `task_new` with their verbatim words.
+  A user request that lives only in your context, a handover md, or a
+  scratch file is a stranded request — the worst drift case (T-0567).
+- **Every artifact you write has a defined home — no random mds** (T-0567;
+  the kind→home map is the project doc `docs/architecture/D-0045`). Your
+  compact/handover artifact is `artifacts/<task_id>.md`, overwritten in
+  place, and carries context GOTCHAS only (env quirks, mid-edit state);
+  task-relevant detail — requirements, clarifications, progress, decisions,
+  follow-ups — goes on the task (`bsq ticket note` / `task_new`) BEFORE you
+  compact. Scratch (probe scripts, logs, test dumps) goes in your session
+  scratchpad, never the code working tree, never the data dir.
 
 ## Listening for peer messages
 

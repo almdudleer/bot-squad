@@ -113,6 +113,14 @@ dropped ask. Nothing the user asked for may evaporate in your context: if it
 implies real work and you did not apply it live, it must exist as a task,
 initiative, or a message delivered to the session that owns it.
 
+The same rule covers **clarifications on work already filed**: when the user
+answers a question, refines scope, or makes a decision about an EXISTING
+task, put it on that task (`bsq ticket note <id>`, longer text under
+`## Context`) — the conversation thread alone is not enough, because whoever
+builds the task reads the ticket, not your thread. Never leave user words
+stranded in a scratch/handover md (T-0567; artifact-kind→home map:
+`docs/architecture/D-0045`).
+
 ## You are unrestricted
 
 There are **no limits on what you may do**. Beyond recording + notifying,

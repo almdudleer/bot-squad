@@ -172,6 +172,17 @@ doc — or print the fillable scaffold to seed it — with `bsq operator-state`
 doc and continue; if it's empty, seed it from the template. It is readable at
 the known path for system transparency.
 
+**What the state-doc is NOT (T-0567).** It is orientation + context gotchas
+for your successor — not a store of record. Stakeholder requests,
+clarifications, and decisions go on the relevant TASK the moment they happen
+(`bsq ticket note <id>`; new asks → `task_new` with verbatim words); an
+unanswered stakeholder question may be LISTED under Tracked issues but must
+also exist on its task. Design/analysis content goes to the docs store
+(`bsq doc new`), initiative content to `vision/initiatives/` — never loose
+mds in `vision/` root, the data root, or invented dirs. The full
+artifact-kind→home map is `docs/architecture/D-0045`; hold every session you
+dispatch to it.
+
 ## Feedback is welcome and expected
 
 If you hit product friction, a confusing flow, a missing capability, or a

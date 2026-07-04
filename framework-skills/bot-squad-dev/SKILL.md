@@ -35,6 +35,7 @@ When DoD (incl. manual walkthrough) is green:
 ## Stay on task + scope
 
 - Track multi-step work on the TICKET (`bsq ticket note`), not in `~/.claude/superpowers/*`. In-session TodoWrite is only for sub-steps within the ticket.
+- **Every artifact you write has a defined home — no random mds** (T-0567; map: `docs/architecture/D-0045`). Stakeholder/user clarifications, decisions, and answers land on the TICKET the moment they happen (`bsq ticket note <id>`; new asks → `bsq task new` with verbatim words) — NEVER only in a handover/compact/scratch md. Your compact artifact (`artifacts/<task_id>.md`) is for context gotchas only. Scratch (probe scripts, logs, test dumps, Playwright output) goes in your session scratchpad — never the code working tree, never the data dir.
 - Don't expand your own scope. Work outside scope → file a one-pager: `bsq task new` (never hand-pick the id), then edit the returned md.
 - Friction/bug/missing-capability → `bsq feedback submit "<note>"`. Don't silently absorb it.
 

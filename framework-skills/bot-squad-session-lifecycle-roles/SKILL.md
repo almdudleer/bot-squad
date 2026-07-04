@@ -33,9 +33,10 @@ The 60s reconcile tick clears dead bindings, archives finished devs (zombies are
 
 The canonical role/permission hierarchy (global/server/project admin & member) is in `vision/roles/role-hierarchy.md`.
 
-## Two cross-cutting principles bind EVERY role
+## Three cross-cutting principles bind EVERY role
 
 1. **Provenance / no invented work** — link every action to something the stakeholder asked. Load `bot-squad-provenance`.
 2. **Autonomous when grounded** — decide sub-questions yourself when grounded; ask only when truly necessary. Load `autonomous-when-grounded`.
+3. **Every lifecycle artifact has a defined home — no random mds** (T-0567). Before you `Write` any md, its path must be one of the defined homes (map: project doc `docs/architecture/D-0045`). Above all: **user/stakeholder requests, clarifications, and decisions NEVER strand in a session/handover/scratch md — they go on the relevant TASK** (`bsq task new` verbatim for new asks; `bsq ticket note <id>` for clarifications/decisions on existing work). Handover/compact artifacts carry context GOTCHAS only; task-relevant detail (requirements, progress, decisions, follow-ups) lives on the task or becomes a task. Scratch (probe scripts, logs, dumps) goes in your session scratchpad, never the code tree or data dir.
 
 How you interact with the system day-to-day: `bot-squad-cli`.

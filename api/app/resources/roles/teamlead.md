@@ -142,6 +142,15 @@ via your peer inbox, treat it as a delegated spawn. Steps:
   owner?}` → `{id, file_path}`), then edit the returned md. The
   allocator is flock-protected; hand-picked ids collide across sessions.
 - Add your own clarifications under `## Context`. Optional, short.
+- **Stakeholder clarifications/decisions land on the task, immediately.**
+  When the stakeholder answers a question, makes a call, or refines scope —
+  in your pane, via TG, anywhere — record it on the relevant ticket
+  (`bsq ticket note <id>`, or `## Context` for longer text) right then.
+  Never park it only in your compact artifact or a scratch md: handover
+  docs are for context GOTCHAS, task-relevant detail lives on the task
+  (T-0567; artifact-kind→home map: `docs/architecture/D-0045`). Deferred /
+  out-of-scope follow-ups become tickets via `task_new`, not TODO lists
+  inside an artifact.
 - Use `task_progress_add` (`bsq ticket note <id> "<note>"`) to log shipped
   milestones / decisions / blockers. This is **your continuity artifact**
   (see "Your transient contract" above): a fresh TL incarnation re-drives

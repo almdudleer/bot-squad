@@ -620,3 +620,150 @@ def test_spawn_session_dev_with_task_id_unaffected(tmp_path, monkeypatch):
     res = A._action_spawn_session(
         {"slug": "test-project", "window": "feature-x", "task_id": "T-0465"})
     assert res == {"ok": True, "sid": "S-dev"}
+
+
+# --- T-0576 (M11/F11.3) — placement guarantee: classify_request + decide_placement ---
+
+from bot_squad_worker.dispatch import classify_request, decide_placement  # noqa: E402
+
+
+def test_classify_control_verb_plus_entity_ref_is_instant():
+    out = classify_request("prioritize T-0450 to P1")
+    assert out["kind"] == "instant_tweak"
+    assert "control-verbs:prioritize" in out["signals"]
+    assert any(s.startswith("entity-refs:") and "T-0450" in s for s in out["signals"])
+
+
+def test_classify_on_off_plus_system_noun_is_instant():
+    out = classify_request("turn the operator off")
+    assert out["kind"] == "instant_tweak"
+    assert "system-nouns:operator" in out["signals"]
+
+
+def test_classify_work_verb_is_long_even_with_system_noun():
+    # Regression from the manual walk: "sessions page" flags a system noun,
+    # but the work verb must win the ladder.
+    out = classify_request(
+        "build a dark-mode toggle for the sessions page and wire it to the settings API")
+    assert out["kind"] == "long_request"
+    assert "work-verbs:build" in out["signals"]
+
+
+def test_classify_work_verb_beats_co_present_control_verbs():
+    out = classify_request(
+        "pause deploys and refactor the deploy pipeline to stop racing the worker restart")
+    assert out["kind"] == "long_request"
+    assert any(s.startswith("work-verbs:") for s in out["signals"])
+    assert any(s.startswith("control-verbs:") for s in out["signals"])
+
+
+def test_classify_control_verb_without_system_target_defaults_long():
+    # "close" is a control verb, but nothing system-shaped is being pointed at
+    # — the durable default must catch it (a mis-applied tweak loses work).
+    out = classify_request("close the security hole in the login form")
+    assert out["kind"] == "long_request"
+    assert "default-durable" in out["signals"]
+
+
+def test_classify_long_text_never_instant(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_TWEAK_MAX_WORDS", "5")
+    out = classify_request("pause the operator right now please and thanks")
+    assert out["kind"] == "long_request"
+    assert any(s.startswith("length:") for s in out["signals"])
+
+
+def test_classify_pure_question_is_instant_query():
+    out = classify_request("what is the status of T-0450?")
+    assert out["kind"] == "instant_tweak"
+    assert "query" in out["signals"]
+
+
+def test_classify_question_with_work_verb_is_long():
+    out = classify_request("can you fix the login bug?")
+    assert out["kind"] == "long_request"
+
+
+def test_classify_blank_raises():
+    with pytest.raises(ValueError, match="empty text"):
+        classify_request("   ")
+
+
+def test_classify_tweak_max_words_env_garbage_falls_back(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_TWEAK_MAX_WORDS", "banana")
+    out = classify_request("pause the operator")
+    assert out["kind"] == "instant_tweak"
+
+
+def test_decide_placement_instant_targets_live_operator(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-operator-p1", window="bot-squad-operator")
+    out = decide_placement(cfg, "test-project", "pause the operator")
+    assert out["route"] == "apply_live"
+    assert out["target_sid"] == "S-u-operator-p1"
+
+
+def test_decide_placement_instant_no_operator_says_ensure_not_file(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    out = decide_placement(cfg, "test-project", "pause the operator")
+    assert out["route"] == "apply_live"
+    assert out["target_sid"] is None
+    assert "do NOT file a task" in out["reason"]
+
+
+def test_decide_placement_long_without_task_points_at_task_new(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    out = decide_placement(cfg, "test-project", "fix the login bug")
+    assert out["route"] == "file_task"
+    assert out["target_sid"] is None
+    assert "dispatch" not in out
+    assert "task_new" in out["reason"] and "dispatch_decision" in out["reason"]
+
+
+def test_decide_placement_long_with_task_chains_decide_dispatch(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev", initiative="alpha.md")
+    _set_context_pct(cfg, "S-u-d1-dev-p1", 12.0)
+    out = decide_placement(cfg, "test-project", "fix the login bug", task_id="T-0009")
+    assert out["route"] == "file_task"
+    assert out["dispatch"]["decision"] == "reuse"
+    assert out["target_sid"] == "S-u-d1-dev-p1"
+    assert "T-0009" in out["reason"]
+
+
+def test_decide_placement_unknown_slug_raises(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        decide_placement(cfg, "nope", "pause the operator")
+
+
+def test_decide_placement_blank_text_raises_action_error(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    with pytest.raises(ActionError, match="empty text"):
+        decide_placement(cfg, "test-project", "  ")
+
+
+def test_placement_decision_action_validates_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    with pytest.raises(ActionError, match="missing required"):
+        A._action_placement_decision({"slug": "test-project"})
+    with pytest.raises(ActionError, match="unexpected params"):
+        A._action_placement_decision(
+            {"slug": "test-project", "text": "x", "nope": 1})
+
+
+def test_placement_decision_action_passthrough(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    out = A._action_placement_decision(
+        {"slug": "test-project", "text": "pause the operator"})
+    assert out["ok"] is True and out["route"] == "apply_live"
+    _make_task(cfg, "T-0010", initiative="alpha.md")
+    out = A._action_placement_decision(
+        {"slug": "test-project", "text": "fix the login bug",
+         "task_id": "T-0010"})
+    assert out["route"] == "file_task"
+    assert out["dispatch"]["task_id"] == "T-0010"

@@ -21,6 +21,7 @@ wins; with none, spawn fresh (a clean context is the safe default).
 from __future__ import annotations
 
 import os
+import re as _re
 import time
 from typing import Any
 
@@ -363,3 +364,211 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
         "candidates": candidates,
         "resume_hints": resume_hints,
     }
+
+
+# ---------------------------------------------------------------------------
+# T-0576 (M11/F11.3) — correct-placement guarantee: instant-tweak vs
+# long-request routing as SYSTEM logic, not prompt convention.
+#
+# The concept (clarification-03 / voice-14): the user firehoses messages at the
+# system through any access point — TG mail, attach-and-write, or a dedicated
+# user session — and the SYSTEM guarantees each one lands in the right place.
+# **Instant tweaks** (on/off, prioritize, write/correct task/initiative) are
+# applied LIVE on the control plane; **long requests** (real work — code,
+# bugs, features) are filed as tasks and offloaded to the software factory.
+# Before T-0576 that split lived only in role-doc prose, so placement rested
+# on each receiving session's judgment (D-0047 F11.3: PARTIAL/MISSING).
+#
+# ``classify_request`` is the classification SSOT: one deterministic,
+# unit-testable heuristic every access point consults, instead of N sessions
+# re-deriving the split from their prompts. ``decide_placement`` turns the
+# classification into a routing decision, chaining the existing
+# ``decide_dispatch`` seam for the long-request side. Both are pure reads
+# (session mds only, no tmux writes) — advisory-shaped like decide_dispatch,
+# with the intake call sites adopting them per the wiring plan on T-0576.
+# ---------------------------------------------------------------------------
+
+# Control-plane verbs — the concept's enumerated instant tweaks (on/off,
+# prioritize, write/correct task/initiative) plus the end-state's firehose
+# levers (session spawning, operator/TL/dev on-off, resource constraints).
+# A control verb alone is NOT enough to classify instant: it must target a
+# system entity (id reference or system noun below), else "close the security
+# hole" would read as a tweak. Ambiguity falls through to long_request — the
+# durable default (a tweak mis-filed as a task is slow; real work mis-applied
+# live is lost).
+INSTANT_TWEAK_VERBS = frozenset({
+    "on", "off", "enable", "disable", "pause", "unpause", "resume", "stop",
+    "start", "restart", "kill", "throttle", "cap",
+    "prioritize", "prioritise", "deprioritize", "deprioritise",
+    "reprioritize", "reprioritise", "bump", "promote", "demote",
+    "close", "reopen", "cancel", "hold", "unhold", "park", "unpark",
+    "postpone", "archive", "unarchive", "suspend",
+    "rename", "retitle", "reword", "correct", "amend", "edit", "update",
+    "assign", "reassign", "unassign", "bind", "unbind", "spawn",
+})
+
+# Work verbs — real product work that must land in the backlog. Checked FIRST:
+# a work verb anywhere makes the whole request long ("pause deploys and
+# refactor the pipeline" files a task; the durable route loses nothing).
+LONG_REQUEST_VERBS = frozenset({
+    "build", "implement", "fix", "add", "create", "refactor", "rewrite",
+    "investigate", "research", "debug", "diagnose", "design", "develop",
+    "migrate", "integrate", "rework", "audit", "optimize", "optimise",
+    "port", "ship", "test", "verify", "document", "prototype",
+})
+
+# System nouns — the entities instant tweaks operate on (M3 tasks/initiatives,
+# M1 sessions, M2 roles, resource levers). Grounds a control verb: "pause the
+# operator" is a tweak, "pause the video" is not our control plane.
+SYSTEM_NOUNS = frozenset({
+    "task", "tasks", "ticket", "tickets", "initiative", "initiatives",
+    "backlog", "priority", "session", "sessions", "operator", "teamlead",
+    "team-lead", "tl", "dev", "devs", "worker", "workers", "team", "teams",
+    "deploy", "deploys", "quota", "pacing", "parallelism", "autopilot",
+    "routine", "routines", "recycle", "everything",
+})
+
+# Entity-id references (T-0450, INI-04, D-0047, P1, a SID) — the strongest
+# instant-tweak grounding: the user is pointing AT a system object.
+_ENTITY_REF = _re.compile(
+    r"\b(?:(?:T|D|UC|F|FL|INI)-\d+|P[0-3]|S-[\w-]+-p\d+)\b", _re.IGNORECASE
+)
+
+# Above this many words a message is never an instant tweak — a paragraph is
+# work (or at least deserves durable placement). Env-tunable on a live worker
+# like BOT_SQUAD_REUSE_MAX_CONTEXT_PCT.
+DEFAULT_TWEAK_MAX_WORDS = 40
+
+
+def tweak_max_words() -> int:
+    raw = os.environ.get("BOT_SQUAD_TWEAK_MAX_WORDS")
+    try:
+        val = int(raw) if raw else DEFAULT_TWEAK_MAX_WORDS
+    except ValueError:
+        val = DEFAULT_TWEAK_MAX_WORDS
+    return val if val > 0 else DEFAULT_TWEAK_MAX_WORDS
+
+
+def classify_request(text: str) -> dict:
+    """Classify one inbound user request as ``instant_tweak`` vs
+    ``long_request`` (F11.3). Deterministic ladder, most-durable default:
+
+    1. blank text → ValueError (degenerate input is a caller bug, never
+       silently routed);
+    2. longer than ``tweak_max_words()`` → long_request;
+    3. any work verb → long_request (work wins over a co-present control verb);
+    4. control verb grounded by an entity ref or system noun → instant_tweak;
+    5. a pure question (ends with ``?``, no work verb) → instant_tweak — F11.4
+       transparency: answered live from system state, never filed as a task;
+    6. everything else → long_request (the safe default: a mis-filed tweak is
+       slow, mis-applied work is lost).
+
+    Returns ``{kind, signals, word_count}`` — ``signals`` names every cue that
+    fired so callers (and the user) can see WHY, not just what.
+    """
+    if not text or not text.strip():
+        raise ValueError("classify_request: empty text")
+    stripped = text.strip()
+    words = _re.findall(r"[\w?/-]+", stripped.lower())
+    word_count = len(words)
+    wordset = set(words)
+
+    signals: list[str] = []
+    work = sorted(wordset & LONG_REQUEST_VERBS)
+    control = sorted(wordset & INSTANT_TWEAK_VERBS)
+    nouns = sorted(wordset & SYSTEM_NOUNS)
+    refs = sorted({m.group(0) for m in _ENTITY_REF.finditer(stripped)})
+    if work:
+        signals.append("work-verbs:" + ",".join(work))
+    if control:
+        signals.append("control-verbs:" + ",".join(control))
+    if nouns:
+        signals.append("system-nouns:" + ",".join(nouns))
+    if refs:
+        signals.append("entity-refs:" + ",".join(refs))
+
+    max_words = tweak_max_words()
+    if word_count > max_words:
+        signals.append(f"length:{word_count}>{max_words}-words")
+        kind = "long_request"
+    elif work:
+        kind = "long_request"
+    elif control and (refs or nouns):
+        kind = "instant_tweak"
+    elif stripped.endswith("?"):
+        signals.append("query")
+        kind = "instant_tweak"
+    else:
+        signals.append("default-durable")
+        kind = "long_request"
+
+    return {"kind": kind, "signals": signals, "word_count": word_count}
+
+
+def decide_placement(
+    cfg: Any, slug: str, text: str, *,
+    task_id: str | None = None, now_epoch: float | None = None,
+) -> dict:
+    """The F11.3 placement decision for one inbound request, whichever access
+    point carried it.
+
+    - ``instant_tweak`` → ``route: apply_live``: apply on the control plane
+      NOW. ``target_sid`` is the live operator (the control-plane surface,
+      via :func:`live_operator_sids`); ``None`` when no operator is on — the
+      caller then ensures one (operator re-drive / ensure) rather than filing
+      a task for a tweak.
+    - ``long_request`` → ``route: file_task``: the request must land durably
+      in the backlog. With ``task_id`` (caller already minted the task) the
+      result chains the T-0237/T-0575 ``decide_dispatch`` seam verbatim under
+      ``dispatch`` — reuse/spawn/resume for THAT task, one hop from intake to
+      factory. Without it, ``reason`` names the next verbs (task_new with
+      verbatim provenance, then dispatch_decision).
+
+    Raises ActionError on unknown project / blank text. Pure read, no tmux
+    writes — same advisory contract as :func:`decide_dispatch`.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"decide_placement: unknown project slug {slug!r}")
+    try:
+        cls = classify_request(text)
+    except ValueError as exc:
+        raise ActionError(str(exc)) from None
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "kind": cls["kind"],
+        "signals": cls["signals"],
+        "word_count": cls["word_count"],
+    }
+
+    if cls["kind"] == "instant_tweak":
+        ops = live_operator_sids(cfg, slug)
+        out["route"] = "apply_live"
+        out["target_sid"] = ops[0] if ops else None
+        out["reason"] = (
+            f"instant tweak — apply live via operator {ops[0]}"
+            if ops else
+            "instant tweak — no live operator; ensure one (re-drive), do NOT "
+            "file a task for a tweak"
+        )
+        return out
+
+    out["route"] = "file_task"
+    if task_id:
+        dispatch = decide_dispatch(cfg, slug, task_id, now_epoch=now_epoch)
+        out["task_id"] = task_id
+        out["dispatch"] = dispatch
+        out["target_sid"] = dispatch.get("target_sid")
+        out["reason"] = (
+            f"long request — already filed as {task_id}; "
+            f"dispatch: {dispatch['reason']}"
+        )
+    else:
+        out["target_sid"] = None
+        out["reason"] = (
+            "long request — file durably first (task_new with verbatim "
+            "provenance), then dispatch_decision for reuse-vs-spawn"
+        )
+    return out

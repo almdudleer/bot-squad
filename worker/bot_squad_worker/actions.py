@@ -2704,6 +2704,35 @@ def _action_dispatch_decision(params: dict[str, Any]) -> dict[str, Any]:
     return _dispatch.decide_dispatch(cfg, params["slug"], params["task_id"])
 
 
+_PLACEMENT_DECISION_REQUIRED = {"slug", "text"}
+_PLACEMENT_DECISION_ALLOWED = _PLACEMENT_DECISION_REQUIRED | {"task_id"}
+
+
+def _action_placement_decision(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0576 (M11/F11.3): classify one inbound user request as instant-tweak
+    vs long-request and decide its placement — the correct-placement guarantee
+    as ONE system surface every access point (TG mail / attach-write /
+    dedicated user session) consults, instead of prompt convention.
+
+    Required params: slug, text. Optional: task_id (a long request already
+    filed — the result then chains the dispatch_decision seam for that task).
+    Returns ``{ok, kind: 'instant_tweak'|'long_request', route:
+    'apply_live'|'file_task', target_sid, reason, signals, ...}``. Advisory
+    like dispatch_decision — it never injects, files, or spawns on its own.
+    """
+    extra = set(params) - _PLACEMENT_DECISION_ALLOWED
+    if extra:
+        raise ActionError(f"placement_decision got unexpected params: {sorted(extra)}")
+    missing = _PLACEMENT_DECISION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"placement_decision missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import dispatch as _dispatch
+    return _dispatch.decide_placement(
+        cfg, params["slug"], params["text"], task_id=params.get("task_id"))
+
+
 _SET_DRIFT_PAUSED_REQUIRED = {"slug", "sid", "paused"}
 _SET_DRIFT_PAUSED_ALLOWED = _SET_DRIFT_PAUSED_REQUIRED
 
@@ -3441,6 +3470,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "bind_initiative": _action_bind_initiative,
     # T-0237 Layer-2: operator-invoked reuse-vs-spawn dispatch recommendation.
     "dispatch_decision": _action_dispatch_decision,
+    # T-0576 (M11/F11.3): instant-tweak vs long-request placement guarantee.
+    "placement_decision": _action_placement_decision,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
     # T-0466: per-session cache-window recycle postpone (bsq postpone).
@@ -3505,6 +3536,9 @@ ACTION_MODES: dict[str, str] = {
     "list_sessions": "tmux_only",
     # T-0237: pure local fs read (session mds + telemetry records), no tmux.
     "dispatch_decision": "tmux_only",
+    # T-0576: same read-only profile as dispatch_decision (session mds + a
+    # tolerant live-pane scan for the operator target) — no coordinator state.
+    "placement_decision": "tmux_only",
     # telemetry_get reads the SHARED install data dir (all users' sampled
     # records land there) → a single coordinator read, not a per-user fan-out.
     "telemetry_get": "coordinator_only",

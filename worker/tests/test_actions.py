@@ -86,6 +86,8 @@ def test_registry_lists_only_allowed_actions():
         "bind_task", "bind_initiative",
         # T-0237 Layer-2: operator-invoked reuse-vs-spawn dispatch decision.
         "dispatch_decision",
+        # T-0576 (M11/F11.3): instant-tweak vs long-request placement guarantee.
+        "placement_decision",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
         # T-0466: per-session ~1h cache-window recycle postpone (bsq postpone).

@@ -805,6 +805,11 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
     # so the UI grouping matches `tmux list-sessions` instead of stale metadata.
     live_tmux_sessions = {p.session for p in panes if p.session}
 
+    # T-0568: every live pane's computed SID, for the uuid-fallback ownership
+    # guard below (an md whose stored SID is another live pane must not be
+    # attributed to this one).
+    all_pane_sids = {compute_sid(user, p.window, p.pane_id) for p in panes}
+
     import re as _re_cmd
     _claude_version_re = _re_cmd.compile(r"^\d+\.\d+\.\d+$")
     for pane in panes:
@@ -864,14 +869,32 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         session_md_path = _find_session_md(sessions_dir_path, sid, claude_uuid)
         existing = _read_session_metadata(session_md_path) if session_md_path else None
 
+        # T-0568 guard: the uuid FALLBACK can land on an md that belongs to a
+        # DIFFERENT live pane — discover_claude_uuid is a shared-cwd mtime
+        # guess (every md-less pane in one cwd resolves to the newest jsonl),
+        # and the /proc walk can transiently miss on a brand-new pane. If the
+        # resolved md's own SID is another live pane, this pane must not wear
+        # that session's identity/task (the p8↔T-0568 roster cross-attribution).
+        # A rename-recovery md (T-0118) is unaffected: its stored SID points at
+        # a window name that no longer exists, so it is never live.
+        if existing is not None and session_md_path is not None:
+            stored_owner_sid = str(existing.get("sid") or session_md_path.stem)
+            if stored_owner_sid != sid and stored_owner_sid in all_pane_sids:
+                session_md_path = None
+                existing = None
+
         # T-0176 #4: a claude `/rename` changes the live tmux window name; sync
         # the stored SessionMd display label to match (it used to lag behind the
         # pre-rename window). uuid identity + the frozen sid/filename (the
         # peer-bus address) are untouched — only the human label is refreshed.
+        # T-0568: never persist a GENERIC live name ('bash', blank — the decay
+        # this ticket repairs) over a stored one; that would destroy the only
+        # good copy of the name the reconcile pass restores from.
         if (
             existing is not None
             and session_md_path is not None
             and pane.window
+            and not _is_generic_window(pane.window)
             and existing.get("window") != pane.window
         ):
             existing["window"] = pane.window
@@ -1415,6 +1438,14 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # primary via --resume + the hook's existing-md fallback, no env needed.
     if adopt_task_id:
         cmd = f"BOT_SQUAD_TASK_ID={shlex.quote(adopt_task_id)} {cmd}"
+    # T-0324 (H1): re-export the stored owner so the SessionStart hook's
+    # env-level constant-team guard also covers RESUMED sessions. spawn()
+    # passes BOT_SQUAD_OWNER but resume never did — a resumed constant-team
+    # session carried no env vars, which is exactly the gap the stale-marker
+    # cross-wire (p179→p181) slipped through.
+    resume_owner = meta.get("owner")
+    if resume_owner and resume_owner != "~":
+        cmd = f"BOT_SQUAD_OWNER={shlex.quote(str(resume_owner))} {cmd}"
 
     result = _run([
         "tmux", "new-window", "-d",
@@ -1784,9 +1815,10 @@ def spawn(
     Opens a new tmux window, starts claude (no resume), and optionally
     sends an initial_prompt after a short delay.
 
-    If task_id is provided, writes ``.claude/task_id`` in the project's
-    repo *before* spawning so the SessionStart hook links the new session
-    to that backlog task automatically.
+    If task_id is provided, it rides the per-process ``BOT_SQUAD_TASK_ID``
+    env on the launch command (T-0525 — the shared ``.claude/task_id`` marker
+    is retired, and T-0324 removed its last reader) so the SessionStart hook
+    links the new session to that backlog task automatically.
 
     If initiative is provided (a filename under vision/initiatives/), the
     SessionStart hook is told via the BOT_SQUAD_INITIATIVE env var to use
@@ -3920,6 +3952,13 @@ def reconcile_primary_from_history(cfg: Any, slug: str) -> dict:
         role = _role_of(meta)  # T-0509: honor a morph stamp
         if role != "dev":
             continue
+        # T-0324: a constant-team session must never adopt a primary either —
+        # its window (e.g. `user-feedback`) derives role "dev", so the role
+        # gate alone would let the adopt branch recreate the p181 cross-wire
+        # worker-side. Its cross-wired primaries are stripped by
+        # reconcile_constant_team_primaries, never repaired toward it.
+        if meta.get("owner") == "constant-team":
+            continue
 
         primary = meta.get("task_id")
         primary = primary if (primary and primary != "~") else None
@@ -3963,6 +4002,153 @@ def reconcile_primary_from_history(cfg: Any, slug: str) -> dict:
 
     rewritten = len([d for d in details if "new_primary" in d])
     return {"ok": True, "scanned": scanned, "rewritten": rewritten, "details": details}
+
+
+def reconcile_constant_team_primaries(cfg: Any, slug: str) -> dict:
+    """T-0324: strip a primary ``task_id`` off any ``owner: constant-team``
+    session md — whatever path set it.
+
+    A constant-team session is a queue consumer (feedback triage, user intake);
+    it has no single ticket, and ``bind_task`` refuses to give it one (T-0185).
+    But the p179→p181 incident proved a primary can arrive via OTHER paths (a
+    stale SessionStart marker back then; any future writer tomorrow). This pass
+    is the belt-and-braces invariant enforcer: no constant-team md holds a
+    primary, live or suspended, and the tick self-heals one that appears.
+
+    The stripped value is NOT preserved as ``last_task_id`` — it was never a
+    legitimate binding, and ``last_task_id`` feeds the idle-trim / redispatch
+    heuristics (T-0202/T-0233). The ticket's ``session_history`` is untouched:
+    it never listed the constant-team SID (that disagreement is how the
+    incident was detectable), and history stays forensics-only.
+
+    Returns ``{"ok": True, "scanned": N, "stripped": [sids]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(
+            f"reconcile_constant_team_primaries: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": True, "scanned": 0, "stripped": []}
+
+    scanned = 0
+    stripped: list[str] = []
+    for md in sorted(sessions_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        scanned += 1
+        if meta.get("owner") != "constant-team":
+            continue
+        tid = meta.get("task_id")
+        if not tid or tid == "~":
+            continue
+        meta["task_id"] = "~"
+        _write_session_metadata(md, meta, atomic=True)
+        stripped.append(meta.get("sid", md.stem))
+
+    return {"ok": True, "scanned": scanned, "stripped": stripped}
+
+
+def rehome_primary(cfg: Any, slug: str, task_id: str, to_sid: str) -> dict:
+    """T-0324 (H2): safely re-home a task's PRIMARY binding onto ``to_sid``.
+
+    Neither ``bind_task`` (adopt-empty / append-extras only) nor ``unbind_task``
+    (refuses to touch the primary) can repair a MIS-SET primary — the p179→p181
+    incident's only remedy was hand-editing session-md frontmatter, which races
+    ``binding_gc``. This is the missing operator/TL repair tool:
+
+      * refuses a constant-team or TL/operator target (same admission rules as
+        ``bind_task`` — a re-home must not create the very state it repairs);
+      * refuses a target already holding a DIFFERENT primary (unbind/close that
+        first — no silent clobber);
+      * under the ``.task-claim.lock`` flock (the same lock spawn/bind_task
+        serialize on, so binding_gc's stale-dup pass never sees a half-move):
+        strips ``task_id`` off every OTHER session md holding it as primary,
+        then stamps it as ``to_sid``'s primary;
+      * appends ``to_sid`` to the ticket's ``session_history`` (idempotent) so
+        the task-md SSOT agrees with the repaired session md.
+
+    Idempotent: re-homing onto the current holder strips any other claimants
+    and succeeds. Returns ``{"ok", "task_id", "to_sid", "stripped": [sids]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"rehome_primary: unknown project slug {slug!r}")
+
+    task_id = (task_id or "").strip()
+    to_sid = (to_sid or "").strip()
+    if not task_id or not to_sid:
+        raise ActionError("rehome_primary: task_id and to_sid are required")
+
+    data_dir = cfg.data_dir
+    backlog_dir = data_dir / slug / "backlog"
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        raise ActionError(f"rehome_primary: task not found: {task_id}")
+
+    sessions_dir = data_dir / slug / "sessions"
+    to_md = _session_file(data_dir, slug, to_sid)
+    to_meta = _read_session_metadata(to_md)
+    if to_meta is None:
+        raise ActionError(f"rehome_primary: no metadata for target SID {to_sid!r}")
+
+    # Same admission rules as bind_task: never (re)create a primary on a
+    # constant-team or coordination-role session.
+    if to_meta.get("owner") == "constant-team":
+        raise ActionError(
+            f"rehome_primary: target {to_sid!r} is a constant-team session — "
+            "it must never hold a primary single-ticket binding")
+    role = _role_of(to_meta)  # T-0509: honor a morph stamp
+    if role != "dev":
+        raise ActionError(
+            f"rehome_primary: target {to_sid!r} is a {role} session — only a "
+            "dev session can hold a primary task binding")
+
+    cur = to_meta.get("task_id")
+    cur = cur if (cur and cur != "~") else None
+    if cur is not None and cur != task_id:
+        raise ActionError(
+            f"rehome_primary: target {to_sid!r} already holds primary {cur} — "
+            "unbind/close that first; refusing to clobber")
+
+    claim_lock = backlog_dir / ".task-claim.lock"
+    claim_lock.parent.mkdir(parents=True, exist_ok=True)
+    stripped: list[str] = []
+    with open(claim_lock, "w") as _lockf:
+        fcntl.flock(_lockf, fcntl.LOCK_EX)
+        # Strip every OTHER claimant (live or not) of this primary. The value
+        # is not preserved as last_task_id: a mis-set primary was never a
+        # legitimate binding (cf reconcile_constant_team_primaries).
+        for md in sorted(sessions_dir.glob("*.md")):
+            if md == to_md:
+                continue
+            meta = _read_session_metadata(md)
+            if meta is None:
+                continue
+            if meta.get("task_id") == task_id:
+                meta["task_id"] = "~"
+                _write_session_metadata(md, meta, atomic=True)
+                stripped.append(meta.get("sid", md.stem))
+
+        # Re-read under the lock (a concurrent bind may have grown extras).
+        to_meta = _read_session_metadata(to_md) or to_meta
+        to_meta["task_id"] = task_id
+        _write_session_metadata(to_md, to_meta, atomic=True)
+
+    try:
+        _append_task_session_history(backlog_dir, task_id, to_sid)
+    except OSError:
+        # Best-effort: the session-md move above is the repair; history
+        # append is the audit trail.
+        pass
+
+    return {"ok": True, "task_id": task_id, "to_sid": to_sid, "stripped": stripped}
 
 
 def gc_dead_bindings(cfg: Any, slug: str) -> dict:
@@ -4323,6 +4509,25 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
 
 _WINDOW_SANITISE_RE = re.compile(r"[^A-Za-z0-9_-]")
 
+# T-0568: window names that carry no identity — what a window decays to when
+# created without ``-n`` (tmux names it after the running command) or when a
+# per-user tmux server's automatic-rename tracks pane_current_command. A
+# version string ("2.1.139") is the agent-teams subagent binary name tmux
+# reports for Claude Code's version-named launchers. `~` is the registry's
+# "unset" sentinel.
+_GENERIC_WINDOW_NAMES = frozenset(
+    {"bash", "sh", "zsh", "fish", "claude", "node", "~"})
+_CLAUDE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _is_generic_window(name: str | None) -> bool:
+    """True when ``name`` is blank or a shell/binary default — i.e. NOT a
+    meaningful session name (T-0568)."""
+    n = (name or "").strip()
+    if not n:
+        return True
+    return n in _GENERIC_WINDOW_NAMES or bool(_CLAUDE_VERSION_RE.match(n))
+
 
 def _sanitise_window(name: str) -> str:
     """Window-name token used in SID derivation (mirrors hook_my_sid.sh)."""
@@ -4387,20 +4592,32 @@ def sync_session_name(cfg: Any, slug: str, sid: str, name: str) -> dict:
         return {"ok": True, "sid": sid, "new_sid": sid, "name": clean}
 
     # Live: rename the tmux window, rotate the SID, migrate md + peer bus.
-    _run(["tmux", "rename-window", "-t", target_pane.pane_id, clean])
-    new_sid = compute_sid(user, clean, target_pane.pane_id)
+    return _rename_live_pane(cfg, slug, meta_file, meta, target_pane, clean)
+
+
+def _rename_live_pane(
+    cfg: Any, slug: str, meta_file: Path, meta: dict, pane: PaneInfo, clean: str,
+) -> dict:
+    """Rename a LIVE pane's tmux window and carry the registry along: rotate
+    the SID, migrate the md to the new path, rebind the peer-bus inbox
+    (T-0072) and re-reconcile the team roster. The single rename core shared
+    by ``sync_session_name`` (UI / ``bsq team rename``) and the T-0568
+    ``reconcile_window_names`` tick pass. ``clean`` must be pre-sanitised."""
+    old_sid = str(meta.get("sid") or meta_file.stem)
+    _run(["tmux", "rename-window", "-t", pane.pane_id, clean])
+    new_sid = compute_sid(_get_current_user(), clean, pane.pane_id)
 
     meta["sid"] = new_sid
     meta["window"] = clean
-    new_meta_file = _session_file(data_dir, slug, new_sid)
+    new_meta_file = _session_file(cfg.data_dir, slug, new_sid)
     _write_session_metadata(new_meta_file, meta)
-    if new_sid != sid and meta_file.exists() and meta_file != new_meta_file:
+    if new_sid != old_sid and meta_file.exists() and meta_file != new_meta_file:
         meta_file.unlink()
 
-    if new_sid != sid:
+    if new_sid != old_sid:
         try:
             from bot_squad_worker import intersession as _is
-            _is.rebind_sid(cfg, slug, sid, new_sid)
+            _is.rebind_sid(cfg, slug, old_sid, new_sid)
         except Exception:
             pass  # peer-bus rebind is best-effort; gc will reconcile
         try:
@@ -4409,4 +4626,115 @@ def sync_session_name(cfg: Any, slug: str, sid: str, name: str) -> dict:
         except Exception:
             pass
 
-    return {"ok": True, "sid": sid, "new_sid": new_sid, "name": clean}
+    return {"ok": True, "sid": old_sid, "new_sid": new_sid, "name": clean}
+
+
+def reconcile_window_names(cfg: Any, slug: str) -> dict:
+    """T-0568: 60s-tick repair pass — sessions must not stay 'bash'/blank.
+
+    The tmux window name is the naming SSOT (SID = ``S-<user>-<window>-p<N>``),
+    but nothing repaired a window that decayed to a generic name: a human
+    starting claude in an unnamed window (default name = the running command,
+    'bash'), a per-user tmux server auto-renaming to the current command, or a
+    manual rename drifting the live name away from the registry. Team status
+    filled with ``bash-pN`` rows, and a BLANK window name is worse — it breaks
+    registration entirely (``hook_my_sid.sh`` exits on an empty window, so no
+    session md is ever written).
+
+    For each live claude pane in this project's repo whose window name is
+    generic/blank, derive the best real name and rename through the same core
+    ``sync_session_name`` uses (SID rotation + md migration + peer-bus rebind):
+
+      * the md's stored ``window`` field, when non-generic (the registry kept
+        the good name while the live window decayed);
+      * else the primary ``task_id`` (a bound dev named 'bash' becomes
+        ``T-NNNN`` — which the hook's window-name tier also re-derives);
+      * else, ONLY for a blank name, a ``claude-<uuid8>``/``claude-p<N>``
+        placeholder so the next hook fire can register the session at all;
+      * a generic-but-named window with no registry record and no binding is a
+        human's own window — left alone.
+
+    The md is resolved by SID, then by the pane's authoritative /proc-walked
+    uuid — NEVER the shared-cwd mtime guess (``discover_claude_uuid``), which
+    attributes every md-less pane in a cwd to the same md (the cross-attribution
+    hazard this ticket's companion guard closes in ``list_sessions``).
+
+    Idempotent: a repaired window is non-generic next tick. Returns
+    ``{"ok": True, "renamed": [{sid, new_sid, new_window}, ...]}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"reconcile_window_names: unknown project slug {slug!r}")
+
+    repo_path = Path(project.repo_path)
+    try:
+        repo_real = repo_path.resolve()
+    except OSError:
+        repo_real = repo_path
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    user = _get_current_user()
+    user_home = _get_user_home()
+
+    renamed: list[dict] = []
+    try:
+        panes = list_panes()
+    except Exception:
+        return {"ok": True, "renamed": renamed}
+
+    for pane in panes:
+        if pane.command != "claude" and not _CLAUDE_VERSION_RE.match(pane.command):
+            continue
+        if not _is_generic_window(pane.window):
+            continue
+        allow_parent = pane.session == slug or pane.window == "operator"
+        if not _cwd_matches_repo(
+            pane.cwd, repo_path, repo_real, allow_parent=allow_parent
+        ):
+            continue
+
+        sid = compute_sid(user, pane.window, pane.pane_id)
+        claude_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home)
+        md_path = _find_session_md(sessions_dir, sid, claude_uuid)
+        meta = _read_session_metadata(md_path) if md_path else None
+
+        desired: str | None = None
+        if meta is not None:
+            stored = str(meta.get("window") or "").strip()
+            if stored and not _is_generic_window(stored):
+                desired = stored
+            else:
+                tid = meta.get("task_id")
+                if tid and tid != "~":
+                    desired = str(tid)
+        if desired is None and not (pane.window or "").strip():
+            desired = (
+                f"claude-{claude_uuid[:8]}" if claude_uuid
+                else f"claude-{pane.pane_id.lstrip('%')}"
+            )
+        if not desired:
+            continue
+        clean = _sanitise_window(desired)
+        if not clean or clean == pane.window:
+            continue
+
+        if meta is not None and md_path is not None:
+            try:
+                res = _rename_live_pane(cfg, slug, md_path, meta, pane, clean)
+            except Exception:
+                continue
+            renamed.append({
+                "sid": res["sid"], "new_sid": res["new_sid"], "new_window": clean,
+            })
+        else:
+            # No registry record (blank-window pane): bare tmux rename so the
+            # next SessionStart/hook fire can compute a SID and register it.
+            _run(["tmux", "rename-window", "-t", pane.pane_id, clean])
+            renamed.append({
+                "sid": sid,
+                "new_sid": compute_sid(user, clean, pane.pane_id),
+                "new_window": clean,
+            })
+
+    return {"ok": True, "renamed": renamed}

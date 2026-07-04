@@ -477,8 +477,10 @@ async def spawn_session(
     """Spawn a new Claude session in the project's repo.
 
     Spawned in the logged-in user's own tmux server (linux_user from auth).
-    Optional `task_id` writes ``.claude/task_id`` so the SessionStart hook
-    links the new session to that backlog task.
+    Optional `task_id` rides the per-process ``BOT_SQUAD_TASK_ID`` env to the
+    new claude (T-0525; the shared ``.claude/task_id`` marker is retired and
+    T-0324 removed its last reader) so the SessionStart hook links the new
+    session to that backlog task.
     """
     _check_project(request, slug)
     if not body.window.strip():

@@ -88,19 +88,23 @@ src_window=""
 if [ -n "${BOT_SQUAD_TASK_ID:-}" ]; then
     task_id="$(printf '%s' "$BOT_SQUAD_TASK_ID" | tr -d '[:space:]')"
 fi
-if [ -z "$task_id" ] && [ -f "$PWD/.claude/task_id" ]; then
-    task_id="$(tr -d '[:space:]' < "$PWD/.claude/task_id" 2>/dev/null || echo "")"
-fi
+# T-0324 (H1): the shared-cwd `.claude/task_id` marker read-tier is RETIRED.
+# T-0525 already removed every writer (spawn/resume use the per-process env
+# above), but the reader survived — so marker residue (pre-fix deploy, an
+# external claude) could still cross-wire an env-less session's PRIMARY to a
+# task it never owned (the p179→p181 incident). Delete any residue instead of
+# reading it, so no later session in this cwd can be poisoned either.
+rm -f "$PWD/.claude/task_id" 2>/dev/null || true
 if [ -z "$task_id" ] && [ "${src_window#T-}" != "$src_window" ]; then
     # window starts with T-; extract T-NNNN if NNNN is digits
     num="$(printf '%s' "$src_window" | sed -E 's/^T-([0-9]+).*$/\1/')"
     [ -n "$num" ] && [ "$num" != "$src_window" ] && task_id="T-$num"
 fi
 # T-0345 / T-0324(H1): a constant-team (queue-consumer / triage) session must
-# NEVER adopt a task_id — it has no single ticket. Drop any stale shared-cwd
-# .claude/task_id marker so its PRIMARY can't cross-wire onto an unrelated newest
-# ticket. This is the SessionStart-marker path that bypassed the bind_task
-# owner=constant-team refusal (the p179→p181 incident).
+# NEVER adopt a task_id — it has no single ticket. This env-level drop covers
+# spawn-time channels (env / window name); the md-persisted `owner:
+# constant-team` case (resumed sessions carry NO env vars) is enforced again
+# inside the python block below, where the existing md is available.
 if [ "${BOT_SQUAD_OWNER:-}" = "constant-team" ]; then
     task_id=""
 fi
@@ -200,6 +204,15 @@ if not linux_user:
     linux_user = existing.get("linux_user") or ""
 if linux_user == "~":
     linux_user = ""
+
+# T-0324 (H1): a constant-team session must NEVER hold a primary single-ticket
+# binding, whatever channel proposed it — env, window name, or a previously
+# cross-wired value preserved from the existing md. This is the md-aware twin
+# of the bash-level BOT_SQUAD_OWNER guard above (resumed sessions have no env
+# vars, only the persisted `owner:`), and it self-heals an already-poisoned
+# md on the next hook fire. Mirrors the bind_task owner=constant-team refusal.
+if owner == "constant-team":
+    task_id = ""
 
 started_at = existing.get("started_at") or "~"
 if started_at == "~" or not started_at:
@@ -356,8 +369,10 @@ def tmux_q(fmt):
 new_window = tmux_q('#W')
 pane_raw   = tmux_q('#{pane_id}')
 # T-0078: re-query the post-break-pane tmux session so the SessionMd
-# reflects the destination (`<slug>-<initiative>` for an initiative TL,
-# `<slug>` for the legacy main session).
+# reflects the destination ('<slug>-<initiative>' for an initiative TL,
+# '<slug>' for the legacy main session). NOTE (T-0568): this whole block
+# rides inside the outer setsid double-quoted string — backticks here are
+# LIVE command substitution to the outer shell, never use them.
 new_tmux_session = tmux_q('#S')
 if not new_window or not pane_raw:
     raise SystemExit
@@ -383,7 +398,7 @@ def sub_field(t, key, value):
     return t
 
 def upsert_field(t, key, value):
-    # T-0078: like sub_field but inserts a line before the closing `---`
+    # T-0078: like sub_field but inserts a line before the closing '---'
     # when the key is absent (so a legacy md without tmux_session picks
     # the field up on its next break-pane migration).
     pat = re.compile(rf'^{re.escape(key)}:.*$', re.M)

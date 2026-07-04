@@ -418,6 +418,12 @@ def binding_gc_tick(cfg: Config) -> None:
         # home here instead of being stripped, and the downstream passes see a
         # consistent primary (stops the reconciler oscillation the ramp surfaced).
         ("reconcile_primary_from_history", _sessions.reconcile_primary_from_history),
+        # T-0324: invariant enforcer — no constant-team session md ever holds a
+        # primary task_id, whatever path set it (the p179→p181 cross-wire class).
+        # Runs right after the history reconciler so a victim dev's primary is
+        # restored first and the cross-wired copy is then stripped, same tick.
+        ("reconcile_constant_team_primaries",
+         _sessions.reconcile_constant_team_primaries),
         ("gc_dead_bindings", _sessions.gc_dead_bindings),
         ("gc_stale_bindings", _sessions.gc_stale_bindings),
         ("archive_dead_teammates", _sessions.archive_dead_teammates),
@@ -429,6 +435,10 @@ def binding_gc_tick(cfg: Config) -> None:
         # (inactive + past the long grace) off-board to backlog/_gc/ (reversible),
         # generalizing the throwaway GC into the real task-cleanup process.
         ("gc_stale_tasks", _task_gc.gc_stale_tasks),
+        # T-0568: repair generic/blank tmux window names (the naming SSOT) from
+        # the registry/binding — runs just before reconcile_teams so the roster
+        # is rebuilt with the rotated SIDs in the same tick.
+        ("reconcile_window_names", _sessions.reconcile_window_names),
         ("reconcile_teams", _teams.reconcile_teams),
         # T-0128: backfill parent_sid for legacy / agent-teams-spawned sessions
         # via the team-projection heuristic (fill-once, never overwrites the

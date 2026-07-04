@@ -253,6 +253,28 @@ def decide_dispatch(cfg: Any, slug: str, task_id: str, *, now_epoch: float | Non
                         "held_task": held_task, **hint,
                     })
 
+            # T-0575: a recycle-v2 remembered session (idle_timeout compact-
+            # terminate-remember, T-0566) is a resume candidate too — its md
+            # carries ``resumable``/``recycled_at``/``resume_hint`` instead of
+            # the graceful-exit stamp above. Recommend --resume when it ran
+            # THIS task and its remembered context fits the <50k budget
+            # (stakeholder 2026-07-04).
+            if (hint is None and meta.get("resumable")
+                    and not S._is_live_holder(meta)):
+                held_task = task_id in S._full_task_set(meta)
+                init_match = bool(task_init) and task_init in S._full_initiative_set(meta)
+                if held_task or init_match:
+                    ok, tokens = S.recycled_resume_eligible(meta.get("claude_uuid"))
+                    resume_hints.append({
+                        "sid": sid, "initiative_match": init_match,
+                        "held_task": held_task,
+                        "resume_recommended": bool(ok and held_task),
+                        "reason": meta.get("resume_hint") or "recycled (resumable)",
+                        "when": meta.get("recycled_at") or "",
+                        "last_work_summary": "",
+                        "context_tokens": tokens,
+                    })
+
             # A session already holding this task is the binding itself, not a
             # reuse target — skip it.
             if task_id in S._full_task_set(meta):

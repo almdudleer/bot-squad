@@ -332,6 +332,78 @@ def test_decide_dispatch_no_hint_field_absent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# T-0575 — recycle-v2 remembered sessions surface as resume hints
+# ---------------------------------------------------------------------------
+
+def _stamp_recycled(cfg, sid):
+    """Add the T-0566 idle_timeout recycle stamp to an existing session md."""
+    p = cfg.data_dir / "test-project" / "sessions" / f"{sid}.md"
+    meta = S._read_session_metadata(p)
+    meta["resumable"] = True
+    meta["recycled_at"] = "2026-07-04T10:00:00Z"
+    meta["resume_hint"] = "idle cache-window recycle (compacted)"
+    _write_session_metadata(p, meta)
+
+
+def test_decide_dispatch_recycled_same_task_recommends_resume(tmp_path, monkeypatch):
+    """A recycle-v2 remembered session that RAN this task and fits the <50k
+    budget recommends --resume and steers the spawn reason (T-0575)."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0009",
+                  status="suspended")
+    _stamp_recycled(cfg, "S-u-d1-dev-p1")
+    monkeypatch.setattr(S, "recycled_resume_eligible",
+                        lambda uuid, user_home=None: (True, 30_000))
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["decision"] == "spawn"
+    assert len(res["resume_hints"]) == 1
+    h = res["resume_hints"][0]
+    assert h["held_task"] is True
+    assert h["resume_recommended"] is True
+    assert h["context_tokens"] == 30_000
+    assert h["reason"] == "idle cache-window recycle (compacted)"
+    assert "S-u-d1-dev-p1" in res["reason"]
+    assert "--resume" in res["reason"]
+
+
+def test_decide_dispatch_recycled_over_budget_surfaced_not_recommended(
+        tmp_path, monkeypatch):
+    """≥50k remembered context → the hint is surfaced (operator can still force
+    it) but never recommended (stakeholder 2026-07-04 rule)."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0009",
+                  status="suspended")
+    _stamp_recycled(cfg, "S-u-d1-dev-p1")
+    monkeypatch.setattr(S, "recycled_resume_eligible",
+                        lambda uuid, user_home=None: (False, 120_000))
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert len(res["resume_hints"]) == 1
+    h = res["resume_hints"][0]
+    assert h["resume_recommended"] is False
+    assert h["context_tokens"] == 120_000
+    assert "--resume" not in res["reason"]
+
+
+def test_decide_dispatch_recycled_unrelated_task_not_surfaced(tmp_path, monkeypatch):
+    """A remembered session that ran a DIFFERENT task (and shares no
+    initiative) is irrelevant to this dispatch — no hint."""
+    cfg = _make_cfg(tmp_path)
+    _make_task(cfg, "T-0009", initiative="alpha.md")
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0777",
+                  status="suspended")
+    _stamp_recycled(cfg, "S-u-d1-dev-p1")
+    monkeypatch.setattr(S, "recycled_resume_eligible",
+                        lambda uuid, user_home=None: (True, 1_000))
+
+    res = decide_dispatch(cfg, "test-project", "T-0009")
+    assert res["resume_hints"] == []
+
+
+# ---------------------------------------------------------------------------
 # T-0472 — operator as transient dispatcher: standing task + one-per-project
 # ---------------------------------------------------------------------------
 

@@ -1410,3 +1410,44 @@ def test_poll_ok_preserved_across_later_error(tmp_path):
     h = _health(cfg)
     assert h["last_ok_poll_at"] == ok_at      # last good poll still visible
     assert h.get("last_error")                # alongside the new error
+
+
+def test_handle_update_unquoted_parked_notifies_user(tmp_path, monkeypatch):
+    """T-0570: when ensure_user_conversation is refused under backoff (spawn
+    saturation), the user gets a 'parked, will attend' notice instead of
+    silence; the route result marks the parked state."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: {"ok": False, "parked": True})
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat_id, text, **k: notices.append((chat_id, text)))
+
+    result = TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg()})
+
+    assert result["action"] == "route_parked"
+    assert len(notices) == 1 and notices[0][0] == "111"
+    assert "заняты" in notices[0][1]
+
+
+def test_ensure_user_conversation_backoff_maps_to_parked(monkeypatch):
+    """T-0570: an ActionError mentioning backoff maps to {'parked': True};
+    other failures keep the silent-None best-effort contract."""
+    from bot_squad_worker import actions as A
+
+    def _boom_backoff(action, params):
+        raise A.ActionError("spawn: backoff — 3/2 effective concurrency")
+
+    monkeypatch.setattr(A, "dispatch", _boom_backoff)
+    assert TL._ensure_user_conversation(object(), "s", "g", "ref") == {
+        "ok": False, "parked": True}
+
+    def _boom_other(action, params):
+        raise A.ActionError("unknown project slug")
+
+    monkeypatch.setattr(A, "dispatch", _boom_other)
+    assert TL._ensure_user_conversation(object(), "s", "g", "ref") is None

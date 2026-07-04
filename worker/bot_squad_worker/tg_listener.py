@@ -392,7 +392,11 @@ def _ensure_user_conversation(
 
     Best-effort: the message is already durable in the conversation store
     (T-0489), so a spawn/pane hiccup must NEVER fail inbound routing — we swallow
-    and return ``None``."""
+    and return ``None``. T-0570: a swallowed failure still must not leave the
+    USER in silence — we surface the failure kind via the return value
+    (``{"ok": False, "parked": True}`` for a backoff/saturation spawn refusal,
+    ``None`` for anything else) so ``_handle_unquoted`` can tell the chat the
+    message is parked rather than dropping into dead air."""
     from bot_squad_worker import actions as A
     try:
         return A.dispatch("ensure_user_conversation", {
@@ -400,6 +404,10 @@ def _ensure_user_conversation(
             "global_user_id": gid,
             "message_ref": message_ref,
         })
+    except A.ActionError as e:
+        if "backoff" in str(e):
+            return {"ok": False, "parked": True}
+        return None
     except Exception:  # noqa: BLE001 — best-effort; never break inbound routing
         return None
 
@@ -505,7 +513,18 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     # timestamp keys it in the (por, gid) thread).
     append_conversation(cfg, por, gid, msg)
     message_ref = _msg_ts(msg)
-    _ensure_user_conversation(cfg, por, gid, message_ref)
+    ensured = _ensure_user_conversation(cfg, por, gid, message_ref)
+    if isinstance(ensured, dict) and ensured.get("parked"):
+        # T-0570: spawn refused under backoff/saturation. The message IS durably
+        # recorded and the spawn retries on ramp-up — but the user must hear
+        # that, not silence. Debounce stays ON so a burst during saturation
+        # yields one notice per cooldown, not one per message.
+        _channel_notify(
+            cfg, chat_id,
+            "Принял и записал. Сейчас все воркеры заняты — займусь, как только "
+            "освободится слот (обычно пара минут).",
+        )
+        return {"ok": True, "action": "route_parked", "slug": por}
     return {"ok": True, "action": "route", "slug": por}
 
 

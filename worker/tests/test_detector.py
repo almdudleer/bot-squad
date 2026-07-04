@@ -36,10 +36,27 @@ def _write_record(cfg, sid: str, *, rate_limited: bool, sampled_at: str) -> None
 
 # --- marker matching -------------------------------------------------------
 
-def test_text_has_limit_marker_matches_known_phrases():
-    assert D.text_has_limit_marker("Claude usage limit reached. resets at 3pm")
-    assert D.text_has_limit_marker("You've hit the 5-hour limit")
-    assert D.text_has_limit_marker("RATE LIMIT — retrying")  # case-insensitive
+# Verbatim pane capture of the Claude Code promo banner (2026-07-04, T-0571).
+# It mentions "usage limit" AND "hit your limit" while the session is perfectly
+# healthy — informational copy like this must never read as pressure.
+FABLE5_PROMO_BANNER = (
+    " ▎ Until July 7, you can use up to 50% of your plan's weekly usage limit "
+    "on Fable 5. If you hit your limit, you can continue on Fable 5 with usage "
+    "credits. Fable 5 draws down usage faster than Opus 4.8. Learn more"
+)
+
+
+def test_text_has_limit_marker_matches_real_limit_banners():
+    # older interactive prompt (with tmux decoration prefix)
+    assert D.text_has_limit_marker("  ⎿  Claude usage limit reached. Your limit will reset at 4am (UTC).")
+    # status-line variants
+    assert D.text_has_limit_marker("✗ 5-hour limit reached ∙ resets 3am")
+    assert D.text_has_limit_marker("Weekly limit reached ∙ resets Oct 9")
+    assert D.text_has_limit_marker("Approaching usage limit · resets at 7pm")
+    # case-insensitive
+    assert D.text_has_limit_marker("USAGE LIMIT REACHED — RESETS AT 18:00")
+    # banner buried in ordinary pane output still trips
+    assert D.text_has_limit_marker("some output\n✗ 5-hour limit reached ∙ resets 3am\n❯ ")
 
 
 def test_text_has_limit_marker_ignores_benign_text():
@@ -47,11 +64,62 @@ def test_text_has_limit_marker_ignores_benign_text():
     assert not D.text_has_limit_marker("")
 
 
+def test_promo_banner_does_not_trip_marker():
+    """T-0571: the Fable-5 promo banner tripped the bare 'usage limit' marker,
+    clamping global concurrency to 2 on healthy idle panes."""
+    assert not D.text_has_limit_marker(FABLE5_PROMO_BANNER)
+    # ...even when embedded in ordinary composer output
+    assert not D.text_has_limit_marker("some output\n" + FABLE5_PROMO_BANNER + "\n❯ ")
+
+
+def test_quoted_marker_text_does_not_trip():
+    """T-0571 (live incident): panes QUOTING marker phrases — a spawn brief, an
+    env-override assignment, or the detector's own source in a diff — must not
+    read as a limit hit; only a banner-shaped line (marker at line start +
+    reset/retry context) counts."""
+    # spawn brief discussing the markers, mid-prose
+    assert not D.text_has_limit_marker(
+        "❯ You are a DEV worker on T-0571: the bare 'usage limit' marker and "
+        "'limit reached' phrases trip session_pressure when quoted"
+    )
+    # env-override assignment in a shell / .env pane, at line start
+    assert not D.text_has_limit_marker(
+        "BOT_SQUAD_LIMIT_MARKERS='limit reached,resets at,rate limit'"
+    )
+    # detector.py source shown in a diff pane: marker string starts the line
+    # (after the +/quote decoration) but has no reset/retry context
+    assert not D.text_has_limit_marker('+    "limit reached",\n+    "rate limited",')
+
+
 def test_limit_markers_env_override(monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_LIMIT_MARKERS", "foobar, baz")
     assert D.limit_markers() == ["foobar", "baz"]
-    assert D.text_has_limit_marker("a FOOBAR appeared")
-    assert not D.text_has_limit_marker("usage limit reached")  # default list overridden
+    # custom markers use the same banner-shape rule: line start + context
+    assert D.text_has_limit_marker("FOOBAR — resets at 5am")
+    assert not D.text_has_limit_marker("a foobar appeared mid-prose, resets at 5am")
+    assert not D.text_has_limit_marker("foobar bare on a line, no lift-time given")
+    assert not D.text_has_limit_marker("usage limit reached — resets at 3pm")  # defaults overridden
+
+
+def test_limit_markers_empty_env_disables_scan(monkeypatch):
+    """unset → defaults; empty → pane scan OFF; csv → custom (operator knob)."""
+    monkeypatch.setenv("BOT_SQUAD_LIMIT_MARKERS", "")
+    assert D.limit_markers() == []
+    assert not D.text_has_limit_marker("✗ 5-hour limit reached ∙ resets 3am")
+
+
+def test_capture_pane_joins_wrapped_lines(monkeypatch):
+    """-J unwraps long prose lines so a quoted marker phrase can't land at a
+    visual line start via terminal wrapping."""
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return types.SimpleNamespace(stdout="text")
+
+    monkeypatch.setattr(D.subprocess, "run", fake_run)
+    assert D._capture_pane("%1") == "text"
+    assert "-J" in seen["cmd"]
 
 
 # --- recency window --------------------------------------------------------

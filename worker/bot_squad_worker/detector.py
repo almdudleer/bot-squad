@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,17 +31,38 @@ from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
-# Default markers for the interactive 5-hour usage-limit / rate-limit pane
-# prompt. Lowercase substrings, matched case-insensitively. Tunable via
-# BOT_SQUAD_LIMIT_MARKERS (comma-separated) once we see the real day-1 copy.
+# Default markers for the interactive usage-limit pane banner. Lowercase,
+# matched case-insensitively — but NOT as free substrings: a marker only
+# counts when it sits at the start of a pane line (after whitespace/decoration
+# like ⎿ ✗ ∙ ▎) AND that line carries reset/retry context ("resets at 3am",
+# "retrying…"). Free substring matching false-positived on panes merely
+# MENTIONING these phrases — the Fable-5 promo banner ("…50% of your plan's
+# weekly usage limit…"), spawn briefs quoting marker text, and detector.py's
+# own source in a diff all clamped concurrency to 2 (T-0571, 2026-07-04).
+# Tunable via BOT_SQUAD_LIMIT_MARKERS: unset → defaults, empty → pane scan
+# OFF, csv → custom markers (same banner-shape rule).
 DEFAULT_LIMIT_MARKERS = [
-    "usage limit",
-    "5-hour limit",
-    "5 hour limit",
+    "claude usage limit reached",
+    "usage limit reached",
+    "5-hour limit reached",
+    "5 hour limit reached",
+    "weekly limit reached",
+    "session limit reached",
     "limit reached",
-    "resets at",
-    "rate limit",
+    "approaching usage limit",
+    "approaching 5-hour limit",
+    "approaching weekly limit",
+    "you've reached your usage limit",
+    "you have reached your usage limit",
+    "rate limited",
+    "rate limit reached",
 ]
+
+# Leading tmux/TUI decoration before the banner text proper.
+_LINE_DECOR_RE = re.compile(r"^[^a-z0-9]+")
+# A real limit banner always says when it lifts; quoted marker text (source
+# code, csv assignments, prose) almost never does on the same line.
+_LIMIT_CONTEXT_RE = re.compile(r"reset|retry|try again")
 
 DEFAULT_PRESSURE_WINDOW_SEC = 180
 
@@ -61,10 +83,26 @@ def pressure_window_sec() -> int:
 
 
 def text_has_limit_marker(text: str) -> bool:
+    """True iff some pane line has the shape of a real limit banner: a marker
+    at line start (past decoration) plus reset/retry context on the same line.
+
+    Residual blind spot: a pane displaying VERBATIM banner copy at line start
+    (e.g. this module's own tests in a diff) is indistinguishable from the
+    banner itself; that's inherent to text-level detection.
+    """
     if not text:
         return False
-    low = text.lower()
-    return any(m in low for m in limit_markers())
+    markers = limit_markers()
+    if not markers:
+        return False
+    for raw_line in text.splitlines():
+        line = raw_line.lower().replace("’", "'")
+        stripped = _LINE_DECOR_RE.sub("", line)
+        if not stripped:
+            continue
+        if any(stripped.startswith(m) for m in markers) and _LIMIT_CONTEXT_RE.search(stripped):
+            return True
+    return False
 
 
 # --- (A) 429 from telemetry records ----------------------------------------
@@ -129,9 +167,11 @@ def _recent_rate_limited(cfg: Any, now_epoch: Optional[float] = None) -> set[str
 # --- (B) 5h-limit pane scan ------------------------------------------------
 
 def _capture_pane(pane_id: str) -> str:
+    # -J joins wrapped lines so quoted marker text inside a long prose line
+    # can't land at a visual line start and mimic the banner shape (T-0571).
     try:
         return subprocess.run(
-            ["tmux", "capture-pane", "-t", pane_id, "-p"],
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-J"],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):

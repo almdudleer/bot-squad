@@ -174,6 +174,21 @@ def test_recycle_from_system_settings(tmp_config_dir: Path) -> None:
     assert cfg.recycle_compact_min_context_tokens == 15000
 
 
+def test_tasks_dedupe_threshold_default(tmp_config_dir: Path) -> None:
+    # T-0577: absent system_settings.toml -> conservative default (0.9).
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tasks_dedupe_threshold == 0.9
+
+
+def test_tasks_dedupe_threshold_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0577: admin tunes the task_new dedupe-vs-create gate via [tasks].
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[tasks]\ndedupe_threshold = 0.75\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.tasks_dedupe_threshold == 0.75
+
+
 def test_secrets_missing_raises(tmp_path: Path) -> None:
     # Build a config dir that has projects.toml but NOT secrets.toml.
     cfg_dir = tmp_path / "config"

@@ -3047,6 +3047,10 @@ def cmd_task_new(args) -> None:
         v = getattr(args, k, None)
         if v:
             params[k] = v
+    # T-0577: only sent when the user opts in, so an unpatched worker (no
+    # dedupe gate yet) still accepts the call unchanged.
+    if getattr(args, "force", False):
+        params["force"] = True
     # T-0519: pass the (client-validated) provenance INTO the action so the
     # worker requires+validates+stamps it at the gate. Fall back to the legacy
     # post-hoc stamp for a pre-T-0519 worker that doesn't yet accept the param
@@ -3887,6 +3891,11 @@ def build_parser() -> argparse.ArgumentParser:
     tnn.add_argument("--initiative", help="initiative basename, e.g. operator-ux-and-session-mgmt.md")
     tnn.add_argument("--priority", help="priority value (frontmatter, verbatim)")
     tnn.add_argument("--owner", help="owner role/name (frontmatter)")
+    tnn.add_argument(
+        "--force", action="store_true",
+        help="bypass the dedupe-vs-create similarity gate (T-0577) — mint even "
+             "if this looks like a near-duplicate of an existing backlog task",
+    )
     tnn.set_defaults(func=cmd_task_new)
     # task search / similar (T-0486) — dedupe / clarify-vs-create tooling.
     tns = tn_sub.add_parser(

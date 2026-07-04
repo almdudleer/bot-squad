@@ -182,6 +182,18 @@ class Config:
     # worth compacting). Loaded from system_settings.toml
     # [recycle].compact_min_context_tokens.
     recycle_compact_min_context_tokens: int = 20000
+    # T-0577: dedupe-vs-create gate on the `task_new` worker action. A fresh
+    # ticket's title (+ verbatim text, when supplied) is ranked against the
+    # project's existing backlog via task_search.rank(); a top match whose
+    # COVERAGE (fraction of the new ticket's distinct meaningful tokens already
+    # found in an existing ticket's title+body — see task_search.py) is at or
+    # above this fraction rejects the mint as a likely duplicate (`force: true`
+    # bypasses). Default is deliberately HIGH/conservative: the stakeholder
+    # rider is that a false reject on someone's first live voice-filed task is
+    # the worst outcome, so this only trips on near-total-token, near-duplicate
+    # titles — a partial paraphrase still mints. Loaded from
+    # system_settings.toml [tasks].dedupe_threshold.
+    tasks_dedupe_threshold: float = 0.9
 
     @property
     def data_dir(self) -> Path:
@@ -240,6 +252,7 @@ class Config:
         voice_audio_retention_days = 30
         recycle_projects: tuple[str, ...] = ("bot-squad",)
         recycle_compact_min_context_tokens = 20000
+        tasks_dedupe_threshold = 0.9
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -268,6 +281,9 @@ class Config:
             recycle_compact_min_context_tokens = int(
                 recycle_block.get("compact_min_context_tokens",
                                   recycle_compact_min_context_tokens))
+            tasks_block = sys_raw.get("tasks", {}) or {}
+            tasks_dedupe_threshold = float(
+                tasks_block.get("dedupe_threshold", tasks_dedupe_threshold))
 
         return cls(
             config_dir=config_dir,
@@ -292,4 +308,5 @@ class Config:
             voice_audio_retention_days=voice_audio_retention_days,
             recycle_projects=recycle_projects,
             recycle_compact_min_context_tokens=recycle_compact_min_context_tokens,
+            tasks_dedupe_threshold=tasks_dedupe_threshold,
         )

@@ -1979,8 +1979,24 @@ _TASK_NEW_REQUIRED = {"slug", "title"}
 # caller of this action can no longer mint a sourceless ticket. Kept out of
 # _REQUIRED so the gate can raise a specific provenance error instead of the
 # generic "missing required params" one.
-_TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {"initiative", "priority", "owner", "provenance"}
+_TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {
+    "initiative", "priority", "owner", "provenance",
+    # T-0577: dedupe-vs-create gate additions. `verbatim` is signal-only (it
+    # widens the similarity query so a bare, generic title still catches a
+    # near-duplicate whose distinctive words live in the caller's verbatim
+    # text) — it is NOT stored on the ticket; the existing task_new body stays
+    # the stub placeholder, unchanged. `force` bypasses the gate outright.
+    "verbatim", "force",
+}
 _TASK_NEW_TITLE_MAX = 240
+# T-0577: dedupe gate tuning. A query with fewer than this many distinct
+# meaningful tokens (task_search.tokenize) is never flagged — mirrors
+# task_search's own duplicate-eligibility floor: a 1-token query has 100%
+# coverage on any hit trivially, which is noise, not a real duplicate signal.
+_TASK_DEDUPE_MIN_TOKENS = 2
+# Cap on how many ranked backlog candidates we even look at before filtering
+# by coverage — keeps a single reject message short and readable.
+_TASK_DEDUPE_CANDIDATE_LIMIT = 5
 
 
 def normalize_id(value: str) -> str:
@@ -2027,11 +2043,66 @@ def _atomic_write_new(path: Path, content: str) -> None:
         raise
 
 
+def _task_new_similar_backlog(cfg: Any, slug: str, query: str) -> list[Any]:
+    """T-0577 dedupe gate: rank ``slug``'s existing backlog tasks against
+    ``query`` (the new ticket's title, optionally + verbatim text) via the
+    ``task_search`` ranker, and return the ranked ``Candidate``s whose
+    COVERAGE — the fraction of ``query``'s distinct meaningful tokens already
+    found in that candidate's title+body — is at/above
+    ``cfg.tasks_dedupe_threshold``.
+
+    Read-only, best-effort: a missing/empty backlog dir or an unparsable
+    ticket file just drops out of consideration (never blocks a mint on an I/O
+    hiccup). Below ``_TASK_DEDUPE_MIN_TOKENS`` distinct query tokens, nothing
+    is ever flagged (a 1-token query trivially "covers" 100% of any hit).
+    """
+    from bot_squad_worker import frontmatter as _fm
+    from bot_squad_worker import task_search as _ts
+
+    tokens = _ts.tokenize(query)
+    if len(tokens) < _TASK_DEDUPE_MIN_TOKENS:
+        return []
+
+    backlog_dir: Path = cfg.data_dir / slug / "backlog"
+    if not backlog_dir.exists():
+        return []
+
+    tickets: list[Any] = []
+    for md in sorted(backlog_dir.glob("T-*.md")):
+        try:
+            raw = md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        parsed = _fm.parse_or_none(raw)
+        if not parsed:
+            continue
+        meta, body = parsed
+        meta = meta or {}
+        stem_parts = md.stem.split("-", 2)
+        fallback_id = "-".join(stem_parts[:2]) if len(stem_parts) >= 2 else md.stem
+        tickets.append(_ts.Ticket(
+            id=str(meta.get("id") or fallback_id).strip(),
+            title=str(meta.get("title") or md.stem),
+            body=body,
+            status=str(meta.get("status") or ""),
+        ))
+    if not tickets:
+        return []
+
+    threshold = cfg.tasks_dedupe_threshold
+    out = []
+    for c in _ts.rank(query, tickets, limit=_TASK_DEDUPE_CANDIDATE_LIMIT):
+        coverage = len(c.matched) / len(tokens)
+        if coverage >= threshold:
+            out.append(c)
+    return out
+
+
 def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     """Atomically allocate the next T-NNNN id and write a stub task md.
 
     Required params: slug, title
-    Optional params: initiative, priority, owner
+    Optional params: initiative, priority, owner, verbatim, force
     Returns: {ok: true, id: "T-NNNN", file_path: "<abs path>"}
 
     Allocation goes through the shared ``idalloc`` allocator (T-0174), which
@@ -2040,6 +2111,14 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     can no longer hand out the same id (they used to lock different files).
     Crashes between alloc and write merely burn one id — fine, ids aren't
     scarce.
+
+    T-0577 dedupe-vs-create gate: before minting, the (title [+ verbatim])
+    text is ranked against the project's existing backlog via
+    ``task_search.rank()``. A top match at/above ``cfg.tasks_dedupe_threshold``
+    coverage raises ``ActionError`` instead of minting — carrying the similar
+    task id(s)+title(s) and the retry recipe (``force: true`` /
+    ``bsq task new --force``) so the reject is never silent. Pass
+    ``force: true`` to bypass (the caller has already judged the ask distinct).
     """
     extra = set(params) - _TASK_NEW_ALLOWED
     if extra:
@@ -2076,6 +2155,29 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     cfg = _get_config()
     if cfg.projects.get(slug) is None:
         raise ActionError(f"task_new: unknown project slug {slug!r}")
+
+    # T-0577: dedupe-vs-create gate. task_search.py (ranking of similar backlog
+    # tasks) previously had zero ingest callers (D-0047) — every TG/voice-driven
+    # task_new minted unconditionally, so a firehose-driven backlog proliferated
+    # near-duplicate tickets. Rank the new ask against the existing backlog and
+    # reject (rather than silently mint) when it looks like a near-duplicate.
+    force = params.get("force", False)
+    if not isinstance(force, bool):
+        raise ActionError("task_new: force must be a boolean")
+    if not force:
+        verbatim = params.get("verbatim")
+        dedupe_query = title
+        if isinstance(verbatim, str) and verbatim.strip():
+            dedupe_query = f"{title}\n{verbatim}"
+        similar = _task_new_similar_backlog(cfg, slug, dedupe_query)
+        if similar:
+            listing = "; ".join(f"{c.id} {c.title!r}" for c in similar)
+            raise ActionError(
+                "task_new: rejected — looks like a near-duplicate of existing "
+                f"backlog task(s): {listing}. If this is genuinely a new, "
+                "distinct task, retry with force:true (bsq: "
+                "`bsq task new ... --force`)."
+            )
 
     from datetime import datetime, timezone
     from bot_squad_worker import idalloc

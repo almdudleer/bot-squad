@@ -168,6 +168,20 @@ class Config:
     # (promoted/dismissed) note's audio is reaped immediately; this age backstop
     # reaps abandoned/orphan blobs. 0 = triage-only GC.
     voice_audio_retention_days: int = 30
+    # T-0563/T-0564 (recycle-v2): the per-project allowlist the three recycle
+    # paths (autocompact / idle_timeout / recovery) consult before touching a
+    # session — see bot_squad_worker.recycle_gate. Loaded from
+    # system_settings.toml [recycle].projects; BOT_SQUAD_RECYCLE_PROJECTS (env,
+    # comma-separated) overrides at call time (read directly by recycle_gate,
+    # NOT baked in here) so this field is only the TOML-configured fallback.
+    # Default = bot-squad only (the 2026-06-29 incident's fix).
+    recycle_projects: tuple[str, ...] = ("bot-squad",)
+    # T-0566 (stakeholder 2026-07-04 /compact+resume policy): minimum context
+    # tokens that make a cache-window recycle worth /compact-ing first. Below
+    # this, idle_timeout terminates+records without sending /compact (nothing
+    # worth compacting). Loaded from system_settings.toml
+    # [recycle].compact_min_context_tokens.
+    recycle_compact_min_context_tokens: int = 20000
 
     @property
     def data_dir(self) -> Path:
@@ -224,6 +238,8 @@ class Config:
         voice_max_duration_sec = 300
         voice_transcribe_timeout_sec = 120
         voice_audio_retention_days = 30
+        recycle_projects: tuple[str, ...] = ("bot-squad",)
+        recycle_compact_min_context_tokens = 20000
         sys_settings = config_dir / "system_settings.toml"
         if sys_settings.exists():
             sys_raw = tomllib.loads(sys_settings.read_text())
@@ -245,6 +261,13 @@ class Config:
             voice_max_duration_sec = int(voice_block.get("max_duration_sec", voice_max_duration_sec))
             voice_transcribe_timeout_sec = int(voice_block.get("transcribe_timeout_sec", voice_transcribe_timeout_sec))
             voice_audio_retention_days = int(voice_block.get("audio_retention_days", voice_audio_retention_days))
+            recycle_block = sys_raw.get("recycle", {}) or {}
+            projects_raw = recycle_block.get("projects")
+            if projects_raw:
+                recycle_projects = tuple(str(s) for s in projects_raw)
+            recycle_compact_min_context_tokens = int(
+                recycle_block.get("compact_min_context_tokens",
+                                  recycle_compact_min_context_tokens))
 
         return cls(
             config_dir=config_dir,
@@ -267,4 +290,6 @@ class Config:
             voice_max_duration_sec=voice_max_duration_sec,
             voice_transcribe_timeout_sec=voice_transcribe_timeout_sec,
             voice_audio_retention_days=voice_audio_retention_days,
+            recycle_projects=recycle_projects,
+            recycle_compact_min_context_tokens=recycle_compact_min_context_tokens,
         )

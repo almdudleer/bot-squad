@@ -23,6 +23,10 @@ from bot_squad_worker import autocompact as A
 from bot_squad_worker import idle_timeout as IT
 from bot_squad_worker import lifecycle_events as LE
 from bot_squad_worker import sessions as S
+# Captured at collection time (before any fixture monkeypatches recycle_gate)
+# so the fail-closed subprocess-error test below can restore the REAL
+# implementation regardless of what the `seams` fixture stubs it to.
+from bot_squad_worker.recycle_gate import is_attached as _REAL_IS_ATTACHED
 
 
 # --- env knobs --------------------------------------------------------------
@@ -116,23 +120,38 @@ def _row(sid: str, *, window="demo", task_id="T-0042", cwd_repo: Path,
 
 @pytest.fixture
 def seams(monkeypatch):
-    """Stub every tmux/spawn/artifact seam so no real session is touched."""
-    calls = {"handoff": [], "suspend": [], "spawn": [], "orphan": []}
-    state = {"pane": "%9", "buf": "❯ ready\n", "artifact_mtime": 100.0,
-             "idle_age": 5000.0}
-    monkeypatch.setattr(A, "_resolve_role_artifact",
-                        lambda cfg, slug, rec: ("/art/T-0042.md", "dev", "T-0042"))
+    """Stub every tmux/telemetry/suspend seam so no real session/tmux is
+    touched. T-0566: the finalize path no longer writes-to-artifact +
+    relaunches — it sends ``/compact`` (over threshold) then terminates
+    (``sessions.suspend``) and records resume state."""
+    calls = {"compact": [], "terminate": []}
+    state = {"pane": "%9", "buf": "❯ ready\n", "idle_age": 5000.0,
+             "tokens": 25000}  # default ABOVE the 20k threshold
+
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
-    monkeypatch.setattr(A, "_inject_handoff",
-                        lambda sid, art, role=None: calls["handoff"].append((sid, art, role)))
-    monkeypatch.setattr(A, "_artifact_mtime", lambda path: state["artifact_mtime"])
-    monkeypatch.setattr(A, "_suspend_session",
-                        lambda cfg, slug, sid: calls["suspend"].append(sid))
-    monkeypatch.setattr(A, "_relaunch_from_artifact",
-                        lambda cfg, slug, rec, art: calls["spawn"].append((rec["sid"], art)))
-    monkeypatch.setattr(A, "_alert_orphaned_handoff",
-                        lambda cfg, slug, sid, reason: calls["orphan"].append((sid, reason)))
+    monkeypatch.setattr(A, "_send_compact", lambda sid: calls["compact"].append(sid))
+    monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: state["tokens"])
+
+    def _fake_suspend(cfg, slug, sid, source=None, reason=None):
+        calls["terminate"].append(sid)
+        md = S._session_file(cfg.data_dir, slug, sid)
+        existing = S._read_session_metadata(md) or {}
+        meta = {"sid": sid, "status": "suspended",
+                "claude_uuid": existing.get("claude_uuid", "~"),
+                "task_id": existing.get("task_id", "~"),
+                "window": existing.get("window", "~")}
+        if source:
+            meta["suspend_source"] = source
+            meta["suspend_reason"] = reason or source
+        S._write_session_metadata(md, meta)
+        return {"ok": True, "suspended": True}
+    monkeypatch.setattr(S, "suspend", _fake_suspend)
+
+    # T-0563/T-0564: default slug "bot-squad" is already allowlisted; no human
+    # is attached in these tests.
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target: False)
+
     # idle clock: jsonl mtime = now - idle_age
     monkeypatch.setattr(S, "_pane_activity_at",
                         lambda cwd, uuid, home: time.time() - state["idle_age"])
@@ -141,19 +160,34 @@ def seams(monkeypatch):
     return {"calls": calls, "state": state}
 
 
-# --- A. TIMEOUT-FIRE: arm then finalize the record-and-exit ------------------
+# --- A. TIMEOUT-FIRE: T-0566 compact-terminate-remember ---------------------
 
-def test_arm_injects_handoff_and_stamps_writing(tmp_path, seams):
+def test_start_sends_compact_and_stamps_compacting_when_over_threshold(tmp_path, seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert seams["calls"]["handoff"] == [(sid, "/art/T-0042.md", "dev")]
+    assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []  # not yet — awaiting compact completion
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert meta["idle_recycle_phase"] == "writing"
-    assert meta["idle_recycle_artifact"] == "/art/T-0042.md"
-    assert float(meta["idle_recycle_arm_mtime"]) == 100.0
+    assert meta["idle_recycle_phase"] == "compacting"
+    assert "idle_recycle_armed_at" in meta
+
+
+def test_start_skips_compact_and_terminates_immediately_below_threshold(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    seams["state"]["tokens"] = 5000  # below the 20k default threshold
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # nothing worth compacting
+    assert seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resumable"] is True
+    assert "recycled_at" in meta
+    assert "no-compact" in meta["resume_hint"]
 
 
 def test_not_due_when_jsonl_fresh(tmp_path, seams):
@@ -163,79 +197,90 @@ def test_not_due_when_jsonl_fresh(tmp_path, seams):
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["handoff"] == []
+    assert seams["calls"]["compact"] == []
+    assert seams["calls"]["terminate"] == []
 
 
-def test_finalize_clears_and_relaunches(tmp_path, seams):
+def test_finalize_terminates_and_records_once_compact_done(tmp_path, seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          extra_md={"idle_recycle_phase": "writing",
-                                    "idle_recycle_armed_at": armed,
-                                    "idle_recycle_arm_mtime": 100.0,
-                                    "idle_recycle_artifact": "/art/T-0042.md"})
-    seams["state"]["artifact_mtime"] = 150.0  # the session wrote it
+                          extra_md={"idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": armed})
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert seams["calls"]["suspend"] == [sid]
-    assert seams["calls"]["spawn"] == [(sid, "/art/T-0042.md")]
+    assert seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["status"] == "suspended"
+    assert meta["resumable"] is True
+    assert "recycled_at" in meta
+    assert "compacted" in meta["resume_hint"]
+    assert "idle_recycle_phase" not in meta  # cleared
 
 
-def test_finalize_waits_until_artifact_written(tmp_path, seams):
+def test_finalize_waits_while_pane_not_composer_ready(tmp_path, seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          extra_md={"idle_recycle_phase": "writing",
-                                    "idle_recycle_armed_at": armed,
-                                    "idle_recycle_arm_mtime": 100.0,
-                                    "idle_recycle_artifact": "/art/T-0042.md"})
-    seams["state"]["artifact_mtime"] = 100.0  # unchanged → still waiting
+                          extra_md={"idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": armed})
+    seams["state"]["buf"] = "· Compacting… (esc to interrupt)"  # still compacting
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["suspend"] == []
+    assert seams["calls"]["terminate"] == []
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert meta["idle_recycle_phase"] == "writing"  # still armed
+    assert meta["idle_recycle_phase"] == "compacting"  # still armed
 
 
-def test_finalize_timeout_drops_handoff(tmp_path, seams):
+def test_finalize_timeout_terminates_anyway(tmp_path, seams):
+    """Never wedge: even if /compact never seems to finish, the bounded wait
+    times out and we terminate + record regardless (T-0566 — the recycle must
+    always converge to a resumable-suspended state)."""
     sid = "S-almdudleer-bot-squad-demo-p5"
-    # armed long ago — past the handoff deadline, never wrote the artifact
     old = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                         time.gmtime(time.time() - A.handoff_timeout_sec() - 60))
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          extra_md={"idle_recycle_phase": "writing",
-                                    "idle_recycle_armed_at": old,
-                                    "idle_recycle_arm_mtime": 100.0,
-                                    "idle_recycle_artifact": "/art/T-0042.md"})
-    seams["state"]["artifact_mtime"] = 100.0  # never written
+                          extra_md={"idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": old})
+    seams["state"]["buf"] = "· Compacting… (esc to interrupt)"  # never returned to ready
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["suspend"] == []
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == [sid]
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert "idle_recycle_phase" not in meta  # dropped → re-arm next window
+    assert meta["resumable"] is True
 
 
-def test_finalize_relaunch_failure_alerts_operator(tmp_path, seams, monkeypatch):
+def test_finalize_drops_stamp_when_pane_already_gone(tmp_path, seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          extra_md={"idle_recycle_phase": "writing",
-                                    "idle_recycle_armed_at": armed,
-                                    "idle_recycle_arm_mtime": 100.0,
-                                    "idle_recycle_artifact": "/art/T-0042.md"})
-    seams["state"]["artifact_mtime"] = 150.0
-
-    def _boom(cfg, slug, rec, art):
-        raise RuntimeError("tmux exploded")
-    monkeypatch.setattr(A, "_relaunch_from_artifact", _boom)
+                          extra_md={"idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": armed})
+    seams["state"]["pane"] = None  # the session already exited on its own
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["suspend"] == [sid]  # old pane cleared
-    assert seams["calls"]["orphan"] and seams["calls"]["orphan"][0][0] == sid
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "idle_recycle_phase" not in meta
+
+
+def test_terminate_failure_is_retried_next_tick(tmp_path, seams, monkeypatch):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+
+    def _boom(cfg, slug, sid, **kw):
+        raise RuntimeError("tmux exploded")
+    monkeypatch.setattr(S, "suspend", _boom)
+    seams["state"]["tokens"] = 5000  # below threshold → terminate attempted this tick
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta.get("status") == "active"  # untouched — will retry next tick
 
 
 def test_arm_skips_when_pane_not_composer_ready(tmp_path, seams):
@@ -245,7 +290,8 @@ def test_arm_skips_when_pane_not_composer_ready(tmp_path, seams):
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["handoff"] == []
+    assert seams["calls"]["compact"] == []
+    assert seams["calls"]["terminate"] == []
 
 
 def test_kill_switch_disables_recycle(tmp_path, seams, monkeypatch):
@@ -255,7 +301,7 @@ def test_kill_switch_disables_recycle(tmp_path, seams, monkeypatch):
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["handoff"] == []
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
 # --- B. POSTPONE: per-window, repeatable ------------------------------------
@@ -268,7 +314,7 @@ def test_postpone_skips_the_recycle(tmp_path, seams):
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["handoff"] == []
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
 def test_expired_postpone_lets_recycle_fire_again(tmp_path, seams):
@@ -279,7 +325,7 @@ def test_expired_postpone_lets_recycle_fire_again(tmp_path, seams):
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert seams["calls"]["handoff"]  # due again — postpone is per-window
+    assert seams["calls"]["compact"] or seams["calls"]["terminate"]  # due again — postpone is per-window
 
 
 def test_set_idle_postpone_default_one_window(tmp_path, monkeypatch):
@@ -364,7 +410,7 @@ def test_auto_postpone_skips_recycle_for_inflight_build(tmp_path, seams):
     # idle past the window, but waiting on a tracked build → auto-postpone
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["handoff"] == []
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
 def test_recycle_fires_once_build_completes(tmp_path, seams):
@@ -374,7 +420,7 @@ def test_recycle_fires_once_build_completes(tmp_path, seams):
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert seams["calls"]["handoff"]
+    assert seams["calls"]["compact"] or seams["calls"]["terminate"]
 
 
 # --- tick: per-project sweep, non-active rows skipped ------------------------
@@ -389,7 +435,7 @@ def test_tick_recycles_active_skips_suspended(tmp_path, seams, monkeypatch):
     monkeypatch.setattr(S, "_get_user_home", lambda: "/home/x")
     monkeypatch.setattr(S, "_get_current_user", lambda: "almdudleer")
     IT.tick(cfg)
-    assert seams["calls"]["handoff"] == [(sid, "/art/T-0042.md", "dev")]
+    assert seams["calls"]["compact"] == [sid]
 
 
 # --- T-0470: hook-driven idle clock + emitted lifecycle events ---------------
@@ -409,7 +455,7 @@ def test_idle_age_reads_hook_signal_over_jsonl(tmp_path, seams):
     # Despite the fresh jsonl, the hook signal drives the decision → it ARMS.
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert seams["calls"]["handoff"] == [(sid, "/art/T-0042.md", "dev")]
+    assert seams["calls"]["compact"] == [sid]
 
 
 def test_active_marker_keeps_session_busy(tmp_path, seams):
@@ -426,7 +472,7 @@ def test_active_marker_keeps_session_busy(tmp_path, seams):
     row = _row(sid, cwd_repo=repo)
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
-    assert seams["calls"]["handoff"] == []
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
 def test_arm_emits_session_timeout_event(tmp_path, seams):
@@ -444,14 +490,107 @@ def test_finalize_emits_session_recycled_event(tmp_path, seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          extra_md={"idle_recycle_phase": "writing",
-                                    "idle_recycle_armed_at": armed,
-                                    "idle_recycle_arm_mtime": 100.0,
-                                    "idle_recycle_artifact": "/art/T-0042.md"})
-    seams["state"]["artifact_mtime"] = 150.0
+                          extra_md={"idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": armed})
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     doc = LE.read_events(cfg, "bot-squad", sid)
     assert doc.get("counts", {}).get(LE.SESSION_RECYCLED) == 1
     assert doc["last"][LE.SESSION_RECYCLED]["cause"] == "idle_timeout"
+
+
+# --- D. T-0563/T-0564: recycle-v2 gates, exercised through maybe_recycle -----
+
+def test_watchrobot_never_touched_by_default_allowlist(tmp_path, seams):
+    """T-0563: the 2026-06-29 incident's fix — a watchrobot session is NEVER
+    touched by idle_timeout under the default allowlist (bot-squad only)."""
+    sid = "S-almdudleer-watchrobot-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    # seed the session under a DIFFERENT (non-allowlisted) project slug
+    sess = data / "watchrobot" / "sessions"
+    sess.mkdir(parents=True)
+    S._write_session_metadata(sess / f"{sid}.md", {
+        "sid": sid, "status": "active", "window": "demo",
+        "cwd": str(data.parent / "repo"), "claude_uuid": "uuid-" + sid,
+        "task_id": "T-0042"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "watchrobot", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
+def test_env_override_allowlists_watchrobot(tmp_path, seams, monkeypatch):
+    """T-0563: BOT_SQUAD_RECYCLE_PROJECTS opts a project in explicitly."""
+    monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "watchrobot")
+    sid = "S-almdudleer-watchrobot-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    sess = data / "watchrobot" / "sessions"
+    sess.mkdir(parents=True)
+    S._write_session_metadata(sess / f"{sid}.md", {
+        "sid": sid, "status": "active", "window": "demo",
+        "cwd": str(data.parent / "repo"), "claude_uuid": "uuid-" + sid,
+        "task_id": "T-0042"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "watchrobot", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+
+
+def test_config_recycle_projects_fallback_allows_watchrobot(tmp_path, seams):
+    """T-0563: system_settings.toml [recycle].projects extends the allowlist
+    when no env override is set."""
+    sid = "S-almdudleer-watchrobot-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    cfg.recycle_projects = ("bot-squad", "watchrobot")
+    sess = data / "watchrobot" / "sessions"
+    sess.mkdir(parents=True)
+    S._write_session_metadata(sess / f"{sid}.md", {
+        "sid": sid, "status": "active", "window": "demo",
+        "cwd": str(data.parent / "repo"), "claude_uuid": "uuid-" + sid,
+        "task_id": "T-0042"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "watchrobot", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+
+
+def test_user_conversation_role_never_recycled(tmp_path, seams):
+    """T-0564: the human's own live chat is never auto-recycled, even when
+    idle past the window and in an allowlisted project."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          extra_md={"role": "user-conversation"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    row["role"] = "user-conversation"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
+def test_attached_session_never_recycled(tmp_path, seams, monkeypatch):
+    """T-0564: a human tmux client attached to the pane blocks the recycle even
+    in an allowlisted project with a non-exempt role."""
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target: True)
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
+def test_attached_check_failure_skips_recycle(tmp_path, seams, monkeypatch):
+    """T-0564: a tmux list-clients error fails CLOSED (treated as attached)."""
+    # exercise the REAL is_attached (undoing the seams fixture's stub) to prove
+    # the fail-closed subprocess-error path, routed through the gate.
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", _REAL_IS_ATTACHED)
+    import subprocess
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("tmux not found")))
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []

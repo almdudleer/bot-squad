@@ -43,7 +43,7 @@ import logging
 import os
 from typing import Any
 
-from bot_squad_worker import assignment
+from bot_squad_worker import assignment, recycle_gate
 
 log = logging.getLogger(__name__)
 
@@ -381,6 +381,15 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     simply defers to the next tick rather than risk interrupting work.
     """
     if not autocompact_enabled():
+        return False
+    sid = rec.get("sid")
+    # T-0563/T-0564 (recycle-v2): never recycle a non-allowlisted project, the
+    # human's own user-conversation session, or a pane a human is currently
+    # attached to — even the operator (T-0334) is subject to this gate.
+    if not recycle_gate.recycle_allowed(
+        cfg, slug=slug, role=rec.get("role"),
+        tmux_target=_pane_for(sid) if sid else None, now=now,
+    ):
         return False
     fired = rec.get("alert_fired_at") or {}
     rec["alert_fired_at"] = fired

@@ -68,11 +68,18 @@ def harness(monkeypatch):
     monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))
     monkeypatch.setattr(A, "autocompact_enabled", lambda: True)
     monkeypatch.setattr(A, "compact_mode", lambda: "claude")
+    # T-0563/T-0564: these tests use slug "proj" with cfg=None and a fake pane
+    # id — allowlist it and stub the tmux attach check so the new shared gate
+    # (recycle_gate.recycle_allowed) doesn't touch real tmux or the default
+    # bot-squad-only allowlist. The gate itself has its own test module.
+    monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "proj")
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target: False)
     return {"sent": sent, "state": state}
 
 
-def _rec(sid="S-almdudleer-dev-p5", activity="idle", fired=None):
-    return {"sid": sid, "activity": activity, "alert_fired_at": dict(fired or {})}
+def _rec(sid="S-almdudleer-dev-p5", activity="idle", fired=None, role=None):
+    return {"sid": sid, "activity": activity, "alert_fired_at": dict(fired or {}),
+            "role": role}
 
 
 def test_maybe_compact_sends_when_idle_urgent_and_composer_ready(harness):
@@ -127,3 +134,31 @@ def test_operator_session_is_not_exempt(harness):
     rec = _rec(sid="S-almdudleer-bot-squad-operator-p5", activity="idle")
     assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is True
     assert harness["sent"] == ["S-almdudleer-bot-squad-operator-p5"]
+
+
+# --- T-0563/T-0564: recycle-v2 gates ----------------------------------------
+
+def test_non_allowlisted_project_is_never_compacted(harness, monkeypatch):
+    """T-0563: the 2026-06-29 incident's fix — a non-allowlisted project (e.g.
+    watchrobot) is NEVER auto-/compact-ed."""
+    monkeypatch.delenv("BOT_SQUAD_RECYCLE_PROJECTS", raising=False)  # undo harness override
+    rec = _rec()
+    assert A.maybe_compact(None, "watchrobot", rec, "urgent", now=1000.0) is False
+    assert harness["sent"] == []
+
+
+def test_user_conversation_role_is_never_compacted(harness):
+    """T-0564: the human's own live chat is never auto-/compact-ed even when
+    over the context ceiling."""
+    rec = _rec(role="user-conversation")
+    assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is False
+    assert harness["sent"] == []
+
+
+def test_attached_pane_is_never_compacted(harness, monkeypatch):
+    """T-0564: a human client attached to the pane blocks the /compact even
+    when everything else says "go"."""
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target: True)
+    rec = _rec()
+    assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is False
+    assert harness["sent"] == []

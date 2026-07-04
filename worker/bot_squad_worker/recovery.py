@@ -34,14 +34,26 @@ Switches:
 Respawn goes through the normal spawn admission, so the backoff governor + cap
 still gate it. ``state.json`` keys per-SID respawn counters; the tick never
 raises (mirrors the other scheduler ticks).
+
+T-0563/T-0564 (recycle-v2): both entry points (``recovery_tick`` AND
+``boot_reconcile``) now consult :mod:`bot_squad_worker.recycle_gate` per
+gathered row — a per-project allowlist (T-0563) plus a user-conversation-role
+exemption (T-0564). The human-attached half of T-0564 is a structural no-op
+here: ``_gather`` only ever yields rows with a DEAD pane (``classify`` never
+respawns/parks a live one), and a dead pane can have no attached tmux client —
+but the SAME shared gate is still called (with ``tmux_target=None``) so the
+policy lives in exactly one place for all three recycle paths.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
+
+from bot_squad_worker import recycle_gate
 
 log = logging.getLogger(__name__)
 
@@ -151,17 +163,21 @@ def _save_state(cfg: Any, state: dict) -> None:
 
 # --- signal gathering (real) -----------------------------------------------
 
-def _gather(cfg: Any) -> list[dict]:
+def _gather(cfg: Any, now: float | None = None) -> list[dict]:
     """One row per CRASHED session (md ``status: active`` but DEAD pane), any
     role. Each row carries: {sid, slug, role, pane_live, task_id, task_status,
     window, initiative, artifact_path, has_artifact}.
 
     Skips archived mds (already history) and non-``active`` mds — a
-    ``suspended``/``paused`` session is intentional, not a crash.
+    ``suspended``/``paused`` session is intentional, not a crash. T-0563/T-0564:
+    also skips a session gated by :func:`recycle_gate.recycle_allowed`
+    (non-allowlisted project or a user-conversation role) before it ever
+    reaches ``classify``.
     """
     from bot_squad_worker import assignment as _assignment
     from bot_squad_worker.sessions import (
         _read_session_metadata, _derive_role, live_pane_map)
+    now = now if now is not None else time.time()
     pane_map = live_pane_map()  # SID -> live pane, the truth (md pane_id is empty)
     rows: list[dict] = []
     for slug in getattr(cfg, "projects", {}) or {}:
@@ -179,6 +195,12 @@ def _gather(cfg: Any) -> list[dict]:
                 continue
             role = meta.get("role") or _derive_role(
                 meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+            # T-0563/T-0564: never recycle a non-allowlisted project or the
+            # human's own user-conversation session (a dead pane here can never
+            # be human-attached, so tmux_target=None is structurally correct).
+            if not recycle_gate.recycle_allowed(cfg, slug=slug, role=role,
+                                                tmux_target=None, now=now):
+                continue
             sid = meta.get("sid")
             task_id = meta.get("task_id")
             task_id = task_id if (task_id and task_id != "~") else None
@@ -279,7 +301,7 @@ def recovery_tick(cfg: Any, now_epoch: Optional[float] = None) -> dict:
     if not recovery_enabled():
         return {"enabled": False, "acted": []}
     try:
-        return _run(cfg, source="tick")
+        return _run(cfg, source="tick", now=now_epoch)
     except Exception:
         log.exception("recovery_tick error")
         return {"enabled": True, "acted": [], "error": True}
@@ -306,11 +328,11 @@ def boot_reconcile(cfg: Any) -> dict:
         return {"boot": True, "enabled": True, "acted": [], "error": True}
 
 
-def _run(cfg: Any, source: str = "tick") -> dict:
+def _run(cfg: Any, source: str = "tick", now: Optional[float] = None) -> dict:
     bound = respawn_bound()
     state = _load_state(cfg)
     acted: list = []
-    for row in _gather(cfg):
+    for row in _gather(cfg, now):
         sid = row.get("sid")
         if not sid:
             continue

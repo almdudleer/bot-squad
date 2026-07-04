@@ -40,6 +40,29 @@ recycle auto-defers with NO session action — killing it mid-build would throw
 away the very wait it is parked on. The concrete bot-squad "build" is a deploy:
 an in-flight ``_jobs/deploy/{queue,processing}/*.json`` with ``requested_by ==
 sid`` auto-postpones the requester with zero registration.
+
+T-0563/T-0564/T-0566 (recycle-v2, 2026-07-04): three changes layered on top of
+the above, all gated the same:
+
+* every recycle decision now runs through :func:`recycle_gate.recycle_allowed`
+  first — a per-project allowlist (T-0563) plus a user-conversation-role /
+  human-attached exemption (T-0564). Both apply even to an otherwise-due
+  session.
+* the FINALIZE step no longer writes a forward-state artifact and relaunches a
+  fresh incarnation. Per the stakeholder's 2026-07-04 verdict (T-0566,
+  verbatim): *"the autocompact loop is worse than claude's internal compact,
+  so probably it should work like IF there are more than 20k tokens in context
+  AND the cache is expiring soon, we call /compact, then we terminate the
+  session and remember it to be --resume'd"*. So: context over threshold
+  (``[recycle].compact_min_context_tokens``, default 20000) → send Claude's
+  native ``/compact`` (reusing autocompact's safe-send primitives), wait
+  (bounded) for the pane to go composer-ready again, THEN terminate
+  (``sessions.suspend``) and stamp ``resumable: true`` / ``recycled_at`` /
+  ``resume_hint`` on the session md. Below threshold → skip ``/compact``,
+  terminate + stamp immediately (nothing worth compacting). NO respawn is ever
+  triggered from here — a future resume (``sessions.resume``, which already
+  prefers ``claude --resume <uuid>``) is a separate, human-or-automation-driven
+  act reading these md fields.
 """
 from __future__ import annotations
 
@@ -50,7 +73,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from bot_squad_worker import autocompact, lifecycle_events, sessions
+from bot_squad_worker import autocompact, lifecycle_events, recycle_gate, sessions
 
 log = logging.getLogger(__name__)
 
@@ -156,13 +179,11 @@ def tracking_long_job(cfg: Any, slug: str, sid: str) -> bool:
 
 # --- per-session executor ---------------------------------------------------
 
-# In-flight handoff + postpone state lives as FLAT scalar md fields (never a
-# nested mapping) so the line-based session_start hook reader stays happy.
+# In-flight compact-wait + postpone state lives as FLAT scalar md fields (never
+# a nested mapping) so the line-based session_start hook reader stays happy.
 _RECYCLE_FIELDS = (
     "idle_recycle_phase",
     "idle_recycle_armed_at",
-    "idle_recycle_arm_mtime",
-    "idle_recycle_artifact",
 )
 
 
@@ -171,14 +192,42 @@ def _clear_recycle_state(meta: dict) -> None:
         meta.pop(k, None)
 
 
+def compact_min_context_tokens(cfg: Any) -> int:
+    """T-0566: context-token floor above which a cache-window recycle sends
+    Claude's native ``/compact`` before terminating. Below it, nothing is worth
+    compacting — terminate + record straight away. ``[recycle]
+    .compact_min_context_tokens`` in system_settings.toml, default 20000."""
+    v = getattr(cfg, "recycle_compact_min_context_tokens", None)
+    try:
+        return int(v) if v else 20000
+    except (TypeError, ValueError):
+        return 20000
+
+
+def _context_tokens(cfg: Any, slug: str, sid: str) -> int:
+    """T-0566: reuse telemetry's already-sampled context-token read (the same
+    per-session record autocompact's ceiling trigger reads from) rather than
+    re-deriving it from the transcript."""
+    from bot_squad_worker import telemetry
+    rec = telemetry._read_json(telemetry._record_path(cfg, slug, sid)) or {}
+    try:
+        return int((rec.get("context") or {}).get("tokens", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bool:
     """Recycle ``row``'s session if it has been idle/waiting past the window AND
-    safe AND not postponed. Returns True iff an action was taken this tick
-    (handoff armed or finalized). Every gate fails closed.
+    safe AND not postponed AND not gated by T-0563/T-0564. Returns True iff an
+    action was taken this tick (compact sent, or terminate+record finalized).
+    Every gate fails closed.
 
-    Drives a tiny 2-phase machine on the session md — ARM (inject the handoff
-    prompt) then FINALIZE (suspend + relaunch) — reusing autocompact's helpers
-    for each concrete step.
+    T-0566: drives a tiny 2-phase machine on the session md only when a
+    ``/compact`` is worth sending (context over threshold) — START sends
+    ``/compact`` and stamps ``idle_recycle_phase: compacting``; FINALIZE waits
+    for the pane to go composer-ready again then terminates + records resume
+    state. A below-threshold session skips the wait entirely: START terminates
+    + records in the same tick.
     """
     if not idle_timeout_enabled():
         return False
@@ -194,10 +243,19 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     if meta is None:
         return False
 
-    # A handoff already in flight → drive its finalize half (independent of the
-    # idle window; the phase field is its own guard).
-    if meta.get("idle_recycle_phase") == "writing":
-        return _finalize(cfg, slug, sid, meta, md_path, now)
+    role = row.get("role") or meta.get("role") or sessions._derive_role(
+        meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+    pane = autocompact._pane_for(sid)
+    # T-0563/T-0564: never recycle a non-allowlisted project, the human's own
+    # user-conversation session, or a pane a human is currently attached to.
+    if not recycle_gate.recycle_allowed(cfg, slug=slug, role=role,
+                                        tmux_target=pane, now=now):
+        return False
+
+    # A compact-wait already in flight → drive its finalize half (independent
+    # of the idle window; the phase field is its own guard).
+    if meta.get("idle_recycle_phase") == "compacting":
+        return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane)
 
     # Otherwise decide whether to START a recycle this tick.
     idle_age = _idle_age(row, meta, user_home, now)
@@ -210,7 +268,7 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
         # stamp) so the moment the job clears the normal window applies again.
         log.info("idle_timeout: auto-postpone %s — waiting on a tracked long job", sid)
         return False
-    return _arm(cfg, slug, sid, row, meta, md_path, now)
+    return _start_recycle(cfg, slug, sid, row, meta, md_path, now, pane)
 
 
 def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None:
@@ -239,104 +297,99 @@ def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None
     return max(0.0, now - at)
 
 
-def _arm(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path, now: float) -> bool:
-    """ARM the record-and-exit: inject the universal-compact handoff prompt and
-    stamp ``idle_recycle_phase: writing``. Reuses autocompact's artifact
-    resolution + prompt + inject seams."""
-    rec = {"sid": sid, "role": row.get("role") or meta.get("role") or "",
-           "task_id": row.get("task_id") or meta.get("task_id")}
-    artifact_path, role, _assignment = autocompact._resolve_role_artifact(cfg, slug, rec)
-    if not artifact_path:
-        # No role artifact ⇒ no clean place to record forward-state. Unlike
-        # autocompact (which falls back to Claude's /compact to claw back
-        # context) an IDLE low-context session gains nothing from a /compact, so
-        # we simply skip and re-evaluate next window.
-        log.debug("idle_timeout: no role artifact for %s — skip recycle", sid)
-        return False
-
-    # Only ever inject into an idle, composer-ready pane — never cut mid-turn.
-    pane = autocompact._pane_for(sid)
+def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path,
+                   now: float, pane: str | None) -> bool:
+    """T-0566: START the cache-window recycle. Only ever acts on an idle,
+    composer-ready pane — never cut mid-turn. Context over threshold → send
+    Claude's native ``/compact`` and stamp ``idle_recycle_phase: compacting``
+    (finalized on a later tick by :func:`_finalize_compact`). Context at/below
+    threshold → nothing worth compacting, terminate + record immediately."""
     if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
         return False
-    try:
-        autocompact._inject_handoff(sid, artifact_path, role)
-    except Exception:
-        log.exception("idle_timeout: handoff inject failed for %s (will retry)", sid)
-        return False
 
-    meta["idle_recycle_phase"] = "writing"
-    meta["idle_recycle_armed_at"] = _now_iso()
-    meta["idle_recycle_arm_mtime"] = autocompact._artifact_mtime(artifact_path)
-    meta["idle_recycle_artifact"] = artifact_path
-    sessions._write_session_metadata(md_path, meta, atomic=True)
-    # T-0470: the stall crossed the window → record the timeout lifecycle event on
-    # the unified surface for operator measurement (best-effort, never raises).
+    # T-0470: the stall crossed the window → record the timeout lifecycle event
+    # on the unified surface for operator measurement (best-effort).
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
-                          now=now, reason="idle_window", artifact=artifact_path)
-    log.info("idle_timeout: armed cache-window handoff for %s → %s", sid, artifact_path)
-    return True
+                          now=now, reason="idle_window")
+
+    tokens = _context_tokens(cfg, slug, sid)
+    threshold = compact_min_context_tokens(cfg)
+    if tokens > threshold:
+        try:
+            autocompact._send_compact(sid)
+        except Exception:
+            log.exception("idle_timeout: /compact send failed for %s (will retry)", sid)
+            return False
+        meta["idle_recycle_phase"] = "compacting"
+        meta["idle_recycle_armed_at"] = _now_iso()
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+        log.info("idle_timeout: sent /compact to %s (%d tokens > %d threshold) — "
+                 "awaiting completion", sid, tokens, threshold)
+        return True
+
+    # Below threshold — nothing worth compacting; terminate + record now.
+    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now, compacted=False)
 
 
-def _finalize(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float) -> bool:
-    """FINALIZE an armed handoff: once the session has written its artifact and
-    the pane is idle, clear (suspend) + relaunch a fresh incarnation from the
-    artifact. Mirrors :func:`autocompact._maybe_finalize`, reusing its helpers."""
+def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
+                      pane: str | None) -> bool:
+    """FINALIZE an in-flight ``/compact`` wait: once the pane is composer-ready
+    again (or the bounded wait times out — never wedge), terminate + record."""
     armed_at = sessions._parse_ts_epoch(meta.get("idle_recycle_armed_at")) or now
-    try:
-        arm_mtime = float(meta.get("idle_recycle_arm_mtime") or 0.0)
-    except (TypeError, ValueError):
-        arm_mtime = 0.0
-    artifact_path = meta.get("idle_recycle_artifact")
+    timed_out = (now - armed_at) > autocompact.handoff_timeout_sec()
 
-    # Never wedge: the session didn't record its state in time → drop the
-    # handoff and let the next window re-arm (an idle session is not urgent, so —
-    # unlike autocompact — there is no /compact fallback to claw back context).
-    if now - armed_at > autocompact.handoff_timeout_sec():
-        _clear_recycle_state(meta)
-        sessions._write_session_metadata(md_path, meta, atomic=True)
-        log.warning("idle_timeout: handoff timed out for %s — dropping (re-arm next "
-                    "window)", sid)
-        return False
-
-    # Wait until the session has actually written its forward-state.
-    if autocompact._artifact_mtime(artifact_path) <= arm_mtime:
-        return False
-
-    # The pane must still exist and be idle/composer-ready to clear safely. A
-    # vanished pane means the session already exited — drop the stamp.
-    pane = autocompact._pane_for(sid)
     if not pane:
+        # Session already gone — nothing left to finalize; drop the stamp.
         _clear_recycle_state(meta)
         sessions._write_session_metadata(md_path, meta, atomic=True)
         return False
-    if not autocompact.composer_ready(autocompact._capture_pane(pane)):
+
+    ready = autocompact.composer_ready(autocompact._capture_pane(pane))
+    if not ready and not timed_out:
+        return False  # still compacting — retry next tick
+
+    if not ready and timed_out:
+        log.warning("idle_timeout: /compact wait timed out for %s — terminating "
+                    "anyway (never wedge)", sid)
+
+    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now, compacted=True)
+
+
+def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
+                            *, compacted: bool) -> bool:
+    """T-0566: terminate the session (``sessions.suspend`` — same graceful
+    C-c/exit/kill-pane sequence autocompact uses) and stamp the resume state on
+    its md: ``resumable: true``, ``recycled_at``, ``resume_hint``.
+    ``claude_uuid`` is already carried by ``sessions.suspend``. NEVER
+    respawns — a future resume is a separate, deliberate act (``sessions.resume``
+    already prefers ``claude --resume <uuid>`` over a fresh spawn)."""
+    _clear_recycle_state(meta)
+    role = meta.get("role") or ""
+    task_id = meta.get("task_id")
+    try:
+        sessions.suspend(cfg, slug, sid, source="idle_timeout",
+                         reason="cache-window recycle (compact-terminate-remember)")
+    except Exception:
+        log.exception("idle_timeout: terminate failed for %s — retry next tick", sid)
+        sessions._write_session_metadata(md_path, meta, atomic=True)
         return False
 
-    # CLEAR + RELAUNCH: close the old pane, boot a fresh incarnation from the
-    # artifact, re-bound to the same assignment (autocompact's exact sequence).
-    try:
-        autocompact._suspend_session(cfg, slug, sid)
-    except Exception:
-        log.exception("idle_timeout: finalize suspend failed for %s — retry next "
-                      "tick", sid)
-        return False
-    role = meta.get("role") or sessions._derive_role(
-        meta.get("window"), meta.get("task_id"), meta.get("initiative"))
-    rec = {"sid": sid, "task_id": meta.get("task_id"), "role": role,
-           "window": meta.get("window")}
-    try:
-        autocompact._relaunch_from_artifact(cfg, slug, rec, artifact_path)
-    except Exception as e:
-        # The old pane is already gone and won't be re-sampled — alert the
-        # operator instead of orphaning the assignment silently.
-        log.exception("idle_timeout: relaunch failed for %s after clear", sid)
-        autocompact._alert_orphaned_handoff(cfg, slug, sid, repr(e))
-        return False
+    # sessions.suspend() rewrites the md wholesale — re-read then layer the
+    # resume-state fields on top (it doesn't know about them).
+    fresh = sessions._read_session_metadata(md_path) or meta
+    fresh["resumable"] = True
+    fresh["recycled_at"] = _now_iso()
+    fresh["resume_hint"] = (
+        f"idle cache-window recycle "
+        f"({'compacted' if compacted else 'no-compact, below threshold'}) — "
+        f"resume via sessions.resume to continue {task_id or role or sid}.")
+    sessions._write_session_metadata(md_path, fresh, atomic=True)
+
     # T-0470: a cache-window recycle finalized → record it on the unified surface.
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_RECYCLED,
-                          now=now, cause="idle_timeout", artifact=artifact_path)
-    log.info("idle_timeout: cache-window recycle complete for %s — relaunched fresh "
-             "from %s", sid, artifact_path)
+                          now=now, cause="idle_timeout", compacted=compacted)
+    log.info("idle_timeout: recycled %s (compacted=%s) — recorded resumable state",
+             sid, compacted)
     return True
 
 

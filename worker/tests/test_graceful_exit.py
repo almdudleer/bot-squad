@@ -377,18 +377,24 @@ def test_tick_exits_done_active_skips_suspended(tmp_path, seams, monkeypatch):
 # --- NO ROLE EXEMPT from recycle-on-timeout (DoD audit) ---------------------
 
 def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
-    """idle_timeout must sweep EVERY role — operator/TL/dev/user-conv alike. We
-    drive an OPERATOR row through maybe_recycle and confirm it arms (not skipped
-    on role). Guards against re-introducing a role exemption (the old per-role
-    drift.py-style scoping the uniform lifecycle removes)."""
-    armed = []
-    monkeypatch.setattr(A, "_resolve_role_artifact",
-                        lambda cfg, slug, rec: ("/art/op.md", rec.get("role"), "op"))
+    """idle_timeout must sweep EVERY role EXCEPT the human's own live chat. We
+    drive an OPERATOR row through maybe_recycle and confirm it recycles (not
+    skipped on role). Guards against re-introducing a general role exemption
+    (the old per-role drift.py-style scoping the uniform lifecycle removes).
+
+    T-0564 (2026-07-04, superseding this test's original "…user-conv alike"
+    claim): ``user-conversation`` IS now a deliberate, narrow exemption — the
+    human's own live chat is never auto-recycled — see
+    test_idle_timeout.py::test_user_conversation_role_never_recycled. Every
+    OTHER role (operator/TL/dev) stays non-exempt, which is what this test
+    still asserts.
+    """
+    compacted = []
     monkeypatch.setattr(A, "_pane_for", lambda sid: "%9")
     monkeypatch.setattr(A, "_capture_pane", lambda pane: "❯ ready\n")
-    monkeypatch.setattr(A, "_inject_handoff",
-                        lambda sid, art, role=None: armed.append((sid, role)))
-    monkeypatch.setattr(A, "_artifact_mtime", lambda path: 100.0)
+    monkeypatch.setattr(A, "_send_compact", lambda sid: compacted.append(sid))
+    monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: 25000)
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target: False)
     monkeypatch.setattr(S, "_pane_activity_at",
                         lambda cwd, uuid, home: time.time() - 5000.0)
     monkeypatch.delenv("BOT_SQUAD_IDLE_TIMEOUT", raising=False)
@@ -399,4 +405,4 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert armed and armed[0][0] == sid  # operator armed → not exempt
+    assert compacted == [sid]  # operator recycled → not exempt

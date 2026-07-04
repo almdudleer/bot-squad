@@ -154,6 +154,26 @@ def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
     assert cfg.tg_remote_control_url == "https://claude.ai/code?session={sid}"
 
 
+def test_recycle_defaults(tmp_config_dir: Path) -> None:
+    # T-0563/T-0566: absent system_settings.toml → bot-squad-only allowlist,
+    # 20k-token compact threshold.
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.recycle_projects == ("bot-squad",)
+    assert cfg.recycle_compact_min_context_tokens == 20000
+
+
+def test_recycle_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0563: admin extends the allowlist + tunes the compact threshold via
+    # [recycle] in system_settings.toml.
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[recycle]\nprojects = ["bot-squad", "watchrobot"]\n'
+        'compact_min_context_tokens = 15000\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.recycle_projects == ("bot-squad", "watchrobot")
+    assert cfg.recycle_compact_min_context_tokens == 15000
+
+
 def test_secrets_missing_raises(tmp_path: Path) -> None:
     # Build a config dir that has projects.toml but NOT secrets.toml.
     cfg_dir = tmp_path / "config"

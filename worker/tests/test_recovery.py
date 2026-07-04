@@ -23,7 +23,11 @@ DONE = "closed"
 
 
 def _cfg(tmp_path):
-    return types.SimpleNamespace(projects={"p1": object()}, data_dir=tmp_path / "data")
+    # T-0563: recycle_projects=("p1",) so these pre-existing tests (which all use
+    # slug "p1") stay allowlisted under the new per-project gate — the gate
+    # itself is covered separately in test_recycle_gate.py.
+    return types.SimpleNamespace(projects={"p1": object()}, data_dir=tmp_path / "data",
+                                 recycle_projects=("p1",))
 
 
 # --- kill-switches ---------------------------------------------------------
@@ -150,12 +154,42 @@ def test_gather_no_artifact_when_file_absent(monkeypatch, tmp_path):
     assert rows[0]["has_artifact"] is False  # no artifact written yet
 
 
+# --- T-0563/T-0564: recycle-v2 gates in _gather -----------------------------
+
+def test_gather_skips_non_allowlisted_project(monkeypatch, tmp_path):
+    """T-0563: a crashed session in a non-allowlisted project (e.g. watchrobot,
+    the 2026-06-29 incident's project) is never gathered — never respawned."""
+    from bot_squad_worker import sessions as S
+    import types as _types
+    # default allowlist (bot-squad only) — this cfg has NO recycle_projects
+    # override, unlike the module's shared _cfg() helper.
+    cfg = _types.SimpleNamespace(projects={"watchrobot": object()},
+                                 data_dir=tmp_path / "data")
+    sess = tmp_path / "data" / "watchrobot" / "sessions"; sess.mkdir(parents=True)
+    S._write_session_metadata(sess / "S-u-wr-p1.md", {
+        "sid": "S-u-wr-p1", "status": "active", "window": "dev", "task_id": "~",
+        "initiative": "~", "role": "dev"})
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    assert R._gather(cfg) == []
+
+
+def test_gather_skips_user_conversation_role(monkeypatch, tmp_path):
+    """T-0564: a crashed user-conversation session is never gathered/respawned
+    — the human's own chat is never touched by any recycle path."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import sessions as S
+    _seed(tmp_path, "S-u-userconv-p1", status="active", role="user-conversation")
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    rows = R._gather(cfg)
+    assert "S-u-userconv-p1" not in {r["sid"] for r in rows}
+
+
 # --- tick dispatch ---------------------------------------------------------
 
 def test_tick_noop_when_disabled(monkeypatch, tmp_path):
     monkeypatch.delenv("BOT_SQUAD_RECOVERY", raising=False)
     called = []
-    monkeypatch.setattr(R, "_gather", lambda cfg: [{"sid": "S-d-p1", "slug": "p1",
+    monkeypatch.setattr(R, "_gather", lambda cfg, now=None: [{"sid": "S-d-p1", "slug": "p1",
         "role": "dev", "pane_live": False, "task_id": "T-1", "task_status": ACTIVE,
         "has_artifact": False}])
     monkeypatch.setattr(R, "_do_respawn", lambda *a, **k: called.append("respawn"))
@@ -170,7 +204,7 @@ def test_tick_routes_respawn_then_park(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     rows = [{"sid": "S-d-p1", "slug": "p1", "role": "dev", "pane_live": False,
              "task_id": "T-1", "task_status": ACTIVE, "has_artifact": False}]
-    monkeypatch.setattr(R, "_gather", lambda c: rows)
+    monkeypatch.setattr(R, "_gather", lambda c, now=None: rows)
     actions = []
     monkeypatch.setattr(R, "_do_respawn", lambda c, row: actions.append(("respawn", row["sid"])))
     monkeypatch.setattr(R, "_do_park", lambda c, row, reason: actions.append(("park", row["sid"])))
@@ -188,7 +222,7 @@ def test_run_counts_failed_respawn_toward_bound(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     rows = [{"sid": "S-d-p1", "slug": "p1", "role": "dev", "pane_live": False,
              "task_id": "T-1", "task_status": ACTIVE, "has_artifact": False}]
-    monkeypatch.setattr(R, "_gather", lambda c: rows)
+    monkeypatch.setattr(R, "_gather", lambda c, now=None: rows)
     parks = []
     def _boom(c, row):
         raise RuntimeError("spawn failed")
@@ -244,7 +278,7 @@ def test_boot_reconcile_redrives_crash_from_artifact_and_archives(monkeypatch, t
 def test_boot_reconcile_disabled_is_noop(monkeypatch, tmp_path):
     monkeypatch.setenv("BOT_SQUAD_BOOT_RECONCILE", "0")
     called = []
-    monkeypatch.setattr(R, "_gather", lambda cfg: called.append("gathered") or [])
+    monkeypatch.setattr(R, "_gather", lambda cfg, now=None: called.append("gathered") or [])
     out = R.boot_reconcile(_cfg(tmp_path))
     assert out["enabled"] is False
     assert called == []  # short-circuits before touching any session

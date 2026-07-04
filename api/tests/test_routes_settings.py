@@ -205,6 +205,7 @@ def test_put_is_atomic_rejected_request_persists_nothing(tmp_bot_squad: Path, mo
     _set_env(monkeypatch, tmp_bot_squad)
     cfg_path = tmp_bot_squad / "config" / "system_settings.toml"
     cfg_path.write_text("[caps]\nmax_parallel_sessions = 7\nmax_total_tokens = 0\n")
+    before = cfg_path.read_text()
     app = build_app()
     with TestClient(app) as client:
         _login(client)
@@ -213,9 +214,33 @@ def test_put_is_atomic_rejected_request_persists_nothing(tmp_bot_squad: Path, mo
             json={"caps": {"max_parallel_sessions": 99}, "tg": {"bot_token": 12345}},  # bot_token not a str
         )
     assert r.status_code == 400, r.text
-    # NOTHING persisted — the live cap is untouched (still 7, not 99)
+    # NOTHING persisted — the file is byte-identical, live cap untouched (7, not 99)
+    assert cfg_path.read_text() == before
     raw = tomllib.loads(cfg_path.read_text())
     assert raw["caps"]["max_parallel_sessions"] == 7
+
+
+def test_put_mothership_locked_409_persists_nothing(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0367: the mothership-lock refusal must be atomic too — a PUT mixing a
+    VALID caps change with a locked field (bot_token) 409s and persists NOTHING
+    (settings byte-identical, secrets untouched)."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    monkeypatch.setenv("BOT_SQUAD_MOTHERSHIP_URL", "https://mom.example/")
+    cfg_path = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg_path.write_text("[caps]\nmax_parallel_sessions = 7\nmax_total_tokens = 0\n")
+    before = cfg_path.read_text()
+    secrets_path = tmp_bot_squad / "config" / "secrets.toml"
+    secrets_before = secrets_path.read_text()
+    app = build_app()
+    with TestClient(app) as client:
+        _login(client)
+        r = client.put(
+            "/api/system-settings",
+            json={"caps": {"max_parallel_sessions": 99}, "tg": {"bot_token": "12345:ABC"}},
+        )
+    assert r.status_code == 409, r.text
+    assert cfg_path.read_text() == before
+    assert secrets_path.read_text() == secrets_before
 
 
 def test_put_bot_token_writes_secrets(tmp_bot_squad: Path, monkeypatch) -> None:

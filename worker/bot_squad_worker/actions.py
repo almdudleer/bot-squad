@@ -2670,6 +2670,35 @@ def _action_unbind_task(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.unbind_task(cfg, params["slug"], params["sid"], params["task_id"])
 
 
+_REHOME_PRIMARY_REQUIRED = {"slug", "task_id", "to_sid"}
+_REHOME_PRIMARY_ALLOWED = _REHOME_PRIMARY_REQUIRED
+
+
+def _action_rehome_primary(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0324 (H2): safely re-home a task's PRIMARY binding onto to_sid.
+
+    The repair neither bind_task (adopt-empty / append-extras only) nor
+    unbind_task (refuses to touch the primary) can do — strips the primary
+    off every other claimant and stamps it on the target, under the
+    .task-claim.lock flock, with bind_task's admission rules (no
+    constant-team / TL / operator target, no clobbering a different primary).
+
+    Required params: slug, task_id, to_sid
+    Returns: {ok, task_id, to_sid, stripped: [sids]}
+    """
+    extra = set(params) - _REHOME_PRIMARY_ALLOWED
+    if extra:
+        raise ActionError(f"rehome_primary got unexpected params: {sorted(extra)}")
+    missing = _REHOME_PRIMARY_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"rehome_primary missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.rehome_primary(
+        cfg, params["slug"], params["task_id"], params["to_sid"])
+
+
 _UNBIND_INITIATIVE_REQUIRED = {"slug", "sid", "initiative"}
 _UNBIND_INITIATIVE_ALLOWED = _UNBIND_INITIATIVE_REQUIRED
 
@@ -3243,6 +3272,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
     "morph_session": _action_morph_session,
     "unbind_task": _action_unbind_task,
+    # T-0324 (H2): safe primary re-home — the repair bind/unbind can't do.
+    "rehome_primary": _action_rehome_primary,
     "unbind_initiative": _action_unbind_initiative,
     "archive_session": _action_archive_session,
     "unarchive_session": _action_unarchive_session,
@@ -3373,6 +3404,9 @@ ACTION_MODES: dict[str, str] = {
     # operator-singleton guard reads mds + a tmux pane scan, both user-local.
     "morph_session": "tmux_only",
     "unbind_task": "coordinator_only",
+    # T-0324 (H2): walks every SessionMd + the backlog under the claim flock —
+    # single-writer semantics, same as the other binding mutators/reconcilers.
+    "rehome_primary": "coordinator_only",
     "unbind_initiative": "coordinator_only",
     "archive_session": "coordinator_only",
     "unarchive_session": "coordinator_only",

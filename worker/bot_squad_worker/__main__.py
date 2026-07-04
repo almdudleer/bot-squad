@@ -84,6 +84,10 @@ def main() -> int:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
+    # T-0569: httpx logs its request URLs at INFO — including the TG getUpdates
+    # long-poll URL, which embeds the bot token — leaking it into the systemd
+    # journal on every poll. Quiet it to WARNING (still surfaces real errors).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     log = logging.getLogger("bot-squad-worker")
 
     mode = os.environ.get("BOT_SQUAD_MODE", "").strip() or "coordinator"

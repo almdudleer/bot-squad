@@ -159,6 +159,11 @@ _TG_NOTIFY_ALLOWED = {
     # T-0386: route by message CLASS (feedback/deploy_logs/team_queries) — the
     # class resolves to the project's forum thread-id via tg_topics.
     "topic",
+    # T-0569: an interactive relay (e.g. a session-authored conversation reply)
+    # wants every send delivered, not deduped against a recent identical
+    # payload — mirrors the debounce=False the channel abstraction already uses
+    # for interactive replies (tg_listener._channel_notify).
+    "debounce",
 }
 
 
@@ -187,6 +192,9 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         slug     : str  — project slug; resolved to tg_chat in projects.toml
         sid      : str  — SID prefix component  (e.g. "S-almdudleer-claude-p5")
         user     : str  — user prefix component
+        debounce : bool — default True; T-0569 pass False to force delivery
+                   even if the exact same payload was just sent (an interactive
+                   relay reply must not be silently deduped).
 
     If neither ``chat_id`` nor ``slug`` is given, falls back to the first
     project's tg_chat (there is usually only one project).  Unknown slug
@@ -269,6 +277,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # disqualify MAX-primary (T-0386 flaw-watch). Delivery itself is the
     # _send_stakeholder_dm SSOT (T-0394).
     explicit_tg_target = bool(params.get("chat_id")) or (params.get("topic_id") not in (None, ""))
+    debounce = bool(params.get("debounce", True))
     return _send_stakeholder_dm(
         cfg,
         message=message,
@@ -278,6 +287,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         tg_chat_id=chat_id,
         tg_topic_id=topic_id,
         prefer_tg=explicit_tg_target,
+        debounce=debounce,
     )
 
 
@@ -292,6 +302,7 @@ def _send_stakeholder_dm(
     tg_topic_id: int | None = None,
     prefer_tg: bool = False,
     group_record: bool = False,
+    debounce: bool = True,
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 channel logic, T-0394 dedupe).
 
@@ -348,6 +359,7 @@ def _send_stakeholder_dm(
         user=user,
         urgent=urgent,
         topic_id=tg_topic_id,
+        debounce=debounce,
     )
     return {"ok": True, "sent": sent, "channel": "tg"}
 

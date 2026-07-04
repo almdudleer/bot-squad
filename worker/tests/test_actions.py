@@ -174,8 +174,11 @@ class _FakeTgClient:
         self.calls: list[dict] = []
         self._suppress = False  # when True, send() returns False (debounce sim)
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None) -> bool:
-        self.calls.append({"chat_id": chat_id, "text": text, "sid": sid, "user": user, "urgent": urgent, "topic_id": topic_id})
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True) -> bool:
+        self.calls.append({
+            "chat_id": chat_id, "text": text, "sid": sid, "user": user,
+            "urgent": urgent, "topic_id": topic_id, "debounce": debounce,
+        })
         return not self._suppress
 
 
@@ -281,6 +284,27 @@ def test_tg_notify_debounce_returns_sent_false(tmp_config_dir, monkeypatch):
     fake._suppress = True
     out = A.dispatch("tg_notify", {"message": "same"})
     assert out == {"ok": True, "sent": False, "channel": "tg"}
+
+
+def test_tg_notify_debounce_defaults_true(tmp_config_dir, monkeypatch):
+    """Backward-compat: callers that don't pass debounce keep the existing
+    debounced-send behavior."""
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    A.dispatch("tg_notify", {"message": "hi"})
+    assert fake.calls[0]["debounce"] is True
+
+
+def test_tg_notify_debounce_false_forwarded(tmp_config_dir, monkeypatch):
+    """T-0569: an interactive relay passes debounce=False so an identical
+    payload isn't silently deduped — the flag must reach TgClient.send."""
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+    out = A.dispatch("tg_notify", {"chat_id": "555", "message": "hi", "debounce": False})
+    assert out["ok"] is True
+    assert fake.calls[0]["debounce"] is False
 
 
 def test_tg_notify_sid_and_user_forwarded(tmp_config_dir, monkeypatch):

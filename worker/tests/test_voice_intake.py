@@ -141,6 +141,106 @@ def _cfg_audio(cfg):
     return d
 
 
+# --- transcribe_only (T-0569: DM voice → conversation, not feedback) -------
+
+def test_transcribe_only_success_no_artifact_no_confirm(tmp_path, monkeypatch):
+    """Success returns the transcript; NO F-*.md artifact and NO #feedback
+    confirmation is written (that stays process_voice's job for group chats)."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T, actions as A
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    monkeypatch.setattr(_T, "transcribe", lambda p, **kw: {
+        "text": "включи тёмную тему", "lang": "ru", "engine": "faster-whisper:small"})
+    monkeypatch.setattr(A, "_get_tg_client",
+                        lambda c: (_ for _ in ()).throw(AssertionError("must not confirm into #feedback")))
+
+    out = _VI.transcribe_only(cfg, "bot-squad", _voice_msg())
+    assert out == {
+        "ok": True, "transcript": "включи тёмную тему", "lang": "ru",
+        "engine": "faster-whisper:small", "duration": 7,
+    }
+    assert (_VI._audio_dir(cfg, "bot-squad") / "uniq1.oga").exists()
+    assert not list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))
+
+
+def test_transcribe_only_no_voice():
+    from bot_squad_worker import voice_intake as _VI
+    out = _VI.transcribe_only(object(), "bot-squad", {"text": "no voice here"})
+    assert out == {"ok": False, "reason": "no_voice", "transcript": ""}
+
+
+def test_transcribe_only_over_cap_before_download(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cfg.voice_max_duration_sec = 60
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T
+
+    def boom_download(c, file_id, dest):
+        raise AssertionError("download_voice called for an over-cap note")
+    monkeypatch.setattr(_VI, "download_voice", boom_download)
+    def boom_transcribe(p, **kw):
+        raise AssertionError("transcribe called for an over-cap note")
+    monkeypatch.setattr(_T, "transcribe", boom_transcribe)
+
+    out = _VI.transcribe_only(cfg, "bot-squad", _voice_msg(voice={
+        "file_id": "big", "file_unique_id": "big", "duration": 600, "mime_type": "audio/ogg"}))
+    assert out["ok"] is False and out["reason"] == "too_long" and out["duration"] == 600
+    assert not (_VI._audio_dir(cfg, "bot-squad") / "big.oga").exists()
+
+
+def test_transcribe_only_download_failure(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI
+
+    def boom_download(c, file_id, dest):
+        raise RuntimeError("proxy timeout")
+    monkeypatch.setattr(_VI, "download_voice", boom_download)
+
+    out = _VI.transcribe_only(cfg, "bot-squad", _voice_msg())
+    assert out["ok"] is False and out["reason"] == "download_failed"
+    assert out["transcript"] == ""
+
+
+def test_transcribe_only_transcription_failure(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    def boom(p, **kw): raise _T.TranscriptionError("no model")
+    monkeypatch.setattr(_T, "transcribe", boom)
+
+    out = _VI.transcribe_only(cfg, "bot-squad", _voice_msg())
+    assert out["ok"] is False and out["reason"] == "transcription_failed"
+    assert out["transcript"] == ""
+    # Audio IS still saved even though no artifact is written for it.
+    assert (_VI._audio_dir(cfg, "bot-squad") / "uniq1.oga").exists()
+
+
+def test_transcribe_only_timeout(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cfg.voice_transcribe_timeout_sec = 0.3
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T
+    import time as _time
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    def slow_transcribe(p, **kw):
+        _time.sleep(5)
+        return {"text": "never returned in time"}
+    monkeypatch.setattr(_T, "transcribe", slow_transcribe)
+
+    started = _time.monotonic()
+    out = _VI.transcribe_only(cfg, "bot-squad", _voice_msg())
+    elapsed = _time.monotonic() - started
+    assert elapsed < 3
+    assert out["ok"] is False and out["reason"] == "transcription_timeout"
+
+
 # --- process_voice (orchestration) -----------------------------------------
 
 def test_process_voice_end_to_end(tmp_path, monkeypatch):

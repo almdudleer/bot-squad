@@ -165,6 +165,66 @@ def _transcribe_with_timeout(dest: Path, *, engine: str, model: str, timeout_sec
     return _transcribe.transcribe(dest, engine=engine, model=model, lang_hint=None)
 
 
+def transcribe_only(cfg: Any, slug: str, message: dict) -> dict[str, Any]:
+    """Download + transcribe a voice message WITHOUT writing a feedback
+    artifact or posting a #feedback confirmation (T-0569).
+
+    A DM voice note routes through the SAME path as typed text (the
+    conversation store + ``ensure_user_conversation``, voice-04 continuity) —
+    it must NOT become a feedback artifact, so it can't reuse ``process_voice``
+    wholesale. This sibling shares the same primitives (``extract_voice``,
+    ``download_voice``, ``_transcribe_with_timeout``) and the same caps
+    (``voice_max_duration_sec`` / ``voice_transcribe_timeout_sec``) as
+    ``process_voice`` — the GROUP/topic path stays on ``process_voice``,
+    unchanged.
+
+    Returns ``{"ok": bool, "transcript": str, "lang": str|None, "engine": str,
+    "duration": int, "reason": str|None}``. On failure ``ok`` is ``False`` and
+    ``reason`` is one of ``no_voice`` / ``too_long`` / ``download_failed`` /
+    ``transcription_timeout`` / ``transcription_failed`` (``transcript`` is
+    empty in that case; ``error`` may carry the exception text).
+    """
+    v = extract_voice(message)
+    if not v:
+        return {"ok": False, "reason": "no_voice", "transcript": ""}
+
+    max_dur = int(getattr(cfg, "voice_max_duration_sec", _DEFAULT_MAX_DURATION_SEC) or 0)
+    if max_dur > 0 and v["duration"] > max_dur:
+        log.info("voice_intake: transcribe_only rejecting over-cap note (%ds > %ds) from %s",
+                  v["duration"], max_dur, v["author"])
+        return {"ok": False, "reason": "too_long", "transcript": "", "duration": v["duration"]}
+
+    dest = _audio_dir(cfg, slug) / f"{v['file_unique_id']}.oga"
+    try:
+        download_voice(cfg, v["file_id"], dest)
+    except Exception as e:  # noqa: BLE001
+        log.exception("voice_intake: transcribe_only download failed for %s", v["file_id"])
+        return {"ok": False, "reason": "download_failed", "transcript": "",
+                 "duration": v["duration"], "error": str(e)}
+
+    engine = getattr(cfg, "voice_engine", "faster-whisper")
+    model = getattr(cfg, "voice_model", "small")
+    timeout_sec = float(getattr(cfg, "voice_transcribe_timeout_sec", _DEFAULT_TRANSCRIBE_TIMEOUT_SEC) or 0)
+    try:
+        res = _transcribe_with_timeout(dest, engine=engine, model=model, timeout_sec=timeout_sec)
+    except concurrent.futures.TimeoutError:
+        log.warning("voice_intake: transcribe_only timed out (>%ss) for %s", timeout_sec, dest)
+        return {"ok": False, "reason": "transcription_timeout", "transcript": "", "duration": v["duration"]}
+    except Exception as e:  # noqa: BLE001
+        log.exception("voice_intake: transcribe_only transcription failed for %s", dest)
+        return {"ok": False, "reason": "transcription_failed", "transcript": "",
+                 "duration": v["duration"], "error": str(e)}
+
+    transcript = (res.get("text") or "").strip()
+    return {
+        "ok": True,
+        "transcript": transcript,
+        "lang": res.get("lang"),
+        "engine": res.get("engine") or engine,
+        "duration": v["duration"],
+    }
+
+
 def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, Any]:
     """Full intake: download → transcribe → artifact → confirm into #feedback.
 

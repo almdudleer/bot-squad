@@ -1753,7 +1753,7 @@ class _RecordingTg:
     def __init__(self):
         self.calls = []
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None):
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True):
         self.calls.append({"text": text, "topic_id": topic_id})
         return True
 

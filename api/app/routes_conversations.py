@@ -23,9 +23,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app import conversation_store as CS
 from app import pins_store
+from app.mothership_users_store import MothershipUsersStore
 from app.project_authz import require_project_read
 from app.routes_auth import require_auth
 from app.routes_mothership import _authenticate_worker
+from app.worker_client import WorkerError
 
 
 def _now_iso() -> str:
@@ -50,13 +52,78 @@ def _data_dir(request: Request):
     return request.app.state.api_config.data_dir
 
 
+def _users_store(request: Request) -> MothershipUsersStore:
+    cfg = request.app.state.api_config
+    return MothershipUsersStore(cfg.data_dir / "_mothership")
+
+
+def _resolve_relay_chat_id(request: Request, slug: str, global_user_id: str) -> str:
+    """T-0569: resolve the Telegram chat to relay a session reply to.
+
+    Primary: the GlobalUser's ``tg_user_id`` (a DM chat id IS the TG user id —
+    every TG user has an implicit private chat with the bot at that same id).
+    Fallback: the project's configured ``tg_chat`` (e.g. when the user record
+    predates linkage, or was never TG-originated). Empty when neither resolves
+    — the caller treats that as "can't relay" (``relayed: false``), never an
+    error."""
+    cfg = request.app.state.api_config
+    try:
+        user = _users_store(request).get_user(global_user_id)
+    except (OSError, ValueError):
+        user = None
+    if user is not None and (user.tg_user_id or "").strip():
+        return user.tg_user_id.strip()
+    project = cfg.project(slug)
+    if project is not None and (project.tg_chat or "").strip():
+        return project.tg_chat.strip()
+    return ""
+
+
+async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, text: str) -> bool:
+    """Best-effort writeback (T-0569): relay a session-authored conversation
+    reply to the user's Telegram chat via the worker's ``tg_notify`` action, so
+    the user actually SEES the reply (before this, nothing surfaced a
+    session's append back to TG at all).
+
+    NEVER raises and NEVER blocks the append that already durably recorded the
+    reply — a relay failure (worker down, no resolvable chat, TG egress error)
+    just means ``relayed: false`` in the response, not a 5xx on the append.
+
+    ``urgent=True``: the user just messaged us — they're awake, so this must
+    bypass the quiet-hours gate in worker ``tg.py`` that otherwise silently
+    drops non-urgent sends 17:00-05:00 UTC (an interactive reply is exactly the
+    opposite of a quiet-hours background notification).
+    ``debounce=False``: an interactive conversation turn must always land, even
+    if textually identical to a recent send (the debounce cooldown exists to
+    quash repeated BACKGROUND notifications, not conversation replies).
+    """
+    chat_id = _resolve_relay_chat_id(request, slug, global_user_id)
+    if not chat_id:
+        return False
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action(
+            "tg_notify",
+            {"chat_id": chat_id, "message": text, "urgent": True, "debounce": False},
+        )
+    except WorkerError:
+        return False
+    except Exception:  # noqa: BLE001 — best-effort; must never fail the append
+        return False
+    return bool(result.get("ok")) and bool(result.get("sent", True))
+
+
 @worker_router.post("/conversations/{slug}/{global_user_id}/messages")
-def append_message(slug: str, global_user_id: str, request: Request, payload: dict) -> dict:
+async def append_message(slug: str, global_user_id: str, request: Request, payload: dict) -> dict:
     """Append one message to the (slug, global_user_id) thread. Worker-only.
 
     Body: ``{author, text, attachments?, timestamp?}`` (``text`` required —
     empty string is allowed, but the key must be present). Returns the stored
-    record."""
+    record plus ``relayed`` (T-0569): when ``author`` is a session writeback
+    (``"session:<sid>"``) with non-empty text, the text is best-effort relayed
+    to the user's Telegram chat (see ``_relay_to_telegram``) — otherwise
+    ``relayed`` is always ``False`` (a user-authored append is never relayed
+    back to itself)."""
     _authenticate_worker(request)
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
@@ -73,7 +140,19 @@ def append_message(slug: str, global_user_id: str, request: Request, payload: di
     except ValueError as e:
         # An unsafe slug / global_user_id segment.
         raise HTTPException(status_code=400, detail=str(e))
-    return record
+
+    relayed = False
+    author = str(record.get("author") or "")
+    text = str(record.get("text") or "")
+    if author.startswith("session:") and text:
+        try:
+            relayed = await _relay_to_telegram(request, slug, global_user_id, text)
+        except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
+            relayed = False
+
+    out = dict(record)
+    out["relayed"] = relayed
+    return out
 
 
 @worker_router.get("/conversations/{slug}/{global_user_id}/messages")

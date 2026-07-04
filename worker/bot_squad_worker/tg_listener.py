@@ -509,6 +509,41 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     return {"ok": True, "action": "route", "slug": por}
 
 
+def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
+    """T-0569: a DM voice note. Transcribes (voice_intake.transcribe_only —
+    NOT process_voice, so it never becomes a feedback artifact), echoes the
+    transcript back (undebounced), then hands the transcript to the SAME
+    routing as an unquoted text message (sticky-project pin +
+    ensure_user_conversation, via ``_handle_unquoted``) so it lands in the
+    per-(project, user) conversation thread with the voice attachment
+    descriptor preserved (``msg`` still carries ``msg["voice"]``; only its
+    ``text`` is overridden to the transcript before handing off — so
+    ``_handle_unquoted``'s own ``append_conversation`` records the transcript,
+    not the empty raw-voice text, and there is no double-append).
+
+    A transcription failure (cap exceeded / download / decode) is best-effort
+    reported back to the user and nothing is routed (nothing to route)."""
+    from bot_squad_worker import voice_intake as _vi
+    out = _vi.transcribe_only(cfg, chat_slug, msg)
+    if not out.get("ok"):
+        _notify(
+            cfg, chat_id,
+            "⚠️ Не удалось распознать голосовое сообщение — попробуйте ещё раз "
+            "или напишите текстом.",
+        )
+        return {"ok": False, "action": "voice_private_failed", "reason": out.get("reason", "transcription_failed")}
+
+    transcript = out["transcript"]
+    _channel_notify(cfg, chat_id, f"\U0001f399 Распознал так: «{transcript}»")
+
+    transcript_msg = dict(msg)
+    transcript_msg["text"] = transcript
+    result = _handle_unquoted(cfg, chat_id, chat_slug, gid, transcript_msg)
+    result["action"] = f"voice_private_{result.get('action', '')}"
+    result["transcript"] = transcript
+    return result
+
+
 def handle_update(cfg, update: dict) -> dict:
     """Dispatch one update. Returns a small audit dict."""
     msg = update.get("message")
@@ -534,19 +569,25 @@ def handle_update(cfg, update: dict) -> dict:
 
     slash = extract_slash_command(msg)
     reply = extract_reply_target(msg) if not slash else None
-    # T-0386 Phase 2: a voice message → transcribe + store as a feedback artifact.
-    # Flag-off-safe: gated on [voice].enabled (default off) so deploying the
-    # voice code is a no-op until the 1-time stakeholder TG setup flips it on.
-    is_voice = bool(
-        not slash and not reply
-        and msg.get("voice") and getattr(cfg, "voice_enabled", False)
-    )
+    # T-0386 Phase 2 / T-0569: a voice message. Flag-off-safe: gated on
+    # [voice].enabled (default off) so deploying the voice code is a no-op
+    # until the 1-time stakeholder TG setup flips it on. T-0569 splits the
+    # enabled case by chat type: a GROUP/topic voice note keeps the original
+    # transcribe->feedback-artifact behavior (process_voice); a PRIVATE (DM)
+    # voice note instead routes through the same path as typed text (the
+    # conversation store + ensure_user_conversation, voice-04 continuity) — a
+    # DM is a conversation with the bot, not feedback.
+    chat_type = str(chat.get("type") or "")
+    voice_present = bool(not slash and not reply and msg.get("voice") and getattr(cfg, "voice_enabled", False))
+    is_voice_group = voice_present and chat_type != "private"
+    is_voice_private = voice_present and chat_type == "private"
 
-    if slash or reply or is_voice:
-        # T-0489: record slash/reply/voice under the chat's project — the slug is
-        # incidental for these (they don't sticky-route). The unquoted firehose
-        # path (below) resolves the project-of-record itself and records there,
-        # so its dump + attending session land on the SAME project (TL-D, T-0492).
+    if slash or reply or is_voice_group:
+        # T-0489: record slash/reply/group-voice under the chat's project — the
+        # slug is incidental for these (they don't sticky-route). The unquoted
+        # firehose path (below, including private voice) resolves the
+        # project-of-record itself and records there, so its dump and attending
+        # session land on the SAME project (TL-D, T-0492).
         if gid:
             append_conversation(cfg, chat_slug, gid, msg)
         if slash:
@@ -559,10 +600,16 @@ def handle_update(cfg, update: dict) -> dict:
                 result = _handle_slash(cfg, chat_id, cmd, args)
         elif reply:
             result = _handle_reply(cfg, chat_id, *reply)
-        else:  # voice
+        else:  # group/topic voice
             from bot_squad_worker import voice_intake as _vi
             r = _vi.process_voice(cfg, chat_slug, msg, ts=_msg_ts(msg))
             result = {"ok": r.get("ok", True), "action": "voice", "slug": chat_slug, "result": r}
+    elif is_voice_private:
+        # T-0569: DM voice — transcribe, echo it back, then route the
+        # transcript through the same unquoted-message path as text. This owns
+        # its own record (like the unquoted path below), so it does NOT also
+        # hit the append_conversation call above (no double-append).
+        result = _handle_private_voice(cfg, chat_id, chat_slug, gid, msg)
     else:
         # T-0485/T-0494: the unquoted firehose path owns its own record (under
         # the project-of-record) so the dump and the user-conversation session

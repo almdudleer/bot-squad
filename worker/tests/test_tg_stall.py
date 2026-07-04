@@ -38,7 +38,7 @@ class _FakeTg:
     def __init__(self):
         self.sent = []
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None):
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True):
         full = f"[{sid}] {text}" if sid else text
         self.sent.append({"chat_id": chat_id, "text": full, "topic_id": topic_id})
         return True

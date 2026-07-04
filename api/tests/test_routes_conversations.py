@@ -278,6 +278,157 @@ def test_worker_list_unconfigured_token_fails_closed(tmp_bot_squad: Path, monkey
     assert r.status_code == 401
 
 
+# ---------------------------------------------------------------------------
+# T-0569: writeback relay — a session-authored append is best-effort relayed
+# to the user's Telegram chat via the worker's tg_notify action, so the user
+# actually sees the reply. worker_client is mocked (no real socket / TG).
+# ---------------------------------------------------------------------------
+
+
+def _mock_call_action(monkeypatch, *, result=None, raise_error: bool = False):
+    """Patch WorkerClient.call_action so append_message's relay hits a fake
+    instead of a real unix socket. Returns a list capturing (name, params)."""
+    from app.worker_client import WorkerClient, WorkerError
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call_action(self, name, params, timeout=None):
+        calls.append((name, params))
+        if raise_error:
+            raise WorkerError("boom")
+        return result if result is not None else {"ok": True, "sent": True, "channel": "tg"}
+
+    monkeypatch.setattr(WorkerClient, "call_action", fake_call_action)
+    return calls
+
+
+def _seed_tg_linked_user(tmp_bot_squad: Path, global_user_id: str, tg_user_id: str) -> None:
+    """Write a GlobalUser with a specific id (matching the (slug, gid) path
+    segment used by CONV) and tg_user_id — bypassing the normal mint-a-random-
+    id creation flow, since the relay lookup keys on the exact gid in the URL."""
+    from datetime import datetime, timezone
+    from app.mothership_users_store import GlobalUser, MothershipUsersStore
+
+    store = MothershipUsersStore(tmp_bot_squad / "data" / "_mothership")
+    user = GlobalUser(
+        id=global_user_id,
+        username=f"tg:{tg_user_id}",
+        password_hash="",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        tg_user_id=tg_user_id,
+    )
+    store._write_users([user])
+
+
+def test_session_append_relays_to_telegram(tmp_bot_squad: Path, monkeypatch):
+    """A session-authored append (author='session:<sid>') triggers the relay:
+    tg_notify is called with the resolved chat_id + the reply text, urgent +
+    undebounced (interactive reply), and the response carries relayed=True."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV,
+        json={"author": f"session:S-x-p1", "text": "here's your answer"},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["relayed"] is True
+
+    assert len(calls) == 1
+    name, params = calls[0]
+    assert name == "tg_notify"
+    assert params["chat_id"] == "555222111"
+    assert params["message"] == "here's your answer"
+    assert params["urgent"] is True
+    assert params["debounce"] is False
+
+
+def test_user_authored_append_never_relays(tmp_bot_squad: Path, monkeypatch):
+    """A regular user-authored append (author='user') must NOT trigger a
+    relay — it would just echo the user's own message back to themselves."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(CONV, json={"author": "user", "text": "hi"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is False
+    assert calls == []
+
+
+def test_session_append_empty_text_never_relays(tmp_bot_squad: Path, monkeypatch):
+    """An empty-text session append (e.g. a bookkeeping/no-op record) has
+    nothing to relay."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(CONV, json={"author": "session:S-x-p1", "text": ""}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is False
+    assert calls == []
+
+
+def test_session_append_relay_failure_does_not_fail_append(tmp_bot_squad: Path, monkeypatch):
+    """A relay failure (worker unreachable) must NEVER fail the append — the
+    message is already durably recorded; relayed just reports False."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "777")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    _mock_call_action(monkeypatch, raise_error=True)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is False
+    # The message IS durably recorded despite the relay failure.
+    out = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    assert out["messages"][-1]["text"] == "answer"
+
+
+def test_session_append_no_resolvable_chat_is_relayed_false(tmp_bot_squad: Path, monkeypatch):
+    """No linked GlobalUser tg_user_id and the project's tg_chat is empty (the
+    conftest fixture sets tg_chat='0', so use a project without one) — nothing
+    resolvable, relayed False, no call attempted."""
+    (tmp_bot_squad / "config" / "projects.toml").write_text(
+        '[projects.test-project]\n'
+        'slug = "test-project"\n'
+        'display_name = "Test Project"\n'
+        'repo_path = "/tmp/test-repo"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = "https://example.com"\n'
+        'staging_url = "https://staging.example.com"\n'
+        'dev_url = "https://dev.example.com"\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = ""\n'
+        'created_at = 2026-05-10\n'
+    )
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is False
+    assert calls == []
+
+
+def test_session_append_falls_back_to_project_tg_chat(tmp_bot_squad: Path, monkeypatch):
+    """No linked GlobalUser (gu_abc doesn't exist in the users store) — falls
+    back to the project's configured tg_chat (conftest sets it to '0')."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][1]["chat_id"] == "0"
+
+
 def test_worker_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     d = tmp_bot_squad / "data"

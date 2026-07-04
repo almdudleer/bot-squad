@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, type Transparency as TransparencyData, type SessionRow } from "../api";
+import {
+  api,
+  type SchedulerState,
+  type Transparency as TransparencyData,
+  type SessionRow,
+} from "../api";
 import { Markdown } from "../components/Markdown";
 import { PageHelp } from "../components/PageHelp";
 import { RouteSkeleton } from "../components/RouteSkeleton";
@@ -30,6 +35,18 @@ const STATUS_ORDER = [
   "reopened",
   "closed",
 ] as const;
+
+function fmtFuture(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const ts = Date.parse(iso);
+  if (isNaN(ts)) return "—";
+  const diff = Math.floor((ts - Date.now()) / 1000);
+  if (diff < 0) return "now";
+  if (diff < 60) return `in ${diff}s`;
+  if (diff < 3600) return `in ${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `in ${Math.floor(diff / 3600)}h`;
+  return `in ${Math.floor(diff / 86400)}d`;
+}
 
 function fmtRel(epoch: number | null): string {
   if (!epoch) return "—";
@@ -147,6 +164,91 @@ function SessionTree({
   );
 }
 
+/**
+ * T-0572 (Occam pass, D-0046): the standalone /scheduler page merged in here
+ * as one more read-only section — worker heartbeat + the time-driven job
+ * table. Own fetch + own error chrome so a scheduler hiccup never blanks the
+ * rest of the system-state view.
+ */
+function SchedulerPanel() {
+  const [state, setState] = useState<SchedulerState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      api
+        .scheduler()
+        .then((s) => {
+          if (!cancelled) {
+            setState(s);
+            setError(null);
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) setError(String(e));
+        });
+    load();
+    const id = setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const heartbeatAge = state?.last_heartbeat_age_seconds ?? null;
+  const heartbeatOk = heartbeatAge !== null && heartbeatAge < 120;
+
+  if (error)
+    return (
+      <div className="text-muted" style={{ fontSize: "0.85rem" }}>
+        Scheduler state unavailable: {error}
+      </div>
+    );
+  if (state === null)
+    return <div className="mc-loading">Loading scheduler state</div>;
+
+  return (
+    <>
+      <div style={{ fontSize: "0.82rem", marginBottom: "0.5rem" }}>
+        <span className={heartbeatOk ? "mc-dot mc-dot-active" : "mc-dot mc-dot-error"} />{" "}
+        <span className={`mc-badge ${heartbeatOk ? "mc-badge-ok" : "mc-badge-danger"}`}>
+          {heartbeatOk ? "worker healthy" : "worker heartbeat stale"}
+        </span>{" "}
+        <span style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)", fontSize: "0.74rem" }}>
+          {heartbeatAge !== null ? `last heartbeat ${Math.floor(heartbeatAge)}s ago` : "no heartbeat yet"}
+          {" · "}
+          {state.jobs.length} scheduled job{state.jobs.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      {state.jobs.length > 0 && (
+        <table className="table table-sm mc-table" style={{ fontSize: "0.78rem" }}>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Trigger</th>
+              <th>Next run</th>
+            </tr>
+          </thead>
+          <tbody>
+            {state.jobs.map((job) => (
+              <tr key={job.id}>
+                <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.74rem" }}>{job.id}</td>
+                <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.74rem", color: "var(--mc-text-dim)" }}>
+                  {job.trigger}
+                </td>
+                <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.74rem", color: "var(--mc-text-dim)" }}>
+                  <span title={job.next_run ?? undefined}>{fmtFuture(job.next_run)}</span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
 export function Transparency() {
   const { slug = "" } = useParams();
   const [data, setData] = useState<TransparencyData | null>(null);
@@ -201,6 +303,10 @@ export function Transparency() {
       {data === null && !error && <RouteSkeleton />}
 
       {data && <TransparencyView data={data} slug={slug} />}
+
+      {/* 5 — scheduler (merged from the retired /scheduler page, T-0572) */}
+      <SectionTitle>Scheduler</SectionTitle>
+      <SchedulerPanel />
     </div>
   );
 }

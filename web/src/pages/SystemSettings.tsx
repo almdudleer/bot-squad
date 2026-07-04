@@ -228,9 +228,8 @@ export function SystemSettings() {
           <Link to="/users" className="mc-badge mc-badge-info" style={{ textDecoration: "none", padding: "0.3rem 0.7rem" }}>
             Manage users →
           </Link>
-          <Link to="/scheduler" className="mc-badge mc-badge-info" style={{ textDecoration: "none", padding: "0.3rem 0.7rem" }}>
-            Scheduler →
-          </Link>
+          {/* T-0572 (Occam pass): the standalone /scheduler page merged into
+              each project's System State (transparency) view. */}
         </div>
       )}
 

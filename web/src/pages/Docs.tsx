@@ -13,7 +13,8 @@ import { DocsOutletContext } from "./DocsSection";
 export function Docs() {
   const { slug = "" } = useParams();
   const [searchParams] = useSearchParams();
-  const { tree } = useOutletContext<DocsOutletContext>();
+  // T-0572 (Occam pass): `manage` gates every write affordance — read-first.
+  const { tree, manage } = useOutletContext<DocsOutletContext>();
 
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -144,7 +145,7 @@ export function Docs() {
       {error && <div className="alert alert-danger py-1 small">{error}</div>}
       {flash && <div className="alert alert-success py-1 small">{flash}</div>}
 
-      {selected === null && <div className="text-muted small">Select an artifact, or create one with + New.</div>}
+      {selected === null && <div className="text-muted small">Select an artifact.</div>}
 
       {selected !== null && draft === null && detail && (
         <>
@@ -154,27 +155,32 @@ export function Docs() {
               {detail.id}
               <span style={{ color: "var(--mc-text-dim)", marginLeft: "0.5rem" }}>{detail.category}</span>
             </div>
-            <div className="d-flex gap-2">
-              <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(detail.raw)}>
-                Edit
-              </button>
-              <button type="button" className="btn btn-outline-danger btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={removeDoc}>
-                Delete
-              </button>
-            </div>
+            {manage && (
+              <div className="d-flex gap-2">
+                <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(detail.raw)}>
+                  Edit
+                </button>
+                <button type="button" className="btn btn-outline-danger btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={removeDoc}>
+                  Delete
+                </button>
+              </div>
+            )}
           </div>
 
           {/* T-0235/T-0283: cross-store nesting — set/clear this doc's parent
               (PUT /docs/{id}/parent, cycle-safe) + list its attached
-              artifacts (the cross-store child_artifact_ids superset). */}
-          <ReparentControl
-            slug={slug}
-            data={tree}
-            selfId={detail.id}
-            currentParentId={detail.parent_doc_id}
-            busy={busy}
-            onSetParent={(pid) => setParent(detail.id, pid)}
-          />
+              artifacts (the cross-store child_artifact_ids superset).
+              T-0572: curation control, manage-gated. */}
+          {manage && (
+            <ReparentControl
+              slug={slug}
+              data={tree}
+              selfId={detail.id}
+              currentParentId={detail.parent_doc_id}
+              busy={busy}
+              onSetParent={(pid) => setParent(detail.id, pid)}
+            />
+          )}
           {childIds.length > 0 && (
             <div className="mb-3">
               <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>
@@ -203,14 +209,18 @@ export function Docs() {
               {(detail.related_tickets ?? []).map((t) => (
                 <span key={t} className="d-inline-flex align-items-center gap-1" style={{ fontSize: "0.74rem" }}>
                   <Link to={`/p/${slug}/t/${t}`} style={{ fontFamily: "var(--mc-mono)" }}>{t}</Link>
-                  <button type="button" className="btn btn-link btn-sm p-0" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }} title="Unlink" disabled={busy} onClick={() => unlink(t)}>✕</button>
+                  {manage && (
+                    <button type="button" className="btn btn-link btn-sm p-0" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }} title="Unlink" disabled={busy} onClick={() => unlink(t)}>✕</button>
+                  )}
                 </span>
               ))}
             </div>
-            <div className="d-flex gap-2" style={{ maxWidth: "20rem" }}>
-              <input className="form-control form-control-sm" style={{ fontSize: "0.74rem" }} placeholder="T-0123" value={linkTicket} onChange={(e) => setLinkTicket(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); link(); } }} />
-              <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} disabled={busy} onClick={link}>Link</button>
-            </div>
+            {manage && (
+              <div className="d-flex gap-2" style={{ maxWidth: "20rem" }}>
+                <input className="form-control form-control-sm" style={{ fontSize: "0.74rem" }} placeholder="T-0123" value={linkTicket} onChange={(e) => setLinkTicket(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); link(); } }} />
+                <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} disabled={busy} onClick={link}>Link</button>
+              </div>
+            )}
           </div>
 
           {/* T-0275: render the doc body as markdown. */}

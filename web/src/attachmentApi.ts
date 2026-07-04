@@ -35,32 +35,15 @@ async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export type AttachmentRow = {
-  server_id: string;
-  server_username: string;
-  tg_chat_id: string;
-  attached_at: string | null;
-  legacy_unmigrated: boolean;
-};
-
-export type MyAttachmentsResponse = {
-  global_user_id: string | null;
-  attachments: AttachmentRow[];
-};
-
 export type AttachmentTgChatId = {
   server_id: string;
   tg_chat_id: string | null;
 };
 
+// T-0572 (Occam pass, D-0046): the /attachment/* pages were cut; the
+// remaining consumers are the per-project PersonalNotificationPanel's
+// save + test-ping calls. listMy/getTgChatId went with the pages.
 export const attachmentApi = {
-  listMy: () => call<MyAttachmentsResponse>("/api/me/attachments"),
-
-  getTgChatId: (serverId: string) =>
-    call<AttachmentTgChatId>(
-      `/api/me/attachment/${encodeURIComponent(serverId)}/tg-chat-id`,
-    ),
-
   putTgChatId: (serverId: string, tg_chat_id: string) =>
     call<AttachmentTgChatId>(
       `/api/me/attachment/${encodeURIComponent(serverId)}/tg-chat-id`,

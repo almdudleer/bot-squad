@@ -22,7 +22,8 @@ export type OnboardingStepId =
   | "srv.9_2.detach_admin"
   | "srv.9_3.cross_server"
   | "srv.9_4.existing_projects"
-  | "srv.9_5.tg_binding"
+  // srv.9_5.tg_binding retired with the /attachment/tg-binding page
+  // (T-0572 Occam pass); persisted seen_steps rows for it are harmless.
   | "srv.9_6.project_create"
   | "proj.has_created_any"
   | "proj.13_1.roles"

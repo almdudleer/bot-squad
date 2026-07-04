@@ -224,7 +224,7 @@ export function isDevRow(s: SessionRow): boolean {
 // (utils/sessionStatus.ts) so the "live" CATEGORY word + count is defined in
 // ONE place across sidebar / sessions / analytics. This predicate is the
 // boolean projection of that category and stays the canonical liveness probe
-// other surfaces import (resourceCaps, AttachmentSessions).
+// other surfaces import (resourceCaps).
 // ---------------------------------------------------------------------------
 export function isLiveSession(s: SessionRow): boolean {
   return sessionLiveness(s) === "live";
@@ -405,6 +405,12 @@ export function Sessions() {
   const [sendInfo, setSendInfo] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [meUsername, setMeUsername] = useState<string>("stakeholder");
+
+  // T-0572 (Occam pass, D-0046): the page is a READ-FIRST status board —
+  // day-to-day steering lives in the TG dialog / operator, so the inline
+  // process controls (spawn, per-row kebabs, group autopilot) hide behind
+  // this one explicit toggle instead of cluttering every row.
+  const [showControls, setShowControls] = useState(false);
 
   // T-0153: autopilot dialog (kebab on a team lane or a single session row).
   const [autopilotOpen, setAutopilotOpen] = useState(false);
@@ -1225,9 +1231,12 @@ export function Sessions() {
           </td>
 
           {/* Actions — T-0141: collapsed behind a kebab so the row stays
-              ≤48px (stakeholder note 10). */}
+              ≤48px (stakeholder note 10). T-0572: read-first — kebab only
+              renders with the ⚙ Controls toggle on. */}
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            <RowActionsMenu actions={rowActions(s)} ariaLabel={`Actions for ${s.sid}`} />
+            {showControls && (
+              <RowActionsMenu actions={rowActions(s)} ariaLabel={`Actions for ${s.sid}`} />
+            )}
           </td>
         </tr>
         {isOpen && renderDetailRow(s, 9)}
@@ -1296,17 +1305,19 @@ export function Sessions() {
             {sessionLastActivity(s)}
           </td>
           <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            <RowActionsMenu
-              ariaLabel={`Actions for ${s.sid}`}
-              actions={[
-                { label: "Resurrect", onClick: () => handleResurrectFromArchive(s.sid), variant: "success" },
-                {
-                  label: "Unarchive",
-                  onClick: () =>
-                    api.unarchiveSession(slug, s.sid).then(load).catch((e) => setActionError(String(e))),
-                },
-              ]}
-            />
+            {showControls && (
+              <RowActionsMenu
+                ariaLabel={`Actions for ${s.sid}`}
+                actions={[
+                  { label: "Resurrect", onClick: () => handleResurrectFromArchive(s.sid), variant: "success" },
+                  {
+                    label: "Unarchive",
+                    onClick: () =>
+                      api.unarchiveSession(slug, s.sid).then(load).catch((e) => setActionError(String(e))),
+                  },
+                ]}
+              />
+            )}
           </td>
         </tr>
         {isOpen && renderDetailRow(s, 8)}
@@ -1702,8 +1713,9 @@ export function Sessions() {
                 👤 {u}
               </span>
             ))}
-            {/* T-0153: team-level autopilot — kebab on the tmux-session lane. */}
-            {!isNone && (
+            {/* T-0153: team-level autopilot — kebab on the tmux-session lane.
+                T-0572: gated behind the ⚙ Controls toggle (read-first board). */}
+            {!isNone && showControls && (
               <div className="ms-auto" onClick={(e) => e.stopPropagation()}>
                 <RowActionsMenu
                   actions={[
@@ -1898,23 +1910,33 @@ export function Sessions() {
           Processes
           <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
-        <button type="button" className="btn btn-primary btn-sm" onClick={() => openModal()}>
-          + New session
-        </button>
+        <div className="d-flex gap-2">
+          <button
+            type="button"
+            className={`btn btn-sm ${showControls ? "btn-secondary" : "btn-outline-secondary"}`}
+            aria-pressed={showControls}
+            title="Reveal the inline process controls (spawn, per-row actions). Day-to-day steering lives in the Telegram dialog."
+            onClick={() => setShowControls((v) => !v)}
+          >
+            ⚙ Controls
+          </button>
+          {showControls && (
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => openModal()}>
+              + New session
+            </button>
+          )}
+        </div>
       </div>
       <PageHelp>
-        Claude tmux sessions whose CWD is this project&apos;s repo.
-        <strong> Pause</strong> interrupts (Ctrl-C) — pane stays open, you
-        can keep typing.
-        <strong> Suspend</strong> closes the window to free resources; the
-        registry keeps the UUID.
-        <strong> Resurrect</strong> spawns a new pane with <code>claude
-        --resume &lt;uuid&gt;</code>.
-        <strong> + New session</strong> opens a fresh pane in the repo.
+        Live status board for the Claude tmux sessions whose CWD is this
+        project&apos;s repo — the system spawns, reuses and reaps them for
+        you. Steer day-to-day via the Telegram dialog: reply to a
+        <code> [SID] needs your input</code> notification and your reply lands
+        in that session, or use <code>/sessions</code>,
+        {" "}<code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
         <div className="mt-2">
-          Reply to a Telegram <code>[SID] needs your input</code> notification —
-          your reply lands in that session. Or use <code>/sessions</code>,
-          {" "}<code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
+          <strong>⚙ Controls</strong> reveals the manual affordances (spawn,
+          pause/suspend/resurrect, archive) when you need to intervene by hand.
         </div>
       </PageHelp>
 
@@ -2083,13 +2105,15 @@ export function Sessions() {
         <div className="mc-empty">
           <div className="mc-empty-icon">◯</div>
           <div>No sessions for <strong>{slug}</strong></div>
-          <button
-            type="button"
-            className="btn btn-outline-primary btn-sm mt-3"
-            onClick={() => openModal()}
-          >
-            + New session
-          </button>
+          {showControls && (
+            <button
+              type="button"
+              className="btn btn-outline-primary btn-sm mt-3"
+              onClick={() => openModal()}
+            >
+              + New session
+            </button>
+          )}
         </div>
       )}
 

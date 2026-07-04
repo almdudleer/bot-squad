@@ -60,7 +60,7 @@ _P = "/api/projects/test-project"
 # Phase 1 — verified-dangerous (cost / destructive / fleet-config).
 _PHASE1 = [
     ("post", f"{_P}/deploy", {"target": "staging", "reason": "x"}),
-    ("put", f"{_P}/repo-agents-md", {"content": "x"}),          # fleet prompt-injection
+    # T-0572: PUT /repo-agents-md CUT with the Workflow page (route removed).
     ("post", f"{_P}/autopilot/start", {"kind": "project", "prompt": "x"}),
     ("post", f"{_P}/autopilot/stop", {"key": "x"}),
     ("post", f"{_P}/sessions", {"window": "x"}),                # spawn agent
@@ -111,7 +111,6 @@ def test_admin_passes_the_gate(tmp_bot_squad, monkeypatch):
     # 400/404/422/502 is fine). Probes one route per gated module.
     samples = [
         ("delete", f"{_P}/backlog/T-0001", None),
-        ("put", f"{_P}/repo-agents-md", {"content": ""}),
         ("post", f"{_P}/docs", {"title": "", "body": ""}),
         ("post", f"{_P}/vision/active_initiatives/foo", {"body": ""}),
     ]

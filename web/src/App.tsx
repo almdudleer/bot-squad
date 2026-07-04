@@ -32,17 +32,11 @@ const TaskDetail = lazy(() => import("./pages/TaskDetail").then((m) => ({ defaul
 const Runs = lazy(() => import("./pages/Runs").then((m) => ({ default: m.Runs })));
 const RunLog = lazy(() => import("./pages/RunLog").then((m) => ({ default: m.RunLog })));
 const Messages = lazy(() => import("./pages/Messages").then((m) => ({ default: m.Messages })));
-const Scheduler = lazy(() => import("./pages/Scheduler").then((m) => ({ default: m.Scheduler })));
-const Clones = lazy(() => import("./pages/Clones").then((m) => ({ default: m.Clones })));
-const Workflow = lazy(() => import("./pages/Workflow").then((m) => ({ default: m.Workflow })));
 const Help = lazy(() => import("./pages/Help").then((m) => ({ default: m.Help })));
 const Welcome = lazy(() => import("./pages/Welcome").then((m) => ({ default: m.Welcome })));
 const Users = lazy(() => import("./pages/Users").then((m) => ({ default: m.Users })));
 const SystemSettings = lazy(() => import("./pages/SystemSettings").then((m) => ({ default: m.SystemSettings })));
 const Profile = lazy(() => import("./pages/Profile").then((m) => ({ default: m.Profile })));
-const AttachmentTgBinding = lazy(() => import("./pages/AttachmentTgBinding").then((m) => ({ default: m.AttachmentTgBinding })));
-const AttachmentSessions = lazy(() => import("./pages/AttachmentSessions").then((m) => ({ default: m.AttachmentSessions })));
-const AttachmentWorker = lazy(() => import("./pages/AttachmentWorker").then((m) => ({ default: m.AttachmentWorker })));
 
 // Mothership centralization layer — docs/architecture/D-0017-mothership-seam.md.
 // Vite inlines VITE_MOTHERSHIP at build time, so the dynamic imports resolve
@@ -115,7 +109,6 @@ export function App() {
             <Route index element={<Project />} />
             <Route path="t/:id" element={<TaskDetail />} />
             <Route path="vision" element={<Vision />} />
-            <Route path="workflow" element={<Workflow />} />
             {/* T-0235 (Pillar C): User Feedback + Use Cases relocated UNDER
                 the docs section (retired as top-level nav). T-0337 then merged
                 the three former tabs into ONE "Docs & Artifacts" view: the
@@ -138,19 +131,14 @@ export function App() {
             <Route path="runs" element={<Runs />} />
             <Route path="runs/:id" element={<RunLog />} />
             <Route path="sessions/:claude_uuid/messages" element={<Messages />} />
-            {/* T-0296: per-project clone health ("Installation ≠ Project"). */}
-            <Route path="clones" element={<Clones />} />
           </Route>
-          <Route path="/scheduler" element={<Scheduler />} />
+          {/* T-0572 (Occam pass): the Workflow, Clones, Scheduler and
+              /attachment/* pages were cut (D-0046). Scheduler state now
+              renders inside the per-project System State (transparency)
+              view; stale deep-links fall through to the `*` redirect. */}
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />
           <Route path="/me" element={<Profile />} />
-          {/* T-0061: ATTACHMENT-scoped (per-user-per-server) pages.
-              (T-0224: dropped the stale pointer to the deleted
-              sidebarHelpers ATTACHMENT_SIDEBAR_ITEMS model.) */}
-          <Route path="/attachment/tg-binding" element={<AttachmentTgBinding />} />
-          <Route path="/attachment/sessions" element={<AttachmentSessions />} />
-          <Route path="/attachment/worker" element={<AttachmentWorker />} />
           {MothershipRoutes && (
             <Route
               path="/m/*"

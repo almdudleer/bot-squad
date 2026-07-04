@@ -768,53 +768,6 @@ export type Transparency = {
   };
 };
 
-// T-0296: per-project clone health read-model ("Installation != Project").
-// `dev` is the repo_path (working) clone, `prod` is the repo_master clone.
-// A clone may be unconfigured (no second clone) → {configured:false}; present
-// but offline/unfetched → branch/ahead/behind are null. ahead/behind are vs
-// origin/<master_branch> after a best-effort fetch.
-export type CloneView = {
-  configured: boolean;
-  present?: boolean;
-  path?: string;
-  branch?: string | null;
-  clean?: boolean;
-  ahead?: number | null;
-  behind?: number | null;
-};
-
-// T-0296: best-effort last-deploy summary (newest deploy run file). null when
-// nothing has ever been deployed.
-export type CloneLastDeploy = {
-  run_id: string;
-  at: number; // epoch seconds (run-file mtime)
-  target: string | null;
-  reason: string | null;
-  requested_by: string | null;
-  ok: boolean | null;
-  returncode: number | null;
-};
-
-export type CloneStatus = {
-  slug: string;
-  master_branch: string;
-  deploy_branch: string;
-  repo_workspace: string | null;
-  workspace_present: boolean | null;
-  dev: CloneView;
-  prod: CloneView;
-  last_deploy: CloneLastDeploy | null;
-};
-
-// T-0296: result of the admin-only ff-only pull-master action. ok=false (with a
-// human `detail`) when the prod clone is diverged/dirty/missing.
-export type PullMasterResult = {
-  ok: boolean;
-  detail: string;
-  from_sha?: string | null;
-  to_sha?: string | null;
-};
-
 // T-0365: the project list drives the landing Picker, the switch-project
 // dropdown, and HomeRedirect — each fetched /api/projects independently, so the
 // list reloaded (and flashed blank) on every visit. `api.projects()` now
@@ -870,13 +823,6 @@ export const api = {
     call<{ ok: boolean; sent: boolean }>(`/api/projects/${slug}/tg/test`, {
       method: "POST",
     }),
-  repoAgentsMd: (slug: string) =>
-    call<{ content: string }>(`/api/projects/${slug}/repo-agents-md`),
-  putRepoAgentsMd: (slug: string, content: string) =>
-    call(`/api/projects/${slug}/repo-agents-md`, {
-      method: "PUT",
-      body: JSON.stringify({ content }),
-    }),
   backlog: (slug: string) =>
     call<Task[]>(`/api/projects/${slug}/backlog`).then((tasks) => tasks.map(normalizeTask)),
   // T-0512 (M9): list the subtasks of a task (every task whose parent_task ===
@@ -895,17 +841,6 @@ export const api = {
   // `api` (like analytics) — single-install, not proxied through mothership.
   transparency: (slug: string) =>
     call<Transparency>(`/api/projects/${slug}/transparency`),
-  // T-0296: per-project clone health read-model ("Installation != Project").
-  // Proxies the worker `clone_status` action (only the worker has on-host git
-  // access to the clones). Read-only; any authed user may view.
-  getClones: (slug: string) => call<CloneStatus>(`/api/projects/${slug}/clones`),
-  // T-0296: admin-only ff-only fast-forward of the prod (master) clone to
-  // origin. 403 for non-admins (server admin, not cross-server god-mode); the
-  // worker returns ok=false (with `detail`) when prod is diverged/dirty.
-  pullMaster: (slug: string) =>
-    call<PullMasterResult>(`/api/projects/${slug}/clones/pull-master`, {
-      method: "POST",
-    }),
   login: (username: string, password: string) =>
     call("/api/auth/login", {
       method: "POST",

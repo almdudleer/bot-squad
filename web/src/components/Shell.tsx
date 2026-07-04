@@ -21,7 +21,7 @@ const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
  * (`vision/roles/role-hierarchy.md`):
  *   • PROJECT  — the prominent `[ PROJECT ]` block: Board / Roadmap / User
  *                Feedback / Use Cases, with a quieter nested AGENTS sub-section
- *                (Agent Sessions / Workflow / Deployment Queue / Analytics).
+ *                (Agent Sessions / Deployment Queue / Analytics).
  *   • MOTHERSHIP — a single "Mothership" entry, global-admin only (global
  *                users + invites + connected servers). Tree-shaken off
  *                detach builds via the VITE_MOTHERSHIP literal gate.

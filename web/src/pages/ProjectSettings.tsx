@@ -209,33 +209,10 @@ export function ProjectSettings() {
         </>
       )}
 
-      {/* T-0358: agent-instruction editing relocated here as a thin link (it
-          used to be the "AGENT WORKFLOW" nav page — a ~30k-px raw dump of the
-          agents' manuals). The page itself now collapses each manual by
-          default; this is the only nav affordance into it. Admin-leaning
-          internals live under this "Advanced" heading. */}
-      {proj && (
-        <>
-          <hr style={{ borderColor: "var(--mc-border, #333)", margin: "1.5rem 0" }} />
-          <section className="mb-4">
-            <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-              Advanced
-            </h3>
-            <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.4rem" }}>
-              <Link to={`/p/${slug}/workflow`}>Agent instructions &amp; workflow</Link>{" "}
-              — view / edit the manuals and role briefings each session receives
-              (AGENTS.md, AGENT_INSTRUCTIONS.md, constitution, roles).
-            </p>
-            {/* T-0359: dev/prod clone topology — git/devops plumbing, demoted
-                here from the per-project rail. */}
-            <p style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.4rem" }}>
-              <Link to={`/p/${slug}/clones`}>Clones &amp; installation topology</Link>{" "}
-              — dev/prod clone health (ahead/behind, working-tree state, paths).
-              Admin-only actions are gated inside the page.
-            </p>
-          </section>
-        </>
-      )}
+      {/* T-0572 (Occam pass, D-0046): the "Advanced" links to the Workflow
+          (agent-manual dump, T-0358) and Clones (git topology, T-0359) pages
+          are gone with the pages themselves — manuals are edited as files in
+          the repo; clone/deploy state is ops-CLI territory. */}
 
       {/* T-0218 — personal (per-user) notification target, inherited
           global → server → project. Distinct from the project-wide binding

@@ -26,8 +26,6 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["projects"], dependencies=[Depends(require_auth)])
 
-_MAX_CONTENT_BYTES = 200 * 1024  # 200 KB
-
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
@@ -661,83 +659,7 @@ async def queue_deploy(
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.get("/{slug}/clones")
-async def get_clones(slug: str, request: Request, user: dict = Depends(require_auth)) -> dict:
-    """Clone health read-model for a project (T-0296, "Installation != Project").
-
-    Proxies the worker's ``clone_status`` action — the worker, not the API,
-    can run git on the on-host clones (the API container mounts only its own
-    data dirs). Read-only; any authed user may view."""
-    cfg: ApiConfig = request.app.state.api_config
-    if cfg.project(slug) is None:
-        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
-    client = request.app.state.worker_router.coordinator()
-    try:
-        return await client.call_action("clone_status", {"slug": slug}, timeout=30.0)
-    except WorkerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@router.post("/{slug}/clones/pull-master")
-async def post_pull_master(
-    slug: str, request: Request, admin: dict = Depends(require_admin)
-) -> dict:
-    """Fast-forward the prod (master) clone to origin (T-0296).
-
-    Admin-gated (server admin — not cross-server god-mode). Proxies the
-    worker's ``pull_master`` action, which does a fetch + ``merge --ff-only``
-    so a diverged/dirty prod clone is refused, not rewritten."""
-    cfg: ApiConfig = request.app.state.api_config
-    if cfg.project(slug) is None:
-        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
-    requested_by = (admin.get("username") if isinstance(admin, dict) else None) or "api"
-    client = request.app.state.worker_router.coordinator()
-    try:
-        return await client.call_action(
-            "pull_master", {"slug": slug, "requested_by": requested_by}, timeout=60.0
-        )
-    except WorkerError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@router.get("/{slug}/repo-agents-md")
-def get_repo_agents_md(slug: str, request: Request) -> dict:
-    cfg = request.app.state.api_config
-    proj = cfg.project(slug)
-    if proj is None:
-        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
-    path = proj.repo_path / "AGENTS.md"
-    # T-0131: missing AGENTS.md is a normal state (the FE's Workflow page
-    # seeds an empty editor either way). Returning 404 here only polluted
-    # the browser console — return 200 with empty content instead.
-    if not path.exists():
-        return {"content": ""}
-    return {"content": path.read_text(encoding="utf-8")}
-
-
-@router.put("/{slug}/repo-agents-md")
-def put_repo_agents_md(
-    slug: str, request: Request, payload: dict,
-    _perm: dict = Depends(require_project_member),  # T-0381: AGENTS.md is read by
-                                            # every agent each turn — non-admin
-                                            # rewrite = fleet-wide prompt injection.
-) -> dict:
-    cfg = request.app.state.api_config
-    proj = cfg.project(slug)
-    if proj is None:
-        raise HTTPException(status_code=404, detail=f"unknown project: {slug}")
-    content = payload.get("content") or ""
-    if not content:
-        raise HTTPException(status_code=400, detail="content must not be empty")
-    try:
-        encoded = content.encode("utf-8")
-    except UnicodeEncodeError:
-        raise HTTPException(status_code=400, detail="content must be valid UTF-8")
-    if len(encoded) > _MAX_CONTENT_BYTES:
-        raise HTTPException(status_code=400, detail="content exceeds 200 KB limit")
-    path = proj.repo_path / "AGENTS.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.rename(tmp, path)
-    return {"ok": True}
+# T-0572 (Occam pass, D-0046): the /{slug}/clones + /clones/pull-master proxy
+# routes (T-0296) and the /{slug}/repo-agents-md GET/PUT pair went with the
+# Clones and Workflow pages they served. The worker's clone_status/pull_master
+# actions remain (ops CLI territory); AGENTS.md is edited as a file in the repo.

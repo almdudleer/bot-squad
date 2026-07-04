@@ -24,7 +24,11 @@ import {
 // a node still routes to its kind's sub-page via kindRoute.
 
 // Shared with the three detail pages through the router <Outlet>.
-export type DocsOutletContext = { tree: ArtifactTreeData };
+// T-0572 (Occam pass, D-0046): `manage` is the section-wide write toggle —
+// the tree is a READ view by default; create/edit/promote/dismiss/delete
+// affordances only render when the user explicitly flips it on (those
+// actions fit the TG dialog / bsq CLI better than always-on web chrome).
+export type DocsOutletContext = { tree: ArtifactTreeData; manage: boolean };
 
 type FilterKind = ArtifactKind | "all";
 
@@ -48,6 +52,9 @@ export function DocsSection() {
   const tree = useArtifacts(slug, 0, showClosedFeedback);
 
   const [filter, setFilter] = useState<FilterKind>("all");
+
+  // T-0572: read-first — write affordances hidden until explicitly revealed.
+  const [manage, setManage] = useState(false);
 
   // Unified "+ New" (replaces the old per-tab "+ New doc" / "+ New use case"
   // split). A type picker chooses doc vs use-case; feedback is collected
@@ -158,17 +165,32 @@ export function DocsSection() {
         One view over every project artifact — docs (📄), use-cases (🎯) and user
         feedback (💬) — joined into a single cross-store tree (T-0283) that nests by{" "}
         <code>parent_doc_id</code>. Use the type filter to narrow the rail to one kind;
-        click any node to open its detail (docs edit in place, use-cases carry flows +
-        Run test, feedback can be Promoted to a task). <strong>+ New</strong> creates a
-        doc or use-case (feedback is collected out-of-band).
+        click any node to open its detail. The tree is read-first —{" "}
+        <strong>✎ Manage</strong> reveals the write affordances (create, edit,
+        promote/dismiss, delete) when you need to curate by hand; day-to-day
+        artifact writes flow in from the agents and the TG dialog.
       </PageHelp>
 
       {error && <div className="alert alert-danger py-1 small">{error}</div>}
 
       <div className="d-flex gap-4">
-        {/* Shared left rail: + New · type filter · the one cross-store tree */}
+        {/* Shared left rail: manage toggle · type filter · the one cross-store tree */}
         <div style={{ minWidth: "240px", flex: "0 0 240px" }}>
-          {/* Unified "+ New" with a type picker */}
+          {/* T-0572: the section-wide write toggle (read-first by default). */}
+          <div className="mb-2">
+            <button
+              type="button"
+              className={`btn btn-sm w-100 ${manage ? "btn-secondary" : "btn-outline-secondary"}`}
+              style={{ fontSize: "0.72rem" }}
+              aria-pressed={manage}
+              title="Reveal create/edit/promote/dismiss/delete affordances"
+              onClick={() => { setManage((v) => !v); setNewOpen(false); setNewKind(null); }}
+            >
+              ✎ Manage
+            </button>
+          </div>
+          {/* Unified "+ New" with a type picker (manage-gated, T-0572) */}
+          {manage && (
           <div className="mb-2" style={{ position: "relative" }}>
             <button
               type="button"
@@ -193,9 +215,10 @@ export function DocsSection() {
               </div>
             )}
           </div>
+          )}
 
           {/* doc-create form (only when "+ New → Doc" picked) */}
-          {newKind === "doc" && (
+          {manage && newKind === "doc" && (
             <div className="mb-3" style={{ border: "1px solid var(--mc-border)", borderRadius: "4px", padding: "0.6rem" }}>
               <label className="form-label" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }}>Category</label>
               <select className="form-select form-select-sm mb-2" style={{ fontSize: "0.74rem" }} value={newCategory} onChange={(e) => setNewCategory(e.target.value)}>
@@ -270,7 +293,7 @@ export function DocsSection() {
         {/* Detail pane — the active kind's page renders here, reading the shared
             tree from Outlet context. */}
         <div style={{ flex: 1, minWidth: 0 }}>
-          <Outlet context={{ tree } satisfies DocsOutletContext} />
+          <Outlet context={{ tree, manage } satisfies DocsOutletContext} />
         </div>
       </div>
     </div>

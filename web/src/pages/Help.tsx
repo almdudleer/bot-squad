@@ -269,8 +269,8 @@ git commit -m "feat: concise description of what this branch does"</code></pre>
       <section className="mc-help-section" id="scheduler">
         <h2>Scheduler</h2>
         <p>
-          The scheduler dashboard at <code>/scheduler</code> shows the APScheduler worker
-          running on the server. It displays:
+          Scheduler state renders inside each project&apos;s <strong>System
+          State</strong> view (the transparency page). It displays:
         </p>
         <ul>
           <li><strong>Worker uptime</strong> — how long the worker process has been running.</li>

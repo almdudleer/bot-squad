@@ -567,7 +567,8 @@ export function Vision() {
         number can be <strong>active</strong> at once — each active initiative
         gets at most one bound teamlead session (its dev workers cascade from
         that TL). Inactive initiatives are not piped into agent context.
-        Edit constitution + roles in the <strong>Workflow</strong> tab.
+        Constitution + role briefings are edited as files in the repo
+        (<code>vision/</code>), not in the UI.
       </PageHelp>
 
       {error && <div className="alert alert-danger">{error}</div>}

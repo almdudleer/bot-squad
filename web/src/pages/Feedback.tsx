@@ -20,7 +20,8 @@ export function Feedback() {
   const { slug = "" } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { tree } = useOutletContext<DocsOutletContext>();
+  // T-0572 (Occam pass): `manage` gates every write affordance — read-first.
+  const { tree, manage } = useOutletContext<DocsOutletContext>();
 
   const [files, setFiles] = useState<FeedbackFile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -172,33 +173,38 @@ export function Feedback() {
                 <span className="mc-badge mc-badge-dim" style={{ marginLeft: "0.4rem" }}>dismissed</span>
               )}
             </div>
-            <div className="d-flex gap-2">
-              <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(selectedFile.content)}>
-                Edit
-              </button>
-              <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => openPromote(selectedFile)}>
-                Promote to task
-              </button>
-              {/* item-12: dismiss = the dominant operator action (acknowledge +
-                  drop without making a task). Hidden once already closed. */}
-              {selectedFile.status !== "dismissed" && selectedFile.status !== "promoted" && (
-                <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={() => handleDismiss(selectedFile)}>
-                  Dismiss
+            {manage && (
+              <div className="d-flex gap-2">
+                <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => setDraft(selectedFile.content)}>
+                  Edit
                 </button>
-              )}
-            </div>
+                <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.72rem" }} onClick={() => openPromote(selectedFile)}>
+                  Promote to task
+                </button>
+                {/* item-12: dismiss = the dominant operator action (acknowledge +
+                    drop without making a task). Hidden once already closed. */}
+                {selectedFile.status !== "dismissed" && selectedFile.status !== "promoted" && (
+                  <button type="button" className="btn btn-outline-secondary btn-sm" style={{ fontSize: "0.72rem" }} disabled={busy} onClick={() => handleDismiss(selectedFile)}>
+                    Dismiss
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           {/* T-0283/D-0029: cross-store nesting — set/clear this theme's
-              parent (PUT /feedback/{name}/parent, cycle-safe). */}
-          <ReparentControl
-            slug={slug}
-            data={tree}
-            selfId={selfId}
-            currentParentId={selectedFile.parent_doc_id}
-            busy={busy}
-            onSetParent={setFbParent}
-          />
+              parent (PUT /feedback/{name}/parent, cycle-safe).
+              T-0572: curation control, manage-gated. */}
+          {manage && (
+            <ReparentControl
+              slug={slug}
+              data={tree}
+              selfId={selfId}
+              currentParentId={selectedFile.parent_doc_id}
+              busy={busy}
+              onSetParent={setFbParent}
+            />
+          )}
           {childArtifacts.length > 0 && (
             <div className="mb-3">
               <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginBottom: "0.25rem" }}>

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# T-0574 test-suite PATH shim. Production wraps deploy children in
+# `systemd-run --user --scope ... -- <argv>`; without this shim the suite
+# spawns REAL bot-squad-deploy-<uuid>.scope units. Record the call, then exec
+# the wrapped argv (everything after `--`) — mirroring --scope exec semantics
+# so proc.pid is the child and executor tests keep running the real recipe,
+# just without systemd.
+LOG="${BOT_SQUAD_TEST_FAKE_SYSTEMCTL_LOG:-}"
+if [ -n "$LOG" ]; then
+  printf 'systemd-run %s\n' "$*" >> "$LOG" 2>/dev/null || true
+fi
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    exec "$@"
+  fi
+  shift
+done
+exit 0

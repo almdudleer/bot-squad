@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# T-0574 test-suite PATH shim. Tests execute generated deploy/apply scripts
+# whose `systemctl --user restart bot-squad-worker` would restart the LIVE
+# worker service. This shim records the call and succeeds without touching
+# systemd. Committed (not tmp-generated) because detached `sleep && systemctl`
+# children can fire AFTER the suite exits — the inherited PATH must still
+# point at an existing file.
+LOG="${BOT_SQUAD_TEST_FAKE_SYSTEMCTL_LOG:-}"
+if [ -n "$LOG" ]; then
+  printf 'systemctl %s\n' "$*" >> "$LOG" 2>/dev/null || true
+fi
+exit 0

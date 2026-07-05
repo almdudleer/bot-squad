@@ -425,31 +425,6 @@ export type TelemetryResponse = {
   caps?: TelemetryCaps;
 };
 
-// T-0280: one weighed reuse-vs-spawn candidate (worker dispatch_decision /
-// T-0237 Layer-2). `eligible` candidates can be resumed instead of spawning;
-// `reject` explains why an ineligible one was passed over.
-export type ReuseCandidate = {
-  sid: string;
-  role?: string;
-  live: boolean;
-  idle: boolean;
-  initiative_match: boolean;
-  context_pct: number;
-  eligible: boolean;
-  reject?: string | null;
-};
-
-// T-0280: the worker's reuse-before-spawn recommendation for a task.
-export type ReuseDecision = {
-  ok: boolean;
-  task_id: string;
-  task_initiative: string | null;
-  decision: "reuse" | "spawn";
-  target_sid: string | null;
-  reason: string;
-  candidates: ReuseCandidate[];
-};
-
 export type RunRow = {
   id: string;
   target: string;
@@ -987,13 +962,6 @@ export const api = {
   // T-0210: resource telemetry (per-session context/memory + quota burndown).
   telemetry: (slug: string) =>
     call<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
-  // T-0280: reuse-vs-spawn recommendation for a backlog task (proxies the
-  // worker dispatch_decision action). Powers the New-session "resume before
-  // spawn" candidate strip.
-  reuseCandidates: (slug: string, task: string) =>
-    call<ReuseDecision>(
-      `/api/projects/${slug}/sessions/reuse-candidates?task=${encodeURIComponent(task)}`,
-    ),
   // T-0437: pin/unpin a session within the project (admin-gated server-side via
   // require_project_member). The pin is a user signal surfaced in the UI; it
   // does NOT change orchestration. Pins are per-project and stamped back onto
@@ -1024,19 +992,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(opts ?? {}),
     }),
-  spawnSession: (slug: string, window: string, initial_prompt?: string, task_id?: string, initiative?: string) =>
-    call(`/api/projects/${slug}/sessions`, {
-      method: "POST",
-      body: JSON.stringify({ window, initial_prompt, task_id, initiative }),
-    }),
-  devSpawnRequest: (slug: string, tl_sid: string, task_id: string | undefined, instructions: string) =>
-    call<{ ok: boolean; delivered_to: string[] }>(
-      `/api/projects/${slug}/dev-spawn-request`,
-      {
-        method: "POST",
-        body: JSON.stringify({ tl_sid, task_id, instructions }),
-      },
-    ),
+  // T-0594 (T-0588b): spawnSession / devSpawnRequest / reuseCandidates client
+  // methods removed — the Sessions page is read + minimal lifecycle controls;
+  // spawning is TG/CLI-driven. The API routes they called remain live (they
+  // are the TG/CLI control plane's substrate).
   bindTask: (slug: string, sid: string, task_id: string) =>
     call<{ ok: boolean; sid: string; task_id: string; extras: string[] }>(
       `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/bind/task`,
@@ -1228,7 +1187,6 @@ export type ProjectApi = Pick<
   | "vision"
   | "sessions"
   | "telemetry"
-  | "reuseCandidates"
   | "createTask"
   | "patchTask"
   | "patchTaskPriority"
@@ -1242,8 +1200,6 @@ export type ProjectApi = Pick<
   | "bindTask"
   | "archiveSession"
   | "unarchiveSession"
-  | "spawnSession"
-  | "devSpawnRequest"
   | "peerSend"
   | "peerInboxRead"
   | "peerInboxWait"

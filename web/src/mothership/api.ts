@@ -29,7 +29,6 @@ import type {
   CreateTaskBody,
   Project,
   ProjectApi,
-  ReuseDecision,
   SessionRow,
   Task,
   TelemetryResponse,
@@ -491,13 +490,6 @@ export function apiFor(serverId: string): ServerApi {
     vision: (slug) => fwd<VisionFile[]>(`/api/projects/${slug}/vision`),
     sessions: (slug) => fwd<SessionRow[]>(`/api/projects/${slug}/sessions`),
     telemetry: (slug) => fwd<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
-    // T-0329: mirror reuseCandidates so the mothership-mounted Sessions view's
-    // New-session reuse strip proxies to the target server (matches the
-    // singleton path in web/src/api.ts).
-    reuseCandidates: (slug, task) =>
-      fwd<ReuseDecision>(
-        `/api/projects/${slug}/sessions/reuse-candidates?task=${encodeURIComponent(task)}`,
-      ),
     createTask: (slug, t: CreateTaskBody) =>
       fwd<Task>(`/api/projects/${slug}/backlog`, {
         method: "POST",
@@ -566,19 +558,9 @@ export function apiFor(serverId: string): ServerApi {
         `/api/projects/${slug}/sessions/${encodeURIComponent(sid)}/unarchive`,
         { method: "POST" },
       ),
-    spawnSession: (slug, window, initial_prompt, task_id, initiative) =>
-      fwd(`/api/projects/${slug}/sessions`, {
-        method: "POST",
-        body: JSON.stringify({ window, initial_prompt, task_id, initiative }),
-      }),
-    devSpawnRequest: (slug, tl_sid, task_id, instructions) =>
-      fwd<{ ok: boolean; delivered_to: string[] }>(
-        `/api/projects/${slug}/dev-spawn-request`,
-        {
-          method: "POST",
-          body: JSON.stringify({ tl_sid, task_id, instructions }),
-        },
-      ),
+    // T-0594 (T-0588b): spawnSession / devSpawnRequest / reuseCandidates
+    // mirrors removed with the ProjectApi surface cut (Sessions page is
+    // read + minimal lifecycle controls; spawning is TG/CLI-driven).
     peerSend: (slug, fromSid, to, text) =>
       fwd<{ ok: boolean; delivered_to: string[] }>(
         `/api/projects/${slug}/peer/send`,

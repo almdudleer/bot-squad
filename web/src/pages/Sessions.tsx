@@ -1,21 +1,12 @@
 import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
-import type { ReuseDecision, SessionRow, Task, VisionFile } from "../api";
-// T-0329: reuseCandidates is now on the shared ProjectApi surface (mirrored in
-// mothership/api.ts), so the reuse lookup goes through the context client like
-// resume/spawn — the mothership-mounted Sessions view proxies to the target
-// server instead of hitting the local single-install singleton.
+import type { SessionRow, Task, VisionFile } from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
-import { Modal } from "../components/Modal";
 import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
-import { AutopilotDialog, type AutopilotTarget } from "../components/AutopilotDialog";
 import { Select } from "../components/Select";
 import {
-  operatorWindow,
-  prodTeamleadWindow,
-  qaWindow,
   sessionActivity,
   sessionLabel,
   sessionLiveness,
@@ -28,7 +19,6 @@ import { PageHelp } from "../components/PageHelp";
 import { PeerInbox } from "../components/PeerInbox";
 import { ResourceCapsPanel } from "../components/ResourceCapsPanel";
 import { TelemetryPanel } from "../components/TelemetryPanel";
-import { uiSidFor } from "../peerInbox";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -368,53 +358,16 @@ export function Sessions() {
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // New session modal
-  const [modalOpen, setModalOpen] = useState(false);
-  const [newRole, setNewRole] = useState<
-    "operator" | "teamlead" | "dev" | "prod-teamlead" | "qa" | null
-  >(null);
-  const [newWindow, setNewWindow] = useState("");
-  const [newPrompt, setNewPrompt] = useState("");
-  const [newTaskId, setNewTaskId] = useState("");
-  const [newInitiative, setNewInitiative] = useState("");
-  const [newTlSid, setNewTlSid] = useState("");
-  const [newInstructions, setNewInstructions] = useState("");
-  const [backlog, setBacklog] = useState<Task[]>([]);
-  const [initiatives, setInitiatives] = useState<VisionFile[]>([]);
-  const [modalError, setModalError] = useState<string | null>(null);
-  const [modalInfo, setModalInfo] = useState<string | null>(null);
-  const [spawning, setSpawning] = useState(false);
-  // T-0280: reuse-before-spawn — the worker's reuse-vs-spawn recommendation
-  // for the task selected in the dev form. Drives the candidate strip.
-  const [reuse, setReuse] = useState<ReuseDecision | null>(null);
-  const [reuseLoading, setReuseLoading] = useState(false);
-  const [reuseError, setReuseError] = useState<string | null>(null);
-  const [resumingSid, setResumingSid] = useState<string | null>(null);
-
-  // T-0006: post-spawn toast surfacing the copyable tmux attach for the
-  // session that just appeared. Computed by diffing the SID set before and
-  // after the spawn call so we don't need a return-value contract change on
-  // api.spawnSession.
-  const [spawnNotice, setSpawnNotice] = useState<{ sid: string; window: string; tmuxSession: string } | null>(null);
-
-  // Send-message modal (cross-session bus)
-  const [sendOpen, setSendOpen] = useState(false);
-  const [sendTarget, setSendTarget] = useState<string>("");
-  const [sendText, setSendText] = useState("");
-  const [sendError, setSendError] = useState<string | null>(null);
-  const [sendInfo, setSendInfo] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
+  // meUsername feeds PeerInbox (the kept reply surface, T-0127).
   const [meUsername, setMeUsername] = useState<string>("stakeholder");
 
-  // T-0572 (Occam pass, D-0046): the page is a READ-FIRST status board —
-  // day-to-day steering lives in the TG dialog / operator, so the inline
-  // process controls (spawn, per-row kebabs, group autopilot) hide behind
-  // this one explicit toggle instead of cluttering every row.
+  // T-0572 (Occam pass, D-0046) + T-0594 (T-0588b): the page is a READ-FIRST
+  // status board — steering lives in the TG dialog / operator, so only the
+  // minimal lifecycle controls (pause/suspend/resume, archive/unarchive,
+  // pin/unpin) hide behind this one explicit toggle. Spawn / send-msg /
+  // autopilot web affordances were cut; their API routes remain the TG/CLI
+  // control plane's substrate.
   const [showControls, setShowControls] = useState(false);
-
-  // T-0153: autopilot dialog (kebab on a team lane or a single session row).
-  const [autopilotOpen, setAutopilotOpen] = useState(false);
-  const [autopilotTarget, setAutopilotTarget] = useState<AutopilotTarget | null>(null);
 
   // Row expansion (click-through cwd / metadata detail) and archived
   // section toggle.
@@ -547,9 +500,9 @@ export function Sessions() {
   }, [slug]);
 
   // T-0040: task→initiative map for the dev-under-TL tree heuristic.
-  // Backlog is also loaded inside openModal but cached here for the always-on
-  // tree render. A 30s refresh is enough — task↔initiative bindings change
-  // far less often than session activity.
+  // Backlog cached here for the always-on tree render. A 30s refresh is
+  // enough — task↔initiative bindings change far less often than session
+  // activity.
   const [taskBacklog, setTaskBacklog] = useState<Task[]>([]);
   useEffect(() => {
     let alive = true;
@@ -615,63 +568,6 @@ export function Sessions() {
     }
   }
 
-  // T-0280: fetch the reuse-vs-spawn recommendation for the dev form's
-  // selected task so we can offer "resume before spawn". Keyed on the task
-  // (the worker derives its initiative); cleared when no task is picked.
-  useEffect(() => {
-    if (!modalOpen || newRole !== "dev" || !newTaskId) {
-      setReuse(null);
-      setReuseError(null);
-      setReuseLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setReuseLoading(true);
-    setReuseError(null);
-    api
-      .reuseCandidates(slug, newTaskId)
-      .then((r) => {
-        if (!cancelled) setReuse(r);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) {
-          setReuse(null);
-          setReuseError(String(e));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setReuseLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [modalOpen, newRole, newTaskId, slug]);
-
-  // T-0280: resume an existing live pro instead of spawning a fresh one.
-  // Calls the existing resume endpoint, then closes the modal + reloads.
-  // T-0389/audit item 6: thread the NEW task into the reused session. The reuse
-  // modal was opened to STAFF `newTaskId` (the reuse-candidate list is fetched
-  // for it), but resume_session alone keeps the session's OLD binding — so the
-  // operator's intent ("this session now works THIS task") silently dropped.
-  // T-0407: forward the task straight through resume — the worker adopts an
-  // empty primary as task_id (T-0166), so the reused session works THIS task as
-  // its PRIMARY in ONE round-trip. (The old path resumed then bind_task'd, which
-  // only appended to extra_task_ids, left the old binding primary, and could
-  // fail "not a dev session" on a suspended resume.) A bare resume is unchanged.
-  async function handleResumeFromModal(sid: string) {
-    setReuseError(null);
-    setResumingSid(sid);
-    try {
-      await api.resumeSession(slug, sid, newTaskId ? { task_id: newTaskId } : undefined);
-      setModalOpen(false);
-      load();
-    } catch (e: unknown) {
-      setReuseError(String(e));
-    } finally {
-      setResumingSid(null);
-    }
-  }
-
   async function handleArchive(sid: string) {
     setActionError(null);
     try {
@@ -693,95 +589,6 @@ export function Sessions() {
       setActionError(String(e));
     }
   }
-
-  function openSendModal(sid: string) {
-    setSendTarget(sid);
-    setSendText("");
-    setSendError(null);
-    setSendInfo(null);
-    setSendOpen(true);
-  }
-
-  // T-0153: open the autopilot dialog for a target (session / team / project).
-  function openAutopilot(target: AutopilotTarget) {
-    setAutopilotTarget(target);
-    setAutopilotOpen(true);
-  }
-
-  async function handleSend() {
-    if (!sendText.trim()) {
-      setSendError("Message text is required");
-      return;
-    }
-    setSending(true);
-    setSendError(null);
-    setSendInfo(null);
-    try {
-      // from_sid is informational; format S-<user>-ui-p0 so the API's
-      // user-prefix check passes for the logged-in user.
-      const fromSid = uiSidFor(meUsername);
-      const result = await api.peerSend(slug, fromSid, sendTarget, sendText.trim());
-      setSendInfo(`Delivered to: ${result.delivered_to.join(", ") || "(none)"}`);
-      setSendText("");
-    } catch (e: unknown) {
-      setSendError(String(e));
-    } finally {
-      setSending(false);
-    }
-  }
-
-  function openModal(prefill?: {
-    role?: "operator" | "teamlead" | "dev" | "prod-teamlead" | "qa";
-    taskId?: string;
-    initiative?: string;
-  }) {
-    // T-0336 (reframe: sessions are system-managed processes): lean the
-    // new-session flow toward the system-managed path. With no explicit role
-    // prefill (the plain "+ New session" entry), default to the delegated dev
-    // flow — the recommended path where the system reuses an existing session
-    // (T-0237/T-0280 reuse-vs-spawn) or delegates a fresh one to a teamlead,
-    // instead of making the operator hand-pick one of five roles. Deep-links
-    // that carry an explicit role still honour it.
-    setNewRole(prefill?.role ?? "dev");
-    setNewWindow("");
-    setNewPrompt("");
-    setNewTaskId(prefill?.taskId ?? "");
-    setNewInitiative(prefill?.initiative ?? "");
-    setNewTlSid("");
-    setNewInstructions("");
-    setModalError(null);
-    setModalInfo(null);
-    setModalOpen(true);
-    api.backlog(slug)
-      .then((rows) => setBacklog(rows.filter((t) => t.status === "open" || t.status === "in_progress" || t.status === "reopened")))
-      .catch(() => setBacklog([]));
-    api.vision(slug)
-      .then((files) => setInitiatives(
-        files.filter((f) => f.name.startsWith("initiatives/") && !f.name.endsWith("/_TEMPLATE.md")),
-      ))
-      .catch(() => setInitiatives([]));
-  }
-
-  // Phase 6: deep-link entry. Project / Roadmap pages navigate here with
-  // ?role=dev&task=T-NNNN  or  ?role=teamlead&initiative=foo.md to open the
-  // New Session modal pre-filled. Clear the params afterwards so refresh
-  // doesn't keep re-opening the modal.
-  useEffect(() => {
-    const roleParam = searchParams.get("role");
-    if (
-      roleParam !== "dev" &&
-      roleParam !== "teamlead" &&
-      roleParam !== "operator" &&
-      roleParam !== "prod-teamlead" &&
-      roleParam !== "qa"
-    )
-      return;
-    const taskId = searchParams.get("task") ?? undefined;
-    const initiative = searchParams.get("initiative") ?? undefined;
-    openModal({ role: roleParam, taskId, initiative });
-    setSearchParams({}, { replace: true });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams]);
 
   // T-0099: deep-link to a specific session. The URL carries ?sid=S-...;
   // once sessions are loaded we make sure the row will render (clear any
@@ -847,13 +654,6 @@ export function Sessions() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetSid, sessions]);
-
-  // Active TLs: role === "teamlead" and live. T-0141: keys off the
-  // authoritative role instead of the old "no task_id" inference, so the
-  // dev-spawn target picker no longer offers every task-less session.
-  const activeTeamleads: SessionRow[] = (sessions ?? []).filter(
-    (s) => s.status === "active" && sessionRole(s) === "teamlead" && !s.archived,
-  );
 
   // Split visible vs archived for the two-section layout.
   const visibleSessions: SessionRow[] = (sessions ?? []).filter((s) => !s.archived);
@@ -1087,14 +887,9 @@ export function Sessions() {
     } else if (s.status === "suspended") {
       acts.push({ label: "Resurrect", onClick: () => handleResume(s.sid), variant: "success" });
     }
-    acts.push({ label: "Send msg", onClick: () => openSendModal(s.sid) });
-    // T-0153: per-session autopilot — hand this session a time-boxed brief.
-    if (!isSuspended) {
-      acts.push({
-        label: "Autopilot…",
-        onClick: () => openAutopilot({ kind: "session", ref: s.sid, label: s.sid }),
-      });
-    }
+    // T-0594 (T-0588b): "Send msg" and "Autopilot…" web affordances cut —
+    // messaging lives in TG /say + PeerInbox; autopilot steering stays on the
+    // Board and the TG/CLI control plane.
     acts.push({
       label: "Archive",
       onClick: () => handleArchive(s.sid),
@@ -1325,167 +1120,6 @@ export function Sessions() {
     );
   }
 
-  async function handleSpawnTeamlead() {
-    if (!newWindow.trim()) {
-      setModalError("Window name is required");
-      return;
-    }
-    setSpawning(true);
-    setModalError(null);
-    try {
-      const before = new Set((sessions ?? []).map((s) => s.sid));
-      await api.spawnSession(
-        slug,
-        newWindow.trim(),
-        newPrompt.trim() || undefined,
-        undefined,
-        newInitiative || undefined,
-      );
-      // T-0006: reload inline so we can diff old/new SIDs and surface the
-      // attach command for the freshly spawned session.
-      try {
-        const after = await api.sessions(slug);
-        setSessions(after);
-        setError(null);
-        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
-        if (fresh) {
-          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
-        }
-      } catch {
-        // Best-effort: if the post-spawn fetch fails, fall back to the
-        // regular poll loop.
-        load();
-      }
-      setModalOpen(false);
-    } catch (e: unknown) {
-      setModalError(String(e));
-    } finally {
-      setSpawning(false);
-    }
-  }
-
-  // T-0041: spawn an operator session. The window is normalised so it always
-  // carries the operator marker (…-operator) and therefore resolves to
-  // operator.md via the worker's _derive_role + the SessionStart hook — never a
-  // silent dev. Operators are not bound to a task or initiative.
-  async function handleSpawnOperator() {
-    const window = operatorWindow(newWindow);
-    setSpawning(true);
-    setModalError(null);
-    try {
-      const before = new Set((sessions ?? []).map((s) => s.sid));
-      await api.spawnSession(slug, window, newPrompt.trim() || undefined);
-      try {
-        const after = await api.sessions(slug);
-        setSessions(after);
-        setError(null);
-        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
-        if (fresh) {
-          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
-        }
-      } catch {
-        load();
-      }
-      setModalOpen(false);
-    } catch (e: unknown) {
-      setModalError(String(e));
-    } finally {
-      setSpawning(false);
-    }
-  }
-
-  // T-0197: spawn a prod-teamlead session. Like the operator, the window is
-  // normalised so it always carries the -prod-tl marker and therefore resolves
-  // to prod-teamlead.md via _derive_role + the SessionStart hook — never a
-  // silent dev. Prod-TLs are not bound to a task or initiative (they live in
-  // the prod clone and watch the deploy queue).
-  async function handleSpawnProdTeamlead() {
-    const window = prodTeamleadWindow(newWindow);
-    setSpawning(true);
-    setModalError(null);
-    try {
-      const before = new Set((sessions ?? []).map((s) => s.sid));
-      await api.spawnSession(slug, window, newPrompt.trim() || undefined);
-      try {
-        const after = await api.sessions(slug);
-        setSessions(after);
-        setError(null);
-        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
-        if (fresh) {
-          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
-        }
-      } catch {
-        load();
-      }
-      setModalOpen(false);
-    } catch (e: unknown) {
-      setModalError(String(e));
-    } finally {
-      setSpawning(false);
-    }
-  }
-
-  // T-0197: spawn a QA session. The window is normalised to carry the -qa
-  // marker so it resolves to qa.md. QA lives in the dev clone and picks up
-  // totest tickets; it is not bound to a single task at spawn time.
-  async function handleSpawnQa() {
-    const window = qaWindow(newWindow);
-    setSpawning(true);
-    setModalError(null);
-    try {
-      const before = new Set((sessions ?? []).map((s) => s.sid));
-      await api.spawnSession(slug, window, newPrompt.trim() || undefined);
-      try {
-        const after = await api.sessions(slug);
-        setSessions(after);
-        setError(null);
-        const fresh = after.find((s) => !before.has(s.sid) && !s.archived);
-        if (fresh) {
-          setSpawnNotice({ sid: fresh.sid, window: fresh.window, tmuxSession: fresh.tmux_session || slug });
-        }
-      } catch {
-        load();
-      }
-      setModalOpen(false);
-    } catch (e: unknown) {
-      setModalError(String(e));
-    } finally {
-      setSpawning(false);
-    }
-  }
-
-  async function handleDevSpawnRequest() {
-    if (!newTlSid) {
-      setModalError("Pick a teamlead to delegate to");
-      return;
-    }
-    if (!newInstructions.trim()) {
-      setModalError("Instructions for the teamlead are required");
-      return;
-    }
-    setSpawning(true);
-    setModalError(null);
-    setModalInfo(null);
-    try {
-      const result = await api.devSpawnRequest(
-        slug,
-        newTlSid,
-        newTaskId || undefined,
-        newInstructions.trim(),
-      );
-      setModalInfo(
-        `Request sent to teamlead ${result.delivered_to.join(", ")}. Watch their session for the spawn.`,
-      );
-      // Reset just the dev-specific inputs; user can dismiss when ready.
-      setNewInstructions("");
-      setNewTaskId("");
-    } catch (e: unknown) {
-      setModalError(String(e));
-    } finally {
-      setSpawning(false);
-    }
-  }
-
   // ---- Initiative grouping for the sessions table ----
   type SessInitMeta = {
     key: string;
@@ -1713,23 +1347,8 @@ export function Sessions() {
                 👤 {u}
               </span>
             ))}
-            {/* T-0153: team-level autopilot — kebab on the tmux-session lane.
-                T-0572: gated behind the ⚙ Controls toggle (read-first board). */}
-            {!isNone && showControls && (
-              <div className="ms-auto" onClick={(e) => e.stopPropagation()}>
-                <RowActionsMenu
-                  actions={[
-                    {
-                      label: "Autopilot…",
-                      // T-0383: display label uses "group" (process vocab); the
-                      // `kind: "team"` value is API contract (autopilotStart) — unchanged.
-                      onClick: () => openAutopilot({ kind: "team", ref: key, label: `group ${key}` }),
-                    },
-                  ]}
-                  ariaLabel={`Group actions for ${key}`}
-                />
-              </div>
-            )}
+            {/* T-0594 (T-0588b): the lane "Autopilot…" kebab was cut with the
+                rest of the autopilot web affordances (Board keeps its own). */}
           </div>
         </td>
       </tr>
@@ -1915,16 +1534,11 @@ export function Sessions() {
             type="button"
             className={`btn btn-sm ${showControls ? "btn-secondary" : "btn-outline-secondary"}`}
             aria-pressed={showControls}
-            title="Reveal the inline process controls (spawn, per-row actions). Day-to-day steering lives in the Telegram dialog."
+            title="Reveal the per-row lifecycle controls (pause/suspend/resume, archive, pin). Steering — spawning, messaging, autopilot — lives in the Telegram dialog."
             onClick={() => setShowControls((v) => !v)}
           >
             ⚙ Controls
           </button>
-          {showControls && (
-            <button type="button" className="btn btn-primary btn-sm" onClick={() => openModal()}>
-              + New session
-            </button>
-          )}
         </div>
       </div>
       <PageHelp>
@@ -1935,8 +1549,10 @@ export function Sessions() {
         in that session, or use <code>/sessions</code>,
         {" "}<code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
         <div className="mt-2">
-          <strong>⚙ Controls</strong> reveals the manual affordances (spawn,
-          pause/suspend/resurrect, archive) when you need to intervene by hand.
+          <strong>⚙ Controls</strong> reveals the minimal lifecycle affordances
+          (pause/suspend/resume, archive/unarchive, pin) when you need to
+          intervene by hand. Spawning sessions, messaging and autopilot run
+          through the Telegram bot / CLI.
         </div>
       </PageHelp>
 
@@ -1951,32 +1567,6 @@ export function Sessions() {
           in server admin. Read+set affordance here; server-level enforcement
           (worker spawn-time checks) stays the source of truth underneath. */}
       <ResourceCapsPanel slug={slug} />
-
-      {/* T-0006: post-spawn toast. Dismisses on click of the close button,
-          stays sticky until then so the user has time to copy the command. */}
-      {spawnNotice && (
-        <div
-          className="alert alert-success d-flex justify-content-between align-items-center flex-wrap gap-2"
-          role="status"
-        >
-          <span style={{ fontSize: "0.85rem" }}>
-            Spawned <code style={{ fontFamily: "var(--mc-mono)" }}>{spawnNotice.window}</code>.
-            Attach with:{" "}
-            <CopyableTmuxAttach
-              session={spawnNotice.tmuxSession}
-              window={spawnNotice.window}
-              size="md"
-            />
-          </span>
-          <button
-            type="button"
-            className="btn-close"
-            aria-label="Dismiss"
-            style={{ filter: "invert(1) opacity(0.5)" }}
-            onClick={() => setSpawnNotice(null)}
-          />
-        </div>
-      )}
 
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
@@ -2105,15 +1695,6 @@ export function Sessions() {
         <div className="mc-empty">
           <div className="mc-empty-icon">◯</div>
           <div>No sessions for <strong>{slug}</strong></div>
-          {showControls && (
-            <button
-              type="button"
-              className="btn btn-outline-primary btn-sm mt-3"
-              onClick={() => openModal()}
-            >
-              + New session
-            </button>
-          )}
         </div>
       )}
 
@@ -2374,521 +1955,6 @@ export function Sessions() {
           </div>
         </div>
       )}
-
-      {/* New session modal */}
-      <Modal
-        open={modalOpen}
-        title="New session"
-        onClose={() => setModalOpen(false)}
-        footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={() => setModalOpen(false)}>
-              {newRole && modalInfo ? "Close" : "Cancel"}
-            </button>
-            {newRole === "operator" && (
-              <button type="button" className="btn btn-primary" onClick={handleSpawnOperator} disabled={spawning}>
-                {spawning ? "Spawning…" : "Spawn operator"}
-              </button>
-            )}
-            {newRole === "teamlead" && (
-              <button type="button" className="btn btn-primary" onClick={handleSpawnTeamlead} disabled={spawning}>
-                {spawning ? "Spawning…" : "Spawn teamlead"}
-              </button>
-            )}
-            {newRole === "prod-teamlead" && (
-              <button type="button" className="btn btn-primary" onClick={handleSpawnProdTeamlead} disabled={spawning}>
-                {spawning ? "Spawning…" : "Spawn prod-TL"}
-              </button>
-            )}
-            {newRole === "qa" && (
-              <button type="button" className="btn btn-primary" onClick={handleSpawnQa} disabled={spawning}>
-                {spawning ? "Spawning…" : "Spawn QA"}
-              </button>
-            )}
-            {newRole === "dev" && (
-              <button type="button" className="btn btn-primary" onClick={handleDevSpawnRequest} disabled={spawning}>
-                {spawning ? "Sending…" : "Send to teamlead"}
-              </button>
-            )}
-          </>
-        }
-      >
-        {modalError && <div className="alert alert-danger">{modalError}</div>}
-        {modalInfo && <div className="alert alert-success">{modalInfo}</div>}
-
-        {/* T-0336 (reframe: sessions are system-managed processes): nudge the
-            operator toward letting the system manage the session rather than
-            hand-picking a role. The recommended path is the delegated dev flow
-            below (default-selected), which reuses an existing live session
-            (T-0237/T-0280) or delegates a fresh one to a teamlead. */}
-        <div
-          className="mb-3"
-          data-testid="system-managed-nudge"
-          style={{
-            border: "1px solid var(--mc-accent, #2f6feb)",
-            background: "rgba(47, 111, 235, 0.07)",
-            borderRadius: 6,
-            padding: "0.5rem 0.7rem",
-            fontSize: "0.8rem",
-          }}
-        >
-          <strong>Let the system manage it</strong>{" "}
-          <span className="mc-badge mc-badge-ok" style={{ marginLeft: "0.25rem" }}>
-            recommended
-          </span>
-          <div style={{ fontSize: "0.74rem", color: "var(--mc-text-mid)", marginTop: "0.25rem" }}>
-            Sessions are system-managed processes. The recommended path delegates
-            to a teamlead and <strong>reuses an existing live session</strong> when
-            one fits (reuse-vs-spawn) instead of always spawning a fresh pane. Pick
-            a specific role below only if you need to.
-          </div>
-        </div>
-
-        {/* Step 1: Role picker — manual override, demoted below the nudge. */}
-        <div className="mb-3">
-          <div style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)", marginBottom: "0.5rem" }}>
-            Or pick a specific role manually:
-          </div>
-          <div className="d-flex gap-2">
-            <button
-              type="button"
-              className={`btn ${newRole === "operator" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
-              onClick={() => { setNewRole("operator"); setModalError(null); setModalInfo(null); }}
-            >
-              Operator
-              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
-                drives projects, spawns teamleads
-              </div>
-            </button>
-            <button
-              type="button"
-              className={`btn ${newRole === "teamlead" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
-              onClick={() => { setNewRole("teamlead"); setModalError(null); setModalInfo(null); }}
-            >
-              Teamlead
-              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
-                drives an initiative, spawns devs
-              </div>
-            </button>
-            <button
-              type="button"
-              className={`btn ${newRole === "dev" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
-              onClick={() => { setNewRole("dev"); setModalError(null); setModalInfo(null); }}
-            >
-              Dev worker{" "}
-              <span className="mc-badge mc-badge-ok" style={{ fontWeight: 600 }}>
-                recommended
-              </span>
-              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
-                system-managed — reuse or delegate via a teamlead
-              </div>
-            </button>
-          </div>
-          {/* T-0197: second row — the prod-ops + QA roles, less common than the
-              feature-dev trio above but now first-class spawnable. */}
-          <div className="d-flex gap-2 mt-2">
-            <button
-              type="button"
-              className={`btn ${newRole === "prod-teamlead" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
-              onClick={() => { setNewRole("prod-teamlead"); setModalError(null); setModalInfo(null); }}
-            >
-              Prod-Teamlead
-              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
-                cuts releases from the prod clone
-              </div>
-            </button>
-            <button
-              type="button"
-              className={`btn ${newRole === "qa" ? "btn-primary" : "btn-outline-primary"} flex-fill`}
-              onClick={() => { setNewRole("qa"); setModalError(null); setModalInfo(null); }}
-            >
-              QA
-              <div style={{ fontSize: "0.72rem", fontWeight: 400, opacity: 0.8, marginTop: "0.15rem" }}>
-                verifies totest tickets vs DoD
-              </div>
-            </button>
-          </div>
-        </div>
-
-        {/* Step 2 (operator): Operator form. The window is normalised to carry
-            the -operator marker so the session resolves to operator.md (T-0041). */}
-        {newRole === "operator" && (
-          <>
-            <hr style={{ borderColor: "var(--mc-border)" }} />
-            <div className="mb-3">
-              <label className="form-label">
-                Window name{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
-                  (optional — defaults to "operator")
-                </span>
-              </label>
-              <input
-                className="form-control"
-                value={newWindow}
-                onChange={(e) => setNewWindow(e.target.value)}
-                placeholder="e.g. operator, bot-squad"
-                autoFocus
-              />
-              <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
-                Spawns as{" "}
-                <code style={{ color: "var(--mc-accent)" }}>{operatorWindow(newWindow)}</code>{" "}
-                → resolves to the operator role (operator.md).
-              </div>
-            </div>
-            <div className="mb-3">
-              <label className="form-label">
-                Initial prompt{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
-              </label>
-              <textarea
-                className="form-control"
-                rows={4}
-                value={newPrompt}
-                onChange={(e) => setNewPrompt(e.target.value)}
-                placeholder="Type a message to send immediately after claude starts…"
-              />
-            </div>
-          </>
-        )}
-
-        {/* Step 2 (prod-teamlead): like operator, the window is normalised to
-            carry the -prod-tl marker so the session resolves to
-            prod-teamlead.md (T-0197). Not bound to a task/initiative. */}
-        {newRole === "prod-teamlead" && (
-          <>
-            <hr style={{ borderColor: "var(--mc-border)" }} />
-            <div className="mb-3">
-              <label className="form-label">
-                Window name{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
-                  (optional — defaults to "prod-tl")
-                </span>
-              </label>
-              <input
-                className="form-control"
-                value={newWindow}
-                onChange={(e) => setNewWindow(e.target.value)}
-                placeholder="e.g. prod-tl, bot-squad"
-                autoFocus
-              />
-              <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
-                Spawns as{" "}
-                <code style={{ color: "var(--mc-accent)" }}>{prodTeamleadWindow(newWindow)}</code>{" "}
-                → resolves to the prod-teamlead role (prod-teamlead.md).
-              </div>
-            </div>
-            <div className="mb-3">
-              <label className="form-label">
-                Initial prompt{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
-              </label>
-              <textarea
-                className="form-control"
-                rows={4}
-                value={newPrompt}
-                onChange={(e) => setNewPrompt(e.target.value)}
-                placeholder="Type a message to send immediately after claude starts…"
-              />
-            </div>
-          </>
-        )}
-
-        {/* Step 2 (qa): window normalised to carry the -qa marker so the
-            session resolves to qa.md (T-0197). QA picks up totest tickets;
-            not bound to a single task at spawn. */}
-        {newRole === "qa" && (
-          <>
-            <hr style={{ borderColor: "var(--mc-border)" }} />
-            <div className="mb-3">
-              <label className="form-label">
-                Window name{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
-                  (optional — defaults to "qa")
-                </span>
-              </label>
-              <input
-                className="form-control"
-                value={newWindow}
-                onChange={(e) => setNewWindow(e.target.value)}
-                placeholder="e.g. qa, bot-squad"
-                autoFocus
-              />
-              <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
-                Spawns as{" "}
-                <code style={{ color: "var(--mc-accent)" }}>{qaWindow(newWindow)}</code>{" "}
-                → resolves to the QA role (qa.md).
-              </div>
-            </div>
-            <div className="mb-3">
-              <label className="form-label">
-                Initial prompt{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
-              </label>
-              <textarea
-                className="form-control"
-                rows={4}
-                value={newPrompt}
-                onChange={(e) => setNewPrompt(e.target.value)}
-                placeholder="Type a message to send immediately after claude starts…"
-              />
-            </div>
-          </>
-        )}
-
-        {/* Step 2a: Teamlead form */}
-        {newRole === "teamlead" && (
-          <>
-            <hr style={{ borderColor: "var(--mc-border)" }} />
-            <div className="mb-3">
-              <label className="form-label">
-                Initiative{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
-                  (optional — overrides the project default for this session)
-                </span>
-              </label>
-              <Select
-                value={newInitiative}
-                onChange={setNewInitiative}
-                style={{ width: "100%" }}
-                ariaLabel="initiative for new teamlead"
-                options={[
-                  { value: "", label: "— Use project default —" },
-                  ...initiatives.map((f) => {
-                    const base = f.name.replace(/^initiatives\//, "");
-                    return {
-                      value: base,
-                      label: base,
-                      hint: f.active ? "active" : undefined,
-                    };
-                  }),
-                ]}
-              />
-            </div>
-            <div className="mb-3">
-              <label className="form-label">
-                Window name <span style={{ color: "var(--mc-accent-danger)" }}>*</span>
-              </label>
-              <input
-                className="form-control"
-                value={newWindow}
-                onChange={(e) => setNewWindow(e.target.value)}
-                placeholder="e.g. v0_7_tl, heatmaps_tl"
-                autoFocus
-              />
-            </div>
-            <div className="mb-3">
-              <label className="form-label">
-                Initial prompt{" "}
-                <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>(optional)</span>
-              </label>
-              <textarea
-                className="form-control"
-                rows={4}
-                value={newPrompt}
-                onChange={(e) => setNewPrompt(e.target.value)}
-                placeholder="Type a message to send immediately after claude starts…"
-              />
-            </div>
-          </>
-        )}
-
-        {/* Step 2b: Dev worker form */}
-        {newRole === "dev" && (
-          <>
-            <hr style={{ borderColor: "var(--mc-border)" }} />
-            {activeTeamleads.length === 0 ? (
-              <div className="alert alert-warning" style={{ fontSize: "0.85rem" }}>
-                No active teamleads — start one first.{" "}
-                <a
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    setNewRole("teamlead");
-                    setModalError(null);
-                  }}
-                  style={{ color: "var(--mc-accent)" }}
-                >
-                  Switch to teamlead role
-                </a>
-              </div>
-            ) : (
-              <>
-                <div className="mb-3">
-                  <label className="form-label">
-                    Target teamlead <span style={{ color: "var(--mc-accent-danger)" }}>*</span>
-                  </label>
-                  <Select
-                    value={newTlSid}
-                    onChange={setNewTlSid}
-                    placeholder="— Pick a teamlead —"
-                    style={{ width: "100%" }}
-                    ariaLabel="target teamlead"
-                    options={activeTeamleads.map((tl) => ({
-                      value: tl.sid,
-                      label: `${tl.window} (${tl.sid})`,
-                    }))}
-                  />
-                </div>
-                <div className="mb-3">
-                  <label className="form-label">
-                    Backlog task{" "}
-                    <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
-                      (optional)
-                    </span>
-                  </label>
-                  <Select
-                    value={newTaskId}
-                    onChange={setNewTaskId}
-                    style={{ width: "100%" }}
-                    ariaLabel="backlog task"
-                    options={[
-                      { value: "", label: "— None (let TL find or create one) —" },
-                      ...backlog.map((t) => ({
-                        value: t.id,
-                        label: `${t.id} · ${t.title}`,
-                      })),
-                    ]}
-                  />
-                </div>
-                {/* T-0280: reuse-before-spawn strip. When a task is picked we
-                    show the worker's reuse-vs-spawn recommendation above the
-                    spawn (Send-to-teamlead) button so the operator can resume
-                    an existing live pro instead of spawning a fresh session. */}
-                {newTaskId && (
-                  <div className="mb-3">
-                    <label className="form-label">
-                      Reuse before spawn{" "}
-                      <span style={{ color: "var(--mc-text-dim)", fontWeight: 400 }}>
-                        (resume a live session bound to {newTaskId}&apos;s initiative)
-                      </span>
-                    </label>
-                    {reuseLoading && (
-                      <div style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
-                        Checking for reusable sessions…
-                      </div>
-                    )}
-                    {!reuseLoading && reuseError && (
-                      <div className="alert alert-danger" style={{ fontSize: "0.8rem" }}>
-                        Couldn&apos;t load reuse candidates: {reuseError}
-                      </div>
-                    )}
-                    {!reuseLoading && !reuseError && reuse && (() => {
-                      const eligible = reuse.candidates
-                        .filter((c) => c.eligible)
-                        .sort((a, b) => a.context_pct - b.context_pct);
-                      if (eligible.length === 0) {
-                        return (
-                          <div style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
-                            No reusable session — {reuse.reason}. Spawn a fresh one below.
-                          </div>
-                        );
-                      }
-                      return (
-                        <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
-                          <div style={{ fontSize: "0.75rem", color: "var(--mc-text-dim)" }}>
-                            {reuse.reason}
-                          </div>
-                          {eligible.map((c) => (
-                            <div
-                              key={c.sid}
-                              className="d-flex align-items-center justify-content-between"
-                              style={{
-                                border: "1px solid var(--mc-border)",
-                                borderRadius: "6px",
-                                padding: "0.4rem 0.6rem",
-                                gap: "0.6rem",
-                              }}
-                            >
-                              <div style={{ minWidth: 0 }}>
-                                <code style={{ color: "var(--mc-accent)" }}>{c.sid}</code>
-                                {c.sid === reuse.target_sid && (
-                                  <span className="mc-badge mc-badge-ok" style={{ marginLeft: "0.4rem" }}>
-                                    recommended
-                                  </span>
-                                )}
-                                <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)" }}>
-                                  {c.role ?? "dev"} · {c.context_pct}% context ·{" "}
-                                  {c.idle ? "idle" : "busy"}
-                                  {c.initiative_match ? " · same initiative" : ""}
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                className="btn btn-outline-primary btn-sm"
-                                disabled={resumingSid !== null}
-                                onClick={() => handleResumeFromModal(c.sid)}
-                              >
-                                {resumingSid === c.sid ? "Resuming…" : "Resume"}
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      );
-                    })()}
-                  </div>
-                )}
-                <div className="mb-3">
-                  <label className="form-label">
-                    Instructions for teamlead <span style={{ color: "var(--mc-accent-danger)" }}>*</span>
-                  </label>
-                  <textarea
-                    className="form-control"
-                    rows={5}
-                    value={newInstructions}
-                    onChange={(e) => setNewInstructions(e.target.value)}
-                    placeholder="Describe what we're spawning a dev worker for. The teamlead will find a matching task in the backlog or create a new one if needed."
-                  />
-                </div>
-              </>
-            )}
-          </>
-        )}
-      </Modal>
-
-      {/* Send-message modal (cross-session bus) */}
-      <Modal
-        open={sendOpen}
-        title={`Send message to ${sendTarget}`}
-        onClose={() => setSendOpen(false)}
-        footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={() => setSendOpen(false)}>
-              Close
-            </button>
-            <button type="button" className="btn btn-primary" onClick={handleSend} disabled={sending}>
-              {sending ? "Sending…" : "Send"}
-            </button>
-          </>
-        }
-      >
-        {sendError && <div className="alert alert-danger">{sendError}</div>}
-        {sendInfo && <div className="alert alert-success">{sendInfo}</div>}
-        <div className="mb-2" style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
-          Lands in <code>{sendTarget}</code>&apos;s inbox via the peer message bus. The
-          target session sees it on its next <code>peer_inbox_read</code> or when its
-          armed <code>peer_inbox_wait</code> wakes.
-        </div>
-        <div className="mb-3">
-          <label className="form-label">Message</label>
-          <textarea
-            className="form-control"
-            rows={5}
-            value={sendText}
-            onChange={(e) => setSendText(e.target.value)}
-            placeholder="Type a message for the agent…"
-            autoFocus
-          />
-        </div>
-      </Modal>
-
-      {/* Autopilot dialog (T-0153) — team-lane or single-session target. */}
-      <AutopilotDialog
-        open={autopilotOpen}
-        slug={slug}
-        target={autopilotTarget}
-        onClose={() => setAutopilotOpen(false)}
-        onStarted={() => load()}
-      />
 
       {/* T-0431: the PeerInbox FAB is fixed bottom-right; at narrow widths
           (~390px) it overlapped the last table row's ATTACH tap target

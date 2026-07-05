@@ -1284,11 +1284,14 @@ def test_handle_update_private_voice_routes_transcript_like_text(tmp_path, monke
 
 
 def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, monkeypatch):
-    """A transcription failure (cap/download/decode) is reported to the user and
-    NOTHING is routed or recorded — there is no transcript to route."""
+    """A transcription failure (download/decode) is reported to the user with
+    the ACTUAL reason, nothing is routed (no transcript), and the refusal
+    leaves a no-drop marker record in the thread (T-0586) carrying the voice
+    attachment so the drop is visible to the attendant."""
     cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
     from bot_squad_worker import voice_intake as VI
     monkeypatch.setattr(
         VI, "transcribe_only",
@@ -1298,7 +1301,9 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
     routed = []
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: routed.append(1))
     recorded = []
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: recorded.append(1))
+    monkeypatch.setattr(
+        TL, "append_conversation",
+        lambda c, slug, gid, msg: recorded.append((slug, gid, msg.get("text"), msg.get("voice"))) or True)
 
     update = {"update_id": 1, "message": _voice_msg()}
     result = TL.handle_update(cfg, update)
@@ -1306,9 +1311,48 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
     assert result["ok"] is False
     assert result["action"] == "voice_private_failed"
     assert result["reason"] == "download_failed"
-    assert notified
+    assert notified and "скачать" in notified[0]  # honest cause, not a generic decode error
     assert routed == []
-    assert recorded == []
+    # T-0586 no-drop: the refusal itself is recorded — marker text + attachment.
+    assert len(recorded) == 1
+    slug, gid, text, voice = recorded[0]
+    assert (slug, gid) == ("test-project", "gu_1")
+    assert "НЕ обработано" in text and "download_failed" in text
+    assert voice["file_id"] == "VID"
+
+
+def test_handle_update_private_voice_too_long_names_cap_and_records(tmp_path, monkeypatch):
+    """T-0586: an over-cap DM voice note gets an HONEST refusal naming the
+    duration + cap (never the generic 'не удалось распознать — попробуйте ещё
+    раз', which invites a retry that can never pass), and leaves the no-drop
+    marker with the file_id — the 2026-07-05 376s-incident regression."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": False, "reason": "too_long", "transcript": "",
+                              "duration": 376})
+    notified = []
+    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notified.append(text))
+    recorded = []
+    monkeypatch.setattr(
+        TL, "append_conversation",
+        lambda c, slug, gid, msg: recorded.append((msg.get("text"), msg.get("voice"))) or True)
+
+    update = {"update_id": 1, "message": _voice_msg()}
+    result = TL.handle_update(cfg, update)
+
+    assert result["reason"] == "too_long"
+    (text_sent,) = notified
+    assert "6:16" in text_sent  # the note's actual duration
+    assert "5 мин" in text_sent  # the cap (default 300s), so the user knows the rule
+    assert "попробуйте ещё раз" not in text_sent  # the old lie
+    (marker_text, marker_voice) = recorded[0]
+    assert "too_long" in marker_text and "376" in marker_text
+    assert marker_voice["file_id"] == "VID"
 
 
 def test_handle_update_group_voice_still_uses_feedback_path(tmp_path, monkeypatch):

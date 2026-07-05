@@ -528,6 +528,48 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     return {"ok": True, "action": "route", "slug": por}
 
 
+def _voice_reject_text(cfg, reason: str, out: dict) -> str:
+    """T-0586: user-facing refusal text naming the real cause + remedy. The
+    pre-fix generic "не удалось распознать — попробуйте ещё раз" was a lie for
+    ``too_long`` (a retry of the same note can never pass the cap)."""
+    if reason == "too_long":
+        cap = int(getattr(cfg, "voice_max_duration_sec", 300) or 0)
+        dur = int(out.get("duration") or 0)
+        return (
+            f"⚠️ Голосовое ({dur // 60}:{dur % 60:02d}) длиннее лимита "
+            f"{cap // 60} мин — оно НЕ обработано и содержимое не сохранилось. "
+            "Отправь его частями покороче или напиши текстом."
+        )
+    if reason == "download_failed":
+        return "⚠️ Не удалось скачать аудио из Telegram — отправь голосовое ещё раз."
+    if reason == "transcription_timeout":
+        return (
+            "⚠️ Распознавание не уложилось в лимит времени — попробуй ещё раз "
+            "или отправь запись покороче."
+        )
+    return (
+        "⚠️ Не удалось распознать голосовое сообщение — попробуйте ещё раз "
+        "или напишите текстом."
+    )
+
+
+def _record_voice_rejection(cfg, chat_slug: str, gid: str, msg: dict, reason: str, out: dict) -> None:
+    """T-0586 no-drop: a refused voice note must still leave a record in the
+    conversation thread — duration + reason + the voice attachment descriptor
+    (file_id) — so the attendant can see the drop and follow up, and the
+    file_id makes late recovery from TG possible at all. Without this the
+    thread is blind to the refusal (the 2026-07-05 376s incident: 6 minutes of
+    stakeholder direction gone with only a TG error toast). Best-effort, same
+    as append_conversation itself."""
+    marker = dict(msg)
+    dur = int(out.get("duration") or (msg.get("voice") or {}).get("duration") or 0)
+    marker["text"] = (
+        f"[голосовое {dur} сек НЕ обработано: {reason} — содержимое не транскрибировано]"
+    )
+    por = get_current_project(cfg, gid) or chat_slug
+    append_conversation(cfg, por, gid, marker)
+
+
 def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
     """T-0569: a DM voice note. Transcribes (voice_intake.transcribe_only —
     NOT process_voice, so it never becomes a feedback artifact), echoes the
@@ -540,17 +582,20 @@ def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict
     ``_handle_unquoted``'s own ``append_conversation`` records the transcript,
     not the empty raw-voice text, and there is no double-append).
 
-    A transcription failure (cap exceeded / download / decode) is best-effort
-    reported back to the user and nothing is routed (nothing to route)."""
+    A transcription failure (cap exceeded / download / decode) is reported back
+    to the user with the ACTUAL reason (T-0586: an over-cap refusal telling the
+    user "не удалось распознать — попробуйте ещё раз" sent them retrying a note
+    that would never pass), and the refusal leaves a thread record carrying
+    duration + reason + the voice attachment (file_id) — so the attendant sees
+    the drop and late recovery stays possible. Nothing is routed (no
+    transcript to route)."""
     from bot_squad_worker import voice_intake as _vi
     out = _vi.transcribe_only(cfg, chat_slug, msg)
     if not out.get("ok"):
-        _notify(
-            cfg, chat_id,
-            "⚠️ Не удалось распознать голосовое сообщение — попробуйте ещё раз "
-            "или напишите текстом.",
-        )
-        return {"ok": False, "action": "voice_private_failed", "reason": out.get("reason", "transcription_failed")}
+        reason = out.get("reason", "transcription_failed")
+        _notify(cfg, chat_id, _voice_reject_text(cfg, reason, out))
+        _record_voice_rejection(cfg, chat_slug, gid, msg, reason, out)
+        return {"ok": False, "action": "voice_private_failed", "reason": reason}
 
     transcript = out["transcript"]
     _channel_notify(cfg, chat_id, f"\U0001f399 Распознал так: «{transcript}»")

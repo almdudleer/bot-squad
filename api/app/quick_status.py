@@ -54,8 +54,8 @@ def aggregate_project_status(rows: list[dict]) -> dict:
     """Compute {status, status_since} from a list of session rows.
 
     `rows` is the merged output of `list_sessions` across all user workers
-    for a single project — same shape as the GET /api/projects/{slug}/sessions
-    response.
+    for a single project — same shape as the "sessions" array inside the
+    GET /api/projects/{slug}/sessions envelope (T-0601).
 
     Returns: {"status": "working|needs-input|idle", "status_since": ISO|None}
     """

@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api, isNotFoundError } from "./api";
+import { api, isNotFoundError, normalizeSessionsPayload, shouldRedirectOn401 } from "./api";
 
 function mockOnce(json: unknown = {}): ReturnType<typeof vi.fn> {
   const spy = vi.fn().mockResolvedValueOnce({
@@ -112,6 +112,80 @@ describe("global api (self-server) — URLs stay un-proxied", () => {
         method: "POST",
         body: JSON.stringify({ category: "product", title: "Child doc", parent_doc_id: "D-0001" }),
       }),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-0601 (F5): sessions payload normalization — the server now returns
+// {sessions, errors}; older servers (behind the mothership proxy) still send
+// a bare array. Both client methods must accept both shapes.
+// ---------------------------------------------------------------------------
+describe("T-0601 sessions fan-out errors", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const row = { sid: "S-u-w-p1", status: "active" };
+
+  test("normalizeSessionsPayload: envelope → rows + errors", () => {
+    expect(
+      normalizeSessionsPayload({
+        sessions: [row],
+        errors: [{ user: "timpo", detail: "connect failed" }],
+      }),
+    ).toEqual({ rows: [row], errors: [{ user: "timpo", detail: "connect failed" }] });
+  });
+
+  test("normalizeSessionsPayload: legacy bare array → rows, no errors", () => {
+    expect(normalizeSessionsPayload([row])).toEqual({ rows: [row], errors: [] });
+  });
+
+  test("normalizeSessionsPayload: garbage → empty payload", () => {
+    expect(normalizeSessionsPayload(null)).toEqual({ rows: [], errors: [] });
+    expect(normalizeSessionsPayload("nope")).toEqual({ rows: [], errors: [] });
+    expect(normalizeSessionsPayload({})).toEqual({ rows: [], errors: [] });
+  });
+
+  test("api.sessions keeps its SessionRow[] contract over the new envelope", async () => {
+    mockOnce({ sessions: [row], errors: [{ user: "aqice", detail: "boom" }] });
+    await expect(api.sessions("alpha")).resolves.toEqual([row]);
+  });
+
+  test("api.sessionsDetail exposes rows AND errors", async () => {
+    const spy = mockOnce({ sessions: [row], errors: [{ user: "aqice", detail: "boom" }] });
+    await expect(api.sessionsDetail("alpha")).resolves.toEqual({
+      rows: [row],
+      errors: [{ user: "aqice", detail: "boom" }],
+    });
+    expect(spy).toHaveBeenCalledWith("/api/projects/alpha/sessions", expect.any(Object));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-0601 (F4): the login call is exempt from the global 401-redirect — a
+// wrong password must reject (so the Login form shows the error) instead of
+// silently reloading /login. These run in node (no `window`): if call() ever
+// tried the redirect on the login path it would crash on the missing global
+// rather than produce the API-error rejection asserted here.
+// ---------------------------------------------------------------------------
+describe("T-0601 login 401-exempt", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("shouldRedirectOn401 exempts exactly the login path", () => {
+    expect(shouldRedirectOn401("/api/auth/login")).toBe(false);
+    expect(shouldRedirectOn401("/api/auth/me")).toBe(true);
+    expect(shouldRedirectOn401("/api/projects/alpha/sessions")).toBe(true);
+  });
+
+  test("api.login rejects with the 401 body instead of redirecting", async () => {
+    const spy = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      text: async () => '{"detail":"bad credentials"}',
+    } as Response);
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await expect(api.login("u", "wrong")).rejects.toThrow(
+      /API error 401.*bad credentials/,
     );
   });
 });

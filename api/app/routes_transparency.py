@@ -207,8 +207,11 @@ async def get_transparency(
 
     # Session tree — reuse the existing fan-out (owner-scoped, pin-stamped). It
     # degrades to [] when no worker is reachable; never let it sink the page.
+    # T-0601 (F5): list_sessions now returns {sessions, errors}; this view
+    # keeps exposing the bare row list (its own contract is unchanged).
     try:
-        sessions = await list_sessions(slug=slug, request=request, user=user)
+        payload = await list_sessions(slug=slug, request=request, user=user)
+        sessions = payload.get("sessions", [])
     except Exception as e:  # pragma: no cover - defensive
         log.warning("transparency: session list failed for %s: %s", slug, e)
         sessions = []

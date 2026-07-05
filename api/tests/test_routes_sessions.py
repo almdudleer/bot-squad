@@ -199,16 +199,20 @@ def test_list_sessions_success(tmp_bot_squad: Path, monkeypatch, fake_worker_ses
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
     data = r.json()
-    assert isinstance(data, list)
-    assert len(data) == 1
-    assert data[0]["sid"] == "S-almdudleer-spec5-p2"
-    assert data[0]["status"] == "active"
+    # T-0601 (F5): envelope shape — rows under "sessions", fan-out failures
+    # under "errors" (none here: the single configured worker is healthy).
+    rows = data["sessions"]
+    assert data["errors"] == []
+    assert isinstance(rows, list)
+    assert len(rows) == 1
+    assert rows[0]["sid"] == "S-almdudleer-spec5-p2"
+    assert rows[0]["status"] == "active"
     # T-0104: derived activity field passes through unchanged.
-    assert data[0]["activity"] == "running"
-    assert data[0]["activity_at"] == 1_700_000_000.0
+    assert rows[0]["activity"] == "running"
+    assert rows[0]["activity_at"] == 1_700_000_000.0
     # T-0232: explicit `live` boolean (running|idle = alive) for the FE
     # live-only view. running → live.
-    assert data[0]["live"] is True
+    assert rows[0]["live"] is True
 
 
 def test_is_live_maps_running_and_idle_only():
@@ -238,12 +242,74 @@ def test_list_sessions_unknown_project_404(tmp_bot_squad: Path, monkeypatch, fak
 def test_list_sessions_dead_worker_returns_empty_list(
     tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
 ):
-    """Phase 2 fan-out: a dead worker doesn't 502 the whole list — it logs and skips."""
+    """Phase 2 fan-out: a dead worker doesn't 502 the whole list — it logs and
+    skips. T-0601 (F5): but the failure is no longer SILENT — the error names
+    the affected linux user so the UI can explain the empty list."""
     broken_sock = tmp_bot_squad / "data" / "_sock" / "broken.sock"
     with _client_logged_in(tmp_bot_squad, monkeypatch, broken_sock) as client:
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
-    assert r.json() == []
+    data = r.json()
+    assert data["sessions"] == []
+    assert len(data["errors"]) == 1
+    assert data["errors"][0]["user"] == "almdudleer"
+    assert data["errors"][0]["detail"]
+
+
+def test_list_sessions_partial_failure_surfaces_errors(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """T-0601 (F5): with one healthy worker and one declared user whose socket
+    is missing (the live timpo/aqice repro), the response carries the healthy
+    rows PLUS an error naming the dead socket's user — not a silently partial
+    list."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = true\n'
+        '[user_meta.timpo]\n'
+        'linux_user = "timpo"\n'
+        '[session]\nttl = "7d"\n'
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.get("/api/projects/test-project/sessions")
+    assert r.status_code == 200
+    data = r.json()
+    # Healthy coordinator rows survive; row shape untouched.
+    assert [row["sid"] for row in data["sessions"]] == ["S-almdudleer-spec5-p2"]
+    # The missing user-timpo.sock is surfaced, not swallowed.
+    assert len(data["errors"]) == 1
+    assert data["errors"][0]["user"] == "timpo"
+    assert data["errors"][0]["detail"]
+
+
+def test_list_sessions_nonadmin_sees_only_own_socket_error(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """T-0601 (F5): error scoping mirrors row scoping — a non-admin sees the
+    failure of their OWN worker socket (their blank-list explanation) but not
+    other users' socket health."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "tu"\n'
+        'is_admin = false\n'
+        '[user_meta.edem]\n'
+        'linux_user = "edem"\n'
+        '[session]\nttl = "7d"\n'
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.get("/api/projects/test-project/sessions")
+    assert r.status_code == 200
+    data = r.json()
+    # Sample row has no owner stamp → admin-only → dropped for non-admin.
+    assert data["sessions"] == []
+    # Both user-tu.sock and user-edem.sock are missing, but the non-admin
+    # only learns about their own.
+    assert [e["user"] for e in data["errors"]] == ["tu"]
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +359,7 @@ def test_pin_then_list_stamps_pinned(tmp_bot_squad: Path, monkeypatch, fake_work
         client.post("/api/projects/test-project/sessions/S-almdudleer-spec5-p2/pin")
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
-    row = r.json()[0]
+    row = r.json()["sessions"][0]
     assert row["sid"] == "S-almdudleer-spec5-p2"
     assert row["pinned"] is True
     assert row["pinned_by"] == "testuser"
@@ -304,7 +370,7 @@ def test_list_unpinned_default_false(tmp_bot_squad: Path, monkeypatch, fake_work
     with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
-    row = r.json()[0]
+    row = r.json()["sessions"][0]
     assert row["pinned"] is False
     assert "pinned_by" not in row
 
@@ -317,7 +383,7 @@ def test_unpin_session_success(tmp_bot_squad: Path, monkeypatch, fake_worker_ses
         assert r.json()["pinned"] is False
         assert r.json()["was_pinned"] is True
         # And the list no longer flags it.
-        row = client.get("/api/projects/test-project/sessions").json()[0]
+        row = client.get("/api/projects/test-project/sessions").json()["sessions"][0]
     assert row["pinned"] is False
 
 
@@ -718,8 +784,10 @@ def test_list_sessions_fans_out_and_merges(
         with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
             r = client.get("/api/projects/test-project/sessions")
         assert r.status_code == 200
-        sids = sorted(row["sid"] for row in r.json())
+        data = r.json()
+        sids = sorted(row["sid"] for row in data["sessions"])
         assert sids == ["S-edem-spec-p2", "S-tu-spec-p1"]
+        assert data["errors"] == []  # both sockets healthy (T-0601)
     finally:
         s1.should_exit = True
         s2.should_exit = True
@@ -746,9 +814,12 @@ def test_list_sessions_tolerates_dead_user_worker(
     with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
+    data = r.json()
     # At minimum, the coordinator's sessions are returned.
-    sids = [row["sid"] for row in r.json()]
+    sids = [row["sid"] for row in data["sessions"]]
     assert "S-almdudleer-spec5-p2" in sids
+    # T-0601 (F5): the dead user worker is NAMED, not silently skipped.
+    assert [e["user"] for e in data["errors"]] == ["deaduser"]
 
 
 # ---------------------------------------------------------------------------
@@ -1106,7 +1177,7 @@ def test_list_sessions_non_admin_drops_other_owners(
         with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
             r = client.get("/api/projects/test-project/sessions")
         assert r.status_code == 200
-        sids = sorted(row["sid"] for row in r.json())
+        sids = sorted(row["sid"] for row in r.json()["sessions"])
         # Only the row stamped owner=testuser survives — the other-owner
         # row and the legacy unstamped row are both filtered out.
         assert sids == ["S-x-b-p2"]
@@ -1157,7 +1228,7 @@ def test_list_sessions_admin_sees_all_owners(
         with _client_logged_in(tmp_bot_squad, monkeypatch, coord_sock) as client:
             r = client.get("/api/projects/test-project/sessions")
         assert r.status_code == 200
-        sids = sorted(row["sid"] for row in r.json())
+        sids = sorted(row["sid"] for row in r.json()["sessions"])
         assert sids == ["S-x-a-p1", "S-x-b-p2", "S-x-c-p3"]
     finally:
         server.should_exit = True

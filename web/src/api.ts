@@ -32,13 +32,20 @@ export function errorDetail(err: unknown): string {
   return msg;
 }
 
+// T-0601 (F4): the ONE call that must not trigger the global 401-redirect is
+// the login attempt itself — redirecting there turned a wrong password into a
+// silent form reload. Exported for unit tests.
+export function shouldRedirectOn401(path: string): boolean {
+  return path !== "/api/auth/login";
+}
+
 async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (res.status === 401) {
+  if (res.status === 401 && shouldRedirectOn401(path)) {
     window.location.href = "/login";
     throw new Error("not authenticated");
   }
@@ -370,6 +377,28 @@ export type SessionRow = {
   suspend_source?: string | null;
   suspend_reason?: string | null;
 };
+
+// T-0601 (F5): one per-user worker socket that failed during the sessions
+// fan-out. The API returns these alongside the rows so the UI can say "list
+// is partial, worker for <user> unreachable" instead of a blank board.
+export type WorkerFanoutError = { user: string; detail: string };
+
+export type SessionsPayload = { rows: SessionRow[]; errors: WorkerFanoutError[] };
+
+// Accepts both server shapes: the T-0601 envelope {sessions, errors} and the
+// legacy bare array (older single-install servers reached via the mothership
+// proxy). Exported for unit tests.
+export function normalizeSessionsPayload(body: unknown): SessionsPayload {
+  if (Array.isArray(body)) return { rows: body as SessionRow[], errors: [] };
+  if (body && typeof body === "object") {
+    const o = body as { sessions?: unknown; errors?: unknown };
+    return {
+      rows: Array.isArray(o.sessions) ? (o.sessions as SessionRow[]) : [],
+      errors: Array.isArray(o.errors) ? (o.errors as WorkerFanoutError[]) : [],
+    };
+  }
+  return { rows: [], errors: [] };
+}
 
 // T-0210: per-session resource telemetry record (worker-sampled).
 export type TelemetrySession = {
@@ -957,8 +986,18 @@ export const api = {
     call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
       `/api/projects/${slug}/docs/${encodeURIComponent(id)}/parent`,
       { method: "PUT", body: JSON.stringify({ parent_doc_id: parentDocId }) }),
+  // T-0601 (F5): the server now returns {sessions, errors} so per-user worker
+  // fan-out failures surface instead of blanking to "No sessions".
+  // `sessions()` keeps its SessionRow[] contract for the many list-only
+  // consumers; `sessionsDetail()` exposes the errors for the Processes board.
+  // Both normalize the legacy bare-array shape (older servers behind the
+  // mothership proxy).
   sessions: (slug: string) =>
-    call<SessionRow[]>(`/api/projects/${slug}/sessions`),
+    call<unknown>(`/api/projects/${slug}/sessions`).then(
+      (body) => normalizeSessionsPayload(body).rows,
+    ),
+  sessionsDetail: (slug: string) =>
+    call<unknown>(`/api/projects/${slug}/sessions`).then(normalizeSessionsPayload),
   // T-0210: resource telemetry (per-session context/memory + quota burndown).
   telemetry: (slug: string) =>
     call<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
@@ -1186,6 +1225,7 @@ export type ProjectApi = Pick<
   | "children"
   | "vision"
   | "sessions"
+  | "sessionsDetail"
   | "telemetry"
   | "createTask"
   | "patchTask"

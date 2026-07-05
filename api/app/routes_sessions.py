@@ -178,12 +178,21 @@ def _is_live(activity: object) -> bool:
 async def list_sessions(
     slug: str, request: Request,
     user: dict = Depends(require_auth),
-) -> list[dict]:
+) -> dict:
     """List all Claude sessions (active + paused) for a project.
 
     Fans out across every configured user worker. Each call is bounded
     by a 5 s timeout so a dead/slow user worker can't block the whole list.
     Results are deduped by sid.
+
+    T-0601 (F5): per-socket fan-out failures are no longer silently
+    swallowed — the response is ``{"sessions": [...], "errors":
+    [{"user", "detail"}, ...]}`` so the UI can render the partial list
+    plus a warning naming the unreachable user workers instead of a
+    misleading "No sessions". Row shape is unchanged; only the top-level
+    envelope is new (the web client accepts both shapes for old servers).
+    Non-admin callers only see errors for their own linux_user (matching
+    the row ownership scoping below).
 
     T-0080 owner gate: non-admin callers see only sessions whose SessionMd
     `owner` field equals their UI username. Sessions written before owner
@@ -203,6 +212,9 @@ async def list_sessions(
     _check_project(request, slug)
     wrouter = _router(request)
 
+    # T-0601 (F5): collect per-socket failures instead of dropping them.
+    errors: list[dict] = []
+
     async def _one(client: WorkerClient, who: str) -> list[dict]:
         try:
             result = await client.call_action(
@@ -211,9 +223,11 @@ async def list_sessions(
             return result.get("sessions", [])
         except WorkerError as e:
             log.warning("list_sessions fan-out for %s failed: %s", who, e)
+            errors.append({"user": who, "detail": str(e)})
             return []
         except Exception as e:
             log.warning("list_sessions fan-out for %s crashed: %s", who, e)
+            errors.append({"user": who, "detail": str(e)})
             return []
 
     pairs = wrouter.all_user_workers()
@@ -239,11 +253,18 @@ async def list_sessions(
             r["pinned_by"] = meta.get("by")
             r["pinned_at"] = meta.get("at")
     if user.get("is_admin"):
-        return rows
+        return {"sessions": rows, "errors": errors}
     # Non-admin: drop rows whose owner doesn't match. Missing owner
     # (legacy session) = admin-only. The worker emits "" for missing.
+    # Errors follow the same scoping: a non-admin sees only their OWN
+    # worker's failure (that IS their blank-list explanation), not the
+    # health of other users' sockets.
     me = user.get("username") or ""
-    return [r for r in rows if _scope_match(r.get("owner_user"), r.get("owner"), me)]
+    my_linux = request.app.state.auth_config.meta_for(me).linux_user
+    return {
+        "sessions": [r for r in rows if _scope_match(r.get("owner_user"), r.get("owner"), me)],
+        "errors": [e for e in errors if e.get("user") == my_linux],
+    }
 
 
 @dev_spawn_router.get("/telemetry")

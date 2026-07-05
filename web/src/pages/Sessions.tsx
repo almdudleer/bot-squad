@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
-import type { SessionRow, Task, VisionFile } from "../api";
+import type { SessionRow, Task, VisionFile, WorkerFanoutError } from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
@@ -357,6 +357,10 @@ export function Sessions() {
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // T-0601 (F5): per-user worker sockets that failed during the sessions
+  // fan-out — rendered as a warning banner so a partial (or empty) list is
+  // never mistaken for "no sessions".
+  const [fanoutErrors, setFanoutErrors] = useState<WorkerFanoutError[]>([]);
 
   // meUsername feeds PeerInbox (the kept reply surface, T-0127).
   const [meUsername, setMeUsername] = useState<string>("stakeholder");
@@ -470,9 +474,10 @@ export function Sessions() {
 
   const load = useCallback(() => {
     api
-      .sessions(slug)
-      .then((rows) => {
+      .sessionsDetail(slug)
+      .then(({ rows, errors }) => {
         setSessions(rows);
+        setFanoutErrors(errors);
         setError(null);
       })
       .catch((e: unknown) => setError(String(e)));
@@ -1570,6 +1575,31 @@ export function Sessions() {
 
       {/* Errors */}
       {error && <div className="alert alert-danger">{error}</div>}
+      {/* T-0601 (F5): worker fan-out failures — the list below is PARTIAL
+          (or empty) because these per-user worker sockets were unreachable.
+          Without this banner a dead socket read as "No sessions". */}
+      {fanoutErrors.length > 0 && (
+        <div
+          className="alert alert-warning"
+          role="status"
+          data-testid="fanout-errors-banner"
+        >
+          <strong style={{ fontSize: "0.85rem" }}>
+            Session list may be incomplete
+          </strong>
+          <div style={{ fontSize: "0.8rem", marginTop: "0.25rem" }}>
+            The worker socket{fanoutErrors.length === 1 ? "" : "s"} for{" "}
+            {fanoutErrors.map((e) => (
+              <code key={e.user} title={e.detail} style={{ marginRight: "0.3rem" }}>
+                {e.user}
+              </code>
+            ))}
+            {fanoutErrors.length === 1 ? "is" : "are"} unreachable — sessions
+            owned by {fanoutErrors.length === 1 ? "this user" : "these users"}{" "}
+            are missing from the list below.
+          </div>
+        </div>
+      )}
       {actionError && (
         <div className="alert alert-warning d-flex justify-content-between align-items-center">
           <span>{actionError}</span>

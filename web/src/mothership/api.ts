@@ -29,11 +29,11 @@ import type {
   CreateTaskBody,
   Project,
   ProjectApi,
-  SessionRow,
   Task,
   TelemetryResponse,
   VisionFile,
 } from "../api";
+import { normalizeSessionsPayload } from "../api";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -488,7 +488,15 @@ export function apiFor(serverId: string): ServerApi {
     // T-0512 (M9): subtasks of a task (parent_task === id).
     children: (slug, id) => fwd<Task[]>(`/api/projects/${slug}/backlog/${id}/children`),
     vision: (slug) => fwd<VisionFile[]>(`/api/projects/${slug}/vision`),
-    sessions: (slug) => fwd<SessionRow[]>(`/api/projects/${slug}/sessions`),
+    // T-0601 (F5): normalize both server shapes (bare array from older
+    // installs, {sessions, errors} envelope from current) — same contract as
+    // the singleton in web/src/api.ts.
+    sessions: (slug) =>
+      fwd<unknown>(`/api/projects/${slug}/sessions`).then(
+        (body) => normalizeSessionsPayload(body).rows,
+      ),
+    sessionsDetail: (slug) =>
+      fwd<unknown>(`/api/projects/${slug}/sessions`).then(normalizeSessionsPayload),
     telemetry: (slug) => fwd<TelemetryResponse>(`/api/projects/${slug}/telemetry`),
     createTask: (slug, t: CreateTaskBody) =>
       fwd<Task>(`/api/projects/${slug}/backlog`, {

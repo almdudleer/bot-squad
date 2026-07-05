@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
-import { api } from "../api";
+import { api, errorDetail } from "../api";
 
 export function Login() {
   const navigate = useNavigate();
@@ -17,7 +17,10 @@ export function Login() {
       await api.login(username, password);
       navigate("/");
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // T-0601 (F4): with the login call exempt from the global 401-redirect,
+      // a wrong password lands here — surface the server's detail ("bad
+      // credentials") instead of the raw `API error 401: {...}` blob.
+      setError(errorDetail(err));
     } finally {
       setBusy(false);
     }

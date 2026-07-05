@@ -26,7 +26,7 @@ import re
 
 _HEADING_RE = re.compile(r"(?im)^##\s+(verbatim request|context|progress)\s*$")
 
-_PROGRESS_MAX_CHARS = 240
+_PROGRESS_MAX_CHARS = 4000
 
 
 def parse_body(text: str) -> dict[str, str]:
@@ -149,10 +149,14 @@ def compose_body(verbatim: str, context: str, progress: str) -> str:
 
 
 def _sanitize_progress_text(text: str) -> str:
-    """Collapse newlines to spaces, squeeze whitespace, cap at 240 chars."""
+    """Collapse newlines to spaces, squeeze whitespace; raise on over-cap text."""
     s = re.sub(r"\s+", " ", (text or "")).strip()
     if len(s) > _PROGRESS_MAX_CHARS:
-        s = s[:_PROGRESS_MAX_CHARS].rstrip()
+        raise ValueError(
+            f"progress note is {len(s)} chars, over the {_PROGRESS_MAX_CHARS}-char cap — "
+            "refusing to truncate (silent loss, F-2026-07-05-bsq-30844bca41). "
+            "Split the note or put long content in the ticket's ## Context section."
+        )
     return s
 
 
@@ -160,8 +164,8 @@ def append_progress(body: str, ts: str, sid: str, text: str) -> str:
     """Append `- <ts> · <sid> · <text>` to the Progress section.
 
     Creates the Progress section if it's missing. Preserves verbatim
-    and context exactly. Text is sanitised (newlines collapsed, capped
-    at 240 chars).
+    and context exactly. Text is sanitised (newlines collapsed); text
+    over _PROGRESS_MAX_CHARS raises ValueError rather than truncating.
     """
     clean = _sanitize_progress_text(text)
     if not clean:

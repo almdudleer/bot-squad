@@ -1,6 +1,8 @@
 """Tests for app.task_body — three-section schema parse/compose/append."""
 from __future__ import annotations
 
+import pytest
+
 from app.task_body import (
     append_progress,
     compose_body,
@@ -84,16 +86,22 @@ def test_append_progress_preserves_other_sections():
     assert "- T1 · S1 · new line" in sections["progress"]
 
 
-def test_append_progress_caps_at_240():
+def test_append_progress_long_note_roundtrips_byte_identical():
+    # Regression for F-2026-07-05-bsq-30844bca41: notes used to be silently
+    # clipped at 240 chars, losing sacred stakeholder verbatims.
     body = "## Verbatim request\n\nv\n"
-    long_text = "x" * 500
-    new = append_progress(body, "T1", "S1", long_text)
-    # The line itself is prefixed with "- T1 · S1 · " — the *text* portion is capped.
+    note = ("stakeholder verbatim word " * 20).strip()
+    assert len(note) > 300
+    new = append_progress(body, "T1", "S1", note)
     parsed = parse_body(new)
-    progress_line = parsed["progress"]
-    text_part = progress_line.split(" · ", 2)[-1]
-    assert len(text_part) == 240
-    assert text_part == "x" * 240
+    text_part = parsed["progress"].split(" · ", 2)[-1]
+    assert text_part == note
+
+
+def test_append_progress_overflow_raises():
+    body = "## Verbatim request\n\nv\n"
+    with pytest.raises(ValueError, match="cap"):
+        append_progress(body, "T1", "S1", "x" * 5000)
 
 
 def test_append_progress_collapses_newlines():

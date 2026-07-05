@@ -1544,8 +1544,9 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
     Returns: {ok: true, task_id, line_appended}
 
     The task md is updated atomically (tmp + rename). The verbatim and
-    context sections are preserved exactly. Text is sanitised: newlines
-    collapsed to spaces, capped at 240 chars.
+    context sections are preserved exactly. Text is sanitised (newlines
+    collapsed to spaces); text over the task_body cap errors instead of
+    silently truncating.
     """
     extra = set(params) - _TASK_PROGRESS_ALLOWED
     if extra:

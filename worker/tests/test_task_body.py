@@ -55,12 +55,22 @@ def test_append_progress_preserves_sections():
     assert "- T1 · S1 · new line" in parsed["progress"]
 
 
-def test_append_progress_caps_at_240():
+def test_append_progress_long_note_roundtrips_byte_identical():
+    # Regression for F-2026-07-05-bsq-30844bca41: notes used to be silently
+    # clipped at 240 chars, losing sacred stakeholder verbatims.
     body = "## Verbatim request\n\nv\n"
-    new = append_progress(body, "T1", "S1", "x" * 500)
+    note = ("stakeholder verbatim word " * 20).strip()
+    assert len(note) > 300
+    new = append_progress(body, "T1", "S1", note)
     parsed = parse_body(new)
     text_part = parsed["progress"].split(" · ", 2)[-1]
-    assert len(text_part) == 240
+    assert text_part == note
+
+
+def test_append_progress_overflow_raises():
+    body = "## Verbatim request\n\nv\n"
+    with pytest.raises(ValueError, match="cap"):
+        append_progress(body, "T1", "S1", "x" * 5000)
 
 
 def test_append_progress_collapses_newlines():

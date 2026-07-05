@@ -3391,7 +3391,12 @@ def _render_feedback_md(ts: str, sid: str, text: str, uc: str) -> tuple[str, str
     digest = hashlib.sha256(line.encode("utf-8")).hexdigest()[:10]
     date = ts[:10] if _INBOX_DATE_RE.match(ts) else "queue"
     name = f"F-{date}-bsq-{digest}.md"
-    title = re.sub(r"^\[[^\]]*\]\s*", "", text).strip()[:80] or "feedback submission"
+    title = re.sub(r"^\[[^\]]*\]\s*", "", text).strip()
+    if len(title) > 80:
+        # summary heading only — full text rides in the body; mark the clip
+        # so it never reads as the complete note (F-2026-07-05-bsq-30844bca41)
+        title = title[:79].rstrip() + "…"
+    title = title or "feedback submission"
     fm_lines = [
         "---",
         "source: bsq feedback",

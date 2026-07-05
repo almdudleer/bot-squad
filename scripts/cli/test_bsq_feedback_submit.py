@@ -48,6 +48,19 @@ def test_render_feedback_md_is_deterministic_for_same_line():
     assert a[0] == b[0]
 
 
+def test_render_feedback_md_long_title_clip_is_visible_and_body_is_full():
+    """F-2026-07-05-bsq-30844bca41: the derived H1 is a summary and may clip,
+    but the clip must be VISIBLE (ellipsis) and the body must carry the full
+    text byte-identical — no silent loss."""
+    text = ("sacred stakeholder verbatim " * 15).strip()
+    assert len(text) > 300
+    _, content = bsq._render_feedback_md("2026-07-05T00:00:00Z", "S-x", text, "")
+    title_line = next(l for l in content.splitlines() if l.startswith("# "))
+    assert title_line.endswith("…")
+    assert len(title_line) <= 2 + 80
+    assert f"\n{text}\n" in content
+
+
 def test_render_feedback_md_undated_ts_falls_back():
     name, _ = bsq._render_feedback_md("not-a-date", "S-x", "note", "")
     assert _FEEDBACK_NAME_RE.match(name)

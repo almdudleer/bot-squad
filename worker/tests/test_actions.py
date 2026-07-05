@@ -1833,6 +1833,51 @@ def test_task_progress_add_appends_line(tmp_path, monkeypatch):
     assert "S-test-p1 · shipped the thing" in content
 
 
+def test_task_progress_add_long_note_roundtrips_byte_identical(tmp_path, monkeypatch):
+    # Regression for F-2026-07-05-bsq-30844bca41: `bsq ticket note` silently
+    # truncated at 240 chars, clipping sacred stakeholder verbatims (T-0566).
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    task_path = backlog / "T-0001-foo.md"
+    task_path.write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
+        "## Verbatim request\n\nI want X.\n"
+    )
+    note = ("stakeholder said this exact sacred thing " * 8).strip()
+    assert len(note) > 300
+    out = A.dispatch("task_progress_add", {
+        "slug": "test-project",
+        "task_id": "T-0001",
+        "sid": "S-test-p1",
+        "text": note,
+    })
+    assert out["ok"] is True
+    assert out["line_appended"].endswith(f" · {note}")
+    content = task_path.read_text()
+    assert f"S-test-p1 · {note}" in content
+
+
+def test_task_progress_add_overflow_raises_and_leaves_file_untouched(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    task_path = backlog / "T-0001-foo.md"
+    original = (
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
+        "## Verbatim request\n\nI want X.\n"
+    )
+    task_path.write_text(original)
+    with pytest.raises(ActionError, match="cap"):
+        A.dispatch("task_progress_add", {
+            "slug": "test-project",
+            "task_id": "T-0001",
+            "sid": "S-test-p1",
+            "text": "x" * 5000,
+        })
+    assert task_path.read_text() == original
+
+
 def test_task_progress_add_concurrent_no_lost_notes(tmp_path, monkeypatch):
     """T-0373: N concurrent progress/comment adds all survive — was a shared-tmp +
     unlocked read-modify-write that lost writes (and 500'd) under contention."""

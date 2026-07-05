@@ -5,6 +5,7 @@ import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { Modal } from "../components/Modal";
+import { ObservabilityPanel } from "../components/ObservabilityPanel";
 import { RowActionsMenu } from "../components/RowActionsMenu";
 import { AutopilotDialog } from "../components/AutopilotDialog";
 import { Select, type SelectOption } from "../components/Select";
@@ -737,6 +738,12 @@ export function Project() {
       </PageHelp>
 
       {/* T-0230: resource telemetry panel relocated to the Agent sessions page. */}
+
+      {/* T-0593 (T-0588a): top-level observability — the retired
+          /p/:slug/transparency page dissolved into the home. Quota strip +
+          live-session count always visible; who-does-what / operator
+          state-doc / scheduler expandable below. */}
+      <ObservabilityPanel slug={slug} />
 
       {error && <div className="alert alert-danger mt-2">{error}</div>}
       {tasks === null && !error && <div className="mc-loading">Loading</div>}

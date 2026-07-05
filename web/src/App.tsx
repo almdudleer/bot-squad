@@ -27,7 +27,6 @@ const Docs = lazy(() => import("./pages/Docs").then((m) => ({ default: m.Docs })
 const DocsSection = lazy(() => import("./pages/DocsSection").then((m) => ({ default: m.DocsSection })));
 const Sessions = lazy(() => import("./pages/Sessions").then((m) => ({ default: m.Sessions })));
 const Analytics = lazy(() => import("./pages/Analytics").then((m) => ({ default: m.Analytics })));
-const Transparency = lazy(() => import("./pages/Transparency").then((m) => ({ default: m.Transparency })));
 const TaskDetail = lazy(() => import("./pages/TaskDetail").then((m) => ({ default: m.TaskDetail })));
 const Runs = lazy(() => import("./pages/Runs").then((m) => ({ default: m.Runs })));
 const RunLog = lazy(() => import("./pages/RunLog").then((m) => ({ default: m.RunLog })));
@@ -127,15 +126,17 @@ export function App() {
             <Route path="sessions" element={<Sessions />} />
             <Route path="settings" element={<ProjectSettings />} />
             <Route path="analytics" element={<Analytics />} />
-            <Route path="transparency" element={<Transparency />} />
+            {/* T-0593 (T-0588a): /p/:slug/transparency dissolved into the
+                project home (index route) — stale deep-links fall through to
+                the `*` redirect, same as the T-0572 cuts. */}
             <Route path="runs" element={<Runs />} />
             <Route path="runs/:id" element={<RunLog />} />
             <Route path="sessions/:claude_uuid/messages" element={<Messages />} />
           </Route>
           {/* T-0572 (Occam pass): the Workflow, Clones, Scheduler and
               /attachment/* pages were cut (D-0046). Scheduler state now
-              renders inside the per-project System State (transparency)
-              view; stale deep-links fall through to the `*` redirect. */}
+              renders in the project home's observability panel (T-0593);
+              stale deep-links fall through to the `*` redirect. */}
           <Route path="/users" element={<Users />} />
           <Route path="/system-settings" element={<SystemSettings />} />
           <Route path="/me" element={<Profile />} />

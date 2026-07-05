@@ -55,7 +55,7 @@ export function Help() {
         <ul>
           <li><strong>BOT·SQUAD wordmark</strong> (top of sidebar) — returns to the project picker. The LED dot beside it shows worker liveness (green = operational, red = offline).</li>
           <li><strong>[PROJECT] section</strong> — shown when you are inside a project. Lists the per-project pages (BOARD, VISION, FEEDBACK, SESSIONS, RUNS). The selected project stays pinned even if you click a [SYSTEM] item.</li>
-          <li><strong>[SYSTEM] section</strong> — always visible. ALL PROJECTS returns to the picker; SCHEDULER shows worker jobs; HELP is this page.</li>
+          <li><strong>[SYSTEM] section</strong> — always visible. ALL PROJECTS returns to the picker; HELP is this page. (Worker/scheduler state lives on each project&apos;s home page.)</li>
           <li><strong>Footer</strong> — your username + Sign out.</li>
         </ul>
         <p>
@@ -269,8 +269,10 @@ git commit -m "feat: concise description of what this branch does"</code></pre>
       <section className="mc-help-section" id="scheduler">
         <h2>Scheduler</h2>
         <p>
-          Scheduler state renders inside each project&apos;s <strong>System
-          State</strong> view (the transparency page). It displays:
+          Scheduler state renders on each project&apos;s <strong>home page</strong>{" "}
+          (<code>/p/&lt;project&gt;</code>, the Board) — expand the{" "}
+          <em>Scheduler</em> section of the observability panel above the board.
+          It displays:
         </p>
         <ul>
           <li><strong>Worker uptime</strong> — how long the worker process has been running.</li>

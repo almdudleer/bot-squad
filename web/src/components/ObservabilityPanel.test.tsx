@@ -1,22 +1,24 @@
 /**
- * T-0511 (M11-F11.4) — render test for the unified transparency surface.
+ * T-0593 (T-0588a) — render test for the project-home observability panel,
+ * ported from the retired Transparency page's test (T-0511).
  *
- * Renders the pure `TransparencyView` against the REAL-derived payload observed
- * from the live data dir (operator-state absent → degrade notice; re-drive
- * PAUSED; no pace cap → ∞; 512-task backlog counts; a 2-row session tree).
+ * Renders the pure `ObservabilityView` against the REAL-derived payload
+ * observed from the live data dir (operator-state absent → degrade notice;
+ * re-drive PAUSED; no pace cap → ∞; a 2-row session tree). The backlog
+ * asserts died with the backlog section (the board below IS the backlog).
  * `renderToStaticMarkup` needs no DOM, so this runs in the existing node-env
  * vitest. This is the automated lock placed AFTER the manual walkthrough
- * (scenarios/T-0511-*.md) per the manual-first rule (T-0158).
+ * (scenarios/T-0593-*.md) per the manual-first rule (T-0158).
  */
 import { renderToStaticMarkup } from "react-dom/server";
 import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
-import { TransparencyView } from "./Transparency";
+import { ObservabilityView } from "./ObservabilityPanel";
 import type { Transparency as TransparencyData } from "../api";
 
 // Mirrors the real bot-squad state observed 2026-06-27 (operator-state absent,
-// paused=true, no pace.json, 512-task backlog with 20 in_progress).
+// paused=true, no pace.json, 20 in_progress), trimmed to the panel's inputs.
 const REAL_DERIVED: TransparencyData = {
   slug: "bot-squad",
   operator_state: {
@@ -46,6 +48,20 @@ const REAL_DERIVED: TransparencyData = {
       cwd: "/x",
       pinned: true,
     } as TransparencyData["sessions"][number],
+    // T-0593: the live payload is ~97% suspended/archived history — the panel
+    // must keep those OUT of the live who-does-what (caught on the manual
+    // walkthrough: a straight port read "LIVE SESSIONS 341").
+    {
+      sid: "S-almdudleer-dead-worker-p1",
+      status: "suspended",
+      activity: "suspended",
+      role: "dev",
+      task_id: null,
+      window: "w",
+      cwd: "/x",
+      pinned: false,
+      archived: true,
+    } as TransparencyData["sessions"][number],
   ],
   backlog: {
     counts: {
@@ -66,41 +82,45 @@ const REAL_DERIVED: TransparencyData = {
 
 function renderView(data: TransparencyData): string {
   return renderToStaticMarkup(
-    <StaticRouter location={`/p/${data.slug}/transparency`}>
-      <TransparencyView data={data} slug={data.slug} />
+    <StaticRouter location={`/p/${data.slug}`}>
+      <ObservabilityView data={data} slug={data.slug} />
     </StaticRouter>,
   );
 }
 
-describe("TransparencyView", () => {
-  test("renders all four sections + the live degrade/quota states", () => {
+describe("ObservabilityView", () => {
+  test("renders the summary strip + detail sections, live-only, no backlog", () => {
     const html = renderView(REAL_DERIVED);
-    // Manual observation aid: dump the rendered text for the walkthrough.
-    // eslint-disable-next-line no-console
-    console.log("RENDERED:", html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 
-    // Four section headers.
-    expect(html).toContain("Operator state-doc");
-    expect(html).toContain("Quota");
-    expect(html).toContain("Session tree");
-    expect(html).toContain("Backlog");
-
-    // Operator state-doc absent → degrade notice (not a markdown body).
-    expect(html).toContain("hasn&#x27;t written a state-doc yet");
-    expect(html).toContain("artifacts/operator-state.md");
+    // Summary strip: quota cards + the live-session count.
+    expect(html).toContain("IN PROGRESS");
+    expect(html).toContain("RE-DRIVE");
+    expect(html).toContain("INITIATIVE PACE");
+    expect(html).toContain("LIVE SESSIONS");
 
     // Quota: paused + unlimited cap (∞) + in_progress count.
     expect(html).toContain("PAUSED");
     expect(html).toContain("20 / ∞");
 
-    // Session tree: both rows, the pinned marker, and a task deep-link.
+    // Live count = 2 (the archived/suspended row is filtered out).
+    expect(html).toContain("Who does what (2)");
+    expect(html).not.toContain("S-almdudleer-dead-worker-p1");
+
+    // Session tree: both live rows, the pinned marker, a task deep-link, and
+    // the pointer to the full history on the Processes page.
     expect(html).toContain("S-almdudleer-lifecycle-roles-p235");
     expect(html).toContain("📌");
     expect(html).toContain("/p/bot-squad/t/T-0511");
+    expect(html).toContain("/p/bot-squad/sessions");
 
-    // Backlog counts surfaced.
-    expect(html).toContain("423"); // closed
-    expect(html).toContain("2 tasks total");
+    // Operator state-doc absent → degrade notice (not a markdown body).
+    expect(html).toContain("hasn&#x27;t written a state-doc yet");
+    expect(html).toContain("artifacts/operator-state.md");
+
+    // The backlog counts section DIED (T-0588a) — the board below IS the
+    // backlog and CanonicalSummary shows the counts.
+    expect(html).not.toContain("Backlog");
+    expect(html).not.toContain("423");
   });
 
   test("renders the state-doc body when present, and RUNNING when not paused", () => {

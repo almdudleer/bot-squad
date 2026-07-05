@@ -1,14 +1,12 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import {
   api,
   type SchedulerState,
   type Transparency as TransparencyData,
   type SessionRow,
 } from "../api";
-import { Markdown } from "../components/Markdown";
-import { PageHelp } from "../components/PageHelp";
-import { RouteSkeleton } from "../components/RouteSkeleton";
+import { Markdown } from "./Markdown";
 import {
   sessionActivity,
   sessionRole,
@@ -16,25 +14,24 @@ import {
 } from "../utils/sessionStatus";
 
 /**
- * T-0511 (M11 / F11.4) — unified read-only system-transparency surface.
+ * T-0593 (T-0588a, D-0046) — top-level observability on the project home.
  *
- *   "the whole system is completely transparent to the user, and he can drive
- *    the system from anywhere" — clarification-03.
+ *   "весь этот юай это в целом больше про обсурдобилити" — the WHOLE UI is
+ *   the observability layer (T-0587), so the separate /p/:slug/transparency
+ *   tab was a mistake.
  *
- * ONE page that shows where the system IS, readable WITHOUT talking to the
- * operator: the operator state-doc (T-0473) + the session tree + the backlog +
- * the quota/pace (T-0482). Strictly read-only — every write affordance lives on
- * its own page (Board, Processes, settings); this view only aggregates.
+ * Ported from the retired Transparency page (T-0511): a compact always-visible
+ * summary strip (quota/pace cards + live-session count) with expandable detail
+ * — the who-does-what session table, the operator state-doc, and the scheduler
+ * panel (merged there from the retired /scheduler page, T-0572). The old
+ * "Backlog" counts section was dropped: the board below IS the backlog, and
+ * CanonicalSummary already shows the counts. Convergence rule: the home owns
+ * live state, Analytics owns history. Strictly read-only.
+ *
+ * NOTE: uses the global `api` singleton (as the Transparency page did) — the
+ * transparency/scheduler reads aren't part of the mothership-proxied
+ * ProjectApi surface.
  */
-
-const STATUS_ORDER = [
-  "planned",
-  "open",
-  "in_progress",
-  "totest",
-  "reopened",
-  "closed",
-] as const;
 
 function fmtFuture(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -57,24 +54,49 @@ function fmtRel(epoch: number | null): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function SectionTitle({ children }: { children: React.ReactNode }) {
+/**
+ * Collapsible detail section — the expandable half of the panel. Native
+ * <details> so the collapsed state needs no React state; the summary reuses
+ * the retired page's SectionTitle look.
+ */
+function DetailSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
   return (
-    <div
-      style={{
-        fontFamily: "var(--mc-mono)",
-        fontSize: "0.66rem",
-        color: "var(--mc-text-dim)",
-        textTransform: "uppercase",
-        letterSpacing: "0.06em",
-        margin: "1.4rem 0 0.5rem",
-      }}
-    >
-      {children}
-    </div>
+    <details style={{ marginTop: "0.6rem" }}>
+      <summary
+        style={{
+          fontFamily: "var(--mc-mono)",
+          fontSize: "0.66rem",
+          color: "var(--mc-text-dim)",
+          textTransform: "uppercase",
+          letterSpacing: "0.06em",
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        {title}
+      </summary>
+      <div style={{ margin: "0.5rem 0 0.25rem" }}>{children}</div>
+    </details>
   );
 }
 
-function QuotaPanel({ quota }: { quota: TransparencyData["quota"] }) {
+/**
+ * The always-visible summary strip: the T-0482 quota/pace cards plus the
+ * live-session count (the headline of the who-does-what table below).
+ */
+function SummaryStrip({
+  quota,
+  liveSessions,
+}: {
+  quota: TransparencyData["quota"];
+  liveSessions: number;
+}) {
   const cap = quota.max_in_progress;
   const capLabel = cap === 0 ? "∞" : String(cap);
   const overCap = cap > 0 && quota.in_progress > cap;
@@ -112,6 +134,11 @@ function QuotaPanel({ quota }: { quota: TransparencyData["quota"] }) {
           {Object.keys(quota.initiatives).length}
         </div>
         <div className="mc-an-card-sub">configured initiatives</div>
+      </div>
+      <div className="mc-an-card">
+        <div className="mc-an-card-label">LIVE SESSIONS</div>
+        <div className="mc-an-card-value">{liveSessions}</div>
+        <div className="mc-an-card-sub">who-does-what below</div>
       </div>
     </div>
   );
@@ -165,10 +192,9 @@ function SessionTree({
 }
 
 /**
- * T-0572 (Occam pass, D-0046): the standalone /scheduler page merged in here
- * as one more read-only section — worker heartbeat + the time-driven job
- * table. Own fetch + own error chrome so a scheduler hiccup never blanks the
- * rest of the system-state view.
+ * T-0572 (Occam pass, D-0046): the standalone /scheduler page merged into the
+ * transparency surface, now riding along onto the project home. Own fetch +
+ * own error chrome so a scheduler hiccup never blanks the rest of the panel.
  */
 function SchedulerPanel() {
   const [state, setState] = useState<SchedulerState | null>(null);
@@ -249,8 +275,77 @@ function SchedulerPanel() {
   );
 }
 
-export function Transparency() {
-  const { slug = "" } = useParams();
+/**
+ * The pure, data-driven body — every section is a function of the already-
+ * loaded transparency payload, so it renders without any fetch (the fetch +
+ * loading/error chrome and the self-fetching SchedulerPanel live in
+ * {@link ObservabilityPanel}). Exported so the render can be exercised
+ * directly against a real-derived payload.
+ */
+export function ObservabilityView({
+  data,
+  slug,
+}: {
+  data: TransparencyData;
+  slug: string;
+}) {
+  // The payload carries the FULL session history (341 rows on the live
+  // install, ~97% suspended/archived). The design brief asks for the LIVE
+  // who-does-what — the working set. Curation of the full history is the
+  // Processes page's job.
+  const live = data.sessions.filter((s) => !s.archived && s.status === "active");
+  return (
+    <>
+      {/* 1 — the always-visible summary strip (quota/pace + session count) */}
+      <SummaryStrip quota={data.quota} liveSessions={live.length} />
+
+      {/* 2 — who does what (the T-0511 session tree, live rows only) */}
+      <DetailSection title={`Who does what (${live.length})`}>
+        <SessionTree sessions={live} slug={slug} />
+        <div className="text-muted" style={{ fontSize: "0.74rem" }}>
+          Full session history and controls live on the{" "}
+          <Link to={`/p/${slug}/sessions`}>Processes page</Link>.
+        </div>
+      </DetailSection>
+
+      {/* 3 — operator state-doc (T-0473) */}
+      <DetailSection title="Operator state-doc">
+        {data.operator_state.exists && data.operator_state.content ? (
+          <div
+            style={{
+              padding: "1rem",
+              border: "1px solid var(--mc-border)",
+              borderRadius: "6px",
+              background: "var(--mc-surface)",
+            }}
+          >
+            <div
+              className="text-muted mb-2"
+              style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }}
+            >
+              {data.operator_state.path} · updated{" "}
+              {fmtRel(data.operator_state.updated_at)}
+            </div>
+            <Markdown source={data.operator_state.content} slug={slug} />
+          </div>
+        ) : (
+          <div className="alert alert-secondary" style={{ fontSize: "0.85rem" }}>
+            The operator hasn&apos;t written a state-doc yet{" "}
+            (<code>{data.operator_state.path}</code>). It is written on autocompact
+            and on major changes; until then there is no carried state to show.
+          </div>
+        )}
+      </DetailSection>
+    </>
+  );
+}
+
+/**
+ * Fetch wrapper rendered at the top of the project home (Project.tsx). One
+ * transparency read per mount (the page-level cadence the Transparency page
+ * had); the scheduler section keeps its own 30s poll.
+ */
+export function ObservabilityPanel({ slug }: { slug: string }) {
   const [data, setData] = useState<TransparencyData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -272,110 +367,21 @@ export function Transparency() {
   }, [slug]);
 
   return (
-    <div className="container py-4">
-      <div className="d-flex justify-content-between align-items-center mb-3">
-        <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>
-          System state
-          <span
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontWeight: 400,
-              color: "var(--mc-text-dim)",
-              fontSize: "0.78rem",
-              marginLeft: "0.5rem",
-            }}
-          >
-            / {slug}
-          </span>
-        </h2>
-      </div>
-
-      <PageHelp>
-        The whole system in one read-only view — the operator&apos;s
-        future-focused state-doc, the live session tree, the backlog, and the
-        quota/pace. It is meant to be readable <strong>without talking to the
-        operator</strong>: a fresh operator or the stakeholder can see where the
-        project IS and where it&apos;s going from here. Nothing on this page
-        writes — use the Board, Processes, and settings for changes.
-      </PageHelp>
-
-      {error && <div className="alert alert-danger">{error}</div>}
-      {data === null && !error && <RouteSkeleton />}
-
-      {data && <TransparencyView data={data} slug={slug} />}
-
-      {/* 5 — scheduler (merged from the retired /scheduler page, T-0572) */}
-      <SectionTitle>Scheduler</SectionTitle>
-      <SchedulerPanel />
-    </div>
-  );
-}
-
-/**
- * The pure, data-driven body of the transparency surface — every section is a
- * function of the already-loaded payload, so it renders without any fetch (the
- * fetch + loading/error chrome lives in {@link Transparency}). Exported so the
- * render can be exercised directly against a real-derived payload.
- */
-export function TransparencyView({
-  data,
-  slug,
-}: {
-  data: TransparencyData;
-  slug: string;
-}) {
-  return (
-    <>
-      {/* 1 — operator state-doc (T-0473) */}
-      <SectionTitle>Operator state-doc</SectionTitle>
-      {data.operator_state.exists && data.operator_state.content ? (
-        <div
-          style={{
-            padding: "1rem",
-            border: "1px solid var(--mc-border)",
-            borderRadius: "6px",
-            background: "var(--mc-surface)",
-          }}
-        >
-          <div
-            className="text-muted mb-2"
-            style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }}
-          >
-            {data.operator_state.path} · updated{" "}
-            {fmtRel(data.operator_state.updated_at)}
-          </div>
-          <Markdown source={data.operator_state.content} slug={slug} />
-        </div>
-      ) : (
-        <div className="alert alert-secondary" style={{ fontSize: "0.85rem" }}>
-          The operator hasn&apos;t written a state-doc yet{" "}
-          (<code>{data.operator_state.path}</code>). It is written on autocompact
-          and on major changes; until then there is no carried state to show.
+    <div style={{ marginBottom: "1rem" }}>
+      {error && (
+        <div className="text-muted" style={{ fontSize: "0.85rem" }}>
+          System state unavailable: {error}
         </div>
       )}
+      {data === null && !error && (
+        <div className="mc-loading">Loading system state</div>
+      )}
+      {data && <ObservabilityView data={data} slug={slug} />}
 
-      {/* 2 — quota / pace (T-0482) */}
-      <SectionTitle>Quota &amp; pace</SectionTitle>
-      <QuotaPanel quota={data.quota} />
-
-      {/* 3 — session tree */}
-      <SectionTitle>Session tree</SectionTitle>
-      <SessionTree sessions={data.sessions} slug={slug} />
-
-      {/* 4 — backlog */}
-      <SectionTitle>Backlog</SectionTitle>
-      <div className="mc-an-cards">
-        {STATUS_ORDER.map((st) => (
-          <div className="mc-an-card" key={st}>
-            <div className="mc-an-card-label">{st.toUpperCase()}</div>
-            <div className="mc-an-card-value">{data.backlog.counts[st] ?? 0}</div>
-          </div>
-        ))}
-      </div>
-      <div className="text-muted mt-2" style={{ fontSize: "0.78rem" }}>
-        {data.backlog.tasks.length} tasks total ·{" "}
-        <Link to={`/p/${slug}`}>open the Board</Link> to act on them.
-      </div>
-    </>
+      {/* scheduler (merged from the retired /scheduler page, T-0572) */}
+      <DetailSection title="Scheduler">
+        <SchedulerPanel />
+      </DetailSection>
+    </div>
   );
 }

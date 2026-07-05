@@ -229,7 +229,7 @@ export function SystemSettings() {
             Manage users →
           </Link>
           {/* T-0572 (Occam pass): the standalone /scheduler page merged into
-              each project's System State (transparency) view. */}
+              the per-project observability panel on the project home (T-0593). */}
         </div>
       )}
 

@@ -1321,6 +1321,61 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
     assert voice["file_id"] == "VID"
 
 
+def test_private_voice_long_transcript_echo_is_chunked(tmp_path, monkeypatch):
+    """T-0586: a transcript longer than one TG message (4096-char API cap) is
+    echoed as numbered parts instead of vanishing — the 2026-07-05 13.5-min
+    note's echo died on a silent API 400. Every part must fit the cap and the
+    full transcript must survive concatenation."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    long_transcript = "слово" * 1800  # ~9000 chars, > 2 TG messages
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": True, "transcript": long_transcript, "lang": "ru",
+                              "engine": "faster-whisper:small", "duration": 810})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+
+    update = {"update_id": 1, "message": _voice_msg()}
+    result = TL.handle_update(cfg, update)
+
+    assert result["transcript"] == long_transcript
+    assert len(echoes) == 3  # 9000 chars / 3900 per chunk
+    assert all(len(e) <= 4096 for e in echoes)
+    assert all("\U0001f399" in e for e in echoes)
+    assert "(1/3)" in echoes[0] and "(3/3)" in echoes[2]
+    # concatenating the quoted chunk bodies reproduces the full transcript
+    import re as _re
+    bodies = [_re.search("«(.*)»$", e, _re.S).group(1) for e in echoes]
+    assert "".join(bodies) == long_transcript
+
+
+def test_private_voice_short_transcript_echo_single_message(tmp_path, monkeypatch):
+    """The common case stays a single 🎙-echo message (no part markers)."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": True, "transcript": "короткое", "lang": "ru",
+                              "engine": "faster-whisper:small", "duration": 3})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg()})
+
+    assert echoes == ["\U0001f399 Распознал так: «короткое»"]
+
+
 def test_handle_update_private_voice_too_long_names_cap_and_records(tmp_path, monkeypatch):
     """T-0586: an over-cap DM voice note gets an HONEST refusal naming the
     duration + cap (never the generic 'не удалось распознать — попробуйте ещё

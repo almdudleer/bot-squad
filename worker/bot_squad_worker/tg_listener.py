@@ -1,6 +1,7 @@
 """Listen for Telegram updates and route replies into sessions."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Optional
 
 import httpx
 
+log = logging.getLogger(__name__)
 
 SID_RE = re.compile(r"\[(S-[A-Za-z0-9_-]+?-p\d+)")
 
@@ -598,7 +600,7 @@ def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict
         return {"ok": False, "action": "voice_private_failed", "reason": reason}
 
     transcript = out["transcript"]
-    _channel_notify(cfg, chat_id, f"\U0001f399 Распознал так: «{transcript}»")
+    _echo_transcript(cfg, chat_id, transcript)
 
     transcript_msg = dict(msg)
     transcript_msg["text"] = transcript
@@ -800,8 +802,32 @@ def _channel_notify(
         _channels.get_channel(cfg, project=_slug_for_chat(cfg, chat_id)).send(
             message, chat_id=chat_id, sid="", urgent=True, **extra
         )
-    except Exception:  # noqa: BLE001 — best-effort; never break inbound routing
-        pass
+    except Exception as e:  # noqa: BLE001 — best-effort; never break inbound routing
+        # T-0586: best-effort must not mean invisible — the 2026-07-05 13.5-min
+        # 🎙-echo vanished here (transcript > TG's 4096-char message cap → API
+        # 400 → bare pass) and the drop was undiagnosable from the journal.
+        log.warning("tg_listener: channel notify to %s dropped: %s", chat_id, e)
+
+
+# TG rejects messages over 4096 chars (API 400). Echoes of long voice
+# transcripts must be split, not silently lost — cut at the cap with headroom
+# for the 🎙 prefix + part markers.
+_TG_MSG_CAP = 4096
+_ECHO_CHUNK = 3900
+
+
+def _echo_transcript(cfg, chat_id: str, transcript: str) -> None:
+    """T-0586: 🎙-echo that survives transcripts longer than one TG message.
+    Single send for the common case; a long transcript goes out as numbered
+    parts so the user still sees the full recognition."""
+    prefix = "\U0001f399 Распознал так: "
+    if len(prefix) + len(transcript) + 2 <= _TG_MSG_CAP:
+        _channel_notify(cfg, chat_id, f"{prefix}«{transcript}»")
+        return
+    chunks = [transcript[i:i + _ECHO_CHUNK] for i in range(0, len(transcript), _ECHO_CHUNK)]
+    total = len(chunks)
+    for n, chunk in enumerate(chunks, 1):
+        _channel_notify(cfg, chat_id, f"{prefix}({n}/{total}) «{chunk}»")
 
 
 def tick(cfg) -> dict:

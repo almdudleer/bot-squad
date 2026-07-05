@@ -5023,3 +5023,151 @@ def test_resume_clears_recycle_remembered_state(tmp_path, monkeypatch):
     assert meta["status"] == "active"
     for k in ("resumable", "recycled_at", "resume_hint"):
         assert k not in meta, f"{k} must be consumed by resume"
+
+
+# ---------------------------------------------------------------------------
+# T-0614: descriptive claude session names — spawn/resume pass --name so the
+# native /resume picker shows a readable, SID-derived name instead of the
+# auto-generated first-message snippet.
+# ---------------------------------------------------------------------------
+
+def _extract_claude_name(shell_cmd: str) -> str | None:
+    """Parse the launched `bash -lc` string and return the --name value."""
+    import shlex as _shlex
+    parts = _shlex.split(shell_cmd)
+    if "--name" in parts:
+        i = parts.index("--name")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def test_spawn_sets_descriptive_claude_name(tmp_path, monkeypatch):
+    """T-0614: spawn(window=W, task_id=T) launches claude with
+    --name '<W> <T>' — the same descriptive string the SID is derived from —
+    so the /resume picker line is readable."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    captured: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            captured.append(args[args.index("-lc") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%4|brave-feature|123|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "brave-feature", task_id="T-0614")
+
+    assert captured, "expected a new-window call"
+    assert _extract_claude_name(captured[0]) == "brave-feature T-0614"
+
+
+def test_spawn_sets_claude_name_without_task(tmp_path, monkeypatch):
+    """T-0614: taskless spawns (operator/attendant) still get their window
+    name as the claude display name."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    captured: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            captured.append(args[args.index("-lc") + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(
+                args, 0, f"%4|operator|123|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "operator")
+
+    assert captured, "expected a new-window call"
+    assert _extract_claude_name(captured[0]) == "operator"
+
+
+def test_claude_session_name_sanitized():
+    """T-0614: the display name is sanitised to a conservative charset before
+    it is shell-quoted into the launch command — a hostile/garbled window
+    value (cf. the T-0200 stray-quote incident) can't leak metacharacters,
+    and an all-garbage value yields '' (caller then omits --name)."""
+    from bot_squad_worker.sessions import _claude_session_name
+    assert _claude_session_name('w"$(rm -rf)"x', "T-1") == "wrm -rfx T-1"
+    assert _claude_session_name("expert", None) == "expert"
+    assert _claude_session_name("expert", "~") == "expert"
+    assert _claude_session_name("", None) == ""
+    assert _claude_session_name('"$()"', None) == ""
+    # task id already embedded in the window name → not repeated
+    assert _claude_session_name("fix-T-0614-picker", "T-0614") == "fix-T-0614-picker"
+
+
+def test_resume_sets_descriptive_claude_name(tmp_path, monkeypatch):
+    """T-0614: the resurrect path passes --name alongside --resume <uuid> so
+    a rotated/resumed session keeps a readable /resume-picker entry (verified
+    live 2026-07-05: --name combined with --resume appends a fresh
+    custom-title record to the transcript)."""
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sdir = cfg.data_dir / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / "S-testuser-expert-p7.md", {
+        "sid": "S-testuser-expert-p7", "status": "suspended", "window": "expert",
+        "cwd": str(repo), "claude_uuid": "u7", "task_id": "T-0100",
+        "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    import bot_squad_worker.sessions as S
+    fake = _resume_fake_run(repo, new_pane="%20")
+    monkeypatch.setattr(S, "_run", fake)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-testuser-expert-p7")
+
+    assert fake.launched, "expected a new-window call"
+    assert "--resume u7" in fake.launched[0]
+    assert _extract_claude_name(fake.launched[0]) == "expert T-0100"
+
+
+def test_resume_claude_name_uses_adopted_task(tmp_path, monkeypatch):
+    """T-0614 x T-0166: when resume ADOPTS a primary (expert-rebind), the
+    display name carries the NEW task id, not the stripped-out old one."""
+    repo = tmp_path / "repo"; repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sdir = cfg.data_dir / "test-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / "S-testuser-expert-p7.md", {
+        "sid": "S-testuser-expert-p7", "status": "suspended", "window": "expert",
+        "cwd": str(repo), "claude_uuid": "u7", "task_id": "~",
+        "last_task_id": "T-0001", "suspended_at": "2026-05-10T12:00:00Z",
+    })
+
+    import bot_squad_worker.sessions as S
+    fake = _resume_fake_run(repo, new_pane="%20")
+    monkeypatch.setattr(S, "_run", fake)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-testuser-expert-p7", task_id="T-0002")
+
+    assert fake.launched, "expected a new-window call"
+    assert _extract_claude_name(fake.launched[0]) == "expert T-0002"

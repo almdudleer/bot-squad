@@ -729,6 +729,34 @@ def _tmux_session_name(slug: str, initiative: str | None) -> str:
     return f"{slug}-{stem}"
 
 
+# T-0614: charset for the claude `--name` display value — the tmux-safe set
+# plus the space, since the name is a human-facing label, not a tmux target.
+_CLAUDE_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._\- ]")
+
+
+def _claude_session_name(window: str, task_id: str | None) -> str:
+    """T-0614: compose the claude ``--name`` display value for a session.
+
+    The native ``/resume`` picker titles sessions by their first-message
+    snippet unless a name is set (claude >= 2.1.196: ``--name`` at launch,
+    persisted as a ``custom-title`` transcript record). We already compose a
+    descriptive window name at spawn time — the same string the SID is
+    derived from (``S-<user>-<window>-p<N>``; the pane suffix doesn't exist
+    until after launch, so the window is the SID's human part). Reuse it,
+    plus the primary task id when it isn't already embedded in the window.
+
+    Sanitised to a conservative charset (T-0200 lesson: a stray quote in a
+    caller-supplied value once produced a broken tmux session name); the
+    result is additionally shlex-quoted at the call sites. Returns "" when
+    nothing usable survives — callers then omit ``--name`` entirely.
+    """
+    parts = [window or ""]
+    tid = (task_id or "").strip()
+    if tid and tid != "~" and tid not in (window or ""):
+        parts.append(tid)
+    return _CLAUDE_NAME_SAFE_RE.sub("", " ".join(p for p in parts if p)).strip()
+
+
 # T-0200: the tmux pane command for a Claude session is either the top-level
 # ``claude`` binary or a version-named binary (e.g. ``2.1.139``) that Claude Code
 # spawns for agent-teams subagents. Shared by ``list_sessions`` grouping and the
@@ -1520,6 +1548,14 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
         cmd = f"claude --dangerously-skip-permissions --resume {claude_uuid}"
     else:
         cmd = "claude --dangerously-skip-permissions"
+    # T-0614: keep the /resume-picker entry readable across rotations —
+    # --name combined with --resume renames the session (a fresh
+    # custom-title record supersedes the old one). Uses the possibly-ADOPTED
+    # primary (T-0166 set meta["task_id"] above) so an expert rebound to a
+    # new ticket is titled by the ticket it now works.
+    _display_name = _claude_session_name(window, meta.get("task_id"))
+    if _display_name:
+        cmd = f"{cmd} --name {shlex.quote(_display_name)}"
     # T-0525: when this resume ADOPTS a primary (T-0166 expert-rebind), carry it
     # to the new claude via the per-process env channel so a concurrent spawn
     # can't clobber it (the shared-marker race). Non-adopt resumes keep their
@@ -2078,6 +2114,12 @@ def spawn(
         env_prefix_parts.append(f"BOT_SQUAD_OWNER_USER={shlex.quote(ou_clean)}")
     env_prefix = (" ".join(env_prefix_parts) + " ") if env_prefix_parts else ""
     shell_cmd = f"{env_prefix}claude --dangerously-skip-permissions"
+    # T-0614: descriptive /resume-picker name — the SID-derived window string
+    # (+ task id) we already compose, so the native picker is navigable
+    # instead of showing first-message snippets. claude >= 2.1.196.
+    _display_name = _claude_session_name(window, task_id)
+    if _display_name:
+        shell_cmd += f" --name {shlex.quote(_display_name)}"
 
     result = _run([
         "tmux", "new-window", "-d",

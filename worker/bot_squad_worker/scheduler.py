@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from bot_squad_worker.config import Config
 from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.operator_redrive import operator_tick
-from bot_squad_worker.routines import routine_tick
+from bot_squad_worker.routines import monitor_tick, routine_tick
 from bot_squad_worker.jobs import (
     autopilot_tick,
     autoupdate_apply_tick,
@@ -371,6 +371,26 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="routines",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # monitor_tick: T-0603 / D-0048 — the hybrid-trigger fast sweep. Code-only
+    # probes watch declared metrics ("даже каждые пять секунд"); AI attaches
+    # ONLY on a persist-confirmed threshold breach, so the 5s cadence costs
+    # zero tokens while healthy. One fast tick scanning due monitors, NOT
+    # per-monitor apscheduler jobs (dynamic add/remove would need a registry↔
+    # scheduler reconciliation — a whole new failure class); the registry list
+    # is dir-mtime-cached so 5s doesn't re-read every md. max_instances=1 +
+    # coalesce plus a per-routine single-flight guard keep a slow probe from
+    # piling up. Kill switch: BOT_SQUAD_MONITORS=0.
+    sched.add_job(
+        monitor_tick,
+        "interval",
+        seconds=5,
+        args=[cfg],
+        id="monitors",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

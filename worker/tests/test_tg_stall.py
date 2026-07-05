@@ -527,12 +527,12 @@ def test_blocked_sids_cleared_marker_drops_out(tmp_path):
     assert TS.blocked_sids(cfg, "bot-squad") == set()
 
 
-def test_escalation_max_primary_with_group_record(tmp_path, monkeypatch):
-    """T-0394: needs-input escalation pages via MAX (primary) + leaves a
-    best-effort #team-queries group-record in TG (D1)."""
+def test_escalation_tg_primary_single_delivery(tmp_path, monkeypatch):
+    """T-0394 → T-0610 inversion: needs-input escalation pages via TG (primary)
+    into #team-queries — ONE delivery; MAX stays reserve even when configured."""
     from bot_squad_worker import actions as A, tg_topics
     cfg = _make_cfg(tmp_path)
-    # Configure MAX as the primary channel.
+    # MAX configured — must stay reserve-only.
     cfg = types.SimpleNamespace(**{**cfg.__dict__, "max_default_chat_id": "MAXID",
                                    "max_recipient_kind": "chat_id"})
     tg_topics.save(cfg, "bot-squad", {"team_queries": 3131})
@@ -548,7 +548,6 @@ def test_escalation_max_primary_with_group_record(tmp_path, monkeypatch):
     _stub_pane(monkeypatch, visible=False)
 
     TS.tick(cfg)
-    assert len(max_calls) == 1                       # personal page via MAX
-    assert max_calls[0]["chat_id"] == "MAXID"
-    assert len(tg_calls) == 1                        # best-effort group-record
+    assert len(tg_calls) == 1                        # personal page via TG
     assert tg_calls[0]["topic_id"] == 3131           # into #team-queries
+    assert max_calls == []                           # one page = one delivery (T-0610)

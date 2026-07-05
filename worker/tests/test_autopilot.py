@@ -137,10 +137,10 @@ def test_start_rejects_bad_kind_and_empty_prompt(cfg_slug):
         ap.start(cfg, slug, kind="session", ref=FAKE, prompt="   ")
 
 
-def test_notify_stakeholder_routes_max_primary(tmp_path: Path, monkeypatch):
-    """P2-08: autopilot's stakeholder page routes through the _send_stakeholder_dm
-    SSOT (MAX-primary on this DPI-blocked host) + a #team-queries group-record,
-    not a raw TG send that silently drops here."""
+def test_notify_stakeholder_routes_tg_primary(tmp_path: Path, monkeypatch):
+    """P2-08 + T-0610 inversion: autopilot's stakeholder page routes through the
+    _send_stakeholder_dm SSOT — ONE TG delivery into #team-queries (TG-primary
+    since the 2026-07-04 proxy fix), MAX untouched, no duplicate."""
     import dataclasses
     import types
     from bot_squad_worker import actions as A, tg_topics
@@ -158,6 +158,6 @@ def test_notify_stakeholder_routes_max_primary(tmp_path: Path, monkeypatch):
 
     ap._notify_stakeholder(cfg, project.slug, "autopilot parked the run")
 
-    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
-    assert "autopilot parked the run" in max_calls[0]["text"]
     assert len(tg_calls) == 1 and tg_calls[0]["topic_id"] == 777
+    assert "autopilot parked the run" in tg_calls[0]["text"]
+    assert len(max_calls) == 0  # one page = one delivery (T-0610)

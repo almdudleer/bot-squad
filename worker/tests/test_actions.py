@@ -116,6 +116,8 @@ def test_registry_lists_only_allowed_actions():
         "list_teams", "archive_team", "resurrect_team", "sync_session_name",
         # T-0247: MAX (max.ru) DM channel — mirrors tg_notify.
         "max_notify",
+        # T-0610: temporary page-channel switch (TG-primary / MAX reserve).
+        "page_channel",
         # T-0386: per-project forum-topic lifecycle (create-on-project / GC).
         "provision_project_topics", "gc_project_topics",
     }
@@ -525,16 +527,16 @@ def _inject_both_channels(monkeypatch, tmp_config_dir, max_client=None):
     return cfg, fake_tg, fake_max
 
 
-def test_tg_notify_routes_to_max_when_configured(tmp_config_dir, monkeypatch):
-    """The DEFAULT stakeholder DM goes via MAX (primary) when [max] is set."""
+def test_tg_notify_routes_to_tg_even_when_max_configured(tmp_config_dir, monkeypatch):
+    """T-0610 inversion: the DEFAULT stakeholder DM goes via TG (primary) even
+    with [max].default_chat_id set — MAX is reserve-only now."""
     import bot_squad_worker.actions as A
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
     out = A.dispatch("tg_notify", {"message": "stakeholder dm", "sid": "S-x-p1"})
-    assert out == {"ok": True, "sent": True, "channel": "max"}
-    assert len(fake_max.calls) == 1 and len(fake_tg.calls) == 0
-    assert fake_max.calls[0]["chat_id"] == "MAXCHAT99"
-    assert fake_max.calls[0]["text"] == "stakeholder dm"
+    assert out == {"ok": True, "sent": True, "channel": "tg"}
+    assert len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
+    assert fake_tg.calls[0]["text"] == "stakeholder dm"
 
 
 def test_tg_notify_uses_tg_when_max_unconfigured(tmp_config_dir, monkeypatch):
@@ -2519,17 +2521,20 @@ def test_gc_project_topics_closes_all(tmp_config_dir, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# T-0394 / Audit Item 2: _send_stakeholder_dm SSOT helper (MAX-primary/failover
-# + best-effort #team-queries group-record). The 3 personal pagers route here.
+# T-0394 / Audit Item 2 → T-0610 inversion: _send_stakeholder_dm SSOT helper.
+# TG-primary / MAX reserve (auto-failover or temporary stakeholder switch),
+# one page = one delivery, short-form pages. The personal pagers route here.
 # ---------------------------------------------------------------------------
 
-def test_send_stakeholder_dm_max_primary(tmp_config_dir, monkeypatch):
+def test_send_stakeholder_dm_tg_primary_even_with_max_configured(tmp_config_dir, monkeypatch):
+    """T-0610: with MAX configured, the page STILL goes TG-first — the
+    MAX-primary premise (DPI-blocked TG) died 2026-07-04."""
     import bot_squad_worker.actions as A
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
     out = A._send_stakeholder_dm(A._get_config(), message="page", sid="S-x-p1", tg_chat_id="-100")
-    assert out["channel"] == "max" and out["sent"] is True
-    assert len(fake_max.calls) == 1 and len(fake_tg.calls) == 0  # no group-record by default
+    assert out["channel"] == "tg" and out["sent"] is True
+    assert len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
 
 
 def test_send_stakeholder_dm_prefer_tg_skips_max(tmp_config_dir, monkeypatch):
@@ -2549,23 +2554,23 @@ def test_send_stakeholder_dm_tg_when_max_unconfigured(tmp_config_dir, monkeypatc
     assert out["channel"] == "tg" and len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
 
 
-def test_send_stakeholder_dm_group_record_on_max(tmp_config_dir, monkeypatch):
-    """D1: MAX-primary delivery ALSO leaves a best-effort group-record in TG."""
+def test_send_stakeholder_dm_no_duplicate_group_record(tmp_config_dir, monkeypatch):
+    """T-0610 DoD: one page = ONE delivery. group_record is a compat no-op —
+    the old MAX-ping + TG-group-record pair was the stakeholder's duplicate
+    complaint; the TG-primary delivery already lands in the group/topic."""
     import bot_squad_worker.actions as A
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
     out = A._send_stakeholder_dm(A._get_config(), message="needs you", sid="S-x-p1",
                                  tg_chat_id="-100", tg_topic_id=77, group_record=True)
-    assert out["channel"] == "max"
-    assert len(fake_max.calls) == 1            # personal ping via MAX
-    assert len(fake_tg.calls) == 1             # best-effort group-record
-    assert fake_tg.calls[0]["topic_id"] == 77  # into #team-queries
+    assert out["channel"] == "tg"
+    assert len(fake_tg.calls) == 1 and len(fake_max.calls) == 0
+    assert fake_tg.calls[0]["topic_id"] == 77
 
 
-def test_send_stakeholder_dm_group_record_failure_is_non_fatal(tmp_config_dir, monkeypatch):
-    """T-0533: a failing best-effort group-record post (e.g. TG DPI-block) must
-    NOT break the page — MAX already delivered above; the failure is swallowed
-    (now logged at DEBUG, not ERROR-per-page)."""
+def test_send_stakeholder_dm_failover_to_max_on_tg_error(tmp_config_dir, monkeypatch):
+    """T-0610: TG raising (e.g. DPI-block returns) fails over to the MAX
+    reserve instead of losing the page."""
     import bot_squad_worker.actions as A
 
     class _BoomTg:
@@ -2574,14 +2579,84 @@ def test_send_stakeholder_dm_group_record_failure_is_non_fatal(tmp_config_dir, m
 
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
-    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())  # group-record post raises
-    out = A._send_stakeholder_dm(A._get_config(), message="needs you", sid="S-x-p1",
-                                 tg_chat_id="-100", tg_topic_id=77, group_record=True)
-    assert out["channel"] == "max" and out.get("sent")  # page delivered; failure non-fatal
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())
+    out = A._send_stakeholder_dm(A._get_config(), message="hi", sid="S-x-p1", tg_chat_id="-100")
+    assert out["channel"] == "max" and out["sent"] is True
     assert len(fake_max.calls) == 1
 
 
-def test_send_stakeholder_dm_failover_to_tg(tmp_config_dir, monkeypatch):
+def test_send_stakeholder_dm_empty_tg_chat_goes_to_max(tmp_config_dir, monkeypatch):
+    """T-0610 sweep: an empty tg_chat_id is not a silent no-op — the page
+    delivers via the MAX reserve."""
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    out = A._send_stakeholder_dm(A._get_config(), message="hi", tg_chat_id="")
+    assert out["channel"] == "max" and len(fake_max.calls) == 1 and len(fake_tg.calls) == 0
+
+
+def test_send_stakeholder_dm_no_channel_is_loud_not_silent(tmp_config_dir, monkeypatch, caplog):
+    """T-0610 sweep: neither channel available → ok=False + channel 'none' +
+    a WARNING — never a silent drop."""
+    import logging as _logging
+    import bot_squad_worker.actions as A
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    with caplog.at_level(_logging.WARNING):
+        out = A._send_stakeholder_dm(A._get_config(), message="hi", tg_chat_id="")
+    assert out == {"ok": False, "sent": False, "channel": "none"}
+    assert len(fake_tg.calls) == 0 and len(fake_max.calls) == 0
+    assert any("NO channel delivered" in r.message for r in caplog.records)
+
+
+def test_send_stakeholder_dm_mode_max_temporary_switch(tmp_config_dir, monkeypatch):
+    """T-0610: the stakeholder's temporary 'max' mode routes pages via MAX
+    (one delivery, no TG copy); 'auto' reverts to TG-primary."""
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, fake_tg, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    cfg = A._get_config()
+    A._set_page_mode(cfg, "max", by="stakeholder")
+    out = A._send_stakeholder_dm(cfg, message="hi", tg_chat_id="-100", group_record=True)
+    assert out["channel"] == "max"
+    assert len(fake_max.calls) == 1 and len(fake_tg.calls) == 0
+    A._set_page_mode(cfg, "auto")
+    out2 = A._send_stakeholder_dm(cfg, message="hi again", tg_chat_id="-100")
+    assert out2["channel"] == "tg" and len(fake_tg.calls) == 1
+
+
+def test_send_stakeholder_dm_slims_long_pages(tmp_config_dir, monkeypatch):
+    """T-0610: pages are short-form — a verbose work summary is cut at a
+    boundary with an explicit continuation pointer."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    verbose = "Сводка по работе. " + "Сделал шаг и проверил результат. " * 40
+    A._send_stakeholder_dm(A._get_config(), message=verbose, tg_chat_id="-100")
+    sent_text = fake_tg.calls[0]["text"]
+    assert len(sent_text) < len(verbose)
+    assert len(sent_text) <= A._PAGE_SLIM_LIMIT + 40
+    assert "детали: см. задачу/тред" in sent_text
+
+
+def test_page_channel_action_set_read_persists(tmp_config_dir, monkeypatch):
+    """T-0610: page_channel action sets/reads the mode; state survives via the
+    data/_worker/page_channel.json file; bad mode rejected."""
+    import pytest as _pytest
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.actions import ActionError as _AE
+    _inject_both_channels(monkeypatch, tmp_config_dir)
+    assert A.dispatch("page_channel", {})["mode"] == "auto"
+    out = A.dispatch("page_channel", {"mode": "max", "by": "stakeholder"})
+    assert out["ok"] is True and out["mode"] == "max"
+    assert A.dispatch("page_channel", {})["mode"] == "max"
+    assert A._page_mode_path(A._get_config()).exists()
+    with _pytest.raises(_AE, match="mode must be one of"):
+        A.dispatch("page_channel", {"mode": "smoke-signals"})
+    assert A.dispatch("page_channel", {"mode": "auto"})["mode"] == "auto"
+
+
+def test_send_stakeholder_dm_mode_max_falls_back_to_tg_when_max_down(tmp_config_dir, monkeypatch):
+    """Even under the temporary 'max' mode, a MAX outage falls back to TG —
+    the page always prefers delivery over mode fidelity."""
     import bot_squad_worker.actions as A
 
     class _BoomMax:
@@ -2590,7 +2665,9 @@ def test_send_stakeholder_dm_failover_to_tg(tmp_config_dir, monkeypatch):
 
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir, max_client=_BoomMax())
-    out = A._send_stakeholder_dm(A._get_config(), message="hi", tg_chat_id="-100", group_record=True)
+    cfg = A._get_config()
+    A._set_page_mode(cfg, "max", by="stakeholder")
+    out = A._send_stakeholder_dm(cfg, message="hi", tg_chat_id="-100", group_record=True)
     assert out["channel"] == "tg" and len(fake_tg.calls) == 1
 
 

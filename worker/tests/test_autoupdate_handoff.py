@@ -229,9 +229,9 @@ def test_notify_failure_no_chat_id_is_banner_only(install_ctx, monkeypatch, capl
     assert called["n"] == 0, "no chat → no send attempt"
 
 
-def test_notify_failure_max_primary_with_group_record(install_ctx, monkeypatch):
-    """T-0394: with MAX configured, the apply-failure page goes via MAX (primary)
-    + leaves a best-effort #team-queries group-record in TG."""
+def test_notify_failure_tg_primary_single_delivery(install_ctx, monkeypatch):
+    """T-0394 → T-0610 inversion: with MAX configured, the apply-failure page
+    goes via TG (primary) into #team-queries — ONE delivery, MAX reserve only."""
     cfg = install_ctx["cfg"]
     cfg.max_default_chat_id = "MAXID"
     cfg.max_recipient_kind = "chat_id"
@@ -246,8 +246,8 @@ def test_notify_failure_max_primary_with_group_record(install_ctx, monkeypatch):
         send=lambda **k: (tg_calls.append(k) or True)))
 
     apply_mod._notify_failure(cfg, version="v9", step="build", log_tail="boom")
-    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
     assert len(tg_calls) == 1 and tg_calls[0]["topic_id"] == 808
+    assert len(max_calls) == 0  # one page = one delivery (T-0610)
 
 
 def test_install_identifier_falls_back_to_env(install_ctx, monkeypatch):

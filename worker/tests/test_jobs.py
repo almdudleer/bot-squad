@@ -646,15 +646,12 @@ def test_deploy_monitor_watchdog_fires_targeted_operator_alert(
     assert all("KILLED" in t for _, t in peers)
 
 
-def test_deploy_monitor_watchdog_alert_routes_max_primary(
+def test_deploy_monitor_watchdog_alert_routes_tg_primary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2-04: the deploy-KILLED alert routes through the _send_stakeholder_dm SSOT
-    (MAX-primary on this DPI-blocked host), not a raw TG send that silently drops.
-
-    MAX carries the loud KILLED alert; TG is only a best-effort #deploy-logs
-    group-record. Previously _alert_operators raw-sent to TG and the wedged-build
-    alert vanished on this host.
+    """P2-04 → T-0610 inversion: the deploy-KILLED alert routes through the
+    _send_stakeholder_dm SSOT, TG-primary (one loud delivery into #deploy-logs),
+    MAX reserve-only — not a raw send and not a duplicated page.
     """
     import dataclasses
     import types
@@ -692,12 +689,12 @@ def test_deploy_monitor_watchdog_alert_routes_max_primary(
 
     deploy_monitor_one(cfg, proj.slug)
 
-    # MAX (primary) carried the loud KILLED alert — it was NOT silently dropped.
-    kill_max = [c for c in max_calls if "KILLED" in c["text"]]
-    assert kill_max and kill_max[0]["chat_id"] == "MAXID"
-    assert all(c["urgent"] is True for c in kill_max)
-    # TG only as a best-effort #deploy-logs group-record (never the primary page).
-    assert all(c["chat_id"] == proj.tg_chat for c in tg_calls)
+    # TG (primary) carried the loud KILLED alert — one delivery, not dropped.
+    kill_tg = [c for c in tg_calls if "KILLED" in c["text"]]
+    assert kill_tg and kill_tg[0]["chat_id"] == proj.tg_chat
+    assert all(c["urgent"] is True for c in kill_tg)
+    # MAX is reserve-only now — no duplicate personal ping (T-0610).
+    assert max_calls == []
 
 
 def test_deploy_monitor_reaps_orphan_with_alert(
@@ -805,11 +802,11 @@ def test_oauth_refresh_failure_ping_is_urgent(
     )
 
 
-def test_oauth_refresh_failure_routes_max_primary(
+def test_oauth_refresh_failure_routes_tg_primary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2-08: the oauth_refresh P1 system page routes through the SSOT
-    (MAX-primary on this DPI-blocked host), not a raw TG send that drops here."""
+    """P2-08 → T-0610 inversion: the oauth_refresh P1 system page routes
+    through the SSOT — TG-primary, one delivery, MAX reserve-only."""
     import dataclasses
     import types
 
@@ -832,11 +829,11 @@ def test_oauth_refresh_failure_routes_max_primary(
 
     oauth_refresh(cfg)
 
-    # MAX (primary) carried the urgent FAILED page — not silently dropped on TG.
-    assert len(max_calls) == 1 and max_calls[0]["chat_id"] == "MAXID"
-    assert max_calls[0]["urgent"] is True and "creds expired" in max_calls[0]["text"]
-    # TG only as a best-effort #team-queries group-record.
-    assert all(c["chat_id"] == proj.tg_chat for c in tg_calls)
+    # TG (primary) carried the urgent FAILED page — one delivery into #team-queries.
+    assert len(tg_calls) == 1 and tg_calls[0]["chat_id"] == proj.tg_chat
+    assert tg_calls[0]["urgent"] is True and "creds expired" in tg_calls[0]["text"]
+    # MAX is reserve-only now — no duplicate personal ping (T-0610).
+    assert max_calls == []
 
 
 # ---------------------------------------------------------------------------

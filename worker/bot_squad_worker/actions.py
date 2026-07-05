@@ -291,6 +291,53 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+_PAGE_MODES = ("auto", "tg", "max")
+# T-0610: stakeholder-facing pages are short-form — headline + refs; detail
+# stays in tasks/threads ("слишком подробные сводки ... очень много подробностей").
+_PAGE_SLIM_LIMIT = 400
+
+
+def _page_mode_path(cfg: Any) -> Path:
+    return Path(cfg.data_dir) / "_worker" / "page_channel.json"
+
+
+def _get_page_mode(cfg: Any) -> str:
+    """Current page-channel mode (T-0610 temp-switch): 'auto' = TG-primary
+    (the default), 'tg' = same but explicit, 'max' = temporarily page via MAX
+    (stakeholder-issued from the TG thread — he cannot write to the MAX bot).
+    Missing/corrupt state file = 'auto'."""
+    try:
+        raw = json.loads(_page_mode_path(cfg).read_text())
+    except (OSError, ValueError):
+        return "auto"
+    mode = str(raw.get("mode", "auto"))
+    return mode if mode in _PAGE_MODES else "auto"
+
+
+def _set_page_mode(cfg: Any, mode: str, *, by: str = "") -> dict[str, Any]:
+    p = _page_mode_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"mode": mode, "set_by": by, "set_at": _now_iso()}
+    p.write_text(json.dumps(payload))
+    return payload
+
+
+def _slim_page(text: str) -> str:
+    """T-0610: cap a page at headline size. Over-limit text is cut at a
+    line/sentence boundary with an explicit continuation pointer — pages must
+    be short, but never silently truncated mid-word."""
+    t = (text or "").strip()
+    if len(t) <= _PAGE_SLIM_LIMIT:
+        return t
+    cut = t[:_PAGE_SLIM_LIMIT]
+    for sep in ("\n", ". "):
+        i = cut.rfind(sep)
+        if i > 100:
+            cut = cut[:i]
+            break
+    return cut.rstrip(" .") + "\n… (детали: см. задачу/тред)"
+
+
 def _send_stakeholder_dm(
     cfg: Any,
     *,
@@ -304,64 +351,75 @@ def _send_stakeholder_dm(
     group_record: bool = False,
     debounce: bool = True,
 ) -> dict[str, Any]:
-    """SSOT for paging the human (T-0247 channel logic, T-0394 dedupe).
+    """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
-    This install's working human channel is MAX (TG is DPI-blocked and only limps
-    via proxy), so when ``[max].default_chat_id`` is configured the page goes via
-    MAX as PRIMARY (same quiet-hours/debounce/SID-prefix). TG is the FAILOVER when
-    MAX is unconfigured OR errors (D1: failover-only, never a broadcast).
-    ``prefer_tg`` forces TG (an explicit group/forum target MAX can't honor).
+    TG is PRIMARY: the DPI-block premise behind the old MAX-primary logic died
+    2026-07-04 (dead proxy removed, direct TG works). MAX is the RESERVE — it
+    delivers when TG errors or no TG chat is configured (auto-failover; do NOT
+    remove the MAX transport, this host has DPI history), or while the
+    stakeholder's temporary 'max' page-mode is set (``page_channel`` action).
 
-    ``group_record=True`` (the personal pagers): on MAX-primary delivery, ALSO
-    leave a best-effort post in the TG group ``tg_chat_id`` (thread
-    ``tg_topic_id``, typically #team-queries) — a GROUP-RECORD, not a second
-    personal ping (D1). Never raises on the group-record path.
+    ONE page = ONE delivery (T-0610 DoD): the MAX-ping + TG-group-record pair
+    was the duplicate he complained about. ``group_record`` is now a compat
+    no-op — the TG-primary delivery already lands in the group/topic the
+    record used to go to.
 
-    Returns ``{ok, sent, channel}`` — the channel that delivered the page.
+    Pages are SHORT-FORM (``_slim_page``): headline + refs, detail in tasks.
+
+    ``prefer_tg`` (an explicit group/forum target MAX can't honor) stays
+    TG-only: no MAX fallback for group-addressed content; TG errors propagate
+    to the caller as before.
+
+    Returns ``{ok, sent, channel}``. ``channel: "none"`` (ok=False) when no
+    transport could deliver — logged loudly, never a silent no-op.
     """
-    max_chat = getattr(cfg, "max_default_chat_id", "") or ""
-    if max_chat and not prefer_tg:
-        try:
-            sent = _get_max_client(cfg).send(
-                chat_id=max_chat,
-                text=message,
-                sid=sid,
-                user=user,
-                urgent=urgent,
-                recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
-            )
-            if group_record and tg_chat_id:
-                try:
-                    _get_tg_client(cfg).send(
-                        chat_id=tg_chat_id, text=message, sid=sid, user=user,
-                        urgent=urgent, topic_id=tg_topic_id,
-                    )
-                except Exception:
-                    # T-0533: DEBUG, not ERROR. This TG #team-queries record is
-                    # best-effort (the page already delivered via MAX above); on a
-                    # DPI-blocked install it ConnectTimeouts on EVERY stakeholder
-                    # page, which spammed an ERROR+traceback per page. Keep the
-                    # detail at DEBUG (exc_info) so reachable installs can still
-                    # diagnose a genuine failure without flooding normal logs.
-                    log.debug(
-                        "_send_stakeholder_dm: group-record post failed "
-                        "(non-fatal; e.g. TG unreachable / DPI-block)",
-                        exc_info=True,
-                    )
-            return {"ok": True, "sent": sent, "channel": "max"}
-        except Exception:
-            log.exception("_send_stakeholder_dm: MAX delivery failed — failing over to TG")
+    del group_record  # T-0610: compat no-op — one page, one delivery
+    message = _slim_page(message)
 
-    sent = _get_tg_client(cfg).send(
-        chat_id=tg_chat_id,
-        text=message,
-        sid=sid,
-        user=user,
-        urgent=urgent,
-        topic_id=tg_topic_id,
-        debounce=debounce,
-    )
-    return {"ok": True, "sent": sent, "channel": "tg"}
+    def _try_tg() -> dict[str, Any] | None:
+        if not tg_chat_id:
+            return None
+        sent = _get_tg_client(cfg).send(
+            chat_id=tg_chat_id, text=message, sid=sid, user=user,
+            urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
+        )
+        return {"ok": True, "sent": sent, "channel": "tg"}
+
+    def _try_max() -> dict[str, Any] | None:
+        max_chat = getattr(cfg, "max_default_chat_id", "") or ""
+        if not max_chat:
+            return None
+        sent = _get_max_client(cfg).send(
+            chat_id=max_chat, text=message, sid=sid, user=user, urgent=urgent,
+            recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
+        )
+        return {"ok": True, "sent": sent, "channel": "max"}
+
+    if prefer_tg:
+        out = _try_tg()
+        if out is None:
+            log.warning(
+                "_send_stakeholder_dm: prefer_tg page with no tg_chat_id "
+                "dropped (sid=%s)", sid)
+            return {"ok": False, "sent": False, "channel": "none"}
+        return out
+
+    mode = _get_page_mode(cfg)
+    order = (_try_max, _try_tg) if mode == "max" else (_try_tg, _try_max)
+    for attempt in order:
+        try:
+            out = attempt()
+        except Exception:  # noqa: BLE001 — reserve channel gets its chance
+            log.exception(
+                "_send_stakeholder_dm: %s delivery failed — trying reserve",
+                attempt.__name__)
+            out = None
+        if out is not None:
+            return out
+    log.warning(
+        "_send_stakeholder_dm: NO channel delivered (tg_chat_id=%r, mode=%s, "
+        "sid=%s) — page dropped", tg_chat_id, mode, sid)
+    return {"ok": False, "sent": False, "channel": "none"}
 
 
 def _coerce_topic_id(raw: Any) -> int | None:
@@ -421,6 +479,37 @@ def _action_max_notify(params: dict[str, Any]) -> dict[str, Any]:
         recipient_kind=params.get("recipient_kind"),
     )
     return {"ok": True, "sent": sent}
+
+
+_PAGE_CHANNEL_ALLOWED = {"mode", "by"}
+
+
+def _action_page_channel(params: dict[str, Any]) -> dict[str, Any]:
+    """Read or set the page-channel mode (T-0610 temporary switch).
+
+    The stakeholder can only issue the switch from the TG thread ("я должен
+    просто иметь возможность сказать типа, давай сейчас переключим временно на
+    Max") — the attendant translates that into this action.
+
+    Params: {} reads the current mode; {"mode": "tg"|"max"|"auto"} sets it
+    ("auto" = revert to the TG-primary default; optional "by" stamps who
+    switched). The mode persists across worker restarts
+    (data/_worker/page_channel.json) and is consulted by the
+    ``_send_stakeholder_dm`` SSOT on every page.
+    """
+    extra = set(params) - _PAGE_CHANNEL_ALLOWED
+    if extra:
+        raise ActionError(f"page_channel got unexpected params: {sorted(extra)}")
+    cfg = _get_config()
+    mode = str(params.get("mode", "") or "")
+    if not mode:
+        return {"ok": True, "mode": _get_page_mode(cfg)}
+    if mode not in _PAGE_MODES:
+        raise ActionError(
+            f"page_channel: mode must be one of {list(_PAGE_MODES)}, got {mode!r}")
+    payload = _set_page_mode(cfg, mode, by=str(params.get("by", "")))
+    log.info("page_channel: mode set to %s (by=%s)", mode, payload["set_by"] or "?")
+    return {"ok": True, **payload}
 
 
 # ---------------------------------------------------------------------------
@@ -3409,6 +3498,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "tg_notify": _action_tg_notify,
     # T-0247: MAX (max.ru) DM channel — mirrors tg_notify.
     "max_notify": _action_max_notify,
+    # T-0610: temporary page-channel switch (TG-primary default / MAX reserve).
+    "page_channel": _action_page_channel,
     "tg_stall_clear": _action_tg_stall_clear,
     # T-0386: per-project forum-topic lifecycle (create-on-project / GC-on-archive).
     "provision_project_topics": _action_provision_project_topics,
@@ -3520,6 +3611,7 @@ ACTION_MODES: dict[str, str] = {
     "tg_verify_login": "coordinator_only",
     "tg_notify": "coordinator_only",
     "max_notify": "coordinator_only",
+    "page_channel": "coordinator_only",
     "tg_stall_clear": "coordinator_only",
     # T-0386: use the coordinator TG client + project config (single writer of
     # the per-project topic map) — coordinator-only like the rest of the TG ops.

@@ -8,6 +8,7 @@ import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import AuthConfig
+from app.payload_guard import str_field
 from app.roles import server_role_for
 from app.routes_auth import require_admin
 
@@ -150,8 +151,8 @@ def list_users(request: Request) -> list[dict]:
 @router.post("")
 def create_user(request: Request, payload: dict) -> dict:
     cfg: AuthConfig = request.app.state.auth_config
-    username = (payload.get("username") or "").strip()
-    password = payload.get("password") or ""
+    username = str_field(payload, "username")
+    password = str_field(payload, "password", strip=False)
     if not username:
         raise HTTPException(status_code=400, detail="username required")
     if not password:
@@ -159,7 +160,7 @@ def create_user(request: Request, payload: dict) -> dict:
     if username in cfg.users:
         raise HTTPException(status_code=400, detail=f"user already exists: {username}")
 
-    linux_user = (payload.get("linux_user") or username).strip() or username
+    linux_user = str_field(payload, "linux_user") or username
     is_admin = _coerce_bool(payload.get("is_admin", False))
 
     new_users = dict(cfg.users)
@@ -186,7 +187,7 @@ def patch_user(username: str, request: Request, payload: dict) -> dict:
     new_linux_user = current.linux_user
     new_is_admin = current.is_admin
     if "linux_user" in payload:
-        lu = (payload.get("linux_user") or "").strip()
+        lu = str_field(payload, "linux_user")
         if not lu:
             raise HTTPException(status_code=400, detail="linux_user must not be empty")
         new_linux_user = lu
@@ -220,7 +221,7 @@ def reset_password(username: str, request: Request, payload: dict) -> dict:
     cfg: AuthConfig = request.app.state.auth_config
     if username not in cfg.users:
         raise HTTPException(status_code=404, detail=f"unknown user: {username}")
-    password = payload.get("password") or ""
+    password = str_field(payload, "password", strip=False)
     if not password:
         raise HTTPException(status_code=400, detail="password required")
     new_users = dict(cfg.users)

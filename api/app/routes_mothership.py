@@ -50,6 +50,7 @@ from app.install_tokens import (
 from app.auth import verify_password
 from app.mothership_store import AttachedServer, MothershipStore
 from app.mothership_users_store import MothershipUsersStore
+from app.payload_guard import str_field
 from app.roles import GlobalRole
 from app.routes_auth import require_auth
 
@@ -385,8 +386,8 @@ def verify_global_user(request: Request, payload: dict) -> dict:
             status_code=403,
             detail="server_bearer required (install_token rejected for /users/verify)",
         )
-    username = (payload.get("username") or "").strip()
-    password = payload.get("password") or ""
+    username = str_field(payload, "username")
+    password = str_field(payload, "password", strip=False)
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
     store = _users_store(request)
@@ -451,8 +452,8 @@ def create_server(
     # (a fleet-attach credential); leaving this at require_auth let a non-admin
     # mint one = privilege escalation. Mirrors install-tokens/mint, which mints
     # the same credential for an existing server and was already super-admin.
-    display_name = (payload.get("display_name") or "").strip()
-    base_url = (payload.get("base_url") or "").strip()
+    display_name = str_field(payload, "display_name")
+    base_url = str_field(payload, "base_url")
     if not display_name or not base_url:
         raise HTTPException(
             status_code=400, detail="display_name and base_url are required"
@@ -531,8 +532,8 @@ def create_invite(
     # ``server`` is resolved + owner-gated by ``require_manage`` (audit Fork-3,
     # D3 owner-only): minting an invite is a management action, so a grantee who
     # can ENTER the server can no longer mint one.
-    target_username = (payload.get("target_username") or "").strip()
-    role = (payload.get("role") or "").strip()
+    target_username = str_field(payload, "target_username")
+    role = str_field(payload, "role")
     if not target_username:
         raise HTTPException(status_code=400, detail="target_username is required")
     if role not in ("admin", "non-admin"):
@@ -610,7 +611,7 @@ def create_grant(
     user: dict = Depends(require_auth),
 ) -> dict:
     store = _store(request)
-    username = (payload.get("username") or "").strip()
+    username = str_field(payload, "username")
     if not username:
         raise HTTPException(status_code=400, detail="username is required")
     updated = store.add_grant(server_id, username, granted_by=user["username"])
@@ -828,12 +829,13 @@ def installer_connect(request: Request, payload: dict) -> dict:
     already burned) so the installer's structured "what + how" message
     can key off it verbatim.
     """
-    token = (payload.get("token") or "").strip()
+    token = str_field(payload, "token")
     if not token or not is_install_token(token):
         raise HTTPException(status_code=400, detail="install token required")
-    result = _store(request).consume_install_token(
-        token, payload.get("server_meta") or {}
-    )
+    server_meta = payload.get("server_meta") or {}
+    if not isinstance(server_meta, dict):
+        raise HTTPException(status_code=400, detail="server_meta must be an object")
+    result = _store(request).consume_install_token(token, server_meta)
     if result is None:
         raise HTTPException(status_code=410, detail="install token gone")
     server, bearer = result
@@ -858,7 +860,7 @@ def installer_join(request: Request, payload: dict) -> dict:
     "what + how" message keys off it verbatim — same recipe as the
     install-token 410 from ``/connect``.
     """
-    token = (payload.get("token") or "").strip()
+    token = str_field(payload, "token")
     # Reject the wrong token KIND with a precise 400 — keeps the
     # install-token-vs-invite-token non-interchangeability invariant
     # auditable without leaking which token a stale plaintext was. Any
@@ -882,8 +884,8 @@ def installer_checkpoint(
     payload: dict,
 ) -> Response:
     server_id, _kind = _authenticate_installer(request)
-    checkpoint = (payload.get("checkpoint") or "").strip()
-    status = (payload.get("status") or "").strip()
+    checkpoint = str_field(payload, "checkpoint")
+    status = str_field(payload, "status")
     if not checkpoint or not status:
         raise HTTPException(status_code=400, detail="checkpoint and status required")
     event = {

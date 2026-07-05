@@ -57,6 +57,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from app.mothership_store import MothershipStore
+from app.payload_guard import str_field
 from app.routes_auth import require_auth
 
 router = APIRouter(prefix="/releases", tags=["releases"])
@@ -208,7 +209,7 @@ def post_telemetry(request: Request, payload: dict) -> None:
     consumer-side caller (the autoupdate poller) hasn't got a session
     cookie. Gating is by ``install_id`` membership in ``MothershipStore``.
     """
-    install_id = (payload.get("install_id") or "").strip()
+    install_id = str_field(payload, "install_id")
     if not install_id:
         raise HTTPException(status_code=400, detail="install_id required")
     store = _telemetry_store(request)

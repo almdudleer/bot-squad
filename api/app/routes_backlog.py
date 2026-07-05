@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import logging
 import re
+import tomllib
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app import task_search
 from app.canonical_status import derive_parent_status
 from app.frontmatter import as_list, parse_or_none
 from app.markdown_parser import ParseError, parse_task
@@ -15,6 +17,7 @@ from app.markdown_writer import (
     slugify,
     write_task,
 )
+from app.payload_guard import opt_str_field, str_field
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 from app.task_body import compose_body, parse_body, regraft_progress, regraft_verbatim
@@ -221,6 +224,67 @@ def _validate_priority(value: object) -> int:
     return value
 
 
+# T-0600 (N2): web parity for the worker's T-0577 dedupe-vs-create gate. The
+# constants mirror worker/bot_squad_worker/actions.py (_TASK_DEDUPE_*); the
+# threshold knob is the SAME [tasks].dedupe_threshold in system_settings.toml
+# the worker config reads, so the two ingest surfaces can't drift on the knob.
+_TASK_DEDUPE_MIN_TOKENS = 2
+_TASK_DEDUPE_CANDIDATE_LIMIT = 5
+_TASKS_DEDUPE_THRESHOLD_DEFAULT = 0.9
+
+
+def _dedupe_threshold(request: Request) -> float:
+    path = request.app.state.api_config.config_dir / "system_settings.toml"
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        return float(
+            (raw.get("tasks") or {}).get(
+                "dedupe_threshold", _TASKS_DEDUPE_THRESHOLD_DEFAULT
+            )
+        )
+    except (OSError, ValueError, TypeError, tomllib.TOMLDecodeError):
+        return _TASKS_DEDUPE_THRESHOLD_DEFAULT
+
+
+def _similar_backlog(backlog_dir: Path, query: str, threshold: float) -> list:
+    """Rank the existing backlog against ``query`` and return the candidates
+    whose COVERAGE (fraction of the query's distinct meaningful tokens found
+    in the candidate) is at/above ``threshold``. Mirrors the worker's
+    ``_task_new_similar_backlog`` (read-only, best-effort: unreadable or
+    unparsable tickets drop out rather than blocking the mint)."""
+    tokens = task_search.tokenize(query)
+    if len(tokens) < _TASK_DEDUPE_MIN_TOKENS:
+        return []
+    if not backlog_dir.exists():
+        return []
+    tickets: list[task_search.Ticket] = []
+    for md in sorted(backlog_dir.glob("T-*.md")):
+        try:
+            raw = md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        parsed = parse_or_none(raw)
+        if not parsed:
+            continue
+        meta, body = parsed
+        meta = meta or {}
+        stem_parts = md.stem.split("-", 2)
+        fallback_id = "-".join(stem_parts[:2]) if len(stem_parts) >= 2 else md.stem
+        tickets.append(task_search.Ticket(
+            id=str(meta.get("id") or fallback_id).strip(),
+            title=str(meta.get("title") or md.stem),
+            body=body,
+            status=str(meta.get("status") or ""),
+        ))
+    if not tickets:
+        return []
+    out = []
+    for c in task_search.rank(query, tickets, limit=_TASK_DEDUPE_CANDIDATE_LIMIT):
+        if len(c.matched) / len(tokens) >= threshold:
+            out.append(c)
+    return out
+
+
 def _default_open_priority(backlog_dir: Path) -> int:
     """Default priority for a new task: max(open priorities) + 100, else 0."""
     max_open: int | None = None
@@ -247,7 +311,7 @@ def create_task(
     payload: dict,
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
-    title = (payload.get("title") or "").strip()
+    title = str_field(payload, "title")
     if not title:
         raise HTTPException(status_code=400, detail="title must not be empty")
     status = payload.get("status", "open")
@@ -259,14 +323,41 @@ def create_task(
         raise HTTPException(status_code=400, detail=f"invalid kind: {kind!r} — must be one of {sorted(_VALID_KINDS)}")
     # Phase 7: prefer `verbatim_request` (composed into canonical body).
     # Fall back to legacy `body` (stored as-is — caller knows the convention).
-    verbatim_request = payload.get("verbatim_request")
+    verbatim_request = opt_str_field(payload, "verbatim_request")
     if verbatim_request is not None:
         body = compose_body(verbatim_request, "", "")
     else:
-        body = payload.get("body") or ""
+        body = opt_str_field(payload, "body") or ""
 
     backlog_dir = _backlog_dir(request, slug)
     backlog_dir.mkdir(parents=True, exist_ok=True)
+
+    # T-0600 (N2): the T-0577 dedupe-vs-create gate, web-parity edition. The
+    # worker's task_new rejects a near-duplicate mint; this route previously
+    # minted unconditionally, so the board bypassed the anti-proliferation
+    # guarantee the voice/CLI lane enforces. Same recipe: rank title
+    # (+ verbatim) against the existing backlog, 409 with the candidates and
+    # the force escape hatch instead of silently creating a twin.
+    force = payload.get("force", False)
+    if not isinstance(force, bool):
+        raise HTTPException(status_code=400, detail="force must be a boolean")
+    if not force:
+        dedupe_query = title
+        if verbatim_request and verbatim_request.strip():
+            dedupe_query = f"{title}\n{verbatim_request}"
+        similar = _similar_backlog(backlog_dir, dedupe_query, _dedupe_threshold(request))
+        if similar:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "near_duplicate",
+                    "message": (
+                        "looks like a near-duplicate of existing backlog "
+                        "task(s) — retry with force:true to create anyway"
+                    ),
+                    "candidates": [{"id": c.id, "title": c.title} for c in similar],
+                },
+            )
 
     # Phase 8: priority. If the caller specified one, validate. Else compute
     # default from existing open tasks so new ones land at the bottom.
@@ -322,7 +413,7 @@ def patch_task(
 
     if "status" in payload and payload["status"] not in _VALID_STATUSES:
         raise HTTPException(status_code=400, detail=_invalid_status_detail(payload["status"]))
-    if "title" in payload and not (payload.get("title") or "").strip():
+    if "title" in payload and not str_field(payload, "title"):
         raise HTTPException(status_code=400, detail="title must not be empty")
     # T-0480: `kind` (task|initiative). null clears it (write_task drops None).
     if "kind" in payload and payload["kind"] is not None and payload["kind"] not in _VALID_KINDS:
@@ -371,7 +462,7 @@ def patch_task(
 
     allowed = {"title", "status", "kind"} | _LINKAGE_PATCH_KEYS
     updates = {k: v for k, v in payload.items() if k in allowed}
-    body = payload.get("body")
+    body = opt_str_field(payload, "body")
     if body is not None:
         # T-0289 + T-0335 item-14: `## Verbatim request` (human-only) and
         # `## Progress` (append-only audit feed, on-disk SSOT) must never be
@@ -443,8 +534,8 @@ async def add_progress(
 ) -> dict:
     """Append a short progress note. Proxies to worker action `task_progress_add`."""
     _validate_task_id(task_id)
-    sid = (payload.get("sid") or "").strip()
-    text = (payload.get("text") or "").strip()
+    sid = str_field(payload, "sid")
+    text = str_field(payload, "text")
     if not text:
         raise HTTPException(status_code=400, detail="text must not be empty")
     if not sid:

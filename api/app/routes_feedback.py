@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from app import artifact_nesting as AN
 from app.markdown_writer import slugify, write_task
+from app.payload_guard import opt_str_field, str_field
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 
@@ -148,7 +149,7 @@ def put_feedback(
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_feedback_name(name)
-    content = payload.get("content") or ""
+    content = str_field(payload, "content", strip=False)
     _validate_content(content)
 
     fb_dir = _fb_dir(request, slug)
@@ -191,8 +192,8 @@ def promote_feedback(
     m = _H1_RE.search(fb_content)
     default_title = m.group(1).strip() if m else fb_path.stem
 
-    title = (payload.get("title") or "").strip() or default_title
-    custom_body = payload.get("body")
+    title = str_field(payload, "title") or default_title
+    custom_body = opt_str_field(payload, "body")
 
     # Build task body
     link = f"[{fname}](../feedback/{fname})"

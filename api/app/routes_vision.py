@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.markdown_writer import slugify
+from app.payload_guard import opt_str_field, str_field
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 
@@ -368,7 +369,7 @@ def put_active_initiative(
 
     Prefer the new POST/DELETE /active_initiatives/{name} endpoints.
     """
-    name = (payload.get("name") or "").strip()
+    name = str_field(payload, "name")
     vision_dir = _vision_dir(request, slug)
     if not name:
         _write_active_initiatives(vision_dir, set())
@@ -394,7 +395,7 @@ def put_vision(
     user: dict = Depends(require_project_member),  # T-0381: project-write gate
 ) -> dict:
     _validate_vision_name(name)
-    content = payload.get("content") or ""
+    content = str_field(payload, "content", strip=False)
     _validate_content(content)
 
     # T-0480 3b-1: editing an initiative's content writes its TASK body, not the
@@ -434,11 +435,11 @@ def post_vision(
     if kind != "initiative":
         raise HTTPException(status_code=400, detail="only kind=initiative is supported")
 
-    name = (payload.get("name") or "").strip()
+    name = str_field(payload, "name")
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
 
-    content = payload.get("content")
+    content = opt_str_field(payload, "content")
     if content is None:
         content = f"# {name}\n"
 

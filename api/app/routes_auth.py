@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.auth import AuthError, issue_jwt, verify_jwt, verify_password
+from app.payload_guard import str_field
 from app.roles import GlobalRole, ServerRole
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -68,8 +69,11 @@ def _is_super_admin(meta) -> bool:
 @router.post("/login")
 def login(request: Request, response: Response, payload: dict) -> dict:
     cfg = request.app.state.auth_config
-    username = (payload.get("username") or "").strip()
-    password = payload.get("password") or ""
+    # T-0600 (N1): pre-auth 500-class — a truthy non-string survived `or ""`
+    # and crashed on .strip() (int/list/bool username) or inside bcrypt (int
+    # password). str_field 400s on wrong types instead.
+    username = str_field(payload, "username")
+    password = str_field(payload, "password", strip=False)
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
     expected = cfg.users.get(username)
@@ -267,8 +271,8 @@ def attach(
     name. (Admin-driven cross-row attach can be a separate endpoint if a
     use case lands.)
     """
-    global_username = (payload.get("global_username") or "").strip()
-    global_password = payload.get("global_password") or ""
+    global_username = str_field(payload, "global_username")
+    global_password = str_field(payload, "global_password", strip=False)
     if not global_username or not global_password:
         raise HTTPException(
             status_code=400,

@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.config import ONBOARDING_SKIP_ALL, ApiConfig, AuthConfig, UserMeta
 from app.mothership_store import MothershipStore
 from app.mothership_users_store import Attachment, MothershipUsersStore
+from app.payload_guard import str_field
 from app.routes_auth import require_auth
 from app.worker_client import WorkerError
 
@@ -75,7 +76,7 @@ def get_onboarding(request: Request, user: dict = Depends(require_auth)) -> dict
 
 @router.post("/onboarding/seen")
 def mark_step_seen(request: Request, payload: dict, user: dict = Depends(require_auth)) -> dict:
-    step = (payload.get("step") or "").strip()
+    step = str_field(payload, "step")
     if not step:
         raise HTTPException(status_code=400, detail="step required")
     if step == ONBOARDING_SKIP_ALL:

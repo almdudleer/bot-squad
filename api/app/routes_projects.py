@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import ApiConfig
+from app.payload_guard import str_field
 from app.project_scaffold import (
     ScaffoldError,
     scaffold_attach_destructive,
@@ -201,9 +202,9 @@ async def create_project(
     admin: dict = Depends(require_admin),
 ) -> dict:
     cfg: ApiConfig = request.app.state.api_config
-    slug = (payload.get("slug") or "").strip()
-    display_name = (payload.get("display_name") or "").strip()
-    mode = (payload.get("mode") or "").strip() or None
+    slug = str_field(payload, "slug")
+    display_name = str_field(payload, "display_name")
+    mode = str_field(payload, "mode") or None
 
     if not slug:
         raise HTTPException(status_code=400, detail="slug required")
@@ -239,7 +240,7 @@ async def create_project(
         (data_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # Defaults — minimal/back-compat path overwrites only repo_path.
-    repo_path_str = (payload.get("repo_path") or "").strip()
+    repo_path_str = str_field(payload, "repo_path")
     repo_master_str = ""
     repo_workspace_str = ""
     scaffold_summary: dict | None = None
@@ -249,9 +250,9 @@ async def create_project(
         # caller takes responsibility for the on-disk layout.
         pass
     elif mode == "attach_destructive":
-        mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
-        existing = _require_abs_path("existing_path", (payload.get("existing_path") or "").strip())
-        existing_becomes = (payload.get("existing_becomes") or "").strip()
+        mother_dir = _require_abs_path("mother_dir", str_field(payload, "mother_dir"))
+        existing = _require_abs_path("existing_path", str_field(payload, "existing_path"))
+        existing_becomes = str_field(payload, "existing_becomes")
         if existing_becomes not in ("dev", "master"):
             raise HTTPException(
                 status_code=400,
@@ -290,9 +291,9 @@ async def create_project(
             "ops_skipped": [str(p) for p in result.ops_skipped],
         }
     elif mode == "paths_as_they_are":
-        mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
+        mother_dir = _require_abs_path("mother_dir", str_field(payload, "mother_dir"))
         repo_path = _require_abs_path("repo_path", repo_path_str)
-        repo_master = _require_abs_path("repo_master", (payload.get("repo_master") or "").strip())
+        repo_master = _require_abs_path("repo_master", str_field(payload, "repo_master"))
         try:
             result = scaffold_paths_as_they_are(
                 slug=slug,
@@ -311,8 +312,8 @@ async def create_project(
             "ops_skipped": [str(p) for p in result.ops_skipped],
         }
     elif mode == "new_from_scratch":
-        mother_dir = _require_abs_path("mother_dir", (payload.get("mother_dir") or "").strip())
-        git_remote = (payload.get("git_remote") or "").strip() or None
+        mother_dir = _require_abs_path("mother_dir", str_field(payload, "mother_dir"))
+        git_remote = str_field(payload, "git_remote") or None
         try:
             result = scaffold_new_from_scratch(
                 slug=slug,
@@ -622,8 +623,8 @@ async def queue_deploy(
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="json object required")
-    target = (payload.get("target") or "").strip()
-    reason = (payload.get("reason") or "").strip()
+    target = str_field(payload, "target")
+    reason = str_field(payload, "reason")
     if not target:
         raise HTTPException(status_code=400, detail="target required")
     if not reason:

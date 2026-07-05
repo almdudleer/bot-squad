@@ -384,6 +384,22 @@ def cmd_tg_ping(args) -> None:
               "not sent. Reply will still route if a prior message went out.")
 
 
+def cmd_page_channel(args) -> None:
+    """Show or set the human-page channel mode (T-0610).
+
+    Default routing is TG-primary with MAX as automatic reserve. The
+    stakeholder can ask (in the TG thread) to temporarily switch pages to MAX
+    — the attendant runs `bsq page-channel max --by stakeholder`; `bsq
+    page-channel auto` reverts. Mode persists across worker restarts.
+    """
+    if args.mode:
+        res = post("page_channel", {"mode": args.mode, "by": args.by})
+        print(f"page channel set: {res.get('mode')} (by={res.get('set_by') or '?'})")
+    else:
+        res = post("page_channel", {})
+        print(f"page channel mode: {res.get('mode')}")
+
+
 def cmd_peer_send(args) -> None:
     slug = resolve_slug()
     from_sid = require_sid(args.from_sid)
@@ -2583,9 +2599,13 @@ def _collect_guidance(slug: str, kws: list[str], limit: int,
     Shared by `bsq guidance search` and T-0149 deterministic spawn assembly.
     """
     hits: list[dict] = []
-    # 1. backlog Verbatim sections (stakeholder source-of-truth).
+    # 1. backlog Verbatim sections (stakeholder source-of-truth) + the
+    #    close-hook harvest sections ("## Stakeholder comments", T-0151) —
+    #    steering routed onto EXISTING tickets lands there, not in the
+    #    verbatim section, and must stay findable (T-0590).
     for p in sorted(backlog_dir(slug).glob("T-*.md")):
         hits += _scan_md_section(p, kws, "Verbatim request")
+        hits += _scan_md_section(p, kws, "Stakeholder comments")
     # 2. session bodies (close-hook-appended stakeholder notes; T-0151 area 4).
     sess_dir = Path(BOT_SQUAD) / "data" / slug / "sessions"
     if sess_dir.is_dir():
@@ -3702,6 +3722,15 @@ def build_parser() -> argparse.ArgumentParser:
     tgp.add_argument("--urgent", action="store_true",
                      help="bypass quiet hours (use sparingly — hard blockers only)")
     tgp.set_defaults(func=cmd_tg_ping)
+
+    # page-channel (T-0610) — read/set the page delivery mode (TG primary / MAX reserve).
+    pc = sub.add_parser(
+        "page-channel",
+        help="show or set the human-page channel mode (auto=TG-primary, max=temporary MAX)")
+    pc.add_argument("mode", nargs="?", choices=["auto", "tg", "max"],
+                    help="omit to show the current mode; 'auto' reverts to TG-primary")
+    pc.add_argument("--by", default="", help="who asked for the switch (audit stamp)")
+    pc.set_defaults(func=cmd_page_channel)
 
     # spawn
     sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")

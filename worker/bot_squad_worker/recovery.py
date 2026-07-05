@@ -43,6 +43,22 @@ here: ``_gather`` only ever yields rows with a DEAD pane (``classify`` never
 respawns/parks a live one), and a dead pane can have no attached tmux client —
 but the SAME shared gate is still called (with ``tmux_target=None``) so the
 policy lives in exactly one place for all three recycle paths.
+
+T-0618 (the 2026-07-05 14:14:46 incident): the recycle allowlist bounds what
+recycle may DESTROY (compact/terminate); recovery reads it as permission to
+RESURRECT — so allowlisting watchrobot for recycle-v2 (T-0613) silently armed
+boot-time re-drive of its weeks-stale ``active`` mds. Two recovery-specific
+guards close that:
+
+  * STANDING NEED — a project whose operator re-drive is user-paused
+    (:func:`operator_redrive.is_paused`, the explicit "no autonomous drive
+    here" signal) is skipped wholesale: not gathered, not respawned, not even
+    archived (a paused project is never written to).
+  * STALE-AGE — a crashed md whose last sign of life (newest of the md mtime
+    and the T-0470 hook markers) predates ``BOT_SQUAD_RECOVERY_STALE_SEC``
+    (default 24h; <=0 disables) is ABANDONED, not a restart casualty: it is
+    ARCHIVED (the T-0618 hygiene decision — defuse the fuel), never respawned,
+    so it can't re-drive when the project is later un-paused.
 """
 from __future__ import annotations
 
@@ -79,6 +95,38 @@ def respawn_bound() -> int:
     except (TypeError, ValueError):
         return 2
     return v if v > 0 else 2
+
+
+def stale_cutoff_sec() -> float:
+    """T-0618 stale-age cutoff (seconds). A crashed md whose last sign of life
+    is older than this is abandoned — archived, never respawned. Default 24h:
+    a genuine restart casualty is reconciled within the outage window, while
+    the incident's fuel was dead for DAYS. ``<=0`` disables the cutoff."""
+    try:
+        return float(os.environ.get("BOT_SQUAD_RECOVERY_STALE_SEC", 86400))
+    except (TypeError, ValueError):
+        return 86400.0
+
+
+def _last_seen_epoch(md: Path, meta: dict) -> float | None:
+    """Best-effort 'last sign of life' for a crashed session: the NEWEST of the
+    session-md mtime (registry writes ride every SessionStart hook fire) and
+    the per-SID Stop/UserPromptSubmit hook markers (touched every turn,
+    T-0470) — md mtime alone would mis-archive a long-running session that
+    never re-fired its SessionStart hook."""
+    from bot_squad_worker import lifecycle_events as _lc
+    candidates = []
+    try:
+        candidates.append(md.stat().st_mtime)
+    except OSError:
+        pass
+    cwd, sid = meta.get("cwd"), meta.get("sid")
+    if cwd and sid:
+        for kind in (_lc.MARKER_STOP, _lc.MARKER_ACTIVE):
+            t = _lc._marker_mtime(str(cwd), sid, kind)
+            if t is not None:
+                candidates.append(t)
+    return max(candidates) if candidates else None
 
 
 def read_task_status(cfg: Any, slug: str, task_id: str) -> str:
@@ -119,14 +167,20 @@ def read_task_status(cfg: Any, slug: str, task_id: str) -> str:
 # --- pure decision ---------------------------------------------------------
 
 def classify(*, pane_live: bool, task_status: str, has_artifact: bool,
-             respawn_count: int, bound: int) -> str:
-    """Pure recovery decision → one of none|respawn|park (role-agnostic).
+             respawn_count: int, bound: int, stale: bool = False) -> str:
+    """Pure recovery decision → one of none|respawn|park|archive (role-agnostic).
 
     Acts on a DEAD-pane session that has recoverable forward-state — either its
     task still needs work, or it wrote a role artifact (the graceful-compact
     sink) before dying. A live pane is never touched (live work is sacred); a
     DONE task is left alone (the deliverable exists); a session with neither an
     active task nor an artifact has nothing to recover from.
+
+    T-0618: ``stale`` (last sign of life beyond the cutoff) redirects a
+    would-be respawn/park to ``archive`` — an md dead for days is abandoned
+    fuel, not a restart casualty; respawning it is churn and parking it pages
+    the operator about garbage. A row recovery would never have acted on stays
+    ``none`` (staleness adds no new write surface).
     """
     if pane_live:
         return "none"  # live work is never touched here
@@ -135,6 +189,8 @@ def classify(*, pane_live: bool, task_status: str, has_artifact: bool,
     recoverable = (task_status in ACTIVE_STATUSES) or has_artifact
     if not recoverable:
         return "none"
+    if stale:
+        return "archive"
     return "respawn" if respawn_count < bound else "park"
 
 
@@ -172,15 +228,28 @@ def _gather(cfg: Any, now: float | None = None) -> list[dict]:
     ``suspended``/``paused`` session is intentional, not a crash. T-0563/T-0564:
     also skips a session gated by :func:`recycle_gate.recycle_allowed`
     (non-allowlisted project or a user-conversation role) before it ever
-    reaches ``classify``.
+    reaches ``classify``. T-0618: skips a whole PROJECT when its operator
+    re-drive is user-paused (no standing need — recovery must not resurrect
+    there), and stamps each row's ``stale`` flag for the classify cutoff.
     """
     from bot_squad_worker import assignment as _assignment
+    from bot_squad_worker import operator_redrive as _redrive
     from bot_squad_worker.sessions import (
         _read_session_metadata, _derive_role, live_pane_map)
     now = now if now is not None else time.time()
+    cutoff = stale_cutoff_sec()
     pane_map = live_pane_map()  # SID -> live pane, the truth (md pane_id is empty)
     rows: list[dict] = []
     for slug in getattr(cfg, "projects", {}) or {}:
+        # T-0618 standing-need gate: the user paused this project's operator
+        # program — the explicit "no autonomous drive here" signal. Recovery
+        # neither respawns NOR archives on it (a paused project is never
+        # written to; its stale mds are defused by the stale-age cutoff
+        # whenever the project is un-paused).
+        if _redrive.is_paused(cfg, slug):
+            log.info("recovery: skipping paused project %s — operator "
+                     "re-drive paused = no standing need (T-0618)", slug)
+            continue
         sess_dir = cfg.data_dir / slug / "sessions"
         if not sess_dir.exists():
             continue
@@ -212,8 +281,11 @@ def _gather(cfg: Any, now: float | None = None) -> list[dict]:
             art = _assignment.role_artifact(
                 cfg.data_dir, slug, role=role, sid=sid, task_id=task_id)
             has_artifact = bool(art) and art.exists() and _nonempty(art.path)
+            last_seen = _last_seen_epoch(md, meta)
+            stale = bool(cutoff > 0 and last_seen is not None
+                         and (now - last_seen) > cutoff)
             rows.append({
-                "sid": sid, "slug": slug, "role": role,
+                "sid": sid, "slug": slug, "role": role, "stale": stale,
                 "pane_live": pane_live, "task_id": task_id,
                 "task_status": read_task_status(cfg, slug, task_id) if task_id else "",
                 "window": meta.get("window") or meta.get("window_name") or "",
@@ -343,7 +415,8 @@ def _run(cfg: Any, source: str = "tick", now: Optional[float] = None) -> dict:
         count = int(state.get(sid, 0))
         action = classify(pane_live=row["pane_live"], task_status=row["task_status"],
                           has_artifact=row.get("has_artifact", False),
-                          respawn_count=count, bound=bound)
+                          respawn_count=count, bound=bound,
+                          stale=row.get("stale", False))
         if action == "respawn":
             try:
                 _do_respawn(cfg, row)
@@ -355,5 +428,13 @@ def _run(cfg: Any, source: str = "tick", now: Optional[float] = None) -> dict:
         elif action == "park":
             _do_park(cfg, row, reason=f"respawn bound {bound} reached")
             acted.append(("park", sid))
+        elif action == "archive":
+            # T-0618: abandoned, not a restart casualty — defuse the fuel so
+            # no later boot can re-drive it.
+            log.warning("recovery: NOT respawning stale crashed %s (%s) — dead "
+                        "beyond the stale cutoff; archiving md instead",
+                        sid, row.get("role"))
+            _retire_dead(cfg, row["slug"], sid)
+            acted.append(("stale-archive", sid))
     _save_state(cfg, state)
     return {"enabled": True, "source": source, "acted": acted}

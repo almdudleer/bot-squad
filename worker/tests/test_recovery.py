@@ -185,6 +185,149 @@ def test_gather_skips_user_conversation_role(monkeypatch, tmp_path):
     assert "S-u-userconv-p1" not in {r["sid"] for r in rows}
 
 
+# --- T-0618: standing-need + stale-age guards (the 14:14:46 incident) --------
+
+def test_classify_stale_dead_pane_archives_not_respawns():
+    """T-0618: a crashed md whose last sign of life predates the cutoff is
+    ABANDONED, not a restart casualty — archived, never respawned (and never
+    parked: parking a weeks-dead md just pages the operator about garbage)."""
+    assert R.classify(pane_live=False, task_status=ACTIVE, has_artifact=False,
+                      respawn_count=0, bound=2, stale=True) == "archive"
+    # the artifact-only path (p361's shape — operator, no task) too
+    assert R.classify(pane_live=False, task_status="", has_artifact=True,
+                      respawn_count=0, bound=2, stale=True) == "archive"
+    # stale overrides the park branch as well
+    assert R.classify(pane_live=False, task_status=ACTIVE, has_artifact=False,
+                      respawn_count=2, bound=2, stale=True) == "archive"
+
+
+def test_classify_stale_leaves_non_recoverable_alone():
+    """stale only redirects a would-be respawn/park; a row recovery would
+    never have acted on stays none (no new write surface)."""
+    assert R.classify(pane_live=False, task_status=DONE, has_artifact=True,
+                      respawn_count=0, bound=2, stale=True) == "none"
+    assert R.classify(pane_live=False, task_status="", has_artifact=False,
+                      respawn_count=0, bound=2, stale=True) == "none"
+    assert R.classify(pane_live=True, task_status=ACTIVE, has_artifact=True,
+                      respawn_count=0, bound=2, stale=True) == "none"
+
+
+def test_gather_skips_operator_paused_project(monkeypatch, tmp_path):
+    """T-0618 standing-need gate: a project whose operator re-drive is user-
+    PAUSED has no standing need — recovery skips it wholesale (no gather, no
+    respawn, no archive; a paused project is never written to). watchrobot was
+    paused at incident time; only the recycle allowlist was consulted."""
+    from bot_squad_worker import operator_redrive as OR
+    from bot_squad_worker import sessions as S
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    _seed(tmp_path, "S-u-crashed-p1", status="active", role="dev", task_id="T-1")
+    (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
+    OR.pause(cfg, "p1", by="user", reason="T-0618 test")
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    assert R._gather(cfg) == []
+
+
+def _age_md(tmp_path, sid, *, days):
+    import os as _os, time as _time
+    md = tmp_path / "data" / "p1" / "sessions" / f"{sid}.md"
+    old = _time.time() - days * 86400
+    _os.utime(md, (old, old))
+    return md
+
+
+def test_boot_reconcile_incident_repro_stale_md_archived_not_respawned(
+        monkeypatch, tmp_path):
+    """THE incident shape (T-0618 DoD): stale `active` md (dead for days) on an
+    allowlisted project + worker boot -> NO spawn; the md is archived instead.
+    p361's exact shape: operator, no task, role artifact present."""
+    from bot_squad_worker import sessions as S
+    from bot_squad_worker import autocompact as A
+    monkeypatch.delenv("BOT_SQUAD_RECOVERY_STALE_SEC", raising=False)
+    cfg = _cfg(tmp_path)
+    artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
+    _seed(tmp_path, "S-u-op-p361", status="active", role="operator")
+    (artifacts / "operator-state.md").write_text("# op forward-state\n")
+    _age_md(tmp_path, "S-u-op-p361", days=5)
+
+    spawns, archives = [], []
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    monkeypatch.setattr(S, "spawn", lambda *a, **k: spawns.append(a) or {"ok": True})
+    monkeypatch.setattr(A, "_relaunch_from_artifact",
+                        lambda *a, **k: spawns.append(a) or {"ok": True})
+    monkeypatch.setattr(S, "archive_session",
+                        lambda cfg, slug, sid: archives.append(sid) or {"ok": True})
+
+    out = R.boot_reconcile(cfg)
+
+    assert spawns == []                                   # NO spawn — the DoD
+    assert out["acted"] == [("stale-archive", "S-u-op-p361")]
+    assert archives == ["S-u-op-p361"]                    # defused, not re-driven
+
+
+def test_gather_fresh_hook_marker_beats_stale_md_mtime(monkeypatch, tmp_path):
+    """The stale clock reads the NEWEST sign of life: an old md mtime with a
+    fresh T-0470 Stop marker (long-running session that never re-fired its
+    SessionStart hook) is NOT stale — legit crash recovery must still run."""
+    from bot_squad_worker import sessions as S
+    from bot_squad_worker import lifecycle_events as LE
+    monkeypatch.delenv("BOT_SQUAD_RECOVERY_STALE_SEC", raising=False)
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
+    cwd = tmp_path / "cwd"; cwd.mkdir()
+    sess = tmp_path / "data" / "p1" / "sessions"; sess.mkdir(parents=True, exist_ok=True)
+    S._write_session_metadata(sess / "S-u-c-p1.md", {
+        "sid": "S-u-c-p1", "status": "active", "window": "dev", "task_id": "T-1",
+        "initiative": "~", "role": "dev", "cwd": str(cwd)})
+    _age_md(tmp_path, "S-u-c-p1", days=5)
+    LE.touch_marker(str(cwd), "S-u-c-p1", LE.MARKER_STOP)  # fresh sign of life
+
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    rows = R._gather(cfg)
+    assert len(rows) == 1
+    assert rows[0]["stale"] is False
+
+
+def test_gather_stale_cutoff_disabled_by_env(monkeypatch, tmp_path):
+    """BOT_SQUAD_RECOVERY_STALE_SEC<=0 disables the cutoff (operator opt-out)."""
+    from bot_squad_worker import sessions as S
+    monkeypatch.setenv("BOT_SQUAD_RECOVERY_STALE_SEC", "0")
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
+    _seed(tmp_path, "S-u-c-p1", status="active", role="dev", task_id="T-1")
+    _age_md(tmp_path, "S-u-c-p1", days=30)
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    rows = R._gather(cfg)
+    assert len(rows) == 1
+    assert rows[0]["stale"] is False
+
+
+def test_boot_reconcile_fresh_crash_on_unpaused_project_still_respawns(
+        monkeypatch, tmp_path):
+    """Regression guard: the T-0471 first-class guarantee is intact — a FRESH
+    crash (md touched just before the restart) on an un-paused allowlisted
+    project is still re-driven."""
+    from bot_squad_worker import sessions as S
+    from bot_squad_worker import autocompact as A
+    monkeypatch.delenv("BOT_SQUAD_RECOVERY_STALE_SEC", raising=False)
+    cfg = _cfg(tmp_path)
+    artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
+    _seed(tmp_path, "S-u-op-p2", status="active", role="operator")
+    (artifacts / "operator-state.md").write_text("# op forward-state\n")
+
+    relaunches = []
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    monkeypatch.setattr(A, "_relaunch_from_artifact",
+                        lambda cfg, slug, row, art: relaunches.append(row["sid"]) or {"ok": True})
+    monkeypatch.setattr(S, "archive_session", lambda *a, **k: {"ok": True})
+
+    out = R.boot_reconcile(cfg)
+    assert out["acted"] == [("respawn", "S-u-op-p2")]
+    assert relaunches == ["S-u-op-p2"]
+
+
 # --- tick dispatch ---------------------------------------------------------
 
 def test_tick_noop_when_disabled(monkeypatch, tmp_path):

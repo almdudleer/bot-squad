@@ -23,11 +23,18 @@ its pane/session) — even in an allowlisted project. Both checks fail CLOSED (a
 attach-check error is treated as attached, i.e. skip) — it is always safer to
 leave a session alone for one more tick than to kill one a human might be
 looking at.
+
+T-0616 hand-launched user sessions: the stakeholder's own sessions launched
+by hand (window ``user-session``, ad-hoc names) derive role ``dev``, so the
+T-0564 role check alone missed them (D-0053 §4). :func:`user_session_exempt`
+extends the exemption to a ``user-session`` window segment and an explicit
+``recycle_exempt: true`` session-md marker.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from typing import Any
 
@@ -80,6 +87,40 @@ def role_exempt(role: str | None) -> bool:
     return (role or "") == "user-conversation"
 
 
+# T-0616: the hand-launch convention — a `user-session` window segment
+# (`user-session`, `user-session-2`, `gu_x-user-session`). Segment-anchored so
+# `user-sessions` / `user-feedback` (a constant-team window) do NOT match.
+_USER_SESSION_WINDOW_RE = re.compile(r"(?:^|[-_])user[-_]session(?:$|[-_])",
+                                     re.IGNORECASE)
+
+
+def user_session_exempt(role: str | None = None, window: str | None = None,
+                        meta: dict | None = None) -> bool:
+    """T-0616 (closes the T-0564 hole): True for ANY of the human's own
+    sessions — no recycle path may compact or terminate them.
+
+    The stakeholder's hand-launched sessions (window ``user-session``, ad-hoc
+    names) derive role ``dev`` (T-0175 default), so the T-0564 role check
+    alone missed them: the 2026-07-04/05 evidence run (D-0053 §4) shows
+    user-session-p8 riding the full idle_timeout recycle path — only the
+    attach-check kept it from termination. Per the stakeholder's T-0612 §0
+    verbatim, user sessions stay in the user's tmux ("пускай она остается
+    там"); recycle paths never touch them. Three signals, any one exempts:
+
+    * role ``user-conversation`` — the T-0564 check, unchanged;
+    * a ``user-session`` window segment — the hand-launch convention;
+    * an explicit ``recycle_exempt: true`` frontmatter field on the session
+      md — the opt-out for hand-launched sessions under ad-hoc window names
+      (stamp it on the md; the SessionStart hook preserves it, T-0616).
+    """
+    if role_exempt(role):
+        return True
+    if window and _USER_SESSION_WINDOW_RE.search(str(window).strip()):
+        return True
+    marker = (meta or {}).get("recycle_exempt")
+    return str(marker or "").strip().lower() in ("true", "1", "yes")
+
+
 def is_attached(tmux_target: str | None) -> bool:
     """True iff a human tmux client is attached to ``tmux_target`` (a pane id
     or session name — tmux resolves either to its enclosing session).
@@ -112,14 +153,19 @@ def is_attached(tmux_target: str | None) -> bool:
 
 
 def recycle_allowed(cfg: Any, *, slug: str, role: str | None,
-                     tmux_target: str | None, now: float) -> bool:
-    """The single combined gate (T-0563 + T-0564): True iff a recycle path may
-    act on this session — its project is allowlisted, its role isn't the
-    human's own user-conversation, and no human client is attached to its
-    pane."""
+                     tmux_target: str | None, now: float,
+                     window: str | None = None,
+                     meta: dict | None = None) -> bool:
+    """The single combined gate (T-0563 + T-0564 + T-0616): True iff a recycle
+    path may act on this session — its project is allowlisted, it isn't one of
+    the human's own sessions (user-conversation role, ``user-session`` window,
+    or ``recycle_exempt`` md marker), and no human client is attached to its
+    pane. ``window``/``meta`` are optional so legacy callers stay valid, but
+    every caller that has the session md SHOULD pass them — without them only
+    the role signal protects a hand-launched user session."""
     if not project_allowed(cfg, slug, now):
         return False
-    if role_exempt(role):
+    if user_session_exempt(role=role, window=window, meta=meta):
         return False
     if is_attached(tmux_target):
         return False

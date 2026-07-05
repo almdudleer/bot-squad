@@ -181,6 +181,12 @@ def tracking_long_job(cfg: Any, slug: str, sid: str) -> bool:
 
 # In-flight compact-wait + postpone state lives as FLAT scalar md fields (never
 # a nested mapping) so the line-based session_start hook reader stays happy.
+# T-0616 hook contract: session_start.sh preserves these two fields ONLY on a
+# source=compact fire (the /compact this recycle sent — clearing them there
+# was the D-0053 double-compact root cause) and still clears them on
+# startup/resume/clear, where a surviving phase stamp is definitionally stale
+# and would hand the next tick a timed-out finalize against a fresh session.
+# Renaming either field means updating the hook's _INFLIGHT_RECYCLE set.
 _RECYCLE_FIELDS = (
     "idle_recycle_phase",
     "idle_recycle_armed_at",
@@ -246,10 +252,14 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     role = row.get("role") or meta.get("role") or sessions._derive_role(
         meta.get("window"), meta.get("task_id"), meta.get("initiative"))
     pane = autocompact._pane_for(sid)
-    # T-0563/T-0564: never recycle a non-allowlisted project, the human's own
-    # user-conversation session, or a pane a human is currently attached to.
+    # T-0563/T-0564/T-0616: never recycle a non-allowlisted project, any of
+    # the human's own sessions (user-conversation role, hand-launched
+    # user-session window, recycle_exempt md marker), or a pane a human is
+    # currently attached to.
     if not recycle_gate.recycle_allowed(cfg, slug=slug, role=role,
-                                        tmux_target=pane, now=now):
+                                        tmux_target=pane, now=now,
+                                        window=row.get("window") or meta.get("window"),
+                                        meta=meta):
         return False
 
     # A compact-wait already in flight → drive its finalize half (independent

@@ -383,12 +383,24 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     if not autocompact_enabled():
         return False
     sid = rec.get("sid")
-    # T-0563/T-0564 (recycle-v2): never recycle a non-allowlisted project, the
-    # human's own user-conversation session, or a pane a human is currently
-    # attached to — even the operator (T-0334) is subject to this gate.
+    # T-0563/T-0564/T-0616 (recycle-v2): never recycle a non-allowlisted
+    # project, any of the human's own sessions (user-conversation role,
+    # hand-launched user-session window, recycle_exempt md marker — the
+    # telemetry rec doesn't carry the marker, so read the session md
+    # best-effort), or a pane a human is currently attached to — even the
+    # operator (T-0334) is subject to this gate.
+    from bot_squad_worker import sessions as _sessions
+    meta = {}
+    if sid:
+        try:
+            meta = _sessions._read_session_metadata(
+                _sessions._session_file(cfg.data_dir, slug, sid)) or {}
+        except Exception:
+            meta = {}
     if not recycle_gate.recycle_allowed(
-        cfg, slug=slug, role=rec.get("role"),
+        cfg, slug=slug, role=rec.get("role") or meta.get("role"),
         tmux_target=_pane_for(sid) if sid else None, now=now,
+        window=rec.get("window") or meta.get("window"), meta=meta,
     ):
         return False
     fired = rec.get("alert_fired_at") or {}

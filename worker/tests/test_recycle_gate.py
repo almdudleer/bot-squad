@@ -72,6 +72,62 @@ def test_role_exempt_only_user_conversation():
     assert G.role_exempt("") is False
 
 
+# --- T-0616: hand-launched user-session exemption -----------------------------
+
+def test_user_session_exempt_role_signal_unchanged():
+    assert G.user_session_exempt(role="user-conversation") is True
+    assert G.user_session_exempt(role="dev") is False
+    assert G.user_session_exempt() is False
+
+
+def test_user_session_exempt_window_marker():
+    # p8's exact shape: window `user-session` derives role dev (T-0175
+    # default) — the D-0053 §4 hole. The window segment must exempt it.
+    assert G.user_session_exempt(role="dev", window="user-session") is True
+    assert G.user_session_exempt(role="dev", window="user-session-2") is True
+    assert G.user_session_exempt(role="dev", window="gu_12ab-user-session") is True
+    assert G.user_session_exempt(role="dev", window="USER-SESSION") is True
+    # segment-anchored: no partial-word / lookalike matches
+    assert G.user_session_exempt(role="dev", window="user-sessions") is False
+    assert G.user_session_exempt(role="dev", window="user-feedback") is False  # constant-team window
+    assert G.user_session_exempt(role="dev", window="somework") is False
+    assert G.user_session_exempt(role="dev", window="") is False
+
+
+def test_user_session_exempt_md_marker():
+    # ad-hoc window names can't be recognised — the explicit md stamp covers
+    # them (the SessionStart hook preserves it since T-0616).
+    assert G.user_session_exempt(role="dev", window="adhoc",
+                                 meta={"recycle_exempt": True}) is True
+    assert G.user_session_exempt(role="dev", window="adhoc",
+                                 meta={"recycle_exempt": "true"}) is True
+    assert G.user_session_exempt(role="dev", window="adhoc",
+                                 meta={"recycle_exempt": False}) is False
+    assert G.user_session_exempt(role="dev", window="adhoc",
+                                 meta={"recycle_exempt": "~"}) is False
+    assert G.user_session_exempt(role="dev", window="adhoc", meta={}) is False
+    assert G.user_session_exempt(role="dev", window="adhoc", meta=None) is False
+
+
+def test_recycle_allowed_blocks_hand_launched_user_session(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_RECYCLE_PROJECTS", raising=False)
+    monkeypatch.setattr(G, "is_attached", lambda t: False)
+    cfg = _cfg()
+    # window signal — even though the derived role is dev
+    assert G.recycle_allowed(cfg, slug="bot-squad", role="dev",
+                             tmux_target="%1", now=1000.0,
+                             window="user-session") is False
+    # md marker signal
+    assert G.recycle_allowed(cfg, slug="bot-squad", role="dev",
+                             tmux_target="%1", now=1000.0, window="adhoc",
+                             meta={"recycle_exempt": True}) is False
+    # control: a plain dev window without the marker is still recyclable —
+    # the exemption is precise, not a blanket recycle-off
+    assert G.recycle_allowed(cfg, slug="bot-squad", role="dev",
+                             tmux_target="%1", now=1000.0, window="adhoc",
+                             meta={}) is True
+
+
 def test_is_attached_no_target_is_false():
     assert G.is_attached(None) is False
     assert G.is_attached("") is False

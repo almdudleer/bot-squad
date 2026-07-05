@@ -120,8 +120,8 @@ fi
 
 if [ -n "$sid" ] && [ -n "$CLAUDE_SID" ]; then
     mkdir -p "$DATA/sessions"
-    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" OWNER_USER="${BOT_SQUAD_OWNER_USER:-}" TMUX_SESSION="$tmux_session" python3 - <<'PY' 2>/dev/null || true
-import os, time
+    SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" OWNER_USER="${BOT_SQUAD_OWNER_USER:-}" TMUX_SESSION="$tmux_session" HOOK_SOURCE="$HOOK_SOURCE" python3 - <<'PY' 2>/dev/null || true
+import os, re, time
 from pathlib import Path
 
 sid        = os.environ["SID"]
@@ -158,16 +158,54 @@ md_path    = data / "sessions" / f"{sid}.md"
 # `~`, so block-style YAML never reaches this reader. Do NOT add a reader for a
 # field that the writer could emit block-style — route it through the shared
 # parser instead.
+#
+# T-0616 (D-0053 root cause) — every frontmatter field NOT managed by the
+# template below is preserved VERBATIM. This rewrite used to rebuild the md
+# from the template alone, silently dropping whatever another module had
+# stamped on it (idle_timeout's idle_recycle_phase / idle_recycle_armed_at,
+# `bsq postpone`'s idle_postpone_until, `bsq morph`'s role, recycle_exempt,
+# resume stamps). SessionStart fires with source=compact the moment a
+# /compact completes — so the drop erased the in-flight recycle phase and
+# idle_timeout re-armed every recycle: the stakeholder's double-compact
+# (p11/p23/p29) and p8's re-compact loop. Passthrough stays within the T-0075
+# constraint: unknown lines are re-emitted byte-for-byte, never parsed; a
+# continuation line (indented / block-style) rides with its key's fate.
+#
+# ONE deliberate exception: idle_timeout's IN-FLIGHT recycle phase
+# (idle_recycle_phase / idle_recycle_armed_at) is only meaningful across the
+# source=compact fire — the /compact the recycle itself sent. On any other
+# source (startup/resume/clear — someone deliberately started a new life for
+# this pane/session) a surviving phase stamp is definitionally stale, and
+# preserving it would hand the next idle tick a timed-out finalize that
+# terminates the fresh session. Pre-T-0616 the clobber cleared it by
+# accident; keep clearing it ON PURPOSE, everywhere except mid-recycle.
+_MANAGED = {
+    "sid", "status", "window", "cwd", "claude_uuid", "task_id", "initiative",
+    "extra_task_ids", "extra_initiatives", "started_at", "owner",
+    "owner_user", "tmux_session", "linux_user",
+}
+_INFLIGHT_RECYCLE = {"idle_recycle_phase", "idle_recycle_armed_at"}
+hook_source = os.environ.get("HOOK_SOURCE") or ""
 existing = {}
+passthrough = []
 if md_path.exists():
     text = md_path.read_text()
     if text.startswith("---"):
         try:
             fm = text.split("---", 2)[1]
-            for line in fm.strip().splitlines():
-                if ":" in line:
+            keep = False
+            for line in fm.splitlines():
+                if not line.strip():
+                    continue
+                m = re.match(r"([A-Za-z0-9_-]+)\s*:", line)
+                if m:
                     k, _, v = line.partition(":")
                     existing[k.strip()] = v.strip()
+                    keep = m.group(1) not in _MANAGED and not (
+                        m.group(1) in _INFLIGHT_RECYCLE
+                        and hook_source != "compact")
+                if keep:
+                    passthrough.append(line)
         except Exception:
             pass
 
@@ -223,6 +261,7 @@ if started_at == "~" or not started_at:
 extra_task_ids   = existing.get("extra_task_ids")   or "[]"
 extra_initiatives = existing.get("extra_initiatives") or "[]"
 
+extra_lines = "".join(line + "\n" for line in passthrough)
 md_path.write_text(
     "---\n"
     f"sid: {sid}\n"
@@ -239,6 +278,7 @@ md_path.write_text(
     f"owner_user: {owner_user or '~'}\n"
     f"tmux_session: {tmux_session or '~'}\n"
     f"linux_user: {linux_user or '~'}\n"
+    + extra_lines +
     "---\n"
 )
 PY

@@ -195,11 +195,15 @@ def _gather(cfg: Any, now: float | None = None) -> list[dict]:
                 continue
             role = meta.get("role") or _derive_role(
                 meta.get("window"), meta.get("task_id"), meta.get("initiative"))
-            # T-0563/T-0564: never recycle a non-allowlisted project or the
-            # human's own user-conversation session (a dead pane here can never
-            # be human-attached, so tmux_target=None is structurally correct).
+            # T-0563/T-0564/T-0616: never recycle a non-allowlisted project or
+            # any of the human's own sessions — user-conversation role,
+            # hand-launched user-session window, recycle_exempt md marker (a
+            # dead pane here can never be human-attached, so tmux_target=None
+            # is structurally correct).
             if not recycle_gate.recycle_allowed(cfg, slug=slug, role=role,
-                                                tmux_target=None, now=now):
+                                                tmux_target=None, now=now,
+                                                window=meta.get("window"),
+                                                meta=meta):
                 continue
             sid = meta.get("sid")
             task_id = meta.get("task_id")

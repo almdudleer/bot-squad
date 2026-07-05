@@ -304,6 +304,54 @@ def test_kill_switch_disables_recycle(tmp_path, seams, monkeypatch):
     assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
+# --- A2. T-0616: hand-launched user sessions are never touched ---------------
+
+def test_hand_launched_user_session_never_recycled(tmp_path, seams):
+    """p8's exact shape (D-0053 §4): window ``user-session`` derives role
+    ``dev``, so the T-0564 role check alone let it ride the full recycle
+    path. The window signal must keep every path off it — no compact, no
+    terminate, md untouched."""
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    before = md.read_text()
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == []
+    assert seams["calls"]["terminate"] == []
+    assert md.read_text() == before
+
+
+def test_hand_launched_user_session_stale_phase_never_finalized(tmp_path, seams):
+    """Even a stale in-flight phase stamp (a pre-fix leftover) must not route
+    an exempt session into the finalize→terminate half."""
+    sid = "S-almdudleer-user-session-p8"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": armed})
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["terminate"] == []
+
+
+def test_recycle_exempt_marker_blocks_recycle(tmp_path, seams):
+    """An ad-hoc-named hand-launched session is exempted by the explicit
+    ``recycle_exempt: true`` md stamp (the hook preserves it, T-0616)."""
+    sid = "S-almdudleer-bot-squad-myadhoc-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="myadhoc", task_id=None,
+                          extra_md={"recycle_exempt": True})
+    row = _row(sid, window="myadhoc", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
 # --- B. POSTPONE: per-window, repeatable ------------------------------------
 
 def test_postpone_skips_the_recycle(tmp_path, seams):

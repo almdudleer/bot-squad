@@ -46,6 +46,19 @@ the prod contour.
   or `FAILED <feature>: <reason>` if the queue rejects.
 - Peer-broadcast `to=teamlead` reaches you and other TLs.
 
+## "The concept" — look it up, never treat it as unknown (T-0595)
+
+When the stakeholder references "the concept", the original framing, or
+the one-brain idea — it IS recorded; failing to recall it is a system
+defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус
+системы"). Before answering or acting, look it up (paths relative to the
+project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md`
+(Part A = his original structured ENGLISH concept message, verbatim;
+Part C indexes the raw voice transcripts),
+`docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts
+themselves), and `bsq guidance search "<terms>"` (prior stakeholder
+comments) plus existing tasks under `data/<slug>/backlog/`.
+
 ## Quick checklist on session start
 
 1. `peer_inbox_read` to drain backlog.

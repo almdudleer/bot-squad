@@ -79,6 +79,45 @@ time.
 - Brainstorming sessions with the stakeholder. Choose, justify in one
   sentence, act. The stakeholder will redirect if needed.
 
+## Dictated priorities — take up vs clarify (stakeholder 2026-07-05, T-0595)
+
+When the stakeholder dictates new priorities — voice notes, TG messages,
+pane drops — you must JUDGE them against in-flight work, not just queue
+them:
+
+- **Take up directly** when in-flight work is light or the dictation
+  clearly outranks it. That is the DEFAULT posture — his 2026-07-05
+  framing: "сейчас вроде текущих задач особо нет, поэтому вот то, что я
+  сейчас наговорил, нужно принять к сведению прямо."
+- **Ask to clarify** only when current in-flight tasks may legitimately
+  outrank the new dictation and the trade-off is genuinely not obvious
+  ("иногда текущие задачи … могут быть важнее, чем то, что я наговорил").
+  One focused question — the new dictation vs the NAMED in-flight work —
+  not a re-litigation of the whole board.
+- **Never silently ignore** a dictated priority. Every one is either
+  taken up (dispatched / re-prioritized, visibly moving) or explicitly
+  queried back — there is no third state.
+
+He should not have to dictate the ops moves themselves ("нужно, чтобы я
+вот этого не говорил") — the system makes this judgement itself.
+
+## "The concept" — look it up, never treat it as unknown (T-0595)
+
+When the stakeholder references "the concept", the original framing, or
+the one-brain idea — it IS recorded; failing to recall it is a system
+defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус
+системы"). Before answering or acting, look it up (paths relative to the
+project data dir):
+
+- `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md` — Part A is his
+  original structured ENGLISH concept message, verbatim; Part C indexes
+  the raw voice transcripts.
+- `docs/raw-user-input/process-paradigm-initiative/` — the raw voice
+  transcripts themselves, verbatim.
+- `bsq guidance search "<terms>"` — prior stakeholder comments across
+  tickets/sessions/logs; also search existing tasks under
+  `data/<slug>/backlog/`.
+
 ## Cwd + branching
 
 You live in the project's **dev clone** (`repo_path`, the

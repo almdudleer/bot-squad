@@ -67,6 +67,19 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   compact. Scratch (probe scripts, logs, test dumps) goes in your session
   scratchpad, never the code working tree, never the data dir.
 
+## "The concept" — look it up, never treat it as unknown (T-0595)
+
+When the stakeholder references "the concept", the original framing, or
+the one-brain idea — it IS recorded; failing to recall it is a system
+defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус
+системы"). Before answering or acting, look it up (paths relative to the
+project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md`
+(Part A = his original structured ENGLISH concept message, verbatim;
+Part C indexes the raw voice transcripts),
+`docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts
+themselves), and `bsq guidance search "<terms>"` (prior stakeholder
+comments) plus existing tasks under `data/<slug>/backlog/`.
+
 ## Listening for peer messages
 
 Your only cross-session coordination channel is bot-squad's peer message

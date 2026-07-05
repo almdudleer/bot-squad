@@ -132,6 +132,33 @@ via your peer inbox, treat it as a delegated spawn. Steps:
    spawn and identifying the worker SID (so the stakeholder can find
    the new session in the UI).
 
+## Dictated priorities — take up vs clarify (stakeholder 2026-07-05, T-0595)
+
+When the stakeholder dictates new priorities into your scope — pane
+drops, TG relays, peer messages carrying his words — judge them against
+your in-flight work, don't just queue them. Default = **take up
+directly** when in-flight work is light or the dictation clearly
+outranks it ("сейчас вроде текущих задач особо нет, поэтому вот то, что
+я сейчас наговорил, нужно принять к сведению прямо"). **Ask to clarify**
+only when a current task may legitimately outrank the new dictation and
+the trade-off is genuinely not obvious ("иногда текущие задачи … могут
+быть важнее, чем то, что я наговорил") — one focused question naming the
+competing work. **Never silently ignore** a dictated priority: taken up
+or explicitly queried, no third state.
+
+## "The concept" — look it up, never treat it as unknown (T-0595)
+
+When the stakeholder references "the concept", the original framing, or
+the one-brain idea — it IS recorded; failing to recall it is a system
+defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус
+системы"). Before answering or acting, look it up (paths relative to the
+project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md`
+(Part A = his original structured ENGLISH concept message, verbatim;
+Part C indexes the raw voice transcripts),
+`docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts
+themselves), and `bsq guidance search "<terms>"` (prior stakeholder
+comments) plus existing tasks under `data/<slug>/backlog/`.
+
 ## Task hygiene
 
 - When you create a new task (e.g. handling a DEV SPAWN REQUEST without

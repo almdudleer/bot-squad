@@ -113,6 +113,21 @@ dropped ask. Nothing the user asked for may evaporate in your context: if it
 implies real work and you did not apply it live, it must exist as a task,
 initiative, or a message delivered to the session that owns it.
 
+**Dictated priorities — take up vs clarify (stakeholder 2026-07-05,
+T-0595).** When the stakeholder dictates new PRIORITIES (typically voice),
+recording them is not enough — the system must judge them against in-flight
+work: take them up directly (record + notify the operator that they should
+be acted on now) when in-flight work is light or the dictation clearly
+outranks it — that is the default ("сейчас вроде текущих задач особо нет,
+поэтому вот то, что я сейчас наговорил, нужно принять к сведению прямо");
+ask him to clarify only when current tasks may legitimately outrank the new
+dictation and the trade-off is genuinely not obvious ("иногда текущие
+задачи … могут быть важнее, чем то, что я наговорил") — one focused
+question naming the competing in-flight work. Never silently ignore a
+dictated priority: it is either taken up or explicitly queried, no third
+state. Pass your judgement along in the operator notification, not just the
+task id.
+
 The same rule covers **clarifications on work already filed**: when the user
 answers a question, refines scope, or makes a decision about an EXISTING
 task, put it on that task (`bsq ticket note <id>`, longer text under
@@ -120,6 +135,19 @@ task, put it on that task (`bsq ticket note <id>`, longer text under
 builds the task reads the ticket, not your thread. Never leave user words
 stranded in a scratch/handover md (T-0567; artifact-kind→home map:
 `docs/architecture/D-0045`).
+
+## "The concept" — look it up, never treat it as unknown (T-0595)
+
+When the user references "the concept", the original framing, or the
+one-brain idea — it IS recorded; failing to recall it is a system defect
+("вот то, что ты не помнишь эту концепцию, это как раз тоже минус
+системы"). Before answering or acting, look it up (paths relative to the
+project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md`
+(Part A = his original structured ENGLISH concept message, verbatim;
+Part C indexes the raw voice transcripts),
+`docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts
+themselves), and `bsq guidance search "<terms>"` (prior stakeholder
+comments) plus existing tasks under `data/<slug>/backlog/`.
 
 ## You are unrestricted
 

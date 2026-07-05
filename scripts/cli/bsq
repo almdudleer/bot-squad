@@ -11,6 +11,7 @@ Verbs:
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
   bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
   bsq task new <title> --provenance <src>  allocate next T-NNNN + stub (atomic — T-0174; --provenance REQUIRED)
+  bsq task digest                   short backlog digest for the TG chat (T-0589)
   bsq doc new <category> <title>   allocate next D-NNNN + stub doc (T-0172)
   bsq uc new <title>               allocate next UC-NNNN + stub use case
   bsq flow new <uc-id> <title>     allocate next UF-NNNN + stub flow (T-0173)
@@ -3188,6 +3189,17 @@ def cmd_task_new(args) -> None:
     print(f"{res['id']}  ->  {res['file_path']}  (provenance: {prov})")
 
 
+def cmd_task_digest(args) -> None:
+    """T-0589: short backlog digest for the TG conversation surface. Prints the
+    ready-to-paste text (attendant thread replies are relayed verbatim)."""
+    slug = resolve_slug()
+    res = post("task_digest", {"slug": slug})
+    if getattr(args, "json", False):
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        return
+    print(res["text"])
+
+
 def cmd_doc_new(args) -> None:
     slug = resolve_slug()
     res = post("doc_new", {"slug": slug, "category": args.category, "title": args.title})
@@ -4044,6 +4056,14 @@ def build_parser() -> argparse.ArgumentParser:
     tnsi.add_argument("--limit", type=int, default=10, help="max candidates (default 10)")
     tnsi.add_argument("--json", action="store_true", help="raw JSON output (for ingest sessions)")
     tnsi.set_defaults(func=cmd_task_similar)
+    # task digest (T-0589) — short backlog digest for the TG conversation:
+    # the attendant runs this on a "что по задачам" ask and pastes the text
+    # into its thread reply.
+    tnd = tn_sub.add_parser(
+        "digest",
+        help="short backlog digest (counts + P1/P2 headlines) for the TG chat")
+    tnd.add_argument("--json", action="store_true", help="raw JSON output ({text, counts})")
+    tnd.set_defaults(func=cmd_task_digest)
 
     # docs (T-0172 docs system): new / list / link / sync. `doc` + `docs` both work.
     dn = sub.add_parser("doc", aliases=["docs"], help="project docs (T-0172): new / list / link / sync")

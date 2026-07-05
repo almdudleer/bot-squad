@@ -600,6 +600,23 @@ def voice_audio_gc_tick(cfg: Config) -> None:
             log.exception("voice_audio_gc_tick: unhandled error for project %s", slug)
 
 
+def task_lifecycle_tick(cfg: Config) -> None:
+    """T-0589: stakeholder-task lifecycle notifications into the TG thread.
+
+    Sweeps backlog frontmatter for provenance ``stakeholder:*`` tasks and posts
+    one line per status transition into in_progress/totest/closed — batched per
+    sweep, deduped via a sidecar, quiet-hours deferred (see
+    ``task_chat.lifecycle_tick``). Per-project errors are contained inside the
+    tick; this wrapper guards the scheduler thread.
+    """
+    from bot_squad_worker import task_chat as _task_chat
+
+    try:
+        _task_chat.lifecycle_tick(cfg)
+    except Exception:
+        log.exception("task_lifecycle_tick error")
+
+
 def autopilot_tick(cfg: Config) -> None:
     """T-0153: per-project autopilot watchdog pass.
 

@@ -1714,6 +1714,35 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "task_id": task_id, "line_appended": line}
 
 
+_TASK_DIGEST_ALLOWED = {"slug"}
+
+
+def _action_task_digest(params: dict[str, Any]) -> dict[str, Any]:
+    """Compose the short on-demand backlog digest (T-0589 direction #1b).
+
+    The ATTENDANT's answer to a TG-thread "что по задачам": status counts +
+    P1/P2 headlines with T-ids, built deterministically in
+    ``task_chat.compose_digest`` so every ask yields the same short shape
+    (conscious single-message cap per the T-0610 slim rule — the digest is
+    conversational content the thread relay carries verbatim, so shortness is
+    enforced at composition, not by the page cut). Read-only.
+
+    Required params: slug. Returns ``{ok, text, counts}``.
+    """
+    extra = set(params) - _TASK_DIGEST_ALLOWED
+    if extra:
+        raise ActionError(f"task_digest got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("task_digest missing required param: slug")
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"task_digest: unknown project slug {slug!r}")
+    from bot_squad_worker import task_chat as _task_chat
+
+    return {"ok": True, **_task_chat.compose_digest(cfg, slug)}
+
+
 _ASSIGNMENT_WRITE_RESULT_REQUIRED = {"slug", "assignment_id", "content", "sid"}
 # T-0464: optional ``kind`` selects the assignment implementer (task default,
 # routine for routine-spawned sessions) — the ONE write-result seam serves both.
@@ -3593,6 +3622,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "sync_exit": _action_sync_exit,
     "sync_status": _action_sync_status,
     "task_progress_add": _action_task_progress_add,
+    # T-0589: on-demand short backlog digest for the TG conversation surface.
+    "task_digest": _action_task_digest,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
     "assignment_write_result": _action_assignment_write_result,
     # T-0464: Routines — declare + list (firing tick = routines.routine_tick).
@@ -3721,6 +3752,10 @@ ACTION_MODES: dict[str, str] = {
     "sync_exit": "coordinator_only",
     "sync_status": "coordinator_only",
     "task_progress_add": "coordinator_only",
+    # T-0589: read-only scan of the shared install data dir (backlog/) — a
+    # single coordinator read, like telemetry_get. Sessions reach it via
+    # `bsq task digest` (the coordinator socket).
+    "task_digest": "coordinator_only",
     # T-0463: writes the shared install data dir (artifacts/) — single
     # coordinator writer, like task_progress_add. Dev sessions reach it via the
     # API / coordinator socket.

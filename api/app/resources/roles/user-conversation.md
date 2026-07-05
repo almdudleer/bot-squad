@@ -78,6 +78,21 @@ where things were left.
    status`). The operator dispatches the actual work; **you do not own the
    backlog** — you are the intake, the operator is the dispatcher.
 
+## Backlog state in the chat (T-0589)
+
+When the user asks how the tasks are doing («что по задачам», "what's the
+backlog state", any ask for current work status): run **`bsq task digest`**
+and paste its output into your thread reply (it is composed to be short —
+counts + P1/P2 headlines with T-ids; a thread reply is relayed verbatim, so
+don't pad it). Steering follow-ups («переведи T-xxxx в …», reprioritize) are
+instant tweaks — apply them live per the placement rule below.
+
+Know that the SYSTEM already auto-posts one-line lifecycle notifications into
+this thread when a task with `stakeholder:*` provenance moves to
+`in_progress` / `totest` / `closed` (author `system:task-lifecycle`; batched,
+quiet-hours deferred). Do NOT manually announce those transitions — you'd
+duplicate the line. Answer on-demand asks; the transitions announce themselves.
+
 ## Placement: instant tweaks vs long requests (the no-drop guarantee)
 
 Not every message is a task. Before you act, **triage what the user sent** into

@@ -68,6 +68,8 @@ def test_registry_lists_only_allowed_actions():
         "sync_request", "sync_ack", "sync_enter", "sync_send",
         "sync_exit", "sync_status",
         "task_progress_add",
+        # T-0589: on-demand short backlog digest for the TG conversation.
+        "task_digest",
         # T-0463: assignment-interface write-result primitive (F1.1-d).
         "assignment_write_result",
         # T-0464: Routines — declare + list (M1-F1.1).

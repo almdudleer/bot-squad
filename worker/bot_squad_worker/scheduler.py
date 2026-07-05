@@ -21,6 +21,7 @@ from bot_squad_worker.jobs import (
     park_tick,
     recovery_tick,
     constant_team_tick,
+    task_lifecycle_tick,
     deploy_monitor_one,
     drift_check_tick,
     graceful_exit_tick,
@@ -391,6 +392,23 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=5,
         args=[cfg],
         id="monitors",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # task_lifecycle_tick: T-0589 — stakeholder-task lifecycle notifications
+    # into the TG conversation. 60s frontmatter sweep + sidecar diff; batches a
+    # sweep's transitions into one message and defers through quiet hours (the
+    # unstamped sidecar retries), so the cadence only bounds latency, not spam.
+    # max_instances=1 + coalesce; idempotent (unchanged statuses never re-fire).
+    # Kill switch: BOT_SQUAD_TASK_NOTIFY=0.
+    sched.add_job(
+        task_lifecycle_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="task_lifecycle",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

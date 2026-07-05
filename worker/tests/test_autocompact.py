@@ -139,11 +139,12 @@ def test_operator_session_is_not_exempt(harness):
 # --- T-0563/T-0564: recycle-v2 gates ----------------------------------------
 
 def test_non_allowlisted_project_is_never_compacted(harness, monkeypatch):
-    """T-0563: the 2026-06-29 incident's fix — a non-allowlisted project (e.g.
-    watchrobot) is NEVER auto-/compact-ed."""
+    """T-0563: the 2026-06-29 incident's fix — a non-allowlisted project is
+    NEVER auto-/compact-ed (watchrobot itself joined the default allowlist in
+    T-0613, so the example is any OTHER project)."""
     monkeypatch.delenv("BOT_SQUAD_RECYCLE_PROJECTS", raising=False)  # undo harness override
     rec = _rec()
-    assert A.maybe_compact(None, "watchrobot", rec, "urgent", now=1000.0) is False
+    assert A.maybe_compact(None, "other-project", rec, "urgent", now=1000.0) is False
     assert harness["sent"] == []
 
 

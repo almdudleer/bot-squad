@@ -11,8 +11,10 @@ incident.
 
 T-0563 per-project allowlist: ``[recycle].projects`` in system_settings.toml
 (or the ``BOT_SQUAD_RECYCLE_PROJECTS`` env override — comma-separated slugs,
-env wins) is the allowlist. Default (both unset) = ``("bot-squad",)`` — a new
-project is NEVER auto-recycled until an operator opts it in explicitly.
+env wins) is the allowlist. Default (both unset) = ``("bot-squad",
+"watchrobot")`` — a new project is NEVER auto-recycled until an operator opts
+it in explicitly. watchrobot joined the default per T-0613 (the T-0612 gate:
+its sessions must ride recycle-v2 BEFORE its operator program spawns).
 
 T-0564 user/attached exemption: independent of the allowlist, no recycle path
 may ever touch (a) a ``user-conversation`` role session (the human's own live
@@ -31,7 +33,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-DEFAULT_RECYCLE_PROJECTS = ("bot-squad",)
+DEFAULT_RECYCLE_PROJECTS = ("bot-squad", "watchrobot")
 
 # Skip-log debounce: at most one INFO line per slug within this window. All
 # three ticks run on a ~60s cadence and call the gate once PER SESSION, so

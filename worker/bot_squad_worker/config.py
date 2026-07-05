@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import secret_crypto
+from .recycle_gate import DEFAULT_RECYCLE_PROJECTS
 
 
 @dataclass(frozen=True)
@@ -174,8 +175,10 @@ class Config:
     # system_settings.toml [recycle].projects; BOT_SQUAD_RECYCLE_PROJECTS (env,
     # comma-separated) overrides at call time (read directly by recycle_gate,
     # NOT baked in here) so this field is only the TOML-configured fallback.
-    # Default = bot-squad only (the 2026-06-29 incident's fix).
-    recycle_projects: tuple[str, ...] = ("bot-squad",)
+    # Default rides recycle_gate.DEFAULT_RECYCLE_PROJECTS (ONE constant — a
+    # local literal here would shadow the gate's fallback, which production
+    # never reaches because this field is always set).
+    recycle_projects: tuple[str, ...] = DEFAULT_RECYCLE_PROJECTS
     # T-0566 (stakeholder 2026-07-04 /compact+resume policy): minimum context
     # tokens that make a cache-window recycle worth /compact-ing first. Below
     # this, idle_timeout terminates+records without sending /compact (nothing
@@ -250,7 +253,7 @@ class Config:
         voice_max_duration_sec = 300
         voice_transcribe_timeout_sec = 120
         voice_audio_retention_days = 30
-        recycle_projects: tuple[str, ...] = ("bot-squad",)
+        recycle_projects: tuple[str, ...] = DEFAULT_RECYCLE_PROJECTS
         recycle_compact_min_context_tokens = 20000
         tasks_dedupe_threshold = 0.9
         sys_settings = config_dir / "system_settings.toml"

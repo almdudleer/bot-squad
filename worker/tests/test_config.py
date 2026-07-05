@@ -155,10 +155,14 @@ def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
 
 
 def test_recycle_defaults(tmp_config_dir: Path) -> None:
-    # T-0563/T-0566: absent system_settings.toml → bot-squad-only allowlist,
-    # 20k-token compact threshold.
+    # T-0563/T-0566/T-0613: absent system_settings.toml → the shared default
+    # allowlist (recycle_gate.DEFAULT_RECYCLE_PROJECTS — bot-squad +
+    # watchrobot), 20k-token compact threshold.
+    from bot_squad_worker.recycle_gate import DEFAULT_RECYCLE_PROJECTS
+
     cfg = Config.load(tmp_config_dir)
-    assert cfg.recycle_projects == ("bot-squad",)
+    assert cfg.recycle_projects == DEFAULT_RECYCLE_PROJECTS
+    assert cfg.recycle_projects == ("bot-squad", "watchrobot")
     assert cfg.recycle_compact_min_context_tokens == 20000
 
 

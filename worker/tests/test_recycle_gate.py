@@ -18,12 +18,16 @@ def _cfg(**kw):
 
 # --- T-0563: per-project allowlist -------------------------------------------
 
-def test_default_allowlist_is_bot_squad_only(monkeypatch):
+def test_default_allowlist_is_bot_squad_and_watchrobot(monkeypatch):
+    # T-0613: watchrobot rides recycle-v2 by default (the T-0612 gate wants it
+    # covered BEFORE its operator program spawns); any OTHER project still
+    # needs an explicit opt-in.
     monkeypatch.delenv("BOT_SQUAD_RECYCLE_PROJECTS", raising=False)
     cfg = _cfg()  # no recycle_projects attr at all
-    assert G.recycle_allowlist(cfg) == ("bot-squad",)
+    assert G.recycle_allowlist(cfg) == ("bot-squad", "watchrobot")
     assert G.project_allowed(cfg, "bot-squad", now=1000.0) is True
-    assert G.project_allowed(cfg, "watchrobot", now=1000.0) is False
+    assert G.project_allowed(cfg, "watchrobot", now=1000.0) is True
+    assert G.project_allowed(cfg, "some-new-project", now=1000.0) is False
 
 
 def test_config_projects_extend_the_allowlist(monkeypatch):
@@ -51,10 +55,10 @@ def test_skip_log_debounced_per_slug(monkeypatch, caplog):
     G._last_skip_log.clear()
     cfg = _cfg()
     caplog.set_level("INFO")
-    assert G.project_allowed(cfg, "watchrobot", now=1000.0) is False
-    assert G.project_allowed(cfg, "watchrobot", now=1000.1) is False  # same tick, no re-log
-    assert G.project_allowed(cfg, "watchrobot", now=1035.0) is False  # window elapsed, re-logs
-    lines = [r.message for r in caplog.records if "watchrobot" in r.message]
+    assert G.project_allowed(cfg, "other-project", now=1000.0) is False
+    assert G.project_allowed(cfg, "other-project", now=1000.1) is False  # same tick, no re-log
+    assert G.project_allowed(cfg, "other-project", now=1035.0) is False  # window elapsed, re-logs
+    lines = [r.message for r in caplog.records if "other-project" in r.message]
     assert len(lines) == 2
 
 
@@ -116,8 +120,11 @@ def test_recycle_allowed_combines_all_three(monkeypatch):
     cfg = _cfg()
     assert G.recycle_allowed(cfg, slug="bot-squad", role="dev",
                             tmux_target="%1", now=1000.0) is True
-    # non-allowlisted project
+    # watchrobot joined the default allowlist (T-0613)
     assert G.recycle_allowed(cfg, slug="watchrobot", role="dev",
+                            tmux_target="%1", now=1000.0) is True
+    # non-allowlisted project
+    assert G.recycle_allowed(cfg, slug="some-new-project", role="dev",
                             tmux_target="%1", now=1000.0) is False
     # user-conversation role, even in an allowlisted project
     assert G.recycle_allowed(cfg, slug="bot-squad", role="user-conversation",

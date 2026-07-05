@@ -157,15 +157,16 @@ def test_gather_no_artifact_when_file_absent(monkeypatch, tmp_path):
 # --- T-0563/T-0564: recycle-v2 gates in _gather -----------------------------
 
 def test_gather_skips_non_allowlisted_project(monkeypatch, tmp_path):
-    """T-0563: a crashed session in a non-allowlisted project (e.g. watchrobot,
-    the 2026-06-29 incident's project) is never gathered — never respawned."""
+    """T-0563: a crashed session in a non-allowlisted project is never
+    gathered — never respawned (watchrobot, the 2026-06-29 incident's project,
+    joined the default allowlist in T-0613, so the example is another slug)."""
     from bot_squad_worker import sessions as S
     import types as _types
-    # default allowlist (bot-squad only) — this cfg has NO recycle_projects
-    # override, unlike the module's shared _cfg() helper.
-    cfg = _types.SimpleNamespace(projects={"watchrobot": object()},
+    # default allowlist — this cfg has NO recycle_projects override, unlike
+    # the module's shared _cfg() helper.
+    cfg = _types.SimpleNamespace(projects={"lim-finance": object()},
                                  data_dir=tmp_path / "data")
-    sess = tmp_path / "data" / "watchrobot" / "sessions"; sess.mkdir(parents=True)
+    sess = tmp_path / "data" / "lim-finance" / "sessions"; sess.mkdir(parents=True)
     S._write_session_metadata(sess / "S-u-wr-p1.md", {
         "sid": "S-u-wr-p1", "status": "active", "window": "dev", "task_id": "~",
         "initiative": "~", "role": "dev"})

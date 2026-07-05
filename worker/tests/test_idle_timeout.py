@@ -502,20 +502,21 @@ def test_finalize_emits_session_recycled_event(tmp_path, seams):
 
 # --- D. T-0563/T-0564: recycle-v2 gates, exercised through maybe_recycle -----
 
-def test_watchrobot_never_touched_by_default_allowlist(tmp_path, seams):
-    """T-0563: the 2026-06-29 incident's fix — a watchrobot session is NEVER
-    touched by idle_timeout under the default allowlist (bot-squad only)."""
-    sid = "S-almdudleer-watchrobot-demo-p5"
+def test_non_allowlisted_project_never_touched_by_default_allowlist(tmp_path, seams):
+    """T-0563: the 2026-06-29 incident's fix — a session in a non-allowlisted
+    project is NEVER touched by idle_timeout (watchrobot itself joined the
+    default allowlist in T-0613, so the example is another slug)."""
+    sid = "S-almdudleer-lim-finance-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
     # seed the session under a DIFFERENT (non-allowlisted) project slug
-    sess = data / "watchrobot" / "sessions"
+    sess = data / "lim-finance" / "sessions"
     sess.mkdir(parents=True)
     S._write_session_metadata(sess / f"{sid}.md", {
         "sid": sid, "status": "active", "window": "demo",
         "cwd": str(data.parent / "repo"), "claude_uuid": "uuid-" + sid,
         "task_id": "T-0042"})
     row = _row(sid, cwd_repo=data.parent / "repo")
-    assert IT.maybe_recycle(cfg, "watchrobot", row, now=time.time(),
+    assert IT.maybe_recycle(cfg, "lim-finance", row, now=time.time(),
                             user_home="/home/x") is False
     assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 

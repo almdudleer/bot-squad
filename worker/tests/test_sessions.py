@@ -662,6 +662,72 @@ def test_list_sessions_per_pane_uuid_under_shared_cwd(tmp_path, monkeypatch):
     assert len(set(starts)) == 3, f"active TLs must have distinct started_at, got {starts}"
 
 
+def test_list_sessions_prefers_md_recorded_uuid_over_cwd_guess(tmp_path, monkeypatch):
+    """T-0584: same-cwd panes emit their md-RECORDED claude_uuid, not the guess.
+
+    Fresh-spawned panes carry no --resume/--session-id in cmdline, so the
+    T-0120 /proc walk returns None and the row's claude_uuid fell through to
+    discover_claude_uuid — the cwd's mtime-newest jsonl, the SAME uuid for
+    every pane sharing the repo cwd. On staging every non-operator row on
+    /p/<slug>/sessions linked the newest session's transcript.
+
+    The session md already records the binding (claude_uuid field, stamped at
+    spawn/resume). When the md resolves by SID, that recorded uuid must win
+    over the shared-cwd guess; the /proc walk stays authoritative when it hits.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_session_metadata(sessions_dir / "S-testuser-dev_a-p20.md", {
+        "sid": "S-testuser-dev_a-p20", "status": "active", "window": "dev_a",
+        "cwd": str(repo), "claude_uuid": "uuid-dev-a",
+        "task_id": "T-0001", "started_at": "2026-07-04T10:00:00Z",
+    })
+    _write_session_metadata(sessions_dir / "S-testuser-dev_b-p21.md", {
+        "sid": "S-testuser-dev_b-p21", "status": "active", "window": "dev_b",
+        "cwd": str(repo), "claude_uuid": "uuid-dev-b",
+        "task_id": "T-0002", "started_at": "2026-07-04T11:00:00Z",
+    })
+
+    # Shared encoded project dir: uuid-dev-b's jsonl is mtime-newest, so the
+    # cwd guess returns "uuid-dev-b" for BOTH panes.
+    encoded = str(repo).replace("/", "-")
+    proj_dir = tmp_path / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "uuid-dev-a.jsonl").write_text("{}")
+    (proj_dir / "uuid-dev-b.jsonl").write_text("{}")
+    now = time.time()
+    os.utime(proj_dir / "uuid-dev-a.jsonl", (now - 600, now - 600))
+    os.utime(proj_dir / "uuid-dev-b.jsonl", (now, now))
+
+    fake_panes = (
+        f"%20|dev_a|4001|{repo}|claude\n"
+        f"%21|dev_b|4002|{repo}|claude\n"
+    )
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_panes, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    # Fresh spawns: the /proc walk finds nothing for either pane.
+    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home: None)
+
+    rows = list_sessions(cfg, "test-project")
+    by_sid = {r["sid"]: r for r in rows if r["status"] == "active"}
+
+    assert by_sid["S-testuser-dev_a-p20"]["claude_uuid"] == "uuid-dev-a"
+    assert by_sid["S-testuser-dev_b-p21"]["claude_uuid"] == "uuid-dev-b"
+
+
 def test_list_sessions_suspended_with_initiative(tmp_path, monkeypatch):
     """Suspended-md path surfaces initiative from frontmatter."""
     repo = tmp_path / "repo"

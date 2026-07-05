@@ -847,10 +847,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # /proc walk reads the uuid the live claude process has open — that's
         # per-pane. discover_claude_uuid stays as the fallback when the walk
         # finds nothing (e.g. claude not yet exec'd in a brand-new pane).
-        claude_uuid = (
-            _pane_claude_uuid_from_proc(pane.pid, user_home)
-            or discover_claude_uuid(pane.cwd, user_home)
-        )
+        proc_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home)
+        claude_uuid = proc_uuid or discover_claude_uuid(pane.cwd, user_home)
 
         # Check for last_prompt_at via .claude/last_user_prompt_ts mtime
         last_prompt_at = None
@@ -882,6 +880,18 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             if stored_owner_sid != sid and stored_owner_sid in all_pane_sids:
                 session_md_path = None
                 existing = None
+
+        # T-0584: when the /proc walk missed (fresh spawn — cmdline carries no
+        # --resume/--session-id), prefer the md-RECORDED claude_uuid over the
+        # shared-cwd mtime guess. The guess is the cwd's newest jsonl — the
+        # SAME uuid for every md-backed pane in the repo cwd, which cross-wired
+        # every non-operator transcript link on /p/<slug>/sessions to the
+        # newest session. The recorded binding is per-session; the live /proc
+        # uuid stays authoritative when it resolves.
+        if proc_uuid is None and existing is not None:
+            recorded_uuid = existing.get("claude_uuid")
+            if recorded_uuid and recorded_uuid != "~":
+                claude_uuid = recorded_uuid
 
         # T-0176 #4: a claude `/rename` changes the live tmux window name; sync
         # the stored SessionMd display label to match (it used to lag behind the

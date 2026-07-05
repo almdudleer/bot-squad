@@ -3,6 +3,7 @@ import {
   BrowserRouter,
   Routes,
   Route,
+  Link,
   Navigate,
   Outlet,
   useLocation,
@@ -11,6 +12,8 @@ import {
 import { Login } from "./pages/Login";
 import { HomeRedirect } from "./pages/HomeRedirect";
 import { Shell } from "./components/Shell";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { useProjectExists } from "./components/useProjectExists";
 
 // T-0365: code-split the route tree. Only the critical first-paint path stays
 // eager — Login, HomeRedirect (the `/` redirector) and the Shell layout. Every
@@ -70,6 +73,11 @@ const LEGACY_SLUG_ALIASES: Record<string, string> = {
 function SlugAliasGuard() {
   const { slug } = useParams();
   const location = useLocation();
+  // T-0602 (N3): probe the slug against the user-scoped project list. While
+  // unresolved (null) render the children as before — the guard only swaps in
+  // the not-found panel once the list positively excludes the slug, so normal
+  // loads pay no latency.
+  const exists = useProjectExists(slug);
   const alias = slug ? LEGACY_SLUG_ALIASES[slug] : undefined;
   if (alias) {
     const target =
@@ -78,7 +86,27 @@ function SlugAliasGuard() {
       location.hash;
     return <Navigate to={target} replace />;
   }
+  if (exists === false) return <ProjectNotFound slug={slug ?? ""} />;
   return <Outlet />;
+}
+
+/**
+ * T-0602 (N3): the body rendered for a bogus /p/:slug/* URL — one not-found
+ * panel for ALL project children (the Shell suppresses the project nav rail
+ * off the same useProjectExists signal). Markup mirrors the Project.tsx
+ * slug-missing panel.
+ */
+export function ProjectNotFound({ slug }: { slug: string }) {
+  return (
+    <div className="container py-4">
+      <div className="alert alert-warning">
+        Project <code>{slug}</code> not found.
+      </div>
+      <Link to="/" style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}>
+        ← back to all projects
+      </Link>
+    </div>
+  );
 }
 
 // T-0235: legacy top-level /p/:slug/feedback + /usecases deep-links redirect
@@ -92,6 +120,11 @@ function LegacyDocsRedirect({ sub }: { sub: string }) {
 export function App() {
   return (
     <BrowserRouter>
+      {/* T-0602 (F3): app-level error boundary — a thrown render error
+          anywhere in the route tree shows the reload card, not a white
+          screen. Inside BrowserRouter so the reload button is the only
+          recovery affordance we need. */}
+      <ErrorBoundary>
       <Routes>
         {/* Login is the only route fully outside the sidebar shell */}
         <Route path="/login" element={<Login />} />
@@ -154,6 +187,7 @@ export function App() {
 
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      </ErrorBoundary>
     </BrowserRouter>
   );
 }

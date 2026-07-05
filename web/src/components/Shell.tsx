@@ -7,6 +7,7 @@ import { ProjectSwitcher } from "./ProjectSwitcher";
 import { RouteSkeleton } from "./RouteSkeleton";
 import { isSuperAdminFromMe, resolveRailContext } from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
+import { useProjectExists } from "./useProjectExists";
 
 const PINNED_PROJECT_KEY = "bot-squad:last-project";
 
@@ -58,9 +59,21 @@ export function Shell() {
     }
   });
 
-  // Keep pinned project in sync when the URL has a slug
+  // Display slug: URL takes precedence; otherwise the pinned slug
+  const slug = urlSlug ?? pinnedSlug;
+  const hasProject = Boolean(slug);
+
+  // T-0602 (N3): does the display slug name a real (user-visible) project?
+  // false suppresses the project nav rail — a bogus /p/<slug> must not wear
+  // full project chrome pretending the project exists. null (unresolved /
+  // list unavailable) keeps the rail, so chrome never flickers on slow loads.
+  const projectExists = useProjectExists(slug);
+
+  // Keep pinned project in sync when the URL has a slug. T-0602: only pin
+  // slugs confirmed to exist, so a bogus deep-link doesn't overwrite the
+  // user's real pinned project.
   useEffect(() => {
-    if (urlSlug && urlSlug !== pinnedSlug) {
+    if (urlSlug && urlSlug !== pinnedSlug && projectExists === true) {
       setPinnedSlug(urlSlug);
       try {
         localStorage.setItem(PINNED_PROJECT_KEY, urlSlug);
@@ -68,11 +81,7 @@ export function Shell() {
         /* ignore quota / disabled */
       }
     }
-  }, [urlSlug, pinnedSlug]);
-
-  // Display slug: URL takes precedence; otherwise the pinned slug
-  const slug = urlSlug ?? pinnedSlug;
-  const hasProject = Boolean(slug);
+  }, [urlSlug, pinnedSlug, projectExists]);
 
   // T-0357 (de-fleet the chrome). Fleet/admin chrome belongs to super-admins on
   // a mothership build only; a non-admin / single-project operator must see ZERO
@@ -257,8 +266,9 @@ export function Shell() {
 
         {/* Project section — shows pinned project even on global routes, but
             NOT in the fleet/admin area (T-0357: railContext keeps the
-            per-project rail and the admin rail mutually exclusive). */}
-        {railContext === "project" && slug && (
+            per-project rail and the admin rail mutually exclusive), and NOT
+            for a slug the project list positively excludes (T-0602 N3). */}
+        {railContext === "project" && slug && projectExists !== false && (
           <>
             <div className="mc-sidebar-section">Project</div>
             <div className="mc-sidebar-project">

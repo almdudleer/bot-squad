@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -246,6 +247,17 @@ def test_evaluate_probe_errors_are_not_breaches():
     assert R.evaluate_probe(spec, _pr(output="not a number"))[0] == "error"
 
 
+def test_evaluate_probe_inf_nan_are_errors_not_crashes():
+    """T-0603 review P3: inf/nan parse as floats, then int(value) raises
+    OverflowError/ValueError OUTSIDE the non-numeric guard — must be the
+    error verdict, never an escaping exception."""
+    spec = R.MonitorTrigger(_spec()).spec
+    for weird in ("inf", "-inf", "nan", "Infinity", "NaN", "+inf\n"):
+        verdict, value = R.evaluate_probe(spec, _pr(output=weird))
+        assert verdict == "error", weird
+        assert "non-finite" in value
+
+
 # --- Judge state machine (poll) ---------------------------------------------
 
 def _poll(trig, now, st, **pr_kw):
@@ -348,6 +360,19 @@ def test_poll_probe_error_counts_not_breaches():
     assert st["breach_first_seen"] == R._iso(T0)
 
 
+def test_poll_inf_output_increments_errors_state_intact():
+    """The P3 crash aborted the sweep step BEFORE save_state — with the fix
+    the non-finite probe rides the normal error path: consecutive_errors
+    increments, breach state untouched, no exception."""
+    trig = R.MonitorTrigger(_spec(threshold=10, persist_s=0))
+    st: dict = {"breach_first_seen": R._iso(T0)}
+    for i, out in enumerate(("inf", "nan"), start=1):
+        ev = _poll(trig, T0 + timedelta(seconds=5 * i), st, output=out)
+        assert ev is None
+        assert st["consecutive_errors"] == i
+    assert st["breach_first_seen"] == R._iso(T0)
+
+
 def test_poll_ok_probe_resets_consecutive_errors():
     trig = R.MonitorTrigger(_spec(threshold=10))
     st: dict = {"consecutive_errors": 7}
@@ -405,6 +430,19 @@ def test_run_probe_timeout_is_an_error_not_a_crash():
     pr = R._run_probe({"cmd": "sleep 5", "timeout_s": 1})
     assert pr.ok is False
     assert "timeout" in pr.error
+
+
+def test_run_probe_timeout_airtight_against_pipe_holding_grandchild():
+    """T-0603 review P2: a backgrounded grandchild inherits the stdout pipe
+    and survives a kill of the shell alone — pre-fix the drain blocked until
+    IT exited (here ~30s), wedging the max_instances=1 monitor job. killpg
+    on the probe's own process group must end the run at ~timeout_s."""
+    start = time.monotonic()
+    pr = R._run_probe({"cmd": "sleep 30 & sleep 30", "timeout_s": 1})
+    elapsed = time.monotonic() - start
+    assert pr.ok is False
+    assert "timeout" in pr.error
+    assert elapsed < 8, f"probe run blocked {elapsed:.1f}s past its 1s timeout"
 
 
 def test_run_probe_output_capped_at_8kb():

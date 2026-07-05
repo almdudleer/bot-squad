@@ -38,8 +38,10 @@ from __future__ import annotations
 import abc
 import json
 import logging
+import math
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -392,6 +394,10 @@ def evaluate_probe(spec: dict, probe: ProbeResult) -> tuple[str, Any]:
         value = float(probe.output.strip())
     except ValueError:
         return ("error", f"non-numeric output {probe.output.strip()[:80]!r}")
+    if not math.isfinite(value):
+        # inf/nan parse as floats but can't be judged (int() raises, nan
+        # comparisons lie) — the error path, same as non-numeric output.
+        return ("error", f"non-finite output {probe.output.strip()[:80]!r}")
     if value == int(value):
         value = int(value)
     t = float(threshold)
@@ -877,22 +883,58 @@ def _fire_count_24h(cfg: Any, slug: str, rid: str, *, now: datetime) -> int:
     return count
 
 
-def _run_probe(spec: dict) -> ProbeResult:
-    """Run one shell probe subprocess: hard timeout, output capped at 8KB."""
+def _kill_probe_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the probe's whole process group and reap without touching the
+    pipes: a grandchild holding stdout would make communicate() block, but
+    wait() only reaps the (dead) shell. Pipes are closed explicitly so an
+    escapee that setsid'd out of the group can't leak our fds."""
     try:
-        p = subprocess.run(
-            spec["cmd"], shell=True, capture_output=True, text=True,
-            timeout=spec["timeout_s"],
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _run_probe(spec: dict) -> ProbeResult:
+    """Run one shell probe subprocess: hard timeout, output capped at 8KB.
+
+    The probe leads its own process group (``start_new_session=True``, the
+    deploy.py T-0212 idiom) so the timeout kill reaches shell grandchildren
+    too. Killing only the shell would leave a backgrounded child holding the
+    stdout pipe, communicate() would block unbounded, and the max_instances=1
+    monitor job would wedge EVERY monitor until a worker restart.
+    """
+    try:
+        p = subprocess.Popen(
+            spec["cmd"], shell=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,  # own process group → killpg reaches children
         )
-    except subprocess.TimeoutExpired:
-        return ProbeResult(ok=False, exit_code=-1, output="",
-                           error=f"timeout after {spec['timeout_s']}s")
     except Exception as e:  # noqa: BLE001 — a probe can never kill the sweep
         return ProbeResult(ok=False, exit_code=-1, output="",
                            error=str(e)[:200])
+    try:
+        out, err = p.communicate(timeout=spec["timeout_s"])
+    except subprocess.TimeoutExpired:
+        _kill_probe_group(p)
+        return ProbeResult(ok=False, exit_code=-1, output="",
+                           error=f"timeout after {spec['timeout_s']}s")
+    except Exception as e:  # noqa: BLE001
+        _kill_probe_group(p)
+        return ProbeResult(ok=False, exit_code=-1, output="",
+                           error=str(e)[:200])
     return ProbeResult(ok=True, exit_code=p.returncode,
-                       output=(p.stdout or "")[:MONITOR_OUTPUT_CAP],
-                       error=(p.stderr or "")[:500])
+                       output=(out or "")[:MONITOR_OUTPUT_CAP],
+                       error=(err or "")[:500])
 
 
 # Registry cache: the 5s tick must not re-read every routine md. Keyed by the

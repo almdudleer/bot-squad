@@ -2637,6 +2637,38 @@ def test_send_stakeholder_dm_slims_long_pages(tmp_config_dir, monkeypatch):
     assert "детали: см. задачу/тред" in sent_text
 
 
+def test_send_stakeholder_dm_prefer_tg_never_slimmed(tmp_config_dir, monkeypatch):
+    """T-0610 review P3: an explicitly-addressed send (prefer_tg — e.g. the
+    T-0569 conversation-relay reply to the stakeholder's DM) is conversational
+    content, not a page — it must arrive untruncated."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    reply = "Развёрнутый ответ по треду. " + "Деталь и обоснование решения. " * 40
+    A._send_stakeholder_dm(A._get_config(), message=reply, tg_chat_id="404", prefer_tg=True)
+    assert fake_tg.calls[0]["text"] == reply  # byte-identical, no cap
+
+
+def test_tg_notify_needs_input_footer_survives_slim(tmp_config_dir, monkeypatch):
+    """T-0610 review P2-1: on a needs-input page, the QUESTION is slimmed but
+    the tmux-attach escalation footer survives — a blanket slim after
+    composition would cut the footer off the end."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_stall as TS
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    monkeypatch.setattr(A, "_resolve_tmux_session", lambda c, slug, sid: "bot-squad")
+    monkeypatch.setattr(
+        TS, "build_escalation_text",
+        lambda cfg, sid, text, session: f"{text}\n\n▶ tmux attach -t {session}")
+    long_question = "Нужен твой выбор по деплою. " + "Контекст решения и варианты. " * 40
+    out = A.dispatch("tg_notify", {"message": long_question, "sid": "S-x-p1",
+                                   "needs_input": True})
+    assert out["channel"] == "tg"
+    sent = fake_tg.calls[0]["text"]
+    assert "tmux attach -t bot-squad" in sent          # footer survived
+    assert len(sent) < len(long_question)              # question was slimmed
+    assert "детали: см. задачу/тред" in sent           # via _slim_page, not a raw cut
+
+
 def test_page_channel_action_set_read_persists(tmp_config_dir, monkeypatch):
     """T-0610: page_channel action sets/reads the mode; state survives via the
     data/_worker/page_channel.json file; bad mode rejected."""

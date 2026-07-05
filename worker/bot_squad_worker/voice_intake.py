@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 # over-long note is rejected pre-download and a runaway decode is time-boxed.
 _DEFAULT_MAX_DURATION_SEC = 300
 _DEFAULT_TRANSCRIBE_TIMEOUT_SEC = 120
+# T-0611: the TG Bot API refuses getFile for files over 20MB — a hard platform
+# limit, not ours (the 2026-07-05 25-min note died on it AFTER passing the
+# duration gate). Reject on the update's file_size BEFORE download with an
+# honest reason; small safety margin under the exact 20*1024*1024.
+_BOT_API_FILE_CAP_BYTES = 20_000_000
 # T-0433 P3: how long an un-triaged voice blob survives in feedback/_audio/ before
 # the age backstop reaps it. A triaged (promoted/dismissed) note's audio is reaped
 # immediately regardless. 0 disables the age backstop (triage-only GC).
@@ -44,6 +49,7 @@ def extract_voice(message: dict) -> dict[str, Any] | None:
         "file_id": voice.get("file_id"),
         "file_unique_id": voice.get("file_unique_id") or voice.get("file_id"),
         "duration": int(voice.get("duration") or 0),
+        "file_size": int(voice.get("file_size") or 0),
         "mime_type": voice.get("mime_type") or "audio/ogg",
         "author": author,
         "author_id": frm.get("id"),
@@ -194,6 +200,13 @@ def transcribe_only(cfg: Any, slug: str, message: dict) -> dict[str, Any]:
                   v["duration"], max_dur, v["author"])
         return {"ok": False, "reason": "too_long", "transcript": "", "duration": v["duration"]}
 
+    if v["file_size"] > _BOT_API_FILE_CAP_BYTES:
+        log.info("voice_intake: transcribe_only rejecting too-big note (%d bytes > %d, %ds) from %s"
+                 " — Bot API getFile cap", v["file_size"], _BOT_API_FILE_CAP_BYTES,
+                 v["duration"], v["author"])
+        return {"ok": False, "reason": "too_big", "transcript": "",
+                "duration": v["duration"], "file_size": v["file_size"]}
+
     dest = _audio_dir(cfg, slug) / f"{v['file_unique_id']}.oga"
     try:
         download_voice(cfg, v["file_id"], dest)
@@ -248,6 +261,14 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
                  v["duration"], max_dur, v["author"])
         _confirm(cfg, slug, v, outcome="too_long")
         return {"ok": False, "reason": "too_long", "duration": v["duration"]}
+
+    if v["file_size"] > _BOT_API_FILE_CAP_BYTES:
+        log.info("voice_intake: rejecting too-big note (%d bytes > %d, %ds) from %s"
+                 " — Bot API getFile cap", v["file_size"], _BOT_API_FILE_CAP_BYTES,
+                 v["duration"], v["author"])
+        _confirm(cfg, slug, v, outcome="too_big")
+        return {"ok": False, "reason": "too_big", "duration": v["duration"],
+                "file_size": v["file_size"]}
 
     dest = _audio_dir(cfg, slug) / f"{v['file_unique_id']}.oga"
     try:
@@ -337,6 +358,12 @@ def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = ""
             cap = int(getattr(cfg, "voice_max_duration_sec", _DEFAULT_MAX_DURATION_SEC) or 0)
             text = (f"⚠️ voice note too long ({duration}s > {cap}s cap) — please split "
                     f"into shorter notes.")
+        elif outcome == "too_big":
+            # T-0611: over the Bot API 20MB getFile cap — a resend can never
+            # pass; the honest remedy is splitting into shorter notes.
+            text = (f"⚠️ voice note too big for Telegram's bot file limit (20MB, "
+                    f"{duration}s) — resending won't help; please split into "
+                    f"shorter notes (≤15 min is safe).")
         elif outcome == "download_failed":
             text = (f"⚠️ couldn't fetch your voice note ({duration}s) — the TG file "
                     f"download failed (proxy?). Please resend.")

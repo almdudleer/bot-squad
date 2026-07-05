@@ -1130,9 +1130,12 @@ def _monitor_notify(cfg: Any, slug: str, rid: str, text: str) -> bool:
 
         project = cfg.projects.get(slug)
         chat_id = getattr(project, "tg_chat", "") if project else ""
-        _send_stakeholder_dm(cfg, message=text, sid=f"routine:{rid}",
-                             urgent=True, tg_chat_id=chat_id)
-        return True
+        res = _send_stakeholder_dm(cfg, message=text, sid=f"routine:{rid}",
+                                   urgent=True, tg_chat_id=chat_id)
+        # T-0610: the SSOT no longer raises on an undeliverable page — it
+        # returns {ok: False, channel: "none"}. Treat that as not-delivered so
+        # the cooldown stays unstamped and the alert retries next tick.
+        return bool(res.get("ok"))
     except Exception:  # noqa: BLE001 — an alert channel outage never kills the sweep
         log.exception("monitor %s: notify delivery failed [%s]", rid, slug)
         return False

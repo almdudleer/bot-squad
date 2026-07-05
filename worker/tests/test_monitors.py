@@ -1056,6 +1056,39 @@ def test_notify_delivery_failure_retries_next_tick(mcfg, tmp_path, monkeypatch):
     assert R.load_state(cfg, slug, rid)["fired"] is True
 
 
+def test_notify_undeliverable_ok_false_retries_next_tick(mcfg, tmp_path, monkeypatch):
+    """T-0610 review P2-2: the SSOT no longer raises on an undeliverable page —
+    it RETURNS {ok: False, channel: 'none'}. The breach notify must treat that
+    as not-delivered (no cooldown stamp) and retry next sweep, same as the
+    raising case above."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800)
+
+    from bot_squad_worker import actions
+
+    def _undeliverable(cfg, *, message, **kw):
+        return {"ok": False, "sent": False, "channel": "none"}  # no raise
+
+    monkeypatch.setattr(actions, "_send_stakeholder_dm", _undeliverable)
+    res = R.monitor_sweep(cfg, slug, now=T0)
+    assert res["fired"] == []
+    st = R.load_state(cfg, slug, rid)
+    assert st["fired"] is False and st["last_fired_at"] is None
+
+    calls: list[dict] = []
+
+    def _up(cfg, *, message, **kw):
+        calls.append({"message": message, **kw})
+        return {"ok": True, "sent": True, "channel": "test"}
+
+    monkeypatch.setattr(actions, "_send_stakeholder_dm", _up)
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    assert res["fired"] == [rid]
+    assert len(calls) == 1
+
+
 # --- on_recover: notify — ✅ only for breaches that actually fired ------------
 
 def test_recover_notify_sends_checkmark_after_fired_breach(mcfg, tmp_path,

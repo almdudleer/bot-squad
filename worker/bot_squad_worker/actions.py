@@ -261,15 +261,20 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
 
     message = params["message"]
     urgent = bool(params.get("urgent", False))
+    do_slim = True
     if bool(params.get("needs_input", False)):
         from bot_squad_worker import tg_stall as _tg_stall
         session_name = params.get("tmux_session") or _resolve_tmux_session(
             cfg, params.get("slug", ""), params.get("sid", "")
         )
+        # T-0610 review fix: slim the QUESTION before the escalation footer is
+        # composed — the SSOT's blanket slim would cut the tmux-attach footer
+        # off the end, which is the page's whole point.
         message = _tg_stall.build_escalation_text(
-            cfg, params.get("sid", ""), message, session_name
+            cfg, params.get("sid", ""), _slim_page(message), session_name
         )
         urgent = True
+        do_slim = False
 
     # An EXPLICIT chat_id/topic_id is a TG group/forum target (MAX has no such
     # binding), so those stay on TG. This decision is computed from the RAW
@@ -288,6 +293,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         tg_topic_id=topic_id,
         prefer_tg=explicit_tg_target,
         debounce=debounce,
+        do_slim=do_slim,
     )
 
 
@@ -350,6 +356,7 @@ def _send_stakeholder_dm(
     prefer_tg: bool = False,
     group_record: bool = False,
     debounce: bool = True,
+    do_slim: bool = True,
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
@@ -365,6 +372,11 @@ def _send_stakeholder_dm(
     record used to go to.
 
     Pages are SHORT-FORM (``_slim_page``): headline + refs, detail in tasks.
+    Slimming applies only to default-routed PAGES: an explicitly-addressed
+    send (``prefer_tg``, e.g. the T-0569 conversation-relay replies to the
+    stakeholder's DM) is conversational content, not a page — never truncated.
+    ``do_slim=False`` lets a caller that already slimmed its question part
+    (needs-input escalations, whose tmux-attach footer must survive) opt out.
 
     ``prefer_tg`` (an explicit group/forum target MAX can't honor) stays
     TG-only: no MAX fallback for group-addressed content; TG errors propagate
@@ -374,7 +386,8 @@ def _send_stakeholder_dm(
     transport could deliver — logged loudly, never a silent no-op.
     """
     del group_record  # T-0610: compat no-op — one page, one delivery
-    message = _slim_page(message)
+    if do_slim and not prefer_tg:
+        message = _slim_page(message)
 
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:

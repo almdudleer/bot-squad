@@ -1321,6 +1321,35 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
     assert voice["file_id"] == "VID"
 
 
+def test_handle_update_private_voice_too_big_honest_no_retry_lie(tmp_path, monkeypatch):
+    """T-0611: a >20MB DM voice note gets the honest Bot-API-cap refusal
+    (resending can't help — say so) + the no-drop marker with file_id."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": False, "reason": "too_big", "transcript": "",
+                              "duration": 1540, "file_size": 25_000_000})
+    notified = []
+    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notified.append(text))
+    recorded = []
+    monkeypatch.setattr(
+        TL, "append_conversation",
+        lambda c, slug, gid, msg: recorded.append((msg.get("text"), msg.get("voice"))) or True)
+
+    result = TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg()})
+
+    assert result["reason"] == "too_big"
+    (text_sent,) = notified
+    assert "20МБ" in text_sent and "25:40" in text_sent
+    assert "НЕ поможет" in text_sent  # resending is explicitly called out as futile
+    (marker_text, marker_voice) = recorded[0]
+    assert "too_big" in marker_text and marker_voice["file_id"] == "VID"
+
+
 def test_private_voice_long_transcript_echo_is_chunked(tmp_path, monkeypatch):
     """T-0586: a transcript longer than one TG message (4096-char API cap) is
     echoed as numbered parts instead of vanishing — the 2026-07-05 13.5-min

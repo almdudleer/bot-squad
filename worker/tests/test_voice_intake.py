@@ -190,6 +190,55 @@ def test_transcribe_only_over_cap_before_download(tmp_path, monkeypatch):
     assert not (_VI._audio_dir(cfg, "bot-squad") / "big.oga").exists()
 
 
+def test_transcribe_only_too_big_before_download(tmp_path, monkeypatch):
+    """T-0611: a voice file over the Bot API 20MB getFile cap is rejected
+    BEFORE download with the honest ``too_big`` reason — the 25-min-note
+    incident surfaced as a misleading in-download failure otherwise. The
+    duration cap being OFF (0) must not matter."""
+    cfg = _cfg(tmp_path)
+    cfg.voice_max_duration_sec = 0  # duration cap removed — size cap still guards
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T
+
+    def boom_download(c, file_id, dest):
+        raise AssertionError("download_voice called for a too-big note")
+    monkeypatch.setattr(_VI, "download_voice", boom_download)
+    def boom_transcribe(p, **kw):
+        raise AssertionError("transcribe called for a too-big note")
+    monkeypatch.setattr(_T, "transcribe", boom_transcribe)
+
+    out = _VI.transcribe_only(cfg, "bot-squad", _voice_msg(voice={
+        "file_id": "huge", "file_unique_id": "huge", "duration": 1540,
+        "mime_type": "audio/ogg", "file_size": 25_000_000}))
+    assert out["ok"] is False and out["reason"] == "too_big"
+    assert out["duration"] == 1540 and out["file_size"] == 25_000_000
+    assert not (_VI._audio_dir(cfg, "bot-squad") / "huge.oga").exists()
+
+
+def test_process_voice_too_big_confirms_honestly(tmp_path, monkeypatch):
+    """T-0611: the group-voice path rejects a >20MB note pre-download and the
+    #feedback confirmation says resending won't help (split instead)."""
+    import types
+    cfg = _cfg(tmp_path)
+    cfg.voice_max_duration_sec = 0
+    from bot_squad_worker import voice_intake as _VI
+    from bot_squad_worker import actions as A
+    from bot_squad_worker import tg_topics
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    out = _VI.process_voice(cfg, "bot-squad", _voice_msg(voice={
+        "file_id": "huge", "file_unique_id": "huge", "duration": 1540,
+        "mime_type": "audio/ogg", "file_size": 25_000_000}),
+        ts="2026-07-05T13:00:00Z")
+
+    assert out["ok"] is False and out["reason"] == "too_big"
+    assert sent and sent[0]["topic_id"] == 9001
+    assert "20MB" in sent[0]["text"] and "split" in sent[0]["text"].lower()
+    assert not (_VI._audio_dir(cfg, "bot-squad") / "huge.oga").exists()
+
+
 def test_transcribe_only_download_failure(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     from bot_squad_worker import voice_intake as _VI

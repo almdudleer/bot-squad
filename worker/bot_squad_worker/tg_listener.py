@@ -542,6 +542,13 @@ def _voice_reject_text(cfg, reason: str, out: dict) -> str:
             f"{cap // 60} мин — оно НЕ обработано и содержимое не сохранилось. "
             "Отправь его частями покороче или напиши текстом."
         )
+    if reason == "too_big":
+        dur = int(out.get("duration") or 0)
+        return (
+            f"⚠️ Голосовое ({dur // 60}:{dur % 60:02d}) больше 20МБ — Telegram не "
+            "отдаёт ботам такие файлы, повторная отправка НЕ поможет. "
+            "Надиктуй частями (до ~15 мин каждая — заведомо проходит)."
+        )
     if reason == "download_failed":
         return "⚠️ Не удалось скачать аудио из Telegram — отправь голосовое ещё раз."
     if reason == "transcription_timeout":

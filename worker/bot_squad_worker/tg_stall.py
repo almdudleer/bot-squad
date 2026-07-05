@@ -471,16 +471,18 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
         log.warning("tg_stall: %s no tg_chat for slug %s — cannot escalate", sid, slug)
         return False
 
-    body = build_escalation_text(cfg, sid, str(data.get("text", "")), pane.session)
-    # T-0394: page the human via the _send_stakeholder_dm SSOT — MAX-primary
-    # (TG is DPI-blocked on this host), TG failover, + a best-effort group-record.
-    # T-0386: the group target is the project's #team-queries forum topic.
-    from bot_squad_worker.actions import _send_stakeholder_dm
+    # T-0394: page the human via the _send_stakeholder_dm SSOT (T-0610:
+    # TG-primary, MAX reserve). T-0386: the group target is the project's
+    # #team-queries forum topic. T-0610 review fix: slim the QUESTION before
+    # composing — the SSOT's blanket slim would cut the tmux-attach footer off
+    # the end, which is the escalation's whole point.
+    from bot_squad_worker.actions import _send_stakeholder_dm, _slim_page
     from bot_squad_worker import tg_topics as _tg_topics
+    body = build_escalation_text(cfg, sid, _slim_page(str(data.get("text", ""))), pane.session)
     result = _send_stakeholder_dm(
         cfg, message=body, sid=sid, tg_chat_id=chat_id,
         tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
-        group_record=True,
+        group_record=True, do_slim=False,
     )
     sent = result["sent"]
 

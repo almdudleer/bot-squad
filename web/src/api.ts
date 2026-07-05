@@ -166,7 +166,44 @@ export type CreateTaskBody = {
   // or `body` (raw, stored as-is for callers that know the convention).
   verbatim_request?: string;
   body?: string;
+  // T-0608: POST /backlog runs the T-0577 near-duplicate gate (T-0600) and
+  // 409s with candidates unless force is set. The board's "create anyway"
+  // re-posts the same payload with force:true.
+  force?: boolean;
 };
+
+// T-0608: the structured 409 detail the near-duplicate gate returns —
+// {"detail": {"error": "near_duplicate", "message": ..., "candidates":
+// [{id, title}, ...]}} packed by call() into `API error 409: <body>`.
+export type NearDuplicateDetail = {
+  message: string;
+  candidates: { id: string; title: string }[];
+};
+
+// Decode a thrown call() error into the near-duplicate payload, or null for
+// anything else (other 409s, other statuses, non-JSON bodies). Pure —
+// exported for unit tests; the board's create modal branches on this.
+export function parseNearDuplicate(err: unknown): NearDuplicateDetail | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = msg.match(/^API error 409: (.*)$/s);
+  if (!m) return null;
+  try {
+    const detail = (JSON.parse(m[1]) as { detail?: unknown }).detail;
+    if (!detail || typeof detail !== "object") return null;
+    const d = detail as { error?: unknown; message?: unknown; candidates?: unknown };
+    if (d.error !== "near_duplicate" || !Array.isArray(d.candidates)) return null;
+    return {
+      message: typeof d.message === "string" ? d.message : "",
+      candidates: d.candidates.filter(
+        (c): c is { id: string; title: string } =>
+          !!c && typeof (c as { id?: unknown }).id === "string" &&
+          typeof (c as { title?: unknown }).title === "string",
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
 
 export type VisionFile = { name: string; content: string; active?: boolean; finished?: boolean };
 

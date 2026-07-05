@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api, isNotFoundError, normalizeSessionsPayload, shouldRedirectOn401 } from "./api";
+import { api, isNotFoundError, normalizeSessionsPayload, parseNearDuplicate, shouldRedirectOn401 } from "./api";
 
 function mockOnce(json: unknown = {}): ReturnType<typeof vi.fn> {
   const spy = vi.fn().mockResolvedValueOnce({
@@ -186,6 +186,65 @@ describe("T-0601 login 401-exempt", () => {
     globalThis.fetch = spy as unknown as typeof fetch;
     await expect(api.login("u", "wrong")).rejects.toThrow(
       /API error 401.*bad credentials/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-0608: near-duplicate 409 decoder — the create modal branches on this to
+// show candidates + "create anyway" instead of a generic error line.
+// ---------------------------------------------------------------------------
+describe("T-0608 parseNearDuplicate", () => {
+  const body409 = JSON.stringify({
+    detail: {
+      error: "near_duplicate",
+      message: "looks like a near-duplicate — retry with force:true to create anyway",
+      candidates: [{ id: "T-0042", title: "existing twin" }],
+    },
+  });
+
+  test("decodes the structured 409 into message + candidates", () => {
+    expect(parseNearDuplicate(new Error(`API error 409: ${body409}`))).toEqual({
+      message: "looks like a near-duplicate — retry with force:true to create anyway",
+      candidates: [{ id: "T-0042", title: "existing twin" }],
+    });
+  });
+
+  test("null for other statuses, other 409s, and non-JSON bodies", () => {
+    expect(parseNearDuplicate(new Error("API error 400: bad"))).toBeNull();
+    expect(
+      parseNearDuplicate(new Error('API error 409: {"detail":"mothership locked"}')),
+    ).toBeNull();
+    expect(
+      parseNearDuplicate(new Error('API error 409: {"detail":{"error":"other"}}')),
+    ).toBeNull();
+    expect(parseNearDuplicate(new Error("API error 409: not-json"))).toBeNull();
+    expect(parseNearDuplicate("random string")).toBeNull();
+  });
+
+  test("drops malformed candidate entries, keeps well-formed ones", () => {
+    const mixed = JSON.stringify({
+      detail: {
+        error: "near_duplicate",
+        message: "m",
+        candidates: [{ id: "T-1", title: "ok" }, { id: 5 }, null, "x"],
+      },
+    });
+    expect(parseNearDuplicate(new Error(`API error 409: ${mixed}`))).toEqual({
+      message: "m",
+      candidates: [{ id: "T-1", title: "ok" }],
+    });
+  });
+
+  test("createTask forwards force:true in the POST body", async () => {
+    const spy = mockOnce({ id: "T-9999" });
+    await api.createTask("alpha", { title: "t", verbatim_request: "v", force: true });
+    expect(spy).toHaveBeenCalledWith(
+      "/api/projects/alpha/backlog",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ title: "t", verbatim_request: "v", force: true }),
+      }),
     );
   });
 });

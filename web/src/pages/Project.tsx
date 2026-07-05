@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { isNotFoundError, type SessionRow, type Task, type VisionFile } from "../api";
+import {
+  isNotFoundError,
+  parseNearDuplicate,
+  type NearDuplicateDetail,
+  type SessionRow,
+  type Task,
+  type VisionFile,
+} from "../api";
 import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
@@ -258,6 +265,10 @@ export function Project() {
 
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
+  // T-0608: POST /backlog's near-duplicate 409 (T-0600 gate). While set, the
+  // create modal shows the candidate list + an explicit "create anyway"
+  // (re-post with force:true) instead of a generic error.
+  const [dupDetail, setDupDetail] = useState<NearDuplicateDetail | null>(null);
   // T-0153: project-level autopilot dialog.
   const [autopilotOpen, setAutopilotOpen] = useState(false);
 
@@ -455,6 +466,7 @@ export function Project() {
     setNewBody("");
     setNewStatus("open");
     setModalError(null);
+    setDupDetail(null);
     setModalKind("create");
   }
 
@@ -462,9 +474,12 @@ export function Project() {
     setModalKind(null);
     setActiveTask(null);
     setModalError(null);
+    setDupDetail(null);
   }
 
-  async function handleCreate() {
+  // T-0608: `force` re-posts the SAME payload past the near-duplicate gate —
+  // only the panel's explicit "create anyway" sets it.
+  async function handleCreate(force = false) {
     if (!newTitle.trim()) { setModalError("Title is required"); return; }
     setSaving(true);
     setModalError(null);
@@ -475,11 +490,20 @@ export function Project() {
         title: newTitle.trim(),
         verbatim_request: newBody,
         status: newStatus,
+        ...(force ? { force: true } : {}),
       });
       closeModal();
       reload();
     } catch (e) {
-      setModalError(String(e));
+      // T-0608: the dedupe gate's structured 409 becomes an informed choice
+      // (candidates + "create anyway"), not a generic error line.
+      const dup = parseNearDuplicate(e);
+      if (dup) {
+        setDupDetail(dup);
+      } else {
+        setDupDetail(null);
+        setModalError(String(e));
+      }
     } finally {
       setSaving(false);
     }
@@ -864,13 +888,50 @@ export function Project() {
         footer={
           <>
             <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={handleCreate} disabled={saving}>
+            <button type="button" className="btn btn-primary" onClick={() => handleCreate()} disabled={saving}>
               {saving ? "Creating…" : "Create"}
             </button>
           </>
         }
       >
         {modalError && <div className="alert alert-danger">{modalError}</div>}
+        {/* T-0608: near-duplicate gate (T-0577/T-0600). Not a rejection — an
+            informed choice: link the candidates, offer an explicit
+            "create anyway" (force:true) or keep editing. */}
+        {dupDetail && (
+          <div className="alert alert-warning" data-testid="near-duplicate-panel">
+            <strong style={{ fontSize: "0.85rem" }}>
+              Looks like a near-duplicate of existing task
+              {dupDetail.candidates.length === 1 ? "" : "s"}
+            </strong>
+            <ul style={{ margin: "0.4rem 0", paddingLeft: "1.2rem", fontSize: "0.82rem" }}>
+              {dupDetail.candidates.map((c) => (
+                <li key={c.id}>
+                  <Link to={`/p/${slug}/t/${c.id}`} onClick={closeModal}>{c.id}</Link>
+                  {" · "}
+                  {c.title}
+                </li>
+              ))}
+            </ul>
+            <div className="d-flex gap-2 align-items-center">
+              <button
+                type="button"
+                className="btn btn-outline-warning btn-sm"
+                disabled={saving}
+                onClick={() => handleCreate(true)}
+              >
+                {saving ? "Creating…" : "Create anyway"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                onClick={() => setDupDetail(null)}
+              >
+                Keep editing
+              </button>
+            </div>
+          </div>
+        )}
         <div className="mb-3">
           <label className="form-label">Title *</label>
           <input

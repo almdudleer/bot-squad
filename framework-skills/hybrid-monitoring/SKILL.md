@@ -20,40 +20,41 @@ Calling AI on a schedule to check a healthy system is waste. Declare a **monitor
 
 This includes "fallbacks": a cron routine whose instruction is "check X, exit if ok" is the same anti-pattern — the healthy-path check belongs in code, always.
 
-## How to declare — engine is live; CLI flags are coming
+## How to declare — the `bsq` CLI (T-0604; pending-deploy: needs the worker running a build ≥ T-0604)
 
-`bsq routine declare` accepts **schedule triggers only** for now (monitor flags land in a later slice). Until then, declare through the worker API on the install host — it validates the spec, allocates the R-id, and writes the routine md. Do NOT hand-write routine mds or hand-pick ids.
+Declare through `bsq routine declare --trigger monitor` — it round-trips the worker socket, which validates the spec, allocates the R-id, and writes the routine md. Do NOT hand-write routine mds or hand-pick ids. (If the install's worker predates T-0604 the socket rejects the `monitor` param — fall back to `routines.declare(cfg, slug, trigger="monitor", monitor={...})` from the worker venv until the deploy lands.)
 
-```python
-# install host, worker venv
-from pathlib import Path
-from bot_squad_worker.config import Config
-from bot_squad_worker import routines
-
-cfg = Config.load(Path("<install>/config"))
-routines.declare(cfg, "<slug>", trigger="monitor",
-    title="staging /var disk watch",
-    instruction=("/var is filling (value, threshold, onset are in your TRIGGER "
-                 "EVENT brief). Find the top growers, report to the operator "
-                 "with a recommended cleanup. Do NOT delete anything yourself."),
-    monitor={"probe": "shell",
-             "cmd": "df -P /var | awk 'NR==2{sub(/%/,\"\",$5); print $5}'",
-             "interval_s": 300, "timeout_s": 10,
-             "judge": "numeric_gt", "threshold": 85,
-             "persist_s": 600, "cooldown_s": 1800})
+```bash
+bsq routine declare --trigger monitor \
+  --cmd "df -P /var | awk 'NR==2{sub(/%/,\"\",\$5); print \$5}'" \
+  --interval 5m --timeout 10s \
+  --judge numeric_gt --threshold 85 \
+  --persist 10m --cooldown 30m \
+  --title "staging /var disk watch" \
+  --provenance "stakeholder:2026-07-05" \
+  "/var is filling (value, threshold, onset are in your TRIGGER EVENT brief). \
+Find the top growers, report to the operator with a recommended cleanup. \
+Do NOT delete anything yourself."
 ```
 
-## Spec cheat-sheet (the `monitor:` block)
+Durations take `30s / 15m / 2h / 1d` (bare number = seconds). An http probe swaps `--cmd`/`--judge`/`--threshold` for `--probe http --url <https://…>` plus optional `--expect-status` (default 200) and `--latency-budget-ms` — it judges itself. `--on-breach notify` = code-only alert, no AI (linza `severity: info` analog); `--on-recover notify` = a ✅ when the metric returns within threshold (sent only if the breach actually fired).
 
-| key | meaning | notes |
+`bsq routine list` shows the live monitor columns from sidecar state — `last=<value> breach=YES|no last_fire=<ts>` plus any standing mute. To silence a KNOWN breach: `bsq routine mute R-NNNN 45m 'why'` — it keeps probing (recovery is still seen) but never fires; `bsq routine mute R-NNNN 0` unmutes, and a breach still standing fires on the next tick.
+
+## Spec cheat-sheet (CLI flag → `monitor:` frontmatter key)
+
+| flag → key | meaning | notes |
 |---|---|---|
-| `probe` + `cmd` | `shell` + the command | only `shell` today; `http` is a coming slice |
-| `interval_s` | probe cadence, seconds | min 5, default 30 |
-| `timeout_s` | probe hard-kill, seconds | **mandatory** — declare-time error if missing |
-| `judge` + `threshold` | breach test | see below |
-| `persist_s` | breach must HOLD this long before the first fire | **seconds, not a failure count**; default 0 — always set it |
-| `cooldown_s` | min gap between fires of one ongoing breach | seconds; default 0 — always set it |
-| `on_breach` | `spawn` (attach AI) | only `spawn` today; `notify` (code-only alert) is a coming slice |
+| `--probe` | `shell` (default) or `http` | |
+| `--cmd` → `cmd` | [shell] the command; stdout is the metric | |
+| `--url` → `url` | [http] endpoint to GET; judges itself via `--expect-status`/`--latency-budget-ms` | don't set `--judge`/`--threshold` |
+| `--interval` → `interval_s` | probe cadence | min 5s, default 30s |
+| `--timeout` → `timeout_s` | probe hard-kill | **mandatory** — declare-time error if missing |
+| `--judge` + `--threshold` | [shell] breach test | see below |
+| `--persist` → `persist_s` | breach must HOLD this long before the first fire | **a duration, not a failure count**; default 0 — always set it |
+| `--cooldown` → `cooldown_s` | min gap between fires of one ongoing breach | default 0 — always set it |
+| `--on-breach` → `on_breach` | `spawn` (attach AI, default) or `notify` (code-only alert) | |
+| `--on-recover` → `on_recover` | `notify` = ✅ on recovery (only after a real fire) | |
 
 Judges: `numeric_gt` / `numeric_lt` / `numeric_ne` — stdout must parse as a number, and a nonzero exit means *probe error*, never a breach · `nonzero_exit` — the exit code IS the signal (no threshold needed) · `regex_match` — `re.search(threshold, stdout)`.
 
@@ -72,8 +73,9 @@ The routine body is what the attached AI *does* on breach: diagnose and report. 
 
 ## Common mistakes
 
-- `persist: 2` meaning "2 consecutive failures" — the key is `persist_s` and it's **seconds**.
+- `--persist 2` meaning "2 consecutive failures" — persist is a **duration** (breach must hold that long).
 - Declaring a cron routine with a "check if ok" instruction — ratchet violation; use a monitor.
-- Hand-dropping a routine md into `routines/` — skips validation and id allocation; use `routines.declare()`.
-- A numeric judge with a probe that exits nonzero on the bad case — that's the error path, not a breach; use `nonzero_exit`.
-- Omitting `timeout_s` or unknown spec keys — both are declare-time `RoutineError`s (the typo guard is strict).
+- Hand-dropping a routine md into `routines/` — skips validation and id allocation; use `bsq routine declare`.
+- A numeric judge with a probe that exits nonzero on the bad case — that's the error path, not a breach; use `--judge nonzero_exit`.
+- Omitting `--timeout` or unknown spec keys — both are declare-time errors (the typo guard is strict).
+- Hand-editing the md to silence a noisy monitor — that's what `bsq routine mute <R-NNNN> <dur> '<reason>'` is for; mute survives a sidecar reset because it lives on the md.

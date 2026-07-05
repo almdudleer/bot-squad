@@ -1782,15 +1782,23 @@ def _action_assignment_write_result(params: dict[str, Any]) -> dict[str, Any]:
 # schedule trigger) that spawns a session per due tick.
 # ---------------------------------------------------------------------------
 
-_ROUTINE_DECLARE_REQUIRED = {"slug", "instruction", "schedule"}
-_ROUTINE_DECLARE_ALLOWED = _ROUTINE_DECLARE_REQUIRED | {"title", "trigger", "provenance"}
+_ROUTINE_DECLARE_REQUIRED = {"slug", "instruction"}
+_ROUTINE_DECLARE_ALLOWED = _ROUTINE_DECLARE_REQUIRED | {
+    "title", "trigger", "provenance",
+    # per-trigger spec — routines.declare enforces exactly-one: a cron string
+    # for "schedule", the D-0048 §3.1 mapping (on_breach/on_recover inside)
+    # for "monitor" (T-0604).
+    "schedule", "monitor",
+}
 
 
 def _action_routine_declare(params: dict[str, Any]) -> dict[str, Any]:
-    """Declare + persist a Routine in the project store (T-0464).
+    """Declare + persist a Routine in the project store (T-0464 / T-0604).
 
-    Required params: slug, instruction, schedule (a 5-field cron expression)
-    Optional params: title, trigger ("schedule", default), provenance
+    Required params: slug, instruction
+    Trigger spec: schedule (5-field cron) for trigger "schedule" (default);
+                  monitor (mapping) for trigger "monitor"
+    Optional params: title, provenance
     Returns: {ok, id, file_path, next_run_at}
     """
     extra = set(params) - _ROUTINE_DECLARE_ALLOWED
@@ -1807,9 +1815,10 @@ def _action_routine_declare(params: dict[str, Any]) -> dict[str, Any]:
         return _routines.declare(
             cfg, params["slug"],
             instruction=params["instruction"],
-            schedule=params["schedule"],
+            schedule=params.get("schedule"),
             title=params.get("title"),
             trigger=params.get("trigger", "schedule") or "schedule",
+            monitor=params.get("monitor"),
             provenance=params.get("provenance"),
         )
     except _routines.RoutineError as e:
@@ -1836,6 +1845,39 @@ def _action_routine_list(params: dict[str, Any]) -> dict[str, Any]:
     if cfg.projects.get(slug) is None:
         raise ActionError(f"routine_list: unknown project slug {slug!r}")
     return {"ok": True, "routines": _routines.list_routines(cfg, slug)}
+
+
+_ROUTINE_MUTE_REQUIRED = {"slug", "rid", "duration_s"}
+_ROUTINE_MUTE_ALLOWED = _ROUTINE_MUTE_REQUIRED | {"reason"}
+
+
+def _action_routine_mute(params: dict[str, Any]) -> dict[str, Any]:
+    """Mute a monitor routine for a duration (T-0604, linza mute semantics):
+    it keeps probing, but never fires until the mute expires. duration_s == 0
+    clears a standing mute; a nonzero mute requires a reason.
+
+    Required params: slug, rid, duration_s
+    Optional params: reason (mandatory when duration_s > 0)
+    Returns: {ok, id, muted_until[, reason]}
+    """
+    extra = set(params) - _ROUTINE_MUTE_ALLOWED
+    if extra:
+        raise ActionError(f"routine_mute got unexpected params: {sorted(extra)}")
+    missing = _ROUTINE_MUTE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"routine_mute missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import routines as _routines
+
+    cfg = _get_config()
+    try:
+        return _routines.mute(
+            cfg, params["slug"], params["rid"],
+            duration_s=params["duration_s"],
+            reason=params.get("reason"),
+        )
+    except _routines.RoutineError as e:
+        raise ActionError(f"routine_mute: {e}") from e
 
 
 _COMPACT_WRITE_STATE_REQUIRED = {"slug", "sid", "content"}
@@ -3556,6 +3598,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0464: Routines — declare + list (firing tick = routines.routine_tick).
     "routine_declare": _action_routine_declare,
     "routine_list": _action_routine_list,
+    # T-0604 (D-0048 slice 2): mute a monitor routine — probes, never fires.
+    "routine_mute": _action_routine_mute,
     # T-0467: universal-compact "write everything down" — role-agnostic save of
     # a session's forward-state into its role artifact (F1.4).
     "compact_write_state": _action_compact_write_state,
@@ -3686,6 +3730,7 @@ ACTION_MODES: dict[str, str] = {
     # it via `bsq routine ...` (the coordinator socket).
     "routine_declare": "coordinator_only",
     "routine_list": "coordinator_only",
+    "routine_mute": "coordinator_only",
     # T-0467: writes the shared install data dir (artifacts/) + reads session md
     # — single coordinator writer, like assignment_write_result. Sessions reach
     # it via `bsq compact-save` (the coordinator socket).

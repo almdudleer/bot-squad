@@ -498,3 +498,106 @@ def test_action_routine_declare_missing_params_raises(tmp_path, monkeypatch):
     _make_action_cfg(tmp_path, monkeypatch)
     with pytest.raises(A.ActionError, match="missing required"):
         A.dispatch("routine_declare", {"slug": "bot-squad"})
+
+
+def test_action_routine_declare_schedule_trigger_still_needs_schedule(
+        tmp_path, monkeypatch):
+    """T-0604 widened the required set to {slug, instruction}; a schedule
+    declare without a schedule must still fail loud (now via the engine)."""
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    with pytest.raises(A.ActionError, match="empty schedule"):
+        A.dispatch("routine_declare", {"slug": "bot-squad", "instruction": "x"})
+
+
+# --- monitor declare + routine_mute worker actions (T-0604, D-0048 slice 2) --
+
+_MON = {
+    "probe": "shell", "cmd": "echo 5", "interval_s": 5, "timeout_s": 3,
+    "judge": "numeric_gt", "threshold": 10,
+}
+
+
+def test_action_routine_declare_monitor_roundtrip(tmp_path, monkeypatch):
+    """monitor (on_breach/on_recover inside) passes through the allowlist into
+    routines.declare; the list action serves the monitor columns back."""
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    out = A.dispatch("routine_declare", {
+        "slug": "bot-squad",
+        "instruction": "investigate per runbook",
+        "trigger": "monitor",
+        "monitor": {**_MON, "on_breach": "notify", "on_recover": "notify"},
+        "provenance": "T-0604",
+    })
+    assert out["ok"] is True and out["id"] == "R-0001"
+    assert out["next_run_at"] is None  # state-driven, never time-scheduled
+
+    listed = A.dispatch("routine_list", {"slug": "bot-squad"})
+    row = listed["routines"][0]
+    assert row["trigger"] == "monitor"
+    assert row["monitor"]["judge"] == "numeric_gt"
+    assert row["monitor"]["on_breach"] == "notify"
+    assert row["monitor"]["last_value"] is None  # sidecar absent pre-probe
+
+
+def test_action_routine_declare_monitor_bad_spec_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    with pytest.raises(A.ActionError, match="numeric threshold"):
+        A.dispatch("routine_declare", {
+            "slug": "bot-squad", "instruction": "x", "trigger": "monitor",
+            "monitor": {**_MON, "threshold": "banana"},
+        })
+    with pytest.raises(A.ActionError, match="not a schedule"):
+        A.dispatch("routine_declare", {
+            "slug": "bot-squad", "instruction": "x", "trigger": "monitor",
+            "monitor": _MON, "schedule": "* * * * *",
+        })
+
+
+def test_action_routine_mute_roundtrip(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    A.dispatch("routine_declare", {
+        "slug": "bot-squad", "instruction": "x", "trigger": "monitor",
+        "monitor": _MON,
+    })
+    out = A.dispatch("routine_mute", {
+        "slug": "bot-squad", "rid": "R-0001", "duration_s": 1800,
+        "reason": "known flap",
+    })
+    assert out["ok"] is True and out["muted_until"] is not None
+    listed = {r["id"]: r for r in A.dispatch(
+        "routine_list", {"slug": "bot-squad"})["routines"]}
+    assert listed["R-0001"]["mute_reason"] == "known flap"
+
+    out = A.dispatch("routine_mute", {
+        "slug": "bot-squad", "rid": "R-0001", "duration_s": 0,
+    })
+    assert out["muted_until"] is None
+
+
+def test_action_routine_mute_validation(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_action_cfg(tmp_path, monkeypatch)
+    A.dispatch("routine_declare", {
+        "slug": "bot-squad", "instruction": "x", "trigger": "monitor",
+        "monitor": _MON,
+    })
+    with pytest.raises(A.ActionError, match="unexpected"):
+        A.dispatch("routine_mute", {
+            "slug": "bot-squad", "rid": "R-0001", "duration_s": 60,
+            "reason": "x", "bogus": 1,
+        })
+    with pytest.raises(A.ActionError, match="missing required"):
+        A.dispatch("routine_mute", {"slug": "bot-squad", "rid": "R-0001"})
+    with pytest.raises(A.ActionError, match="reason"):
+        A.dispatch("routine_mute", {
+            "slug": "bot-squad", "rid": "R-0001", "duration_s": 60,
+        })

@@ -1237,3 +1237,140 @@ def test_http_monitor_spawn_mode_brief_carries_observation(mcfg, http_target):
     brief = spawns[0]["prompt"]
     assert "TRIGGER EVENT" in brief
     assert "status=502" in brief and "status==200" in brief
+
+
+# ---------------------------------------------------------------------------
+# T-0604 (D-0048 slice 2) — mute: probes but never fires (linza semantics)
+# + `list_routines` monitor columns from sidecar state.
+# ---------------------------------------------------------------------------
+
+def test_mute_suppresses_fire_but_probes_continue(mcfg, tmp_path):
+    """The T-0604 walkthrough contract (scenario step 5): a muted monitor keeps
+    probing and tracking breach state, but delivers NOTHING — no spawn, no
+    event line, no fired/cooldown stamp."""
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10, persist_s=0,
+                                cooldown_s=0, interval_s=5)
+    R.mute(cfg, slug, rid, duration_s=3600, reason="known cert flap", now=T0)
+
+    res = R.monitor_sweep(cfg, slug, now=T0)
+    assert res["probed"] == 1 and res["fired"] == []
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    assert res["fired"] == []
+    assert spawns == []
+    assert _events(cfg, slug) == []
+    st = R.load_state(cfg, slug, rid)
+    assert st["last_value"] == 42                  # probing continued
+    assert st["breach_first_seen"] is not None     # state machine tracked it
+    assert st["fired"] is False and st["last_fired_at"] is None
+
+
+def test_mute_expiry_fires_standing_breach_next_tick(mcfg, tmp_path):
+    """Suppressed fires never stamp cooldown, so a breach outliving the mute
+    fires on the FIRST due sweep after expiry (scenario step 6)."""
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10, persist_s=0,
+                                cooldown_s=1800, interval_s=5)
+    R.mute(cfg, slug, rid, duration_s=60, reason="short silence", now=T0)
+    R.monitor_sweep(cfg, slug, now=T0)
+    assert spawns == []
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=65))
+    assert res["fired"] == [rid]
+    assert len(spawns) == 1
+    assert [e["kind"] for e in _events(cfg, slug)] == ["fire"]
+
+
+def test_unmute_zero_clears_stamp_and_fire_resumes(mcfg, tmp_path):
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10, persist_s=0,
+                                cooldown_s=0, interval_s=5)
+    R.mute(cfg, slug, rid, duration_s=3600, reason="silenced", now=T0)
+    R.monitor_sweep(cfg, slug, now=T0)
+    assert spawns == []
+
+    out = R.mute(cfg, slug, rid, duration_s=0)
+    assert out == {"ok": True, "id": rid, "muted_until": None}
+    r = R.load(cfg, slug, rid)
+    assert r.muted_until is None and r.mute_reason is None
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    assert res["fired"] == [rid] and len(spawns) == 1
+
+
+def test_mute_stamp_survives_sidecar_reset(mcfg, tmp_path):
+    """Mute lives on the MD, not the sidecar: the documented delete-to-reset
+    of the disposable state must not silently unmute (walkthrough catch)."""
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10, persist_s=0,
+                                cooldown_s=0, interval_s=5)
+    R.mute(cfg, slug, rid, duration_s=3600, reason="known breach", now=T0)
+    R.monitor_sweep(cfg, slug, now=T0)
+    R.state_path(cfg, slug, rid).unlink()
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    assert res["fired"] == [] and spawns == []
+
+
+def test_mute_validation(mcfg):
+    cfg, slug, _ = mcfg
+    metric_rid = R.declare(cfg, slug, instruction="x", trigger="monitor",
+                           monitor=_spec(), now=T0)["id"]
+    sched_rid = R.declare(cfg, slug, instruction="daily", schedule="0 9 * * *",
+                          now=T0)["id"]
+    with pytest.raises(R.RoutineError, match="reason"):
+        R.mute(cfg, slug, metric_rid, duration_s=60)
+    with pytest.raises(R.RoutineError, match=">= 0"):
+        R.mute(cfg, slug, metric_rid, duration_s=-5, reason="x")
+    with pytest.raises(R.RoutineError, match="integer"):
+        R.mute(cfg, slug, metric_rid, duration_s="soon", reason="x")
+    with pytest.raises(R.RoutineError, match="monitor-only"):
+        R.mute(cfg, slug, sched_rid, duration_s=60, reason="x")
+    with pytest.raises(R.RoutineError, match="not found"):
+        R.mute(cfg, slug, "R-9999", duration_s=60, reason="x")
+    with pytest.raises(R.RoutineError, match="unknown project"):
+        R.mute(cfg, "nope", metric_rid, duration_s=60, reason="x")
+
+
+def test_list_routines_monitor_columns_from_sidecar(mcfg, tmp_path):
+    """T-0604: `bsq routine list` columns — spec essentials + last value /
+    breach / last fire from the sidecar; absent state (pre-first-probe)
+    renders as no-observation-yet, never a crash."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10, persist_s=0,
+                                cooldown_s=0, interval_s=5)
+
+    fresh = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]
+    assert fresh["monitor"]["last_value"] is None
+    assert fresh["monitor"]["breach"] is False
+    assert fresh["monitor"]["last_fired_at"] is None
+    assert fresh["monitor"]["judge"] == "numeric_gt"
+    assert fresh["monitor"]["interval_s"] == 5
+    assert "muted_until" not in fresh
+
+    R.monitor_sweep(cfg, slug, now=T0)
+    R.mute(cfg, slug, rid, duration_s=3600, reason="known flap", now=T0)
+    listed = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]
+    assert listed["monitor"]["last_value"] == 42
+    assert listed["monitor"]["breach"] is True
+    assert listed["monitor"]["last_fired_at"] == R._iso(T0)
+    assert listed["muted_until"] == R._iso(T0 + timedelta(seconds=3600))
+    assert listed["mute_reason"] == "known flap"
+
+
+def test_list_routines_schedule_rows_unchanged(mcfg):
+    """Schedule routines keep the pre-T-0604 summary shape — no monitor key,
+    no mute keys."""
+    cfg, slug, _ = mcfg
+    rid = R.declare(cfg, slug, instruction="daily", schedule="0 9 * * *",
+                    now=T0)["id"]
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]
+    assert "monitor" not in row and "muted_until" not in row
+    assert row["schedule"] == "0 9 * * *"

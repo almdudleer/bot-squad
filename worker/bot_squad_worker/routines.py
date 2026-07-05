@@ -528,6 +528,18 @@ class Routine:
     next_run_at: Optional[str]
     file_path: Path
     monitor: Optional[dict] = None
+    muted_until: Optional[str] = None
+    mute_reason: Optional[str] = None
+
+    def is_muted(self, now: datetime) -> bool:
+        """True while a mute stamp is standing (T-0604, linza semantics):
+        the monitor keeps probing and tracking state, but never fires."""
+        until = _parse_iso(self.muted_until)
+        if until is None:
+            return False
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now < until
 
     def trigger(self) -> Trigger:
         if self.trigger_type == "monitor":
@@ -546,7 +558,7 @@ class Routine:
         return now >= nxt
 
     def to_summary(self) -> dict:
-        return {
+        out = {
             "id": self.id,
             "title": self.title,
             "trigger": self.trigger_type,
@@ -556,6 +568,11 @@ class Routine:
             "last_run_at": self.last_run_at,
             "file_path": str(self.file_path),
         }
+        if self.muted_until:
+            out["muted_until"] = self.muted_until
+            if self.mute_reason:
+                out["mute_reason"] = self.mute_reason
+        return out
 
 
 def routines_dir(cfg: Any, slug: str) -> Path:
@@ -690,6 +707,10 @@ def _routine_from_md(path: Path) -> Optional[Routine]:
         next_run_at=meta.get("next_run_at"),
         file_path=path,
         monitor=monitor if isinstance(monitor, dict) else None,
+        muted_until=(str(meta["muted_until"]).strip()
+                     if meta.get("muted_until") else None),
+        mute_reason=(str(meta["mute_reason"]).strip()
+                     if meta.get("mute_reason") else None),
     )
 
 
@@ -712,8 +733,27 @@ def list_routines(cfg: Any, slug: str) -> list[dict]:
     out: list[dict] = []
     for md in sorted(d.glob("*.md")):
         r = _routine_from_md(md)
-        if r is not None:
-            out.append(r.to_summary())
+        if r is None:
+            continue
+        summary = r.to_summary()
+        if r.trigger_type == "monitor":
+            # T-0604: monitor columns for `bsq routine list` — spec essentials
+            # from the md, live values from the disposable sidecar (§3.2).
+            # Absent state (pre-first-probe) renders as no-observation-yet.
+            spec = r.monitor or {}
+            st = load_state(cfg, slug, r.id)
+            summary["monitor"] = {
+                "probe": spec.get("probe"),
+                "interval_s": spec.get("interval_s"),
+                "judge": spec.get("judge"),
+                "threshold": spec.get("threshold"),
+                "on_breach": spec.get("on_breach"),
+                "last_value": st.get("last_value"),
+                "last_probe_at": st.get("last_probe_at"),
+                "breach": bool(st.get("breach_first_seen")),
+                "last_fired_at": st.get("last_fired_at"),
+            }
+        out.append(summary)
     return out
 
 
@@ -742,6 +782,51 @@ def _set_status(cfg: Any, slug: str, rid: str, status: str) -> None:
     if path is None:
         raise RoutineError(f"routine not found: {rid}")
     _rewrite_meta(path, {"status": status})
+
+
+def mute(cfg: Any, slug: str, rid: str, *, duration_s: Any,
+         reason: Optional[str] = None,
+         now: Optional[datetime] = None) -> dict:
+    """Mute a monitor routine for a duration (T-0604, linza mute semantics):
+    it keeps probing and tracking breach state, but never FIRES — no spawn, no
+    breach alert — until ``muted_until`` passes. ``duration_s == 0`` clears a
+    standing mute. A mute needs a reason (it silences a known breach; the why
+    must survive on the md).
+
+    The stamp lives on the routine MD, not the sidecar: state is documented as
+    disposable (delete-to-reset), and a reset must not silently unmute.
+    """
+    if cfg.projects.get(slug) is None:
+        raise RoutineError(f"unknown project slug {slug!r}")
+    routine = load(cfg, slug, rid)
+    if routine is None:
+        raise RoutineError(f"routine not found: {rid}")
+    if routine.trigger_type != "monitor":
+        raise RoutineError(
+            f"routine {rid} has trigger {routine.trigger_type!r} — mute is "
+            "monitor-only (probes-but-never-fires has no meaning for a "
+            "schedule routine; pause it instead)")
+    try:
+        duration_s = int(duration_s)
+    except (TypeError, ValueError):
+        raise RoutineError(
+            f"mute duration must be an integer of seconds, got {duration_s!r}")
+    if duration_s < 0:
+        raise RoutineError(f"mute duration must be >= 0, got {duration_s}")
+
+    if duration_s == 0:
+        _rewrite_meta(routine.file_path, {"muted_until": None, "mute_reason": None})
+        log.info("routine unmuted: %s [%s]", rid, slug)
+        return {"ok": True, "id": rid, "muted_until": None}
+
+    reason = (reason or "").strip()
+    if not reason:
+        raise RoutineError("mute needs a reason (what known breach is being silenced?)")
+    now = now or _utcnow()
+    until = _iso(now + timedelta(seconds=duration_s))
+    _rewrite_meta(routine.file_path, {"muted_until": until, "mute_reason": reason})
+    log.info("routine muted: %s until %s (%s) [%s]", rid, until, reason, slug)
+    return {"ok": True, "id": rid, "muted_until": until, "reason": reason}
 
 
 # ---------------------------------------------------------------------------
@@ -1251,7 +1336,13 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
             try:
                 ev = trig.poll(now, {"state": st, "probe": probes[r.id]})
                 if ev is not None:
-                    if ev.kind == "fire":
+                    if ev.kind == "fire" and r.is_muted(now):
+                        # T-0604 mute: probes but never fires — fired/cooldown
+                        # NOT stamped, so a breach outliving the mute fires on
+                        # the first post-expiry tick.
+                        log.debug("monitor %s: muted (until %s), fire "
+                                  "suppressed [%s]", r.id, r.muted_until, slug)
+                    elif ev.kind == "fire":
                         if trig.spec.get("on_breach") == "notify":
                             delivered = _notify_breach(cfg, slug, r, ev, now)
                         else:

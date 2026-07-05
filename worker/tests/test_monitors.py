@@ -121,9 +121,12 @@ def test_schedule_trigger_poll_fires_when_due():
     {"threshold": "not-a-number"},        # numeric judge needs numeric threshold
     {"judge": "regex_match", "threshold": "("},   # invalid regex
     {"judge": "regex_match", "threshold": ""},    # empty regex
-    {"probe": "http"},                    # http probe is slice 3
+    {"probe": "http"},                    # http probe takes url, not cmd (T-0605)
     {"probe": "grafana"},
-    {"on_breach": "notify"},              # notify path is slice 3
+    {"on_breach": "page-everyone"},       # unknown on_breach mode
+    {"on_recover": "vibes"},              # unknown on_recover mode (T-0605)
+    {"url": "http://x"},                  # http-probe key on a shell probe
+    {"latency_budget_ms": 500},           # http-probe key on a shell probe
     {"persist_s": -1},
     {"cooldown_s": -1},
     {"nonsense_key": 1},                  # unknown keys refused (typo guard)
@@ -781,3 +784,423 @@ def test_scheduler_registers_monitor_job_at_5s(mcfg):
     jobs = {j.id: j for j in sched.get_jobs()}
     assert "monitors" in jobs
     assert "0:00:05" in str(jobs["monitors"].trigger)
+
+
+# ===========================================================================
+# T-0605 / D-0048 slice 3 — alert parity (manual walkthrough passed first,
+# scenario T-0605): on_breach notify (urgent TG, no AI) + on_recover ✅ +
+# http probe + monitor-broken self-alert. All stakeholder pages ride the
+# actions._send_stakeholder_dm SSOT (T-0394 guard) with urgent=True — the
+# quiet-hours gate silently drops non-urgent sends 17-05 UTC.
+# ===========================================================================
+
+@pytest.fixture
+def dm_capture(monkeypatch):
+    """Capture-stub the _send_stakeholder_dm SSOT (the delivery boundary)."""
+    calls: list[dict] = []
+
+    def _fake(cfg, *, message, **kw):
+        calls.append({"message": message, **kw})
+        return {"ok": True, "sent": True, "channel": "test"}
+
+    from bot_squad_worker import actions
+    monkeypatch.setattr(actions, "_send_stakeholder_dm", _fake)
+    return calls
+
+
+def _declare_notify_monitor(cfg, slug, metric_file: Path, *, threshold=10,
+                            persist_s=0, cooldown_s=0, interval_s=5,
+                            on_recover=None, on_breach="notify") -> str:
+    spec = _spec(cmd=f"cat {metric_file}", threshold=threshold,
+                 persist_s=persist_s, cooldown_s=cooldown_s,
+                 interval_s=interval_s, on_breach=on_breach)
+    if on_recover:
+        spec["on_recover"] = on_recover
+    return R.declare(cfg, slug, instruction="alert-parity monitor",
+                     trigger="monitor", monitor=spec,
+                     provenance="T-0605", now=T0)["id"]
+
+
+# --- spec validation: notify modes + http probe -----------------------------
+
+def test_monitor_spec_accepts_on_breach_notify_and_on_recover():
+    trig = R.MonitorTrigger(_spec(on_breach="notify", on_recover="notify"))
+    assert trig.spec["on_breach"] == "notify"
+    assert trig.spec["on_recover"] == "notify"
+    # on_recover omitted -> absent from the normalized spec
+    assert "on_recover" not in R.MonitorTrigger(_spec()).spec
+
+
+def _http_spec(**overrides) -> dict:
+    base = {"probe": "http", "url": "http://127.0.0.1:1/health",
+            "interval_s": 5, "timeout_s": 3}
+    base.update(overrides)
+    return base
+
+
+def test_http_spec_normalizes_self_judging_fields():
+    trig = R.MonitorTrigger(_http_spec())
+    assert trig.spec["judge"] == "http"
+    assert trig.spec["expect_status"] == 200  # default
+    assert trig.spec["threshold"] == "status==200"
+    assert "cmd" not in trig.spec
+
+    trig = R.MonitorTrigger(_http_spec(expect_status=302, latency_budget_ms=500))
+    assert trig.spec["threshold"] == "status==302 & latency<=500ms"
+    assert trig.spec["latency_budget_ms"] == 500
+
+
+def test_http_normalized_spec_revalidates_on_reload():
+    """The persisted normalized spec (judge='http', derived threshold) must
+    round-trip through declare-time validation — Routine.trigger() re-runs it."""
+    first = R.MonitorTrigger(_http_spec(latency_budget_ms=250)).spec
+    again = R.MonitorTrigger(dict(first)).spec
+    assert again == first
+
+
+@pytest.mark.parametrize("bad", [
+    {"url": None},                          # url mandatory
+    {"url": "ftp://x/health"},              # not http(s)
+    {"url": "127.0.0.1:80"},                # scheme missing
+    {"judge": "numeric_gt"},                # http probe judges itself
+    {"threshold": 200},                     # threshold is derived
+    {"expect_status": 99},
+    {"expect_status": 600},
+    {"expect_status": "teapot"},
+    {"latency_budget_ms": 0},
+    {"latency_budget_ms": "fast"},
+    {"cmd": "curl ..."},                    # http probe takes url, not cmd
+])
+def test_http_spec_validation_rejects(bad):
+    spec = _http_spec(**bad)
+    if bad.get("url", "x") is None:
+        spec.pop("url")
+    with pytest.raises(R.RoutineError):
+        R.MonitorTrigger(spec)
+
+
+def test_declare_http_monitor_persists_and_loads(mcfg):
+    cfg, slug, _ = mcfg
+    rid = R.declare(cfg, slug, instruction="watch the endpoint",
+                    trigger="monitor",
+                    monitor=_http_spec(expect_status=200, latency_budget_ms=800),
+                    provenance="T-0605", now=T0)["id"]
+    r = R.load(cfg, slug, rid)
+    assert r.monitor["judge"] == "http"
+    assert r.monitor["url"] == "http://127.0.0.1:1/health"
+    assert isinstance(r.trigger(), R.MonitorTrigger)  # revalidates on load
+
+
+# --- evaluate_probe: the http judge ------------------------------------------
+
+def test_evaluate_http_judge_maps_exit_code_to_breach():
+    spec = R.MonitorTrigger(_http_spec()).spec
+    ok = _pr(exit_code=0, output="status=200 latency_ms=12")
+    assert R.evaluate_probe(spec, ok) == ("ok", "status=200 latency_ms=12")
+    bad = _pr(exit_code=1, output="status=502 latency_ms=40")
+    assert R.evaluate_probe(spec, bad) == ("breach", "status=502 latency_ms=40")
+    # probe machinery failure stays the error path
+    assert R.evaluate_probe(spec, _pr(ok=False, error="boom"))[0] == "error"
+
+
+# --- _run_http_probe against a real local server ------------------------------
+
+@pytest.fixture
+def http_target():
+    """A controllable local HTTP server: set ctl['code'] / ctl['delay']."""
+    import http.server
+    import threading
+
+    ctl = {"code": 200, "delay": 0.0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(ctl["delay"])
+            self.send_response(ctl["code"])
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):  # noqa: D102 — quiet test output
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}", ctl
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_run_http_probe_healthy(http_target):
+    url, _ctl = http_target
+    spec = R.MonitorTrigger(_http_spec(url=f"{url}/health")).spec
+    pr = R._run_probe(spec)
+    assert pr.ok and pr.exit_code == 0
+    assert pr.output.startswith("status=200 latency_ms=")
+
+
+def test_run_http_probe_status_mismatch_is_breach(http_target):
+    url, ctl = http_target
+    ctl["code"] = 500
+    spec = R.MonitorTrigger(_http_spec(url=f"{url}/health")).spec
+    pr = R._run_probe(spec)
+    assert pr.ok and pr.exit_code == 1
+    assert pr.output.startswith("status=500")
+    assert "status 500 != 200" in pr.error
+
+
+def test_run_http_probe_latency_budget_breach(http_target):
+    url, ctl = http_target
+    ctl["delay"] = 0.15
+    spec = R.MonitorTrigger(_http_spec(url=f"{url}/", latency_budget_ms=1)).spec
+    pr = R._run_probe(spec)
+    assert pr.ok and pr.exit_code == 1
+    assert "latency" in pr.error and "> 1ms" in pr.error
+
+
+def test_run_http_probe_unreachable_is_breach_not_error():
+    """Connection refused IS the outage for a health probe (T-0605 design
+    note): it must alert as a breach within persist_s, not sit silent for 10
+    intervals and then phrase itself as a broken monitor."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # port now closed
+    spec = R.MonitorTrigger(_http_spec(url=f"http://127.0.0.1:{port}/")).spec
+    pr = R._run_probe(spec)
+    assert pr.ok is True and pr.exit_code == 1
+    assert pr.output.startswith("unreachable (")
+
+
+def test_run_http_probe_timeout_is_unreachable_breach(http_target):
+    url, ctl = http_target
+    ctl["delay"] = 3.0
+    spec = R.MonitorTrigger(_http_spec(url=f"{url}/", timeout_s=1)).spec
+    pr = R._run_probe(spec)
+    assert pr.ok is True and pr.exit_code == 1
+    assert pr.output.startswith("unreachable (")
+
+
+# --- on_breach: notify — code-only alert, zero AI ----------------------------
+
+def test_notify_breach_pages_urgent_without_spawning(mcfg, tmp_path, dm_capture):
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800)
+    res = R.monitor_sweep(cfg, slug, now=T0)
+    assert res["fired"] == [rid]
+    assert spawns == []                     # ZERO AI
+    assert len(dm_capture) == 1
+    dm = dm_capture[0]
+    assert dm["urgent"] is True             # the quiet-hours trap
+    assert dm["sid"] == f"routine:{rid}"
+    assert dm["tg_chat_id"] == "TEST_CHAT_ID"
+    assert rid in dm["message"] and "42" in dm["message"] and "10" in dm["message"]
+    # events.ndjson records kind=notify (D-0048 §3.3)
+    assert [e["kind"] for e in _events(cfg, slug)] == ["notify"]
+    # cooldown stamped exactly like a spawn fire
+    st = R.load_state(cfg, slug, rid)
+    assert st["fired"] is True
+    assert st["last_fired_at"] == R._iso(T0)
+    # md untouched: no AI attached (last_run_at is a slow AI-attach field)
+    assert R.load(cfg, slug, rid).last_run_at is None
+
+
+def test_notify_breach_cooldown_gaps_realerts_then_refires(mcfg, tmp_path,
+                                                           dm_capture):
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800)
+    R.monitor_sweep(cfg, slug, now=T0)
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=600))
+    assert len(dm_capture) == 1             # inside cooldown: no re-alert
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=1805))
+    assert res["fired"] == [rid]
+    assert len(dm_capture) == 2             # past cooldown, still breaching
+
+
+def test_notify_delivery_failure_retries_next_tick(mcfg, tmp_path, monkeypatch):
+    """A raised delivery (both channels down) must NOT stamp cooldown — the
+    breach re-alerts on the next sweep, mirroring capacity-deferred spawns."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800)
+
+    from bot_squad_worker import actions
+    calls: list[dict] = []
+
+    def _down(cfg, *, message, **kw):
+        raise RuntimeError("MAX and TG both unreachable")
+
+    monkeypatch.setattr(actions, "_send_stakeholder_dm", _down)
+    res = R.monitor_sweep(cfg, slug, now=T0)
+    assert res["fired"] == []
+    st = R.load_state(cfg, slug, rid)
+    assert st["fired"] is False and st["last_fired_at"] is None
+    assert _events(cfg, slug) == []         # nothing delivered, nothing recorded
+
+    def _up(cfg, *, message, **kw):
+        calls.append({"message": message, **kw})
+        return {"ok": True, "sent": True, "channel": "test"}
+
+    monkeypatch.setattr(actions, "_send_stakeholder_dm", _up)
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    assert res["fired"] == [rid]
+    assert len(calls) == 1
+    assert R.load_state(cfg, slug, rid)["fired"] is True
+
+
+# --- on_recover: notify — ✅ only for breaches that actually fired ------------
+
+def test_recover_notify_sends_checkmark_after_fired_breach(mcfg, tmp_path,
+                                                           dm_capture):
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800,
+                                  on_recover="notify")
+    R.monitor_sweep(cfg, slug, now=T0)
+    assert len(dm_capture) == 1
+    metric.write_text("5")
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=10))
+    assert spawns == []
+    assert len(dm_capture) == 2
+    dm = dm_capture[1]
+    assert dm["urgent"] is True
+    assert "✅" in dm["message"] and rid in dm["message"] and "5" in dm["message"]
+    assert [e["kind"] for e in _events(cfg, slug)] == ["notify", "recover"]
+
+
+def test_recover_without_on_recover_stays_silent(mcfg, tmp_path, dm_capture):
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800)  # no on_recover
+    R.monitor_sweep(cfg, slug, now=T0)
+    metric.write_text("5")
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=10))
+    assert len(dm_capture) == 1             # breach alert only, no ✅
+    # the recover event is still recorded (observability seam)
+    assert [e["kind"] for e in _events(cfg, slug)] == ["notify", "recover"]
+
+
+def test_recover_notify_silent_for_unfired_breach(mcfg, tmp_path, dm_capture):
+    """A breach sighting that never fired (persist window) clears silently —
+    the linza rule; no ✅ noise for a blip nobody was alerted to."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    _declare_notify_monitor(cfg, slug, metric, persist_s=600,
+                            on_recover="notify")
+    R.monitor_sweep(cfg, slug, now=T0)      # sighting inside persist: no fire
+    metric.write_text("5")
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=10))
+    assert dm_capture == []
+    assert _events(cfg, slug) == []
+
+
+def test_spawn_mode_with_recover_notify_mixes(mcfg, tmp_path, dm_capture):
+    """on_breach: spawn + on_recover: notify — AI attaches on breach, the ✅
+    is still a code-only page."""
+    cfg, slug, spawns = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("42")
+    rid = _declare_notify_monitor(cfg, slug, metric, cooldown_s=1800,
+                                  on_breach="spawn", on_recover="notify")
+    R.monitor_sweep(cfg, slug, now=T0)
+    assert len(spawns) == 1 and dm_capture == []
+    metric.write_text("5")
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=10))
+    assert len(spawns) == 1
+    assert len(dm_capture) == 1
+    assert "✅" in dm_capture[0]["message"] and rid in dm_capture[0]["message"]
+
+
+# --- monitor-broken self-alert (once, urgent) ---------------------------------
+
+def test_monitor_broken_pages_once_urgent(mcfg, dm_capture):
+    cfg, slug, spawns = mcfg
+    rid = R.declare(cfg, slug, instruction="x", trigger="monitor",
+                    monitor=_spec(cmd="false", judge="numeric_gt", threshold=1,
+                                  interval_s=5, timeout_s=2),
+                    provenance="T-0605", now=T0)["id"]
+    for i in range(R.MONITOR_ERROR_BOUND + 3):
+        R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * i))
+    assert spawns == []                     # never fire AI with garbage
+    assert len(dm_capture) == 1             # once, not per-tick
+    dm = dm_capture[0]
+    assert dm["urgent"] is True
+    assert "BROKEN" in dm["message"] and rid in dm["message"]
+    assert str(R.MONITOR_ERROR_BOUND) in dm["message"]
+
+
+def test_monitor_broken_alert_failure_never_kills_the_sweep(mcfg, tmp_path,
+                                                            monkeypatch):
+    cfg, slug, _ = mcfg
+    R.declare(cfg, slug, instruction="x", trigger="monitor",
+              monitor=_spec(cmd="false", judge="numeric_gt", threshold=1,
+                            interval_s=5, timeout_s=2),
+              provenance="T-0605", now=T0)["id"]
+    from bot_squad_worker import actions
+    monkeypatch.setattr(actions, "_send_stakeholder_dm",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    for i in range(R.MONITOR_ERROR_BOUND + 1):
+        R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * i))
+    # the event is still on the observability seam despite the dead channel
+    broken = [e for e in _events(cfg, slug) if e["kind"] == "monitor_broken"]
+    assert len(broken) == 1
+
+
+# --- http probe end-to-end through the sweep ----------------------------------
+
+def test_http_monitor_sweep_end_to_end_notify(mcfg, http_target, dm_capture):
+    """Walking-skeleton parity for slice 3: a REAL local endpoint goes 500 →
+    the notify-mode http monitor pages urgent with the observation, zero AI."""
+    cfg, slug, spawns = mcfg
+    url, ctl = http_target
+    rid = R.declare(cfg, slug, instruction="watch the endpoint",
+                    trigger="monitor",
+                    monitor={"probe": "http", "url": f"{url}/health",
+                             "interval_s": 5, "timeout_s": 3,
+                             "persist_s": 0, "cooldown_s": 1800,
+                             "on_breach": "notify", "on_recover": "notify"},
+                    provenance="T-0605", now=T0)["id"]
+    R.monitor_sweep(cfg, slug, now=T0)
+    assert dm_capture == [] and spawns == []    # healthy: zero noise
+    assert str(R.load_state(cfg, slug, rid)["last_value"]).startswith("status=200")
+
+    ctl["code"] = 500
+    res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    assert res["fired"] == [rid] and spawns == []
+    assert len(dm_capture) == 1
+    assert dm_capture[0]["urgent"] is True
+    assert "status=500" in dm_capture[0]["message"]
+    assert "status==200" in dm_capture[0]["message"]
+
+    ctl["code"] = 200
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=10))
+    assert len(dm_capture) == 2
+    assert "✅" in dm_capture[1]["message"]
+
+
+def test_http_monitor_spawn_mode_brief_carries_observation(mcfg, http_target):
+    """on_breach: spawn (default) for an http monitor — the TRIGGER EVENT brief
+    carries the http observation + derived threshold."""
+    cfg, slug, spawns = mcfg
+    url, ctl = http_target
+    ctl["code"] = 502
+    R.declare(cfg, slug, instruction="investigate the endpoint",
+              trigger="monitor",
+              monitor=_http_spec(url=f"{url}/health"),
+              provenance="T-0605", now=T0)
+    R.monitor_sweep(cfg, slug, now=T0)
+    assert len(spawns) == 1
+    brief = spawns[0]["prompt"]
+    assert "TRIGGER EVENT" in brief
+    assert "status=502" in brief and "status==200" in brief

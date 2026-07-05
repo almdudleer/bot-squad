@@ -198,8 +198,10 @@ _MONITOR_NUMERIC_JUDGES = frozenset({"numeric_gt", "numeric_lt", "numeric_ne"})
 _MONITOR_JUDGES = _MONITOR_NUMERIC_JUDGES | {"nonzero_exit", "regex_match"}
 _MONITOR_SPEC_KEYS = frozenset({
     "probe", "cmd", "interval_s", "timeout_s", "judge", "threshold",
-    "persist_s", "cooldown_s", "on_breach",
+    "persist_s", "cooldown_s", "on_breach", "on_recover",
+    "url", "expect_status", "latency_budget_ms",
 })
+_HTTP_ONLY_KEYS = frozenset({"url", "expect_status", "latency_budget_ms"})
 
 
 @dataclass
@@ -253,60 +255,127 @@ class MonitorTrigger(Trigger):
                 f"(supported: {sorted(_MONITOR_SPEC_KEYS)})")
 
         probe = str(spec.get("probe") or "shell").strip().lower()
-        if probe != "shell":
+        if probe not in ("shell", "http"):
             raise RoutineError(
                 f"monitor spec: unsupported probe {probe!r} "
-                "(only 'shell' in slice 1; http lands in slice 3)")
-        cmd = str(spec.get("cmd") or "").strip()
-        if not cmd:
-            raise RoutineError("monitor spec: empty cmd")
+                "(supported: 'shell', 'http')")
 
         interval_s = _spec_int(spec, "interval_s", default=30, minimum=5)
         timeout_s = _spec_int(spec, "timeout_s", minimum=1)  # mandatory
         persist_s = _spec_int(spec, "persist_s", default=0, minimum=0)
         cooldown_s = _spec_int(spec, "cooldown_s", default=0, minimum=0)
 
-        judge = str(spec.get("judge") or "").strip().lower()
-        if judge not in _MONITOR_JUDGES:
-            raise RoutineError(
-                f"monitor spec: unknown judge {judge!r} "
-                f"(supported: {sorted(_MONITOR_JUDGES)})")
-        threshold = spec.get("threshold")
-        if judge in _MONITOR_NUMERIC_JUDGES:
-            try:
-                float(threshold)
-            except (TypeError, ValueError):
+        if probe == "http":
+            judge, threshold, http_fields = self._validate_http(spec)
+        else:
+            http_only = set(spec) & _HTTP_ONLY_KEYS
+            if http_only:
                 raise RoutineError(
-                    f"monitor spec: judge {judge} needs a numeric threshold, "
-                    f"got {threshold!r}")
-        elif judge == "regex_match":
-            if not threshold or not str(threshold).strip():
+                    f"monitor spec: {sorted(http_only)} are http-probe keys; "
+                    "a shell probe takes cmd + judge/threshold")
+            http_fields = {}
+            cmd = str(spec.get("cmd") or "").strip()
+            if not cmd:
+                raise RoutineError("monitor spec: empty cmd")
+
+            judge = str(spec.get("judge") or "").strip().lower()
+            if judge not in _MONITOR_JUDGES:
                 raise RoutineError(
-                    "monitor spec: judge regex_match needs a regex threshold")
-            try:
-                re.compile(str(threshold))
-            except re.error as e:
-                raise RoutineError(
-                    f"monitor spec: invalid regex threshold {threshold!r}: {e}")
+                    f"monitor spec: unknown judge {judge!r} "
+                    f"(supported: {sorted(_MONITOR_JUDGES)})")
+            threshold = spec.get("threshold")
+            if judge in _MONITOR_NUMERIC_JUDGES:
+                try:
+                    float(threshold)
+                except (TypeError, ValueError):
+                    raise RoutineError(
+                        f"monitor spec: judge {judge} needs a numeric threshold, "
+                        f"got {threshold!r}")
+            elif judge == "regex_match":
+                if not threshold or not str(threshold).strip():
+                    raise RoutineError(
+                        "monitor spec: judge regex_match needs a regex threshold")
+                try:
+                    re.compile(str(threshold))
+                except re.error as e:
+                    raise RoutineError(
+                        f"monitor spec: invalid regex threshold {threshold!r}: {e}")
 
         on_breach = str(spec.get("on_breach") or "spawn").strip().lower()
-        if on_breach != "spawn":
+        if on_breach not in ("spawn", "notify"):
             raise RoutineError(
                 f"monitor spec: unsupported on_breach {on_breach!r} "
-                "(only 'spawn' in slice 1; 'notify' lands in slice 3)")
+                "(supported: 'spawn' = attach AI, 'notify' = code-only TG alert)")
+        on_recover = str(spec.get("on_recover") or "").strip().lower()
+        if on_recover not in ("", "notify"):
+            raise RoutineError(
+                f"monitor spec: unsupported on_recover {on_recover!r} "
+                "(supported: 'notify' or omit)")
 
         self.spec: dict = {
             "probe": probe,
-            "cmd": cmd,
             "interval_s": interval_s,
             "timeout_s": timeout_s,
             "judge": judge,
             "persist_s": persist_s,
             "cooldown_s": cooldown_s,
             "on_breach": on_breach,
+            **http_fields,
         }
+        if probe == "shell":
+            self.spec["cmd"] = cmd
         if threshold is not None:
             self.spec["threshold"] = threshold
+        if on_recover:
+            self.spec["on_recover"] = on_recover
+
+    @staticmethod
+    def _validate_http(spec: dict) -> tuple[str, str, dict]:
+        """Validate the http-probe keys (D-0048 §3.1: url + expect_status /
+        latency budget). An http probe judges ITSELF — the breach condition is
+        derived from expect_status/latency_budget_ms, so ``judge`` is the
+        internal ``http`` and ``threshold`` is the derived expectation string
+        (both re-accepted on reload so the persisted normalized spec round-trips
+        through this validation).
+
+        Returns ``(judge, threshold, http_fields)``.
+        """
+        if spec.get("cmd"):
+            raise RoutineError(
+                "monitor spec: http probe takes url, not cmd")
+        url = str(spec.get("url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise RoutineError(
+                f"monitor spec: http probe needs an http(s):// url, got {url!r}")
+        expect_status = _spec_int(spec, "expect_status", default=200, minimum=100)
+        if expect_status > 599:
+            raise RoutineError(
+                f"monitor spec: expect_status must be a 100..599 HTTP status, "
+                f"got {expect_status}")
+        latency_ms: Optional[int] = None
+        if spec.get("latency_budget_ms") is not None:
+            latency_ms = _spec_int(spec, "latency_budget_ms", minimum=1)
+
+        parts = [f"status=={expect_status}"]
+        if latency_ms is not None:
+            parts.append(f"latency<={latency_ms}ms")
+        threshold = " & ".join(parts)
+
+        judge = str(spec.get("judge") or "http").strip().lower()
+        if judge != "http":
+            raise RoutineError(
+                "monitor spec: an http probe judges itself via "
+                "expect_status/latency_budget_ms — don't set judge")
+        declared = spec.get("threshold")
+        if declared is not None and str(declared) != threshold:
+            raise RoutineError(
+                "monitor spec: an http probe derives its threshold from "
+                f"expect_status/latency_budget_ms ({threshold!r}) — don't set it")
+
+        http_fields: dict = {"url": url, "expect_status": expect_status}
+        if latency_ms is not None:
+            http_fields["latency_budget_ms"] = latency_ms
+        return judge, threshold, http_fields
 
     def next_fire(self, after: datetime, *, inclusive: bool) -> Optional[datetime]:
         return None  # state-driven, never time-scheduled
@@ -380,6 +449,12 @@ def evaluate_probe(spec: dict, probe: ProbeResult) -> tuple[str, Any]:
     threshold = spec.get("threshold")
     if not probe.ok:
         return ("error", (probe.error or "probe failed")[:_MONITOR_VALUE_CLIP])
+    if judge == "http":
+        # http probes judge themselves (exit_code 0 = expectations met);
+        # the value is the observation ("status=... latency_ms=..." or
+        # "unreachable (...)"), not a number.
+        value = probe.output.strip()[:_MONITOR_VALUE_CLIP]
+        return ("breach" if probe.exit_code != 0 else "ok", value)
     if judge == "nonzero_exit":
         return ("breach" if probe.exit_code != 0 else "ok", probe.exit_code)
     if probe.exit_code != 0:
@@ -904,7 +979,53 @@ def _kill_probe_group(proc: subprocess.Popen) -> None:
                 pass
 
 
+def _run_http_probe(spec: dict) -> ProbeResult:
+    """Run one http probe (D-0048 §3.1): GET ``url``, judge status + latency.
+
+    ``exit_code`` 0 = expectations met, 1 = breach (status mismatch, latency
+    over budget) — the ``http`` judge consumes it. An UNREACHABLE endpoint
+    (connect error / timeout) is a BREACH observation, not a probe error: for
+    a health probe "connection refused" is the paradigmatic outage, and the
+    consecutive_errors path would stay silent for 10 intervals and then phrase
+    it as a broken monitor. The error path is reserved for the probe machinery
+    itself failing.
+    """
+    import httpx  # lazy import — same idiom as tg.py
+
+    url = spec["url"]
+    timeout_s = spec["timeout_s"]
+    start = time.monotonic()
+    try:
+        resp = httpx.get(url, timeout=timeout_s)
+    except httpx.HTTPError as e:
+        reason = f"{type(e).__name__}: {e}".strip()[:200]
+        return ProbeResult(ok=True, exit_code=1,
+                           output=f"unreachable ({reason})", error=reason)
+    except Exception as e:  # noqa: BLE001 — a probe can never kill the sweep
+        return ProbeResult(ok=False, exit_code=-1, output="",
+                           error=str(e)[:200])
+    latency_ms = int((time.monotonic() - start) * 1000)
+    status = resp.status_code
+
+    failures: list[str] = []
+    if status != spec["expect_status"]:
+        failures.append(f"status {status} != {spec['expect_status']}")
+    budget = spec.get("latency_budget_ms")
+    if budget is not None and latency_ms > budget:
+        failures.append(f"latency {latency_ms}ms > {budget}ms")
+    return ProbeResult(ok=True, exit_code=1 if failures else 0,
+                       output=f"status={status} latency_ms={latency_ms}",
+                       error="; ".join(failures)[:500])
+
+
 def _run_probe(spec: dict) -> ProbeResult:
+    """Run one probe: shell subprocess or http request, per ``spec['probe']``."""
+    if spec.get("probe") == "http":
+        return _run_http_probe(spec)
+    return _run_shell_probe(spec)
+
+
+def _run_shell_probe(spec: dict) -> ProbeResult:
     """Run one shell probe subprocess: hard timeout, output capped at 8KB.
 
     The probe leads its own process group (``start_new_session=True``, the
@@ -992,6 +1113,51 @@ def _live_routine_session(cfg: Any, slug: str, rid: str) -> Optional[str]:
                 and not row.get("archived")):
             return row.get("sid")
     return None
+
+
+def _monitor_notify(cfg: Any, slug: str, rid: str, text: str) -> bool:
+    """Code-only monitor alert to the stakeholder (D-0048 §6) — zero AI.
+
+    Routes through the ``_send_stakeholder_dm`` SSOT (MAX-primary on this
+    DPI-blocked host, TG failover; a raw TgClient here would trip the T-0394
+    notify-SSOT guard). ALWAYS ``urgent=True``: the quiet-hours gate silently
+    drops non-urgent sends 17-05 UTC, and a threshold breach — or a monitor
+    that went blind — is by definition urgent. Returns False when delivery
+    raised (callers may retry next tick); never raises.
+    """
+    try:
+        from bot_squad_worker.actions import _send_stakeholder_dm
+
+        project = cfg.projects.get(slug)
+        chat_id = getattr(project, "tg_chat", "") if project else ""
+        _send_stakeholder_dm(cfg, message=text, sid=f"routine:{rid}",
+                             urgent=True, tg_chat_id=chat_id)
+        return True
+    except Exception:  # noqa: BLE001 — an alert channel outage never kills the sweep
+        log.exception("monitor %s: notify delivery failed [%s]", rid, slug)
+        return False
+
+
+def _notify_breach(cfg: Any, slug: str, routine: Routine, event: FireEvent,
+                   now: datetime) -> bool:
+    """``on_breach: notify`` — deliver the code-only breach alert (no spawn).
+
+    Returns True when delivered — only then does the caller stamp
+    fired/cooldown; a failed delivery retries next tick, exactly like a
+    capacity-deferred spawn.
+    """
+    text = (f"🔴 monitor {routine.id} ({routine.title}) breach: "
+            f"value {event.value} vs threshold {event.threshold} "
+            f"(judge {event.judge}), since {event.breach_first_seen}. "
+            f"on_breach=notify — no AI attached.")
+    if not _monitor_notify(cfg, slug, routine.id, text):
+        return False
+    append_event(cfg, slug, ts=_iso(now), routine=routine.id, kind="notify",
+                 value=event.value, threshold=event.threshold,
+                 note="on_breach=notify: code-only alert, no AI")
+    log.info("monitor breach notified: %s (value %s vs %s) [%s]",
+             routine.id, event.value, event.threshold, slug)
+    return True
 
 
 def _handle_fire(cfg: Any, slug: str, routine: Routine, event: FireEvent,
@@ -1083,7 +1249,11 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
                 ev = trig.poll(now, {"state": st, "probe": probes[r.id]})
                 if ev is not None:
                     if ev.kind == "fire":
-                        if _handle_fire(cfg, slug, r, ev, st, now):
+                        if trig.spec.get("on_breach") == "notify":
+                            delivered = _notify_breach(cfg, slug, r, ev, now)
+                        else:
+                            delivered = _handle_fire(cfg, slug, r, ev, st, now)
+                        if delivered:
                             st["fired"] = True
                             st["last_fired_at"] = _iso(now)
                             fired.append(r.id)
@@ -1091,6 +1261,16 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
                         append_event(cfg, slug, ts=_iso(now), routine=r.id,
                                      kind="recover", value=ev.value,
                                      threshold=ev.threshold)
+                        if trig.spec.get("on_recover") == "notify":
+                            # poll emits recover ONLY for a breach that actually
+                            # fired (linza rule) — best-effort: the ✅ moment
+                            # doesn't recur, so a failed send is logged, not retried
+                            _monitor_notify(
+                                cfg, slug, r.id,
+                                f"✅ monitor {r.id} ({r.title}) recovered: "
+                                f"value {ev.value} back within threshold "
+                                f"{ev.threshold} (breach began "
+                                f"{ev.breach_first_seen}).")
                         log.info("monitor recovered: %s (value %s) [%s]",
                                  r.id, ev.value, slug)
                     elif ev.kind == "monitor_broken":
@@ -1098,6 +1278,14 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
                                      kind="monitor_broken",
                                      threshold=ev.threshold,
                                      note=str(ev.value))
+                        # once, not per-tick: poll emits this event only at
+                        # exactly consecutive_errors == MONITOR_ERROR_BOUND
+                        _monitor_notify(
+                            cfg, slug, r.id,
+                            f"⚠️ monitor {r.id} ({r.title}) is BROKEN: "
+                            f"{MONITOR_ERROR_BOUND} consecutive probe errors "
+                            f"(last: {ev.value}). It cannot see its metric — "
+                            f"no breach/recovery alerts until the probe is fixed.")
                         log.warning(
                             "monitor %s is BROKEN: %d consecutive probe "
                             "errors (last: %s) [%s]", r.id,

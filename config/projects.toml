@@ -32,7 +32,15 @@ repo_master   = "/home/almdudleer/watchrobot/master"
 repo_deploy   = "/home/almdudleer/watchrobot/deploy"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
-# RETAINED (external infra — see note above): real deployment URLs.
+# RETAINED (external infra — see note above): real deployment URLs. These
+# are the recipe/smoke-test URLs (prod.sh polls prod_url's /api/version) and
+# stay pinned to the .uzinvestapi.com hosts the deploy tooling has always
+# used. T-0201 (2026-07-06): the REAL prod host is a single `signal-tracker`
+# container, traefik-routed, that answers on FOUR hostnames — this alias
+# plus watchrobot.${DOMAIN}, terminal.nolim.finance (full app), and
+# watchrobot.nolim.finance (news-only render) — see docker-compose.yml's
+# traefik router rule for signal-tracker. There is no separate prod host per
+# vanity domain; they're all the same container/deploy.
 prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
 staging_url   = "https://signal-staging.dev.uzinvestapi.com"
 dev_url       = "https://signal-dev.dev.uzinvestapi.com"

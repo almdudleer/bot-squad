@@ -95,6 +95,10 @@ def build_app() -> FastAPI:
     from app.routes_autopilot import router as autopilot_router
     app.include_router(autopilot_router, prefix="/api")
 
+    # T-0630 (T-0620 seam): operator pause/resume + fleet-default model.
+    from app.routes_operator import router as operator_router
+    app.include_router(operator_router, prefix="/api")
+
     from app.routes_intersession import router as intersession_router
     app.include_router(intersession_router, prefix="/api")
 

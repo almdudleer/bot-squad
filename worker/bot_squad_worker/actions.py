@@ -2180,6 +2180,45 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# T-0630 (T-0620 seam): fleet-default `claude --model` (~/.claude/settings.json
+# `model` key of the worker linux user). Thin wrappers over fleet_model.py —
+# the API container has no filesystem access to write this itself.
+# ---------------------------------------------------------------------------
+
+def _action_fleet_model_get(params: dict[str, Any]) -> dict[str, Any]:
+    """Read the fleet-default model. No params. Returns: {ok, model}
+    ("" if unset — the built-in claude default applies)."""
+    if params:
+        raise ActionError(f"fleet_model_get got unexpected params: {sorted(params)}")
+
+    from bot_squad_worker import fleet_model
+    return {"ok": True, "model": fleet_model.get_model()}
+
+
+_FLEET_MODEL_SET_REQUIRED = {"model"}
+
+
+def _action_fleet_model_set(params: dict[str, Any]) -> dict[str, Any]:
+    """Set (or, for ``model=""``, clear) the fleet-default model — atomic
+    read-modify-write of ~/.claude/settings.json preserving every other key.
+    Required: model (one of fleet_model.ALLOWED_MODELS). Returns: {ok, model}."""
+    extra = set(params) - _FLEET_MODEL_SET_REQUIRED
+    if extra:
+        raise ActionError(f"fleet_model_set got unexpected params: {sorted(extra)}")
+    missing = _FLEET_MODEL_SET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"fleet_model_set missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import fleet_model
+    model = params["model"]
+    try:
+        fleet_model.set_model(model)
+    except ValueError as e:
+        raise ActionError(str(e)) from e
+    return {"ok": True, "model": model}
+
+
 _TASK_NEW_REQUIRED = {"slug", "title"}
 # T-0519: ``provenance`` is accepted (and required at the gate below) so a direct
 # caller of this action can no longer mint a sourceless ticket. Kept out of
@@ -3672,6 +3711,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "operator_pause": _action_operator_pause,
     "operator_resume": _action_operator_resume,
     "operator_status": _action_operator_status,
+    # T-0630: fleet-default `claude --model` (~/.claude/settings.json).
+    "fleet_model_get": _action_fleet_model_get,
+    "fleet_model_set": _action_fleet_model_set,
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
     "doc_new": _action_doc_new,
@@ -3812,6 +3854,10 @@ ACTION_MODES: dict[str, str] = {
     "operator_pause": "coordinator_only",
     "operator_resume": "coordinator_only",
     "operator_status": "coordinator_only",
+    # T-0630: edits the worker linux user's OWN ~/.claude/settings.json — a
+    # single coordinator-owned file, like the rest of the project-state ops.
+    "fleet_model_get": "coordinator_only",
+    "fleet_model_set": "coordinator_only",
     "task_new": "coordinator_only",
     "doc_new": "coordinator_only",
     "uc_new": "coordinator_only",

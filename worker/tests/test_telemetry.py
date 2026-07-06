@@ -524,6 +524,57 @@ def test_fresh_tail_read_does_not_redetect_429(tmp_path, fake_session, monkeypat
     assert quota["rate_limit_429"]["count"] == 0
 
 
+def test_quota_sampler_write_preserves_alert_fired_at_no_429_spam(
+    tmp_path, fake_session, monkeypatch,
+):
+    """T-0619: the sampler's ``_update_quota`` write must preserve
+    ``alert_fired_at`` exactly like ``last_alert`` — it is the dict
+    ``cooldown_ok`` uses to gate the 3h "RATE LIMITED" cooldown. Before the
+    fix, every quota-write tick (incl. ticks with no new 429) dropped
+    ``alert_fired_at``, so a second genuine 429 arriving within the cooldown
+    window re-fired the urgent TG alert (74 pings on 2026-07-05).
+
+    Sequence: baseline sample (no 429) -> first 429 (fires ONE alert) -> a
+    plain sampler tick with NO new 429 (the "write in between" that used to
+    clobber the cooldown state) -> a second 429 still inside the cooldown
+    window. Exactly one alert must fire across the whole sequence.
+    """
+    cfg = _make_cfg(tmp_path)
+    calls = _capture_human_tg(monkeypatch)
+    # Distinct sampled_at/last_429_at per call so the "new 429" check
+    # (`rl.last_at != last_seen`) sees a genuinely fresh timestamp each time —
+    # real wall-clock precision (1s) is too coarse for a fast test.
+    iso_values = iter(f"2026-07-05T20:{i:02d}:00Z" for i in range(60))
+    monkeypatch.setattr(T, "_now_iso", lambda: next(iso_values))
+
+    lines = [_assistant((2, 70000, 100), 500)]
+    _write_transcript(fake_session["home"], fake_session["uuid"], lines)
+    T.sample(cfg, "proj")  # baseline tail-read, no 429 yet
+    assert calls == []
+
+    rl_line = json.dumps({"error": "rate_limit", "apiErrorStatus": 429})
+    lines.append(rl_line)
+    _write_transcript(fake_session["home"], fake_session["uuid"], lines)
+    T.sample(cfg, "proj")  # first real (incremental) 429 -> fires the alert
+    rate_limited_calls = [c for c in calls if "RATE LIMITED" in c["text"]]
+    assert len(rate_limited_calls) == 1
+
+    T.sample(cfg, "proj")  # plain sampler tick, no new 429 in between
+
+    lines.append(rl_line)
+    _write_transcript(fake_session["home"], fake_session["uuid"], lines)
+    T.sample(cfg, "proj")  # second real 429, still inside the 3h cooldown
+
+    rate_limited_calls = [c for c in calls if "RATE LIMITED" in c["text"]]
+    assert len(rate_limited_calls) == 1, (
+        "cooldown must suppress the second 429 alert; got "
+        f"{len(rate_limited_calls)} RATE LIMITED pings"
+    )
+    quota = json.loads((cfg.data_dir / "proj" / "_worker" / "telemetry"
+                        / "_quota.json").read_text())
+    assert quota["alert_fired_at"].get("throttle:urgent") is not None
+
+
 def test_human_tg_routes_tg_primary_single_delivery(tmp_path, monkeypatch):
     """T-0394 → T-0610 inversion: telemetry human pages route via the
     _send_stakeholder_dm SSOT — TG-primary into #team-queries, ONE delivery,

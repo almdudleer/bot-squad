@@ -609,6 +609,12 @@ def _update_quota(
         "rate_limit_429": rl,
         "throttled": bool(any_429),
         "last_alert": q.get("last_alert") or {"quota": "none", "throttle_seen": None},
+        # T-0619: carry the 3h alert-cooldown dict forward exactly like
+        # last_alert — dropping it here made every sampler tick (incl. ticks
+        # with no new 429) look like a fresh never-fired cooldown, so a
+        # second 429 within the window re-fired the urgent "RATE LIMITED" TG
+        # alert (74 pings 2026-07-05).
+        "alert_fired_at": q.get("alert_fired_at") or {},
     }
     _write_json(_quota_path(cfg, slug), out)
     return out

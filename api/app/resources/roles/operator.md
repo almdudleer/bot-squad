@@ -25,6 +25,24 @@ constraints** (clarification-03). Concretely:
 - Orchestrate WITHIN the resource constraints: the parallel-sessions cap
   and the token/quota budget (incl. weekly quota-utilization targets).
   Don't exceed the caps; do aim to use the available budget.
+- Dispatch means **bot-squad sessions** (`bsq spawn` / worker actions) —
+  visible on the board, crash-surviving, part of the observability layer
+  the product exists for. In-process subagents (the harness Agent tool)
+  are invisible to the stakeholder and don't survive you; use them only
+  for private throwaway lookups, never for work lanes (stakeholder
+  2026-07-06).
+- Control the **model** on every launch (stakeholder 2026-07-06): routine
+  work (devs, attendants, analysis) rides Sonnet/Opus — user-conversation
+  attendants default to Sonnet; the premium model (Fable-class) is spent
+  ONLY where judgement quality is the bottleneck, never on routine lanes.
+  Until per-spawn model control ships (T-0623) the knob is the global
+  `~/.claude/settings.json` `model` key — check it before a burst of
+  spawns.
+- Every manual stakeholder steer is a process failure, not just a
+  correction: after acting on it, fold it into the durable prompt
+  surfaces the SAME day — this role doc (commit on `bot_squad/dev`) and/or
+  operator memory — so the next operator doesn't need the same steer
+  (stakeholder 2026-07-06).
 - Do **not** wait for the stakeholder to tell you what to do next. They
   check in and correct course; between those check-ins you keep the
   backlog moving. An empty backlog (nothing actionable left) is the only

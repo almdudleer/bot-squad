@@ -11,6 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from bot_squad_worker.config import Config
 from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.operator_redrive import operator_tick
+from bot_squad_worker.uc_redrive import uc_redrive_tick
 from bot_squad_worker.routines import monitor_tick, routine_tick
 from bot_squad_worker.jobs import (
     autopilot_tick,
@@ -353,6 +354,24 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="operator_redrive",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # uc_redrive_tick: T-0622 — re-drive a user-conversation attendant whose
+    # reply turn died (e.g. a 429 storm) before it answered, so a stakeholder
+    # message never sits unanswered. Gated on the SAME pressure signal the
+    # backoff governor uses (never redrive into a live storm) plus the T-0104
+    # idle activity enum (never interrupt an in-flight reply); bounded
+    # retries/cooldown per (slug, gid). Kill switch: BOT_SQUAD_UC_REDRIVE=0.
+    # max_instances=1 + coalesce keeps overlapping ticks from racing the nudge.
+    sched.add_job(
+        uc_redrive_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="uc_redrive",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

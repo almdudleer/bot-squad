@@ -191,6 +191,33 @@ describe("T-0601 login 401-exempt", () => {
 });
 
 // ---------------------------------------------------------------------------
+// T-0609: the COMPOSED redirect path — shouldRedirectOn401 alone can't catch a
+// regression where call() stops consulting it (or stops redirecting at all).
+// Stub a window so the node run can observe the redirect instead of crashing.
+// ---------------------------------------------------------------------------
+describe("T-0609 composed call() 401-redirect", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  test("a 401 on /api/auth/me redirects to /login and rejects", async () => {
+    const loc = { href: "" };
+    vi.stubGlobal("window", { location: loc });
+    const spy = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      text: async () => '{"detail":"not authenticated"}',
+    } as Response);
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await expect(api.me()).rejects.toThrow("not authenticated");
+    expect(loc.href).toBe("/login");
+    expect(spy).toHaveBeenCalledWith("/api/auth/me", expect.any(Object));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // T-0608: near-duplicate 409 decoder — the create modal branches on this to
 // show candidates + "create anyway" instead of a generic error line.
 // ---------------------------------------------------------------------------

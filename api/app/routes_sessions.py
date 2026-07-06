@@ -192,7 +192,10 @@ async def list_sessions(
     misleading "No sessions". Row shape is unchanged; only the top-level
     envelope is new (the web client accepts both shapes for old servers).
     Non-admin callers only see errors for their own linux_user (matching
-    the row ownership scoping below).
+    the row ownership scoping below), plus — T-0609 — a sanitized
+    ``{"user": "coordinator"}`` entry when the coordinator socket failed,
+    since that socket hosts sessions they own under someone else's
+    linux_user.
 
     T-0080 owner gate: non-admin callers see only sessions whose SessionMd
     `owner` field equals their UI username. Sessions written before owner
@@ -261,9 +264,25 @@ async def list_sessions(
     # health of other users' sockets.
     me = user.get("username") or ""
     my_linux = request.app.state.auth_config.meta_for(me).linux_user
+    scoped_errors = [e for e in errors if e.get("user") == my_linux]
+    # T-0609: rows are scoped by owner_user, errors by linux_user — and the
+    # two disagree exactly at the coordinator socket. It hosts sessions the
+    # caller OWNS but that don't run under their linux_user (for_user()'s
+    # fallback for users without a per-user worker; system-spawned sessions
+    # like user-conversations stamped owner_user=them). A dead coordinator
+    # therefore blanks a non-admin's list while the linux_user filter above
+    # eats the only explanation. Surface it as a fixed sanitized entry — no
+    # raw exception text (it carries socket paths) and still nothing about
+    # OTHER users' per-user sockets.
+    coord = wrouter.coordinator_user
+    if coord != my_linux and any(e.get("user") == coord for e in errors):
+        scoped_errors.append({
+            "user": "coordinator",
+            "detail": "coordinator worker unreachable — sessions it hosts are missing",
+        })
     return {
         "sessions": [r for r in rows if _scope_match(r.get("owner_user"), r.get("owner"), me)],
-        "errors": [e for e in errors if e.get("user") == my_linux],
+        "errors": scoped_errors,
     }
 
 

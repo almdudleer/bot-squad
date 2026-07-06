@@ -312,6 +312,120 @@ def test_list_sessions_nonadmin_sees_only_own_socket_error(
     assert [e["user"] for e in data["errors"]] == ["tu"]
 
 
+def test_list_sessions_nonadmin_dead_coordinator_sanitized_error(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """T-0609: rows are scoped by owner_user but errors by linux_user, and the
+    two disagree at the coordinator socket — it hosts sessions a non-admin
+    OWNS under someone else's linux_user (for_user() fallback, system-spawned
+    user-conversations). With the caller's own socket HEALTHY and the
+    coordinator dead, the pre-fix response was errors:[] — the blank list had
+    no explanation. Now: one fixed sanitized entry, no raw exception text
+    (it carries socket paths), still nothing about other users' sockets."""
+    import threading
+    import time
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    wu_sock = sock_dir / "user-wu.sock"
+    app = FastAPI()
+
+    @app.post("/actions/list_sessions")
+    def list_sessions(params: dict | None = None) -> dict:
+        return {"sessions": []}
+
+    cfg = uvicorn.Config(app, uds=str(wu_sock), log_level="warning")
+    server = uvicorn.Server(cfg)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+    for _ in range(50):
+        if wu_sock.exists():
+            break
+        time.sleep(0.05)
+    try:
+        (tmp_bot_squad / "config" / "auth.toml").write_text(
+            '[users]\n'
+            'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+            '[user_meta.testuser]\n'
+            'linux_user = "wu"\n'
+            'is_admin = false\n'
+            '[session]\nttl = "7d"\n'
+        )
+        monkeypatch.setenv("BOT_SQUAD_COORDINATOR_USER", "almdudleer")
+        # Coordinator socket (worker.sock) is never bound → dead coordinator.
+        with _client_logged_in(
+            tmp_bot_squad, monkeypatch, sock_dir / "worker.sock",
+        ) as client:
+            r = client.get("/api/projects/test-project/sessions")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["errors"] == [{
+            "user": "coordinator",
+            "detail": "coordinator worker unreachable — sessions it hosts are missing",
+        }]
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+
+
+def test_list_sessions_nonadmin_own_and_coordinator_both_dead(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """T-0609: the caller's OWN socket failure keeps its raw entry (that is
+    their diagnostic); the coordinator failure rides along as the sanitized
+    pseudo-user, appended after the scoped list."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "wu"\n'
+        'is_admin = false\n'
+        '[user_meta.edem]\n'
+        'linux_user = "edem"\n'
+        '[session]\nttl = "7d"\n'
+    )
+    monkeypatch.setenv("BOT_SQUAD_COORDINATOR_USER", "almdudleer")
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    # No socket bound at all: coordinator, wu and edem are all dead.
+    with _client_logged_in(
+        tmp_bot_squad, monkeypatch, sock_dir / "worker.sock",
+    ) as client:
+        r = client.get("/api/projects/test-project/sessions")
+    assert r.status_code == 200
+    data = r.json()
+    # Own raw entry first, sanitized coordinator entry appended; edem's
+    # socket health still never leaks.
+    assert [e["user"] for e in data["errors"]] == ["wu", "coordinator"]
+    assert data["errors"][0]["detail"]  # raw own-socket detail preserved
+
+
+def test_list_sessions_nonadmin_coordinator_linux_user_no_duplicate(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """T-0609: a non-admin whose linux_user IS the coordinator user already
+    gets the raw coordinator entry through the own-socket filter — no extra
+    sanitized pseudo-entry on top."""
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "almdudleer"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    monkeypatch.setenv("BOT_SQUAD_COORDINATOR_USER", "almdudleer")
+    sock_dir = tmp_bot_squad / "data" / "_sock"
+    with _client_logged_in(
+        tmp_bot_squad, monkeypatch, sock_dir / "worker.sock",
+    ) as client:
+        r = client.get("/api/projects/test-project/sessions")
+    assert r.status_code == 200
+    data = r.json()
+    assert [e["user"] for e in data["errors"]] == ["almdudleer"]
+
+
 # ---------------------------------------------------------------------------
 # POST /api/projects/{slug}/sessions/{sid}/pause
 # ---------------------------------------------------------------------------

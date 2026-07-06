@@ -480,7 +480,13 @@ export function Sessions() {
         setFanoutErrors(errors);
         setError(null);
       })
-      .catch((e: unknown) => setError(String(e)));
+      .catch((e: unknown) => {
+        setError(String(e));
+        // T-0609: a total load failure means the fan-out picture is unknown —
+        // keeping the previous poll's banner would name sockets we can no
+        // longer vouch for, alongside the error alert.
+        setFanoutErrors([]);
+      });
   }, [slug]);
 
   useEffect(() => {

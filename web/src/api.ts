@@ -35,6 +35,11 @@ export function errorDetail(err: unknown): string {
 // T-0601 (F4): the ONE call that must not trigger the global 401-redirect is
 // the login attempt itself — redirecting there turned a wrong password into a
 // silent form reload. Exported for unit tests.
+// T-0609 breadcrumb: /api/auth/attach is the next candidate for this
+// exemption — it 401s on bad GLOBAL credentials while the caller's LOCAL
+// session cookie is still valid, so redirecting would bounce a logged-in
+// user to /login over a typo. No web caller goes through call() for it yet;
+// add the exemption here when one lands.
 export function shouldRedirectOn401(path: string): boolean {
   return path !== "/api/auth/login";
 }

@@ -2563,6 +2563,91 @@ def test_spawn_without_owner_omits_env_var(tmp_path, monkeypatch):
     assert "BOT_SQUAD_OWNER" not in captured[0]
 
 
+# ---------------------------------------------------------------------------
+# T-0623: per-spawn model control
+# ---------------------------------------------------------------------------
+
+
+def _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, window: str, **spawn_kw) -> str:
+    """Run spawn() with a stubbed tmux and return the captured `bash -lc` cmd."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    cfg = _make_cfg(tmp_path, repo)
+
+    captured_shell_cmd: list[str] = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            try:
+                i = args.index("-lc")
+                captured_shell_cmd.append(args[i + 1])
+            except (ValueError, IndexError):
+                pass
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%6|{window}|123|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", window, **spawn_kw)
+    assert captured_shell_cmd, "expected a new-window call"
+    return captured_shell_cmd[0]
+
+
+def test_spawn_explicit_model_lands_on_shell_cmd(tmp_path, monkeypatch):
+    """spawn(model=X) bakes `claude --model X` into the bash -lc shell cmd."""
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="claude-opus-4-8")
+    assert "--model claude-opus-4-8" in cmd
+
+
+def test_spawn_without_model_omits_flag_for_dev_role(tmp_path, monkeypatch):
+    """A plain dev window ("w") has no configured role default, so absent
+    `model` means no --model flag at all — settings.json default applies."""
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w")
+    assert "--model" not in cmd
+
+
+def test_spawn_user_conversation_window_gets_sonnet5_default(tmp_path, monkeypatch):
+    """T-0623: the user-conversation role's built-in default is claude-sonnet-5,
+    applied even when the caller passes no explicit model."""
+    cmd = _spawn_and_capture_shell_cmd(
+        tmp_path, monkeypatch, "gu_a1b2c3-user-conversation")
+    assert "--model claude-sonnet-5" in cmd
+
+
+def test_spawn_explicit_model_overrides_role_default(tmp_path, monkeypatch):
+    """An explicit model always wins over the role-based default."""
+    cmd = _spawn_and_capture_shell_cmd(
+        tmp_path, monkeypatch, "gu_a1b2c3-user-conversation", model="claude-opus-4-8")
+    assert "--model claude-opus-4-8" in cmd
+    assert "claude-sonnet-5" not in cmd
+
+
+def test_read_model_defaults_missing_file_returns_builtin(tmp_path):
+    from bot_squad_worker.sessions import _read_model_defaults
+    defaults = _read_model_defaults(tmp_path / "no-such-config-dir")
+    assert defaults["user-conversation"] == "claude-sonnet-5"
+
+
+def test_read_model_defaults_toml_override(tmp_path):
+    """An admin-configured [models] section overrides/extends the built-in
+    defaults — e.g. pinning a dev-role default, without a code change."""
+    from bot_squad_worker.sessions import _read_model_defaults
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "system_settings.toml").write_text(
+        '[models]\n"user-conversation" = "claude-opus-4-8"\ndev = "claude-haiku-4-5"\n'
+    )
+    defaults = _read_model_defaults(cfg_dir)
+    assert defaults["user-conversation"] == "claude-opus-4-8"
+    assert defaults["dev"] == "claude-haiku-4-5"
+
+
 def test_list_sessions_emits_owner_from_md(tmp_path, monkeypatch):
     """list_sessions surfaces SessionMd `owner:` for both active + suspended."""
     repo = tmp_path / "repo"

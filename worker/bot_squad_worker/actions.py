@@ -960,6 +960,7 @@ _SPAWN_SESSION_REQUIRED = {"slug", "window"}
 _SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {
     "initial_prompt", "task_id", "initiative", "owner", "parent_sid",
     "owner_user",  # T-0321: per-user-scoping username
+    "model",  # T-0623: explicit `claude --model` override; absent = role default
 }
 
 
@@ -1017,6 +1018,7 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         owner=params.get("owner"),
         parent_sid=params.get("parent_sid"),
         owner_user=params.get("owner_user"),
+        model=params.get("model"),
     )
 
 
@@ -1025,7 +1027,9 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _ENSURE_UCONV_REQUIRED = {"slug", "global_user_id"}
-_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref"}
+# T-0623: optional explicit model override for the fresh-spawn path; absent
+# falls through to sessions.spawn's role default (user-conversation -> claude-sonnet-5).
+_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref", "model"}
 
 
 def _user_conversation_boot_prompt(
@@ -1148,7 +1152,9 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
     Required params: slug, global_user_id
     Optional params: message_ref (a reference/snippet of the inbound message,
                      surfaced in the boot prompt; the session reads the full
-                     thread from the store).
+                     thread from the store); model (T-0623: explicit
+                     `claude --model` override for a fresh spawn — absent
+                     falls through to sessions.spawn's role default).
     Returns: {ok, sid, spawned: bool}
     """
     extra = set(params) - _ENSURE_UCONV_ALLOWED
@@ -1223,6 +1229,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
             slug,
             window,
             _user_conversation_boot_prompt(slug, gid, message_ref),
+            model=params.get("model"),
         )
         return {"ok": True, "sid": result["sid"], "spawned": True}
     finally:

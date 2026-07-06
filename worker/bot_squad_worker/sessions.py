@@ -1937,8 +1937,19 @@ def spawn(
     owner: str | None = None,
     parent_sid: str | None = None,
     owner_user: str | None = None,
+    model: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
+
+    T-0623: ``model`` (optional) lands as ``claude --model <m>`` on the launch
+    command. Absent/blank falls back to the role-based default from
+    ``system_settings.toml`` [models] (see ``_read_model_defaults``) — the
+    role is derived from ``window`` the same way ``_action_spawn_session``
+    derives it for the operator-singleton guard. No role default resolves to
+    Fable — a fleet-wide burn is only possible via an explicit ``model``.
+    Still absent (no config entry either) → no ``--model`` flag, i.e. the
+    spawned ``claude`` inherits the per-linux-user ``~/.claude/settings.json``
+    default, matching pre-T-0623 behavior for untouched roles.
 
     Opens a new tmux window, starts claude (no resume), and optionally
     sends an initial_prompt after a short delay.
@@ -2120,6 +2131,12 @@ def spawn(
     _display_name = _claude_session_name(window, task_id)
     if _display_name:
         shell_cmd += f" --name {shlex.quote(_display_name)}"
+    # T-0623: explicit model wins; else the role-based default; else no flag
+    # (settings.json default).
+    _role = _derive_role(window, task_id, initiative)
+    _model = (model or "").strip() or _read_model_defaults(_caps_config_dir(cfg)).get(_role, "")
+    if _model:
+        shell_cmd += f" --model {shlex.quote(_model)}"
 
     result = _run([
         "tmux", "new-window", "-d",
@@ -2492,6 +2509,36 @@ def _read_caps(config_dir: Path) -> dict:
         # T-0408: idle-but-live suspend window (seconds), 0/absent = OFF.
         "idle_suspend_sec": _c("idle_suspend_sec"),
     }
+
+
+# T-0623: per-role default `claude --model` value, keyed by the same role
+# strings `_derive_role` returns (operator/prod-teamlead/qa/teamlead/dev/
+# user-conversation). Ships with ONE built-in default (user-conversation →
+# claude-sonnet-5, the stakeholder's explicit ask) so a fresh/legacy install without
+# a [models] section in system_settings.toml still gets it; every other role
+# is unset (falls through to the spawn's explicit `model` or the per-
+# linux-user settings.json default). Deliberately no built-in default ever
+# names Fable — that model is only ever used via an explicit spawn `model`.
+_DEFAULT_MODEL_DEFAULTS: dict[str, str] = {"user-conversation": "claude-sonnet-5"}
+
+
+def _read_model_defaults(config_dir: Path) -> dict[str, str]:
+    """Fresh-read the [models] section from system_settings.toml — role name
+    -> default model string. Missing file / unparseable / missing [models] ->
+    the built-in ``_DEFAULT_MODEL_DEFAULTS``. An explicit (even empty-string)
+    key in the file overrides the built-in for that role; roles absent from
+    both the file and the built-in resolve to "" (no --model flag)."""
+    path = Path(config_dir) / "system_settings.toml"
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return dict(_DEFAULT_MODEL_DEFAULTS)
+    models = raw.get("models")
+    if not isinstance(models, dict):
+        return dict(_DEFAULT_MODEL_DEFAULTS)
+    merged = dict(_DEFAULT_MODEL_DEFAULTS)
+    merged.update({str(k): str(v) for k, v in models.items()})
+    return merged
 
 
 def _proc_children_map() -> dict[int, list[int]]:

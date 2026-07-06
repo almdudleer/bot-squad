@@ -648,6 +648,8 @@ def cmd_spawn(args) -> None:
         params["initiative"] = initiative
     if args.owner:
         params["owner"] = args.owner
+    if args.model:
+        params["model"] = args.model
     # T-0128: stamp the spawning session's own SID as the new session's parent
     # so the session-tree survives a worker restart (no heuristic needed). The
     # parent of a TL-spawned dev is the TL; of an operator-spawned TL, the
@@ -3850,6 +3852,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--owner", help="UI username to stamp on the session")
     sp.add_argument("--role", default="dev", choices=["dev", "tl", "teamlead", "operator"],
                     help="role contract to assemble into the prompt (default dev)")
+    sp.add_argument("--model",
+                    help="claude --model override for the launch (alias like 'sonnet'/"
+                         "'opus'/'fable', or a full name like 'claude-sonnet-5'); "
+                         "default: the role's configured default, else the settings.json "
+                         "default (T-0623)")
     sp.add_argument("--prompt", help="custom initial prompt (overrides deterministic assembly)")
     sp.add_argument("--prompt-file", help="read initial prompt from a file")
     sp.add_argument("--fresh", action="store_true",

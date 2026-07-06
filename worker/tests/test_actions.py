@@ -1151,6 +1151,28 @@ def test_spawn_session_action_threads_parent_sid(tmp_path, monkeypatch):
     assert captured.get("parent_sid") == "S-x-tl-p0"
 
 
+def test_spawn_session_action_threads_model(tmp_path, monkeypatch):
+    """T-0623: spawn_session accepts the optional model param and threads it
+    to sessions.spawn (allowlist + wiring)."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured.update(kw)
+        return {"ok": True, "sid": "S-x-w-p1"}
+
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+    result = A.dispatch("spawn_session", {
+        "slug": "test-project", "window": "w",
+        "model": "claude-opus-4-8",
+    })
+    assert result["ok"] is True
+    assert captured.get("model") == "claude-opus-4-8"
+
+
 # ---------------------------------------------------------------------------
 # ensure_user_conversation action tests (T-0478, M2/F2.4)
 # ---------------------------------------------------------------------------
@@ -1201,6 +1223,31 @@ def test_ensure_user_conversation_spawns_when_none_live(tmp_path, monkeypatch):
     assert "VERBATIM" in captured["initial_prompt"]
     assert "please add dark mode" in captured["initial_prompt"]
     assert result["sid"] == "S-u-gu_a1b2c3-user-conversation-p3"
+
+
+def test_ensure_user_conversation_threads_explicit_model(tmp_path, monkeypatch):
+    """T-0623: an explicit model param on ensure_user_conversation reaches
+    sessions.spawn on the fresh-spawn path (absent → the role default applies
+    inside spawn() itself, exercised in test_sessions.py)."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured.update(kw)
+        return {"ok": True, "sid": f"S-u-{window}-p4"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "model": "claude-opus-4-8",
+    })
+    assert result["ok"] is True
+    assert captured.get("model") == "claude-opus-4-8"
 
 
 def test_ensure_user_conversation_reuses_live_attendant(tmp_path, monkeypatch):

@@ -4,17 +4,31 @@
  *
  * Renders the pure `ObservabilityView` against the REAL-derived payload
  * observed from the live data dir (operator-state absent → degrade notice;
- * re-drive PAUSED; no pace cap → ∞; a 2-row session tree). The backlog
- * asserts died with the backlog section (the board below IS the backlog).
- * `renderToStaticMarkup` needs no DOM, so this runs in the existing node-env
- * vitest. This is the automated lock placed AFTER the manual walkthrough
- * (scenarios/T-0593-*.md) per the manual-first rule (T-0158).
+ * re-drive PAUSED; no pace cap → ∞). `renderToStaticMarkup` needs no DOM, so
+ * this runs in the existing node-env vitest (no jsdom/testing-library in this
+ * project — effects don't fire during a static render, so the interactive
+ * RE-DRIVE/model controls render their SYNCHRONOUS initial state only).
+ *
+ * T-0627 (D-0056 IA audit): who-does-what table, INITIATIVE PACE card, and
+ * Scheduler section died. The RE-DRIVE card gained pause/resume + fleet
+ * model — those async happy/error/unavailable paths are unit-tested
+ * directly against the extracted `fetchFleetModel`/`setFleetModel`/
+ * `pauseOperator`/`resumeOperator` helpers below (no DOM needed).
+ *
+ * This is the automated lock placed AFTER the manual walkthrough
+ * (scenarios/T-0593-*.md, scenarios/T-0627-*.md) per the manual-first rule.
  */
 import { renderToStaticMarkup } from "react-dom/server";
 import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
-import { ObservabilityView } from "./ObservabilityPanel";
+import {
+  fetchFleetModel,
+  ObservabilityView,
+  pauseOperator,
+  resumeOperator,
+  setFleetModel,
+} from "./ObservabilityPanel";
 import type { Transparency as TransparencyData } from "../api";
 
 // Mirrors the real bot-squad state observed 2026-06-27 (operator-state absent,
@@ -49,7 +63,7 @@ const REAL_DERIVED: TransparencyData = {
       pinned: true,
     } as TransparencyData["sessions"][number],
     // T-0593: the live payload is ~97% suspended/archived history — the panel
-    // must keep those OUT of the live who-does-what (caught on the manual
+    // must keep those OUT of the LIVE SESSIONS count (caught on the manual
     // walkthrough: a straight port read "LIVE SESSIONS 341").
     {
       sid: "S-almdudleer-dead-worker-p1",
@@ -89,41 +103,45 @@ function renderView(data: TransparencyData): string {
 }
 
 describe("ObservabilityView", () => {
-  test("renders the summary strip + detail sections, live-only, no backlog", () => {
+  test("renders the slimmed summary strip + operator state-doc, no dead sections", () => {
     const html = renderView(REAL_DERIVED);
 
-    // Summary strip: quota cards + the live-session count.
+    // Summary strip: IN PROGRESS, RE-DRIVE (now a control), LIVE SESSIONS.
     expect(html).toContain("IN PROGRESS");
     expect(html).toContain("RE-DRIVE");
-    expect(html).toContain("INITIATIVE PACE");
     expect(html).toContain("LIVE SESSIONS");
 
-    // Quota: paused + unlimited cap (∞) + in_progress count.
+    // Quota: paused + unlimited cap (∞) + in_progress count. Pause control
+    // shows a "Resume" button (initial synchronous state from quota.paused).
     expect(html).toContain("PAUSED");
     expect(html).toContain("20 / ∞");
+    expect(html).toContain("Resume");
 
-    // Live count = 2 (the archived/suspended row is filtered out).
-    expect(html).toContain("Who does what (2)");
-    expect(html).not.toContain("S-almdudleer-dead-worker-p1");
-
-    // Session tree: both live rows, the pinned marker, a task deep-link, and
-    // the pointer to the full history on the Processes page.
-    expect(html).toContain("S-almdudleer-lifecycle-roles-p235");
-    expect(html).toContain("📌");
-    expect(html).toContain("/p/bot-squad/t/T-0511");
+    // Live count = 2 (the archived/suspended row is filtered out) surfaces on
+    // the LIVE SESSIONS card, which links to the Processes page — the
+    // who-does-what table itself died (T-0627; Processes owns session rows).
+    expect(html).toContain(">2<");
     expect(html).toContain("/p/bot-squad/sessions");
+    expect(html).not.toContain("Who does what");
+    expect(html).not.toContain("S-almdudleer-lifecycle-roles-p235");
+
+    // INITIATIVE PACE card and Scheduler section died (T-0627 — Vision page
+    // and /system-settings own those facts respectively).
+    expect(html).not.toContain("INITIATIVE PACE");
+    expect(html).not.toContain("Scheduler");
+    expect(html).not.toContain("configured initiatives");
 
     // Operator state-doc absent → degrade notice (not a markdown body).
     expect(html).toContain("hasn&#x27;t written a state-doc yet");
     expect(html).toContain("artifacts/operator-state.md");
 
-    // The backlog counts section DIED (T-0588a) — the board below IS the
-    // backlog and CanonicalSummary shows the counts.
+    // The backlog counts section stays dead (T-0588a) — the board below IS
+    // the backlog and the column kickers show the counts.
     expect(html).not.toContain("Backlog");
     expect(html).not.toContain("423");
   });
 
-  test("renders the state-doc body when present, and RUNNING when not paused", () => {
+  test("renders the state-doc body when present, and RUNNING (Pause button) when not paused", () => {
     const html = renderView({
       ...REAL_DERIVED,
       operator_state: {
@@ -137,6 +155,123 @@ describe("ObservabilityView", () => {
     expect(html).toContain("Ship the transparency surface.");
     expect(html).toContain("RUNNING");
     expect(html).toContain("20 / 13");
+    expect(html).toContain("Pause");
     expect(html).not.toContain("hasn&#x27;t written a state-doc yet");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-0620/T-0630 operator controls — happy/error/unavailable paths against a
+// mocked api client. No DOM/click simulation needed: the component handlers
+// are thin wrappers over these exported pure async functions.
+// ---------------------------------------------------------------------------
+describe("fetchFleetModel", () => {
+  test("ok: returns the current model", async () => {
+    const outcome = await fetchFleetModel(
+      { getWorkerModel: async () => ({ model: "claude-sonnet-5" }) },
+      "bot-squad",
+    );
+    expect(outcome).toEqual({ kind: "ok", data: { model: "claude-sonnet-5" } });
+  });
+
+  test("unavailable: a 404 (route not deployed yet) degrades gracefully, not an error", async () => {
+    const outcome = await fetchFleetModel(
+      {
+        getWorkerModel: async () => {
+          throw new Error("API error 404: not found");
+        },
+      },
+      "bot-squad",
+    );
+    expect(outcome).toEqual({ kind: "unavailable" });
+  });
+
+  test("error: a non-404 failure surfaces as an error", async () => {
+    const outcome = await fetchFleetModel(
+      {
+        getWorkerModel: async () => {
+          throw new Error("API error 500: worker unreachable");
+        },
+      },
+      "bot-squad",
+    );
+    expect(outcome.kind).toBe("error");
+    expect((outcome as { message: string }).message).toContain("500");
+  });
+});
+
+describe("setFleetModel", () => {
+  test("ok: echoes back the saved model", async () => {
+    const outcome = await setFleetModel(
+      { putWorkerModel: async (_slug, model) => ({ model }) },
+      "bot-squad",
+      "claude-opus-4-8",
+    );
+    expect(outcome).toEqual({ kind: "ok", data: { model: "claude-opus-4-8" } });
+  });
+
+  test("error: a rejected (non-allowlisted) model surfaces the server message", async () => {
+    const outcome = await setFleetModel(
+      {
+        putWorkerModel: async () => {
+          throw new Error("API error 400: model not in allowlist");
+        },
+      },
+      "bot-squad",
+      "gpt-5",
+    );
+    expect(outcome.kind).toBe("error");
+  });
+});
+
+describe("pauseOperator / resumeOperator", () => {
+  test("pauseOperator ok: returns the pause meta", async () => {
+    const outcome = await pauseOperator(
+      {
+        operatorPause: async (_slug, reason) => ({
+          ok: true,
+          paused: { paused_by: "almdudleer", reason: reason ?? "", paused_at: 1_700_000_000 },
+          was_already_paused: false,
+        }),
+      },
+      "bot-squad",
+      "hit a rate limit",
+    );
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      expect(outcome.data.paused.reason).toBe("hit a rate limit");
+    }
+  });
+
+  test("pauseOperator unavailable: 404 before T-0630 lands", async () => {
+    const outcome = await pauseOperator(
+      {
+        operatorPause: async () => {
+          throw new Error("API error 404: not found");
+        },
+      },
+      "bot-squad",
+    );
+    expect(outcome).toEqual({ kind: "unavailable" });
+  });
+
+  test("resumeOperator ok: reports was_paused", async () => {
+    const outcome = await resumeOperator(
+      { operatorResume: async () => ({ ok: true, was_paused: true }) },
+      "bot-squad",
+    );
+    expect(outcome).toEqual({ kind: "ok", data: { ok: true, was_paused: true } });
+  });
+
+  test("resumeOperator error: a non-404 failure surfaces inline", async () => {
+    const outcome = await resumeOperator(
+      {
+        operatorResume: async () => {
+          throw new Error("API error 403: not a project member");
+        },
+      },
+      "bot-squad",
+    );
+    expect(outcome.kind).toBe("error");
   });
 });

@@ -28,12 +28,7 @@ import {
 } from "../onboarding/copy";
 
 import { PageHelp } from "../components/PageHelp";
-import {
-  CANONICAL_LABELS,
-  CANONICAL_STATE,
-  CANONICAL_STATES,
-  type CanonicalState,
-} from "../canonicalStatus";
+import { CANONICAL_LABELS, CANONICAL_STATE } from "../canonicalStatus";
 // T-0479: column order tracks the canonical 4-state model (backlog →
 // in-progress → validating → done), so the internal statuses that roll up into
 // the same canonical state sit adjacent. backlog = planned/open/reopened;
@@ -71,40 +66,6 @@ export function buildNesting(tasks: Task[]): {
     }
   }
   return { subtasksByParent, nestedChildIds };
-}
-
-// T-0479: tally the visible tasks into the canonical 4 states.
-function canonicalCounts(tasks: Task[]): Record<CanonicalState, number> {
-  const acc: Record<CanonicalState, number> = {
-    backlog: 0,
-    "in-progress": 0,
-    validating: 0,
-    done: 0,
-  };
-  for (const t of tasks) {
-    const cs = CANONICAL_STATE[t.status as keyof typeof CANONICAL_STATE];
-    if (cs) acc[cs] += 1;
-  }
-  return acc;
-}
-
-// T-0479: the canonical 4-state overview strip shown above the board. Presents
-// the stakeholder's model (backlog → in-progress → validating → done) with the
-// internal statuses grouped beneath it in the columns themselves.
-function CanonicalSummary({ counts }: { counts: Record<CanonicalState, number> }) {
-  return (
-    <div className="mc-canon-summary" role="list" aria-label="Canonical task states">
-      {CANONICAL_STATES.map((cs, i) => (
-        <div key={cs} className="mc-canon-pill" role="listitem">
-          <span className="mc-canon-pill-label">{CANONICAL_LABELS[cs]}</span>
-          <span className="mc-canon-pill-count">{counts[cs]}</span>
-          {i < CANONICAL_STATES.length - 1 && (
-            <span className="mc-canon-pill-arrow" aria-hidden>→</span>
-          )}
-        </div>
-      ))}
-    </div>
-  );
 }
 
 type ModalKind = "create" | "editBody" | "addComment" | "setInitiative" | null;
@@ -820,11 +781,6 @@ export function Project() {
         </div>
       </div>
 
-      {groupBy === "none" && (
-        // T-0479: the canonical 4-state model (backlog → in-progress →
-        // validating → done) surfaced above the richer 6-status columns.
-        <CanonicalSummary counts={canonicalCounts(ungroupedTasks)} />
-      )}
       {groupBy === "none" ? (
         viewMode === "board" ? (
           <div className="mc-board-row mt-1">

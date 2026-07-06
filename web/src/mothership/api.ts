@@ -27,11 +27,14 @@ import type {
   AutopilotConfig,
   AutopilotStatus,
   CreateTaskBody,
+  OperatorPauseResult,
+  OperatorResumeResult,
   Project,
   ProjectApi,
   Task,
   TelemetryResponse,
   VisionFile,
+  WorkerModel,
 } from "../api";
 import { normalizeSessionsPayload } from "../api";
 
@@ -600,6 +603,24 @@ export function apiFor(serverId: string): ServerApi {
         `/api/projects/${slug}/autopilot/stop`,
         { method: "POST", body: JSON.stringify(opts) },
       ),
+    // T-0620/T-0630: operator pause/resume + fleet model read/write, mirrors
+    // the singleton in web/src/api.ts.
+    operatorPause: (slug, reason?: string) =>
+      fwd<OperatorPauseResult>(`/api/projects/${slug}/operator/pause`, {
+        method: "POST",
+        body: JSON.stringify(reason ? { reason } : {}),
+      }),
+    operatorResume: (slug) =>
+      fwd<OperatorResumeResult>(`/api/projects/${slug}/operator/resume`, {
+        method: "POST",
+      }),
+    getWorkerModel: (slug) =>
+      fwd<WorkerModel>(`/api/projects/${slug}/worker/model`),
+    putWorkerModel: (slug, model: string) =>
+      fwd<WorkerModel>(`/api/projects/${slug}/worker/model`, {
+        method: "PUT",
+        body: JSON.stringify({ model }),
+      }),
   };
 }
 

@@ -814,6 +814,22 @@ export type Transparency = {
   };
 };
 
+// T-0620/T-0630: web operator controls — pause/resume the re-drive tick and
+// read/change the fleet default model. Thin wrappers over the operator_pause/
+// operator_resume/fleet_model_get/fleet_model_set worker actions (T-0474/
+// T-0630); the response shapes mirror those actions' return values verbatim.
+export type OperatorPauseResult = {
+  ok: boolean;
+  paused: { paused_by: string; reason: string; paused_at: number };
+  was_already_paused: boolean;
+};
+export type OperatorResumeResult = {
+  ok: boolean;
+  was_paused: boolean;
+};
+// "" = no override — the fleet falls back to its built-in default.
+export type WorkerModel = { model: string };
+
 // T-0365: the project list drives the landing Picker, the switch-project
 // dropdown, and HomeRedirect — each fetched /api/projects independently, so the
 // list reloaded (and flashed blank) on every visit. `api.projects()` now
@@ -887,6 +903,27 @@ export const api = {
   // `api` (like analytics) — single-install, not proxied through mothership.
   transparency: (slug: string) =>
     call<Transparency>(`/api/projects/${slug}/transparency`),
+  // T-0620/T-0630: pause takes effect immediately on the 60s re-drive tick;
+  // `reason` is optional (surfaced back on the paused-state read). Resume is
+  // idempotent no-op if not paused.
+  operatorPause: (slug: string, reason?: string) =>
+    call<OperatorPauseResult>(`/api/projects/${slug}/operator/pause`, {
+      method: "POST",
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
+  operatorResume: (slug: string) =>
+    call<OperatorResumeResult>(`/api/projects/${slug}/operator/resume`, {
+      method: "POST",
+    }),
+  // T-0630: fleet default model, read+write against the allowlisted set
+  // (`""` clears the override → builtin default). PUT is admin-only server-side.
+  getWorkerModel: (slug: string) =>
+    call<WorkerModel>(`/api/projects/${slug}/worker/model`),
+  putWorkerModel: (slug: string, model: string) =>
+    call<WorkerModel>(`/api/projects/${slug}/worker/model`, {
+      method: "PUT",
+      body: JSON.stringify({ model }),
+    }),
   login: (username: string, password: string) =>
     call("/api/auth/login", {
       method: "POST",
@@ -1288,4 +1325,8 @@ export type ProjectApi = Pick<
   | "autopilotStatus"
   | "autopilotStart"
   | "autopilotStop"
+  | "operatorPause"
+  | "operatorResume"
+  | "getWorkerModel"
+  | "putWorkerModel"
 >;

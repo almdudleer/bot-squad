@@ -1,24 +1,112 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, SystemSettings as Settings } from "../api";
+import { api, SchedulerJob, SchedulerState, SystemSettings as Settings } from "../api";
 import { Modal } from "../components/Modal";
-// T-0339: CapMeter moved to the shared ResourceCapsPanel so the admin caps view
-// and the new process-view caps panel render the SAME bar (no drift).
-import { CapMeter } from "../components/ResourceCapsPanel";
 import { Coachmark } from "../onboarding";
-import {
-  PARALLEL_SESSION_CEILING,
-  ProjectUtilization,
-  aggregateUtilization,
-  capInputError,
-  capSoftWarning,
-  isOverCap,
-  sanitizeCapInput,
-} from "./resourceCaps";
 
 const TTL_RE = /^\d+[smhd]$/;
 // T-0194: socks5(h)/http(s) — mirrors the API's _PROXY_RE. Empty = direct.
 const PROXY_RE = /^(socks5h?|https?):\/\/.+/i;
+
+function fmtFuture(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const ts = Date.parse(iso);
+  if (isNaN(ts)) return "—";
+  const diff = Math.floor((ts - Date.now()) / 1000);
+  if (diff < 0) return "now";
+  if (diff < 60) return `in ${diff}s`;
+  if (diff < 3600) return `in ${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `in ${Math.floor(diff / 3600)}h`;
+  return `in ${Math.floor(diff / 86400)}d`;
+}
+
+/**
+ * Pure render of the job list — no fetch, no heartbeat (WorkerHealthPill
+ * owns worker health, D-0056). Exported so it can be unit-tested directly.
+ */
+export function SchedulerJobsView({ jobs }: { jobs: SchedulerJob[] }) {
+  if (jobs.length === 0) {
+    return (
+      <div className="text-muted" style={{ fontSize: "0.82rem" }}>
+        No scheduled jobs.
+      </div>
+    );
+  }
+  return (
+    <table className="table table-sm mc-table" style={{ fontSize: "0.78rem" }}>
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Trigger</th>
+          <th>Next run</th>
+        </tr>
+      </thead>
+      <tbody>
+        {jobs.map((job) => (
+          <tr key={job.id}>
+            <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.74rem" }}>{job.id}</td>
+            <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.74rem", color: "var(--mc-text-dim)" }}>
+              {job.trigger}
+            </td>
+            <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.74rem", color: "var(--mc-text-dim)" }}>
+              <span title={job.next_run ?? undefined}>{fmtFuture(job.next_run)}</span>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/**
+ * Relocated from ObservabilityPanel (D-0056/T-0629, T-0627 removed it there) —
+ * system-level job facts belong on the admin surface, not the per-project
+ * home. Own fetch + 30s poll (matches the old panel's cadence) so a scheduler
+ * hiccup can't blank the rest of the settings form.
+ */
+function SchedulerJobsSection() {
+  const [state, setState] = useState<SchedulerState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      api
+        .scheduler()
+        .then((s) => {
+          if (!cancelled) {
+            setState(s);
+            setError(null);
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) setError(String(e));
+        });
+    load();
+    const id = setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  return (
+    <details className="mb-4" data-testid="scheduler-jobs">
+      <summary style={{ fontSize: "0.85rem", fontWeight: 600, cursor: "pointer" }}>
+        Scheduler jobs
+      </summary>
+      <div style={{ marginTop: "0.5rem" }}>
+        {error && (
+          <div className="text-muted" style={{ fontSize: "0.85rem" }}>
+            Scheduler state unavailable: {error}
+          </div>
+        )}
+        {state === null && !error && <div className="mc-loading">Loading scheduler state</div>}
+        {state && <SchedulerJobsView jobs={state.jobs} />}
+      </div>
+    </details>
+  );
+}
 
 export function SystemSettings() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -37,31 +125,6 @@ export function SystemSettings() {
   const [ttl, setTtl] = useState<string>("7d");
   const [coordUser, setCoordUser] = useState<string>("");
 
-  // T-0240: resource caps + live server-wide utilization (Task-Manager style).
-  // T-0310: caps are held as raw STRINGS so we can tell an empty field (invalid)
-  // apart from an explicit "0" (= unlimited) — the old number state coerced both
-  // to 0 and silently uncapped the system on a cleared field.
-  const [maxParallel, setMaxParallel] = useState<string>("0");
-  const [maxTokens, setMaxTokens] = useState<string>("0");
-  const [util, setUtil] = useState<{ liveSessions: number; totalTokens: number } | null>(null);
-
-  // T-0310: derived numeric caps (null = empty/invalid) + inline validation.
-  const parallelNum = maxParallel.trim() === "" ? null : Number.parseInt(maxParallel, 10);
-  const tokensNum = maxTokens.trim() === "" ? null : Number.parseInt(maxTokens, 10);
-  const parallelErr = capInputError(maxParallel, "Max parallel sessions");
-  const tokensErr = capInputError(maxTokens, "Max total tokens");
-  const parallelWarn =
-    parallelNum === null
-      ? null
-      : capSoftWarning(parallelNum, PARALLEL_SESSION_CEILING, "Max parallel sessions");
-  // T-0306: the token cap is enforced at spawn-time as a per-quota-period budget
-  // (output since the last anchor) that FREES on re-anchor. The meter below sums
-  // the LIFETIME cumulative counter — the only token figure the telemetry API
-  // exposes to the FE today — so treat over-cap here as "at/over the budget"
-  // (an upper bound on the per-period figure the cap actually checks).
-  const tokensOverCap =
-    util !== null && tokensNum !== null && isOverCap(util.totalTokens, tokensNum);
-
   function load() {
     setError(null);
     api
@@ -74,35 +137,12 @@ export function SystemSettings() {
         setProxyUrl(s.tg.proxy_url);
         setTtl(s.session.ttl);
         setCoordUser(s.admin.coordinator_user);
-        setMaxParallel(String(s.caps.max_parallel_sessions));
-        setMaxTokens(String(s.caps.max_total_tokens));
       })
       .catch((e) => setError(String(e)));
   }
 
-  // T-0240: caps are a server-wide policy but the sessions/telemetry endpoints
-  // are project-scoped, so fan out over projects and aggregate. A failed
-  // per-project fetch contributes 0 (null slot) rather than sinking the readout.
-  function loadUtilization() {
-    api
-      .projects()
-      .then(async (projects) => {
-        const perProject: ProjectUtilization[] = await Promise.all(
-          projects.map(async (p) => ({
-            sessions: await api.sessions(p.slug).catch(() => null),
-            telemetry: await api.telemetry(p.slug).catch(() => null),
-          })),
-        );
-        setUtil(aggregateUtilization(perProject));
-      })
-      .catch(() => {
-        /* utilization is best-effort; leave it null (renders "—") on failure */
-      });
-  }
-
   useEffect(() => {
     load();
-    loadUtilization();
     api
       .me()
       .then((m) => setIsAdmin(Boolean(m.is_admin)))
@@ -126,13 +166,6 @@ export function SystemSettings() {
     }
     if (!coordUser.trim()) {
       return "coordinator linux user must not be empty";
-    }
-    // T-0240/T-0310: caps are non-negative ints; 0 = unlimited. An empty field
-    // is rejected (it must not silently uncap the system). Soft over-ceiling is
-    // a warning only, so it does NOT block Save.
-    const capErr = parallelErr ?? tokensErr;
-    if (capErr !== null) {
-      return capErr;
     }
     return null;
   }
@@ -165,20 +198,11 @@ export function SystemSettings() {
         },
         session: { ttl },
         admin: { coordinator_user: coordUser.trim() },
-        // T-0240/T-0310: resource caps (non-negative ints, 0 = unlimited).
-        // validate() guarantees both are present + valid by this point.
-        caps: { max_parallel_sessions: parallelNum ?? 0, max_total_tokens: tokensNum ?? 0 },
       };
       const result = await api.putSystemSettings(body);
       setSettings(result);
-      setMaxParallel(String(result.caps.max_parallel_sessions));
-      setMaxTokens(String(result.caps.max_total_tokens));
       setBotToken("");
-      setNotice(
-        result.restart_required
-          ? "Saved. Restart the worker for changes (incl. resource caps) to take effect."
-          : "Saved.",
-      );
+      setNotice(result.restart_required ? "Saved. Restart the worker for changes to take effect." : "Saved.");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -415,132 +439,33 @@ export function SystemSettings() {
             </small>
           </section>
 
-          {/* T-0240: resource caps — Task-Manager-style view + set of the
-              parallel-session / token caps, with live server-wide utilization.
-              Caps are admin-settable; the worker enforces them at spawn-time
-              (parallel: T-0239 slice 2; tokens: T-0306, a per-quota-period budget
-              that frees on anchor reset). 0 = unlimited. */}
+          {/* D-0056 (T-0629): the caps meters + admin inputs moved to
+              ResourceCapsPanel on each project's Processes page (T-0339 chose
+              that home) — this page keeps only a pointer so the fact has one
+              home instead of two. */}
           <section className="mb-4" data-testid="resource-caps">
             <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>
               Resource caps
             </h3>
-
-            <div style={{ maxWidth: "26rem", marginBottom: "0.9rem" }}>
-              <CapMeter
-                label="Parallel sessions (live)"
-                used={util ? util.liveSessions : null}
-                cap={parallelNum ?? 0}
-              />
-              <CapMeter
-                label="Total tokens (output, cumulative)"
-                used={util ? util.totalTokens : null}
-                cap={tokensNum ?? 0}
-              />
-              {/* T-0306: the token cap IS enforced at spawn-time (commit dd55951,
-                  "semantics B") as a budget for the current quota period — output
-                  tokens since the last [quota] anchor — that FREES when the
-                  operator re-anchors (rebases the baseline). The meter above sums
-                  the LIFETIME cumulative output counter (the only token figure the
-                  telemetry API exposes to the FE today), so it is an upper bound on
-                  the per-period budget the cap actually checks. BE follow-up:
-                  surface the since-anchor output total so the bar matches
-                  enforcement exactly. */}
-              <small style={{ display: "block", color: "var(--mc-text-dim)", fontSize: "0.68rem" }}>
-                The token cap is <strong>enforced at spawn-time</strong> as a budget
-                for the current quota period (output tokens since the last anchor)
-                and <strong>frees when the anchor is reset</strong>. The bar shows
-                lifetime cumulative output — an upper bound on the per-period figure
-                the cap checks.
-              </small>
-              {tokensOverCap && (
-                <div
-                  className="alert alert-warning py-1 px-2 mt-2 mb-0"
-                  data-testid="cap-tokens-over"
-                  style={{ fontSize: "0.7rem" }}
-                >
-                  ⚠ Cumulative output has passed the cap. Spawns are refused once
-                  the per-period budget (output since the last anchor) reaches the
-                  cap; the budget frees on the next anchor reset, or raise the cap
-                  (0 = unlimited).
-                </div>
-              )}
+            <div className="alert alert-secondary py-2" style={{ fontSize: "0.8rem", marginBottom: 0 }}>
+              Resource caps (parallel sessions, token budget) are viewed and set
+              on each project&apos;s <Link to="/">Processes page</Link> (Resources
+              &amp; quota panel) — pick a project from the home picker.
             </div>
-
-            <div className="d-flex gap-3 align-items-start flex-wrap">
-              <div>
-                <label htmlFor="ss-cap-parallel" className="form-label" style={{ fontSize: "0.72rem" }}>
-                  Max parallel sessions
-                </label>
-                {/* T-0310: text input + digit-only sanitiser so a typed minus/
-                    decimal can't be held; empty stays empty (≠ 0). */}
-                <input
-                  id="ss-cap-parallel"
-                  type="text"
-                  inputMode="numeric"
-                  className="form-control"
-                  data-testid="cap-parallel"
-                  value={maxParallel}
-                  disabled={!isAdmin}
-                  aria-invalid={parallelErr !== null}
-                  onChange={(e) => setMaxParallel(sanitizeCapInput(e.target.value))}
-                  style={{ width: "9rem" }}
-                />
-                {parallelErr && (
-                  <div data-testid="cap-parallel-error" style={{ color: "var(--mc-accent-danger, #d33)", fontSize: "0.68rem", marginTop: 2, maxWidth: "11rem" }}>
-                    {parallelErr}
-                  </div>
-                )}
-                {!parallelErr && parallelWarn && (
-                  <div data-testid="cap-parallel-warn" style={{ color: "var(--mc-accent-warn, #e0a000)", fontSize: "0.68rem", marginTop: 2, maxWidth: "11rem" }}>
-                    {parallelWarn}
-                  </div>
-                )}
-              </div>
-              <div>
-                <label htmlFor="ss-cap-tokens" className="form-label" style={{ fontSize: "0.72rem" }}>
-                  Max total tokens
-                </label>
-                <input
-                  id="ss-cap-tokens"
-                  type="text"
-                  inputMode="numeric"
-                  className="form-control"
-                  data-testid="cap-tokens"
-                  value={maxTokens}
-                  disabled={!isAdmin}
-                  aria-invalid={tokensErr !== null}
-                  onChange={(e) => setMaxTokens(sanitizeCapInput(e.target.value))}
-                  style={{ width: "11rem" }}
-                />
-                {tokensErr && (
-                  <div data-testid="cap-tokens-error" style={{ color: "var(--mc-accent-danger, #d33)", fontSize: "0.68rem", marginTop: 2, maxWidth: "11rem" }}>
-                    {tokensErr}
-                  </div>
-                )}
-              </div>
-            </div>
-            <small style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.35rem" }}>
-              <strong>0 = unlimited.</strong> Caps the simultaneously-live sessions
-              and the per-quota-period output-token budget the system allows. Both
-              are enforced at spawn-time; the token budget frees on anchor reset.
-              Restart the worker after saving.{!isAdmin && " Admin-only."}
-            </small>
-            {/* T-0339: caps are now also surfaced + settable in each project's
-                process (sessions) view — the operator's Task-Manager home per
-                the reframe. This admin page remains the underlying enforcement
-                config. */}
-            <small style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
-              These caps (and the budget-anchor status) are also surfaced and
-              settable in each project&apos;s <strong>process view</strong> (the
-              Agent-sessions page) — the operator-facing Task-Manager home.
-            </small>
           </section>
+
+          {/* D-0056 (T-0629): the scheduler job table relocates here from the
+              project home's ObservabilityPanel (lane A, T-0627) — system-level
+              facts live on the admin surface, not the per-project one. No
+              heartbeat dot: WorkerHealthPill (Shell) already owns worker
+              health. */}
+          <SchedulerJobsSection />
 
           <button
             type="button"
             className="btn btn-primary"
             onClick={save}
-            disabled={saving || parallelErr !== null || tokensErr !== null}
+            disabled={saving}
           >
             {saving ? "Saving…" : "Save"}
           </button>

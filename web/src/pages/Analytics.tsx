@@ -119,69 +119,11 @@ function BarChart({
   );
 }
 
-/** Horizontal breakdown of a status→count map. */
-function StatusBreakdown({
-  title,
-  counts,
-  palette,
-  scope,
-}: {
-  title: string;
-  counts: Record<string, number>;
-  palette: Record<string, string>;
-  scope?: string;
-}) {
-  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-  const max = Math.max(1, ...entries.map(([, c]) => c));
-  return (
-    <div className="mc-an-chart">
-      <div className="mc-an-chart-head">
-        <span>{title}{scope && <> · <ScopeLabel scope={scope} /></>}</span>
-      </div>
-      <div className="mc-an-status-list">
-        {entries.length === 0 && <div className="mc-an-card-sub">no data</div>}
-        {entries.map(([k, c]) => (
-          <div className="mc-an-status-row" key={k}>
-            <span className="mc-an-status-name">{k}</span>
-            <span className="mc-an-status-track">
-              <span
-                className="mc-an-status-fill"
-                style={{
-                  width: `${(c / max) * 100}%`,
-                  background: palette[k] ?? "var(--mc-text-dim)",
-                }}
-              />
-            </span>
-            <span className="mc-an-status-count">{c}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const TICKET_PALETTE: Record<string, string> = {
-  closed: "var(--mc-green)",
-  totest: "var(--mc-cyan)",
-  in_progress: "var(--mc-amber)",
-  reopened: "var(--mc-red)",
-  open: "var(--mc-text-dim)",
-  planned: "var(--mc-text-faint)",
-};
-
 // T-0340: the canonical liveness vocabulary is live | suspended (archived is
-// an orthogonal flag shown parenthetically). The breakdown rolls the raw md
-// statuses up to that category so the chart can't disagree with the headline
-// "N live · M suspended" — see livenessRollup below.
-const SESSION_PALETTE: Record<string, string> = {
-  live: "var(--mc-green)",
-  suspended: "var(--mc-text-dim)",
-};
-
-// Roll the per-status session counts up to the canonical liveness category
-// (T-0340). `live` sums the LIVE_STATUSES (active + paused); everything else
-// that isn't archived is `suspended`. Keyed identically to SESSION_PALETTE so
-// the "Sessions by status" breakdown and the headline read off ONE truth.
+// an orthogonal flag shown parenthetically).
+// Roll the per-status session counts up to that category. `live` sums the
+// LIVE_STATUSES (active + paused); everything else that isn't archived is
+// `suspended`.
 function livenessRollup(byStatus: Record<string, number>): {
   live: number;
   suspended: number;
@@ -278,9 +220,8 @@ export function Analytics() {
               // suspended === total. `archived` is an orthogonal frontmatter
               // flag (a subset that mostly overlaps suspended), so it stays a
               // parenthetical annotation rather than a third additive bucket.
-              // "live" is the SAME word the sidebar/Sessions board use, and the
-              // count rolls up via livenessRollup so it can't disagree with the
-              // "Sessions by status" breakdown below. (T-0256 / T-0340)
+              // "live" is the SAME word the sidebar/Sessions board use.
+              // (T-0256 / T-0340)
               sub={(() => {
                 const { live, suspended } = livenessRollup(
                   data.sessions.by_status,
@@ -345,21 +286,6 @@ export function Analytics() {
                 tip: `${w.week}: ${w.ok} ok, ${w.fail} fail`,
               }))}
               color="var(--mc-amber)"
-            />
-          </div>
-
-          <div className="mc-an-grid">
-            <StatusBreakdown
-              title="Tickets by status"
-              scope="all-time"
-              counts={data.tickets.by_status}
-              palette={TICKET_PALETTE}
-            />
-            <StatusBreakdown
-              title="Processes by liveness"
-              scope="all-time"
-              counts={livenessRollup(data.sessions.by_status)}
-              palette={SESSION_PALETTE}
             />
           </div>
         </>

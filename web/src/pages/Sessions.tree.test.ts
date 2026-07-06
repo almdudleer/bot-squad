@@ -203,3 +203,46 @@ describe("buildSessionTree task-less nesting (T-0222)", () => {
     expect(out.map((e) => e.row.sid).sort()).toEqual(["S-test-a-p0", "S-test-b-p1"]);
   });
 });
+
+describe("T-0628 (D-0056): pinned roots sort first — Pinned-table merge", () => {
+  test("a pinned dev root floats ahead of the operator/TL/rest tiers", () => {
+    const operator = tl({ sid: "S-test-op-p0", window: "operator", role: "operator" });
+    const lead = tl({ sid: "S-test-tl-p0", role: "teamlead" });
+    // An orphan dev root (no traceable TL) that happens to be pinned.
+    const pinnedDev = dev({ sid: "S-test-dev-p1", task_id: "T-0001", pinned: true });
+    const out = buildSessionTree([operator, lead, pinnedDev], new Map());
+    const rootSids = out.filter((e) => e.level === 0).map((e) => e.row.sid);
+    expect(rootSids).toEqual(["S-test-dev-p1", "S-test-op-p0", "S-test-tl-p0"]);
+  });
+
+  test("unpinned roots keep the existing operator → TL → rest ordering (no regression)", () => {
+    const operator = tl({ sid: "S-test-op-p0", window: "operator", role: "operator" });
+    const lead = tl({ sid: "S-test-tl-p0", role: "teamlead" });
+    const rest = tl({ sid: "S-test-rest-p2", window: "rest", role: "dev" });
+    const out = buildSessionTree([rest, lead, operator], new Map());
+    const rootSids = out.filter((e) => e.level === 0).map((e) => e.row.sid);
+    expect(rootSids).toEqual(["S-test-op-p0", "S-test-tl-p0", "S-test-rest-p2"]);
+  });
+
+  test("among several pinned roots, the role tiers still order them relative to each other", () => {
+    const pinnedRest = tl({ sid: "S-test-rest-p2", window: "rest", role: "dev", pinned: true });
+    const pinnedLead = tl({ sid: "S-test-tl-p0", role: "teamlead", pinned: true });
+    const unpinnedOperator = tl({ sid: "S-test-op-p0", window: "operator", role: "operator" });
+    const out = buildSessionTree([unpinnedOperator, pinnedRest, pinnedLead], new Map());
+    const rootSids = out.filter((e) => e.level === 0).map((e) => e.row.sid);
+    // Both pinned roots (TL tier ahead of rest tier) come before the unpinned operator.
+    expect(rootSids).toEqual(["S-test-tl-p0", "S-test-rest-p2", "S-test-op-p0"]);
+  });
+
+  test("a pinned CHILD stays nested under its parent — only root ordering changes", () => {
+    const lead = tl({ sid: "S-test-tl-p0", role: "teamlead" });
+    const pinnedChild = dev({
+      sid: "S-test-dev-p1",
+      task_id: "T-0001",
+      parent_sid: "S-test-tl-p0",
+      pinned: true,
+    });
+    const out = buildSessionTree([lead, pinnedChild], new Map());
+    expect(out.find((e) => e.row.sid === "S-test-dev-p1")?.level).toBe(1);
+  });
+});

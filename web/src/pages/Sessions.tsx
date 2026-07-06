@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useRef, useState, useCallback, Fragment } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 // Link kept for session SID links and task links inside the table
-import type { SessionRow, Task, VisionFile, WorkerFanoutError } from "../api";
+import type {
+  SessionRow,
+  Task,
+  TelemetryResponse,
+  TelemetrySession,
+  VisionFile,
+  WorkerFanoutError,
+} from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
@@ -18,7 +25,6 @@ import {
 import { PageHelp } from "../components/PageHelp";
 import { PeerInbox } from "../components/PeerInbox";
 import { ResourceCapsPanel } from "../components/ResourceCapsPanel";
-import { TelemetryPanel } from "../components/TelemetryPanel";
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -82,6 +88,70 @@ function AwaitingInputBadge({ row }: { row: SessionRow }) {
     >
       ⏳ Awaiting input
     </span>
+  );
+}
+
+// T-0628 (D-0056): TelemetryPanel dissolves — per-session context-token usage
+// joins the main table as a cell on live rows instead of a second
+// session-keyed table. Bucket a context % into the ok/warn/danger vocabulary
+// TelemetryPanel used (carried over verbatim so the meaning doesn't drift).
+export function contextBadgeKind(pct: number): "ok" | "warn" | "danger" {
+  if (pct >= 100) return "danger";
+  if (pct >= 80) return "warn";
+  return "ok";
+}
+
+// Roll large token counts into k/M/B tiers (T-0267, carried over from the
+// dissolved TelemetryPanel.fmtTokens).
+export function fmtContextTokens(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e11 ? 0 : 1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e8 ? 0 : 1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+// T-0264 (carried over): normalize every row's bar + % to the single,
+// caller-supplied ceiling (the max ceiling across sampled sessions) rather
+// than the row's own possibly-stale context.ceiling, so bars share one
+// denominator. Rows with no telemetry sample yet (not live, or worker hasn't
+// ticked) render a dim placeholder rather than a misleading empty bar.
+function ContextCell({
+  telemetry,
+  ceiling,
+}: {
+  telemetry: TelemetrySession | undefined;
+  ceiling: number;
+}) {
+  if (!telemetry) {
+    return <span style={{ color: "var(--mc-text-dim)", fontSize: "0.72rem" }}>—</span>;
+  }
+  const pct = ceiling > 0 ? (telemetry.context.tokens / ceiling) * 100 : 0;
+  const kind = contextBadgeKind(pct);
+  const barColor =
+    kind === "danger" ? "var(--mc-danger, #d33)"
+      : kind === "warn" ? "var(--mc-warn, #e0a000)"
+        : "var(--mc-ok, #3a8)";
+  return (
+    <div
+      style={{ minWidth: 96 }}
+      title={`${telemetry.context.tokens.toLocaleString()} / ${ceiling.toLocaleString()} tokens`}
+    >
+      <div
+        style={{
+          position: "relative", height: 6, borderRadius: 2,
+          background: "var(--mc-border)", overflow: "hidden",
+        }}
+      >
+        <div style={{
+          position: "absolute", inset: 0, width: `${Math.min(100, pct)}%`,
+          background: barColor,
+        }} />
+      </div>
+      <div style={{ fontSize: "0.6rem", color: "var(--mc-muted, #888)", marginTop: 2 }}>
+        {fmtContextTokens(telemetry.context.tokens)} · {Math.round(pct)}%
+        {telemetry.rate_limited && <span title="hit a 429"> 🚫</span>}
+      </div>
+    </div>
   );
 }
 
@@ -328,7 +398,17 @@ export function buildSessionTree(
     if (role === "teamlead" || role === "prod-teamlead") return 1;
     return 2;
   };
-  roots.sort((a, b) => rootRank(a) - rootRank(b));
+  // T-0628 (D-0056): the Pinned section (a duplicate session-keyed table)
+  // dissolves — a pinned root instead floats to the top of the root list,
+  // ahead of the operator/TL/rest tiers, so "pin = surfaces first" survives
+  // without a second rendering. The role tiers still order everything else,
+  // and the sort stays stable so unpinned same-rank roots are unaffected.
+  roots.sort((a, b) => {
+    const pa = a.pinned ? 0 : 1;
+    const pb = b.pinned ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    return rootRank(a) - rootRank(b);
+  });
 
   const out: { row: SessionRow; level: number }[] = [];
   const emitted = new Set<string>();
@@ -494,6 +574,35 @@ export function Sessions() {
     const id = setInterval(load, 10_000);
     return () => clearInterval(id);
   }, [load]);
+
+  // T-0210/T-0628 (D-0056): per-session resource telemetry — the dissolved
+  // TelemetryPanel's own poll, same 10s cadence as the sessions list so the
+  // context% cell never lags the row it's attached to.
+  const [telemetry, setTelemetry] = useState<TelemetryResponse | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const loadTelemetry = () => {
+      api
+        .telemetry(slug)
+        .then((d) => { if (!cancelled) setTelemetry(d); })
+        .catch(() => { /* silent — cell just shows "—" until next poll */ });
+    };
+    loadTelemetry();
+    const id = setInterval(loadTelemetry, 10_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [slug, api]);
+  const telemetryBySid = useMemo(() => {
+    const m = new Map<string, TelemetrySession>();
+    for (const s of telemetry?.sessions ?? []) m.set(s.sid, s);
+    return m;
+  }, [telemetry]);
+  // T-0230/T-0264 (carried over): the contract ceiling is tunable and worker-
+  // stamped per session — derive the column's shared denominator from the
+  // payload itself rather than hard-coding it.
+  const contextCeiling = useMemo(
+    () => Math.max(0, ...(telemetry?.sessions ?? []).map((s) => s.context?.ceiling ?? 0)),
+    [telemetry],
+  );
 
   // Initiative list for grouping/filter. Loaded once per slug; cheap to
   // refetch occasionally but we don't need real-time refreshes here.
@@ -669,15 +778,6 @@ export function Sessions() {
   // Split visible vs archived for the two-section layout.
   const visibleSessions: SessionRow[] = (sessions ?? []).filter((s) => !s.archived);
   const archivedSessions: SessionRow[] = (sessions ?? []).filter((s) => !!s.archived);
-
-  // T-0437: pinned sessions surface in a distinct section ABOVE the full tree —
-  // the tree itself stays UNCHANGED (it's the parallelism-observability view the
-  // stakeholder wanted kept). A pinned row therefore appears in both: called out
-  // here, and in context below. Non-archived only (a pin on an archived session
-  // is stale); sorted by most-recently-pinned first.
-  const pinnedSessions: SessionRow[] = visibleSessions
-    .filter((s) => s.pinned)
-    .sort((a, b) => (b.pinned_at ?? "").localeCompare(a.pinned_at ?? ""));
 
   // T-0232 (Pillar A): the main board shows LIVE-only rows (alive in tmux —
   // running/idle/paused). Suspended (non-archived) rows are retained in the
@@ -1023,6 +1123,13 @@ export function Sessions() {
             </div>
           </td>
 
+          {/* Context — T-0628 (D-0056): merged in from the dissolved
+              TelemetryPanel, one cell on the row that already IS this
+              session's home. */}
+          <td>
+            <ContextCell telemetry={telemetryBySid.get(s.sid)} ceiling={contextCeiling} />
+          </td>
+
           {/* Started */}
           <td style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
             {relativeTime(s.started_at)}
@@ -1045,7 +1152,7 @@ export function Sessions() {
             )}
           </td>
         </tr>
-        {isOpen && renderDetailRow(s, 9)}
+        {isOpen && renderDetailRow(s, 10)}
       </Fragment>
     );
   }
@@ -1567,16 +1674,14 @@ export function Sessions() {
         </div>
       </PageHelp>
 
-      {/* T-0210/T-0230: resource telemetry — per-session context/memory/quota
-          for live sessions. Relocated here from the board page (it's per-session
-          resource data, a natural fit alongside the sessions list). */}
-      <TelemetryPanel slug={slug} />
-
       {/* T-0339 (reframe Pillar A item 5 + T-0306): consolidated caps/budget
           control — the operator's Task-Manager limits surfaced RIGHT IN the
           process view where you watch and constrain the brain, instead of buried
           in server admin. Read+set affordance here; server-level enforcement
-          (worker spawn-time checks) stays the source of truth underneath. */}
+          (worker spawn-time checks) stays the source of truth underneath.
+          T-0628 (D-0056): TelemetryPanel's header facts (429 badge, burn
+          rate) merged in here too — ONE resources panel instead of two;
+          its per-session rows joined the main table as the Context column. */}
       <ResourceCapsPanel slug={slug} />
 
       {/* Errors */}
@@ -1800,55 +1905,10 @@ export function Sessions() {
         </div>
       )}
 
-      {/* T-0437: Pinned section — sessions the user works closely with, called
-          out above the full tree. The tree below is unchanged (observability of
-          real parallelism), so a pinned row shows here AND in its tree position.
-          Reuses renderSessionRow so the anatomy (📌 marker, Unpin action) is
-          identical; rendered flat at level 0. */}
-      {sessions !== null && pinnedSessions.length > 0 && (
-        <div
-          className="mb-3"
-          style={{
-            border: "1px solid var(--mc-border)",
-            borderRadius: "0.4rem",
-            padding: "0.4rem 0.6rem",
-            background: "rgba(250, 204, 21, 0.04)",
-          }}
-        >
-          <div
-            style={{
-              fontFamily: "var(--mc-mono)",
-              fontSize: "0.74rem",
-              color: "var(--mc-text-dim)",
-              textTransform: "uppercase",
-              letterSpacing: "0.08em",
-              padding: "0.15rem 0 0.35rem",
-            }}
-          >
-            📌 Pinned ({pinnedSessions.length})
-          </div>
-          <div className="table-responsive">
-            <table className="table table-hover align-middle mb-0">
-              <thead>
-                <tr>
-                  <th style={{ width: "1.5rem" }}></th>
-                  <th>SID</th>
-                  <th>Attach</th>
-                  <th>Role</th>
-                  <th>Target</th>
-                  <th>Status</th>
-                  <th>Started</th>
-                  <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {pinnedSessions.map((s) => renderSessionRow(s, 0))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      {/* T-0437/T-0628 (D-0056): the separate Pinned table dissolved — a
+          pinned row's 📌 marker (renderSessionRow) is the surviving signal,
+          and buildSessionTree floats a pinned root to the top of the tree
+          below instead of duplicating its row in a second table. */}
 
       {/* Session table */}
       {sessions !== null && sessions.length > 0 && (
@@ -1862,6 +1922,7 @@ export function Sessions() {
                 <th>Role</th>
                 <th>Target</th>
                 <th>Status</th>
+                <th>Context</th>
                 <th>Started</th>
                 <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
                 <th></th>
@@ -1872,7 +1933,7 @@ export function Sessions() {
                 ? groupSessionsByTmux(applySessFilter(boardSessions)).flatMap((g) => {
                     const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                     const nodes: React.ReactNode[] = [
-                      renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed),
+                      renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed),
                     ];
                     if (!collapsed) {
                       for (const { row, level } of buildTmuxGroupTree(g.rows)) {
@@ -1886,11 +1947,11 @@ export function Sessions() {
                   // header marks the owner; tmux lanes nest inside it.
                   groupSessionsByUser(applySessFilter(boardSessions)).flatMap((ug) => {
                     const nodes: React.ReactNode[] = [
-                      renderUserHeaderRow(ug.key, ug.rows, 9),
+                      renderUserHeaderRow(ug.key, ug.rows, 10),
                     ];
                     for (const g of groupSessionsByTmux(ug.rows)) {
                       const collapsed = tmuxLaneCollapsed(g.key, g.rows);
-                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed));
+                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed));
                       if (!collapsed) {
                         for (const { row, level } of buildTmuxGroupTree(g.rows)) {
                           nodes.push(renderSessionRow(row, level));
@@ -1907,7 +1968,7 @@ export function Sessions() {
                       const laneRows = groupSessionsByLane(boardSessions)[lane.key] ?? [];
                       const collapsed = Boolean(collapsedSessLanes[lane.key]);
                       const nodes: React.ReactNode[] = [
-                        renderLaneHeaderRow(lane, laneRows.length, 9),
+                        renderLaneHeaderRow(lane, laneRows.length, 10),
                       ];
                       if (!collapsed) {
                         // Within each initiative lane the tree is also useful — TL at

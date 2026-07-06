@@ -21,6 +21,11 @@
  *     resolves into an exhaustion projection once an anchor is set.
  * The anchor is set server-side in system_settings [quota] (no FE setter yet —
  * the worker owns it); this panel surfaces its STATUS and the relationship.
+ *
+ * T-0628 (D-0056): the dissolved TelemetryPanel's header facts — the 🚫
+ * rate-limited badge and the instantaneous burn ~N/hr estimate — merged into
+ * this panel's summary row (it already showed the exhaustion projection), so
+ * quota status has ONE home ("Resources & quota") instead of two panels.
  */
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -38,7 +43,8 @@ import {
   utilizationRatio,
 } from "../pages/resourceCaps";
 
-// Roll large token counts into k/M/B tiers (mirrors TelemetryPanel.fmtTokens).
+// Roll large token counts into k/M/B tiers (T-0267; shared shape with
+// Sessions.tsx's fmtContextTokens — the dissolved TelemetryPanel's original).
 function fmtTokens(n: number): string {
   if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e11 ? 0 : 1)}B`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e8 ? 0 : 1)}M`;
@@ -282,7 +288,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
         style={{ gap: "0.5rem", flexWrap: "wrap" }}
       >
         <div className="d-flex align-items-center" style={{ gap: "0.5rem", flexWrap: "wrap" }}>
-          <strong style={{ fontSize: "0.74rem" }}>Resource caps &amp; budget</strong>
+          <strong style={{ fontSize: "0.74rem" }}>Resources &amp; quota</strong>
           {/* T-0428 (dogfood): until the server-wide caps land, show a skeleton
               instead of flashing a misleading 'parallel ∞' that then jumps to
               the real 'N/cap'. */}
@@ -290,6 +296,26 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
             <span className="mc-skeleton" style={{ display: "inline-block", width: "9rem", height: "1.1rem" }} aria-label="Loading caps" />
           ) : (
             <>
+              {/* T-0628 (D-0056): merged in from the dissolved TelemetryPanel
+                  header — a session hit a 429 rate-limit (distinct from the
+                  AIMD parallel-admission throttle badge below). */}
+              {quota?.throttled && (
+                <span className="mc-badge mc-badge-danger" title="A session hit a 429 rate-limit">
+                  🚫 rate-limited
+                </span>
+              )}
+              {/* T-0266 (carried over): label burn as an INSTANTANEOUS spot
+                  estimate, not a stable rate — the backend figure is Δ
+                  output-tokens over a ~30-min window ×3600/dt, so it swings
+                  sharply (e.g. a resume re-reads its transcript). */}
+              <span
+                className="mc-badge mc-badge-dim"
+                title="Instantaneous output-token burn — a volatile spot estimate (Δ output tokens over a ~30-min window, ×3600). It can swing sharply when a session's cumulative counter jumps (e.g. a resume re-reads its transcript), so treat it as a rough estimate, not a smoothed rate. Set a budget anchor below to turn it into an exhaustion projection."
+              >
+                burn {burn != null
+                  ? <>~{fmtTokens(Math.round(burn))}/hr <span style={{ opacity: 0.7 }}>· spot</span></>
+                  : "—"}
+              </span>
               {/* T-0389 item 22: live count / hard ceiling + AIMD throttle. */}
               <span
                 className={`mc-badge ${throttled ? "mc-badge-warn" : "mc-badge-dim"}`}

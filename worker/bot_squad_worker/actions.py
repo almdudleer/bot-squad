@@ -1567,6 +1567,18 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     honors the ``project -> server -> global`` precedence for the message's
     ``slug`` (see ``_resolve_user_tg_chat_id``). Mirror failures are logged but
     never break the bus write — delivered_to still reflects the inbox.
+
+    T-0624: ``slug`` is only the SENDER's cwd-resolved project (see bsq's
+    ``resolve_slug()``) — for a literal-SID ``to`` it is NOT necessarily the
+    recipient's project. A cross-project send used to write silently into the
+    sender's ``_chat`` dir while the recipient's ``bsq inbox check`` drained a
+    different one (durable message loss, reported as "sent"). So a literal-SID
+    target is delivered under ITS OWN project, resolved via a session-registry
+    scan across every known project (``park._slug_for_sid``); an unresolvable
+    recipient (no registered session anywhere) is a hard error rather than a
+    silent misfile into the sender's project. Role-keyword targets
+    (``teamlead``/``dev``/``all``) keep using the caller's ``slug`` — those are
+    inherently an in-project broadcast, not addressed at a specific SID.
     """
     extra = set(params) - _PEER_SEND_ALLOWED
     if extra:
@@ -1576,9 +1588,22 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"peer_send missing required params: {sorted(missing)}")
 
     cfg = _get_config()
+    to = params["to"]
+    delivery_slug = params["slug"]
+    if to not in {"teamlead", "dev", "all"}:
+        from bot_squad_worker.park import _slug_for_sid
+        recipient_slug = _slug_for_sid(cfg, to)
+        if recipient_slug is None:
+            raise ActionError(
+                f"peer_send: recipient SID {to!r} has no registered session "
+                f"under any known project — refusing to deliver into sender's "
+                f"project {params['slug']!r} (would silently misfile)"
+            )
+        delivery_slug = recipient_slug
+
     from bot_squad_worker import intersession as _is
     result = _is.send(
-        cfg, params["slug"], params["from_sid"], params["to"], params["text"],
+        cfg, delivery_slug, params["from_sid"], to, params["text"],
         user=params.get("user"),
     )
 

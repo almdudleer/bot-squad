@@ -626,6 +626,7 @@ def test_max_notify_sid_user_and_recipient_kind_forwarded(tmp_config_dir, monkey
 def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monkeypatch):
     """peer_send addressed to S-<user>-ui-p0 fires tg.send for the user's bound chat."""
     import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
 
     (tmp_config_dir / "auth.toml").write_text(
         '[users]\n'
@@ -636,6 +637,10 @@ def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monk
         'tg_chat_id = "404580642"\n'
     )
     (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    _write_session_metadata(
+        tmp_path / "data" / "test-project" / "sessions" / "S-alexey-ui-p0.md",
+        {"sid": "S-alexey-ui-p0", "status": "active"},
+    )
     cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
 
     out = A.dispatch("peer_send", {
@@ -657,6 +662,7 @@ def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monk
 def test_peer_send_skips_tg_mirror_when_user_has_no_chat_id(tmp_path, tmp_config_dir, monkeypatch):
     """User present in user_meta but with no tg_chat_id → no TG call."""
     import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
 
     (tmp_config_dir / "auth.toml").write_text(
         '[users]\n'
@@ -666,6 +672,10 @@ def test_peer_send_skips_tg_mirror_when_user_has_no_chat_id(tmp_path, tmp_config
         'linux_user = "aqice"\n'
     )
     (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    _write_session_metadata(
+        tmp_path / "data" / "test-project" / "sessions" / "S-aqice-ui-p0.md",
+        {"sid": "S-aqice-ui-p0", "status": "active"},
+    )
     cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
 
     out = A.dispatch("peer_send", {
@@ -681,6 +691,7 @@ def test_peer_send_skips_tg_mirror_when_user_has_no_chat_id(tmp_path, tmp_config
 def test_peer_send_no_mirror_for_non_ui_sid(tmp_path, tmp_config_dir, monkeypatch):
     """A dev/TL/operator SID should never trigger the TG mirror."""
     import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
 
     (tmp_config_dir / "auth.toml").write_text(
         '[user_meta.alexey]\n'
@@ -688,6 +699,10 @@ def test_peer_send_no_mirror_for_non_ui_sid(tmp_path, tmp_config_dir, monkeypatc
         'tg_chat_id = "404580642"\n'
     )
     (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    _write_session_metadata(
+        tmp_path / "data" / "test-project" / "sessions" / "S-almdudleer-operator-p23.md",
+        {"sid": "S-almdudleer-operator-p23", "status": "active"},
+    )
     cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
 
     out = A.dispatch("peer_send", {
@@ -796,6 +811,7 @@ def test_peer_send_tg_mirror_uses_project_override(
     """peer_send tg-mirror fires to the project-override chat for the slug it
     was sent under, not the global binding."""
     import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
 
     (tmp_config_dir / "auth.toml").write_text(
         '[users]\n'
@@ -810,6 +826,10 @@ def test_peer_send_tg_mirror_uses_project_override(
         tmp_path, tg_chat_id="222", project_tg_chat_ids={"test-project": "999"}
     )
     (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    _write_session_metadata(
+        tmp_path / "data" / "test-project" / "sessions" / "S-alexey-ui-p0.md",
+        {"sid": "S-alexey-ui-p0", "status": "active"},
+    )
     cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
 
     out = A.dispatch("peer_send", {
@@ -821,6 +841,121 @@ def test_peer_send_tg_mirror_uses_project_override(
     assert out["ok"] is True
     assert len(fake.calls) == 1
     assert fake.calls[0]["chat_id"] == "999"
+
+
+# ---------------------------------------------------------------------------
+# T-0624: peer_send resolves the delivery slug from the RECIPIENT SID's own
+# project (session-registry scan across all projects), not the sender's cwd.
+# ---------------------------------------------------------------------------
+
+
+def _two_project_config(tmp_path: Path) -> Config:
+    """Two registered projects sharing one config/data root, no TG token needed."""
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.proj-a]\n'
+        'slug = "proj-a"\n'
+        'display_name = "Proj A"\n'
+        'repo_path = "/tmp/proj-a"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+        '\n'
+        '[projects.proj-b]\n'
+        'slug = "proj-b"\n'
+        'display_name = "Proj B"\n'
+        'repo_path = "/tmp/proj-b"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = ""\nstaging_url = ""\ndev_url = ""\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    return Config.load(cfg_dir)
+
+
+def test_peer_send_cross_project_lands_in_recipient_project(tmp_path, monkeypatch):
+    """A send from proj-a to a proj-b SID must land (and be drainable) under
+    proj-b's _chat/, not proj-a's — the T-0624 misfile scenario."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    recipient = "S-almdudleer-watchrobot-gate-launch-p62"
+    _write_session_metadata(
+        cfg.data_dir / "proj-b" / "sessions" / f"{recipient}.md",
+        {"sid": recipient, "status": "active"},
+    )
+
+    out = A.dispatch("peer_send", {
+        "slug": "proj-a",
+        "from_sid": "S-almdudleer-operator-p23",
+        "to": recipient,
+        "text": "hello from the other project",
+    })
+    assert out["ok"] is True
+    assert out["delivered_to"] == [recipient]
+
+    # Landed under the RECIPIENT's project, not the sender's.
+    assert (cfg.data_dir / "proj-b" / "_chat" / f"inbox-{recipient}.log").exists()
+    assert not (cfg.data_dir / "proj-a" / "_chat" / f"inbox-{recipient}.log").exists()
+
+    # Drainable exactly as the recipient's own `bsq inbox check` would (slug=proj-b).
+    drained = A.dispatch("peer_inbox_read", {"slug": "proj-b", "sid": recipient})
+    assert drained["count"] == 1
+    assert "hello from the other project" in drained["messages"][0]
+
+    # The sender's own project inbox never saw it.
+    not_there = A.dispatch("peer_inbox_read", {"slug": "proj-a", "sid": recipient})
+    assert not_there["count"] == 0
+
+
+def test_peer_send_unresolvable_recipient_hard_errors(tmp_path, monkeypatch):
+    """A literal-SID target with no registered session anywhere must hard-error,
+    not silently misfile into the sender's project."""
+    import bot_squad_worker.actions as A
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="no registered session"):
+        A.dispatch("peer_send", {
+            "slug": "proj-a",
+            "from_sid": "S-almdudleer-operator-p23",
+            "to": "S-nobody-ghost-p1",
+            "text": "into the void",
+        })
+    assert not (cfg.data_dir / "proj-a" / "_chat" / "inbox-S-nobody-ghost-p1.log").exists()
+
+
+def test_peer_send_role_fanout_still_scoped_to_sender_slug(tmp_path, monkeypatch):
+    """Role-keyword targets (teamlead/dev/all) are an in-project broadcast —
+    they keep using the caller's slug, never a per-recipient lookup."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    _write_session_metadata(
+        cfg.data_dir / "proj-a" / "sessions" / "S-almdudleer-teamlead-p1.md",
+        {"sid": "S-almdudleer-teamlead-p1", "status": "active", "task_id": "~"},
+    )
+
+    out = A.dispatch("peer_send", {
+        "slug": "proj-a",
+        "from_sid": "S-almdudleer-operator-p23",
+        "to": "teamlead",
+        "text": "status?",
+    })
+    assert out["delivered_to"] == ["S-almdudleer-teamlead-p1"]
+    assert (cfg.data_dir / "proj-a" / "_chat" / "inbox-S-almdudleer-teamlead-p1.log").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1717,9 +1852,27 @@ def _make_inject_cfg(tmp_path: Path, monkeypatch):
     return cfg
 
 
-def test_inject_input_happy_path(tmp_path, monkeypatch):
-    """Happy path: pane found, subprocess called once per line."""
+def _patch_inject_transport(monkeypatch, tmp_path):
+    """Patch the T-0578 mux transport seams; returns the send-keys call log."""
     import subprocess
+    import bot_squad_worker.input_mux as M
+    import bot_squad_worker.sessions as S
+
+    run_calls = []
+
+    def fake_run(args, **kwargs):
+        run_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(M, "_capture_pane", lambda pane_id: "")  # not typing
+    monkeypatch.setattr(M, "_DIRECT_INTERLINE_PAUSE_SEC", 0.0)
+    return run_calls
+
+
+def test_inject_input_happy_path(tmp_path, monkeypatch):
+    """Happy path: pane found, delivery routed through the input_mux direct
+    lane (T-0578) — send-keys emitted once per line, verbatim."""
     import bot_squad_worker.actions as A
     import bot_squad_worker.sessions as S
     from bot_squad_worker.sessions import PaneInfo
@@ -1731,25 +1884,23 @@ def test_inject_input_happy_path(tmp_path, monkeypatch):
     fake_pane = PaneInfo(pane_id="%5", window="specwin", pid="1234", cwd="/tmp", command="claude")
     monkeypatch.setattr(S, "list_panes", lambda: [fake_pane])
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-
-    run_calls = []
-
-    def fake_run(args, check=False):
-        run_calls.append(args)
-        return subprocess.CompletedProcess(args, 0)
-
-    monkeypatch.setattr("subprocess.run", fake_run)
+    run_calls = _patch_inject_transport(monkeypatch, tmp_path)
 
     result = A.dispatch("inject_input", {"sid": "S-testuser-specwin-p5", "text": "hello"})
     assert result["ok"] is True
     assert result["pane_id"] == "%5"
     assert result["lines_sent"] == 1
-    assert any("send-keys" in str(c) for c in run_calls)
+    # Golden keystroke sequence — byte-identical to the pre-T-0578 raw loop:
+    # the text (verbatim, uncaptioned) then a SEPARATE Enter.
+    send_keys = [c for c in run_calls if "send-keys" in c]
+    assert send_keys == [
+        ["tmux", "send-keys", "-t", "%5", "--", "hello"],
+        ["tmux", "send-keys", "-t", "%5", "Enter"],
+    ]
 
 
 def test_inject_input_multiline(tmp_path, monkeypatch):
     """Multi-line text sends one send-keys per line."""
-    import subprocess
     import bot_squad_worker.actions as A
     import bot_squad_worker.sessions as S
     from bot_squad_worker.sessions import PaneInfo
@@ -1759,15 +1910,14 @@ def test_inject_input_multiline(tmp_path, monkeypatch):
     fake_pane = PaneInfo(pane_id="%7", window="win", pid="1111", cwd="/tmp", command="bash")
     monkeypatch.setattr(S, "list_panes", lambda: [fake_pane])
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-
-    run_calls = []
-    monkeypatch.setattr("subprocess.run", lambda args, check=False: run_calls.append(args) or subprocess.CompletedProcess(args, 0))
+    run_calls = _patch_inject_transport(monkeypatch, tmp_path)
 
     result = A.dispatch("inject_input", {"sid": "S-testuser-win-p7", "text": "line1\nline2\nline3"})
     assert result["lines_sent"] == 3
     # 2 send-keys calls per line (text + Enter sent separately so Enter submits
-    # outside tmux's bracketed-paste — see _action_inject_input)
-    assert len(run_calls) == 6
+    # outside tmux's bracketed-paste — see input_mux.deliver_direct)
+    send_keys = [c for c in run_calls if "send-keys" in c]
+    assert len(send_keys) == 6
 
 
 def test_inject_input_unknown_sid(tmp_path, monkeypatch):

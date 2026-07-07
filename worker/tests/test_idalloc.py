@@ -54,6 +54,33 @@ def test_allocate_seeds_from_existing_files(tmp_path):
     assert idalloc.allocate_id(tmp_path, "p", "task") == "T-0134"
 
 
+def test_scan_existing_max_honors_frontmatter_id_over_filename(tmp_path):
+    """T-0231: a file's ``id:`` frontmatter can diverge from its filename's
+    numeric prefix (manual edit, rename-without-refile, migration artifact).
+    The filename-only scan would miss such a file entirely; allocation must
+    still never mint an id some file already declares as its own."""
+    backlog = tmp_path / "p" / "backlog"
+    backlog.mkdir(parents=True)
+    # Filename has no numeric prefix at all, but frontmatter claims T-0500.
+    (backlog / "subscription-contract-redesign.md").write_text(
+        "---\nid: T-0500\ntitle: x\nstatus: open\n---\n\nbody\n"
+    )
+    assert idalloc.allocate_id(tmp_path, "p", "task") == "T-0501"
+
+
+def test_scan_existing_max_ignores_non_matching_frontmatter_ids(tmp_path):
+    """A tombstone's deliberately-mismatched id (e.g. 'T-0030-DUPLICATE-DO-NOT-USE')
+    must not be parsed as a numeric collision for some OTHER prefix's counter."""
+    backlog = tmp_path / "p" / "backlog"
+    backlog.mkdir(parents=True)
+    (backlog / "T-0030-tombstone.md").write_text(
+        "---\nid: T-0030-DUPLICATE-DO-NOT-USE\ntitle: x\nstatus: closed\n---\n\nbody\n"
+    )
+    # Filename prefix T-0030 still counts (unchanged behavior); the malformed
+    # frontmatter id contributes nothing extra since it doesn't match `T-\d+`.
+    assert idalloc.allocate_id(tmp_path, "p", "task") == "T-0031"
+
+
 def test_allocate_self_heals_against_manual_higher_id(tmp_path):
     docs = tmp_path / "p" / "docs" / "arch"
     docs.mkdir(parents=True)

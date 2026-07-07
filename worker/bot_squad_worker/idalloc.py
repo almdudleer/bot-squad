@@ -102,8 +102,35 @@ def _id_pattern(prefix: str) -> "re.Pattern[str]":
     return re.compile(rf"^{re.escape(prefix)}-(\d+)(?:[-.]|$)")
 
 
+_FRONTMATTER_ID_RE = re.compile(r"^id:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def _frontmatter_id(path: Path) -> str | None:
+    """Best-effort read of a md file's own ``id:`` frontmatter value, or None."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    fm_end = text.find("\n---", 4) if text.startswith("---\n") else -1
+    if fm_end < 0:
+        return None
+    m = _FRONTMATTER_ID_RE.search(text[:fm_end])
+    return m.group(1).strip() if m else None
+
+
 def scan_existing_max(project_dir: Path, et: EntityType) -> int:
-    """Highest numeric id of ``et`` already on disk under ``project_dir`` (0 if none)."""
+    """Highest numeric id of ``et`` already on disk under ``project_dir`` (0 if none).
+
+    Scans two ways and takes the max (T-0231): by FILENAME prefix (the
+    original behavior — cheap, covers the common case), and by each file's
+    own ``id:`` frontmatter value regardless of filename (defense in depth —
+    a file's filename numeric prefix and its declared ``id:`` can diverge
+    after a manual edit, rename, or tombstone, which the filename-only scan
+    can't see). Without the second pass, a hand-authored file whose
+    frontmatter claims an id but whose filename doesn't start with it would
+    be invisible to this allocator and a fresh ``allocate_id`` could mint a
+    real ``id:`` collision (the T-0030 / T-0222 incidents).
+    """
     scan_dir = project_dir / et.scan_subdir
     if not scan_dir.is_dir():
         return 0
@@ -112,6 +139,16 @@ def scan_existing_max(project_dir: Path, et: EntityType) -> int:
     max_n = 0
     for p in globber(f"{et.prefix}-*"):
         m = pat.match(p.name)
+        if m:
+            n = int(m.group(1))
+            if n > max_n:
+                max_n = n
+    id_pat = re.compile(rf"^{re.escape(et.prefix)}-(\d+)$")
+    for p in globber("*.md"):
+        fid = _frontmatter_id(p)
+        if not fid:
+            continue
+        m = id_pat.match(fid)
         if m:
             n = int(m.group(1))
             if n > max_n:

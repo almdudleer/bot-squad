@@ -222,10 +222,31 @@ def backlog_dir(slug: str) -> Path:
 
 
 def find_ticket(slug: str, ticket: str) -> Path:
+    """Resolve a ticket id to its backlog md (T-0231).
+
+    Multiple files can share a numeric filename prefix — a genuine id
+    collision, or a tombstone left behind after a renumber. Plain
+    ``sorted(glob(...))​[0]`` silently resolves to whichever sorts first,
+    which caused two real incidents (T-0030, T-0222) where `bsq ticket
+    status/update/note` silently landed on the WRONG ticket. Disambiguate by
+    re-reading each candidate's own ``id:`` frontmatter: the tombstone
+    convention stamps a deliberately non-matching id (e.g.
+    ``T-0030-DUPLICATE-DO-NOT-USE``) precisely so it's skipped here,
+    regardless of alphabetical sort order.
+    """
     matches = sorted(backlog_dir(slug).glob(f"{ticket}-*.md"))
     if not matches:
         die(f"ticket not found: {ticket} (looked in {backlog_dir(slug)})")
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    exact = [p for p in matches if read_frontmatter(p).get("id") == ticket]
+    if len(exact) == 1:
+        return exact[0]
+    die(
+        f"ticket id collision: {ticket} matches {len(matches)} files and "
+        f"{len(exact)} declare id: {ticket} in frontmatter (need exactly 1) — "
+        f"{', '.join(str(p) for p in matches)} (see T-0231)"
+    )
 
 
 def _strip_surrounding_quotes(v: str) -> str:

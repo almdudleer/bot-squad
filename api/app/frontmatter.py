@@ -42,6 +42,7 @@ DESIGN CONSTRAINTS
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -51,6 +52,12 @@ _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)", re.DOTALL)
 
 class FrontmatterError(Exception):
     """Raised when a string has no parseable ``---`` frontmatter mapping."""
+
+
+class AmbiguousIdError(Exception):
+    """Raised by ``resolve_id_file`` (strict mode) when an id's filename glob
+    matches 2+ files and 0 or 2+ of them declare that id in their own
+    frontmatter — a genuine, unresolved id collision (T-0231)."""
 
 
 # Loader/Dumper subclasses with the implicit *timestamp* resolver removed, so
@@ -228,3 +235,49 @@ def as_list(value: Any) -> list[str]:
             return []
         return [x.strip() for x in s.split(",") if x.strip() and x.strip() != "~"]
     return [s]
+
+
+def resolve_id_file(dir_path: Path, entity_id: str, *, strict: bool = False) -> Path | None:
+    """Find ``dir_path/<entity_id>-*.md``, disambiguating by ``id:`` frontmatter (T-0231).
+
+    Two real incidents (T-0030, T-0222) happened because every call site that
+    resolved an id to a file did ``sorted(dir.glob(f"{id}-*.md"))[0]`` — the
+    alphabetically-FIRST filename match, chosen without ever reading the
+    file's own ``id:`` frontmatter. When a genuine id collision existed (two
+    files whose filenames both start with the same id), or a tombstone was
+    left behind after a renumber, this silently resolved to whichever name
+    sorted first — sometimes the wrong ticket.
+
+    Behavior:
+    - 0 matches -> ``None``.
+    - 1 match -> that file (no frontmatter read needed).
+    - 2+ matches -> re-read each candidate's ``id:`` field; if exactly ONE
+      declares ``id: <entity_id>`` exactly, return it (this is what makes the
+      tombstone convention work: a renumbered ticket's stub is stamped with a
+      non-matching id, e.g. ``T-0030-DUPLICATE-DO-NOT-USE``, specifically so
+      it's skipped here regardless of alphabetical sort order).
+    - 2+ matches, 0 or 2+ of which declare a matching id (a genuine unresolved
+      collision) -> if ``strict``, raises :class:`AmbiguousIdError`; otherwise
+      falls back to the alphabetically-first match (the old behavior), so a
+      read-mostly/best-effort caller (e.g. a background nag) degrades instead
+      of crashing.
+    """
+    matches = sorted(Path(dir_path).glob(f"{entity_id}-*.md"))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    exact = []
+    for p in matches:
+        parsed = parse_or_none(p.read_text(errors="replace"))
+        if parsed and str(parsed[0].get("id", "")).strip() == entity_id:
+            exact.append(p)
+    if len(exact) == 1:
+        return exact[0]
+    if strict:
+        raise AmbiguousIdError(
+            f"id {entity_id!r} matches {len(matches)} files under {dir_path}, "
+            f"and {len(exact)} of them declare that id in frontmatter "
+            f"(need exactly 1): {[str(p) for p in matches]}"
+        )
+    return matches[0]

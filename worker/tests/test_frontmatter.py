@@ -261,3 +261,63 @@ def test_dod_block_style_session_history_appended_correctly(tmp_path: Path):
     assert meta["session_history"] == ["S-old-p1", "S-new-p2"]
     # idempotent
     assert sessions._append_task_session_history(backlog, "T-0075", "S-new-p2") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_id_file (T-0231): id-collision-safe resolution, not filename-sort-first
+# ---------------------------------------------------------------------------
+
+def _write_md(path: Path, task_id: str, **extra_fm) -> None:
+    lines = [f"id: {task_id}"]
+    for k, v in extra_fm.items():
+        lines.append(f"{k}: {v}")
+    path.write_text("---\n" + "\n".join(lines) + "\n---\n\nbody\n")
+
+
+def test_resolve_id_file_no_match_returns_none(tmp_path: Path):
+    assert fm.resolve_id_file(tmp_path, "T-0001") is None
+
+
+def test_resolve_id_file_single_match(tmp_path: Path):
+    p = tmp_path / "T-0001-only.md"
+    _write_md(p, "T-0001")
+    assert fm.resolve_id_file(tmp_path, "T-0001") == p
+
+
+def test_resolve_id_file_picks_frontmatter_match_over_alpha_first(tmp_path: Path):
+    """Reproduces the T-0030 incident: two filenames share the numeric prefix,
+    the real ticket sorts AFTER the tombstone alphabetically. A plain
+    sorted(glob())[0] would return the tombstone; resolve_id_file must not."""
+    tombstone = tmp_path / "T-0030-aaa-tombstone.md"
+    real = tmp_path / "T-0030-zzz-real-ticket.md"
+    _write_md(tombstone, "T-0030-DUPLICATE-DO-NOT-USE", status="closed")
+    _write_md(real, "T-0030", status="in_progress")
+    assert sorted(tmp_path.glob("T-0030-*.md"))[0] == tombstone  # sanity: alpha-first is the wrong one
+    assert fm.resolve_id_file(tmp_path, "T-0030") == real
+
+
+def test_resolve_id_file_genuine_collision_falls_back_permissively(tmp_path: Path):
+    a = tmp_path / "T-0030-a.md"
+    b = tmp_path / "T-0030-b.md"
+    _write_md(a, "T-0030")
+    _write_md(b, "T-0030")
+    # Both genuinely declare the same id — no way to disambiguate; permissive
+    # (non-strict) callers get the old alphabetical-first behavior back.
+    assert fm.resolve_id_file(tmp_path, "T-0030") == sorted([a, b])[0]
+
+
+def test_resolve_id_file_genuine_collision_raises_in_strict_mode(tmp_path: Path):
+    a = tmp_path / "T-0030-a.md"
+    b = tmp_path / "T-0030-b.md"
+    _write_md(a, "T-0030")
+    _write_md(b, "T-0030")
+    with pytest.raises(fm.AmbiguousIdError):
+        fm.resolve_id_file(tmp_path, "T-0030", strict=True)
+
+
+def test_resolve_id_file_strict_mode_still_resolves_unambiguous_case(tmp_path: Path):
+    tombstone = tmp_path / "T-0030-aaa-tombstone.md"
+    real = tmp_path / "T-0030-zzz-real-ticket.md"
+    _write_md(tombstone, "T-0030-DUPLICATE-DO-NOT-USE", status="closed")
+    _write_md(real, "T-0030", status="in_progress")
+    assert fm.resolve_id_file(tmp_path, "T-0030", strict=True) == real

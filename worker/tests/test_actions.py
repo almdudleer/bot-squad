@@ -2131,6 +2131,53 @@ def test_task_progress_add_unknown_task_raises(tmp_path, monkeypatch):
         })
 
 
+def test_task_progress_add_skips_tombstone_with_mismatched_id(tmp_path, monkeypatch):
+    """T-0231: a renumbered ticket's tombstone shares the numeric filename
+    prefix but declares a non-matching id: — the note must land on the real
+    ticket even if the tombstone sorts first alphabetically."""
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    (backlog / "T-0030-aaa-tombstone.md").write_text(
+        "---\nid: T-0030-DUPLICATE-DO-NOT-USE\ntitle: Wrong\nstatus: closed\n---\n\nbody\n"
+    )
+    real = backlog / "T-0030-zzz-real.md"
+    real.write_text(
+        "---\nid: T-0030\ntitle: Real\nstatus: open\n---\n\n"
+        "## Verbatim request\n\nI want X.\n"
+    )
+    out = A.dispatch("task_progress_add", {
+        "slug": "test-project",
+        "task_id": "T-0030",
+        "sid": "S-test-p1",
+        "text": "noted",
+    })
+    assert out["ok"] is True
+    assert "noted" in real.read_text()
+    assert "noted" not in (backlog / "T-0030-aaa-tombstone.md").read_text()
+
+
+def test_task_progress_add_genuine_collision_raises(tmp_path, monkeypatch):
+    """Two files genuinely declaring the same id: — must fail loudly instead
+    of silently writing the note onto whichever sorts first."""
+    import bot_squad_worker.actions as A
+
+    cfg, backlog = _make_task_progress_cfg(tmp_path, monkeypatch)
+    (backlog / "T-0030-a.md").write_text(
+        "---\nid: T-0030\ntitle: A\nstatus: open\n---\n\nbody\n"
+    )
+    (backlog / "T-0030-b.md").write_text(
+        "---\nid: T-0030\ntitle: B\nstatus: open\n---\n\nbody\n"
+    )
+    with pytest.raises(ActionError, match="T-0030"):
+        A.dispatch("task_progress_add", {
+            "slug": "test-project",
+            "task_id": "T-0030",
+            "sid": "S-x",
+            "text": "x",
+        })
+
+
 def test_task_progress_add_unknown_slug_raises(tmp_path, monkeypatch):
     import bot_squad_worker.actions as A
 

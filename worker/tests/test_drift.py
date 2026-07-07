@@ -340,6 +340,41 @@ def test_reopened_ticket_still_nudges(tmp_path, monkeypatch):
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
 
 
+def test_ticket_id_collision_resolves_by_frontmatter_not_alpha_sort(tmp_path, monkeypatch):
+    """T-0231: a tombstone left behind after a renumber (or a genuine id
+    collision) can share the numeric filename prefix with the session's real
+    bound ticket. If it sorts alphabetically BEFORE the real ticket, the old
+    ``sorted(glob())[0]`` resolution would nag using the WRONG ticket's title
+    (or wrongly skip the nudge if the tombstone reads as terminal/closed).
+    resolve_id_file must still find the real, in-progress ticket."""
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=90, activity_ago_sec=30, task_id="T-0030",
+        ticket_status="in_progress")
+    # ticket file from _setup is "T-0030-dynamic-context-manager.md" — add a
+    # tombstone that sorts alphabetically BEFORE it and looks terminal/closed
+    # (mirroring the real T-0030 tombstone convention: mismatched id: value).
+    backlog = cfg.data_dir / slug / "backlog"
+    tombstone = backlog / "T-0030-aaa-tombstone.md"
+    tombstone.write_text(
+        "---\nid: T-0030-DUPLICATE-DO-NOT-USE\n"
+        "title: WRONG TICKET SHOULD NOT BE NAGGED ABOUT\nstatus: closed\n---\n\nbody\n"
+    )
+    assert sorted(backlog.glob("T-0030-*.md"))[0] == tombstone  # sanity
+
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered = []
+    monkeypatch.setattr(
+        S, "_deliver_prompt",
+        lambda pane, text, **_kw: delivered.append((pane, text)))
+
+    res = drift.drift_check(cfg, slug)
+    assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+    assert "Dynamic context manager" in delivered[0][1]
+    assert "WRONG TICKET" not in delivered[0][1]
+
+
 # ── T-0449 (#6): _initiative_stem DRY-delegates the .md-strip to normalize_id ──
 
 @pytest.mark.parametrize(

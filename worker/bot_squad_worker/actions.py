@@ -1701,10 +1701,15 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"task_progress_add: unknown project slug {slug!r}")
 
     backlog_dir: Path = cfg.data_dir / slug / "backlog"
-    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
-    if not matches:
+    from bot_squad_worker import frontmatter as _fm
+    try:
+        # T-0231: resolve by id: frontmatter (strict) — a note must never land
+        # on the wrong ticket because a stale filename happened to sort first.
+        path = _fm.resolve_id_file(backlog_dir, task_id, strict=True)
+    except _fm.AmbiguousIdError as e:
+        raise ActionError(f"task_progress_add: {e}") from e
+    if path is None:
         raise ActionError(f"task_progress_add: task not found: {task_id}")
-    path = matches[0]
 
     from datetime import datetime, timezone
     import re as _re

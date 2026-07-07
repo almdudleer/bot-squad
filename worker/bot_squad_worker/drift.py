@@ -51,6 +51,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from bot_squad_worker import frontmatter as _fm
 from bot_squad_worker.actions import normalize_id
 
 log = logging.getLogger(__name__)
@@ -331,10 +332,13 @@ def drift_check(cfg: Any, slug: str) -> dict:
         if meta is not None and _truthy(meta.get("drift_paused")):
             continue
 
-        matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
-        if not matches:
+        # T-0231: resolve by id: frontmatter, not the alphabetically-first
+        # filename match — a stale/colliding ticket file must never get
+        # nagged about (or worse, silently supply a WRONG title/status) in
+        # place of the session's real bound ticket.
+        ticket_path = _fm.resolve_id_file(backlog_dir, task_id)
+        if ticket_path is None:
             continue
-        ticket_path = matches[0]
         title = ""
         ticket_initiative = ""
         ticket_status = ""

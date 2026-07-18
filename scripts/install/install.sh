@@ -1295,6 +1295,75 @@ to see the exact pip error."
   fi
 }
 
+# --- seed_claude_settings checkpoint (T-0541) --------------------------------
+#
+# Seed the install's OWN bot-squad clone `.claude/settings.json` with the three
+# lifecycle hooks (SessionStart/UserPromptSubmit/Stop), reusing the SAME seeder
+# the project-scaffold flow uses (`_seed_claude`/`_render_claude_settings` in
+# api/app/project_scaffold.py) so the two bootstrap paths cannot drift. T-0501's
+# `_seed_claude` covers a project CLONE wired into an EXISTING install; this
+# covers the install's own clone on a FRESH multi-server bring-up, which no
+# scaffold step ever reaches (T-0541). Without it a fresh install's
+# `.claude/settings.json` is empty + untracked, so the install's own sessions
+# silently lose hook-driven lifecycle measurement (jsonl-mtime fallback still
+# works; the richer hook signal is lost).
+#
+# Idempotent + non-clobbering: `_seed_claude` never overwrites an existing
+# settings.json, and re-asserts the per-clone git-exclude either way.
+#
+#   BOTSQUAD_SEED_CLAUDE_PY — python interpreter override (test seam); default
+#                             prefers the worker venv python, then host python3.
+seed_claude_python() {
+  if [[ -n "${BOTSQUAD_SEED_CLAUDE_PY:-}" ]]; then
+    printf '%s' "$BOTSQUAD_SEED_CLAUDE_PY"; return 0
+  fi
+  local venv_py="$BOTSQUAD_INSTALL_DIR/worker/.venv/bin/python"
+  if [[ -x "$venv_py" ]]; then printf '%s' "$venv_py"; return 0; fi
+  if command -v python3 >/dev/null 2>&1; then printf '%s' python3; return 0; fi
+  return 1
+}
+
+step_seed_claude_settings() {
+  local clone="$BOTSQUAD_INSTALL_DIR"
+  local scaffold_py="$clone/api/app/project_scaffold.py"
+  [[ -r "$scaffold_py" ]] || die_struct seed_claude_settings \
+    "Claude-settings seeder module missing: $scaffold_py" \
+    "The repo clone is incomplete or out of date. Try
+'cd $clone && git status' and re-pull — the clone_repo checkpoint should
+have fetched api/app/project_scaffold.py."
+  local py
+  py="$(seed_claude_python)" || die_struct seed_claude_settings \
+    "No python3 available to run the Claude-settings seeder." \
+    "Ensure the python_venv checkpoint succeeded (it provisions
+$clone/worker/.venv), or install a system python3."
+  # Reuse the scaffolder's seeder verbatim: importlib-load project_scaffold.py
+  # by path (it is stdlib-only, so this does NOT import the FastAPI app) and
+  # call _seed_claude against the install's own clone. The install's clone IS
+  # the install root, so its data dir is <clone>/data and _install_root(data)
+  # resolves the hook command paths to <clone>/scripts/hooks/*.sh with
+  # BOT_SQUAD=<clone> — portable across non-default install paths.
+  BOTSQUAD_SEED_CLONE="$clone" "$py" - "$scaffold_py" <<'PY' || die_struct seed_claude_settings \
+    "Failed to seed the install's .claude/settings.json." \
+    "Inspect the python error above. Check that the install dir is writable
+by the installing user (the install_dir checkpoint makes it group-writable)."
+import importlib.util, os, sys
+from pathlib import Path
+
+scaffold = sys.argv[1]
+spec = importlib.util.spec_from_file_location("_bsq_seed_claude", scaffold)
+mod = importlib.util.module_from_spec(spec)
+# Register before exec so the module's @dataclass can resolve its own
+# __module__ via sys.modules (dataclasses looks it up during processing).
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+
+clone = Path(os.environ["BOTSQUAD_SEED_CLONE"])
+seeded = mod._seed_claude(clone, clone / "data")
+print("seeded" if seeded else "preserved (existing settings.json kept)")
+PY
+  log "install Claude settings ready: $clone/.claude/settings.json (T-0541)"
+}
+
 step_systemd_unit() {
   local src="$BOTSQUAD_INSTALL_DIR/systemd/bot-squad-worker.service"
   local dest="/etc/systemd/system/bot-squad-worker.service"
@@ -1766,6 +1835,7 @@ INSTALL_STEPS=(
   render_env
   mothership_handshake
   python_venv
+  seed_claude_settings
   tg_proxy
   systemd_unit
   per_user_worker_unit

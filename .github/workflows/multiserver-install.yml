@@ -34,6 +34,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Seed install-level .claude/settings.json hook registration (T-0541)
+        # Host-side (no docker): drives the seed_claude_settings checkpoint
+        # against the real _seed_claude seeder. Fast, so it runs first.
+        run: |
+          scripts/install/tests/seed_claude_settings.sh
       - name: Exercise the served/substituted install bundle in Docker
         run: |
           scripts/install/tests/multiserver_install_docker.sh

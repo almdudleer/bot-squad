@@ -126,9 +126,9 @@ note "run served install.sh in clean debian (handshake should COMPLETE)"
 # steps that need dind — out of scope for this SAFE harness).
 printf '%s\n' detect_distro require_sudo proxy_url pkg_index_update install_base_pkgs \
   install_tmux install_nodejs install_claude_code install_docker botsquad_group \
-  install_dir clone_repo render_env python_venv tg_proxy systemd_unit \
-  per_user_worker_unit install_reverse_proxy docker_compose_up agent_teams_flag \
-  spawn_operator print_attach > "$WORK/install.state.seed"
+  install_dir clone_repo render_env python_venv seed_claude_settings tg_proxy \
+  systemd_unit per_user_worker_unit install_reverse_proxy docker_compose_up \
+  agent_teams_flag spawn_operator print_attach > "$WORK/install.state.seed"
 
 # SSE listener (durable jsonl is the primary assertion; SSE is a bonus signal).
 ( curl -sN -b "$J" --max-time 45 "http://$MS_IP:8000/api/m/servers/$SRV/checkpoints" > "$WORK/sse.log" 2>&1 ) &

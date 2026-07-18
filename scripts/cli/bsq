@@ -2592,12 +2592,45 @@ def _commit_hunks(args, repo_root: str) -> None:
     sys.exit(0)
 
 
+def _is_install_clone(repo_root: str) -> bool:
+    """True when ``repo_root`` is the running installation's own clone
+    (``BOT_SQUAD``) rather than a project's editing (dev/master) clone.
+
+    The install is a deploy TARGET, not an editing surface. A commit made
+    there never reaches origin through the normal dev-clone flow and can trip
+    the deploy commit-guard's destroy check (T-0305 incident, 2026-07-18:
+    534bf49 committed in-place in /home/www/bot-squad failed the destroy-guard
+    and needed operator cherry-pick + reset recovery — T-0651).
+    """
+    return os.path.realpath(repo_root) == os.path.realpath(BOT_SQUAD)
+
+
+def _dev_clone_hint() -> str:
+    """Best-effort bot-squad dev-clone path to point a misdirected commit at."""
+    try:
+        with open(PROJECTS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+        repo_path = cfg.get("projects", {}).get("bot-squad", {}).get("repo_path")
+        if repo_path:
+            return repo_path
+    except OSError:
+        pass
+    return "the project's dev clone (see repo_path in projects.toml)"
+
+
 def cmd_commit(args) -> None:
     repo_root = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
     ).stdout.strip()
     if not repo_root:
         die("not inside a git repo")
+    if _is_install_clone(repo_root):
+        die(
+            f"refusing to commit inside the INSTALL clone ({BOT_SQUAD}) — "
+            "that's the deploy TARGET, not an editing surface. A commit made "
+            "here can trip the deploy destroy-guard (T-0305/T-0651). cd to "
+            f"the dev clone and retry:\n  cd {_dev_clone_hint()}"
+        )
     if getattr(args, "hunks", False):
         return _commit_hunks(args, repo_root)
     if not args.files:

@@ -36,6 +36,17 @@ active work, a Ctrl-C'd (paused) pane, or a confirmation dialog:
   ``BOT_SQUAD_COMPACT_MODE=claude`` forces it. A per-session cooldown stops a
   re-/compact while a compaction is still in flight (it rotates the transcript,
   so context only resets a tick or two later).
+
+Neither strategy above ever runs against the human's own exempt sessions
+(:func:`recycle_gate.user_session_exempt`) — T-0649 (2026-07-18) gives them a
+third path instead: :func:`_maybe_compact_stay_ceiling` reuses
+:mod:`idle_timeout`'s T-0617 compact-in-place machine (``compact_stay_*`` md
+fields), so the ceiling trigger built here and the idle-window trigger built
+there share ONE anti-loop guard (``compact_stay_last_at``) and can never
+double-compact the same session. Worker sessions (dev/TL/operator) are
+unaffected — the stakeholder's "autocompact loop is worse" complaint never
+targeted them, and the handoff/artifact model above IS their designed
+continuity mechanism.
 """
 from __future__ import annotations
 
@@ -371,38 +382,101 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
     return True
 
 
+def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: float,
+                                pane: str | None) -> bool:
+    """T-0649: the ceiling-trigger counterpart to :mod:`idle_timeout`'s T-0617
+    compact-and-stay. Drives the SAME ``compact_stay_phase`` /
+    ``compact_stay_armed_at`` / ``compact_stay_last_at`` session-md fields as
+    the idle-window trigger — sharing that state (not forking it) is what
+    makes ``compact_stay_last_at`` an effective anti-loop guard across BOTH
+    triggers: whichever one compacts first blocks the other for the rest of
+    the cache window. Only the ARM condition differs from idle_timeout's own
+    :func:`idle_timeout._maybe_compact_and_stay`: this arms on the context
+    ceiling (``level == 'urgent'``), not an idle window elapsing — a
+    ceiling-triggered compact needs to fire immediately, same as it always has
+    for worker sessions, not wait out an idle clock. NEVER calls
+    ``sessions.suspend`` — the pane/tmux/process stay exactly where the human
+    left them, same guarantee as T-0617.
+    """
+    from bot_squad_worker import idle_timeout, sessions as _sessions
+
+    if meta.get("compact_stay_phase") == "compacting":
+        return idle_timeout._finalize_compact_stay(sid, meta, md_path, now, pane)
+
+    if level != "urgent":
+        return False
+    if not idle_timeout.compact_stay_due(meta.get("compact_stay_last_at"), now,
+                                         idle_timeout.idle_timeout_sec()):
+        return False  # already compacted-and-stayed this cache window
+    if not pane or not composer_ready(_capture_pane(pane)):
+        return False
+
+    try:
+        _send_compact(sid)
+    except Exception:
+        log.exception("autocompact: ceiling compact-and-stay /compact send "
+                      "failed for %s (will retry)", sid)
+        return False
+    meta["compact_stay_phase"] = "compacting"
+    meta["compact_stay_armed_at"] = idle_timeout._now_iso()
+    _sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("autocompact: ceiling compact-and-stay sent /compact to %s — "
+             "session stays, no relaunch", sid)
+    return True
+
+
 def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> bool:
     """Recycle ``rec``'s session if it's over-threshold AND safe.
 
-    Two strategies (see module docstring): the T-0467 write-to-artifact handoff
-    (default) and the legacy Claude ``/compact`` fallback. Returns True iff an
-    action was taken this tick (handoff armed, handoff finalized, or /compact
-    sent). Every gate fails closed — an unresolved pane / not-ready composer
-    simply defers to the next tick rather than risk interrupting work.
+    Two strategies for WORKER (dev/TL/operator) sessions (see module
+    docstring): the T-0467 write-to-artifact handoff (default) and the legacy
+    Claude ``/compact`` fallback. The human's own exempt sessions (T-0616)
+    never ride either — T-0649 routes their ceiling trigger to T-0617's
+    compact-in-place mechanism instead (see :func:`_maybe_compact_stay_ceiling`).
+    Returns True iff an action was taken this tick (handoff armed, handoff
+    finalized, compact-and-stay armed/finalized, or /compact sent). Every gate
+    fails closed — an unresolved pane / not-ready composer simply defers to the
+    next tick rather than risk interrupting work.
     """
     if not autocompact_enabled():
         return False
     sid = rec.get("sid")
     # T-0563/T-0564/T-0616 (recycle-v2): never recycle a non-allowlisted
-    # project, any of the human's own sessions (user-conversation role,
-    # hand-launched user-session window, recycle_exempt md marker — the
-    # telemetry rec doesn't carry the marker, so read the session md
-    # best-effort), or a pane a human is currently attached to — even the
-    # operator (T-0334) is subject to this gate.
+    # project, or touch a pane a human is currently attached to — even the
+    # operator (T-0334) is subject to this gate. The telemetry rec doesn't
+    # carry the recycle_exempt md marker, so read the session md best-effort.
     from bot_squad_worker import sessions as _sessions
-    meta = {}
+    meta: dict = {}
+    md_path = None
     if sid:
         try:
-            meta = _sessions._read_session_metadata(
-                _sessions._session_file(cfg.data_dir, slug, sid)) or {}
+            md_path = _sessions._session_file(cfg.data_dir, slug, sid)
+            meta = _sessions._read_session_metadata(md_path) or {}
         except Exception:
             meta = {}
-    if not recycle_gate.recycle_allowed(
-        cfg, slug=slug, role=rec.get("role") or meta.get("role"),
-        tmux_target=_pane_for(sid) if sid else None, now=now,
-        window=rec.get("window") or meta.get("window"), meta=meta,
-    ):
+            md_path = None
+    if not recycle_gate.project_allowed(cfg, slug, now):
         return False
+    pane = _pane_for(sid) if sid else None
+    if recycle_gate.is_attached(pane):
+        return False
+
+    role = rec.get("role") or meta.get("role")
+    window = rec.get("window") or meta.get("window")
+
+    # T-0649: the human's own sessions (user-conversation role, hand-launched
+    # user-session window, recycle_exempt md marker) never ride the
+    # handoff/terminate machinery below — their ceiling trigger reuses
+    # idle_timeout's T-0617 compact-in-place state instead, sharing its
+    # compact_stay_last_at anti-loop guard so the ceiling and idle-window
+    # triggers can never double-compact the same session. Worker sessions
+    # (dev/TL/operator) are not exempt and fall through to the unchanged flow
+    # below.
+    if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
+        if md_path is None:
+            return False
+        return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane)
+
     fired = rec.get("alert_fired_at") or {}
     rec["alert_fired_at"] = fired
 

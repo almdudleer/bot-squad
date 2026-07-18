@@ -6,11 +6,18 @@ is ready (❯), never mid-turn. The operator session is NOT exempt (T-0334).
 """
 from __future__ import annotations
 
+import time
 import types
 
 import pytest
 
 from bot_squad_worker import autocompact as A
+from bot_squad_worker import idle_timeout as IT
+from bot_squad_worker import sessions as S
+# T-0649: reuse idle_timeout's tmp cfg + session-md harness rather than
+# duplicating it — the ceiling compact-and-stay path drives the exact same
+# session-md fields idle_timeout's own compact-and-stay suite exercises.
+from tests.test_idle_timeout import _make_cfg
 
 
 # --- pure decision helpers --------------------------------------------------
@@ -148,9 +155,13 @@ def test_non_allowlisted_project_is_never_compacted(harness, monkeypatch):
     assert harness["sent"] == []
 
 
-def test_user_conversation_role_is_never_compacted(harness):
-    """T-0564: the human's own live chat is never auto-/compact-ed even when
-    over the context ceiling."""
+def test_user_conversation_role_never_gets_the_handoff_path(harness):
+    """T-0564/T-0649: the human's own live chat never rides the
+    handoff/terminate machinery — with no resolvable session md (cfg=None
+    here) the T-0649 compact-in-place branch also fails closed, so nothing is
+    sent. See test_exempt_session_ceiling_compacts_in_place below for the
+    real (cfg-backed) compact-in-place behavior this session now gets
+    instead of "never touched"."""
     rec = _rec(role="user-conversation")
     assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is False
     assert harness["sent"] == []
@@ -163,3 +174,131 @@ def test_attached_pane_is_never_compacted(harness, monkeypatch):
     rec = _rec()
     assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is False
     assert harness["sent"] == []
+
+
+# --- T-0649: ceiling trigger for exempt sessions → compact-in-place ---------
+#
+# The human's own exempt sessions (recycle_gate.user_session_exempt) never
+# ride the handoff/terminate machinery above. Their context-ceiling trigger
+# instead reuses idle_timeout's T-0617 compact-and-stay state machine
+# (compact_stay_phase/_armed_at/_last_at on the session md) — same fields,
+# same anti-loop guard, so the ceiling and idle-window triggers can never
+# double-compact one session. Needs a REAL cfg (not the cfg=None harness
+# above) since it reads/writes the session md.
+
+@pytest.fixture
+def stay_harness(monkeypatch):
+    """Mirrors ``harness`` but leaves cfg/session-md resolution real — the
+    T-0649 ceiling compact-and-stay path needs an actual md_path to arm/
+    finalize against."""
+    sent: list[str] = []
+    state = {"pane": "%9", "buf": "❯ ready\n"}
+    monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
+    monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
+    monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))
+    monkeypatch.setattr(A, "autocompact_enabled", lambda: True)
+    monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "bot-squad")
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target: False)
+    return {"sent": sent, "state": state}
+
+
+def test_exempt_session_ceiling_compacts_in_place_no_suspend(tmp_path, stay_harness, monkeypatch):
+    """T-0649 core behavior: an exempt session over the context ceiling gets
+    a native /compact sent AND stays running — never sessions.suspend()."""
+    sid = "S-almdudleer-operator-p9"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda *a, **k: suspended.append(a))
+
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == [sid]
+    assert suspended == []
+
+    meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
+    assert meta["compact_stay_phase"] == "compacting"
+    assert "compact_stay_armed_at" in meta
+    # T-0617's terminate-flow fields must never be touched by this path.
+    assert "idle_recycle_phase" not in meta
+
+
+def test_exempt_session_ceiling_skips_below_urgent(tmp_path, stay_harness):
+    sid = "S-almdudleer-operator-p9"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "warn", now=1000.0) is False
+    assert stay_harness["sent"] == []
+
+
+def test_exempt_session_ceiling_finalize_never_suspends(tmp_path, stay_harness, monkeypatch):
+    """A ceiling-armed compact-and-stay finalizes like idle_timeout's own —
+    clears the phase, stamps compact_stay_last_at, never terminates."""
+    sid = "S-almdudleer-operator-p9"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1000.0 - 30))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_phase": "compacting",
+                                    "compact_stay_armed_at": armed})
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda *a, **k: suspended.append(a))
+
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == []  # nothing re-sent — just finalizing
+    assert suspended == []
+
+    meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
+    assert "compact_stay_phase" not in meta
+    assert "compact_stay_armed_at" not in meta
+    assert "compact_stay_last_at" in meta
+
+
+def test_exempt_session_ceiling_respects_shared_anti_loop_guard(tmp_path, stay_harness):
+    """T-0649's whole point: an idle-window compact-and-stay that already
+    finalized THIS cache window blocks the ceiling trigger from re-arming —
+    and vice versa, since both read/write compact_stay_last_at."""
+    sid = "S-almdudleer-operator-p9"
+    just_finalized = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1000.0 - 10))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_last_at": just_finalized})
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is False
+    assert stay_harness["sent"] == []
+
+
+def test_exempt_session_ceiling_rearms_once_window_elapsed(tmp_path, stay_harness):
+    sid = "S-almdudleer-operator-p9"
+    long_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(1000.0 - IT.idle_timeout_sec() - 1))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_last_at": long_ago})
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == [sid]
+
+
+def test_hand_launched_user_session_ceiling_also_compacts_in_place(tmp_path, stay_harness):
+    """T-0616's window-segment exemption (not just role) is honored on the
+    ceiling path too."""
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    rec = {"sid": sid, "activity": "idle", "role": "dev"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == [sid]
+
+
+def test_worker_session_ceiling_unaffected_by_exempt_path(tmp_path, stay_harness, monkeypatch):
+    """T-0649 explicitly scopes worker (dev/TL/operator) sessions OUT — a
+    non-exempt session over the ceiling still tries the handoff/legacy
+    /compact path, never the compact-and-stay one (no role artifact resolves
+    here, so it falls to the legacy claude /compact — but critically it
+    never touches compact_stay_* fields)."""
+    sid = "S-almdudleer-dev-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id=None)
+    monkeypatch.setattr(A, "compact_mode", lambda: "claude")
+    rec = {"sid": sid, "activity": "idle", "role": "dev"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == [sid]
+
+    meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
+    assert "compact_stay_phase" not in meta
+    assert "compact_stay_last_at" not in meta

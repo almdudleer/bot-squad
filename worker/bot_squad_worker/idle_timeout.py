@@ -86,6 +86,17 @@ blocks a new arm for a full ``idle_timeout_sec()`` window, checked
 independently of the (possibly stale, post-compact) idle-age signal — so even
 if a hook mis-fire or a flaky idle clock says "due" again five seconds later,
 this session's own last-completed timestamp says no.
+
+T-0649 (2026-07-18) EXTENDS this same compact-in-place machine to
+``autocompact.py``'s context-CEILING trigger, for exempt sessions only —
+``autocompact._maybe_compact_stay_ceiling`` arms/finalizes the identical
+``compact_stay_*`` fields defined here (:func:`_finalize_compact_stay` and
+:func:`compact_stay_due` are called directly from there). Worker sessions
+(dev/TL/operator) are untouched: their ceiling trigger still runs the
+handoff/artifact+relaunch mechanism in ``autocompact.py`` unchanged. Sharing
+the SAME md fields (not forking a second pair) is what makes
+``compact_stay_last_at`` an effective anti-loop guard across both triggers —
+whichever fires first for a given cache window blocks the other.
 """
 from __future__ import annotations
 

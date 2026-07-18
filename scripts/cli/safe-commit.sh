@@ -8,8 +8,8 @@
 #   BOT_SQUAD_ACK_PEERS=1 safe-commit -m MSG -- backend/foo.py
 #
 # This clone is shared by ~10 concurrent Claude sessions, all committing under
-# one git identity, against ONE working tree and ONE `.git/index`. Two distinct
-# failure modes follow; safe-commit layers a defence against each:
+# one git identity, against ONE working tree and ONE `.git/index`. Three
+# distinct failure modes follow; safe-commit layers a defence against each:
 #
 #   1. index.lock collision (T-0093). git takes `.git/index.lock` atomically via
 #      O_EXCL; concurrent `git commit`s don't queue — losers get
@@ -40,6 +40,21 @@
 #      hunks and `git apply --cached --recount` it, then run THIS wrapper with
 #      no pathspec to commit the staged index as-is. See AGENT_INSTRUCTIONS.md
 #      "Concurrent-commit safety" for the full recipe.
+#
+#   3. unlocked-stage race (T-0648, 2026-07-18 p31/p34 incident). Pathspec
+#      commit is only absorb-proof from the *commit* step onward; the earlier
+#      `git add` that puts your paths in the index was, until this fix, run
+#      by the CALLER before ever reaching safe-commit's flock. A concurrent
+#      lane's locked `git commit` and your unlocked `git add` both touch the
+#      one shared `.git/index` and can collide on `.git/index.lock` —
+#      reproduced under stress as either a hard EEXIST failure or a lane
+#      believing its commit landed when the add silently lost the race.
+#      Defence: `bsq commit` now hands its path list to safe-commit via
+#      BOT_SQUAD_STAGE_PATHS_FILE (a NUL-separated temp file) instead of
+#      staging itself; safe-commit stages AFTER taking the flock, so
+#      add+commit is one lock-scoped critical section per lane. On success,
+#      safe-commit also echoes the resulting commit's file list so
+#      attribution is verifiable at a glance.
 #
 # Overrides:
 #   BOT_SQUAD_ALLOW_COMMIT_ALL=1   permit `-a`/`--all` (single-tenant clone,
@@ -141,14 +156,49 @@ TIMEOUT="${BOT_SQUAD_COMMIT_TIMEOUT:-120}"
 # Touch the lockfile so flock has a fd to open. Harmless if it exists.
 : > "$LOCK" 2>/dev/null || true
 
-# fd 9 holds the advisory lock for the duration of the git commit.
+# fd 9 holds the advisory lock for the duration of the stage + commit.
 exec 9>"$LOCK"
 if ! flock --timeout="$TIMEOUT" 9; then
     echo "safe-commit: could not acquire commit lock in ${TIMEOUT}s — running git commit anyway, expect possible EEXIST" >&2
 fi
 
+# ---------------------------------------------------------------------------
+# Locked staging (T-0648) — `bsq commit` hands us its explicit path list here
+# (NUL-separated, in a temp file named by BOT_SQUAD_STAGE_PATHS_FILE) instead
+# of running `git add` itself before calling this wrapper. Staging AFTER the
+# flock makes add+commit one lock-scoped critical section: a concurrent
+# lane's `git add`/`git commit` can no longer interleave with ours on the one
+# shared `.git/index` (the 2026-07-18 p31/p34 incident — an unlocked `git add`
+# racing a locked commit for `.git/index.lock`).
+# ---------------------------------------------------------------------------
+if [ -n "${BOT_SQUAD_STAGE_PATHS_FILE:-}" ]; then
+    stage_paths=()
+    while IFS= read -r -d '' p; do
+        stage_paths+=("$p")
+    done < "$BOT_SQUAD_STAGE_PATHS_FILE"
+    if [ "${#stage_paths[@]}" -gt 0 ]; then
+        if ! git add -- "${stage_paths[@]}"; then
+            echo "safe-commit: git add failed for staged paths" >&2
+            exec 9>&-
+            exit 1
+        fi
+    fi
+fi
+
 git commit "$@"
 rc=$?
+
+# Echo the resulting commit's file list (T-0648) so attribution is verifiable
+# at a glance — a dev can see at commit time exactly what landed, instead of
+# trusting that the pathspec they passed is what actually got committed.
+if [ "$rc" = "0" ]; then
+    committed_files=()
+    while IFS= read -r -d '' cf; do
+        committed_files+=("$cf")
+    done < <(git diff-tree --no-commit-id --name-only -r -z HEAD)
+    echo "safe-commit: committed ${#committed_files[@]} file(s):"
+    printf '  %s\n' "${committed_files[@]}"
+fi
 
 exec 9>&-
 exit $rc

@@ -2607,16 +2607,35 @@ def cmd_commit(args) -> None:
         safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
 
     # Stage ONLY the explicit paths (no `git add .` / `-u` / dir — that
-    # sweeps peers' in-flight work into your commit).
-    add = subprocess.run(["git", "add", "--", *args.files])
-    if add.returncode != 0:
-        die("git add failed", add.returncode)
+    # sweeps peers' in-flight work into your commit) — and do it INSIDE
+    # safe-commit's advisory lock (T-0648), not here. A `git add` run here,
+    # before the lock, races a concurrent lane's locked `git commit` for
+    # `.git/index.lock`: both processes touch the one shared index, and
+    # under stress that collision surfaces as either a hard EEXIST failure
+    # or (via the peer-activity hook re-reading a part-written index) a
+    # dev believing nothing landed when it did, or vice versa — the
+    # p31/p34 2026-07-18 incident. Handing the path list to safe-commit.sh
+    # via a NUL-separated temp file makes stage+commit one lock-scoped
+    # critical section, so no interleaving with a peer's add/commit is
+    # possible.
+    stage_file = tempfile.NamedTemporaryFile(
+        mode="wb", suffix=".stage-paths", delete=False
+    )
+    try:
+        stage_file.write(b"".join(f.encode() + b"\0" for f in args.files))
+        stage_file.close()
 
-    env = dict(os.environ)
-    if args.ack:
-        env["BOT_SQUAD_ACK_PEERS"] = "1"
-    cmd = [safe_commit, "-m", args.message, "--", *args.files]
-    rc = subprocess.run(cmd, env=env).returncode
+        env = dict(os.environ)
+        env["BOT_SQUAD_STAGE_PATHS_FILE"] = stage_file.name
+        if args.ack:
+            env["BOT_SQUAD_ACK_PEERS"] = "1"
+        cmd = [safe_commit, "-m", args.message, "--", *args.files]
+        rc = subprocess.run(cmd, env=env).returncode
+    finally:
+        try:
+            os.unlink(stage_file.name)
+        except OSError:
+            pass
     if rc != 0 and not args.ack:
         print(
             "\nbsq: commit blocked by the peer-activity pre-commit hook (this is "

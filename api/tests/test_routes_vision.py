@@ -32,12 +32,14 @@ def _anon(tmp_bot_squad: Path, monkeypatch):
 
 def _write_initiative_task(backlog: Path, tid: str, stem: str, status: str,
                            title: str = "T", body: str = "init body\n",
-                           aka: str | None = None) -> None:
+                           aka: str | None = None,
+                           initiative_kind: str | None = None) -> None:
     aka = aka if aka is not None else stem
     backlog.mkdir(parents=True, exist_ok=True)
+    ik_line = f"initiative_kind: {initiative_kind}\n" if initiative_kind else ""
     (backlog / f"{tid}-{stem}.md").write_text(
         f"---\nid: {tid}\ntitle: \"{title}\"\nstatus: {status}\n"
-        f"kind: initiative\naka: [{aka}]\n---\n\n{body}",
+        f"kind: initiative\naka: [{aka}]\n{ik_line}---\n\n{body}",
         encoding="utf-8",
     )
 
@@ -66,6 +68,26 @@ def test_vision_finished_initiative_task(tmp_bot_squad: Path, monkeypatch):
     entry = next(x for x in r.json() if x["name"] == "initiatives/process-paradigm.md")
     assert entry["finished"] is True
     assert entry["active"] is False
+
+
+# T-0354: initiative_kind surfaces persistent|one-shot on the vision-list entry
+# (defaults to one-shot when the frontmatter field is absent).
+def test_vision_initiative_kind_defaults_one_shot(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_initiative_task(backlog, "T-0544", "persistent-initiatives", "open")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    entry = next(x for x in r.json() if x["name"] == "initiatives/persistent-initiatives.md")
+    assert entry["initiative_kind"] == "one-shot"
+
+
+def test_vision_initiative_kind_persistent(tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    _write_initiative_task(backlog, "T-0545", "ini-02", "open", initiative_kind="persistent")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    entry = next(x for x in r.json() if x["name"] == "initiatives/ini-02.md")
+    assert entry["initiative_kind"] == "persistent"
 
 
 def test_vision_dedupes_task_against_dir(tmp_bot_squad: Path, monkeypatch):

@@ -2707,13 +2707,15 @@ def _action_flow_new(params: dict[str, Any]) -> dict[str, Any]:
 
 
 _INITIATIVE_NEW_REQUIRED = {"slug", "name"}
-_INITIATIVE_NEW_ALLOWED = _INITIATIVE_NEW_REQUIRED | {"provenance"}
+_INITIATIVE_NEW_ALLOWED = _INITIATIVE_NEW_REQUIRED | {"provenance", "persistent"}
 
 
 def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate the next INI-NN id and write a stub initiative md.
 
     Required params: slug, name
+    Optional: persistent (bool) — T-0354: standing responsibility vs the
+      default one-shot; sets ``initiative_kind: persistent`` on the stub.
     Returns: {ok, id, file_path}
 
     Storage: ``data/<slug>/vision/initiatives/INI-NN-<slug>.md``. Legacy
@@ -2750,7 +2752,7 @@ def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
     stem = _slugify_title(name)
     file_path = backlog_dir / f"{new_id}-{stem}.md"
 
-    fm = "\n".join([
+    fm_lines = [
         f"id: {new_id}",
         f"title: {_yaml_quote(name)}",
         "status: open",
@@ -2759,10 +2761,19 @@ def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
         f"created: {ts}",
         f"provenance: {prov}",
         f"aka: [{stem}]",
-    ])
+    ]
+    persistent = bool(params.get("persistent"))
+    if persistent:
+        # T-0354: omitted entirely for the one-shot (default) case, so the
+        # stub for the common path stays byte-identical to before this.
+        fm_lines.append("initiative_kind: persistent")
+    fm = "\n".join(fm_lines)
     content = f"---\n{fm}\n---\n\n# {name}\n\n(filed via initiative_new)\n"
     _atomic_write_new(file_path, content)
-    return {"ok": True, "id": new_id, "kind": "initiative", "file_path": str(file_path)}
+    result = {"ok": True, "id": new_id, "kind": "initiative", "file_path": str(file_path)}
+    if persistent:
+        result["initiative_kind"] = "persistent"
+    return result
 
 
 _PEER_INBOX_WAIT_REQUIRED = {"slug", "sid", "timeout"}

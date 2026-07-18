@@ -3444,8 +3444,12 @@ def cmd_flow_new(args) -> None:
 
 def cmd_initiative_new(args) -> None:
     slug = resolve_slug()
-    res = post("initiative_new", {"slug": slug, "name": args.name})
-    print(f"{res['id']}  ->  {res['file_path']}")
+    params = {"slug": slug, "name": args.name}
+    if getattr(args, "persistent", False):
+        params["persistent"] = True
+    res = post("initiative_new", params)
+    suffix = "  [persistent]" if res.get("initiative_kind") == "persistent" else ""
+    print(f"{res['id']}  ->  {res['file_path']}{suffix}")
 
 
 # --------------------------------------------------------------------------
@@ -4205,6 +4209,9 @@ def build_parser() -> argparse.ArgumentParser:
     ini_sub = ini.add_subparsers(dest="sub", required=True)
     inin = ini_sub.add_parser("new", help="allocate the next INI-NN + write a stub initiative")
     inin.add_argument("name", help="initiative name")
+    inin.add_argument("--persistent", action="store_true",
+                       help="T-0354: standing responsibility, never auto-closed "
+                            "(sets initiative_kind: persistent; default is one-shot)")
     inin.set_defaults(func=cmd_initiative_new)
 
     # autopilot (T-0153: prompt-driven, time-boxed autonomous runs)

@@ -2579,6 +2579,20 @@ def test_initiative_new_mints_kind_initiative_task(tmp_path, tmp_config_dir, mon
     assert "provenance:" in body               # post-cutoff task → needs provenance
     # NOT written as a legacy vision file
     assert not (proj / "vision" / "initiatives").exists()
+    assert "initiative_kind" not in body   # default (one-shot) omits the field
+
+
+def test_initiative_new_persistent_sets_initiative_kind(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0354: persistent=True stamps initiative_kind: persistent on the stub."""
+    import bot_squad_worker.actions as A
+
+    _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("initiative_new", {
+        "slug": "test-project", "name": "Prod Support", "persistent": True,
+    })
+    assert out["initiative_kind"] == "persistent"
+    body = Path(out["file_path"]).read_text()
+    assert "initiative_kind: persistent" in body
 
 
 def test_doc_new_self_heals_against_manual_file(tmp_path, tmp_config_dir, monkeypatch):

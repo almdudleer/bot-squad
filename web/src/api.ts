@@ -210,7 +210,15 @@ export function parseNearDuplicate(err: unknown): NearDuplicateDetail | null {
   }
 }
 
-export type VisionFile = { name: string; content: string; active?: boolean; finished?: boolean };
+export type VisionFile = {
+  name: string;
+  content: string;
+  active?: boolean;
+  finished?: boolean;
+  // T-0354: persistent (standing responsibility) vs one-shot, set on
+  // kind:initiative tasks; absent/"one-shot" for non-initiative vision files.
+  initiative_kind?: "persistent" | "one-shot";
+};
 
 // T-0283 (Pillar C / D-0029): the unified cross-store artifact kind. Every
 // nestable artifact (doc, use-case, feedback theme) carries a `kind` so the

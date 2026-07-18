@@ -155,6 +155,10 @@ def _initiative_entries_from_tasks(project_data_dir: Path) -> list[dict]:
             "finished": status == "closed",
             "task_id": t.get("id"),
             "kind": "initiative",
+            # T-0354: persistent (standing responsibility) vs the default
+            # one-shot; replaces the dead constant_team-in-body regex the FE
+            # used to parse (T-0411) — that source never populated post-T-0480.
+            "initiative_kind": t.get("initiative_kind") or "one-shot",
         })
     return out
 

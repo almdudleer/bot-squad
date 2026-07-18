@@ -69,12 +69,13 @@ export function initiativeDisplayName(name: string): string {
     .join(" ");
 }
 
-export function isPersistentInitiative(content: string | undefined | null): boolean {
-  if (!content) return false;
-  const m = content.match(/^constant_team:\s*(.+?)\s*$/im);
-  if (!m) return false;
-  const v = m[1].trim().toLowerCase().replace(/^["']|["']$/g, "");
-  return v === "true" || v === "1" || v === "yes" || v === "on";
+// T-0354: initiative_kind: persistent|one-shot on the kind:initiative task
+// backing this entry — replaces the T-0411 constant_team-in-body regex
+// above (dead since T-0480 moved initiatives into backlog tasks: no
+// kind:initiative task ever carried a constant_team line in its body, so
+// this badge/control never fired). D-0059.
+export function isPersistentInitiative(f: Pick<VisionFile, "initiative_kind"> | undefined | null): boolean {
+  return f?.initiative_kind === "persistent";
 }
 
 export function Vision() {
@@ -421,7 +422,7 @@ export function Vision() {
                 </button>
                 {/* T-0411: surface constant-team initiatives so item-16's
                     staffing kill-switch isn't operating off-screen. */}
-                {isPersistentInitiative(f.content) && (
+                {isPersistentInitiative(f) && (
                   <span
                     className="mc-badge mc-badge-info"
                     style={{ fontSize: "0.6rem" }}
@@ -447,14 +448,14 @@ export function Vision() {
                         className="btn btn-outline-secondary btn-sm"
                         style={{ fontSize: "0.72rem" }}
                         onClick={() => markFinished(f)}
-                        title={isPersistentInitiative(f.content)
+                        title={isPersistentInitiative(f)
                           ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
                           : undefined}
                       >
                         {/* T-0410: a persistent constant-team has no real
                             'finished' state — relabel its worker-stopping
                             control so marking it finished isn't a category error. */}
-                        {isPersistentInitiative(f.content) ? "Stop staffing / Retire" : "Mark finished"}
+                        {isPersistentInitiative(f) ? "Stop staffing / Retire" : "Mark finished"}
                       </button>
                     </>
                   )}
@@ -473,14 +474,14 @@ export function Vision() {
                         className="btn btn-outline-secondary btn-sm"
                         style={{ fontSize: "0.72rem" }}
                         onClick={() => markFinished(f)}
-                        title={isPersistentInitiative(f.content)
+                        title={isPersistentInitiative(f)
                           ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
                           : undefined}
                       >
                         {/* T-0410: a persistent constant-team has no real
                             'finished' state — relabel its worker-stopping
                             control so marking it finished isn't a category error. */}
-                        {isPersistentInitiative(f.content) ? "Stop staffing / Retire" : "Mark finished"}
+                        {isPersistentInitiative(f) ? "Stop staffing / Retire" : "Mark finished"}
                       </button>
                     </>
                   )}

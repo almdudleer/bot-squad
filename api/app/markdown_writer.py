@@ -53,6 +53,12 @@ _ALLOWED_UPDATE_KEYS = frozenset({
     # T-0480: `kind` marks an initiative-task (`kind: initiative`); absent ==
     # a normal task. The explicit mark behind initiative-as-special-task.
     "kind",
+    # T-0354: on a `kind: initiative` task, `initiative_kind` distinguishes a
+    # standing responsibility (`persistent`) from a normal do-it-then-done
+    # initiative (`one-shot`, the default when absent). Separate from `kind`
+    # above — that field answers "is this an initiative at all," this one
+    # answers "what kind of initiative."
+    "initiative_kind",
     "session_history",
     # T-0172: ticket→doc mentions (list of D-NNNN). Kept in sync with each
     # doc's `related_tickets` by routes_docs link/unlink.

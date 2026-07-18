@@ -192,6 +192,19 @@ def test_merge_task_update_accepts_kind(tmp_path: Path):
     assert task["kind"] == "initiative"
 
 
+def test_merge_task_update_accepts_initiative_kind(tmp_path: Path):
+    """T-0354: persistent-vs-one-shot is patchable post-creation, distinct
+    from the `kind` field (which marks initiative-vs-task)."""
+    from app.markdown_parser import parse_task
+
+    p = tmp_path / "T-0071-initiative-kind.md"
+    write_task(p, {"id": "T-0071", "title": "X", "status": "open", "kind": "initiative"}, "body\n")
+    merge_task_update(p, {"initiative_kind": "persistent"})
+    task = parse_task(p)
+    assert task["kind"] == "initiative"
+    assert task["initiative_kind"] == "persistent"
+
+
 # ---------------------------------------------------------------------------
 # T-0105 — session_history is allowed through merge_task_update
 # ---------------------------------------------------------------------------

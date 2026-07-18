@@ -2876,15 +2876,89 @@ def test_send_stakeholder_dm_mode_max_temporary_switch(tmp_config_dir, monkeypat
 
 def test_send_stakeholder_dm_slims_long_pages(tmp_config_dir, monkeypatch):
     """T-0610: pages are short-form — a verbose work summary is cut at a
-    boundary with an explicit continuation pointer."""
+    boundary with an explicit continuation pointer.
+
+    T-0635: on a single-project install the pointer is a real staging-web
+    link (built from the sole registered project), not the bare words
+    "см. задачу/тред"."""
     import bot_squad_worker.actions as A
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
     verbose = "Сводка по работе. " + "Сделал шаг и проверил результат. " * 40
     A._send_stakeholder_dm(A._get_config(), message=verbose, tg_chat_id="-100")
     sent_text = fake_tg.calls[0]["text"]
     assert len(sent_text) < len(verbose)
-    assert len(sent_text) <= A._PAGE_SLIM_LIMIT + 40
-    assert "детали: см. задачу/тред" in sent_text
+    assert len(sent_text) <= A._PAGE_SLIM_LIMIT + 80
+    assert "детали: см. задачу/тред" not in sent_text
+    assert "https://staging.example.com/p/test-project/sessions" in sent_text
+
+
+def test_slim_page_appends_real_link_when_given(tmp_config_dir, monkeypatch):
+    """T-0635: _slim_page appends the caller-supplied link verbatim instead of
+    the plain-text 'см. задачу/тред' pointer."""
+    import bot_squad_worker.actions as A
+    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
+    out = A._slim_page(long_text, link="https://staging.example.com/p/test-project/t/T-1")
+    assert out.endswith("https://staging.example.com/p/test-project/t/T-1")
+    assert "см. задачу/тред" not in out
+
+
+def test_slim_page_falls_back_to_generic_text_without_a_link(tmp_config_dir, monkeypatch):
+    """T-0635: an unresolvable link (e.g. multi-project install, no chat
+    match) falls back to the old generic pointer rather than a dangling
+    'подробнее: ' with nothing after it."""
+    import bot_squad_worker.actions as A
+    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
+    out = A._slim_page(long_text)
+    assert out.endswith("(детали: см. задачу/тред)")
+
+
+def test_send_stakeholder_dm_link_targets_explicit_task_id(tmp_config_dir, monkeypatch):
+    """T-0635: when the call site has a task_id on hand (tg_notify's optional
+    ``task_id`` param, threaded through to the SSOT), the pointer links
+    straight to that task."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
+    # No explicit chat_id/topic_id — an explicit target is a group/forum
+    # address (prefer_tg, never slimmed); slug-based default routing is what
+    # actually exercises the slim+link path.
+    A.dispatch("tg_notify", {"message": long_text, "slug": "test-project",
+                              "task_id": "T-0635"})
+    sent = fake_tg.calls[0]["text"]
+    assert "https://staging.example.com/p/test-project/t/T-0635" in sent
+
+
+def test_send_stakeholder_dm_link_scoped_to_real_session_sid(tmp_config_dir, monkeypatch):
+    """T-0635: without a task_id, a real session sid (S-...) scopes the
+    sessions-page link; a synthetic label sid (e.g. "autopilot") does not."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
+    A._send_stakeholder_dm(A._get_config(), message=long_text, tg_chat_id="-100",
+                            sid="S-almdudleer-dev-p1")
+    sent = fake_tg.calls[0]["text"]
+    assert "https://staging.example.com/p/test-project/sessions?sid=S-almdudleer-dev-p1" in sent
+
+    A._send_stakeholder_dm(A._get_config(), message=long_text, tg_chat_id="-100",
+                            sid="autopilot")
+    sent2 = fake_tg.calls[1]["text"]
+    assert sent2.endswith("https://staging.example.com/p/test-project/sessions")
+
+
+def test_send_stakeholder_dm_link_present_via_max_transport_too(tmp_config_dir, monkeypatch):
+    """T-0635 DoD: the link must resolve for both TG and MAX transports (the
+    T-0610 page-mode switch) — it's baked into ``message`` before the
+    tg/max branch split, so a MAX-routed page carries it too."""
+    import bot_squad_worker.actions as A
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())
+    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
+    out = A._send_stakeholder_dm(A._get_config(), message=long_text, sid="S-x-p1",
+                                  tg_chat_id="-100")
+    assert out["channel"] == "max"
+    sent = fake_max.calls[0]["text"]
+    assert "https://staging.example.com/p/test-project/sessions?sid=S-x-p1" in sent
 
 
 def test_send_stakeholder_dm_prefer_tg_never_slimmed(tmp_config_dir, monkeypatch):

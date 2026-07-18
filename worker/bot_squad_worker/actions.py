@@ -164,6 +164,10 @@ _TG_NOTIFY_ALLOWED = {
     # payload — mirrors the debounce=False the channel abstraction already uses
     # for interactive replies (tg_listener._channel_notify).
     "debounce",
+    # T-0635: explicit task id for the truncation-pointer deep link — see
+    # _page_detail_link. Optional; falls back to a sessions-page link when
+    # absent.
+    "task_id",
 }
 
 
@@ -294,6 +298,8 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         prefer_tg=explicit_tg_target,
         debounce=debounce,
         do_slim=do_slim,
+        slug=slug,
+        task_id=str(params.get("task_id") or ""),
     )
 
 
@@ -328,10 +334,18 @@ def _set_page_mode(cfg: Any, mode: str, *, by: str = "") -> dict[str, Any]:
     return payload
 
 
-def _slim_page(text: str) -> str:
+def _slim_page(text: str, link: str = "") -> str:
     """T-0610: cap a page at headline size. Over-limit text is cut at a
     line/sentence boundary with an explicit continuation pointer — pages must
-    be short, but never silently truncated mid-word."""
+    be short, but never silently truncated mid-word.
+
+    T-0635: the pointer is a real clickable ``link`` (staging web URL to the
+    task/session), not the bare words "см. задачу/тред" — a plain-text
+    pointer read as evasive/broken to the stakeholder. ``link`` is best-effort
+    (built by ``_page_detail_link`` from whatever the call site has on hand);
+    an empty link falls back to the old generic phrasing rather than emitting
+    a dangling "подробнее: " with nothing after it.
+    """
     t = (text or "").strip()
     if len(t) <= _PAGE_SLIM_LIMIT:
         return t
@@ -341,7 +355,45 @@ def _slim_page(text: str) -> str:
         if i > 100:
             cut = cut[:i]
             break
-    return cut.rstrip(" .") + "\n… (детали: см. задачу/тред)"
+    cut = cut.rstrip(" .")
+    if link:
+        return f"{cut}\n… подробнее: {link}"
+    return cut + "\n… (детали: см. задачу/тред)"
+
+
+def _page_detail_link(cfg: Any, *, slug: str = "", tg_chat_id: str = "",
+                       sid: str = "", task_id: str = "") -> str:
+    """T-0635: best-effort staging-web URL for a truncated page's continuation
+    pointer. Resolves a project from whatever the call site has on hand —
+    explicit ``slug`` first, else a reverse lookup by ``tg_chat_id`` (every
+    ``_send_stakeholder_dm`` caller already has this), else the sole project
+    on a single-project install — then links to the specific task
+    (``task_id``) when known, else the sessions view (scoped to ``sid`` when
+    it looks like a real session id, e.g. "S-..." — labels like "autopilot"
+    or "routine:<id>" aren't a session to filter on). Empty when no project
+    can be resolved (multi-project install, no chat match) — the caller falls
+    back to the old generic text rather than a broken link. ``getattr``
+    throughout: some test doubles stand in a bare ``SimpleNamespace`` for
+    ``Project`` with only the fields that test exercises.
+    """
+    resolved_slug = slug
+    project = cfg.projects.get(slug) if slug else None
+    if project is None and tg_chat_id:
+        for k, p in cfg.projects.items():
+            if getattr(p, "tg_chat", "") == tg_chat_id:
+                project, resolved_slug = p, k
+                break
+    if project is None and len(cfg.projects) == 1:
+        resolved_slug, project = next(iter(cfg.projects.items()))
+    staging_url = getattr(project, "staging_url", "") if project else ""
+    if not staging_url or not resolved_slug:
+        return ""
+    base = staging_url.rstrip("/")
+    if task_id:
+        return f"{base}/p/{resolved_slug}/t/{task_id}"
+    if sid.startswith("S-"):
+        return f"{base}/p/{resolved_slug}/sessions?sid={sid}"
+    return f"{base}/p/{resolved_slug}/sessions"
 
 
 def _send_stakeholder_dm(
@@ -357,6 +409,8 @@ def _send_stakeholder_dm(
     group_record: bool = False,
     debounce: bool = True,
     do_slim: bool = True,
+    slug: str = "",
+    task_id: str = "",
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
@@ -378,6 +432,11 @@ def _send_stakeholder_dm(
     ``do_slim=False`` lets a caller that already slimmed its question part
     (needs-input escalations, whose tmux-attach footer must survive) opt out.
 
+    ``slug``/``task_id`` (T-0635, both optional) feed ``_page_detail_link`` so
+    a truncated page's continuation pointer is a real staging-web link instead
+    of the bare words "см. задачу/тред" — see that function for the fallback
+    chain when a caller doesn't have them on hand.
+
     ``prefer_tg`` (an explicit group/forum target MAX can't honor) stays
     TG-only: no MAX fallback for group-addressed content; TG errors propagate
     to the caller as before.
@@ -387,7 +446,10 @@ def _send_stakeholder_dm(
     """
     del group_record  # T-0610: compat no-op — one page, one delivery
     if do_slim and not prefer_tg:
-        message = _slim_page(message)
+        link = _page_detail_link(
+            cfg, slug=slug, tg_chat_id=tg_chat_id, sid=sid, task_id=task_id,
+        )
+        message = _slim_page(message, link)
 
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:

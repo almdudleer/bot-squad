@@ -739,7 +739,21 @@ def apply(cfg: Any, entry: dict) -> ApplyResult:
         # T-0107 — schedule the worker self-restart so the running process
         # picks up the new code. Fires AFTER state is persisted and we
         # return, so the caller (drain_one / the tick) finishes cleanly.
-        _schedule_worker_restart()
+        # T-0305 part-b: share deploy's minimum-restart-interval gate — a burst
+        # of rapid consecutive applies (several releases published in quick
+        # succession) must not bounce the worker every few minutes either. A
+        # skipped restart is never lost: it's self-healing because apply()
+        # already rewrote the on-disk code regardless, and the NEXT successful
+        # apply calls this again, catching up once the window elapses.
+        from bot_squad_worker import deploy as _deploy
+        if _deploy._restart_rate_limited(cfg, source="autoupdate_apply", reason=version):
+            log.info(
+                "autoupdate_apply: worker restart RATE-LIMITED for version=%s — "
+                "on-disk code already updated; the next qualifying restart "
+                "trigger picks it up", version,
+            )
+        else:
+            _schedule_worker_restart()
 
         return ApplyResult(ok=True, version=version)
 

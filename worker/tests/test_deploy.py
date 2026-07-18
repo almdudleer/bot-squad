@@ -1410,6 +1410,109 @@ def test_run_next_no_restart_forced_but_no_worker_change(
 
 
 # ---------------------------------------------------------------------------
+# T-0305 part-b: minimum-restart-interval gate — journal archaeology (see
+# ticket) found the ~6min cadence was overwhelmingly NON-hermetic pytest runs
+# spawning REAL worker restarts (T-0574, fixed separately). This gate is
+# defense-in-depth so a burst of individually-legitimate worker-changing
+# events still can't bounce the worker faster than the configured floor.
+# ---------------------------------------------------------------------------
+
+
+def test_restart_rate_limited_false_then_true_within_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+
+    assert d._restart_rate_limited(cfg, source="deploy") is False
+    # Second call inside the window is rate-limited, and does NOT reclaim it.
+    assert d._restart_rate_limited(cfg, source="deploy") is True
+    assert d._restart_rate_limited(cfg, source="deploy") is True
+
+
+def test_restart_rate_limited_clears_after_window_elapses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+
+    assert d._restart_rate_limited(cfg, source="deploy") is False
+    marker = d._restart_rate_limit_path(cfg)
+    stamped = json.loads(marker.read_text())
+    marker.write_text(json.dumps({**stamped, "at": stamped["at"] - 301}))
+    assert d._restart_rate_limited(cfg, source="deploy") is False
+
+
+def test_restart_rate_limited_disabled_by_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bot_squad_worker.deploy as d
+    cfg = _make_config(tmp_path, _make_project(tmp_path))
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "0")
+
+    assert d._restart_rate_limited(cfg, source="deploy") is False
+    assert d._restart_rate_limited(cfg, source="deploy") is False
+
+
+def test_run_next_second_worker_changing_deploy_rate_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two back-to-back worker-changing deploys within the window: the first
+    fires, the second is skipped as rate-limited (NOT double-restarted) — and
+    is distinguishable in worker_restart_status from a no-worker-change skip."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+
+    enqueue(cfg, proj.slug, "staging", "worker change #1", "user", restart_worker=True)
+    result1 = run_next(cfg, proj.slug)
+    assert result1 is not None and result1.worker_restart_status == "fired"
+    assert len(calls) == 1
+
+    enqueue(cfg, proj.slug, "staging", "worker change #2", "user", restart_worker=True)
+    result2 = run_next(cfg, proj.slug)
+    assert result2 is not None and result2.worker_restart_status == "skipped: rate-limited"
+    assert len(calls) == 1  # NOT fired a second time
+
+
+def test_run_next_worker_restart_not_rate_limited_after_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second worker-changing deploy AFTER the interval elapses still fires —
+    the gate never permanently swallows a legitimate restart."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+
+    enqueue(cfg, proj.slug, "staging", "worker change #1", "user", restart_worker=True)
+    run_next(cfg, proj.slug)
+    assert len(calls) == 1
+
+    marker = d._restart_rate_limit_path(cfg)
+    stamped = json.loads(marker.read_text())
+    marker.write_text(json.dumps({**stamped, "at": stamped["at"] - 301}))
+
+    enqueue(cfg, proj.slug, "staging", "worker change #2", "user", restart_worker=True)
+    result2 = run_next(cfg, proj.slug)
+    assert result2 is not None and result2.worker_restart_status == "fired"
+    assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
 # T-0446 / next-wave #2: surface the resolved sha + worker-restart decision on
 # the DeployResult so the terminal #deploy-logs ping echoes which commit shipped
 # and whether the worker bounced (kills the T-0436 false-stale-worker panic).

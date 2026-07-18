@@ -211,6 +211,54 @@ def _should_restart_worker(cfg: "Config", *, ok: bool, forced: bool) -> bool:
     return os.environ.get("BOT_SQUAD_DEPLOY_AUTO_RESTART", "1").strip() != "0"
 
 
+def _restart_rate_limit_path(cfg: "Config") -> Path:
+    return cfg.data_dir / "_worker" / "restart_rate_limit.json"
+
+
+def _restart_rate_limited(cfg: "Config", *, source: str, reason: str = "") -> bool:
+    """T-0305 part-b: minimum-interval gate shared by EVERY worker-restart
+    trigger (deploy's ``_restart_worker_detached`` AND autoupdate_apply's
+    ``_schedule_worker_restart``) — caps how often ANY of them may actually
+    fire, so a burst of individually-legitimate worker-changing events (several
+    deploys/applies a few minutes apart during a busy run) still can't bounce
+    the worker every few minutes and repeatedly kill every TL's
+    ``peer_inbox_wait`` long-poll run-wide (the T-0305 verbatim complaint).
+
+    Distinct from T-0287's coalescing marker: T-0287 debounces restarts
+    requested within the same few-second burst (trailing-edge, collapses N
+    concurrent deploys into 1). This gates the ~minutes-apart cadence T-0287
+    doesn't touch.
+
+    Returns True (rate-limited — caller must SKIP the restart) iff a restart
+    already fired within ``BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS``
+    (default 300s = 5min; <=0 disables the gate entirely). Self-healing: a
+    skipped restart is never lost — the worker stays on stale code until the
+    NEXT qualifying trigger fires past the window, and that one restart picks
+    up everything accumulated since boot (deploy's gate compares boot sha to
+    live HEAD, not to any single deploy's diff).
+
+    On an ALLOWED call this atomically claims the window (writes ``now`` as
+    the new stamp) — never call this speculatively; only when the caller is
+    committed to actually firing the restart.
+    """
+    interval = int(os.environ.get("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300"))
+    if interval <= 0:
+        return False
+    marker = _restart_rate_limit_path(cfg)
+    now = time.time()
+    try:
+        last = float(json.loads(marker.read_text()).get("at", 0.0))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        last = 0.0
+    if now - last < interval:
+        return True
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.parent / f"{marker.name}.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps({"at": now, "source": source, "reason": reason}))
+    os.replace(tmp, marker)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # systemd-scope detach (T-0213)
 # ---------------------------------------------------------------------------
@@ -754,21 +802,38 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     # BOT_SQUAD_DEPLOY_AUTO_RESTART=0.
     forced = bool(payload.get("restart_worker"))
     will_restart = _should_restart_worker(cfg, ok=ok, forced=forced)
+    rate_limited = False
     if will_restart:
         reason = payload.get("reason", "")
         tag = "restart_worker" if forced else "auto-restart: worker/ changed"
         reason = f"{tag} — {reason}".strip(" —")
-        try:
-            _restart_worker_detached(cfg, slug, queue_id, reason)
-        except Exception:
-            log.exception(
-                "deploy.run_next: %s/%s post-deploy worker restart launch failed "
-                "(deploy itself succeeded — restart the worker manually)", slug, target,
+        # T-0305 part-b: a qualifying (worker-changed, not-killswitched) restart
+        # can still be part of a burst of a few-minutes-apart deploys during a
+        # busy run — cap the actual bounce rate. Self-healing: the NEXT
+        # qualifying deploy's restart (once the window elapses) still catches
+        # this one's worker/ change, since the gate compares boot sha to live
+        # HEAD, not to any single deploy's diff.
+        if _restart_rate_limited(cfg, source="deploy", reason=reason):
+            rate_limited = True
+            will_restart = False
+            log.info(
+                "deploy.run_next: %s/%s worker restart RATE-LIMITED (min interval "
+                "not yet elapsed since the last restart) — skipping; the next "
+                "qualifying deploy still catches this change", slug, target,
             )
+        else:
+            try:
+                _restart_worker_detached(cfg, slug, queue_id, reason)
+            except Exception:
+                log.exception(
+                    "deploy.run_next: %s/%s post-deploy worker restart launch failed "
+                    "(deploy itself succeeded — restart the worker manually)", slug, target,
+                )
     # T-0446: surface which commit shipped + the worker-restart decision so the
     # terminal #deploy-logs ping is self-explaining (no false stale-worker panic).
     worker_restart_status = (
         "fired" if will_restart
+        else "skipped: rate-limited" if rate_limited
         else ("skipped: deploy failed" if not ok else "skipped: no worker change")
     )
     return DeployResult(

@@ -443,6 +443,39 @@ def test_apply_happy_path_schedules_worker_restart(install_ctx, monkeypatch):
     assert restart_calls == [1], "apply success must schedule exactly one worker restart"
 
 
+def test_apply_restart_rate_limited_skips_schedule(install_ctx, monkeypatch):
+    """T-0305 part-b: a successful apply within the shared min-restart-interval
+    window must NOT call _schedule_worker_restart — the on-disk code is already
+    updated regardless, and the next qualifying restart trigger catches up."""
+    from bot_squad_worker import deploy as deploy_mod
+
+    cfg = install_ctx["cfg"]
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    # Claim the window as if a restart JUST fired via some other trigger.
+    assert deploy_mod._restart_rate_limited(cfg, source="test-setup") is False
+
+    _pre_stamp(cfg, "v2026.05.16.1")
+    tar_bytes = _make_tarball("v2026.05.16.2")
+    sha = hashlib.sha256(tar_bytes).hexdigest()
+    entry = _make_entry("v2026.05.16.2", sha)
+
+    _install_fake_download(monkeypatch, tar_bytes)
+    monkeypatch.setattr(apply_mod, "_docker_compose_up_build", lambda cfg, git_sha=None: "ok")
+    monkeypatch.setattr(apply_mod, "_smoke", lambda url: None)
+    monkeypatch.setattr(apply_mod, "_running_git_sha", lambda cfg: entry["git_sha"])
+
+    restart_calls: list[int] = []
+    monkeypatch.setattr(
+        apply_mod, "_schedule_worker_restart",
+        lambda *a, **kw: restart_calls.append(1),
+    )
+
+    result = apply_mod.apply(cfg, entry)
+
+    assert result.ok is True  # the apply itself still succeeds
+    assert restart_calls == [], "rate-limited restart must not fire"
+
+
 # ---------------------------------------------------------------------------
 # Failure paths — each step rolls back to prior state
 # ---------------------------------------------------------------------------

@@ -197,6 +197,21 @@ def on_peer_send(cfg: Any, slug: str, from_sid: str, recipient_sids: list[str]) 
             clear_blocked(cfg, slug, rsid)
         return
 
+    # T-0599: never auto-mark one of the human's own sessions blocked on
+    # itself. A user-conversation session's whole job is a one-way
+    # intake->operator notify (never a question awaiting a reply — see its
+    # role contract), and a hand-launched `user-session` window IS the
+    # stakeholder, who cannot be "blocked on" themselves. Journal-evidenced
+    # false positives (2026-07-05 11:20Z + 19:01Z): a routine FYI / a
+    # closing confirmation each got marked blocked purely because the
+    # recipient's role was operator, with no regard for the sender or intent.
+    # Reuses recycle_gate's existing SSOT for this same "human's own
+    # sessions" class (T-0564/T-0616) rather than inventing a new signal.
+    from bot_squad_worker import recycle_gate as _recycle_gate
+    sender = rows.get(from_sid, {})
+    if _recycle_gate.user_session_exempt(role=sender.get("role"), window=sender.get("window")):
+        return
+
     for rsid in recipient_sids:
         if rows.get(rsid, {}).get("role") == "operator":
             # The agent just asked the stakeholder something → it is now

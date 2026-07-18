@@ -161,6 +161,50 @@ def test_operator_reply_clears_marker(tmp_path, fake_roles):
 
 
 # ---------------------------------------------------------------------------
+# T-0599: never auto-mark one of the human's own sessions blocked on itself —
+# journal-evidenced false positives (2026-07-05 11:20Z + 19:01Z), see
+# recycle_gate.user_session_exempt (T-0564/T-0616) for the shared signal.
+# ---------------------------------------------------------------------------
+
+USERCONV = "S-almdudleer-gu_abc123-user-conversation-p12"
+USERSESSION = "S-almdudleer-user-session-p8"
+
+
+def test_peer_send_user_conversation_role_does_not_mark(tmp_path, monkeypatch):
+    """A user-conversation session's peer_send to the operator is its normal
+    one-way intake->operator notify (per its role contract), never a question
+    awaiting a reply — must not be auto-marked blocked."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(
+        S, "list_sessions",
+        lambda cfg, slug: [
+            {"sid": USERCONV, "role": "user-conversation", "window": "gu_abc123-user-conversation"},
+            {"sid": OP, "role": "operator", "window": "operator"},
+        ],
+    )
+    cfg = _make_cfg(tmp_path)
+    TS.on_peer_send(cfg, "bot-squad", USERCONV, [OP])
+    assert not TS._marker_path(cfg, "bot-squad", USERCONV).exists()
+
+
+def test_peer_send_hand_launched_user_session_window_does_not_mark(tmp_path, monkeypatch):
+    """A hand-launched `user-session` window IS the stakeholder — they cannot
+    be "blocked on" themselves, even though this window derives role `dev`
+    (T-0175 default, D-0053 §4)."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(
+        S, "list_sessions",
+        lambda cfg, slug: [
+            {"sid": USERSESSION, "role": "dev", "window": "user-session"},
+            {"sid": OP, "role": "operator", "window": "operator"},
+        ],
+    )
+    cfg = _make_cfg(tmp_path)
+    TS.on_peer_send(cfg, "bot-squad", USERSESSION, [OP])
+    assert not TS._marker_path(cfg, "bot-squad", USERSESSION).exists()
+
+
+# ---------------------------------------------------------------------------
 # tick escalation (scenario steps 4, 5, 6)
 # ---------------------------------------------------------------------------
 

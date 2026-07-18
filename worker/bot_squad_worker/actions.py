@@ -2308,8 +2308,11 @@ _TASK_NEW_TITLE_MAX = 240
 # task_search's own duplicate-eligibility floor: a 1-token query has 100%
 # coverage on any hit trivially, which is noise, not a real duplicate signal.
 _TASK_DEDUPE_MIN_TOKENS = 2
-# Cap on how many ranked backlog candidates we even look at before filtering
-# by coverage — keeps a single reject message short and readable.
+# Cap on how many coverage-filtered candidates go into the reject message —
+# applied AFTER ranking+filtering (never before: capping the ranked list
+# first can crowd out a lower-scored candidate that actually clears the
+# coverage threshold, see the recall-gap fix in _task_new_similar_backlog).
+# Keeps a single reject message short and readable.
 _TASK_DEDUPE_CANDIDATE_LIMIT = 5
 
 
@@ -2392,24 +2395,36 @@ def _task_new_similar_backlog(cfg: Any, slug: str, query: str) -> list[Any]:
             continue
         meta, body = parsed
         meta = meta or {}
+        status = str(meta.get("status") or "")
+        if status == "closed":
+            # A closed ticket is done — re-filing a regression of it (or a
+            # fresh, unrelated ask that happens to share vocabulary with an
+            # old closed ticket) must not need --force. Only OPEN backlog
+            # entries are live near-duplicate risk.
+            continue
         stem_parts = md.stem.split("-", 2)
         fallback_id = "-".join(stem_parts[:2]) if len(stem_parts) >= 2 else md.stem
         tickets.append(_ts.Ticket(
             id=str(meta.get("id") or fallback_id).strip(),
             title=str(meta.get("title") or md.stem),
             body=body,
-            status=str(meta.get("status") or ""),
+            status=status,
         ))
     if not tickets:
         return []
 
     threshold = cfg.tasks_dedupe_threshold
     out = []
-    for c in _ts.rank(query, tickets, limit=_TASK_DEDUPE_CANDIDATE_LIMIT):
+    # Rank UNBOUNDED (limit=len(tickets)) so the title-weighted score never
+    # crowds a body-only near-dupe out before it reaches the coverage filter,
+    # THEN filter by coverage, THEN cap the listing — capping first (the old
+    # behaviour) could drop the one candidate that actually clears threshold
+    # in favour of five higher-scored-but-irrelevant ones (recall gap).
+    for c in _ts.rank(query, tickets, limit=len(tickets)):
         coverage = len(c.matched) / len(tokens)
         if coverage >= threshold:
             out.append(c)
-    return out
+    return out[:_TASK_DEDUPE_CANDIDATE_LIMIT]
 
 
 def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
@@ -2483,7 +2498,19 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
         dedupe_query = title
         if isinstance(verbatim, str) and verbatim.strip():
             dedupe_query = f"{title}\n{verbatim}"
-        similar = _task_new_similar_backlog(cfg, slug, dedupe_query)
+        # Fail OPEN, not closed: the gate is a courtesy dedupe check, not a
+        # security boundary — an unexpected error here (PermissionError from
+        # glob iteration, a bug in task_search.rank, a malformed backlog
+        # file) must never block a legitimate mint. Log and proceed as if
+        # nothing similar was found.
+        try:
+            similar = _task_new_similar_backlog(cfg, slug, dedupe_query)
+        except Exception:
+            log.exception(
+                "task_new: dedupe gate raised for slug=%r — failing OPEN (minting without a dedupe check)",
+                slug,
+            )
+            similar = []
         if similar:
             listing = "; ".join(f"{c.id} {c.title!r}" for c in similar)
             raise ActionError(

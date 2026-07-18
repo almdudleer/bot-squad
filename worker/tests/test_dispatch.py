@@ -694,6 +694,29 @@ def test_classify_tweak_max_words_env_garbage_falls_back(monkeypatch):
     assert out["kind"] == "instant_tweak"
 
 
+def test_classify_on_off_slash_notation_tokenizes_separately():
+    # Regression (T-0581 finding 5): the old tokenizer regex kept "/" inside
+    # a word, so "on/off" fused into one token matching neither the "on" nor
+    # the "off" control verb — a common tweak phrasing fell through to
+    # long_request. "toggle" itself isn't a recognized verb; "on"/"off" must
+    # each tokenize standalone to ground the tweak.
+    out = classify_request("toggle the autopilot on/off")
+    assert out["kind"] == "instant_tweak"
+    assert "system-nouns:autopilot" in out["signals"]
+    assert any(s.startswith("control-verbs:") for s in out["signals"])
+
+
+def test_classify_mid_sentence_question_mark_does_not_glue_to_system_noun():
+    # Regression (T-0581 finding 5): the old tokenizer kept a mid-sentence
+    # "?" glued to the preceding word ("task?" != "task" in SYSTEM_NOUNS),
+    # so a control verb pointed at a noun immediately followed by "?" lost
+    # its grounding and fell through to the durable default.
+    out = classify_request("pause task? and continue please")
+    assert out["kind"] == "instant_tweak"
+    assert "system-nouns:task" in out["signals"]
+    assert "control-verbs:pause" in out["signals"]
+
+
 def test_decide_placement_instant_targets_live_operator(tmp_path):
     cfg = _make_cfg(tmp_path)
     _make_session(cfg, "S-u-operator-p1", window="bot-squad-operator")

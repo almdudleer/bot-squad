@@ -473,7 +473,11 @@ def classify_request(text: str) -> dict:
     if not text or not text.strip():
         raise ValueError("classify_request: empty text")
     stripped = text.strip()
-    words = _re.findall(r"[\w?/-]+", stripped.lower())
+    # Word chars + hyphen only: "?" and "/" must NOT be part of a token —
+    # "on/off" needs to tokenize as two control verbs ("on", "off"), not one
+    # unmatched blob, and a mid-sentence "?" must not glue onto the noun it
+    # follows ("tasks?" needs to match the "tasks" system noun).
+    words = _re.findall(r"[\w-]+", stripped.lower())
     word_count = len(words)
     wordset = set(words)
 

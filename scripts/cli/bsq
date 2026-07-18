@@ -278,6 +278,52 @@ def read_frontmatter(path: Path) -> dict:
     return fm
 
 
+# T-0591 (F3.3): non-placeholder Verbatim discipline on stakeholder-sourced
+# tasks. `_action_task_new`'s stub body always seeds `## Verbatim request`
+# with a literal "(filed via task_new)" placeholder — the caller is expected
+# to come back and paste the real words (D-0047 F3.3: "population is
+# per-caller, not enforced"). This regex catches that seed plus the sibling
+# entity_new placeholders (doc_new/uc_new/flow_new/initiative_new) in case one
+# ever lands on a task body by mistake.
+_VERBATIM_PLACEHOLDER_RE = re.compile(
+    r"^\(filed via [a-z_]+(?: — [^)]*)?\)$", re.IGNORECASE
+)
+
+
+def _extract_verbatim_section(path: Path) -> str:
+    """Raw text of a ticket's `## Verbatim request` section (line-sliced, same
+    heading-scan as `_scan_md_section`). Empty string if the section is
+    missing or blank."""
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
+    lines = body.splitlines()
+    out, collecting = [], False
+    for ln in lines:
+        is_heading = bool(re.match(r"^#+\s", ln))
+        if is_heading and "verbatim request" in ln.lower():
+            collecting = True
+            continue
+        if collecting and is_heading:
+            break
+        if collecting:
+            out.append(ln)
+    return "\n".join(out).strip()
+
+
+def _verbatim_is_placeholder(text: str) -> bool:
+    """True for an empty Verbatim section or a known `(filed via ...)` stub —
+    i.e. text that is NOT the stakeholder's actual words."""
+    t = text.strip()
+    return not t or bool(_VERBATIM_PLACEHOLDER_RE.match(t))
+
+
+def _is_stakeholder_provenance(provenance: str) -> bool:
+    return any(
+        tok.strip().lower().startswith("stakeholder:")
+        for tok in (provenance or "").split(",")
+    )
+
+
 # --------------------------------------------------------------------------
 # verbs
 # --------------------------------------------------------------------------
@@ -3205,6 +3251,24 @@ def cmd_ticket_update(args) -> None:
     if status not in TICKET_STATUSES:
         die(f"invalid status {status!r}; canonical: {', '.join(TICKET_STATUSES)}")
     path = find_ticket(slug, args.id.strip())
+    # T-0591 (F3.3): gate the planned/open -> in_progress transition — the
+    # moment real build work starts — on a stakeholder-sourced ticket having
+    # ACTUAL verbatim words, not the task_new stub. Later transitions
+    # (totest/closed/reopened) aren't re-checked: by then the builder has
+    # already either fixed it or hit this same gate on a later restart.
+    if status == "in_progress":
+        fm = read_frontmatter(path)
+        if _is_stakeholder_provenance(fm.get("provenance", "")):
+            verbatim = _extract_verbatim_section(path)
+            if _verbatim_is_placeholder(verbatim):
+                die(
+                    f"{args.id}: refusing planned/open -> in_progress — "
+                    "this is a stakeholder-sourced ticket but its "
+                    "'## Verbatim request' section is empty or still the "
+                    "task_new placeholder. Paste the stakeholder's actual "
+                    "words into that section first (edit the ticket body), "
+                    "then retry."
+                )
     text = path.read_text()
     m = re.match(r"\A---\n(.*?)\n---\n", text, re.DOTALL)
     if not m:
@@ -3307,6 +3371,9 @@ def cmd_task_new(args) -> None:
     # dedupe gate yet) still accepts the call unchanged.
     if getattr(args, "force", False):
         params["force"] = True
+    verbatim = getattr(args, "verbatim", None)
+    if verbatim:
+        params["verbatim"] = verbatim
     # T-0519: pass the (client-validated) provenance INTO the action so the
     # worker requires+validates+stamps it at the gate. Fall back to the legacy
     # post-hoc stamp for a pre-T-0519 worker that doesn't yet accept the param
@@ -4185,6 +4252,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="bypass the dedupe-vs-create similarity gate (T-0577) — mint even "
              "if this looks like a near-duplicate of an existing backlog task",
+    )
+    tnn.add_argument(
+        "--verbatim",
+        help="widen the dedupe-gate query with the caller's own words (T-0577) "
+             "— signal only, never stored on the ticket body",
     )
     tnn.set_defaults(func=cmd_task_new)
     # task search / similar (T-0486) — dedupe / clarify-vs-create tooling.

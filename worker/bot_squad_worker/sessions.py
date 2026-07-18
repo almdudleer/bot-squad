@@ -1249,8 +1249,12 @@ def pause(cfg: Any, slug: str, sid: str) -> dict:
     existing["paused_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _write_session_metadata(meta_file, existing)
 
-    # Just the interrupt — no /exit, no kill-pane.
-    _run(["tmux", "send-keys", "-t", target_pane.pane_id, "C-c", ""])
+    # Just the interrupt — no /exit, no kill-pane. T-0578: control keys ride
+    # the mux delivery lock so the interrupt can't land mid-keystroke inside a
+    # concurrent mux delivery (send-keys itself lives only in input_mux).
+    from bot_squad_worker import input_mux
+    with input_mux.delivery_lock(data_dir, sid):
+        input_mux.raw_keys(target_pane.pane_id, "C-c", "")
     return {"ok": True, "paused": True}
 
 
@@ -1334,10 +1338,15 @@ def suspend(cfg: Any, slug: str, sid: str, *,
         meta["suspend_reason"] = reason or source
     _write_session_metadata(meta_file, meta)
 
-    # Graceful exit then force-kill if needed.
-    _run(["tmux", "send-keys", "-t", target_pane.pane_id, "C-c", ""])
-    time.sleep(0.3)
-    _run(["tmux", "send-keys", "-t", target_pane.pane_id, "/exit", "Enter"])
+    # Graceful exit then force-kill if needed. T-0578: the whole teardown key
+    # sequence holds the mux delivery lock, so C-c / "/exit" can never splice
+    # into the middle of a concurrent mux delivery (and a mid-flight batch
+    # finishes before the exit keys land).
+    from bot_squad_worker import input_mux
+    with input_mux.delivery_lock(data_dir, sid):
+        input_mux.raw_keys(target_pane.pane_id, "C-c", "")
+        time.sleep(0.3)
+        input_mux.raw_keys(target_pane.pane_id, "/exit", "Enter")
 
     deadline = time.time() + 10.0
     while time.time() < deadline:
@@ -1659,7 +1668,8 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
-        _deliver_prompt(new_pane.pane_id, initial_prompt)
+        _deliver_prompt(new_pane.pane_id, initial_prompt,
+                        data_dir=data_dir, sid=new_sid)
 
     return {"ok": True, "sid": new_sid}
 
@@ -1856,8 +1866,15 @@ def _composer_content(pane_id: str) -> str | None:
     return content
 
 
-def _deliver_prompt(pane_id: str, text: str) -> None:
+def _deliver_prompt(pane_id: str, text: str, *,
+                    data_dir: Any = None, sid: str | None = None) -> None:
     """Reliably deliver a prompt into a claude composer (T-0126/T-0144/T-0201).
+
+    T-0578: when the caller knows the session identity (``data_dir`` + ``sid``
+    — all in-tree callers do), the whole paste+submit runs under the mux
+    delivery lock so a concurrent peer nudge / send_input flush can never
+    interleave with the prompt. Without identity the paste runs unlocked
+    (pre-T-0578 behavior).
 
     Loads ``text`` into a dedicated tmux paste buffer and pastes it in
     bracketed-paste mode (``paste-buffer -p``), then submits with a *separate*
@@ -1882,6 +1899,18 @@ def _deliver_prompt(pane_id: str, text: str) -> None:
     recover via ``inject_input`` / a manual Enter (same contract as the
     composer-ready check the callers run just before this).
     """
+    from bot_squad_worker import input_mux
+    from bot_squad_worker.actions import ActionError
+
+    if data_dir is not None and sid:
+        with input_mux.delivery_lock(data_dir, sid):
+            return _deliver_prompt_unlocked(pane_id, text)
+    return _deliver_prompt_unlocked(pane_id, text)
+
+
+def _deliver_prompt_unlocked(pane_id: str, text: str) -> None:
+    """The paste+confirm body of :func:`_deliver_prompt` (see its docstring)."""
+    from bot_squad_worker import input_mux
     from bot_squad_worker.actions import ActionError
 
     import re as _re
@@ -1914,7 +1943,7 @@ def _deliver_prompt(pane_id: str, text: str) -> None:
     # (2) Submit; confirm the composer cleared, re-sending Enter up to the cap.
     confirm_iters = max(1, int(_SUBMIT_CONFIRM_TIMEOUT_SEC / _SUBMIT_CONFIRM_POLL_INTERVAL_SEC))
     for _attempt in range(_SUBMIT_MAX_RETRIES):
-        _run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+        input_mux.raw_keys(pane_id, "Enter")
         for _ in range(confirm_iters):
             time.sleep(_SUBMIT_CONFIRM_POLL_INTERVAL_SEC)
             if _composer_content(pane_id) == "":
@@ -2239,7 +2268,8 @@ def spawn(
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
-        _deliver_prompt(new_pane.pane_id, initial_prompt)
+        _deliver_prompt(new_pane.pane_id, initial_prompt,
+                        data_dir=cfg.data_dir, sid=new_sid)
 
     return {"ok": True, "sid": new_sid}
 

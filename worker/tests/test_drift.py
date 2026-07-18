@@ -88,7 +88,7 @@ def test_stale_session_gets_nudged(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_COOLDOWN_MINUTES", "30")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered: list[tuple[str, str]] = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
 
     res = drift.drift_check(cfg, slug)
     assert res["ok"] and len(res["nudged"]) == 1
@@ -101,7 +101,7 @@ def test_disabled_by_env(tmp_path, monkeypatch):
     patch(monkeypatch)
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "0")
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res.get("disabled") is True and not delivered
 
@@ -113,7 +113,7 @@ def test_idle_session_not_nudged(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -124,7 +124,7 @@ def test_non_dev_role_not_nudged(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -137,7 +137,7 @@ def test_superpowers_signal(tmp_path, monkeypatch):
     monkeypatch.setattr(drift, "_recent_write_targets",
                         lambda *_a, **_k: ["/home/u/.claude/superpowers/skills/foo.md"])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "superpowers"
     assert "T-0152" in delivered[0][1] and "superpowers" in delivered[0][1]
@@ -150,7 +150,7 @@ def test_automation_signal_only_without_scenario(tmp_path, monkeypatch):
     monkeypatch.setattr(drift, "_recent_write_targets",
                         lambda *_a, **_k: ["/repo/tests/e2e/foo.mjs"])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "automation"
 
@@ -167,7 +167,7 @@ def test_automation_signal_suppressed_when_scenario_exists(tmp_path, monkeypatch
     scen.mkdir(parents=True, exist_ok=True)
     (scen / "T-0149-dynamic-context-manager.md").write_text("# scenario\n")
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -197,7 +197,7 @@ def test_cooldown_suppresses_second_nudge(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_COOLDOWN_MINUTES", "30")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
 
     first = drift.drift_check(cfg, slug)
     assert len(first["nudged"]) == 1
@@ -216,7 +216,7 @@ def test_skipped_when_project_not_opted_in(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res.get("skipped") == "drift_enforcement_off"
     assert res["nudged"] == [] and not delivered
@@ -231,7 +231,7 @@ def test_per_session_pause_suppresses_nudge(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -242,7 +242,7 @@ def test_drift_message_carries_off_ramp_footer(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1
     assert "bsq drift off" in delivered[0][1]
@@ -259,7 +259,7 @@ def test_constant_team_session_not_nudged(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -275,7 +275,7 @@ def test_initiative_mismatch_not_nudged(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -290,7 +290,7 @@ def test_initiative_match_still_nudges(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
 
@@ -309,7 +309,7 @@ def test_terminal_ticket_status_not_nudged(tmp_path, monkeypatch, terminal_statu
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert res["nudged"] == [] and not delivered
 
@@ -322,7 +322,7 @@ def test_in_progress_ticket_still_nudges(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
 
@@ -335,7 +335,7 @@ def test_reopened_ticket_still_nudges(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
     monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
     delivered = []
-    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text: delivered.append((pane, text)))
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
     res = drift.drift_check(cfg, slug)
     assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
 

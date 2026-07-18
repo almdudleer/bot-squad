@@ -8,6 +8,7 @@ the user's live-typed composer text.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -198,3 +199,71 @@ def test_two_concurrent_injects_land_captioned_in_order(tmp_path):
     assert blob.index("from one") < blob.index("from two")
     # Channel fully drained.
     assert input_mux.read_queue(tmp_path, sid) == []
+
+
+# ---------------------------------------------------------------------------
+# DoD (T-0578): direct lane vs queued lane never splice keystrokes together
+# ---------------------------------------------------------------------------
+
+def test_direct_lane_and_queued_lane_serialize_on_delivery_lock(tmp_path, monkeypatch):
+    """A peer 'check mail' nudge (queued lane, ``flush()``) racing an
+    operator ``send_input`` (direct lane, ``deliver_direct()``) must never
+    interleave keystrokes into one composer line. Both lanes hold the same
+    per-sid ``delivery_lock`` — exercise the real lock (not a stub) and
+    record wall-clock spans for each lane's critical section to prove they
+    never overlap, however the thread scheduler interleaves them.
+    """
+    sid = "S-almdudleer-target-p9"
+    pane_id = "%1"
+    spans: list[tuple[str, float, float]] = []
+    spans_lock = threading.Lock()
+
+    def fake_raw_keys(pid, *keys):
+        # Direct-lane keystrokes: slow them down to widen the race window a
+        # real interleave bug would exploit.
+        start = time.monotonic()
+        time.sleep(0.05)
+        end = time.monotonic()
+        with spans_lock:
+            spans.append(("direct", start, end))
+
+    monkeypatch.setattr(input_mux, "raw_keys", fake_raw_keys)
+
+    def queued_deliver(pid, text):
+        start = time.monotonic()
+        time.sleep(0.15)
+        end = time.monotonic()
+        with spans_lock:
+            spans.append(("queued", start, end))
+
+    input_mux.enqueue(tmp_path, sid, "check mail", "S-alice")
+
+    def run_queued():
+        input_mux.flush(tmp_path, sid, pane_lookup=lambda s: pane_id,
+                        capture=lambda p: _BUF_EMPTY, deliver=queued_deliver)
+
+    def run_direct():
+        input_mux.deliver_direct(tmp_path, sid, pane_id, "operator send-input",
+                                 capture=lambda p: _BUF_EMPTY)
+
+    t_queued = threading.Thread(target=run_queued)
+    t_direct = threading.Thread(target=run_direct)
+    t_queued.start()
+    time.sleep(0.02)   # let the queued lane grab the lock first
+    t_direct.start()
+    t_queued.join()
+    t_direct.join()
+
+    queued_spans = [s for s in spans if s[0] == "queued"]
+    direct_spans = [s for s in spans if s[0] == "direct"]
+    assert queued_spans and direct_spans   # both lanes actually ran
+
+    def overlaps(a, b):
+        return a[1] < b[2] and b[1] < a[2]
+
+    for q in queued_spans:
+        for d in direct_spans:
+            assert not overlaps(q, d), (
+                "direct-lane keystroke landed inside the queued-lane delivery "
+                "window — the two lanes spliced into one composer line"
+            )

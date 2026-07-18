@@ -1414,6 +1414,9 @@ manually to see the error."
 installer just finished bringing up FastAPI + worker + UI. Your job is
 to manage projects, sessions, and high-level orchestration on this
 server. Read AGENTS.md if present. Wait for the user."
+  # T-0578 exemption (documented): raw send-keys is allowed ONLY here — this
+  # is install-time bootstrap of the very first operator pane, before any
+  # worker (and therefore the input_mux choke point) exists to route through.
   tmux send-keys -t "$BOTSQUAD_OPERATOR_SESSION" "$brief" Enter
 }
 

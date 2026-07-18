@@ -216,7 +216,10 @@ def _deliver(cfg: Any, slug: str, target_sid: str, text: str) -> dict:
         panes = {S.compute_sid(user, p.window, p.pane_id): p for p in S.list_panes()}
         pane = panes.get(target_sid)
         if pane is not None:
-            S._deliver_prompt(pane.pane_id, text)
+            # T-0578: identity threads through so the paste holds the per-sid
+            # mux delivery lock (never interleaves with other writers).
+            S._deliver_prompt(pane.pane_id, text,
+                              data_dir=cfg.data_dir, sid=target_sid)
             result["pane"] = True
     except Exception:  # noqa: BLE001
         log.exception("autopilot: pane delivery failed for %s", target_sid)

@@ -1270,6 +1270,13 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
 
     Required params: sid, text
     Returns: {ok: true, pane_id, lines_sent: int}
+
+    T-0578: the transport is ``input_mux.deliver_direct`` — content lands
+    byte-identical (verbatim, uncaptioned, one submission per line: "check
+    mail" stays "check mail", "/compact" stays a bare slash command), but the
+    keystrokes are serialised under the per-sid delivery lock so a nudge can
+    never interleave with a concurrent ``send_input`` flush, and briefly gate
+    on live user typing.
     """
     extra = set(params) - _INJECT_INPUT_ALLOWED
     if extra:
@@ -1293,24 +1300,11 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     if pane is None:
         raise ActionError(f"inject_input: no live pane for sid {sid!r}")
 
-    # tmux wraps long send-keys payloads as a bracketed-paste escape sequence;
-    # an Enter chained in the same send-keys call lands inside the paste and
-    # does NOT submit Claude's input box. Send text and Enter as separate
-    # send-keys invocations with a brief pause, mirroring spawn_session.
-    import subprocess
-    import time as _time
-    lines_sent = 0
-    for line in text.split("\n"):
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane.pane_id, "--", line],
-            check=False,
-        )
-        _time.sleep(0.4)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", pane.pane_id, "Enter"],
-            check=False,
-        )
-        lines_sent += 1
+    from bot_squad_worker import input_mux
+    cfg = _get_config()
+    lines_sent = input_mux.deliver_direct(
+        cfg.data_dir, sid, pane.pane_id, text,
+    )
     return {"ok": True, "pane_id": pane.pane_id, "lines_sent": lines_sent}
 
 

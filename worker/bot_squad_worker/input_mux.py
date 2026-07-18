@@ -23,15 +23,36 @@ concurrent writers naturally merge into one delivery.
 Delivery uses a bracketed paste + a single Enter (not one Enter per line like
 the raw ``inject_input`` primitive): a batched payload is multi-line and must
 land as ONE composer message, not N separate submissions.
+
+T-0578 (F1.6 sweep): this module is additionally the SINGLE CHOKE POINT for
+tmux keystroke emission system-wide. ``tmux send-keys`` may appear nowhere
+else in the worker/CLI:
+
+* :func:`raw_keys` is the one send-keys emitter. Callers outside this module
+  use it only under :func:`delivery_lock` (or during pre-mux bootstrap, e.g.
+  install.sh before any worker exists).
+* :func:`deliver_direct` is the verbatim direct lane — the transport that
+  used to live inline in the ``inject_input`` action (one send-keys + Enter
+  per line, byte-identical content, no caption/batch — a solo "check mail"
+  stays "check mail" and "/compact" stays a bare slash command). It holds the
+  per-sid delivery lock so it can never interleave keystrokes with a queued-
+  lane flush, and briefly gates on live user typing (bounded wait, then
+  delivers anyway — the direct lane is synchronous and guaranteed, never
+  queued/dropped).
+* Teardown/control keys (``C-c``, ``/exit``) go through
+  :func:`delivery_lock` + :func:`raw_keys` in sessions.py for the same
+  serialization.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
+import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from bot_squad_worker.autocompact import composer_ready
 
@@ -61,6 +82,24 @@ def _append_lock_path(data_dir: Path | str, sid: str) -> Path:
 
 def _delivery_lock_path(data_dir: Path | str, sid: str) -> Path:
     return queue_dir(data_dir) / f"{_safe(sid)}.delivery.lock"
+
+
+@contextlib.contextmanager
+def delivery_lock(data_dir: Path | str, sid: str) -> Iterator[None]:
+    """Hold ``sid``'s exclusive delivery lock — the anti-interleave gate.
+
+    EVERY keystroke writer to a session's pane (queued-lane flush, direct-lane
+    deliver, teardown control keys, spawn/resume prompt paste) serialises on
+    this flock, so two concurrent writers can never interleave keystrokes into
+    one composer line. Not reentrant — never nest for the same sid.
+    """
+    queue_dir(data_dir).mkdir(parents=True, exist_ok=True)
+    lock_fd = open(_delivery_lock_path(data_dir, sid), "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        lock_fd.close()
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +258,17 @@ def _capture_pane(pane_id: str) -> str:
     return _cap(pane_id)
 
 
+def raw_keys(pane_id: str, *keys: str) -> None:
+    """The system-wide ``tmux send-keys`` choke point (T-0578).
+
+    Callers outside this module hold :func:`delivery_lock` first (or are a
+    pre-mux bootstrap, e.g. install.sh before any worker exists). Delegates to
+    ``sessions._run`` — the executor seam the test suite already patches.
+    """
+    from bot_squad_worker.sessions import _run
+    _run(["tmux", "send-keys", "-t", pane_id, *keys])
+
+
 def _deliver_to_pane(pane_id: str, text: str) -> None:
     """Deliver a (possibly multi-line) payload as ONE composer message.
 
@@ -228,17 +278,59 @@ def _deliver_to_pane(pane_id: str, text: str) -> None:
     which sends one Enter per line (correct for single-line nudges, wrong for a
     batched payload).
     """
-    import subprocess
+    from bot_squad_worker.sessions import _run
     buf_name = f"bsq-input-{pane_id.lstrip('%')}"
-    # Load the payload into a named tmux buffer, then bracketed-paste it.
-    subprocess.run(["tmux", "set-buffer", "-b", buf_name, "--", text],
-                   check=False)
-    subprocess.run(
-        ["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"],
-        check=False,
-    )
+    # Load the payload into a named tmux buffer over STDIN, then bracketed-
+    # paste it. `load-buffer -`, NOT `set-buffer -- <arg>`: tmux's command
+    # parser rejects a large argument with "command too long" (T-0201, verified
+    # live on ~140-line briefs), so a big batch would silently never paste.
+    _run(["tmux", "load-buffer", "-b", buf_name, "-"], input=text)
+    _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"])
     time.sleep(0.4)
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=False)
+    raw_keys(pane_id, "Enter")
+
+
+# Direct-lane knobs (read at call time so tests can monkeypatch them):
+# a bounded wait while the user is live-typing in the target composer. On
+# timeout the payload is delivered anyway — the direct lane is synchronous
+# and guaranteed (a wake nudge or /compact must never be silently dropped),
+# so the gate only narrows the splice window, it never blocks delivery.
+_DIRECT_GATE_TIMEOUT_SEC = 3.0
+_DIRECT_GATE_POLL_INTERVAL_SEC = 0.3
+# Pause between a line's text and its Enter — tmux wraps long send-keys
+# payloads in a bracketed-paste escape; an Enter chained in the SAME call
+# lands inside the paste and does not submit (pre-T-0578 inject_input value).
+_DIRECT_INTERLINE_PAUSE_SEC = 0.4
+
+
+def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
+                   capture: Callable[[str], str] | None = None) -> int:
+    """Verbatim direct-lane transport (the old raw ``inject_input`` loop).
+
+    Sends ``text`` one send-keys per line with a separate Enter each —
+    byte-identical keystrokes to the pre-T-0578 inline loop (no caption, no
+    batching, one submission per line), but serialised under the per-sid
+    :func:`delivery_lock` so it can never interleave with a queued-lane flush
+    or teardown keys, and gated (bounded) on live user typing. Returns the
+    number of lines sent.
+    """
+    capture = capture or _capture_pane
+    with delivery_lock(data_dir, sid):
+        # Bounded live-typing gate (skipped under the mux kill switch so
+        # BOT_SQUAD_INPUT_MUX=0 restores the exact legacy timing).
+        if os.environ.get("BOT_SQUAD_INPUT_MUX") != "0":
+            deadline = time.monotonic() + _DIRECT_GATE_TIMEOUT_SEC
+            while user_is_typing(capture(pane_id)):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_DIRECT_GATE_POLL_INTERVAL_SEC)
+        lines_sent = 0
+        for line in text.split("\n"):
+            raw_keys(pane_id, "--", line)
+            time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
+            raw_keys(pane_id, "Enter")
+            lines_sent += 1
+        return lines_sent
 
 
 def _default_pane_lookup(sid: str) -> str | None:
@@ -271,11 +363,7 @@ def flush(data_dir: Path | str, sid: str, *,
     capture = capture or _capture_pane
     deliver = deliver or _deliver_to_pane
 
-    queue_dir(data_dir).mkdir(parents=True, exist_ok=True)
-    lock_fd = open(_delivery_lock_path(data_dir, sid), "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
+    with delivery_lock(data_dir, sid):
         if not read_queue(data_dir, sid):
             return {"delivered": 0, "deferred": False, "reason": "empty",
                     "pane": None}
@@ -301,8 +389,6 @@ def flush(data_dir: Path | str, sid: str, *,
             raise
         return {"delivered": len(batch), "deferred": False,
                 "reason": "delivered", "pane": pane}
-    finally:
-        lock_fd.close()
 
 
 def flush_pending(data_dir: Path | str) -> dict[str, Any]:

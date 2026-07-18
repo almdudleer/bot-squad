@@ -384,7 +384,10 @@ def drift_check(cfg: Any, slug: str) -> dict:
             continue
 
         try:
-            S._deliver_prompt(pane.pane_id, text)
+            # T-0578: identity threads through so the nudge paste holds the
+            # per-sid mux delivery lock (never interleaves with other writers).
+            S._deliver_prompt(pane.pane_id, text,
+                              data_dir=cfg.data_dir, sid=sid)
         except Exception:
             log.exception("drift_check: inject failed for %s", sid)
             continue

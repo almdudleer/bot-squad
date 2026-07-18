@@ -411,6 +411,54 @@ def test_handle_update_links_sender_and_records_identity(tmp_path, monkeypatch):
     assert result["global_user_id"] == "gu_zzz"  # identity still surfaced
 
 
+def test_handle_update_first_contact_affirms_free_form_steering(tmp_path, monkeypatch):
+    """T-0634: a brand-new sender (created=True) gets a one-time welcome
+    affirming that free-form text — no command — is the normal way to steer,
+    so a stakeholder never has to wonder whether typing here "just works"."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    monkeypatch.setattr(
+        TL, "resolve_or_link_sender",
+        lambda c, m, slug: {"global_user_id": "gu_new", "created": True, "slug": slug},
+    )
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: None)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+    update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
+    TL.handle_update(cfg, update)
+    assert any("no command" in t.lower() or "any request" in t.lower() for t in echoes)
+
+
+def test_handle_update_returning_sender_no_welcome(tmp_path, monkeypatch):
+    """T-0634: created=False (a returning sender) must NOT re-fire the welcome
+    on every message."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    monkeypatch.setattr(
+        TL, "resolve_or_link_sender",
+        lambda c, m, slug: {"global_user_id": "gu_old", "created": False, "slug": slug},
+    )
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: None)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+    update = {"update_id": 10, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello again"}}
+    TL.handle_update(cfg, update)
+    assert echoes == []
+
+
+def test_handle_slash_help_affirms_free_form_steering(tmp_path, monkeypatch):
+    """T-0634: /help must state that plain typed text (no command) is routed —
+    the discoverability gap the stakeholder flagged."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+    result = TL._handle_slash(cfg, "12345", "help", "")
+    assert result["action"] == "help"
+    assert any("no command" in t.lower() for t in echoes)
+
+
 # ---------------------------------------------------------------------------
 # T-0489: conversation history append. Each inbound TG user message is recorded
 # to the API conversation store (single-writer = API), keyed by

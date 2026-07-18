@@ -640,6 +640,22 @@ def handle_update(cfg, update: dict) -> dict:
     identity = resolve_or_link_sender(cfg, msg, chat_slug)
     gid = identity.get("global_user_id") if identity else ""
 
+    # T-0634: affirm free-form steering on FIRST contact — a stakeholder must
+    # never have to guess whether typing a request/feedback/steering comment
+    # here "just works". Fires once per sender (gated on the linkage layer's
+    # own created=True, so a recycled/resumed session never re-sends it).
+    # Best-effort via _channel_notify (same as every other reply here) — a
+    # send failure must not block inbound routing.
+    if identity and identity.get("created"):
+        _channel_notify(
+            cfg, chat_id,
+            "👋 First message from you here. Quick note: you don't need a "
+            "command for this — any request, feedback, or steering comment "
+            "typed directly in this chat is recorded and routed to the "
+            "project. /help lists the extra commands, but plain text is the "
+            "normal way to talk to it.",
+        )
+
     slash = extract_slash_command(msg)
     reply = extract_reply_target(msg) if not slash else None
     # T-0386 Phase 2 / T-0569: a voice message. Flag-off-safe: gated on
@@ -768,6 +784,9 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
 
     if cmd == "help":
         _notify(cfg, chat_id,
+                "You can just type any request, feedback, or steering "
+                "comment directly — no command needed, it's recorded and "
+                "routed to the project.\n"
                 "Reply to a notification to inject text into the session.\n"
                 "/sessions — list active sessions\n"
                 "/say <sid> <text> — direct inject without reply-quoting")

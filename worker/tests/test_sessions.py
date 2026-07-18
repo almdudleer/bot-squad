@@ -3433,12 +3433,12 @@ def test_session_start_hook_uses_tl_pane_tmux_session_for_break_pane():
 # ---------------------------------------------------------------------------
 
 def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
-    """Zombie md (status: active + pane_id no longer in tmux) → patched to suspended."""
+    """Zombie md (status: active + no live claude agent) → patched to suspended."""
     import bot_squad_worker.sessions as S
 
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-    monkeypatch.setattr(S, "list_panes", lambda: [])  # no live panes
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())  # no live agents
 
     sessions_dir = tmp_path / "data" / "test-project" / "sessions"
     zombie = sessions_dir / "S-testuser-T-0026-p60.md"
@@ -3464,7 +3464,7 @@ def test_gc_sessions_flips_zombie_to_suspended(tmp_path, monkeypatch):
     assert after["claude_uuid"] == "uuid-zombie"
     # T-0444: the auto-close stamps WHY/WHO so the badge can surface it.
     assert after["suspend_source"] == "gc_sessions"
-    assert "no live tmux pane" in after["suspend_reason"]
+    assert "no live claude pane" in after["suspend_reason"]
 
 
 def test_suspend_stamps_source_reason_when_provided(tmp_path, monkeypatch):
@@ -3502,28 +3502,34 @@ def test_suspend_stamps_source_reason_when_provided(tmp_path, monkeypatch):
     assert "suspend_source" not in after2
 
 
-def test_gc_sessions_skips_missing_pane_id_unverifiable(tmp_path, monkeypatch):
-    """T-0134 regression: SessionMd without pane_id (legacy schema, or claude
-    in non-bot-squad tmux pane) must be treated as UNVERIFIABLE — skipped, not
-    flagged as zombie. Caught on Day-6 deploy: gc_sessions flipped 4 live TL
-    sessions to suspended on first invocation because they predated the
-    pane_id field.
+def test_gc_sessions_missing_pane_id_but_live_agent_is_spared(tmp_path, monkeypatch):
+    """T-0134 regression, now activity-based (T-0401): a SessionMd with no
+    recorded ``pane_id`` (legacy schema, or claude in a non-bot-squad tmux
+    pane) that STILL resolves to a live claude agent via ``_live_agent_sids``
+    must be spared — the exact Day-6 incident (4 live TL sessions flipped to
+    suspended because they predated the pane_id field) must stay impossible,
+    but the signal is now "is a claude process actually running for this
+    sid", not "does this md happen to carry a pane_id field".
     """
     import bot_squad_worker.sessions as S
 
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-    monkeypatch.setattr(S, "list_panes", lambda: [])  # no live panes
+    # Case 1: pane_id field entirely absent (legacy SessionMd schema), but a
+    # live claude agent resolves to this exact sid.
+    monkeypatch.setattr(
+        S, "_live_agent_sids",
+        lambda: {"S-testuser-multi_server-p8", "S-testuser-teamlead-p13"},
+    )
 
     sessions_dir = tmp_path / "data" / "test-project" / "sessions"
-    # Case 1: pane_id field entirely absent (legacy SessionMd schema).
     legacy = sessions_dir / "S-testuser-multi_server-p8.md"
     _write_session_metadata(legacy, {
         "sid": "S-testuser-multi_server-p8",
         "status": "active",
         "claude_uuid": "uuid-legacy-live",
     })
-    # Case 2: pane_id explicitly null (~) — same semantic.
+    # Case 2: pane_id explicitly null (~) — same semantic, still live.
     null_pane = sessions_dir / "S-testuser-teamlead-p13.md"
     _write_session_metadata(null_pane, {
         "sid": "S-testuser-teamlead-p13",
@@ -3534,20 +3540,51 @@ def test_gc_sessions_skips_missing_pane_id_unverifiable(tmp_path, monkeypatch):
 
     result = S.gc_sessions(cfg, "test-project")
     assert result["repaired"] == 0, (
-        f"T-0134: pane_id-less SessionMds must be skipped (unverifiable), "
-        f"not flipped. Got repaired={result!r}."
+        f"T-0134: a pane_id-less SessionMd with a genuinely live claude agent "
+        f"must be spared. Got repaired={result!r}."
     )
     assert _read_session_metadata(legacy)["status"] == "active"
     assert _read_session_metadata(null_pane)["status"] == "active"
 
 
-def test_gc_sessions_skips_live_pane(tmp_path, monkeypatch):
-    """status:active with a matching live pane is left alone."""
+def test_gc_sessions_missing_pane_id_and_dead_flips_to_suspended(tmp_path, monkeypatch):
+    """T-0401: the actual phantom-active incident — a SessionMd with no
+    recorded ``pane_id`` (so the old T-0134 guard skipped it FOREVER) whose
+    window no longer maps to ANY live claude agent must now be flipped.
+    Real-world case: ``S-almdudleer-multi_server-TL-p30`` sat ``active`` with
+    no pane_id and no live pane for weeks, silently holding its task + mail.
+    """
     import bot_squad_worker.sessions as S
 
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-    monkeypatch.setattr(S, "list_panes", lambda: [_fake_pane(pane_id="%5", window="multi_server")])
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())  # nothing live
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    phantom = sessions_dir / "S-testuser-multi_server-TL-p30.md"
+    _write_session_metadata(phantom, {
+        "sid": "S-testuser-multi_server-TL-p30",
+        "status": "active",
+        "task_id": "~",
+        "claude_uuid": "uuid-phantom",
+        "started_at": "2026-06-02T10:58:05Z",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert result["sids"] == ["S-testuser-multi_server-TL-p30"]
+    after = _read_session_metadata(phantom)
+    assert after["status"] == "suspended"
+    assert after["suspend_source"] == "gc_sessions"
+
+
+def test_gc_sessions_skips_live_pane(tmp_path, monkeypatch):
+    """status:active with a matching live claude agent is left alone."""
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {"S-testuser-multi_server-p5"})
 
     sessions_dir = tmp_path / "data" / "test-project" / "sessions"
     live_md = sessions_dir / "S-testuser-multi_server-p5.md"
@@ -3562,13 +3599,43 @@ def test_gc_sessions_skips_live_pane(tmp_path, monkeypatch):
     assert _read_session_metadata(live_md)["status"] == "active"
 
 
+def test_gc_sessions_dead_pane_with_lingering_bash_flips(tmp_path, monkeypatch):
+    """T-0401/T-0397: a tmux pane can OUTLIVE the claude process that died in
+    it (falls back to a bare shell). Pane existence alone must no longer
+    spare the md — only a LIVE claude agent does. Regression guard for the
+    gap the old ``pane_id in live_pane_ids`` check left open (it only checked
+    the pane existed, never that claude was still running inside it).
+    """
+    import bot_squad_worker.sessions as S
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    # The pane is still there (tmux never closed it), but no claude process
+    # is running inside it any more — _live_agent_sids correctly excludes it.
+    monkeypatch.setattr(S, "list_panes", lambda: [_fake_pane(pane_id="%5", window="multi_server")])
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    dead_claude_md = sessions_dir / "S-testuser-multi_server-p5.md"
+    _write_session_metadata(dead_claude_md, {
+        "sid": "S-testuser-multi_server-p5",
+        "status": "active",
+        "pane_id": "%5",
+        "task_id": "T-0099",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert _read_session_metadata(dead_claude_md)["status"] == "suspended"
+
+
 def test_gc_sessions_skips_archived(tmp_path, monkeypatch):
     """archived: true is operator intent — janitor must not touch it."""
     import bot_squad_worker.sessions as S
 
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
 
     sessions_dir = tmp_path / "data" / "test-project" / "sessions"
     md = sessions_dir / "S-testuser-w-p9.md"
@@ -3593,7 +3660,7 @@ def test_gc_sessions_other_user_sids_untouched(tmp_path, monkeypatch):
 
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
-    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
 
     sessions_dir = tmp_path / "data" / "test-project" / "sessions"
     cross_user = sessions_dir / "S-alexey-claude-p1.md"

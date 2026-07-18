@@ -2418,14 +2418,15 @@ def _live_task_owner(
     skipped — they do not gatekeep a rebind under the T-0237 cap.
 
     T-0402: ``_is_live_holder`` trusts the persisted ``status: active`` alone,
-    but a crashed dev's md lingers ``active`` (gc_sessions can't reconcile an
-    empty-pane_id md — the T-0134 guard). Such a phantom would PERMANENTLY
-    gatekeep its task ('already bound to live session {dead}'), the exact
-    failure this fn promises to prevent. So a holder must ALSO map to a pane
-    running a live claude agent (``_live_agent_sids``) — the same reconcile the
-    T-0397 ``_count_live_sessions`` fix (d0b3cdc) applies to the parallel cap.
-    Computed once per call (a tmux + /proc scan), so the bind path is no longer
-    a pure data op but stays under the claim flock.
+    but a crashed dev's md lingers ``active`` until the next ``gc_sessions``
+    tick reconciles it (T-0401). Until then such a phantom would gatekeep its
+    task ('already bound to live session {dead}'), the exact failure this fn
+    promises to prevent. So a holder must ALSO map to a pane running a live
+    claude agent (``_live_agent_sids``) — the same reconcile the T-0397
+    ``_count_live_sessions`` fix (d0b3cdc) applies to the parallel cap, checked
+    here in real time rather than waiting on the next tick. Computed once per
+    call (a tmux + /proc scan), so the bind path is no longer a pure data op
+    but stays under the claim flock.
     """
     sess_dir = data_dir / slug / "sessions"
     if not sess_dir.exists():
@@ -2710,13 +2711,15 @@ def _count_live_sessions(cfg: Any) -> int:
     T-0397: a session counts only if it is a live-holder (status active/paused,
     not archived) AND its SID maps to a pane with a live claude agent
     (``_live_agent_sids``). The persisted ``status`` field ALONE is unreliable:
-    ``gc_sessions`` cannot reconcile a dead session whose md ``pane_id`` is empty
-    (routinely empty for live sessions), so phantoms linger as ``active`` — and
-    even a dead-claude pane that fell back to bash would pass a mere
-    pane-existence check. Trusting them inflated the count (15/15 while only ~9
-    agents were live) and made ``_enforce_parallel_cap`` silently refuse spawns
-    at a false ceiling. ``backoff._live_count`` delegates here, so the AIMD
-    effective_limit and the caps meter (items 7/22) inherit the corrected count.
+    even after T-0401 taught ``gc_sessions`` to reconcile pane_id-less phantoms
+    too, that is a periodic TICK — a session that died since the last tick
+    still reads ``active`` here, and a dead-claude pane that fell back to bash
+    would pass a mere pane-existence check. Re-deriving liveness directly
+    (rather than trusting the last reconcile pass) inflated the count (15/15
+    while only ~9 agents were live) and made ``_enforce_parallel_cap`` silently
+    refuse spawns at a false ceiling. ``backoff._live_count`` delegates here, so
+    the AIMD effective_limit and the caps meter (items 7/22) inherit the
+    corrected count.
 
     T-0524: the cap governs the disposable LEAF-DEV workload, so always-on
     COORDINATION sessions (operator + team-leads, see ``_counts_against_dev_cap``
@@ -3512,11 +3515,32 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
     """T-0077: flip md ``status: active`` to ``suspended`` when no live pane.
 
     Walks ``data/<slug>/sessions/*.md`` filtered to the current linux user.
-    For each SessionMd claiming ``status: active`` whose SID is not in
-    ``list_panes()``, rewrites the md atomically with ``status: suspended``
-    + ``suspended_at: <now>``. Original ``started_at`` and ``claude_uuid``
-    are preserved so the session remains resurrectable via ``resume()``.
-    Skips mds with ``archived: true`` (operator intent).
+    For each SessionMd claiming ``status: active`` whose SID has no LIVE
+    claude agent (``_live_agent_sids`` — a real ``claude`` process in the
+    pane's /proc subtree, T-0397), rewrites the md atomically with
+    ``status: suspended`` + ``suspended_at: <now>``. Original ``started_at``
+    and ``claude_uuid`` are preserved so the session remains resurrectable
+    via ``resume()``. Skips mds with ``archived: true`` (operator intent).
+
+    T-0401: liveness used to be decided by "SID is in ``list_panes()``",
+    gated by a T-0134 guard that additionally REQUIRED an explicit
+    ``pane_id`` field on the md before a mismatch could flip it — a
+    SessionMd with no ``pane_id`` (legacy schema, or a pane whose id was
+    never recorded) was "unverifiable" and left ``active`` forever. That let
+    a genuinely dead session (no pane_id, no matching pane) sit
+    phantom-active indefinitely, silently holding its task binding + mail
+    (the ``multi_server-TL-p30`` incident: dead since its tmux window closed,
+    never reconciled because it had no recorded ``pane_id``). Switching the
+    liveness signal to ``_live_agent_sids()`` — the SAME reconciliation
+    ``_count_live_sessions``/``_live_task_owner`` already trust — closes that
+    gap WITHOUT reopening T-0134: it recomputes each live pane's sid from
+    tmux state directly (``compute_sid(user, window, pane_id)``), so a
+    genuinely-alive legacy session (its tmux pane, and the claude process in
+    it, still running) still resolves to a live sid and is spared — no
+    recorded ``pane_id`` field required. It's process liveness, not a
+    recent-activity clock, so a quiet-but-alive session (idle, no recent
+    output, process still up) is also spared — only a pane with no live
+    claude process anywhere is flipped.
 
     Returns ``{"ok": True, "scanned": N, "repaired": K, "sids": [...]}``.
     """
@@ -3532,9 +3556,7 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
 
     user = _get_current_user()
     user_prefix = f"S-{user}-"
-    live_panes = list_panes()
-    live_sids = {compute_sid(user, p.window, p.pane_id) for p in live_panes}
-    live_pane_ids = {p.pane_id for p in live_panes}
+    live = _live_agent_sids()
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     scanned = 0
@@ -3548,20 +3570,10 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
         scanned += 1
         if meta.get("status") != "active":
             continue
-        sid = meta.get("sid", md.stem)
-        if sid in live_sids:
-            continue
         if str(meta.get("archived", "")).lower() == "true":
             continue
-        # T-0134: require an explicit pane_id on SessionMd to flag suspended.
-        # Sessions without a recorded pane_id are unverifiable (legacy schema,
-        # or claude running in a non-bot-squad tmux pane) — skip them rather
-        # than false-flag as zombie.
-        recorded_pane_id = meta.get("pane_id")
-        if not recorded_pane_id or recorded_pane_id == "~":
-            continue
-        # Verified suspect: pane_id is recorded but no longer in tmux list-panes.
-        if recorded_pane_id in live_pane_ids:
+        sid = meta.get("sid", md.stem)
+        if sid in live:
             continue
         meta["status"] = "suspended"
         meta["suspended_at"] = now
@@ -3569,7 +3581,7 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
         # the Processes status badge (the doctrine's "visible close"). This path
         # is the silent idle/no-pane suspend that "ships dark" today.
         meta["suspend_source"] = "gc_sessions"
-        meta["suspend_reason"] = "auto-suspended: no live tmux pane"
+        meta["suspend_reason"] = "auto-suspended: no live claude pane"
         _write_session_metadata(md, meta, atomic=True)
         repaired.append(sid)
     return {"ok": True, "scanned": scanned, "repaired": len(repaired), "sids": repaired}

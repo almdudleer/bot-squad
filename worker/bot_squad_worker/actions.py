@@ -414,6 +414,15 @@ def _send_stakeholder_dm(
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
+    T-0591 (F5.3) descope: deliberately NOT routed through
+    ``channels.get_channel`` — this function IS a primary/reserve failover
+    across two DIFFERENT addresses (``tg_chat_id`` vs ``max_default_chat_id``),
+    which ``get_channel`` doesn't model (it selects ONE channel per call, not
+    a fallback chain). Forcing the highest-criticality paging path through an
+    abstraction extension it doesn't have yet is out of scope for a cleanup
+    batch; F5.3's other call sites (voice_intake, deploy pause/resume,
+    peer_send tg-mirror) are wired instead.
+
     TG is PRIMARY: the DPI-block premise behind the old MAX-primary logic died
     2026-07-04 (dead proxy removed, direct TG works). MAX is the RESERVE — it
     delivers when TG errors or no TG chat is configured (auto-failover; do NOT
@@ -847,12 +856,13 @@ def _action_pause_deploys(params: dict[str, Any]) -> dict[str, Any]:
     meta = _deploy.pause(cfg, slug, params["reason"], params["requested_by"])
 
     if not was_paused:
+        from bot_squad_worker import channels as _channels
         from bot_squad_worker import sessions as _sessions
         from bot_squad_worker import tg_topics as _tg_topics
-        tg = _get_tg_client(cfg)
-        tg.send(
+        # T-0591 (F5.3): routed through the channel abstraction.
+        _channels.get_channel(cfg, project=slug).send(
+            f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
             chat_id=project.tg_chat,  # type: ignore[attr-defined]
-            text=f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
             sid=_sessions.sid_display_label("deploy_monitor", slug),
             topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
         )
@@ -889,12 +899,13 @@ def _action_resume_deploys(params: dict[str, Any]) -> dict[str, Any]:
 
     if was_paused:
         who = params.get("requested_by") or "?"
+        from bot_squad_worker import channels as _channels
         from bot_squad_worker import sessions as _sessions
         from bot_squad_worker import tg_topics as _tg_topics
-        tg = _get_tg_client(cfg)
-        tg.send(
+        # T-0591 (F5.3): routed through the channel abstraction.
+        _channels.get_channel(cfg, project=slug).send(
+            f"🟢 deploys resumed for {slug} (by {who})",
             chat_id=project.tg_chat,  # type: ignore[attr-defined]
-            text=f"🟢 deploys resumed for {slug} (by {who})",
             sid=_sessions.sid_display_label("deploy_monitor", slug),
             topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
         )
@@ -1101,8 +1112,34 @@ _ENSURE_UCONV_REQUIRED = {"slug", "global_user_id"}
 _ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref", "model"}
 
 
+def _group_prompt_block(cfg: Any, slug: str, global_user_id: str) -> str:
+    """T-0591 (F5.10): the user's project-group prompt, if any — the one
+    consumption seam ``project_groups_store.group_for_user`` (T-0496) was
+    built for but never had a caller. Injected directly into the boot/resume
+    prompt (in-process file read, not an HTTP round-trip — the worker already
+    has ``cfg.data_dir`` on hand at spawn time). Empty string when the user
+    has no group (default treatment, unchanged behaviour)."""
+    from bot_squad_worker import project_groups_store as _groups
+
+    try:
+        group = _groups.group_for_user(cfg.data_dir, slug, global_user_id)
+    except ValueError:
+        return ""
+    if not group or not str(group.get("prompt") or "").strip():
+        return ""
+    name = group.get("name") or group.get("id") or "?"
+    role = group.get("role") or ""
+    scope = group.get("access_scope") or ""
+    header = f"\nYou are bound to project group `{name}`"
+    if role:
+        header += f" (role: {role})"
+    if scope:
+        header += f" — access scope: {scope}"
+    return f"{header}. Group-specific instructions:\n{group['prompt'].strip()}\n"
+
+
 def _user_conversation_boot_prompt(
-    slug: str, global_user_id: str, message_ref: str | None
+    cfg: Any, slug: str, global_user_id: str, message_ref: str | None
 ) -> str:
     """The initial prompt a freshly-spawned user-conversation session boots on.
 
@@ -1119,6 +1156,7 @@ def _user_conversation_boot_prompt(
             "\nThe message that triggered this spawn:\n"
             f"  {str(message_ref).strip()}\n"
         )
+    group_block = _group_prompt_block(cfg, slug, global_user_id)
     return f"""\
 You are a USER-CONVERSATION session (system-controlled), spawned on incoming
 user mail for project `{slug}`, attending the user `{global_user_id}`.
@@ -1137,11 +1175,11 @@ the product/protocol. Your mandate, in short:
     id> — <one-liner>"`); the operator dispatches the build, not you.
   - You are UNRESTRICTED: you may spawn an operator/TL/ad-hoc session or fix
     things yourself in service of the user's ask.
-{new_msg}"""
+{new_msg}{group_block}"""
 
 
 def _user_conversation_resume_prompt(
-    slug: str, gid: str, message_ref: Any
+    cfg: Any, slug: str, gid: str, message_ref: Any
 ) -> str:
     """Wake prompt for a RESUMED (recycled) attendant. Unlike the fresh-spawn
     boot prompt it re-orients rather than onboards — the conversation context
@@ -1152,11 +1190,12 @@ def _user_conversation_resume_prompt(
             "\nThe message that triggered this resume:\n"
             f"  {str(message_ref).strip()}\n"
         )
+    group_block = _group_prompt_block(cfg, slug, gid)
     return (
         f"Your user-conversation session (user `{gid}`, project `{slug}`) was "
         "recycled and has now been RESUMED on new incoming mail. Re-read this "
         f"user's thread (GET /api/conversations/{slug}/{gid}/messages) and "
-        f"respond to the new message.\n{new_msg}"
+        f"respond to the new message.\n{new_msg}{group_block}"
     )
 
 
@@ -1188,7 +1227,7 @@ def _resume_recycled_user_conversation(
         res = _sessions.resume(
             cfg, slug, cand["sid"],
             initial_prompt=_user_conversation_resume_prompt(
-                slug, gid, message_ref),
+                cfg, slug, gid, message_ref),
         )
         return res.get("sid")
     except Exception:  # noqa: BLE001 — resume failure must never fail the ensure
@@ -1297,7 +1336,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
             cfg,
             slug,
             window,
-            _user_conversation_boot_prompt(slug, gid, message_ref),
+            _user_conversation_boot_prompt(cfg, slug, gid, message_ref),
             model=params.get("model"),
         )
         return {"ok": True, "sid": result["sid"], "spawned": True}
@@ -1693,10 +1732,16 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
             )
             continue
         try:
+            from bot_squad_worker import channels as _channels
             from bot_squad_worker import sessions as _sessions
-            _get_tg_client(cfg).send(
+            # T-0591 (F5.3): routed through the channel abstraction. This
+            # mirror is deliberately TG-only regardless of the project's
+            # configured channel (it targets a specific UI user's bound TG
+            # chat, not the project's default), so the channel is forced
+            # explicitly rather than selected via `project=`.
+            _channels.get_channel(cfg, name="tg").send(
+                params["text"],
                 chat_id=chat_id,
-                text=params["text"],
                 sid=_sessions.sid_display_label(params["from_sid"], delivery_slug),
                 user=username,
             )

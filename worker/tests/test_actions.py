@@ -1363,6 +1363,63 @@ def test_ensure_user_conversation_spawns_when_none_live(tmp_path, monkeypatch):
     assert result["sid"] == "S-u-gu_a1b2c3-user-conversation-p3"
 
 
+def test_ensure_user_conversation_injects_group_prompt(tmp_path, monkeypatch):
+    """T-0591 (F5.10): a user bound to a project group gets that group's
+    prompt folded into the boot prompt — the consumption seam
+    project_groups_store.group_for_user (T-0496) was built for but never had
+    a caller."""
+    import json
+
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _ = _make_sessions_cfg(tmp_path, monkeypatch)
+    (cfg.data_dir / "test-project" / "groups.json").write_text(json.dumps({
+        "version": 1,
+        "groups": [{"id": "grp_1", "name": "support", "role": "support",
+                    "access_scope": "scoped help", "prompt": "Only answer FAQ."}],
+        "memberships": {"gu_a1b2c3": "grp_1"},
+    }))
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured["initial_prompt"] = initial_prompt
+        return {"ok": True, "sid": f"S-u-{window}-p3"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+    })
+    assert result["ok"] is True
+    assert "support" in captured["initial_prompt"]
+    assert "Only answer FAQ." in captured["initial_prompt"]
+
+
+def test_ensure_user_conversation_no_group_omits_group_block(tmp_path, monkeypatch):
+    """No groups.json / no membership ⟹ boot prompt is unchanged (default
+    treatment, matching pre-T-0591 behaviour)."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured["initial_prompt"] = initial_prompt
+        return {"ok": True, "sid": f"S-u-{window}-p3"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_nogroup",
+    })
+    assert result["ok"] is True
+    assert "Group-specific instructions" not in captured["initial_prompt"]
+
+
 def test_ensure_user_conversation_threads_explicit_model(tmp_path, monkeypatch):
     """T-0623: an explicit model param on ensure_user_conversation reaches
     sessions.spawn on the fresh-spawn path (absent → the role default applies

@@ -290,17 +290,17 @@ _VERBATIM_PLACEHOLDER_RE = re.compile(
 )
 
 
-def _extract_verbatim_section(path: Path) -> str:
-    """Raw text of a ticket's `## Verbatim request` section (line-sliced, same
-    heading-scan as `_scan_md_section`). Empty string if the section is
-    missing or blank."""
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
+def _extract_md_section(body: str, heading: str) -> str:
+    """Text of a `## <heading>` section — from the matching heading line up to
+    the next heading (or EOF). Case-insensitive substring match on the
+    heading text. Empty string if the heading isn't present. Shared by
+    `_scan_md_section` (keyword search), the F3.3 verbatim gate, and the
+    session-history Progress-line index (T-0591)."""
     lines = body.splitlines()
     out, collecting = [], False
     for ln in lines:
         is_heading = bool(re.match(r"^#+\s", ln))
-        if is_heading and "verbatim request" in ln.lower():
+        if is_heading and heading.lower() in ln.lower():
             collecting = True
             continue
         if collecting and is_heading:
@@ -308,6 +308,18 @@ def _extract_verbatim_section(path: Path) -> str:
         if collecting:
             out.append(ln)
     return "\n".join(out).strip()
+
+
+def _md_body(path: Path) -> str:
+    """A backlog/session md's body text, frontmatter stripped."""
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    return re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
+
+
+def _extract_verbatim_section(path: Path) -> str:
+    """Raw text of a ticket's `## Verbatim request` section. Empty string if
+    the section is missing or blank."""
+    return _extract_md_section(_md_body(path), "verbatim request")
 
 
 def _verbatim_is_placeholder(text: str) -> bool:
@@ -1306,6 +1318,128 @@ def cmd_expert_find(args) -> None:
         print(f"  why: {'; '.join(c['reasons'])}\n")
     print("`bsq spawn <ticket>` auto-resumes a HIGH-confidence top match; for a "
           "medium/low one use `bsq spawn <ticket> --resume <sid>`.")
+
+
+# ---------------------------------------------------------------------------
+# T-0591: general session-history search (D-0047 gap — `bsq expert find` is
+# ticket-scoped only; this is a free-text/--sid query over EXITED sessions,
+# with no ticket to anchor on required).
+# ---------------------------------------------------------------------------
+
+_PROGRESS_LINE_RE = re.compile(r"^-\s+(\S+)\s+·\s+(\S+)\s+·\s+(.*)$")
+
+
+def _progress_lines_by_sid(slug: str) -> dict[str, list[dict]]:
+    """Every `## Progress` line across the project's backlog, indexed by the
+    authoring SID and sorted chronologically per sid.
+
+    Progress lines (`- <ts> · <sid> · <text>`, task_body.append_progress's
+    format) are a session's own narration of its work, stamped by sid — the
+    one place that trail survives archival, since a session's LIVE task
+    binding (task_id) is cleared when it's archived (last_task_id is the only
+    frontmatter trace left). This is the corpus session-history search runs
+    over."""
+    out: dict[str, list[dict]] = {}
+    for p in sorted(backlog_dir(slug).glob("T-*.md")):
+        section = _extract_md_section(_md_body(p), "progress")
+        if not section:
+            continue
+        fm = read_frontmatter(p)
+        tid = fm.get("id") or p.stem
+        for ln in section.splitlines():
+            m = _PROGRESS_LINE_RE.match(ln.strip())
+            if not m:
+                continue
+            ts, sid, text = m.groups()
+            out.setdefault(sid, []).append({"ts": ts, "ticket": tid, "text": text})
+    for lines in out.values():
+        lines.sort(key=lambda r: r["ts"])
+    return out
+
+
+def _exited_sessions(slug: str) -> list[dict]:
+    """Suspended or archived sessions (the ones with a finished/paused
+    history worth searching) via the worker's live session list — same
+    source + filter `bsq expert find` uses (`_find_expert`), so ids stay
+    real-typed rather than re-parsed from flat frontmatter."""
+    sessions = post("list_sessions", {"slug": slug}).get("sessions", [])
+    return [s for s in sessions
+            if s.get("sid") and (s.get("status") == "suspended" or bool(s.get("archived")))]
+
+
+def _session_history_tickets(s: dict) -> list[str]:
+    out = _session_tickets(s) | set(_clean_id_list(s.get("last_task_id")))
+    return sorted(out)
+
+
+def cmd_session_search(args) -> None:
+    slug = resolve_slug()
+    by_sid = _progress_lines_by_sid(slug)
+
+    if args.sid:
+        sid = args.sid.strip()
+        sessions = {s["sid"]: s for s in _exited_sessions(slug)}
+        s = sessions.get(sid)
+        lines = by_sid.get(sid, [])
+        if s is None and not lines:
+            die(f"no exited session found for sid {sid!r} "
+                f"(no session record and no Progress notes under it)")
+        if args.json:
+            print(json.dumps({"sid": sid, "session": s, "progress": lines}, indent=2))
+            return
+        if s:
+            tag = "archived" if s.get("archived") else s.get("status", "?")
+            print(f"{sid}  [{tag}]  window={s.get('window', '?')}")
+            print(f"  tickets: {', '.join(_session_history_tickets(s)) or '-'}")
+            print(f"  started: {s.get('started_at', '?')}   "
+                  f"suspended: {s.get('suspended_at', '?')}")
+        else:
+            print(f"{sid}  (no live session record — Progress trail only)")
+        if not lines:
+            print("  (no Progress notes found under this sid)")
+            return
+        print("  progress:")
+        for r in lines:
+            print(f"    {r['ts']}  {r['ticket']}  {r['text']}")
+        return
+
+    query = (args.query or "").strip()
+    if not query:
+        die("session search: pass a free-text query or --sid <sid>")
+    kws = [w for w in re.split(r"[^A-Za-z0-9]+", query.lower()) if len(w) >= 2]
+    if not kws:
+        die(f"session search: query {query!r} has no usable keywords")
+
+    cands = []
+    for s in _exited_sessions(slug):
+        sid = s["sid"]
+        lines = by_sid.get(sid, [])
+        blob = " ".join([s.get("window", "").replace("-", " ")] + [r["text"] for r in lines])
+        score = _score(blob, kws)
+        if score <= 0:
+            continue
+        cands.append({
+            "sid": sid, "window": s.get("window", ""),
+            "status": s.get("status", ""), "archived": bool(s.get("archived")),
+            "score": score, "tickets": _session_history_tickets(s),
+            "snippet": _snippet(blob, kws),
+        })
+    cands.sort(key=lambda c: (-c["score"], c["sid"]))
+    limit = max(1, args.limit)
+    cands = cands[:limit]
+
+    if args.json:
+        print(json.dumps(cands, indent=2))
+        return
+    if not cands:
+        print(f"(no exited session matched {query!r})")
+        return
+    print(f"session-history matches for {query!r} (best first):\n")
+    for c in cands:
+        tag = "archived" if c["archived"] else c["status"]
+        print(f"• {c['sid']}  [{tag}, score {c['score']}]")
+        print(f"  window: {c['window']}   tickets: {', '.join(c['tickets']) or '-'}")
+        print(f"  {c['snippet']}\n")
 
 
 _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
@@ -2847,22 +2981,7 @@ def _scan_md_section(path: Path, kws: list[str], section: str | None) -> list[di
         return []
     fm = read_frontmatter(path)
     body = re.sub(r"\A---\n.*?\n---\n", "", raw, flags=re.DOTALL)
-    if section:
-        # Line-based section slice: from the matching heading line up to the
-        # next heading. (A regex with lazy capture + DOTALL mis-slices here.)
-        lines = body.splitlines()
-        out, collecting = [], False
-        for ln in lines:
-            is_heading = bool(re.match(r"^#+\s", ln))
-            if is_heading and section.lower() in ln.lower():
-                collecting = True
-                continue
-            if collecting and is_heading:
-                break
-            if collecting:
-                out.append(ln)
-        body = "\n".join(out)
-    body = body.strip()
+    body = _extract_md_section(body, section) if section else body.strip()
     if not body:
         return []
     sc = _score(body, kws)
@@ -4115,6 +4234,20 @@ def build_parser() -> argparse.ArgumentParser:
     exf.add_argument("--bundle", help="comma-separated extra ticket ids (same as spawn)")
     exf.add_argument("--json", action="store_true", help="raw JSON output")
     exf.set_defaults(func=cmd_expert_find)
+
+    # session (T-0591: general history search over exited sessions — unlike
+    # `expert find`, no ticket to anchor on is required)
+    sh = sub.add_parser("session", help="search history across exited sessions (T-0591)")
+    sh_sub = sh.add_subparsers(dest="sub", required=True)
+    shs = sh_sub.add_parser(
+        "search",
+        help="free-text search, or --sid to look up one session's own history")
+    shs.add_argument("query", nargs="?", default="",
+                      help="free-text keywords (omit when using --sid)")
+    shs.add_argument("--sid", help="look up one specific session's history directly")
+    shs.add_argument("--limit", type=int, default=10, help="max results (query mode)")
+    shs.add_argument("--json", action="store_true", help="raw JSON output")
+    shs.set_defaults(func=cmd_session_search)
 
     # team
     team = sub.add_parser("team", help="session roster (composes with T-0142)")

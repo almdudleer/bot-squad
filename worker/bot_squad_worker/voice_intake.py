@@ -346,7 +346,7 @@ def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = ""
     fails (proxy hiccup on this DPI host) and there's nothing else to show.
     """
     try:
-        from bot_squad_worker import actions as A, tg_topics
+        from bot_squad_worker import channels as _channels, tg_topics
         project = cfg.projects.get(slug)
         chat_id = getattr(project, "tg_chat", "") if project else ""
         if not chat_id:
@@ -373,7 +373,10 @@ def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = ""
         else:
             snippet = transcript[:140] + ("…" if len(transcript) > 140 else "")
             text = f"✅ got your voice note ({duration}s): {snippet}"
-        A._get_tg_client(cfg).send(chat_id=chat_id, text=text, sid="voice_intake", topic_id=topic)
+        # T-0591 (F5.3): routed through the channel abstraction instead of a
+        # raw TgClient — matches tg_listener._channel_notify's pattern.
+        _channels.get_channel(cfg, project=slug).send(
+            text, chat_id=chat_id, sid="voice_intake", topic_id=topic)
     except Exception:  # noqa: BLE001
         log.exception("voice_intake: confirmation send failed")
 

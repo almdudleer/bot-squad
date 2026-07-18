@@ -30,8 +30,15 @@ Design notes
 
 Shape on disk (``data/_mothership/conversations/<slug>/<global_user_id>.jsonl``)::
 
-    {"timestamp": "<iso8601>", "author": "user", "text": "...", "attachments": []}
-    {"timestamp": "<iso8601>", "author": "session:S-...", "text": "...", "attachments": []}
+    {"timestamp": "<iso8601>", "author": "user", "text": "...", "attachments": [], "channel": "tg"}
+    {"timestamp": "<iso8601>", "author": "session:S-...", "text": "...", "attachments": [], "channel": "tg"}
+
+``channel`` (T-0631): which inbound transport the message arrived on ("tg"
+today; "mcp"/"api" for a direct append; "mail"/"max" once those transports
+land, T-0490). Additive + back-compat: a record written before T-0631 has no
+``channel`` key on disk; reads normalize the absent field to "tg" (every
+pre-T-0631 record is TG-origin) so old threads don't silently look
+channel-less.
 """
 from __future__ import annotations
 
@@ -87,18 +94,22 @@ def append(
     text: str,
     attachments: list | None = None,
     timestamp: str | None = None,
+    channel: str | None = None,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
     ``author`` is free-form ("user" for inbound TG, "session:<sid>" for an
     attending session's writeback). ``attachments`` defaults to ``[]``.
-    ``timestamp`` defaults to now (UTC, ISO-8601).
+    ``timestamp`` defaults to now (UTC, ISO-8601). ``channel`` (T-0631) is the
+    inbound transport ("tg", "mcp", "api", ...); defaults to "tg" since every
+    caller predating T-0631 is TG-origin.
     """
     record = {
         "timestamp": timestamp or _now_iso(),
         "author": str(author),
         "text": "" if text is None else str(text),
         "attachments": list(attachments) if attachments else [],
+        "channel": str(channel) if channel else "tg",
     }
     p = conv_path(data_dir, slug, global_user_id)
     line = json.dumps(record, ensure_ascii=False)
@@ -131,6 +142,7 @@ def _read_all(data_dir: Path, slug: str, global_user_id: str) -> list[dict]:
             # rather than failing the whole lookup (the record is best-effort).
             continue
         if isinstance(rec, dict):
+            rec.setdefault("channel", "tg")  # T-0631: pre-migration records are TG-origin
             out.append(rec)
     return out
 

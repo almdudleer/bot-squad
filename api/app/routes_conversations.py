@@ -113,17 +113,70 @@ async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, t
     return bool(result.get("ok")) and bool(result.get("sent", True))
 
 
+async def _ensure_attendant(
+    request: Request, slug: str, global_user_id: str, message_ref: str,
+) -> dict:
+    """T-0631: the channel-agnostic half of the intake seam — best-effort wake
+    of the (slug, global_user_id) user-conversation attendant for a freshly
+    appended USER-authored message, via the worker's ``ensure_user_conversation``
+    action (T-0478: idempotent route-to-active / resume / spawn decision).
+
+    Before T-0631 only ``tg_listener`` triggered this (in-process, right after
+    its own append call) — a user-authored message landing here via any OTHER
+    caller (MCP, a direct API script, and eventually the email/MAX transports
+    once they exist, T-0490) was durably recorded but woke nothing. Centralizing
+    the trigger HERE means every channel that lands a user message through this
+    ONE append endpoint gets the same wake, not just TG.
+
+    ``ensure_user_conversation`` is a tmux_only action; it runs on the
+    coordinator because that's also where ``tg_listener`` (and its scheduler
+    tick) run (T-0119 __main__ coordinator-only scheduler), so the coordinator
+    client is the right target — same one the TG relay call below uses.
+
+    Never raises: a spawn/pane hiccup, or the worker being briefly unreachable,
+    must never fail the append (the message is already durable in the store).
+    Mirrors tg_listener's own ``_ensure_user_conversation`` backoff detection so
+    a saturation refusal is still distinguishable (``parked: True``) from any
+    other failure."""
+    client = request.app.state.worker_router.coordinator()
+    try:
+        return await client.call_action(
+            "ensure_user_conversation",
+            {"slug": slug, "global_user_id": global_user_id, "message_ref": message_ref},
+        )
+    except WorkerError as e:
+        if "backoff" in str(e):
+            return {"ok": False, "parked": True}
+        return {"ok": False}
+    except Exception:  # noqa: BLE001 — best-effort; must never fail the append
+        return {"ok": False}
+
+
 @worker_router.post("/conversations/{slug}/{global_user_id}/messages")
 async def append_message(slug: str, global_user_id: str, request: Request, payload: dict) -> dict:
     """Append one message to the (slug, global_user_id) thread. Worker-only.
 
-    Body: ``{author, text, attachments?, timestamp?}`` (``text`` required —
-    empty string is allowed, but the key must be present). Returns the stored
-    record plus ``relayed`` (T-0569): when ``author`` is a session writeback
-    (``"session:<sid>"``) with non-empty text, the text is best-effort relayed
-    to the user's Telegram chat (see ``_relay_to_telegram``) — otherwise
-    ``relayed`` is always ``False`` (a user-authored append is never relayed
-    back to itself)."""
+    T-0631: this endpoint IS the channel-generic user-mail intake seam — every
+    inbound channel (TG's ``tg_listener`` today; a direct MCP/API caller; email
+    and MAX once their transports land, T-0490 — they register here, no
+    transport is built by this ticket) lands its user-authored messages through
+    this ONE append, and gets the same attendant-wake behavior (see
+    ``_ensure_attendant``) rather than TG being special-cased.
+
+    Body: ``{author, text, attachments?, timestamp?, channel?}`` (``text``
+    required — empty string is allowed, but the key must be present).
+    ``channel`` (T-0631) names the inbound transport ("tg", "mcp", "api", ...);
+    defaults to "tg" for back-compat with pre-T-0631 callers. Returns the
+    stored record plus:
+    - ``relayed`` (T-0569): when ``author`` is a session writeback
+      (``"session:<sid>"``) with non-empty text, the text is best-effort
+      relayed to the user's Telegram chat (see ``_relay_to_telegram``) —
+      otherwise always ``False`` (a user-authored append is never relayed back
+      to itself).
+    - ``ensured`` (T-0631): present only for a user-authored append (``author
+      == "user"``) — the outcome of the attendant-wake (see
+      ``_ensure_attendant``); absent for a session writeback (it already HAS an
+      attending session, waking one would be circular)."""
     _authenticate_worker(request)
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
@@ -136,6 +189,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             text=payload.get("text"),
             attachments=payload.get("attachments"),
             timestamp=payload.get("timestamp"),
+            channel=payload.get("channel"),
         )
     except ValueError as e:
         # An unsafe slug / global_user_id segment.
@@ -152,6 +206,10 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
 
     out = dict(record)
     out["relayed"] = relayed
+    if author == "user":
+        out["ensured"] = await _ensure_attendant(
+            request, slug, global_user_id, str(record.get("timestamp") or ""),
+        )
     return out
 
 

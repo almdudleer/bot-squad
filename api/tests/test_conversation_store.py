@@ -41,6 +41,32 @@ def test_append_defaults_timestamp_when_absent(tmp_path: Path):
     assert rec["timestamp"]  # an ISO timestamp was stamped
 
 
+def test_append_defaults_channel_to_tg(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi")
+    assert rec["channel"] == "tg"
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["channel"] == "tg"
+
+
+def test_append_records_explicit_channel(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi", channel="mcp")
+    assert rec["channel"] == "mcp"
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["channel"] == "mcp"
+
+
+def test_read_normalizes_missing_channel_to_tg(tmp_path: Path):
+    """T-0631: a record written before the channel field existed has no
+    ``channel`` key on disk — reads must still expose "tg" (every pre-T-0631
+    record is TG-origin), not a missing/None field."""
+    p = CS.conv_path(tmp_path, "proj", "gu_abc")
+    p.parent.mkdir(parents=True)
+    p.write_text('{"timestamp": "2026-06-01T00:00:00Z", "author": "user", '
+                 '"text": "pre-migration", "attachments": []}\n', encoding="utf-8")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["channel"] == "tg"
+
+
 def test_append_preserves_attachments(tmp_path: Path):
     atts = [{"type": "voice", "file_id": "VID"}]
     rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="", attachments=atts)

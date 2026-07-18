@@ -349,14 +349,16 @@ def test_session_append_relays_to_telegram(tmp_bot_squad: Path, monkeypatch):
 
 def test_user_authored_append_never_relays(tmp_bot_squad: Path, monkeypatch):
     """A regular user-authored append (author='user') must NOT trigger a
-    relay — it would just echo the user's own message back to themselves."""
+    relay — it would just echo the user's own message back to themselves. (It
+    DOES trigger the T-0631 attendant-wake — see test_routes_conversations_seam.py
+    — so calls is no longer expected to be empty here.)"""
     client = _client(tmp_bot_squad, monkeypatch)
     calls = _mock_call_action(monkeypatch)
 
     r = client.post(CONV, json={"author": "user", "text": "hi"}, headers=_worker_auth())
     assert r.status_code == 200, r.text
     assert r.json()["relayed"] is False
-    assert calls == []
+    assert [name for name, _ in calls] == ["ensure_user_conversation"]
 
 
 def test_session_append_empty_text_never_relays(tmp_bot_squad: Path, monkeypatch):

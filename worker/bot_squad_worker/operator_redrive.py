@@ -242,7 +242,7 @@ def weekly_quota_target_pct(cfg: Any) -> Optional[float]:
 
 
 def _burn_signal(cfg: Any, slug: str) -> dict:
-    """Best-effort read of telemetry's quota estimate (``_telemetry/_quota.json``):
+    """Best-effort read of telemetry's quota estimate (``telemetry._quota_path``):
     ``{burn_tokens_per_hr, remaining_tokens, rate_limit_429, spend_pct}``. All-None
     (spend_pct excepted, 0 for rate_limit_429) when no signal exists yet (Max
     remaining is never authoritative — estimate only).
@@ -252,7 +252,9 @@ def _burn_signal(cfg: Any, slug: str) -> dict:
     operator-set ``[quota]`` anchor telemetry persists alongside ``remaining_tokens``
     (``telemetry._update_quota`` writes ``anchor`` into the same file). None when no
     anchor is set — there is then no total to measure spend against."""
-    q = cfg.data_dir / slug / "_telemetry" / "_quota.json"
+    from bot_squad_worker import telemetry as _telemetry
+
+    q = _telemetry._quota_path(cfg, slug)
     try:
         data = json.loads(q.read_text(encoding="utf-8"))
     except (OSError, ValueError):

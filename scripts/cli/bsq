@@ -2242,9 +2242,11 @@ def _pace_weekly_target_pct(slug: str) -> float | None:
 def _pace_spend_pct(slug: str) -> float | None:
     """Mirrors operator_redrive._burn_signal's spend_pct (F2.7): best-effort
     percent of the operator-set ``[quota]`` budget spent to date, derived from
-    ``_telemetry/_quota.json``'s persisted anchor + remaining_tokens. None when
-    no anchor is set (no total to measure spend against)."""
-    path = Path(BOT_SQUAD) / "data" / slug / "_telemetry" / "_quota.json"
+    ``_worker/telemetry/_quota.json``'s persisted anchor + remaining_tokens
+    (T-0646: was bare ``_telemetry/``, the SAME wrong path _burn_signal had —
+    telemetry.py's ``_telemetry_dir`` is ``_worker/telemetry``). None when no
+    anchor is set (no total to measure spend against)."""
+    path = Path(BOT_SQUAD) / "data" / slug / "_worker" / "telemetry" / "_quota.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

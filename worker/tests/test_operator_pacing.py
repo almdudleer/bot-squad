@@ -12,6 +12,7 @@ import pytest
 
 from bot_squad_worker import operator_redrive as ord_
 from bot_squad_worker import pace as _pace
+from bot_squad_worker import telemetry as _telemetry
 
 SLUG = "bot-squad"
 
@@ -20,7 +21,6 @@ SLUG = "bot-squad"
 def cfg(tmp_path: Path):
     data = tmp_path / "data"
     (data / SLUG / "backlog").mkdir(parents=True, exist_ok=True)
-    (data / SLUG / "_telemetry").mkdir(parents=True, exist_ok=True)
     cfgdir = tmp_path / "config"
     cfgdir.mkdir(parents=True, exist_ok=True)
     return SimpleNamespace(data_dir=data, config_dir=cfgdir)
@@ -44,8 +44,9 @@ def _set_quota(cfg, *, burn=None, remaining=None, r429=0, budget=None):
     }
     if budget is not None:
         data["anchor"] = {"budget_tokens": budget, "set_at": "2026-07-14T00:00:00Z"}
-    (cfg.data_dir / SLUG / "_telemetry" / "_quota.json").write_text(
-        json.dumps(data), encoding="utf-8")
+    q = _telemetry._quota_path(cfg, SLUG)
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(json.dumps(data), encoding="utf-8")
 
 
 def test_fresh_project_degrades_to_ok(cfg, monkeypatch):
@@ -112,6 +113,27 @@ def test_burn_signal_surfaced_when_present(cfg, monkeypatch):
     st = ord_.pacing_status(cfg, SLUG)
     assert st["burn_tokens_per_hr"] == 999.0
     assert st["remaining_tokens"] == 500000
+
+
+def test_burn_signal_reads_telemetrys_real_quota_path(cfg, monkeypatch):
+    """T-0646 regression: _burn_signal must read the SAME file telemetry's own
+    writer (_update_quota) targets — ``_worker/telemetry/_quota.json`` via the
+    shared ``telemetry._quota_path`` helper — not a hand-duplicated path string.
+    Writing through the real writer primitive (``_write_json`` at
+    ``_quota_path``) and reading back through ``_burn_signal`` catches any
+    future divergence between the two, which a bare ``_telemetry/`` path would
+    silently fail (FileNotFoundError -> all-None signal)."""
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    q = _telemetry._quota_path(cfg, SLUG)
+    assert q == cfg.data_dir / SLUG / "_worker" / "telemetry" / "_quota.json"
+    _telemetry._write_json(q, {
+        "burn_tokens_per_hr": 42.0, "remaining_tokens": 100,
+        "anchor": {"budget_tokens": 1000}, "rate_limit_429": {"count": 0},
+    })
+    signal = ord_._burn_signal(cfg, SLUG)
+    assert signal["burn_tokens_per_hr"] == 42.0
+    assert signal["remaining_tokens"] == 100
+    assert signal["spend_pct"] == pytest.approx(90.0)
 
 
 def test_target_unreadable_degrades_to_none(cfg, monkeypatch):

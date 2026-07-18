@@ -2719,16 +2719,15 @@ _INITIATIVE_NEW_ALLOWED = _INITIATIVE_NEW_REQUIRED | {"provenance", "persistent"
 
 
 def _action_initiative_new(params: dict[str, Any]) -> dict[str, Any]:
-    """Allocate the next INI-NN id and write a stub initiative md.
+    """Allocate the next T-NNNN id and write a stub ``kind: initiative`` task.
 
     Required params: slug, name
     Optional: persistent (bool) — T-0354: standing responsibility vs the
       default one-shot; sets ``initiative_kind: persistent`` on the stub.
-    Returns: {ok, id, file_path}
+    Returns: {ok, id, kind, file_path}
 
-    Storage: ``data/<slug>/vision/initiatives/INI-NN-<slug>.md``. Legacy
-    slug-named initiatives are non-numeric and untouched; new ones get an
-    INI-NN id while keeping a human ``name``.
+    Storage: ``data/<slug>/backlog/T-NNNN-<slug>.md`` (T-0480 3b-1 — an
+    initiative IS a task now, not a separate ``vision/initiatives/`` entity).
     """
     from bot_squad_worker import idalloc
 

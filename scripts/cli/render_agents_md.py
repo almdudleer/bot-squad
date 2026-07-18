@@ -4,12 +4,16 @@
 Usage:
     python3 render_agents_md.py <slug> [--config-dir /home/www/bot-squad/config]
 
-Reads the CURRENT vision schema from data/<slug>/vision/ — `product.md` plus
-the `active_initiatives` list and `initiatives/<name>.md` (T-0199; the old
-north-star/strategy/tactical trio no longer exists in live data) —
-interpolates it into the canonical AGENTS.md template, and writes the result
-to <repo_path>/AGENTS.md.  Prints a unified diff to stdout so the caller can
-review before committing.
+Reads the CURRENT vision schema from data/<slug>/vision/ — `product.md` (T-0199;
+the old north-star/strategy/tactical trio no longer exists in live data) — plus
+active initiatives, interpolates it into the canonical AGENTS.md template, and
+writes the result to <repo_path>/AGENTS.md.  Prints a unified diff to stdout so
+the caller can review before committing.
+
+Initiatives (T-0562): a `kind: initiative` backlog task (T-0480 — an initiative
+IS a task now) is the PRIMARY source. The pre-migration `vision/active_initiatives`
+list + `initiatives/<name>.md` files are read too, as a fallback for a project
+that hasn't run `migrate_initiatives_to_tasks.py` yet.
 
 Everything project-specific in the template is config-driven via OPTIONAL
 `[projects.<slug>]` fields in projects.toml (same pattern as T-0195's
@@ -24,6 +28,21 @@ import re
 import sys
 import tomllib
 from pathlib import Path
+
+_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
+
+
+def _parse_frontmatter(text: str) -> dict[str, str]:
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    meta: dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        meta[k.strip()] = v.strip().strip('"').strip("'")
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -91,24 +110,51 @@ def _md_title(path: Path) -> str | None:
     return None
 
 
-def render_active_initiatives(vision_dir: Path, ops: str) -> str:
+def _initiative_tasks(backlog_dir: Path) -> list[tuple[str, str]]:
+    """(title, filename) for open `kind: initiative` backlog tasks (T-0480).
+
+    An initiative IS a task now — `closed` is the only terminal status (see
+    `operator_redrive._TERMINAL_STATUSES`), so anything else (open, planned,
+    in_progress, totest) counts as active.
+    """
+    out: list[tuple[str, str]] = []
+    if not backlog_dir.exists():
+        return out
+    for path in sorted(backlog_dir.glob("*.md")):
+        try:
+            meta = _parse_frontmatter(path.read_text())
+        except OSError:
+            continue
+        if meta.get("kind") != "initiative" or meta.get("status") == "closed":
+            continue
+        out.append((meta.get("title") or path.stem, path.name))
+    return out
+
+
+def render_active_initiatives(vision_dir: Path, backlog_dir: Path, ops: str) -> str:
     """Bullet list of the project's active initiatives.
 
-    `vision/active_initiatives` lists one `initiatives/<basename>` per line
-    (blank lines ignored).  Each bullet carries the initiative's H1 title —
-    falling back to the basename stem when the file is missing or untitled —
-    plus its path.  Graceful when the list file is absent or empty.
+    T-0562: `kind: initiative` backlog tasks (T-0480) are the PRIMARY source.
+    The pre-migration `vision/active_initiatives` sidecar (one
+    `initiatives/<basename>` per line) is also read, as a fallback for a
+    project that hasn't run `migrate_initiatives_to_tasks.py` yet — so this
+    keeps working for both a migrated project (bot-squad) and one still on
+    the legacy scheme (e.g. watchrobot). Graceful when both are absent/empty.
     """
+    lines = [
+        f"- **{title}** — `{ops}/backlog/{filename}`"
+        for title, filename in _initiative_tasks(backlog_dir)
+    ]
+
     listing = vision_dir / "active_initiatives"
-    names: list[str] = []
     if listing.exists():
         names = [ln.strip() for ln in listing.read_text().splitlines() if ln.strip()]
-    if not names:
-        return f"_(No active initiatives listed — see `{ops}/vision/initiatives/`.)_"
-    lines = []
-    for name in names:
-        title = _md_title(vision_dir / "initiatives" / name) or Path(name).stem
-        lines.append(f"- **{title}** — `{ops}/vision/initiatives/{name}`")
+        for name in names:
+            title = _md_title(vision_dir / "initiatives" / name) or Path(name).stem
+            lines.append(f"- **{title}** — `{ops}/vision/initiatives/{name}`")
+
+    if not lines:
+        return f"_(No active initiatives — see `{ops}/backlog/` for open `kind: initiative` tasks.)_"
     return "\n".join(lines)
 
 
@@ -258,8 +304,9 @@ It lands in `{ops}/feedback/`; it's how the process improves.
 
 {initiatives_block}
 
-(The active set is `{ops}/vision/active_initiatives`; full texts live in
-`{ops}/vision/initiatives/`.)
+(Open `kind: initiative` tasks live in `{ops}/backlog/`; a project still on
+the pre-migration scheme also lists them in `{ops}/vision/active_initiatives`,
+full texts under `{ops}/vision/initiatives/`.)
 
 ## Hard rules — non-negotiable
 
@@ -306,8 +353,9 @@ deploy prod.
 
 - `{ops}/vision/team_protocol.md` — working conventions for every session
 - `{ops}/vision/roles/` — role contracts (operator, teamlead, dev)
-- `{ops}/vision/initiatives/` — discrete strategic bets, full texts
-- `{ops}/backlog/` — all open work, one .md per task
+- `{ops}/backlog/` — all open work, one .md per task, incl. `kind: initiative`
+  (discrete strategic bets; `{ops}/vision/initiatives/` is the legacy home
+  for a project that hasn't migrated to task-based initiatives yet)
 - `{ops}/feedback/` — raw user feedback for JTBD evidence
 - `{ops}/docs/` — categorized project docs (architecture / design /
   support / runbook / product)
@@ -353,7 +401,9 @@ def render(slug: str, config_dir: Path, data_dir: Path) -> str:
         display_name=project.get("display_name", slug),
         ops=ops,
         product_body=product_body,
-        initiatives_block=render_active_initiatives(vision_dir, ops),
+        initiatives_block=render_active_initiatives(
+            vision_dir, data_dir / slug / "backlog", ops
+        ),
         hard_rules_block=render_hard_rules(project, ops),
         stack_paths_block=render_stack_paths(project, slug, ops, data_dir),
         deploy_branch=project.get("deploy_branch", "bot_squad/dev"),

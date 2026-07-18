@@ -131,11 +131,62 @@ def test_feedback_blurb_is_project_agnostic(tmp_path):
 
 
 def test_missing_vision_entirely_graceful(tmp_path):
-    """A project with NO vision dir at all: placeholders, no exception."""
+    """A project with NO vision dir (and no backlog dir) at all: placeholders,
+    no exception."""
     cfg = _synthetic_config(tmp_path)
     out = ram.render("synthetic", cfg, tmp_path)
     assert "No `vision/product.md` yet" in out
-    assert "No active initiatives listed" in out
+    assert "No active initiatives" in out
+
+
+# ---------------------------------------------------------------------------
+# kind:initiative backlog tasks (T-0480/T-0562) — the PRIMARY source now
+# ---------------------------------------------------------------------------
+
+def _write_initiative_task(backlog: Path, task_id: str, title: str, status: str) -> None:
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / f"{task_id}-{title}.md").write_text(
+        f'---\nid: {task_id}\ntitle: "{title}"\nstatus: {status}\n'
+        f"kind: initiative\npriority: 0\n---\n\n# {title}\n"
+    )
+
+
+def test_initiative_tasks_are_primary_source(tmp_path):
+    """An open `kind: initiative` backlog task renders as an active initiative,
+    pointing at the backlog file — no vision/initiatives/ dir needed at all."""
+    cfg = _synthetic_config(tmp_path)
+    (tmp_path / "synthetic" / "vision").mkdir(parents=True)
+    (tmp_path / "synthetic" / "vision" / "product.md").write_text("# Prod\n\nStatement.\n")
+    backlog = tmp_path / "synthetic" / "backlog"
+    _write_initiative_task(backlog, "T-0001", "persistent-initiatives", "open")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "- **persistent-initiatives** — `ops/backlog/T-0001-persistent-initiatives.md`" in out
+
+
+def test_closed_initiative_task_excluded(tmp_path):
+    """A `closed` kind:initiative task is done — it must not clutter the
+    active-initiatives block (only `closed` is terminal, per T-0480)."""
+    cfg = _synthetic_config(tmp_path)
+    (tmp_path / "synthetic" / "vision").mkdir(parents=True)
+    backlog = tmp_path / "synthetic" / "backlog"
+    _write_initiative_task(backlog, "T-0001", "done-thing", "closed")
+    _write_initiative_task(backlog, "T-0002", "open-thing", "in_progress")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "done-thing" not in out
+    assert "- **open-thing** — `ops/backlog/T-0002-open-thing.md`" in out
+
+
+def test_initiative_tasks_and_legacy_scheme_combine(tmp_path):
+    """A project mid-migration: kind:initiative tasks AND the legacy
+    vision/initiatives/ scheme both render (union), so nothing is dropped
+    while a project transitions to T-0480."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    backlog = tmp_path / "synthetic" / "backlog"
+    _write_initiative_task(backlog, "T-0001", "new-model-bet", "open")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "- **new-model-bet** — `ops/backlog/T-0001-new-model-bet.md`" in out
+    assert "- **Alpha — first bet** — `ops/vision/initiatives/alpha.md`" in out
 
 
 def test_default_ops_prefix(tmp_path):

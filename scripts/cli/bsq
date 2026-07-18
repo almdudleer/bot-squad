@@ -15,7 +15,7 @@ Verbs:
   bsq doc new <category> <title>   allocate next D-NNNN + stub doc (T-0172)
   bsq uc new <title>               allocate next UC-NNNN + stub use case
   bsq flow new <uc-id> <title>     allocate next UF-NNNN + stub flow (T-0173)
-  bsq initiative new <name>        allocate next INI-NN + stub initiative
+  bsq initiative new <name>        allocate next T-NNNN + stub kind:initiative task (T-0480)
   bsq spawn <ticket> [--bundle ids] spawn a dev session (auto-resumes an expert)
   bsq cluster-launch <seed>        seed a problem → suggest a similar cluster → launch ONE bundled session (T-0487)
   bsq expert find <ticket>          rank resumable 'pro' sessions for a ticket
@@ -4223,10 +4223,11 @@ def build_parser() -> argparse.ArgumentParser:
     fln.add_argument("title", help="single-line flow title")
     fln.set_defaults(func=cmd_flow_new)
 
-    # initiative new (rare but uniform; INI-NN)
-    ini = sub.add_parser("initiative", help="initiatives: new (atomic INI-NN id, T-0174)")
+    # initiative new — an initiative IS a task now (T-0480): mints a
+    # kind:initiative backlog task with an atomic T-NNNN id, not an INI-NN.
+    ini = sub.add_parser("initiative", help="initiatives: new (kind:initiative task, atomic T-id, T-0480)")
     ini_sub = ini.add_subparsers(dest="sub", required=True)
-    inin = ini_sub.add_parser("new", help="allocate the next INI-NN + write a stub initiative")
+    inin = ini_sub.add_parser("new", help="allocate the next T-NNNN + write a stub kind:initiative task")
     inin.add_argument("name", help="initiative name")
     inin.add_argument("--persistent", action="store_true",
                        help="T-0354: standing responsibility, never auto-closed "

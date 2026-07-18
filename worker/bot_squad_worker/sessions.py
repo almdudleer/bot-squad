@@ -16,7 +16,7 @@ import shlex
 import subprocess
 import time
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,14 @@ IDLE_AT_PROMPT_SECONDS = float(os.environ.get("BOT_SQUAD_IDLE_AT_PROMPT_SECONDS"
 # re-dispatchable) instead of letting it linger in the working set forever.
 # Read per-call (not frozen at import) so it is env-tunable on a live worker;
 # the default is aggressive-but-safe — a pane-gone run idle > 24h is dead.
+#
+# T-0288: this is a DIFFERENT concept from the roadmap Ch. III "idle session
+# suspends after 12h (HARD)" spec, and its 24h default is deliberate, not a
+# spec violation — it grades an *already-exited* pane's crash/abandon grace,
+# where a false-positive reap is costlier (the run is gone, only the binding
+# is at stake) than the LIVE-pane idle-suspend case. The Ch. III 12h figure
+# governs a *live* pane going idle-too-long instead; that threshold is
+# DEFAULT_IDLE_SUSPEND_SEC / _session_idle_suspend_sec() below, not this one.
 # ---------------------------------------------------------------------------
 DEFAULT_SESSION_STALE_SEC = 24 * 3600
 
@@ -76,20 +84,60 @@ def session_stale_sec() -> float:
     return val if val > 0 else DEFAULT_SESSION_STALE_SEC
 
 
+# T-0288: reconciles the idle-suspend threshold to the roadmap's Ch. III HARD
+# spec ("any idle session suspends after 12h") — the default effective window
+# once no explicit operator override exists, below.
+DEFAULT_IDLE_SUSPEND_SEC = 12 * 3600
+
+
+def _read_idle_suspend_cap(config_dir: Path | None) -> tuple[bool, float]:
+    """Raw ``[caps].idle_suspend_sec`` read from ``system_settings.toml``,
+    distinguishing an EXPLICIT value (including an operator's deliberate
+    ``0`` = OFF) from an ABSENT key/file/dir (the caller falls through to
+    ``DEFAULT_IDLE_SUSPEND_SEC``). Returns ``(explicit, value)``; a garbage
+    explicit value reads the same as absent (``(False, 0.0)``), matching the
+    garbage-falls-to-default handling used throughout this module.
+    """
+    if config_dir is None:
+        return False, 0.0
+    path = Path(config_dir) / "system_settings.toml"
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return False, 0.0
+    caps = raw.get("caps", {}) or {}
+    if "idle_suspend_sec" not in caps:
+        return False, 0.0
+    try:
+        v = float(caps["idle_suspend_sec"])
+    except (TypeError, ValueError):
+        return False, 0.0
+    return True, (v if v > 0 else 0.0)
+
+
 def _session_idle_suspend_sec(cfg: Any = None) -> float:
     """T-0335 item-10 / Fork-2 Part B: idle-but-live dev suspend window (seconds).
 
-    T-0408: the knob now lives in ``system_settings.toml [caps].idle_suspend_sec``
+    T-0408: the knob lives in ``system_settings.toml [caps].idle_suspend_sec``
     (the System Settings UI, written by the API caps PUT, read fresh like the
-    other caps). Ships **DARK** (D2): 0 / absent ⟹ the idle-suspend arm in
-    ``archive_dead_teammates`` is OFF; the operator opts in by setting e.g.
-    ``43200`` (12h). Suspend is reversible (the task stays open +
-    re-dispatchable), so a long window is safe.
+    other caps).
+
+    T-0288: reconciled to the roadmap Ch. III HARD spec — an ABSENT cap (no
+    ``system_settings.toml``, or the key missing from ``[caps]``) now falls
+    through to ``DEFAULT_IDLE_SUSPEND_SEC`` (12h) instead of OFF, so the
+    idle-suspend arm in ``archive_dead_teammates`` is live out of the box.
+    This supersedes item-10's original "ships DARK, operator opts in later"
+    rollout-safety default (D2) now that the operator-facing cap UI exists
+    (T-0408) and the spec calls this a HARD rule, not opt-in. An operator who
+    explicitly writes ``idle_suspend_sec = 0`` still gets a genuine, honored
+    OFF — only *absence* defaults to the spec value, never an explicit
+    override. Suspend is reversible (the task stays open + re-dispatchable),
+    so the default window is safe.
 
     A *positive* ``BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC`` env var force-overrides
     the cap (dev / emergency escape hatch). An unset / 0 / garbage env falls
-    through to the cap, so a leftover dark-ship ``=0`` in the unit can never
-    shadow the UI setting. ``cfg=None`` (no config to read) ⟹ env-only.
+    through to the cap (or the 12h default when the cap is itself absent).
+    ``cfg=None`` (no config to read) ⟹ env-or-default (no cap file to consult).
     """
     raw = os.environ.get("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC")
     try:
@@ -98,13 +146,11 @@ def _session_idle_suspend_sec(cfg: Any = None) -> float:
         env_val = 0.0
     if env_val > 0:
         return env_val
-    if cfg is not None:
-        try:
-            cap = float(_read_caps(_caps_config_dir(cfg)).get("idle_suspend_sec", 0))
-        except (ValueError, TypeError):
-            return 0.0
-        return cap if cap > 0 else 0.0
-    return 0.0
+    config_dir = _caps_config_dir(cfg) if cfg is not None else None
+    explicit, cap = _read_idle_suspend_cap(config_dir)
+    if explicit:
+        return cap
+    return DEFAULT_IDLE_SUSPEND_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -4574,6 +4620,102 @@ def _session_idle_age(meta: dict, user_home: str, now_epoch: float) -> float | N
     return None
 
 
+# ---------------------------------------------------------------------------
+# T-0288 — reaper run log ("N processes reaped today").
+#
+# archive_dead_teammates is THE reaper (T-0233 stale-exited reap + the T-0288
+# 12h idle-suspend arm above): every sid it archives is logged here as one
+# JSONL line in a day-bucketed file under
+# ``<data_dir>/<slug>/_worker/reaper/<YYYY-MM-DD>.jsonl`` (UTC date), flock-
+# appended the same way input_mux.enqueue serialises its queue writes — this
+# tree is shared across every linux user's worker instance on a multi-tenant
+# install, so concurrent appends from different users' ticks must not
+# interleave a partial line. Query with ``reaped_today`` / ``reaped_since``.
+# No UI surface yet (T-0288 DoD holds the per-row hint + footnote rendering
+# behind T-0637's Sessions-area declutter verdict) — this is the queryable
+# backend the eventual footnote will call.
+# ---------------------------------------------------------------------------
+_REAP_LOG_SUBDIR = "reaper"
+
+
+def _reap_log_dir(cfg: Any, slug: str) -> Path:
+    return cfg.data_dir / slug / "_worker" / _REAP_LOG_SUBDIR
+
+
+def _reap_log_path(cfg: Any, slug: str, date_str: str) -> Path:
+    return _reap_log_dir(cfg, slug) / f"{date_str}.jsonl"
+
+
+def _log_reap_event(cfg: Any, slug: str, sid: str, reason: str, *,
+                     now: float | None = None) -> None:
+    """Append one reap event. Best-effort — a log-write failure must never
+    block or fail the archive it is recording."""
+    ts_epoch = time.time() if now is None else now
+    date_str = time.strftime("%Y-%m-%d", time.gmtime(ts_epoch))
+    ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_epoch))
+    line = json.dumps(
+        {"sid": sid, "reason": reason, "at": ts_iso, "epoch": ts_epoch},
+        ensure_ascii=False,
+    )
+    try:
+        log_dir = _reap_log_dir(cfg, slug)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lock_fd = open(log_dir / f"{date_str}.lock", "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with open(_reap_log_path(cfg, slug, date_str), "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        finally:
+            lock_fd.close()
+    except OSError:
+        pass  # measurement is best-effort; never wedge the reaper on it
+
+
+def reaped_since(cfg: Any, slug: str, since_epoch: float, *,
+                  now: float | None = None) -> int:
+    """Count reap events logged by ``_log_reap_event`` at/after ``since_epoch``.
+
+    Reads the day-bucketed jsonl files spanning ``[since_epoch, now]`` (UTC
+    dates). Missing log dir / files / unparseable lines all read as absent —
+    never raises."""
+    now_epoch = time.time() if now is None else now
+    log_dir = _reap_log_dir(cfg, slug)
+    if not log_dir.exists():
+        return 0
+    start_date = datetime.fromtimestamp(since_epoch, tz=timezone.utc).date()
+    end_date = datetime.fromtimestamp(now_epoch, tz=timezone.utc).date()
+    count = 0
+    d = start_date
+    while d <= end_date:
+        try:
+            with open(_reap_log_path(cfg, slug, d.isoformat()), encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except ValueError:
+                        continue
+                    ep = rec.get("epoch")
+                    if isinstance(ep, (int, float)) and ep >= since_epoch:
+                        count += 1
+        except OSError:
+            pass
+        d += timedelta(days=1)
+    return count
+
+
+def reaped_today(cfg: Any, slug: str, *, now: float | None = None) -> int:
+    """'N processes reaped today' (T-0288 DoD) — reap events since UTC
+    midnight, sourced from the reaper run log."""
+    now_epoch = time.time() if now is None else now
+    midnight = datetime.fromtimestamp(now_epoch, tz=timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp()
+    return reaped_since(cfg, slug, midnight, now=now_epoch)
+
+
 def archive_dead_teammates(cfg: Any, slug: str) -> dict:
     """T-0142/T-0144: auto-archive cleanly-delivered dev teammates.
 
@@ -4703,7 +4845,9 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
             if reason is None:
                 # T-0335 item-10 (Fork-2 Part B): an idle-but-live dev — pane gone
                 # quiet past the suspend window — is suspended so it stops holding
-                # a slot, even with work still open. Ships DARK (window 0 = OFF).
+                # a slot, even with work still open. T-0288: window defaults to
+                # DEFAULT_IDLE_SUSPEND_SEC (12h, Ch. III HARD spec) unless the
+                # operator explicitly set [caps].idle_suspend_sec = 0 (OFF).
                 # Spared when it is awaiting TG input (blocked_sids: a real "waiting
                 # on you" signal, not a leak) or its pane is still active. A session
                 # with no transcript activity signal is spared (age unknowable). The
@@ -4784,6 +4928,7 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
         meta["archive_reason"] = f"auto-archive:{reason}"
         _write_session_metadata(md, meta, atomic=True)
         archived.append(sid)
+        _log_reap_event(cfg, slug, sid, reason, now=now_epoch)
 
     return {"ok": True, "scanned": scanned, "archived": len(archived), "sids": archived}
 

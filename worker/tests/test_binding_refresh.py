@@ -1,6 +1,8 @@
 """Tests for the T-0142 binding-refresh + auto-archive reconcilers."""
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -273,7 +275,8 @@ def test_same_tick_close_then_trim(tmp_path, monkeypatch):
     assert meta["last_task_id"] == "T-0001"
 
 
-# --- T-0335 item-10: idle-but-live dev suspend (Fork-2 Part B, DARK by default) ---
+# --- T-0335 item-10 / T-0288: idle-but-live dev suspend (Fork-2 Part B; T-0288
+# reconciled the default to the roadmap Ch. III HARD 12h spec) ---
 
 def _seed_idle_live_dev(cfg, monkeypatch, *, status="in_progress"):
     _seed_task(cfg, "T-0001", status)
@@ -283,13 +286,46 @@ def _seed_idle_live_dev(cfg, monkeypatch, *, status="in_progress"):
     return p
 
 
-def test_idle_live_dev_not_suspended_when_knob_off(tmp_path, monkeypatch):
-    """Default (knob unset/0) → the idle-suspend arm is dark; an idle in-progress
-    dev is left running (ships DARK per D2)."""
+def test_idle_live_dev_suspended_by_default_past_12h(tmp_path, monkeypatch):
+    """T-0288: no env, no [caps] override → the idle-suspend arm now defaults
+    to the Ch. III HARD 12h window (was DARK/opt-in per T-0335 item-10 D2).
+    An open-task dev idle for 13h is reaped."""
+    import time as _time
     cfg = _make_cfg(tmp_path)
-    _seed_idle_live_dev(cfg, monkeypatch)
+    p = _seed_idle_live_dev(cfg, monkeypatch, status="open")
     monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
-    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: 0.0)  # ancient → idle
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 13 * 3600)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    monkeypatch.setattr(S, "suspend", lambda cfg, slug, sid: None)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    meta = S._read_session_metadata(p)
+    assert meta["archive_reason"] == "auto-archive:idle-suspend"
+
+
+def test_idle_live_dev_not_suspended_before_default_12h(tmp_path, monkeypatch):
+    """Default window is 12h, not 0 — a dev idle for only 1h is still spared."""
+    cfg = _make_cfg(tmp_path)
+    import time as _time
+    _seed_idle_live_dev(cfg, monkeypatch, status="open")
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 3600)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+
+
+def test_idle_live_dev_not_suspended_when_explicitly_disabled(tmp_path, monkeypatch):
+    """An operator who explicitly writes [caps].idle_suspend_sec = 0 in System
+    Settings still gets a genuine OFF — explicit intent beats the 12h default."""
+    import time as _time
+    cfg = _make_cfg(tmp_path)
+    _seed_idle_live_dev(cfg, monkeypatch, status="open")
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
+    _write_caps(cfg, idle_suspend_sec=0)
+    monkeypatch.setattr(S, "_pane_activity_at", lambda *a, **k: _time.time() - 13 * 3600)
+    monkeypatch.setattr("bot_squad_worker.tg_stall.blocked_sids", lambda cfg, slug: set())
     res = archive_dead_teammates(cfg, "test-project")
     assert res["archived"] == 0
 
@@ -395,10 +431,21 @@ def test_idle_suspend_sec_reads_from_caps_when_env_unset(tmp_path, monkeypatch):
     assert S._session_idle_suspend_sec(cfg) == 3600
 
 
-def test_idle_suspend_sec_caps_zero_or_missing_is_off(tmp_path, monkeypatch):
+def test_idle_suspend_sec_missing_cap_defaults_to_12h(tmp_path, monkeypatch):
+    """T-0288: an ABSENT cap (no system_settings.toml, or [caps] without the
+    key) falls through to the Ch. III HARD spec default (12h), not OFF."""
     cfg = _make_cfg(tmp_path)
     monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
-    assert S._session_idle_suspend_sec(cfg) == 0.0  # no system_settings.toml
+    assert S._session_idle_suspend_sec(cfg) == S.DEFAULT_IDLE_SUSPEND_SEC == 12 * 3600
+    _write_caps(cfg, max_parallel_sessions=5)  # [caps] present, key still absent
+    assert S._session_idle_suspend_sec(cfg) == S.DEFAULT_IDLE_SUSPEND_SEC
+
+
+def test_idle_suspend_sec_explicit_zero_cap_is_off(tmp_path, monkeypatch):
+    """An EXPLICIT idle_suspend_sec = 0 is a deliberate operator override — OFF
+    is honored, it does not fall back to the 12h default."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.delenv("BOT_SQUAD_SESSION_IDLE_SUSPEND_SEC", raising=False)
     _write_caps(cfg, idle_suspend_sec=0)
     assert S._session_idle_suspend_sec(cfg) == 0.0
 
@@ -577,3 +624,57 @@ def test_live_in_progress_dev_is_never_stale_reaped(tmp_path, monkeypatch):
     res = archive_dead_teammates(cfg, "test-project")
     assert res["archived"] == 0
     assert "archived" not in S._read_session_metadata(p)
+
+
+# --- T-0288: reaper run log ("N processes reaped today") ---
+
+def test_archive_writes_reap_log_entry(tmp_path):
+    """Every sid archive_dead_teammates archives is logged; reaped_today counts
+    it the same tick."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "totest")
+    _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    log_path = cfg.data_dir / "test-project" / "_worker" / "reaper"
+    files = list(log_path.glob("*.jsonl"))
+    assert len(files) == 1
+    lines = [json.loads(ln) for ln in files[0].read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert lines[0]["sid"] == "S-u-feat-dev-p1"
+    assert lines[0]["reason"] == "exited-totest"
+    assert S.reaped_today(cfg, "test-project") == 1
+
+
+def test_reaped_today_excludes_yesterday(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    now = time.time()
+    yesterday = now - 26 * 3600
+    S._log_reap_event(cfg, "test-project", "S-u-a-p1", "exited-stale", now=yesterday)
+    S._log_reap_event(cfg, "test-project", "S-u-b-p2", "idle-suspend", now=now)
+    assert S.reaped_today(cfg, "test-project", now=now) == 1
+
+
+def test_reaped_today_zero_when_no_log(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert S.reaped_today(cfg, "test-project") == 0
+
+
+def test_reaped_since_spans_multiple_day_files(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    now = time.time()
+    two_days_ago = now - 2 * 24 * 3600
+    S._log_reap_event(cfg, "test-project", "S-u-a-p1", "exited-stale", now=two_days_ago)
+    S._log_reap_event(cfg, "test-project", "S-u-b-p2", "idle-suspend", now=now)
+    assert S.reaped_since(cfg, "test-project", two_days_ago, now=now) == 2
+    assert S.reaped_since(cfg, "test-project", now - 3600, now=now) == 1
+
+
+def test_reap_log_concurrent_appends_do_not_interleave(tmp_path):
+    """Two archived sids in the same tick both land as clean, separate lines
+    (the flock append must not interleave partial writes)."""
+    cfg = _make_cfg(tmp_path)
+    now = time.time()
+    for i in range(20):
+        S._log_reap_event(cfg, "test-project", f"S-u-dev-p{i}", "exited-stale", now=now)
+    assert S.reaped_since(cfg, "test-project", now - 1, now=now) == 20

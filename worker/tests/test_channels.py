@@ -267,5 +267,9 @@ def test_deploy_notifications_flow_through_channel(tmp_path, monkeypatch):
     texts = [c["text"] for c in fake_tg.calls]
     assert any("starting deploy" in t for t in texts), texts
     assert any("SUCCESS" in t for t in texts), texts
-    # Sanity: the channel preserved the deploy_monitor sid + urgent flag.
-    assert all(c["sid"] == "deploy_monitor" and c["urgent"] for c in fake_tg.calls)
+    # Sanity: the channel preserved the deploy_monitor sid (T-0644: now
+    # slug-qualified) + urgent flag.
+    assert all(
+        c["sid"] == f"[{proj.slug}] deploy_monitor" and c["urgent"]
+        for c in fake_tg.calls
+    )

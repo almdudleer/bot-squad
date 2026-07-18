@@ -657,7 +657,8 @@ def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monk
     call = fake.calls[0]
     assert call["chat_id"] == "404580642"
     assert call["text"] == "ack — got your ping"
-    assert call["sid"] == "S-almdudleer-operator-p23"
+    # T-0644: the TG mirror carries the slug-qualified label, not the bare sid.
+    assert call["sid"] == "[test-project] S-almdudleer-operator-p23"
     assert call["user"] == "alexey"
 
 

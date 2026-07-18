@@ -219,9 +219,12 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     # evening/night) silently dropped every deploy alert: the regression the
     # stakeholder reported as "no more alerts from @bot_squad_bot". Same
     # precedent as autoupdate_apply's apply-failure ping.
+    from bot_squad_worker import sessions as _sessions
+    sid_label = _sessions.sid_display_label(sid, slug)
+
     def _tg_safe(text: str) -> None:
         try:
-            channel.send(text, chat_id=chat_id, sid=sid, urgent=True, topic_id=deploy_topic)
+            channel.send(text, chat_id=chat_id, sid=sid_label, urgent=True, topic_id=deploy_topic)
         except Exception:
             log.exception("deploy_monitor: channel.send failed (non-fatal): %s", text)
 
@@ -287,6 +290,7 @@ def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None
                 tg_chat_id=chat_id,
                 tg_topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
                 group_record=True,
+                slug=slug,
             )
         except Exception:
             log.exception("deploy_monitor: operator alert failed (non-fatal): %s", text)

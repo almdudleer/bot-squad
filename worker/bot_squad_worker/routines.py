@@ -1218,7 +1218,7 @@ def _monitor_notify(cfg: Any, slug: str, rid: str, text: str) -> bool:
         project = cfg.projects.get(slug)
         chat_id = getattr(project, "tg_chat", "") if project else ""
         res = _send_stakeholder_dm(cfg, message=text, sid=f"routine:{rid}",
-                                   urgent=True, tg_chat_id=chat_id)
+                                   urgent=True, tg_chat_id=chat_id, slug=slug)
         # T-0610: the SSOT no longer raises on an undeliverable page — it
         # returns {ok: False, channel: "none"}. Treat that as not-delivered so
         # the cooldown stays unstamped and the alert retries next tick.

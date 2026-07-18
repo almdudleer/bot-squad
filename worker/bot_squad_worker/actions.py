@@ -451,11 +451,16 @@ def _send_stakeholder_dm(
         )
         message = _slim_page(message, link)
 
+    # T-0644: slug-qualified label for the [<sid>] prefix — falls back to the
+    # bare sid when no slug is on hand (see sid_display_label).
+    from bot_squad_worker import sessions as _sessions
+    sid_label = _sessions.sid_display_label(sid, slug) if slug else sid
+
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:
             return None
         sent = _get_tg_client(cfg).send(
-            chat_id=tg_chat_id, text=message, sid=sid, user=user,
+            chat_id=tg_chat_id, text=message, sid=sid_label, user=user,
             urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
         )
         return {"ok": True, "sent": sent, "channel": "tg"}
@@ -465,7 +470,7 @@ def _send_stakeholder_dm(
         if not max_chat:
             return None
         sent = _get_max_client(cfg).send(
-            chat_id=max_chat, text=message, sid=sid, user=user, urgent=urgent,
+            chat_id=max_chat, text=message, sid=sid_label, user=user, urgent=urgent,
             recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
         )
         return {"ok": True, "sent": sent, "channel": "max"}
@@ -842,12 +847,13 @@ def _action_pause_deploys(params: dict[str, Any]) -> dict[str, Any]:
     meta = _deploy.pause(cfg, slug, params["reason"], params["requested_by"])
 
     if not was_paused:
+        from bot_squad_worker import sessions as _sessions
         from bot_squad_worker import tg_topics as _tg_topics
         tg = _get_tg_client(cfg)
         tg.send(
             chat_id=project.tg_chat,  # type: ignore[attr-defined]
             text=f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
-            sid="deploy_monitor",
+            sid=_sessions.sid_display_label("deploy_monitor", slug),
             topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
         )
 
@@ -883,12 +889,13 @@ def _action_resume_deploys(params: dict[str, Any]) -> dict[str, Any]:
 
     if was_paused:
         who = params.get("requested_by") or "?"
+        from bot_squad_worker import sessions as _sessions
         from bot_squad_worker import tg_topics as _tg_topics
         tg = _get_tg_client(cfg)
         tg.send(
             chat_id=project.tg_chat,  # type: ignore[attr-defined]
             text=f"🟢 deploys resumed for {slug} (by {who})",
-            sid="deploy_monitor",
+            sid=_sessions.sid_display_label("deploy_monitor", slug),
             topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
         )
 
@@ -1686,10 +1693,11 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
             )
             continue
         try:
+            from bot_squad_worker import sessions as _sessions
             _get_tg_client(cfg).send(
                 chat_id=chat_id,
                 text=params["text"],
-                sid=params["from_sid"],
+                sid=_sessions.sid_display_label(params["from_sid"], delivery_slug),
                 user=username,
             )
         except Exception:  # noqa: BLE001 — never let TG hiccups corrupt the bus reply

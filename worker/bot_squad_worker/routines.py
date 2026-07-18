@@ -834,7 +834,8 @@ def mute(cfg: Any, slug: str, rid: str, *, duration_s: Any,
 # ---------------------------------------------------------------------------
 
 def spawn_brief(cfg: Any, slug: str, routine: Routine,
-                event: Optional[FireEvent] = None) -> str:
+                event: Optional[FireEvent] = None, *,
+                now: Optional[datetime] = None) -> str:
     """Compose the initial prompt that BINDS the spawned session to the routine
     assignment: the 4 assignment primitives (T-0463) delivered into the session —
     (a) how-to, (b) id, (c) the instruction text, (d) how to write the result.
@@ -859,7 +860,7 @@ def spawn_brief(cfg: Any, slug: str, routine: Routine,
                     else "none yet (this firing produces the first)")
         # this fire is not in events.ndjson yet (appended after a successful
         # spawn), hence the +1
-        count = _fire_count_24h(cfg, slug, routine.id, now=_utcnow()) + 1
+        count = _fire_count_24h(cfg, slug, routine.id, now=now or _utcnow()) + 1
         lines += [
             "",
             "TRIGGER EVENT — the monitor firing that attached this session:",
@@ -884,13 +885,14 @@ def spawn_brief(cfg: Any, slug: str, routine: Routine,
 # ---------------------------------------------------------------------------
 
 def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
-                       event: Optional[FireEvent] = None) -> Optional[str]:
+                       event: Optional[FireEvent] = None, *,
+                       now: Optional[datetime] = None) -> Optional[str]:
     from bot_squad_worker import sessions as S
     from bot_squad_worker.actions import ActionError
 
     try:
         res = S.spawn(cfg, slug, "dev",
-                      initial_prompt=spawn_brief(cfg, slug, routine, event),
+                      initial_prompt=spawn_brief(cfg, slug, routine, event, now=now),
                       owner=f"routine:{routine.id}")
         return res.get("sid")
     except ActionError as e:
@@ -928,7 +930,7 @@ def tick(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dict:
             continue  # monitor routines belong to monitor_tick (D-0048 §4)
         if not routine.is_due(now):
             continue
-        sid = _spawn_for_routine(cfg, slug, routine)
+        sid = _spawn_for_routine(cfg, slug, routine, now=now)
         if not sid:
             continue  # deferred — retry next tick, next_run_at untouched
         nxt = routine.trigger().next_fire(now, inclusive=False)
@@ -1275,7 +1277,7 @@ def _handle_fire(cfg: Any, slug: str, routine: Routine, event: FireEvent,
                  routine.id, live_sid, slug)
         return True
 
-    sid = _spawn_for_routine(cfg, slug, routine, event=event)
+    sid = _spawn_for_routine(cfg, slug, routine, event=event, now=now)
     if not sid:
         return False  # deferred under backpressure — cooldown NOT stamped
     # md keeps only the slow field: the AI actually attached (§3.2)

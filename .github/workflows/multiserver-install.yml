@@ -1,0 +1,39 @@
+# T-0330: CI hook for the multi-server SERVED-install regression guard.
+#
+# Runs scripts/install/tests/multiserver_install_docker.sh, which exercises the
+# REAL mothership-served install path end to end (mints an install_token,
+# fetches the SUBSTITUTED bundle the API serves, runs it in a clean container,
+# asserts the handshake + checkpoint flow). This is the coverage the lint job
+# (backlog-frontmatter) and the source-only unit tests (invite_install.sh /
+# smoke_engine.sh) miss — they source the RAW repo install.sh with sentinels
+# intact, so they cannot catch a broken served bundle (T-0263) or a
+# substitution that breaks the served guards (T-0279).
+#
+# The harness is container-only and cleans up after itself (see the script
+# header). ubuntu-latest ships docker + curl + python3, which is all the host
+# side needs. Path-filtered so it only fires when the install path or the API
+# image (which carries the served bundle) actually changes.
+name: multiserver-install
+
+on:
+  push:
+    branches: [master, bot_squad/dev]
+    paths:
+      - "scripts/install/**"
+      - "api/**"
+      - ".github/workflows/multiserver-install.yml"
+  pull_request:
+    paths:
+      - "scripts/install/**"
+      - "api/**"
+      - ".github/workflows/multiserver-install.yml"
+
+jobs:
+  served-install-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the served/substituted install bundle in Docker
+        run: |
+          scripts/install/tests/multiserver_install_docker.sh

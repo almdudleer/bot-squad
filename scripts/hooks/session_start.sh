@@ -179,12 +179,25 @@ md_path    = data / "sessions" / f"{sid}.md"
 # preserving it would hand the next idle tick a timed-out finalize that
 # terminates the fresh session. Pre-T-0616 the clobber cleared it by
 # accident; keep clearing it ON PURPOSE, everywhere except mid-recycle.
+#
+# T-0617: compact-and-stay (exempt user sessions) runs its OWN in-flight pair
+# (compact_stay_phase / compact_stay_armed_at) through the identical hazard —
+# it too sends a /compact and needs the source=compact fire that follows to
+# NOT clobber its arm stamp, or idle_timeout would re-arm a second /compact on
+# top of the first (the exact double-compact this exception exists to avoid).
+# Same rule, same reasoning, separate fields. ``compact_stay_last_at`` is NOT
+# in this set on purpose — it is a completed-fact stamp (the anti-loop guard
+# for the rest of the cache window), not in-flight state, so it must survive
+# every hook fire the same as any other unmanaged field, not just compact.
 _MANAGED = {
     "sid", "status", "window", "cwd", "claude_uuid", "task_id", "initiative",
     "extra_task_ids", "extra_initiatives", "started_at", "owner",
     "owner_user", "tmux_session", "linux_user",
 }
-_INFLIGHT_RECYCLE = {"idle_recycle_phase", "idle_recycle_armed_at"}
+_INFLIGHT_RECYCLE = {
+    "idle_recycle_phase", "idle_recycle_armed_at",
+    "compact_stay_phase", "compact_stay_armed_at",
+}
 hook_source = os.environ.get("HOOK_SOURCE") or ""
 existing = {}
 passthrough = []

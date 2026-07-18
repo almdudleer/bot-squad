@@ -163,9 +163,37 @@ def compute_sid(user: str, window: str, pane_id: str) -> str:
     """Compute ``S-<user>-<window>-p<pane_id_no_pct>``.
 
     pane_id typically looks like ``%2``; we strip the ``%``.
+
+    T-0636: this is the ROUTING key — tmux pane matching (``live_pane_map``,
+    every ``compute_sid(user, pane.window, pane.pane_id) == sid`` scan in this
+    module), peer-bus addressing, and session-md filenames all reproduce this
+    exact shape from ``(user, window, pane_id)`` alone. It deliberately does
+    NOT carry the project slug: two sessions in different projects under the
+    same role/window render identical SIDs (the stakeholder's 2026-07-18
+    complaint — "no way to know which project it's for"), but reshaping this
+    string would ripple into every one of those matching sites across the
+    worker, well beyond a display fix. See :func:`sid_display_label` for the
+    human-facing label that DOES carry the slug.
     """
     pane_no_pct = pane_id.lstrip("%")
     return f"S-{user}-{window}-p{pane_no_pct}"
+
+
+def sid_display_label(sid: str, slug: str | None) -> str:
+    """T-0636: human-facing label for ``sid`` that also names its project.
+
+    ``compute_sid``'s ``S-<user>-<window>-p<pane>`` shape carries no project
+    cue, so two sessions in different projects under the same role/window are
+    visually identical wherever the raw SID is surfaced (TG pings, the web
+    sessions list). This wraps it for DISPLAY ONLY — ``[<slug>] <sid>`` — so
+    every caller that has a slug in hand can render a readable label without
+    the underlying routing key ever changing shape (see ``compute_sid``).
+    Falls back to ``sid`` unchanged when ``slug`` is empty/None so callers
+    without a slug handy degrade gracefully instead of erroring.
+    """
+    if not slug:
+        return sid
+    return f"[{slug}] {sid}"
 
 
 def live_pane_map(user: str | None = None) -> dict[str, str]:
@@ -1197,6 +1225,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         _blocked = set()
     for _r in rows:
         sid = _r.get("sid")
+        # T-0636: slug-qualified display label — see sid_display_label.
+        _r["sid_label"] = sid_display_label(sid, slug)
         blocked = sid in _blocked
         # P2-05: close-on-attach reconcile. A blocked, LIVE (active) session that
         # has resumed crunching (new jsonl activity after the block) got its

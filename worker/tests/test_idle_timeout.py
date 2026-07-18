@@ -304,29 +304,34 @@ def test_kill_switch_disables_recycle(tmp_path, seams, monkeypatch):
     assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
-# --- A2. T-0616: hand-launched user sessions are never touched ---------------
+# --- A2. T-0616/T-0617: hand-launched user sessions never TERMINATE, but ----
+# ---     DO get compact-and-stay (T-0617) --------------------------------
 
-def test_hand_launched_user_session_never_recycled(tmp_path, seams):
+def test_hand_launched_user_session_compacts_but_never_terminates(tmp_path, seams):
     """p8's exact shape (D-0053 §4): window ``user-session`` derives role
     ``dev``, so the T-0564 role check alone let it ride the full recycle
-    path. The window signal must keep every path off it — no compact, no
-    terminate, md untouched."""
+    path. The window signal must keep it off the terminate-and-remember flow
+    forever — but T-0617 gives it compact-and-stay instead of the old full
+    no-op exemption: it still gets compacted in place, session left running."""
     sid = "S-almdudleer-user-session-p8"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
-    md = data / "bot-squad" / "sessions" / f"{sid}.md"
-    before = md.read_text()
     row = _row(sid, window="user-session", task_id=None,
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["compact"] == []
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
-    assert md.read_text() == before
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["compact_stay_phase"] == "compacting"
+    assert "compact_stay_armed_at" in meta
+    assert "idle_recycle_phase" not in meta  # the terminate-flow field, untouched
 
 
-def test_hand_launched_user_session_stale_phase_never_finalized(tmp_path, seams):
-    """Even a stale in-flight phase stamp (a pre-fix leftover) must not route
-    an exempt session into the finalize→terminate half."""
+def test_hand_launched_user_session_stale_terminate_phase_never_finalized(tmp_path, seams):
+    """Even a stale terminate-flow in-flight phase stamp (a pre-fix leftover,
+    or hand-edited md) must not route an exempt session into the
+    finalize→terminate half — the exempt branch ignores ``idle_recycle_phase``
+    entirely and drives its own ``compact_stay_phase`` machine instead."""
     sid = "S-almdudleer-user-session-p8"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
@@ -335,21 +340,153 @@ def test_hand_launched_user_session_stale_phase_never_finalized(tmp_path, seams)
     row = _row(sid, window="user-session", task_id=None,
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
+                            user_home="/home/x") is True
     assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["compact"] == [sid]
 
 
-def test_recycle_exempt_marker_blocks_recycle(tmp_path, seams):
-    """An ad-hoc-named hand-launched session is exempted by the explicit
-    ``recycle_exempt: true`` md stamp (the hook preserves it, T-0616)."""
+def test_recycle_exempt_marker_blocks_terminate_but_allows_compact_stay(tmp_path, seams):
+    """An ad-hoc-named hand-launched session is exempted from TERMINATE by
+    the explicit ``recycle_exempt: true`` md stamp (the hook preserves it,
+    T-0616) — but T-0617 still compacts it in place."""
     sid = "S-almdudleer-bot-squad-myadhoc-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="myadhoc", task_id=None,
                           extra_md={"recycle_exempt": True})
     row = _row(sid, window="myadhoc", task_id=None,
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid] and seams["calls"]["terminate"] == []
+
+
+# --- A3. T-0617: compact-and-stay — arm, finalize, anti-loop ----------------
+
+def test_compact_stay_finalize_never_terminates_and_stamps_last_at(tmp_path, seams):
+    sid = "S-almdudleer-user-session-p8"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_phase": "compacting",
+                                    "compact_stay_armed_at": armed})
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "compact_stay_phase" not in meta
+    assert "compact_stay_armed_at" not in meta
+    assert "compact_stay_last_at" in meta
+    assert meta["status"] == "active"  # session untouched — never suspended
+
+
+def test_compact_stay_finalize_waits_while_pane_not_composer_ready(tmp_path, seams):
+    sid = "S-almdudleer-user-session-p8"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_phase": "compacting",
+                                    "compact_stay_armed_at": armed})
+    seams["state"]["buf"] = "· Compacting… (esc to interrupt)"
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["compact_stay_phase"] == "compacting"  # still armed
+
+
+def test_compact_stay_finalize_timeout_never_terminates(tmp_path, seams):
+    """Never wedge — even if /compact never seems to finish, the bounded wait
+    times out and finalize converges. Unlike the terminate flow, converging
+    here means clearing the phase and leaving the session running, NOT
+    calling sessions.suspend."""
+    sid = "S-almdudleer-user-session-p8"
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                        time.gmtime(time.time() - A.handoff_timeout_sec() - 60))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_phase": "compacting",
+                                    "compact_stay_armed_at": old})
+    seams["state"]["buf"] = "· Compacting… (esc to interrupt)"
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "compact_stay_phase" not in meta
+    assert "compact_stay_last_at" in meta
+
+
+def test_compact_stay_finalize_drops_stamp_when_pane_already_gone(tmp_path, seams):
+    sid = "S-almdudleer-user-session-p8"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_phase": "compacting",
+                                    "compact_stay_armed_at": armed})
+    seams["state"]["pane"] = None
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "compact_stay_phase" not in meta
+
+
+def test_compact_stay_skips_when_nothing_worth_compacting(tmp_path, seams):
+    """Below the context-token threshold, compact-and-stay is a no-op (not a
+    terminate — unlike the non-exempt flow's below-threshold branch)."""
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    seams["state"]["tokens"] = 5000  # below the 20k default threshold
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
     assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
+def test_compact_stay_anti_loop_blocks_rearm_within_same_window(tmp_path, seams):
+    """T-0617's core ask: a compact-and-stay fires at most once per cache
+    window. ``compact_stay_last_at`` is the guard — set it fresh (as
+    FINALIZE would just have) and prove a second ARM does not fire even
+    though the idle-age signal still reads well past the window (the exact
+    T-0616 double-compact shape: a stale/misbehaving idle clock must not be
+    trusted to have reset)."""
+    sid = "S-almdudleer-user-session-p8"
+    just_finalized = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_last_at": just_finalized})
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
+def test_compact_stay_rearms_once_the_window_has_elapsed(tmp_path, seams):
+    """The anti-loop guard is per-window, not permanent: once a full
+    ``idle_timeout_sec()`` has passed since the last compact-and-stay, the
+    next idle-due tick may arm again."""
+    sid = "S-almdudleer-user-session-p8"
+    long_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(time.time() - IT.idle_timeout_sec() - 10))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_last_at": long_ago})
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+
+
+def test_compact_stay_due_helper():
+    now = 10_000.0
+    assert IT.compact_stay_due(None, now, 3600) is True
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 100))
+    assert IT.compact_stay_due(fresh, now, 3600) is False
+    stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3700))
+    assert IT.compact_stay_due(stale, now, 3600) is True
 
 
 # --- B. POSTPONE: per-window, repeatable ------------------------------------
@@ -604,17 +741,20 @@ def test_config_recycle_projects_fallback_allows_watchrobot(tmp_path, seams):
     assert seams["calls"]["compact"] == [sid]
 
 
-def test_user_conversation_role_never_recycled(tmp_path, seams):
-    """T-0564: the human's own live chat is never auto-recycled, even when
-    idle past the window and in an allowlisted project."""
+def test_user_conversation_role_never_terminated_but_gets_compact_stay(tmp_path, seams):
+    """T-0564: the human's own live chat is never auto-TERMINATED, even when
+    idle past the window and in an allowlisted project. T-0617: it DOES get
+    compact-and-stay — this is in fact the session the T-0566 soft ask
+    ("compact user sessions before cache expiry, in place") most concretely
+    describes, since it is the longest-lived session in the system."""
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
                           extra_md={"role": "user-conversation"})
     row = _row(sid, cwd_repo=data.parent / "repo")
     row["role"] = "user-conversation"
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid] and seams["calls"]["terminate"] == []
 
 
 def test_attached_session_never_recycled(tmp_path, seams, monkeypatch):

@@ -29,6 +29,14 @@ by hand (window ``user-session``, ad-hoc names) derive role ``dev``, so the
 T-0564 role check alone missed them (D-0053 §4). :func:`user_session_exempt`
 extends the exemption to a ``user-session`` window segment and an explicit
 ``recycle_exempt: true`` session-md marker.
+
+T-0617 compact-and-stay: the one deliberate exception to "no recycle path may
+ever touch" an exempt session above. ``idle_timeout`` alone (not
+``autocompact``, not ``recovery``) still compacts an exempt session's context
+in place before its cache window lapses, using :func:`user_session_exempt`
+directly rather than :func:`recycle_allowed` — it just never terminates the
+session the way the non-exempt compact-terminate-remember flow (T-0566) does.
+See ``idle_timeout``'s module docstring for the full state machine.
 """
 from __future__ import annotations
 
@@ -97,7 +105,13 @@ _USER_SESSION_WINDOW_RE = re.compile(r"(?:^|[-_])user[-_]session(?:$|[-_])",
 def user_session_exempt(role: str | None = None, window: str | None = None,
                         meta: dict | None = None) -> bool:
     """T-0616 (closes the T-0564 hole): True for ANY of the human's own
-    sessions — no recycle path may compact or terminate them.
+    sessions — no recycle path may terminate them, and neither
+    ``autocompact`` nor ``recovery`` (both gate on :func:`recycle_allowed`,
+    which folds this check in) may touch them at all. T-0617 layers one
+    narrow, deliberate exception on top: ``idle_timeout``'s compact-and-stay
+    path checks this signal directly (it does not call ``recycle_allowed``)
+    and, for a session this exempts, still compacts its context in place
+    before the cache window lapses — it just never terminates it.
 
     The stakeholder's hand-launched sessions (window ``user-session``, ad-hoc
     names) derive role ``dev`` (T-0175 default), so the T-0564 role check

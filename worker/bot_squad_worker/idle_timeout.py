@@ -63,6 +63,29 @@ the above, all gated the same:
   triggered from here — a future resume (``sessions.resume``, which already
   prefers ``claude --resume <uuid>``) is a separate, human-or-automation-driven
   act reading these md fields.
+
+T-0617 COMPACT-AND-STAY (2026-07-18): the T-0566 verdict above was written for
+ordinary task sessions, where terminate-and-remember is fine — a future resume
+is cheap. T-0616 deliberately did NOT extend it to the human's own exempt
+sessions (:func:`recycle_gate.user_session_exempt`): full exemption was the
+fail-safe reading at the time, because doing the T-0566 flow's compact-then-ARM
+bookkeeping on an exempt session risked the exact double-compact spam T-0616
+was fixing, and the stakeholder's actual ask ("compact user sessions before
+cache expiry, in place") was left as a follow-up. This is that follow-up:
+:func:`_maybe_compact_and_stay` gives exempt sessions their OWN 2-phase
+compact-in-place machine — same shape as :func:`_start_recycle` /
+:func:`_finalize_compact` (arm → send ``/compact`` → wait for composer-ready →
+finalize), but FINALIZE never calls ``sessions.suspend``: the pane, the tmux
+session, the Claude process all stay exactly where the human left them. It
+uses its OWN md fields (``compact_stay_phase`` / ``compact_stay_armed_at`` /
+``compact_stay_last_at``) rather than reusing ``idle_recycle_phase`` /
+``idle_recycle_armed_at``, so the two state machines can never collide or
+mis-finalize into each other. The anti-loop guard T-0616 flagged as the risk
+is ``compact_stay_last_at``: a fresh completion stamp written by FINALIZE that
+blocks a new arm for a full ``idle_timeout_sec()`` window, checked
+independently of the (possibly stale, post-compact) idle-age signal — so even
+if a hook mis-fire or a flaky idle clock says "due" again five seconds later,
+this session's own last-completed timestamp says no.
 """
 from __future__ import annotations
 
@@ -198,6 +221,41 @@ def _clear_recycle_state(meta: dict) -> None:
         meta.pop(k, None)
 
 
+# T-0617: compact-and-stay's OWN in-flight pair — deliberately NOT
+# ``idle_recycle_phase``/``idle_recycle_armed_at`` so the terminate-flow state
+# machine and the stay-in-place state machine can never collide (a session
+# can never be "mid-terminate-compact" and "mid-stay-compact" at once, but
+# giving them separate fields means neither's finalize can ever misread the
+# other's stamp). Same hook contract as ``_RECYCLE_FIELDS``: session_start.sh
+# preserves these two ONLY on a source=compact fire, still clears them on
+# startup/resume/clear. ``compact_stay_last_at`` is deliberately NOT in this
+# tuple — it is a completed-fact stamp (the anti-loop guard), not in-flight
+# state, so it survives every hook fire like any other unmanaged field.
+_COMPACT_STAY_FIELDS = (
+    "compact_stay_phase",
+    "compact_stay_armed_at",
+)
+
+
+def _clear_compact_stay_state(meta: dict) -> None:
+    for k in _COMPACT_STAY_FIELDS:
+        meta.pop(k, None)
+
+
+def compact_stay_due(last_at: Any, now: float, window: int) -> bool:
+    """T-0617 anti-loop guard: a compact-and-stay may ARM at most once per
+    cache window. ``last_at`` is the ISO stamp the previous compact-and-stay
+    FINALIZED at; ``None``/unparsable never blocks (first fire ever). This is
+    independent of the idle-age signal on purpose — T-0616 root-caused the
+    double-compact incident on a stale post-compact idle reading, so the
+    guard here reads this session's OWN last-completed fact instead of
+    trusting the external clock to have reset."""
+    ts = sessions._parse_ts_epoch(last_at)
+    if ts is None:
+        return True
+    return (now - ts) >= window
+
+
 def compact_min_context_tokens(cfg: Any) -> int:
     """T-0566: context-token floor above which a cache-window recycle sends
     Claude's native ``/compact`` before terminating. Below it, nothing is worth
@@ -252,15 +310,22 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     role = row.get("role") or meta.get("role") or sessions._derive_role(
         meta.get("window"), meta.get("task_id"), meta.get("initiative"))
     pane = autocompact._pane_for(sid)
-    # T-0563/T-0564/T-0616: never recycle a non-allowlisted project, any of
-    # the human's own sessions (user-conversation role, hand-launched
-    # user-session window, recycle_exempt md marker), or a pane a human is
-    # currently attached to.
-    if not recycle_gate.recycle_allowed(cfg, slug=slug, role=role,
-                                        tmux_target=pane, now=now,
-                                        window=row.get("window") or meta.get("window"),
-                                        meta=meta):
+    window = row.get("window") or meta.get("window")
+
+    # T-0563: never recycle a non-allowlisted project.
+    if not recycle_gate.project_allowed(cfg, slug, now):
         return False
+    # T-0564: never touch a pane a human is currently attached to — applies
+    # to every session, exempt or not.
+    if recycle_gate.is_attached(pane):
+        return False
+
+    # T-0564/T-0616: the human's own sessions (user-conversation role,
+    # hand-launched user-session window, recycle_exempt md marker) never ride
+    # the terminate-and-remember flow below — T-0617 gives them a separate
+    # compact-in-place-only path instead of the old full no-op exemption.
+    if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
+        return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
 
     # A compact-wait already in flight → drive its finalize half (independent
     # of the idle window; the phase field is its own guard).
@@ -400,6 +465,89 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
                           now=now, cause="idle_timeout", compacted=compacted)
     log.info("idle_timeout: recycled %s (compacted=%s) — recorded resumable state",
              sid, compacted)
+    return True
+
+
+# --- T-0617: compact-and-stay (exempt user sessions) ------------------------
+
+def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                            md_path, now: float, pane: str | None,
+                            user_home: str) -> bool:
+    """T-0617: the exempt-session counterpart to :func:`_start_recycle` /
+    :func:`_finalize_compact` — same idle-window trigger and context-threshold
+    gate, but FINALIZE never terminates. Drives its own 2-phase machine on
+    ``compact_stay_phase`` so a tick that lands mid-``/compact`` just retries
+    the wait instead of re-arming."""
+    if meta.get("compact_stay_phase") == "compacting":
+        return _finalize_compact_stay(sid, meta, md_path, now, pane)
+
+    idle_age = _idle_age(row, meta, user_home, now)
+    if not idle_due(idle_age, idle_timeout_sec()):
+        return False
+    if not compact_stay_due(meta.get("compact_stay_last_at"), now, idle_timeout_sec()):
+        return False  # already compacted-and-stayed once this cache window
+    if postpone_active(meta.get("idle_postpone_until"), now):
+        return False
+    if tracking_long_job(cfg, slug, sid):
+        log.info("idle_timeout: compact-and-stay auto-postpone %s — waiting "
+                 "on a tracked long job", sid)
+        return False
+    if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
+        return False
+
+    tokens = _context_tokens(cfg, slug, sid)
+    threshold = compact_min_context_tokens(cfg)
+    if tokens <= threshold:
+        # Nothing worth compacting yet — leave compact_stay_last_at alone so
+        # this is re-checked (cheaply) on every later tick, not just once per
+        # window, until there's actually context worth clearing.
+        return False
+
+    try:
+        autocompact._send_compact(sid)
+    except Exception:
+        log.exception("idle_timeout: compact-and-stay /compact send failed "
+                      "for %s (will retry)", sid)
+        return False
+    meta["compact_stay_phase"] = "compacting"
+    meta["compact_stay_armed_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: compact-and-stay sent /compact to %s (%d tokens "
+             "> %d threshold) — session stays, no terminate", sid, tokens,
+             threshold)
+    return True
+
+
+def _finalize_compact_stay(sid: str, meta: dict, md_path, now: float,
+                           pane: str | None) -> bool:
+    """FINALIZE an in-flight compact-and-stay: once the pane is
+    composer-ready again (or the bounded wait times out — never wedge),
+    clear the in-flight phase and stamp ``compact_stay_last_at`` (the
+    anti-loop guard for the rest of this cache window). NEVER terminates —
+    that is the entire point of this path vs. :func:`_finalize_compact`."""
+    armed_at = sessions._parse_ts_epoch(meta.get("compact_stay_armed_at")) or now
+    timed_out = (now - armed_at) > autocompact.handoff_timeout_sec()
+
+    if not pane:
+        # Session already gone by other means — nothing left to finalize.
+        _clear_compact_stay_state(meta)
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+        return False
+
+    ready = autocompact.composer_ready(autocompact._capture_pane(pane))
+    if not ready and not timed_out:
+        return False  # still compacting — retry next tick
+
+    if not ready and timed_out:
+        log.warning("idle_timeout: compact-and-stay /compact wait timed out "
+                    "for %s — leaving the session as-is (never wedge, never "
+                    "terminate)", sid)
+
+    _clear_compact_stay_state(meta)
+    meta["compact_stay_last_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: compact-and-stay finalized for %s — compacted "
+             "in place, session left running", sid)
     return True
 
 

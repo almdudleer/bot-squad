@@ -18,6 +18,7 @@ from bot_squad_worker.sessions import (
     pause,
     resume,
     set_drift_paused,
+    sid_display_label,
     spawn,
     _append_task_session_history,
     _live_task_owner,
@@ -81,6 +82,31 @@ def test_compute_sid_strips_pct():
 
 def test_compute_sid_no_pct():
     assert compute_sid("alice", "mywin", "3") == "S-alice-mywin-p3"
+
+
+def test_compute_sid_unaffected_by_slug():
+    """T-0636: compute_sid stays the ROUTING key — no slug param, no change
+    to its output shape. sid_display_label carries the slug instead."""
+    assert compute_sid("alice", "mywin", "%2") == "S-alice-mywin-p2"
+
+
+def test_sid_display_label_prefixes_slug():
+    assert sid_display_label("S-alice-mywin-p2", "bot-squad") == "[bot-squad] S-alice-mywin-p2"
+
+
+def test_sid_display_label_two_projects_same_role_are_distinguishable():
+    """T-0636 stakeholder complaint: two sessions in different projects under
+    the same role/window render identically. The label must differ even
+    when the underlying SID (the routing key) does not."""
+    sid_a = compute_sid("alexey", "operator", "%2")
+    sid_b = compute_sid("alexey", "operator", "%2")
+    assert sid_a == sid_b  # same routing key — expected, by design
+    assert sid_display_label(sid_a, "bot-squad") != sid_display_label(sid_b, "watchrobot")
+
+
+def test_sid_display_label_falls_back_to_sid_when_slug_empty():
+    assert sid_display_label("S-alice-mywin-p2", "") == "S-alice-mywin-p2"
+    assert sid_display_label("S-alice-mywin-p2", None) == "S-alice-mywin-p2"
 
 
 def test_discover_claude_uuid_returns_stem(tmp_path):
@@ -225,6 +251,9 @@ def test_list_sessions_active_pane(tmp_path, monkeypatch):
     # Phase 6: initiative key is always present (empty string when unset).
     assert "initiative" in rows[0]
     assert rows[0]["initiative"] == ""
+    # T-0636: every row carries a slug-qualified display label alongside the
+    # raw routing SID.
+    assert rows[0]["sid_label"] == "[test-project] S-testuser-mywin-p2"
 
 
 def test_list_sessions_stamps_awaiting_input_from_tg_stall(tmp_path, monkeypatch):

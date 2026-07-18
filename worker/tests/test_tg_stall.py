@@ -215,7 +215,7 @@ def _age_marker(cfg, sid, seconds):
     p.write_text(json.dumps(d))
 
 
-def _stub_pane(monkeypatch, visible: bool, present: bool = True, route=None):
+def _stub_pane(monkeypatch, visible: bool, present: bool = True, route=None, archived: bool = False):
     pane = types.SimpleNamespace(pane_id="%7", window="tg-gating", session="bot-squad")
     monkeypatch.setattr(TS, "_pane_for_sid", lambda sid: pane if present else None)
     monkeypatch.setattr(TS, "_window_visible", lambda pid: visible)
@@ -223,6 +223,9 @@ def _stub_pane(monkeypatch, visible: bool, present: bool = True, route=None):
     # operator / prod-teamlead case), keeping these the TG-path tests they were.
     # A redirect test passes route=<target SID>.
     monkeypatch.setattr(TS, "_route_idle_escalation", lambda cfg, slug, sid: route)
+    # T-0647: default archived=False keeps existing tests exercising the
+    # normal escalation path; a suppression test passes archived=True.
+    monkeypatch.setattr(TS, "_session_row", lambda cfg, slug, sid: {"archived": archived})
 
 
 def test_tick_too_early_no_tg(tmp_path, faketg, monkeypatch):
@@ -288,6 +291,22 @@ def test_tick_pane_gone_drops_marker(tmp_path, faketg, monkeypatch):
     TS.mark_blocked(cfg, "bot-squad", DEV, "x")
     _age_marker(cfg, DEV, 16 * 60)
     _stub_pane(monkeypatch, visible=False, present=False)  # session ended
+    audit = TS.tick(cfg)
+    assert audit["escalated"] == 0
+    assert faketg.sent == []
+    assert not TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+def test_tick_archived_session_drops_marker_no_escalation(tmp_path, faketg, monkeypatch):
+    """T-0647: a session whose work is already complete (archived — result
+    written / ticket closed) must not idle-nag anyone, TL or operator or
+    stakeholder. Journal-evidenced: p16 was already
+    archive_reason=dead-binding:task-closed when it idle-nagged a TL."""
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "x")
+    _age_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False, archived=True)  # would otherwise TG-escalate
+
     audit = TS.tick(cfg)
     assert audit["escalated"] == 0
     assert faketg.sent == []
@@ -386,42 +405,82 @@ def test_window_visible_tmux_error(monkeypatch):
 TL = "S-almdudleer-multi_server-TL-p30"
 
 
-def _stub_rows(monkeypatch, rows, tl_of=None):
-    """Stub the session list + team-projection lookup the router consults."""
+def _stub_rows(monkeypatch, rows):
+    """Stub the session list the router consults."""
     import bot_squad_worker.sessions as S
-    import bot_squad_worker.teams as T
     monkeypatch.setattr(S, "list_sessions", lambda cfg, slug: rows)
-    monkeypatch.setattr(T, "tl_for_sid", lambda cfg, slug, sid: (tl_of or {}).get(sid))
 
 
 def test_route_dev_with_teamlead_parent_returns_tl(tmp_path, monkeypatch):
+    """A dev's genuine (non-heuristic) parent_sid pointing at a live TL row
+    routes there."""
     cfg = _make_cfg(tmp_path)
     _stub_rows(
         monkeypatch,
-        [{"sid": DEV, "role": "dev"}, {"sid": TL, "role": "teamlead"},
+        [{"sid": DEV, "role": "dev", "parent_sid": TL, "parent_sid_heuristic": False},
+         {"sid": TL, "role": "teamlead"},
          {"sid": OP, "role": "operator"}],
-        tl_of={DEV: TL},
     )
     assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == TL
 
 
-def test_route_dev_without_tl_returns_operator(tmp_path, monkeypatch):
+def test_route_dev_parent_is_operator_returns_operator(tmp_path, monkeypatch):
+    """A dev spawned directly by the operator (parent_sid = the operator's own
+    SID) routes straight to the operator."""
     cfg = _make_cfg(tmp_path)
-    # team lead slot is the operator (or no team at all) → ad-hoc dev → operator
     _stub_rows(
         monkeypatch,
-        [{"sid": DEV, "role": "dev"}, {"sid": OP, "role": "operator"}],
-        tl_of={DEV: OP},   # tl resolves to an operator-role session → not a TL
+        [{"sid": DEV, "role": "dev", "parent_sid": OP, "parent_sid_heuristic": False},
+         {"sid": OP, "role": "operator"}],
     )
     assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == OP
 
 
-def test_route_dev_no_team_returns_operator(tmp_path, monkeypatch):
+def test_route_dev_no_parent_recorded_returns_operator(tmp_path, monkeypatch):
+    """No parent_sid at all (ad-hoc dev, never backfilled) → operator, not a
+    team broadcast."""
     cfg = _make_cfg(tmp_path)
     _stub_rows(
         monkeypatch,
         [{"sid": DEV, "role": "dev"}, {"sid": OP, "role": "operator"}],
-        tl_of={},          # no team owns the dev
+    )
+    assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == OP
+
+
+# --- T-0647 regression: the actual reported bug ----------------------------
+# Journal-evidenced 2026-07-18: three operator-parented, already-finished
+# devs (S-almdudleer-tg-outage-p11, S-almdudleer-settings-max-fix-p16,
+# S-almdudleer-quota-path-fix-p34) each idle-nagged the SAME unrelated TL
+# (S-almdudleer-gateway-routing-tl-p23) that had no relationship to any of
+# them — because the old routing derived its target from whichever TL was
+# newest/live in the project's single shared team roster
+# (teams.tl_for_sid), not from each dev's actual parent binding.
+
+def test_route_dev_heuristic_parent_ignored_falls_back_to_operator(tmp_path, monkeypatch):
+    """A parent_sid backfill *guessed* (nearest-live-TL heuristic, not a
+    genuine spawn-time link) must never be trusted as the actual parent —
+    that guess is exactly the mechanism that mis-routed p11/p16/p34's
+    idle-nags onto unrelated TL p23."""
+    cfg = _make_cfg(tmp_path)
+    _stub_rows(
+        monkeypatch,
+        [{"sid": DEV, "role": "dev", "parent_sid": TL, "parent_sid_heuristic": True},
+         {"sid": TL, "role": "teamlead"},
+         {"sid": OP, "role": "operator"}],
+    )
+    assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == OP
+
+
+def test_route_dev_operator_parented_never_broadcasts_to_unrelated_live_tl(tmp_path, monkeypatch):
+    """An operator-parented dev with no parent binding at all must go
+    straight to the operator even when an unrelated TL happens to be alive in
+    the roster — never a role-broadcast / nearest-live-TL fallback."""
+    cfg = _make_cfg(tmp_path)
+    _stub_rows(
+        monkeypatch,
+        [{"sid": DEV, "role": "dev"},
+         {"sid": TL, "role": "teamlead"},   # a live TL exists, but is unrelated
+         {"sid": OP, "role": "operator"}],
     )
     assert TS._route_idle_escalation(cfg, "bot-squad", DEV) == OP
 

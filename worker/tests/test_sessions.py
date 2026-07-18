@@ -4590,6 +4590,10 @@ def test_list_sessions_returns_parent_sid(tmp_path, monkeypatch):
     assert by_sid["S-testuser-devwin-p2"]["parent_sid"] == "S-testuser-tl-p1"
     assert by_sid["S-testuser-old-p9"]["parent_sid"] == "S-testuser-tl-p1"
     assert by_sid["S-testuser-legacy-p8"]["parent_sid"] == ""
+    # T-0647: neither of these was backfill-guessed — both are genuine
+    # spawn-time-stamped values, so the heuristic flag must read False.
+    assert by_sid["S-testuser-devwin-p2"]["parent_sid_heuristic"] is False
+    assert by_sid["S-testuser-old-p9"]["parent_sid_heuristic"] is False
 
 
 def test_backfill_parent_sid_fills_legacy_and_preserves_existing(tmp_path, monkeypatch):
@@ -4635,9 +4639,12 @@ def test_backfill_parent_sid_fills_legacy_and_preserves_existing(tmp_path, monke
 
     m1 = _read_session_metadata(sessions_dir / "S-testuser-dev-p2.md")
     assert m1["parent_sid"] == "S-testuser-tl-p1"
+    # T-0647: a backfilled parent is flagged as a guess, not a genuine link.
+    assert S._parent_sid_heuristic_of(m1) is True
     # Existing value preserved.
     m2 = _read_session_metadata(sessions_dir / "S-testuser-dev2-p3.md")
     assert m2["parent_sid"] == "S-testuser-PRESET-p0"
+    assert S._parent_sid_heuristic_of(m2) is False
     # No-parent session left unset.
     m3 = _read_session_metadata(sessions_dir / "S-testuser-root-p4.md")
     assert not m3.get("parent_sid")
@@ -4695,14 +4702,17 @@ def test_backfill_parent_sid_gates_nondev_and_heals_operator(tmp_path, monkeypat
 
     op = _read_session_metadata(sessions_dir / "S-testuser-operator-p5.md")
     assert not S._parent_sid_of(op)          # operator is a root again
+    assert S._parent_sid_heuristic_of(op) is False   # T-0647: flag cleared too
     tl = _read_session_metadata(sessions_dir / "S-testuser-tl-p1.md")
     assert not S._parent_sid_of(tl)          # non-dev never gets invented parent
     otl = _read_session_metadata(sessions_dir / "S-testuser-otl-p7.md")
     assert not S._parent_sid_of(otl)         # artifact fingerprint cleared
+    assert S._parent_sid_heuristic_of(otl) is False  # T-0647: flag cleared too
     spawned = _read_session_metadata(sessions_dir / "S-testuser-spawned-tl-p8.md")
     assert spawned["parent_sid"] == "S-testuser-operator-p5"   # genuine parent kept
     dev = _read_session_metadata(sessions_dir / "S-testuser-dev-p2.md")
     assert dev["parent_sid"] == "S-testuser-tl-p1"
+    assert S._parent_sid_heuristic_of(dev) is True   # T-0647: freshly backfilled → flagged
 
     # Idempotent: cleared rows stay clean, genuine parent kept, nothing re-filled.
     res2 = S.backfill_parent_sid(cfg, "test-project")

@@ -286,22 +286,35 @@ def _window_visible(pane_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _route_idle_escalation(cfg: Any, slug: str, sid: str) -> Optional[str]:
-    """Where should ``sid``'s idle/blocked escalation go? (T-0034)
+    """Where should ``sid``'s idle/blocked escalation go? (T-0034, T-0647)
 
     Returns a target SID to ``peer_send``, or ``None`` meaning "page the
     stakeholder via TG" (the existing behaviour). Routing follows the ticket:
 
-      - **dev**, team ``tl`` is a teamlead    → that TL.
-      - **dev**, team ``tl`` is operator/none → the operator session.
-      - **teamlead** (regular dev TL)         → the operator session.
-      - **operator**                          → ``None`` (TG the stakeholder).
+      - **dev**, with a genuine (non-heuristic) ``parent_sid`` whose row is a
+        teamlead or the operator            → that parent, directly.
+      - **dev**, no trustworthy parent       → the operator session.
+      - **teamlead** (regular dev TL)        → the operator session.
+      - **operator**                         → ``None`` (TG the stakeholder).
       - **teamlead with no operator** (a prod-teamlead on the prod contour,
-        which has no operator above it)       → ``None`` (TG the stakeholder).
+        which has no operator above it)      → ``None`` (TG the stakeholder).
 
     The fall-through to TG is exactly "no upstream session to peer_send". The
     point of T-0034: a dev going idle under a TL never pages the stakeholder —
     the TL gets the peer_send instead. Explicit ``bsq tg ping`` pages bypass
     this watchdog entirely and still reach the stakeholder.
+
+    T-0647: a dev's target is resolved from its own recorded ``parent_sid``
+    binding — NEVER from ``teams.tl_for_sid``'s shared team-roster "tl" slot.
+    That slot holds whichever TL is currently live for the *whole* project
+    team, so any dev listed in that one flat roster — including one the
+    operator spawned directly, with no relationship to that TL — got
+    attributed to it. Journal-evidenced 2026-07-18: three operator-parented,
+    already-finished devs (p11/p16/p34) each idle-nagged the same unrelated
+    TL, p23, simply because it was the newest live TL in the roster. A
+    ``parent_sid`` stamped by ``backfill_parent_sid``'s heuristic carries the
+    exact same flaw (it's derived from that slot too), so it is treated the
+    same as "no parent" here — see ``parent_sid_heuristic``.
 
     Best-effort: any lookup failure routes to ``None`` (TG) — the safe default
     that never silently swallows an escalation.
@@ -314,7 +327,8 @@ def _route_idle_escalation(cfg: Any, slug: str, sid: str) -> Optional[str]:
         return None
 
     by_sid = {r.get("sid"): r for r in rows}
-    role = (by_sid.get(sid) or {}).get("role")
+    row = by_sid.get(sid) or {}
+    role = row.get("role")
     operator_sid = next((r.get("sid") for r in rows if r.get("role") == "operator"), None)
 
     if role == "operator":
@@ -322,15 +336,15 @@ def _route_idle_escalation(cfg: Any, slug: str, sid: str) -> Optional[str]:
         return None
 
     if role == "dev":
-        try:
-            from bot_squad_worker import teams as T
-            tl = T.tl_for_sid(cfg, slug, sid)
-        except Exception:  # noqa: BLE001
-            log.exception("tg_stall: team-projection lookup failed for %s", sid)
-            tl = None
-        if tl and (by_sid.get(tl) or {}).get("role") == "teamlead":
-            return tl              # dev under a TL → the TL
-        return operator_sid        # ad-hoc dev (no TL) → the operator
+        parent = row.get("parent_sid") or ""
+        heuristic = bool(row.get("parent_sid_heuristic"))
+        if parent and not heuristic and parent != sid:
+            parent_role = (by_sid.get(parent) or {}).get("role")
+            if parent_role in ("teamlead", "operator"):
+                return parent       # actual recorded parent → route there
+        # No trustworthy parent binding (none recorded, or only a guessed
+        # one) → straight to the operator. NEVER the team-broadcast fallback.
+        return operator_sid
 
     # teamlead (regular dev TL) → the operator. A prod-teamlead on the prod
     # contour has no operator session, so operator_sid is None → TG. The same
@@ -448,6 +462,18 @@ def tick(cfg: Any) -> dict:
     return audit
 
 
+def _session_row(cfg: Any, slug: str, sid: str) -> dict:
+    """Best-effort: ``sid``'s row from the live session registry, or {}."""
+    try:
+        from bot_squad_worker import sessions as S
+        for r in S.list_sessions(cfg, slug):
+            if r.get("sid") == sid:
+                return r
+    except Exception:  # noqa: BLE001
+        log.exception("tg_stall: session-row lookup failed for %s (slug=%s)", sid, slug)
+    return {}
+
+
 def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
     """Escalate one stale marker. Returns True if it was consumed (a TG sent or
     an in-bus redirect delivered) so the watchdog counts it once.
@@ -465,6 +491,17 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
         # the marker rather than paging about a dead session.
         marker.unlink(missing_ok=True)
         log.info("tg_stall: %s pane gone — dropping marker (no escalation)", sid)
+        return False
+
+    # T-0647: a session whose work is already complete (result written /
+    # ticket closed, hence already archived) has nothing left to nag anyone
+    # about. Journal-evidenced: p16 was already
+    # archive_reason=dead-binding:task-closed at the moment it idle-nagged a
+    # TL on 2026-07-18. Drop the marker instead of paging a TL/operator/
+    # stakeholder for a finished lane.
+    if _session_row(cfg, slug, sid).get("archived"):
+        marker.unlink(missing_ok=True)
+        log.info("tg_stall: %s already archived (work complete) — dropping marker, no escalation", sid)
         return False
 
     # T-0034: redirect to the TL / operator instead of TG, when there is one.

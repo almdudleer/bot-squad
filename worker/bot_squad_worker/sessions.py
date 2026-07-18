@@ -674,6 +674,20 @@ def _parent_sid_of(meta: dict | None) -> str:
     return ""
 
 
+def _parent_sid_heuristic_of(meta: dict | None) -> bool:
+    """T-0647: True when ``parent_sid`` was *inferred* by
+    ``backfill_parent_sid``'s nearest-live-TL heuristic rather than stamped at
+    spawn time by the actual requesting session. A guessed parent is not the
+    same claim as a recorded one — routing decisions that need the real
+    spawn relationship (e.g. idle-notify target) must not treat the two as
+    equivalent, since the guess can land on a TL with no real relationship to
+    the session (journal-evidenced T-0647: p11/p16/p34 -> unrelated TL p23).
+    """
+    if not meta:
+        return False
+    return str(meta.get("parent_sid_heuristic", "")).lower() == "true"
+
+
 def _get_current_user() -> str:
     """Return the OS username."""
     import getpass
@@ -1066,6 +1080,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             # spawn). Empty string when unset (legacy session) — the web tree
             # falls back to the task→initiative→TL heuristic in that case.
             "parent_sid": _parent_sid_of(existing),
+            # T-0647: True iff the above was a backfill *guess*, not a
+            # genuine spawn-time link — see _parent_sid_heuristic_of.
+            "parent_sid_heuristic": _parent_sid_heuristic_of(existing),
             # T-0157: linux user that owns this session (explicit field, else
             # SID prefix). For active panes the SID's user IS the worker's user.
             "linux_user": _session_linux_user(sid, existing),
@@ -1206,6 +1223,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "owner_user": md_owner_user,
                 # T-0128: persisted spawn-time parent for suspended rows too.
                 "parent_sid": _parent_sid_of(meta),
+                # T-0647: True iff the above was a backfill guess, not genuine.
+                "parent_sid_heuristic": _parent_sid_heuristic_of(meta),
                 # T-0157: linux user owning this (suspended) session.
                 "linux_user": _session_linux_user(sid, meta),
                 # T-0078: surface tmux_session so the UI can still suggest the
@@ -4022,6 +4041,13 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
     Runs after ``reconcile_teams`` in the binding-gc tick so the Team
     projection it consults is fresh.
 
+    T-0647: every fill this way is stamped ``parent_sid_heuristic: true`` —
+    it is a *guess* (whichever TL currently occupies the team's shared lead
+    slot), not a recorded spawn relationship, and can land on a TL with no
+    real tie to the session once that slot changes hands. Consumers that need
+    the actual parent (e.g. idle-notify routing) must check the flag rather
+    than treat every ``parent_sid`` as equally authoritative.
+
     Only DEV rows (carrying a primary ``task_id``) are backfilled — this
     mirrors the web tree's ``isDevRow`` gate. Non-dev rows (TL / prod-tl / qa)
     are tree roots unless an explicit spawn-time ``parent_sid`` was stamped, so
@@ -4078,6 +4104,7 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
                     heuristic and _parent_sid_of(meta) == heuristic
                 ):
                     meta.pop("parent_sid", None)
+                    meta.pop("parent_sid_heuristic", None)
                     try:
                         _write_session_metadata(md, meta, atomic=True)
                     except OSError:
@@ -4096,6 +4123,7 @@ def backfill_parent_sid(cfg: Any, slug: str) -> dict:
         if not parent or parent == sid:
             continue
         meta["parent_sid"] = parent
+        meta["parent_sid_heuristic"] = "true"
         try:
             _write_session_metadata(md, meta, atomic=True)
         except OSError:

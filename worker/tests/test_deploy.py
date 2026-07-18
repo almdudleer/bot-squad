@@ -1246,6 +1246,10 @@ def test_run_next_no_restart_when_flag_off(
     _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
     enqueue(cfg, proj.slug, "staging", "no restart", "user")  # default OFF
 
+    # T-0535: pin the no-worker-change gate instead of relying on the real repo's
+    # git state — under host load a concurrent commit on the shared tree can flip
+    # _worker_subtree_changed_since_boot's real git probe mid-test and flake this.
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
     calls: list = []
     monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
     result = run_next(cfg, proj.slug)
@@ -1701,7 +1705,12 @@ def test_run_next_no_auto_restart_when_worker_unchanged(
     _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
     enqueue(cfg, proj.slug, "staging", "docs only", "user")  # flag OFF
 
-    monkeypatch.setattr(d, "_worker_needs_restart", lambda c: False)
+    # T-0535: run_next's actual call path is _should_restart_worker ->
+    # _worker_subtree_changed_since_boot, not _worker_needs_restart (that stale
+    # target was never on the code path run_next exercises, so this monkeypatch
+    # was a no-op — the assertion was passing only because the real repo's git
+    # probe happened to also return "unchanged", which host load can flip).
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
     calls: list = []
     monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
     result = run_next(cfg, proj.slug)

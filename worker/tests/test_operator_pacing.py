@@ -37,11 +37,15 @@ def _set_target(cfg, pct):
         f"[operator]\nweekly_quota_target_pct = {pct}\n", encoding="utf-8")
 
 
-def _set_quota(cfg, *, burn=None, remaining=None, r429=0):
-    (cfg.data_dir / SLUG / "_telemetry" / "_quota.json").write_text(json.dumps({
+def _set_quota(cfg, *, burn=None, remaining=None, r429=0, budget=None):
+    data = {
         "burn_tokens_per_hr": burn, "remaining_tokens": remaining,
         "rate_limit_429": {"count": r429, "last_at": None},
-    }), encoding="utf-8")
+    }
+    if budget is not None:
+        data["anchor"] = {"budget_tokens": budget, "set_at": "2026-07-14T00:00:00Z"}
+    (cfg.data_dir / SLUG / "_telemetry" / "_quota.json").write_text(
+        json.dumps(data), encoding="utf-8")
 
 
 def test_fresh_project_degrades_to_ok(cfg, monkeypatch):
@@ -123,3 +127,136 @@ def test_pace_failure_never_breaks_status(cfg, monkeypatch):
     st = ord_.pacing_status(cfg, SLUG)
     assert st["max_in_progress"] == 0  # degraded
     assert "recommendation" in st
+
+
+# ---------------------------------------------------------------------------
+# F2.7 / T-0579 — mechanized ramp-UP when spend-to-date runs under the weekly
+# target's pace line. Today (T-0475) a target with no cap pressure always
+# degrades to the same static "advisory" text regardless of under/on/over —
+# these tests cover the new pace_verdict + ramp-to-target_in_progress behavior.
+# ---------------------------------------------------------------------------
+
+def _no_backoff_clamp(monkeypatch):
+    """A wide-open backoff ceiling — the AIMD governor is not currently
+    suppressing concurrency, so it never blocks a ramp in these tests."""
+    from bot_squad_worker import backoff as _backoff
+    monkeypatch.setattr(_backoff, "effective_limit", lambda c: 1_000)
+
+
+def test_spend_pct_computed_from_anchor_and_remaining(cfg, monkeypatch):
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    _set_quota(cfg, budget=1000, remaining=300)  # 700/1000 spent = 70%
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["spend_pct"] == pytest.approx(70.0)
+
+
+def test_spend_pct_none_without_anchor(cfg, monkeypatch):
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    _set_quota(cfg, remaining=300)  # no budget anchor set
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["spend_pct"] is None
+    assert st["pace_verdict"] is None
+
+
+def test_under_pace_ramps_above_baseline(cfg, monkeypatch):
+    """spend-to-date (30%) under the 70% target -> RAMP, target_in_progress
+    admits above the current in-progress baseline (F2.7 DoD)."""
+    _no_backoff_clamp(monkeypatch)
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)  # unlimited board cap
+    _set_target(cfg, 70)
+    _set_quota(cfg, budget=1000, remaining=700)  # 300/1000 = 30% spent
+    _task(cfg, "T-1", status="in_progress")
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["pace_verdict"] == "under"
+    assert st["recommendation"] == "ramp"
+    assert st["target_in_progress"] is not None
+    assert st["target_in_progress"] > st["in_progress"]
+
+
+def test_on_pace_no_ramp(cfg, monkeypatch):
+    _no_backoff_clamp(monkeypatch)
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    _set_target(cfg, 70)
+    _set_quota(cfg, budget=1000, remaining=300)  # 700/1000 = 70% spent = on target
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["pace_verdict"] == "on"
+    assert st["recommendation"] == "advisory"
+    assert st["target_in_progress"] is None
+
+
+def test_over_pace_no_ramp(cfg, monkeypatch):
+    _no_backoff_clamp(monkeypatch)
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    _set_target(cfg, 20)
+    _set_quota(cfg, budget=1000, remaining=300)  # 700/1000 = 70% spent > 20% target
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["pace_verdict"] == "over"
+    assert st["recommendation"] == "advisory"
+    assert st["target_in_progress"] is None
+
+
+def test_ramp_never_exceeds_max_in_progress_cap(cfg, monkeypatch):
+    """Under pace with headroom, but the board cap is already saturated by
+    in-progress load -> ramp collapses to advisory (never overrides the cap)."""
+    _no_backoff_clamp(monkeypatch)
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 1)
+    _set_target(cfg, 70)
+    _set_quota(cfg, budget=1000, remaining=700)  # 30% spent, well under target
+    _task(cfg, "T-1", status="in_progress")  # already at the cap (1)
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["pace_verdict"] == "under"
+    assert st["at_cap"] is True
+    assert st["recommendation"] == "throttle"  # at_cap wins over ramp
+    assert st["target_in_progress"] is None
+
+
+def test_ramp_bounded_by_max_in_progress_when_headroom_exists(cfg, monkeypatch):
+    """Cap allows some headroom -> ramp climbs toward it but never past it."""
+    _no_backoff_clamp(monkeypatch)
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 3)
+    _set_target(cfg, 70)
+    _set_quota(cfg, budget=1000, remaining=700)  # 30% spent
+    _task(cfg, "T-1", status="in_progress")  # in_progress=1, cap=3
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["recommendation"] == "ramp"
+    assert st["in_progress"] < st["target_in_progress"] <= 3
+
+
+def test_backoff_clamped_suppresses_ramp(cfg, monkeypatch):
+    """An active AIMD backoff clamp (effective_limit already at/below the current
+    load) suppresses the ramp even though spend is under target (F2.7 DoD:
+    'backoff-clamped => no ramp')."""
+    from bot_squad_worker import backoff as _backoff
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)  # no board cap
+    _set_target(cfg, 70)
+    _set_quota(cfg, budget=1000, remaining=700)  # 30% spent, well under target
+    _task(cfg, "T-1", status="in_progress")
+    _task(cfg, "T-2", status="in_progress")  # in_progress = 2
+    monkeypatch.setattr(_backoff, "effective_limit", lambda c: 2)  # clamped at current load
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["pace_verdict"] == "under"
+    assert st["recommendation"] == "advisory"
+    assert st["target_in_progress"] is None
+
+
+def test_backoff_unreadable_does_not_block_ramp(cfg, monkeypatch):
+    """A backoff-signal failure degrades gracefully — it must not crash, and (with
+    no other bound) doesn't suppress the ramp either."""
+    from bot_squad_worker import backoff as _backoff
+    def boom(c):
+        raise RuntimeError("backoff exploded")
+    monkeypatch.setattr(_backoff, "effective_limit", boom)
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    _set_target(cfg, 70)
+    _set_quota(cfg, budget=1000, remaining=700)  # 30% spent
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["recommendation"] == "ramp"
+    assert st["target_in_progress"] is not None
+
+
+def test_pace_verdict_helper_thresholds():
+    assert ord_.pace_verdict(70, 30) == "under"
+    assert ord_.pace_verdict(70, 70) == "on"
+    assert ord_.pace_verdict(70, 90) == "over"
+    assert ord_.pace_verdict(None, 30) is None
+    assert ord_.pace_verdict(70, None) is None

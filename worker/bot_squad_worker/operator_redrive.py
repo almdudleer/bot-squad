@@ -243,31 +243,82 @@ def weekly_quota_target_pct(cfg: Any) -> Optional[float]:
 
 def _burn_signal(cfg: Any, slug: str) -> dict:
     """Best-effort read of telemetry's quota estimate (``_telemetry/_quota.json``):
-    ``{burn_tokens_per_hr, remaining_tokens, rate_limit_429}``. All-None when no
-    signal exists yet (Max remaining is never authoritative — estimate only)."""
+    ``{burn_tokens_per_hr, remaining_tokens, rate_limit_429, spend_pct}``. All-None
+    (spend_pct excepted, 0 for rate_limit_429) when no signal exists yet (Max
+    remaining is never authoritative — estimate only).
+
+    ``spend_pct`` (F2.7) is the best-effort weekly-budget spend-to-date percent:
+    ``100 * (budget_tokens - remaining_tokens) / budget_tokens``, derived from the
+    operator-set ``[quota]`` anchor telemetry persists alongside ``remaining_tokens``
+    (``telemetry._update_quota`` writes ``anchor`` into the same file). None when no
+    anchor is set — there is then no total to measure spend against."""
     q = cfg.data_dir / slug / "_telemetry" / "_quota.json"
     try:
         data = json.loads(q.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"burn_tokens_per_hr": None, "remaining_tokens": None, "rate_limit_429": 0}
+        return {"burn_tokens_per_hr": None, "remaining_tokens": None,
+                "rate_limit_429": 0, "spend_pct": None}
     rl = data.get("rate_limit_429") or {}
+    anchor = data.get("anchor") or {}
+    remaining = data.get("remaining_tokens")
+    spend_pct = None
+    try:
+        budget = float(anchor.get("budget_tokens"))
+        if budget > 0 and remaining is not None:
+            spend_pct = max(0.0, min(100.0, 100.0 * (budget - float(remaining)) / budget))
+    except (TypeError, ValueError):
+        spend_pct = None
     return {
         "burn_tokens_per_hr": data.get("burn_tokens_per_hr"),
-        "remaining_tokens": data.get("remaining_tokens"),
+        "remaining_tokens": remaining,
         "rate_limit_429": int(rl.get("count", 0)) if isinstance(rl, dict) else 0,
+        "spend_pct": spend_pct,
     }
+
+
+def pace_verdict(target_pct: Optional[float], spend_pct: Optional[float]) -> Optional[str]:
+    """``under`` / ``on`` / ``over`` the weekly-target pace line, or None when
+    either signal is unknown (unset target, or no quota anchor to measure spend
+    against — the graceful-degradation case T-0475 already established)."""
+    if target_pct is None or spend_pct is None:
+        return None
+    if spend_pct < target_pct:
+        return "under"
+    if spend_pct > target_pct:
+        return "over"
+    return "on"
+
+
+# Additive ramp-up step (board tasks) applied per pacing read while under pace,
+# mirroring backoff.py's AIMD additive-increase shape. Env-tunable, no redeploy.
+def _pace_ramp_step() -> int:
+    try:
+        v = int(os.environ.get("BOT_SQUAD_PACE_RAMP_STEP", "2"))
+    except (TypeError, ValueError):
+        return 2
+    return v if v > 0 else 2
 
 
 def pacing_status(cfg: Any, slug: str) -> dict:
     """The operator's pacing dashboard — the signals it honors when deciding how
-    many sessions to run (T-0475 / F2.6). Composed from the parallelism cap
-    (pace.py SSOT), current load, the optional weekly target, and the best-effort
-    burn estimate. ``recommendation`` is the one-word steer for the operator brief:
+    many sessions to run (T-0475 / F2.6, ramp-up mechanized by F2.7 / T-0579).
+    Composed from the parallelism cap (pace.py SSOT), current load, the optional
+    weekly target + best-effort spend-to-date, and the AIMD backoff ceiling.
+    ``recommendation`` is the one-word steer for the operator brief:
 
       * ``throttle``  — at/over the parallelism cap OR rate-limit 429s seen:
                         stop dispatching new sessions, let in-flight drain.
-      * ``advisory``  — a weekly target is set but the weekly total isn't knowable
-                        (best-effort): pace by judgement toward the target %.
+      * ``ramp``      — a weekly target is set, spend-to-date is UNDER it, and
+                        there is real headroom below BOTH the board cap
+                        (``max_in_progress``) and the live AIMD backoff ceiling
+                        (``backoff.effective_limit``): ``target_in_progress`` names
+                        the concrete number of lanes to admit toward (F2.7 — this
+                        is the mechanized ramp-UP; it never exceeds either bound,
+                        so an active backoff clamp or a tight board cap silently
+                        suppresses it back to ``advisory``).
+      * ``advisory``  — a weekly target is set but spend-to-date is at/over it, OR
+                        under it with no ramp headroom, OR the weekly total isn't
+                        knowable (no quota anchor): pace by judgement toward it.
       * ``ok``        — under cap, no target/pressure: dispatch freely.
 
     Always safe + total (never raises): every signal degrades to None/0 so the
@@ -282,9 +333,31 @@ def pacing_status(cfg: Any, slug: str) -> dict:
     at_cap = cap > 0 and in_prog >= cap
     target = weekly_quota_target_pct(cfg)
     burn = _burn_signal(cfg, slug)
+    verdict = pace_verdict(target, burn["spend_pct"])
 
+    try:
+        from bot_squad_worker import backoff as _backoff
+        backoff_ceiling = _backoff.effective_limit(cfg)
+    except Exception:  # noqa: BLE001 — an unreadable backoff state is not fatal
+        backoff_ceiling = None
+
+    ramp_to: Optional[int] = None
     if at_cap or burn["rate_limit_429"] > 0:
         rec = "throttle"
+    elif verdict == "under":
+        # Never overrides an explicit max_in_progress or an active backoff clamp
+        # (F2.7 DoD) — both bound the candidate below, so a clamped backoff or a
+        # cap already saturated by in_prog collapses this back to "advisory".
+        candidate = in_prog + _pace_ramp_step()
+        if cap > 0:
+            candidate = min(candidate, cap)
+        if backoff_ceiling is not None:
+            candidate = min(candidate, backoff_ceiling)
+        if candidate > in_prog:
+            ramp_to = candidate
+            rec = "ramp"
+        else:
+            rec = "advisory"
     elif target is not None:
         rec = "advisory"
     else:
@@ -295,9 +368,12 @@ def pacing_status(cfg: Any, slug: str) -> dict:
         "in_progress": in_prog,
         "at_cap": at_cap,
         "weekly_target_pct": target,       # None = unset (optional)
+        "spend_pct": burn["spend_pct"],    # None = no quota anchor to measure against
+        "pace_verdict": verdict,           # under/on/over/None
         "burn_tokens_per_hr": burn["burn_tokens_per_hr"],
         "remaining_tokens": burn["remaining_tokens"],  # estimate, may be None
         "rate_limit_429": burn["rate_limit_429"],
+        "target_in_progress": ramp_to,     # None unless recommendation == "ramp"
         "recommendation": rec,
     }
 

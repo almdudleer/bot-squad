@@ -2222,8 +2222,59 @@ def _pace_initiatives(raw: dict) -> dict:
     return out
 
 
+def _pace_weekly_target_pct(slug: str) -> float | None:
+    """Mirrors operator_redrive.weekly_quota_target_pct: best-effort read of
+    ``[operator].weekly_quota_target_pct`` from system_settings.toml."""
+    path = Path(BOT_SQUAD) / "config" / "system_settings.toml"
+    if not path.exists():
+        return None
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    v = (data.get("operator") or {}).get("weekly_quota_target_pct")
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pace_spend_pct(slug: str) -> float | None:
+    """Mirrors operator_redrive._burn_signal's spend_pct (F2.7): best-effort
+    percent of the operator-set ``[quota]`` budget spent to date, derived from
+    ``_telemetry/_quota.json``'s persisted anchor + remaining_tokens. None when
+    no anchor is set (no total to measure spend against)."""
+    path = Path(BOT_SQUAD) / "data" / slug / "_telemetry" / "_quota.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    anchor = data.get("anchor") or {}
+    remaining = data.get("remaining_tokens")
+    try:
+        budget = float(anchor.get("budget_tokens"))
+        if budget > 0 and remaining is not None:
+            return max(0.0, min(100.0, 100.0 * (budget - float(remaining)) / budget))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _pace_verdict(target_pct: float | None, spend_pct: float | None) -> str | None:
+    """Mirrors operator_redrive.pace_verdict: under/on/over, or None if either
+    signal is unknown."""
+    if target_pct is None or spend_pct is None:
+        return None
+    if spend_pct < target_pct:
+        return "under"
+    if spend_pct > target_pct:
+        return "over"
+    return "on"
+
+
 def cmd_pace_show(args) -> None:
-    """T-0482: print the project's pace-control config (the user's pace surface)."""
+    """T-0482: print the project's pace-control config (the user's pace surface).
+    T-0579/F2.7: also surfaces the weekly-quota-target pace verdict (under/on/over)."""
     slug = resolve_slug()
     raw = _pace_load_raw(slug)
     try:
@@ -2243,6 +2294,16 @@ def cmd_pace_show(args) -> None:
                   f"paused={'yes' if e['paused'] else 'no'}")
     else:
         print("  initiatives: (none)")
+    target = _pace_weekly_target_pct(slug)
+    if target is None:
+        print("  weekly quota target: (none set)")
+    else:
+        spend = _pace_spend_pct(slug)
+        verdict = _pace_verdict(target, spend)
+        spend_s = f"{spend:.1f}%" if spend is not None else "unknown (no quota anchor)"
+        verdict_s = verdict if verdict is not None else "unknown"
+        print(f"  weekly quota target: {target}%  spend-to-date: {spend_s}  "
+              f"verdict: {verdict_s}")
 
 
 def cmd_pace_set(args) -> None:

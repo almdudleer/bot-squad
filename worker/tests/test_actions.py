@@ -96,6 +96,8 @@ def test_registry_lists_only_allowed_actions():
         "placement_decision",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
+        # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
+        "set_drive",
         # T-0466: per-session ~1h cache-window recycle postpone (bsq postpone).
         "idle_postpone",
         # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
@@ -3157,3 +3159,58 @@ def test_morph_session_action_requires_role(tmp_path, monkeypatch):
     _make_sessions_cfg(tmp_path, monkeypatch)
     with pytest.raises(ActionError, match="missing required"):
         A.dispatch("morph_session", {"slug": "test-project", "sid": "S-u-claude-p1"})
+
+
+# ---------------------------------------------------------------------------
+# T-0655: set_drive action — operator's own drive=on/off continuity toggle.
+# ---------------------------------------------------------------------------
+
+def test_set_drive_action_off_and_on(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    _seed_user_session(cfg, repo, "S-u-operator-p1", window="operator")
+
+    out = A.dispatch("set_drive", {
+        "slug": "test-project", "sid": "S-u-operator-p1", "on": False,
+    })
+    assert out["ok"] and out["drive"] == "off"
+
+    out = A.dispatch("set_drive", {
+        "slug": "test-project", "sid": "S-u-operator-p1", "on": True,
+    })
+    assert out["drive"] == "on"
+
+
+def test_set_drive_action_refuses_non_operator(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    _seed_user_session(cfg, repo, "S-u-claude-p1")  # derives role dev
+
+    with pytest.raises(ActionError, match="not operator"):
+        A.dispatch("set_drive", {
+            "slug": "test-project", "sid": "S-u-claude-p1", "on": False,
+        })
+
+
+def test_set_drive_action_rejects_extra_and_bad_type(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg, repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    _seed_user_session(cfg, repo, "S-u-operator-p1", window="operator")
+
+    with pytest.raises(ActionError, match="unexpected"):
+        A.dispatch("set_drive", {
+            "slug": "test-project", "sid": "S-u-operator-p1", "on": False,
+            "bogus": 1,
+        })
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("set_drive", {"slug": "test-project", "sid": "S-u-operator-p1"})
+    with pytest.raises(ActionError, match="boolean"):
+        A.dispatch("set_drive", {
+            "slug": "test-project", "sid": "S-u-operator-p1", "on": "off",
+        })
+
+
+def test_set_drive_registered_with_mode():
+    from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
+    assert "set_drive" in ACTION_REGISTRY
+    assert ACTION_MODES["set_drive"] == "tmux_only"

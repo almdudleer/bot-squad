@@ -18,6 +18,7 @@ from bot_squad_worker.sessions import (
     pause,
     resume,
     set_drift_paused,
+    set_drive,
     sid_display_label,
     spawn,
     _append_task_session_history,
@@ -3216,6 +3217,51 @@ def test_set_drift_paused_round_trip(tmp_path, monkeypatch):
     res = set_drift_paused(cfg, "test-project", "S-alice-w-p2", False)
     assert res["drift_paused"] is False
     assert "drift_paused" not in _read_session_metadata(md)
+
+
+def test_set_drive_round_trip_on_operator_session(tmp_path):
+    """T-0655: bsq drive off/on toggles the explicit `drive` field on the
+    operator's OWN session md."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    md = sessions_dir / "S-alice-operator-p1.md"
+    _write_session_metadata(md, {
+        "sid": "S-alice-operator-p1", "status": "active", "window": "operator",
+        "cwd": str(repo), "claude_uuid": "u-1",
+    })
+
+    res = set_drive(cfg, "test-project", "S-alice-operator-p1", False)
+    assert res["ok"] and res["drive"] == "off"
+    assert _read_session_metadata(md).get("drive") == "off"
+
+    res = set_drive(cfg, "test-project", "S-alice-operator-p1", True)
+    assert res["drive"] == "on"
+    assert _read_session_metadata(md).get("drive") == "on"
+
+
+def test_set_drive_refuses_non_operator_role(tmp_path):
+    """`drive` only ever applies to the operator's own continuity — a dev/TL
+    session calling this must be refused, not silently no-op."""
+    from bot_squad_worker.actions import ActionError
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    md = sessions_dir / "S-alice-demo-p2.md"
+    _write_session_metadata(md, {
+        "sid": "S-alice-demo-p2", "status": "active", "window": "demo",
+        "cwd": str(repo), "claude_uuid": "u-2", "task_id": "T-0042",
+    })
+
+    with pytest.raises(ActionError, match="not operator"):
+        set_drive(cfg, "test-project", "S-alice-demo-p2", False)
 
 
 def test_session_history_rotates_on_resume(tmp_path, monkeypatch):

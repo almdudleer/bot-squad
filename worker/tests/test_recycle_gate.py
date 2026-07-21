@@ -128,6 +128,36 @@ def test_recycle_allowed_blocks_hand_launched_user_session(monkeypatch):
                              meta={}) is True
 
 
+# --- T-0655: operator drive=on/off predicate ---------------------------------
+
+def test_operator_drive_on_defaults_true_when_unset():
+    # Absent drive field on an operator session reads as ON — "runs non-stop
+    # while work is on" is the default, not an opt-in.
+    assert G.operator_drive_on(role="operator") is True
+    assert G.operator_drive_on(role="operator", meta={}) is True
+    assert G.operator_drive_on(role="operator", meta={"drive": "on"}) is True
+
+
+def test_operator_drive_off_only_when_explicit():
+    assert G.operator_drive_on(role="operator", meta={"drive": "off"}) is False
+    assert G.operator_drive_on(role="operator", meta={"drive": "OFF"}) is False
+    assert G.operator_drive_on(role="operator", meta={"drive": " Off "}) is False
+    # garbage/unexpected values fail SAFE toward "keep it alive", not toward
+    # "recycle it" — only the literal off turns it off.
+    assert G.operator_drive_on(role="operator", meta={"drive": "banana"}) is True
+
+
+def test_operator_drive_on_never_true_for_other_roles():
+    # The predicate only ever applies to the operator role — dev/TL/
+    # user-conversation sessions are untouched by this mechanism regardless
+    # of what a `drive` field might (incorrectly) carry.
+    assert G.operator_drive_on(role="dev", meta={"drive": "on"}) is False
+    assert G.operator_drive_on(role="teamlead", meta={"drive": "on"}) is False
+    assert G.operator_drive_on(role="user-conversation", meta={"drive": "on"}) is False
+    assert G.operator_drive_on(role=None) is False
+    assert G.operator_drive_on() is False
+
+
 def test_is_attached_no_target_is_false():
     assert G.is_attached(None) is False
     assert G.is_attached("") is False

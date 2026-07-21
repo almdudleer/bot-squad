@@ -769,6 +769,218 @@ def test_attached_session_never_recycled(tmp_path, seams, monkeypatch):
     assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
+def _operator_row(sid: str, *, cwd_repo: Path, status="active"):
+    return {"sid": sid, "status": status, "window": "operator", "task_id": None,
+            "role": "operator", "cwd": str(cwd_repo), "claude_uuid": "uuid-" + sid,
+            "linux_user": ""}
+
+
+@pytest.fixture
+def keepalive_seams(seams, monkeypatch):
+    """Extend `seams` with a spy on the keep-alive nudge send."""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(IT, "_send_keepalive_nudge",
+                        lambda sid, text: calls.append((sid, text)))
+    seams["calls"]["keepalive"] = calls
+    return seams
+
+
+# --- T-0655: drive=on operator gets a keep-alive nudge instead of recycle ----
+
+def test_drive_on_operator_gets_keepalive_nudge_not_recycled(tmp_path, keepalive_seams):
+    """The stakeholder's core ask: an idle drive=on operator past its cache
+    window is nudged ("continue"), never terminated/compacted."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(keepalive_seams["calls"]["keepalive"]) == 1
+    assert keepalive_seams["calls"]["keepalive"][0][0] == sid
+    assert keepalive_seams["calls"]["compact"] == []
+    assert keepalive_seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "operator_keepalive_last_at" in meta
+    assert meta["status"] == "active"  # never suspended
+
+
+def test_drive_on_operator_default_when_field_absent(tmp_path, keepalive_seams):
+    """`drive` unset on an operator session still reads as on (default)."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "drive" not in meta
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert keepalive_seams["calls"]["terminate"] == []
+
+
+def test_drive_on_operator_not_due_when_jsonl_fresh(tmp_path, keepalive_seams):
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    keepalive_seams["state"]["idle_age"] = 10.0
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert keepalive_seams["calls"]["keepalive"] == []
+
+
+def test_drive_on_operator_nudge_anti_loop_blocks_within_same_window(tmp_path, keepalive_seams):
+    """A second tick within the same cache window must not re-nudge — this is
+    what protects against every ~60s tick re-injecting 'continue' if the
+    operator never responds (idle clock doesn't reset without a new turn)."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    just_sent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
+                          extra_md={"operator_keepalive_last_at": just_sent})
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert keepalive_seams["calls"]["keepalive"] == []
+
+
+def test_drive_on_operator_nudge_rearms_after_window_elapses(tmp_path, keepalive_seams):
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    long_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(time.time() - IT.idle_timeout_sec() - 10))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
+                          extra_md={"operator_keepalive_last_at": long_ago})
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(keepalive_seams["calls"]["keepalive"]) == 1
+
+
+def test_drive_on_operator_postpone_active_skips_nudge(tmp_path, keepalive_seams):
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
+                          extra_md={"idle_postpone_until": future})
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert keepalive_seams["calls"]["keepalive"] == []
+
+
+def test_drive_on_operator_tracked_job_skips_nudge(tmp_path, keepalive_seams):
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    _enqueue_deploy(data, sid, phase="processing")
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert keepalive_seams["calls"]["keepalive"] == []
+
+
+def test_drive_on_operator_nudge_waits_for_composer_ready(tmp_path, keepalive_seams):
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    keepalive_seams["state"]["buf"] = "working… esc to interrupt\n"  # mid-turn
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert keepalive_seams["calls"]["keepalive"] == []
+
+
+def test_keepalive_due_helper():
+    now = 10_000.0
+    assert IT.keepalive_due(None, now, 3600) is True
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 100))
+    assert IT.keepalive_due(fresh, now, 3600) is False
+    stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3700))
+    assert IT.keepalive_due(stale, now, 3600) is True
+
+
+def test_keepalive_nudge_text_no_target_steers_to_drive_off(monkeypatch):
+    from bot_squad_worker import operator_redrive
+    monkeypatch.setattr(operator_redrive, "weekly_quota_target_pct", lambda cfg: None)
+    text = IT._keepalive_nudge_text(cfg=None, slug="bot-squad")
+    assert "drive=off" in text or "drive off" in text
+    assert "maintenance" not in text.lower()  # only the WITH-target case steers there
+
+
+def test_keepalive_nudge_text_with_target_steers_to_maintenance(monkeypatch):
+    """Addendum 1: a live quota target must steer toward maintenance backlog,
+    not toward setting drive=off."""
+    from bot_squad_worker import operator_redrive
+    monkeypatch.setattr(operator_redrive, "weekly_quota_target_pct", lambda cfg: 20.0)
+    text = IT._keepalive_nudge_text(cfg=None, slug="bot-squad")
+    assert "20%" in text
+    assert "maintenance" in text.lower()
+    assert "NOT" in text  # "NOT by itself a reason to set drive=off"
+
+
+# --- T-0655: drive=off is the ONLY thing that permits an operator to recycle -
+
+def test_drive_off_operator_falls_through_to_normal_recycle(tmp_path, keepalive_seams):
+    """Once the operator itself sets drive=off, the normal terminate-and-
+    remember machinery applies — but WITHOUT the resumable/resume_hint bait
+    (self-terminate, per the stakeholder's explicit preference)."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
+                          extra_md={"drive": "off"})
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert keepalive_seams["calls"]["keepalive"] == []
+    assert keepalive_seams["calls"]["compact"] == [sid]  # default seams tokens > threshold
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["idle_recycle_phase"] == "compacting"
+
+
+def test_drive_off_operator_below_threshold_self_terminates_without_resume_bait(tmp_path, keepalive_seams):
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
+                          extra_md={"drive": "off"})
+    keepalive_seams["state"]["tokens"] = 5000  # below threshold — terminate immediately
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert keepalive_seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["status"] == "suspended"
+    assert "recycled_at" in meta
+    # T-0655: self_terminate — no resume bait for a deliberate operator stop
+    assert "resumable" not in meta
+    assert "resume_hint" not in meta
+
+
+def test_drive_off_operator_finalize_compact_also_self_terminates(tmp_path, keepalive_seams):
+    """The finalize half of an in-flight compact must ALSO self-terminate for
+    an operator — role is threaded through, not just the arm half."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
+                          extra_md={"drive": "off",
+                                    "idle_recycle_phase": "compacting",
+                                    "idle_recycle_armed_at": armed})
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert keepalive_seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "resumable" not in meta
+    assert "resume_hint" not in meta
+
+
+# --- T-0655 regression: dev/TL terminate-and-remember flow is UNCHANGED -----
+
+def test_dev_role_recycle_still_stamps_resumable_unaffected_by_drive(tmp_path, seams):
+    """Confirms the drive=on-operator exception never leaks onto a plain dev
+    session — the existing 'exit when task is done' / resumable-recycle
+    behaviour for dev/TL sessions is untouched by this ticket."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    seams["state"]["tokens"] = 5000  # below threshold — terminate immediately
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resumable"] is True
+    assert "resume_hint" in meta
+
+
 def test_attached_check_failure_skips_recycle(tmp_path, seams, monkeypatch):
     """T-0564: a tmux list-clients error fails CLOSED (treated as attached)."""
     # exercise the REAL is_attached (undoing the seams fixture's stub) to prove

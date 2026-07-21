@@ -3155,6 +3155,32 @@ def _action_set_drift_paused(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.set_drift_paused(cfg, params["slug"], params["sid"], params["paused"])
 
 
+_SET_DRIVE_REQUIRED = {"slug", "sid", "on"}
+_SET_DRIVE_ALLOWED = _SET_DRIVE_REQUIRED
+
+
+def _action_set_drive(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0655: the operator's own drive=on/off toggle (``bsq drive off/on``).
+
+    Required params: slug, sid, on (bool). Returns {ok, sid, drive}.
+    Operator-role only (``sessions.set_drive`` refuses any other role).
+    ``tmux_only`` — it writes only its OWN SessionMd frontmatter
+    (filesystem-local), like ``set_drift_paused``.
+    """
+    extra = set(params) - _SET_DRIVE_ALLOWED
+    if extra:
+        raise ActionError(f"set_drive got unexpected params: {sorted(extra)}")
+    missing = _SET_DRIVE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"set_drive missing required params: {sorted(missing)}")
+    if not isinstance(params["on"], bool):
+        raise ActionError("set_drive: 'on' must be a boolean")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.set_drive(cfg, params["slug"], params["sid"], params["on"])
+
+
 _IDLE_POSTPONE_REQUIRED = {"slug", "sid"}
 _IDLE_POSTPONE_ALLOWED = _IDLE_POSTPONE_REQUIRED | {"seconds", "reason"}
 
@@ -3879,6 +3905,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "placement_decision": _action_placement_decision,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
+    # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
+    "set_drive": _action_set_drive,
     # T-0466: per-session cache-window recycle postpone (bsq postpone).
     "idle_postpone": _action_idle_postpone,
     # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
@@ -4020,6 +4048,10 @@ ACTION_MODES: dict[str, str] = {
     # it writes only its own SessionMd frontmatter (filesystem-local), so
     # tmux_only (no coordinator privilege required).
     "set_drift_paused": "tmux_only",
+    # T-0655: the operator toggles its OWN drive continuity flag — writes
+    # only its own SessionMd frontmatter (filesystem-local), tmux_only like
+    # set_drift_paused.
+    "set_drive": "tmux_only",
     # T-0466: a session postpones its OWN cache-window recycle by stamping its
     # own SessionMd frontmatter (filesystem-local) — tmux_only, like the drift
     # off-ramp; no coordinator privilege required.

@@ -27,6 +27,7 @@ Verbs:
   bsq compact [--sid SID]           send /compact to a session (self by default)
   bsq compact-save "<state>"        write your forward-state to your role artifact (compact handoff)
   bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
+  bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
 
 Conventions shared with the other ops shims:
@@ -2310,6 +2311,46 @@ def cmd_drift_status(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# T-0655: operator's own drive=on/off continuity toggle.
+#
+# Distinct from `bsq pace pause` (a project-wide dispatch gate — stop
+# admitting new work) and from drift (a per-session nag off-ramp): `drive`
+# governs whether THIS operator session stays alive across its own ~1h
+# cache-expiry-while-idle window, or is allowed to recycle. Only the operator
+# itself may set it (worker-side role check in sessions.set_drive) — the
+# stakeholder's explicit ask is that THE OPERATOR decides this, not the
+# harness. Mirrors the drift CLI shape/pattern.
+# --------------------------------------------------------------------------
+
+def _set_drive(args, on: bool) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    res = post("set_drive", {"slug": slug, "sid": sid, "on": on})
+    print(f"drive for {res.get('sid', sid)}: {res.get('drive', 'on' if on else 'off')}")
+
+
+def cmd_drive_off(args) -> None:
+    _set_drive(args, False)
+
+
+def cmd_drive_on(args) -> None:
+    _set_drive(args, True)
+
+
+def cmd_drive_status(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    md = sessions_dir(slug) / f"{sid}.md"
+    drive = "on"
+    if md.exists():
+        fm = read_frontmatter(md)
+        drive = str(fm.get("drive", "") or "on").strip().lower() or "on"
+    else:
+        print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
+    print(f"drive for {sid}: {drive}")
+
+
+# --------------------------------------------------------------------------
 # T-0482: user-controlled execution pace (Process Paradigm M3 / F3.4).
 #
 # The user surface for the pace-control config the operator consumes
@@ -4298,6 +4339,19 @@ def build_parser() -> argparse.ArgumentParser:
     drs = dr_sub.add_parser("status", help="show whether drift checks are paused for this session")
     drs.add_argument("--sid", help="target SID (default: this session)")
     drs.set_defaults(func=cmd_drift_status)
+
+    # drive (T-0655: operator-only drive=on/off continuity toggle)
+    dv = sub.add_parser("drive", help="operator-only: your own drive=on/off continuity toggle (T-0655)")
+    dv_sub = dv.add_subparsers(dest="sub", required=True)
+    dvo = dv_sub.add_parser("off", help="set drive=off — permits this operator to recycle")
+    dvo.add_argument("--sid", help="target SID (default: this session)")
+    dvo.set_defaults(func=cmd_drive_off)
+    dvon = dv_sub.add_parser("on", help="set drive=on (the default) — stay alive across idle cache-expiry")
+    dvon.add_argument("--sid", help="target SID (default: this session)")
+    dvon.set_defaults(func=cmd_drive_on)
+    dvs = dv_sub.add_parser("status", help="show this session's drive state")
+    dvs.add_argument("--sid", help="target SID (default: this session)")
+    dvs.set_defaults(func=cmd_drive_status)
 
     # guidance (T-0151: surface buried stakeholder guidance)
     gd = sub.add_parser("guidance", help="search prior stakeholder guidance (T-0151)")

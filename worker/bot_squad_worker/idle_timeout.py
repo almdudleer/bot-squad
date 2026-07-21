@@ -97,6 +97,35 @@ handoff/artifact+relaunch mechanism in ``autocompact.py`` unchanged. Sharing
 the SAME md fields (not forking a second pair) is what makes
 ``compact_stay_last_at`` an effective anti-loop guard across both triggers —
 whichever fires first for a given cache window blocks the other.
+
+T-0655 (2026-07-21) KEEP-ALIVE NUDGE for drive=on operators (stakeholder
+verbatim, TG): *"надо убедиться, что оператор у нас не ресайклится через час,
+чтобы только воскреситься тут же, он должен поддерживаться всегда в живых пока
+drive=on ... система должна его тыкнуть, типа продолжай, но оператор может
+решить что ... поставить drive=off, и только тогда заресайклиться"*. A THIRD
+narrow exception, same shape as T-0617/T-0649 but a different fix for a
+different session: an operator-role session with ``drive`` on (default —
+:func:`recycle_gate.operator_drive_on`) never reaches the terminate-and-
+remember machinery below on a plain idle-window fire. Instead
+:func:`_maybe_keepalive_nudge` injects a "continue" nudge into its pane (one
+per cache window — ``operator_keepalive_last_at`` is the anti-loop guard,
+mirroring ``compact_stay_last_at``) and leaves the session running. Only once
+the OPERATOR ITSELF stamps ``drive: off`` (via ``bsq drive off`` — see
+``sessions.set_drive``) does it fall through to the SAME terminate-and-
+remember path every other role already rides — at which point
+:func:`_terminate_and_remember` skips stamping ``resumable``/``resume_hint``
+for it (``self_terminate=True``): a drive=off operator's exit is a deliberate,
+considered stop, not a stale-cache artifact worth resuming, and leaving no
+resume bait is what the stakeholder's "лучше самозавершиться" ("better to just
+self-terminate") preference asks for — it forecloses any future
+resurrect-then-immediately-recycle churn (operator_redrive spawns a FRESH
+operator if/when new backlog work actually appears, never a resume of this
+one). Addendum 1's quota-utilization steering (when a hard weekly quota
+target is live, the operator should NOT set drive=off just because
+primary-track work ran dry — it should pull from maintenance backlog
+instead) is carried entirely in the NUDGE TEXT itself
+(:func:`_keepalive_nudge_text`): it is prompt-level framing for the
+operator's own judgement call, not something this module can force.
 """
 from __future__ import annotations
 
@@ -338,10 +367,17 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
         return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
 
+    # T-0655: a drive=on operator gets a keep-alive nudge instead of the
+    # terminate-and-remember machinery below — only the operator's own
+    # drive=off decision (bsq drive off) permits it to fall through to the
+    # normal recycle path a few lines down.
+    if recycle_gate.operator_drive_on(role=role, meta=meta):
+        return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
+
     # A compact-wait already in flight → drive its finalize half (independent
     # of the idle window; the phase field is its own guard).
     if meta.get("idle_recycle_phase") == "compacting":
-        return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane)
+        return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane, role=role)
 
     # Otherwise decide whether to START a recycle this tick.
     idle_age = _idle_age(row, meta, user_home, now)
@@ -354,7 +390,7 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
         # stamp) so the moment the job clears the normal window applies again.
         log.info("idle_timeout: auto-postpone %s — waiting on a tracked long job", sid)
         return False
-    return _start_recycle(cfg, slug, sid, row, meta, md_path, now, pane)
+    return _start_recycle(cfg, slug, sid, row, meta, md_path, now, pane, role=role)
 
 
 def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None:
@@ -384,12 +420,16 @@ def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None
 
 
 def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path,
-                   now: float, pane: str | None) -> bool:
+                   now: float, pane: str | None, *, role: str | None = None) -> bool:
     """T-0566: START the cache-window recycle. Only ever acts on an idle,
     composer-ready pane — never cut mid-turn. Context over threshold → send
     Claude's native ``/compact`` and stamp ``idle_recycle_phase: compacting``
     (finalized on a later tick by :func:`_finalize_compact`). Context at/below
-    threshold → nothing worth compacting, terminate + record immediately."""
+    threshold → nothing worth compacting, terminate + record immediately.
+
+    T-0655: ``role`` is threaded through to :func:`_terminate_and_remember` so
+    a drive=off operator (the only way an operator reaches this function at
+    all — see :func:`maybe_recycle`) self-terminates without resume bait."""
     if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
         return False
 
@@ -414,11 +454,13 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
         return True
 
     # Below threshold — nothing worth compacting; terminate + record now.
-    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now, compacted=False)
+    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
+                                   compacted=False,
+                                   self_terminate=(role == "operator"))
 
 
 def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
-                      pane: str | None) -> bool:
+                      pane: str | None, *, role: str | None = None) -> bool:
     """FINALIZE an in-flight ``/compact`` wait: once the pane is composer-ready
     again (or the bounded wait times out — never wedge), terminate + record."""
     armed_at = sessions._parse_ts_epoch(meta.get("idle_recycle_armed_at")) or now
@@ -438,17 +480,30 @@ def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: f
         log.warning("idle_timeout: /compact wait timed out for %s — terminating "
                     "anyway (never wedge)", sid)
 
-    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now, compacted=True)
+    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
+                                   compacted=True,
+                                   self_terminate=(role == "operator"))
 
 
 def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
-                            *, compacted: bool) -> bool:
+                            *, compacted: bool, self_terminate: bool = False) -> bool:
     """T-0566: terminate the session (``sessions.suspend`` — same graceful
     C-c/exit/kill-pane sequence autocompact uses) and stamp the resume state on
     its md: ``resumable: true``, ``recycled_at``, ``resume_hint``.
     ``claude_uuid`` is already carried by ``sessions.suspend``. NEVER
     respawns — a future resume is a separate, deliberate act (``sessions.resume``
-    already prefers ``claude --resume <uuid>`` over a fresh spawn)."""
+    already prefers ``claude --resume <uuid>`` over a fresh spawn).
+
+    T-0655 ``self_terminate``: True only for an operator that reached here
+    with ``drive: off`` already stamped (the only way an operator role gets
+    this far — see :func:`maybe_recycle`'s drive=on gate). That is a
+    deliberate, considered stop the operator made about ITS OWN continuity,
+    not a stale-cache artifact — per the stakeholder's explicit preference
+    ("лучше самозавершиться" / better to just self-terminate), it leaves NO
+    resumable/resume_hint bait behind, so nothing can ever resurrect this
+    exact incarnation into a resume-then-immediately-exit churn loop.
+    ``operator_redrive`` still spawns a FRESH operator later if/when new
+    backlog work actually appears — that is a distinct, deliberate act."""
     _clear_recycle_state(meta)
     role = meta.get("role") or ""
     task_id = meta.get("task_id")
@@ -463,19 +518,23 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
     # sessions.suspend() rewrites the md wholesale — re-read then layer the
     # resume-state fields on top (it doesn't know about them).
     fresh = sessions._read_session_metadata(md_path) or meta
-    fresh["resumable"] = True
     fresh["recycled_at"] = _now_iso()
-    fresh["resume_hint"] = (
-        f"idle cache-window recycle "
-        f"({'compacted' if compacted else 'no-compact, below threshold'}) — "
-        f"resume via sessions.resume to continue {task_id or role or sid}.")
+    if not self_terminate:
+        fresh["resumable"] = True
+        fresh["resume_hint"] = (
+            f"idle cache-window recycle "
+            f"({'compacted' if compacted else 'no-compact, below threshold'}) — "
+            f"resume via sessions.resume to continue {task_id or role or sid}.")
     sessions._write_session_metadata(md_path, fresh, atomic=True)
 
     # T-0470: a cache-window recycle finalized → record it on the unified surface.
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_RECYCLED,
-                          now=now, cause="idle_timeout", compacted=compacted)
-    log.info("idle_timeout: recycled %s (compacted=%s) — recorded resumable state",
-             sid, compacted)
+                          now=now, cause="idle_timeout", compacted=compacted,
+                          self_terminate=self_terminate)
+    log.info("idle_timeout: recycled %s (compacted=%s, self_terminate=%s) — %s",
+             sid, compacted, self_terminate,
+             "no resume state (deliberate stop)" if self_terminate
+             else "recorded resumable state")
     return True
 
 
@@ -559,6 +618,92 @@ def _finalize_compact_stay(sid: str, meta: dict, md_path, now: float,
     sessions._write_session_metadata(md_path, meta, atomic=True)
     log.info("idle_timeout: compact-and-stay finalized for %s — compacted "
              "in place, session left running", sid)
+    return True
+
+
+# --- T-0655: keep-alive nudge (drive=on operators) --------------------------
+
+def keepalive_due(last_at: Any, now: float, window: int) -> bool:
+    """Anti-loop guard mirroring :func:`compact_stay_due`: a keep-alive nudge
+    may fire at most once per cache window. ``last_at`` is the ISO stamp the
+    previous nudge was sent at; ``None``/unparsable never blocks (first fire
+    ever). Without this, an operator that ignores the nudge (composer text
+    sitting unprocessed — no new turn, so the idle clock never resets) would
+    get re-nudged every ~60s tick instead of once per window."""
+    ts = sessions._parse_ts_epoch(last_at)
+    if ts is None:
+        return True
+    return (now - ts) >= window
+
+
+def _keepalive_nudge_text(cfg: Any, slug: str) -> str:
+    """T-0655 Addendum 1: the nudge text itself carries the quota-utilization
+    steering — a hard weekly target live means "primary work ran dry" is NOT
+    by itself grounds for drive=off; the operator should pull from maintenance
+    backlog first. This is prompt-level framing for the operator's own
+    judgement call, not a mechanism this module can enforce."""
+    from bot_squad_worker import operator_redrive
+
+    target = operator_redrive.weekly_quota_target_pct(cfg)
+    text = ("continue — your ~1h cache window is about to expire while idle; "
+            "you are drive=on so the system is keeping you alive instead of "
+            "recycling you. Judge for yourself whether there is genuinely "
+            "more unsupervised work you can safely do right now.")
+    if target is not None:
+        text += (
+            f" A weekly quota-utilization target ({target:g}%) is live — "
+            "running out of primary-track work is NOT by itself a reason to "
+            "set drive=off; pull from the maintenance backlog (tests, code "
+            "quality, bug hunting, deeper UI testing) before considering it."
+        )
+    else:
+        text += (
+            " No quota-utilization target is set — if there is truly nothing "
+            "left you can safely do without a human present, set drive=off "
+            "yourself (`bsq drive off`) and this session will end."
+        )
+    return text
+
+
+def _send_keepalive_nudge(sid: str, text: str) -> None:
+    from bot_squad_worker.actions import _action_inject_input
+    _action_inject_input({"sid": sid, "text": text})
+
+
+def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                           md_path, now: float, pane: str | None,
+                           user_home: str) -> bool:
+    """T-0655: the drive=on-operator counterpart to :func:`_maybe_compact_and_stay`
+    — same idle-window trigger, postpone/tracked-job gates, and composer-ready
+    gate, but instead of ``/compact`` it injects a plain-text keep-alive nudge
+    and NEVER terminates. ``operator_keepalive_last_at`` bounds it to at most
+    once per cache window (:func:`keepalive_due`)."""
+    idle_age = _idle_age(row, meta, user_home, now)
+    if not idle_due(idle_age, idle_timeout_sec()):
+        return False
+    if not keepalive_due(meta.get("operator_keepalive_last_at"), now, idle_timeout_sec()):
+        return False  # already nudged once this cache window
+    if postpone_active(meta.get("idle_postpone_until"), now):
+        return False
+    if tracking_long_job(cfg, slug, sid):
+        log.info("idle_timeout: keepalive auto-postpone %s — waiting on a "
+                 "tracked long job", sid)
+        return False
+    if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
+        return False
+
+    try:
+        _send_keepalive_nudge(sid, _keepalive_nudge_text(cfg, slug))
+    except Exception:
+        log.exception("idle_timeout: keepalive nudge send failed for %s "
+                      "(will retry)", sid)
+        return False
+    meta["operator_keepalive_last_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
+                          now=now, reason="idle_window_keepalive")
+    log.info("idle_timeout: sent keep-alive nudge to drive=on operator %s — "
+             "session stays, no recycle", sid)
     return True
 
 

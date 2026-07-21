@@ -127,6 +127,11 @@ def test_extract_slash_command_help():
     assert TL.extract_slash_command(msg) == ("help", "")
 
 
+def test_extract_slash_command_state():
+    msg = _slash_message("/state")
+    assert TL.extract_slash_command(msg) == ("state", "")
+
+
 def test_extract_slash_command_unknown_returns_none():
     msg = _slash_message("/garbage something")
     assert TL.extract_slash_command(msg) is None
@@ -457,6 +462,73 @@ def test_handle_slash_help_affirms_free_form_steering(tmp_path, monkeypatch):
     result = TL._handle_slash(cfg, "12345", "help", "")
     assert result["action"] == "help"
     assert any("no command" in t.lower() for t in echoes)
+
+
+# ---------------------------------------------------------------------------
+# T-0655 (Addendum 1): /state — drive on/off, quota target, lifecycle state.
+# ---------------------------------------------------------------------------
+
+def test_handle_slash_state_reports_drive_and_target(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+
+    import bot_squad_worker.dispatch as D
+    import bot_squad_worker.operator_redrive as ORD
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(D, "live_operator_sids", lambda c, slug: ["S-op-1"])
+    monkeypatch.setattr(S, "_find_session_md", lambda sdir, sid, uuid: sdir / f"{sid}.md")
+    monkeypatch.setattr(S, "_read_session_metadata", lambda p: {"drive": "off"})
+    monkeypatch.setattr(S, "list_sessions", lambda c, slug: [
+        {"sid": "S-op-1"}, {"sid": "S-dev-1"},
+    ])
+    monkeypatch.setattr(ORD, "pacing_status", lambda c, slug: {
+        "weekly_target_pct": 20.0, "spend_pct": 4.5, "recommendation": "advisory",
+    })
+
+    result = TL._handle_slash(cfg, "12345", "state", "")
+    assert result["ok"] is True
+    assert result["action"] == "state"
+    assert result["drive"] == "off"
+    assert result["operator"] == "S-op-1"
+    body = echoes[0]
+    assert "S-op-1" in body
+    assert "drive=off" in body
+    assert "20%" in body
+    assert "2" in body  # active session count
+
+
+def test_handle_slash_state_no_live_operator(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+
+    import bot_squad_worker.dispatch as D
+    import bot_squad_worker.operator_redrive as ORD
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(D, "live_operator_sids", lambda c, slug: [])
+    monkeypatch.setattr(S, "list_sessions", lambda c, slug: [])
+    monkeypatch.setattr(ORD, "pacing_status", lambda c, slug: {
+        "weekly_target_pct": None, "spend_pct": None, "recommendation": "ok",
+    })
+
+    result = TL._handle_slash(cfg, "12345", "state", "")
+    assert result["ok"] is True
+    assert result["operator"] is None
+    assert result["drive"] == "n/a (no live operator)"
+    assert "not set" in echoes[0]
+
+
+def test_handle_slash_state_unlinked_chat(tmp_path, monkeypatch):
+    """A chat with no project mapped to it (tg_chat mismatch) is refused,
+    not a crash reading a nonexistent slug's session dir."""
+    cfg = _make_cfg(tmp_path, tg_chat="99999")  # different from the call below
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+
+    result = TL._handle_slash(cfg, "12345", "state", "")
+    assert result["ok"] is False
+    assert result["action"] == "state_no_project"
 
 
 # ---------------------------------------------------------------------------

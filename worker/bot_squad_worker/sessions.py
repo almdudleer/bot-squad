@@ -3162,6 +3162,56 @@ def set_drift_paused(cfg: Any, slug: str, sid: str, paused: bool) -> dict:
     return {"ok": True, "sid": meta.get("sid", sid), "drift_paused": bool(paused)}
 
 
+def set_drive(cfg: Any, slug: str, sid: str, on: bool) -> dict:
+    """T-0655: the operator's OWN drive=on/off toggle (``bsq drive off`` /
+    ``bsq drive on``).
+
+    ``drive`` governs whether THIS operator session stays alive across its
+    own ~1h cache-expiry-while-idle window (:func:`recycle_gate.
+    operator_drive_on`) — distinct from ``bsq pace pause`` (a project-wide
+    dispatch gate) and from the human's own :func:`recycle_gate.
+    user_session_exempt` sessions (exempted forever, not a self-toggle).
+    ``drive`` defaults to ON implicitly (unset reads as on); this verb writes
+    an EXPLICIT ``on``/``off`` string (rather than popping the field on
+    "on", the way ``set_drift_paused`` does) so ``/state`` and any other
+    reader can distinguish "explicitly re-enabled" from "never touched" —
+    both behave identically to the recycle gate either way.
+
+    Operator-role only: only the operator itself may decide its own
+    continuity, per the stakeholder's explicit ask ("операторе может решить
+    ... и поставить drive=off"). Refuses for any other role so a stray call
+    from a dev/TL session can't silently no-op a field that governs nothing
+    for it. Resolves the md by SID with the rename-tolerant claude_uuid
+    fallback, mirroring :func:`set_drift_paused`.
+
+    Returns ``{ok, sid, drive}``.
+    """
+    from bot_squad_worker.actions import ActionError
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"set_drive: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    md_path = _find_session_md(sessions_dir, sid, None)
+    if md_path is None:
+        raise ActionError(f"set_drive: no session metadata for SID {sid!r}")
+    meta = _read_session_metadata(md_path)
+    if meta is None:
+        raise ActionError(f"set_drive: unreadable session metadata for SID {sid!r}")
+
+    role = meta.get("role") or _derive_role(
+        meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+    if role != "operator":
+        raise ActionError(
+            f"set_drive: {sid!r} is role {role!r}, not operator — drive only "
+            "applies to the operator's own continuity")
+
+    meta["drive"] = "on" if on else "off"
+    _write_session_metadata(md_path, meta, atomic=True)
+    return {"ok": True, "sid": meta.get("sid", sid), "drive": meta["drive"]}
+
+
 def set_idle_postpone(cfg: Any, slug: str, sid: str,
                       seconds: int | None = None, reason: str | None = None) -> dict:
     """T-0466: defer this session's next cache-window recycle (``bsq postpone``).

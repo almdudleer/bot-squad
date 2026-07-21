@@ -37,6 +37,19 @@ in place before its cache window lapses, using :func:`user_session_exempt`
 directly rather than :func:`recycle_allowed` — it just never terminates the
 session the way the non-exempt compact-terminate-remember flow (T-0566) does.
 See ``idle_timeout``'s module docstring for the full state machine.
+
+T-0655 operator drive=on: a SECOND, narrower exception in the same shape as
+T-0617 — an operator-role session with ``drive`` on (the default; see
+:func:`operator_drive_on`) never rides the terminate-and-remember flow either,
+but for a different reason than the human's own sessions: the STAKEHOLDER
+verbatim ask is that a `drive=on` operator must not be silently recycled
+purely because its cache is about to expire while idle — the system should
+keep it alive with a keep-alive nudge instead, and only the OPERATOR ITSELF
+(by setting ``drive=off``) may permit a recycle. ``idle_timeout`` checks this
+directly (like :func:`user_session_exempt`, not folded into
+:func:`recycle_allowed`) and, for a drive=on operator, sends a "continue"
+nudge in place of the compact/terminate machinery. See ``idle_timeout``'s
+module docstring for the full state machine.
 """
 from __future__ import annotations
 
@@ -133,6 +146,31 @@ def user_session_exempt(role: str | None = None, window: str | None = None,
         return True
     marker = (meta or {}).get("recycle_exempt")
     return str(marker or "").strip().lower() in ("true", "1", "yes")
+
+
+def operator_drive_on(role: str | None = None, meta: dict | None = None) -> bool:
+    """T-0655: True for an operator-role session whose ``drive`` is on.
+
+    ``drive`` is a session-md field DISTINCT from ``bsq pace pause`` (a
+    project-wide dispatch gate — stop admitting new work) and from
+    :func:`user_session_exempt` (the human's own live sessions, exempted
+    forever). ``drive`` governs whether THIS operator session itself stays
+    alive across its own ~1h cache-expiry-while-idle window, or is allowed to
+    recycle. Only ever meaningful for ``role == "operator"`` — every other
+    role always returns False here, unaffected by this predicate.
+
+    Absent/unset defaults to ON, matching the documented "operator runs
+    non-stop while work is on" behaviour (clarification-01) — an operator
+    never has to opt in to staying alive; it has to explicitly opt OUT
+    (``bsq drive off``) once it judges further unsupervised work unsafe or
+    unavailable. Any value other than the literal ``off`` (case-insensitive)
+    reads as on, so a truthy/garbage stamp fails safe toward "keep it alive"
+    rather than toward "recycle it".
+    """
+    if (role or "") != "operator":
+        return False
+    val = str((meta or {}).get("drive") or "on").strip().lower()
+    return val != "off"
 
 
 def is_attached(tmux_target: str | None) -> bool:

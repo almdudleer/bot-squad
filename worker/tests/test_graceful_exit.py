@@ -377,17 +377,26 @@ def test_tick_exits_done_active_skips_suspended(tmp_path, seams, monkeypatch):
 # --- NO ROLE EXEMPT from recycle-on-timeout (DoD audit) ---------------------
 
 def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
-    """idle_timeout must sweep EVERY role EXCEPT the human's own live chat. We
-    drive an OPERATOR row through maybe_recycle and confirm it recycles (not
-    skipped on role). Guards against re-introducing a general role exemption
-    (the old per-role drift.py-style scoping the uniform lifecycle removes).
+    """idle_timeout must sweep EVERY role EXCEPT the human's own live chat (and,
+    per T-0655, a drive=on operator — see below). We drive a TEAMLEAD row
+    through maybe_recycle and confirm it recycles (not skipped on role).
+    Guards against re-introducing a general role exemption (the old per-role
+    drift.py-style scoping the uniform lifecycle removes).
 
     T-0564 (2026-07-04, superseding this test's original "…user-conv alike"
     claim): ``user-conversation`` IS now a deliberate, narrow exemption — the
     human's own live chat is never auto-recycled — see
-    test_idle_timeout.py::test_user_conversation_role_never_recycled. Every
-    OTHER role (operator/TL/dev) stays non-exempt, which is what this test
-    still asserts.
+    test_idle_timeout.py::test_user_conversation_role_never_recycled.
+
+    T-0655 (2026-07-21, superseding this test's ORIGINAL operator-row subject):
+    an operator with ``drive=on`` (the default) is now ALSO a deliberate,
+    narrow exception — it gets a keep-alive nudge instead of being recycled;
+    see test_idle_timeout.py::test_drive_on_operator_gets_keepalive_nudge_not_recycled
+    and recycle_gate.operator_drive_on. This test switches its subject to a
+    TEAMLEAD row (a role T-0655 does not touch at all) so it keeps guarding
+    against a general/accidental role exemption without colliding with the
+    now-deliberate operator carve-out. dev/TL stay non-exempt, which is what
+    this test still asserts.
     """
     compacted = []
     monkeypatch.setattr(A, "_pane_for", lambda sid: "%9")
@@ -399,10 +408,10 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
                         lambda cwd, uuid, home: time.time() - 5000.0)
     monkeypatch.delenv("BOT_SQUAD_IDLE_TIMEOUT", raising=False)
     monkeypatch.delenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", raising=False)
-    sid = "S-almdudleer-bot-squad-operator-p1"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
-    row = _row(sid, role="operator", window="operator", task_id=None,
+    sid = "S-almdudleer-bot-squad-TL-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="TL", task_id=None)
+    row = _row(sid, role="teamlead", window="TL", task_id=None,
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert compacted == [sid]  # operator recycled → not exempt
+    assert compacted == [sid]  # teamlead recycled → not exempt

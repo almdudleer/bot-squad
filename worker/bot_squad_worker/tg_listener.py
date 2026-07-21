@@ -122,14 +122,16 @@ def extract_reply_target(message: dict) -> Optional[tuple[str, str]]:
 
 
 def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
-    """Extract (cmd, args_str) if this is a /sessions, /say, or /help command."""
+    """Extract (cmd, args_str) if this is a /sessions, /say, /help, /project,
+    or /state command."""
     text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return None
     parts = text.split(None, 1)
     cmd = parts[0].lstrip("/").split("@")[0]   # strip @botname if present
     args = parts[1] if len(parts) > 1 else ""
-    if cmd not in {"sessions", "say", "help", "project"}:
+    # T-0655 (Addendum 1): /state — drive on/off, quota target, lifecycle state.
+    if cmd not in {"sessions", "say", "help", "project", "state"}:
         return None
     return (cmd, args)
 
@@ -789,8 +791,49 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
                 "routed to the project.\n"
                 "Reply to a notification to inject text into the session.\n"
                 "/sessions — list active sessions\n"
-                "/say <sid> <text> — direct inject without reply-quoting")
+                "/say <sid> <text> — direct inject without reply-quoting\n"
+                "/state — drive on/off, quota target, core lifecycle state")
         return {"ok": True, "action": "help"}
+
+    if cmd == "state":
+        # T-0655 (Addendum 1): "нужна команда в чате типа /state, которая
+        # будет показывать состояние проекта по основным вещам, особенно
+        # drive on, таргет и т.п." — gather the live signals, then _notify
+        # (the /sessions pattern), not a static-text dump (the /help pattern).
+        from bot_squad_worker import dispatch as _dispatch
+        from bot_squad_worker import operator_redrive as _ord
+
+        slug = _slug_for_chat(cfg, chat_id)
+        if not slug:
+            _notify(cfg, chat_id, "❌ /state: this chat isn't linked to a registered project")
+            return {"ok": False, "action": "state_no_project"}
+
+        live_ops = _dispatch.live_operator_sids(cfg, slug)
+        op_sid = live_ops[0] if live_ops else None
+        drive = "n/a (no live operator)"
+        if op_sid:
+            sessions_dir = cfg.data_dir / slug / "sessions"
+            md_path = S._find_session_md(sessions_dir, op_sid, None)
+            meta = S._read_session_metadata(md_path) if md_path else None
+            drive = str((meta or {}).get("drive") or "on")
+
+        pacing = _ord.pacing_status(cfg, slug)
+        target = pacing["weekly_target_pct"]
+        target_str = f"{target:g}%" if target is not None else "(not set)"
+        spend_str = (f"{pacing['spend_pct']:.1f}%"
+                     if pacing["spend_pct"] is not None else "unknown")
+        active = len(S.list_sessions(cfg, slug))
+
+        body = "\n".join([
+            f"Project: {slug}",
+            f"Operator: {op_sid or '(none live)'}  drive={drive}",
+            f"Weekly quota target: {target_str}  "
+            f"(spend so far: {spend_str}, pacing: {pacing['recommendation']})",
+            f"Active sessions: {active}",
+        ])
+        _notify(cfg, chat_id, body)
+        return {"ok": True, "action": "state", "slug": slug, "drive": drive,
+                "operator": op_sid}
 
     return {"ok": False, "action": "unknown_cmd"}
 

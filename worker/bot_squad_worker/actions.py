@@ -375,6 +375,20 @@ def _page_detail_link(cfg: Any, *, slug: str = "", tg_chat_id: str = "",
     back to the old generic text rather than a broken link. ``getattr``
     throughout: some test doubles stand in a bare ``SimpleNamespace`` for
     ``Project`` with only the fields that test exercises.
+
+    T-0657: the ``/p/<slug>/...`` route lives ONLY inside bot-squad's own
+    web dashboard (``web/src/App.tsx``), deployed once at whichever project
+    is flagged ``mothership = true`` in projects.toml. A non-mothership
+    project's own ``staging_url`` is a DIFFERENT real deployment (that
+    project's own product host, e.g. watchrobot's
+    signal-staging.dev.uzinvestapi.com) with no such route — using it as the
+    link base produced a garbage/404 stakeholder-DM link. The base host is
+    therefore always the mothership project's ``staging_url``; only
+    ``resolved_slug``/``sid``/``task_id`` in the path identify the target
+    project's session. Falls back to the resolved project's own
+    ``staging_url`` when no project is flagged mothership (e.g. a bare
+    single-project test fixture) so existing single-project behaviour is
+    unchanged.
     """
     resolved_slug = slug
     project = cfg.projects.get(slug) if slug else None
@@ -388,7 +402,12 @@ def _page_detail_link(cfg: Any, *, slug: str = "", tg_chat_id: str = "",
     staging_url = getattr(project, "staging_url", "") if project else ""
     if not staging_url or not resolved_slug:
         return ""
-    base = staging_url.rstrip("/")
+    dashboard_url = ""
+    for p in cfg.projects.values():
+        if getattr(p, "mothership", False):
+            dashboard_url = getattr(p, "staging_url", "") or ""
+            break
+    base = (dashboard_url or staging_url).rstrip("/")
     if task_id:
         return f"{base}/p/{resolved_slug}/t/{task_id}"
     if sid.startswith("S-"):

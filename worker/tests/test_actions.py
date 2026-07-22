@@ -3019,6 +3019,55 @@ def test_send_stakeholder_dm_link_scoped_to_real_session_sid(tmp_config_dir, mon
     assert sent2.endswith("https://staging.example.com/p/test-project/sessions")
 
 
+def test_page_detail_link_uses_mothership_host_for_other_project(tmp_path):
+    """T-0657: on a multi-project install, a page-detail link for a
+    NON-mothership project (e.g. watchrobot) must use the mothership
+    project's own staging_url as the dashboard host — the ``/p/<slug>/...``
+    route lives only in bot-squad's own web dashboard, never in the target
+    project's own product deployment (which 404s / is garbage). Only the
+    slug/sid in the path identify the target project's session."""
+    import bot_squad_worker.actions as A
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.bot-squad]\n'
+        'slug = "bot-squad"\n'
+        'display_name = "Bot Squad"\n'
+        'repo_path = "/tmp/bot-squad-repo"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = "https://botsquad.dev"\n'
+        'staging_url = "https://staging.botsquad.dev"\n'
+        'dev_url = "https://dev.botsquad.dev"\n'
+        'deploy_targets = ["staging", "prod"]\n'
+        'mothership = true\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+        '\n'
+        '[projects.watchrobot]\n'
+        'slug = "watchrobot"\n'
+        'display_name = "Watchrobot"\n'
+        'repo_path = "/tmp/watchrobot-repo"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = "https://signal-tracker.dev.uzinvestapi.com"\n'
+        'staging_url = "https://signal-staging.dev.uzinvestapi.com"\n'
+        'dev_url = "https://signal-dev.dev.uzinvestapi.com"\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "404580642"\n'
+        'created_at = 2026-05-10\n'
+    )
+    (cfg_dir / "secrets.toml").write_text(
+        '[telegram]\n'
+        'bot_token = "TESTBOT:TOKEN"\n'
+        'auth_age_max = 86400\n'
+    )
+    cfg = Config.load(cfg_dir)
+    link = A._page_detail_link(cfg, slug="watchrobot", sid="S-almdudleer-x-p1")
+    assert link == "https://staging.botsquad.dev/p/watchrobot/sessions?sid=S-almdudleer-x-p1"
+    assert "signal-staging.dev.uzinvestapi.com" not in link
+
+
 def test_send_stakeholder_dm_link_present_via_max_transport_too(tmp_config_dir, monkeypatch):
     """T-0635 DoD: the link must resolve for both TG and MAX transports (the
     T-0610 page-mode switch) — it's baked into ``message`` before the

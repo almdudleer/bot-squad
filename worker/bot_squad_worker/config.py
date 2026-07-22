@@ -40,6 +40,12 @@ class Project:
     # ticket. Only projects that explicitly set ``drift_enforcement = true`` get
     # the tick; everyone else is left alone. Default False = safe (opt-in).
     drift_enforcement: bool = False
+    # T-0657: SSOT for is_mothership() (mirrors install_role.is_mothership's
+    # projects.toml read) — the one install whose OWN staging_url serves the
+    # bot-squad web dashboard (/p/<slug>/... routes). Needed here (not just
+    # re-read from disk) so _page_detail_link can resolve the dashboard host
+    # for a stakeholder-DM link about a DIFFERENT project's session.
+    mothership: bool = False
 
     def repo_for_target(self, target: str) -> Path:
         """Pick the clone the deploy recipe EXECUTES in for ``target``.
@@ -99,6 +105,7 @@ class Project:
             repo_deploy=Path(raw["repo_deploy"]) if raw.get("repo_deploy") else None,
             repo_workspace=Path(raw["repo_workspace"]) if raw.get("repo_workspace") else None,
             drift_enforcement=bool(raw.get("drift_enforcement", False)),
+            mothership=bool(raw.get("mothership", False)),
         )
 
 

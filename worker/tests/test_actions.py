@@ -54,8 +54,9 @@ def test_registry_lists_only_allowed_actions():
         "tg_stall_clear",
         # T-0639: runtime (chat_id,thread_id)->project topic-binding surface.
         "tg_topic_bind", "tg_topic_unbind", "tg_topic_list",
-        # T-0660: create-and-bind a forum topic in one step + rename General.
-        "tg_topic_create", "tg_topic_rename_general",
+        # T-0660: create-and-bind a forum topic in one step + rename General
+        # + close-on-done.
+        "tg_topic_create", "tg_topic_rename_general", "tg_topic_close_for_ticket",
         "pause_deploys", "resume_deploys",
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",
@@ -517,6 +518,57 @@ def test_tg_notify_explicit_chat_id_overrides_locus(tmp_path, monkeypatch):
     conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 42)
 
     A.dispatch("tg_notify", {"chat_id": "555", "slug": "group-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "555"
+    assert fake.calls[0]["topic_id"] is None
+
+
+# --- T-0660 Phase 2: direct-write into a task's topic (`bsq topic say`) ---
+# resolves chat_id/topic_id from the ticket's bound topic.
+
+def test_tg_notify_ticket_id_resolves_task_topic(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1003761939853", 42, "group-project",
+                            ticket_id="T-0700", session_id="S-dev-p9")
+
+    A.dispatch("tg_notify", {"ticket_id": "T-0700", "message": "on it", "sid": "S-dev-p9"})
+    assert fake.calls[0]["chat_id"] == "-1003761939853"
+    assert fake.calls[0]["topic_id"] == 42
+    assert fake.calls[0]["sid"] == "S-dev-p9"
+
+
+def test_tg_notify_ticket_id_unbound_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="no topic bound to ticket"):
+        A.dispatch("tg_notify", {"ticket_id": "T-9999", "message": "hi"})
+
+
+def test_tg_notify_explicit_topic_id_overrides_ticket_binding(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1003761939853", 42, "group-project", ticket_id="T-0700")
+
+    A.dispatch("tg_notify", {"ticket_id": "T-0700", "message": "hi", "topic_id": 7})
+    assert fake.calls[0]["topic_id"] == 7
+
+
+def test_tg_notify_explicit_chat_id_overrides_ticket_id(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1003761939853", 42, "group-project", ticket_id="T-0700")
+
+    A.dispatch("tg_notify", {"ticket_id": "T-0700", "chat_id": "555", "message": "hi"})
     assert fake.calls[0]["chat_id"] == "555"
     assert fake.calls[0]["topic_id"] is None
 
@@ -2965,6 +3017,24 @@ def test_tg_topic_create_with_ticket_id_binds_task_topic(tmp_config_dir, monkeyp
     assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None}
 
 
+def test_tg_topic_create_with_session_id_binds_originating_session(tmp_config_dir, monkeypatch):
+    """T-0660 Phase 2: an optional session_id routes an inbound topic message
+    straight to that originating session (tg_listener._handle_topic_bound),
+    not the project's user-conversation attendant."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    fake = _FakeForumTg()
+    cfg = Config.load(tmp_config_dir)
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "name": "[test-project] Add user panel",
+        "slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9",
+    })
+    rec = tg_bindings.resolve(cfg, "111", out["thread_id"])
+    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9"}
+
+
 def test_tg_topic_create_unknown_slug_raises(tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 
@@ -2991,6 +3061,63 @@ def test_tg_topic_create_rejects_unexpected_param(tmp_config_dir, monkeypatch):
         A.dispatch("tg_topic_create", {
             "chat_id": "111", "name": "X", "slug": "test-project", "bogus": "y",
         })
+
+
+# --- T-0660 field note (TL p23): a documented TG API failure (bad chat_id,
+# missing can_manage_topics admin right, …) must surface as a legible
+# ActionError, not an opaque 500 — tg.py's _call already puts the API's
+# `description` into the exception message; these actions must not let it
+# bubble up unwrapped. ---
+
+def test_tg_topic_create_surfaces_tg_api_error_as_action_error(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    class _FailingForumTg(_FakeForumTg):
+        def create_forum_topic(self, *, chat_id, name):
+            raise RuntimeError("Telegram API error (createForumTopic): CHAT_ADMIN_REQUIRED")
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FailingForumTg())
+    with pytest.raises(ActionError, match="CHAT_ADMIN_REQUIRED"):
+        A.dispatch("tg_topic_create", {"chat_id": "111", "name": "X", "slug": "test-project"})
+
+
+def test_tg_topic_rename_general_surfaces_tg_api_error_as_action_error(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    class _FailingForumTg(_FakeForumTg):
+        def rename_general_forum_topic(self, *, chat_id, name):
+            raise RuntimeError("Telegram API error (editGeneralForumTopic): CHAT_ADMIN_REQUIRED")
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FailingForumTg())
+    with pytest.raises(ActionError, match="CHAT_ADMIN_REQUIRED"):
+        A.dispatch("tg_topic_rename_general", {"chat_id": "111", "name": "X"})
+
+
+def test_tg_topic_close_for_ticket_surfaces_tg_api_error_as_action_error(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    class _FailingForumTg(_FakeForumTg):
+        def close_forum_topic(self, *, chat_id, thread_id):
+            raise RuntimeError("Telegram API error (closeForumTopic): TOPIC_NOT_FOUND")
+
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FailingForumTg())
+    tg_bindings.set_binding(cfg, "111", 42, "test-project", ticket_id="T-0700")
+    with pytest.raises(ActionError, match="TOPIC_NOT_FOUND"):
+        A.dispatch("tg_topic_close_for_ticket", {"ticket_id": "T-0700"})
+
+
+def test_tg_topic_create_surfaces_httpx_status_error_as_action_error(tmp_config_dir, monkeypatch):
+    import httpx
+    import bot_squad_worker.actions as A
+
+    class _FailingForumTg(_FakeForumTg):
+        def create_forum_topic(self, *, chat_id, name):
+            raise httpx.HTTPStatusError("502 Bad Gateway", request=None, response=None)
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FailingForumTg())
+    with pytest.raises(ActionError, match="502 Bad Gateway"):
+        A.dispatch("tg_topic_create", {"chat_id": "111", "name": "X", "slug": "test-project"})
 
 
 def test_tg_topic_rename_general_calls_edit_general_forum_topic(tmp_config_dir, monkeypatch):
@@ -3021,6 +3148,69 @@ def test_tg_topic_rename_general_rejects_unexpected_param(tmp_config_dir, monkey
     _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
     with pytest.raises(ActionError, match="unexpected params"):
         A.dispatch("tg_topic_rename_general", {"chat_id": "111", "name": "X", "bogus": "y"})
+
+
+# ---------------------------------------------------------------------------
+# T-0660 Phase 2: close a ticket's dedicated forum topic (if any) when the
+# ticket reaches its terminal status — `bsq ticket update <id> closed`.
+# ---------------------------------------------------------------------------
+
+
+def test_tg_topic_close_for_ticket_closes_and_clears_binding(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    fake = _FakeForumTg()
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    tg_bindings.set_binding(cfg, "111", 42, "test-project", ticket_id="T-0700")
+
+    out = A.dispatch("tg_topic_close_for_ticket", {"ticket_id": "T-0700"})
+    assert out == {"ok": True, "closed": True, "chat_id": "111", "thread_id": 42}
+    assert fake.closed == [{"chat_id": "111", "thread_id": 42}]
+    assert tg_bindings.resolve(cfg, "111", 42) is None  # binding cleared
+
+
+def test_tg_topic_close_for_ticket_no_dedicated_topic_is_noop(tmp_config_dir, monkeypatch):
+    """The common case (T-0660 Addendum 2): most tasks stay in the project's
+    General room, no dedicated topic exists — no-op, not an error."""
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_close_for_ticket", {"ticket_id": "T-9999"})
+    assert out == {"ok": True, "closed": False}
+    assert fake.closed == []
+
+
+def test_tg_topic_close_for_ticket_general_binding_not_closed(tmp_config_dir, monkeypatch):
+    """A ticket_id degenerately bound to a chat's General feed (thread_id=None)
+    has nothing closeForumTopic applies to — skipped, not an API error."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    fake = _FakeForumTg()
+    cfg, _ = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    tg_bindings.set_binding(cfg, "111", None, "test-project", ticket_id="T-0700")
+
+    out = A.dispatch("tg_topic_close_for_ticket", {"ticket_id": "T-0700"})
+    assert out == {"ok": True, "closed": False}
+    assert fake.closed == []
+
+
+def test_tg_topic_close_for_ticket_missing_required_param_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="missing required params"):
+        A.dispatch("tg_topic_close_for_ticket", {})
+
+
+def test_tg_topic_close_for_ticket_rejects_unexpected_param(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("tg_topic_close_for_ticket", {"ticket_id": "T-0700", "bogus": "y"})
 
 
 # ---------------------------------------------------------------------------

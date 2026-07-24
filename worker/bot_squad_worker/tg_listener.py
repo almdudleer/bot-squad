@@ -456,17 +456,31 @@ def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
 
 
 def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -> dict:
-    """T-0639: an unquoted message arriving in a BOUND forum topic.
+    """T-0639/T-0660: an unquoted message arriving in a BOUND forum topic.
 
     The topic binding IS the routing signal (D-0055 §2 step 1) — the
     strongest, zero-ambiguity one there is — so this bypasses the sticky-pin
-    resolution `_handle_unquoted` does for the DM firehose entirely, and
-    routes straight to the bound project via the SAME durable path (T-0489
-    append + T-0485 ensure-session) that path uses. Unrecognized senders keep
-    the same skip as the rest of the listener (no identity to anchor on)."""
+    resolution `_handle_unquoted` does for the DM firehose entirely.
+    Unrecognized senders keep the same skip as the rest of the listener (no
+    identity to anchor on).
+
+    T-0660: a binding carrying a ``session_id`` is a per-TASK topic (not a
+    project/General one) — it routes straight to that ORIGINATING session by
+    id (reusing the same inject_input path an explicit ``[<sid>]`` reply
+    uses), never through the project's user-conversation attendant, and does
+    NOT update the conversation locus (T-0667) — a task-topic message must
+    never redirect the project's own attendant-reply relay into the task
+    topic. A plain project/General binding (no session_id) keeps the T-0639
+    behavior: durable append (T-0489) + ensure-session (T-0485) + locus."""
     if not gid:
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
     slug = binding["slug"]
+    session_id = binding.get("session_id")
+    if session_id:
+        result = _handle_reply(cfg, chat_id, session_id, msg.get("text") or "")
+        result["action"] = f"task_topic_{result.get('action', 'inject')}"
+        result["slug"] = slug
+        return result
     append_conversation(cfg, slug, gid, msg)
     # T-0667: remember where this landed so an OUTGOING reply follows the
     # same chat/topic instead of falling back to the project's static DM.

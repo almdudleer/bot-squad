@@ -110,6 +110,34 @@ def test_load_drops_entries_missing_slug(tmp_path):
     assert TB.load(cfg) == {"111:8": {"slug": "ok", "ticket_id": None, "session_id": None}}
 
 
+def test_find_by_ticket_returns_bound_topic(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700", session_id="S-dev-p9")
+    found = TB.find_by_ticket(cfg, "T-0700")
+    assert found == {"chat_id": "111", "thread_id": 42, "slug": "beta", "session_id": "S-dev-p9"}
+
+
+def test_find_by_ticket_none_thread_id_roundtrips(tmp_path):
+    """A ticket bound to a chat's General feed (thread_id=None) round-trips
+    that None, not an empty string."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", None, "beta", ticket_id="T-0700")
+    found = TB.find_by_ticket(cfg, "T-0700")
+    assert found["thread_id"] is None
+
+
+def test_find_by_ticket_unbound_returns_none(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700")
+    assert TB.find_by_ticket(cfg, "T-9999") is None
+
+
+def test_find_by_ticket_ignores_project_topics_without_ticket_id(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 1, "beta")  # plain project/General topic
+    assert TB.find_by_ticket(cfg, "T-0700") is None
+
+
 def test_set_binding_carries_optional_ticket_and_session_id(tmp_path):
     """T-0660 (per-task topics) generalization: the record already carries
     optional ticket_id/session_id so that layer bolts on with no rewrite —

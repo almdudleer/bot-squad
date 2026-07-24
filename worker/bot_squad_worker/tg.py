@@ -140,16 +140,31 @@ class TgClient:
         self._call("editGeneralForumTopic", {"chat_id": chat_id, "name": name})
 
     def _call(self, method: str, payload: dict) -> dict:
-        """POST to an arbitrary Bot API method, honoring the egress proxy."""
+        """POST to an arbitrary Bot API method, honoring the egress proxy.
+
+        Parses the JSON body BEFORE ``raise_for_status()`` (T-0660 field
+        note): a documented Bot API failure (bad chat_id, missing
+        ``can_manage_topics`` admin right, …) comes back as a 4xx with a
+        JSON body carrying ``description`` — e.g. "Bad Request:
+        CHAT_ADMIN_REQUIRED". Calling ``raise_for_status()`` first threw that
+        body away, surfacing only an opaque ``httpx.HTTPStatusError`` at the
+        action layer (a bare 500 with no reason). Now the description is
+        always in the raised message; ``raise_for_status()`` still runs as a
+        fallback for a genuinely non-JSON failure (proxy/network error)."""
         import httpx  # lazy import — not available in all envs
 
         url = _TG_METHOD.format(token=self._token, method=method)
         extra = {"proxy": self._proxy} if self._proxy else {}
         resp = httpx.post(url, json=payload, timeout=10, **extra)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            resp.raise_for_status()
+            raise
         if not data.get("ok"):
-            raise RuntimeError(f"Telegram API error ({method}): {data}")
+            desc = data.get("description") or f"HTTP {resp.status_code}"
+            raise RuntimeError(f"Telegram API error ({method}): {desc}")
+        resp.raise_for_status()
         return data
 
     # ------------------------------------------------------------------

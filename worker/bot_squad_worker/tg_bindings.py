@@ -135,3 +135,24 @@ def bound_chat_ids(cfg: Any) -> set[str]:
     allowlist (T-0639) so a bound supergroup is admitted even when it isn't
     any project's static ``tg_chat``."""
     return {key.split(":", 1)[0] for key in load(cfg)}
+
+
+def find_by_ticket(cfg: Any, ticket_id: str) -> Optional[dict]:
+    """Reverse lookup: the topic bound to ``ticket_id`` (T-0660 direct-write,
+    ``bsq topic say``/``tg_notify``'s ``ticket_id`` param) — a dev/TL/
+    orchestrator session posting into its task's topic knows the ticket id,
+    not the raw ``(chat_id, thread_id)``.
+
+    Returns ``{chat_id, thread_id, slug, session_id}`` for the first binding
+    whose ``ticket_id`` matches, or ``None`` when no topic is bound to it
+    (e.g. the task is being discussed in the project's General instead —
+    T-0660 Addendum 2: a dedicated topic is opt-in, not automatic)."""
+    for key, rec in load(cfg).items():
+        if rec.get("ticket_id") == ticket_id:
+            chat_id, _, thread_part = key.partition(":")
+            thread_id = int(thread_part) if thread_part else None
+            return {
+                "chat_id": chat_id, "thread_id": thread_id,
+                "slug": rec["slug"], "session_id": rec.get("session_id"),
+            }
+    return None

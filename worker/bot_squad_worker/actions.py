@@ -168,6 +168,10 @@ _TG_NOTIFY_ALLOWED = {
     # _page_detail_link. Optional; falls back to a sessions-page link when
     # absent.
     "task_id",
+    # T-0660: direct-write into a task's forum topic — resolves chat_id/
+    # topic_id from the ticket's bound topic (tg_bindings.find_by_ticket)
+    # instead of the caller spelling out chat_id/topic_id itself.
+    "ticket_id",
 }
 
 
@@ -221,6 +225,20 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     chat_id: str | None = params.get("chat_id") or None
     topic_id: int | None = _coerce_topic_id(params.get("topic_id"))
     slug: str = params.get("slug") or ""
+    ticket_id: str = params.get("ticket_id") or ""
+    if not chat_id and ticket_id:
+        # T-0660: direct-write into a task's forum topic (`bsq topic say` /
+        # a dev-TL-orchestrator session posting into its own task's topic) —
+        # resolve straight from the ticket id, ahead of slug/locus
+        # resolution below (a task topic is more specific than the
+        # project's General room).
+        from bot_squad_worker import tg_bindings
+        binding = tg_bindings.find_by_ticket(cfg, ticket_id)
+        if binding is None:
+            raise ActionError(f"tg_notify: no topic bound to ticket {ticket_id!r}")
+        chat_id = binding["chat_id"]
+        if topic_id is None:
+            topic_id = binding["thread_id"]
     if not chat_id:
         if slug:
             project = cfg.projects.get(slug)
@@ -824,8 +842,23 @@ def _action_tg_topic_list(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "bindings": tg_bindings.load(_get_config())}
 
 
+def _tg_call(fn, *, action: str):
+    """Call a TgClient forum-topic method, re-raising a documented Bot API
+    failure (tg.py's ``_call`` puts the API's own ``description`` — e.g.
+    "CHAT_ADMIN_REQUIRED" — into the message) or a transport-level
+    ``httpx.HTTPStatusError`` as ``ActionError`` with that reason intact.
+    Without this, either bubbles up as an opaque, undiagnosable 500 at the
+    action layer (T-0660 field note, TL p23 — a real can_manage_topics
+    permission failure took manual digging to identify)."""
+    import httpx
+    try:
+        return fn()
+    except (RuntimeError, httpx.HTTPStatusError) as e:
+        raise ActionError(f"{action}: {e}") from e
+
+
 _TG_TOPIC_CREATE_REQUIRED = {"chat_id", "name", "slug"}
-_TG_TOPIC_CREATE_ALLOWED = _TG_TOPIC_CREATE_REQUIRED | {"ticket_id"}
+_TG_TOPIC_CREATE_ALLOWED = _TG_TOPIC_CREATE_REQUIRED | {"ticket_id", "session_id"}
 
 
 def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
@@ -834,8 +867,11 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
     ends up with a TG topic that exists but isn't routed anywhere.
 
     Required: chat_id, name, slug. Optional: ticket_id (T-0660 per-task
-    topics — binds ``{slug, ticket_id}`` instead of just ``{slug}``). Returns
-    ``{ok, chat_id, thread_id, slug, name}``.
+    topics — binds ``{slug, ticket_id}`` instead of just ``{slug}``);
+    session_id (Phase 2 — the ORIGINATING session working the task, so an
+    inbound message in the new topic routes straight to it instead of the
+    project's user-conversation attendant, see ``tg_listener._handle_topic_
+    bound``). Returns ``{ok, chat_id, thread_id, slug, name}``.
     """
     extra = set(params) - _TG_TOPIC_CREATE_ALLOWED
     if extra:
@@ -850,11 +886,15 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"tg_topic_create: unknown project slug {slug!r}")
 
     tg = _get_tg_client(cfg)
-    thread_id = tg.create_forum_topic(chat_id=params["chat_id"], name=params["name"])
+    thread_id = _tg_call(
+        lambda: tg.create_forum_topic(chat_id=params["chat_id"], name=params["name"]),
+        action="tg_topic_create",
+    )
 
     from bot_squad_worker import tg_bindings
     tg_bindings.set_binding(
-        cfg, params["chat_id"], thread_id, slug, ticket_id=params.get("ticket_id"),
+        cfg, params["chat_id"], thread_id, slug,
+        ticket_id=params.get("ticket_id"), session_id=params.get("session_id"),
     )
     return {
         "ok": True, "chat_id": params["chat_id"], "thread_id": thread_id,
@@ -885,8 +925,56 @@ def _action_tg_topic_rename_general(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     tg = _get_tg_client(cfg)
-    tg.rename_general_forum_topic(chat_id=params["chat_id"], name=params["name"])
+    _tg_call(
+        lambda: tg.rename_general_forum_topic(chat_id=params["chat_id"], name=params["name"]),
+        action="tg_topic_rename_general",
+    )
     return {"ok": True, "chat_id": params["chat_id"], "name": params["name"]}
+
+
+_TG_TOPIC_CLOSE_FOR_TICKET_REQUIRED = {"ticket_id"}
+_TG_TOPIC_CLOSE_FOR_TICKET_ALLOWED = _TG_TOPIC_CLOSE_FOR_TICKET_REQUIRED
+
+
+def _action_tg_topic_close_for_ticket(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0660: close a ticket's dedicated forum topic (if it has one) when the
+    ticket reaches its terminal status. A no-op, not an error, when no topic
+    is bound to this ticket — most tasks stay in the project's General room
+    (T-0660 Addendum 2: a dedicated topic is opt-in, not automatic), so "no
+    topic to close" is the common case, called from ``bsq ticket update
+    <id> closed``.
+
+    Clears the binding too (``tg_bindings.clear_binding``) — an inbound
+    message can't land in a topic that no longer accepts them, so a stale
+    binding routing into a closed topic would be a dead end.
+
+    Required: ticket_id. Returns ``{ok, closed: bool, chat_id?, thread_id?}``.
+    """
+    extra = set(params) - _TG_TOPIC_CLOSE_FOR_TICKET_ALLOWED
+    if extra:
+        raise ActionError(f"tg_topic_close_for_ticket got unexpected params: {sorted(extra)}")
+    missing = _TG_TOPIC_CLOSE_FOR_TICKET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_topic_close_for_ticket missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import tg_bindings
+    binding = tg_bindings.find_by_ticket(cfg, params["ticket_id"])
+    if binding is None or binding.get("thread_id") is None:
+        # No dedicated topic (or, degenerately, a ticket "bound" to a chat's
+        # General feed — closeForumTopic doesn't apply to General at all).
+        return {"ok": True, "closed": False}
+
+    tg = _get_tg_client(cfg)
+    _tg_call(
+        lambda: tg.close_forum_topic(chat_id=binding["chat_id"], thread_id=binding["thread_id"]),
+        action="tg_topic_close_for_ticket",
+    )
+    tg_bindings.clear_binding(cfg, binding["chat_id"], binding["thread_id"])
+    return {
+        "ok": True, "closed": True,
+        "chat_id": binding["chat_id"], "thread_id": binding["thread_id"],
+    }
 
 
 _CLONE_STATUS_REQUIRED = {"slug"}
@@ -4008,6 +4096,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0660: create-and-bind a forum topic in one step + rename General.
     "tg_topic_create": _action_tg_topic_create,
     "tg_topic_rename_general": _action_tg_topic_rename_general,
+    "tg_topic_close_for_ticket": _action_tg_topic_close_for_ticket,
     # T-0386: per-project forum-topic lifecycle (create-on-project / GC-on-archive).
     "provision_project_topics": _action_provision_project_topics,
     "gc_project_topics": _action_gc_project_topics,
@@ -4138,6 +4227,7 @@ ACTION_MODES: dict[str, str] = {
     # editGeneralForumTopic) — coordinator-only like the rest of the TG ops.
     "tg_topic_create": "coordinator_only",
     "tg_topic_rename_general": "coordinator_only",
+    "tg_topic_close_for_ticket": "coordinator_only",
     # T-0386: use the coordinator TG client + project config (single writer of
     # the per-project topic map) — coordinator-only like the rest of the TG ops.
     "provision_project_topics": "coordinator_only",

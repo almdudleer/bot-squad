@@ -534,16 +534,24 @@ def cmd_topic_create(args) -> None:
     """Create a forum topic AND bind it to a project in one step (T-0660).
 
     Calls Telegram's createForumTopic then binds the returned thread_id to
-    <slug> (+ optional --ticket for a per-task topic) — never leaves a TG
-    topic that exists but isn't routed anywhere.
+    <slug> (+ optional --ticket for a per-task topic, --session to route an
+    inbound topic message straight to that ORIGINATING session instead of
+    the project's user-conversation attendant) — never leaves a TG topic
+    that exists but isn't routed anywhere.
     """
     params = {"chat_id": args.chat_id, "name": args.name, "slug": args.slug}
     if args.ticket:
         params["ticket_id"] = args.ticket
+    if args.session:
+        params["session_id"] = args.session
     res = post("tg_topic_create", params)
+    extra = ""
+    if args.ticket:
+        extra += f" ticket_id={args.ticket}"
+    if args.session:
+        extra += f" session_id={args.session}"
     print(f"created topic '{res.get('name')}' chat_id={res.get('chat_id')} "
-          f"thread_id={res.get('thread_id')} -> slug={res.get('slug')}"
-          + (f" ticket_id={args.ticket}" if args.ticket else ""))
+          f"thread_id={res.get('thread_id')} -> slug={res.get('slug')}{extra}")
 
 
 def cmd_topic_rename_general(args) -> None:
@@ -554,6 +562,27 @@ def cmd_topic_rename_general(args) -> None:
     """
     res = post("tg_topic_rename_general", {"chat_id": args.chat_id, "name": args.name})
     print(f"renamed General (chat_id={res.get('chat_id')}) -> '{res.get('name')}'")
+
+
+def cmd_topic_say(args) -> None:
+    """Post directly into a task's forum topic (T-0660 Phase 2, direct-write).
+
+    A dev/TL/orchestrator session posting into ITS OWN task's topic — resolved
+    from the ticket id (the topic must already exist, `bsq topic create
+    ... --ticket <id>`), tagged with this session's SID so the stakeholder
+    sees who's writing and can reply straight back to it.
+    """
+    sid = require_sid(args.sid)
+    message = " ".join(args.message).strip()
+    if not message:
+        die("topic say: empty message")
+    res = post("tg_notify", {"ticket_id": args.ticket, "message": message, "sid": sid,
+                             "urgent": bool(args.urgent)})
+    if res.get("sent"):
+        print(f"posted to topic for ticket={args.ticket} (sid={sid})")
+    else:
+        print("post suppressed (no bot token, debounce, or quiet hours) — not sent. "
+              "Reply will still route back to this session if it lands.")
 
 
 def cmd_peer_send(args) -> None:
@@ -3522,6 +3551,20 @@ def cmd_ticket_update(args) -> None:
     # canonical by construction. (scripts/lint/backlog_frontmatter.py scans
     # every project — it would false-warn on other projects' legacy values.)
 
+    # T-0660: closeForumTopic when a ticket reaches its terminal status — a
+    # no-op (not an error) when it has no dedicated topic (the common case,
+    # T-0660 Addendum 2: a topic is opt-in per-task, not automatic). Best-
+    # effort: never let a TG hiccup block the status update that already
+    # succeeded.
+    if status == "closed":
+        try:
+            res = post("tg_topic_close_for_ticket", {"ticket_id": args.id.strip()}, fatal=False)
+        except WorkerError:
+            res = {}
+        if res.get("closed"):
+            print(f"{args.id}: closed its forum topic (chat_id={res.get('chat_id')} "
+                  f"thread_id={res.get('thread_id')})")
+
 
 def cmd_ticket_note(args) -> None:
     slug = resolve_slug()
@@ -4299,12 +4342,21 @@ def build_parser() -> argparse.ArgumentParser:
     tpc.add_argument("name", help="topic title, e.g. '[watchrobot] General'")
     tpc.add_argument("slug", help="project slug to bind the new topic to")
     tpc.add_argument("--ticket", help="ticket id (T-0660 per-task topic: binds {slug, ticket_id})")
+    tpc.add_argument("--session", help="originating session id — an inbound topic message "
+                                        "routes straight to it instead of the project's attendant")
     tpc.set_defaults(func=cmd_topic_create)
     tpr = tp_sub.add_parser(
         "rename-general", help="rename a forum's General topic (T-0660, editGeneralForumTopic)")
     tpr.add_argument("chat_id", help="Telegram chat_id (the forum supergroup)")
     tpr.add_argument("name", help="new title for General, e.g. '[bot-squad] General'")
     tpr.set_defaults(func=cmd_topic_rename_general)
+    tps = tp_sub.add_parser(
+        "say", help="post directly into a task's forum topic (T-0660, direct-write)")
+    tps.add_argument("ticket", help="ticket id whose bound topic to post into")
+    tps.add_argument("message", nargs="+", help="the message text")
+    tps.add_argument("--sid", help="override the auto-detected session id")
+    tps.add_argument("--urgent", action="store_true", help="bypass quiet hours")
+    tps.set_defaults(func=cmd_topic_say)
 
     # spawn
     sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")

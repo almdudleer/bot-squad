@@ -405,3 +405,92 @@ def test_close_forum_topic_posts_message_thread_id(tmp_path: Path) -> None:
         client.close_forum_topic(chat_id="-100999", thread_id=555)
     assert captured["url"].endswith("/closeForumTopic")
     assert captured["json"] == {"chat_id": "-100999", "message_thread_id": 555}
+
+
+def test_rename_general_forum_topic_posts_payload(tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["url"] = url
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True, "result": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client.rename_general_forum_topic(chat_id="-100999", name="[bot-squad] General")
+    assert captured["url"].endswith("/editGeneralForumTopic")
+    assert captured["json"] == {"chat_id": "-100999", "name": "[bot-squad] General"}
+
+
+def test_rename_general_forum_topic_raises_without_token(tmp_path: Path) -> None:
+    cfg = _FakeCfg(token="", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with pytest.raises(RuntimeError, match="no bot token"):
+        client.rename_general_forum_topic(chat_id="-100999", name="x")
+
+
+# ---------------------------------------------------------------------------
+# T-0660 field note (TL p23): a documented Bot API failure (bad chat_id,
+# missing can_manage_topics admin right, …) must surface the API's own
+# `description` — not get swallowed by raise_for_status() into an opaque
+# httpx.HTTPStatusError before the JSON body is ever read.
+# ---------------------------------------------------------------------------
+
+
+def test_call_surfaces_api_description_on_documented_failure(tmp_path: Path) -> None:
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        resp = MagicMock()
+        resp.status_code = 400
+        resp.json.return_value = {
+            "ok": False, "error_code": 400,
+            "description": "Bad Request: CHAT_ADMIN_REQUIRED",
+        }
+        resp.raise_for_status.side_effect = AssertionError(
+            "must not be reached — the description must be read from the JSON "
+            "body first, not thrown away by raise_for_status()"
+        )
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        with pytest.raises(RuntimeError, match="CHAT_ADMIN_REQUIRED"):
+            client.create_forum_topic(chat_id="-100999", name="x")
+
+
+def test_call_falls_back_to_http_status_when_no_description(tmp_path: Path) -> None:
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        resp = MagicMock()
+        resp.status_code = 403
+        resp.json.return_value = {"ok": False}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        with pytest.raises(RuntimeError, match="HTTP 403"):
+            client.create_forum_topic(chat_id="-100999", name="x")
+
+
+def test_call_raises_for_status_on_non_json_failure(tmp_path: Path) -> None:
+    """A genuinely non-JSON failure (proxy/network error) still surfaces via
+    the raise_for_status() fallback — the description path only applies when
+    TG actually returned its documented JSON error shape."""
+    import httpx
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        resp = MagicMock()
+        resp.json.side_effect = ValueError("not json")
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "502 Bad Gateway", request=MagicMock(), response=MagicMock()
+        )
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.create_forum_topic(chat_id="-100999", name="x")

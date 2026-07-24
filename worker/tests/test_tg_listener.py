@@ -1175,6 +1175,98 @@ def test_handle_topic_bound_parked_notifies_user(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# T-0660 Phase 2: a per-TASK topic binding (carries a session_id) routes an
+# unquoted message straight to the ORIGINATING session by id — reusing the
+# same inject_input path an explicit [<sid>] reply uses — never through the
+# project's user-conversation attendant, and does NOT touch the conversation
+# locus (that must stay pointed at the project's General room).
+# ---------------------------------------------------------------------------
+
+
+def test_handle_topic_bound_with_session_id_injects_to_that_session(tmp_path, monkeypatch):
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    injected = []
+    monkeypatch.setattr(A, "dispatch", lambda name, params: (
+        injected.append((name, params)) or {"ok": True}
+    ))
+    # These must NOT be called for a task-topic route.
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not append to project thread")))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not wake the attendant")))
+
+    msg = _topic_msg("fix the flaky test please", chat_id=111, thread_id=42)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["ok"] is True
+    assert result["action"] == "task_topic_inject"
+    assert result["sid"] == "S-dev-p9"
+    assert result["slug"] == "beta"
+    assert injected == [("inject_input", {"sid": "S-dev-p9", "text": "fix the flaky test please"})]
+
+
+def test_handle_topic_bound_with_session_id_does_not_touch_locus(tmp_path, monkeypatch):
+    from bot_squad_worker import tg_bindings, conversation_locus
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    # The project's own General is elsewhere; a task topic must not steal it.
+    conversation_locus.set_locus(cfg, "beta", "gu_1", "999", None)
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True})
+
+    msg = _topic_msg("status?", chat_id=111, thread_id=42)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert conversation_locus.get_locus(cfg, "beta", "gu_1") == {
+        "chat_id": "999", "thread_id": None,
+        "at": conversation_locus.get_locus(cfg, "beta", "gu_1")["at"],
+    }
+
+
+def test_handle_topic_bound_with_session_id_no_identity_still_skips(tmp_path, monkeypatch):
+    """The identity guard applies uniformly — a task topic doesn't bypass it."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender", lambda c, m, slug: None)
+
+    msg = _topic_msg("hi", chat_id=111, thread_id=42)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+    assert result == {"ok": True, "action": "skip", "reason": "not a reply or command"}
+
+
+def test_handle_topic_bound_session_id_inject_failure_notifies(tmp_path, monkeypatch):
+    """The bound session isn't active -> the same failure path _handle_reply
+    already has for an explicit [<sid>] reply (no silent drop)."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", session_id="S-gone-p1")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+
+    def _raise(name, params):
+        raise A.ActionError("no such pane")
+    monkeypatch.setattr(A, "dispatch", _raise)
+    notices = []
+    monkeypatch.setattr(TL, "_notify", lambda c, chat_id, text, **k: notices.append((chat_id, text)))
+
+    msg = _topic_msg("hello?", chat_id=111, thread_id=42)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["ok"] is False
+    assert result["action"] == "task_topic_inject_failed"
+    assert len(notices) == 1 and "S-gone-p1" in notices[0][1]
+
+
+# ---------------------------------------------------------------------------
 # T-0667: OUTGOING routing follows the conversation LOCUS (last-seen
 # chat_id/thread_id per (slug,gid)) recorded here on every INCOMING route, so
 # a reply lands where the user actually wrote instead of always the static

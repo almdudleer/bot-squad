@@ -978,63 +978,43 @@ def test_detect_cross_project_target_no_false_positive(tmp_path):
     assert TL._detect_cross_project_target(cfg, "the alpha build mentions beta colors", "alpha") is None
 
 
-def test_handle_update_unquoted_cross_project_offers_reroute(tmp_path, monkeypatch):
-    """A message explicitly targeting another project is NOT silently routed to
-    the pinned project — a reroute-confirm is offered, and ensure is NOT called."""
+def test_handle_update_unquoted_cross_project_mention_routes_no_reroute(tmp_path, monkeypatch):
+    """T-0666: a message explicitly mentioning another project no longer
+    triggers a reroute-confirm prompt (stakeholder found it disruptive,
+    'отключи, мешаются') — it routes straight to the pinned project-of-record
+    like any other unquoted message. ``_offer_reroute``/``_user_can_access_project``
+    are gone entirely; ``_detect_cross_project_target`` is retained (D-0055 §2 /
+    T-0640 reuse) but no longer wired to any prompt."""
+    assert not hasattr(TL, "_offer_reroute")
+    assert not hasattr(TL, "_user_can_access_project")
+
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")  # pinned alpha
-    offers, ensures = [], []
-    monkeypatch.setattr(TL, "_offer_reroute",
-                        lambda c, chat, target, current: offers.append((target, current)))
-    monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda *a, **k: ensures.append(a))
-
-    msg = _dated_msg(text="in beta I see the buttons overlap")
-    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
-
-    assert result["action"] == "reroute_confirm"
-    assert result["target"] == "beta" and result["slug"] == "alpha"
-    assert offers == [("beta", "alpha")]
-    assert ensures == []  # NOT silently routed to the pinned project
-
-
-def test_handle_update_unquoted_cross_project_respects_access(tmp_path, monkeypatch):
-    """A reroute is only offered for a target the user may access; when access is
-    denied the message falls through to normal pinned-project routing."""
-    cfg = _make_multi_cfg(tmp_path, chat="111")
-    monkeypatch.setattr(TL, "resolve_or_link_sender",
-                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
-    monkeypatch.setattr(TL, "_user_can_access_project", lambda c, gid, slug: False)
-    offers, ensures = [], []
-    monkeypatch.setattr(TL, "_offer_reroute",
-                        lambda c, chat, target, current: offers.append((target, current)))
+    ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref: ensures.append((slug, gid)))
+    notified = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: notified.append(a))
 
     msg = _dated_msg(text="in beta I see the buttons overlap")
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
-    # Inaccessible target -> no reroute offer, normal route to the pinned project.
     assert result["action"] == "route" and result["slug"] == "alpha"
-    assert offers == []
-    assert ensures == [("alpha", "gu_1")]
+    assert ensures == [("alpha", "gu_1")]  # routed straight to the POR, no confirm gate
+    assert notified == []  # no reroute-confirm prompt sent
 
 
 def test_handle_update_unquoted_no_cross_mention_routes_normally(tmp_path, monkeypatch):
-    """No explicit cross-project mention -> ordinary T-0485 routing, no offer."""
+    """No explicit cross-project mention -> ordinary T-0485 routing, unchanged."""
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
-    offers, ensures = [], []
-    monkeypatch.setattr(TL, "_offer_reroute",
-                        lambda *a, **k: offers.append(a))
+    ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref: ensures.append((slug, gid)))
 
@@ -1042,37 +1022,7 @@ def test_handle_update_unquoted_no_cross_mention_routes_normally(tmp_path, monke
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert result["action"] == "route" and result["slug"] == "alpha"
-    assert offers == [] and ensures == [("alpha", "gu_1")]
-
-
-def test_offer_reroute_sends_confirm_keyboard(tmp_path, monkeypatch):
-    """The reroute offer routes through the channel abstraction with both
-    choices as normal-message buttons (switch to target / keep current), with
-    the interactive-reply flags."""
-    import bot_squad_worker.actions as A
-    cfg = _make_multi_cfg(tmp_path, chat="111")
-    calls: list[dict] = []
-
-    class _FakeTg:
-        def send(self, **kw):
-            calls.append(kw)
-            return True
-
-    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: _FakeTg())
-    monkeypatch.setattr(
-        "httpx.post",
-        lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("raw httpx.post — must route via the channel")),
-    )
-
-    TL._offer_reroute(cfg, "111", "beta", "alpha")
-
-    assert calls, "reroute offer did not route through the channel"
-    kw = calls[-1]
-    btn_texts = [btn["text"] for row in kw["reply_markup"]["keyboard"] for btn in row]
-    assert "/project beta" in btn_texts   # switch to the detected target
-    assert "/project alpha" in btn_texts  # keep the current project
-    assert kw["urgent"] is True and kw["sid"] == "" and kw["debounce"] is False
+    assert ensures == [("alpha", "gu_1")]
 
 
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):

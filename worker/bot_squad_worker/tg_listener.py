@@ -416,14 +416,15 @@ def _ensure_user_conversation(
         return None
 
 
-# ---- T-0494: misattribution guard ------------------------------------------
+# ---- T-0494: misattribution guard (detector retained, prompt removed T-0666) -
 # A pinned user may write a message that EXPLICITLY targets a DIFFERENT project
-# than the pinned one ("in bot-squad I see ...", voice-02). We must not silently
-# file + route it under the pinned project. We detect the explicit mention at
-# the intake layer (lightweight; the deep intent analysis lives in the session)
-# and offer a reroute-confirm BEFORE committing the slug — so a genuine "I meant
-# alpha" isn't silently recorded + routed under the pinned beta. A reroute is
-# only offered to a target the user may access (privacy/scoping, T-0493/M5-T6).
+# than the pinned one ("in bot-squad I see ...", voice-02). T-0494 originally
+# offered a reroute-confirm prompt before committing the slug; the stakeholder
+# found that prompt disruptive ("отключи, мешаются") and T-0666 removes it
+# outright — a cross-project mention now just routes to the project-of-record
+# like any other unquoted message, no confirm. ``_detect_cross_project_target``
+# is KEPT (not orphaned): D-0055 §2 reuses it as the per-message classifier for
+# the gated Slice 2 (T-0640) per-message dynamic routing.
 
 _CROSS_PROJECT_CUE = r"(?:in|on|for|about|regarding|project)"
 
@@ -441,7 +442,10 @@ def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
     """Return a registered project slug (≠ ``current``) the message EXPLICITLY
     targets, else ``None``. Conservative (cue-prefixed mention) to avoid
     false-positive reroutes on incidental mentions — the deep intent analysis
-    stays in the session."""
+    stays in the session.
+
+    Retained for D-0055 §2 / T-0640's per-message routing classifier (see
+    module comment above) — not currently wired to any prompt (T-0666)."""
     t = text or ""
     for slug in cfg.projects:
         if slug == current:
@@ -449,35 +453,6 @@ def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
         if _slug_mention_re(slug).search(t):
             return slug
     return None
-
-
-def _user_can_access_project(cfg, gid: str, slug: str) -> bool:
-    """T-0494 reroute scoping: a reroute is only OFFERED for a target the user
-    may access. Today every project registered on THIS install is routable;
-    deeper per-user grant enforcement (M5-T6 / the project-scoped read, T-0493)
-    lives downstream. Kept as a seam so the offer respects access."""
-    return slug in cfg.projects
-
-
-def _offer_reroute(cfg, chat_id: str, target: str, current: str) -> None:
-    """Offer a reroute-confirm: two normal-message buttons (switch to the
-    detected target, or keep the current project) so the choice arrives under
-    allowed_updates:["message"] (no poll-contract change; mirrors the picker).
-    Best-effort — a messenger outage must not break inbound handling."""
-    if not cfg.tg_bot_token:
-        return
-    keyboard = [[{"text": f"/project {target}"}], [{"text": f"/project {current}"}]]
-    reply_markup = {
-        "keyboard": keyboard,
-        "one_time_keyboard": True,
-        "resize_keyboard": True,
-    }
-    _channel_notify(
-        cfg, chat_id,
-        f"This looks like it's about '{target}', but you're on '{current}'. "
-        f"Reroute to '{target}', or keep '{current}'?",
-        reply_markup=reply_markup,
-    )
 
 
 def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
@@ -503,13 +478,10 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     # The pinned project is the project-of-record.
     por = sticky
 
-    # T-0494: an explicit mention of a DIFFERENT accessible project → flag the
-    # mismatch + offer a reroute-confirm BEFORE committing the slug (no record,
-    # no routing until the user confirms the target).
-    target = _detect_cross_project_target(cfg, msg.get("text", ""), por)
-    if target and target != por and _user_can_access_project(cfg, gid, target):
-        _offer_reroute(cfg, chat_id, target, por)
-        return {"ok": True, "action": "reroute_confirm", "slug": por, "target": target}
+    # T-0666: a message explicitly mentioning a different project (T-0494's
+    # _detect_cross_project_target) no longer intercepts routing with a
+    # confirm prompt — it just routes to the project-of-record below, same as
+    # any other unquoted message.
 
     # T-0489 + T-0485: record the dump under the project-of-record, then hand it
     # to the (continued-or-spawned) user-conversation session on the SAME

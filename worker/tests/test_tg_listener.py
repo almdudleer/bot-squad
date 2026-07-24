@@ -1174,6 +1174,66 @@ def test_handle_topic_bound_parked_notifies_user(tmp_path, monkeypatch):
     assert "заняты" in notices[0][1]
 
 
+# ---------------------------------------------------------------------------
+# T-0667: OUTGOING routing follows the conversation LOCUS (last-seen
+# chat_id/thread_id per (slug,gid)) recorded here on every INCOMING route, so
+# a reply lands where the user actually wrote instead of always the static
+# project DM/tg_chat.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_topic_bound_records_locus(tmp_path, monkeypatch):
+    from bot_squad_worker import tg_bindings, conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("hello", chat_id=111, thread_id=7)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    rec = conversation_locus.get_locus(cfg, "beta", "gu_1")
+    assert rec == {"chat_id": "111", "thread_id": 7, "at": rec["at"]}
+
+
+def test_handle_unquoted_records_locus(tmp_path, monkeypatch):
+    from bot_squad_worker import conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _dated_msg(text="hi", chat_id=111)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    rec = conversation_locus.get_locus(cfg, "alpha", "gu_1")
+    assert rec["chat_id"] == "111" and rec["thread_id"] is None
+
+
+def test_handle_unquoted_records_locus_thread_id_when_present(tmp_path, monkeypatch):
+    """An unquoted message inside an UNBOUND topic (falls through to
+    _handle_unquoted via the static tg_chat map, T-0639) still records its own
+    real thread_id in the locus, not None — so a later relay lands back in
+    that SAME topic, not the chat's general feed."""
+    from bot_squad_worker import conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    rec = conversation_locus.get_locus(cfg, "alpha", "gu_1")
+    assert rec["chat_id"] == "111" and rec["thread_id"] == 999
+
+
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
     """T-0513: the picker now routes through the channel abstraction (was a raw
     httpx sendMessage). The keyboard must reach the TG client via the channel,

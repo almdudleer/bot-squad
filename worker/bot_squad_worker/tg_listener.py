@@ -468,6 +468,10 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
     slug = binding["slug"]
     append_conversation(cfg, slug, gid, msg)
+    # T-0667: remember where this landed so an OUTGOING reply follows the
+    # same chat/topic instead of falling back to the project's static DM.
+    from bot_squad_worker import conversation_locus
+    conversation_locus.set_locus(cfg, slug, gid, chat_id, msg.get("message_thread_id"))
     message_ref = _msg_ts(msg)
     ensured = _ensure_user_conversation(cfg, slug, gid, message_ref)
     if isinstance(ensured, dict) and ensured.get("parked"):
@@ -516,6 +520,10 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     # project. message_ref points at that just-appended store record (its
     # timestamp keys it in the (por, gid) thread).
     append_conversation(cfg, por, gid, msg)
+    # T-0667: remember where this landed so an OUTGOING reply follows the
+    # same chat/topic instead of falling back to the project's static DM.
+    from bot_squad_worker import conversation_locus
+    conversation_locus.set_locus(cfg, por, gid, chat_id, msg.get("message_thread_id"))
     message_ref = _msg_ts(msg)
     ensured = _ensure_user_conversation(cfg, por, gid, message_ref)
     if isinstance(ensured, dict) and ensured.get("parked"):

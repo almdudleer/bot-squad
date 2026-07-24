@@ -17,6 +17,8 @@ user-communication module is centralized on the mothership (voice-04), and the
 """
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -28,6 +30,9 @@ from app.project_authz import require_project_read
 from app.routes_auth import require_auth
 from app.routes_mothership import _authenticate_worker
 from app.worker_client import WorkerError
+
+
+log = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -57,26 +62,68 @@ def _users_store(request: Request) -> MothershipUsersStore:
     return MothershipUsersStore(cfg.data_dir / "_mothership")
 
 
-def _resolve_relay_chat_id(request: Request, slug: str, global_user_id: str) -> str:
-    """T-0569: resolve the Telegram chat to relay a session reply to.
+def _read_conversation_locus(request: Request, slug: str, global_user_id: str) -> dict | None:
+    """T-0667: read-only lookup of the worker-owned conversation-locus store —
+    the last ``(chat_id, thread_id)`` an inbound message from ``(slug,
+    global_user_id)`` arrived on, recorded in-process by ``tg_listener``
+    (``bot_squad_worker.conversation_locus``, ``_handle_topic_bound`` /
+    ``_handle_unquoted``).
 
-    Primary: the GlobalUser's ``tg_user_id`` (a DM chat id IS the TG user id —
-    every TG user has an implicit private chat with the bot at that same id).
-    Fallback: the project's configured ``tg_chat`` (e.g. when the user record
-    predates linkage, or was never TG-originated). Empty when neither resolves
-    — the caller treats that as "can't relay" (``relayed: false``), never an
-    error."""
+    Worker and API share the data dir but run in separate processes/envs — this
+    reads the SAME on-disk file directly rather than round-tripping through the
+    worker socket, mirroring the pattern ``routes_autoupdate.py`` already uses
+    for the worker's autoupdate state. Best-effort: a missing/corrupt file is
+    "no locus recorded", never an error.
+    """
     cfg = request.app.state.api_config
+    path = cfg.data_dir / "_worker" / "conversation_locus.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("routes_conversations: could not parse %s: %s", path, e)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    rec = raw.get(f"{slug}:{global_user_id}")
+    if not isinstance(rec, dict) or not rec.get("chat_id"):
+        return None
+    return {"chat_id": rec["chat_id"], "thread_id": rec.get("thread_id")}
+
+
+def _resolve_relay_target(request: Request, slug: str, global_user_id: str) -> tuple[str, int | None]:
+    """T-0569 / T-0667: resolve the ``(chat_id, topic_id)`` to relay a session
+    reply to.
+
+    Priority (T-0667 — "one coherent dialogue", D-0055 Addendum 3):
+    1. The conversation LOCUS — the ``(chat_id, thread_id)`` the user's most
+       recent inbound message for THIS project arrived on. Without this, a
+       reply always landed in the user's DM even when they'd just written in
+       a bound forum topic, splitting the conversation (the live gap this
+       ticket fixes).
+    2. The GlobalUser's ``tg_user_id`` (a DM chat id IS the TG user id — every
+       TG user has an implicit private chat with the bot at that same id) —
+       the right default for a user who has never written into a bound topic.
+    3. The project's configured ``tg_chat``/``tg_topic_id`` (legacy static
+       fallback, e.g. when the user record predates linkage).
+    ``("", None)`` when nothing resolves — the caller treats that as "can't
+    relay" (``relayed: false``), never an error.
+    """
+    cfg = request.app.state.api_config
+    locus = _read_conversation_locus(request, slug, global_user_id)
+    if locus:
+        return locus["chat_id"], locus.get("thread_id")
     try:
         user = _users_store(request).get_user(global_user_id)
     except (OSError, ValueError):
         user = None
     if user is not None and (user.tg_user_id or "").strip():
-        return user.tg_user_id.strip()
+        return user.tg_user_id.strip(), None
     project = cfg.project(slug)
     if project is not None and (project.tg_chat or "").strip():
-        return project.tg_chat.strip()
-    return ""
+        return project.tg_chat.strip(), getattr(project, "tg_topic_id", None)
+    return "", None
 
 
 async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, text: str) -> bool:
@@ -96,16 +143,19 @@ async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, t
     ``debounce=False``: an interactive conversation turn must always land, even
     if textually identical to a recent send (the debounce cooldown exists to
     quash repeated BACKGROUND notifications, not conversation replies).
+    ``topic_id`` (T-0667): when the resolved target carries a forum thread
+    (locus or static ``tg_topic_id``), the reply is delivered into THAT thread
+    instead of the chat's general feed.
     """
-    chat_id = _resolve_relay_chat_id(request, slug, global_user_id)
+    chat_id, topic_id = _resolve_relay_target(request, slug, global_user_id)
     if not chat_id:
         return False
     client = request.app.state.worker_router.coordinator()
+    params: dict = {"chat_id": chat_id, "message": text, "urgent": True, "debounce": False}
+    if topic_id is not None:
+        params["topic_id"] = topic_id
     try:
-        result = await client.call_action(
-            "tg_notify",
-            {"chat_id": chat_id, "message": text, "urgent": True, "debounce": False},
-        )
+        result = await client.call_action("tg_notify", params)
     except WorkerError:
         return False
     except Exception:  # noqa: BLE001 — best-effort; must never fail the append

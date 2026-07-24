@@ -431,6 +431,121 @@ def test_session_append_falls_back_to_project_tg_chat(tmp_bot_squad: Path, monke
     assert calls[0][1]["chat_id"] == "0"
 
 
+# ---------------------------------------------------------------------------
+# T-0667: outgoing relay follows the conversation LOCUS (worker-recorded
+# last-seen chat_id/thread_id per (slug,gid)) ahead of the tg_user_id DM and
+# the project's static tg_chat — so a reply lands where the user last wrote,
+# not always the old default DM (live stakeholder-reported split-conversation
+# gap).
+# ---------------------------------------------------------------------------
+
+
+def _write_locus(tmp_bot_squad: Path, slug: str, gid: str, chat_id: str, thread_id) -> None:
+    """Write the worker-owned conversation_locus.json directly — mirrors what
+    ``bot_squad_worker.conversation_locus.set_locus`` persists, exercised here
+    without spinning up the worker (API reads this file directly, T-0667)."""
+    import json
+    p = tmp_bot_squad / "data" / "_worker" / "conversation_locus.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = json.loads(p.read_text()) if p.is_file() else {}
+    existing[f"{slug}:{gid}"] = {"chat_id": chat_id, "thread_id": thread_id, "at": "2026-07-24T15:00:00Z"}
+    p.write_text(json.dumps(existing))
+
+
+def test_session_append_relay_prefers_locus_over_tg_user_id(tmp_bot_squad: Path, monkeypatch):
+    """A locus recorded for (slug,gid) wins over the GlobalUser's DM chat_id —
+    the reply must follow where the user actually last wrote, in-topic."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")  # old DM chat_id
+    _write_locus(tmp_bot_squad, "test-project", "gu_abc", "-1003761939853", 42)
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][1]["chat_id"] == "-1003761939853"
+    assert calls[0][1]["topic_id"] == 42
+
+
+def test_session_append_relay_locus_dm_thread_id_none_omits_topic_id(tmp_bot_squad: Path, monkeypatch):
+    """A locus with thread_id=None (a DM/general feed) must not send a bogus
+    topic_id param."""
+    _write_locus(tmp_bot_squad, "test-project", "gu_abc", "444", None)
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "444"
+    assert "topic_id" not in calls[0][1]
+
+
+def test_session_append_relay_falls_back_to_tg_user_id_when_no_locus(tmp_bot_squad: Path, monkeypatch):
+    """No locus recorded (fresh/never-topic-bound user) -> unchanged pre-T-0667
+    behavior: the GlobalUser's DM chat_id."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "555222111"
+    assert "topic_id" not in calls[0][1]
+
+
+def test_session_append_relay_locus_scoped_to_gid(tmp_bot_squad: Path, monkeypatch):
+    """A locus recorded for a DIFFERENT global_user_id must not leak into this
+    user's relay target."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    _write_locus(tmp_bot_squad, "test-project", "gu_someone_else", "999", 1)
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "555222111"
+
+
+def test_session_append_relay_locus_scoped_to_slug(tmp_bot_squad: Path, monkeypatch):
+    """A locus recorded for a DIFFERENT project must not leak into this one."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    _write_locus(tmp_bot_squad, "some-other-project", "gu_abc", "999", 1)
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "555222111"
+
+
+def test_session_append_relay_locus_corrupt_file_falls_back(tmp_bot_squad: Path, monkeypatch):
+    """An unreadable conversation_locus.json must never break the relay —
+    falls back the same as no locus at all."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    p = tmp_bot_squad / "data" / "_worker" / "conversation_locus.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][1]["chat_id"] == "555222111"
+
+
 def test_worker_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     d = tmp_bot_squad / "data"

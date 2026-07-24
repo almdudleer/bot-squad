@@ -450,6 +450,75 @@ def test_tg_notify_topic_none_when_project_has_no_topic(tmp_config_dir, monkeypa
     assert fake.calls[0]["topic_id"] is None
 
 
+# --- T-0667: slug-resolved sends (bsq tg ping / stall escalations) follow
+# the conversation LOCUS ahead of the project's static tg_chat/tg_topic_id ---
+
+def test_tg_notify_slug_prefers_locus_over_static_tg_chat(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 42)
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "999888777"
+    assert fake.calls[0]["topic_id"] == 42
+
+
+def test_tg_notify_slug_falls_back_to_static_when_no_locus(tmp_path, monkeypatch):
+    """No locus recorded yet for this slug -> unchanged pre-T-0667 behavior:
+    the project's static tg_chat/tg_topic_id."""
+    import bot_squad_worker.actions as A
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    _, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "-1001234567890"
+    assert fake.calls[0]["topic_id"] == 99
+
+
+def test_tg_notify_explicit_topic_id_overrides_locus(tmp_path, monkeypatch):
+    """An explicit topic_id param still wins over the locus's thread_id."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 42)
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi", "topic_id": 7})
+    assert fake.calls[0]["chat_id"] == "999888777"
+    assert fake.calls[0]["topic_id"] == 7
+
+
+def test_tg_notify_slug_locus_scoped_to_slug(tmp_path, monkeypatch):
+    """A locus recorded for a DIFFERENT slug must not leak into this one."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "some-other-project", "gu_1", "111", 1)
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "-1001234567890"
+
+
+def test_tg_notify_explicit_chat_id_overrides_locus(tmp_path, monkeypatch):
+    """An explicit chat_id param bypasses slug resolution (and locus) entirely."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 42)
+
+    A.dispatch("tg_notify", {"chat_id": "555", "slug": "group-project", "message": "hi"})
+    assert fake.calls[0]["chat_id"] == "555"
+    assert fake.calls[0]["topic_id"] is None
+
+
 def test_tg_notify_rejects_non_integer_topic(tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 

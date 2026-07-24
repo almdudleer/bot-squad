@@ -226,9 +226,21 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
             project = cfg.projects.get(slug)
             if project is None:
                 raise ActionError(f"tg_notify: unknown project slug {slug!r}")
-            chat_id = project.tg_chat
-            if topic_id is None:
-                topic_id = project.tg_topic_id
+            # T-0667: prefer the conversation LOCUS (where the user most
+            # recently wrote about this project) over the project's static
+            # tg_chat — a slug-only send (e.g. `bsq tg ping`, a stall
+            # escalation) must land in the same place the conversation is
+            # actually happening, not always the old default DM.
+            from bot_squad_worker import conversation_locus
+            locus = conversation_locus.latest_for_slug(cfg, slug)
+            if locus:
+                chat_id = locus["chat_id"]
+                if topic_id is None:
+                    topic_id = locus.get("thread_id")
+            else:
+                chat_id = project.tg_chat
+                if topic_id is None:
+                    topic_id = project.tg_topic_id
         elif cfg.tg_default_chat_id:
             # T-0171: per-server default chat for the local (detached/standalone)
             # bot — preferred over the first-project guess when configured.

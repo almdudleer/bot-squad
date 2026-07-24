@@ -259,6 +259,53 @@ def test_handle_update_skips_plain_message(tmp_path):
     assert result["action"] == "skip"
 
 
+def test_handle_update_project_slash_not_appended_to_store(tmp_path, monkeypatch):
+    """T-0659: a /project control command must NOT be append_conversation()'d
+    into the statically-mapped project's store. Doing so spuriously wakes that
+    project's user-conversation attendant (the append endpoint auto-wakes on
+    any user-authored append, T-0631) with a contextless '/project' it can't
+    interpret — the confused-clarification reply the stakeholder hit every time
+    he used /project to switch."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    msg = _slash_message("/project other-project", chat_id=12345)
+    update = {"update_id": 20, "message": msg}
+
+    # Resolve a real gid so the `if gid` guard passes — the ONLY thing that must
+    # now prevent the append is the T-0659 `not slash` condition.
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda *a, **k: {"global_user_id": "gu_test"})
+    append_calls = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda cfg, slug, gid, m: append_calls.append((slug, gid)))
+    # _handle_project reads/sets the pin over HTTP — stub it out.
+    monkeypatch.setattr(TL, "_handle_project",
+                        lambda cfg, chat_id, gid, args: {"ok": True, "action": "project", "slug": args})
+
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "project"
+    assert append_calls == []  # no spurious append for a control/routing command
+
+
+def test_handle_update_reply_still_appended_to_store(tmp_path, monkeypatch):
+    """T-0659 guard: the fix skips the append for SLASH commands only — a reply
+    (real project-directed content, T-0489) must still be recorded to the store."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    msg = _reply_message("S-alice-spec5-p3", "go ahead", chat_id=12345)
+    update = {"update_id": 21, "message": msg}
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda *a, **k: {"global_user_id": "gu_test"})
+    append_calls = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda cfg, slug, gid, m: append_calls.append((slug, gid)))
+    import bot_squad_worker.actions as A
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "pane_id": "%3", "lines_sent": 1})
+
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "inject"
+    assert append_calls == [("test-project", "gu_test")]  # content still recorded
+
+
 # ---------------------------------------------------------------------------
 # T-0488: TG sender -> mothership GlobalUser linkage (single bot user recognition)
 # resolve_or_link_sender posts to the API (single-writer owns the registry write);

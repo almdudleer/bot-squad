@@ -674,12 +674,23 @@ def handle_update(cfg, update: dict) -> dict:
     is_voice_private = voice_present and chat_type == "private"
 
     if slash or reply or is_voice_group:
-        # T-0489: record slash/reply/group-voice under the chat's project — the
-        # slug is incidental for these (they don't sticky-route). The unquoted
+        # T-0489: record reply/group-voice under the chat's project — the slug
+        # is incidental for these (they don't sticky-route). The unquoted
         # firehose path (below, including private voice) resolves the
         # project-of-record itself and records there, so its dump and attending
         # session land on the SAME project (TL-D, T-0492).
-        if gid:
+        #
+        # T-0659: do NOT append SLASH commands. /project, /state, /sessions,
+        # /say, /help are pure control/routing, not project-directed content.
+        # Appending a bare command into the statically-mapped (_slug_for_chat)
+        # project's store — the "incidental" slug the pin design says NOT to
+        # trust — spuriously wakes THAT project's user-conversation attendant
+        # (the append endpoint auto-wakes on any user-authored append, T-0631),
+        # which sees a contextless "/project" and replies with a confused
+        # clarification it can't act on (the slash-routing context lives only
+        # here, never in the store). The stakeholder hit this every time he
+        # used /project to switch.
+        if gid and not slash:
             append_conversation(cfg, chat_slug, gid, msg)
         if slash:
             cmd, args = slash

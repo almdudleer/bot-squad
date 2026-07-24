@@ -573,6 +573,75 @@ def test_tg_notify_explicit_chat_id_overrides_ticket_id(tmp_path, monkeypatch):
     assert fake.calls[0]["topic_id"] is None
 
 
+# --- T-0660 Phase 2 mechanic #3: a task-topic direct-write ALSO records a
+# passive FYI append into the project's attendant thread, so the attendant
+# keeps context without treating it as its own actionable inbox item. ---
+
+def test_tg_notify_ticket_id_direct_write_records_fyi(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings, conversation_locus, tg_listener as TL
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1003761939853", 42, "group-project",
+                            ticket_id="T-0700", session_id="S-dev-p9")
+    # The attendant thread this task's project has been talking to (T-0667 locus).
+    conversation_locus.set_locus(cfg, "group-project", "gu_stake", "999", None)
+
+    fyi_calls = []
+    monkeypatch.setattr(
+        TL, "append_conversation_fyi",
+        lambda cfg, slug, gid, *, author, text: fyi_calls.append(
+            {"slug": slug, "gid": gid, "author": author, "text": text}
+        ),
+    )
+
+    A.dispatch("tg_notify", {"ticket_id": "T-0700", "message": "on it, fixing now",
+                             "sid": "S-dev-p9"})
+
+    assert len(fyi_calls) == 1
+    call = fyi_calls[0]
+    assert call["slug"] == "group-project"
+    assert call["gid"] == "gu_stake"
+    assert call["author"] == "session:S-dev-p9"
+    assert "on it, fixing now" in call["text"]
+    assert "T-0700" in call["text"]
+
+
+def test_tg_notify_ticket_id_direct_write_no_locus_skips_fyi(tmp_path, monkeypatch):
+    """No locus recorded yet for this project (never talked to it via TG) ->
+    no gid to record under — best-effort skip, the send itself still succeeds."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings, tg_listener as TL
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1003761939853", 42, "group-project", ticket_id="T-0700")
+
+    fyi_calls = []
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda *a, **k: fyi_calls.append((a, k)))
+
+    out = A.dispatch("tg_notify", {"ticket_id": "T-0700", "message": "hi"})
+    assert out["sent"] is True
+    assert fyi_calls == []
+
+
+def test_tg_notify_non_ticket_send_never_records_fyi(tmp_config_dir, monkeypatch):
+    """A plain slug/chat_id send (no ticket_id) is NOT a task-topic
+    direct-write — must never trigger the FYI mechanic."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_listener as TL
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir)
+    fyi_calls = []
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda *a, **k: fyi_calls.append((a, k)))
+
+    A.dispatch("tg_notify", {"slug": "test-project", "message": "hi"})
+    assert fyi_calls == []
+
+
 def test_tg_notify_rejects_non_integer_topic(tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 

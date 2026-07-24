@@ -67,6 +67,31 @@ def test_read_normalizes_missing_channel_to_tg(tmp_path: Path):
     assert out["messages"][0]["channel"] == "tg"
 
 
+def test_append_defaults_fyi_to_false(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi")
+    assert rec["fyi"] is False
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["fyi"] is False
+
+
+def test_append_records_explicit_fyi(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi", fyi=True)
+    assert rec["fyi"] is True
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["fyi"] is True
+
+
+def test_read_normalizes_missing_fyi_to_false(tmp_path: Path):
+    """T-0660: a record written before the fyi field existed has no ``fyi``
+    key on disk — reads must still expose False, not a missing/None field."""
+    p = CS.conv_path(tmp_path, "proj", "gu_abc")
+    p.parent.mkdir(parents=True)
+    p.write_text('{"timestamp": "2026-06-01T00:00:00Z", "author": "user", '
+                 '"text": "pre-migration", "attachments": []}\n', encoding="utf-8")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["fyi"] is False
+
+
 def test_append_preserves_attachments(tmp_path: Path):
     atts = [{"type": "voice", "file_id": "VID"}]
     rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="", attachments=atts)

@@ -39,6 +39,16 @@ land, T-0490). Additive + back-compat: a record written before T-0631 has no
 ``channel`` key on disk; reads normalize the absent field to "tg" (every
 pre-T-0631 record is TG-origin) so old threads don't silently look
 channel-less.
+
+``fyi`` (T-0660): a PASSIVE, non-actionable append — a session wrote directly
+to the stakeholder, or the stakeholder replied directly to a session,
+bypassing this thread's own attendant. Recorded here for context but must
+never be treated as this thread's own actionable inbox item (the caller,
+``routes_conversations.append_message``, suppresses the attendant-wake / TG
+relay side effects a normal append of that author would otherwise trigger).
+Additive + back-compat: omitted from the record entirely when False (the
+overwhelming common case) — absent on disk reads back as ``False``, so no
+pre-T-0660 record is affected.
 """
 from __future__ import annotations
 
@@ -95,6 +105,7 @@ def append(
     attachments: list | None = None,
     timestamp: str | None = None,
     channel: str | None = None,
+    fyi: bool = False,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
@@ -102,7 +113,9 @@ def append(
     attending session's writeback). ``attachments`` defaults to ``[]``.
     ``timestamp`` defaults to now (UTC, ISO-8601). ``channel`` (T-0631) is the
     inbound transport ("tg", "mcp", "api", ...); defaults to "tg" since every
-    caller predating T-0631 is TG-origin.
+    caller predating T-0631 is TG-origin. ``fyi`` (T-0660) marks a passive,
+    non-actionable append (see module docstring); omitted from the stored
+    record when False.
     """
     record = {
         "timestamp": timestamp or _now_iso(),
@@ -110,6 +123,7 @@ def append(
         "text": "" if text is None else str(text),
         "attachments": list(attachments) if attachments else [],
         "channel": str(channel) if channel else "tg",
+        "fyi": bool(fyi),
     }
     p = conv_path(data_dir, slug, global_user_id)
     line = json.dumps(record, ensure_ascii=False)
@@ -143,6 +157,7 @@ def _read_all(data_dir: Path, slug: str, global_user_id: str) -> list[dict]:
             continue
         if isinstance(rec, dict):
             rec.setdefault("channel", "tg")  # T-0631: pre-migration records are TG-origin
+            rec.setdefault("fyi", False)  # T-0660: absent -> not a passive/FYI append
             out.append(rec)
     return out
 

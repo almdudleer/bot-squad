@@ -97,6 +97,7 @@ def test_latest_for_slug_picks_most_recent_across_gids(tmp_path, monkeypatch):
 
     latest = CL.latest_for_slug(cfg, "bot-squad")
     assert latest["chat_id"] == "222"
+    assert latest["gid"] == "gu_2"  # T-0660: FYI-append mechanic needs the gid too
 
 
 def test_latest_for_slug_scoped_to_slug(tmp_path):
@@ -104,6 +105,7 @@ def test_latest_for_slug_scoped_to_slug(tmp_path):
     CL.set_locus(cfg, "alpha", "gu_1", "111", 1)
     CL.set_locus(cfg, "beta", "gu_1", "222", 2)
     assert CL.latest_for_slug(cfg, "alpha")["chat_id"] == "111"
+    assert CL.latest_for_slug(cfg, "alpha")["gid"] == "gu_1"
 
 
 def test_latest_for_slug_none_when_unset(tmp_path):

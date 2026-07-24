@@ -226,6 +226,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     topic_id: int | None = _coerce_topic_id(params.get("topic_id"))
     slug: str = params.get("slug") or ""
     ticket_id: str = params.get("ticket_id") or ""
+    task_topic_binding: dict | None = None
     if not chat_id and ticket_id:
         # T-0660: direct-write into a task's forum topic (`bsq topic say` /
         # a dev-TL-orchestrator session posting into its own task's topic) —
@@ -239,6 +240,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         chat_id = binding["chat_id"]
         if topic_id is None:
             topic_id = binding["thread_id"]
+        task_topic_binding = binding
     if not chat_id:
         if slug:
             project = cfg.projects.get(slug)
@@ -317,7 +319,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # _send_stakeholder_dm SSOT (T-0394).
     explicit_tg_target = bool(params.get("chat_id")) or (params.get("topic_id") not in (None, ""))
     debounce = bool(params.get("debounce", True))
-    return _send_stakeholder_dm(
+    result = _send_stakeholder_dm(
         cfg,
         message=message,
         sid=params.get("sid", ""),
@@ -330,6 +332,39 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         do_slim=do_slim,
         slug=slug,
         task_id=str(params.get("task_id") or ""),
+    )
+    if task_topic_binding is not None and result.get("sent"):
+        _fyi_record_task_topic_direct_write(
+            cfg, task_topic_binding["slug"], sid=params.get("sid", ""),
+            ticket_id=ticket_id, text=params["message"],
+        )
+    return result
+
+
+def _fyi_record_task_topic_direct_write(cfg: Any, slug: str, *, sid: str, ticket_id: str, text: str) -> None:
+    """T-0660 mechanic #3: after a session's direct-write into its task's
+    topic actually sends, ALSO record a passive FYI append into the
+    project's (slug, gid) attendant thread — so the user-conversation
+    attendant keeps context of what was said directly to the stakeholder,
+    without treating it as its own inbox item.
+
+    ``gid`` is resolved via the conversation LOCUS (T-0667: "most recently
+    seen" for this slug) — bot-squad's single-operator-per-project model
+    makes this a reasonable proxy for "the" stakeholder even without an
+    explicit gid at the call site (mirrors the same resolution `tg_notify`'s
+    slug-only path already uses). Best-effort: no gid resolvable (never
+    talked to this project via TG yet) -> silently skipped, never raises —
+    the direct-write itself already succeeded and must not be undone by a
+    context-recording nicety failing."""
+    from bot_squad_worker import conversation_locus, tg_listener as _tg_listener
+    locus = conversation_locus.latest_for_slug(cfg, slug)
+    gid = locus.get("gid") if locus else None
+    if not gid:
+        return
+    sid_label = sid or "?"
+    _tg_listener.append_conversation_fyi(
+        cfg, slug, gid, author=f"session:{sid_label}",
+        text=f"Сессия {sid_label} написала пользователю напрямую (тикет {ticket_id}): {text}",
     )
 
 

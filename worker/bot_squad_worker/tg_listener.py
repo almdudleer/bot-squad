@@ -272,6 +272,55 @@ def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optio
     return True
 
 
+_FYI_PREFIX = "[FYI — ответ не требуется]"
+
+
+def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str, text: str) -> Optional[bool]:
+    """T-0660: record a PASSIVE, non-actionable append into the project's
+    (slug, global_user_id) attendant thread — for either of the two
+    session<->stakeholder direct-contact directions the task-topic model adds
+    (D-0055 'Topic model evolution' mechanics #3):
+      - a dev/TL/orchestrator session wrote directly to the stakeholder
+        (``author="session:<sid>"``), or
+      - the stakeholder replied directly to a session, bypassing the
+        attendant (``author="user"``).
+
+    Marked ``fyi=True`` on the API append (T-0660) so the endpoint records it
+    for context but suppresses the side effects a normal append of that
+    ``author`` would trigger: a ``session:``-authored append normally
+    RELAYS back to the user's TG (would echo the "no reply needed" note
+    right back to them — wrong); a ``user``-authored append normally WAKES
+    the attendant (this isn't its own inbox item to act on). ``text`` is
+    prefixed with an unambiguous marker so a reading session never mistakes
+    this for something requiring a reply.
+
+    Same best-effort/env-gated contract as ``append_conversation``: a no-op
+    when unconfigured or on failure, never blocks the caller."""
+    gid = str(global_user_id or "").strip()
+    if not gid or not str(slug or ""):
+        return None
+    base = _api_base_url()
+    token = _worker_api_token()
+    if not base or not token:
+        return None
+    url = f"{base}/api/m/worker/conversations/{slug}/{gid}/messages"  # T-0529: /worker prefix
+    try:
+        r = httpx.post(
+            url,
+            json={
+                "author": author,
+                "text": f"{_FYI_PREFIX} {text}",
+                "fyi": True,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        r.raise_for_status()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return True
+
+
 # ---- T-0492: hardwired project routing --------------------------------------
 # A user pins a CURRENT project (a button / ``/project <slug>``); subsequent
 # unquoted messages sticky-route to it; the bot ASKS which project when unset
@@ -471,15 +520,26 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     NOT update the conversation locus (T-0667) — a task-topic message must
     never redirect the project's own attendant-reply relay into the task
     topic. A plain project/General binding (no session_id) keeps the T-0639
-    behavior: durable append (T-0489) + ensure-session (T-0485) + locus."""
+    behavior: durable append (T-0489) + ensure-session (T-0485) + locus.
+
+    The stakeholder replying directly to a session is ALSO recorded as a
+    passive FYI append into the project's OWN (slug, gid) attendant thread
+    (T-0660 mechanic #3) — so the attendant keeps full context of what was
+    said without treating it as its own actionable inbox item (wake
+    suppressed by the ``fyi`` marker, see ``append_conversation_fyi``)."""
     if not gid:
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
     slug = binding["slug"]
     session_id = binding.get("session_id")
     if session_id:
-        result = _handle_reply(cfg, chat_id, session_id, msg.get("text") or "")
+        text = msg.get("text") or ""
+        result = _handle_reply(cfg, chat_id, session_id, text)
         result["action"] = f"task_topic_{result.get('action', 'inject')}"
         result["slug"] = slug
+        append_conversation_fyi(
+            cfg, slug, gid, author="user",
+            text=f"Пользователь ответил сессии {session_id} напрямую: {text}",
+        )
         return result
     append_conversation(cfg, slug, gid, msg)
     # T-0667: remember where this landed so an OUTGOING reply follows the

@@ -373,6 +373,90 @@ def test_session_append_empty_text_never_relays(tmp_bot_squad: Path, monkeypatch
     assert calls == []
 
 
+# ---------------------------------------------------------------------------
+# T-0660: a PASSIVE, non-actionable "fyi" append — a session wrote directly to
+# the stakeholder (author=session:<sid>), or the stakeholder replied directly
+# to a session (author=user, bypassing this thread's own attendant). Must
+# record durably for context, but MUST NOT relay (would echo the FYI note
+# right back to the user) and MUST NOT wake the attendant (not its own inbox
+# item). Non-FYI appends must be completely unaffected.
+# ---------------------------------------------------------------------------
+
+
+def test_fyi_session_append_records_but_does_not_relay(tmp_bot_squad: Path, monkeypatch):
+    """T-0660 requirement (c): a session's direct-write already went out via
+    its own channel — relaying the FYI record again would echo the 'no reply
+    needed' note straight back to the user. Must NOT happen."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV,
+        json={"author": "session:S-dev-p9", "text": "[FYI — ответ не требуется] ...",
+              "fyi": True},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fyi"] is True
+    assert body["relayed"] is False
+    assert calls == []  # tg_notify never called — no echo back to the user
+
+    out = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    assert out["messages"][-1]["fyi"] is True  # still durably recorded
+
+
+def test_fyi_user_append_records_but_does_not_wake_attendant(tmp_bot_squad: Path, monkeypatch):
+    """T-0660 requirement (b): the stakeholder replied directly to ANOTHER
+    session (not this project's attendant) — recorded for context, but this
+    isn't the attendant's own inbox item, so its auto-wake must be skipped."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV,
+        json={"author": "user", "text": "[FYI — ответ не требуется] ...", "fyi": True},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fyi"] is True
+    assert body["ensured"] == {"ok": True, "skipped": "fyi"}
+    assert calls == []  # ensure_user_conversation never called — no wake
+
+    out = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    assert out["messages"][-1]["fyi"] is True  # still durably recorded
+
+
+def test_fyi_omitted_defaults_to_normal_behavior(tmp_bot_squad: Path, monkeypatch):
+    """No `fyi` key at all -> unchanged pre-T-0660 behavior (back-compat)."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "a normal reply"},
+        headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fyi"] is False
+    assert body["relayed"] is True
+    assert [name for name, _ in calls] == ["tg_notify"]
+
+
+def test_non_fyi_user_append_still_wakes_attendant(tmp_bot_squad: Path, monkeypatch):
+    """Regression guard: a NORMAL user-authored append (the common case) must
+    still trigger the attendant wake exactly as before T-0660."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(CONV, json={"author": "user", "text": "hi"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["fyi"] is False
+    assert [name for name, _ in calls] == ["ensure_user_conversation"]
+
+
 def test_session_append_relay_failure_does_not_fail_append(tmp_bot_squad: Path, monkeypatch):
     """A relay failure (worker unreachable) must NEVER fail the append — the
     message is already durably recorded; relayed just reports False."""

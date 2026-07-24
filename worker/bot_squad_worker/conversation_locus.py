@@ -107,9 +107,16 @@ def latest_for_slug(cfg: Any, slug: str) -> Optional[dict]:
     ``tg_notify``'s slug-only resolution path (e.g. ``bsq tg ping``, stall
     escalations), which has no ``global_user_id`` to key on. bot-squad's
     single-operator-per-project model makes "most recent" a reasonable proxy
-    for "the" locus even without an explicit gid."""
+    for "the" locus even without an explicit gid.
+
+    The returned record also carries ``gid`` (extracted from the key) — used
+    by T-0660's FYI-append mechanic, which needs to know WHICH (slug, gid)
+    attendant thread to record into, not just the chat/topic to send to."""
     prefix = f"{slug}:"
-    candidates = [v for k, v in load(cfg).items() if k.startswith(prefix)]
+    candidates = [
+        {**v, "gid": k[len(prefix):]}
+        for k, v in load(cfg).items() if k.startswith(prefix)
+    ]
     if not candidates:
         return None
     return max(candidates, key=lambda r: r.get("at") or "")

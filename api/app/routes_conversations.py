@@ -213,23 +213,31 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     this ONE append, and gets the same attendant-wake behavior (see
     ``_ensure_attendant``) rather than TG being special-cased.
 
-    Body: ``{author, text, attachments?, timestamp?, channel?}`` (``text``
+    Body: ``{author, text, attachments?, timestamp?, channel?, fyi?}`` (``text``
     required — empty string is allowed, but the key must be present).
     ``channel`` (T-0631) names the inbound transport ("tg", "mcp", "api", ...);
-    defaults to "tg" for back-compat with pre-T-0631 callers. Returns the
-    stored record plus:
+    defaults to "tg" for back-compat with pre-T-0631 callers. ``fyi`` (T-0660)
+    marks a PASSIVE, non-actionable append — a session wrote directly to the
+    stakeholder, or the stakeholder replied directly to a session, bypassing
+    this thread's own attendant (see ``tg_listener.append_conversation_fyi``,
+    the sole intended caller). Returns the stored record plus:
     - ``relayed`` (T-0569): when ``author`` is a session writeback
-      (``"session:<sid>"``) with non-empty text, the text is best-effort
-      relayed to the user's Telegram chat (see ``_relay_to_telegram``) —
-      otherwise always ``False`` (a user-authored append is never relayed back
-      to itself).
+      (``"session:<sid>"``) with non-empty text AND NOT ``fyi``, the text is
+      best-effort relayed to the user's Telegram chat (see
+      ``_relay_to_telegram``) — otherwise always ``False`` (a user-authored
+      append is never relayed back to itself; an ``fyi`` append already went
+      out via its own direct-write, so relaying it again would echo the "no
+      reply needed" note straight back to the user — T-0660).
     - ``ensured`` (T-0631): present only for a user-authored append (``author
       == "user"``) — the outcome of the attendant-wake (see
-      ``_ensure_attendant``); absent for a session writeback (it already HAS an
+      ``_ensure_attendant``), UNLESS ``fyi`` (T-0660: this isn't the
+      attendant's own inbox item, just context — the wake is suppressed, not
+      run); absent entirely for a session writeback (it already HAS an
       attending session, waking one would be circular)."""
     _authenticate_worker(request)
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
+    fyi = bool(payload.get("fyi", False))
     try:
         record = CS.append(
             _data_dir(request),
@@ -240,6 +248,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             attachments=payload.get("attachments"),
             timestamp=payload.get("timestamp"),
             channel=payload.get("channel"),
+            fyi=fyi,
         )
     except ValueError as e:
         # An unsafe slug / global_user_id segment.
@@ -248,7 +257,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     relayed = False
     author = str(record.get("author") or "")
     text = str(record.get("text") or "")
-    if author.startswith("session:") and text:
+    if author.startswith("session:") and text and not fyi:
         try:
             relayed = await _relay_to_telegram(request, slug, global_user_id, text)
         except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
@@ -257,9 +266,12 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     out = dict(record)
     out["relayed"] = relayed
     if author == "user":
-        out["ensured"] = await _ensure_attendant(
-            request, slug, global_user_id, str(record.get("timestamp") or ""),
-        )
+        if fyi:
+            out["ensured"] = {"ok": True, "skipped": "fyi"}
+        else:
+            out["ensured"] = await _ensure_attendant(
+                request, slug, global_user_id, str(record.get("timestamp") or ""),
+            )
     return out
 
 

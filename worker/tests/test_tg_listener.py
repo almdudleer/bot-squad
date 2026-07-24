@@ -655,6 +655,62 @@ def test_append_conversation_swallows_http_error(tmp_path, monkeypatch):
         assert TL.append_conversation(cfg, "test-project", "gu_abc", msg) is None
 
 
+# ---------------------------------------------------------------------------
+# T-0660: append_conversation_fyi — a passive, non-actionable append into a
+# project's attendant thread, prefixed unambiguously and marked fyi=True.
+# ---------------------------------------------------------------------------
+
+
+def test_append_conversation_fyi_posts_prefixed_marked_payload(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    with patch("httpx.post", side_effect=fake_post):
+        ok = TL.append_conversation_fyi(
+            cfg, "test-project", "gu_abc",
+            author="session:S-dev-p9", text="on it, fixing now",
+        )
+
+    assert ok is True
+    assert captured["url"] == "https://mship.test/api/m/worker/conversations/test-project/gu_abc/messages"
+    assert captured["json"]["author"] == "session:S-dev-p9"
+    assert captured["json"]["fyi"] is True
+    assert captured["json"]["text"].startswith("[FYI — ответ не требуется]")
+    assert "on it, fixing now" in captured["json"]["text"]
+    assert captured["headers"]["Authorization"] == "Bearer WTOKEN"
+
+
+def test_append_conversation_fyi_noop_without_env(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch, base=None, token=None)
+    with patch("httpx.post", side_effect=AssertionError("must not POST")):
+        assert TL.append_conversation_fyi(cfg, "test-project", "gu_abc", author="user", text="x") is None
+
+
+def test_append_conversation_fyi_noop_without_gid(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    with patch("httpx.post", side_effect=AssertionError("must not POST")):
+        assert TL.append_conversation_fyi(cfg, "test-project", "", author="user", text="x") is None
+
+
+def test_append_conversation_fyi_swallows_http_error(tmp_path, monkeypatch):
+    import httpx
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    with patch("httpx.post", side_effect=httpx.ConnectError("down")):
+        assert TL.append_conversation_fyi(cfg, "test-project", "gu_abc", author="user", text="x") is None
+
+
 def test_handle_update_records_conversation(tmp_path, monkeypatch):
     """An inbound message with a recognized sender is recorded to the store."""
     cfg = _make_cfg(tmp_path, tg_chat="12345")
@@ -1264,6 +1320,82 @@ def test_handle_topic_bound_session_id_inject_failure_notifies(tmp_path, monkeyp
     assert result["ok"] is False
     assert result["action"] == "task_topic_inject_failed"
     assert len(notices) == 1 and "S-gone-p1" in notices[0][1]
+
+
+# ---------------------------------------------------------------------------
+# T-0660 Phase 2 mechanic #3: the stakeholder replying directly in a task
+# topic ALSO records a passive FYI append into the project's own (slug, gid)
+# attendant thread — so the attendant keeps context without treating it as
+# its own actionable inbox item.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_topic_bound_session_id_records_fyi_to_attendant_thread(tmp_path, monkeypatch):
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True})
+    fyi_calls = []
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda cfg, slug, gid, *, author, text: fyi_calls.append(
+                            {"slug": slug, "gid": gid, "author": author, "text": text}
+                        ))
+
+    msg = _topic_msg("looks good, ship it", chat_id=111, thread_id=42)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert len(fyi_calls) == 1
+    call = fyi_calls[0]
+    assert call["slug"] == "beta"
+    assert call["gid"] == "gu_1"
+    assert call["author"] == "user"
+    assert "S-dev-p9" in call["text"]
+    assert "looks good, ship it" in call["text"]
+
+
+def test_handle_topic_bound_session_id_records_fyi_even_on_inject_failure(tmp_path, monkeypatch):
+    """The attendant should still learn the stakeholder tried to reach the
+    session, even if that session is no longer active to receive it."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", session_id="S-gone-p1")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+
+    def _raise(name, params):
+        raise A.ActionError("no such pane")
+    monkeypatch.setattr(A, "dispatch", _raise)
+    monkeypatch.setattr(TL, "_notify", lambda *a, **k: None)
+    fyi_calls = []
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda *a, **k: fyi_calls.append((a, k)))
+
+    msg = _topic_msg("hello?", chat_id=111, thread_id=42)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+    assert len(fyi_calls) == 1
+
+
+def test_handle_topic_bound_plain_project_topic_never_records_fyi(tmp_path, monkeypatch):
+    """A plain project/General binding (no session_id) is the T-0639 base
+    case, not a task-topic direct-reply — must never trigger the FYI mechanic."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")  # no session_id
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    fyi_calls = []
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda *a, **k: fyi_calls.append((a, k)))
+
+    msg = _topic_msg("hi", chat_id=111, thread_id=7)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+    assert fyi_calls == []
 
 
 # ---------------------------------------------------------------------------

@@ -208,6 +208,13 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     project's tg_chat (there is usually only one project).  Unknown slug
     raises ActionError.
 
+    T-0665: this action never page-slims (``_slim_page``'s 400-char cut) —
+    every caller of the ``tg_notify`` action is an explicitly-addressed,
+    agent/API-initiated conversational send (``bsq tg ping``, ``bsq topic
+    say``, the T-0569 relay, admin test-pings), not an automated stall/
+    deploy/autopilot alert page. Those alert pages call
+    ``_send_stakeholder_dm`` directly and keep their own slimming.
+
     Returns {ok: true, sent: <bool>}.
     """
     extra = set(params) - _TG_NOTIFY_ALLOWED
@@ -297,7 +304,17 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
 
     message = params["message"]
     urgent = bool(params.get("urgent", False))
-    do_slim = True
+    # T-0665: the tg_notify ACTION is always an agent/API-initiated, explicitly-
+    # addressed send (`bsq tg ping`, `bsq topic say`, the T-0569 conversation
+    # relay, the /tg/test / tg-chat-id/test admin pings) — never the automated
+    # stall/deploy/autopilot alert pages, which page the human via a DIRECT
+    # `_send_stakeholder_dm` call (see tg_stall.py/autopilot.py/telemetry.py/
+    # jobs.py/routines.py/autoupdate_apply.py) and control `do_slim` there.
+    # Per the SSOT docstring's own stated rule (_send_stakeholder_dm), an
+    # explicitly-addressed send is conversational content, not a page — so
+    # this action never page-slims; automated page-slimming stays scoped to
+    # those direct callers, unaffected by this change.
+    do_slim = False
     if bool(params.get("needs_input", False)):
         from bot_squad_worker import tg_stall as _tg_stall
         session_name = params.get("tmux_session") or _resolve_tmux_session(
@@ -310,7 +327,6 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
             cfg, params.get("sid", ""), _slim_page(message), session_name
         )
         urgent = True
-        do_slim = False
 
     # An EXPLICIT chat_id/topic_id is a TG group/forum target (MAX has no such
     # binding), so those stay on TG. This decision is computed from the RAW

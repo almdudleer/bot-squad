@@ -3425,17 +3425,19 @@ def test_slim_page_falls_back_to_generic_text_without_a_link(tmp_config_dir, mon
 
 
 def test_send_stakeholder_dm_link_targets_explicit_task_id(tmp_config_dir, monkeypatch):
-    """T-0635: when the call site has a task_id on hand (tg_notify's optional
-    ``task_id`` param, threaded through to the SSOT), the pointer links
-    straight to that task."""
+    """T-0635: when the call site has a task_id on hand (threaded through to
+    the SSOT), the pointer links straight to that task.
+
+    T-0665: exercised directly against ``_send_stakeholder_dm`` (do_slim=True)
+    rather than via the ``tg_notify`` action dispatch — the action itself no
+    longer slims (every ``tg_notify`` caller is an explicitly-addressed
+    conversational send), but automated pages that call the SSOT directly
+    still slim and still need a working link."""
     import bot_squad_worker.actions as A
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
     long_text = "Заголовок. " + "Много подробностей подряд. " * 40
-    # No explicit chat_id/topic_id — an explicit target is a group/forum
-    # address (prefer_tg, never slimmed); slug-based default routing is what
-    # actually exercises the slim+link path.
-    A.dispatch("tg_notify", {"message": long_text, "slug": "test-project",
-                              "task_id": "T-0635"})
+    A._send_stakeholder_dm(A._get_config(), message=long_text, tg_chat_id="-100",
+                            slug="test-project", task_id="T-0635")
     sent = fake_tg.calls[0]["text"]
     assert "https://staging.example.com/p/test-project/t/T-0635" in sent
 
@@ -3531,6 +3533,24 @@ def test_send_stakeholder_dm_prefer_tg_never_slimmed(tmp_config_dir, monkeypatch
     reply = "Развёрнутый ответ по треду. " + "Деталь и обоснование решения. " * 40
     A._send_stakeholder_dm(A._get_config(), message=reply, tg_chat_id="404", prefer_tg=True)
     assert fake_tg.calls[0]["text"] == reply  # byte-identical, no cap
+
+
+def test_tg_notify_slug_only_never_slimmed(tmp_config_dir, monkeypatch):
+    """T-0665: `bsq tg ping` dispatches ``tg_notify`` with only slug/message/
+    sid/urgent — no chat_id/topic_id, so it used to fall through to the
+    alert-page ``_slim_page`` cut at 400 chars even though it's a live,
+    explicitly-addressed conversational send. A long message must now arrive
+    byte-identical: no cut, no dangling "… подробнее" continuation tail."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    long_reply = ("Статус деплоя. Вариант 1: откатить. Вариант 2: катить дальше. "
+                  + "Ещё немного контекста по решению. " * 20)
+    assert len(long_reply) > A._PAGE_SLIM_LIMIT
+    A.dispatch("tg_notify", {"slug": "test-project", "message": long_reply,
+                              "sid": "S-x-p1", "urgent": True})
+    sent = fake_tg.calls[0]["text"]
+    assert sent == long_reply
+    assert "подробнее" not in sent
 
 
 def test_tg_notify_needs_input_footer_survives_slim(tmp_config_dir, monkeypatch):

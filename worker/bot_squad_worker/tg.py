@@ -127,6 +127,18 @@ class TgClient:
             {"chat_id": chat_id, "message_thread_id": int(thread_id)},
         )
 
+    def rename_general_forum_topic(self, *, chat_id: str, name: str) -> None:
+        """Rename a forum's General topic (T-0660: ``editGeneralForumTopic``).
+
+        General is the chat's default topic — it has no ``message_thread_id``
+        of its own (``thread_id=None`` in the binding store), so it is a
+        distinct Bot API call from ``create_forum_topic``/``close_forum_topic``,
+        not just those with ``thread_id=None``.
+        """
+        if not self._token:
+            raise RuntimeError("tg.rename_general_forum_topic: no bot token configured")
+        self._call("editGeneralForumTopic", {"chat_id": chat_id, "name": name})
+
     def _call(self, method: str, payload: dict) -> dict:
         """POST to an arbitrary Bot API method, honoring the egress proxy."""
         import httpx  # lazy import — not available in all envs

@@ -54,6 +54,8 @@ def test_registry_lists_only_allowed_actions():
         "tg_stall_clear",
         # T-0639: runtime (chat_id,thread_id)->project topic-binding surface.
         "tg_topic_bind", "tg_topic_unbind", "tg_topic_list",
+        # T-0660: create-and-bind a forum topic in one step + rename General.
+        "tg_topic_create", "tg_topic_rename_general",
         "pause_deploys", "resume_deploys",
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",
@@ -2782,6 +2784,7 @@ class _FakeForumTg(_FakeTgClient):
         super().__init__()
         self.created: list[dict] = []
         self.closed: list[dict] = []
+        self.renamed_general: list[dict] = []
         self._next_tid = 100
 
     def create_forum_topic(self, *, chat_id, name) -> int:
@@ -2791,6 +2794,9 @@ class _FakeForumTg(_FakeTgClient):
 
     def close_forum_topic(self, *, chat_id, thread_id) -> None:
         self.closed.append({"chat_id": chat_id, "thread_id": thread_id})
+
+    def rename_general_forum_topic(self, *, chat_id, name) -> None:
+        self.renamed_general.append({"chat_id": chat_id, "name": name})
 
 
 def test_tg_notify_topic_class_resolves_to_thread_id(tmp_config_dir, monkeypatch):
@@ -2913,6 +2919,108 @@ def test_gc_project_topics_closes_all(tmp_config_dir, monkeypatch):
     assert out["ok"] is True
     assert set(out["closed"]) == {"feedback", "deploy_logs"}
     assert {c["thread_id"] for c in fake.closed} == {11, 22}
+
+
+# ---------------------------------------------------------------------------
+# T-0660: create-and-bind a forum topic in ONE step + rename a forum's
+# General topic (Phase 1 — the runtime capability the stakeholder's live
+# group setup is executed against once deployed).
+# ---------------------------------------------------------------------------
+
+
+def test_tg_topic_create_creates_and_binds(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "-1003761939853", "name": "[watchrobot] General", "slug": "test-project",
+    })
+    assert out["ok"] is True
+    assert out["chat_id"] == "-1003761939853"
+    assert out["name"] == "[watchrobot] General"
+    assert out["slug"] == "test-project"
+    thread_id = out["thread_id"]
+    assert fake.created == [{"chat_id": "-1003761939853", "name": "[watchrobot] General", "id": thread_id}]
+
+    rec = tg_bindings.resolve(Config.load(tmp_config_dir), "-1003761939853", thread_id)
+    assert rec == {"slug": "test-project", "ticket_id": None, "session_id": None}
+
+
+def test_tg_topic_create_with_ticket_id_binds_task_topic(tmp_config_dir, monkeypatch):
+    """T-0660 per-task topic: an optional ticket_id binds {slug, ticket_id}
+    instead of just {slug}."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    fake = _FakeForumTg()
+    cfg = Config.load(tmp_config_dir)
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "name": "[test-project] Add user panel",
+        "slug": "test-project", "ticket_id": "T-0700",
+    })
+    rec = tg_bindings.resolve(cfg, "111", out["thread_id"])
+    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None}
+
+
+def test_tg_topic_create_unknown_slug_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        A.dispatch("tg_topic_create", {"chat_id": "111", "name": "X", "slug": "no-such"})
+    assert fake.created == []  # no API call attempted for an invalid bind target
+
+
+def test_tg_topic_create_missing_required_param_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="missing required params"):
+        A.dispatch("tg_topic_create", {"chat_id": "111", "name": "X"})  # no slug
+
+
+def test_tg_topic_create_rejects_unexpected_param(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("tg_topic_create", {
+            "chat_id": "111", "name": "X", "slug": "test-project", "bogus": "y",
+        })
+
+
+def test_tg_topic_rename_general_calls_edit_general_forum_topic(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_rename_general", {
+        "chat_id": "-1003761939853", "name": "[bot-squad] General",
+    })
+    assert out == {"ok": True, "chat_id": "-1003761939853", "name": "[bot-squad] General"}
+    assert fake.renamed_general == [
+        {"chat_id": "-1003761939853", "name": "[bot-squad] General"},
+    ]
+
+
+def test_tg_topic_rename_general_missing_required_param_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="missing required params"):
+        A.dispatch("tg_topic_rename_general", {"chat_id": "111"})  # no name
+
+
+def test_tg_topic_rename_general_rejects_unexpected_param(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("tg_topic_rename_general", {"chat_id": "111", "name": "X", "bogus": "y"})
 
 
 # ---------------------------------------------------------------------------

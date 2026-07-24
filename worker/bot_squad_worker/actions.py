@@ -824,6 +824,71 @@ def _action_tg_topic_list(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "bindings": tg_bindings.load(_get_config())}
 
 
+_TG_TOPIC_CREATE_REQUIRED = {"chat_id", "name", "slug"}
+_TG_TOPIC_CREATE_ALLOWED = _TG_TOPIC_CREATE_REQUIRED | {"ticket_id"}
+
+
+def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0660: create a forum topic AND bind it to a project in one step —
+    ``createForumTopic`` then ``tg_bindings.set_binding`` — so a caller never
+    ends up with a TG topic that exists but isn't routed anywhere.
+
+    Required: chat_id, name, slug. Optional: ticket_id (T-0660 per-task
+    topics — binds ``{slug, ticket_id}`` instead of just ``{slug}``). Returns
+    ``{ok, chat_id, thread_id, slug, name}``.
+    """
+    extra = set(params) - _TG_TOPIC_CREATE_ALLOWED
+    if extra:
+        raise ActionError(f"tg_topic_create got unexpected params: {sorted(extra)}")
+    missing = _TG_TOPIC_CREATE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_topic_create missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"tg_topic_create: unknown project slug {slug!r}")
+
+    tg = _get_tg_client(cfg)
+    thread_id = tg.create_forum_topic(chat_id=params["chat_id"], name=params["name"])
+
+    from bot_squad_worker import tg_bindings
+    tg_bindings.set_binding(
+        cfg, params["chat_id"], thread_id, slug, ticket_id=params.get("ticket_id"),
+    )
+    return {
+        "ok": True, "chat_id": params["chat_id"], "thread_id": thread_id,
+        "slug": slug, "name": params["name"],
+    }
+
+
+_TG_TOPIC_RENAME_GENERAL_REQUIRED = {"chat_id", "name"}
+_TG_TOPIC_RENAME_GENERAL_ALLOWED = _TG_TOPIC_RENAME_GENERAL_REQUIRED
+
+
+def _action_tg_topic_rename_general(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0660: rename a forum's General topic (``editGeneralForumTopic``).
+
+    General has no ``message_thread_id`` of its own (unlike a created topic),
+    so this is a separate Bot API call from create/close — it doesn't touch
+    the binding store (General's binding, if any, is set separately via
+    ``tg_topic_bind`` with ``thread_id=None``).
+
+    Required: chat_id, name. Returns ``{ok, chat_id, name}``.
+    """
+    extra = set(params) - _TG_TOPIC_RENAME_GENERAL_ALLOWED
+    if extra:
+        raise ActionError(f"tg_topic_rename_general got unexpected params: {sorted(extra)}")
+    missing = _TG_TOPIC_RENAME_GENERAL_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_topic_rename_general missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    tg = _get_tg_client(cfg)
+    tg.rename_general_forum_topic(chat_id=params["chat_id"], name=params["name"])
+    return {"ok": True, "chat_id": params["chat_id"], "name": params["name"]}
+
+
 _CLONE_STATUS_REQUIRED = {"slug"}
 _CLONE_STATUS_ALLOWED = _CLONE_STATUS_REQUIRED
 
@@ -3940,6 +4005,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "tg_topic_bind": _action_tg_topic_bind,
     "tg_topic_unbind": _action_tg_topic_unbind,
     "tg_topic_list": _action_tg_topic_list,
+    # T-0660: create-and-bind a forum topic in one step + rename General.
+    "tg_topic_create": _action_tg_topic_create,
+    "tg_topic_rename_general": _action_tg_topic_rename_general,
     # T-0386: per-project forum-topic lifecycle (create-on-project / GC-on-archive).
     "provision_project_topics": _action_provision_project_topics,
     "gc_project_topics": _action_gc_project_topics,
@@ -4066,6 +4134,10 @@ ACTION_MODES: dict[str, str] = {
     "tg_topic_bind": "coordinator_only",
     "tg_topic_unbind": "coordinator_only",
     "tg_topic_list": "coordinator_only",
+    # T-0660: both call the coordinator's TG client (createForumTopic /
+    # editGeneralForumTopic) — coordinator-only like the rest of the TG ops.
+    "tg_topic_create": "coordinator_only",
+    "tg_topic_rename_general": "coordinator_only",
     # T-0386: use the coordinator TG client + project config (single writer of
     # the per-project topic map) — coordinator-only like the rest of the TG ops.
     "provision_project_topics": "coordinator_only",

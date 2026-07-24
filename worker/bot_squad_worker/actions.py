@@ -740,6 +740,78 @@ def _action_tg_stall_clear(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "cleared": cleared}
 
 
+# ---------------------------------------------------------------------------
+# T-0639: runtime (chat_id, message_thread_id) -> project topic-binding
+# surface. The stakeholder's explicit requirement: "не HardCotion, настраиваемо
+# через чат ID" — a topic->project binding must be set/cleared at RUNTIME, not
+# baked into code. `bsq topic bind/unbind/list` (scripts/cli/bsq) is the thin
+# CLI surface over these actions; the worker-owned store lives in
+# tg_bindings.py (single-writer JSON, mirrors tg_topics.py/pins_store).
+# ---------------------------------------------------------------------------
+
+_TG_TOPIC_BIND_REQUIRED = {"chat_id", "thread_id", "slug"}
+_TG_TOPIC_BIND_ALLOWED = _TG_TOPIC_BIND_REQUIRED
+
+
+def _action_tg_topic_bind(params: dict[str, Any]) -> dict[str, Any]:
+    """Bind ``(chat_id, thread_id)`` -> ``slug`` (T-0639 topic-supergroup
+    routing). Idempotent — rebinding the same key replaces it; a project may
+    have multiple bound keys (a project isn't 1:1 with chat/topic ids).
+
+    Required params: chat_id, thread_id, slug. ``thread_id`` may be ``None``
+    (binds the chat's non-topic/General feed). Returns {ok, binding}.
+    """
+    extra = set(params) - _TG_TOPIC_BIND_ALLOWED
+    if extra:
+        raise ActionError(f"tg_topic_bind got unexpected params: {sorted(extra)}")
+    missing = _TG_TOPIC_BIND_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_topic_bind missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"tg_topic_bind: unknown project slug {slug!r}")
+
+    from bot_squad_worker import tg_bindings
+    rec = tg_bindings.set_binding(cfg, params["chat_id"], params["thread_id"], slug)
+    return {"ok": True, "binding": rec}
+
+
+_TG_TOPIC_UNBIND_REQUIRED = {"chat_id", "thread_id"}
+_TG_TOPIC_UNBIND_ALLOWED = _TG_TOPIC_UNBIND_REQUIRED
+
+
+def _action_tg_topic_unbind(params: dict[str, Any]) -> dict[str, Any]:
+    """Clear the ``(chat_id, thread_id)`` binding (T-0639). Idempotent.
+
+    Required params: chat_id, thread_id. Returns {ok, cleared: bool}.
+    """
+    extra = set(params) - _TG_TOPIC_UNBIND_ALLOWED
+    if extra:
+        raise ActionError(f"tg_topic_unbind got unexpected params: {sorted(extra)}")
+    missing = _TG_TOPIC_UNBIND_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_topic_unbind missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import tg_bindings
+    cleared = tg_bindings.clear_binding(cfg, params["chat_id"], params["thread_id"])
+    return {"ok": True, "cleared": cleared}
+
+
+def _action_tg_topic_list(params: dict[str, Any]) -> dict[str, Any]:
+    """List every current ``(chat_id, thread_id)`` -> binding (T-0639).
+    Read-only, no params. Returns {ok, bindings: {key: {slug, ticket_id,
+    session_id}}}.
+    """
+    extra = set(params)
+    if extra:
+        raise ActionError(f"tg_topic_list got unexpected params: {sorted(extra)}")
+    from bot_squad_worker import tg_bindings
+    return {"ok": True, "bindings": tg_bindings.load(_get_config())}
+
+
 _CLONE_STATUS_REQUIRED = {"slug"}
 _CLONE_STATUS_ALLOWED = _CLONE_STATUS_REQUIRED
 
@@ -3852,6 +3924,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0610: temporary page-channel switch (TG-primary default / MAX reserve).
     "page_channel": _action_page_channel,
     "tg_stall_clear": _action_tg_stall_clear,
+    # T-0639: runtime (chat_id,thread_id)->project topic-binding surface.
+    "tg_topic_bind": _action_tg_topic_bind,
+    "tg_topic_unbind": _action_tg_topic_unbind,
+    "tg_topic_list": _action_tg_topic_list,
     # T-0386: per-project forum-topic lifecycle (create-on-project / GC-on-archive).
     "provision_project_topics": _action_provision_project_topics,
     "gc_project_topics": _action_gc_project_topics,
@@ -3973,6 +4049,11 @@ ACTION_MODES: dict[str, str] = {
     "max_notify": "coordinator_only",
     "page_channel": "coordinator_only",
     "tg_stall_clear": "coordinator_only",
+    # T-0639: the binding store is read by the coordinator's TG listener
+    # (single writer, mirrors the tg_stall/tg_topics ops above it).
+    "tg_topic_bind": "coordinator_only",
+    "tg_topic_unbind": "coordinator_only",
+    "tg_topic_list": "coordinator_only",
     # T-0386: use the coordinator TG client + project config (single writer of
     # the per-project topic map) — coordinator-only like the rest of the TG ops.
     "provision_project_topics": "coordinator_only",

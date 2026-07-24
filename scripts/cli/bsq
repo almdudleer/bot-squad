@@ -489,6 +489,47 @@ def cmd_page_channel(args) -> None:
         print(f"page channel mode: {res.get('mode')}")
 
 
+def cmd_topic_bind(args) -> None:
+    """Bind a Telegram (chat_id, thread_id) to a project (T-0639).
+
+    The runtime, configurable surface the stakeholder explicitly asked for
+    ("не HardCotion, настраиваемо через чат ID") — a topic->project binding
+    is set here, at runtime, never hardcoded. A project may have MULTIPLE
+    bound (chat_id, thread_id) entries; rebinding one replaces it.
+    """
+    thread_id = None if args.thread_id in (None, "", "none", "None") else args.thread_id
+    res = post("tg_topic_bind", {
+        "chat_id": args.chat_id, "thread_id": thread_id, "slug": args.slug,
+    })
+    b = res.get("binding", {})
+    print(f"bound chat_id={args.chat_id} thread_id={thread_id} -> slug={b.get('slug')}")
+
+
+def cmd_topic_unbind(args) -> None:
+    """Clear a (chat_id, thread_id) topic binding (T-0639). Idempotent."""
+    thread_id = None if args.thread_id in (None, "", "none", "None") else args.thread_id
+    res = post("tg_topic_unbind", {"chat_id": args.chat_id, "thread_id": thread_id})
+    if res.get("cleared"):
+        print(f"unbound chat_id={args.chat_id} thread_id={thread_id}")
+    else:
+        print(f"no binding existed for chat_id={args.chat_id} thread_id={thread_id} (no-op)")
+
+
+def cmd_topic_list(args) -> None:
+    """List every current (chat_id, thread_id) -> project topic binding."""
+    res = post("tg_topic_list", {})
+    bindings = res.get("bindings", {})
+    if not bindings:
+        print("no topic bindings set")
+        return
+    for key, rec in bindings.items():
+        chat_id, _, thread_id = key.partition(":")
+        extra = ""
+        if rec.get("ticket_id") or rec.get("session_id"):
+            extra = f"  ticket_id={rec.get('ticket_id')} session_id={rec.get('session_id')}"
+        print(f"chat_id={chat_id}  thread_id={thread_id or '(none)'}  -> slug={rec.get('slug')}{extra}")
+
+
 def cmd_peer_send(args) -> None:
     slug = resolve_slug()
     from_sid = require_sid(args.from_sid)
@@ -4209,6 +4250,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="omit to show the current mode; 'auto' reverts to TG-primary")
     pc.add_argument("--by", default="", help="who asked for the switch (audit stamp)")
     pc.set_defaults(func=cmd_page_channel)
+
+    # topic (T-0639: runtime chat_id/thread_id -> project binding surface)
+    tp = sub.add_parser(
+        "topic", help="runtime Telegram topic->project binding (T-0639, gateway routing)")
+    tp_sub = tp.add_subparsers(dest="sub", required=True)
+    tpb = tp_sub.add_parser("bind", help="bind a (chat_id, thread_id) to a project")
+    tpb.add_argument("chat_id", help="Telegram chat_id (the forum supergroup)")
+    tpb.add_argument("thread_id", help="Telegram message_thread_id (the topic); "
+                                        "'none' for the chat's non-topic feed")
+    tpb.add_argument("slug", help="project slug to route this topic to")
+    tpb.set_defaults(func=cmd_topic_bind)
+    tpu = tp_sub.add_parser("unbind", help="clear a (chat_id, thread_id) binding")
+    tpu.add_argument("chat_id", help="Telegram chat_id")
+    tpu.add_argument("thread_id", help="Telegram message_thread_id; 'none' for the non-topic feed")
+    tpu.set_defaults(func=cmd_topic_unbind)
+    tpl = tp_sub.add_parser("list", help="list every current topic binding")
+    tpl.set_defaults(func=cmd_topic_list)
 
     # spawn
     sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")

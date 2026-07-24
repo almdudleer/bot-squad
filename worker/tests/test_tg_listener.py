@@ -1025,6 +1025,155 @@ def test_handle_update_unquoted_no_cross_mention_routes_normally(tmp_path, monke
     assert ensures == [("alpha", "gu_1")]
 
 
+# ---------------------------------------------------------------------------
+# T-0639: gateway topic-supergroup routing — the runtime (chat_id,thread_id)
+# binding store (tg_bindings.py) is consulted FIRST in project-of-record
+# resolution, ahead of both the legacy static tg_chat map AND the sticky pin;
+# a bound chat is folded into the listener's allowlist even when it isn't any
+# project's static tg_chat.
+# ---------------------------------------------------------------------------
+
+
+def _topic_msg(text, chat_id, thread_id):
+    return {
+        "chat": {"id": chat_id, "type": "supergroup"},
+        "from": _from(),
+        "text": text,
+        "date": 1_700_000_000,
+        "message_thread_id": thread_id,
+    }
+
+
+def test_handle_update_allowlist_admits_bound_chat_outside_projects(tmp_path, monkeypatch):
+    """A chat_id with a topic binding is allowlisted even though it is not any
+    project's static tg_chat (D-0055 §3: the supergroup isn't project.tg_chat)."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")  # projects alpha(111)/beta(222)
+    tg_bindings.set_binding(cfg, "999", 42, "alpha")  # a THIRD, unregistered chat
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("hello", chat_id=999, thread_id=42)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route_bound_topic" and result["slug"] == "alpha"
+
+
+def test_handle_update_unbound_unregistered_chat_still_skips(tmp_path):
+    """No regression: an unregistered chat WITHOUT a binding is still rejected."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    msg = _topic_msg("hello", chat_id=999, thread_id=42)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+    assert result == {"ok": True, "action": "skip", "reason": "chat 999 not allowlisted"}
+
+
+def test_handle_update_bound_topic_wins_over_static_slug_and_pin(tmp_path, monkeypatch):
+    """Resolver precedence: a bound topic routes to the BOUND slug — not the
+    chat's static tg_chat slug, and not the user's sticky pin. Binding is the
+    strongest signal (D-0055 §2 step 1)."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")  # chat 111's static slug is alpha
+    tg_bindings.set_binding(cfg, "111", 7, "beta")  # topic 7 in that SAME chat -> beta
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m: appended.append(slug))
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")  # pinned alpha
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+
+    msg = _topic_msg("what's the status", chat_id=111, thread_id=7)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route_bound_topic"
+    assert result["slug"] == "beta"  # binding beats BOTH the static slug and the pin
+    assert appended == ["beta"]
+    assert ensures == [("beta", "gu_1")]
+
+
+def test_handle_update_unbound_thread_falls_back_to_static_slug(tmp_path, monkeypatch):
+    """No binding for this (chat_id, thread_id) -> legacy static tg_chat
+    resolution + the existing pin-based routing, unaffected."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+
+    msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route" and result["slug"] == "alpha"
+    assert ensures == [("alpha", "gu_1")]
+
+
+def test_handle_update_multi_chat_per_project_binding(tmp_path, monkeypatch):
+    """A project may have MULTIPLE bound (chat_id, thread_id) entries (D-0055
+    §3, explicit stakeholder requirement — not 1:1); both route to it."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 1, "beta")
+    tg_bindings.set_binding(cfg, "111", 2, "beta")
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref: ensures.append(slug))
+
+    for thread in (1, 2):
+        result = TL.handle_update(
+            cfg, {"update_id": 1, "message": _topic_msg("x", 111, thread)})
+        assert result["action"] == "route_bound_topic" and result["slug"] == "beta"
+    assert ensures == ["beta", "beta"]
+
+
+def test_handle_topic_bound_no_identity_skips(tmp_path, monkeypatch):
+    """No resolved sender identity -> skip, same guard as _handle_unquoted."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender", lambda c, m, slug: None)
+
+    msg = _topic_msg("hi", chat_id=111, thread_id=7)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+    assert result == {"ok": True, "action": "skip", "reason": "not a reply or command"}
+
+
+def test_handle_topic_bound_parked_notifies_user(tmp_path, monkeypatch):
+    """T-0570 parity: a bound-topic route refused under backoff/saturation
+    still tells the user — no silent drop."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: {"ok": False, "parked": True})
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat_id, text, **k: notices.append((chat_id, text)))
+
+    msg = _topic_msg("x", chat_id=111, thread_id=7)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route_parked" and result["slug"] == "beta"
+    assert len(notices) == 1 and notices[0][0] == "111"
+    assert "заняты" in notices[0][1]
+
+
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
     """T-0513: the picker now routes through the channel abstraction (was a raw
     httpx sendMessage). The keyboard must reach the TG client via the channel,

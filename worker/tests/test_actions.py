@@ -52,6 +52,8 @@ def test_registry_lists_only_allowed_actions():
         "clone_status", "pull_master",
         # T-0155: stall-watchdog marker clear (UserPromptSubmit hook).
         "tg_stall_clear",
+        # T-0639: runtime (chat_id,thread_id)->project topic-binding surface.
+        "tg_topic_bind", "tg_topic_unbind", "tg_topic_list",
         "pause_deploys", "resume_deploys",
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",

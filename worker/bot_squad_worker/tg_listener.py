@@ -455,6 +455,33 @@ def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
     return None
 
 
+def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -> dict:
+    """T-0639: an unquoted message arriving in a BOUND forum topic.
+
+    The topic binding IS the routing signal (D-0055 §2 step 1) — the
+    strongest, zero-ambiguity one there is — so this bypasses the sticky-pin
+    resolution `_handle_unquoted` does for the DM firehose entirely, and
+    routes straight to the bound project via the SAME durable path (T-0489
+    append + T-0485 ensure-session) that path uses. Unrecognized senders keep
+    the same skip as the rest of the listener (no identity to anchor on)."""
+    if not gid:
+        return {"ok": True, "action": "skip", "reason": "not a reply or command"}
+    slug = binding["slug"]
+    append_conversation(cfg, slug, gid, msg)
+    message_ref = _msg_ts(msg)
+    ensured = _ensure_user_conversation(cfg, slug, gid, message_ref)
+    if isinstance(ensured, dict) and ensured.get("parked"):
+        # T-0570 parity: a spawn refused under backoff/saturation must still
+        # tell the user, not go silent (see _handle_unquoted's identical case).
+        _channel_notify(
+            cfg, chat_id,
+            "Принял и записал. Сейчас все воркеры заняты — займусь, как только "
+            "освободится слот (обычно пара минут).",
+        )
+        return {"ok": True, "action": "route_parked", "slug": slug}
+    return {"ok": True, "action": "route_bound_topic", "slug": slug}
+
+
 def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
     """An unquoted (non-reply, non-command) message — the firehose dump path.
 
@@ -462,9 +489,10 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     T-0492; the chat slug is incidental) and lands BOTH the durable record
     (T-0489) and the attending user-conversation session (T-0485/T-0478) on that
     SAME project, so the dump isn't lost to a session reading a different thread.
-    Asks which project when unpinned; offers a reroute-confirm when the message
-    explicitly targets a different accessible project (T-0494). Unrecognized
-    senders keep the pre-T-0492 skip (no identity to anchor routing on)."""
+    Asks which project when unpinned. Unrecognized senders keep the pre-T-0492
+    skip (no identity to anchor routing on). A message in a BOUND forum topic
+    never reaches here — `handle_update` routes it via `_handle_topic_bound`
+    instead (T-0639: the topic binding outranks this pin-based resolution)."""
     if not gid:
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
     sticky = get_current_project(cfg, gid)
@@ -599,13 +627,23 @@ def handle_update(cfg, update: dict) -> dict:
 
     chat = msg.get("chat", {})
     chat_id = str(chat.get("id", ""))
+    thread_id = msg.get("message_thread_id")
 
-    # Allowlist: only accept from registered tg_chat values across projects.
+    from bot_squad_worker import tg_bindings
+
+    # T-0639: Allowlist: registered tg_chat values across projects, PLUS any
+    # chat_id with a runtime topic binding (the stakeholder's forum supergroup
+    # is not any project's static tg_chat, so it must be admitted separately).
     allowed_chats = {str(p.tg_chat) for p in cfg.projects.values()} - {"0"}
+    allowed_chats |= tg_bindings.bound_chat_ids(cfg)
     if chat_id not in allowed_chats:
         return {"ok": True, "action": "skip", "reason": f"chat {chat_id} not allowlisted"}
 
-    chat_slug = _slug_for_chat(cfg, chat_id)
+    # T-0639: the topic binding is a stronger, zero-ambiguity signal than the
+    # static tg_chat map (D-0055 §2 step 1) — consulted FIRST, falling back to
+    # the legacy `_slug_for_chat` so existing per-project chats are unchanged.
+    binding = tg_bindings.resolve(cfg, chat_id, thread_id)
+    chat_slug = (binding.get("slug") if binding else None) or _slug_for_chat(cfg, chat_id)
 
     # T-0488: recognize the TG sender as a cross-server GlobalUser (link on first
     # contact). Best-effort + env-gated, so inbound routing below is never
@@ -684,6 +722,12 @@ def handle_update(cfg, update: dict) -> dict:
         # its own record (like the unquoted path below), so it does NOT also
         # hit the append_conversation call above (no double-append).
         result = _handle_private_voice(cfg, chat_id, chat_slug, gid, msg)
+    elif binding:
+        # T-0639: an unquoted message in a BOUND forum topic — the binding IS
+        # the routing signal (D-0055 §2 step 1), stronger than the sticky pin,
+        # so this bypasses `_handle_unquoted`'s pin-based resolution entirely
+        # and routes straight to the bound project via the same durable path.
+        result = _handle_topic_bound(cfg, chat_id, gid, binding, msg)
     else:
         # T-0485/T-0494: the unquoted firehose path owns its own record (under
         # the project-of-record) so the dump and the user-conversation session

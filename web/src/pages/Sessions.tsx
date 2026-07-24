@@ -290,6 +290,21 @@ export function isLiveSession(s: SessionRow): boolean {
   return sessionLiveness(s) === "live";
 }
 
+// T-0658: an all-worker-socket-timeout poll tick returns `rows: []` with a
+// populated `errors` array — that's an UNKNOWN session count, not a
+// confirmed-empty project. Pulled out as a pure function (mirrors
+// `isLiveSession` above) so the empty-vs-uncertain classification is unit
+// testable without rendering the page.
+export type SessionsEmptyState = "none" | "uncertain" | null;
+
+export function sessionsEmptyState(
+  sessions: SessionRow[] | null,
+  fanoutErrors: WorkerFanoutError[],
+): SessionsEmptyState {
+  if (sessions === null || sessions.length > 0) return null;
+  return fanoutErrors.length > 0 ? "uncertain" : "none";
+}
+
 // T-0347: the per-row tmux-attach affordance. Only a LIVE session has a tmux
 // pane to attach to — a suspended/archived row has none, and offering the copy
 // there emitted a broken `tmux a -t …:<window>` that never attached (it ties to
@@ -1831,11 +1846,22 @@ export function Sessions() {
         <div className="mc-loading">Loading sessions</div>
       )}
 
-      {/* Empty state */}
-      {sessions !== null && sessions.length === 0 && (
+      {/* Empty state — T-0658: distinguishes a confirmed-empty project from
+          an all-worker-socket-timeout tick (the fanout-errors banner above
+          already names the unreachable sockets). */}
+      {sessionsEmptyState(sessions, fanoutErrors) === "none" && (
         <div className="mc-empty">
           <div className="mc-empty-icon">◯</div>
           <div>No sessions for <strong>{slug}</strong></div>
+        </div>
+      )}
+      {sessionsEmptyState(sessions, fanoutErrors) === "uncertain" && (
+        <div className="mc-empty" data-testid="fanout-uncertain-state">
+          <div className="mc-empty-icon">◇</div>
+          <div>
+            Couldn't confirm sessions for <strong>{slug}</strong> — worker
+            sockets unreachable, see banner above
+          </div>
         </div>
       )}
 

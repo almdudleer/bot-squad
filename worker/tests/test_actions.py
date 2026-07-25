@@ -3218,6 +3218,28 @@ def test_tg_topic_create_with_ticket_id_derives_name_from_ticket_title(tmp_confi
     assert fake.created == [{"chat_id": "111", "name": "[test-project] Add user panel", "id": out["thread_id"]}]
 
 
+def test_tg_topic_create_with_ticket_id_uses_topic_abbrev(tmp_config_dir, monkeypatch):
+    """T-0680 (stakeholder: rename [watchrobot] topics to WR, [bot-squad] to
+    BS): when the project has a configured topic_abbrev, the task-topic name
+    uses it in place of the full slug."""
+    import bot_squad_worker.actions as A
+
+    (tmp_config_dir / "projects.toml").write_text(
+        (tmp_config_dir / "projects.toml").read_text()
+        + '\ntopic_abbrev = "WR"\n'
+    )
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    backlog.mkdir(parents=True)
+    (backlog / "T-0700-add-user-panel.md").write_text(
+        "---\nid: T-0700\ntitle: Add user panel\nstatus: open\n---\n"
+    )
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700",
+    })
+    assert out["name"] == "[WR] Add user panel"
+
+
 def test_tg_topic_create_with_ticket_id_ignores_caller_name(tmp_config_dir, monkeypatch):
     """T-0669: a caller-supplied `name` is accepted (so an old caller isn't
     broken by the param becoming non-required) but IGNORED for a per-task

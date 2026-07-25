@@ -18,6 +18,35 @@ def test_load_finds_signal_tracker(tmp_config_dir: Path) -> None:
     assert "staging" in proj.deploy_targets
 
 
+def test_topic_abbrev_default_none(tmp_config_dir: Path) -> None:
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.projects["test-project"].topic_abbrev is None
+
+
+def test_topic_abbrev_from_toml(tmp_path: Path) -> None:
+    """T-0680: an explicit topic_abbrev overrides the slug in topic names."""
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "projects.toml").write_text(
+        '[projects.watchrobot]\n'
+        'slug = "watchrobot"\n'
+        'display_name = "Watchrobot"\n'
+        'repo_path = "/tmp/test-repo"\n'
+        'deploy_branch = "bot_squad/dev"\n'
+        'master_branch = "master"\n'
+        'prod_url = "https://example.com"\n'
+        'staging_url = "https://staging.example.com"\n'
+        'dev_url = "https://dev.example.com"\n'
+        'deploy_targets = ["staging"]\n'
+        'tg_chat = "0"\n'
+        'created_at = 2026-05-10\n'
+        'topic_abbrev = "WR"\n'
+    )
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = "TESTBOT:TOKEN"\n')
+    cfg = Config.load(cfg_dir)
+    assert cfg.projects["watchrobot"].topic_abbrev == "WR"
+
+
 def test_load_missing_projects_toml_raises(tmp_path: Path) -> None:
     (tmp_path / "config").mkdir()
     with pytest.raises(FileNotFoundError):

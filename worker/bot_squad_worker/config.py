@@ -46,6 +46,12 @@ class Project:
     # re-read from disk) so _page_detail_link can resolve the dashboard host
     # for a stakeholder-DM link about a DIFFERENT project's session.
     mothership: bool = False
+    # T-0680 (stakeholder 2026-07-25: "rename topics from [watchrobot] to WR",
+    # "и аналогично с BS"): short abbreviation used in TG topic names
+    # (``[<abbrev>] <title>``) instead of the full slug. None -> fall back to
+    # the slug itself (unabbreviated), so a project that hasn't set one keeps
+    # today's behaviour rather than guessing at an abbreviation nobody chose.
+    topic_abbrev: str | None = None
 
     def repo_for_target(self, target: str) -> Path:
         """Pick the clone the deploy recipe EXECUTES in for ``target``.
@@ -106,6 +112,7 @@ class Project:
             repo_workspace=Path(raw["repo_workspace"]) if raw.get("repo_workspace") else None,
             drift_enforcement=bool(raw.get("drift_enforcement", False)),
             mothership=bool(raw.get("mothership", False)),
+            topic_abbrev=str(raw["topic_abbrev"]) if raw.get("topic_abbrev") else None,
         )
 
 

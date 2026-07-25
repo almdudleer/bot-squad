@@ -4,6 +4,10 @@
 [projects.watchrobot]
 slug          = "watchrobot"
 display_name  = "Watchrobot"
+# T-0680 (stakeholder 2026-07-25: "rename topics from [watchrobot] to WR"):
+# short abbreviation used in TG topic names, [<topic_abbrev>] instead of the
+# full slug. Only touches topic naming — slug/display_name are unchanged.
+topic_abbrev  = "WR"
 # T-0189 (stakeholder 2026-06-02, "it's all watchrobot now"): the bot-squad
 # project SLUG is now `watchrobot`, matching the public brand (repo, home dir,
 # staging domain). This SUPERSEDES the 2026-05-19 decision to keep the slug
@@ -73,6 +77,10 @@ extra_hard_rules = [
 [projects.bot-squad]
 slug          = "bot-squad"
 display_name  = "Bot Squad"
+# T-0680 (stakeholder 2026-07-25: "и аналогично с BS" — same for bot-squad):
+# short abbreviation used in TG topic names, [<topic_abbrev>] instead of the
+# full slug.
+topic_abbrev  = "BS"
 # Workspace dir: parent of dev/master, where the operator lives. The
 # hook resolves the slug for any session run at or under this path.
 repo_workspace = "/home/almdudleer/bot-squad"

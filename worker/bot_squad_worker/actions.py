@@ -1037,6 +1037,10 @@ def _derive_task_topic_name(cfg: Any, slug: str, ticket_id: str) -> str:
     documented task-topic naming convention. Raises ActionError if the
     ticket can't be resolved so a topic is never created under a name nobody
     asked for.
+
+    T-0680 (stakeholder: rename ``[watchrobot]`` -> ``WR``, ``[bot-squad]``
+    -> ``BS``): the bracket carries the project's ``topic_abbrev`` when one
+    is configured, else the full slug unchanged.
     """
     from bot_squad_worker import frontmatter as fm
     backlog_dir = Path(cfg.data_dir) / slug / "backlog"
@@ -1055,7 +1059,9 @@ def _derive_task_topic_name(cfg: Any, slug: str, ticket_id: str) -> str:
     title = str(parsed[0].get("title") or "").strip()
     if not title:
         raise ActionError(f"tg_topic_create: ticket {ticket_id!r} has no title in frontmatter")
-    return f"[{slug}] {title}"
+    project = cfg.projects.get(slug)
+    prefix = (project.topic_abbrev if project and project.topic_abbrev else slug)
+    return f"[{prefix}] {title}"
 
 
 def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:

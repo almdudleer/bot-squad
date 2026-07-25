@@ -2,8 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   isNotFoundError,
-  parseNearDuplicate,
-  type NearDuplicateDetail,
   type SessionRow,
   type Task,
   type VisionFile,
@@ -11,12 +9,9 @@ import {
 import { useApiClient } from "../apiContext";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
-import { Modal } from "../components/Modal";
 import { ObservabilityPanel } from "../components/ObservabilityPanel";
-import { RowActionsMenu } from "../components/RowActionsMenu";
-import { AutopilotDialog } from "../components/AutopilotDialog";
-import { Select, type SelectOption } from "../components/Select";
-import { MenuAction, TaskCard } from "../components/TaskCard";
+import { Select } from "../components/Select";
+import { TaskCard } from "../components/TaskCard";
 import { sessionActivity } from "../utils/sessionStatus";
 import { Coachmark, hasSeen, useOnboardingState } from "../onboarding";
 import {
@@ -68,7 +63,6 @@ export function buildNesting(tasks: Task[]): {
   return { subtasksByParent, nestedChildIds };
 }
 
-type ModalKind = "create" | "editBody" | "addComment" | "setInitiative" | null;
 type GroupBy = "none" | "initiative";
 type ViewMode = "board" | "list";
 
@@ -205,37 +199,6 @@ export function Project() {
   function toggleRail(status: typeof COLUMNS[number]) {
     setExpandedRail((prev) => (prev === status ? null : status));
   }
-
-  // modal state
-  const [modalKind, setModalKind] = useState<ModalKind>(null);
-  const [activeTask, setActiveTask] = useState<Task | null>(null);
-
-  // create form
-  const [newTitle, setNewTitle] = useState("");
-  const [newBody, setNewBody] = useState("");
-  const [newStatus, setNewStatus] = useState<Task["status"]>("open");
-
-  // edit body form
-  const [editBody, setEditBody] = useState("");
-
-  // comment form
-  const [commentText, setCommentText] = useState("");
-
-  // set-initiative form. "" = unattached.
-  const [initiativeChoice, setInitiativeChoice] = useState<string>("");
-
-  const [saving, setSaving] = useState(false);
-  const [modalError, setModalError] = useState<string | null>(null);
-  // T-0608: POST /backlog's near-duplicate 409 (T-0600 gate). While set, the
-  // create modal shows the candidate list + an explicit "create anyway"
-  // (re-post with force:true) instead of a generic error.
-  const [dupDetail, setDupDetail] = useState<NearDuplicateDetail | null>(null);
-  // T-0153: project-level autopilot dialog.
-  const [autopilotOpen, setAutopilotOpen] = useState(false);
-
-  const reload = () => {
-    api.backlog(slug).then(setTasks).catch((e) => setError(String(e)));
-  };
 
   // T-0104: refresh the sessions map so card pills track the
   // worker-derived `running`/`idle` flip in near-real-time. Poll
@@ -422,253 +385,6 @@ export function Project() {
     groupBy === "initiative" ||
     (filterInit !== "" && filterInit !== ACTIVE_ONLY);
 
-  function openCreate() {
-    setNewTitle("");
-    setNewBody("");
-    setNewStatus("open");
-    setModalError(null);
-    setDupDetail(null);
-    setModalKind("create");
-  }
-
-  function closeModal() {
-    setModalKind(null);
-    setActiveTask(null);
-    setModalError(null);
-    setDupDetail(null);
-  }
-
-  // T-0608: `force` re-posts the SAME payload past the near-duplicate gate —
-  // only the panel's explicit "create anyway" sets it.
-  async function handleCreate(force = false) {
-    if (!newTitle.trim()) { setModalError("Title is required"); return; }
-    setSaving(true);
-    setModalError(null);
-    try {
-      // newBody is the stakeholder's verbatim request — composed by the API
-      // into a canonical body with the `## Verbatim request` heading.
-      await api.createTask(slug, {
-        title: newTitle.trim(),
-        verbatim_request: newBody,
-        status: newStatus,
-        ...(force ? { force: true } : {}),
-      });
-      closeModal();
-      reload();
-    } catch (e) {
-      // T-0608: the dedupe gate's structured 409 becomes an informed choice
-      // (candidates + "create anyway"), not a generic error line.
-      const dup = parseNearDuplicate(e);
-      if (dup) {
-        setDupDetail(dup);
-      } else {
-        setDupDetail(null);
-        setModalError(String(e));
-      }
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleEditBody() {
-    if (!activeTask) return;
-    setSaving(true);
-    setModalError(null);
-    try {
-      // T-0419: the modal edits ONLY the Context section; recompose the body
-      // with the existing (immutable) Verbatim + Progress so order/content stay
-      // canonical. The backend regraft (T-0289/item-14) is the belt-and-braces
-      // guarantee for Verbatim/Progress; this keeps the FE honest about what it
-      // sends instead of round-tripping the whole raw body.
-      const v = (activeTask.verbatim ?? "").trim();
-      const c = editBody.trim();
-      const pr = (activeTask.progress ?? "").trim();
-      const body = [
-        v ? `## Verbatim request\n\n${v}\n` : "",
-        c ? `## Context\n\n${c}\n` : "",
-        pr ? `## Progress\n\n${pr}\n` : "",
-      ].filter(Boolean).join("\n");
-      await api.patchTask(slug, activeTask.id, { body });
-      closeModal();
-      reload();
-    } catch (e) {
-      setModalError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleAddComment() {
-    if (!activeTask) return;
-    if (!commentText.trim()) { setModalError("Comment cannot be empty"); return; }
-    setSaving(true);
-    setModalError(null);
-    try {
-      // T-0238: comments land in the working-area feed (progress notes) — the
-      // reused, no-new-schema comment channel. "S-stakeholder" = the user.
-      await api.addProgress(slug, activeTask.id, "S-stakeholder", commentText.trim());
-      closeModal();
-      reload();
-    } catch (e) {
-      setModalError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleMove(taskId: string, fromStatus: Task["status"], toStatus: Task["status"]) {
-    if (fromStatus === toStatus) return;
-    // Optimistic update so the card moves immediately
-    setTasks((prev) =>
-      prev ? prev.map((t) => (t.id === taskId ? { ...t, status: toStatus } : t)) : prev,
-    );
-    try {
-      await api.patchTask(slug, taskId, { status: toStatus });
-      reload();
-    } catch (e) {
-      setError(String(e));
-      reload();   // revert to server truth
-    }
-  }
-
-  // Phase 8: within-column reorder. Sparse-int scheme: pick a value that
-  // slots the dragged task between its new neighbors; renumber the column
-  // when there's no gap to expand into.
-  async function handleReorder(taskId: string, status: Task["status"], targetIndex: number) {
-    const current = tasks;
-    if (!current) return;
-    const columnSorted = sortByPriority(current.filter((t) => t.status === status));
-    const without = columnSorted.filter((t) => t.id !== taskId);
-    const dragged = columnSorted.find((t) => t.id === taskId);
-    if (!dragged) return;
-
-    // Translate the visual target index into the position within `without`.
-    // If dragging downward in the same column the index above the original
-    // position shifts by one. computeDropIndex used the pre-removal indices,
-    // so clamp to the post-removal range.
-    const oldIndex = columnSorted.findIndex((t) => t.id === taskId);
-    let insertAt = targetIndex;
-    if (oldIndex !== -1 && targetIndex > oldIndex) insertAt = targetIndex - 1;
-    if (insertAt === oldIndex) return;     // dropped on itself — no-op
-    if (insertAt < 0) insertAt = 0;
-    if (insertAt > without.length) insertAt = without.length;
-
-    const before = insertAt > 0 ? without[insertAt - 1] : null;
-    const after = insertAt < without.length ? without[insertAt] : null;
-    const beforeP = before && typeof before.priority === "number" ? before.priority : null;
-    const afterP = after && typeof after.priority === "number" ? after.priority : null;
-
-    // Compute the new priority. If we can't pick a clean gap, renumber.
-    let newPriority: number | null = null;
-    let needsRenumber = false;
-    if (beforeP === null && afterP === null) {
-      // Empty column (or all neighbors null) → start at 100.
-      newPriority = 100;
-    } else if (beforeP === null && afterP !== null) {
-      // Dropping above all: need top - 100 ≥ 0.
-      if (afterP > 100) newPriority = afterP - 100;
-      else needsRenumber = true;
-    } else if (beforeP !== null && afterP === null) {
-      // Dropping below all (priority-wise).
-      newPriority = beforeP + 100;
-    } else if (beforeP !== null && afterP !== null) {
-      if (afterP - beforeP >= 2) newPriority = Math.floor((beforeP + afterP) / 2);
-      else needsRenumber = true;
-    }
-
-    // Compose the post-move order locally for optimistic UI + renumber.
-    const newOrder = [...without.slice(0, insertAt), dragged, ...without.slice(insertAt)];
-
-    if (needsRenumber) {
-      // Renumber 100, 200, 300, ...
-      const updates = newOrder.map((t, i) => ({ id: t.id, priority: (i + 1) * 100 }));
-      setTasks((prev) => {
-        if (!prev) return prev;
-        const byId = new Map(updates.map((u) => [u.id, u.priority]));
-        return prev.map((t) => (byId.has(t.id) ? { ...t, priority: byId.get(t.id) as number } : t));
-      });
-      try {
-        await Promise.all(
-          updates.map((u) => api.patchTaskPriority(slug, u.id, u.priority)),
-        );
-        reload();
-      } catch (e) {
-        setError(String(e));
-        reload();
-      }
-      return;
-    }
-
-    if (newPriority === null) return;
-    const finalPriority = newPriority;
-    setTasks((prev) =>
-      prev ? prev.map((t) => (t.id === taskId ? { ...t, priority: finalPriority } : t)) : prev,
-    );
-    try {
-      await api.patchTaskPriority(slug, taskId, finalPriority);
-      reload();
-    } catch (e) {
-      setError(String(e));
-      reload();
-    }
-  }
-
-  async function handleMenuAction(task: Task, action: MenuAction) {
-    if (action.kind === "status") {
-      try {
-        await api.patchTask(slug, task.id, { status: action.status });
-        reload();
-      } catch (e) {
-        setError(String(e));
-      }
-    } else if (action.kind === "editBody") {
-      setActiveTask(task);
-      // T-0419: edit the CONTEXT section only. Pre-filling the full raw body
-      // dumped immutable ## Verbatim + the long ## Progress feed into one
-      // textarea — editing those lines then Saving silently no-op'd (the
-      // backend regrafts them, T-0289/item-14). Context is the only editable
-      // section, so offer just that.
-      setEditBody(task.context ?? "");
-      setModalError(null);
-      setModalKind("editBody");
-    } else if (action.kind === "addComment") {
-      setActiveTask(task);
-      setCommentText("");
-      setModalError(null);
-      setModalKind("addComment");
-    } else if (action.kind === "setInitiative") {
-      setActiveTask(task);
-      setInitiativeChoice((task.initiative ?? "").trim());
-      setModalError(null);
-      setModalKind("setInitiative");
-    } else if (action.kind === "delete") {
-      if (!confirm(`Delete task ${task.id}: "${task.title}"?`)) return;
-      try {
-        await api.deleteTask(slug, task.id);
-        reload();
-      } catch (e) {
-        setError(String(e));
-      }
-    }
-  }
-
-  async function handleSetInitiative() {
-    if (!activeTask) return;
-    setSaving(true);
-    setModalError(null);
-    try {
-      await api.patchTask(slug, activeTask.id, {
-        initiative: initiativeChoice ? initiativeChoice : null,
-      });
-      closeModal();
-      reload();
-    } catch (e) {
-      setModalError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
   if (slugMissing === true) {
     return (
       <div className="container py-4">
@@ -694,32 +410,17 @@ export function Project() {
       <div className="d-flex justify-content-between align-items-center mb-3">
         {/* T-0366 #3: title matches the "Board" nav label (was "Backlog"). */}
         <h2 style={{ fontSize: "1rem", fontWeight: 600, margin: 0 }}>Board</h2>
-        <div className="d-flex align-items-center gap-2">
-          <button type="button" className="btn btn-primary btn-sm" onClick={openCreate}>
-            + New task
-          </button>
-          {/* T-0153: project-level autopilot (spawns a TL if none is live). */}
-          <RowActionsMenu
-            actions={[
-              { label: "Autopilot…", onClick: () => setAutopilotOpen(true) },
-            ]}
-            ariaLabel="Project actions"
-          />
-        </div>
       </div>
 
-      <AutopilotDialog
-        open={autopilotOpen}
-        slug={slug}
-        target={{ kind: "project", label: slug }}
-        onClose={() => setAutopilotOpen(false)}
-      />
+      {/* T-0674 (D-0057 §4/§8): the board is pure read-first now — task
+          create/edit/comment/delete and the project-level autopilot trigger
+          are cut. Task mutation happens via the TG dialog (R5). */}
       <PageHelp>
         Open work for this project across the canonical lifecycle — <strong>Backlog →
         In progress → Validating → Done</strong> (the overview strip), refined into six
-        internal statuses in the columns. <strong>Drag</strong> a card to change status,
-        <strong>click</strong> a card for full detail, or <strong>⋯</strong> for the quick
-        menu (status / edit body / comment / delete).
+        internal statuses in the columns. <strong>Click</strong> a card to open its full
+        detail. Creating, editing, or commenting on a task happens via the Telegram
+        dialog — this board is read-only.
       </PageHelp>
 
       {/* T-0230: resource telemetry panel relocated to the Agent sessions page. */}
@@ -792,9 +493,13 @@ export function Project() {
                 canonical={CANONICAL_LABELS[CANONICAL_STATE[c]]}
                 tasks={grouped[c]}
                 slug={slug}
-                onMenuAction={handleMenuAction}
-                onMove={handleMove}
-                onReorder={handleReorder}
+                // T-0674: board is pure read-first — no menu/drag mutation.
+                // TaskCard renders no kebab and isn't draggable, so these
+                // handlers are unreachable; kept as no-ops only to satisfy
+                // BoardColumn's prop contract.
+                onMenuAction={() => {}}
+                onMove={() => {}}
+                onReorder={() => {}}
                 railMode={
                   RAIL_STATUSES.has(c)
                     ? (expandedRail === c ? "expanded" : "collapsed")
@@ -811,7 +516,6 @@ export function Project() {
           <ListBoard
             tasks={ungroupedTasks}
             slug={slug}
-            onMenuAction={handleMenuAction}
             hideInitiative={hideInitiativeChip}
           />
         )
@@ -826,216 +530,12 @@ export function Project() {
               viewMode={viewMode}
               collapsed={laneCollapsed(lane)}
               onToggleCollapsed={() => toggleLane(lane.key, laneCollapsed(lane))}
-              onMenuAction={handleMenuAction}
-              onMove={handleMove}
-              onReorder={handleReorder}
               expandedRail={expandedRail}
               onToggleRail={toggleRail}
             />
           ))}
         </div>
       )}
-
-      {/* Create task modal */}
-      <Modal
-        open={modalKind === "create"}
-        title="New task"
-        onClose={closeModal}
-        footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={() => handleCreate()} disabled={saving}>
-              {saving ? "Creating…" : "Create"}
-            </button>
-          </>
-        }
-      >
-        {modalError && <div className="alert alert-danger">{modalError}</div>}
-        {/* T-0608: near-duplicate gate (T-0577/T-0600). Not a rejection — an
-            informed choice: link the candidates, offer an explicit
-            "create anyway" (force:true) or keep editing. */}
-        {dupDetail && (
-          <div className="alert alert-warning" data-testid="near-duplicate-panel">
-            <strong style={{ fontSize: "0.85rem" }}>
-              Looks like a near-duplicate of existing task
-              {dupDetail.candidates.length === 1 ? "" : "s"}
-            </strong>
-            <ul style={{ margin: "0.4rem 0", paddingLeft: "1.2rem", fontSize: "0.82rem" }}>
-              {dupDetail.candidates.map((c) => (
-                <li key={c.id}>
-                  <Link to={`/p/${slug}/t/${c.id}`} onClick={closeModal}>{c.id}</Link>
-                  {" · "}
-                  {c.title}
-                </li>
-              ))}
-            </ul>
-            <div className="d-flex gap-2 align-items-center">
-              <button
-                type="button"
-                className="btn btn-outline-warning btn-sm"
-                disabled={saving}
-                onClick={() => handleCreate(true)}
-              >
-                {saving ? "Creating…" : "Create anyway"}
-              </button>
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                onClick={() => setDupDetail(null)}
-              >
-                Keep editing
-              </button>
-            </div>
-          </div>
-        )}
-        <div className="mb-3">
-          <label className="form-label">Title *</label>
-          <input
-            className="form-control"
-            value={newTitle}
-            onChange={(e) => setNewTitle(e.target.value)}
-            autoFocus
-          />
-        </div>
-        <div className="mb-3">
-          <label className="form-label">Verbatim request — what you literally want (preserved exactly)</label>
-          <textarea
-            className="form-control"
-            rows={5}
-            value={newBody}
-            onChange={(e) => setNewBody(e.target.value)}
-            placeholder="Write your request in your own words. Sessions cannot rewrite this."
-          />
-          <div
-            style={{
-              fontSize: "0.7rem",
-              color: "var(--mc-text-dim)",
-              marginTop: "0.25rem",
-            }}
-          >
-            This is the source-of-truth artifact for the task. Sessions cannot rewrite
-            it; they append progress notes below.
-          </div>
-        </div>
-        <div className="mb-3">
-          <label className="form-label">Status</label>
-          {/* T-0389/audit item 20: a brand-new task can only start as Open
-              (default) or Planned — in_progress/totest/reopened/closed are
-              nonsensical at creation (a task no session has touched yet). */}
-          <Select
-            value={newStatus}
-            onChange={(v) => setNewStatus(v as Task["status"])}
-            style={{ width: "100%" }}
-            ariaLabel="task status"
-            options={(["open", "planned"] as const).map((c) => ({ value: c, label: COLUMN_LABELS[c] }))}
-          />
-        </div>
-      </Modal>
-
-      {/* Edit context modal (T-0419: Context is the only editable section — the
-          ask/Verbatim is yours-only + the Progress feed is append-only, both
-          regrafted server-side). */}
-      <Modal
-        open={modalKind === "editBody"}
-        title={`Edit context — ${activeTask?.id ?? ""}`}
-        onClose={closeModal}
-        footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={handleEditBody} disabled={saving}>
-              {saving ? "Saving…" : "Save"}
-            </button>
-          </>
-        }
-      >
-        {modalError && <div className="alert alert-danger">{modalError}</div>}
-        <div style={{ fontSize: "0.72rem", color: "var(--mc-text-dim)", marginBottom: "0.4rem" }}>
-          The ask and the working/Progress feed are preserved automatically — edit the Context (TL clarification) here.
-        </div>
-        <textarea
-          className="form-control"
-          rows={8}
-          value={editBody}
-          onChange={(e) => setEditBody(e.target.value)}
-          placeholder="Short TL clarification — keep it brief."
-          autoFocus
-        />
-      </Modal>
-
-      {/* Add comment modal */}
-      <Modal
-        open={modalKind === "addComment"}
-        title={`Add comment — ${activeTask?.id ?? ""}`}
-        onClose={closeModal}
-        footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={handleAddComment} disabled={saving}>
-              {saving ? "Posting…" : "Post"}
-            </button>
-          </>
-        }
-      >
-        {modalError && <div className="alert alert-danger">{modalError}</div>}
-        <textarea
-          className="form-control"
-          rows={4}
-          maxLength={240}
-          placeholder="Write your comment… (cap 240 chars)"
-          value={commentText}
-          onChange={(e) => setCommentText(e.target.value)}
-          autoFocus
-        />
-        <div style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
-          Recorded in the task's working area (the agent working / negotiation log).
-        </div>
-      </Modal>
-
-      {/* Set initiative modal — T-0038 follow-up. Quick assign from the
-          three-dots menu. The TaskDetail page has the same control inline. */}
-      <Modal
-        open={modalKind === "setInitiative"}
-        title={`Set initiative — ${activeTask?.id ?? ""}`}
-        onClose={closeModal}
-        footer={
-          <>
-            <button type="button" className="btn btn-secondary" onClick={closeModal}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={handleSetInitiative} disabled={saving}>
-              {saving ? "Saving…" : "Save"}
-            </button>
-          </>
-        }
-      >
-        {modalError && <div className="alert alert-danger">{modalError}</div>}
-        {(() => {
-          // Orphan-aware option list: surface the current binding even if
-          // the vision file was deleted, so saving is a deliberate act.
-          const orphanOpt: SelectOption | null =
-            activeTask?.initiative &&
-            !initiativeMeta.some((m) => m.key === activeTask.initiative)
-              ? { value: activeTask.initiative, label: `${activeTask.initiative} (orphan)` }
-              : null;
-          const options: SelectOption[] = [
-            { value: "", label: "— unattached —" },
-            ...(orphanOpt ? [orphanOpt] : []),
-            ...initiativeMeta.map((m) => ({
-              value: m.key,
-              label: m.title,
-              hint: m.status,
-            })),
-          ];
-          return (
-            <Select
-              value={initiativeChoice}
-              onChange={setInitiativeChoice}
-              autoFocus
-              style={{ width: "100%" }}
-              ariaLabel="initiative"
-              options={options}
-            />
-          );
-        })()}
-      </Modal>
     </div>
   );
 }
@@ -1097,9 +597,6 @@ interface InitiativeLaneProps {
   viewMode: ViewMode;
   collapsed: boolean;
   onToggleCollapsed: () => void;
-  onMenuAction: (task: Task, action: MenuAction) => void;
-  onMove: (taskId: string, from: Task["status"], to: Task["status"]) => void;
-  onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
   // T-0058: rail expansion is shared across lanes — the parent owns the state.
   expandedRail: typeof COLUMNS[number] | null;
   onToggleRail: (status: typeof COLUMNS[number]) => void;
@@ -1112,9 +609,6 @@ function InitiativeLane({
   viewMode,
   collapsed,
   onToggleCollapsed,
-  onMenuAction,
-  onMove,
-  onReorder,
   expandedRail,
   onToggleRail,
 }: InitiativeLaneProps) {
@@ -1239,9 +733,10 @@ function InitiativeLane({
               canonical={CANONICAL_LABELS[CANONICAL_STATE[c]]}
               tasks={grouped[c]}
               slug={slug}
-              onMenuAction={onMenuAction}
-              onMove={onMove}
-              onReorder={onReorder}
+              // T-0674: pure read-first — see the ungrouped board's comment.
+              onMenuAction={() => {}}
+              onMove={() => {}}
+              onReorder={() => {}}
               railMode={
                 RAIL_STATUSES.has(c)
                   ? (expandedRail === c ? "expanded" : "collapsed")
@@ -1258,7 +753,6 @@ function InitiativeLane({
         <ListBoard
           tasks={tasks}
           slug={slug}
-          onMenuAction={onMenuAction}
           hideInitiative
         />
       ))}
@@ -1269,17 +763,15 @@ function InitiativeLane({
 interface ListBoardProps {
   tasks: Task[];
   slug: string;
-  onMenuAction: (task: Task, action: MenuAction) => void;
   // T-0096: forwarded to every TaskCard rendered by the list.
   hideInitiative?: boolean;
 }
 
 /**
  * Compact list view: one section per status, tasks rendered as cards but
- * stacked into a single column. DnD reordering is omitted to keep the
- * list lean — use the board view when reordering matters.
+ * stacked into a single column. Pure read (T-0674) — no drag, no menu.
  */
-function ListBoard({ tasks, slug, onMenuAction, hideInitiative = false }: ListBoardProps) {
+function ListBoard({ tasks, slug, hideInitiative = false }: ListBoardProps) {
   const grouped = COLUMNS.reduce<Record<string, Task[]>>(
     (acc, c) => ({ ...acc, [c]: [] }),
     {},
@@ -1309,7 +801,6 @@ function ListBoard({ tasks, slug, onMenuAction, hideInitiative = false }: ListBo
                     key={t.id}
                     task={t}
                     slug={slug}
-                    onMenuAction={onMenuAction}
                     hideInitiative={hideInitiative}
                   />
                 ))}

@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, isNotFoundError, SessionRow, Task, VisionFile } from "../api";
-import { Select, type SelectOption } from "../components/Select";
+import { api, isNotFoundError, SessionRow, Task } from "../api";
 import {
   CANONICAL_LABELS,
   CANONICAL_STATE,
@@ -13,8 +12,12 @@ import {
   sessionGlyph,
   sessionLabel,
 } from "../utils/sessionStatus";
-import { normalizeId } from "../utils/normalizeId";
 
+// T-0674 (D-0057 §4/§8): TaskDetail is pure read-first — every inline edit
+// control (title, stage, initiative, verbatim, context, comment, dev-process
+// binding, related-doc link/unlink, delete) is cut. Task mutation happens via
+// the TG dialog (R5); this page is the "ticket view" lookup the north star
+// names. STATUS_OPTIONS stays as a label lookup for the read-only stage text.
 const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "planned", label: "Planned" },
   { value: "open", label: "Open" },
@@ -23,10 +26,6 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "reopened", label: "Reopened" },
   { value: "closed", label: "Closed" },
 ];
-
-// T-0366 #5: the at-a-glance stage label/colour helpers fed the static header
-// pill, which was a redundant third status display — removed. The editable
-// `stage ▾` dropdown (STATUS_OPTIONS) is now the single status surface here.
 
 export type ProgressEntry = { ts: string; sid: string; text: string };
 
@@ -84,43 +83,11 @@ export function TaskDetail() {
   // "network_error" → retryable banner. Replaces the previous single
   // `error` string which conflated 404 with transient failures.
   const [loadState, setLoadState] = useState<"loading" | "ok" | "not_found" | "network_error">("loading");
-  const [saving, setSaving] = useState(false);
-  const [activeDevs, setActiveDevs] = useState<SessionRow[]>([]);
   // T-0104: keep every session row keyed by sid so we can look up the
   // worker-derived activity for the bound dev session below. The
   // /backlog endpoint that drove `task.session` doesn't enrich with
   // the activity probe, so we join client-side from /sessions.
   const [sessionsBySid, setSessionsBySid] = useState<Record<string, SessionRow>>({});
-  // T-0038 follow-up: surface initiative binding here. We load every
-  // initiative file (active+draft+done) so the operator can bind a task
-  // to e.g. a draft initiative without first activating it.
-  const [initiatives, setInitiatives] = useState<VisionFile[]>([]);
-
-  const [editingTitle, setEditingTitle] = useState(false);
-  const [titleValue, setTitleValue] = useState("");
-  const titleRef = useRef<HTMLInputElement>(null);
-
-  const [statusValue, setStatusValue] = useState<Task["status"]>("open");
-
-  // Section edit state — each section saves independently.
-  const [editingVerbatim, setEditingVerbatim] = useState(false);
-  const [verbatimValue, setVerbatimValue] = useState("");
-
-  const [editingContext, setEditingContext] = useState(false);
-  const [contextValue, setContextValue] = useState("");
-
-  const [progressText, setProgressText] = useState("");
-  const [progressError, setProgressError] = useState<string | null>(null);
-  const [progressSaving, setProgressSaving] = useState(false);
-  // T-0273: comment control matches the board kebab modal — a multi-line
-  // (auto-growing) textarea rather than a single-line input. This ref drives
-  // the auto-grow effect below.
-  const progressRef = useRef<HTMLTextAreaElement>(null);
-
-  const [actionError, setActionError] = useState<string | null>(null);
-
-  // T-0172: related docs (ticket→doc half of the bidirectional mention).
-  const [docToLink, setDocToLink] = useState("");
 
   // T-0512 (M9): this task's subtasks (children whose parent_task === id),
   // loaded from the children endpoint. When non-empty the task is ABSTRACT —
@@ -136,39 +103,19 @@ export function TaskDetail() {
         const found = tasks.find((t) => t.id === id);
         if (!found) { setLoadState("not_found"); return; }
         setTask(found);
-        setTitleValue(found.title);
-        setStatusValue(found.status);
-        setVerbatimValue(found.verbatim ?? "");
-        setContextValue(found.context ?? "");
         setLoadState("ok");
         // Side-loads only fire once the parent project is known to exist
         // (i.e. backlog returned 200). Keeps the not-found path quiet —
-        // no extra 404s on /sessions or /vision.
+        // no extra 404s on /sessions.
         api.sessions(slug)
           .then((rows) => {
-            setActiveDevs(rows.filter((s) => {
-              if (s.status !== "active") return false;
-              const tid = (s.task_id ?? "").trim();
-              return Boolean(tid) && tid !== "~";
-            }));
             const map: Record<string, SessionRow> = {};
             for (const r of rows) map[r.sid] = r;
             setSessionsBySid(map);
           })
           .catch(() => {
-            setActiveDevs([]);
             setSessionsBySid({});
           });
-        api.vision(slug)
-          .then((files) =>
-            setInitiatives(
-              files.filter(
-                (f) =>
-                  f.name.startsWith("initiatives/") && !f.name.endsWith("/_TEMPLATE.md"),
-              ),
-            ),
-          )
-          .catch(() => setInitiatives([]));
         // T-0512 (M9): load this task's subtasks for the Subtasks panel.
         api.children(slug, id)
           .then(setChildren)
@@ -181,209 +128,10 @@ export function TaskDetail() {
       });
   }
 
-  // Build the option list once per `initiatives` change. Sort active first,
-  // draft second, done last — matches the swimlane order on the board.
-  const initiativeOptions = useMemo(() => {
-    const list = initiatives.map((f) => ({
-      basename: f.name.replace(/^initiatives\//, ""),
-      active: Boolean(f.active),
-      finished: Boolean(f.finished),
-    }));
-    const rank = (i: { active: boolean; finished: boolean }) =>
-      i.finished ? 2 : i.active ? 0 : 1;
-    list.sort((a, b) => {
-      const ra = rank(a);
-      const rb = rank(b);
-      if (ra !== rb) return ra - rb;
-      return a.basename.localeCompare(b.basename);
-    });
-    return list;
-  }, [initiatives]);
-
-  async function saveInitiative(value: string | null) {
-    if (!task) return;
-    setSaving(true);
-    setActionError(null);
-    try {
-      // value="" from the select means "unattached" — send null to clear.
-      await api.patchTask(slug, id, {
-        initiative: value && value.length > 0 ? value : null,
-      });
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function bindToDev(sid: string) {
-    if (!task) return;
-    try {
-      await api.bindTask(slug, sid, task.id);
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    }
-  }
-
-  async function unassignSession() {
-    if (!task || !task.session) return;
-    // unbind_task only works on extras — for the session's primary task
-    // we'd be erasing the session's identity, which the worker refuses.
-    if (!window.confirm(`Unbind ${task.id} from ${task.session.sid}?`)) return;
-    try {
-      await api.unbindTask(slug, task.session.sid, task.id);
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    }
-  }
-
   useEffect(() => {
     loadTask();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug, id]);
-
-  useEffect(() => {
-    if (editingTitle && titleRef.current) titleRef.current.focus();
-  }, [editingTitle]);
-
-  // T-0273: auto-grow the comment textarea to fit its content (and shrink
-  // back to one row when it's cleared after posting).
-  useEffect(() => {
-    const el = progressRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [progressText]);
-
-  function composeBody(verbatim: string, context: string, progress: string): string {
-    const parts: string[] = [];
-    const v = verbatim.trim();
-    const c = context.trim();
-    const p = progress.trim();
-    if (v) parts.push(`## Verbatim request\n\n${v}\n`);
-    if (c) parts.push(`## Context\n\n${c}\n`);
-    if (p) parts.push(`## Progress\n\n${p}\n`);
-    return parts.join("\n");
-  }
-
-  async function saveTitle() {
-    if (!task || titleValue.trim() === task.title) { setEditingTitle(false); return; }
-    if (!titleValue.trim()) { setEditingTitle(false); return; }
-    setSaving(true);
-    setActionError(null);
-    try {
-      await api.patchTask(slug, id, { title: titleValue.trim() });
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    } finally {
-      setSaving(false);
-      setEditingTitle(false);
-    }
-  }
-
-  async function saveStatus(newStatus: Task["status"]) {
-    setStatusValue(newStatus);
-    setSaving(true);
-    setActionError(null);
-    try {
-      await api.patchTask(slug, id, { status: newStatus });
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function saveVerbatim() {
-    if (!task) return;
-    setSaving(true);
-    setActionError(null);
-    try {
-      const body = composeBody(verbatimValue, task.context ?? "", task.progress ?? "");
-      await api.patchTask(slug, id, { body });
-      setEditingVerbatim(false);
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function saveContext() {
-    if (!task) return;
-    setSaving(true);
-    setActionError(null);
-    try {
-      const body = composeBody(task.verbatim ?? "", contextValue, task.progress ?? "");
-      await api.patchTask(slug, id, { body });
-      setEditingContext(false);
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function postProgress() {
-    if (!progressText.trim()) { setProgressError("Comment cannot be empty"); return; }
-    setProgressSaving(true);
-    setProgressError(null);
-    try {
-      // T-0238: the stakeholder's comment is recorded into the working-area
-      // feed (progress notes) — the reused, no-new-schema comment channel.
-      await api.addProgress(slug, id, STAKEHOLDER_SID, progressText.trim());
-      setProgressText("");
-      loadTask();
-    } catch (e) {
-      setProgressError(String(e));
-    } finally {
-      setProgressSaving(false);
-    }
-  }
-
-  async function linkDoc() {
-    if (!task) return;
-    const d = docToLink.trim().toUpperCase();
-    if (!/^D-\d{4}$/.test(d)) { setActionError("Doc must look like D-0123."); return; }
-    setActionError(null);
-    try {
-      // Bidirectional: also writes this doc-id into task.related_docs.
-      await api.linkDoc(slug, d, task.id);
-      setDocToLink("");
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    }
-  }
-
-  async function unlinkDoc(docId: string) {
-    if (!task) return;
-    setActionError(null);
-    try {
-      await api.unlinkDoc(slug, docId, task.id);
-      loadTask();
-    } catch (e) {
-      setActionError(String(e));
-    }
-  }
-
-  async function deleteTask() {
-    if (!task) return;
-    if (!confirm(`Delete task ${task.id}: "${task.title}"?`)) return;
-    try {
-      await api.deleteTask(slug, id);
-      navigate(`/p/${slug}`);
-    } catch (e) {
-      setActionError(String(e));
-    }
-  }
 
   if (loadState === "not_found") {
     return (
@@ -443,16 +191,15 @@ export function TaskDetail() {
         </Link>
       </div>
 
-      {actionError && <div className="alert alert-danger">{actionError}</div>}
-
       {/* ==================================================================
           USER-FACING HEADER (T-0238) — what the user asked for + the stage.
-          The header is the user's summary; agents work in the area below.
+          T-0674: pure read-first — title/stage/initiative/verbatim are all
+          plain facts now; task mutation happens via the TG dialog (R5).
           ================================================================== */}
       <div className="mc-task-zone mc-zone-header">
         <div className="mc-zone-tag">▸ User-facing — what you asked for</div>
 
-        {/* Title row — id, editable title, at-a-glance stage pill */}
+        {/* Title row — id + title */}
         <div className="d-flex align-items-start gap-2 mb-3">
           <span
             style={{
@@ -465,109 +212,41 @@ export function TaskDetail() {
             {task.id}
           </span>
           <div className="flex-grow-1">
-            {editingTitle ? (
-              <input
-                ref={titleRef}
-                className="form-control fw-semibold"
-                style={{ fontSize: "1.05rem" }}
-                value={titleValue}
-                onChange={(e) => setTitleValue(e.target.value)}
-                onBlur={saveTitle}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") { e.preventDefault(); saveTitle(); }
-                  if (e.key === "Escape") { setEditingTitle(false); setTitleValue(task.title); }
-                }}
-                disabled={saving}
-              />
-            ) : (
-              <h4
-                style={{
-                  cursor: "text",
-                  marginBottom: 0,
-                  fontSize: "1.05rem",
-                  fontWeight: 600,
-                  color: "var(--mc-text)",
-                }}
-                title="Click to edit title"
-                onClick={() => setEditingTitle(true)}
-              >
-                {task.title}
-              </h4>
-            )}
+            <h4
+              style={{
+                marginBottom: 0,
+                fontSize: "1.05rem",
+                fontWeight: 600,
+                color: "var(--mc-text)",
+              }}
+            >
+              {task.title}
+            </h4>
           </div>
-          {/* T-0366 #5: the static stage pill was a third redundant status
-              display (alongside the editable `stage ▾` dropdown below + the
-              board column). Cut it — the dropdown is the single source. */}
         </div>
 
-        {/* Stage + initiative controls — how the user steers the task. */}
+        {/* Stage + initiative — read-only facts. */}
         <div className="d-flex flex-wrap align-items-center gap-3 mb-3" style={{ fontSize: "0.78rem" }}>
           <div className="d-flex align-items-center gap-2">
-            <label
-              htmlFor="task-status"
-              style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)", margin: 0 }}
-            >
+            <span style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)" }}>
               stage:
-            </label>
-            <Select
-              id="task-status"
-              value={statusValue}
-              onChange={(v) => saveStatus(v as Task["status"])}
-              disabled={saving}
-              style={{ minWidth: "9rem" }}
-              ariaLabel="task status"
-              options={STATUS_OPTIONS.map((s) => ({ value: s.value, label: s.label }))}
-            />
+            </span>
+            <span style={{ color: "var(--mc-text)" }}>
+              {STATUS_OPTIONS.find((s) => s.value === task.status)?.label ?? task.status}
+            </span>
           </div>
-          {/* T-0038: initiative binding. */}
+          {/* T-0038: initiative binding — read-only, links to the roadmap. */}
           <div className="d-flex align-items-center gap-2">
-            <label
-              htmlFor="task-initiative"
-              style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)", margin: 0 }}
-            >
+            <span style={{ color: "var(--mc-text-dim)", fontFamily: "var(--mc-mono)" }}>
               initiative:
-            </label>
-            {(() => {
-              // T-0425: compare task.initiative against the option basenames via
-              // the shared normalize_id contract (strip one trailing .md), so a
-              // bare-stem binding ("ui-polish") matches its ".md" option
-              // ("ui-polish.md") instead of being false-flagged "(not found)".
-              const matched = task.initiative
-                ? initiativeOptions.find(
-                    (i) => normalizeId(i.basename) === normalizeId(task.initiative),
-                  )
-                : undefined;
-              const orphan: SelectOption | null =
-                task.initiative && !matched
-                  ? { value: task.initiative, label: `${task.initiative} (not found)` }
-                  : null;
-              const options: SelectOption[] = [
-                { value: "", label: "— unattached —" },
-                ...(orphan ? [orphan] : []),
-                ...initiativeOptions.map((i) => {
-                  const tag = i.finished ? "done" : i.active ? "active" : "draft";
-                  return {
-                    value: i.basename,
-                    label: i.basename.replace(/\.md$/, ""),
-                    hint: tag,
-                  };
-                }),
-              ];
-              return (
-                <Select
-                  id="task-initiative"
-                  // Use the matched option's exact basename so the Select
-                  // highlights the bound initiative regardless of the stored
-                  // id-form; fall back to the raw value (orphan) or unattached.
-                  value={matched ? matched.basename : (task.initiative ?? "")}
-                  onChange={(v) => saveInitiative(v || null)}
-                  disabled={saving}
-                  style={{ minWidth: "14rem", maxWidth: "26rem" }}
-                  ariaLabel="initiative binding"
-                  options={options}
-                />
-              );
-            })()}
+            </span>
+            {task.initiative && task.initiative !== "~" ? (
+              <Link to={`/p/${slug}/vision#${encodeURIComponent(task.initiative)}`}>
+                {task.initiative.replace(/\.md$/, "")}
+              </Link>
+            ) : (
+              <span style={{ color: "var(--mc-text-dim)" }}>— unattached —</span>
+            )}
           </div>
         </div>
 
@@ -633,72 +312,29 @@ export function TaskDetail() {
           );
         })()}
 
-        {/* The ask — verbatim. T-0366 #5: dropped the redundant "The ask —
-            source of truth" title (the zone tag above already labels this zone)
-            and the permanent instructional paragraph (hand-holding for a
-            long-active operator). The Edit affordance stays. */}
-        <div className="d-flex justify-content-end align-items-center mb-2">
-          {!editingVerbatim && (
-            <button
-              type="button"
-              className="btn btn-outline-secondary btn-sm"
-              style={{ fontSize: "0.72rem" }}
-              title="Only you edit the ask — processes record their work in the area below"
-              onClick={() => { setVerbatimValue(task.verbatim ?? ""); setEditingVerbatim(true); }}
-            >
-              Edit
-            </button>
+        {/* The ask — verbatim, read-only (T-0674: edit moved to the TG dialog). */}
+        <pre
+          className="mc-pre"
+          style={{
+            borderLeft: "3px solid var(--mc-accent-success, #4ade80)",
+            paddingLeft: "0.75rem",
+            marginBottom: 0,
+          }}
+        >
+          {task.verbatim?.trim() ? task.verbatim : (
+            <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic" }}>
+              (no request recorded)
+            </span>
           )}
-        </div>
-        {editingVerbatim ? (
-          <>
-            <textarea
-              className="form-control"
-              rows={6}
-              value={verbatimValue}
-              onChange={(e) => setVerbatimValue(e.target.value)}
-              autoFocus
-            />
-            <div className="mt-2 d-flex gap-2">
-              <button type="button" className="btn btn-primary btn-sm" onClick={saveVerbatim} disabled={saving}>
-                {saving ? "Saving…" : "Save"}
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => { setEditingVerbatim(false); setVerbatimValue(task.verbatim ?? ""); }}
-              >
-                Cancel
-              </button>
-            </div>
-          </>
-        ) : (
-          <pre
-            className="mc-pre"
-            style={{
-              borderLeft: "3px solid var(--mc-accent-success, #4ade80)",
-              paddingLeft: "0.75rem",
-              marginBottom: 0,
-            }}
-          >
-            {task.verbatim?.trim() ? task.verbatim : (
-              <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic" }}>
-                (no request recorded)
-              </span>
-            )}
-          </pre>
-        )}
+        </pre>
       </div>
 
       {/* ==================================================================
-          AGENT WORKING AREA (T-0238) — the progress-notes feed reused as the
-          agents' working / negotiation log AND where the user's comments are
-          recorded. No new schema field (operator fork 2026-06-19).
+          AGENT WORKING AREA (T-0238) — the progress-notes feed: agents'
+          working / negotiation log + past user comments. T-0674: read-only —
+          adding a comment moved to the TG dialog (R5).
           ================================================================== */}
       <div className="mc-task-zone mc-zone-work">
-        {/* T-0366 #7: ⚙ is reserved for settings — use 💬 for the working/
-            comments log. #5: the permanent instructional paragraph moved into
-            the zone-tag tooltip rather than hand-holding inline. */}
         <div
           className="mc-zone-tag"
           title="Where processes record progress and negotiate the work, and where your comments are recorded — newest first."
@@ -708,7 +344,7 @@ export function TaskDetail() {
 
         {progressEntries.length === 0 && (
           <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>
-            Nothing recorded yet. Add the first comment below.
+            Nothing recorded yet.
           </p>
         )}
         {progressEntries.map((p, i) => {
@@ -742,114 +378,34 @@ export function TaskDetail() {
             </div>
           );
         })}
-
-        <div className="mt-3">
-          {progressError && <div className="alert alert-danger py-1 small">{progressError}</div>}
-          <textarea
-            ref={progressRef}
-            className="form-control form-control-sm"
-            placeholder="Add a comment — recorded in the working log (cap 240 chars)…"
-            rows={2}
-            maxLength={240}
-            style={{ resize: "none", overflow: "hidden" }}
-            value={progressText}
-            onChange={(e) => setProgressText(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter inserts a newline (multi-line comments); ⌘/Ctrl+Enter posts.
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
-                postProgress();
-              }
-            }}
-          />
-          <div style={{ fontSize: "0.68rem", color: "var(--mc-text-dim)", marginTop: "0.25rem" }}>
-            Enter for a new line · ⌘/Ctrl+Enter to post
-          </div>
-          <button
-            type="button"
-            className="btn btn-sm btn-primary mt-2"
-            onClick={postProgress}
-            disabled={progressSaving}
-          >
-            {progressSaving ? "Posting…" : "Add comment"}
-          </button>
-        </div>
       </div>
 
       {/* ==================================================================
           TASK DETAILS — plumbing the user rarely touches. Process binding,
           TL context, related docs, and the session-history audit trail.
+          T-0674: all read-only facts now.
           ================================================================== */}
       <div className="mc-task-zone mc-zone-details">
         <div className="mc-zone-tag">Task details</div>
 
-        {/* Unified dev-session select. */}
+        {/* Bound dev process — read-only. */}
         <div className="mb-3 d-flex align-items-center gap-2 flex-wrap" style={{ fontSize: "0.78rem" }}>
-          <label
-            htmlFor="task-session"
+          <span
             style={{
               color: "var(--mc-text-dim)",
               fontFamily: "var(--mc-mono)",
               minWidth: "5.5rem",
-              margin: 0,
             }}
           >
             dev process:
-          </label>
-          {(() => {
-            // Surface the current binding even if it's not in activeDevs
-            // (paused/suspended) so the select reflects reality. T-0104:
-            // label via the canonical activity formatter so this row reads
-            // the same vocabulary as the rest of the page.
-            const orphanSession: SelectOption | null =
-              task.session && !activeDevs.some((d) => d.sid === task.session!.sid)
-                ? {
-                    value: task.session.sid,
-                    label: `${task.session.sid} (${sessionLabel(
-                      sessionActivity(sessionsBySid[task.session.sid] ?? task.session),
-                    )})`,
-                  }
-                : null;
-            const options: SelectOption[] = [
-              { value: "", label: "— none —", disabled: true },
-              ...(orphanSession ? [orphanSession] : []),
-              ...activeDevs.map((d) => ({
-                value: d.sid,
-                label: `${d.window || d.sid} (${d.sid})`,
-              })),
-              {
-                action: true,
-                key: "__new__",
-                label: "+ Create new dev process…",
-                onSelect: () =>
-                  navigate(`/p/${slug}/sessions?role=dev&task=${encodeURIComponent(task.id)}`),
-              },
-            ];
-            return (
-              <Select
-                id="task-session"
-                value={task.session ? task.session.sid : ""}
-                onChange={(v) => {
-                  if (v) bindToDev(v);
-                }}
-                disabled={saving}
-                style={{ minWidth: "16rem", maxWidth: "30rem" }}
-                ariaLabel="dev process binding"
-                options={options}
-              />
-            );
-          })()}
+          </span>
+          {!task.session && (
+            <span style={{ color: "var(--mc-text-dim)" }}>— none —</span>
+          )}
           {task.session && (
-            <button
-              type="button"
-              className="btn btn-outline-secondary btn-sm"
-              style={{ fontSize: "0.7rem" }}
-              title="Clear the dev-session binding for this task"
-              onClick={unassignSession}
-              disabled={saving}
-            >
-              Unassign
-            </button>
+            <Link to={`/p/${slug}/sessions?sid=${encodeURIComponent(task.session.sid)}`}>
+              {task.session.sid}
+            </Link>
           )}
           {task.session && (() => {
             // T-0104: prefer the worker-derived activity (from /sessions
@@ -876,80 +432,35 @@ export function TaskDetail() {
           })()}
         </div>
 
-        {/* Context — optional TL clarification */}
+        {/* Context — optional TL clarification. Read-only (T-0674). */}
         <div className="mb-4">
-          <div className="d-flex justify-content-between align-items-center mb-2">
-            <div className="mc-section-title" style={{ margin: 0 }}>Context (optional)</div>
-            {!editingContext && (
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                style={{ fontSize: "0.72rem" }}
-                onClick={() => { setContextValue(task.context ?? ""); setEditingContext(true); }}
-              >
-                Edit
-              </button>
-            )}
-          </div>
-          {editingContext ? (
-            <>
-              <textarea
-                className="form-control"
-                rows={4}
-                value={contextValue}
-                onChange={(e) => setContextValue(e.target.value)}
-                autoFocus
-                placeholder="Short clarification — keep it brief."
-              />
-              <div className="mt-2 d-flex gap-2">
-                <button type="button" className="btn btn-primary btn-sm" onClick={saveContext} disabled={saving}>
-                  {saving ? "Saving…" : "Save"}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => { setEditingContext(false); setContextValue(task.context ?? ""); }}
-                >
-                  Cancel
-                </button>
-              </div>
-            </>
-          ) : task.context?.trim() ? (
+          <div className="mc-section-title" style={{ margin: 0, marginBottom: "0.5rem" }}>Context (optional)</div>
+          {task.context?.trim() ? (
             <pre className="mc-pre">{task.context}</pre>
           ) : (
             <p style={{ fontSize: "0.8rem", color: "var(--mc-text-dim)" }}>(no context yet)</p>
           )}
         </div>
 
-        {/* Related docs — ticket→doc half of the T-0172 bidirectional mention */}
+        {/* Related docs — ticket→doc half of the T-0172 bidirectional mention.
+            Read-only (T-0674): linking/unlinking moved to the TG dialog. */}
         <div className="mb-4">
           <div className="mc-section-title">Related docs ({(task.related_docs ?? []).length})</div>
-          <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
+          <div className="d-flex flex-wrap gap-2 align-items-center">
             {(task.related_docs ?? []).length === 0 && (
               <span style={{ fontSize: "0.78rem", color: "var(--mc-text-dim)" }}>
-                No docs linked. Link an architecture/design/support doc so agents find the context.
+                No docs linked.
               </span>
             )}
             {(task.related_docs ?? []).map((d) => (
-              <span key={d} className="d-inline-flex align-items-center gap-1" style={{ fontSize: "0.78rem" }}>
-                <Link to={`/p/${slug}/docs?doc=${encodeURIComponent(d)}`} style={{ fontFamily: "var(--mc-mono)" }}>{d}</Link>
-                <button type="button" className="btn btn-link btn-sm p-0" style={{ fontSize: "0.7rem", color: "var(--mc-text-dim)" }} title="Unlink" onClick={() => unlinkDoc(d)}>✕</button>
-              </span>
+              <Link
+                key={d}
+                to={`/p/${slug}/docs?doc=${encodeURIComponent(d)}`}
+                style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem" }}
+              >
+                {d}
+              </Link>
             ))}
-          </div>
-          <div className="d-flex gap-2" style={{ maxWidth: "20rem" }}>
-            <input
-              type="text"
-              className="form-control form-control-sm"
-              style={{ fontFamily: "var(--mc-mono)", fontSize: "0.76rem" }}
-              placeholder="D-0123"
-              value={docToLink}
-              onChange={(e) => setDocToLink(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); linkDoc(); } }}
-            />
-            <button type="button" className="btn btn-outline-primary btn-sm" style={{ fontSize: "0.7rem" }} onClick={linkDoc}>
-              Link doc
-            </button>
           </div>
         </div>
 
@@ -1027,14 +538,11 @@ export function TaskDetail() {
         </div>
       </div>
 
-      {/* Actions */}
+      {/* Actions — T-0674: "Delete task" moved to the TG dialog (R5). */}
       <div
         className="d-flex gap-2 align-items-center"
         style={{ borderTop: "1px solid var(--mc-border)", paddingTop: "1rem" }}
       >
-        <button type="button" className="btn btn-sm btn-outline-danger" onClick={deleteTask}>
-          Delete task
-        </button>
         {task.from && (
           <Link to={`/p/${slug}/feedback`} className="btn btn-sm btn-outline-secondary">
             View source feedback ({task.from})

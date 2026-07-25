@@ -3,17 +3,16 @@
  * ported from the retired Transparency page's test (T-0511).
  *
  * Renders the pure `ObservabilityView` against the REAL-derived payload
- * observed from the live data dir (operator-state absent → degrade notice;
- * re-drive PAUSED; no pace cap → ∞). `renderToStaticMarkup` needs no DOM, so
- * this runs in the existing node-env vitest (no jsdom/testing-library in this
- * project — effects don't fire during a static render, so the interactive
- * RE-DRIVE/model controls render their SYNCHRONOUS initial state only).
+ * observed from the live data dir (operator-state absent; no pace cap → ∞).
+ * `renderToStaticMarkup` needs no DOM, so this runs in the existing node-env
+ * vitest (no jsdom/testing-library in this project).
  *
  * T-0627 (D-0056 IA audit): who-does-what table, INITIATIVE PACE card, and
- * Scheduler section died. The RE-DRIVE card gained pause/resume + fleet
- * model — those async happy/error/unavailable paths are unit-tested
- * directly against the extracted `fetchFleetModel`/`setFleetModel`/
- * `pauseOperator`/`resumeOperator` helpers below (no DOM needed).
+ * Scheduler section died.
+ *
+ * T-0674 (D-0057 §4/§8): the RE-DRIVE pause/resume + fleet-model control
+ * (T-0620) is cut entirely — its happy/error/unavailable async-helper tests
+ * went with it. The strip is IN PROGRESS + LIVE SESSIONS only now.
  *
  * This is the automated lock placed AFTER the manual walkthrough
  * (scenarios/T-0593-*.md, scenarios/T-0627-*.md) per the manual-first rule.
@@ -22,13 +21,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
-import {
-  fetchFleetModel,
-  ObservabilityView,
-  pauseOperator,
-  resumeOperator,
-  setFleetModel,
-} from "./ObservabilityPanel";
+import { ObservabilityView } from "./ObservabilityPanel";
 import type { Transparency as TransparencyData } from "../api";
 
 // Mirrors the real bot-squad state observed 2026-06-27 (operator-state absent,
@@ -106,16 +99,15 @@ describe("ObservabilityView", () => {
   test("renders the slimmed summary strip + operator state-doc, no dead sections", () => {
     const html = renderView(REAL_DERIVED);
 
-    // Summary strip: IN PROGRESS, RE-DRIVE (now a control), LIVE SESSIONS.
+    // Summary strip: IN PROGRESS + LIVE SESSIONS only — RE-DRIVE cut (T-0674).
     expect(html).toContain("IN PROGRESS");
-    expect(html).toContain("RE-DRIVE");
+    expect(html).not.toContain("RE-DRIVE");
     expect(html).toContain("LIVE SESSIONS");
 
-    // Quota: paused + unlimited cap (∞) + in_progress count. Pause control
-    // shows a "Resume" button (initial synchronous state from quota.paused).
-    expect(html).toContain("PAUSED");
+    // Quota: unlimited cap (∞) + in_progress count. No pause/resume control.
     expect(html).toContain("20 / ∞");
-    expect(html).toContain("Resume");
+    expect(html).not.toContain("Resume");
+    expect(html).not.toContain("PAUSED");
 
     // Live count = 2 (the archived/suspended row is filtered out) surfaces on
     // the LIVE SESSIONS card, which links to the Processes page — the
@@ -141,7 +133,7 @@ describe("ObservabilityView", () => {
     expect(html).not.toContain("423");
   });
 
-  test("renders the state-doc body when present, and RUNNING (Pause button) when not paused", () => {
+  test("renders the state-doc body when present", () => {
     const html = renderView({
       ...REAL_DERIVED,
       operator_state: {
@@ -153,125 +145,7 @@ describe("ObservabilityView", () => {
       quota: { ...REAL_DERIVED.quota, paused: false, max_in_progress: 13 },
     });
     expect(html).toContain("Ship the transparency surface.");
-    expect(html).toContain("RUNNING");
     expect(html).toContain("20 / 13");
-    expect(html).toContain("Pause");
     expect(html).not.toContain("hasn&#x27;t written a state-doc yet");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// T-0620/T-0630 operator controls — happy/error/unavailable paths against a
-// mocked api client. No DOM/click simulation needed: the component handlers
-// are thin wrappers over these exported pure async functions.
-// ---------------------------------------------------------------------------
-describe("fetchFleetModel", () => {
-  test("ok: returns the current model", async () => {
-    const outcome = await fetchFleetModel(
-      { getWorkerModel: async () => ({ model: "claude-sonnet-5" }) },
-      "bot-squad",
-    );
-    expect(outcome).toEqual({ kind: "ok", data: { model: "claude-sonnet-5" } });
-  });
-
-  test("unavailable: a 404 (route not deployed yet) degrades gracefully, not an error", async () => {
-    const outcome = await fetchFleetModel(
-      {
-        getWorkerModel: async () => {
-          throw new Error("API error 404: not found");
-        },
-      },
-      "bot-squad",
-    );
-    expect(outcome).toEqual({ kind: "unavailable" });
-  });
-
-  test("error: a non-404 failure surfaces as an error", async () => {
-    const outcome = await fetchFleetModel(
-      {
-        getWorkerModel: async () => {
-          throw new Error("API error 500: worker unreachable");
-        },
-      },
-      "bot-squad",
-    );
-    expect(outcome.kind).toBe("error");
-    expect((outcome as { message: string }).message).toContain("500");
-  });
-});
-
-describe("setFleetModel", () => {
-  test("ok: echoes back the saved model", async () => {
-    const outcome = await setFleetModel(
-      { putWorkerModel: async (_slug, model) => ({ model }) },
-      "bot-squad",
-      "claude-opus-4-8",
-    );
-    expect(outcome).toEqual({ kind: "ok", data: { model: "claude-opus-4-8" } });
-  });
-
-  test("error: a rejected (non-allowlisted) model surfaces the server message", async () => {
-    const outcome = await setFleetModel(
-      {
-        putWorkerModel: async () => {
-          throw new Error("API error 400: model not in allowlist");
-        },
-      },
-      "bot-squad",
-      "gpt-5",
-    );
-    expect(outcome.kind).toBe("error");
-  });
-});
-
-describe("pauseOperator / resumeOperator", () => {
-  test("pauseOperator ok: returns the pause meta", async () => {
-    const outcome = await pauseOperator(
-      {
-        operatorPause: async (_slug, reason) => ({
-          ok: true,
-          paused: { paused_by: "almdudleer", reason: reason ?? "", paused_at: 1_700_000_000 },
-          was_already_paused: false,
-        }),
-      },
-      "bot-squad",
-      "hit a rate limit",
-    );
-    expect(outcome.kind).toBe("ok");
-    if (outcome.kind === "ok") {
-      expect(outcome.data.paused.reason).toBe("hit a rate limit");
-    }
-  });
-
-  test("pauseOperator unavailable: 404 before T-0630 lands", async () => {
-    const outcome = await pauseOperator(
-      {
-        operatorPause: async () => {
-          throw new Error("API error 404: not found");
-        },
-      },
-      "bot-squad",
-    );
-    expect(outcome).toEqual({ kind: "unavailable" });
-  });
-
-  test("resumeOperator ok: reports was_paused", async () => {
-    const outcome = await resumeOperator(
-      { operatorResume: async () => ({ ok: true, was_paused: true }) },
-      "bot-squad",
-    );
-    expect(outcome).toEqual({ kind: "ok", data: { ok: true, was_paused: true } });
-  });
-
-  test("resumeOperator error: a non-404 failure surfaces inline", async () => {
-    const outcome = await resumeOperator(
-      {
-        operatorResume: async () => {
-          throw new Error("API error 403: not a project member");
-        },
-      },
-      "bot-squad",
-    );
-    expect(outcome.kind).toBe("error");
   });
 });

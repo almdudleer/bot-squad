@@ -1,4 +1,3 @@
-import { useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task } from "../api";
 import {
@@ -14,8 +13,13 @@ import {
   sessionLabel,
   sessionNeedsInput,
 } from "../utils/sessionStatus";
-import { DRAG_MIME } from "./BoardColumn";
 
+// T-0674 (D-0057 §4/§8): the board is pure read-first — the status-change/
+// edit/comment/setInitiative/delete kebab and drag-to-move/reorder are cut.
+// `MenuAction` and `onMenuAction` stay on the props type only because
+// BoardColumn.tsx (out of this lane's scope) still types its own
+// `onMenuAction` prop against them; the card itself no longer renders a
+// menu or calls it.
 export type MenuAction =
   | { kind: "status"; status: Task["status"] }
   | { kind: "editBody" }
@@ -26,21 +30,12 @@ export type MenuAction =
 interface TaskCardProps {
   task: Task;
   slug: string;
-  onMenuAction: (task: Task, action: MenuAction) => void;
+  onMenuAction?: (task: Task, action: MenuAction) => void;
   // T-0096: when the board is already filtered to a single initiative or
   // grouped by initiative, the chip is redundant noise. Parent decides;
   // the card does not infer.
   hideInitiative?: boolean;
 }
-
-const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
-  { value: "planned", label: "Planned" },
-  { value: "open", label: "Open" },
-  { value: "in_progress", label: "In progress" },
-  { value: "totest", label: "To Test" },
-  { value: "reopened", label: "Reopened" },
-  { value: "closed", label: "Closed" },
-];
 
 // T-0238: the working area (agent log + user comments) is the progress-notes
 // feed — each note is a line "- <ts> · <sid> · <text>". Count those so the
@@ -62,165 +57,19 @@ const CANONICAL_DOT: Record<CanonicalState, string> = {
   done: "var(--mc-accent-success, #4ade80)",
 };
 
-export function TaskCard({ task, slug, onMenuAction, hideInitiative = false }: TaskCardProps) {
+export function TaskCard({ task, slug, hideInitiative = false }: TaskCardProps) {
   const navigate = useNavigate();
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
-  const dragSuppressClickRef = useRef(false);
   const noteCount = countNotes(task.progress);
   const updated = relativeTime(task.updated);
 
-  function handleDragStart(e: React.DragEvent<HTMLDivElement>) {
-    e.dataTransfer.setData(
-      DRAG_MIME,
-      JSON.stringify({ id: task.id, fromStatus: task.status }),
-    );
-    e.dataTransfer.effectAllowed = "move";
-    setIsDragging(true);
-    dragSuppressClickRef.current = true;
-  }
-
-  function handleDragEnd() {
-    setIsDragging(false);
-    // Clear the suppress flag on the next tick so the click from the same gesture is ignored
-    setTimeout(() => { dragSuppressClickRef.current = false; }, 50);
-  }
-
   function handleCardClick() {
-    if (dragSuppressClickRef.current) return;   // ignore click that's part of a drag
     navigate(`/p/${slug}/t/${task.id}`);
   }
 
   return (
-    <div
-      className={`mc-task-card${isDragging ? " dragging" : ""}`}
-      draggable
-      onDragStart={handleDragStart}
-      onDragEnd={handleDragEnd}
-      onClick={handleCardClick}
-    >
+    <div className="mc-task-card" onClick={handleCardClick}>
       <div className="d-flex justify-content-between align-items-start">
         <div className="mc-task-id">{task.id}</div>
-        <div
-          data-no-nav
-          onClick={(e) => e.stopPropagation()}
-          style={{ position: "relative" }}
-        >
-          <button
-            type="button"
-            style={{
-              background: "none",
-              border: "none",
-              padding: "0 0.1rem",
-              cursor: "pointer",
-              color: "var(--mc-text-dim)",
-              fontSize: "1rem",
-              lineHeight: 1,
-            }}
-            onClick={() => setMenuOpen((v) => !v)}
-            onBlur={() => setTimeout(() => setMenuOpen(false), 150)}
-          >
-            ⋯
-          </button>
-          {menuOpen && (
-            <div
-              style={{
-                position: "absolute",
-                right: 0,
-                top: "100%",
-                zIndex: 1050,
-                minWidth: "160px",
-                background: "var(--mc-surface-raised)",
-                border: "1px solid var(--mc-border-mid)",
-                borderRadius: "3px",
-                boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "0.65rem",
-                  textTransform: "uppercase",
-                  letterSpacing: "0.07em",
-                  color: "var(--mc-text-dim)",
-                  padding: "0.4rem 0.625rem",
-                  borderBottom: "1px solid var(--mc-border)",
-                }}
-              >
-                Change status
-              </div>
-              {STATUS_OPTIONS.filter((s) => s.value !== task.status).map((s) => (
-                <button
-                  key={s.value}
-                  type="button"
-                  style={{
-                    display: "block",
-                    width: "100%",
-                    textAlign: "left",
-                    background: "none",
-                    border: "none",
-                    padding: "0.3rem 0.625rem",
-                    fontSize: "0.78rem",
-                    color: "var(--mc-text-mid)",
-                    cursor: "pointer",
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = "var(--mc-text)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = "var(--mc-text-mid)")}
-                  onMouseDown={() => {
-                    setMenuOpen(false);
-                    onMenuAction(task, { kind: "status", status: s.value });
-                  }}
-                >
-                  → {s.label}
-                </button>
-              ))}
-              <div style={{ borderTop: "1px solid var(--mc-border)", margin: "0.2rem 0" }} />
-              {(["editBody", "addComment", "setInitiative"] as const).map((kind) => (
-                <button
-                  key={kind}
-                  type="button"
-                  style={{
-                    display: "block",
-                    width: "100%",
-                    textAlign: "left",
-                    background: "none",
-                    border: "none",
-                    padding: "0.3rem 0.625rem",
-                    fontSize: "0.78rem",
-                    color: "var(--mc-text-mid)",
-                    cursor: "pointer",
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = "var(--mc-text)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = "var(--mc-text-mid)")}
-                  onMouseDown={() => { setMenuOpen(false); onMenuAction(task, { kind }); }}
-                >
-                  {kind === "editBody"
-                    ? "Edit context"
-                    : kind === "addComment"
-                      ? "Add comment"
-                      : "Set initiative…"}
-                </button>
-              ))}
-              <div style={{ borderTop: "1px solid var(--mc-border)", margin: "0.2rem 0" }} />
-              <button
-                type="button"
-                style={{
-                  display: "block",
-                  width: "100%",
-                  textAlign: "left",
-                  background: "none",
-                  border: "none",
-                  padding: "0.3rem 0.625rem",
-                  fontSize: "0.78rem",
-                  color: "var(--mc-accent-danger)",
-                  cursor: "pointer",
-                }}
-                onMouseDown={() => { setMenuOpen(false); onMenuAction(task, { kind: "delete" }); }}
-              >
-                Delete
-              </button>
-            </div>
-          )}
-        </div>
       </div>
       <div className="mc-task-title">{task.title}</div>
       <div className="mc-task-meta">

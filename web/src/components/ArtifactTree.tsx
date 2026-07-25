@@ -66,18 +66,20 @@ export type ArtifactNode = {
   status?: string;
 };
 
-const KIND_ICON: Record<ArtifactKind, string> = {
+// T-0671 (Lane D): the use_case entity is deleted; no node of that kind is
+// ever produced by useArtifacts below. ArtifactKind (api.ts, H1-owned) still
+// names "use_case" in its union, so this stays a Partial map rather than a
+// full Record.
+const KIND_ICON: Partial<Record<ArtifactKind, string>> = {
   doc: "📄",
-  use_case: "🎯",
   feedback: "💬",
 };
 
 // Per-store route + selection key. Each page reads its selection from these
-// query params (?doc= / ?uc= / ?fb=).
+// query params (?doc= / ?fb=).
 export function kindRoute(slug: string, node: ArtifactNode): string {
   const base = `/p/${slug}/docs`;
   const v = encodeURIComponent(node.routeId);
-  if (node.kind === "use_case") return `${base}/usecases?uc=${v}`;
   if (node.kind === "feedback") return `${base}/feedback?fb=${v}`;
   return `${base}?doc=${v}`;
 }
@@ -167,17 +169,14 @@ export function useArtifacts(slug: string, reloadKey: number, includeClosedFeedb
     setError(null);
     // item-12: feedback default-hides closed (promoted/dismissed); the rail's
     // "Show closed" toggle re-fetches with them included.
-    Promise.allSettled([api.docs(slug), api.useCases(slug), api.feedback(slug, includeClosedFeedback)])
-      .then(([docsR, ucR, fbR]) => {
+    // T-0671 (Lane D): the use_case store is deleted — two stores now.
+    Promise.allSettled([api.docs(slug), api.feedback(slug, includeClosedFeedback)])
+      .then(([docsR, fbR]) => {
         if (!alive) return;
         const out: ArtifactNode[] = [];
         if (docsR.status === "fulfilled") {
           for (const d of docsR.value)
             out.push({ id: d.id, title: d.title, kind: "doc", parent_doc_id: d.parent_doc_id ?? null, routeId: d.id, section: d.category });
-        }
-        if (ucR.status === "fulfilled") {
-          for (const u of ucR.value)
-            out.push({ id: u.id, title: u.title, kind: "use_case", parent_doc_id: u.parent_doc_id ?? null, routeId: u.id, section: "use cases" });
         }
         if (fbR.status === "fulfilled") {
           for (const f of fbR.value) {
@@ -187,8 +186,8 @@ export function useArtifacts(slug: string, reloadKey: number, includeClosedFeedb
         }
         // Surface a store error only if EVERY store failed (one being slow/empty
         // shouldn't blank the rail).
-        const errs = [docsR, ucR, fbR].filter((r) => r.status === "rejected");
-        if (errs.length === 3) setError(String((errs[0] as PromiseRejectedResult).reason));
+        const errs = [docsR, fbR].filter((r) => r.status === "rejected");
+        if (errs.length === 2) setError(String((errs[0] as PromiseRejectedResult).reason));
         setNodes(out);
       });
     return () => { alive = false; };

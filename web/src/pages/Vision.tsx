@@ -167,26 +167,6 @@ export function Vision() {
     }
   }
 
-  async function activate(f: VisionFile) {
-    const base = f.name.replace(/^initiatives\//, "");
-    try {
-      await api.activateInitiative(slug, base);
-      reload();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function deactivate(f: VisionFile) {
-    const base = f.name.replace(/^initiatives\//, "");
-    try {
-      await api.deactivateInitiative(slug, base);
-      reload();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
   async function markFinished(f: VisionFile) {
     const base = f.name.replace(/^initiatives\//, "");
     try {
@@ -433,57 +413,21 @@ export function Vision() {
                 )}
                 <div className="d-flex gap-2 align-items-center flex-wrap">
                   {opts.kind === "active" && renderTlBindings(base, f.name)}
-                  {opts.kind === "active" && (
-                    <>
-                      <button
-                        type="button"
-                        className="btn btn-outline-secondary btn-sm"
-                        style={{ fontSize: "0.72rem" }}
-                        onClick={() => deactivate(f)}
-                      >
-                        Deactivate
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-secondary btn-sm"
-                        style={{ fontSize: "0.72rem" }}
-                        onClick={() => markFinished(f)}
-                        title={isPersistentInitiative(f)
-                          ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
-                          : undefined}
-                      >
-                        {/* T-0410: a persistent constant-team has no real
-                            'finished' state — relabel its worker-stopping
-                            control so marking it finished isn't a category error. */}
-                        {isPersistentInitiative(f) ? "Stop staffing / Retire" : "Mark finished"}
-                      </button>
-                    </>
-                  )}
-                  {opts.kind === "inactive" && (
-                    <>
-                      <button
-                        type="button"
-                        className="btn btn-outline-success btn-sm"
-                        style={{ fontSize: "0.72rem" }}
-                        onClick={() => activate(f)}
-                      >
-                        Activate
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-secondary btn-sm"
-                        style={{ fontSize: "0.72rem" }}
-                        onClick={() => markFinished(f)}
-                        title={isPersistentInitiative(f)
-                          ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
-                          : undefined}
-                      >
-                        {/* T-0410: a persistent constant-team has no real
-                            'finished' state — relabel its worker-stopping
-                            control so marking it finished isn't a category error. */}
-                        {isPersistentInitiative(f) ? "Stop staffing / Retire" : "Mark finished"}
-                      </button>
-                    </>
+                  {(opts.kind === "active" || opts.kind === "inactive") && (
+                    <button
+                      type="button"
+                      className="btn btn-outline-secondary btn-sm"
+                      style={{ fontSize: "0.72rem" }}
+                      onClick={() => markFinished(f)}
+                      title={isPersistentInitiative(f)
+                        ? "Stop staffing this constant team (maps to the finished-skip) — a persistent job has no normal 'finished' state, so this retires it."
+                        : undefined}
+                    >
+                      {/* T-0410: a persistent constant-team has no real
+                          'finished' state — relabel its worker-stopping
+                          control so marking it finished isn't a category error. */}
+                      {isPersistentInitiative(f) ? "Stop staffing / Retire" : "Mark finished"}
+                    </button>
                   )}
                   {opts.kind === "finished" && (
                     <button

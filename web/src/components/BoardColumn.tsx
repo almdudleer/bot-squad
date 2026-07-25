@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { Task } from "../api";
+import { canonicalOf } from "../canonicalStatus";
 import { TaskCard, MenuAction, SubtaskRow } from "./TaskCard";
 
 interface BoardColumnProps {
@@ -34,6 +35,20 @@ interface BoardColumnProps {
 
 const DRAG_MIME = "application/x-bot-squad-task";
 
+// T-0663: a parent's subtask list grows unboundedly with total subtask count
+// (not active count) because every child renders regardless of status. Mirrors
+// the T-0058 rail / T-0272 lane collapse-by-default pattern, applied to
+// subtask nesting: split done children out so the caller can hide them by
+// default behind a "N done" toggle.
+export function splitSubtasksByDone(subtasks: Task[]): { active: Task[]; done: Task[] } {
+  const active: Task[] = [];
+  const done: Task[] = [];
+  for (const t of subtasks) {
+    (canonicalOf(t.status) === "done" ? done : active).push(t);
+  }
+  return { active, done };
+}
+
 // Sort ascending by priority; null/undefined sort last. Stable by id as tie-breaker.
 export function sortByPriority(tasks: Task[]): Task[] {
   return [...tasks].sort((a, b) => {
@@ -67,6 +82,19 @@ export function BoardColumn({
   const [isOver, setIsOver] = useState(false);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
   const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
+  // T-0663: which parent cards have their done subtasks expanded. Done
+  // subtasks are collapsed by default (see splitSubtasksByDone); toggling a
+  // parent id here reveals them on demand, per-parent.
+  const [expandedDoneParents, setExpandedDoneParents] = useState<Set<string>>(new Set());
+
+  function toggleDoneSubtasks(parentId: string) {
+    setExpandedDoneParents((prev) => {
+      const next = new Set(prev);
+      if (next.has(parentId)) next.delete(parentId);
+      else next.add(parentId);
+      return next;
+    });
+  }
 
   // T-0512: suppress subtasks whose parent is visible — they render nested
   // under the parent, not as standalone top-level cards in this column.
@@ -195,15 +223,37 @@ export function BoardColumn({
           >
             {showIndicatorAt(i) && <DropIndicator />}
             <TaskCard task={t} slug={slug} onMenuAction={onMenuAction} hideInitiative={hideInitiative} />
-            {/* T-0512 (M9): nest this parent's subtasks directly beneath it,
-                grouped under the parent regardless of each child's own status. */}
-            {kids && kids.length > 0 && (
-              <div className="mc-subtask-group" style={{ marginBottom: "0.4rem" }}>
-                {sortByPriority(kids).map((k) => (
-                  <SubtaskRow key={k.id} task={k} slug={slug} />
-                ))}
-              </div>
-            )}
+            {/* T-0512 (M9): nest this parent's subtasks directly beneath it.
+                T-0663: done subtasks collapse behind a "N done" toggle by
+                default so a parent with many completed children doesn't
+                grow the board unboundedly with total subtask count. */}
+            {kids && kids.length > 0 && (() => {
+              const { active, done } = splitSubtasksByDone(kids);
+              const expanded = expandedDoneParents.has(t.id);
+              const visible = expanded ? kids : active;
+              return (
+                <div className="mc-subtask-group" style={{ marginBottom: "0.4rem" }}>
+                  {sortByPriority(visible).map((k) => (
+                    <SubtaskRow key={k.id} task={k} slug={slug} />
+                  ))}
+                  {done.length > 0 && (
+                    <button
+                      type="button"
+                      className="mc-subtask-done-toggle"
+                      onClick={() => toggleDoneSubtasks(t.id)}
+                      aria-expanded={expanded}
+                      aria-label={
+                        expanded
+                          ? `Hide ${done.length} done subtasks`
+                          : `Show ${done.length} done subtasks`
+                      }
+                    >
+                      {expanded ? `▾ hide ${done.length} done` : `▸ ${done.length} done`}
+                    </button>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         );
       })}

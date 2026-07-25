@@ -1418,6 +1418,22 @@ pre.bg-light {
   margin-right: 0.1rem;
 }
 
+/* T-0663: "N done" toggle for collapsed done-subtasks under a parent card. */
+.mc-subtask-done-toggle {
+  display: block;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--mc-mono);
+  font-size: 0.65rem;
+  color: var(--mc-text-dim);
+  padding: 0.15rem 0.4rem 0.15rem 0.85rem;
+  margin-left: 0.35rem;
+}
+.mc-subtask-done-toggle:hover {
+  color: var(--mc-text);
+}
+
 /* Per-page help — collapsible block that explains what the page does.
    The wrap holds a toggle button by default; when expanded, a panel
    appears below it. */

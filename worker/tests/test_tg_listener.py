@@ -155,6 +155,81 @@ def test_handle_update_skips_non_message(tmp_path):
     assert result["reason"] == "no message"
 
 
+# ---------------------------------------------------------------------------
+# T-0682 (T-0676 item 2): bot/service-message intake guard
+# ---------------------------------------------------------------------------
+
+
+def test_handle_update_skips_bot_authored_message(tmp_path):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 3,
+        "message": {
+            "chat": {"id": 12345, "type": "supergroup"},
+            "from": {"id": 8206895402, "is_bot": True, "first_name": "Bot Squad"},
+            "text": "hi",
+        },
+    }
+    result = TL.handle_update(cfg, update)
+    assert result == {"ok": True, "action": "skip", "reason": "bot or service message"}
+
+
+def test_handle_update_skips_forum_topic_created_service_message(tmp_path):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 4,
+        "message": {
+            "chat": {"id": 12345, "type": "supergroup"},
+            "message_thread_id": 45,
+            "from": {"id": 8206895402, "is_bot": True, "first_name": "Bot Squad"},
+            "forum_topic_created": {"name": "[watchrobot] T-0270", "icon_color": 0},
+        },
+    }
+    result = TL.handle_update(cfg, update)
+    assert result == {"ok": True, "action": "skip", "reason": "bot or service message"}
+
+
+def test_handle_update_skips_sender_chat_message(tmp_path):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 5,
+        "message": {
+            "chat": {"id": 12345, "type": "supergroup"},
+            "sender_chat": {"id": -100999, "type": "channel", "title": "Anon"},
+            "text": "hi",
+        },
+    }
+    result = TL.handle_update(cfg, update)
+    assert result == {"ok": True, "action": "skip", "reason": "bot or service message"}
+
+
+def test_handle_update_does_not_skip_ordinary_human_message(tmp_path):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 6,
+        "message": {
+            "chat": {"id": 12345, "type": "private"},
+            "from": {"id": 555123, "is_bot": False, "first_name": "Alexey"},
+            "text": "hi",
+        },
+    }
+    result = TL.handle_update(cfg, update)
+    assert result["action"] != "skip" or result.get("reason") != "bot or service message"
+
+
+def test_is_ignorable_service_message_true_cases():
+    assert TL._is_ignorable_service_message({"from": {"is_bot": True}})
+    assert TL._is_ignorable_service_message({"sender_chat": {"id": -1}})
+    assert TL._is_ignorable_service_message({"forum_topic_created": {"name": "x"}})
+    assert TL._is_ignorable_service_message({"new_chat_members": [{"id": 1}]})
+    assert TL._is_ignorable_service_message({"pinned_message": {"message_id": 1}})
+
+
+def test_is_ignorable_service_message_false_for_plain_text():
+    assert not TL._is_ignorable_service_message({"from": {"is_bot": False}, "text": "hi"})
+    assert not TL._is_ignorable_service_message({"text": "hi"})
+
+
 def test_handle_update_skips_non_allowlisted_chat(tmp_path):
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     update = {

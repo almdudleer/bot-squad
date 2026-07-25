@@ -13,6 +13,50 @@ log = logging.getLogger(__name__)
 
 SID_RE = re.compile(r"\[(S-[A-Za-z0-9_-]+?-p\d+)")
 
+# T-0682 (T-0676 item 2): TG chat/topic service-event field names — a message
+# carrying any of these is a system notice (e.g. the forum_topic_created echo
+# from our own createForumTopic call), not human-authored content.
+_SERVICE_MESSAGE_FIELDS = (
+    "forum_topic_created",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "forum_topic_edited",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+    "new_chat_members",
+    "left_chat_member",
+    "new_chat_title",
+    "new_chat_photo",
+    "delete_chat_photo",
+    "group_chat_created",
+    "supergroup_chat_created",
+    "channel_chat_created",
+    "migrate_to_chat_id",
+    "migrate_from_chat_id",
+    "pinned_message",
+    "video_chat_scheduled",
+    "video_chat_started",
+    "video_chat_ended",
+    "video_chat_participants_invited",
+)
+
+
+def _is_ignorable_service_message(msg: dict) -> bool:
+    """T-0682: our own bot's forum-topic service messages (the
+    forum_topic_created echo from a createForumTopic call) were being
+    ingested as human DMs — no is_bot/service-message guard existed — which
+    minted a GlobalUser for the bot itself (id confirmed via getMe) and
+    spawned attendant sessions replying to empty messages (the item-2
+    echo-loop). Skip: any bot-authored message (ours or another bot's),
+    anonymous channel-linked posts, and TG's own chat/topic service events.
+    """
+    frm = msg.get("from") or {}
+    if frm.get("is_bot"):
+        return True
+    if msg.get("sender_chat"):
+        return True
+    return any(field in msg for field in _SERVICE_MESSAGE_FIELDS)
+
 
 def _proxy_kwargs(cfg) -> dict:
     """T-0194: ``{"proxy": url}`` when a per-installation TG proxy is set, else
@@ -758,6 +802,12 @@ def handle_update(cfg, update: dict) -> dict:
     msg = update.get("message")
     if not msg:
         return {"ok": True, "action": "skip", "reason": "no message"}
+
+    # T-0682: bot/service-authored messages never carry human intent — bail
+    # out before any allowlisting or identity-linking work (that linking is
+    # exactly what minted a GlobalUser for our own bot in the echo-loop bug).
+    if _is_ignorable_service_message(msg):
+        return {"ok": True, "action": "skip", "reason": "bot or service message"}
 
     chat = msg.get("chat", {})
     chat_id = str(chat.get("id", ""))

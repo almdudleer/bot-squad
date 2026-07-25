@@ -166,6 +166,65 @@ def test_handle_update_skips_non_allowlisted_chat(tmp_path):
     assert "not allowlisted" in result["reason"]
 
 
+# ---------------------------------------------------------------------------
+# T-0664: unrecognized chat_id onboarding seam
+# ---------------------------------------------------------------------------
+
+
+def test_handle_update_unknown_chat_logs_warning(tmp_path, caplog):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 2,
+        "message": {
+            "chat": {"id": 99999, "type": "group", "title": "New Squad HQ"},
+            "text": "hi",
+        },
+    }
+    with caplog.at_level("WARNING"):
+        TL.handle_update(cfg, update)
+    assert any("99999" in r.message for r in caplog.records)
+
+
+def test_handle_update_unknown_chat_writes_discovery_record(tmp_path):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 2,
+        "message": {
+            "chat": {"id": 99999, "type": "group", "title": "New Squad HQ"},
+            "text": "hi",
+        },
+    }
+    result = TL.handle_update(cfg, update)
+
+    # T-0664: the skip return shape is unchanged — discovery is a side effect.
+    assert result == {"ok": True, "action": "skip", "reason": "chat 99999 not allowlisted"}
+
+    import json
+    record = json.loads(TL._unknown_chats_path(cfg).read_text())
+    assert record["99999"]["title"] == "New Squad HQ"
+    assert record["99999"]["type"] == "group"
+    assert record["99999"]["count"] == 1
+    assert record["99999"]["first_seen_at"] == record["99999"]["last_seen_at"]
+
+
+def test_handle_update_unknown_chat_second_message_updates_in_place(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    update = {
+        "update_id": 2,
+        "message": {"chat": {"id": 99999, "type": "group", "title": "New Squad HQ"}, "text": "hi"},
+    }
+    TL.handle_update(cfg, update)
+
+    times = iter(["2026-07-25T00:00:00Z", "2026-07-25T00:05:00Z"])
+    monkeypatch.setattr(TL, "_now_iso", lambda: next(times))
+    TL.handle_update(cfg, {**update, "update_id": 3})
+
+    import json
+    record = json.loads(TL._unknown_chats_path(cfg).read_text())
+    assert len(record) == 1
+    assert record["99999"]["count"] == 2
+
+
 def test_handle_update_dispatches_reply_to_inject(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     msg = _reply_message("S-alice-spec5-p3", "go ahead", chat_id=12345)

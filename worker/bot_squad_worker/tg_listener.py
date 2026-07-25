@@ -29,6 +29,10 @@ def _poll_health_path(cfg) -> Path:
     return cfg.data_dir / "_worker" / "tg_poll_health.json"
 
 
+def _unknown_chats_path(cfg) -> Path:
+    return cfg.data_dir / "_worker" / "tg_unknown_chats.json"
+
+
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -59,6 +63,45 @@ def _record_poll_health(cfg, *, ok: bool, error: str = "") -> None:
         else:
             state["last_error"] = error
             state["last_error_at"] = now
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _record_unknown_chat(cfg, chat_id: str, chat: dict) -> None:
+    """T-0664: onboarding seam — a message from a non-allowlisted chat_id is
+    otherwise silently dropped, leaving a freshly-added group's id undiscoverable.
+    Logs a WARNING (visible with no new tooling) and persists a per-chat_id
+    record so it's self-service discoverable by reading one file. Mirrors
+    ``_record_poll_health``'s atomic (tmp+replace) + best-effort-never-raises
+    shape: a discovery-write failure must not break the allowlist skip."""
+    title = chat.get("title") or chat.get("username") or chat.get("first_name") or ""
+    chat_type = str(chat.get("type") or "")
+    log.warning(
+        "tg_listener: message from unrecognized chat_id=%s (title=%r type=%r) — "
+        "not allowlisted; add it to a project's tg_chat (or bind a topic) to admit it",
+        chat_id, title, chat_type,
+    )
+    import json
+    import os
+    try:
+        p = _unknown_chats_path(cfg)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            state = json.loads(p.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        now = _now_iso()
+        entry = state.get(chat_id) or {"first_seen_at": now, "count": 0}
+        entry["title"] = title
+        entry["type"] = chat_type
+        entry["last_seen_at"] = now
+        entry["count"] = entry.get("count", 0) + 1
+        state[chat_id] = entry
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=2))
         os.replace(tmp, p)
@@ -719,6 +762,7 @@ def handle_update(cfg, update: dict) -> dict:
     allowed_chats = {str(p.tg_chat) for p in cfg.projects.values()} - {"0"}
     allowed_chats |= tg_bindings.bound_chat_ids(cfg)
     if chat_id not in allowed_chats:
+        _record_unknown_chat(cfg, chat_id, chat)
         return {"ok": True, "action": "skip", "reason": f"chat {chat_id} not allowlisted"}
 
     # T-0639: the topic binding is a stronger, zero-ambiguity signal than the

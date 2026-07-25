@@ -305,6 +305,8 @@ def test_management_routes_carry_require_manage_by_identity(tmp_bot_squad, monke
         ("GET", "/servers/{server_id}/grants"),
         ("POST", "/servers/{server_id}/grants"),
         ("DELETE", "/servers/{server_id}/grants/{username}"),
+        ("POST", "/servers/{server_id}/hold"),
+        ("POST", "/servers/{server_id}/unhold"),
     }
     app = build_app()
     seen = set()

@@ -71,6 +71,15 @@ export type AttachedServer = {
    * deserialise via the dataclass default).
    */
   is_self?: boolean;
+  /**
+   * T-0653: set together when an owner marks a non-terminal install as
+   * DELIBERATELY held pending explicit stakeholder/owner action (vs. a
+   * genuinely stalled/dead install) — see ``serverState.ts``. All three
+   * are ``null`` when not held.
+   */
+  hold_reason?: string | null;
+  held_at?: string | null;
+  held_by?: string | null;
 };
 
 /** Envelope returned for each server in a `fanOut` call. */
@@ -345,6 +354,29 @@ export const mothershipApi = {
       { method: "DELETE" },
     );
     return out.grants;
+  },
+
+  /** T-0653: mark a non-terminal install as deliberately held pending
+   *  explicit stakeholder/owner action (owner-only on the BE, 403
+   *  otherwise). Invalidates the servers cache so the badge/copy updates
+   *  on the next `listServers()` without a hard reload. */
+  holdServer: async (serverId: string, reason: string): Promise<AttachedServer> => {
+    const out = await call<AttachedServer>(
+      `/api/m/servers/${encodeURIComponent(serverId)}/hold`,
+      { method: "POST", body: JSON.stringify({ reason }) },
+    );
+    invalidateServersCache();
+    return out;
+  },
+
+  /** T-0653: clear a hold set by `holdServer`. Owner-only on the BE. */
+  unholdServer: async (serverId: string): Promise<AttachedServer> => {
+    const out = await call<AttachedServer>(
+      `/api/m/servers/${encodeURIComponent(serverId)}/unhold`,
+      { method: "POST" },
+    );
+    invalidateServersCache();
+    return out;
   },
 
   projectsFor: (serverId: string) =>

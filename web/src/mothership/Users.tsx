@@ -6,6 +6,7 @@ import {
   type AttachedServer,
   type Grant,
 } from "./api";
+import { pendingInstallState, pendingStateBadgeClass } from "./serverState";
 import { api } from "../api";
 import { isSuperAdminFromMe } from "../components/sidebarHelpers";
 
@@ -230,6 +231,16 @@ function ConnectedServers() {
             {state.servers.map((s) => {
               const manageable = canManageGrants(s, username);
               const isOpen = expanded === s.id;
+              // T-0653: non-terminal rows (not ready/connected/failed) go
+              // through the SAME held/stalled/pending derivation the fleet
+              // card (`/m`) uses, so the two admin pages never disagree on
+              // vocabulary for the same server again (T-0331 dogfood).
+              const nonTerminalState =
+                s.install_state === "ready" ||
+                s.install_state === "connected" ||
+                s.install_state === "failed"
+                  ? null
+                  : pendingInstallState(s);
               return (
                 <Fragment key={s.id}>
                   <tr>
@@ -244,17 +255,28 @@ function ConnectedServers() {
                     <td style={{ fontFamily: "var(--mc-mono)" }}>{s.base_url}</td>
                     <td style={{ fontFamily: "var(--mc-mono)" }}>{s.owner_user}</td>
                     <td>
-                      <span
-                        className={
-                          s.install_state === "ready" || s.install_state === "connected"
-                            ? "mc-badge mc-badge-ok"
-                            : s.install_state === "failed"
+                      {nonTerminalState === null ? (
+                        <span
+                          className={
+                            s.install_state === "failed"
                               ? "mc-badge mc-badge-danger"
-                              : "mc-badge mc-badge-active"
-                        }
-                      >
-                        {s.install_state}
-                      </span>
+                              : "mc-badge mc-badge-ok"
+                          }
+                        >
+                          {s.install_state}
+                        </span>
+                      ) : (
+                        <span
+                          className={pendingStateBadgeClass(nonTerminalState)}
+                          title={
+                            nonTerminalState === "held"
+                              ? s.hold_reason ?? undefined
+                              : undefined
+                          }
+                        >
+                          {nonTerminalState}
+                        </span>
+                      )}
                     </td>
                     <td style={{ color: "var(--mc-text-dim)" }}>{s.last_seen_at ?? "—"}</td>
                     <td>

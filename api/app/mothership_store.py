@@ -54,7 +54,9 @@ from app.install_tokens import (
 # v2 (T-0221): adds the per-server ``grants`` list to AttachedServer. Old v1
 # rows (no ``grants`` key) deserialise unchanged — the dataclass default ([])
 # applies via the known-field splat in ``list_servers``.
-SCHEMA_VERSION = 2
+# v3 (T-0653): adds ``hold_reason``/``held_at``/``held_by``. Old v2 rows (no
+# hold_reason key) deserialise unchanged (dataclass default None).
+SCHEMA_VERSION = 3
 INSTALL_TOKEN_TTL_SECONDS = 24 * 3600
 # Invite tokens (T-0026) share the install-token shape but are per-user, not
 # per-server. Same 24h TTL — same blast radius if the link leaks; the user
@@ -113,6 +115,17 @@ class AttachedServer:
     # routes_mothership.py. Defaults to [] so pre-v2 rows on disk (no key)
     # deserialise unchanged via the known-field splat in ``list_servers``.
     grants: list[dict] = field(default_factory=list)
+    # T-0653: an owner can mark a non-terminal install as DELIBERATELY held
+    # pending explicit stakeholder/owner action — distinct from a genuinely
+    # stalled/dead install (the fleet-card 30-min elapsed-time heuristic in
+    # ``web/src/mothership/serverState.ts`` stands down once this is set).
+    # Set together by ``set_hold``/cleared together by ``clear_hold``.
+    # Public (NOT popped in ``to_public``) — any viewer who can see the row
+    # needs to see why it's held. Defaults to None so pre-T-0653 rows on
+    # disk deserialise unchanged.
+    hold_reason: str | None = None
+    held_at: str | None = None
+    held_by: str | None = None
 
     def to_public(self, include_invites: bool = False) -> dict:
         d = asdict(self)
@@ -659,6 +672,43 @@ class MothershipStore:
                     for g in s.grants
                 ]
                 servers[i] = replace(s, grants=new_grants)
+                self.write(servers)
+                return servers[i]
+        return None
+
+    # T-0653: deliberate hold — a server's non-terminal install can be marked
+    # as intentionally paused pending explicit stakeholder/owner action, so
+    # the FE stops reading a multi-week pending row purely off the elapsed-
+    # time stale heuristic. Owner-issued only (enforced at the route layer
+    # via ``require_manage``, mirroring grants).
+
+    def set_hold(
+        self, server_id: str, reason: str, held_by: str
+    ) -> AttachedServer | None:
+        """Mark ``server_id`` as held with ``reason``. Idempotent: re-holding
+        an already-held server overwrites reason/held_by/held_at with the
+        latest call. Returns ``None`` if no such server."""
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                servers[i] = replace(
+                    s, hold_reason=reason, held_by=held_by, held_at=_utc_now_iso()
+                )
+                self.write(servers)
+                return servers[i]
+        return None
+
+    def clear_hold(self, server_id: str) -> AttachedServer | None:
+        """Clear a hold set by ``set_hold``. Idempotent no-op if not held.
+        Returns ``None`` if no such server."""
+        with self._lock:
+            servers = self.list_servers()
+            for i, s in enumerate(servers):
+                if s.id != server_id:
+                    continue
+                servers[i] = replace(s, hold_reason=None, held_at=None, held_by=None)
                 self.write(servers)
                 return servers[i]
         return None

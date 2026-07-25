@@ -7,6 +7,13 @@ import {
   type FanOutResult,
   type ServerProject,
 } from "./api";
+import {
+  isStaleInstall,
+  pendingInstallState,
+  pendingStateBadgeClass,
+} from "./serverState";
+import { canManageGrants } from "./Users";
+import { api } from "../api";
 import { Coachmark } from "../onboarding";
 import { STEP_9_3_BULLETS, STEP_9_3_TITLE } from "../onboarding/copy";
 
@@ -62,26 +69,11 @@ export function buildSections(
 // T-0342: a PENDING/installing server card otherwise lingers forever as
 // "install hasn't finished yet" (dogfood F6 — the stale `linza` card). An
 // install that hasn't made progress in this long is treated as stalled: the
-// card switches to a "stalled" wording and gains a dismiss affordance. We use
-// the freshest activity timestamp we have (last_seen_at, else created_at) so a
-// still-progressing install (heartbeating last_seen_at) never trips the gate.
-export const STALE_INSTALL_MS = 30 * 60 * 1000; // 30 min
-
-export function isStaleInstall(
-  server: Pick<AttachedServer, "install_state" | "created_at" | "last_seen_at">,
-  now: Date = new Date(),
-): boolean {
-  // Only non-terminal installs can be "stalled"; `failed` already reads as a
-  // terminal state via its own badge, and `ready` isn't an installing card.
-  if (server.install_state === "ready" || server.install_state === "failed") {
-    return false;
-  }
-  const stamp = server.last_seen_at || server.created_at;
-  if (!stamp) return false;
-  const t = new Date(stamp).getTime();
-  if (Number.isNaN(t)) return false;
-  return now.getTime() - t >= STALE_INSTALL_MS;
-}
+// card switches to a "stalled" wording and gains a dismiss affordance. T-0653
+// moved the derivation (`isStaleInstall`/`STALE_INSTALL_MS`) into
+// `serverState.ts`, shared with `/m/users`'s Connected-servers table, so a
+// deliberate hold (`hold_reason`) reads identically on both pages instead of
+// disagreeing on vocabulary for the same row.
 
 // T-0342: dismissed stale-install cards persist per server id in localStorage
 // so a dismissal sticks across reloads (the registry row stays PENDING until
@@ -235,6 +227,9 @@ export function AllProjects() {
   const [dismissed, setDismissed] = useState<Set<string>>(() =>
     loadDismissedInstalls(),
   );
+  // T-0653: viewer's username drives the owner-only Hold/Unhold affordance
+  // (mirrors the grants-manage gate — see `canManageGrants`).
+  const [username, setUsername] = useState<string | undefined>(undefined);
 
   function dismissInstall(id: string) {
     setDismissed((prev) => {
@@ -245,30 +240,48 @@ export function AllProjects() {
     });
   }
 
+  async function loadSections(cancelledRef: { current: boolean }) {
+    try {
+      const servers = await mothershipApi.listServers();
+      const readyIds = servers
+        .filter((s) => s.install_state === "ready")
+        .map((s) => s.id);
+      const fanResults = await fanOut(readyIds, (id) =>
+        mothershipApi.projectsFor(id),
+      );
+      if (cancelledRef.current) return;
+      setSections(buildSections(servers, fanResults));
+    } catch (e) {
+      if (cancelledRef.current) return;
+      setTopError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   useEffect(() => {
-    let cancelled = false;
+    const cancelledRef = { current: false };
     setTopError(null);
     setSections(null);
-    (async () => {
-      try {
-        const servers = await mothershipApi.listServers();
-        const readyIds = servers
-          .filter((s) => s.install_state === "ready")
-          .map((s) => s.id);
-        const fanResults = await fanOut(readyIds, (id) =>
-          mothershipApi.projectsFor(id),
-        );
-        if (cancelled) return;
-        setSections(buildSections(servers, fanResults));
-      } catch (e) {
-        if (cancelled) return;
-        setTopError(e instanceof Error ? e.message : String(e));
-      }
-    })();
+    loadSections(cancelledRef);
+    api
+      .getMyProfile()
+      .then((me) => {
+        if (!cancelledRef.current) setUsername(me.username);
+      })
+      .catch(() => {
+        /* anon / failed profile fetch — Hold/Unhold stays hidden */
+      });
     return () => {
-      cancelled = true;
+      cancelledRef.current = true;
     };
   }, []);
+
+  // T-0653: re-fetch the registry after a hold/unhold mutation so the badge
+  // reflects the new hold_reason without a hard reload. `invalidateServersCache`
+  // (called by `holdServer`/`unholdServer`) ensures this refetch isn't served
+  // stale data from the 5s cache.
+  function reload() {
+    loadSections({ current: false });
+  }
 
   return (
     <div className="container py-4" style={{ maxWidth: "900px" }}>
@@ -340,7 +353,9 @@ export function AllProjects() {
               <ServerRow
                 key={section.server.id}
                 section={section}
+                username={username}
                 onDismiss={() => dismissInstall(section.server.id)}
+                onReload={reload}
               />
             ))}
         </div>
@@ -365,15 +380,37 @@ function projectCountLabel(section: ServerSection): string {
  */
 function ServerRow({
   section,
+  username,
   onDismiss,
+  onReload,
 }: {
   section: ServerSection;
+  username: string | undefined;
   onDismiss: () => void;
+  onReload: () => void;
 }) {
   const { server, kind } = section;
   const label = serverHeaderLabel(server);
   const stalled = kind === "installing" && isStaleInstall(server);
+  const held = kind === "installing" && Boolean(server.hold_reason);
+  const canManage = canManageGrants(server, username);
   const count = projectCountLabel(section);
+
+  // T-0653: owner-only hold/unhold. window.prompt mirrors the existing
+  // pause-reason affordance in ObservabilityPanel.tsx — no reason text
+  // component exists yet for a one-off free-text admin action.
+  async function holdInstall() {
+    const reason = window.prompt("Hold reason (why is this install intentionally paused?):");
+    if (!reason) return; // cancelled or empty — a hold needs a reason
+    await mothershipApi.holdServer(server.id, reason);
+    onReload();
+  }
+
+  async function unholdInstall() {
+    await mothershipApi.unholdServer(server.id);
+    onReload();
+  }
+
   return (
     <Link
       to={`/m/servers/${encodeURIComponent(server.id)}`}
@@ -426,7 +463,10 @@ function ServerRow({
               {count}
             </span>
           )}
-          <ServerHeaderBadge section={section} stalled={stalled} />
+          <ServerHeaderBadge section={section} />
+          {/* T-0653: a held install is an ACCURATE, intentional state —
+              Dismiss (which would hide that visibility) is offered only for
+              a genuinely stalled/unheld card, never a held one. */}
           {stalled && (
             <button
               type="button"
@@ -444,15 +484,49 @@ function ServerRow({
               Dismiss
             </button>
           )}
+          {kind === "installing" && canManage && !held && (
+            <button
+              type="button"
+              data-testid={`hold-install-${server.id}`}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                void holdInstall();
+              }}
+              title="Mark this install as deliberately held pending explicit action"
+              className="btn btn-sm btn-outline-secondary"
+              style={{ fontSize: "0.7rem", lineHeight: 1, padding: "2px 8px" }}
+            >
+              Hold
+            </button>
+          )}
+          {kind === "installing" && canManage && held && (
+            <button
+              type="button"
+              data-testid={`unhold-install-${server.id}`}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                void unholdInstall();
+              }}
+              title="Clear the hold — resume normal stale-install tracking"
+              className="btn btn-sm btn-outline-secondary"
+              style={{ fontSize: "0.7rem", lineHeight: 1, padding: "2px 8px" }}
+            >
+              Clear hold
+            </button>
+          )}
         </div>
       </div>
       <div style={{ marginTop: "0.4rem" }}>
         <InstallTokenRow server={server} />
         {kind === "installing" && (
           <div style={{ color: "var(--mc-text-dim)", fontSize: 12 }}>
-            {stalled
-              ? "Install appears stalled — no progress in over 30 min."
-              : "Install hasn’t finished yet."}{" "}
+            {held
+              ? `Held: ${server.hold_reason}`
+              : stalled
+                ? "Install appears stalled — no progress in over 30 min."
+                : "Install hasn’t finished yet."}{" "}
             <span style={{ color: "var(--mc-cyan)" }}>watch progress →</span>
           </div>
         )}
@@ -489,23 +563,23 @@ function InstallTokenRow({ server }: { server: AttachedServer }) {
   );
 }
 
-function ServerHeaderBadge({
-  section,
-  stalled = false,
-}: {
-  section: ServerSection;
-  stalled?: boolean;
-}) {
+function ServerHeaderBadge({ section }: { section: ServerSection }) {
   const { server, kind, result } = section;
   if (kind === "installing") {
-    if (stalled) {
-      return <span className="mc-badge mc-badge-danger">stalled</span>;
+    // T-0653: `failed` is a terminal state, checked before the shared
+    // held/stalled/pending derivation (which only covers non-terminal rows).
+    if (server.install_state === "failed") {
+      return <span className="mc-badge mc-badge-danger">failed</span>;
     }
-    const cls =
-      server.install_state === "failed"
-        ? "mc-badge mc-badge-danger"
-        : "mc-badge mc-badge-warn";
-    return <span className={cls}>{server.install_state}</span>;
+    const state = pendingInstallState(server);
+    return (
+      <span
+        className={pendingStateBadgeClass(state)}
+        title={state === "held" ? server.hold_reason ?? undefined : undefined}
+      >
+        {state}
+      </span>
+    );
   }
   if (result && result.ok) {
     return <span className="mc-badge mc-badge-ok">reachable</span>;

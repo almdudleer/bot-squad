@@ -635,6 +635,46 @@ def delete_grant(
     return {"server_id": server_id, "grants": _active_grants(updated)}
 
 
+# ---- T-0653: deliberate hold (owner-only) ------------------------------------
+# Distinguishes "install deliberately held pending explicit stakeholder/owner
+# action" from a genuinely stalled/dead install. The FE stands its 30-min
+# elapsed-time stale heuristic down once ``hold_reason`` is set (see
+# ``web/src/mothership/serverState.ts``), and both `/m` and `/m/users` read
+# the SAME state so they stop disagreeing on vocabulary for the same row.
+
+
+@router.post("/servers/{server_id}/hold")
+def hold_server(
+    request: Request,
+    server_id: str,
+    payload: dict,
+    server: AttachedServer = Depends(require_manage),
+    user: dict = Depends(require_auth),
+) -> dict:
+    reason = str_field(payload, "reason")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason is required")
+    store = _store(request)
+    updated = store.set_hold(server_id, reason, held_by=user["username"])
+    if updated is None:
+        # Race: server removed between require_manage's lookup and set_hold.
+        raise HTTPException(status_code=404, detail="server not found")
+    return updated.to_public()
+
+
+@router.post("/servers/{server_id}/unhold")
+def unhold_server(
+    request: Request,
+    server_id: str,
+    server: AttachedServer = Depends(require_manage),
+) -> dict:
+    store = _store(request)
+    updated = store.clear_hold(server_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    return updated.to_public()
+
+
 # ---- T-0129: install-token revoke + re-mint (super-admin) -------------------
 
 

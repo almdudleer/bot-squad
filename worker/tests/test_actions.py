@@ -1695,6 +1695,100 @@ def test_ensure_user_conversation_reuse_survives_nudge_failure(tmp_path, monkeyp
     assert result == {"ok": True, "sid": existing, "spawned": False}
 
 
+def test_ensure_user_conversation_thread_id_in_fresh_spawn_boot_prompt(tmp_path, monkeypatch):
+    """T-0676 items 3/6: a thread_id on the ensure call tells the (still
+    single, per-(slug,gid)) attendant to read/reply into THAT bound topic's
+    isolated thread instead of the whole mixed project history."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured["initial_prompt"] = initial_prompt
+        return {"ok": True, "sid": f"S-u-{window}-p3"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "hi", "thread_id": 7,
+    })
+    assert result["ok"] is True
+    assert "thread_id 7" in captured["initial_prompt"]
+    assert "thread_id=7" in captured["initial_prompt"]
+
+
+def test_ensure_user_conversation_no_thread_id_boot_prompt_unaffected(tmp_path, monkeypatch):
+    """Absent thread_id (DM / non-topic message) -> the boot prompt carries
+    no thread-scoped block at all — byte-identical to before this change."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured["initial_prompt"] = initial_prompt
+        return {"ok": True, "sid": f"S-u-{window}-p3"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3", "message_ref": "hi",
+    })
+    assert result["ok"] is True
+    assert "BOUND FORUM TOPIC" not in captured["initial_prompt"]
+    assert "thread_id" not in captured["initial_prompt"]
+
+
+def test_ensure_user_conversation_thread_id_in_nudge_for_live_attendant(tmp_path, monkeypatch):
+    """A thread_id on the ensure call, routed to an ALREADY-live attendant,
+    must be named in the nudge text so the SAME session knows which topic's
+    isolated thread the new message belongs to."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_a1b2c3-user-conversation-p9"
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: existing)
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "another message", "thread_id": 7,
+    })
+    assert result == {"ok": True, "sid": existing, "spawned": False}
+    assert "thread_id 7" in nudged["text"]
+    assert "thread_id=7" in nudged["text"]
+
+
+def test_ensure_user_conversation_no_thread_id_nudge_unchanged(tmp_path, monkeypatch):
+    """Absent thread_id -> the exact pre-T-0676 generic nudge text."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_a1b2c3-user-conversation-p9"
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: existing)
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "another message",
+    })
+    assert nudged["text"] == (
+        "A new message arrived in your user-conversation thread — read it and respond."
+    )
+
+
 def test_ensure_user_conversation_unknown_slug(tmp_path, monkeypatch):
     import bot_squad_worker.actions as A
     _make_sessions_cfg(tmp_path, monkeypatch)

@@ -1630,7 +1630,28 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
 _ENSURE_UCONV_REQUIRED = {"slug", "global_user_id"}
 # T-0623: optional explicit model override for the fresh-spawn path; absent
 # falls through to sessions.spawn's role default (user-conversation -> claude-sonnet-5).
-_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref", "model"}
+# T-0676 items 3/6: optional thread_id — see _action_ensure_user_conversation.
+_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref", "model", "thread_id"}
+
+
+def _thread_scoped_read_write_block(slug: str, global_user_id: str, thread_id: Any) -> str:
+    """T-0676 items 3/6: when the triggering message came from a BOUND FORUM
+    TOPIC, the attendant must read/reply into THAT topic's isolated thread —
+    not the project's whole (mixed-topic) history — or it re-surfaces the
+    cross-topic bleed (item 6) and misroutes its reply to the wrong topic
+    (item 3). ``thread_id`` absent (DM / non-topic message) returns "" —
+    caller falls back to the exact pre-T-0676 instructions, so a DM attendant
+    is completely unaffected."""
+    if thread_id is None or str(thread_id).strip() == "":
+        return ""
+    return (
+        f"\nThis message arrived in a BOUND FORUM TOPIC (thread_id "
+        f"{thread_id}) — read and reply WITHIN that topic's own isolated "
+        f"thread, not the project's full history:\n"
+        f"  GET /api/conversations/{slug}/{global_user_id}/messages?thread_id={thread_id}\n"
+        f"  (reply by appending with thread_id={thread_id} so it relays back "
+        f"into the SAME topic, not elsewhere)\n"
+    )
 
 
 def _group_prompt_block(cfg: Any, slug: str, global_user_id: str) -> str:
@@ -1660,7 +1681,8 @@ def _group_prompt_block(cfg: Any, slug: str, global_user_id: str) -> str:
 
 
 def _user_conversation_boot_prompt(
-    cfg: Any, slug: str, global_user_id: str, message_ref: str | None
+    cfg: Any, slug: str, global_user_id: str, message_ref: str | None,
+    thread_id: Any = None,
 ) -> str:
     """The initial prompt a freshly-spawned user-conversation session boots on.
 
@@ -1678,6 +1700,7 @@ def _user_conversation_boot_prompt(
             f"  {str(message_ref).strip()}\n"
         )
     group_block = _group_prompt_block(cfg, slug, global_user_id)
+    thread_block = _thread_scoped_read_write_block(slug, global_user_id, thread_id)
     return f"""\
 You are a USER-CONVERSATION session (system-controlled), spawned on incoming
 user mail for project `{slug}`, attending the user `{global_user_id}`.
@@ -1696,11 +1719,11 @@ the product/protocol. Your mandate, in short:
     id> — <one-liner>"`); the operator dispatches the build, not you.
   - You are UNRESTRICTED: you may spawn an operator/TL/ad-hoc session or fix
     things yourself in service of the user's ask.
-{new_msg}{group_block}"""
+{new_msg}{thread_block}{group_block}"""
 
 
 def _user_conversation_resume_prompt(
-    cfg: Any, slug: str, gid: str, message_ref: Any
+    cfg: Any, slug: str, gid: str, message_ref: Any, thread_id: Any = None,
 ) -> str:
     """Wake prompt for a RESUMED (recycled) attendant. Unlike the fresh-spawn
     boot prompt it re-orients rather than onboards — the conversation context
@@ -1712,16 +1735,17 @@ def _user_conversation_resume_prompt(
             f"  {str(message_ref).strip()}\n"
         )
     group_block = _group_prompt_block(cfg, slug, gid)
+    thread_block = _thread_scoped_read_write_block(slug, gid, thread_id)
     return (
         f"Your user-conversation session (user `{gid}`, project `{slug}`) was "
         "recycled and has now been RESUMED on new incoming mail. Re-read this "
         f"user's thread (GET /api/conversations/{slug}/{gid}/messages) and "
-        f"respond to the new message.\n{new_msg}{group_block}"
+        f"respond to the new message.\n{new_msg}{thread_block}{group_block}"
     )
 
 
 def _resume_recycled_user_conversation(
-    cfg: Any, slug: str, gid: str, message_ref: Any
+    cfg: Any, slug: str, gid: str, message_ref: Any, thread_id: Any = None,
 ) -> str | None:
     """T-0575: resume the newest recycled (compact-terminate-remembered)
     attendant for ``(slug, gid)`` when its remembered context fits the <50k
@@ -1748,7 +1772,7 @@ def _resume_recycled_user_conversation(
         res = _sessions.resume(
             cfg, slug, cand["sid"],
             initial_prompt=_user_conversation_resume_prompt(
-                cfg, slug, gid, message_ref),
+                cfg, slug, gid, message_ref, thread_id),
         )
         return res.get("sid")
     except Exception:  # noqa: BLE001 — resume failure must never fail the ensure
@@ -1783,7 +1807,14 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                      surfaced in the boot prompt; the session reads the full
                      thread from the store); model (T-0623: explicit
                      `claude --model` override for a fresh spawn — absent
-                     falls through to sessions.spawn's role default).
+                     falls through to sessions.spawn's role default); thread_id
+                     (T-0676 items 3/6: the bound forum topic this message
+                     came from, when any — the ONE attendant per (slug, gid)
+                     is unchanged, but the boot/resume/nudge it gets is told
+                     to read/reply into THAT topic's isolated thread instead
+                     of the project's whole mixed history, killing the
+                     cross-topic bleed / misrouted-reply pair. Absent/None
+                     behaves byte-identically to before this change).
     Returns: {ok, sid, spawned: bool}
     """
     extra = set(params) - _ENSURE_UCONV_ALLOWED
@@ -1803,6 +1834,13 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"ensure_user_conversation: unknown project slug {slug!r}")
     gid = params["global_user_id"]
     message_ref = params.get("message_ref")
+    # T-0676 items 3/6: which bound forum topic (if any) triggered this ensure
+    # — threaded through to the boot/resume/nudge prompts so the ONE
+    # attendant per (slug, gid) reads/replies into THAT topic's isolated
+    # thread for this message, instead of the whole mixed project history.
+    # None (DM / non-topic message) leaves every prompt byte-identical to
+    # before this change.
+    thread_id = params.get("thread_id")
 
     # Validate the gid up front (raises on a crafted value): it is both the
     # spawn window AND the per-(slug,gid) lock-file segment below, so it must be
@@ -1832,11 +1870,21 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                 # Best-effort wake — the attendant re-reads its thread for the
                 # new message. A pane-timing hiccup must never fail the ensure
                 # (the message is already durable in the store).
+                nudge_text = "A new message arrived in your user-conversation thread — read it and respond."
+                if thread_id is not None and str(thread_id).strip() != "":
+                    # T-0676 items 3/6: point the SAME attendant at THIS
+                    # topic's isolated thread, not the mixed project history.
+                    nudge_text = (
+                        f"A new message arrived in topic (thread_id {thread_id}) "
+                        f"of your user-conversation — read that topic's isolated "
+                        f"thread (GET /api/conversations/{slug}/{gid}/messages"
+                        f"?thread_id={thread_id}) and reply into it (append with "
+                        f"thread_id={thread_id})."
+                    )
                 try:
                     _action_inject_input({
                         "sid": existing,
-                        "text": ("A new message arrived in your user-"
-                                 "conversation thread — read it and respond."),
+                        "text": nudge_text,
                     })
                 except ActionError:
                     pass
@@ -1847,7 +1895,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
         # user's last session"). Still under the flock, so the resumed pane
         # can't race a concurrent ensure into a duplicate. Any ineligibility
         # or failure falls through to the fresh-spawn path below.
-        resumed = _resume_recycled_user_conversation(cfg, slug, gid, message_ref)
+        resumed = _resume_recycled_user_conversation(cfg, slug, gid, message_ref, thread_id)
         if resumed is not None:
             return {"ok": True, "sid": resumed, "spawned": False,
                     "resumed": True}
@@ -1857,7 +1905,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
             cfg,
             slug,
             window,
-            _user_conversation_boot_prompt(cfg, slug, gid, message_ref),
+            _user_conversation_boot_prompt(cfg, slug, gid, message_ref, thread_id),
             model=params.get("model"),
         )
         return {"ok": True, "sid": result["sid"], "spawned": True}

@@ -230,6 +230,30 @@ def test_is_ignorable_service_message_false_for_plain_text():
     assert not TL._is_ignorable_service_message({"text": "hi"})
 
 
+def test_own_bot_id_derived_from_token():
+    cfg = types.SimpleNamespace(tg_bot_token="8206895402:AAGSomeSecretHere")
+    assert TL._own_bot_id(cfg) == "8206895402"
+
+
+def test_own_bot_id_empty_without_token():
+    cfg = types.SimpleNamespace(tg_bot_token="")
+    assert TL._own_bot_id(cfg) == ""
+
+
+def test_is_ignorable_service_message_matches_own_bot_id_even_without_is_bot():
+    # Belt-and-suspenders: a payload that (hypothetically) omits is_bot but
+    # carries our own bot's numeric id is still caught.
+    cfg = types.SimpleNamespace(tg_bot_token="8206895402:AAGSomeSecretHere")
+    msg = {"from": {"id": 8206895402}, "text": ""}
+    assert TL._is_ignorable_service_message(msg, cfg)
+
+
+def test_is_ignorable_service_message_does_not_match_other_sender_id():
+    cfg = types.SimpleNamespace(tg_bot_token="8206895402:AAGSomeSecretHere")
+    msg = {"from": {"id": 555123, "is_bot": False}, "text": "hi"}
+    assert not TL._is_ignorable_service_message(msg, cfg)
+
+
 def test_handle_update_skips_non_allowlisted_chat(tmp_path):
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     update = {
@@ -1294,11 +1318,11 @@ def test_handle_update_bound_topic_wins_over_static_slug_and_pin(tmp_path, monke
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     appended = []
     monkeypatch.setattr(TL, "append_conversation",
-                        lambda c, slug, gid, m: appended.append(slug))
+                        lambda c, slug, gid, m, **k: appended.append(slug))
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")  # pinned alpha
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
     msg = _topic_msg("what's the status", chat_id=111, thread_id=7)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
@@ -1342,7 +1366,7 @@ def test_handle_update_multi_chat_per_project_binding(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: ensures.append(slug))
+                        lambda c, slug, gid, ref, **k: ensures.append(slug))
 
     for thread in (1, 2):
         result = TL.handle_update(
@@ -1577,7 +1601,7 @@ def test_handle_topic_bound_records_locus(tmp_path, monkeypatch):
     msg = _topic_msg("hello", chat_id=111, thread_id=7)
     TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
-    rec = conversation_locus.get_locus(cfg, "beta", "gu_1")
+    rec = conversation_locus.get_locus(cfg, "beta", "gu_1", 7)
     assert rec == {"chat_id": "111", "thread_id": 7, "at": rec["at"]}
 
 
@@ -1613,7 +1637,7 @@ def test_handle_unquoted_records_locus_thread_id_when_present(tmp_path, monkeypa
     msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
     TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
-    rec = conversation_locus.get_locus(cfg, "alpha", "gu_1")
+    rec = conversation_locus.get_locus(cfg, "alpha", "gu_1", 999)
     assert rec["chat_id"] == "111" and rec["thread_id"] == 999
 
 

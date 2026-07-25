@@ -58,6 +58,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -88,11 +89,29 @@ def conversations_root(data_dir: Path) -> Path:
     return Path(data_dir) / "_mothership" / "conversations"
 
 
-def conv_path(data_dir: Path, slug: str, global_user_id: str) -> Path:
-    """Path to one (project, user) conversation thread (a JSONL file)."""
+def conv_path(
+    data_dir: Path, slug: str, global_user_id: str, thread_id: Any = None,
+) -> Path:
+    """Path to one (project, user[, forum thread]) conversation thread (a
+    JSONL file).
+
+    T-0676 items 3/6: a bound forum topic's messages were colliding into the
+    SAME (slug, global_user_id) file as every other topic of that project,
+    collapsing per-topic context (cross-topic bleed) and making the last
+    written topic win for outbound relay (misrouted replies). ``thread_id``
+    (the TG ``message_thread_id`` of a bound topic) is OPTIONAL and additive:
+    ``None`` (the overwhelming pre-existing case — DMs and unbound-group
+    messages have no thread) resolves to the EXACT pre-T-0676 path, so every
+    thread recorded before this change is unaffected. A given ``thread_id``
+    resolves to its OWN nested file, isolated from the bare per-user file and
+    from every other thread.
+    """
     s = _safe_segment(slug)
     g = _safe_segment(global_user_id)
-    return conversations_root(data_dir) / s / f"{g}.jsonl"
+    if thread_id is None or thread_id == "":
+        return conversations_root(data_dir) / s / f"{g}.jsonl"
+    t = _safe_segment(str(thread_id))
+    return conversations_root(data_dir) / s / g / f"t{t}.jsonl"
 
 
 def append(
@@ -106,6 +125,7 @@ def append(
     timestamp: str | None = None,
     channel: str | None = None,
     fyi: bool = False,
+    thread_id: Any = None,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
@@ -115,7 +135,9 @@ def append(
     inbound transport ("tg", "mcp", "api", ...); defaults to "tg" since every
     caller predating T-0631 is TG-origin. ``fyi`` (T-0660) marks a passive,
     non-actionable append (see module docstring); omitted from the stored
-    record when False.
+    record when False. ``thread_id`` (T-0676 items 3/6) isolates a bound forum
+    topic's thread from the rest of the (slug, global_user_id) history — see
+    :func:`conv_path`; omitted from the stored record when ``None``.
     """
     record = {
         "timestamp": timestamp or _now_iso(),
@@ -125,7 +147,9 @@ def append(
         "channel": str(channel) if channel else "tg",
         "fyi": bool(fyi),
     }
-    p = conv_path(data_dir, slug, global_user_id)
+    if thread_id is not None and thread_id != "":
+        record["thread_id"] = thread_id
+    p = conv_path(data_dir, slug, global_user_id, thread_id)
     line = json.dumps(record, ensure_ascii=False)
     with _append_lock:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -134,9 +158,11 @@ def append(
     return record
 
 
-def _read_all(data_dir: Path, slug: str, global_user_id: str) -> list[dict]:
+def _read_all(
+    data_dir: Path, slug: str, global_user_id: str, thread_id: Any = None,
+) -> list[dict]:
     """Read every record in append order, skipping any torn/garbage line."""
-    p = conv_path(data_dir, slug, global_user_id)
+    p = conv_path(data_dir, slug, global_user_id, thread_id)
     if not p.exists():
         return []
     out: list[dict] = []
@@ -177,13 +203,16 @@ def list_messages(
     *,
     limit: int = 200,
     offset: int = 0,
+    thread_id: Any = None,
 ) -> dict:
     """Return a paginated, chronological page of the thread.
 
     ``total`` is the full thread length (not the page size) so a caller can
-    drive pagination. A missing thread yields an empty page.
+    drive pagination. A missing thread yields an empty page. ``thread_id``
+    (T-0676) selects a bound topic's isolated thread instead of the bare
+    per-user one — see :func:`conv_path`.
     """
-    records = _read_all(data_dir, slug, global_user_id)
+    records = _read_all(data_dir, slug, global_user_id, thread_id)
     return _paginate(records, limit=limit, offset=offset)
 
 
@@ -195,10 +224,11 @@ def search(
     *,
     limit: int = 200,
     offset: int = 0,
+    thread_id: Any = None,
 ) -> dict:
     """Return a paginated page of records whose ``text`` contains ``query``
     (case-insensitive). ``total`` is the full match count."""
     needle = str(query or "").lower()
-    records = [r for r in _read_all(data_dir, slug, global_user_id)
+    records = [r for r in _read_all(data_dir, slug, global_user_id, thread_id)
                if needle in str(r.get("text", "")).lower()]
     return _paginate(records, limit=limit, offset=offset)

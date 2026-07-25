@@ -43,8 +43,18 @@ def locus_path(cfg: Any) -> Path:
     return Path(cfg.data_dir) / "_worker" / "conversation_locus.json"
 
 
-def _key(slug: str, global_user_id: str) -> str:
-    return f"{slug}:{global_user_id}"
+def _key(slug: str, global_user_id: str, thread_id: Any = None) -> str:
+    """T-0676 items 3/6: a bare ``(slug, global_user_id)`` key collapses EVERY
+    bound topic of a project onto one locus entry, so the last-written topic
+    always wins for outbound relay (the misrouted-reply half of item 3) and a
+    per-topic attendant can't tell which topic it's actually resolving for
+    (item 6). ``thread_id`` is optional and additive: ``None`` (every DM /
+    unbound-group message, and every locus recorded before this change)
+    resolves to the EXACT pre-existing key, so nothing already on disk is
+    affected. A given ``thread_id`` gets its own isolated key."""
+    if thread_id is None or thread_id == "":
+        return f"{slug}:{global_user_id}"
+    return f"{slug}:{global_user_id}:{thread_id}"
 
 
 def _now_iso() -> str:
@@ -87,19 +97,30 @@ def _save(cfg: Any, mapping: dict[str, dict]) -> None:
 
 def set_locus(cfg: Any, slug: str, global_user_id: str, chat_id: Any, thread_id: Any) -> dict:
     """Record ``(chat_id, thread_id)`` as the last-seen locus for
-    ``(slug, global_user_id)``. Idempotent — always overwrites with the
-    latest inbound message's origin. Returns the stored record."""
+    ``(slug, global_user_id[, thread_id])``. Idempotent — always overwrites
+    with the latest inbound message's origin for that key. Returns the stored
+    record.
+
+    T-0676 items 3/6: keyed (also) on ``thread_id`` when present, so a bound
+    topic's locus is isolated from every other topic of the same project —
+    see :func:`_key`. The stored record still names its own ``thread_id`` (as
+    before), so a caller resolving without a thread (e.g. ``latest_for_slug``)
+    can still see which topic a match came from.
+    """
     mapping = load(cfg)
     rec = {"chat_id": str(chat_id), "thread_id": thread_id, "at": _now_iso()}
-    mapping[_key(slug, global_user_id)] = rec
+    mapping[_key(slug, global_user_id, thread_id)] = rec
     _save(cfg, mapping)
     return rec
 
 
-def get_locus(cfg: Any, slug: str, global_user_id: str) -> Optional[dict]:
-    """The last-seen ``{chat_id, thread_id, at}`` for ``(slug, global_user_id)``,
-    or ``None`` when this pair has never been recorded."""
-    return load(cfg).get(_key(slug, global_user_id))
+def get_locus(
+    cfg: Any, slug: str, global_user_id: str, thread_id: Any = None,
+) -> Optional[dict]:
+    """The last-seen ``{chat_id, thread_id, at}`` for
+    ``(slug, global_user_id[, thread_id])``, or ``None`` when this exact key
+    has never been recorded."""
+    return load(cfg).get(_key(slug, global_user_id, thread_id))
 
 
 def latest_for_slug(cfg: Any, slug: str) -> Optional[dict]:
@@ -111,10 +132,16 @@ def latest_for_slug(cfg: Any, slug: str) -> Optional[dict]:
 
     The returned record also carries ``gid`` (extracted from the key) — used
     by T-0660's FYI-append mechanic, which needs to know WHICH (slug, gid)
-    attendant thread to record into, not just the chat/topic to send to."""
+    attendant thread to record into, not just the chat/topic to send to.
+
+    T-0676 items 3/6: a key may now be ``slug:gid`` OR ``slug:gid:thread_id``
+    (see :func:`_key`) — ``gid`` is always the FIRST segment after the
+    ``slug:`` prefix (a ``global_user_id`` never itself contains ``:``), so
+    splitting once on ``:`` extracts it correctly either way.
+    """
     prefix = f"{slug}:"
     candidates = [
-        {**v, "gid": k[len(prefix):]}
+        {**v, "gid": k[len(prefix):].split(":", 1)[0]}
         for k, v in load(cfg).items() if k.startswith(prefix)
     ]
     if not candidates:

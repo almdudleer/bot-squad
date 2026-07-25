@@ -181,3 +181,55 @@ def test_path_traversal_segments_rejected(tmp_path: Path, bad: str):
         CS.append(tmp_path, bad, "gu_abc", author="user", text="x")
     with pytest.raises(ValueError):
         CS.list_messages(tmp_path, "proj", bad)
+
+
+# ---------------------------------------------------------------------------
+# T-0676 items 3/6: optional thread_id — per-topic isolation, back-compat
+# when absent/None.
+# ---------------------------------------------------------------------------
+
+
+def test_thread_id_absent_matches_pre_t0676_path(tmp_path: Path):
+    """No thread_id -> the EXACT pre-existing path, byte for byte."""
+    assert CS.conv_path(tmp_path, "proj", "gu_abc") == CS.conv_path(tmp_path, "proj", "gu_abc", None)
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi")
+    assert "thread_id" not in rec
+
+
+def test_thread_id_isolates_from_bare_and_other_threads(tmp_path: Path):
+    """Two different bound topics of the SAME (slug, gid) get their own
+    isolated histories — neither collides with each other nor with the bare
+    (no-thread) DM thread (the item-6 cross-topic bleed this closes)."""
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="dm message")
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="topic 7 message", thread_id=7)
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="topic 9 message", thread_id=9)
+
+    dm = CS.list_messages(tmp_path, "proj", "gu_abc")
+    t7 = CS.list_messages(tmp_path, "proj", "gu_abc", thread_id=7)
+    t9 = CS.list_messages(tmp_path, "proj", "gu_abc", thread_id=9)
+
+    assert [m["text"] for m in dm["messages"]] == ["dm message"]
+    assert [m["text"] for m in t7["messages"]] == ["topic 7 message"]
+    assert [m["text"] for m in t9["messages"]] == ["topic 9 message"]
+
+
+def test_thread_id_recorded_on_the_stored_record(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi", thread_id=7)
+    assert rec["thread_id"] == 7
+    out = CS.list_messages(tmp_path, "proj", "gu_abc", thread_id=7)
+    assert out["messages"][0]["thread_id"] == 7
+
+
+def test_thread_id_search_scoped_to_its_own_thread(tmp_path: Path):
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="deploy in DM")
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="deploy in topic", thread_id=7)
+    dm_hits = CS.search(tmp_path, "proj", "gu_abc", "deploy")
+    t7_hits = CS.search(tmp_path, "proj", "gu_abc", "deploy", thread_id=7)
+    assert [m["text"] for m in dm_hits["messages"]] == ["deploy in DM"]
+    assert [m["text"] for m in t7_hits["messages"]] == ["deploy in topic"]
+
+
+def test_thread_id_path_nested_under_gid(tmp_path: Path):
+    p = CS.conv_path(tmp_path, "proj", "gu_abc", 7)
+    assert p.parent.name == "gu_abc"
+    assert p.name == "t7.jsonl"

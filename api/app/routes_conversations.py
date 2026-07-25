@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -62,18 +63,34 @@ def _users_store(request: Request) -> MothershipUsersStore:
     return MothershipUsersStore(cfg.data_dir / "_mothership")
 
 
-def _read_conversation_locus(request: Request, slug: str, global_user_id: str) -> dict | None:
+def _locus_key(slug: str, global_user_id: str, thread_id: Any = None) -> str:
+    """Mirrors ``bot_squad_worker.conversation_locus._key`` exactly (the API
+    reads the worker's on-disk file directly, so the key derivation must stay
+    byte-identical). ``thread_id`` absent -> the pre-T-0676 ``slug:gid`` key;
+    given -> the isolated ``slug:gid:thread_id`` key (T-0676 items 3/6)."""
+    if thread_id is None or thread_id == "":
+        return f"{slug}:{global_user_id}"
+    return f"{slug}:{global_user_id}:{thread_id}"
+
+
+def _read_conversation_locus(
+    request: Request, slug: str, global_user_id: str, thread_id: Any = None,
+) -> dict | None:
     """T-0667: read-only lookup of the worker-owned conversation-locus store —
     the last ``(chat_id, thread_id)`` an inbound message from ``(slug,
-    global_user_id)`` arrived on, recorded in-process by ``tg_listener``
-    (``bot_squad_worker.conversation_locus``, ``_handle_topic_bound`` /
-    ``_handle_unquoted``).
+    global_user_id[, thread_id])`` arrived on, recorded in-process by
+    ``tg_listener`` (``bot_squad_worker.conversation_locus``,
+    ``_handle_topic_bound`` / ``_handle_unquoted``).
 
     Worker and API share the data dir but run in separate processes/envs — this
     reads the SAME on-disk file directly rather than round-tripping through the
     worker socket, mirroring the pattern ``routes_autoupdate.py`` already uses
     for the worker's autoupdate state. Best-effort: a missing/corrupt file is
     "no locus recorded", never an error.
+
+    ``thread_id`` (T-0676 items 3/6): when given, look up THAT topic's own
+    isolated locus entry rather than the project's single collapsed one —
+    see :func:`_locus_key`.
     """
     cfg = request.app.state.api_config
     path = cfg.data_dir / "_worker" / "conversation_locus.json"
@@ -86,22 +103,25 @@ def _read_conversation_locus(request: Request, slug: str, global_user_id: str) -
         return None
     if not isinstance(raw, dict):
         return None
-    rec = raw.get(f"{slug}:{global_user_id}")
+    rec = raw.get(_locus_key(slug, global_user_id, thread_id))
     if not isinstance(rec, dict) or not rec.get("chat_id"):
         return None
     return {"chat_id": rec["chat_id"], "thread_id": rec.get("thread_id")}
 
 
-def _resolve_relay_target(request: Request, slug: str, global_user_id: str) -> tuple[str, int | None]:
+def _resolve_relay_target(
+    request: Request, slug: str, global_user_id: str, thread_id: Any = None,
+) -> tuple[str, int | None]:
     """T-0569 / T-0667: resolve the ``(chat_id, topic_id)`` to relay a session
     reply to.
 
     Priority (T-0667 — "one coherent dialogue", D-0055 Addendum 3):
     1. The conversation LOCUS — the ``(chat_id, thread_id)`` the user's most
-       recent inbound message for THIS project arrived on. Without this, a
-       reply always landed in the user's DM even when they'd just written in
-       a bound forum topic, splitting the conversation (the live gap this
-       ticket fixes).
+       recent inbound message for THIS project (and, when ``thread_id`` is
+       given, THIS bound topic specifically — T-0676 items 3/6) arrived on.
+       Without this, a reply always landed in the user's DM even when they'd
+       just written in a bound forum topic, splitting the conversation (the
+       live gap this ticket fixes).
     2. The GlobalUser's ``tg_user_id`` (a DM chat id IS the TG user id — every
        TG user has an implicit private chat with the bot at that same id) —
        the right default for a user who has never written into a bound topic.
@@ -111,7 +131,7 @@ def _resolve_relay_target(request: Request, slug: str, global_user_id: str) -> t
     relay" (``relayed: false``), never an error.
     """
     cfg = request.app.state.api_config
-    locus = _read_conversation_locus(request, slug, global_user_id)
+    locus = _read_conversation_locus(request, slug, global_user_id, thread_id)
     if locus:
         return locus["chat_id"], locus.get("thread_id")
     try:
@@ -126,7 +146,9 @@ def _resolve_relay_target(request: Request, slug: str, global_user_id: str) -> t
     return "", None
 
 
-async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, text: str) -> bool:
+async def _relay_to_telegram(
+    request: Request, slug: str, global_user_id: str, text: str, thread_id: Any = None,
+) -> bool:
     """Best-effort writeback (T-0569): relay a session-authored conversation
     reply to the user's Telegram chat via the worker's ``tg_notify`` action, so
     the user actually SEES the reply (before this, nothing surfaced a
@@ -147,7 +169,7 @@ async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, t
     (locus or static ``tg_topic_id``), the reply is delivered into THAT thread
     instead of the chat's general feed.
     """
-    chat_id, topic_id = _resolve_relay_target(request, slug, global_user_id)
+    chat_id, topic_id = _resolve_relay_target(request, slug, global_user_id, thread_id)
     if not chat_id:
         return False
     client = request.app.state.worker_router.coordinator()
@@ -165,6 +187,7 @@ async def _relay_to_telegram(request: Request, slug: str, global_user_id: str, t
 
 async def _ensure_attendant(
     request: Request, slug: str, global_user_id: str, message_ref: str,
+    thread_id: Any = None,
 ) -> dict:
     """T-0631: the channel-agnostic half of the intake seam — best-effort wake
     of the (slug, global_user_id) user-conversation attendant for a freshly
@@ -189,11 +212,11 @@ async def _ensure_attendant(
     a saturation refusal is still distinguishable (``parked: True``) from any
     other failure."""
     client = request.app.state.worker_router.coordinator()
+    params: dict = {"slug": slug, "global_user_id": global_user_id, "message_ref": message_ref}
+    if thread_id is not None and thread_id != "":
+        params["thread_id"] = thread_id
     try:
-        return await client.call_action(
-            "ensure_user_conversation",
-            {"slug": slug, "global_user_id": global_user_id, "message_ref": message_ref},
-        )
+        return await client.call_action("ensure_user_conversation", params)
     except WorkerError as e:
         if "backoff" in str(e):
             return {"ok": False, "parked": True}
@@ -233,11 +256,18 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
       ``_ensure_attendant``), UNLESS ``fyi`` (T-0660: this isn't the
       attendant's own inbox item, just context — the wake is suppressed, not
       run); absent entirely for a session writeback (it already HAS an
-      attending session, waking one would be circular)."""
+      attending session, waking one would be circular).
+
+    ``thread_id`` (T-0676 items 3/6): the bound forum topic this message
+    belongs to, when any — isolates the record into that topic's OWN thread
+    and scopes the relay/attendant-wake to it, instead of the project's
+    mixed history. Omitted / ``None`` (DM, non-topic message — every
+    pre-T-0676 caller) behaves byte-identically to before this change."""
     _authenticate_worker(request)
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
     fyi = bool(payload.get("fyi", False))
+    thread_id = payload.get("thread_id")
     try:
         record = CS.append(
             _data_dir(request),
@@ -249,6 +279,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             timestamp=payload.get("timestamp"),
             channel=payload.get("channel"),
             fyi=fyi,
+            thread_id=thread_id,
         )
     except ValueError as e:
         # An unsafe slug / global_user_id segment.
@@ -259,7 +290,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     text = str(record.get("text") or "")
     if author.startswith("session:") and text and not fyi:
         try:
-            relayed = await _relay_to_telegram(request, slug, global_user_id, text)
+            relayed = await _relay_to_telegram(request, slug, global_user_id, text, thread_id)
         except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
             relayed = False
 
@@ -271,6 +302,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
         else:
             out["ensured"] = await _ensure_attendant(
                 request, slug, global_user_id, str(record.get("timestamp") or ""),
+                thread_id,
             )
     return out
 
@@ -283,6 +315,7 @@ def worker_list_conversation(
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     q: str = Query(default=""),
+    thread_id: str = Query(default=""),
 ) -> dict:
     """Worker-token READ of the (slug, global_user_id) thread (T-0542).
 
@@ -292,12 +325,18 @@ def worker_list_conversation(
     read surface to review its OWN thread — before this it had to reach into the
     store JSONL directly (an architectural wart). Same store call + pagination/
     search as the session read; token-gated by the shared worker secret (fails
-    closed when unset), the established worker->API trust path."""
+    closed when unset), the established worker->API trust path.
+
+    ``thread_id`` (T-0676 items 3/6): read a bound topic's OWN isolated
+    thread instead of the project's mixed (slug, global_user_id) history —
+    see ``conversation_store.conv_path``. Empty/omitted behaves exactly as
+    before this change."""
     _authenticate_worker(request)
+    tid = thread_id or None
     try:
         if q:
-            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset)
-        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset)
+            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset, thread_id=tid)
+        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset, thread_id=tid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -342,6 +381,7 @@ def list_conversation(
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     q: str = Query(default=""),
+    thread_id: str = Query(default=""),
 ) -> dict:
     """Paginated thread lookup. With ``q`` set, returns only records whose text
     contains it (case-insensitive); otherwise the full chronological thread.
@@ -353,10 +393,15 @@ def list_conversation(
     stored under ``data/<slug>/``); this guarantees the read cannot cross slugs
     for a project-limited user. (Binding a live conversational SESSION object to
     one project is the T-0478 seam — deferred; this enforces the DATA-access
-    privacy guarantee now.)"""
+    privacy guarantee now.)
+
+    ``thread_id`` (T-0676 items 3/6): read a bound topic's OWN isolated
+    thread instead of the project's mixed history. Empty/omitted behaves
+    exactly as before this change."""
+    tid = thread_id or None
     try:
         if q:
-            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset)
-        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset)
+            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset, thread_id=tid)
+        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset, thread_id=tid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -41,17 +41,31 @@ _SERVICE_MESSAGE_FIELDS = (
 )
 
 
-def _is_ignorable_service_message(msg: dict) -> bool:
+def _own_bot_id(cfg) -> str:
+    """The numeric TG user id of our own bot, derived from the configured bot
+    token (``<bot_id>:<secret>``) — never hardcoded, so it tracks whichever
+    token is actually configured (T-0682 review note: derive, don't hardcode
+    the id observed via getMe). Empty string when no token is configured."""
+    token = getattr(cfg, "tg_bot_token", "") or ""
+    return token.split(":", 1)[0] if ":" in token else ""
+
+
+def _is_ignorable_service_message(msg: dict, cfg: Any = None) -> bool:
     """T-0682: our own bot's forum-topic service messages (the
     forum_topic_created echo from a createForumTopic call) were being
     ingested as human DMs — no is_bot/service-message guard existed — which
     minted a GlobalUser for the bot itself (id confirmed via getMe) and
     spawned attendant sessions replying to empty messages (the item-2
-    echo-loop). Skip: any bot-authored message (ours or another bot's),
-    anonymous channel-linked posts, and TG's own chat/topic service events.
+    echo-loop). Skip: any bot-authored message (ours or another bot's, or a
+    sender id matching our OWN bot's id — belt-and-suspenders in case a
+    payload ever omits ``is_bot``), anonymous channel-linked posts, and TG's
+    own chat/topic service events.
     """
     frm = msg.get("from") or {}
     if frm.get("is_bot"):
+        return True
+    own_id = _own_bot_id(cfg) if cfg is not None else ""
+    if own_id and str(frm.get("id", "")) == own_id:
         return True
     if msg.get("sender_chat"):
         return True
@@ -319,7 +333,9 @@ def _msg_attachments(msg: dict) -> list[dict]:
     return out
 
 
-def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optional[bool]:
+def append_conversation(
+    cfg, slug: str, global_user_id: str, msg: dict, *, thread_id: Any = None,
+) -> Optional[bool]:
     """T-0489: record one inbound TG user message to the per-(project, user)
     conversation history store — the durable thread "we can always look up"
     (voice-04), the continuity substrate across session recycles.
@@ -328,6 +344,12 @@ def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optio
     append endpoint over the same worker->API path T-0488 established (httpx,
     base=MOTHERSHIP_BASE_URL, Bearer=WORKER_API_TOKEN) — NOT through the TG
     egress proxy (this is a local-API call, not Telegram traffic).
+
+    ``thread_id`` (T-0676 items 3/6): the bound forum topic this message
+    arrived in, when any — isolates the record into that topic's OWN thread
+    (see ``conversation_store.conv_path``) instead of the project's mixed
+    history. Omitted from the request body when ``None`` (DM / non-topic
+    message), so an existing caller's request is byte-identical to before.
 
     Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
     ``global_user_id``, or the API base / worker token aren't configured — so a
@@ -341,15 +363,18 @@ def append_conversation(cfg, slug: str, global_user_id: str, msg: dict) -> Optio
     if not base or not token:
         return None
     url = f"{base}/api/m/worker/conversations/{slug}/{gid}/messages"  # T-0529: /worker prefix
+    payload = {
+        "author": "user",
+        "text": msg.get("text") or "",
+        "attachments": _msg_attachments(msg),
+        "timestamp": _msg_ts(msg),
+    }
+    if thread_id is not None and str(thread_id).strip() != "":
+        payload["thread_id"] = thread_id
     try:
         r = httpx.post(
             url,
-            json={
-                "author": "user",
-                "text": msg.get("text") or "",
-                "attachments": _msg_attachments(msg),
-                "timestamp": _msg_ts(msg),
-            },
+            json=payload,
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )
@@ -518,7 +543,7 @@ def _handle_project(cfg, chat_id: str, gid: str, args: str, *, thread_id: Any = 
 
 
 def _ensure_user_conversation(
-    cfg, slug: str, gid: str, message_ref: str
+    cfg, slug: str, gid: str, message_ref: str, *, thread_id: Any = None,
 ) -> Optional[dict]:
     """T-0485 (M4 firehose intake): route an unquoted dump to a (continued-or-
     spawned) user-conversation session via the ``ensure_user_conversation``
@@ -541,12 +566,15 @@ def _ensure_user_conversation(
     ``None`` for anything else) so ``_handle_unquoted`` can tell the chat the
     message is parked rather than dropping into dead air."""
     from bot_squad_worker import actions as A
+    params = {
+        "slug": slug,
+        "global_user_id": gid,
+        "message_ref": message_ref,
+    }
+    if thread_id is not None and str(thread_id).strip() != "":
+        params["thread_id"] = thread_id
     try:
-        return A.dispatch("ensure_user_conversation", {
-            "slug": slug,
-            "global_user_id": gid,
-            "message_ref": message_ref,
-        })
+        return A.dispatch("ensure_user_conversation", params)
     except A.ActionError as e:
         if "backoff" in str(e):
             return {"ok": False, "parked": True}
@@ -631,13 +659,17 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
             text=f"Пользователь ответил сессии {session_id} напрямую: {text}",
         )
         return result
-    append_conversation(cfg, slug, gid, msg)
+    # T-0676 items 3/6: isolate this bound topic's record + attendant-read
+    # from the rest of the project's (mixed) history — see append_conversation
+    # / _ensure_user_conversation / conversation_locus docstrings.
+    bound_thread_id = msg.get("message_thread_id")
+    append_conversation(cfg, slug, gid, msg, thread_id=bound_thread_id)
     # T-0667: remember where this landed so an OUTGOING reply follows the
     # same chat/topic instead of falling back to the project's static DM.
     from bot_squad_worker import conversation_locus
-    conversation_locus.set_locus(cfg, slug, gid, chat_id, msg.get("message_thread_id"))
+    conversation_locus.set_locus(cfg, slug, gid, chat_id, bound_thread_id)
     message_ref = _msg_ts(msg)
-    ensured = _ensure_user_conversation(cfg, slug, gid, message_ref)
+    ensured = _ensure_user_conversation(cfg, slug, gid, message_ref, thread_id=bound_thread_id)
     if isinstance(ensured, dict) and ensured.get("parked"):
         # T-0570 parity: a spawn refused under backoff/saturation must still
         # tell the user, not go silent (see _handle_unquoted's identical case).
@@ -806,7 +838,7 @@ def handle_update(cfg, update: dict) -> dict:
     # T-0682: bot/service-authored messages never carry human intent — bail
     # out before any allowlisting or identity-linking work (that linking is
     # exactly what minted a GlobalUser for our own bot in the echo-loop bug).
-    if _is_ignorable_service_message(msg):
+    if _is_ignorable_service_message(msg, cfg):
         return {"ok": True, "action": "skip", "reason": "bot or service message"}
 
     chat = msg.get("chat", {})

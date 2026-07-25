@@ -630,6 +630,121 @@ def test_session_append_relay_locus_corrupt_file_falls_back(tmp_bot_squad: Path,
     assert calls[0][1]["chat_id"] == "555222111"
 
 
+# ---------------------------------------------------------------------------
+# T-0676 items 3/6: optional thread_id — a bound forum topic's history +
+# outbound relay are isolated from the project's mixed (slug, gid) thread.
+# Absent thread_id must behave byte-identically to every test above.
+# ---------------------------------------------------------------------------
+
+
+def _write_threaded_locus(tmp_bot_squad: Path, slug: str, gid: str, thread_id, chat_id: str) -> None:
+    """Write a locus entry under the THREAD-SCOPED key (mirrors
+    ``conversation_locus._key`` with a thread_id) — distinct from
+    ``_write_locus``'s bare ``slug:gid`` key."""
+    import json
+    p = tmp_bot_squad / "data" / "_worker" / "conversation_locus.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = json.loads(p.read_text()) if p.is_file() else {}
+    existing[f"{slug}:{gid}:{thread_id}"] = {
+        "chat_id": chat_id, "thread_id": thread_id, "at": "2026-07-25T15:00:00Z",
+    }
+    p.write_text(json.dumps(existing))
+
+
+def test_append_with_thread_id_isolates_from_bare_thread(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    client.post(CONV, json={"author": "user", "text": "dm message"}, headers=_worker_auth())
+    client.post(CONV, json={"author": "user", "text": "topic message", "thread_id": 7},
+                headers=_worker_auth())
+
+    dm = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    topic = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc", thread_id=7)
+    assert [m["text"] for m in dm["messages"]] == ["dm message"]
+    assert [m["text"] for m in topic["messages"]] == ["topic message"]
+
+
+def test_worker_list_with_thread_id_reads_isolated_thread(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    d = tmp_bot_squad / "data"
+    CS.append(d, "test-project", "gu_abc", author="user", text="dm msg")
+    CS.append(d, "test-project", "gu_abc", author="user", text="topic msg", thread_id=7)
+
+    r = client.get(CONV, headers=_worker_auth())
+    assert [m["text"] for m in r.json()["messages"]] == ["dm msg"]
+
+    r = client.get(CONV, params={"thread_id": "7"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    assert [m["text"] for m in r.json()["messages"]] == ["topic msg"]
+
+
+def test_session_authed_list_with_thread_id_reads_isolated_thread(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    d = tmp_bot_squad / "data"
+    CS.append(d, "test-project", "gu_abc", author="user", text="dm msg")
+    CS.append(d, "test-project", "gu_abc", author="user", text="topic msg", thread_id=7)
+    _login(client)
+
+    r = client.get(AUTH_CONV, params={"thread_id": "7"})
+    assert r.status_code == 200, r.text
+    assert [m["text"] for m in r.json()["messages"]] == ["topic msg"]
+
+
+def test_session_append_with_thread_id_relays_to_that_topics_locus(tmp_bot_squad: Path, monkeypatch):
+    """The relay for a threaded reply must resolve THAT topic's own locus —
+    not the bare (slug,gid) one, and not a DIFFERENT topic's locus — closing
+    the item-3 misrouted-reply / item-6 bleed pair."""
+    _write_locus(tmp_bot_squad, "test-project", "gu_abc", "111", None)  # bare/DM locus
+    _write_threaded_locus(tmp_bot_squad, "test-project", "gu_abc", 7, "-100777")
+    _write_threaded_locus(tmp_bot_squad, "test-project", "gu_abc", 9, "-100999")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 7},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][1]["chat_id"] == "-100777"
+    assert calls[0][1]["topic_id"] == 7
+
+
+def test_session_append_without_thread_id_still_uses_bare_locus(tmp_bot_squad: Path, monkeypatch):
+    """Back-compat: omitting thread_id resolves the bare (slug,gid) locus
+    exactly as before this change, ignoring any threaded entries."""
+    _write_locus(tmp_bot_squad, "test-project", "gu_abc", "111", None)
+    _write_threaded_locus(tmp_bot_squad, "test-project", "gu_abc", 7, "-100777")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "111"
+
+
+def test_user_authored_append_with_thread_id_passes_thread_id_to_ensure(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """The attendant-wake for a topic-bound message carries the thread_id
+    through, so the SAME (slug,gid) attendant knows which topic's isolated
+    thread the new message belongs to (T-0676 items 3/6 design)."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch, result={"ok": True, "sid": "S-x-p1", "spawned": False})
+
+    r = client.post(
+        CONV, json={"author": "user", "text": "hi", "thread_id": 7}, headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][0] == "ensure_user_conversation"
+    assert calls[0][1]["thread_id"] == 7
+
+
 def test_worker_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     d = tmp_bot_squad / "data"

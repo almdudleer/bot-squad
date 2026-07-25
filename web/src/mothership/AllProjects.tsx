@@ -13,6 +13,7 @@ import {
   pendingStateBadgeClass,
 } from "./serverState";
 import { canManageGrants } from "./Users";
+import { CrossProjectSessions } from "./CrossProjectSessions";
 import { api } from "../api";
 import { Coachmark } from "../onboarding";
 import { STEP_9_3_BULLETS, STEP_9_3_TITLE } from "../onboarding/copy";
@@ -303,6 +304,12 @@ export function AllProjects() {
           </ul>
         }
       />
+
+      {/* T-0661: cross-project Processes/Sessions glance view, placed at the
+          top of the page per the stakeholder's own suggested placement. Fed
+          by the SAME `sections` fan-out the Servers list below renders from
+          — no duplicate server/project fetch. */}
+      <CrossProjectSessions sections={sections} />
 
       <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
         <div className="mc-section-title" style={{ margin: 0 }}>

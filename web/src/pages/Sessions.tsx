@@ -34,7 +34,7 @@ import { ResourceCapsPanel } from "../components/ResourceCapsPanel";
 // state — a live-but-quiet pane is `idle`, never `running`. Same
 // vocabulary is used by TaskCard / TaskDetail so card and detail no
 // longer disagree on the label.
-function StatusBadge({ row }: { row: SessionRow }) {
+export function StatusBadge({ row }: { row: SessionRow }) {
   const a = sessionActivity(row);
   if (a === "running") {
     return (
@@ -78,7 +78,7 @@ function StatusBadge({ row }: { row: SessionRow }) {
 // operator and got no reply). Amber, distinct from the activity StatusBadge so
 // a blocked-but-still-"running" pane is glanceable. Renders nothing when not
 // blocked, so callers can drop it inline next to the status with no layout cost.
-function AwaitingInputBadge({ row }: { row: SessionRow }) {
+export function AwaitingInputBadge({ row }: { row: SessionRow }) {
   if (!row.awaiting_input) return null;
   return (
     <span
@@ -159,7 +159,7 @@ function ContextCell({
 // legacy task_id inference for a pre-T-0141 worker). Teamlead = green,
 // operator = amber, dev = blue. T-0197: prod-teamlead = red (prod caution),
 // qa = active/purple. `dim` mutes the badge for archived rows.
-function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
+export function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
   const role = sessionRole(row);
   // T-0220: the worker neutralized an elevated window-derived role on this
   // suspended row because its persisted cwd didn't match the project (the role
@@ -218,7 +218,7 @@ function relativeTime(raw: string | number | null | undefined): string {
 // shared across every pane in the repo and so reads the same for every row.
 // For suspended rows the worker leaves activity_at null and stuffs
 // suspended_at/paused_at into last_prompt_at; fall through to that.
-function sessionLastActivity(s: SessionRow): string {
+export function sessionLastActivity(s: SessionRow): string {
   if (s.activity_at != null) return relativeTime(s.activity_at);
   if (s.last_prompt_at != null) return relativeTime(s.last_prompt_at);
   return "never";

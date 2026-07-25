@@ -48,12 +48,18 @@ def _make_cfg(tmp_path: Path) -> Any:
     return types.SimpleNamespace(projects=cfg.projects, data_dir=data_dir, tg_bot_token="")
 
 
+# Captured before the autouse fixture below ever patches the attribute, so
+# tests that need the REAL /proc-walk call chain (e.g. the proc-map-build
+# count test) can restore it for just that test.
+_REAL_PANE_CLAUDE_UUID_FROM_PROC = S._pane_claude_uuid_from_proc
+
+
 @pytest.fixture(autouse=True)
 def _user(monkeypatch):
     monkeypatch.setattr(S, "_get_current_user", lambda: "u")
     monkeypatch.setattr(S, "_get_user_home", lambda: "/nonexistent-home")
     # Tests drive uuid resolution explicitly; default to "no uuid found".
-    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home: None)
+    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home, children=None: None)
 
 
 def _pane(pane_id: str, window: str, cwd: str, command: str = "claude"):
@@ -128,7 +134,7 @@ def test_generic_window_restored_from_stored_window_field(tmp_path, monkeypatch)
         "cwd": repo, "claude_uuid": "uuid-x", "task_id": "T-0042",
     })
     monkeypatch.setattr(S, "list_panes", lambda: [_pane("%1", "bash", repo)])
-    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home: "uuid-x")
+    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home, children=None: "uuid-x")
     calls = _run_recorder(monkeypatch)
 
     S.reconcile_window_names(cfg, "test-project")
@@ -279,3 +285,35 @@ def test_list_sessions_uuid_fallback_skips_md_owned_by_another_live_pane(tmp_pat
     assert rows["S-u-worker-b-p2"]["task_id"] == "T-0001"
     # The md-less pane must NOT inherit worker-b's binding via the uuid guess.
     assert rows["S-u-scratch-p1"]["task_id"] is None
+
+
+def test_reconcile_window_names_builds_proc_map_once_for_multiple_panes(
+    tmp_path, monkeypatch,
+):
+    """T-0668: reconcile_window_names (a binding_gc_tick pass) used to have
+    _pane_claude_uuid_from_proc rebuild the /proc children-map via a full
+    /proc scan for EACH generic-window pane it resolves. Mirrors
+    test_list_sessions_builds_proc_map_once_for_multiple_panes in
+    test_sessions.py — same underlying function, second call site. Assert
+    ONE map build for 3 generic-window panes."""
+    cfg = _make_cfg(tmp_path)
+    repo = tmp_path / "repo"
+    panes = [
+        _pane("%1", "bash", str(repo)),
+        _pane("%2", "bash", str(repo)),
+        _pane("%3", "bash", str(repo)),
+    ]
+    monkeypatch.setattr(S, "list_panes", lambda: panes)
+    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", _REAL_PANE_CLAUDE_UUID_FROM_PROC)
+    _run_recorder(monkeypatch)
+
+    builds = {"n": 0}
+
+    def _counting_map():
+        builds["n"] += 1
+        return {}
+
+    monkeypatch.setattr(S, "_proc_children_map", _counting_map)
+
+    S.reconcile_window_names(cfg, "test-project")
+    assert builds["n"] == 1, f"expected ONE /proc map build for 3 panes, got {builds['n']}"

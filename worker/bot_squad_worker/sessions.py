@@ -290,7 +290,9 @@ _UUID_RE = re.compile(
 )
 
 
-def _pane_claude_uuid_from_proc(pane_pid: str, user_home: str) -> str | None:
+def _pane_claude_uuid_from_proc(
+    pane_pid: str, user_home: str, children: dict[int, list[int]] | None = None,
+) -> str | None:
     """T-0120: return the AUTHORITATIVE claude_uuid for a tmux pane via /proc.
 
     Walks /proc descendants of ``pane_pid`` for a ``claude`` process whose
@@ -312,26 +314,23 @@ def _pane_claude_uuid_from_proc(pane_pid: str, user_home: str) -> str | None:
     .jsonl open as a long-lived fd — it opens, appends, closes per write —
     so an fd scan races with each turn boundary. The cmdline is stable for
     the lifetime of the claude process.
+
+    T-0668: ``children`` is the prebuilt ``_proc_children_map()`` (same param
+    T-0416 already added to ``_pane_has_live_claude``). This function used to
+    rebuild that map from a full /proc scan on EVERY call; list_sessions()
+    calls it once per live pane, and list_sessions() itself is invoked by
+    ~15 independent scheduler jobs a minute plus every real-time fan-out
+    request — on a busy host that redundant O(panes x host-processes) scan
+    kept the coordinator CPU-bound long enough to blow the fan-out httpx
+    timeout. Standalone callers omit ``children`` and one is built on demand.
     """
     del user_home  # reserved; see docstring
     try:
         target = int(pane_pid)
     except (ValueError, TypeError):
         return None
-    children: dict[int, list[int]] = {}
-    try:
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                st = (entry / "status").read_text()
-            except OSError:
-                continue
-            m = re.search(r"^PPid:\s+(\d+)", st, re.M)
-            if m:
-                children.setdefault(int(m.group(1)), []).append(int(entry.name))
-    except OSError:
-        return None
+    if children is None:
+        children = _proc_children_map()
     queue: list[int] = [target]
     seen: set[int] = set()
     while queue:
@@ -928,6 +927,11 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
 
     import re as _re_cmd
     _claude_version_re = _re_cmd.compile(r"^\d+\.\d+\.\d+$")
+    # T-0668: build the /proc children-map ONCE for every pane's uuid walk
+    # below, instead of _pane_claude_uuid_from_proc rebuilding it per pane
+    # (see that function's T-0668 note; same fix T-0416 already applied to
+    # _pane_has_live_claude/_live_agent_sids).
+    proc_children = _proc_children_map()
     for pane in panes:
         pane_cwd = Path(pane.cwd) if pane.cwd else None
         # Accept top-level "claude" plus the version-named binaries Claude Code
@@ -963,7 +967,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # /proc walk reads the uuid the live claude process has open — that's
         # per-pane. discover_claude_uuid stays as the fallback when the walk
         # finds nothing (e.g. claude not yet exec'd in a brand-new pane).
-        proc_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home)
+        proc_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home, proc_children)
         claude_uuid = proc_uuid or discover_claude_uuid(pane.cwd, user_home)
 
         # Check for last_prompt_at via .claude/last_user_prompt_ts mtime
@@ -5173,6 +5177,9 @@ def reconcile_window_names(cfg: Any, slug: str) -> dict:
     except Exception:
         return {"ok": True, "renamed": renamed}
 
+    # T-0668: one /proc children-map for every pane's uuid walk below, instead
+    # of a full /proc rescan per pane (see _pane_claude_uuid_from_proc's note).
+    proc_children = _proc_children_map()
     for pane in panes:
         if pane.command != "claude" and not _CLAUDE_VERSION_RE.match(pane.command):
             continue
@@ -5185,7 +5192,7 @@ def reconcile_window_names(cfg: Any, slug: str) -> dict:
             continue
 
         sid = compute_sid(user, pane.window, pane.pane_id)
-        claude_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home)
+        claude_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home, proc_children)
         md_path = _find_session_md(sessions_dir, sid, claude_uuid)
         meta = _read_session_metadata(md_path) if md_path else None
 

@@ -693,7 +693,7 @@ def test_list_sessions_per_pane_uuid_under_shared_cwd(tmp_path, monkeypatch):
         "3003": "uuid-update-delivery",
     }
 
-    def fake_proc(pid, user_home):
+    def fake_proc(pid, user_home, children=None):
         return pid_to_uuid.get(pid)
 
     import bot_squad_worker.sessions as S
@@ -722,6 +722,55 @@ def test_list_sessions_per_pane_uuid_under_shared_cwd(tmp_path, monkeypatch):
     # this test exists to prevent.
     starts = [r["started_at"] for r in by_sid.values()]
     assert len(set(starts)) == 3, f"active TLs must have distinct started_at, got {starts}"
+
+
+def test_list_sessions_builds_proc_map_once_for_multiple_panes(tmp_path, monkeypatch):
+    """T-0668: _pane_claude_uuid_from_proc used to rebuild the /proc children-map
+    via its own full /proc scan on EVERY pane it resolves. list_sessions() is
+    called by ~15 independent scheduler jobs a minute plus every real-time
+    fan-out request, so N live panes meant N redundant O(host-processes) scans
+    PER call — the coordinator worker was CPU-bound often enough to blow the
+    5s fan-out httpx timeout (live repro: sustained ~57% CPU, binding_gc_tick
+    ticks running 60-76s instead of the low-single-digit-second cost the
+    reconcile passes actually need).
+
+    T-0416 already fixed this exact bug class in a sibling function
+    (_pane_has_live_claude / _live_agent_sids, the parallel-cap liveness
+    check) via a shared _proc_children_map() built once per pass — see
+    test_live_agent_sids_builds_proc_map_once in test_spawn_caps.py, which
+    this test mirrors. _pane_claude_uuid_from_proc (what list_sessions()
+    actually calls) was never migrated to it until now.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    fake_panes = (
+        f"%1|dev-a|4001|{repo}|claude\n"
+        f"%2|dev-b|4002|{repo}|claude\n"
+        f"%3|dev-c|4003|{repo}|claude\n"
+    )
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_panes, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    builds = {"n": 0}
+
+    def _counting_map():
+        builds["n"] += 1
+        return {}
+
+    monkeypatch.setattr(S, "_proc_children_map", _counting_map)
+
+    list_sessions(cfg, "test-project")
+    assert builds["n"] == 1, f"expected ONE /proc map build for 3 panes, got {builds['n']}"
 
 
 def test_list_sessions_prefers_md_recorded_uuid_over_cwd_guess(tmp_path, monkeypatch):
@@ -781,7 +830,7 @@ def test_list_sessions_prefers_md_recorded_uuid_over_cwd_guess(tmp_path, monkeyp
     monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
     # Fresh spawns: the /proc walk finds nothing for either pane.
-    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home: None)
+    monkeypatch.setattr(S, "_pane_claude_uuid_from_proc", lambda pid, home, children=None: None)
 
     rows = list_sessions(cfg, "test-project")
     by_sid = {r["sid"]: r for r in rows if r["status"] == "active"}

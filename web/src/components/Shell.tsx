@@ -5,7 +5,7 @@ import { AutoupdatePill } from "./AutoupdatePill";
 import { WorkerHealthPill } from "./WorkerHealthPill";
 import { ProjectSwitcher } from "./ProjectSwitcher";
 import { RouteSkeleton } from "./RouteSkeleton";
-import { isSuperAdminFromMe, resolveRailContext } from "./sidebarHelpers";
+import { isMoreOpsRoute, isSuperAdminFromMe, resolveRailContext } from "./sidebarHelpers";
 import { GlobalBusyIndicator } from "./GlobalBusyIndicator";
 import { useProjectExists } from "./useProjectExists";
 
@@ -19,10 +19,16 @@ const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
  * Shell — left sidebar navigation present on every authenticated page.
  *
  * T-0170 (sidebar v3) collapses the IA onto the role hierarchy
- * (`vision/roles/role-hierarchy.md`):
- *   • PROJECT  — the prominent `[ PROJECT ]` block: Board / Roadmap / User
- *                Feedback / Use Cases, with a quieter nested AGENTS sub-section
- *                (Agent Sessions / Deployment Queue / Analytics).
+ * (`vision/roles/role-hierarchy.md`); T-0637 (D-0057 §4/§8, wave 3 declutter)
+ * further collapsed the per-project rail from 6 destinations to 3 + a low-
+ * emphasis group:
+ *   • PROJECT  — the prominent `[ PROJECT ]` block, primary tier: Board /
+ *                Roadmap / Processes (Agent Sessions), plus Docs (the
+ *                durable, read-first artifact tree — User Feedback + Use
+ *                Cases no longer get their own rail entries, R5/R7). A
+ *                quieter "More / Ops" disclosure holds Analytics + Deployment
+ *                Queue — ops/history surfaces, not daily at-a-glance state
+ *                (R3), collapsed by default.
  *   • MOTHERSHIP — a single "Mothership" entry, global-admin only (global
  *                users + invites + connected servers). Tree-shaken off
  *                detach builds via the VITE_MOTHERSHIP literal gate.
@@ -51,6 +57,10 @@ export function Shell() {
   // falls back to is_admin. Drop the fallback once users-model-split lands.
   const [isSuperAdmin, setIsSuperAdmin] = useState<boolean>(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // T-0637: the "More / Ops" rail disclosure (Analytics + Deployment Queue).
+  // Collapsed by default; starts open when the initial route already lives
+  // inside it so a direct deep-link doesn't hide its own active entry.
+  const [moreOpsOpen, setMoreOpsOpen] = useState(() => isMoreOpsRoute(location.pathname));
   const [pinnedSlug, setPinnedSlug] = useState<string | null>(() => {
     try {
       return localStorage.getItem(PINNED_PROJECT_KEY);
@@ -145,6 +155,13 @@ export function Shell() {
   // Close sidebar on route change (mobile)
   useEffect(() => {
     setSidebarOpen(false);
+  }, [location.pathname]);
+
+  // T-0637: auto-open "More / Ops" on in-app navigation into Analytics /
+  // Deployment Queue. One-way (never auto-closes) so a manual toggle-open
+  // elsewhere in the rail isn't fought on every route change.
+  useEffect(() => {
+    if (isMoreOpsRoute(location.pathname)) setMoreOpsOpen(true);
   }, [location.pathname]);
 
   function handleSignOut() {
@@ -293,7 +310,14 @@ export function Shell() {
             </div>
 
             {/* Product nav — the body of the [ PROJECT ] section. No header
-                of its own; it reads as the project's primary links. */}
+                of its own; it reads as the project's primary links.
+                T-0637 (D-0057 §4/§8): the everyday rail collapsed from 6
+                destinations to this primary Board/Roadmap/Processes tier
+                plus Docs — the north star names Board (task rows), the
+                session tree, and ticket views as the at-a-glance lookup
+                surfaces; Processes (Agent Sessions) moved up from the old
+                nested AGENTS group to sit alongside them. Docs stays as the
+                durable, read-first decision log (R5). */}
             <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
@@ -312,10 +336,20 @@ export function Shell() {
                   VISION
                 </NavLink>
               </li>
-              {/* T-0235 (Pillar C): USER FEEDBACK + USE CASES retired as
-                  top-level nav — they now live UNDER the docs section via its
-                  sub-nav (Docs · User Feedback · Use Cases). Old deep-links
-                  redirect into /docs/<sub> (App.tsx LegacyDocsRedirect). */}
+              <li>
+                <NavLink
+                  to={`/p/${slug}/sessions`}
+                  data-onboarding-anchor="sessions-nav"
+                  className={({ isActive }) => (isActive ? "active" : undefined)}
+                >
+                  PROCESSES
+                </NavLink>
+              </li>
+              {/* T-0235 (Pillar C) / T-0637: USER FEEDBACK + USE CASES have no
+                  rail entry of their own — folded into the single cross-store
+                  Docs artifact tree (T-0337) rather than separate nav/tabs.
+                  Old deep-links redirect into /docs/<sub> (App.tsx
+                  LegacyDocsRedirect). */}
               <li>
                 <NavLink
                   to={`/p/${slug}/docs`}
@@ -326,56 +360,44 @@ export function Shell() {
               </li>
             </ul>
 
-            {/* T-0170: a NESTED sub-section under PROJECT (quieter, indented vs.
-                the bracketed `[ PROJECT ]`) grouping the worker-PROCESS views:
-                the process list + its deploy queue + analytics.
-                T-0385: collapsed the redundant "Processes" section header — after
-                the T-0383 rename it exactly duplicated the "PROCESSES" nav item
-                below it (the dup label dogfood flagged). The nested indent still
-                groups these items; no header label needed. */}
-            <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
-              <li>
-                <NavLink
-                  to={`/p/${slug}/sessions`}
-                  data-onboarding-anchor="sessions-nav"
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  PROCESSES
-                </NavLink>
-              </li>
-              {/* T-0358: AGENT WORKFLOW left the rail. It was a ~30k-px raw
-                  dump of AGENTS.md + AGENT_INSTRUCTIONS.md (the agents' system
-                  prompt) presented as an operator nav page. Editing those
-                  manuals now lives behind a thin link in Project settings; the
-                  page itself collapses each manual by default. */}
-              <li>
-                <NavLink
-                  to={`/p/${slug}/runs`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  DEPLOYMENT QUEUE
-                </NavLink>
-              </li>
-              {/* T-0359: CLONES left the rail. It surfaced git/devops plumbing
-                  (ahead/behind/dirty, fs paths, "Installation ≠ Project",
-                  "Admin-only") as a top-level project nav item — sysadmin
-                  internals that loudly re-assert a distinction the operator
-                  product hides. Relocated to a link under Project settings →
-                  Advanced. (T-0296 page unchanged; read still any-authed.) */}
-              {/* T-0147: internal-usage analytics dashboard. */}
-              <li>
-                <NavLink
-                  to={`/p/${slug}/analytics`}
-                  data-onboarding-anchor="analytics-nav"
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  ANALYTICS
-                </NavLink>
-              </li>
-              {/* T-0593 (T-0588a): SYSTEM STATE left the rail — the T-0511
-                  transparency view dissolved into the project home (BOARD),
-                  which now renders the observability panel at top level. */}
-            </ul>
+            {/* T-0637 (D-0057 §4, Q3): "More / Ops" — a low-emphasis rail
+                disclosure (not a settings-gear demotion) holding the two
+                surfaces that are ops signal / history rather than daily
+                at-a-glance state (R3): Analytics and the Deployment Queue.
+                Collapsed by default; auto-opens on navigation into either
+                (see the isMoreOpsRoute effect above) so a direct deep-link
+                never hides its own active entry. */}
+            <button
+              type="button"
+              className="mc-sidebar-more-ops-toggle"
+              aria-expanded={moreOpsOpen}
+              onClick={() => setMoreOpsOpen((v) => !v)}
+            >
+              <span>More / Ops</span>
+              <span className="mc-sidebar-more-caret">{moreOpsOpen ? "▾" : "▸"}</span>
+            </button>
+            {moreOpsOpen && (
+              <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
+                {/* T-0147: internal-usage analytics dashboard. */}
+                <li>
+                  <NavLink
+                    to={`/p/${slug}/analytics`}
+                    data-onboarding-anchor="analytics-nav"
+                    className={({ isActive }) => (isActive ? "active" : undefined)}
+                  >
+                    ANALYTICS
+                  </NavLink>
+                </li>
+                <li>
+                  <NavLink
+                    to={`/p/${slug}/runs`}
+                    className={({ isActive }) => (isActive ? "active" : undefined)}
+                  >
+                    DEPLOYMENT QUEUE
+                  </NavLink>
+                </li>
+              </ul>
+            )}
           </>
         )}
 

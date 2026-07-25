@@ -72,6 +72,18 @@ export function resolveRailContext(opts: {
   return "none";
 }
 
+/**
+ * T-0637 (D-0057 §4/§8) — which project-rail routes collapse into the
+ * low-emphasis "More / Ops" disclosure (Analytics, Deployment Queue) instead
+ * of the primary Board/Roadmap/Processes tier. Pure path match so Shell can
+ * also auto-expand the group when the current route already lives inside it
+ * (a direct deep-link to /analytics or /runs shouldn't hide its own
+ * highlighted entry behind a collapsed toggle).
+ */
+export function isMoreOpsRoute(pathname: string): boolean {
+  return /^\/p\/[^/]+\/(analytics|runs)(\/|$)/.test(pathname);
+}
+
 /** T-0060 — localStorage key for the server picker selection. Scoped per
  *  installation; in a multi-user context the key would also be per-user,
  *  but the cookie session already isolates browsers. */

@@ -270,6 +270,33 @@ h1, h2, h3, h4, h5, h6 {
   padding-left: 1.4rem;
 }
 
+/* ---- Sidebar: "More / Ops" rail disclosure (T-0637, D-0057 §4) ----
+   A quieter cousin of `.mc-sidebar-more-toggle` below (T-0140's loud
+   amber/bracketed section-header look): same interactive shape (flex +
+   caret + button), but dim/faint typography matching `.mc-sidebar-subsection`
+   — Analytics + Deployment Queue are ops/history signal, not primary nav
+   weight. */
+.mc-sidebar-more-ops-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  padding: 0.7rem 1rem 0.2rem 1.4rem;
+  font-family: var(--mc-mono);
+  font-size: 0.58rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--mc-text-faint);
+  font-weight: 600;
+}
+.mc-sidebar-more-ops-toggle:hover {
+  color: var(--mc-text-dim);
+}
+
 /* ---- Sidebar: MORE collapsible drawer (T-0140) ----------- */
 /* The MORE toggle reuses the section-header look (a `<button>` styled like
    `.mc-sidebar-section`) but adds a caret + interactive affordances. */

@@ -25,7 +25,6 @@ const Project = lazy(() => import("./pages/Project").then((m) => ({ default: m.P
 const ProjectSettings = lazy(() => import("./pages/ProjectSettings").then((m) => ({ default: m.ProjectSettings })));
 const Vision = lazy(() => import("./pages/Vision").then((m) => ({ default: m.Vision })));
 const Feedback = lazy(() => import("./pages/Feedback").then((m) => ({ default: m.Feedback })));
-const UseCases = lazy(() => import("./pages/UseCases").then((m) => ({ default: m.UseCases })));
 const Docs = lazy(() => import("./pages/Docs").then((m) => ({ default: m.Docs })));
 const DocsSection = lazy(() => import("./pages/DocsSection").then((m) => ({ default: m.DocsSection })));
 const Sessions = lazy(() => import("./pages/Sessions").then((m) => ({ default: m.Sessions })));
@@ -141,21 +140,23 @@ export function App() {
             <Route index element={<Project />} />
             <Route path="t/:id" element={<TaskDetail />} />
             <Route path="vision" element={<Vision />} />
-            {/* T-0235 (Pillar C): User Feedback + Use Cases relocated UNDER
-                the docs section (retired as top-level nav). T-0337 then merged
-                the three former tabs into ONE "Docs & Artifacts" view: the
-                DocsSection wrapper owns the shared rail (type filter + one
-                "+ New" + the cross-store tree) and hands its tree to whichever
-                detail page the sub-route resolves (index=Docs, feedback, usecases)
-                via Outlet context. Old top-level /feedback + /usecases deep-links
-                still redirect in (LegacyDocsRedirect). */}
+            {/* T-0235 (Pillar C): User Feedback relocated UNDER the docs
+                section (retired as top-level nav). T-0337 then merged the
+                former tabs into ONE "Docs & Artifacts" view: the DocsSection
+                wrapper owns the shared rail (type filter + the cross-store
+                tree) and hands its tree to whichever detail page the
+                sub-route resolves (index=Docs, feedback) via Outlet context.
+                Old top-level /feedback deep-link still redirects in
+                (LegacyDocsRedirect). T-0637 Lane D/A (D-0057 §8 Q1=CUT):
+                Use Cases + the flow entity are deleted — the page, its
+                sub-route, and the /usecases legacy redirect are gone; a
+                stale deep-link now falls through to the `*` redirect below,
+                same as other T-0572-era cuts. */}
             <Route path="docs" element={<DocsSection />}>
               <Route index element={<Docs />} />
               <Route path="feedback" element={<Feedback />} />
-              <Route path="usecases" element={<UseCases />} />
             </Route>
             <Route path="feedback" element={<LegacyDocsRedirect sub="feedback" />} />
-            <Route path="usecases" element={<LegacyDocsRedirect sub="usecases" />} />
             <Route path="sessions" element={<Sessions />} />
             <Route path="settings" element={<ProjectSettings />} />
             <Route path="analytics" element={<Analytics />} />

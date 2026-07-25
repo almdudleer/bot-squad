@@ -255,6 +255,38 @@ def test_list_sessions_active_pane(tmp_path, monkeypatch):
     # T-0636: every row carries a slug-qualified display label alongside the
     # raw routing SID.
     assert rows[0]["sid_label"] == "[test-project] S-testuser-mywin-p2"
+    # T-0662: no labels set for this sid -> empty, not missing.
+    assert rows[0]["aliases"] == []
+
+
+def test_list_sessions_active_pane_carries_session_aliases(tmp_path, monkeypatch):
+    """T-0662: a stakeholder-assigned label on this sid surfaces on its row,
+    orthogonal to the auto-derived sid_label (T-0636)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    from bot_squad_worker import session_aliases
+    session_aliases.set_alias(cfg.data_dir, "mynick", "S-testuser-mywin-p2")
+    session_aliases.set_alias(cfg.data_dir, "othernick", "S-testuser-mywin-p2")
+    session_aliases.set_alias(cfg.data_dir, "unrelated", "S-someone-else-p9")
+
+    fake_pane_output = f"%2|mywin|1234|{repo}|claude\n"
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, fake_pane_output, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    rows = list_sessions(cfg, "test-project")
+    assert len(rows) == 1
+    assert rows[0]["sid"] == "S-testuser-mywin-p2"
+    assert rows[0]["aliases"] == ["mynick", "othernick"]
 
 
 def test_list_sessions_stamps_awaiting_input_from_tg_stall(tmp_path, monkeypatch):

@@ -893,6 +893,92 @@ def _action_tg_topic_list(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "bindings": tg_bindings.load(_get_config())}
 
 
+# ---------------------------------------------------------------------------
+# session_aliases.py (T-0662: human-readable label -> session SID aliases,
+# single-writer global JSON, mirrors tg_bindings.py above).
+# ---------------------------------------------------------------------------
+
+_SESSION_ALIAS_SET_REQUIRED = {"label", "sid"}
+_SESSION_ALIAS_SET_ALLOWED = _SESSION_ALIAS_SET_REQUIRED
+
+
+def _action_session_alias_set(params: dict[str, Any]) -> dict[str, Any]:
+    """Point a human-readable label at a session SID (T-0662).
+
+    Required params: label, sid. Idempotent — rebinding an existing label
+    repoints it (one label -> exactly one sid; multiple labels may point at
+    the same sid). Returns {ok, label, sid, previous_sid} (previous_sid is
+    None when the label was previously unset).
+    """
+    extra = set(params) - _SESSION_ALIAS_SET_ALLOWED
+    if extra:
+        raise ActionError(f"session_alias_set got unexpected params: {sorted(extra)}")
+    missing = _SESSION_ALIAS_SET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"session_alias_set missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import session_aliases
+    cfg = _get_config()
+    previous = session_aliases.resolve_alias(cfg.data_dir, params["label"])
+    try:
+        norm = session_aliases.set_alias(cfg.data_dir, params["label"], params["sid"])
+    except session_aliases.InvalidLabelError as e:
+        raise ActionError(f"session_alias_set: {e}") from e
+    return {"ok": True, "label": norm, "sid": params["sid"], "previous_sid": previous}
+
+
+_SESSION_ALIAS_REMOVE_REQUIRED = {"label"}
+_SESSION_ALIAS_REMOVE_ALLOWED = _SESSION_ALIAS_REMOVE_REQUIRED
+
+
+def _action_session_alias_remove(params: dict[str, Any]) -> dict[str, Any]:
+    """Remove a session label (T-0662). Required params: label. Idempotent —
+    removing an unknown label is not an error. Returns {ok, removed: bool}."""
+    extra = set(params) - _SESSION_ALIAS_REMOVE_ALLOWED
+    if extra:
+        raise ActionError(f"session_alias_remove got unexpected params: {sorted(extra)}")
+    missing = _SESSION_ALIAS_REMOVE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"session_alias_remove missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import session_aliases
+    cfg = _get_config()
+    removed = session_aliases.remove_alias(cfg.data_dir, params["label"])
+    return {"ok": True, "removed": removed}
+
+
+_SESSION_ALIAS_RESOLVE_REQUIRED = {"label"}
+_SESSION_ALIAS_RESOLVE_ALLOWED = _SESSION_ALIAS_RESOLVE_REQUIRED
+
+
+def _action_session_alias_resolve(params: dict[str, Any]) -> dict[str, Any]:
+    """label -> sid lookup (T-0662). Required params: label. Returns {ok,
+    sid} — sid is None when the label is unknown (this is the exact shape a
+    future to-session <label> control-phrase resolver, T-0660 Addendum 1,
+    will call)."""
+    extra = set(params) - _SESSION_ALIAS_RESOLVE_ALLOWED
+    if extra:
+        raise ActionError(f"session_alias_resolve got unexpected params: {sorted(extra)}")
+    missing = _SESSION_ALIAS_RESOLVE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"session_alias_resolve missing required params: {sorted(missing)}")
+
+    from bot_squad_worker import session_aliases
+    cfg = _get_config()
+    return {"ok": True, "sid": session_aliases.resolve_alias(cfg.data_dir, params["label"])}
+
+
+def _action_session_alias_list(params: dict[str, Any]) -> dict[str, Any]:
+    """List every label -> sid mapping (T-0662). No params. Returns {ok,
+    aliases: {label: sid}}."""
+    extra = set(params)
+    if extra:
+        raise ActionError(f"session_alias_list got unexpected params: {sorted(extra)}")
+    from bot_squad_worker import session_aliases
+    cfg = _get_config()
+    return {"ok": True, "aliases": session_aliases.load_aliases(cfg.data_dir)}
+
+
 def _tg_call(fn, *, action: str):
     """Call a TgClient forum-topic method, re-raising a documented Bot API
     failure (tg.py's ``_call`` puts the API's own ``description`` — e.g.
@@ -4144,6 +4230,11 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "tg_topic_bind": _action_tg_topic_bind,
     "tg_topic_unbind": _action_tg_topic_unbind,
     "tg_topic_list": _action_tg_topic_list,
+    # T-0662: human-readable label -> session SID aliases.
+    "session_alias_set": _action_session_alias_set,
+    "session_alias_remove": _action_session_alias_remove,
+    "session_alias_resolve": _action_session_alias_resolve,
+    "session_alias_list": _action_session_alias_list,
     # T-0660: create-and-bind a forum topic in one step + rename General.
     "tg_topic_create": _action_tg_topic_create,
     "tg_topic_rename_general": _action_tg_topic_rename_general,
@@ -4274,6 +4365,13 @@ ACTION_MODES: dict[str, str] = {
     "tg_topic_bind": "coordinator_only",
     "tg_topic_unbind": "coordinator_only",
     "tg_topic_list": "coordinator_only",
+    # T-0662: the alias store is GLOBAL (data/_worker/session_aliases.json,
+    # not per-project) — single writer, coordinator-only like the bindings
+    # store above it.
+    "session_alias_set": "coordinator_only",
+    "session_alias_remove": "coordinator_only",
+    "session_alias_resolve": "coordinator_only",
+    "session_alias_list": "coordinator_only",
     # T-0660: both call the coordinator's TG client (createForumTopic /
     # editGeneralForumTopic) — coordinator-only like the rest of the TG ops.
     "tg_topic_create": "coordinator_only",

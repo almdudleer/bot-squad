@@ -1539,6 +1539,42 @@ def cmd_session_search(args) -> None:
         print(f"  {c['snippet']}\n")
 
 
+def cmd_session_alias_set(args) -> None:
+    res = post("session_alias_set", {"label": args.label, "sid": args.sid})
+    prev = res.get("previous_sid")
+    suffix = f" (was -> {prev})" if prev and prev != res.get("sid") else ""
+    print(f"{res['label']} -> {res['sid']}{suffix}")
+
+
+def cmd_session_alias_remove(args) -> None:
+    res = post("session_alias_remove", {"label": args.label})
+    if res.get("removed"):
+        print(f"removed {args.label}")
+    else:
+        print(f"{args.label}: no such label")
+
+
+def cmd_session_alias_resolve(args) -> None:
+    res = post("session_alias_resolve", {"label": args.label})
+    sid = res.get("sid")
+    if sid is None:
+        die(f"{args.label}: no such label")
+    print(sid)
+
+
+def cmd_session_alias_list(args) -> None:
+    res = post("session_alias_list", {})
+    aliases = res.get("aliases", {})
+    if args.json:
+        print(json.dumps(aliases, indent=2))
+        return
+    if not aliases:
+        print("(no session labels set)")
+        return
+    for label, sid in sorted(aliases.items()):
+        print(f"{label}  ->  {sid}")
+
+
 _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
                "operator": "operator.md",
                # T-0478: user-conversation intake session role contract.
@@ -4437,6 +4473,25 @@ def build_parser() -> argparse.ArgumentParser:
     shs.add_argument("--limit", type=int, default=10, help="max results (query mode)")
     shs.add_argument("--json", action="store_true", help="raw JSON output")
     shs.set_defaults(func=cmd_session_search)
+
+    # session alias (T-0662: human-readable label -> session SID, a building
+    # block for a future gateway `to-session <label>` control phrase)
+    sha = sh_sub.add_parser(
+        "alias", help="human-readable session labels (T-0662)")
+    sha_sub = sha.add_subparsers(dest="alias_sub", required=True)
+    shaset = sha_sub.add_parser("set", help="point a label at a session SID")
+    shaset.add_argument("label", help="short nickname, e.g. gateway-tl")
+    shaset.add_argument("sid", help="target session SID")
+    shaset.set_defaults(func=cmd_session_alias_set)
+    sharm = sha_sub.add_parser("remove", help="remove a label")
+    sharm.add_argument("label", help="label to remove")
+    sharm.set_defaults(func=cmd_session_alias_remove)
+    shares = sha_sub.add_parser("resolve", help="label -> sid lookup")
+    shares.add_argument("label", help="label to resolve")
+    shares.set_defaults(func=cmd_session_alias_resolve)
+    shalist = sha_sub.add_parser("list", help="list every label -> sid mapping")
+    shalist.add_argument("--json", action="store_true", help="raw JSON output")
+    shalist.set_defaults(func=cmd_session_alias_list)
 
     # team
     team = sub.add_parser("team", help="session roster (composes with T-0142)")

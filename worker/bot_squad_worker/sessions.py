@@ -1288,10 +1288,24 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         _blocked = _tg_stall.blocked_sids(cfg, slug)
     except Exception:  # noqa: BLE001 — never let the watchdog wedge the list
         _blocked = set()
+
+    # T-0662: stakeholder-assigned nicknames (orthogonal to the auto-derived
+    # sid_label below) — load the global alias map once, not per-row.
+    try:
+        from bot_squad_worker import session_aliases as _session_aliases
+        _alias_map = _session_aliases.load_aliases(data_dir)
+    except Exception:  # noqa: BLE001 — never let a corrupt alias file wedge the list
+        _alias_map = {}
+    _aliases_by_sid: dict[str, list[str]] = {}
+    for _label, _sid in _alias_map.items():
+        _aliases_by_sid.setdefault(_sid, []).append(_label)
+
     for _r in rows:
         sid = _r.get("sid")
         # T-0636: slug-qualified display label — see sid_display_label.
         _r["sid_label"] = sid_display_label(sid, slug)
+        # T-0662: labels pointing at this sid, sorted for stable display.
+        _r["aliases"] = sorted(_aliases_by_sid.get(sid, []))
         blocked = sid in _blocked
         # P2-05: close-on-attach reconcile. A blocked, LIVE (active) session that
         # has resumed crunching (new jsonl activity after the block) got its

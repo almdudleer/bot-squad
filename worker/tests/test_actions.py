@@ -133,6 +133,9 @@ def test_registry_lists_only_allowed_actions():
         "page_channel",
         # T-0386: per-project forum-topic lifecycle (create-on-project / GC).
         "provision_project_topics", "gc_project_topics",
+        # T-0662: human-readable label -> session SID aliases.
+        "session_alias_set", "session_alias_remove",
+        "session_alias_resolve", "session_alias_list",
     }
 
 
@@ -3721,3 +3724,107 @@ def test_set_drive_registered_with_mode():
     from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
     assert "set_drive" in ACTION_REGISTRY
     assert ACTION_MODES["set_drive"] == "tmux_only"
+
+
+# ---------------------------------------------------------------------------
+# T-0662: human-readable label -> session SID aliases.
+# ---------------------------------------------------------------------------
+
+
+def test_session_alias_set_and_resolve(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    out = A.dispatch("session_alias_set", {
+        "label": "gateway-tl", "sid": "S-almdudleer-gateway-routing-tl-p23",
+    })
+    assert out == {
+        "ok": True, "label": "gateway-tl",
+        "sid": "S-almdudleer-gateway-routing-tl-p23", "previous_sid": None,
+    }
+    resolved = A.dispatch("session_alias_resolve", {"label": "gateway-tl"})
+    assert resolved == {"ok": True, "sid": "S-almdudleer-gateway-routing-tl-p23"}
+
+
+def test_session_alias_resolve_unknown_label(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    out = A.dispatch("session_alias_resolve", {"label": "nope"})
+    assert out == {"ok": True, "sid": None}
+
+
+def test_session_alias_set_reports_previous_sid_on_repoint(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    A.dispatch("session_alias_set", {"label": "alpha", "sid": "S-x-p1"})
+    out = A.dispatch("session_alias_set", {"label": "alpha", "sid": "S-y-p2"})
+    assert out == {"ok": True, "label": "alpha", "sid": "S-y-p2", "previous_sid": "S-x-p1"}
+
+
+def test_session_alias_set_rejects_invalid_label(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError):
+        A.dispatch("session_alias_set", {"label": "S-looks-like-a-sid", "sid": "S-x-p1"})
+
+
+def test_session_alias_set_rejects_extra_and_missing_params(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="unexpected"):
+        A.dispatch("session_alias_set", {"label": "alpha", "sid": "S-x-p1", "bogus": 1})
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("session_alias_set", {"label": "alpha"})
+
+
+def test_session_alias_remove(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    A.dispatch("session_alias_set", {"label": "alpha", "sid": "S-x-p1"})
+    out = A.dispatch("session_alias_remove", {"label": "alpha"})
+    assert out == {"ok": True, "removed": True}
+    # Idempotent — removing again is a no-op, not an error.
+    out2 = A.dispatch("session_alias_remove", {"label": "alpha"})
+    assert out2 == {"ok": True, "removed": False}
+    assert A.dispatch("session_alias_resolve", {"label": "alpha"}) == {"ok": True, "sid": None}
+
+
+def test_session_alias_list(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    A.dispatch("session_alias_set", {"label": "alpha", "sid": "S-x-p1"})
+    A.dispatch("session_alias_set", {"label": "beta", "sid": "S-y-p2"})
+    out = A.dispatch("session_alias_list", {})
+    assert out == {"ok": True, "aliases": {"alpha": "S-x-p1", "beta": "S-y-p2"}}
+
+
+def test_session_alias_list_rejects_params(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+
+    with pytest.raises(ActionError, match="unexpected"):
+        A.dispatch("session_alias_list", {"slug": "test-project"})
+
+
+def test_session_alias_actions_registered_coordinator_only():
+    from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
+    for name in (
+        "session_alias_set", "session_alias_remove",
+        "session_alias_resolve", "session_alias_list",
+    ):
+        assert name in ACTION_REGISTRY
+        assert ACTION_MODES[name] == "coordinator_only"

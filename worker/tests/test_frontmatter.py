@@ -321,3 +321,44 @@ def test_resolve_id_file_strict_mode_still_resolves_unambiguous_case(tmp_path: P
     _write_md(tombstone, "T-0030-DUPLICATE-DO-NOT-USE", status="closed")
     _write_md(real, "T-0030", status="in_progress")
     assert fm.resolve_id_file(tmp_path, "T-0030", strict=True) == real
+
+
+# ---------------------------------------------------------------------------
+# T-0668: CSafeLoader perf swap (binding_gc_tick GIL contention) + the global
+# resolver-pollution bug the swap surfaced.
+# ---------------------------------------------------------------------------
+
+
+def test_loader_uses_csafeloader_when_libyaml_available():
+    """The pure-Python SafeLoader parse of ~1,450 session/task mds across
+    binding_gc_tick's 13 passes every 60s was a GIL hog that starved the
+    worker's own HTTP-serving threads, causing fan-out 5s timeouts. CSafeLoader
+    (libyaml) is the drop-in perf fix; guard against an accidental revert."""
+    import yaml
+    assert yaml.__with_libyaml__, "libyaml unavailable — _loader_base() should fall back to SafeLoader"
+    assert issubclass(fm._Loader, yaml.CSafeLoader)
+
+
+def test_loader_base_falls_back_to_safeloader_without_libyaml(monkeypatch):
+    import yaml
+    monkeypatch.setattr(yaml, "__with_libyaml__", False, raising=False)
+    assert fm._loader_base() is yaml.SafeLoader
+
+
+def test_strip_timestamp_resolver_does_not_pollute_shared_stock_loaders():
+    """The original ``_strip_timestamp_resolver`` mutated
+    ``cls.yaml_implicit_resolvers`` IN PLACE — since a fresh ``_Loader``
+    subclass has no entry of its own yet, that attribute resolved (via the
+    MRO) to the SAME dict object shared by stock yaml.SafeLoader/CSafeLoader/
+    SafeDumper, so stripping the timestamp resolver for ``_Loader`` silently
+    stripped it for every OTHER consumer of those stock classes in the whole
+    process too. Caught when swapping ``_Loader`` to CSafeLoader widened this
+    from polluting only SafeLoader to polluting CSafeLoader as well. Stock
+    loaders must keep normal timestamp auto-resolution; only frontmatter's own
+    ``_Loader``/``_Dumper`` should have it stripped."""
+    import yaml
+    assert isinstance(yaml.load("t: 2024-01-01", Loader=yaml.SafeLoader)["t"], object)
+    assert type(yaml.load("t: 2024-01-01", Loader=yaml.SafeLoader)["t"]).__name__ == "date"
+    assert type(yaml.load("t: 2024-01-01", Loader=yaml.CSafeLoader)["t"]).__name__ == "date"
+    # frontmatter's own Loader still strips it (the intended, scoped behavior).
+    assert yaml.load("t: 2024-01-01", Loader=fm._Loader)["t"] == "2024-01-01"

@@ -256,13 +256,18 @@ def test_list_sessions_dead_worker_returns_empty_list(
     assert data["errors"][0]["detail"]
 
 
-def test_list_sessions_partial_failure_surfaces_errors(
+def test_list_sessions_never_provisioned_user_worker_is_silent(
     tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
 ):
-    """T-0601 (F5): with one healthy worker and one declared user whose socket
-    is missing (the live timpo/aqice repro), the response carries the healthy
-    rows PLUS an error naming the dead socket's user — not a silently partial
-    list."""
+    """T-0668: a declared user_meta entry whose per-user worker socket was
+    NEVER provisioned (no socket file ever created — the live timpo/aqice
+    repro: ~96% of fan-out failures in a 24h prod log sample, on effectively
+    every page load) must NOT be attempted or surfaced as an error. That
+    account's tmux panes were never visible to fan-out anyway (no worker
+    process exists to have reported them) — skipping loses no data, it just
+    stops alerting on a permanent, expected condition. (Superseded
+    T-0601(F5)'s prior expectation that this exact scenario should surface as
+    an error — that WAS the noise this ticket fixes.)"""
     (tmp_bot_squad / "config" / "auth.toml").write_text(
         '[users]\n'
         'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
@@ -279,10 +284,8 @@ def test_list_sessions_partial_failure_surfaces_errors(
     data = r.json()
     # Healthy coordinator rows survive; row shape untouched.
     assert [row["sid"] for row in data["sessions"]] == ["S-almdudleer-spec5-p2"]
-    # The missing user-timpo.sock is surfaced, not swallowed.
-    assert len(data["errors"]) == 1
-    assert data["errors"][0]["user"] == "timpo"
-    assert data["errors"][0]["detail"]
+    # timpo has no socket file at all — never provisioned, silently excluded.
+    assert data["errors"] == []
 
 
 def test_list_sessions_nonadmin_sees_only_own_socket_error(
@@ -290,7 +293,13 @@ def test_list_sessions_nonadmin_sees_only_own_socket_error(
 ):
     """T-0601 (F5): error scoping mirrors row scoping — a non-admin sees the
     failure of their OWN worker socket (their blank-list explanation) but not
-    other users' socket health."""
+    other users' socket health. T-0668: "own worker failure" here means a
+    per-user socket that EXISTS but doesn't answer (a genuinely broken
+    worker) — a per-user socket that was simply never provisioned is now
+    silently excluded rather than surfaced (see
+    test_list_sessions_never_provisioned_user_worker_is_silent), so this test
+    creates a stale (present-but-dead) socket file for the caller's own user
+    to keep exercising the scoping logic."""
     (tmp_bot_squad / "config" / "auth.toml").write_text(
         '[users]\n'
         'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
@@ -301,14 +310,18 @@ def test_list_sessions_nonadmin_sees_only_own_socket_error(
         'linux_user = "edem"\n'
         '[session]\nttl = "7d"\n'
     )
+    # "tu" (the caller) has a socket file present but not a live listener —
+    # a genuinely dead worker, not an unprovisioned one. "edem" has no
+    # socket file at all (never provisioned).
+    (fake_worker_sessions.parent / "user-tu.sock").write_bytes(b"")
     with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
     data = r.json()
     # Sample row has no owner stamp → admin-only → dropped for non-admin.
     assert data["sessions"] == []
-    # Both user-tu.sock and user-edem.sock are missing, but the non-admin
-    # only learns about their own.
+    # tu's dead-but-present socket surfaces; edem's never-provisioned one
+    # doesn't even get attempted.
     assert [e["user"] for e in data["errors"]] == ["tu"]
 
 
@@ -375,7 +388,12 @@ def test_list_sessions_nonadmin_own_and_coordinator_both_dead(
 ):
     """T-0609: the caller's OWN socket failure keeps its raw entry (that is
     their diagnostic); the coordinator failure rides along as the sanitized
-    pseudo-user, appended after the scoped list."""
+    pseudo-user, appended after the scoped list. T-0668: "wu"'s own worker
+    socket is a stale present-but-dead file (a genuinely broken worker) —
+    not simply unprovisioned, which is now silently skipped (see
+    test_list_sessions_never_provisioned_user_worker_is_silent) — so the
+    scoping behavior under test still has something to surface. edem stays
+    unprovisioned (no socket file) throughout."""
     (tmp_bot_squad / "config" / "auth.toml").write_text(
         '[users]\n'
         'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
@@ -388,7 +406,10 @@ def test_list_sessions_nonadmin_own_and_coordinator_both_dead(
     )
     monkeypatch.setenv("BOT_SQUAD_COORDINATOR_USER", "almdudleer")
     sock_dir = tmp_bot_squad / "data" / "_sock"
-    # No socket bound at all: coordinator, wu and edem are all dead.
+    sock_dir.mkdir(parents=True, exist_ok=True)
+    (sock_dir / "user-wu.sock").write_bytes(b"")
+    # Coordinator socket itself is not bound: coordinator and wu are both
+    # dead (present-but-unresponsive); edem is unprovisioned (no file).
     with _client_logged_in(
         tmp_bot_squad, monkeypatch, sock_dir / "worker.sock",
     ) as client:
@@ -912,7 +933,11 @@ def test_list_sessions_fans_out_and_merges(
 def test_list_sessions_tolerates_dead_user_worker(
     tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
 ):
-    """A non-responsive user worker must NOT block list_sessions."""
+    """A non-responsive user worker must NOT block list_sessions. T-0668:
+    "non-responsive" here is a socket file that EXISTS but doesn't answer —
+    a genuinely dead worker — not one that was simply never provisioned
+    (that case is now silently skipped, see
+    test_list_sessions_never_provisioned_user_worker_is_silent)."""
     (tmp_bot_squad / "config" / "auth.toml").write_text(
         '[users]\n'
         'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
@@ -925,6 +950,7 @@ def test_list_sessions_tolerates_dead_user_worker(
         '[session]\nttl = "7d"\n'
     )
     monkeypatch.setenv("BOT_SQUAD_COORDINATOR_USER", "almdudleer")
+    (fake_worker_sessions.parent / "user-deaduser.sock").write_bytes(b"")
     with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
         r = client.get("/api/projects/test-project/sessions")
     assert r.status_code == 200
@@ -932,7 +958,8 @@ def test_list_sessions_tolerates_dead_user_worker(
     # At minimum, the coordinator's sessions are returned.
     sids = [row["sid"] for row in data["sessions"]]
     assert "S-almdudleer-spec5-p2" in sids
-    # T-0601 (F5): the dead user worker is NAMED, not silently skipped.
+    # T-0601 (F5): the dead-but-provisioned user worker is NAMED, not
+    # silently skipped.
     assert [e["user"] for e in data["errors"]] == ["deaduser"]
 
 

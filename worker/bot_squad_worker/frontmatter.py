@@ -60,11 +60,26 @@ class AmbiguousIdError(Exception):
     frontmatter — a genuine, unresolved id collision (T-0231)."""
 
 
+def _loader_base() -> type:
+    """CSafeLoader (libyaml) is a drop-in perf swap for SafeLoader — same
+    safe-tag surface, same Resolver mixin the timestamp-strip below relies
+    on — but parses in C instead of pure Python.
+
+    T-0668: ``binding_gc_tick`` re-globs + re-parses ~1,450 session/task mds
+    across its 13 passes every 60s, all in the ONE worker process that also
+    serves the fan-out HTTP handler; pure-Python ``SafeLoader`` parsing that
+    volume held the GIL long enough to starve the HTTP-serving threads,
+    surfacing as the 5s fan-out timeout. Falls back to SafeLoader if libyaml
+    isn't available in this environment.
+    """
+    return yaml.CSafeLoader if getattr(yaml, "__with_libyaml__", False) else yaml.SafeLoader
+
+
 # Loader/Dumper subclasses with the implicit *timestamp* resolver removed, so
 # ISO date strings round-trip as plain ``str`` in BOTH directions (read: no
 # datetime objects; write: no defensive quoting). Everything else keeps stock
 # SafeLoader/SafeDumper semantics.
-class _Loader(yaml.SafeLoader):
+class _Loader(_loader_base()):
     pass
 
 
@@ -73,12 +88,23 @@ class _Dumper(yaml.SafeDumper):
 
 
 def _strip_timestamp_resolver(cls: type) -> None:
-    for ch, mappings in list(cls.yaml_implicit_resolvers.items()):
-        cls.yaml_implicit_resolvers[ch] = [
+    # T-0668: rebind a FRESH dict onto ``cls`` rather than mutating
+    # ``cls.yaml_implicit_resolvers`` in place. Before a subclass sets its own
+    # entry, that attribute resolves (via the MRO) to the SAME dict object
+    # shared by yaml.SafeLoader/CSafeLoader/SafeDumper — an in-place
+    # ``cls.yaml_implicit_resolvers[ch] = ...`` mutates that shared object,
+    # silently stripping timestamp auto-resolution from every OTHER consumer
+    # of those stock loader/dumper classes in the process (caught when the
+    # CSafeLoader swap below made this same latent bug corrupt CSafeLoader
+    # too — global side effect, not scoped to _Loader/_Dumper).
+    cls.yaml_implicit_resolvers = {
+        ch: [
             (tag, regexp)
             for tag, regexp in mappings
             if tag != "tag:yaml.org,2002:timestamp"
         ]
+        for ch, mappings in cls.yaml_implicit_resolvers.items()
+    }
 
 
 _strip_timestamp_resolver(_Loader)

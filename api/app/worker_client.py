@@ -122,18 +122,32 @@ class WorkerRouter:
         return None
 
     def all_user_workers(self) -> list[tuple[str, WorkerClient]]:
-        """Return (linux_user, client) for every known user (coordinator + meta).
+        """Return (linux_user, client) for every known user with a reachable
+        worker (coordinator, always; per-user meta only if its socket exists).
 
         Used by list_sessions fan-out. Unlike for_user(), this does NOT
-        fall back to coordinator for missing user sockets — we want each
-        declared user to be queried at their expected socket so missing
-        sockets fail fast (and get swallowed by the fan-out warning) rather
-        than re-hitting coordinator N times and double-counting sessions.
+        fall back to coordinator for a per-user socket that exists but errors
+        — we want each declared user to be queried at their expected socket
+        so a genuinely broken worker fails fast and surfaces, rather than
+        re-hitting coordinator N times and double-counting sessions.
+
+        T-0668: a user_meta entry whose per-user worker was never provisioned
+        (no socket file ever created — e.g. a staged multi-user rollout not
+        yet flipped on for that account) is excluded here instead of being
+        queried anyway. That produced a GUARANTEED ENOENT on every single
+        fan-out call forever (live repro: aqice/timpo, ~96% of fan-out
+        failures in a 24h prod log sample) — not a transient reachability
+        blip but a permanent, expected non-provisioning that isn't worth
+        alerting on every page load. It loses no data: with no worker
+        process for that account, its tmux panes were never visible to
+        fan-out anyway.
         """
         out: list[tuple[str, WorkerClient]] = []
         for u in self.users:
             if u == self.coordinator_user:
                 out.append((u, WorkerClient(self._coordinator_sock)))
-            else:
-                out.append((u, WorkerClient(_user_sock(self._sock_dir, u))))
+                continue
+            sock = _user_sock(self._sock_dir, u)
+            if sock.exists():
+                out.append((u, WorkerClient(sock)))
         return out

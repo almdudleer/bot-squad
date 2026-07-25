@@ -38,6 +38,29 @@ _SERVICE_MESSAGE_FIELDS = (
     "video_chat_started",
     "video_chat_ended",
     "video_chat_participants_invited",
+    # T-0684 audit: this tuple was built (T-0682) around the ONE service type
+    # that actually bit us (forum_topic_created), not the full TG Bot API
+    # Message-object service-field surface. Any of these ALSO carries no
+    # `text` and no `is_bot`/`sender_chat` marker when a REAL group member
+    # triggers it via ordinary TG client UI (no special bot flow needed) — so
+    # each is a live path to the exact same "empty message wakes/spawns an
+    # attendant for no content" bug T-0682 fixed, just via a different
+    # trigger. Added defensively; harmless if a listed field never actually
+    # fires in this deployment.
+    "message_auto_delete_timer_changed",
+    "chat_background_set",
+    "boost_added",
+    "users_shared",
+    "chat_shared",
+    "write_access_allowed",
+    "proximity_alert_triggered",
+    "giveaway_created",
+    "giveaway",
+    "giveaway_winners",
+    "giveaway_completed",
+    "web_app_data",
+    "passport_data",
+    "connected_website",
 )
 
 
@@ -985,7 +1008,7 @@ def _handle_reply(cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = No
         result = A.dispatch("inject_input", {"sid": sid, "text": text})
         # T-0155: the stakeholder answered via TG — the agent is no longer
         # blocked on him; cancel any pending stall escalation.
-        _clear_stall(cfg, chat_id, sid)
+        _clear_stall(cfg, chat_id, sid, thread_id=thread_id)
         return {"ok": True, "action": "inject", "sid": sid, "result": result}
     except A.ActionError as e:
         _notify(cfg, chat_id, f"❌ session {sid} not active — message dropped",
@@ -993,13 +1016,31 @@ def _handle_reply(cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = No
         return {"ok": False, "action": "inject_failed", "sid": sid, "error": str(e)}
 
 
-def _clear_stall(cfg, chat_id: str, sid: str) -> None:
-    """Clear ``sid``'s stall marker in whichever project owns ``chat_id``."""
+def _clear_stall(cfg, chat_id: str, sid: str, *, thread_id: Any = None) -> None:
+    """Clear ``sid``'s stall marker in whichever project owns ``chat_id``.
+
+    T-0684 audit: the marker lives at ``data/<slug>/_worker/tg_stall/<sid>.json``
+    — slug-scoped — so clearing it requires resolving ``chat_id`` back to a
+    slug. The original lookup only checked a project's STATIC ``tg_chat``, but
+    ``handle_update``'s own allowlist comment is explicit that a T-0639 bound
+    forum topic's ``chat_id`` is "not any project's static tg_chat" — so a
+    stall-escalation reply arriving via a bound topic (the same reply path
+    ``_handle_reply`` handles) could never clear its marker, and the
+    stakeholder would get a redundant "still blocked" re-ping after
+    ``tg_stall_minutes`` even though they'd already answered. Also resolve via
+    ``tg_bindings`` (the same runtime (chat_id, thread_id)->slug map
+    ``handle_update`` consults) so a topic-bound reply clears correctly too."""
     try:
-        from bot_squad_worker import tg_stall as _tg_stall
-        for slug, p in cfg.projects.items():
-            if str(getattr(p, "tg_chat", "")) == str(chat_id):
-                _tg_stall.clear_blocked(cfg, slug, sid)
+        from bot_squad_worker import tg_bindings, tg_stall as _tg_stall
+        slugs = {
+            slug for slug, p in cfg.projects.items()
+            if str(getattr(p, "tg_chat", "")) == str(chat_id)
+        }
+        binding = tg_bindings.resolve(cfg, chat_id, thread_id)
+        if binding and binding.get("slug"):
+            slugs.add(binding["slug"])
+        for slug in slugs:
+            _tg_stall.clear_blocked(cfg, slug, sid)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1178,8 +1219,21 @@ def tick(cfg) -> dict:
             handle_update(cfg, update)
             handled += 1
         except Exception:
-            # Log via logging would be nicer; for now just swallow so one bad
-            # update doesn't poison the offset.
+            # T-0684 audit: this update_id is still folded into max_id above and
+            # will be persisted below, so TG's getUpdates offset moves past it
+            # regardless — deliberate (a permanently-raising payload must not
+            # head-of-line-block every later update, see
+            # test_tick_bad_update_does_not_poison_offset). But that means an
+            # uncaught exception here is a SILENT, PERMANENT message loss: TG
+            # never redelivers an acknowledged offset. Before this fix nothing
+            # logged it at all, so a genuine drop was indistinguishable from
+            # ordinary attendant latency (exactly the ambiguity the stakeholder
+            # hit in the T-0676 retest) — log it so it's at least diagnosable.
+            log.exception(
+                "tg_listener: handle_update raised on update_id=%s — message "
+                "dropped (offset still advances past it)",
+                update.get("update_id"),
+            )
             continue
     if max_id > last_id:
         _write_last_update_id(cfg, max_id)

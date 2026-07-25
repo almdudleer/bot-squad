@@ -1,6 +1,7 @@
 """Tests for worker.tg_listener — all network + subprocess mocked."""
 from __future__ import annotations
 
+import logging
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -230,6 +231,17 @@ def test_is_ignorable_service_message_false_for_plain_text():
     assert not TL._is_ignorable_service_message({"text": "hi"})
 
 
+def test_is_ignorable_service_message_covers_real_member_triggerable_types():
+    """T-0684 audit: these TG service-message types carry no `text` and can be
+    triggered by an ordinary (non-bot) group member via normal client UI — a
+    real human hitting one of these would otherwise slip past the T-0682 guard
+    and re-trigger the same 'empty message wakes an attendant' bug via a
+    different door."""
+    assert TL._is_ignorable_service_message({"from": {"is_bot": False}, "message_auto_delete_timer_changed": {"message_auto_delete_time": 86400}})
+    assert TL._is_ignorable_service_message({"from": {"is_bot": False}, "chat_background_set": {}})
+    assert TL._is_ignorable_service_message({"from": {"is_bot": False}, "boost_added": {"boost_count": 1}})
+
+
 def test_own_bot_id_derived_from_token():
     cfg = types.SimpleNamespace(tg_bot_token="8206895402:AAGSomeSecretHere")
     assert TL._own_bot_id(cfg) == "8206895402"
@@ -351,6 +363,36 @@ def test_handle_update_reply_clears_stall_marker(tmp_path, monkeypatch):
     assert TS._marker_path(cfg, "test-project", sid).exists()
 
     update = {"update_id": 4, "message": _reply_message(sid, "ship it", chat_id=12345)}
+    result = TL.handle_update(cfg, update)
+    assert result["action"] == "inject"
+    assert not TS._marker_path(cfg, "test-project", sid).exists()
+
+
+def test_handle_update_reply_in_bound_topic_clears_stall_marker(tmp_path, monkeypatch):
+    """T-0684 audit: a stall-escalation reply can arrive via a T-0639 BOUND
+    forum topic whose chat_id is NOT any project's static tg_chat (by design
+    — see handle_update's own allowlist comment: "the stakeholder's forum
+    supergroup is not any project's static tg_chat"). Before this fix,
+    _clear_stall only matched a project's static tg_chat, so this reply could
+    never find its marker — it would survive to a redundant re-escalation
+    even though the stakeholder already answered."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    sid = "S-alice-spec5-p3"
+    bound_chat_id = "999888"
+    thread_id = 42
+
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.tg_stall as TS
+    from bot_squad_worker import tg_bindings
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True})
+
+    tg_bindings.set_binding(cfg, bound_chat_id, thread_id, "test-project")
+    TS.mark_blocked(cfg, "test-project", sid, "need a call")
+    assert TS._marker_path(cfg, "test-project", sid).exists()
+
+    msg = _reply_message(sid, "ship it", chat_id=int(bound_chat_id))
+    msg["message_thread_id"] = thread_id
+    update = {"update_id": 5, "message": msg}
     result = TL.handle_update(cfg, update)
     assert result["action"] == "inject"
     assert not TS._marker_path(cfg, "test-project", sid).exists()
@@ -1756,6 +1798,28 @@ def test_tick_bad_update_does_not_poison_offset(tmp_path, monkeypatch):
     # max_id should still be 201
     assert result["max_update_id"] == 201
     assert TL._read_last_update_id(cfg) == 201
+
+
+def test_tick_bad_update_logs_the_drop(tmp_path, monkeypatch, caplog):
+    """T-0684 audit: a crash in handle_update still silently loses the message
+    (offset advances past it by design, per the test above) — before this fix
+    nothing recorded that it happened at all, making a genuine drop
+    indistinguishable from ordinary attendant latency. Must be logged."""
+    cfg = _make_cfg(tmp_path)
+    TL._write_last_update_id(cfg, 0)
+
+    fake_updates = [{"update_id": 300}]
+    monkeypatch.setattr(TL, "poll_updates", lambda cfg, last_id, timeout=25: fake_updates)
+
+    def bad_handle(cfg, upd):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(TL, "handle_update", bad_handle)
+
+    with caplog.at_level(logging.ERROR, logger=TL.log.name):
+        TL.tick(cfg)
+
+    assert any("300" in r.message and "dropped" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

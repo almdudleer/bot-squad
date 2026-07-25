@@ -11,7 +11,6 @@ import type {
 } from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
-import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
 import { Select } from "../components/Select";
 import {
   sessionActivity,
@@ -451,7 +450,6 @@ export function Sessions() {
 
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
   // T-0601 (F5): per-user worker sockets that failed during the sessions
   // fan-out — rendered as a warning banner so a partial (or empty) list is
   // never mistaken for "no sessions".
@@ -460,13 +458,11 @@ export function Sessions() {
   // meUsername feeds PeerInbox (the kept reply surface, T-0127).
   const [meUsername, setMeUsername] = useState<string>("stakeholder");
 
-  // T-0572 (Occam pass, D-0046) + T-0594 (T-0588b): the page is a READ-FIRST
-  // status board — steering lives in the TG dialog / operator, so only the
-  // minimal lifecycle controls (pause/suspend/resume, archive/unarchive,
-  // pin/unpin) hide behind this one explicit toggle. Spawn / send-msg /
-  // autopilot web affordances were cut; their API routes remain the TG/CLI
-  // control plane's substrate.
-  const [showControls, setShowControls] = useState(false);
+  // T-0572 (Occam pass, D-0046) + T-0594/T-0675 (D-0057 §8, full 2b): the
+  // page is pure read-first observability — steering (pause/suspend/resume,
+  // archive/unarchive, pin/unpin) lives in the TG dialog / CLI now. The old
+  // kebab-behind-a-toggle lifecycle controls are cut entirely; their API
+  // routes remain the TG/CLI control plane's substrate.
 
   // Row expansion (click-through cwd / metadata detail) and archived
   // section toggle.
@@ -658,72 +654,6 @@ export function Sessions() {
     }
     return m;
   }, [taskBacklog]);
-
-  async function handlePause(sid: string) {
-    setActionError(null);
-    try {
-      await api.pauseSession(slug, sid);
-      load();
-    } catch (e: unknown) {
-      setActionError(String(e));
-    }
-  }
-
-  async function handleSuspend(sid: string) {
-    setActionError(null);
-    try {
-      await api.suspendSession(slug, sid);
-      load();
-    } catch (e: unknown) {
-      setActionError(String(e));
-    }
-  }
-
-  async function handleResume(sid: string) {
-    setActionError(null);
-    try {
-      await api.resumeSession(slug, sid);
-      load();
-    } catch (e: unknown) {
-      setActionError(String(e));
-    }
-  }
-
-  // T-0437: pin/unpin a session within the project. The pin is a user signal
-  // (surfaced in the Pinned section + a 📌 badge here and on the Board card); it
-  // does NOT change orchestration. Reload so the pinned flag re-stamps.
-  async function handleTogglePin(s: SessionRow) {
-    setActionError(null);
-    try {
-      if (s.pinned) await api.unpinSession(slug, s.sid);
-      else await api.pinSession(slug, s.sid);
-      load();
-    } catch (e: unknown) {
-      setActionError(String(e));
-    }
-  }
-
-  async function handleArchive(sid: string) {
-    setActionError(null);
-    try {
-      await api.archiveSession(slug, sid);
-      load();
-    } catch (e: unknown) {
-      setActionError(String(e));
-    }
-  }
-
-  async function handleResurrectFromArchive(sid: string) {
-    setActionError(null);
-    try {
-      // Unarchive first so the resumed session appears in the active list.
-      await api.unarchiveSession(slug, sid);
-      await api.resumeSession(slug, sid);
-      load();
-    } catch (e: unknown) {
-      setActionError(String(e));
-    }
-  }
 
   // T-0099: deep-link to a specific session. The URL carries ?sid=S-...;
   // once sessions are loaded we make sure the row will render (clear any
@@ -990,41 +920,6 @@ export function Sessions() {
     );
   }
 
-  // T-0141: assemble the action set for a row's overflow (kebab) menu so the
-  // row stays short. Mirrors the prior inline button logic exactly.
-  function rowActions(s: SessionRow): RowAction[] {
-    const isSuspended = s.status === "suspended";
-    const acts: RowAction[] = [];
-    // T-0437: pin/unpin sits at the top — it's the "I'm working closely with
-    // this one" signal that drives the Pinned section + the Board-card marker.
-    acts.push({
-      label: s.pinned ? "Unpin" : "Pin",
-      onClick: () => handleTogglePin(s),
-      title: s.pinned
-        ? "Remove the pin (it stops surfacing in the Pinned section)"
-        : "Pin this session — surface it distinctly + mark its Board card",
-    });
-    if (s.status === "active") {
-      acts.push({ label: "Pause", onClick: () => handlePause(s.sid), variant: "warning" });
-      acts.push({ label: "Suspend", onClick: () => handleSuspend(s.sid) });
-    } else if (s.status === "paused") {
-      acts.push({ label: "Resume", onClick: () => handleResume(s.sid), variant: "success" });
-      acts.push({ label: "Suspend", onClick: () => handleSuspend(s.sid) });
-    } else if (s.status === "suspended") {
-      acts.push({ label: "Resurrect", onClick: () => handleResume(s.sid), variant: "success" });
-    }
-    // T-0594 (T-0588b): "Send msg" and "Autopilot…" web affordances cut —
-    // messaging lives in TG /say + PeerInbox; autopilot steering stays on the
-    // Board and the TG/CLI control plane.
-    acts.push({
-      label: "Archive",
-      onClick: () => handleArchive(s.sid),
-      disabled: !isSuspended,
-      title: isSuspended ? "Archive this suspended session" : "Suspend the session first",
-    });
-    return acts;
-  }
-
   function renderSessionRow(s: SessionRow, level = 0) {
     const isOpen = expandedSids.has(s.sid);
     const isFlashing = flashSid === s.sid;
@@ -1157,17 +1052,8 @@ export function Sessions() {
           >
             {sessionLastActivity(s)}
           </td>
-
-          {/* Actions — T-0141: collapsed behind a kebab so the row stays
-              ≤48px (stakeholder note 10). T-0572: read-first — kebab only
-              renders with the ⚙ Controls toggle on. */}
-          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            {showControls && (
-              <RowActionsMenu actions={rowActions(s)} ariaLabel={`Actions for ${s.sid}`} />
-            )}
-          </td>
         </tr>
-        {isOpen && renderDetailRow(s, 10)}
+        {isOpen && renderDetailRow(s, 9)}
       </Fragment>
     );
   }
@@ -1232,23 +1118,8 @@ export function Sessions() {
           >
             {sessionLastActivity(s)}
           </td>
-          <td onClick={(e) => e.stopPropagation()} style={{ width: "1px", whiteSpace: "nowrap" }}>
-            {showControls && (
-              <RowActionsMenu
-                ariaLabel={`Actions for ${s.sid}`}
-                actions={[
-                  { label: "Resurrect", onClick: () => handleResurrectFromArchive(s.sid), variant: "success" },
-                  {
-                    label: "Unarchive",
-                    onClick: () =>
-                      api.unarchiveSession(slug, s.sid).then(load).catch((e) => setActionError(String(e))),
-                  },
-                ]}
-              />
-            )}
-          </td>
         </tr>
-        {isOpen && renderDetailRow(s, 8)}
+        {isOpen && renderDetailRow(s, 7)}
       </Fragment>
     );
   }
@@ -1662,17 +1533,6 @@ export function Sessions() {
           Processes
           <span style={{ fontFamily: "var(--mc-mono)", fontWeight: 400, color: "var(--mc-text-dim)", fontSize: "0.78rem", marginLeft: "0.5rem" }}>/ {slug}</span>
         </h2>
-        <div className="d-flex gap-2">
-          <button
-            type="button"
-            className={`btn btn-sm ${showControls ? "btn-secondary" : "btn-outline-secondary"}`}
-            aria-pressed={showControls}
-            title="Reveal the per-row lifecycle controls (pause/suspend/resume, archive, pin). Steering — spawning, messaging, autopilot — lives in the Telegram dialog."
-            onClick={() => setShowControls((v) => !v)}
-          >
-            ⚙ Controls
-          </button>
-        </div>
       </div>
       <PageHelp>
         Live status board for the Claude tmux sessions whose CWD is this
@@ -1681,12 +1541,6 @@ export function Sessions() {
         <code> [SID] needs your input</code> notification and your reply lands
         in that session, or use <code>/sessions</code>,
         {" "}<code>/say &lt;sid&gt; &lt;text&gt;</code> via the bot.
-        <div className="mt-2">
-          <strong>⚙ Controls</strong> reveals the minimal lifecycle affordances
-          (pause/suspend/resume, archive/unarchive, pin) when you need to
-          intervene by hand. Spawning sessions, messaging and autopilot run
-          through the Telegram bot / CLI.
-        </div>
       </PageHelp>
 
       {/* T-0339 (reframe Pillar A item 5 + T-0306): consolidated caps/budget
@@ -1726,22 +1580,11 @@ export function Sessions() {
           </div>
         </div>
       )}
-      {actionError && (
-        <div className="alert alert-warning d-flex justify-content-between align-items-center">
-          <span>{actionError}</span>
-          <button
-            type="button"
-            className="btn-close"
-            style={{ filter: "invert(1) opacity(0.5)" }}
-            onClick={() => setActionError(null)}
-          />
-        </div>
-      )}
-
       {/* T-0346: needs-input deep-link banner. Shown when the operator arrived
           from a home `needs-input` project card. Lists the waiting session(s)
-          with their attach command (and Resume for paused) so "needs input" on
-          home leads in one click to WHAT needs input + how to respond. */}
+          with their attach command so "needs input" on home leads in one
+          click to WHAT needs input — reply via TG/CLI attach (T-0675/D-0057
+          §8: web dropped the in-place Resume control, pure lookup now). */}
       {needsInputView && !needsInputDismissed && sessions !== null && (
         <div
           className="alert alert-warning"
@@ -1823,15 +1666,6 @@ export function Sessions() {
                       {/* T-0347: gated to live sessions (these are always live by
                           construction — paused/at-prompt — but stay consistent). */}
                       <AttachAffordance s={s} slug={slug} size="md" />
-                      {paused && (
-                        <button
-                          type="button"
-                          className="btn btn-outline-success btn-sm"
-                          onClick={() => handleResume(s.sid)}
-                        >
-                          Resume
-                        </button>
-                      )}
                     </div>
                   </div>
                 );
@@ -1951,7 +1785,6 @@ export function Sessions() {
                 <th>Context</th>
                 <th>Started</th>
                 <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
-                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -1959,7 +1792,7 @@ export function Sessions() {
                 ? groupSessionsByTmux(applySessFilter(boardSessions)).flatMap((g) => {
                     const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                     const nodes: React.ReactNode[] = [
-                      renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed),
+                      renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed),
                     ];
                     if (!collapsed) {
                       for (const { row, level } of buildTmuxGroupTree(g.rows)) {
@@ -1973,11 +1806,11 @@ export function Sessions() {
                   // header marks the owner; tmux lanes nest inside it.
                   groupSessionsByUser(applySessFilter(boardSessions)).flatMap((ug) => {
                     const nodes: React.ReactNode[] = [
-                      renderUserHeaderRow(ug.key, ug.rows, 10),
+                      renderUserHeaderRow(ug.key, ug.rows, 9),
                     ];
                     for (const g of groupSessionsByTmux(ug.rows)) {
                       const collapsed = tmuxLaneCollapsed(g.key, g.rows);
-                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 10, collapsed));
+                      nodes.push(renderTmuxLaneHeaderRow(g.key, g.rows, 9, collapsed));
                       if (!collapsed) {
                         for (const { row, level } of buildTmuxGroupTree(g.rows)) {
                           nodes.push(renderSessionRow(row, level));
@@ -1994,7 +1827,7 @@ export function Sessions() {
                       const laneRows = groupSessionsByLane(boardSessions)[lane.key] ?? [];
                       const collapsed = Boolean(collapsedSessLanes[lane.key]);
                       const nodes: React.ReactNode[] = [
-                        renderLaneHeaderRow(lane, laneRows.length, 10),
+                        renderLaneHeaderRow(lane, laneRows.length, 9),
                       ];
                       if (!collapsed) {
                         // Within each initiative lane the tree is also useful — TL at
@@ -2042,7 +1875,6 @@ export function Sessions() {
                   <th>Target</th>
                   <th>Started</th>
                   <th title={LAST_ACTIVITY_TOOLTIP}>Last activity</th>
-                  <th></th>
                 </tr>
               </thead>
               <tbody>
@@ -2050,7 +1882,7 @@ export function Sessions() {
                   ? groupSessionsByTmux(applySessFilter(archivedSessions)).flatMap((g) => {
                       const collapsed = tmuxLaneCollapsed(g.key, g.rows);
                       const nodes: React.ReactNode[] = [
-                        renderTmuxLaneHeaderRow(g.key, g.rows, 8, collapsed),
+                        renderTmuxLaneHeaderRow(g.key, g.rows, 7, collapsed),
                       ];
                       if (!collapsed) {
                         for (const s of g.rows) nodes.push(renderArchivedRow(s));
@@ -2066,7 +1898,7 @@ export function Sessions() {
                         // off-by-default so noise-suppression matters more.
                         if (laneRows.length === 0) return [];
                         const nodes: React.ReactNode[] = [
-                          renderLaneHeaderRow(lane, laneRows.length, 8),
+                          renderLaneHeaderRow(lane, laneRows.length, 7),
                         ];
                         if (!collapsed) {
                           for (const s of laneRows) nodes.push(renderArchivedRow(s));

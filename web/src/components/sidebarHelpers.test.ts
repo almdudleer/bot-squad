@@ -74,23 +74,26 @@ describe("resolveRailContext (T-0357 — never show fleet + project chrome at on
 });
 
 describe("isMoreOpsRoute (T-0637 — More/Ops rail collapse)", () => {
-  test("matches the Analytics and Deployment Queue routes at any depth", () => {
+  test("matches the Docs, Analytics and Deployment Queue routes at any depth", () => {
+    expect(isMoreOpsRoute("/p/watchrobot/docs")).toBe(true);
+    expect(isMoreOpsRoute("/p/watchrobot/docs/feedback")).toBe(true);
     expect(isMoreOpsRoute("/p/watchrobot/analytics")).toBe(true);
     expect(isMoreOpsRoute("/p/watchrobot/runs")).toBe(true);
     expect(isMoreOpsRoute("/p/watchrobot/runs/run_123")).toBe(true);
   });
 
-  test("does NOT match the primary Board/Roadmap/Processes/Docs routes", () => {
+  test("does NOT match the primary Board/Roadmap/Processes routes", () => {
     expect(isMoreOpsRoute("/p/watchrobot")).toBe(false);
     expect(isMoreOpsRoute("/p/watchrobot/vision")).toBe(false);
     expect(isMoreOpsRoute("/p/watchrobot/sessions")).toBe(false);
-    expect(isMoreOpsRoute("/p/watchrobot/docs")).toBe(false);
   });
 
   test("does NOT loosely match unrelated routes sharing a prefix", () => {
-    // Guard against a loose substring match: /analytics-foo or /p/analytics
-    // (a slug literally named "analytics") must not false-positive.
+    // Guard against a loose substring match: /analytics-foo, /docsomething,
+    // or /p/analytics (a slug literally named "analytics") must not
+    // false-positive.
     expect(isMoreOpsRoute("/p/watchrobot/analytics-foo")).toBe(false);
+    expect(isMoreOpsRoute("/p/watchrobot/docsomething")).toBe(false);
     expect(isMoreOpsRoute("/p/analytics")).toBe(false);
   });
 });

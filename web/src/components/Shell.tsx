@@ -23,12 +23,14 @@ const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
  * further collapsed the per-project rail from 6 destinations to 3 + a low-
  * emphasis group:
  *   • PROJECT  — the prominent `[ PROJECT ]` block, primary tier: Board /
- *                Roadmap / Processes (Agent Sessions), plus Docs (the
- *                durable, read-first artifact tree — User Feedback + Use
- *                Cases no longer get their own rail entries, R5/R7). A
- *                quieter "More / Ops" disclosure holds Analytics + Deployment
- *                Queue — ops/history surfaces, not daily at-a-glance state
- *                (R3), collapsed by default.
+ *                Roadmap / Processes (Agent Sessions) — D-0057's own
+ *                "measured target" is exactly this trio, nothing more. A
+ *                quieter "More / Ops" disclosure holds Docs (the durable
+ *                read-first artifact tree — User Feedback + Use Cases no
+ *                longer get their own rail entries, R5/R7), Analytics and
+ *                Deployment Queue — lower-frequency lookup / ops-history
+ *                surfaces, not daily at-a-glance state (R3), collapsed by
+ *                default.
  *   • MOTHERSHIP — a single "Mothership" entry, global-admin only (global
  *                users + invites + connected servers). Tree-shaken off
  *                detach builds via the VITE_MOTHERSHIP literal gate.
@@ -311,13 +313,13 @@ export function Shell() {
 
             {/* Product nav — the body of the [ PROJECT ] section. No header
                 of its own; it reads as the project's primary links.
-                T-0637 (D-0057 §4/§8): the everyday rail collapsed from 6
-                destinations to this primary Board/Roadmap/Processes tier
-                plus Docs — the north star names Board (task rows), the
-                session tree, and ticket views as the at-a-glance lookup
-                surfaces; Processes (Agent Sessions) moved up from the old
-                nested AGENTS group to sit alongside them. Docs stays as the
-                durable, read-first decision log (R5). */}
+                T-0637 (D-0057 §4/§8, TL review 2026-07-25): the everyday
+                rail collapsed from 6 destinations to EXACTLY this primary
+                Board/Roadmap/Processes trio — D-0057's own "measured
+                target" line names only these three; Docs is a separate,
+                lower-frequency lookup surface and moved into "More / Ops"
+                below alongside Analytics/Deployment Queue rather than
+                sitting here as a quiet 4th item. */}
             <ul className="mc-sidebar-nav">
               <li>
                 <NavLink
@@ -345,28 +347,19 @@ export function Shell() {
                   PROCESSES
                 </NavLink>
               </li>
-              {/* T-0235 (Pillar C) / T-0637: USER FEEDBACK + USE CASES have no
-                  rail entry of their own — folded into the single cross-store
-                  Docs artifact tree (T-0337) rather than separate nav/tabs.
-                  Old deep-links redirect into /docs/<sub> (App.tsx
-                  LegacyDocsRedirect). */}
-              <li>
-                <NavLink
-                  to={`/p/${slug}/docs`}
-                  className={({ isActive }) => (isActive ? "active" : undefined)}
-                >
-                  DOCS
-                </NavLink>
-              </li>
             </ul>
 
-            {/* T-0637 (D-0057 §4, Q3): "More / Ops" — a low-emphasis rail
-                disclosure (not a settings-gear demotion) holding the two
-                surfaces that are ops signal / history rather than daily
-                at-a-glance state (R3): Analytics and the Deployment Queue.
-                Collapsed by default; auto-opens on navigation into either
-                (see the isMoreOpsRoute effect above) so a direct deep-link
-                never hides its own active entry. */}
+            {/* T-0637 (D-0057 §4, Q3 + TL review 2026-07-25): "More / Ops" —
+                a low-emphasis rail disclosure (not a settings-gear demotion)
+                holding the surfaces that aren't daily at-a-glance state
+                (R3): Docs (the durable read-first artifact tree — User
+                Feedback + Use Cases have no rail entry of their own,
+                folded into the single cross-store tree, T-0337; old
+                deep-links redirect via App.tsx LegacyDocsRedirect),
+                Analytics, and the Deployment Queue. Collapsed by default;
+                auto-opens on navigation into any of the three (see the
+                isMoreOpsRoute effect above) so a direct deep-link never
+                hides its own active entry. */}
             <button
               type="button"
               className="mc-sidebar-more-ops-toggle"
@@ -378,6 +371,14 @@ export function Shell() {
             </button>
             {moreOpsOpen && (
               <ul className="mc-sidebar-nav mc-sidebar-nav-nested">
+                <li>
+                  <NavLink
+                    to={`/p/${slug}/docs`}
+                    className={({ isActive }) => (isActive ? "active" : undefined)}
+                  >
+                    DOCS
+                  </NavLink>
+                </li>
                 {/* T-0147: internal-usage analytics dashboard. */}
                 <li>
                   <NavLink

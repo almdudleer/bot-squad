@@ -274,8 +274,8 @@ h1, h2, h3, h4, h5, h6 {
    A quieter cousin of `.mc-sidebar-more-toggle` below (T-0140's loud
    amber/bracketed section-header look): same interactive shape (flex +
    caret + button), but dim/faint typography matching `.mc-sidebar-subsection`
-   — Analytics + Deployment Queue are ops/history signal, not primary nav
-   weight. */
+   — Docs, Analytics and Deployment Queue are lower-frequency lookup / ops
+   signal, not primary nav weight. */
 .mc-sidebar-more-ops-toggle {
   display: flex;
   align-items: center;

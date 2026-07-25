@@ -73,15 +73,19 @@ export function resolveRailContext(opts: {
 }
 
 /**
- * T-0637 (D-0057 §4/§8) — which project-rail routes collapse into the
- * low-emphasis "More / Ops" disclosure (Analytics, Deployment Queue) instead
- * of the primary Board/Roadmap/Processes tier. Pure path match so Shell can
- * also auto-expand the group when the current route already lives inside it
- * (a direct deep-link to /analytics or /runs shouldn't hide its own
- * highlighted entry behind a collapsed toggle).
+ * T-0637 (D-0057 §4/§8, TL review 2026-07-25) — which project-rail routes
+ * collapse into the low-emphasis "More / Ops" disclosure (Docs, Analytics,
+ * Deployment Queue) instead of the primary Board/Roadmap/Processes tier.
+ * D-0057's own "measured target" is explicit that the rail is 3 (Board /
+ * Roadmap / Sessions) — Docs isn't in §3's KEEP-shine observability trio
+ * either, so it moves in here too rather than sitting as a quiet 4th primary
+ * item. Pure path match so Shell can also auto-expand the group when the
+ * current route already lives inside it (a direct deep-link to /docs,
+ * /analytics or /runs shouldn't hide its own highlighted entry behind a
+ * collapsed toggle).
  */
 export function isMoreOpsRoute(pathname: string): boolean {
-  return /^\/p\/[^/]+\/(analytics|runs)(\/|$)/.test(pathname);
+  return /^\/p\/[^/]+\/(analytics|runs|docs)(\/|$)/.test(pathname);
 }
 
 /** T-0060 — localStorage key for the server picker selection. Scoped per

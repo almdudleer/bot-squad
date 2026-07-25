@@ -790,3 +790,92 @@ def test_placement_decision_action_passthrough(tmp_path, monkeypatch):
          "task_id": "T-0010"})
     assert out["route"] == "file_task"
     assert out["dispatch"]["task_id"] == "T-0010"
+
+
+# --- T-0656 — drive-mode granularity: classify_drive_mode + decide_placement ---
+
+from bot_squad_worker.dispatch import classify_drive_mode  # noqa: E402
+
+
+def test_drive_mode_record_only_ru_phrase():
+    out = classify_drive_mode("выключи permanent drive, я просто дал заметку")
+    assert out["mode"] == "record_only"
+    assert any(s.startswith("record-only-phrase:") for s in out["signals"])
+
+
+def test_drive_mode_bare_permanent_drive_not_do_all():
+    # Regression: "turn OFF permanent drive" must never classify as do_all —
+    # a bare mode-name mention is not a scope signal, only "выключи
+    # permanent drive"/negation phrasing (or an explicit scope phrase) is.
+    out = classify_drive_mode("permanent drive is running, status check")
+    assert out["mode"] == "ambiguous"
+
+
+def test_drive_mode_record_only_wins_over_work_verb():
+    # An explicit "not yet" must beat an accompanying work verb — the whole
+    # point of T-0656 is that a wish phrased with a build verb still isn't a
+    # build directive.
+    out = classify_drive_mode("build a dark-mode toggle, but just a note for now, no rush")
+    assert out["mode"] == "record_only"
+
+
+def test_drive_mode_do_all_explicit_phrase():
+    out = classify_drive_mode("Давай permanent drive на закрытие всего пришедшего фидбека")
+    assert out["mode"] == "do_all"
+    assert any(s.startswith("do-all-phrase:") for s in out["signals"])
+
+
+def test_drive_mode_do_all_english_everything():
+    out = classify_drive_mode("clear the backlog, drive everything to done")
+    assert out["mode"] == "do_all"
+
+
+def test_drive_mode_bounded_entity_ref():
+    out = classify_drive_mode("fix T-0450, the login bug")
+    assert out["mode"] == "bounded"
+    assert any(s.startswith("entity-refs:") and "T-0450" in s for s in out["signals"])
+
+
+def test_drive_mode_bounded_this_task_phrase():
+    out = classify_drive_mode("just fix this task, nothing else")
+    assert out["mode"] == "bounded"
+    assert any(s.startswith("bounded-phrase:") for s in out["signals"])
+
+
+def test_drive_mode_ambiguous_default_no_scope_signal():
+    # T-0656's core requirement: an unscoped work request must NOT default
+    # to do_all (or silently to anything) — it must ask.
+    out = classify_drive_mode("fix the login bug")
+    assert out["mode"] == "ambiguous"
+    assert "no-scope-signal" in out["signals"]
+
+
+def test_drive_mode_blank_raises():
+    with pytest.raises(ValueError, match="empty text"):
+        classify_drive_mode("   ")
+
+
+def test_decide_placement_carries_drive_mode_record_only(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    out = decide_placement(cfg, "test-project", "просто пожелание, пока не делай")
+    assert out["route"] == "file_task"
+    assert out["drive_mode"] == "record_only"
+    assert out["reason"].startswith("record-only")
+
+
+def test_decide_placement_carries_drive_mode_ambiguous(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    out = decide_placement(cfg, "test-project", "fix the login bug")
+    assert out["drive_mode"] == "ambiguous"
+    assert out["reason"].startswith("drive-mode unclear")
+    # Original file_task guidance must still be present, just prefixed.
+    assert "task_new" in out["reason"] and "dispatch_decision" in out["reason"]
+
+
+def test_decide_placement_carries_drive_mode_do_all(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    out = decide_placement(cfg, "test-project", "clear the backlog, drive everything to done")
+    assert out["drive_mode"] == "do_all"
+    # do_all gets no special reason prefix — only ambiguous/record_only do.
+    assert not out["reason"].startswith("drive-mode unclear")
+    assert not out["reason"].startswith("record-only")

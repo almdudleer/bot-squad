@@ -167,6 +167,42 @@ dropped ask. Nothing the user asked for may evaporate in your context: if it
 implies real work and you did not apply it live, it must exist as a task,
 initiative, or a message delivered to the session that owns it.
 
+**Drive-mode granularity — do-all / one-task / just-record, ask when
+ambiguous (stakeholder 2026-07-21, T-0656).** Filing a long request is not
+enough — you must also judge HOW MUCH of the backlog it authorizes driving,
+using the worker's `placement_decision` action's `drive_mode` field
+(`bot_squad_worker.dispatch.classify_drive_mode`) as your starting signal,
+then apply judgment the same way you do for the placement call itself:
+
+- **`record_only`** — the message is a note/wish, not a build directive
+  ("просто заметка", "пока не делай", "just a note"). File the task
+  verbatim and **stop** — do NOT notify the operator to dispatch it, and
+  say so explicitly in the ticket (`bsq ticket note <id> "record_only —
+  captured as a wish, no build without a further explicit go"`). This is
+  the direct fix for the T-0655 incident: a stakeholder musing was driven
+  plan→build→deploy→closed off one nudge, which he then flagged as wrong.
+- **`bounded`** — scoped to one task or a named small set. Notify the
+  operator as usual, but say so: pass `drive_mode: bounded` in the
+  notification so the operator drives only what was asked, then stops.
+- **`do_all`** — an explicit, unscoped "drive everything" instruction. This
+  must be **rare and explicit** — never infer it from an accompanying work
+  verb or from "permanent drive" alone (that names continuous operation,
+  not scope, and is trivially negated: "выключи permanent drive" is the
+  OPPOSITE of a do-all order). When it does fire, log the authorization on
+  the ticket/note before anyone treats it as a go (see T-0656's own
+  progress notes for the pattern: verify the actual quote, don't just
+  relay a paraphrase).
+- **`ambiguous`** — the default when no scope signal fires. **Ask the
+  stakeholder to pick** (do all tasks / just this task / just record it)
+  rather than guessing and running — this mirrors the dictated-priorities
+  "never silently ignore, take up or query, no third state" rule below,
+  applied to build-scope instead of ranking.
+
+Most real messages land on `record_only` or `bounded` — `do_all` should be
+rare, not the silent default a single nudge falls into. Whichever mode you
+land on, pass it along in the operator notification (not just the task id),
+same discipline as the dictated-priorities rule.
+
 **Dictated priorities — take up vs clarify (stakeholder 2026-07-05,
 T-0595).** When the stakeholder dictates new PRIORITIES (typically voice),
 recording them is not enough — the system must judge them against in-flight

@@ -513,6 +513,115 @@ def classify_request(text: str) -> dict:
     return {"kind": kind, "signals": signals, "word_count": word_count}
 
 
+# ---------------------------------------------------------------------------
+# T-0656 — drive-mode granularity: distinguish do-all / do-one-task /
+# just-record-as-wish, ask when ambiguous.
+#
+# Sits downstream of classify_request: once a message is a long_request (real
+# work, not an instant tweak), THIS classifies how much of the backlog it
+# authorizes driving. Direct incident: T-0655 was filed from a stakeholder
+# musing/note ("я просто дал заметку") and got driven plan->build->deploy->
+# closed off one nudge — the operator treated a wish as a build directive.
+#
+# Unlike classify_request's silent long_request default (durable-but-safe: a
+# mis-filed TWEAK is slow, mis-applied WORK is lost, so default toward
+# filing), drive-mode's safe default runs the OTHER way: when scope is
+# unclear, the answer is "ambiguous" (ask), never a silent guess-and-run —
+# driving unscoped work is precisely the failure this ticket exists to stop.
+# ``do_all`` is deliberately rare and requires an explicit, matchable signal;
+# it is never the fallback.
+# ---------------------------------------------------------------------------
+
+# Record-only phrasing — the stakeholder is noting/wishing, not directing a
+# build. Checked FIRST: an explicit "not yet" always wins over an
+# accompanying work verb ("собери фичу, но это пока просто пожелание").
+RECORD_ONLY_PHRASES = (
+    # RU
+    "просто заметка", "просто пометка", "это просто заметка",
+    "это пожелание", "как пожелание", "просто пожелание",
+    "просто дал заметку", "просто дала заметку", "дал заметку как",
+    "пока не делай", "пока не начинай", "не начинай", "не делай пока",
+    "запиши пожелание", "просто запиши", "на будущее", "пока не надо",
+    "не сейчас", "пока рано", "выключи permanent drive",
+    "выключи драйв", "выключи автопилот",
+    # EN
+    "just a note", "just a wish", "just noting", "just record",
+    "don't build", "dont build", "not now", "no rush", "for later",
+    "just file this", "just log this", "no need to build",
+    "turn off permanent drive", "turn off drive",
+)
+
+# Whole-backlog phrasing — explicit, unscoped "drive everything" language.
+# NOTE: deliberately does NOT include a bare "permanent drive"/"драйв" — that
+# names the continuous-operation mode, not scope, and is trivially negated
+# ("выключи permanent drive" = turn OFF do-all, not a do-all order). Every
+# entry here names WHAT is in scope, not just that driving continues.
+DO_ALL_PHRASES = (
+    # RU
+    "все задачи", "всех задач", "весь бэклог", "весь backlog",
+    "закрой всё", "закрой все", "закрой весь", "все таски",
+    "всего пришедшего фидбека", "весь фидбек",
+    # EN
+    "all tasks", "everything", "whole backlog", "entire backlog",
+    "clear the backlog", "close everything", "all the feedback",
+)
+
+# Single/bounded-scope phrasing — points at one task or "just this".
+BOUNDED_PHRASES = (
+    # RU
+    "эту задачу", "это задачу", "только это", "только эту",
+    "один таск", "одну задачу", "этот тикет", "вот эту",
+    # EN
+    "this task", "just this task", "one task", "this ticket", "only this",
+)
+
+
+def classify_drive_mode(text: str) -> dict:
+    """Classify one long-request's authorized drive scope (T-0656).
+
+    Deterministic phrase ladder, ask-first default:
+
+    1. blank text -> ValueError (same contract as :func:`classify_request`);
+    2. a record-only phrase present -> ``record_only`` (checked first: an
+       explicit "just a note" wins even alongside a work verb or entity ref);
+    3. a whole-backlog phrase present -> ``do_all``;
+    4. a bounded-scope phrase, or an entity-id reference (reusing
+       :data:`_ENTITY_REF`), present -> ``bounded``;
+    5. none of the above -> ``ambiguous`` — the caller must ask the
+       stakeholder to pick a mode rather than guess and run.
+
+    Returns ``{mode, signals}`` — ``signals`` names every cue that fired.
+    """
+    if not text or not text.strip():
+        raise ValueError("classify_drive_mode: empty text")
+    stripped = text.strip()
+    lowered = stripped.lower()
+
+    signals: list[str] = []
+    record_hits = sorted({p for p in RECORD_ONLY_PHRASES if p in lowered})
+    do_all_hits = sorted({p for p in DO_ALL_PHRASES if p in lowered})
+    bounded_hits = sorted({p for p in BOUNDED_PHRASES if p in lowered})
+    refs = sorted({m.group(0) for m in _ENTITY_REF.finditer(stripped)})
+
+    if record_hits:
+        signals.append("record-only-phrase:" + ",".join(record_hits))
+        mode = "record_only"
+    elif do_all_hits:
+        signals.append("do-all-phrase:" + ",".join(do_all_hits))
+        mode = "do_all"
+    elif bounded_hits or refs:
+        if bounded_hits:
+            signals.append("bounded-phrase:" + ",".join(bounded_hits))
+        if refs:
+            signals.append("entity-refs:" + ",".join(refs))
+        mode = "bounded"
+    else:
+        signals.append("no-scope-signal")
+        mode = "ambiguous"
+
+    return {"mode": mode, "signals": signals}
+
+
 def decide_placement(
     cfg: Any, slug: str, text: str, *,
     task_id: str | None = None, now_epoch: float | None = None,
@@ -564,6 +673,15 @@ def decide_placement(
         return out
 
     out["route"] = "file_task"
+
+    # T-0656: a long_request also carries a drive-mode scope — how much of
+    # the backlog this message authorizes driving. Computed unconditionally
+    # (independent of task_id/dispatch) so callers always see it before
+    # deciding whether to dispatch at all.
+    dm = classify_drive_mode(text)
+    out["drive_mode"] = dm["mode"]
+    out["drive_mode_signals"] = dm["signals"]
+
     if task_id:
         dispatch = decide_dispatch(cfg, slug, task_id, now_epoch=now_epoch)
         out["task_id"] = task_id
@@ -579,4 +697,17 @@ def decide_placement(
             "long request — file durably first (task_new with verbatim "
             "provenance), then dispatch_decision for reuse-vs-spawn"
         )
+
+    if dm["mode"] == "ambiguous":
+        out["reason"] = (
+            "drive-mode unclear — ask the stakeholder to pick one before "
+            "driving: do all tasks / just this task / just record it. "
+            + out["reason"]
+        )
+    elif dm["mode"] == "record_only":
+        out["reason"] = (
+            "record-only — file it, take NO build action without a further "
+            "explicit go. " + out["reason"]
+        )
+
     return out

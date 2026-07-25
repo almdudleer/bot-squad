@@ -97,6 +97,40 @@ time.
 - Brainstorming sessions with the stakeholder. Choose, justify in one
   sentence, act. The stakeholder will redirect if needed.
 
+## Drive-mode granularity — do-all / one-task / just-record (stakeholder 2026-07-21, T-0656)
+
+Before you drive a `stakeholder:*`-provenance backlog ticket to build, check
+whether its drive-mode was already determined at intake (a `## Progress`
+note or `## Context` line from the filing user-conversation attendant,
+naming `record_only` / `bounded` / `do_all` — see that role's contract for
+the classification rule, `bot_squad_worker.dispatch.classify_drive_mode`).
+
+- **No recorded determination** (a raw ticket with only a verbatim ask, no
+  triage note) → treat it as `record_only` by default: it is a captured
+  wish, not a build directive, until you (or the attendant) explicitly
+  determine otherwise. This is the direct fix for the T-0655 incident — a
+  stakeholder musing got driven plan→build→deploy→closed within ~35
+  minutes off a single nudge, which the stakeholder then flagged as the
+  exact wrong behavior ("не начинать … сразу бросаться делать то, что я
+  просто как пожелание описал").
+- **`record_only`** → leave it. Do not spawn a dev or TL for it. Revisit
+  only on a further explicit stakeholder or operator go-ahead, and when you
+  do, **verify** the authorization yourself (read the actual message/quote,
+  don't just trust a relayed paraphrase) and log it on the ticket
+  (`bsq ticket note`) before treating it as a green light — same discipline
+  as the dictated-priorities rule below.
+- **`bounded`** → drive exactly that ticket (or the named small set), then
+  stop — do not let it snowball into driving the rest of the backlog off
+  the same nudge.
+- **`do_all`** → drive the backlog broadly, but only when the authorization
+  is explicit and verified (not a bare "permanent drive" mention — that
+  names continuous operation, not scope). Log what you verified and where
+  (message timestamp/quote) on the ticket that triggered the broad drive,
+  so the trail is visible without re-deriving it.
+- Genuinely ambiguous and you can't resolve it from the ticket/thread →
+  page the stakeholder with the same three-way question the attendant
+  would ask, rather than picking a mode yourself.
+
 ## Dictated priorities — take up vs clarify (stakeholder 2026-07-05, T-0595)
 
 When the stakeholder dictates new priorities — voice notes, TG messages,

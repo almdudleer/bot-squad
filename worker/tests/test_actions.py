@@ -92,7 +92,7 @@ def test_registry_lists_only_allowed_actions():
         # T-0042: atomic T-NNNN allocator.
         "task_new",
         # T-0174: generalized atomic allocator across all entity types.
-        "doc_new", "uc_new", "flow_new", "initiative_new",
+        "doc_new", "initiative_new",
         # Phase 9: bind multi-task-per-dev / multi-initiative-per-TL.
         "bind_task", "bind_initiative",
         # T-0237 Layer-2: operator-invoked reuse-vs-spawn dispatch decision.
@@ -2768,53 +2768,6 @@ def test_doc_new_rejects_bad_category(tmp_path, tmp_config_dir, monkeypatch):
     with pytest.raises(ActionError, match="invalid category"):
         A.dispatch("doc_new", {
             "slug": "test-project", "category": "../etc", "title": "x",
-        })
-
-
-def test_uc_new_stem_is_id_and_ignores_legacy_slug_ucs(tmp_path, tmp_config_dir, monkeypatch):
-    import bot_squad_worker.actions as A
-
-    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
-    # A legacy slug-named UC is non-numeric and must NOT bump the counter.
-    (proj / "use_cases").mkdir(parents=True)
-    (proj / "use_cases" / "UC-autopilot-popover.md").write_text("---\nid: UC-autopilot-popover\n---\n")
-    out = A.dispatch("uc_new", {"slug": "test-project", "title": "Probe flow"})
-    assert out["id"] == "UC-0001"
-    p = Path(out["file_path"])
-    # filename stem IS the id (what routes_usecases keys on) — no -slug suffix.
-    assert p == proj / "use_cases" / "UC-0001.md"
-    assert "id: UC-0001" in p.read_text()
-
-
-def test_flow_new_requires_existing_uc(tmp_path, tmp_config_dir, monkeypatch):
-    import bot_squad_worker.actions as A
-
-    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
-    with pytest.raises(ActionError, match="unknown use case"):
-        A.dispatch("flow_new", {
-            "slug": "test-project", "uc_id": "UC-0001", "title": "x",
-        })
-    # Create the UC, then the flow lands under it.
-    A.dispatch("uc_new", {"slug": "test-project", "title": "parent"})
-    out = A.dispatch("flow_new", {
-        "slug": "test-project", "uc_id": "UC-0001", "title": "Happy path",
-    })
-    assert out["id"] == "UF-0001"  # T-0180: user-flow prefix, distinct from feedback F-
-    assert out["uc_id"] == "UC-0001"
-    p = Path(out["file_path"])
-    assert p == proj / "use_cases" / "UC-0001" / "flows" / "UF-0001-happy-path.md"
-    body = p.read_text()
-    assert "uc_id: UC-0001" in body
-    assert "```mermaid" in body
-
-
-def test_flow_new_rejects_bad_uc_id(tmp_path, tmp_config_dir, monkeypatch):
-    import bot_squad_worker.actions as A
-
-    _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
-    with pytest.raises(ActionError, match="invalid uc_id"):
-        A.dispatch("flow_new", {
-            "slug": "test-project", "uc_id": "../evil", "title": "x",
         })
 
 

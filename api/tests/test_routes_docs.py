@@ -43,6 +43,22 @@ def _create(client, *, category="product", title="Doc", parent_doc_id=None):
     return r
 
 
+def _seed_feedback(tmp_bot_squad: Path, name: str, *, parent_doc_id=None) -> str:
+    """Write a feedback md directly to disk (no create endpoint exists for
+    feedback — it's filed out-of-band) to stand in as the SECOND store for
+    cross-store nesting tests (docs used to pair with use-cases here; the
+    use-case entity was retired, T-0671)."""
+    fb_dir = tmp_bot_squad / "data" / "test-project" / "feedback"
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    fm = [f"id: {name}", f"title: {name}"]
+    if parent_doc_id is not None:
+        fm.append(f"parent_doc_id: {parent_doc_id}")
+    (fb_dir / f"{name}.md").write_text(
+        "---\n" + "\n".join(fm) + "\n---\n\n# fb\n", encoding="utf-8"
+    )
+    return name
+
+
 # ---------------------------------------------------------------------------
 # back-compat: a flat doc with no parent keeps working
 # ---------------------------------------------------------------------------
@@ -245,20 +261,15 @@ def test_delete_doc_with_children_rejected(tmp_bot_squad: Path, monkeypatch):
 
 def test_delete_doc_with_cross_store_child_rejected(tmp_bot_squad: Path, monkeypatch):
     """Item 5: the orphan guard spans STORES. A doc with a cross-store child (a
-    use-case parented under it) must not be deletable — the docs-only children
-    scan missed it, silently orphaning the use-case."""
+    feedback item parented under it) must not be deletable — the docs-only
+    children scan missed it, silently orphaning the feedback item."""
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         mother = _create(client, title="Mother").json()["id"]
-        uc = client.post(
-            "/api/projects/test-project/use_cases",
-            json={"title": "UC child", "parent_doc_id": mother},
-        )
-        assert uc.status_code == 200, uc.text
-        uc_id = uc.json()["id"]
+        fb_id = _seed_feedback(tmp_bot_squad, "F-child", parent_doc_id=mother)
         r = client.delete(f"/api/projects/test-project/docs/{mother}")
         assert r.status_code == 409, r.text
-        assert uc_id in r.text  # the cross-store child is named
+        assert fb_id in r.text  # the cross-store child is named
         assert client.get(f"/api/projects/test-project/docs/{mother}").status_code == 200
 
 
@@ -318,36 +329,31 @@ def test_doc_children_include_cross_store(tmp_bot_squad: Path, monkeypatch):
         _login(client)
         mother = _create(client, title="Theme").json()["id"]
         doc_child = _create(client, title="DocChild", parent_doc_id=mother).json()["id"]
-        # a use-case nested under the doc mother (cross-store)
-        uc_child = client.post(
-            "/api/projects/test-project/use_cases",
-            json={"title": "UC child", "parent_doc_id": mother},
-        ).json()["id"]
+        # a feedback item nested under the doc mother (cross-store)
+        fb_child = _seed_feedback(tmp_bot_squad, "F-child", parent_doc_id=mother)
         kids = client.get(f"/api/projects/test-project/docs/{mother}/children").json()
         by_id = {k["id"]: k for k in kids}
         # mother GET: child_doc_ids is docs-only; child_artifact_ids is the superset
         got = client.get(f"/api/projects/test-project/docs/{mother}").json()
     assert by_id[doc_child]["kind"] == "doc"
-    assert by_id[uc_child]["kind"] == "use_case"
+    assert by_id[fb_child]["kind"] == "feedback"
     assert set(got["child_doc_ids"]) == {doc_child}
-    assert set(got["child_artifact_ids"]) == {doc_child, uc_child}
+    assert set(got["child_artifact_ids"]) == {doc_child, fb_child}
 
 
-def test_doc_reparent_under_use_case_cross_store(tmp_bot_squad: Path, monkeypatch):
+def test_doc_reparent_under_feedback_cross_store(tmp_bot_squad: Path, monkeypatch):
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
-        uc = client.post(
-            "/api/projects/test-project/use_cases", json={"title": "Mother UC"}
-        ).json()["id"]
+        fb = _seed_feedback(tmp_bot_squad, "F-mother")
         doc = _create(client, title="Insight").json()["id"]
         r = client.put(
             f"/api/projects/test-project/docs/{doc}/parent",
-            json={"parent_doc_id": uc},
+            json={"parent_doc_id": fb},
         )
         assert r.status_code == 200, r.text
-        assert r.json()["parent_doc_id"] == uc
-        # the UC's cross-store children include this doc
-        kids = client.get(f"/api/projects/test-project/use_cases/{uc}/children").json()
+        assert r.json()["parent_doc_id"] == fb
+        # the feedback item's cross-store children include this doc
+        kids = client.get(f"/api/projects/test-project/feedback/{fb}/children").json()
     assert {k["id"] for k in kids} == {doc}
 
 
@@ -355,15 +361,12 @@ def test_doc_reparent_cross_store_cycle_rejected(tmp_bot_squad: Path, monkeypatc
     with _client(tmp_bot_squad, monkeypatch) as client:
         _login(client)
         doc = _create(client, title="D").json()["id"]
-        # a UC nested under the doc
-        uc = client.post(
-            "/api/projects/test-project/use_cases",
-            json={"title": "U", "parent_doc_id": doc},
-        ).json()["id"]
-        # making the doc's parent the UC would close doc -> uc -> doc
+        # a feedback item nested under the doc
+        fb = _seed_feedback(tmp_bot_squad, "F-child", parent_doc_id=doc)
+        # making the doc's parent the feedback item would close doc -> fb -> doc
         r = client.put(
             f"/api/projects/test-project/docs/{doc}/parent",
-            json={"parent_doc_id": uc},
+            json={"parent_doc_id": fb},
         )
     assert r.status_code == 400, r.text
     assert "cycle" in r.text.lower()

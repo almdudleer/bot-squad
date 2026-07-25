@@ -3002,7 +3002,7 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# T-0174: generalized entity_new actions (doc / uc / flow / initiative).
+# T-0174: generalized entity_new actions (doc / initiative).
 # All wrap the same idalloc allocator + _atomic_write_new helper as task_new,
 # so every entity type gets collision-free ids from a per-type counter.
 # ---------------------------------------------------------------------------
@@ -3082,101 +3082,6 @@ def _action_doc_new(params: dict[str, Any]) -> dict[str, Any]:
     content = f"---\n{fm}\n---\n\n# {title}\n\n(filed via doc_new — T-0172 docs system)\n"
     _atomic_write_new(file_path, content)
     return {"ok": True, "id": new_id, "file_path": str(file_path), "category": category}
-
-
-_UC_NEW_REQUIRED = {"slug", "title"}
-_UC_NEW_ALLOWED = _UC_NEW_REQUIRED
-
-
-def _action_uc_new(params: dict[str, Any]) -> dict[str, Any]:
-    """Allocate the next UC-NNNN id and write a stub use-case md (composes T-0159/T-0173).
-
-    Required params: slug, title
-    Returns: {ok, id, file_path}
-
-    Storage: ``data/<slug>/use_cases/UC-NNNN.md`` — the filename stem IS the id
-    (what routes_usecases keys on). Legacy slug-named UCs (``UC-<slug>.md``) are
-    non-numeric, so the scan ignores them and they keep working alongside the
-    new numeric ones.
-    """
-    from bot_squad_worker import idalloc
-
-    cfg, slug = _entity_setup(params, _UC_NEW_REQUIRED, _UC_NEW_ALLOWED, "uc_new")
-    title = _require_str(params, "title", "uc_new")
-
-    uc_dir = cfg.data_dir / slug / "use_cases"
-    uc_dir.mkdir(parents=True, exist_ok=True)
-    new_id = idalloc.allocate_id(cfg.data_dir, slug, "uc")
-    file_path = uc_dir / f"{new_id}.md"
-
-    fm = "\n".join([
-        f"id: {new_id}",
-        f"title: {_yaml_quote(title)}",
-        "user_persona: TBD",
-        "goal: TBD",
-        "preconditions: TBD",
-        "success_criteria: TBD",
-        "related_tickets: []",
-        "status: draft",
-    ])
-    body = (
-        f"# {title}\n\n## Steps\n\n1. TBD\n\n## Feedback\n\n"
-        "(filed via uc_new — attach user flows with `bsq flow new "
-        f"{new_id} <title>`)\n"
-    )
-    content = f"---\n{fm}\n---\n\n{body}"
-    _atomic_write_new(file_path, content)
-    return {"ok": True, "id": new_id, "file_path": str(file_path)}
-
-
-_FLOW_NEW_REQUIRED = {"slug", "uc_id", "title"}
-_FLOW_NEW_ALLOWED = _FLOW_NEW_REQUIRED
-_UC_ID_RE = re.compile(r"^UC-[A-Za-z0-9][A-Za-z0-9_.-]*$")
-
-
-def _action_flow_new(params: dict[str, Any]) -> dict[str, Any]:
-    """Allocate the next UF-NNNN id and write a stub user-flow md (composes T-0173).
-
-    Required params: slug, uc_id, title
-    Returns: {ok, id, file_path, uc_id}
-
-    Storage: ``data/<slug>/use_cases/<uc-id>/flows/UF-NNNN-<slug>.md``. The
-    parent use case must exist (either ``<uc-id>.md`` or a ``<uc-id>/`` dir).
-    The flow counter is per-project (one UF-NNNN sequence across all UCs). The
-    "UF-" (user-flow) prefix is distinct from curated feedback's "F-" (T-0180).
-    """
-    from bot_squad_worker import idalloc
-
-    cfg, slug = _entity_setup(params, _FLOW_NEW_REQUIRED, _FLOW_NEW_ALLOWED, "flow_new")
-    uc_id = _require_str(params, "uc_id", "flow_new")
-    if not _UC_ID_RE.match(uc_id):
-        raise ActionError(f"flow_new: invalid uc_id {uc_id!r}")
-    title = _require_str(params, "title", "flow_new")
-
-    uc_root = cfg.data_dir / slug / "use_cases"
-    if not (uc_root / f"{uc_id}.md").exists() and not (uc_root / uc_id).is_dir():
-        raise ActionError(f"flow_new: unknown use case {uc_id!r}")
-
-    flows_dir = uc_root / uc_id / "flows"
-    flows_dir.mkdir(parents=True, exist_ok=True)
-    new_id = idalloc.allocate_id(cfg.data_dir, slug, "flow")
-    file_path = flows_dir / f"{new_id}-{_slugify_title(title)}.md"
-
-    fm = "\n".join([
-        f"id: {new_id}",
-        f"uc_id: {uc_id}",
-        f"title: {_yaml_quote(title)}",
-        "status: draft",
-        f"created: {_now_iso()}",
-    ])
-    body = (
-        f"# {title}\n\n## Steps\n\n1. TBD\n\n## Mermaid\n\n"
-        "```mermaid\ngraph TD\n  A[start] --> B[TBD]\n```\n\n"
-        "(filed via flow_new — T-0173 user flows)\n"
-    )
-    content = f"---\n{fm}\n---\n\n{body}"
-    _atomic_write_new(file_path, content)
-    return {"ok": True, "id": new_id, "file_path": str(file_path), "uc_id": uc_id}
 
 
 _INITIATIVE_NEW_REQUIRED = {"slug", "name"}
@@ -4300,8 +4205,6 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0042: atomic T-NNNN allocator (flock-protected).
     "task_new": _action_task_new,
     "doc_new": _action_doc_new,
-    "uc_new": _action_uc_new,
-    "flow_new": _action_flow_new,
     "initiative_new": _action_initiative_new,
     "bind_task": _action_bind_task,
     "bind_initiative": _action_bind_initiative,
@@ -4462,8 +4365,6 @@ ACTION_MODES: dict[str, str] = {
     "fleet_model_set": "coordinator_only",
     "task_new": "coordinator_only",
     "doc_new": "coordinator_only",
-    "uc_new": "coordinator_only",
-    "flow_new": "coordinator_only",
     "initiative_new": "coordinator_only",
     "bind_task": "coordinator_only",
     "bind_initiative": "coordinator_only",

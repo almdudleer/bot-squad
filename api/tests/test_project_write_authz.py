@@ -78,8 +78,6 @@ _PHASE2 = [
     ("put", f"{_P}/vision/roles/dev", {"body": "x"}),
     ("post", f"{_P}/docs", {"title": "x", "body": "y"}),
     ("put", f"{_P}/docs/D-0001", {"body": "x"}),
-    ("post", f"{_P}/use_cases", {"title": "x"}),
-    ("post", f"{_P}/use_cases/UC-0001/run", {}),
     ("post", f"{_P}/feedback/F-0001/promote", {}),
 ]
 _GATED = _PHASE1 + _PHASE2

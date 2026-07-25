@@ -12,8 +12,6 @@ from bot_squad_worker import idalloc
 def test_format_id_per_type():
     assert idalloc.format_id("task", 7) == "T-0007"
     assert idalloc.format_id("doc", 42) == "D-0042"
-    assert idalloc.format_id("uc", 1) == "UC-0001"
-    assert idalloc.format_id("flow", 1234) == "UF-1234"  # T-0180: user-flow prefix
     assert idalloc.format_id("initiative", 3) == "INI-03"
     assert idalloc.format_id("routine", 7) == "R-0007"  # T-0464: routine type
 
@@ -91,41 +89,11 @@ def test_allocate_self_heals_against_manual_higher_id(tmp_path):
     assert idalloc.allocate_id(tmp_path, "p", "doc") == "D-0501"
 
 
-def test_scan_recursion_difference(tmp_path):
-    """uc scan is shallow (top of use_cases/); flow scan recurses into it."""
-    uc = tmp_path / "p" / "use_cases"
-    (uc / "UC-0005" / "flows").mkdir(parents=True)
-    (uc / "UC-0005.md").write_text("x")  # numeric UC at top level
-    (uc / "UC-0005" / "flows" / "UF-0009-x.md").write_text("x")  # nested flow
-    # uc (shallow) sees UC-0005 -> next UC-0006
-    assert idalloc.allocate_id(tmp_path, "p", "uc") == "UC-0006"
-    # flow (recursive) sees UF-0009 -> next UF-0010
-    assert idalloc.allocate_id(tmp_path, "p", "flow") == "UF-0010"
-
-
-def test_flow_prefix_disjoint_from_feedback(tmp_path):
-    """T-0180: flows use UF-, curated feedback uses F- in a separate dir.
-
-    A feedback `F-NNNN-*.md` under feedback/ must NOT influence flow allocation
-    (different prefix AND different scan dir), so a bare id is never ambiguous
-    between a user flow and a curated feedback item.
-    """
-    proj = tmp_path / "p"
-    (proj / "feedback").mkdir(parents=True)
-    # High-numbered feedback item that would collide if the flow scan saw it.
-    (proj / "feedback" / "F-0099-some-friction.md").write_text("x")
-    (proj / "use_cases").mkdir(parents=True)
-    # First flow ignores the feedback F- entirely -> starts at UF-0001.
-    assert idalloc.allocate_id(tmp_path, "p", "flow") == "UF-0001"
-    # The flow prefix is "UF", deliberately not "F".
-    assert idalloc.ENTITY_TYPES["flow"].prefix == "UF"
-
-
 def test_legacy_slug_ids_ignored_by_scan(tmp_path):
-    uc = tmp_path / "p" / "use_cases"
-    uc.mkdir(parents=True)
-    (uc / "UC-autopilot-popover.md").write_text("x")  # non-numeric legacy
-    assert idalloc.allocate_id(tmp_path, "p", "uc") == "UC-0001"
+    docs = tmp_path / "p" / "docs" / "arch"
+    docs.mkdir(parents=True)
+    (docs / "autopilot-popover.md").write_text("x")  # non-numeric legacy
+    assert idalloc.allocate_id(tmp_path, "p", "doc") == "D-0001"
 
 
 def test_concurrent_allocation_no_collisions(tmp_path):

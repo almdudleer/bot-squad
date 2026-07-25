@@ -1,12 +1,12 @@
 """Cross-store artifact nesting (T-0283 Pillar-C).
 
-Feedback, use-cases and docs are three separate on-disk stores. The reframe
-treats them as one nestable ARTIFACT model: any artifact may carry a
-``parent_doc_id`` frontmatter field naming ANY other artifact (doc ``D-NNNN``,
-use-case ``UC-NNNN`` or feedback ``F-...``), and parent/child/ancestry edges
-resolve ACROSS the three stores. This module is the single place that knows the
-store layout + the uniform ``parent_doc_id`` field, so ``routes_docs`` /
-``routes_usecases`` / ``routes_feedback`` share one cycle-safe implementation.
+Feedback and docs are separate on-disk stores. The reframe treats them as one
+nestable ARTIFACT model: any artifact may carry a ``parent_doc_id``
+frontmatter field naming ANY other artifact (doc ``D-NNNN`` or feedback
+``F-...``), and parent/child/ancestry edges resolve ACROSS the stores. This
+module is the single place that knows the store layout + the uniform
+``parent_doc_id`` field, so ``routes_docs`` / ``routes_feedback`` share one
+cycle-safe implementation.
 
 Storage is in-place: nothing moves between stores. Feedback is
 frontmatter-tolerant — legacy raw-markdown ``F-*.md`` files (no frontmatter)
@@ -26,7 +26,6 @@ _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
 
 # kinds, in the order children/listing prefer when surfacing summaries.
 KIND_DOC = "doc"
-KIND_USE_CASE = "use_case"
 KIND_FEEDBACK = "feedback"
 
 
@@ -42,10 +41,6 @@ class ArtifactRef:
 
 def _docs_root(project_root: Path) -> Path:
     return project_root / "docs"
-
-
-def _uc_root(project_root: Path) -> Path:
-    return project_root / "use_cases"
 
 
 def _fb_root(project_root: Path) -> Path:
@@ -118,17 +113,12 @@ def ref_for_path(kind: str, path: Path) -> ArtifactRef:
 
 
 def iter_artifacts(project_root: Path) -> Iterator[ArtifactRef]:
-    """Yield every artifact across the three stores."""
+    """Yield every artifact across the stores."""
     docs = _docs_root(project_root)
     if docs.exists():
         for cdir in sorted(p for p in docs.iterdir() if p.is_dir()):
             for f in sorted(cdir.glob("*.md")):
                 yield _ref_for(KIND_DOC, f)
-    uc = _uc_root(project_root)
-    if uc.exists():
-        # Top-level *.md only — a `<uc_id>/` subdir holds flows, not artifacts.
-        for f in sorted(uc.glob("*.md")):
-            yield _ref_for(KIND_USE_CASE, f)
     fb = _fb_root(project_root)
     if fb.exists():
         for f in sorted(fb.glob("*.md")):

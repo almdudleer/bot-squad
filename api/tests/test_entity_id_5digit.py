@@ -9,7 +9,7 @@ NOT widened and are out of scope here.
 """
 from __future__ import annotations
 
-from app import routes_backlog, routes_docs, routes_usecases
+from app import routes_backlog, routes_docs
 from app.artifact_nesting import _id_from_stem
 from app.markdown_writer import _TASK_ID_RE as MW_TASK_ID_RE
 
@@ -27,11 +27,6 @@ def test_doc_id_re_accepts_5_digits():
     assert routes_docs._TASK_ID_RE.match("T-12345")
 
 
-def test_flow_id_re_accepts_5_digits():
-    assert routes_usecases._FLOW_ID_RE.match("UF-10000")
-    assert not routes_usecases._FLOW_ID_RE.match("UF-999")
-
-
 def test_markdown_writer_task_id_captures_5_digits():
     m = MW_TASK_ID_RE.match("T-10000-some-slug")
     assert m and m.group(1) == "10000"
@@ -41,5 +36,4 @@ def test_markdown_writer_task_id_captures_5_digits():
 
 def test_id_from_stem_canonicalises_5_digit_id():
     assert _id_from_stem("D-10000-some-slug") == "D-10000"
-    assert _id_from_stem("UF-12345") == "UF-12345"
     assert _id_from_stem("D-0001-x") == "D-0001"  # 4-digit unchanged

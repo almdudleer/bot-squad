@@ -14,10 +14,9 @@ Why this exists
 Before T-0174 every entity type allocated IDs its own way: tickets had TWO
 independent allocators (the worker's ``task_new`` locked ``.task-id.lock`` while
 the API's ``POST /backlog`` locked ``.lock`` — different files, so a web create
-and an agent ``task new`` could hand out the same T-NNNN), use cases took a
-hand-typed ``id:`` in the frontmatter, and initiatives/docs/flows had nothing.
-That hand-picking is the root cause of the ID-collision incidents (T-0042,
-T-0114, T-0120).
+and an agent ``task new`` could hand out the same T-NNNN), and initiatives/docs
+had nothing. That hand-picking is the root cause of the ID-collision incidents
+(T-0042, T-0114, T-0120).
 
 The model
 ---------
@@ -63,14 +62,6 @@ class EntityType:
 ENTITY_TYPES: dict[str, EntityType] = {
     "task": EntityType("task", "T", 4, "backlog", False),
     "doc": EntityType("doc", "D", 4, "docs", True),
-    "uc": EntityType("uc", "UC", 4, "use_cases", False),
-    # Flows live under use_cases/<uc-id>/flows/, so the scan recurses. Prefix
-    # "UF-" (user-flow) is deliberately distinct from curated feedback's "F-"
-    # (feedback/F-NNNN-*.md — hand-curated, no counter here) so a bare id is
-    # never ambiguous between a flow and a feedback item (T-0180). The counter
-    # file stays keyed by the type name ("flow.txt"); only the display prefix
-    # changed, so no counter rename is needed.
-    "flow": EntityType("flow", "UF", 4, "use_cases", True),
     # Initiatives are rare; a 2-digit pad is plenty. Legacy initiatives are
     # slug-named (non-numeric) and are ignored by the scan, so new ones start
     # at INI-01 while old ones keep working.

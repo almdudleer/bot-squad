@@ -1,10 +1,10 @@
 """Cross-store artifact nesting (T-0283 Pillar-C).
 
-The shared module resolves parent/child/ancestry edges across the three
-artifact stores — docs (``docs/<cat>/D-*.md``), use-cases
-(``use_cases/UC-*.md``) and feedback (``feedback/F-*.md``) — via a uniform
-``parent_doc_id`` frontmatter field. Feedback is frontmatter-tolerant: legacy
-raw-markdown files with no frontmatter read as root artifacts.
+The shared module resolves parent/child/ancestry edges across the artifact
+stores — docs (``docs/<cat>/D-*.md``) and feedback (``feedback/F-*.md``) —
+via a uniform ``parent_doc_id`` frontmatter field. Feedback is
+frontmatter-tolerant: legacy raw-markdown files with no frontmatter read as
+root artifacts.
 """
 from __future__ import annotations
 
@@ -22,15 +22,6 @@ def _doc(root: Path, doc_id: str, *, category="design", parent=None, title="Doc"
     (d / f"{doc_id}-x.md").write_text("---\n" + "\n".join(fm) + "\n---\n\nbody\n")
 
 
-def _uc(root: Path, uc_id: str, *, parent=None, title="UC"):
-    d = root / "use_cases"
-    d.mkdir(parents=True, exist_ok=True)
-    fm = [f"id: {uc_id}", f"title: {title}", "status: draft"]
-    if parent is not None:
-        fm.append(f"parent_doc_id: {parent}")
-    (d / f"{uc_id}.md").write_text("---\n" + "\n".join(fm) + "\n---\n\n# UC\n")
-
-
 def _fb(root: Path, name: str, *, parent=None, legacy=False):
     d = root / "feedback"
     d.mkdir(parents=True, exist_ok=True)
@@ -45,10 +36,8 @@ def _fb(root: Path, name: str, *, parent=None, legacy=False):
 
 def test_find_artifact_across_stores(tmp_path: Path):
     _doc(tmp_path, "D-0001")
-    _uc(tmp_path, "UC-0002")
     _fb(tmp_path, "F-a")
     assert AN.find_artifact(tmp_path, "D-0001").kind == "doc"
-    assert AN.find_artifact(tmp_path, "UC-0002").kind == "use_case"
     assert AN.find_artifact(tmp_path, "F-a").kind == "feedback"
     assert AN.find_artifact(tmp_path, "D-9999") is None
 
@@ -61,20 +50,20 @@ def test_legacy_feedback_reads_as_root(tmp_path: Path):
 
 
 def test_children_of_is_cross_store(tmp_path: Path):
-    # A use-case mother with a doc child AND a feedback child (cross-store).
-    _uc(tmp_path, "UC-0001")
-    _doc(tmp_path, "D-0002", parent="UC-0001")
-    _fb(tmp_path, "F-evid", parent="UC-0001")
+    # A doc mother with a doc child AND a feedback child (cross-store).
+    _doc(tmp_path, "D-0001")
+    _doc(tmp_path, "D-0002", parent="D-0001")
+    _fb(tmp_path, "F-evid", parent="D-0001")
     _doc(tmp_path, "D-0003")  # unrelated root
-    kids = AN.children_of(tmp_path, "UC-0001")
+    kids = AN.children_of(tmp_path, "D-0001")
     got = {(c["id"], c["kind"]) for c in kids}
     assert got == {("D-0002", "doc"), ("F-evid", "feedback")}
 
 
 def test_parent_of_reads_field(tmp_path: Path):
     _doc(tmp_path, "D-0001")
-    _uc(tmp_path, "UC-0002", parent="D-0001")
-    assert AN.parent_of(tmp_path, "UC-0002") == "D-0001"
+    _fb(tmp_path, "F-a", parent="D-0001")
+    assert AN.parent_of(tmp_path, "F-a") == "D-0001"
     assert AN.parent_of(tmp_path, "D-0001") is None
 
 
@@ -84,10 +73,10 @@ def test_would_cycle_self_parent(tmp_path: Path):
 
 
 def test_would_cycle_cross_store_ancestry(tmp_path: Path):
-    # D-0001 -> UC-0002 -> F-c (chain via parent_doc_id). Making F-c's parent
+    # D-0001 -> F-mid -> F-c (chain via parent_doc_id). Making F-c's parent
     # D-0001 would close a cross-store cycle.
-    _doc(tmp_path, "D-0001", parent="UC-0002")
-    _uc(tmp_path, "UC-0002", parent="F-c")
+    _doc(tmp_path, "D-0001", parent="F-mid")
+    _fb(tmp_path, "F-mid", parent="F-c")
     _fb(tmp_path, "F-c")
     assert AN.would_cycle(tmp_path, "F-c", "D-0001") is True
     # An unrelated new parent does not cycle.
@@ -96,12 +85,12 @@ def test_would_cycle_cross_store_ancestry(tmp_path: Path):
 
 
 def test_set_parent_writes_and_clears(tmp_path: Path):
-    _uc(tmp_path, "UC-0001")
-    ref = AN.find_artifact(tmp_path, "UC-0001")
+    _fb(tmp_path, "F-a")
+    ref = AN.find_artifact(tmp_path, "F-a")
     AN.set_parent(ref, "D-0007")
-    assert AN.parent_of(tmp_path, "UC-0001") == "D-0007"
-    AN.set_parent(AN.find_artifact(tmp_path, "UC-0001"), None)
-    assert AN.parent_of(tmp_path, "UC-0001") is None
+    assert AN.parent_of(tmp_path, "F-a") == "D-0007"
+    AN.set_parent(AN.find_artifact(tmp_path, "F-a"), None)
+    assert AN.parent_of(tmp_path, "F-a") is None
 
 
 def test_set_parent_on_legacy_feedback_adds_frontmatter(tmp_path: Path):

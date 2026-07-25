@@ -26,7 +26,7 @@ description: Use when you are a bot-squad session and need to interact with the 
 | New ticket (atomic id) | `bsq task new "<title>"` (never hand-pick `T-NNNN`) |
 | Manual-test scenario template | `bsq scenario new <ticket>` |
 | Report process/product friction | `bsq feedback submit "<note>"` |
-| Docs / use cases / flows | `bsq doc\|uc\|flow new ...` |
+| Docs | `bsq doc new <category> <title>` |
 | Commit your work | `bsq commit -m MSG --ack <explicit files>` |
 | Full orientation on demand | `bsq brief` |
 

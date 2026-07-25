@@ -426,7 +426,7 @@ def set_current_project(cfg, global_user_id: str, slug: str) -> Optional[bool]:
     return True
 
 
-def _ask_which_project(cfg, chat_id: str) -> None:
+def _ask_which_project(cfg, chat_id: str, *, thread_id: Any = None) -> None:
     """Hardwired 'which project?' prompt — a reply-keyboard listing every
     project. Each button sends ``/project <slug>`` as a NORMAL message, so the
     selection arrives under ``allowed_updates:["message"]`` (no poll-contract
@@ -445,28 +445,31 @@ def _ask_which_project(cfg, chat_id: str) -> None:
     # debounce=False (offer the picker every time it's needed). Best-effort: a
     # messenger outage must not break inbound routing (channel.send raises).
     _channel_notify(cfg, chat_id, "Which project are you talking to? Pick one:",
-                    reply_markup=reply_markup)
+                    reply_markup=reply_markup, thread_id=thread_id)
 
 
-def _handle_project(cfg, chat_id: str, gid: str, args: str) -> dict:
+def _handle_project(cfg, chat_id: str, gid: str, args: str, *, thread_id: Any = None) -> dict:
     """``/project [slug]`` — pin/switch the current project, or (no arg / unknown
     slug) re-offer the picker."""
     if not gid:
-        _notify(cfg, chat_id, "Couldn't identify you yet — try again in a moment.")
+        _notify(cfg, chat_id, "Couldn't identify you yet — try again in a moment.",
+                thread_id=thread_id)
         return {"ok": False, "action": "project_no_identity"}
     slug = args.strip()
     if not slug:
-        _ask_which_project(cfg, chat_id)
+        _ask_which_project(cfg, chat_id, thread_id=thread_id)
         return {"ok": True, "action": "ask_project"}
     if slug not in cfg.projects:
-        _notify(cfg, chat_id, f"Unknown project: {slug}")
-        _ask_which_project(cfg, chat_id)
+        _notify(cfg, chat_id, f"Unknown project: {slug}", thread_id=thread_id)
+        _ask_which_project(cfg, chat_id, thread_id=thread_id)
         return {"ok": False, "action": "project_unknown", "slug": slug}
     ok = set_current_project(cfg, gid, slug)
     if not ok:
-        _notify(cfg, chat_id, f"Couldn't switch to {slug} right now — try again.")
+        _notify(cfg, chat_id, f"Couldn't switch to {slug} right now — try again.",
+                thread_id=thread_id)
         return {"ok": False, "action": "project_set_failed", "slug": slug}
-    _notify(cfg, chat_id, f"You're on project {slug}. Messages now go there.")
+    _notify(cfg, chat_id, f"You're on project {slug}. Messages now go there.",
+            thread_id=thread_id)
     return {"ok": True, "action": "project_set", "slug": slug}
 
 
@@ -594,10 +597,13 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     if isinstance(ensured, dict) and ensured.get("parked"):
         # T-0570 parity: a spawn refused under backoff/saturation must still
         # tell the user, not go silent (see _handle_unquoted's identical case).
+        # T-0676 item 3: land it back in the SAME topic the message arrived
+        # on, not the chat's general feed.
         _channel_notify(
             cfg, chat_id,
             "Принял и записал. Сейчас все воркеры заняты — займусь, как только "
             "освободится слот (обычно пара минут).",
+            thread_id=msg.get("message_thread_id"),
         )
         return {"ok": True, "action": "route_parked", "slug": slug}
     return {"ok": True, "action": "route_bound_topic", "slug": slug}
@@ -621,7 +627,7 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
         # Unpinned: hardwired ask (voice-04). Record under the chat's project so
         # the message isn't lost while we wait for the pin.
         append_conversation(cfg, chat_slug, gid, msg)
-        _ask_which_project(cfg, chat_id)
+        _ask_which_project(cfg, chat_id, thread_id=msg.get("message_thread_id"))
         return {"ok": True, "action": "ask_project"}
 
     # The pinned project is the project-of-record.
@@ -648,10 +654,13 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
         # recorded and the spawn retries on ramp-up — but the user must hear
         # that, not silence. Debounce stays ON so a burst during saturation
         # yields one notice per cooldown, not one per message.
+        # T-0676 item 3: preserve the originating thread (a legacy per-project
+        # supergroup can still carry topics even without a T-0639 binding).
         _channel_notify(
             cfg, chat_id,
             "Принял и записал. Сейчас все воркеры заняты — займусь, как только "
             "освободится слот (обычно пара минут).",
+            thread_id=msg.get("message_thread_id"),
         )
         return {"ok": True, "action": "route_parked", "slug": por}
     return {"ok": True, "action": "route", "slug": por}
@@ -832,12 +841,14 @@ def handle_update(cfg, update: dict) -> dict:
             cmd, args = slash
             # T-0492: /project pins/switches the user's current project (needs
             # the sender identity, which _handle_slash doesn't carry).
+            # T-0676 item 3: thread_id (computed above) so the command's reply
+            # lands back in the topic it was typed in, not the general feed.
             if cmd == "project":
-                result = _handle_project(cfg, chat_id, gid, args)
+                result = _handle_project(cfg, chat_id, gid, args, thread_id=thread_id)
             else:
-                result = _handle_slash(cfg, chat_id, cmd, args)
+                result = _handle_slash(cfg, chat_id, cmd, args, thread_id=thread_id)
         elif reply:
-            result = _handle_reply(cfg, chat_id, *reply)
+            result = _handle_reply(cfg, chat_id, *reply, thread_id=thread_id)
         else:  # group/topic voice
             from bot_squad_worker import voice_intake as _vi
             r = _vi.process_voice(cfg, chat_slug, msg, ts=_msg_ts(msg))
@@ -885,7 +896,7 @@ def _msg_ts(msg: dict) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _handle_reply(cfg, chat_id: str, sid: str, text: str) -> dict:
+def _handle_reply(cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = None) -> dict:
     """Find the pane by SID and inject the text."""
     from bot_squad_worker import actions as A
     try:
@@ -895,7 +906,8 @@ def _handle_reply(cfg, chat_id: str, sid: str, text: str) -> dict:
         _clear_stall(cfg, chat_id, sid)
         return {"ok": True, "action": "inject", "sid": sid, "result": result}
     except A.ActionError as e:
-        _notify(cfg, chat_id, f"❌ session {sid} not active — message dropped")
+        _notify(cfg, chat_id, f"❌ session {sid} not active — message dropped",
+                thread_id=thread_id)
         return {"ok": False, "action": "inject_failed", "sid": sid, "error": str(e)}
 
 
@@ -910,7 +922,7 @@ def _clear_stall(cfg, chat_id: str, sid: str) -> None:
         pass
 
 
-def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
+def _handle_slash(cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = None) -> dict:
     """Implement /sessions, /say, /help."""
     from bot_squad_worker import actions as A, sessions as S
     if cmd == "sessions":
@@ -920,21 +932,21 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
             for row in S.list_sessions(cfg, slug):
                 rows.append(f"  {row['sid']}  win={row['window']}  status={row['status']}")
         body = "Active sessions:\n" + ("\n".join(rows) if rows else "  (none)")
-        _notify(cfg, chat_id, body)
+        _notify(cfg, chat_id, body, thread_id=thread_id)
         return {"ok": True, "action": "sessions", "count": len(rows)}
 
     if cmd == "say":
         # /say <sid> <text>
         parts = args.split(None, 1)
         if len(parts) < 2:
-            _notify(cfg, chat_id, "Usage: /say <sid> <text>")
+            _notify(cfg, chat_id, "Usage: /say <sid> <text>", thread_id=thread_id)
             return {"ok": False, "action": "say_usage"}
         sid, text = parts[0], parts[1]
         try:
             result = A.dispatch("inject_input", {"sid": sid, "text": text})
             return {"ok": True, "action": "say", "sid": sid, "result": result}
         except A.ActionError as e:
-            _notify(cfg, chat_id, f"❌ /say failed: {e}")
+            _notify(cfg, chat_id, f"❌ /say failed: {e}", thread_id=thread_id)
             return {"ok": False, "action": "say_failed", "error": str(e)}
 
     if cmd == "help":
@@ -945,7 +957,8 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
                 "Reply to a notification to inject text into the session.\n"
                 "/sessions — list active sessions\n"
                 "/say <sid> <text> — direct inject without reply-quoting\n"
-                "/state — drive on/off, quota target, core lifecycle state")
+                "/state — drive on/off, quota target, core lifecycle state",
+                thread_id=thread_id)
         return {"ok": True, "action": "help"}
 
     if cmd == "state":
@@ -958,7 +971,8 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
 
         slug = _slug_for_chat(cfg, chat_id)
         if not slug:
-            _notify(cfg, chat_id, "❌ /state: this chat isn't linked to a registered project")
+            _notify(cfg, chat_id, "❌ /state: this chat isn't linked to a registered project",
+                    thread_id=thread_id)
             return {"ok": False, "action": "state_no_project"}
 
         live_ops = _dispatch.live_operator_sids(cfg, slug)
@@ -984,26 +998,33 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str) -> dict:
             f"(spend so far: {spend_str}, pacing: {pacing['recommendation']})",
             f"Active sessions: {active}",
         ])
-        _notify(cfg, chat_id, body)
+        _notify(cfg, chat_id, body, thread_id=thread_id)
         return {"ok": True, "action": "state", "slug": slug, "drive": drive,
                 "operator": op_sid}
 
     return {"ok": False, "action": "unknown_cmd"}
 
 
-def _notify(cfg, chat_id: str, message: str) -> None:
+def _notify(cfg, chat_id: str, message: str, *, thread_id: Any = None) -> None:
     """Lightweight outbound command reply -- no SID prefix, no debounce.
 
     T-0513: routes through the channel abstraction (``channels.get_channel``)
     instead of a raw httpx ``sendMessage`` that bypassed it. The egress proxy,
     token gate, and quiet-hours policy now live in one place (tg.py via the
     channel), not duplicated here.
+
+    ``thread_id`` (T-0676 item 3): the forum-topic thread the triggering
+    message arrived on, when known — forwarded straight through so an
+    acknowledgment/confirmation lands back in THAT topic instead of the
+    chat's general feed. ``None`` (DM, General, or a caller with no msg in
+    scope) preserves the exact pre-fix behavior.
     """
-    _channel_notify(cfg, chat_id, message)
+    _channel_notify(cfg, chat_id, message, thread_id=thread_id)
 
 
 def _channel_notify(
-    cfg, chat_id: str, message: str, *, reply_markup: dict | None = None
+    cfg, chat_id: str, message: str, *,
+    reply_markup: dict | None = None, thread_id: Any = None,
 ) -> None:
     """Send an interactive group reply via the channel abstraction (T-0513).
 
@@ -1012,6 +1033,14 @@ def _channel_notify(
     asked for), ``sid=""`` (no ``[SID]`` prefix), ``debounce=False`` (echo every
     time, not once per 60s). Best-effort — ``channel.send`` raises on a
     transport/API error and an outage must not break inbound command handling.
+
+    ``thread_id`` (T-0676 item 3 — misrouted reply): before this, every
+    synchronous reply/ack sent through this helper dropped the originating
+    message's ``message_thread_id`` entirely, so a message typed in a bound
+    forum topic got its acknowledgment delivered to the chat's GENERAL feed
+    instead of back into that topic — a plain, zero-race misroute (distinct
+    from the T-0667 conversation-locus staleness this ticket also covers).
+    Passed straight to ``channel.send``'s ``topic_id`` when given.
     """
     if not cfg.tg_bot_token:
         return
@@ -1020,6 +1049,8 @@ def _channel_notify(
     extra: dict[str, Any] = {"debounce": False}
     if reply_markup is not None:
         extra["reply_markup"] = reply_markup
+    if thread_id is not None:
+        extra["topic_id"] = thread_id
     try:
         _channels.get_channel(cfg, project=_slug_for_chat(cfg, chat_id)).send(
             message, chat_id=chat_id, sid="", urgent=True, **extra

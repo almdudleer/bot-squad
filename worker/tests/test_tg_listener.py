@@ -268,7 +268,7 @@ def test_handle_update_dispatches_sessions_slash(tmp_path, monkeypatch):
     ])
 
     # Mock _notify to avoid real HTTP
-    monkeypatch.setattr(TL, "_notify", lambda cfg, chat_id, text: None)
+    monkeypatch.setattr(TL, "_notify", lambda cfg, chat_id, text, **k: None)
 
     result = TL.handle_update(cfg, update)
     assert result["ok"] is True
@@ -300,7 +300,7 @@ def test_handle_update_inject_failed_notifies(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "dispatch", MagicMock(side_effect=A.ActionError("no pane")))
 
     notify_calls = []
-    monkeypatch.setattr(TL, "_notify", lambda cfg, chat_id, text: notify_calls.append(text))
+    monkeypatch.setattr(TL, "_notify", lambda cfg, chat_id, text, **k: notify_calls.append(text))
 
     result = TL.handle_update(cfg, update)
     assert result["ok"] is False
@@ -338,7 +338,7 @@ def test_handle_update_project_slash_not_appended_to_store(tmp_path, monkeypatch
                         lambda cfg, slug, gid, m: append_calls.append((slug, gid)))
     # _handle_project reads/sets the pin over HTTP — stub it out.
     monkeypatch.setattr(TL, "_handle_project",
-                        lambda cfg, chat_id, gid, args: {"ok": True, "action": "project", "slug": args})
+                        lambda cfg, chat_id, gid, args, **k: {"ok": True, "action": "project", "slug": args})
 
     result = TL.handle_update(cfg, update)
     assert result["action"] == "project"
@@ -515,7 +515,7 @@ def test_handle_update_links_sender_and_records_identity(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: None)
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
     result = TL.handle_update(cfg, update)
     assert result["action"] == "ask_project"     # recognized + unpinned -> asks
@@ -533,7 +533,7 @@ def test_handle_update_first_contact_affirms_free_form_steering(tmp_path, monkey
     )
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: None)
     echoes = []
     monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
@@ -551,7 +551,7 @@ def test_handle_update_returning_sender_no_welcome(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: None)
     echoes = []
     monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
     update = {"update_id": 10, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello again"}}
@@ -873,7 +873,7 @@ def test_handle_update_project_command_pins(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "set_current_project",
                         lambda c, gid, slug: set_calls.append((gid, slug)) or True)
     notify = []
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notify.append(text))
+    monkeypatch.setattr(TL, "_notify", lambda c, chat, text, **k: notify.append(text))
 
     update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project beta"}}
     result = TL.handle_update(cfg, update)
@@ -881,6 +881,28 @@ def test_handle_update_project_command_pins(tmp_path, monkeypatch):
     assert result["slug"] == "beta"
     assert set_calls == [("gu_1", "beta")]
     assert any("beta" in t for t in notify)  # "you're on project beta"
+
+
+def test_handle_update_project_command_in_topic_replies_into_same_topic(tmp_path, monkeypatch):
+    """T-0676 item 3 (misrouted reply): a /project command typed inside a
+    forum topic must get its confirmation delivered back into THAT topic —
+    before this fix, _notify/_channel_notify dropped message_thread_id
+    entirely, so every command reply landed in the chat's general feed no
+    matter which topic triggered it."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "set_current_project", lambda c, gid, slug: True)
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **k: notices.append((chat, text, k)))
+
+    msg = _topic_msg("/project beta", chat_id=111, thread_id=42)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "project_set"
+    assert notices and notices[-1][2].get("thread_id") == 42
 
 
 def test_handle_update_project_command_unknown_slug(tmp_path, monkeypatch):
@@ -891,8 +913,8 @@ def test_handle_update_project_command_unknown_slug(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "set_current_project",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not set")))
     asks = []
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: asks.append(chat))
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: None)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
+    monkeypatch.setattr(TL, "_notify", lambda c, chat, text, **k: None)
 
     update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project ghost"}}
     result = TL.handle_update(cfg, update)
@@ -906,7 +928,7 @@ def test_handle_update_project_command_no_args_asks(tmp_path, monkeypatch):
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     asks = []
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: asks.append(chat))
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
 
     update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project"}}
     result = TL.handle_update(cfg, update)
@@ -955,7 +977,7 @@ def test_handle_update_unquoted_unset_asks(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
     asks = []
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat: asks.append(chat))
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
 
     update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "hi there"}}
     result = TL.handle_update(cfg, update)
@@ -1279,7 +1301,7 @@ def test_handle_topic_bound_parked_notifies_user(tmp_path, monkeypatch):
                         lambda *a, **k: {"ok": False, "parked": True})
     notices = []
     monkeypatch.setattr(TL, "_channel_notify",
-                        lambda c, chat_id, text, **k: notices.append((chat_id, text)))
+                        lambda c, chat_id, text, **k: notices.append((chat_id, text, k)))
 
     msg = _topic_msg("x", chat_id=111, thread_id=7)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
@@ -1287,6 +1309,9 @@ def test_handle_topic_bound_parked_notifies_user(tmp_path, monkeypatch):
     assert result["action"] == "route_parked" and result["slug"] == "beta"
     assert len(notices) == 1 and notices[0][0] == "111"
     assert "заняты" in notices[0][1]
+    # T-0676 item 3: the parked ack must land back in the SAME forum topic
+    # the message arrived on, not the chat's general feed.
+    assert notices[0][2].get("thread_id") == 7
 
 
 # ---------------------------------------------------------------------------
@@ -1723,6 +1748,30 @@ def test_notify_routes_through_channel(tmp_path, monkeypatch):
     assert calls and calls[-1]["text"] == "hi there"
     assert calls[-1]["urgent"] is True and calls[-1]["sid"] == ""
     assert calls[-1]["debounce"] is False
+
+
+def test_notify_forwards_thread_id_as_topic_id(tmp_path, monkeypatch):
+    """T-0676 item 3: a caller that knows which forum topic the triggering
+    message arrived on can pass ``thread_id`` through _notify/_channel_notify
+    so the ack lands back in THAT topic — before this fix the parameter
+    didn't exist at all and every ack went to the chat's general feed."""
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    calls: list[dict] = []
+
+    class _FakeTg:
+        def send(self, **kw):
+            calls.append(kw)
+            return True
+
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _FakeTg())
+    TL._notify(cfg, "12345", "hi there", thread_id=7)
+    assert calls and calls[-1]["topic_id"] == 7
+
+    # Omitted thread_id -> topic_id stays None (exact pre-fix call shape).
+    calls.clear()
+    TL._notify(cfg, "12345", "hi there")
+    assert calls and calls[-1]["topic_id"] is None
 
 
 def test_notify_noop_without_token(tmp_path, monkeypatch):

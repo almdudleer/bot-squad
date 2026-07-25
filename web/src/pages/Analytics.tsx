@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, type Analytics as AnalyticsData, type DayCount } from "../api";
-import { PageHelp } from "../components/PageHelp";
 import { RouteSkeleton } from "../components/RouteSkeleton";
 import { LIVE_STATUSES } from "../utils/sessionStatus";
 
@@ -191,16 +190,6 @@ export function Analytics() {
           </span>
         </h2>
       </div>
-
-      <PageHelp>
-        Internal-usage analytics for bot-squad itself — sessions, ticket flow,
-        and deploys computed server-side from this project&apos;s data dir.
-        Each widget states its own time scope: the headline cards + status
-        breakdowns are <strong>all-time</strong>; the day charts cover the last{" "}
-        {data?.window_days ?? 14} days; the deploys chart the last{" "}
-        {data?.deploy_weeks ?? 8} weeks. (T-0360: these used to sit under one
-        misleading &quot;last 14d&quot; label.)
-      </PageHelp>
 
       {error && <div className="alert alert-danger">{error}</div>}
       {/* T-0365: meaningful skeleton while the analytics payload loads. */}

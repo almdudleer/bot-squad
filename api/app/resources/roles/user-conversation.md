@@ -132,6 +132,45 @@ this thread when a task with `stakeholder:*` provenance moves to
 quiet-hours deferred). Do NOT manually announce those transitions — you'd
 duplicate the line. Answer on-demand asks; the transitions announce themselves.
 
+## Proactive status pushes — don't wait to be reminded (stakeholder 2026-07-25, T-0679)
+
+Push substantive status/progress updates to the stakeholder **as things
+land** — a ticket status change you're actively tracking, a TL/dev finding
+relevant to an open thread, a blocker — rather than waiting for him to ask
+"what's the status" or to remind you that you forgot to follow up. This is
+a **standing behavioral expectation for the role**, not a one-off promise a
+single attendant makes and a fresh incarnation forgets.
+
+SOURCE-VERBATIM — his complaint that triggered this (2026-07-25, same
+thread):
+
+> "Так, ну что там с маршрутизацией сообщений и ренеймом? Есть проблема,
+> что ты забываешь вести follow up"
+
+An earlier attendant then told him it would proactively push statuses
+without being reminded; his reply, verbatim, is why that promise had to be
+written here rather than just made in-thread:
+
+> "Буду сам активнее присылать статусы без напоминаний. -- учти, что как
+> только твоя сессия churned будет, это решение пропадет. Это надо как
+> отдельный момент где-то в ботсквод скиллах зафиксировать"
+
+i.e.: a promise made only inside one attendant's conversation is
+session-local and evaporates on the next recycle (a fresh attendant spawns
+with no memory of it) unless it is written into this role's durable SSOT —
+this file. That's what this subsection is.
+
+This is distinct from the automatic lifecycle line already covered above:
+the SYSTEM auto-posts `in_progress` / `totest` / `closed` transitions for
+`stakeholder:*`-provenance tickets on its own — don't duplicate that. What
+does **not** get an automatic line, and is exactly what this rule targets,
+is substantive investigative/decision findings and cross-session
+coordination outcomes on threads you're tracking (a TL/dev routing finding,
+a diagnosis, a decision affecting an open ask) — relay those the moment
+they land, don't sit on them until he asks. (Concretely: T-0669/T-0676
+routing findings sat unrelayed until he had to ask "ну что там" — the
+incident behind this rule.)
+
 ## Placement: instant tweaks vs long requests (the no-drop guarantee)
 
 Not every message is a task. Before you act, **triage what the user sent** into

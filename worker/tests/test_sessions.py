@@ -112,6 +112,76 @@ def test_sid_display_label_falls_back_to_sid_when_slug_empty():
     assert sid_display_label("S-alice-mywin-p2", None) == "S-alice-mywin-p2"
 
 
+# ---------------------------------------------------------------------------
+# T-0676 item 5: compact '<slug> <role>' style (stakeholder found '[watchrobot]
+# S-almdudleer-operator-p160' noisy). Opt-in via compact=True — the default
+# (bracket) form above is UNCHANGED.
+# ---------------------------------------------------------------------------
+
+
+def test_sid_display_label_compact_renders_slug_and_role():
+    sid = compute_sid("almdudleer", "operator", "%160")
+    assert sid_display_label(sid, "watchrobot", compact=True) == "watchrobot operator"
+
+
+def test_sid_display_label_compact_derives_dev_role_by_default():
+    """No recognized role marker in the window -> falls to 'dev', matching
+    _derive_role's own default."""
+    assert sid_display_label("S-alice-mywin-p2", "bot-squad", compact=True) == "bot-squad dev"
+
+
+def test_sid_display_label_compact_derives_teamlead_role():
+    sid = compute_sid("almdudleer", "gateway-routing-tl", "%23")
+    assert sid_display_label(sid, "bot-squad", compact=True) == "bot-squad teamlead"
+
+
+def test_sid_display_label_compact_derives_user_conversation_role():
+    sid = compute_sid("almdudleer", "gu_dc8262b6cea9098d98e04d7e-user-conversation", "%5")
+    assert sid_display_label(sid, "watchrobot", compact=True) == "watchrobot user-conversation"
+
+
+def test_sid_display_label_compact_falls_back_to_bracket_for_non_sid_shaped_id():
+    """A synthetic sender like 'deploy_monitor' has no role segment to derive
+    — compact degrades to the old bracket form rather than fabricating one."""
+    assert sid_display_label("deploy_monitor", "watchrobot", compact=True) == "[watchrobot] deploy_monitor"
+
+
+def test_sid_display_label_compact_falls_back_to_sid_when_slug_empty():
+    sid = compute_sid("almdudleer", "operator", "%2")
+    assert sid_display_label(sid, "", compact=True) == sid
+
+
+def test_sid_display_label_compact_prefers_alias_when_set(tmp_path):
+    from bot_squad_worker import session_aliases
+
+    sid = compute_sid("almdudleer", "operator", "%160")
+    session_aliases.set_alias(tmp_path, "watchrobot-operator", sid)
+    assert (
+        sid_display_label(sid, "watchrobot", compact=True, data_dir=tmp_path)
+        == "watchrobot watchrobot-operator"
+    )
+
+
+def test_sid_display_label_compact_ignores_alias_without_data_dir():
+    """No data_dir passed -> alias lookup is skipped entirely (not an error),
+    falling through to the derived role — an opt-in, not a silent default."""
+    sid = compute_sid("almdudleer", "operator", "%160")
+    assert sid_display_label(sid, "watchrobot", compact=True) == "watchrobot operator"
+
+
+def test_sid_display_label_non_compact_never_substitutes_alias(tmp_path):
+    """The bracket (default) form is unaffected by aliases even when
+    data_dir is passed — alias preference is scoped to compact=True."""
+    from bot_squad_worker import session_aliases
+
+    sid = compute_sid("almdudleer", "operator", "%160")
+    session_aliases.set_alias(tmp_path, "watchrobot-operator", sid)
+    assert (
+        sid_display_label(sid, "watchrobot", data_dir=tmp_path)
+        == f"[watchrobot] {sid}"
+    )
+
+
 def test_discover_claude_uuid_returns_stem(tmp_path):
     proj_dir = tmp_path / ".claude" / "projects" / "-home-alice-myrepo"
     proj_dir.mkdir(parents=True)

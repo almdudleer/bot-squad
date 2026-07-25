@@ -432,6 +432,35 @@ def test_rename_general_forum_topic_raises_without_token(tmp_path: Path) -> None
         client.rename_general_forum_topic(chat_id="-100999", name="x")
 
 
+def test_edit_forum_topic_posts_payload(tmp_path: Path) -> None:
+    """T-0669/T-0676 item 1: editForumTopic — the regular-topic counterpart
+    to rename_general_forum_topic, for a topic with its own thread_id."""
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["url"] = url
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True, "result": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client.edit_forum_topic(chat_id="-100999", thread_id=45, name="[watchrobot] T-0270 title")
+    assert captured["url"].endswith("/editForumTopic")
+    assert captured["json"] == {
+        "chat_id": "-100999", "message_thread_id": 45, "name": "[watchrobot] T-0270 title",
+    }
+
+
+def test_edit_forum_topic_raises_without_token(tmp_path: Path) -> None:
+    cfg = _FakeCfg(token="", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with pytest.raises(RuntimeError, match="no bot token"):
+        client.edit_forum_topic(chat_id="-100999", thread_id=45, name="x")
+
+
 # ---------------------------------------------------------------------------
 # T-0660 field note (TL p23): a documented Bot API failure (bad chat_id,
 # missing can_manage_topics admin right, …) must surface the API's own

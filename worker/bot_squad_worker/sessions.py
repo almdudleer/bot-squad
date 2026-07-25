@@ -225,7 +225,43 @@ def compute_sid(user: str, window: str, pane_id: str) -> str:
     return f"S-{user}-{window}-p{pane_no_pct}"
 
 
-def sid_display_label(sid: str, slug: str | None) -> str:
+_SID_SHAPE_RE = re.compile(r"^S-(.+)-p\d+$")
+
+
+def _role_segment_of_sid(sid: str) -> str | None:
+    """T-0676 item 5: recover the ROLE from a routing SID's own shape
+    (``S-<user>-<window>-p<pane>``) without a metadata load — reuses
+    :func:`_derive_role`'s window-marker regexes against the user+window
+    middle segment. Exact, not an approximation: ``_derive_role`` only
+    matches markers against its ``window`` arg (task_id/initiative no longer
+    influence the role per T-0175), and a role marker is always a SUFFIX of
+    that window, which is in turn a suffix of the sid's middle segment — so
+    matching the whole segment finds the same marker regardless of where the
+    user/window boundary actually falls. Returns ``None`` for a
+    non-SID-shaped id (e.g. the synthetic ``"deploy_monitor"`` sender) so the
+    caller can fall back to the old bracket form.
+    """
+    m = _SID_SHAPE_RE.match(sid or "")
+    if not m:
+        return None
+    return _derive_role(m.group(1), None, None)
+
+
+def _alias_for_sid(data_dir: Any, sid: str) -> str | None:
+    """T-0662 alias lookup for :func:`sid_display_label`'s ``compact`` form —
+    a stakeholder-assigned nickname beats an auto-derived role label. Several
+    labels may point at one sid; picks the alphabetically-first for a stable
+    result. ``None`` when no alias is set (or the store is missing/corrupt —
+    ``load_aliases`` already degrades to ``{}`` rather than raising)."""
+    from bot_squad_worker import session_aliases as _session_aliases
+    matches = sorted(
+        label for label, aliased_sid in _session_aliases.load_aliases(data_dir).items()
+        if aliased_sid == sid
+    )
+    return matches[0] if matches else None
+
+
+def sid_display_label(sid: str, slug: str | None, *, compact: bool = False, data_dir: Any = None) -> str:
     """T-0636: human-facing label for ``sid`` that also names its project.
 
     ``compute_sid``'s ``S-<user>-<window>-p<pane>`` shape carries no project
@@ -236,10 +272,30 @@ def sid_display_label(sid: str, slug: str | None) -> str:
     the underlying routing key ever changing shape (see ``compute_sid``).
     Falls back to ``sid`` unchanged when ``slug`` is empty/None so callers
     without a slug handy degrade gracefully instead of erroring.
+
+    ``compact=True`` (T-0676 item 5 — stakeholder found ``[watchrobot]
+    S-almdudleer-operator-p160`` noisy): renders ``"<slug> <role>"`` instead,
+    e.g. ``"watchrobot operator"`` — the TG-facing paths (pager/notify/
+    topic-say/relay/peer-send-mirror) opt into this explicitly; the web
+    sessions list default is UNCHANGED (still the bracket form; out of this
+    batch's scope). Falls back to the bracket form when ``sid`` doesn't parse
+    as a real routing SID (e.g. the synthetic ``"deploy_monitor"`` sender —
+    no role segment to derive). Pass ``data_dir`` to let a T-0662
+    stakeholder-assigned alias win over the derived role (``compact`` only —
+    the bracket form never substitutes an alias, unaffected either way).
     """
     if not slug:
         return sid
-    return f"[{slug}] {sid}"
+    if not compact:
+        return f"[{slug}] {sid}"
+    if data_dir is not None:
+        alias = _alias_for_sid(data_dir, sid)
+        if alias:
+            return f"{slug} {alias}"
+    role = _role_segment_of_sid(sid)
+    if role is None:
+        return f"[{slug}] {sid}"
+    return f"{slug} {role}"
 
 
 def live_pane_map(user: str | None = None) -> dict[str, str]:

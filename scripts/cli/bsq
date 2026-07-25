@@ -537,8 +537,17 @@ def cmd_topic_create(args) -> None:
     inbound topic message straight to that ORIGINATING session instead of
     the project's user-conversation attendant) — never leaves a TG topic
     that exists but isn't routed anywhere.
+
+    T-0669: with --ticket, `name` is DERIVED server-side from the ticket's
+    own title ('[<slug>] <title>') and any --name given here is ignored — so
+    it's optional in that case. Without --ticket, --name is required (a
+    project-level topic has no ticket to derive a title from).
     """
-    params = {"chat_id": args.chat_id, "name": args.name, "slug": args.slug}
+    if not args.ticket and not args.name:
+        die("topic create: --name is required unless --ticket is given (T-0669)")
+    params = {"chat_id": args.chat_id, "slug": args.slug}
+    if args.name:
+        params["name"] = args.name
     if args.ticket:
         params["ticket_id"] = args.ticket
     if args.session:
@@ -561,6 +570,18 @@ def cmd_topic_rename_general(args) -> None:
     """
     res = post("tg_topic_rename_general", {"chat_id": args.chat_id, "name": args.name})
     print(f"renamed General (chat_id={res.get('chat_id')}) -> '{res.get('name')}'")
+
+
+def cmd_topic_rename(args) -> None:
+    """Rename a REGULAR (non-General) forum topic (T-0669/T-0676 item 1,
+    editForumTopic). Doesn't touch the (chat_id, thread_id) -> slug/ticket
+    binding — only the TG-visible title changes.
+    """
+    res = post("tg_topic_rename", {
+        "chat_id": args.chat_id, "thread_id": args.thread_id, "name": args.name,
+    })
+    print(f"renamed thread_id={res.get('thread_id')} (chat_id={res.get('chat_id')}) "
+          f"-> '{res.get('name')}'")
 
 
 def cmd_topic_say(args) -> None:
@@ -4196,8 +4217,10 @@ def build_parser() -> argparse.ArgumentParser:
     tpc = tp_sub.add_parser(
         "create", help="create a forum topic + bind it to a project (T-0660)")
     tpc.add_argument("chat_id", help="Telegram chat_id (the forum supergroup)")
-    tpc.add_argument("name", help="topic title, e.g. '[watchrobot] General'")
     tpc.add_argument("slug", help="project slug to bind the new topic to")
+    tpc.add_argument("--name", help="topic title, e.g. '[watchrobot] General' — required unless "
+                                     "--ticket is given (T-0669: with --ticket, the name is "
+                                     "derived from the ticket's own title and this is ignored)")
     tpc.add_argument("--ticket", help="ticket id (T-0660 per-task topic: binds {slug, ticket_id})")
     tpc.add_argument("--session", help="originating session id — an inbound topic message "
                                         "routes straight to it instead of the project's attendant")
@@ -4207,6 +4230,12 @@ def build_parser() -> argparse.ArgumentParser:
     tpr.add_argument("chat_id", help="Telegram chat_id (the forum supergroup)")
     tpr.add_argument("name", help="new title for General, e.g. '[bot-squad] General'")
     tpr.set_defaults(func=cmd_topic_rename_general)
+    tprn = tp_sub.add_parser(
+        "rename", help="rename a REGULAR forum topic (T-0669/T-0676, editForumTopic)")
+    tprn.add_argument("chat_id", help="Telegram chat_id (the forum supergroup)")
+    tprn.add_argument("thread_id", help="Telegram message_thread_id (the topic to rename)")
+    tprn.add_argument("name", help="new title, e.g. '[watchrobot] Add user panel'")
+    tprn.set_defaults(func=cmd_topic_rename)
     tps = tp_sub.add_parser(
         "say", help="post directly into a task's forum topic (T-0660, direct-write)")
     tps.add_argument("ticket", help="ticket id whose bound topic to post into")

@@ -248,6 +248,14 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         if topic_id is None:
             topic_id = binding["thread_id"]
         task_topic_binding = binding
+        # T-0676 item 4: a ticket-topic direct-write (`bsq topic say`) rarely
+        # passes `slug` explicitly — without it, the sender label built below
+        # (see `_send_stakeholder_dm`'s sid_label) loses project context, one
+        # of the "messages arrive unattributed" complaints. The binding
+        # itself names the project, so default from it rather than requiring
+        # every caller to pass a slug it may not have on hand.
+        if not slug:
+            slug = binding.get("slug") or slug
     if not chat_id:
         if slug:
             project = cfg.projects.get(slug)
@@ -561,9 +569,15 @@ def _send_stakeholder_dm(
         message = _slim_page(message, link)
 
     # T-0644: slug-qualified label for the [<sid>] prefix — falls back to the
-    # bare sid when no slug is on hand (see sid_display_label).
+    # bare sid when no slug is on hand (see sid_display_label). T-0676 item 5:
+    # compact '<slug> <role>' style for this TG-facing SSOT (every tg_notify/
+    # tg_ping/topic-say/relay/needs-input page funnels through here), with a
+    # T-0662 alias preferred when one is set.
     from bot_squad_worker import sessions as _sessions
-    sid_label = _sessions.sid_display_label(sid, slug) if slug else sid
+    sid_label = (
+        _sessions.sid_display_label(sid, slug, compact=True, data_dir=cfg.data_dir)
+        if slug else sid
+    )
 
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:
@@ -994,8 +1008,54 @@ def _tg_call(fn, *, action: str):
         raise ActionError(f"{action}: {e}") from e
 
 
-_TG_TOPIC_CREATE_REQUIRED = {"chat_id", "name", "slug"}
-_TG_TOPIC_CREATE_ALLOWED = _TG_TOPIC_CREATE_REQUIRED | {"ticket_id", "session_id"}
+_TG_TOPIC_CREATE_REQUIRED = {"chat_id", "slug"}
+_TG_TOPIC_CREATE_ALLOWED = _TG_TOPIC_CREATE_REQUIRED | {"name", "ticket_id", "session_id"}
+
+# T-0669: a topic name that IS a raw routing SID (optionally wrapped in the
+# '[<slug>] ' bracket sid_display_label itself produces) — the exact shape of
+# the bug: a creating session named a topic with its own sid_display_label
+# instead of a real title. Mirrors session_aliases._validate_label's
+# SID-shape guard (that one just checks a `s-` prefix on a short label; a
+# topic name is a longer free-text string so this anchors on the full
+# `S-<user>-<window>-p<pane>` shape to avoid false positives on a title that
+# merely starts with those letters).
+_SID_NAME_RE = re.compile(r"^s-[a-z0-9_-]+-p\d+$", re.IGNORECASE)
+
+
+def _looks_like_sid_name(name: str) -> bool:
+    candidate = name.strip()
+    if candidate.startswith("["):
+        _, _, rest = candidate.partition("]")
+        if rest.strip():
+            candidate = rest.strip()
+    return bool(_SID_NAME_RE.match(candidate))
+
+
+def _derive_task_topic_name(cfg: Any, slug: str, ticket_id: str) -> str:
+    """T-0669 root-cause fix: derive a task-topic's name from the TICKET,
+    never the caller — ``[<slug>] <ticket title>``, matching D-0055's
+    documented task-topic naming convention. Raises ActionError if the
+    ticket can't be resolved so a topic is never created under a name nobody
+    asked for.
+    """
+    from bot_squad_worker import frontmatter as fm
+    backlog_dir = Path(cfg.data_dir) / slug / "backlog"
+    path = fm.resolve_id_file(backlog_dir, ticket_id)
+    if path is None:
+        raise ActionError(
+            f"tg_topic_create: ticket {ticket_id!r} not found under {slug!r} backlog"
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ActionError(f"tg_topic_create: could not read ticket {ticket_id!r}: {e}") from e
+    parsed = fm.parse_or_none(text)
+    if parsed is None:
+        raise ActionError(f"tg_topic_create: ticket {ticket_id!r} md has no valid frontmatter")
+    title = str(parsed[0].get("title") or "").strip()
+    if not title:
+        raise ActionError(f"tg_topic_create: ticket {ticket_id!r} has no title in frontmatter")
+    return f"[{slug}] {title}"
 
 
 def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
@@ -1003,12 +1063,21 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
     ``createForumTopic`` then ``tg_bindings.set_binding`` — so a caller never
     ends up with a TG topic that exists but isn't routed anywhere.
 
-    Required: chat_id, name, slug. Optional: ticket_id (T-0660 per-task
-    topics — binds ``{slug, ticket_id}`` instead of just ``{slug}``);
-    session_id (Phase 2 — the ORIGINATING session working the task, so an
-    inbound message in the new topic routes straight to it instead of the
-    project's user-conversation attendant, see ``tg_listener._handle_topic_
-    bound``). Returns ``{ok, chat_id, thread_id, slug, name}``.
+    Required: chat_id, slug. Optional: ticket_id (T-0660 per-task topics —
+    binds ``{slug, ticket_id}`` instead of just ``{slug}``); session_id
+    (Phase 2 — the ORIGINATING session working the task, so an inbound
+    message in the new topic routes straight to it instead of the project's
+    user-conversation attendant, see ``tg_listener._handle_topic_bound``).
+
+    ``name``: for a per-task topic (``ticket_id`` given), the name is ALWAYS
+    DERIVED from the ticket's own title (T-0669 — a caller-supplied ``name``
+    is accepted but ignored, so an old caller isn't broken by the param
+    becoming non-required). For a project-level topic (no ``ticket_id``),
+    ``name`` is required and a SID-shaped name is rejected (T-0669: the exact
+    phantom-topic bug — a session named a topic with its own
+    sid_display_label instead of a real title).
+
+    Returns ``{ok, chat_id, thread_id, slug, name}``.
     """
     extra = set(params) - _TG_TOPIC_CREATE_ALLOWED
     if extra:
@@ -1022,9 +1091,26 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
     if cfg.projects.get(slug) is None:
         raise ActionError(f"tg_topic_create: unknown project slug {slug!r}")
 
+    ticket_id = params.get("ticket_id") or ""
+    if ticket_id:
+        name = _derive_task_topic_name(cfg, slug, ticket_id)
+    else:
+        caller_name = str(params.get("name") or "").strip()
+        if not caller_name:
+            raise ActionError(
+                "tg_topic_create missing required params: ['name'] "
+                "(required unless ticket_id is given)"
+            )
+        if _looks_like_sid_name(caller_name):
+            raise ActionError(
+                f"tg_topic_create: name {caller_name!r} looks like a raw session "
+                "SID, not a topic title (T-0669) — pass a real name"
+            )
+        name = caller_name
+
     tg = _get_tg_client(cfg)
     thread_id = _tg_call(
-        lambda: tg.create_forum_topic(chat_id=params["chat_id"], name=params["name"]),
+        lambda: tg.create_forum_topic(chat_id=params["chat_id"], name=name),
         action="tg_topic_create",
     )
 
@@ -1035,7 +1121,7 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
     )
     return {
         "ok": True, "chat_id": params["chat_id"], "thread_id": thread_id,
-        "slug": slug, "name": params["name"],
+        "slug": slug, "name": name,
     }
 
 
@@ -1067,6 +1153,42 @@ def _action_tg_topic_rename_general(params: dict[str, Any]) -> dict[str, Any]:
         action="tg_topic_rename_general",
     )
     return {"ok": True, "chat_id": params["chat_id"], "name": params["name"]}
+
+
+_TG_TOPIC_RENAME_REQUIRED = {"chat_id", "thread_id", "name"}
+_TG_TOPIC_RENAME_ALLOWED = _TG_TOPIC_RENAME_REQUIRED
+
+
+def _action_tg_topic_rename(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0669/T-0676 item 1: rename a REGULAR (non-General) forum topic
+    (``editForumTopic``) — the ``tg_topic_rename_general`` counterpart for a
+    topic that has its own ``message_thread_id``. Lets a bad/SID-named topic
+    (the T-0669 phantom-SID bug) be relabeled without recreating it; doesn't
+    touch the binding store — the (chat_id, thread_id) -> slug/ticket routing
+    is unaffected by a display-name change.
+
+    Required: chat_id, thread_id, name. Returns ``{ok, chat_id, thread_id, name}``.
+    """
+    extra = set(params) - _TG_TOPIC_RENAME_ALLOWED
+    if extra:
+        raise ActionError(f"tg_topic_rename got unexpected params: {sorted(extra)}")
+    missing = _TG_TOPIC_RENAME_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"tg_topic_rename missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    tg = _get_tg_client(cfg)
+    try:
+        thread_id = int(params["thread_id"])
+    except (TypeError, ValueError):
+        raise ActionError(f"tg_topic_rename: thread_id must be an integer, got {params['thread_id']!r}")
+    _tg_call(
+        lambda: tg.edit_forum_topic(
+            chat_id=params["chat_id"], thread_id=thread_id, name=params["name"],
+        ),
+        action="tg_topic_rename",
+    )
+    return {"ok": True, "chat_id": params["chat_id"], "thread_id": thread_id, "name": params["name"]}
 
 
 _TG_TOPIC_CLOSE_FOR_TICKET_REQUIRED = {"ticket_id"}
@@ -2135,7 +2257,10 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
             _channels.get_channel(cfg, name="tg").send(
                 params["text"],
                 chat_id=chat_id,
-                sid=_sessions.sid_display_label(params["from_sid"], delivery_slug),
+                # T-0676 item 5: compact '<slug> <role>' style, alias-preferred.
+                sid=_sessions.sid_display_label(
+                    params["from_sid"], delivery_slug, compact=True, data_dir=cfg.data_dir,
+                ),
                 user=username,
             )
         except Exception:  # noqa: BLE001 — never let TG hiccups corrupt the bus reply
@@ -4170,6 +4295,7 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0660: create-and-bind a forum topic in one step + rename General.
     "tg_topic_create": _action_tg_topic_create,
     "tg_topic_rename_general": _action_tg_topic_rename_general,
+    "tg_topic_rename": _action_tg_topic_rename,
     "tg_topic_close_for_ticket": _action_tg_topic_close_for_ticket,
     # T-0386: per-project forum-topic lifecycle (create-on-project / GC-on-archive).
     "provision_project_topics": _action_provision_project_topics,
@@ -4308,6 +4434,8 @@ ACTION_MODES: dict[str, str] = {
     # editGeneralForumTopic) — coordinator-only like the rest of the TG ops.
     "tg_topic_create": "coordinator_only",
     "tg_topic_rename_general": "coordinator_only",
+    # T-0669/T-0676 item 1: editForumTopic, same coordinator TG client.
+    "tg_topic_rename": "coordinator_only",
     "tg_topic_close_for_ticket": "coordinator_only",
     # T-0386: use the coordinator TG client + project config (single writer of
     # the per-project topic map) — coordinator-only like the rest of the TG ops.

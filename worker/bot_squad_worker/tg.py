@@ -139,6 +139,20 @@ class TgClient:
             raise RuntimeError("tg.rename_general_forum_topic: no bot token configured")
         self._call("editGeneralForumTopic", {"chat_id": chat_id, "name": name})
 
+    def edit_forum_topic(self, *, chat_id: str, thread_id: int, name: str) -> None:
+        """Rename a REGULAR (non-General) forum topic (T-0669/T-0676 item 1:
+        ``editForumTopic``) — the counterpart to
+        :meth:`rename_general_forum_topic` for a topic that has its own
+        ``message_thread_id``. Lets a bad/SID-named topic (e.g. the T-0669
+        phantom-SID topic name bug) be relabeled without recreating it.
+        """
+        if not self._token:
+            raise RuntimeError("tg.edit_forum_topic: no bot token configured")
+        self._call(
+            "editForumTopic",
+            {"chat_id": chat_id, "message_thread_id": int(thread_id), "name": name},
+        )
+
     def _call(self, method: str, payload: dict) -> dict:
         """POST to an arbitrary Bot API method, honoring the egress proxy.
 

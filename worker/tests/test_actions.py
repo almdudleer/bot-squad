@@ -56,7 +56,8 @@ def test_registry_lists_only_allowed_actions():
         "tg_topic_bind", "tg_topic_unbind", "tg_topic_list",
         # T-0660: create-and-bind a forum topic in one step + rename General
         # + close-on-done.
-        "tg_topic_create", "tg_topic_rename_general", "tg_topic_close_for_ticket",
+        "tg_topic_create", "tg_topic_rename_general", "tg_topic_rename",
+        "tg_topic_close_for_ticket",
         "pause_deploys", "resume_deploys",
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",
@@ -542,7 +543,10 @@ def test_tg_notify_ticket_id_resolves_task_topic(tmp_path, monkeypatch):
     A.dispatch("tg_notify", {"ticket_id": "T-0700", "message": "on it", "sid": "S-dev-p9"})
     assert fake.calls[0]["chat_id"] == "-1003761939853"
     assert fake.calls[0]["topic_id"] == 42
-    assert fake.calls[0]["sid"] == "S-dev-p9"
+    # T-0676 item 4: no `slug` param was given, but the ticket's bound topic
+    # names one — the sender label now carries it (compact '<slug> <role>'
+    # style, item 5), instead of degrading to the bare unattributed sid.
+    assert fake.calls[0]["sid"] == "group-project dev"
 
 
 def test_tg_notify_ticket_id_unbound_raises(tmp_config_dir, monkeypatch):
@@ -858,8 +862,9 @@ def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monk
     call = fake.calls[0]
     assert call["chat_id"] == "404580642"
     assert call["text"] == "ack — got your ping"
-    # T-0644: the TG mirror carries the slug-qualified label, not the bare sid.
-    assert call["sid"] == "[test-project] S-almdudleer-operator-p23"
+    # T-0644: the TG mirror carries the slug-qualified label, not the bare
+    # sid. T-0676 item 5: compact '<slug> <role>' style.
+    assert call["sid"] == "test-project operator"
     assert call["user"] == "alexey"
 
 
@@ -2864,6 +2869,7 @@ class _FakeForumTg(_FakeTgClient):
         self.created: list[dict] = []
         self.closed: list[dict] = []
         self.renamed_general: list[dict] = []
+        self.renamed: list[dict] = []
         self._next_tid = 100
 
     def create_forum_topic(self, *, chat_id, name) -> int:
@@ -2876,6 +2882,9 @@ class _FakeForumTg(_FakeTgClient):
 
     def rename_general_forum_topic(self, *, chat_id, name) -> None:
         self.renamed_general.append({"chat_id": chat_id, "name": name})
+
+    def edit_forum_topic(self, *, chat_id, thread_id, name) -> None:
+        self.renamed.append({"chat_id": chat_id, "thread_id": thread_id, "name": name})
 
 
 def test_tg_notify_topic_class_resolves_to_thread_id(tmp_config_dir, monkeypatch):
@@ -3027,6 +3036,14 @@ def test_tg_topic_create_creates_and_binds(tmp_config_dir, monkeypatch):
     assert rec == {"slug": "test-project", "ticket_id": None, "session_id": None}
 
 
+def _write_ticket(cfg, slug: str, ticket_id: str, title: str) -> None:
+    backlog = cfg.data_dir / slug / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / f"{ticket_id}-{title.lower().replace(' ', '-')}.md").write_text(
+        f"---\nid: {ticket_id}\ntitle: {title}\nstatus: open\n---\n"
+    )
+
+
 def test_tg_topic_create_with_ticket_id_binds_task_topic(tmp_config_dir, monkeypatch):
     """T-0660 per-task topic: an optional ticket_id binds {slug, ticket_id}
     instead of just {slug}."""
@@ -3035,10 +3052,10 @@ def test_tg_topic_create_with_ticket_id_binds_task_topic(tmp_config_dir, monkeyp
 
     fake = _FakeForumTg()
     cfg = Config.load(tmp_config_dir)
+    _write_ticket(cfg, "test-project", "T-0700", "Add user panel")
     _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
     out = A.dispatch("tg_topic_create", {
-        "chat_id": "111", "name": "[test-project] Add user panel",
-        "slug": "test-project", "ticket_id": "T-0700",
+        "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700",
     })
     rec = tg_bindings.resolve(cfg, "111", out["thread_id"])
     assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None}
@@ -3053,10 +3070,10 @@ def test_tg_topic_create_with_session_id_binds_originating_session(tmp_config_di
 
     fake = _FakeForumTg()
     cfg = Config.load(tmp_config_dir)
+    _write_ticket(cfg, "test-project", "T-0700", "Add user panel")
     _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
     out = A.dispatch("tg_topic_create", {
-        "chat_id": "111", "name": "[test-project] Add user panel",
-        "slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9",
+        "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9",
     })
     rec = tg_bindings.resolve(cfg, "111", out["thread_id"])
     assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9"}
@@ -3175,6 +3192,166 @@ def test_tg_topic_rename_general_rejects_unexpected_param(tmp_config_dir, monkey
     _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
     with pytest.raises(ActionError, match="unexpected params"):
         A.dispatch("tg_topic_rename_general", {"chat_id": "111", "name": "X", "bogus": "y"})
+
+
+# ---------------------------------------------------------------------------
+# T-0669: harden tg_topic_create — a per-task topic's name is DERIVED from
+# the ticket's own title (never the caller), and a project-level topic name
+# that IS a raw session SID is rejected. Root cause of the T-0270 phantom-SID
+# topic name bug.
+# ---------------------------------------------------------------------------
+
+
+def test_tg_topic_create_with_ticket_id_derives_name_from_ticket_title(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    backlog.mkdir(parents=True)
+    (backlog / "T-0700-add-user-panel.md").write_text(
+        "---\nid: T-0700\ntitle: Add user panel\nstatus: open\n---\n"
+    )
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700",
+    })
+    assert out["name"] == "[test-project] Add user panel"
+    assert fake.created == [{"chat_id": "111", "name": "[test-project] Add user panel", "id": out["thread_id"]}]
+
+
+def test_tg_topic_create_with_ticket_id_ignores_caller_name(tmp_config_dir, monkeypatch):
+    """T-0669: a caller-supplied `name` is accepted (so an old caller isn't
+    broken by the param becoming non-required) but IGNORED for a per-task
+    topic — the ticket's own title always wins, even a SID-shaped one."""
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    backlog = cfg.data_dir / "test-project" / "backlog"
+    backlog.mkdir(parents=True)
+    (backlog / "T-0700-add-user-panel.md").write_text(
+        "---\nid: T-0700\ntitle: Add user panel\nstatus: open\n---\n"
+    )
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700",
+        "name": "S-almdudleer-watchrobot-user-conversation-p70",
+    })
+    assert out["name"] == "[test-project] Add user panel"
+
+
+def test_tg_topic_create_with_ticket_id_missing_ticket_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    (cfg.data_dir / "test-project" / "backlog").mkdir(parents=True)
+    with pytest.raises(ActionError, match="not found"):
+        A.dispatch("tg_topic_create", {
+            "chat_id": "111", "slug": "test-project", "ticket_id": "T-9999",
+        })
+    assert fake.created == []
+
+
+def test_tg_topic_create_without_ticket_id_requires_name(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="name.*required"):
+        A.dispatch("tg_topic_create", {"chat_id": "111", "slug": "test-project"})
+
+
+@pytest.mark.parametrize("bad_name", [
+    "S-almdudleer-watchrobot-operator-p160",
+    "[watchrobot] S-almdudleer-watchrobot-operator-p160",
+])
+def test_tg_topic_create_without_ticket_id_rejects_sid_shaped_name(tmp_config_dir, monkeypatch, bad_name):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    with pytest.raises(ActionError, match="looks like a raw session SID"):
+        A.dispatch("tg_topic_create", {"chat_id": "111", "slug": "test-project", "name": bad_name})
+    assert fake.created == []
+
+
+def test_tg_topic_create_without_ticket_id_accepts_real_title(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "slug": "test-project", "name": "[test-project] General",
+    })
+    assert out["name"] == "[test-project] General"
+
+
+# ---------------------------------------------------------------------------
+# T-0669/T-0676 item 1: rename a REGULAR forum topic (editForumTopic) — the
+# capability the TL uses to relabel the live phantom-SID-named T-0270 topic.
+# ---------------------------------------------------------------------------
+
+
+def test_tg_topic_rename_calls_edit_forum_topic(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_rename", {
+        "chat_id": "-1003761939853", "thread_id": 45, "name": "[watchrobot] T-0270 title",
+    })
+    assert out == {
+        "ok": True, "chat_id": "-1003761939853", "thread_id": 45,
+        "name": "[watchrobot] T-0270 title",
+    }
+    assert fake.renamed == [
+        {"chat_id": "-1003761939853", "thread_id": 45, "name": "[watchrobot] T-0270 title"},
+    ]
+
+
+def test_tg_topic_rename_does_not_touch_binding(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    tg_bindings.set_binding(cfg, "111", 45, "test-project", ticket_id="T-0700")
+    A.dispatch("tg_topic_rename", {"chat_id": "111", "thread_id": 45, "name": "new title"})
+    rec = tg_bindings.resolve(cfg, "111", 45)
+    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None}
+
+
+def test_tg_topic_rename_missing_required_param_raises(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="missing required params"):
+        A.dispatch("tg_topic_rename", {"chat_id": "111", "thread_id": 45})  # no name
+
+
+def test_tg_topic_rename_rejects_unexpected_param(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("tg_topic_rename", {
+            "chat_id": "111", "thread_id": 45, "name": "X", "bogus": "y",
+        })
+
+
+def test_tg_topic_rename_rejects_non_integer_thread_id(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FakeForumTg())
+    with pytest.raises(ActionError, match="must be an integer"):
+        A.dispatch("tg_topic_rename", {"chat_id": "111", "thread_id": "not-a-number", "name": "X"})
+
+
+def test_tg_topic_rename_surfaces_tg_api_error_as_action_error(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    class _FailingForumTg(_FakeForumTg):
+        def edit_forum_topic(self, *, chat_id, thread_id, name):
+            raise RuntimeError("Telegram API error (editForumTopic): CHAT_ADMIN_REQUIRED")
+
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=_FailingForumTg())
+    with pytest.raises(ActionError, match="CHAT_ADMIN_REQUIRED"):
+        A.dispatch("tg_topic_rename", {"chat_id": "111", "thread_id": 45, "name": "X"})
 
 
 # ---------------------------------------------------------------------------

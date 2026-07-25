@@ -1,8 +1,4 @@
-import type { FlowGraph } from "./utils/flowGraph";
-
 type Json = Record<string, unknown> | unknown[];
-
-export type { FlowGraph };
 
 // T-0138/T-0139: pages distinguish "the slug/task doesn't exist" (render a
 // not-found panel) from transient network errors (offer a retry). The
@@ -221,11 +217,11 @@ export type VisionFile = {
 };
 
 // T-0283 (Pillar C / D-0029): the unified cross-store artifact kind. Every
-// nestable artifact (doc, use-case, feedback theme) carries a `kind` so the
-// Docs-section tree can pick an icon + route per store, and a `parent_doc_id`
-// edge that may point at ANY artifact id (cross-store nesting).
-export type ArtifactKind = "doc" | "use_case" | "feedback";
-// Shape of a `/children` row across all three stores (per D-0029): a UC mother
+// nestable artifact (doc, feedback theme) carries a `kind` so the Docs-section
+// tree can pick an icon + route per store, and a `parent_doc_id` edge that may
+// point at ANY artifact id (cross-store nesting). T-0671: use_case retired.
+export type ArtifactKind = "doc" | "feedback";
+// Shape of a `/children` row across all three stores (per D-0029): a mother doc
 // may list doc children, a feedback theme may list evidence children, etc.
 export type ArtifactChild = {
   id: string;
@@ -248,37 +244,6 @@ export type FeedbackFile = {
   // (absent → open). Closed items are hidden from GET /feedback unless
   // include_closed=true.
   status?: "open" | "promoted" | "dismissed" | string;
-};
-
-export type UseCaseSummary = {
-  id: string;
-  title: string;
-  status: string;
-  user_persona: string;
-  goal: string;
-  // T-0283: the cross-store nesting edge (optional until the BE adds it to the
-  // list summary; the detail GET already carries it).
-  parent_doc_id?: string | null;
-  kind?: ArtifactKind;
-};
-export type UseCaseDetail = {
-  id: string;
-  title?: string;
-  user_persona?: string;
-  goal?: string;
-  preconditions?: string;
-  success_criteria?: string;
-  related_tickets?: string;
-  status?: string;
-  body: string;
-  raw: string;
-  // T-0283: a use-case is a nestable artifact — it may be parented under any
-  // artifact and may mother child docs/use-cases. `child_artifact_ids` is the
-  // cross-store superset of the legacy doc-only `child_doc_ids`.
-  kind?: ArtifactKind;
-  parent_doc_id?: string | null;
-  child_artifact_ids?: string[];
-  child_doc_ids?: string[];
 };
 
 // T-0172: project docs system. Docs live at
@@ -315,27 +280,6 @@ export type DocDetail = {
   child_artifact_ids?: string[];
   child_doc_ids?: string[];
   kind?: ArtifactKind;
-};
-
-// T-0173: user flows attached to a use case
-// (data/<slug>/use_cases/<uc-id>/flows/UF-NNNN-<slug>.md).
-export type FlowSummary = {
-  id: string;
-  uc_id: string;
-  title: string;
-  status: string;
-};
-export type FlowDetail = {
-  id: string;
-  uc_id?: string;
-  title?: string;
-  status?: string;
-  created?: string;
-  body: string;
-  raw: string;
-  // T-0226: structured node-graph (parsed from the flow md `graph:` frontmatter
-  // key by the backend's `{**meta}` spread). Absent == markdown-only flow.
-  graph?: FlowGraph;
 };
 
 export type SessionRow = {
@@ -990,43 +934,6 @@ export const api = {
     call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
       `/api/projects/${slug}/feedback/${encodeURIComponent(name)}/parent`,
       { method: "PUT", body: JSON.stringify({ parent_doc_id: parentDocId }) }),
-  useCases: (slug: string) =>
-    call<UseCaseSummary[]>(`/api/projects/${slug}/use_cases`),
-  useCase: (slug: string, id: string) =>
-    call<UseCaseDetail>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`),
-  putUseCase: (slug: string, id: string, content: string) =>
-    call(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ content }) }),
-  // T-0283/D-0029: use-cases are nestable cross-store artifacts. List a UC's
-  // children (may include docs/feedback) and adopt/disown the UC itself by
-  // setting (or clearing, with null) its parent_doc_id. Cycle-safe on the BE.
-  useCaseChildren: (slug: string, id: string) =>
-    call<ArtifactChild[]>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/children`),
-  setUseCaseParent: (slug: string, id: string, parentDocId: string | null) =>
-    call<{ ok: boolean; id: string; parent_doc_id: string | null }>(
-      `/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/parent`,
-      { method: "PUT", body: JSON.stringify({ parent_doc_id: parentDocId }) }),
-  // T-0174: allocate a UC-NNNN id atomically (server-side); no hand-typed ids.
-  createUseCase: (slug: string, title: string) =>
-    call<{ ok: boolean; id: string }>(`/api/projects/${slug}/use_cases`, { method: "POST", body: JSON.stringify({ title }) }),
-  runUseCase: (slug: string, id: string) =>
-    call<{ ok: boolean; id: string; window: string; sid?: string }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}/run`, { method: "POST" }),
-  // T-0276: delete a use case (cascades its owned flows subtree on the BE);
-  // UC-NNNN is tombstoned, not reclaimed. 404 if missing.
-  deleteUseCase: (slug: string, id: string) =>
-    call<{ ok: boolean; id: string; deleted: boolean }>(`/api/projects/${slug}/use_cases/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  // T-0173: user flows attached to a use case.
-  flows: (slug: string, ucId: string) =>
-    call<FlowSummary[]>(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows`),
-  flow: (slug: string, ucId: string, flowId: string) =>
-    call<FlowDetail>(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows/${encodeURIComponent(flowId)}`),
-  createFlow: (slug: string, ucId: string, title: string) =>
-    call<{ ok: boolean; id: string; uc_id: string }>(
-      `/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows`,
-      { method: "POST", body: JSON.stringify({ title }) },
-    ),
-  putFlow: (slug: string, ucId: string, flowId: string, content: string) =>
-    call(`/api/projects/${slug}/use_cases/${encodeURIComponent(ucId)}/flows/${encodeURIComponent(flowId)}`,
-      { method: "PUT", body: JSON.stringify({ content }) }),
   // T-0172: project docs.
   docs: (slug: string, category?: string) =>
     call<DocSummary[]>(`/api/projects/${slug}/docs${category ? `?category=${encodeURIComponent(category)}` : ""}`),

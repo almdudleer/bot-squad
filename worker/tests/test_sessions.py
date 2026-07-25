@@ -3202,6 +3202,51 @@ def test_suspend_preserves_owner_field(tmp_path, monkeypatch):
     assert meta["owner"] == "aqice"
 
 
+def test_suspend_preserves_model_field(tmp_path, monkeypatch):
+    """T-0678 reopen: suspend() rewrites the md from a field whitelist that
+    previously omitted `model`, silently dropping a `bsq model set` override
+    on every suspend — resume() then reads meta.get("model") back and finds
+    nothing, reverting to the fleet default instead of staying sticky."""
+    from bot_squad_worker.sessions import suspend
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-u-w-p3.md", {
+        "sid": "S-u-w-p3",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-1",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:00:00Z",
+        "model": "claude-fable-5",
+    })
+
+    pane_calls = [0]
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            pane_calls[0] += 1
+            # First call: pane live. After kill: gone.
+            if pane_calls[0] == 1:
+                return subprocess.CompletedProcess(args, 0, f"%3|w|11|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    suspend(cfg, "test-project", "S-u-w-p3")
+    meta = _read_session_metadata(sessions_dir / "S-u-w-p3.md")
+    assert meta["model"] == "claude-fable-5"
+
+
 # ---------------------------------------------------------------------------
 # T-0105: session_history append on bind / rotate
 # ---------------------------------------------------------------------------

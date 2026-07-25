@@ -1502,6 +1502,14 @@ def suspend(cfg: Any, slug: str, sid: str, *,
         "owner_user": owner_user_val,
         "tmux_session": tmux_sess_val,
     }
+    # T-0678 reopen: preserve a per-session `model` override (bsq model set)
+    # across suspend the same way owner/tmux_session are preserved above —
+    # this whitelist previously dropped it silently, so resume()'s
+    # meta.get("model") read (and last_operator_model()'s md scan) always
+    # came back empty after a suspend, reverting to the fleet default.
+    model_val = existing.get("model")
+    if model_val and model_val != "~":
+        meta["model"] = model_val
     if source:  # T-0444: visible-close stamp on the auto-close path
         meta["suspend_source"] = source
         meta["suspend_reason"] = reason or source

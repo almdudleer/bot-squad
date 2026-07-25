@@ -39,9 +39,10 @@ def cfg_slug(tmp_path: Path, monkeypatch):
 
     spawns: list[dict] = []
 
-    def _fake_spawn(c, s, window, initial_prompt=None, owner=None, **kw):
+    def _fake_spawn(c, s, window, initial_prompt=None, owner=None, model=None, **kw):
         sid = f"S-op-{len(spawns)}"
-        spawns.append({"window": window, "prompt": initial_prompt, "owner": owner, "sid": sid})
+        spawns.append({"window": window, "prompt": initial_prompt, "owner": owner,
+                       "model": model, "sid": sid})
         return {"ok": True, "sid": sid}
 
     monkeypatch.setattr(S, "spawn", _fake_spawn)
@@ -138,6 +139,43 @@ def test_canonical_operator_no_md_continues_no_dup(cfg_slug, monkeypatch):
     assert res["action"] == "continue"
     assert res["operator"] == "S-u-bot-squad-operator-p5"
     assert spawns == []  # NO duplicate operator spawned
+
+
+# --- T-0678: per-session model override carries across a full respawn ------
+
+def test_respawn_carries_forward_last_operator_model(cfg_slug):
+    """A full re-drive respawn mints a BRAND-NEW SID (unlike sessions.resume()'s
+    in-place carry-forward), so without help a sticky per-session `model`
+    override set via `bsq model set` would silently revert to the fleet/role
+    default on every re-drive. _respawn_operator must look up the model the
+    replaced operator incarnation carried and pass it forward explicitly."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    S._write_session_metadata(sessions_dir / "S-old-operator-p1.md", {
+        "sid": "S-old-operator-p1", "status": "suspended", "window": "operator",
+        "cwd": str(cfg.projects[slug].repo_path), "claude_uuid": "u-1",
+        "archived": "true", "model": "claude-fable-5",
+        "started_at": "2026-07-25T10:00:00Z",
+    })
+
+    res = ord_.tick(cfg, slug)
+    assert res["action"] == "respawned"
+    assert len(spawns) == 1
+    assert spawns[0]["model"] == "claude-fable-5"
+
+
+def test_respawn_omits_model_when_no_prior_operator_had_one(cfg_slug):
+    """No prior operator md carries a `model` override -> respawn passes none,
+    so the freshly spawned operator falls through to the role/fleet default
+    exactly as before T-0678."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+
+    res = ord_.tick(cfg, slug)
+    assert res["action"] == "respawned"
+    assert spawns[0]["model"] is None
 
 
 # --- empty backlog is the only idle state -----------------------------------

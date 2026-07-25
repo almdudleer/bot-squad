@@ -26,6 +26,7 @@ Verbs:
   bsq compact-save "<state>"        write your forward-state to your role artifact (compact handoff)
   bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
+  bsq model set/clear/status         durable per-session claude --model override (T-0678)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
 
 Conventions shared with the other ops shims:
@@ -2481,6 +2482,44 @@ def cmd_drive_status(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# T-0678: durable PER-SESSION `claude --model` override (bsq model set/
+# clear/status), distinct from `fleet_model_set` (T-0630, edits the
+# coordinator's ~/.claude/settings.json fleet-wide default). Stamps a `model`
+# field on THIS session's SessionMd — resume() adds `--model` from it,
+# operator_redrive carries the operator's forward across a full re-drive
+# respawn. Mirrors the drift/drive CLI shape/pattern.
+# --------------------------------------------------------------------------
+
+def _set_model(args, model: str) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    res = post("set_model", {"slug": slug, "sid": sid, "model": model})
+    label = res.get("model") or "(none — follows fleet/role default)"
+    print(f"model override for {res.get('sid', sid)}: {label}")
+
+
+def cmd_model_set(args) -> None:
+    _set_model(args, args.model)
+
+
+def cmd_model_clear(args) -> None:
+    _set_model(args, "")
+
+
+def cmd_model_status(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    md = sessions_dir(slug) / f"{sid}.md"
+    model = ""
+    if md.exists():
+        fm = read_frontmatter(md)
+        model = str(fm.get("model", "") or "").strip()
+    else:
+        print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
+    print(f"model override for {sid}: {model or '(none — follows fleet/role default)'}")
+
+
+# --------------------------------------------------------------------------
 # T-0482: user-controlled execution pace (Process Paradigm M3 / F3.4).
 #
 # The user surface for the pace-control config the operator consumes
@@ -4337,6 +4376,21 @@ def build_parser() -> argparse.ArgumentParser:
     dvs = dv_sub.add_parser("status", help="show this session's drive state")
     dvs.add_argument("--sid", help="target SID (default: this session)")
     dvs.set_defaults(func=cmd_drive_status)
+
+    # model (T-0678: durable per-session `claude --model` override, distinct
+    # from the fleet-wide default a coordinator settings.json edit sets)
+    md_p = sub.add_parser("model", help="durable per-session claude --model override (T-0678)")
+    md_sub = md_p.add_subparsers(dest="sub", required=True)
+    mds = md_sub.add_parser("set", help="set this session's sticky model override")
+    mds.add_argument("model", help="model string, e.g. claude-fable-5, claude-opus-4-8")
+    mds.add_argument("--sid", help="target SID (default: this session)")
+    mds.set_defaults(func=cmd_model_set)
+    mdc = md_sub.add_parser("clear", help="clear this session's model override (revert to fleet/role default)")
+    mdc.add_argument("--sid", help="target SID (default: this session)")
+    mdc.set_defaults(func=cmd_model_clear)
+    mdst = md_sub.add_parser("status", help="show this session's model override, if any")
+    mdst.add_argument("--sid", help="target SID (default: this session)")
+    mdst.set_defaults(func=cmd_model_status)
 
     # guidance (T-0151: surface buried stakeholder guidance)
     gd = sub.add_parser("guidance", help="search prior stakeholder guidance (T-0151)")

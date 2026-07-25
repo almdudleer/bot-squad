@@ -17,8 +17,10 @@ from bot_squad_worker.sessions import (
     list_sessions,
     pause,
     resume,
+    last_operator_model,
     set_drift_paused,
     set_drive,
+    set_model,
     sid_display_label,
     spawn,
     _append_task_session_history,
@@ -3343,6 +3345,218 @@ def test_set_drive_refuses_non_operator_role(tmp_path):
 
     with pytest.raises(ActionError, match="not operator"):
         set_drive(cfg, "test-project", "S-alice-demo-p2", False)
+
+
+def test_set_model_round_trip(tmp_path):
+    """T-0678: set_model toggles the sticky per-session `model` field on the
+    SessionMd, distinct from the fleet-wide settings.json default."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    md = sessions_dir / "S-alice-w-p2.md"
+    _write_session_metadata(md, {
+        "sid": "S-alice-w-p2", "status": "active", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
+    })
+
+    res = set_model(cfg, "test-project", "S-alice-w-p2", "claude-fable-5")
+    assert res["ok"] and res["model"] == "claude-fable-5"
+    assert _read_session_metadata(md).get("model") == "claude-fable-5"
+
+    res = set_model(cfg, "test-project", "S-alice-w-p2", "")
+    assert res["model"] == ""
+    assert "model" not in _read_session_metadata(md)
+
+
+def test_set_model_rejects_disallowed_model(tmp_path):
+    """Only the same ALLOWED_MODELS allowlist fleet_model.set_model enforces —
+    one SSOT, not a second copy of the list."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    md = sessions_dir / "S-alice-w-p2.md"
+    _write_session_metadata(md, {
+        "sid": "S-alice-w-p2", "status": "active", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1",
+    })
+
+    from bot_squad_worker.actions import ActionError
+    with pytest.raises(ActionError, match="not allowed"):
+        set_model(cfg, "test-project", "S-alice-w-p2", "gpt-5")
+
+
+def test_last_operator_model_returns_most_recent_stamped_value(tmp_path):
+    """operator_redrive's full respawn mints a new SID, so it must look up the
+    model the PREVIOUS operator incarnation carried via this helper."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+
+    _write_session_metadata(sessions_dir / "S-old-1.md", {
+        "sid": "S-old-1", "status": "suspended", "window": "operator",
+        "cwd": str(repo), "claude_uuid": "u-1", "model": "claude-opus-4-8",
+        "started_at": "2026-07-20T00:00:00Z",
+    })
+    _write_session_metadata(sessions_dir / "S-old-2.md", {
+        "sid": "S-old-2", "status": "suspended", "window": "operator",
+        "cwd": str(repo), "claude_uuid": "u-2", "model": "claude-fable-5",
+        "started_at": "2026-07-25T00:00:00Z",
+    })
+    # A non-operator session's model must never leak in.
+    _write_session_metadata(sessions_dir / "S-dev-1.md", {
+        "sid": "S-dev-1", "status": "active", "window": "T-9999",
+        "cwd": str(repo), "claude_uuid": "u-3", "model": "claude-sonnet-5",
+        "started_at": "2026-07-26T00:00:00Z", "task_id": "T-9999",
+    })
+
+    assert last_operator_model(cfg, "test-project") == "claude-fable-5"
+
+
+def test_last_operator_model_empty_when_none_stamped(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-old-1.md", {
+        "sid": "S-old-1", "status": "suspended", "window": "operator",
+        "cwd": str(repo), "claude_uuid": "u-1",
+    })
+
+    assert last_operator_model(cfg, "test-project") == ""
+
+
+def test_spawn_stamps_explicit_model_onto_session_md(tmp_path, monkeypatch):
+    """T-0678: an EXPLICIT spawn `model` arg is a sticky per-session override —
+    stamped onto the new session's md so a later resume() still honors it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%9|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w", model="claude-fable-5")
+
+    md = cfg.data_dir / "test-project" / "sessions" / "S-u-w-p9.md"
+    assert _read_session_metadata(md).get("model") == "claude-fable-5"
+
+
+def test_spawn_without_explicit_model_does_not_stamp_one(tmp_path, monkeypatch):
+    """A role-based/settings.json fallback is NOT sticky — only an explicit
+    `model` arg becomes a per-session override, so an untouched spawn keeps
+    following whatever the current default is at resume time."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%9|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    spawn(cfg, "test-project", "w")
+
+    md = cfg.data_dir / "test-project" / "sessions" / "S-u-w-p9.md"
+    assert "model" not in (_read_session_metadata(md) or {})
+
+
+def test_resume_adds_model_flag_when_override_present(tmp_path, monkeypatch):
+    """T-0678: resume() honors the sticky per-session `model` override — this
+    is what makes it survive a window recycle instead of reverting to
+    whatever the fleet default happens to be."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2", "status": "suspended", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
+        "model": "claude-fable-5",
+    })
+
+    captured_shell_cmd = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            try:
+                i = args.index("-lc")
+                captured_shell_cmd.append(args[i + 1])
+            except (ValueError, IndexError):
+                pass
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%9|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-alice-w-p2")
+
+    assert captured_shell_cmd
+    assert "--model claude-fable-5" in captured_shell_cmd[0]
+
+
+def test_resume_omits_model_flag_when_no_override(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2", "status": "suspended", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
+    })
+
+    captured_shell_cmd = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            try:
+                i = args.index("-lc")
+                captured_shell_cmd.append(args[i + 1])
+            except (ValueError, IndexError):
+                pass
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%9|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-alice-w-p2")
+
+    assert captured_shell_cmd
+    assert "--model" not in captured_shell_cmd[0]
 
 
 def test_session_history_rotates_on_resume(tmp_path, monkeypatch):

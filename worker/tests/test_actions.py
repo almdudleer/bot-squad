@@ -103,6 +103,8 @@ def test_registry_lists_only_allowed_actions():
         "set_drift_paused",
         # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
         "set_drive",
+        # T-0678: durable per-session `claude --model` override (bsq model set/status).
+        "set_model",
         # T-0466: per-session ~1h cache-window recycle postpone (bsq postpone).
         "idle_postpone",
         # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).

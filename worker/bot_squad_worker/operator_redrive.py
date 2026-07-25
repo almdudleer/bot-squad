@@ -396,10 +396,17 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
     from bot_squad_worker.actions import ActionError
 
     try:
+        # T-0678: carry forward a sticky per-session `model` override from the
+        # operator incarnation this respawn replaces — a full respawn mints a
+        # BRAND-NEW SID (unlike sessions.resume()'s in-place carry-forward), so
+        # without this the override would silently revert to the fleet/role
+        # default on every re-drive.
+        model = S.last_operator_model(cfg, slug) or None
         res = S.spawn(
             cfg, slug, "operator",
             initial_prompt=_dispatch.operator_standing_task(),
             owner="operator-redrive",
+            model=model,
         )
         return res.get("sid")
     except ActionError as e:

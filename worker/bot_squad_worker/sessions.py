@@ -1670,6 +1670,13 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
         cmd = f"claude --dangerously-skip-permissions --resume {claude_uuid}"
     else:
         cmd = "claude --dangerously-skip-permissions"
+    # T-0678: a per-session `model` override (bsq model set) takes precedence
+    # over the fleet-wide settings.json default resume() would otherwise
+    # silently inherit — this is what makes the override "stick across
+    # recycles" instead of reverting the moment the tmux window recycles.
+    resume_model = meta.get("model")
+    if resume_model and resume_model != "~":
+        cmd += f" --model {shlex.quote(str(resume_model))}"
     # T-0614: keep the /resume-picker entry readable across rotations —
     # --name combined with --resume renames the session (a fresh
     # custom-title record supersedes the old one). Uses the possibly-ADOPTED
@@ -2315,6 +2322,15 @@ def spawn(
     seed_meta = _read_session_metadata(seed_meta_file) or {}
     seed_meta.setdefault("sid", new_sid)
     seed_meta["tmux_session"] = target_session
+    # T-0678: an EXPLICIT `model` arg (not the role-based/settings.json
+    # fallback `_model` resolves to when this is blank — see above) is a
+    # sticky per-session override: stamp it now so a later `resume()` still
+    # honors it. A caller that omitted `model` gets no field here, so it
+    # keeps following whatever the role/fleet default is at RESUME time,
+    # rather than freezing today's fallback onto the session forever.
+    _explicit_model = (model or "").strip()
+    if _explicit_model:
+        seed_meta["model"] = _explicit_model
     # T-0157: stamp the spawning linux user so the SessionMd carries an
     # explicit user mark (the SID prefix already encodes it, but the field
     # makes per-user listing/grouping robust to SID rotation).
@@ -3228,6 +3244,81 @@ def set_drive(cfg: Any, slug: str, sid: str, on: bool) -> dict:
     meta["drive"] = "on" if on else "off"
     _write_session_metadata(md_path, meta, atomic=True)
     return {"ok": True, "sid": meta.get("sid", sid), "drive": meta["drive"]}
+
+
+def set_model(cfg: Any, slug: str, sid: str, model: str) -> dict:
+    """T-0678: durable PER-SESSION ``claude --model`` override (``bsq model
+    set``), distinct from the fleet-wide default :func:`fleet_model.set_model`
+    edits in the coordinator's ``~/.claude/settings.json`` (T-0630).
+
+    Stamps (or, for ``model == ""``, clears) the ``model`` field on THIS
+    session's SessionMd — mirrors :func:`set_drift_paused` / :func:`set_drive`.
+    ``resume`` reads it back to add ``--model`` to the resurrect command
+    (taking precedence over the fleet default) so the override survives a
+    window recycle; :func:`last_operator_model` lets ``operator_redrive``'s
+    full respawn (a brand-new SID, so it can't just re-read ITS OWN md) carry
+    it forward too. Validated against the same :data:`fleet_model.
+    ALLOWED_MODELS` allowlist — one SSOT for valid model strings, not a
+    second copy of it here. Resolves the md by SID with the rename-tolerant
+    claude_uuid fallback, mirroring :func:`set_drift_paused`.
+
+    Returns ``{ok, sid, model}``.
+    """
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker import fleet_model as _fleet_model
+
+    if model not in _fleet_model.ALLOWED_MODELS:
+        raise ActionError(f"set_model: model not allowed: {model!r}")
+
+    project = cfg.projects.get(slug)
+    if project is None:
+        raise ActionError(f"set_model: unknown project slug {slug!r}")
+
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    md_path = _find_session_md(sessions_dir, sid, None)
+    if md_path is None:
+        raise ActionError(f"set_model: no session metadata for SID {sid!r}")
+    meta = _read_session_metadata(md_path)
+    if meta is None:
+        raise ActionError(f"set_model: unreadable session metadata for SID {sid!r}")
+
+    if model:
+        meta["model"] = model
+    else:
+        meta.pop("model", None)
+    _write_session_metadata(md_path, meta, atomic=True)
+    return {"ok": True, "sid": meta.get("sid", sid), "model": model}
+
+
+def last_operator_model(cfg: Any, slug: str) -> str:
+    """T-0678: best-effort ``model`` override carried by the most recently
+    started OPERATOR SessionMd for ``slug`` (live or archived — archival never
+    deletes/moves the md, it just flips ``archived``/``status`` in place).
+
+    ``operator_redrive``'s re-drive respawns a brand-new operator SID rather
+    than resuming the dead one in place (Process Paradigm: sessions are
+    transient), so a per-session ``model`` override set via ``bsq model set``
+    would otherwise be lost the moment the operator recycles. This gives
+    ``_respawn_operator`` a way to look up what the incarnation it's replacing
+    had set, and pass it forward as the new spawn's explicit ``model`` — so
+    the override reads as "sticky for the operator role on this project"
+    across re-drives, not just within one tmux-resume chain. "" when no
+    operator md carries one (the common case — most operators never set one,
+    and fall through to the role/fleet default same as before).
+    """
+    sessions_dir = cfg.data_dir / slug / "sessions"
+    if not sessions_dir.exists():
+        return ""
+    best: dict | None = None
+    for md in sessions_dir.glob("*.md"):
+        meta = _read_session_metadata(md)
+        if not meta or not meta.get("model"):
+            continue
+        if _role_of(meta) != "operator":
+            continue
+        if best is None or _started_at_key(meta.get("started_at")) > _started_at_key(best.get("started_at")):
+            best = meta
+    return str(best.get("model")) if best else ""
 
 
 def set_idle_postpone(cfg: Any, slug: str, sid: str,

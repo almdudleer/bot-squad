@@ -3479,6 +3479,33 @@ def _action_set_drive(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.set_drive(cfg, params["slug"], params["sid"], params["on"])
 
 
+_SET_MODEL_REQUIRED = {"slug", "sid", "model"}
+_SET_MODEL_ALLOWED = _SET_MODEL_REQUIRED
+
+
+def _action_set_model(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0678: durable PER-SESSION ``claude --model`` override (``bsq model
+    set`` / ``bsq model status``), distinct from the FLEET-WIDE
+    ``fleet_model_set`` (T-0630, edits the coordinator's settings.json).
+
+    Required params: slug, sid, model (str; "" clears the override). Returns
+    {ok, sid, model}. ``tmux_only`` — it writes only its OWN SessionMd
+    frontmatter (filesystem-local), like ``set_drift_paused`` / ``set_drive``.
+    """
+    extra = set(params) - _SET_MODEL_ALLOWED
+    if extra:
+        raise ActionError(f"set_model got unexpected params: {sorted(extra)}")
+    missing = _SET_MODEL_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"set_model missing required params: {sorted(missing)}")
+    if not isinstance(params["model"], str):
+        raise ActionError("set_model: 'model' must be a string")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.set_model(cfg, params["slug"], params["sid"], params["model"])
+
+
 _IDLE_POSTPONE_REQUIRED = {"slug", "sid"}
 _IDLE_POSTPONE_ALLOWED = _IDLE_POSTPONE_REQUIRED | {"seconds", "reason"}
 
@@ -4216,6 +4243,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "set_drift_paused": _action_set_drift_paused,
     # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
     "set_drive": _action_set_drive,
+    # T-0678: per-session `claude --model` override (bsq model set/status).
+    "set_model": _action_set_model,
     # T-0466: per-session cache-window recycle postpone (bsq postpone).
     "idle_postpone": _action_idle_postpone,
     # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
@@ -4376,6 +4405,10 @@ ACTION_MODES: dict[str, str] = {
     # only its own SessionMd frontmatter (filesystem-local), tmux_only like
     # set_drift_paused.
     "set_drive": "tmux_only",
+    # T-0678: a session sets its OWN per-session model override — writes only
+    # its own SessionMd frontmatter (filesystem-local), tmux_only like
+    # set_drive/set_drift_paused.
+    "set_model": "tmux_only",
     # T-0466: a session postpones its OWN cache-window recycle by stamping its
     # own SessionMd frontmatter (filesystem-local) — tmux_only, like the drift
     # off-ramp; no coordinator privilege required.

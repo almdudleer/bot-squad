@@ -1,0 +1,100 @@
+# T-0328 Phase-1 security read-back — linza-specific corrected copy of
+# systemd/bot-squad-worker.service.
+#
+# install.sh's `step_systemd_unit` checkpoint has NO per-host override hook:
+# it does a literal `sudo install -m 0644
+# "$BOTSQUAD_INSTALL_DIR/systemd/bot-squad-worker.service" \
+# /etc/systemd/system/bot-squad-worker.service` — i.e. it always installs
+# whatever is checked into the repo at that path, verbatim, for every host.
+#
+# The base file hardcodes THIS (mothership) host's own install dir
+# (/home/www/bot-squad) and, more importantly, `ReadWritePaths=... \
+# /home/almdudleer` — the coordinator's home. This unit runs with NO `User=`
+# directive, i.e. as root. Ported to linza unmodified, a root-level systemd
+# unit would get explicit systemd-enforced read-write into linza's REAL
+# almdudleer's home directory — exactly the isolation leak P6 is meant to
+# prevent, just at the systemd-hardening layer instead of the docker-volume
+# layer (see docker-compose.linza.yml's header note for the container-side
+# equivalent of this same class of bug).
+#
+# HOW TO APPLY (there is no override flag for this — a one-time file swap):
+# after install.sh's `clone_repo` checkpoint succeeds and BEFORE the
+# `systemd_unit` checkpoint runs, copy this file's contents over
+# `$BOTSQUAD_INSTALL_DIR/systemd/bot-squad-worker.service` in the freshly
+# cloned working tree on linza (a local file replacement in that clone, not
+# a repo commit) — then let install.sh's `systemd_unit` checkpoint run
+# normally; it will install THIS corrected content.
+#
+# Diff from the base file: every /home/www/bot-squad path below must match
+# whatever $BOTSQUAD_INSTALL_DIR is actually set to for this install (this
+# copy assumes /home/botsquad/bot-squad per the README's env-var block —
+# update both if a different install dir is chosen), and
+# `ReadWritePaths` now points at the dedicated botsquad user's OWN home
+# (/home/botsquad) instead of /home/almdudleer.
+
+[Unit]
+Description=bot-squad worker (APScheduler + Unix-socket action API)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/botsquad/bot-squad
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_LEVEL=info
+# T-0179: load the install .env so the worker sees BOT_SQUAD_SECRETS_KEY (the
+# at-rest encryption key for secrets.toml — the worker's config.load() must
+# decrypt the TG bot token). Leading '-' = optional: a missing .env must NEVER
+# block worker startup (no key → secrets stay plaintext, nothing breaks). This
+# also loads the rest of .env (JWT_SECRET etc.) into the worker env — acceptable,
+# the worker is already trusted and reads secrets.toml directly.
+EnvironmentFile=-/home/botsquad/bot-squad/.env
+# Phase 2 multi-user: coordinator mode = scheduler + all actions + tmux ops
+# for this user. Per-user workers (other Linux users) use the separate
+# bot-squad-user-worker.service template.
+Environment=BOT_SQUAD_MODE=coordinator
+# T-0488: worker-scoped override of MOTHERSHIP_BASE_URL so the worker reaches the
+# localhost-only user-recognition API (compose publishes 127.0.0.1:8099). Placed
+# AFTER EnvironmentFile so it wins even if .env later sets MOTHERSHIP_BASE_URL
+# (which is the API container's PUBLIC self-URL and must stay distinct). Pairs with
+# .env WORKER_API_TOKEN (operator-provisioned) to activate TG-sender->GlobalUser
+# linkage at deploy #4; fail-safe no-op until all three are present.
+Environment=MOTHERSHIP_BASE_URL=http://127.0.0.1:8099
+# T-0194 (2026-06-03): the blunt global HTTPS_PROXY lift-and-shift (which proxied
+# ALL worker HTTPS to work around the Telegram DPI-block, T-0192) was REMOVED here
+# once the durable, TG-ONLY primitive landed: tg.py + tg_listener now honour
+# `[tg].proxy_url` from config/system_settings.toml (set via the settings gear UI
+# or `--tg-proxy-url` at install). So only Telegram egress is proxied; all other
+# worker HTTPS goes direct. To proxy TG, set [tg].proxy_url — NOT this env.
+# T-0184/T-0185 (2026-06-02): the system-wide drift kill-switch
+# (BOT_SQUAD_DRIFT_MINUTES=0, operator hotfix 1e612aa) was REMOVED here once the
+# per-project opt-in landed — drift now fires only for projects that set
+# `drift_enforcement = true` in config/projects.toml (bot-squad opts in; others
+# stay off), plus a per-session `bsq drift off` off-ramp. Re-add the env line
+# only as an emergency global kill.
+ExecStart=/home/botsquad/bot-squad/worker/.venv/bin/python -m bot_squad_worker --config /home/botsquad/bot-squad/config
+Restart=on-failure
+RestartSec=10s
+# T-0119: cap graceful-shutdown wait so in-flight peer_inbox_wait long-polls
+# don't hold systemd for the default 90s before SIGKILL. The worker handler
+# trips the shutdown event on SIGTERM and inbox_wait returns reason=shutdown
+# within ~1 poll tick; this is defense-in-depth for any other slow surface.
+TimeoutStopSec=10s
+
+# Hardening (defense-in-depth — worker still has docker/git/tmux/claude access
+# for spec #3 actions, but we lock down what we can).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/botsquad/bot-squad/data /home/botsquad
+# PrivateTmp INTENTIONALLY DISABLED — the worker needs to see the user's
+# tmux server at /tmp/tmux-<uid>/default to discover and control Claude
+# sessions (spec #5 list_sessions/pause/resume/spawn). Re-enabling will
+# silently break session discovery.
+# PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

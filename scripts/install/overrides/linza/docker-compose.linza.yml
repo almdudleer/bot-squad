@@ -1,0 +1,93 @@
+# T-0328 Phase-1 security read-back — linza-specific compose override.
+#
+# The base docker-compose.yml (repo root) hardcodes assumptions that are true
+# for THIS (mothership) host but wrong on
+# almdudleer@ssh.deployments.linzametrics.com:
+#   - external network literally named `avo_backend` (linza's real shared
+#     traefik network is named `traefik` — confirmed live, 2026-07-26)
+#   - `tls.certresolver=le` (linza's traefik only defines a resolver named
+#     `linzaresolver` — confirmed from its container's own command line)
+#   - an always-on `bot-squad-mothership` router for botsquad.dev /
+#     staging.botsquad.dev, regardless of $MOTHERSHIP — inert in practice
+#     (DNS for those names doesn't point at linza) but shouldn't be shipped
+#     to a third-party host at all
+#   - bind mounts to /home/almdudleer/.claude/projects (ro) and
+#     /home/almdudleer/signal_tracker* (ro/RW) — THIS host's coordinator's
+#     home. Run verbatim on linza this would reach into LINZA's real
+#     almdudleer's home directory, defeating the whole point of installing
+#     under a dedicated `botsquad` user (P6).
+#
+# Layer this on top of the base file:
+#   docker compose -f docker-compose.yml \
+#     -f scripts/install/overrides/linza/docker-compose.linza.yml \
+#     up -d --build
+#
+# `labels:` and `volumes:` below use the compose-spec `!override` tag
+# (verified against Compose 2.40.3, the version linza runs — see note below)
+# to fully REPLACE those lists rather than merge-by-key — deliberate, so a
+# reviewer can see the complete final set in one block instead of reasoning
+# about a merge. `environment:` is a plain key-merge override (we want to
+# keep every other var from the base file, e.g. JWT_SECRET/MOTHERSHIP/
+# COOKIE_SECURE, and only repoint one key).
+#
+# ⚠ Verified by hand with `docker compose config` against this exact Compose
+# version: the compose-spec's `!reset` tag (the one documented for "clear
+# then replace") silently DROPS the field entirely here when given a
+# non-empty value instead of resetting-then-setting it — i.e. `!reset` would
+# ship a container with NO labels and NO volumes at all, silently. `!override`
+# is the one that actually does a full-list replacement correctly on this
+# version. Re-verify with `docker compose -f docker-compose.yml -f
+# docker-compose.linza.yml config` before trusting any future edit here.
+#
+# OPEN — do not resolve silently, confirm with the operator/stakeholder first:
+#   - Host rule below uses the DoD's literal text
+#     `botsquad.deployments.linzametrics.com` (no hyphen). The base compose's
+#     own convention is `bot-squad.${DOMAIN}` (WITH a hyphen). Whichever
+#     spelling DNS is actually provisioned for on linza is what must go here
+#     — confirm before running, don't assume either is already correct.
+#   - `${BOTSQUAD_COORDINATOR_HOME}` below must be the DEDICATED botsquad
+#     user's real home dir (e.g. /home/botsquad) — export it before running
+#     compose. Do not default it to /home/almdudleer.
+
+services:
+  bot-squad-api:
+    networks:
+      - avo_backend
+    environment:
+      - CLAUDE_PROJECTS_DIR=${BOTSQUAD_COORDINATOR_HOME:?set to the dedicated botsquad user's home, e.g. /home/botsquad}/.claude/projects
+    volumes: !override
+      - ./config:/config:rw
+      - ./data:/data:rw
+      # Repoints the base file's /home/almdudleer/.claude/projects (ro) mount
+      # to the dedicated user's own home — this is CORE functionality (the
+      # UI's session-history read path, api/app/routes_messages.py), not
+      # optional, so it's repointed rather than dropped.
+      - ${BOTSQUAD_COORDINATOR_HOME:?set to the dedicated botsquad user's home}/.claude/projects:${BOTSQUAD_COORDINATOR_HOME}/.claude/projects:ro
+      # The base file's /home/almdudleer/signal_tracker(_mgmt) mounts are
+      # DROPPED, not repointed: they're project-specific (AGENTS.md
+      # read/write for a specific bot-squad-managed project on THIS host),
+      # and there is no managed project on linza yet at install time. When
+      # cctv-backend is later onboarded as a bot-squad-managed project
+      # (D-0027's "bridge" phase, a separate ticket), whoever does that adds
+      # the appropriate project mount then.
+    labels: !override
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      # T-0529: keep worker-token routes off the public router.
+      - "traefik.http.routers.bot-squad.rule=Host(`botsquad.deployments.linzametrics.com`) && !PathPrefix(`/api/m/worker`)"
+      - "traefik.http.routers.bot-squad.entrypoints=websecure"
+      - "traefik.http.routers.bot-squad.tls.certresolver=linzaresolver"
+      - "traefik.http.services.bot-squad.loadbalancer.server.port=8000"
+      # bot-squad-mothership router intentionally OMITTED (see header note).
+
+networks:
+  # `avo_backend` is only this compose file's internal alias name — it is
+  # NOT what appears in the `traefik.docker.network` label above (that must
+  # be the REAL docker network name, `traefik`, for Traefik's docker
+  # provider to find the container). Mapping the alias to the real external
+  # network here is what makes `docker compose up` attach to linza's
+  # existing traefik network instead of failing to find one named
+  # `avo_backend` (which does not exist on that host).
+  avo_backend:
+    external: true
+    name: traefik

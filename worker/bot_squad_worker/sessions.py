@@ -1591,17 +1591,56 @@ def suspend(cfg: Any, slug: str, sid: str, *,
 
 RESUME_MAX_CONTEXT_TOKENS = 50_000
 
+# T-0722: fallback re-read window when the standard telemetry tail (256 KiB)
+# holds no compact boundary. idle_timeout compacts and terminates, so the
+# boundary is structurally near EOF — but a transcript with multi-hundred-KiB
+# attachment lines after it can push it past the tail, and reading the last
+# usage line instead would silently reinstate the pre-compact number. Rare
+# one-shot read (only for remembered sessions, only on a dispatch decision).
+_RESUME_RESCAN_BYTES = 4 * 1024 * 1024
+
+
+def _resume_window_tokens(transcript: Path, size: int) -> int | None:
+    """Tokens a ``--resume <uuid>`` of ``transcript`` would ACTUALLY reload.
+
+    T-0722: the naive "last assistant ``usage`` line in the tail" reading is
+    the PRE-compact window for exactly the sessions this gate exists to admit.
+    ``idle_timeout`` sends ``/compact`` and terminates immediately, so no
+    assistant turn ever runs afterwards and no post-compact ``usage`` line is
+    ever written — the tail's last one predates the compact it was supposed to
+    measure. (Measured live 2026-07-26: p164 read 95,498 where the real
+    post-compact window is 11,015.)
+
+    So: prefer ``compactMetadata.postTokens`` from the last compact boundary —
+    the model's own count of what the summary leaves behind, which is what a
+    resume replays. Only when real turns ran after the compact does the last
+    ``usage`` line already reflect it and become the better (live) number.
+    Returns None when nothing is measurable at all.
+    """
+    from bot_squad_worker import telemetry as T  # function-level: avoid cycle
+    scan: dict = {"last_window": None}
+    for window in (T._TAIL_BYTES, _RESUME_RESCAN_BYTES):
+        text, _ = T._read_chunk(transcript, max(0, size - window))
+        scan = T.scan_lines(text.splitlines())
+        if scan["compact_post_window"] is not None:
+            return (scan["last_window"] if scan["usage_after_compact"]
+                    else scan["compact_post_window"])
+        if size <= window:
+            break  # whole file already scanned — there is no boundary
+    return scan["last_window"]
+
 
 def recycled_resume_eligible(claude_uuid: str | None,
                              user_home: str | None = None) -> tuple[bool, int | None]:
     """The T-0575 resume-vs-fresh gate: measure the remembered session's REAL
-    context occupancy from its transcript tail and apply the <50k rule.
+    context occupancy from its transcript and apply the <50k rule.
 
     Returns ``(eligible, tokens)``. The transcript for ``claude_uuid`` must
     exist (a missing one means ``--resume`` would fail — fresh spawn instead);
-    a transcript with no assistant ``usage`` line in the tail measures None
-    and stays eligible (a compact-terminate-remembered session is small by
-    construction; resume failure still falls back to fresh spawn).
+    a transcript that measures None stays eligible (a compact-terminate-
+    remembered session is small by construction; resume failure still falls
+    back to fresh spawn). See ``_resume_window_tokens`` for what "REAL" means —
+    post-compact, not the pre-compact number the tail's last usage line carries.
 
     Measured from the transcript, NOT the telemetry record: the record is
     keyed by the pre-recycle SID and may predate the /compact — the transcript
@@ -1618,8 +1657,7 @@ def recycled_resume_eligible(claude_uuid: str | None,
         size = transcript.stat().st_size
     except OSError:
         return False, None
-    text, _ = T._read_chunk(transcript, max(0, size - T._TAIL_BYTES))
-    tokens = T.scan_lines(text.splitlines())["last_window"]
+    tokens = _resume_window_tokens(transcript, size)
     return (tokens is None or tokens < RESUME_MAX_CONTEXT_TOKENS), tokens
 
 

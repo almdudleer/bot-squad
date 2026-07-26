@@ -165,17 +165,31 @@ def _usage_window_tokens(usage: dict) -> int:
 
 
 def scan_lines(lines: Iterable[str]) -> dict:
-    """Scan jsonl text lines → {last_window, model, output_sum, saw_429}.
+    """Scan jsonl text lines → {last_window, model, output_sum, saw_429,
+    compact_post_window, usage_after_compact}.
 
     ``last_window`` / ``model`` come from the LAST assistant line carrying a
     ``usage`` block (None when the chunk holds no such line). ``output_sum`` is
     the total ``output_tokens`` across assistant lines in the chunk (used to
     accrue burn). ``saw_429`` is True if any line is a 429 rate_limit api-error.
+
+    T-0722: a ``/compact`` writes a ``system``/``compact_boundary`` line into
+    the SAME transcript, carrying ``compactMetadata.postTokens`` — the window
+    the model is left holding once the summary replaces the dropped turns.
+    ``compact_post_window`` is that number for the LAST boundary in the chunk
+    (None when the chunk holds no boundary, or one without the metadata), and
+    ``usage_after_compact`` says whether any assistant ``usage`` line followed
+    a boundary (always False when the chunk holds none). Together they let a
+    caller tell "``last_window`` is the PRE-compact number, because no turn has
+    run since" from "the compact is old news and ``last_window`` reflects it".
     """
     last_window: int | None = None
     model: str | None = None
     output_sum = 0
     saw_429 = False
+    compact_post_window: int | None = None
+    saw_boundary = False
+    usage_after_compact = False
     for line in lines:
         line = line.strip()
         if not line:
@@ -186,6 +200,13 @@ def scan_lines(lines: Iterable[str]) -> dict:
             continue
         if d.get("error") == "rate_limit" and d.get("apiErrorStatus") == 429:
             saw_429 = True
+        if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+            meta = d.get("compactMetadata")
+            post = meta.get("postTokens") if isinstance(meta, dict) else None
+            compact_post_window = int(post) if isinstance(post, (int, float)) else None
+            saw_boundary = True
+            usage_after_compact = False
+            continue
         if d.get("type") != "assistant":
             continue
         msg = d.get("message")
@@ -193,6 +214,7 @@ def scan_lines(lines: Iterable[str]) -> dict:
         if not isinstance(usage, dict):
             continue
         last_window = _usage_window_tokens(usage)
+        usage_after_compact = usage_after_compact or saw_boundary
         if isinstance(msg, dict) and msg.get("model"):
             model = str(msg.get("model"))
         output_sum += int(usage.get("output_tokens", 0))
@@ -201,6 +223,8 @@ def scan_lines(lines: Iterable[str]) -> dict:
         "model": model,
         "output_sum": output_sum,
         "saw_429": saw_429,
+        "compact_post_window": compact_post_window,
+        "usage_after_compact": usage_after_compact,
     }
 
 

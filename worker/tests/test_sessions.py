@@ -5860,6 +5860,111 @@ def test_recycled_resume_eligible_placeholder_uuid(tmp_path):
     assert S.recycled_resume_eligible(None, user_home=str(tmp_path)) == (False, None)
 
 
+# ---------------------------------------------------------------------------
+# T-0722 — the gate must measure POST-compact context. idle_timeout /compacts
+# and terminates immediately, so no assistant turn (and no usage line) ever
+# follows the compact: the tail's last usage line is the PRE-compact window,
+# i.e. exactly the number the compact was supposed to shrink. Measured live on
+# 2026-07-26: 0 of 14 remembered sessions passed the <50k gate (70k-217k
+# readings); reading compactMetadata.postTokens instead → 11 of 14 pass (7k-13k,
+# the other 3 have no transcript left on disk).
+# ---------------------------------------------------------------------------
+
+def _usage_line(window_tokens: int) -> str:
+    import json
+    return json.dumps({
+        "type": "assistant",
+        "message": {"model": "m", "usage": {
+            "input_tokens": window_tokens, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0, "output_tokens": 5,
+        }},
+    })
+
+
+def _boundary_line(post_tokens: int | None, pre_tokens: int = 95_555) -> str:
+    """The system/compact_boundary line Claude writes into the SAME transcript."""
+    import json
+    meta = {"trigger": "manual", "preTokens": pre_tokens}
+    if post_tokens is not None:
+        meta["postTokens"] = post_tokens
+    return json.dumps({
+        "type": "system", "subtype": "compact_boundary",
+        "content": "Conversation compacted", "compactMetadata": meta,
+    })
+
+
+def _write_lines(home, uuid: str, lines: list[str]) -> None:
+    d = home / ".claude" / "projects" / "proj"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{uuid}.jsonl").write_text("\n".join(lines) + "\n")
+
+
+def test_recycled_resume_eligible_measures_post_compact_window(tmp_path):
+    """The p164 shape: a fat pre-compact usage line, then the compact boundary
+    and NOTHING after it. The gate must read postTokens (11,015 → eligible),
+    not the last usage line (95,498 → rejected, the pre-fix behaviour)."""
+    import bot_squad_worker.sessions as S
+    _write_lines(tmp_path, "uu-compacted", [
+        _usage_line(95_498),
+        _boundary_line(11_015),
+        '{"type": "user", "isCompactSummary": true, "message": {}}',
+    ])
+    ok, tokens = S.recycled_resume_eligible("uu-compacted", user_home=str(tmp_path))
+    assert ok is True
+    assert tokens == 11_015
+
+
+def test_recycled_resume_eligible_post_compact_can_still_exceed_budget(tmp_path):
+    """The threshold is the stakeholder's and still bites — a compact that left
+    60k behind is measured honestly and rejected."""
+    import bot_squad_worker.sessions as S
+    _write_lines(tmp_path, "uu-fat-compact", [
+        _usage_line(400_000), _boundary_line(60_000),
+    ])
+    ok, tokens = S.recycled_resume_eligible("uu-fat-compact", user_home=str(tmp_path))
+    assert ok is False
+    assert tokens == 60_000
+
+
+def test_recycled_resume_eligible_prefers_usage_after_compact(tmp_path):
+    """When real turns DID run after the compact, their usage line is the live
+    post-compact window and beats the boundary's now-stale postTokens."""
+    import bot_squad_worker.sessions as S
+    _write_lines(tmp_path, "uu-worked-on", [
+        _usage_line(95_498), _boundary_line(11_015), _usage_line(38_000),
+    ])
+    ok, tokens = S.recycled_resume_eligible("uu-worked-on", user_home=str(tmp_path))
+    assert ok is True
+    assert tokens == 38_000
+
+
+def test_recycled_resume_eligible_boundary_without_post_tokens(tmp_path):
+    """A boundary carrying no postTokens is unmeasurable — fall back to the
+    last usage line rather than inventing a number."""
+    import bot_squad_worker.sessions as S
+    _write_lines(tmp_path, "uu-nometa", [
+        _usage_line(120_000), _boundary_line(None),
+    ])
+    ok, tokens = S.recycled_resume_eligible("uu-nometa", user_home=str(tmp_path))
+    assert ok is False
+    assert tokens == 120_000
+
+
+def test_recycled_resume_eligible_boundary_outside_the_standard_tail(tmp_path):
+    """A fat attachment line after the boundary can push it past the 256 KiB
+    telemetry tail; the escalated re-read must still find it, else the gate
+    silently reinstates the pre-compact number."""
+    import bot_squad_worker.sessions as S
+    _write_lines(tmp_path, "uu-deep", [
+        _usage_line(150_000),
+        _boundary_line(9_000),
+        '{"type": "attachment", "pad": "%s"}' % ("x" * 300_000),
+    ])
+    ok, tokens = S.recycled_resume_eligible("uu-deep", user_home=str(tmp_path))
+    assert ok is True
+    assert tokens == 9_000
+
+
 def test_resume_clears_recycle_remembered_state(tmp_path, monkeypatch):
     """T-0575: a resurrect CONSUMES the recycle-v2 remembered state — the
     resumed md must not carry resumable/recycled_at/resume_hint, so the

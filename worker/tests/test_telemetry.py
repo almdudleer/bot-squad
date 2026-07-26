@@ -67,6 +67,47 @@ def test_scan_lines_skips_partial_or_garbage_lines():
     assert scan["output_sum"] == 5
 
 
+def _boundary(post_tokens, pre_tokens=95_555):
+    meta = {"trigger": "manual", "preTokens": pre_tokens}
+    if post_tokens is not None:
+        meta["postTokens"] = post_tokens
+    return json.dumps({
+        "type": "system", "subtype": "compact_boundary",
+        "content": "Conversation compacted", "compactMetadata": meta,
+    })
+
+
+def test_scan_lines_reports_compact_boundary_post_tokens():
+    """T-0722: a /compact writes its boundary into the same transcript, and
+    the last usage line BEFORE it is the pre-compact window."""
+    scan = T.scan_lines([_assistant((95_498, 0, 0), 20), _boundary(11_015)])
+    assert scan["last_window"] == 95_498       # pre-compact — stale
+    assert scan["compact_post_window"] == 11_015
+    assert scan["usage_after_compact"] is False
+
+
+def test_scan_lines_flags_usage_after_the_compact_boundary():
+    scan = T.scan_lines([
+        _assistant((95_498, 0, 0), 20), _boundary(11_015),
+        _assistant((38_000, 0, 0), 7),
+    ])
+    assert scan["last_window"] == 38_000
+    assert scan["compact_post_window"] == 11_015
+    assert scan["usage_after_compact"] is True
+
+
+def test_scan_lines_compact_fields_default_when_no_boundary():
+    scan = T.scan_lines([_assistant((1, 10, 0), 5)])
+    assert scan["compact_post_window"] is None
+    assert scan["usage_after_compact"] is False
+
+
+def test_scan_lines_boundary_without_post_tokens_measures_none():
+    scan = T.scan_lines([_assistant((120_000, 0, 0), 5), _boundary(None)])
+    assert scan["compact_post_window"] is None
+    assert scan["last_window"] == 120_000
+
+
 def test_context_and_memory_levels(monkeypatch):
     # T-0210 (stakeholder 2026-06-19): default ceiling 700k, warn at the same
     # 0.8 warn:urgent ratio → 560k. Ensure no env override is set.

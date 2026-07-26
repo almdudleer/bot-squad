@@ -1510,6 +1510,40 @@ def suspend(cfg: Any, slug: str, sid: str, *,
     model_val = existing.get("model")
     if model_val and model_val != "~":
         meta["model"] = model_val
+    # T-0702 audit: this whitelist rebuild dropped `initiative` / the Phase 9
+    # multi-binding extras / a morph-stamped `role` too, the same class of
+    # bug the T-0678 reopen fixed for `model` — every one of these is read
+    # straight off the md by a live path: resume() uses `initiative` to route
+    # the resurrect into the right per-initiative tmux sibling session
+    # (T-0001) instead of dumping a TL back into the main project session;
+    # bind_task / gc_dead_bindings / list_sessions all read `extra_task_ids`
+    # / `extra_initiatives` as the multi-binding source of truth; and
+    # `_role_of` (T-0509) honors a stored `role` morph stamp over the
+    # window-derived heuristic — losing it silently reverts a morphed
+    # user→dev/teamlead/operator session back to its pre-morph role. This
+    # isn't a rare manual-suspend-only path either: idle_timeout's automatic
+    # cache-window recycle (`_terminate_and_remember`) calls this same
+    # suspend() on every idle-timeout tick, so a long-lived initiative TL or
+    # multi-bound dev would lose these fields on its very first idle recycle.
+    initiative_val = existing.get("initiative")
+    if initiative_val and initiative_val != "~":
+        meta["initiative"] = initiative_val
+    extra_task_ids_val = existing.get("extra_task_ids")
+    if isinstance(extra_task_ids_val, list) and extra_task_ids_val:
+        meta["extra_task_ids"] = extra_task_ids_val
+    extra_initiatives_val = existing.get("extra_initiatives")
+    if isinstance(extra_initiatives_val, list) and extra_initiatives_val:
+        meta["extra_initiatives"] = extra_initiatives_val
+    role_val = existing.get("role")
+    if role_val and role_val != "~":
+        meta["role"] = role_val
+    # T-0702 audit: `bsq drift off` stamps `drift_paused: true` (drift.py
+    # reads it directly to skip the per-session drift-check nag) with no
+    # fallback if it's lost — unlike model/owner/tmux_session this one has no
+    # SID/heuristic backstop, so dropping it here silently un-silences a nag
+    # the user explicitly turned off, the moment the session idle-recycles.
+    if existing.get("drift_paused"):
+        meta["drift_paused"] = existing["drift_paused"]
     if source:  # T-0444: visible-close stamp on the auto-close path
         meta["suspend_source"] = source
         meta["suspend_reason"] = reason or source

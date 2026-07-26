@@ -3370,6 +3370,109 @@ def test_suspend_preserves_model_field(tmp_path, monkeypatch):
     assert meta["model"] == "claude-fable-5"
 
 
+def test_suspend_preserves_initiative_and_extras_and_role(tmp_path, monkeypatch):
+    """T-0698 audit: suspend() rewrote the md from a field whitelist that
+    (like the T-0678 `model` bug) silently dropped `initiative`,
+    `extra_task_ids`, `extra_initiatives`, and a morph-stamped `role`.
+
+    `initiative` drives resume()'s per-initiative tmux routing (T-0001);
+    extra_task_ids/extra_initiatives are the Phase 9 multi-binding source of
+    truth; `role` is honored by `_role_of` (T-0509) over the window-derived
+    heuristic for a morphed session. All four are read straight off the md
+    by live paths, and idle_timeout's automatic cache-window recycle calls
+    this same suspend() — so a long-lived initiative TL or multi-bound dev
+    would lose them on its very first idle recycle, not just a manual one."""
+    from bot_squad_worker.sessions import suspend
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-u-w-p3.md", {
+        "sid": "S-u-w-p3",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-1",
+        "task_id": "T-1000",
+        "started_at": "2026-05-16T10:00:00Z",
+        "initiative": "myinit.md",
+        "extra_task_ids": ["T-1001", "T-1002"],
+        "extra_initiatives": ["other.md"],
+        "role": "dev",
+    })
+
+    pane_calls = [0]
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            pane_calls[0] += 1
+            # First call: pane live. After kill: gone.
+            if pane_calls[0] == 1:
+                return subprocess.CompletedProcess(args, 0, f"%3|w|11|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    suspend(cfg, "test-project", "S-u-w-p3")
+    meta = _read_session_metadata(sessions_dir / "S-u-w-p3.md")
+    assert meta["initiative"] == "myinit.md"
+    assert meta["extra_task_ids"] == ["T-1001", "T-1002"]
+    assert meta["extra_initiatives"] == ["other.md"]
+    assert meta["role"] == "dev"
+
+
+def test_suspend_preserves_drift_paused_field(tmp_path, monkeypatch):
+    """T-0702 audit: `bsq drift off` stamps `drift_paused: true`; unlike
+    model/owner/tmux_session this field has no SID/heuristic fallback in
+    drift.py, so suspend()'s whitelist rebuild silently un-silencing it would
+    resurface the drift-check nag against the user's explicit request the
+    moment the session idle-recycles."""
+    from bot_squad_worker.sessions import suspend
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sessions_dir / "S-u-w-p3.md", {
+        "sid": "S-u-w-p3",
+        "status": "active",
+        "window": "w",
+        "cwd": str(repo),
+        "claude_uuid": "uuid-1",
+        "task_id": "~",
+        "started_at": "2026-05-16T10:00:00Z",
+        "drift_paused": True,
+    })
+
+    pane_calls = [0]
+
+    def fake_run(args, **kwargs):
+        if "list-panes" in args:
+            pane_calls[0] += 1
+            if pane_calls[0] == 1:
+                return subprocess.CompletedProcess(args, 0, f"%3|w|11|{repo}|claude\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    suspend(cfg, "test-project", "S-u-w-p3")
+    meta = _read_session_metadata(sessions_dir / "S-u-w-p3.md")
+    assert meta.get("drift_paused") is True
+
+
 # ---------------------------------------------------------------------------
 # T-0105: session_history append on bind / rotate
 # ---------------------------------------------------------------------------

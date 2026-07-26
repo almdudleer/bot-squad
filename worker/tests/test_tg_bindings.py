@@ -153,7 +153,60 @@ def test_find_by_ticket_returns_bound_topic(tmp_path):
     cfg = _cfg(tmp_path)
     TB.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700", session_id="S-dev-p9")
     found = TB.find_by_ticket(cfg, "T-0700")
-    assert found == {"chat_id": "111", "thread_id": 42, "slug": "beta", "session_id": "S-dev-p9"}
+    # T-0723 unified the two reverse lookups' shape — the record also names the
+    # ticket, so a caller that resolved by SESSION knows which task's topic it
+    # landed in (it needs that for the T-0660 FYI append).
+    assert found == {"chat_id": "111", "thread_id": 42, "slug": "beta",
+                     "ticket_id": "T-0700", "session_id": "S-dev-p9"}
+
+
+# --- T-0723: reverse lookup by SESSION — "does this sender own a topic?" ---
+
+def test_find_by_session_returns_the_topic_bound_to_that_session(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700", session_id="S-dev-p9")
+    assert TB.find_by_session(cfg, "S-dev-p9") == {
+        "chat_id": "111", "thread_id": 42, "slug": "beta",
+        "ticket_id": "T-0700", "session_id": "S-dev-p9",
+    }
+
+
+def test_find_by_session_finds_a_direct_mode_binding_with_no_ticket(tmp_path):
+    """T-0677 direct mode: the stakeholder pinned a plain project topic to one
+    session. That topic is the session's own even with no ticket on it."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "beta")
+    TB.set_direct_session(cfg, "111", 7, "S-dev-p9", pinned_message_id=555)
+    found = TB.find_by_session(cfg, "S-dev-p9")
+    assert (found["chat_id"], found["thread_id"], found["ticket_id"]) == ("111", 7, None)
+
+
+def test_find_by_session_unnamed_binding_is_nobodys(tmp_path):
+    """A binding with no session_id belongs to the project's attendant, not to
+    every session — and an empty/None probe must never match it."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 42, "beta", ticket_id="T-0700")
+    assert TB.find_by_session(cfg, "S-dev-p9") is None
+    assert TB.find_by_session(cfg, "") is None
+    assert TB.find_by_session(cfg, None) is None
+
+
+def test_find_by_session_prefers_a_real_topic_over_the_general_feed(tmp_path):
+    """General (thread_id=None) is not a topic of one's own — when a session is
+    named by both, the real forum topic is the answer regardless of scan
+    order."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", None, "beta", session_id="S-dev-p9")  # General feed
+    TB.set_binding(cfg, "111", 42, "beta", session_id="S-dev-p9")    # a real topic
+    assert TB.find_by_session(cfg, "S-dev-p9")["thread_id"] == 42
+
+
+def test_find_by_session_falls_back_to_a_general_feed_only_match(tmp_path):
+    """Only a General-feed binding names the session: report it truthfully and
+    let the CALLER decide it isn't a topic (actions._own_topic_binding does)."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", None, "beta", session_id="S-dev-p9")
+    assert TB.find_by_session(cfg, "S-dev-p9")["thread_id"] is None
 
 
 def test_find_by_ticket_none_thread_id_roundtrips(tmp_path):

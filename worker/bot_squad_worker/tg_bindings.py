@@ -215,16 +215,61 @@ def find_by_ticket(cfg: Any, ticket_id: str) -> Optional[dict]:
     orchestrator session posting into its task's topic knows the ticket id,
     not the raw ``(chat_id, thread_id)``.
 
-    Returns ``{chat_id, thread_id, slug, session_id}`` for the first binding
-    whose ``ticket_id`` matches, or ``None`` when no topic is bound to it
-    (e.g. the task is being discussed in the project's General instead —
+    Returns ``{chat_id, thread_id, slug, ticket_id, session_id}`` for the first
+    binding whose ``ticket_id`` matches, or ``None`` when no topic is bound to
+    it (e.g. the task is being discussed in the project's General instead —
     T-0660 Addendum 2: a dedicated topic is opt-in, not automatic)."""
+    return _find(cfg, lambda rec: rec.get("ticket_id") == ticket_id)
+
+
+def find_by_session(cfg: Any, session_id: str) -> Optional[dict]:
+    """Reverse lookup: the topic whose binding NAMES ``session_id`` (T-0723) —
+    the mirror of :func:`find_by_ticket` for a sender that knows its own sid
+    but not the ticket the topic was bound to.
+
+    A binding carries a ``session_id`` in exactly two cases, and both mean
+    "this topic belongs to that session": a T-0677 direct-mode/pinned topic
+    (the stakeholder pointed the topic at one session) and a T-0660 Phase-2
+    per-task topic created with its originating session. That makes this the
+    lookup ``tg_notify`` needs to route a session's slug-only send into its OWN
+    topic instead of the project-wide conversation locus (T-0723 — the locus is
+    "wherever the human last wrote", which is not an identity).
+
+    A REAL forum topic wins over a ``(chat_id, None)`` General-feed binding
+    pointed at the same session: General is not a topic of one's own, so a
+    sender that only has that keeps the locus behaviour (see the caller,
+    ``actions._own_topic_binding``). Returns the same record shape as
+    :func:`find_by_ticket`, or ``None`` when no binding names the session
+    (``session_id`` empty/None never matches — an unnamed binding is not
+    everyone's).
+    """
+    if not session_id:
+        return None
+    return _find(cfg, lambda rec: rec.get("session_id") == session_id,
+                 prefer_topic=True)
+
+
+def _find(cfg: Any, pred: Any, *, prefer_topic: bool = False) -> Optional[dict]:
+    """Shared reverse-lookup body for the ``find_by_*`` helpers: the first
+    binding satisfying ``pred``, decoded into
+    ``{chat_id, thread_id, slug, ticket_id, session_id}``.
+
+    ``prefer_topic`` keeps scanning past a General-feed (``thread_id is None``)
+    match for a real forum topic, and only falls back to the General one when
+    no topic matched.
+    """
+    fallback: Optional[dict] = None
     for key, rec in load(cfg).items():
-        if rec.get("ticket_id") == ticket_id:
-            chat_id, _, thread_part = key.partition(":")
-            thread_id = int(thread_part) if thread_part else None
-            return {
-                "chat_id": chat_id, "thread_id": thread_id,
-                "slug": rec["slug"], "session_id": rec.get("session_id"),
-            }
-    return None
+        if not pred(rec):
+            continue
+        chat_id, _, thread_part = key.partition(":")
+        thread_id = int(thread_part) if thread_part else None
+        out = {
+            "chat_id": chat_id, "thread_id": thread_id, "slug": rec["slug"],
+            "ticket_id": rec.get("ticket_id"), "session_id": rec.get("session_id"),
+        }
+        if not prefer_topic or thread_id is not None:
+            return out
+        if fallback is None:
+            fallback = out
+    return fallback

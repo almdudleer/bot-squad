@@ -665,6 +665,301 @@ def test_tg_notify_rejects_non_integer_topic(tmp_config_dir, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# T-0723: a session that OWNS a topic posts THERE, not into whatever topic the
+# stakeholder last wrote in. The destination precedence ladder (see
+# _action_tg_notify's "DESTINATION PRECEDENCE" comment — this block IS its
+# encoding, so the order can't quietly drift back into branch order):
+#
+#   explicit chat_id/topic_id > ticket_id param > SENDER'S OWN topic >
+#   topic class > conversation locus > project static default
+# ---------------------------------------------------------------------------
+
+def _dev_session(cfg, sid: str, *, slug: str = "group-project",
+                 task_id: str = "~", extra_task_ids=None) -> None:
+    """Write a dev SessionMd so `sid` resolves to its task binding(s)."""
+    from bot_squad_worker.sessions import _write_session_metadata
+    sdir = cfg.data_dir / slug / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    _write_session_metadata(sdir / f"{sid}.md", {
+        "sid": sid, "status": "active", "window": "dev-window",
+        "task_id": task_id, "initiative": "~",
+        "extra_task_ids": extra_task_ids or [],
+    })
+
+
+def test_tg_notify_task_bound_sender_beats_locus(tmp_path, monkeypatch):
+    """THE T-0723 regression: the locus points at topic A ([BS] General, where
+    the stakeholder last typed) while the sending dev owns topic B (its T-0660
+    per-task topic). The message must land in B."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "-1001234567890", 5)   # topic A
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            ticket_id="T-0723")                                       # topic B
+    _dev_session(cfg, "S-u-dev-p9", task_id="T-0723")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["topic_id"] == 77
+    assert fake.calls[0]["chat_id"] == "-1001234567890"
+
+
+def test_tg_notify_own_topic_resolved_from_extra_task_ids(tmp_path, monkeypatch):
+    """A bundled/BIND_TASK dev owns its extra tasks' topics too."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "-1001234567890", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 88, "group-project",
+                            ticket_id="T-0999")
+    _dev_session(cfg, "S-u-dev-p9", task_id="T-0723", extra_task_ids=["T-0999"])
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["topic_id"] == 88
+
+
+def test_tg_notify_direct_mode_pinned_topic_beats_locus(tmp_path, monkeypatch):
+    """T-0677 direct mode: a topic pinned to this session is its own topic even
+    with no ticket bound to it — no SessionMd task binding needed."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "-1001234567890", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 61, "group-project")
+    tg_bindings.set_direct_session(cfg, "-1001234567890", 61, "S-u-oper-p2",
+                                   pinned_message_id=444)
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "status",
+                             "sid": "S-u-oper-p2"})
+
+    assert fake.calls[0]["topic_id"] == 61
+
+
+def test_tg_notify_topicless_sender_still_follows_locus(tmp_path, monkeypatch):
+    """Do NOT regress T-0667: a sender with no topic of its own (`bsq tg ping`
+    from a plain session, a project-level escalation) keeps following the
+    conversation — including when OTHER sessions own topics."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            ticket_id="T-0723", session_id="S-u-other-p1")
+    _dev_session(cfg, "S-u-dev-p9", task_id="~")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "need you",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["chat_id"] == "999888777"
+    assert fake.calls[0]["topic_id"] == 5
+
+
+def test_tg_notify_sidless_send_still_follows_locus(tmp_path, monkeypatch):
+    """No sid at all (the admin test-ping, an API-initiated project send) has no
+    identity to resolve a topic from — locus, unchanged."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            ticket_id="T-0723")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "test ping"})
+
+    assert fake.calls[0]["chat_id"] == "999888777"
+    assert fake.calls[0]["topic_id"] == 5
+
+
+def test_tg_notify_explicit_topic_id_beats_own_topic(tmp_path, monkeypatch):
+    """Rung 1 > rung 3: a caller that spelled the thread out means it."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            session_id="S-u-dev-p9")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi",
+                             "sid": "S-u-dev-p9", "topic_id": 7})
+
+    assert fake.calls[0]["topic_id"] == 7
+
+
+def test_tg_notify_explicit_chat_id_beats_own_topic(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            session_id="S-u-dev-p9")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "chat_id": "555",
+                             "message": "hi", "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["chat_id"] == "555"
+    assert fake.calls[0]["topic_id"] is None
+
+
+def test_tg_notify_own_topic_beats_topic_class(tmp_path, monkeypatch):
+    """Rung 3 > rung 4: the sender's own topic outranks a class thread."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings, tg_topics
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_topics.save(cfg, "group-project", {"feedback": 12})
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            session_id="S-u-dev-p9")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "hi",
+                             "sid": "S-u-dev-p9", "topic": "feedback"})
+
+    assert fake.calls[0]["topic_id"] == 77
+
+
+def test_tg_notify_topic_class_beats_locus(tmp_path, monkeypatch):
+    """Rung 4 > rung 5: a class-routed send belongs in the project's thread for
+    that class, in the project's OWN chat — not wherever the human last wrote
+    (which used to preempt the class entirely)."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_topics
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_topics.save(cfg, "group-project", {"deploy_logs": 12})
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 5)
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "deploy ok",
+                             "topic": "deploy_logs"})
+
+    assert fake.calls[0]["chat_id"] == "-1001234567890"
+    assert fake.calls[0]["topic_id"] == 12
+
+
+def test_tg_notify_own_topic_beats_static_default(tmp_path, monkeypatch):
+    """Rung 3 > rung 6: with no locus recorded at all, the owned topic still
+    wins over the project's static tg_chat/tg_topic_id."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    tg_bindings.set_binding(cfg, "-1009999999999", 77, "group-project",
+                            ticket_id="T-0723")
+    _dev_session(cfg, "S-u-dev-p9", task_id="T-0723")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["chat_id"] == "-1009999999999"
+    assert fake.calls[0]["topic_id"] == 77
+
+
+def test_tg_notify_own_topic_never_crosses_projects(tmp_path, monkeypatch):
+    """The slug is a GUARD on rung 3: a topic bound under a DIFFERENT project is
+    never a valid destination for this project's send — it falls through to the
+    locus instead."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "some-other-project",
+                            session_id="S-u-dev-p9")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["chat_id"] == "999888777"
+    assert fake.calls[0]["topic_id"] == 5
+
+
+def test_tg_notify_general_feed_binding_is_not_an_own_topic(tmp_path, monkeypatch):
+    """A (chat_id, None) General-feed binding naming this session is not a topic
+    of its own — such a sender keeps the locus behaviour."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", None, "group-project",
+                            session_id="S-u-dev-p9")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["chat_id"] == "999888777"
+    assert fake.calls[0]["topic_id"] == 5
+
+
+def test_tg_notify_own_task_topic_records_the_fyi(tmp_path, monkeypatch):
+    """Landing in a task's topic is a task-topic direct-write however it was
+    resolved, so it earns the same T-0660 mechanic #3 FYI append — carrying the
+    ticket the BINDING named (no `ticket_id` param was passed)."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings, tg_listener as TL
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_stake", "999888777", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project",
+                            ticket_id="T-0723")
+    _dev_session(cfg, "S-u-dev-p9", task_id="T-0723")
+
+    fyi_calls = []
+    monkeypatch.setattr(
+        TL, "append_conversation_fyi",
+        lambda cfg, slug, gid, *, author, text: fyi_calls.append(
+            {"gid": gid, "author": author, "text": text}),
+    )
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["topic_id"] == 77
+    assert len(fyi_calls) == 1
+    assert fyi_calls[0]["author"] == "session:S-u-dev-p9"
+    assert "T-0723" in fyi_calls[0]["text"]
+
+
+def test_tg_notify_own_topic_survives_an_unreadable_session_md(tmp_path, monkeypatch):
+    """Routing must never fail on session state: a garbage SessionMd degrades to
+    "no topic of my own" (locus), not to an exception."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "999888777", 5)
+    sdir = cfg.data_dir / "group-project" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "S-u-dev-p9.md").write_text("not: [valid, frontmatter\n")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "progress",
+                             "sid": "S-u-dev-p9"})
+
+    assert fake.calls[0]["chat_id"] == "999888777"
+
+
+# ---------------------------------------------------------------------------
 # max_notify tests (T-0247) — MAX (max.ru) DM channel, mirrors tg_notify
 # ---------------------------------------------------------------------------
 

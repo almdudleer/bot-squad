@@ -196,6 +196,71 @@ def _resolve_tmux_session(cfg: Any, slug: str, sid: str) -> str:
     return str((meta or {}).get("tmux_session") or "")
 
 
+def _sender_task_ids(cfg: Any, slug: str, sid: str) -> list[str]:
+    """The task ids the sending session is bound to right now — its SessionMd
+    ``task_id`` plus any ``extra_task_ids`` (a bundled/BIND_TASK dev owns
+    several). Ordered: the primary binding first. ``~``/empty sentinels and
+    duplicates are dropped; unresolvable session -> ``[]``.
+
+    Deliberately does NOT read ``last_task_id`` (the reaped-binding keepsake,
+    see sessions.py): a finished task's topic is no longer the session's home.
+    """
+    if not sid or not slug:
+        return []
+    try:
+        from bot_squad_worker import sessions as _sessions
+        meta = _sessions.resolve_session(cfg, slug, sid) or {}
+    except Exception:  # noqa: BLE001 — routing must never fail on a bad md
+        return []
+    out: list[str] = []
+    extra = meta.get("extra_task_ids") or []
+    for raw in [meta.get("task_id"), *(extra if isinstance(extra, list) else [])]:
+        tid = str(raw or "").strip()
+        if tid and tid != "~" and tid not in out:
+            out.append(tid)
+    return out
+
+
+def _own_topic_binding(cfg: Any, sid: str, slug: str) -> dict | None:
+    """T-0723 rung 3: the forum topic that BELONGS to the SENDING session, or
+    ``None`` when it doesn't own one.
+
+    Two ways a session owns a topic today, checked in this order:
+
+    1. a binding that NAMES it (``session_id``) — a T-0677 direct-mode/pinned
+       topic, or a T-0660 Phase-2 task topic created with its originating
+       session (``tg_bindings.find_by_session``);
+    2. a topic bound to one of the session's OWN tasks (``task_id`` /
+       ``extra_task_ids``) — the T-0660 per-task topic, which is frequently
+       created without a ``session_id`` (``tg_bindings.find_by_ticket``).
+
+    This is resolved from the caller's own IDENTITY (the ``sid`` it already
+    passes) and never guessed from the conversation locus — guessing "the
+    current topic" from where the human last wrote IS the T-0723 bug.
+
+    A General-feed binding (``thread_id is None``) is not a topic of one's own,
+    so it returns ``None`` there: such a sender keeps T-0667's locus behaviour
+    unchanged. ``slug``, when the caller passed one, is a GUARD rather than a
+    lookup key — a binding into a different project is never a valid
+    destination for this project's send.
+    """
+    if not sid:
+        return None
+    from bot_squad_worker import tg_bindings
+    own = tg_bindings.find_by_session(cfg, sid)
+    if own is None:
+        for tid in _sender_task_ids(cfg, slug, sid):
+            found = tg_bindings.find_by_ticket(cfg, tid)
+            if found is not None:
+                own = found
+                break
+    if own is None or own.get("thread_id") is None:
+        return None
+    if slug and own.get("slug") and own["slug"] != slug:
+        return None
+    return own
+
+
 def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     """Send a Telegram message, with optional SID prefix and debounce.
 
@@ -203,7 +268,11 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         message  : str  — required; the text to send
         chat_id  : str  — explicit chat; takes precedence over slug
         slug     : str  — project slug; resolved to tg_chat in projects.toml
-        sid      : str  — SID prefix component  (e.g. "S-almdudleer-claude-p5")
+        sid      : str  — the SENDING session (e.g. "S-almdudleer-claude-p5"):
+                   its display prefix, its reply-map route (T-0719) and — when
+                   no chat/ticket/topic is spelled out — the identity its OWN
+                   topic is resolved from (T-0723, rung 3 of the precedence
+                   ladder below)
         user     : str  — user prefix component
         debounce : bool — default True; T-0569 pass False to force delivery
                    even if the exact same payload was just sent (an interactive
@@ -233,9 +302,32 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     cfg = _get_config()
 
     # --- resolve chat_id (+ project-bound forum topic, T-0156) ---
-    # An explicit topic_id param wins; otherwise, when the chat is resolved
-    # from a project, inherit that project's tg_topic_id so group bindings
-    # land in the right forum thread without the caller spelling it out.
+    # DESTINATION PRECEDENCE — the SSOT, in strict order (T-0723; it used to be
+    # implicit in branch order, which is how the locus came to override a
+    # sender's own topic). Each rung is only consulted when no earlier one
+    # resolved; `topic_id` is laddered independently of `chat_id`, so an
+    # explicit `topic_id` param always survives whichever rung supplied the
+    # chat:
+    #
+    #   1. explicit `chat_id` / `topic_id` params   — the caller spelled the
+    #                                                 destination out
+    #   2. explicit `ticket_id` param      (T-0660) — direct-write into that
+    #                                                 task's topic
+    #   3. the SENDER'S OWN topic          (T-0723) — `sid`'s per-task (T-0660)
+    #                                                 or pinned/direct-mode
+    #                                                 (T-0677) topic
+    #   4. topic CLASS (`topic` param)     (T-0386) — class -> the project's
+    #                                                 own thread for it
+    #   5. conversation LOCUS              (T-0667) — where the human last
+    #                                                 wrote about this project
+    #   6. the project's static tg_chat / tg_topic_id (T-0156) — pre-gateway
+    #                                                 default
+    #
+    # Rungs 3 and 5 are the T-0723 fix: a sender WITH a topic of its own posts
+    # there; a sender WITHOUT one still follows the conversation exactly as
+    # T-0667 intended (`bsq tg ping` from a topic-less session, a project-level
+    # escalation). The ordering is encoded in tests (test_actions.py, the
+    # "T-0723" block), not left to branch order.
     chat_id: str | None = params.get("chat_id") or None
     topic_id: int | None = _coerce_topic_id(params.get("topic_id"))
     slug: str = params.get("slug") or ""
@@ -264,25 +356,59 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         if not slug:
             slug = binding.get("slug") or slug
     if not chat_id:
+        # Rung 3 (T-0723): the sending session's OWN topic, resolved from the
+        # `sid` it already passes. Ahead of the locus because a sender with a
+        # home topic must not be dragged to wherever the human last wrote —
+        # the reported bug ("dev sessions are writing into the wrong topic").
+        own = _own_topic_binding(cfg, params.get("sid") or "", slug)
+        if own is not None:
+            chat_id = own["chat_id"]
+            if topic_id is None:
+                topic_id = own["thread_id"]
+            if not slug:
+                slug = own.get("slug") or slug
+            if own.get("ticket_id"):
+                # Landing in a task's topic is a task-topic direct-write no
+                # matter which rung resolved it, so it earns the same T-0660
+                # mechanic #3 FYI append into the attendant thread as an
+                # explicit `ticket_id` send does.
+                task_topic_binding = own
+    if not chat_id:
         if slug:
             project = cfg.projects.get(slug)
             if project is None:
                 raise ActionError(f"tg_notify: unknown project slug {slug!r}")
-            # T-0667: prefer the conversation LOCUS (where the user most
-            # recently wrote about this project) over the project's static
-            # tg_chat — a slug-only send (e.g. `bsq tg ping`, a stall
-            # escalation) must land in the same place the conversation is
-            # actually happening, not always the old default DM.
-            from bot_squad_worker import conversation_locus
-            locus = conversation_locus.latest_for_slug(cfg, slug)
-            if locus:
-                chat_id = locus["chat_id"]
-                if topic_id is None:
-                    topic_id = locus.get("thread_id")
-            else:
-                chat_id = project.tg_chat
-                if topic_id is None:
-                    topic_id = project.tg_topic_id
+            # Rung 4 (T-0386, ordered ahead of the locus by T-0723): a message
+            # CLASS names a thread inside the PROJECT'S OWN supergroup, so it
+            # pairs with tg_chat — pairing a class thread with the locus's chat
+            # would address a thread id in the wrong chat. Resolves to None
+            # when the project has provisioned no thread for the class, which
+            # falls through to the locus below unchanged.
+            if topic_id is None and params.get("topic"):
+                from bot_squad_worker import tg_topics as _tg_topics
+                class_topic = _tg_topics.resolve(cfg, slug, params["topic"])
+                if class_topic is not None:
+                    chat_id = project.tg_chat
+                    topic_id = class_topic
+            if not chat_id:
+                # Rung 5 (T-0667): prefer the conversation LOCUS (where the
+                # user most recently wrote about this project) over the
+                # project's static tg_chat — a slug-only send from a session
+                # with NO topic of its own (e.g. `bsq tg ping`, a stall
+                # escalation) must land in the same place the conversation is
+                # actually happening, not always the old default DM. T-0723
+                # narrowed WHEN this applies (rung 3 above), never WHETHER.
+                from bot_squad_worker import conversation_locus
+                locus = conversation_locus.latest_for_slug(cfg, slug)
+                if locus:
+                    chat_id = locus["chat_id"]
+                    if topic_id is None:
+                        topic_id = locus.get("thread_id")
+                else:
+                    # Rung 6: the project's static binding.
+                    chat_id = project.tg_chat
+                    if topic_id is None:
+                        topic_id = project.tg_topic_id
         elif cfg.tg_default_chat_id:
             # T-0171: per-server default chat for the local (detached/standalone)
             # bot — preferred over the first-project guess when configured.
@@ -312,6 +438,11 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # T-0386: when a message CLASS is given (and no explicit numeric topic), map
     # it to the project's forum thread so deploy-logs/team-queries/feedback land
     # in their own thread. Falls back to the legacy single topic / general feed.
+    # T-0723: the slug-resolution ladder above already applies the class as its
+    # rung 4 (so it beats the locus, which used to preempt it). This is the same
+    # resolution for the destinations that ladder never reaches — an explicit
+    # `chat_id`/`ticket_id` send, the default-chat fallbacks — and is a no-op
+    # whenever a rung already produced a topic.
     topic_class = params.get("topic") or ""
     if topic_id is None and topic_class and slug:
         from bot_squad_worker import tg_topics as _tg_topics
@@ -367,9 +498,12 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         task_id=str(params.get("task_id") or ""),
     )
     if task_topic_binding is not None and result.get("sent"):
+        # T-0723: the ticket may come from the `ticket_id` param (rung 2) or
+        # from the sender's own task topic (rung 3) — take whichever named it.
         _fyi_record_task_topic_direct_write(
             cfg, task_topic_binding["slug"], sid=params.get("sid", ""),
-            ticket_id=ticket_id, text=params["message"],
+            ticket_id=ticket_id or str(task_topic_binding.get("ticket_id") or ""),
+            text=params["message"],
         )
     return result
 

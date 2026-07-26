@@ -56,7 +56,9 @@ def test_fresh_spawn_brief_hands_verbatim_and_anchors(tmp_path, monkeypatch):
     # (b) explicit START anchor + STAY-ON-TASK both point at the verbatim ask.
     assert "START HERE" in brief and "ANCHOR ON THE ASK" in brief
     assert f"{TICKET}'s `## Verbatim request`" in brief          # START anchor
-    assert "Re-read" in brief and "is the target" in brief       # rule #4 anchor
+    assert "STAY ON TASK" in brief
+    stay_on_task = brief[brief.index("STAY ON TASK"):]
+    assert f"{TICKET}'s `## Verbatim request`" in stay_on_task   # rule #4 anchor
     assert "{primary}" not in brief                              # f-string resolved
 
 

@@ -1714,45 +1714,20 @@ and HUMAN-ONLY — never edit it.
 {guidance}
 
 == HARD PROCESS RULES (enforced — not suggestions) ==
-1. TASK MANAGEMENT VIA BOT-SQUAD TICKETS ONLY (T-0152). Do NOT write planning
-   artifacts, notes, or task lists into ~/.claude/superpowers/* or other doc
-   folders — that's where sessions get lost. Track all multi-step work on the
-   ticket: `bsq ticket note <id> <text>` for progress, `bsq ticket update <id>
-   <status>` for status. In-session TodoWrite/TaskCreate is ONLY for sub-steps
-   within one ticket.
-2. MANUAL-TESTING-FIRST (T-0158). For any verification DoD item: (a) write the
-   user scenario in plain English (`bsq scenario new <id>` opens a template),
-   (b) walk it through MANUALLY (playwright MCP or narrated scripted
-   walkthrough) observing the REAL result, (c) automate ONLY after the manual
-   pass. A test .mjs written before the manual walkthrough is a process
-   violation.
-3. GIT DISCIPLINE. Edit the shared tree directly on branch bot_squad/dev — no
-   worktree, no branch switch, no git stash. Commit ONLY with `bsq commit -m
-   <msg> --ack <explicit files>` (review the peer report first). Never wide-add,
-   never rewrite pushed history (revert to undo), never push or merge — your
-   {('TL' if role == 'dev' else 'reviewer')} reviews and deploys.
-4. STAY ON TASK (T-0149). A drift-check tick monitors time-since-commit and
-   time-since-progress-note. Re-read {primary}'s `## Verbatim request` as your
-   anchor — that stated ask is the target, NOT the evolved model your context
-   suggests (T-0483). Come back to the DoD regularly; if you defer or descope
-   anything, record WHY via `bsq ticket note` — don't silently drift.
-5. REPORT READY. When a ticket's DoD (incl. manual walkthrough) is green:
-   `bsq ticket update <id> totest`, `bsq ticket note <id> '<summary>'`, then
-   `bsq peer send {report_to} 'READY <id> — <summary>'`.
-6. REACHING THE STAKEHOLDER (T-0155). Bot-squad NO LONGER DMs the stakeholder on
-   every idle turn. If you are genuinely blocked on HIM (not your TL) and need a
-   decision, send ONE explicit `bsq tg ping '<what you need>'` — he can reply
-   straight to that Telegram message and his answer lands back in this pane.
-   Don't spam it. If you forget and stay blocked on him with your tmux window
-   unwatched for ~15+ min, the worker auto-escalates for you — but the explicit
-   ping is faster and clearer. Route routine questions to your TL via
-   `bsq peer send` first.
-7. REPORT FRICTION UPSTREAM (T-0154). When the process itself fights you —
-   you hit the SAME workaround twice, the ticket scope conflicts with reality,
-   a tool/recipe is broken or missing, or guidance is contradictory — submit it:
-   `bsq feedback submit '<what bit you + what would help>'`. It lands in the
-   project feedback queue for the operator to triage; don't silently absorb it.
-   This is how the process improves. (Tag a use case with `--usecase <id>`.)
+Ticket-only task tracking (T-0152), manual-testing-first (T-0158), git/commit
+discipline, stakeholder-ping etiquette (T-0155), and feedback submission
+(T-0154) are already covered above in your role contract and in
+AGENT_INSTRUCTIONS.md ({ai_path}) — read both rather than re-deriving from
+scratch.
+
+STAY ON TASK (T-0149): a drift-check tick watches time-since-commit and
+time-since-progress-note against {primary}'s `## Verbatim request` (your
+anchor, printed above). If you defer or descope anything, record WHY via
+`bsq ticket note` — don't silently drift.
+
+REPORT READY: when a ticket's DoD (incl. manual walkthrough) is green,
+`bsq ticket update <id> totest`, `bsq ticket note <id> '<summary>'`, then
+`bsq peer send {report_to} 'READY <id> — <summary>'`.
 
 Run `bsq --help` for the full verb reference."""
 

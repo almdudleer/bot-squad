@@ -23,6 +23,7 @@ RAW_TG_SEND_ALLOWED = {
     "jobs.py",          # routine #deploy-logs deploy events (topic_id); KILLED alert + oauth_refresh now route via SSOT (P2-04/P2-08)
     "voice_intake.py",  # voice-note confirmation -> #feedback topic (topic_id)
     "channels.py",      # T-0490: the channel abstraction (TgChannel wraps _get_tg_client); sends are via self._client(), and TgChannel.send forwards topic_id= for group deploy posts — not a hidden personal pager
+    "tg_listener.py",   # T-0677: /pin-session's send_and_pin/unpin_message — a FORUM-TOPIC pin (the topic's visible direct-mode marker) with no counterpart on MAX, so it cannot route via the channel abstraction; every other reply here still goes through _channel_notify
 }
 # The TG/MAX client classes themselves.
 CLIENT_MODULES = {"tg.py", "max.py"}
@@ -75,8 +76,16 @@ def _is_tg_receiver(recv: ast.AST, tg_names: set[str]) -> bool:
     return isinstance(recv, ast.Name) and recv.id in tg_names
 
 
+# Raw TG-client methods that DELIVER a message to a human audience — each one
+# must declare its group ``topic_id=`` at the call site. ``send_and_pin``
+# (T-0677) is here for the same reason ``send`` is: it is a sendMessage under
+# the hood, so leaving it out would make an allowlisted module's new pager
+# invisible to the call-site check.
+_SENDING_METHODS = {"send", "send_and_pin"}
+
+
 def _bare_tg_sends(module: str, src: str) -> list[tuple[str, int]]:
-    """``(enclosing_function, lineno)`` for raw TG ``.send()`` lacking topic_id=."""
+    """``(enclosing_function, lineno)`` for a raw TG send lacking topic_id=."""
     tree = ast.parse(src)
     tg_names = _tg_bound_names(tree)
     offenders: list[tuple[str, int]] = []
@@ -89,7 +98,7 @@ def _bare_tg_sends(module: str, src: str) -> list[tuple[str, int]]:
             if (
                 isinstance(child, ast.Call)
                 and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "send"
+                and child.func.attr in _SENDING_METHODS
                 and _is_tg_receiver(child.func.value, tg_names)
             ):
                 exempt = func in SSOT_FUNCTIONS or (module, func) in BARE_DM_ALLOWED

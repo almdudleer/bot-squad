@@ -3127,7 +3127,8 @@ def test_tg_topic_create_creates_and_binds(tmp_config_dir, monkeypatch):
     assert fake.created == [{"chat_id": "-1003761939853", "name": "[watchrobot] General", "id": thread_id}]
 
     rec = tg_bindings.resolve(Config.load(tmp_config_dir), "-1003761939853", thread_id)
-    assert rec == {"slug": "test-project", "ticket_id": None, "session_id": None}
+    assert rec == {"slug": "test-project", "ticket_id": None, "session_id": None,
+                   "pinned_message_id": None}
 
 
 def _write_ticket(cfg, slug: str, ticket_id: str, title: str) -> None:
@@ -3152,7 +3153,8 @@ def test_tg_topic_create_with_ticket_id_binds_task_topic(tmp_config_dir, monkeyp
         "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700",
     })
     rec = tg_bindings.resolve(cfg, "111", out["thread_id"])
-    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None}
+    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None,
+                   "pinned_message_id": None}
 
 
 def test_tg_topic_create_with_session_id_binds_originating_session(tmp_config_dir, monkeypatch):
@@ -3170,7 +3172,8 @@ def test_tg_topic_create_with_session_id_binds_originating_session(tmp_config_di
         "chat_id": "111", "slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9",
     })
     rec = tg_bindings.resolve(cfg, "111", out["thread_id"])
-    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9"}
+    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": "S-dev-p9",
+                   "pinned_message_id": None}
 
 
 def test_tg_topic_create_unknown_slug_raises(tmp_config_dir, monkeypatch):
@@ -3504,7 +3507,8 @@ def test_tg_topic_rename_does_not_touch_binding(tmp_config_dir, monkeypatch):
     tg_bindings.set_binding(cfg, "111", 45, "test-project", ticket_id="T-0700")
     A.dispatch("tg_topic_rename", {"chat_id": "111", "thread_id": 45, "name": "new title"})
     rec = tg_bindings.resolve(cfg, "111", 45)
-    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None}
+    assert rec == {"slug": "test-project", "ticket_id": "T-0700", "session_id": None,
+                   "pinned_message_id": None}
 
 
 def test_tg_topic_rename_missing_required_param_raises(tmp_config_dir, monkeypatch):

@@ -196,6 +196,22 @@ _MONITOR_VALUE_CLIP = 500
 
 _MONITOR_NUMERIC_JUDGES = frozenset({"numeric_gt", "numeric_lt", "numeric_ne"})
 _MONITOR_JUDGES = _MONITOR_NUMERIC_JUDGES | {"nonzero_exit", "regex_match"}
+
+#: T-0708: commands whose exit code encodes something OTHER than "did the
+#: command run" — grep -c/-q (1 = zero matches, the common healthy case),
+#: diff/cmp (1 = inputs differ). Under a numeric judge a nonzero exit is the
+#: error path (evaluate_probe), so an unguarded use of one of these silently
+#: turns every healthy/zero-match tick into a probe error, never "ok" — this
+#: is exactly what happened to R-0008 (never reset consecutive_errors, only
+#: alerted once at MONITOR_ERROR_BOUND and then went silently blind).
+_EXIT_CODE_FOOTGUN_RE = re.compile(
+    r'\bgrep\b(?:\s+(?:--\S+|-\S+))*\s+-[a-zA-Z]*[cq][a-zA-Z]*\b'
+    r'|\bgrep\s+--(?:count|quiet|silent)\b'
+    r'|\bdiff\b|\bcmp\b'
+)
+#: a guard that makes the pipeline's own exit code always 0, so the numeric
+#: judge sees stdout instead of erroring on the footgun command's exit code.
+_EXIT_CODE_GUARD_RE = re.compile(r'(?:\|\||;)\s*(?:true\b|exit\s+0\b)')
 _MONITOR_SPEC_KEYS = frozenset({
     "probe", "cmd", "interval_s", "timeout_s", "judge", "threshold",
     "persist_s", "cooldown_s", "on_breach", "on_recover",
@@ -291,6 +307,17 @@ class MonitorTrigger(Trigger):
                     raise RoutineError(
                         f"monitor spec: judge {judge} needs a numeric threshold, "
                         f"got {threshold!r}")
+                if (_EXIT_CODE_FOOTGUN_RE.search(cmd)
+                        and not _EXIT_CODE_GUARD_RE.search(cmd)):
+                    raise RoutineError(
+                        f"monitor spec: cmd looks like it uses grep -c/-q, diff, "
+                        f"or cmp under judge {judge} — those commands exit "
+                        "nonzero on the common/healthy case (zero matches / no "
+                        "difference), which evaluate_probe treats as a PROBE "
+                        "ERROR, not a valid 0 value (this silently broke "
+                        "R-0008 — T-0708). Guard the pipeline so a healthy "
+                        "tick still exits 0, e.g. append '|| true', or use "
+                        "judge=nonzero_exit instead")
             elif judge == "regex_match":
                 if not threshold or not str(threshold).strip():
                     raise RoutineError(

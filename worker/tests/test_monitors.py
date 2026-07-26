@@ -130,6 +130,13 @@ def test_schedule_trigger_poll_fires_when_due():
     {"persist_s": -1},
     {"cooldown_s": -1},
     {"nonsense_key": 1},                  # unknown keys refused (typo guard)
+    # T-0708: grep -c/-q, diff, cmp exit nonzero on the common/healthy case
+    # (zero matches / no difference) — under a numeric judge that's the
+    # PROBE ERROR path, never a valid 0 value, unless guarded.
+    {"cmd": "journalctl -u x | grep -c 'boom'"},
+    {"cmd": "grep -qc pattern /var/log/x"},
+    {"cmd": "diff a.txt b.txt"},
+    {"cmd": "cmp a.txt b.txt"},
 ])
 def test_monitor_spec_validation_rejects(bad):
     spec = _spec(**bad)
@@ -137,6 +144,27 @@ def test_monitor_spec_validation_rejects(bad):
         spec.pop("timeout_s")
     with pytest.raises(R.RoutineError):
         R.MonitorTrigger(spec)
+
+
+@pytest.mark.parametrize("cmd", [
+    "journalctl -u x | grep -c 'boom' || true",
+    "grep -c pattern /var/log/x; true",
+    "diff a.txt b.txt || exit 0",
+])
+def test_monitor_spec_grep_c_footgun_allowed_when_guarded(cmd):
+    """T-0708: the same exit-code-quirky commands are fine once the author
+    guards the pipeline so a healthy tick still exits 0."""
+    trig = R.MonitorTrigger(_spec(cmd=cmd))
+    assert trig.spec["cmd"] == cmd
+
+
+def test_monitor_spec_grep_c_footgun_only_checked_for_numeric_judges():
+    # nonzero_exit judge WANTS the exit code as signal — grep -c/-q etc.
+    # are exactly the right idiom there, not a footgun.
+    spec = _spec(judge="nonzero_exit", cmd="grep -c boom /var/log/x")
+    spec.pop("threshold")
+    trig = R.MonitorTrigger(spec)
+    assert trig.spec["judge"] == "nonzero_exit"
 
 
 def test_monitor_spec_not_a_dict_raises():
@@ -452,6 +480,32 @@ def test_run_probe_output_capped_at_8kb():
     pr = R._run_probe({"cmd": "python3 -c \"print('x' * 20000)\"", "timeout_s": 10})
     assert pr.ok
     assert len(pr.output) <= R.MONITOR_OUTPUT_CAP == 8192
+
+
+def test_run_probe_grep_c_zero_matches_unguarded_reproduces_r0008_bug():
+    """T-0708: pre-fix R-0008 cmd shape — a healthy (zero-match) tick makes
+    grep -c exit 1, which the numeric judge treats as a probe error, not
+    ok/0. Regression pin for the bug this ticket fixes; declare-time now
+    refuses this shape (see test_monitor_spec_validation_rejects), this
+    test documents WHY."""
+    # built as a raw spec (not through MonitorTrigger) since declare-time
+    # validation now refuses this exact unguarded shape.
+    spec = _spec(cmd="echo nomatch | grep -c boom", judge="numeric_gt", threshold=0)
+    pr = R._run_probe(spec)
+    assert pr.ok and pr.exit_code == 1 and pr.output.strip() == "0"
+    verdict, _value = R.evaluate_probe(spec, pr)
+    assert verdict == "error"  # the bug: a healthy 0-count tick is NOT "ok"
+
+
+def test_run_probe_grep_c_zero_matches_guarded_fixes_r0008_bug():
+    """T-0708 fix: appending '|| true' makes a healthy tick evaluate ok/0,
+    matching R-0008's actual post-fix cmd."""
+    spec = _spec(cmd="echo nomatch | grep -c boom || true", judge="numeric_gt",
+                 threshold=0)
+    pr = R._run_probe(spec)
+    assert pr.ok and pr.exit_code == 0 and pr.output.strip() == "0"
+    verdict, value = R.evaluate_probe(spec, pr)
+    assert (verdict, value) == ("ok", 0)
 
 
 # --- The sweep: walking skeleton + engine behaviors --------------------------

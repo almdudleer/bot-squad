@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api, isNotFoundError, normalizeSessionsPayload, parseNearDuplicate, shouldRedirectOn401 } from "./api";
+import { api, isNotFoundError, isPublicRoute, normalizeSessionsPayload, parseNearDuplicate, shouldRedirectOn401 } from "./api";
 
 function mockOnce(json: unknown = {}): ReturnType<typeof vi.fn> {
   const spy = vi.fn().mockResolvedValueOnce({
@@ -214,6 +214,63 @@ describe("T-0609 composed call() 401-redirect", () => {
     await expect(api.me()).rejects.toThrow("not authenticated");
     expect(loc.href).toBe("/login");
     expect(spy).toHaveBeenCalledWith("/api/auth/me", expect.any(Object));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-0714: /help is documented (in its own copy) as reachable without login, but
+// the Shell's background fetches 401 there and used to bounce the visitor to
+// /login. The exemption is keyed on the PAGE route — a 401 on a private page
+// must still redirect.
+// ---------------------------------------------------------------------------
+describe("T-0714 public-route 401 exemption", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  test("isPublicRoute matches /help (and tolerates a trailing slash) only", () => {
+    expect(isPublicRoute("/help")).toBe(true);
+    expect(isPublicRoute("/help/")).toBe(true);
+    expect(isPublicRoute("/login")).toBe(false);
+    expect(isPublicRoute("/p/bot-squad")).toBe(false);
+    expect(isPublicRoute("/")).toBe(false);
+    expect(isPublicRoute(undefined)).toBe(false);
+  });
+
+  test("shouldRedirectOn401 suppresses the bounce on /help, not elsewhere", () => {
+    expect(shouldRedirectOn401("/api/auth/me", "/help")).toBe(false);
+    expect(shouldRedirectOn401("/api/projects", "/help")).toBe(false);
+    expect(shouldRedirectOn401("/api/auth/me", "/p/bot-squad")).toBe(true);
+    expect(shouldRedirectOn401("/api/auth/me", "/login")).toBe(true);
+  });
+
+  test("call() on /help rejects without navigating away", async () => {
+    const loc = { href: "https://host/help", pathname: "/help" };
+    vi.stubGlobal("window", { location: loc });
+    const spy = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      text: async () => '{"detail":"not authenticated"}',
+    } as Response);
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await expect(api.me()).rejects.toThrow(/API error 401/);
+    expect(loc.href).toBe("https://host/help");
+  });
+
+  test("call() on a private page still redirects to /login", async () => {
+    const loc = { href: "https://host/p/bot-squad", pathname: "/p/bot-squad" };
+    vi.stubGlobal("window", { location: loc });
+    const spy = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      text: async () => '{"detail":"not authenticated"}',
+    } as Response);
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await expect(api.me()).rejects.toThrow("not authenticated");
+    expect(loc.href).toBe("/login");
   });
 });
 

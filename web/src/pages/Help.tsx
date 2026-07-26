@@ -118,17 +118,26 @@ export function Help() {
         <h2>Vision</h2>
         <p>
           The vision is a set of markdown files at <code>/p/&lt;slug&gt;/vision</code> that define
-          the product direction. Organised in layers:
+          the product direction. The page reads them back in two parts:
         </p>
         <ul>
-          <li><strong>North-star</strong> — the ultimate purpose of the project in one sentence.</li>
-          <li><strong>Strategy</strong> — the 6–18 month bet: what to build and what not to build.</li>
-          <li><strong>Tactical</strong> — near-term priorities; what agents should focus on this week/sprint.</li>
-          <li><strong>Initiatives</strong> — individual initiatives you can add with <strong>+ New initiative</strong>. Each is a separate markdown file you name and edit freely.</li>
+          <li><strong>Product description</strong> — <code>product.md</code>, rendered at the top: what this project is, in prose.</li>
+          <li><strong>Initiatives</strong> — one markdown file each, grouped into <strong>Active</strong>, <strong>Other</strong> (not piped into agent context) and <strong>Finished</strong>. Click an initiative to expand its body.</li>
         </ul>
         <p>
+          Each active initiative gets at most one bound team-lead process (its dev workers
+          cascade from that lead). The lead is shown beside the initiative as a green chip —
+          or <em>no lead</em> — and clicking it jumps to that process on the Processes page.
+          A <strong>PERSISTENT</strong> badge marks a constant-team initiative that is staffed
+          continuously and never reaches a normal &quot;finished&quot; state.
+        </p>
+        <p>
           Agents read the vision files at the start of each session to stay aligned with the
-          product direction. Edit liberally — changes take effect on the next session spawn.
+          product direction. This page is read-only: creating an initiative, editing a vision
+          file, binding a lead, and finishing / retiring / reopening happen through the
+          Telegram dialog or the CLI (<code>bsq initiative new</code>,{" "}
+          <code>bsq spawn --initiative</code>, <code>bsq ticket update</code>) — changes take
+          effect on the next session spawn.
         </p>
       </section>
 

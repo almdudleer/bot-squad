@@ -28,6 +28,22 @@ export function errorDetail(err: unknown): string {
   return msg;
 }
 
+// T-0714: routes that must render for an anonymous visitor. `/help` says so in
+// its own first paragraph ("always reachable at /help — no login required") and
+// the server does serve it unauthenticated — but the Shell wraps every route,
+// so its background fetches (/api/health, /api/auth/me, /api/projects,
+// /api/autoupdate/status) all 401 and the FIRST one to land used to navigate the
+// whole app to /login. Every one of those callers already handles the rejection
+// (empty rail, no username), so suppressing only the *navigation* is enough.
+export const PUBLIC_ROUTES: readonly string[] = ["/help"];
+
+export function isPublicRoute(pathname: string | null | undefined): boolean {
+  if (!pathname) return false;
+  // Tolerate a trailing slash; "/" itself is not public.
+  const clean = pathname.replace(/\/+$/, "");
+  return PUBLIC_ROUTES.includes(clean);
+}
+
 // T-0601 (F4): the ONE call that must not trigger the global 401-redirect is
 // the login attempt itself — redirecting there turned a wrong password into a
 // silent form reload. Exported for unit tests.
@@ -36,8 +52,18 @@ export function errorDetail(err: unknown): string {
 // session cookie is still valid, so redirecting would bounce a logged-in
 // user to /login over a typo. No web caller goes through call() for it yet;
 // add the exemption here when one lands.
-export function shouldRedirectOn401(path: string): boolean {
-  return path !== "/api/auth/login";
+// T-0714: the exemption is keyed on the PAGE route, not the API path — the
+// same endpoints must still bounce an expired session off a private page.
+export function shouldRedirectOn401(
+  path: string,
+  pagePath?: string | null,
+): boolean {
+  // T-0601 (F4): the login attempt itself is exempt on every route.
+  if (path === "/api/auth/login") return false;
+  const page =
+    pagePath ??
+    (typeof window !== "undefined" ? window.location?.pathname : undefined);
+  return !isPublicRoute(page);
 }
 
 async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {

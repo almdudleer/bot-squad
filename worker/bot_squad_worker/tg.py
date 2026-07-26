@@ -62,6 +62,7 @@ class TgClient:
         debounce: bool = True,
         reply_markup: dict | None = None,
         route_sid: str = "",
+        reply_to_message_id: int | None = None,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -90,6 +91,14 @@ class TgClient:
         to this session by message id, not by re-parsing the prefix. Empty (or
         a non-routing name like ``deploy_monitor``) → nothing recorded, and the
         reply falls through to the legacy regex/attendant path as before.
+
+        ``reply_to_message_id`` (T-0725): make this send an actual Telegram
+        REPLY to that inbound message, so the answer is visibly threaded to
+        what it answers (the voice-note transcript that arrived detached was
+        the reported symptom). ``None`` sends a standalone message exactly as
+        before. This addresses only the *threading* — WHERE the message goes is
+        still ``chat_id``/``topic_id``, which the caller must derive from the
+        inbound message rather than from a static project default.
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
@@ -106,7 +115,8 @@ class TgClient:
             return False
 
         data = self._post(
-            chat_id=chat_id, text=full_text, topic_id=topic_id, reply_markup=reply_markup
+            chat_id=chat_id, text=full_text, topic_id=topic_id,
+            reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
         )
         self._record_reply_route(chat_id=chat_id, data=data, route_sid=route_sid)
         if debounce:
@@ -306,6 +316,7 @@ class TgClient:
         text: str,
         topic_id: int | None = None,
         reply_markup: dict | None = None,
+        reply_to_message_id: int | None = None,
     ) -> dict:
         """POST sendMessage. Returns the parsed API response (T-0677 needs the
         ``result.message_id`` to pin it); ``send`` ignores the return value, so
@@ -318,6 +329,13 @@ class TgClient:
             payload["message_thread_id"] = topic_id
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+            # T-0725: a reply target that has since been deleted makes TG reject
+            # the WHOLE send (400 "message to be replied not found"). The
+            # threading is a nicety; delivering the text is the point — so
+            # degrade to an unthreaded message instead of losing it.
+            payload["allow_sending_without_reply"] = True
         # T-0194: pass proxy= only when configured, so the no-proxy call shape
         # (and httpx trust_env) is unchanged.
         extra = {"proxy": self._proxy} if self._proxy else {}

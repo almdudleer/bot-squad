@@ -138,10 +138,12 @@ class _FakeTgClientOpt:
         self.calls: list[dict] = []
 
     def send(self, *, chat_id, text, sid="", user="", urgent=False,
-             topic_id=None, debounce=True, reply_markup=None):
+             topic_id=None, debounce=True, reply_markup=None,
+             reply_to_message_id=None):
         self.calls.append(dict(chat_id=chat_id, text=text, sid=sid, user=user,
                                urgent=urgent, topic_id=topic_id,
-                               debounce=debounce, reply_markup=reply_markup))
+                               debounce=debounce, reply_markup=reply_markup,
+                               reply_to_message_id=reply_to_message_id))
         return True
 
 
@@ -157,6 +159,28 @@ def test_tg_channel_forwards_reply_markup_and_debounce(monkeypatch):
            debounce=False, reply_markup=markup)
     assert ftg.calls[-1]["reply_markup"] == markup
     assert ftg.calls[-1]["debounce"] is False
+
+
+def test_tg_channel_forwards_reply_to_message_id(monkeypatch):
+    """T-0725: the reply target rides through to the client, so a transcript can
+    be sent as an actual TG reply to the voice note it transcribes."""
+    import bot_squad_worker.actions as A
+
+    ftg = _FakeTgClientOpt()
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: ftg)
+    c = channels.get_channel(_FakeCfg(), name="tg")
+    c.send("transcript", chat_id="C1", topic_id=77, reply_to_message_id=555)
+    assert ftg.calls[-1]["reply_to_message_id"] == 555
+    assert ftg.calls[-1]["topic_id"] == 77
+
+
+def test_tg_channel_omits_reply_to_message_id_when_absent(fake_clients):
+    """Opt-in, like every other T-0513/T-0719 knob: a fixed-signature client
+    that knows nothing of reply threading is called with the legacy shape."""
+    ftg, _ = fake_clients  # _FakeTgClient has NO reply_to_message_id param
+    assert channels.get_channel(_FakeCfg(), name="tg").send(
+        "hi", chat_id="C1", topic_id=3) is True
+    assert "reply_to_message_id" not in ftg.calls[-1]
 
 
 def test_tg_channel_omits_optional_knobs_when_absent(fake_clients):

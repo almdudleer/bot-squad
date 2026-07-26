@@ -138,6 +138,13 @@ class TgChannel(Channel):
         # with fixed signatures keep working.
         if "route_sid" in extra:
             opt["route_sid"] = extra["route_sid"]
+        # T-0725: thread this send as a TG reply to the inbound message it
+        # answers (the voice-note transcript arrived detached from its note).
+        # Same opt-in shape again — omitted unless the caller asks, so fakes
+        # with fixed signatures keep working. Transports without a reply
+        # notion (MAX) simply never receive it.
+        if "reply_to_message_id" in extra:
+            opt["reply_to_message_id"] = extra["reply_to_message_id"]
         return self._client().send(
             chat_id=chat_id,
             text=text,

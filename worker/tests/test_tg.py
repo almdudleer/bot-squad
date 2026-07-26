@@ -258,6 +258,58 @@ def test_post_omits_message_thread_id_when_no_topic(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# T-0725: reply threading — reply_to_message_id
+# ---------------------------------------------------------------------------
+
+def test_post_includes_reply_to_message_id_when_given(tmp_path: Path) -> None:
+    """T-0725: the send must carry reply_to_message_id so the answer is an
+    actual TG reply to the message it answers — plus allow_sending_without_reply
+    so a deleted target degrades to an unthreaded send instead of a 400."""
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="-100999", text="body", topic_id=7, reply_to_message_id=300)
+    assert captured["json"]["reply_to_message_id"] == 300
+    assert captured["json"]["allow_sending_without_reply"] is True
+    # threading is orthogonal to WHERE it goes — the topic still rides along
+    assert captured["json"]["message_thread_id"] == 7
+
+
+def test_post_omits_reply_to_message_id_when_none(tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        captured["json"] = json
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch("httpx.post", side_effect=fake_httpx_post):
+        client._post(chat_id="123", text="body")
+    assert "reply_to_message_id" not in captured["json"]
+    assert "allow_sending_without_reply" not in captured["json"]
+
+
+def test_send_forwards_reply_to_message_id_to_post(tmp_path: Path) -> None:
+    """The public send() surface plumbs the reply target down to _post."""
+    cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
+    client = TgClient(cfg)
+    with patch.object(client, "_post", return_value={}) as post:
+        assert client.send(chat_id="-100999", text="hi", reply_to_message_id=300) is True
+    assert post.call_args.kwargs["reply_to_message_id"] == 300
+
+
+# ---------------------------------------------------------------------------
 # T-0194: per-installation TG egress proxy — _post routes through cfg.tg_proxy_url
 # ---------------------------------------------------------------------------
 

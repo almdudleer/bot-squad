@@ -2610,7 +2610,8 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
         VI, "transcribe_only",
         lambda c, slug, msg: {"ok": False, "reason": "download_failed", "transcript": ""})
     notified = []
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notified.append(text))
+    monkeypatch.setattr(TL, "_notify",
+                        lambda c, chat, text, **k: notified.append(text))
     routed = []
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: routed.append(1))
     recorded = []
@@ -2647,7 +2648,8 @@ def test_handle_update_private_voice_too_big_honest_no_retry_lie(tmp_path, monke
         lambda c, slug, msg: {"ok": False, "reason": "too_big", "transcript": "",
                               "duration": 1540, "file_size": 25_000_000})
     notified = []
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notified.append(text))
+    monkeypatch.setattr(TL, "_notify",
+                        lambda c, chat, text, **k: notified.append(text))
     recorded = []
     monkeypatch.setattr(
         TL, "append_conversation",
@@ -2695,6 +2697,85 @@ def test_private_voice_long_transcript_echo_is_chunked(tmp_path, monkeypatch):
     import re as _re
     bodies = [_re.search("«(.*)»$", e, _re.S).group(1) for e in echoes]
     assert "".join(bodies) == long_transcript
+
+
+# T-0725: the DM echo is threaded to the note it transcribes. The DM path's
+# CHAT was already correct (it uses the inbound chat_id) — only the threading
+# was missing, so these tests assert threading without touching chat handling.
+
+def test_private_voice_echo_replies_to_the_voice_note(tmp_path, monkeypatch):
+    """T-0725: the 🎙-echo goes out as an actual TG reply to the note, in the
+    chat it arrived in."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": True, "transcript": "тёмная тема", "lang": "ru",
+                              "engine": "faster-whisper:small", "duration": 5})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **kw: echoes.append((chat, text, kw)))
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg()})
+
+    assert len(echoes) == 1
+    chat, text, kw = echoes[0]
+    assert chat == "12345"                      # unchanged: already correct
+    assert kw["reply_to_message_id"] == 42      # T-0725: now threaded to the note
+    assert "тёмная тема" in text
+
+
+def test_private_voice_every_echo_part_replies_to_the_note(tmp_path, monkeypatch):
+    """A multi-part echo threads EVERY part to the note — a tail floating free
+    of the note is the same detachment complaint at a smaller scale."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": True, "transcript": "слово" * 1800, "lang": "ru",
+                              "engine": "faster-whisper:small", "duration": 810})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    kwargs = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **kw: kwargs.append(kw))
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg()})
+
+    assert len(kwargs) == 3
+    assert all(kw["reply_to_message_id"] == 42 for kw in kwargs)
+
+
+def test_private_voice_rejection_replies_to_the_note(tmp_path, monkeypatch):
+    """T-0725: a refusal ("note too long") is about THIS note, so it is threaded
+    to it too — the group path threads every outcome through _confirm."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    cfg.voice_max_duration_sec = 300
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": False, "reason": "too_long", "transcript": "",
+                              "duration": 900})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    notified = []
+    monkeypatch.setattr(TL, "_notify",
+                        lambda c, chat, text, **kw: notified.append((chat, kw)))
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg(duration=900)})
+
+    assert notified and notified[0][0] == "12345"
+    assert notified[0][1]["reply_to_message_id"] == 42
 
 
 def test_private_voice_long_transcript_echo_uses_the_shared_splitter(tmp_path, monkeypatch):
@@ -2764,7 +2845,8 @@ def test_handle_update_private_voice_too_long_names_cap_and_records(tmp_path, mo
         lambda c, slug, msg: {"ok": False, "reason": "too_long", "transcript": "",
                               "duration": 376})
     notified = []
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text: notified.append(text))
+    monkeypatch.setattr(TL, "_notify",
+                        lambda c, chat, text, **k: notified.append(text))
     recorded = []
     monkeypatch.setattr(
         TL, "append_conversation",

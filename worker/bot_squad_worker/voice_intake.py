@@ -57,6 +57,32 @@ def extract_voice(message: dict) -> dict[str, Any] | None:
     }
 
 
+def origin_of(message: dict) -> dict[str, Any]:
+    """Where a voice note actually ARRIVED — the destination its answer belongs
+    in (T-0725).
+
+    ``{"chat_id": str, "thread_id": int|None, "message_id": int|None}``, read
+    straight off the inbound update. Before this the confirmation resolved its
+    destination from the project's STATIC ``tg_chat`` plus the fixed
+    ``#feedback`` topic, so a note sent in any other chat/topic had its
+    transcript posted somewhere else entirely — and never as a reply. The three
+    fields were always on the message; they were simply not read.
+
+    Deliberately NOT a routing *decision*: there is nothing to resolve or rank
+    here (contrast T-0723's sender-identity precedence ladder in
+    ``actions._action_tg_notify``, which picks a destination for a send that has
+    no inbound message at all). An answer to an inbound message goes where that
+    message is, full stop.
+    """
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    return {
+        "chat_id": "" if chat_id is None else str(chat_id),
+        "thread_id": message.get("message_thread_id"),
+        "message_id": message.get("message_id"),
+    }
+
+
 def _audio_dir(cfg: Any, slug: str) -> Path:
     return Path(cfg.data_dir) / slug / "feedback" / "_audio"
 
@@ -252,6 +278,11 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
     if not v:
         return {"ok": True, "action": "skip", "reason": "no voice"}
 
+    # T-0725: resolved ONCE here, off the inbound update, and handed to every
+    # _confirm below — so no acknowledgement (success or failure) can re-derive
+    # or guess its destination.
+    origin = origin_of(message)
+
     # Cap BEFORE download/transcribe: TG carries voice.duration without a fetch, so
     # a huge note never hits the proxy/disk/decode. Confirm + bail (no artifact —
     # nothing was transcribed). 0 = no cap.
@@ -259,14 +290,14 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
     if max_dur > 0 and v["duration"] > max_dur:
         log.info("voice_intake: rejecting over-cap note (%ds > %ds) from %s",
                  v["duration"], max_dur, v["author"])
-        _confirm(cfg, slug, v, outcome="too_long")
+        _confirm(cfg, slug, v, outcome="too_long", origin=origin)
         return {"ok": False, "reason": "too_long", "duration": v["duration"]}
 
     if v["file_size"] > _BOT_API_FILE_CAP_BYTES:
         log.info("voice_intake: rejecting too-big note (%d bytes > %d, %ds) from %s"
                  " — Bot API getFile cap", v["file_size"], _BOT_API_FILE_CAP_BYTES,
                  v["duration"], v["author"])
-        _confirm(cfg, slug, v, outcome="too_big")
+        _confirm(cfg, slug, v, outcome="too_big", origin=origin)
         return {"ok": False, "reason": "too_big", "duration": v["duration"],
                 "file_size": v["file_size"]}
 
@@ -277,7 +308,7 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
         log.exception("voice_intake: download failed for %s", v["file_id"])
         # Don't silently drop the note — on this DPI host the TG file fetch can
         # fail transiently (proxy). Tell the stakeholder so they can resend.
-        _confirm(cfg, slug, v, outcome="download_failed")
+        _confirm(cfg, slug, v, outcome="download_failed", origin=origin)
         return {"ok": False, "reason": "download_failed", "error": str(e)}
 
     audio_ref = f"feedback/_audio/{v['file_unique_id']}.oga"
@@ -314,6 +345,7 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
         cfg, slug, v,
         outcome="transcribe_failed" if failed else "ok",
         transcript=transcript,
+        origin=origin,
     )
 
     if failed:
@@ -338,20 +370,39 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
     return {"ok": True, "artifact": str(artifact), "lang": lang}
 
 
-def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = "") -> None:
-    """Post a confirmation back into the project's #feedback topic (best-effort).
+def _confirm(
+    cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = "",
+    origin: dict[str, Any] | None = None,
+) -> None:
+    """Post a confirmation back where the voice note arrived (best-effort).
 
     ``outcome`` ∈ {"ok", "transcribe_failed", "download_failed"} — so the
     stakeholder always gets an acknowledgement, including when the TG file fetch
     fails (proxy hiccup on this DPI host) and there's nothing else to show.
+
+    T-0725: ``origin`` (from :func:`origin_of`) carries the inbound chat, thread
+    and message id, and it drives the send — the confirmation lands in the SAME
+    chat and topic as the note, threaded as a real TG reply to it. It used to
+    read ``project.tg_chat`` + the fixed ``#feedback`` topic instead, which put
+    the transcript in a different chat from the note whenever the note wasn't
+    sent in the project's default #feedback thread. The static lookup survives
+    only as a fallback for a message with no chat on it at all (never a real
+    TG update) — a caller passing no ``origin`` gets the old destination.
     """
     try:
         from bot_squad_worker import channels as _channels, tg_topics
         project = cfg.projects.get(slug)
-        chat_id = getattr(project, "tg_chat", "") if project else ""
+        origin = origin or {}
+        chat_id = str(origin.get("chat_id") or "")
+        if chat_id:
+            topic = origin.get("thread_id")
+            reply_to = origin.get("message_id")
+        else:
+            chat_id = getattr(project, "tg_chat", "") if project else ""
+            topic = tg_topics.resolve(cfg, slug, "feedback")
+            reply_to = None
         if not chat_id:
             return
-        topic = tg_topics.resolve(cfg, slug, "feedback")
         duration = v["duration"]
         if outcome == "too_long":
             # T-0433 P2: rejected pre-download for exceeding the duration cap.
@@ -375,8 +426,11 @@ def _confirm(cfg: Any, slug: str, v: dict, *, outcome: str, transcript: str = ""
             text = f"✅ got your voice note ({duration}s): {snippet}"
         # T-0591 (F5.3): routed through the channel abstraction instead of a
         # raw TgClient — matches tg_listener._channel_notify's pattern.
+        extra: dict[str, Any] = {}
+        if reply_to is not None:
+            extra["reply_to_message_id"] = reply_to
         _channels.get_channel(cfg, project=slug).send(
-            text, chat_id=chat_id, sid="voice_intake", topic_id=topic)
+            text, chat_id=chat_id, sid="voice_intake", topic_id=topic, **extra)
     except Exception:  # noqa: BLE001
         log.exception("voice_intake: confirmation send failed")
 

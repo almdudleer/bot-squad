@@ -1254,12 +1254,19 @@ def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict
     out = _vi.transcribe_only(cfg, chat_slug, msg)
     if not out.get("ok"):
         reason = out.get("reason", "transcription_failed")
-        _notify(cfg, chat_id, _voice_reject_text(cfg, reason, out))
+        # T-0725: the refusal is about THIS note — thread it to the note, same
+        # as the transcript echo below (the group path threads every outcome
+        # through _confirm; the DM path shouldn't be the odd one out).
+        _notify(cfg, chat_id, _voice_reject_text(cfg, reason, out),
+                reply_to_message_id=msg.get("message_id"))
         _record_voice_rejection(cfg, chat_slug, gid, msg, reason, out)
         return {"ok": False, "action": "voice_private_failed", "reason": reason}
 
     transcript = out["transcript"]
-    _echo_transcript(cfg, chat_id, transcript)
+    # T-0725: threaded to the note itself, so the transcript reads as an answer
+    # to that recording rather than a detached message.
+    _echo_transcript(cfg, chat_id, transcript,
+                     reply_to_message_id=msg.get("message_id"))
 
     transcript_msg = dict(msg)
     transcript_msg["text"] = transcript
@@ -1604,7 +1611,10 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = No
     return {"ok": False, "action": "unknown_cmd"}
 
 
-def _notify(cfg, chat_id: str, message: str, *, thread_id: Any = None) -> None:
+def _notify(
+    cfg, chat_id: str, message: str, *, thread_id: Any = None,
+    reply_to_message_id: Any = None,
+) -> None:
     """Lightweight outbound command reply -- no SID prefix, no debounce.
 
     T-0513: routes through the channel abstraction (``channels.get_channel``)
@@ -1617,13 +1627,18 @@ def _notify(cfg, chat_id: str, message: str, *, thread_id: Any = None) -> None:
     acknowledgment/confirmation lands back in THAT topic instead of the
     chat's general feed. ``None`` (DM, General, or a caller with no msg in
     scope) preserves the exact pre-fix behavior.
+
+    ``reply_to_message_id`` (T-0725): thread the reply to the message it
+    answers — see :func:`_channel_notify`.
     """
-    _channel_notify(cfg, chat_id, message, thread_id=thread_id)
+    _channel_notify(cfg, chat_id, message, thread_id=thread_id,
+                    reply_to_message_id=reply_to_message_id)
 
 
 def _channel_notify(
     cfg, chat_id: str, message: str, *,
     reply_markup: dict | None = None, thread_id: Any = None,
+    reply_to_message_id: Any = None,
 ) -> None:
     """Send an interactive group reply via the channel abstraction (T-0513).
 
@@ -1640,6 +1655,11 @@ def _channel_notify(
     instead of back into that topic — a plain, zero-race misroute (distinct
     from the T-0667 conversation-locus staleness this ticket also covers).
     Passed straight to ``channel.send``'s ``topic_id`` when given.
+
+    ``reply_to_message_id`` (T-0725): thread this reply to the specific inbound
+    message it answers, so it reads as an answer instead of a loose message in
+    the feed. Independent of ``thread_id`` — that one says which TOPIC, this one
+    says which MESSAGE. ``None`` sends unthreaded, exactly as before.
     """
     if not cfg.tg_bot_token:
         return
@@ -1650,6 +1670,8 @@ def _channel_notify(
         extra["reply_markup"] = reply_markup
     if thread_id is not None:
         extra["topic_id"] = thread_id
+    if reply_to_message_id is not None:
+        extra["reply_to_message_id"] = reply_to_message_id
     try:
         _channels.get_channel(cfg, project=_slug_for_chat(cfg, chat_id)).send(
             message, chat_id=chat_id, sid="", urgent=True, **extra
@@ -1670,18 +1692,29 @@ _TG_MSG_CAP = _tg.TG_MSG_CAP
 _ECHO_CHUNK = 3900
 
 
-def _echo_transcript(cfg, chat_id: str, transcript: str) -> None:
+def _echo_transcript(
+    cfg, chat_id: str, transcript: str, *, reply_to_message_id: Any = None,
+) -> None:
     """T-0586: 🎙-echo that survives transcripts longer than one TG message.
     Single send for the common case; a long transcript goes out as numbered
-    parts so the user still sees the full recognition."""
+    parts so the user still sees the full recognition.
+
+    T-0725: ``reply_to_message_id`` threads the echo to the voice note it
+    transcribes. EVERY part replies to the note (not part 1 only) — a
+    multi-part echo whose tail floated free of the note is the same detachment
+    complaint at a smaller scale. The DM path's ``chat_id`` was already
+    correct, so this adds threading only; nothing about where it goes changes.
+    """
     prefix = "\U0001f399 Распознал так: "
     if len(prefix) + len(transcript) + 2 <= _TG_MSG_CAP:
-        _channel_notify(cfg, chat_id, f"{prefix}«{transcript}»")
+        _channel_notify(cfg, chat_id, f"{prefix}«{transcript}»",
+                        reply_to_message_id=reply_to_message_id)
         return
     chunks = _tg.split_for_tg(transcript, limit=_ECHO_CHUNK)
     total = len(chunks)
     for n, chunk in enumerate(chunks, 1):
-        _channel_notify(cfg, chat_id, f"{prefix}{_tg.part_marker(n, total)} «{chunk}»")
+        _channel_notify(cfg, chat_id, f"{prefix}{_tg.part_marker(n, total)} «{chunk}»",
+                        reply_to_message_id=reply_to_message_id)
 
 
 def tick(cfg) -> dict:

@@ -234,7 +234,9 @@ def test_process_voice_too_big_confirms_honestly(tmp_path, monkeypatch):
         ts="2026-07-05T13:00:00Z")
 
     assert out["ok"] is False and out["reason"] == "too_big"
-    assert sent and sent[0]["topic_id"] == 9001
+    # T-0725: back where the note arrived, threaded to it — not topic 9001.
+    assert sent and sent[0]["chat_id"] == "-100777"
+    assert sent[0]["topic_id"] is None and sent[0]["reply_to_message_id"] == 300
     assert "20MB" in sent[0]["text"] and "split" in sent[0]["text"].lower()
     assert not (_VI._audio_dir(cfg, "bot-squad") / "huge.oga").exists()
 
@@ -308,8 +310,8 @@ def test_process_voice_end_to_end(tmp_path, monkeypatch):
 
     sent = []
     class _Tg:
-        def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None):
-            sent.append({"chat_id": chat_id, "text": text, "topic_id": topic_id}); return True
+        def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, **kw):
+            sent.append({"chat_id": chat_id, "text": text, "topic_id": topic_id, **kw}); return True
     monkeypatch.setattr(A, "_get_tg_client", lambda c: _Tg())
 
     out = _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-06-21T13:00:00Z")
@@ -319,8 +321,12 @@ def test_process_voice_end_to_end(tmp_path, monkeypatch):
     # Artifact written with the transcript.
     arts = list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))
     assert len(arts) == 1 and "сделай тёмную тему" in arts[0].read_text()
-    # Confirmation posted back into the #feedback topic.
-    assert sent and sent[0]["topic_id"] == 9001
+    # T-0725: confirmation posted back where the note arrived (the inbound
+    # chat/thread), threaded as a reply to the note — NOT the static #feedback
+    # topic 9001 saved above.
+    assert sent and sent[0]["chat_id"] == "-100777"
+    assert sent[0]["topic_id"] is None
+    assert sent[0]["reply_to_message_id"] == 300
 
 
 def test_process_voice_records_transcript_to_conversation_store(tmp_path, monkeypatch):
@@ -372,8 +378,10 @@ def test_process_voice_download_failure_confirms_resend(tmp_path, monkeypatch):
 
     out = _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-06-21T13:00:00Z")
     assert out["ok"] is False and out["reason"] == "download_failed"
-    # Not silent: a confirm went back into #feedback asking to resend.
-    assert sent and sent[0]["topic_id"] == 9001
+    # Not silent: a confirm went back to the note's own chat asking to resend
+    # (T-0725: threaded to the note, not dropped into the static #feedback topic).
+    assert sent and sent[0]["chat_id"] == "-100777"
+    assert sent[0]["topic_id"] is None and sent[0]["reply_to_message_id"] == 300
     assert "resend" in sent[0]["text"].lower()
 
 
@@ -405,8 +413,10 @@ def test_process_voice_rejects_over_cap_before_download(tmp_path, monkeypatch):
         ts="2026-06-21T13:00:00Z")
 
     assert out["ok"] is False and out["reason"] == "too_long"
-    # Confirmed back into #feedback, mentioning the cap, asking to split.
-    assert sent and sent[0]["topic_id"] == 9001
+    # Confirmed back where the note arrived (T-0725), mentioning the cap,
+    # asking to split.
+    assert sent and sent[0]["chat_id"] == "-100777"
+    assert sent[0]["topic_id"] is None and sent[0]["reply_to_message_id"] == 300
     assert "too long" in sent[0]["text"].lower() and "split" in sent[0]["text"].lower()
     # Nothing written: no audio blob, no artifact.
     assert not (_VI._audio_dir(cfg, "bot-squad") / "big.oga").exists()
@@ -582,3 +592,109 @@ def test_process_voice_transcription_failure_still_stores_audio(tmp_path, monkey
     # An artifact is still written so the note isn't silently dropped.
     arts = list((cfg.data_dir / "bot-squad" / "feedback").glob("F-*-voice-*.md"))
     assert len(arts) == 1
+
+
+# --- T-0725: the transcript lands where the note did, threaded to the note ---
+
+def test_origin_of_reads_the_three_inbound_fields():
+    """The chat/thread/message ids were always on the update — origin_of just
+    reads them, so nothing downstream has to re-derive or guess a destination."""
+    o = VI.origin_of(_voice_msg(**{"chat": {"id": -100888, "type": "supergroup"},
+                                   "message_thread_id": 4242}))
+    assert o == {"chat_id": "-100888", "thread_id": 4242, "message_id": 300}
+
+
+def test_origin_of_empty_chat_id_when_no_chat():
+    assert VI.origin_of({})["chat_id"] == ""
+
+
+def test_process_voice_confirms_in_the_arriving_chat_and_thread(tmp_path, monkeypatch):
+    """T-0725 REGRESSION GUARD — the stakeholder's exact complaint: "transcript
+    arrives without being a reply to the voice note, and not even in the same
+    chat at all".
+
+    A note arrives in chat A / thread B. The project's STATIC ``tg_chat`` is
+    deliberately a DIFFERENT chat and a ``feedback`` topic is deliberately
+    saved — so the old ``project.tg_chat`` + ``tg_topics.resolve(..., "feedback")``
+    lookup would send to (-100777, 9001) and this test would fail LOUDLY on any
+    regression to it. The confirmation must instead go to (A, B), threaded as a
+    real TG reply to the note's own ``message_id``.
+    """
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T, tg_topics, actions as A
+
+    # The static destination the buggy path used — present, and NOT where the
+    # note arrived. cfg's project.tg_chat is "-100777".
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    monkeypatch.setattr(_T, "transcribe",
+                        lambda p, **kw: {"text": "тёмная тема", "lang": "ru",
+                                         "engine": "faster-whisper:small"})
+
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    msg = _voice_msg(**{
+        "message_id": 555,
+        "chat": {"id": -100999, "type": "supergroup"},   # chat A ≠ project.tg_chat
+        "message_thread_id": 77,                          # thread B ≠ feedback topic
+    })
+    out = _VI.process_voice(cfg, "bot-squad", msg, ts="2026-07-26T22:25:00Z")
+
+    assert out["ok"] is True
+    assert sent, "no confirmation sent"
+    got = sent[0]
+    assert got["chat_id"] == "-100999", f"posted to the wrong CHAT: {got['chat_id']}"
+    assert got["chat_id"] != str(cfg.projects["bot-squad"].tg_chat)
+    assert got["topic_id"] == 77, f"posted to the wrong TOPIC: {got['topic_id']}"
+    assert got["topic_id"] != 9001
+    assert got["reply_to_message_id"] == 555, "transcript is not a reply to the note"
+    assert "тёмная тема" in got["text"]
+
+
+def test_process_voice_failure_confirms_also_land_on_the_note(tmp_path, monkeypatch):
+    """Every acknowledgement — not just the happy path — answers the note where
+    it arrived. A "couldn't fetch your note" landing in another chat is the same
+    defect wearing a different outcome."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, tg_topics, actions as A
+
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+    monkeypatch.setattr(_VI, "download_voice",
+                        lambda c, f, d: (_ for _ in ()).throw(RuntimeError("proxy timeout")))
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    out = _VI.process_voice(cfg, "bot-squad", _voice_msg(**{
+        "message_id": 556,
+        "chat": {"id": -100999, "type": "supergroup"},
+        "message_thread_id": 77,
+    }), ts="2026-07-26T22:25:00Z")
+
+    assert out["ok"] is False and out["reason"] == "download_failed"
+    assert sent and sent[0]["chat_id"] == "-100999"
+    assert sent[0]["topic_id"] == 77 and sent[0]["reply_to_message_id"] == 556
+
+
+def test_confirm_falls_back_to_static_chat_without_an_origin(tmp_path, monkeypatch):
+    """The static ``project.tg_chat`` + ``#feedback`` lookup survives ONLY as the
+    degenerate fallback for a message carrying no chat at all (never a real TG
+    update). Documents that the old path is fallback-only, not the default."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, tg_topics, actions as A
+
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    _VI._confirm(cfg, "bot-squad", {"duration": 5}, outcome="ok", transcript="hi",
+                 origin=_VI.origin_of({}))
+    assert sent and sent[0]["chat_id"] == "-100777"
+    assert sent[0]["topic_id"] == 9001
+    assert "reply_to_message_id" not in sent[0]

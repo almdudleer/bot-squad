@@ -27,6 +27,36 @@ ALLOWED_MODELS = frozenset({
     "", "claude-sonnet-5", "claude-opus-4-8", "opus[1m]", "claude-fable-5",
 })
 
+# T-0694: the short names ``bsq spawn --model``'s own help text advertises
+# ("alias like 'sonnet'/'opus'/'fable', or a full name") but that nothing
+# ever actually translated to a canonical ALLOWED_MODELS entry — the raw
+# alias reached the ``claude --model <m>`` launch command, ``claude`` didn't
+# recognize it, and silently fell back to the account default with zero
+# error. One SSOT for the mapping; resolve_model is the single choke point
+# every caller (bsq spawn's CLI, sessions.spawn's role-default fallback)
+# routes through before the value reaches a launch command.
+MODEL_ALIASES = {
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-4-8",
+    "fable": "claude-fable-5",
+}
+
+
+def resolve_model(value: str) -> str:
+    """Canonicalize a ``--model`` value: alias -> canonical name; a name
+    already in :data:`ALLOWED_MODELS` passes through unchanged; "" (or
+    whitespace-only) passes through as "" (no override). Raises
+    ``ValueError`` for anything else — an unresolved value must fail loudly
+    here rather than silently reach the launch command (T-0694).
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    canonical = MODEL_ALIASES.get(v, v)
+    if canonical not in ALLOWED_MODELS:
+        raise ValueError(f"model not allowed: {value!r}")
+    return canonical
+
 
 def _settings_path() -> Path:
     return Path(_sessions._get_user_home()) / ".claude" / "settings.json"

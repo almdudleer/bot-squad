@@ -2811,6 +2811,54 @@ def test_spawn_explicit_model_overrides_role_default(tmp_path, monkeypatch):
     assert "claude-sonnet-5" not in cmd
 
 
+def test_spawn_model_alias_resolves_on_launch_command(tmp_path, monkeypatch):
+    """T-0694: `spawn(model="fable")` must bake the CANONICAL name onto the
+    assembled `claude --model` launch command, not the raw alias — a bare
+    'fable' on the actual command line is silently ignored by the claude
+    binary (falls back to the account default with zero error), which is
+    exactly the bug this regression test targets. Inspecting only the
+    stored session-md model field would NOT have caught the original bug
+    (the md said 'fable' correctly; only the launch command was wrong)."""
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="fable")
+    assert "--model claude-fable-5" in cmd
+    assert "--model fable" not in cmd
+
+
+def test_spawn_model_alias_sonnet_and_opus_resolve(tmp_path, monkeypatch):
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="sonnet")
+    assert "--model claude-sonnet-5" in cmd
+
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w2", model="opus")
+    assert "--model claude-opus-4-8" in cmd
+
+
+def test_spawn_rejects_unrecognized_model_value(tmp_path, monkeypatch):
+    """An unresolvable --model value must error loudly, not silently launch
+    on the wrong (account-default) model — matching `bsq model set`'s
+    existing ALLOWED_MODELS validation, which `spawn` had no equivalent of."""
+    from bot_squad_worker.actions import ActionError
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    launched = []
+
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            launched.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    with pytest.raises(ActionError, match="model not allowed"):
+        spawn(cfg, "test-project", "w", model="bogus-model-name")
+    assert not launched, "must reject before ever opening the tmux window"
+
+
 def test_read_model_defaults_missing_file_returns_builtin(tmp_path):
     from bot_squad_worker.sessions import _read_model_defaults
     defaults = _read_model_defaults(tmp_path / "no-such-config-dir")

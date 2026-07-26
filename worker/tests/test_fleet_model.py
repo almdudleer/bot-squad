@@ -99,3 +99,28 @@ def test_get_model_non_dict_json_returns_empty(_home):
 def test_all_allowed_models_accepted(_home, model):
     fleet_model.set_model(model)
     assert fleet_model.get_model() == model
+
+
+# ---------------------------------------------------------------------------
+# T-0694: resolve_model — alias -> canonical, single SSOT for spawn/set_model
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("alias, canonical", sorted(fleet_model.MODEL_ALIASES.items()))
+def test_resolve_model_translates_alias_to_canonical(alias, canonical):
+    assert fleet_model.resolve_model(alias) == canonical
+
+
+@pytest.mark.parametrize("model", sorted(m for m in fleet_model.ALLOWED_MODELS if m))
+def test_resolve_model_passes_through_canonical_names(model):
+    assert fleet_model.resolve_model(model) == model
+
+
+def test_resolve_model_empty_string_passes_through():
+    assert fleet_model.resolve_model("") == ""
+    assert fleet_model.resolve_model("   ") == ""
+
+
+def test_resolve_model_rejects_unrecognized_value():
+    with pytest.raises(ValueError, match="not allowed"):
+        fleet_model.resolve_model("gpt-5")

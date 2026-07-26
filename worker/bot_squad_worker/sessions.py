@@ -2345,10 +2345,22 @@ def spawn(
     if _display_name:
         shell_cmd += f" --name {shlex.quote(_display_name)}"
     # T-0623: explicit model wins; else the role-based default; else no flag
-    # (settings.json default).
+    # (settings.json default). T-0694: whichever it is, it must pass through
+    # fleet_model.resolve_model before landing on the launch command below —
+    # this is the ONE choke point every spawn caller (bsq CLI, the
+    # spawn_session/ensure_user_conversation worker actions) funnels through,
+    # so an alias like 'fable' gets canonicalized instead of reaching
+    # `claude --model` unresolved (silently ignored -> wrong model, zero
+    # error) and a genuinely bogus value errors loudly here instead.
     _role = _derive_role(window, task_id, initiative)
     _model = (model or "").strip() or _read_model_defaults(_caps_config_dir(cfg)).get(_role, "")
     if _model:
+        from bot_squad_worker import fleet_model as _fleet_model
+        try:
+            _model = _fleet_model.resolve_model(_model)
+        except ValueError as exc:
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(f"spawn: {exc}") from exc
         shell_cmd += f" --model {shlex.quote(_model)}"
 
     result = _run([

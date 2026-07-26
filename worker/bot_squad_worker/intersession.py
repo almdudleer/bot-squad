@@ -119,13 +119,24 @@ def _resolve_recipients(
     """Map a recipient spec to a list of SIDs.
 
     Role keywords:
-      - ``teamlead``: every session with no task_id (or task_id == "~")
-      - ``dev``:      every session with a real task_id
-      - ``all``:      every session listed in data/<slug>/sessions/
+      - ``teamlead``: every LIVE session with no task_id (or task_id == "~")
+      - ``dev``:      every LIVE session with a real task_id
+      - ``all``:      every LIVE session listed in data/<slug>/sessions/
 
     Anything else is treated as a literal SID (returned as-is — see ``send``
     docstring: an unknown SID still gets a per-sid inbox so the recipient
     will pick it up on their next read).
+
+    T-0683: role-keyword fan-out is scoped to LIVE sessions only (the same
+    ``_is_live_holder`` check ``bsq team status``'s default roster and the
+    dispatch/binding paths already use — status active/paused, not archived).
+    Without this, a role broadcast walked EVERY session md ever written for
+    the project, including long-dead/archived ones, and fired an
+    ``inject_input`` "check mail" nudge at each — a project with a large
+    historical fleet turned one broadcast into a burst of hundreds of
+    "no live pane for sid" 400s. A literal-SID target is never filtered:
+    addressing a specific SID is already an explicit choice (see
+    ``test_send_to_unknown_sid_still_writes_inbox``).
 
     T-0157 (multi-user boundary): role-keyword fan-out is scoped to a single
     linux user so a TL on one user's tmux can't message another user's
@@ -133,16 +144,20 @@ def _resolve_recipients(
     when given, else the sender's own linux user (parsed from ``from_sid``).
 
     Scoping only engages when the project actually has MORE THAN ONE distinct
-    linux user among its sessions — a single-user project (the common case)
-    behaves exactly as pre-T-0157 ("works just as good as one user"). When no
-    scope user resolves (legacy non-SID sender like "stakeholder", no override)
-    the fan-out is also unscoped, preserving cross-user notifications such as
-    ``bind_task``'s stakeholder→SID notify (a literal SID anyway). A literal-SID
-    target is never scoped: addressing a specific ``S-<user>-…`` SID is already
-    an explicit choice.
+    linux user among its LIVE sessions — a single-user project (the common
+    case) behaves exactly as pre-T-0157 ("works just as good as one user").
+    When no scope user resolves (legacy non-SID sender like "stakeholder", no
+    override) the fan-out is also unscoped, preserving cross-user
+    notifications such as ``bind_task``'s stakeholder→SID notify (a literal
+    SID anyway). A literal-SID target is never scoped: addressing a specific
+    ``S-<user>-…`` SID is already an explicit choice.
     """
     if to in {"teamlead", "dev", "all"}:
-        rows = _list_session_sids(cfg, slug)
+        from bot_squad_worker.sessions import _is_live_holder
+        rows = [
+            (sid, meta) for sid, meta in _list_session_sids(cfg, slug)
+            if _is_live_holder(meta)
+        ]
         distinct_users = {
             u for u in (_session_linux_user(sid, meta) for sid, meta in rows) if u
         }

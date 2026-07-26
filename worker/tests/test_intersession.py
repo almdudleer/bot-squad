@@ -15,16 +15,22 @@ def _make_cfg(tmp_path: Path) -> types.SimpleNamespace:
     return types.SimpleNamespace(data_dir=tmp_path / "data")
 
 
-def _write_session(tmp_path: Path, slug: str, sid: str, task_id: str = "") -> None:
+def _write_session(
+    tmp_path: Path, slug: str, sid: str, task_id: str = "",
+    *, status: str = "active", archived: bool = False,
+) -> None:
     sess_dir = tmp_path / "data" / slug / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
-    (sess_dir / f"{sid}.md").write_text(
-        "---\n"
-        f"sid: {sid}\n"
-        "status: active\n"
-        f"task_id: {task_id or '~'}\n"
-        "---\n"
-    )
+    lines = [
+        "---",
+        f"sid: {sid}",
+        f"status: {status}",
+        f"task_id: {task_id or '~'}",
+    ]
+    if archived:
+        lines.append("archived: true")
+    lines += ["---", ""]
+    (sess_dir / f"{sid}.md").write_text("\n".join(lines))
 
 
 def test_send_then_read_roundtrip(tmp_path):
@@ -92,6 +98,34 @@ def test_role_fanout_teamlead_and_dev(tmp_path):
     assert sorted(al["delivered_to"]) == sorted([
         "S-u-tl1-p0", "S-u-tl2-p1", "S-u-w1-p2", "S-u-w2-p3",
     ])
+
+
+def test_role_fanout_excludes_dead_and_archived_sessions(tmp_path):
+    """T-0683: a role broadcast (teamlead/dev/all) must only reach LIVE
+    sessions (status active/paused, not archived) — not every session md
+    ever written for the project. Regression for the inject_input 400 storm
+    (~431 calls in <3min) caused by broadcasting to a large historical fleet.
+    """
+    cfg = _make_cfg(tmp_path)
+    # Live roster: one live TL, one live dev.
+    _write_session(tmp_path, "p", "S-u-tl-live-p0", status="active")
+    _write_session(tmp_path, "p", "S-u-dev-live-p1", "T-0001", status="paused")
+    # Dead roster: suspended (no live pane, never archived), and explicitly
+    # archived — both should be excluded from every role-keyword fan-out.
+    _write_session(tmp_path, "p", "S-u-tl-suspended-p2", status="suspended")
+    _write_session(
+        tmp_path, "p", "S-u-dev-archived-p3", "T-0002",
+        status="suspended", archived=True,
+    )
+
+    tl = I.send(cfg, "p", "S-orchestrator", "teamlead", "hi TLs")
+    assert tl["delivered_to"] == ["S-u-tl-live-p0"]
+
+    dv = I.send(cfg, "p", "S-orchestrator", "dev", "hi devs")
+    assert dv["delivered_to"] == ["S-u-dev-live-p1"]
+
+    al = I.send(cfg, "p", "S-orchestrator", "all", "hi everyone")
+    assert sorted(al["delivered_to"]) == ["S-u-dev-live-p1", "S-u-tl-live-p0"]
 
 
 def test_wait_timeout_returns_not_ready(tmp_path):

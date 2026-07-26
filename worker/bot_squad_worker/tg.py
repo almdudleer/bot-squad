@@ -153,6 +153,72 @@ class TgClient:
             {"chat_id": chat_id, "message_thread_id": int(thread_id), "name": name},
         )
 
+    # ------------------------------------------------------------------
+    # Pinned messages (T-0677) — the topic's visible direct-mode marker.
+    # ------------------------------------------------------------------
+
+    def send_and_pin(
+        self, *, chat_id: str, text: str, topic_id: int | None = None
+    ) -> dict:
+        """Send ``text`` and pin the resulting message. Returns
+        ``{"sent", "message_id", "pinned", "pin_error"}``.
+
+        Used by the ``/pin-session`` confirmation (T-0677: "on choice, the
+        message about this should get pinned in the topic"). Deliberately NOT
+        routed through :meth:`send`: this is an interactive command reply, so
+        it skips debounce/quiet-hours exactly like ``tg_listener``'s other
+        command replies do — and it needs the ``message_id`` back, which
+        ``send``'s bool contract doesn't carry.
+
+        There is no ``message_thread_id`` on ``pinChatMessage`` — a forum pin
+        is scoped by the message's OWN thread, so sending into ``topic_id``
+        first is what makes the pin land in that topic.
+
+        A pin failure (the bot is not an admin / lacks ``can_pin_messages``) is
+        REPORTED, not raised: the confirmation itself is already delivered and
+        the user must be told the marker is missing rather than see the whole
+        command blow up.
+        """
+        if not self._token:
+            log.debug("tg.send_and_pin: no bot token configured — skipping")
+            return {"sent": False, "message_id": None, "pinned": False, "pin_error": ""}
+        data = self._post(chat_id=chat_id, text=text, topic_id=topic_id)
+        message_id = ((data or {}).get("result") or {}).get("message_id")
+        if message_id is None:
+            return {"sent": True, "message_id": None, "pinned": False,
+                    "pin_error": "no message_id in sendMessage response"}
+        try:
+            self.pin_message(chat_id=chat_id, message_id=int(message_id))
+        except Exception as e:  # noqa: BLE001 — reported to the user, see docstring
+            log.warning("tg.send_and_pin: pin failed for chat %s: %s", chat_id, e)
+            return {"sent": True, "message_id": int(message_id), "pinned": False,
+                    "pin_error": str(e)}
+        return {"sent": True, "message_id": int(message_id), "pinned": True,
+                "pin_error": ""}
+
+    def pin_message(self, *, chat_id: str, message_id: int) -> None:
+        """Pin an existing message (``pinChatMessage``)."""
+        if not self._token:
+            raise RuntimeError("tg.pin_message: no bot token configured")
+        self._call(
+            "pinChatMessage",
+            {"chat_id": chat_id, "message_id": int(message_id),
+             "disable_notification": True},
+        )
+
+    def unpin_message(self, *, chat_id: str, message_id: int) -> None:
+        """Unpin one specific message (``unpinChatMessage``).
+
+        Always targets a KNOWN message_id — never ``unpinAllChatMessages``,
+        which would clear pins this bot didn't place.
+        """
+        if not self._token:
+            raise RuntimeError("tg.unpin_message: no bot token configured")
+        self._call(
+            "unpinChatMessage",
+            {"chat_id": chat_id, "message_id": int(message_id)},
+        )
+
     def _call(self, method: str, payload: dict) -> dict:
         """POST to an arbitrary Bot API method, honoring the egress proxy.
 
@@ -209,7 +275,10 @@ class TgClient:
         text: str,
         topic_id: int | None = None,
         reply_markup: dict | None = None,
-    ) -> None:
+    ) -> dict:
+        """POST sendMessage. Returns the parsed API response (T-0677 needs the
+        ``result.message_id`` to pin it); ``send`` ignores the return value, so
+        its bool contract is unchanged."""
         import httpx  # lazy import — not available in all envs
 
         url = _TG_API.format(token=self._token)
@@ -232,6 +301,7 @@ class TgClient:
         if not data.get("ok"):
             raise RuntimeError(f"Telegram API error: {data}")
         log.info("tg.send: sent to chat %s (text len=%d)", chat_id, len(text))
+        return data if isinstance(data, dict) else {}
 
 
 # ------------------------------------------------------------------

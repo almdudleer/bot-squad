@@ -14,11 +14,20 @@ def _cfg(tmp_path: Path):
     return types.SimpleNamespace(data_dir=data_dir)
 
 
+def _rec(slug: str, *, ticket_id=None, session_id=None, pinned_message_id=None) -> dict:
+    """The full stored record shape — every optional field explicit, so a
+    future field addition shows up as one edit here instead of N."""
+    return {
+        "slug": slug, "ticket_id": ticket_id, "session_id": session_id,
+        "pinned_message_id": pinned_message_id,
+    }
+
+
 def test_set_and_resolve_binding(tmp_path):
     cfg = _cfg(tmp_path)
     rec = TB.set_binding(cfg, "111", 7, "bot-squad")
-    assert rec == {"slug": "bot-squad", "ticket_id": None, "session_id": None}
-    assert TB.resolve(cfg, "111", 7) == {"slug": "bot-squad", "ticket_id": None, "session_id": None}
+    assert rec == _rec("bot-squad")
+    assert TB.resolve(cfg, "111", 7) == _rec("bot-squad")
 
 
 def test_resolve_unbound_returns_none(tmp_path):
@@ -34,7 +43,7 @@ def test_resolve_none_thread_id_is_a_distinct_key(tmp_path):
     from any real thread id (T-0660's project-General catch-all reuses this)."""
     cfg = _cfg(tmp_path)
     TB.set_binding(cfg, "111", None, "bot-squad")
-    assert TB.resolve(cfg, "111", None) == {"slug": "bot-squad", "ticket_id": None, "session_id": None}
+    assert TB.resolve(cfg, "111", None) == _rec("bot-squad")
     assert TB.resolve(cfg, "111", 1) is None
 
 
@@ -114,7 +123,7 @@ def test_persists_across_reload(tmp_path):
     cfg = _cfg(tmp_path)
     TB.set_binding(cfg, "111", 7, "bot-squad")
     assert TB.bindings_path(cfg).exists()
-    assert TB.load(cfg) == {"111:7": {"slug": "bot-squad", "ticket_id": None, "session_id": None}}
+    assert TB.load(cfg) == {"111:7": _rec("bot-squad")}
 
 
 def test_load_missing_file_returns_empty(tmp_path):
@@ -137,7 +146,7 @@ def test_load_drops_entries_missing_slug(tmp_path):
     p = TB.bindings_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"111:7": {"ticket_id": "T-1"}, "111:8": {"slug": "ok"}}))
-    assert TB.load(cfg) == {"111:8": {"slug": "ok", "ticket_id": None, "session_id": None}}
+    assert TB.load(cfg) == {"111:8": _rec("ok")}
 
 
 def test_find_by_ticket_returns_bound_topic(tmp_path):
@@ -174,5 +183,51 @@ def test_set_binding_carries_optional_ticket_and_session_id(tmp_path):
     this MVP just never populates them via the T-0639 bind surface."""
     cfg = _cfg(tmp_path)
     rec = TB.set_binding(cfg, "111", 9, "bot-squad", ticket_id="T-0660", session_id="S-x-p1")
-    assert rec == {"slug": "bot-squad", "ticket_id": "T-0660", "session_id": "S-x-p1"}
+    assert rec == _rec("bot-squad", ticket_id="T-0660", session_id="S-x-p1")
     assert TB.resolve(cfg, "111", 9) == rec
+
+
+# ---------------------------------------------------------------------------
+# T-0677: set_direct_session — the per-topic direct-mode toggle's one field
+# ---------------------------------------------------------------------------
+
+def test_set_direct_session_flips_only_the_session_id(tmp_path):
+    """Direct mode is a MODE of an existing binding, not a new record: the
+    topic's project (and its per-task ticket_id) must survive the toggle."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "bot-squad", ticket_id="T-0677")
+
+    rec = TB.set_direct_session(cfg, "111", 7, "S-dev-p9", pinned_message_id=555)
+
+    assert rec == _rec("bot-squad", ticket_id="T-0677", session_id="S-dev-p9",
+                       pinned_message_id=555)
+    assert TB.resolve(cfg, "111", 7) == rec
+
+
+def test_set_direct_session_none_returns_to_the_attendant(tmp_path):
+    """Attendant-routed is the default — clearing session_id (and the stale pin
+    id) is the way back."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "bot-squad")
+    TB.set_direct_session(cfg, "111", 7, "S-dev-p9", pinned_message_id=555)
+
+    rec = TB.set_direct_session(cfg, "111", 7, None)
+
+    assert rec == _rec("bot-squad")
+
+
+def test_set_direct_session_refuses_to_create_a_binding(tmp_path):
+    """An unbound topic has no project to route to — inventing one is the
+    silent mis-slugging T-0693 removed. Report it instead."""
+    cfg = _cfg(tmp_path)
+    assert TB.set_direct_session(cfg, "111", 7, "S-dev-p9") is None
+    assert TB.load(cfg) == {}
+
+
+def test_pinned_message_id_survives_a_reload(tmp_path):
+    """The pin id must outlive the process — a worker restart still has to be
+    able to unpin the marker it placed."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "bot-squad")
+    TB.set_direct_session(cfg, "111", 7, "S-dev-p9", pinned_message_id=555)
+    assert TB.load(cfg)["111:7"]["pinned_message_id"] == 555

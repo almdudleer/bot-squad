@@ -15,7 +15,8 @@ level, for the same reason — it can't live under a single project's own dir).
 
 Shape on disk (``data/_worker/tg_bindings.json``)::
 
-    { "<chat_id>:<thread_id>": {"slug": "...", "ticket_id": null, "session_id": null} }
+    { "<chat_id>:<thread_id>": {"slug": "...", "ticket_id": null,
+                                "session_id": null, "pinned_message_id": null} }
 
 T-0660 (per-task topics, already scoped) generalizes what a binding ROUTES TO:
 a project topic binds only ``slug`` (this MVP); a task topic additionally
@@ -48,8 +49,15 @@ def _key(chat_id: Any, thread_id: Any) -> str:
 
 
 def load(cfg: Any) -> dict[str, dict]:
-    """Return the persisted key->{slug, ticket_id, session_id} map, or {} when
-    none/unreadable. Entries missing a ``slug`` are dropped as corrupt."""
+    """Return the persisted key->{slug, ticket_id, session_id, pinned_message_id}
+    map, or {} when none/unreadable. Entries missing a ``slug`` are dropped as
+    corrupt.
+
+    T-0677: ``pinned_message_id`` is the message_id of the direct-mode
+    confirmation pinned in the topic (see :func:`set_direct_session`) — kept in
+    the record so the marker can be UNPINNED when direct mode is switched off
+    or re-pointed, instead of leaving a pin that lies about where the topic
+    routes. ``None`` for every binding that has never pinned one."""
     p = bindings_path(cfg)
     if not p.exists():
         return {}
@@ -68,6 +76,7 @@ def load(cfg: Any) -> dict[str, dict]:
             "slug": v["slug"],
             "ticket_id": v.get("ticket_id"),
             "session_id": v.get("session_id"),
+            "pinned_message_id": v.get("pinned_message_id"),
         }
     return out
 
@@ -98,8 +107,50 @@ def set_binding(
     Returns the stored record.
     """
     mapping = load(cfg)
-    rec = {"slug": slug, "ticket_id": ticket_id, "session_id": session_id}
+    rec = {
+        "slug": slug, "ticket_id": ticket_id, "session_id": session_id,
+        "pinned_message_id": None,
+    }
     mapping[_key(chat_id, thread_id)] = rec
+    _save(cfg, mapping)
+    return rec
+
+
+def set_direct_session(
+    cfg: Any,
+    chat_id: Any,
+    thread_id: Any,
+    session_id: Optional[str],
+    *,
+    pinned_message_id: Optional[int] = None,
+) -> Optional[dict]:
+    """T-0677: point an EXISTING binding's direct-mode target at ``session_id``
+    (or back at the project's user-conversation attendant when ``None``).
+
+    This is the whole of "direct mode" — the routing it toggles already exists
+    (``tg_listener._handle_topic_bound``: a binding carrying a ``session_id``
+    injects straight into that session; ``None`` goes through the attendant,
+    which stays the DEFAULT). Nothing here writes a new route; it flips the one
+    field that branch already reads.
+
+    Deliberately does NOT create a binding: an unbound topic has no project, so
+    there is no candidate-session set to pin from and no slug to invent — the
+    caller reports that rather than guessing (the T-0693 lesson). Returns the
+    updated record, or ``None`` when ``(chat_id, thread_id)`` is unbound.
+
+    ``slug``/``ticket_id`` are preserved (unlike :func:`set_binding`, which
+    replaces the whole record). ``pinned_message_id`` records the confirmation
+    message pinned in the topic so it can later be unpinned; pass ``None`` to
+    forget it.
+    """
+    mapping = load(cfg)
+    key = _key(chat_id, thread_id)
+    rec = mapping.get(key)
+    if rec is None:
+        return None
+    rec["session_id"] = session_id
+    rec["pinned_message_id"] = pinned_message_id
+    mapping[key] = rec
     _save(cfg, mapping)
     return rec
 

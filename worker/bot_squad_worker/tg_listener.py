@@ -320,15 +320,22 @@ def extract_reply_target(message: dict) -> Optional[tuple[str, str]]:
 
 def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
     """Extract (cmd, args_str) if this is a /sessions, /say, /help, /project,
-    or /state command."""
+    /state or /pin-session command."""
     text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return None
     parts = text.split(None, 1)
     cmd = parts[0].lstrip("/").split("@")[0]   # strip @botname if present
     args = parts[1] if len(parts) > 1 else ""
+    # T-0677: `/pin_session` is an accepted alias for `/pin-session` — the
+    # stakeholder's verbatim spells it with a dash, but TG's own command
+    # registry/autocomplete only accepts [a-z0-9_], so the underscore form is
+    # what a user typing via autocomplete would get. Both normalize to the
+    # dashed name the picker buttons emit.
+    if cmd == "pin_session":
+        cmd = "pin-session"
     # T-0655 (Addendum 1): /state — drive on/off, quota target, lifecycle state.
-    if cmd not in {"sessions", "say", "help", "project", "state"}:
+    if cmd not in {"sessions", "say", "help", "project", "state", "pin-session"}:
         return None
     return (cmd, args)
 
@@ -755,6 +762,242 @@ def _warn_if_general_feed_collides(cfg, slug: str, chat_id: str) -> None:
         pass
 
 
+# ---- T-0677: per-topic direct mode (`/pin-session`) -------------------------
+# Stakeholder, verbatim (2026-07-25): "it should be like /pin-session, replying
+# with buttons to pick the session to pin, and on choice, the message about
+# this should get pinned in the topic."
+#
+# The ROUTING this toggles already exists (T-0660): a `tg_bindings` entry
+# carrying a ``session_id`` makes `_handle_topic_bound` inject straight into
+# that session; ``session_id=None`` routes through the project's
+# user-conversation attendant, which stays the DEFAULT. So this command flips
+# ONE field of an existing binding — it is not a second routing path.
+#
+# The picker is a REPLY-KEYBOARD (each button sends ``/pin-session <sid>`` as a
+# NORMAL message), exactly like `_ask_which_project`: the poller runs
+# ``allowed_updates:["message"]`` and deliberately avoids inline
+# callback_query buttons, so an inline picker would need a poll-contract change
+# (operator p241, 2026-07-26 — explicitly not in scope for this ticket).
+
+#: Args that mean "back to the attendant" (turn direct mode off).
+_PIN_SESSION_OFF = {"off", "none", "attendant", "-"}
+
+
+def _pinnable_sessions(cfg, slug: str) -> list[dict]:
+    """Sessions of ``slug`` that `/pin-session` may target — the ones an
+    inbound topic message could actually be injected into.
+
+    Excludes SUSPENDED/archived rows: a binding pointing at one would send
+    every message in the topic into `_handle_reply`'s "session not active —
+    message dropped" branch, i.e. a topic that silently eats the stakeholder's
+    input. Paused-but-live panes are kept (the pane still receives input)."""
+    from bot_squad_worker import sessions as S
+    try:
+        rows = S.list_sessions(cfg, slug)
+    except Exception:  # noqa: BLE001 — unknown slug / tmux hiccup; offer nothing
+        return []
+    return [
+        r for r in rows
+        if str(r.get("status") or "") != "suspended" and not r.get("archived")
+    ]
+
+
+def _pin_session_candidates(cfg, slug: str, binding: dict) -> list[dict]:
+    """`_pinnable_sessions` ordered most-relevant-first: the session already
+    pinned, then the one working THIS topic's ticket (a T-0660 per-task topic
+    binds a ``ticket_id``), then the rest — so the obvious choice is the first
+    button rather than somewhere down a list of look-alike SIDs."""
+    current = binding.get("session_id")
+    ticket_id = binding.get("ticket_id")
+
+    def rank(row: dict) -> tuple[int, str]:
+        sid = str(row.get("sid") or "")
+        if current and sid == current:
+            return (0, sid)
+        if ticket_id and row.get("task_id") == ticket_id:
+            return (1, sid)
+        return (2, sid)
+
+    return sorted(_pinnable_sessions(cfg, slug), key=rank)
+
+
+def _resolve_pin_target(cfg, slug: str, arg: str) -> Optional[str]:
+    """Resolve a `/pin-session` argument to a live SID of ``slug``.
+
+    Accepts a full SID (what the picker buttons send) or a T-0662 session
+    alias. Returns ``None`` when it names nothing pinnable — the caller
+    refuses and re-offers the picker rather than binding the topic to a
+    session that can't receive anything."""
+    from bot_squad_worker import session_aliases
+    candidate = arg.strip()
+    if not candidate.lower().startswith("s-"):
+        resolved = session_aliases.resolve_alias(cfg.data_dir, candidate)
+        if not resolved:
+            return None
+        candidate = resolved
+    live = {str(r.get("sid") or "") for r in _pinnable_sessions(cfg, slug)}
+    return candidate if candidate in live else None
+
+
+def _describe_session(row: dict) -> str:
+    """One picker line: the SID plus just enough to tell look-alikes apart."""
+    bits = [str(row.get("sid") or "")]
+    role = str(row.get("role") or "")
+    if role:
+        bits.append(role)
+    task_id = str(row.get("task_id") or "")
+    if task_id:
+        bits.append(task_id)
+    bits.append(str(row.get("status") or ""))
+    return "  ·  ".join(b for b in bits if b)
+
+
+def _ask_which_session(cfg, chat_id: str, slug: str, binding: dict, *,
+                       thread_id: Any = None) -> dict:
+    """The picker: a reply-keyboard of `/pin-session <sid>` buttons (plus an
+    ``off`` button back to attendant routing). Best-effort, like every other
+    interactive reply here."""
+    rows = _pin_session_candidates(cfg, slug, binding)
+    if not rows:
+        _notify(cfg, chat_id,
+                f"No live sessions in {slug} to pin right now — messages in "
+                "this topic keep going through the attendant.",
+                thread_id=thread_id)
+        return {"ok": False, "action": "pin_session_no_candidates", "slug": slug}
+    current = binding.get("session_id")
+    lines = [f"Which session should this topic talk to directly? (project {slug})"]
+    lines.append(
+        f"Now: {current} (direct)" if current
+        else "Now: the user-conversation attendant (default)"
+    )
+    lines.append("")
+    lines += [_describe_session(r) for r in rows]
+    keyboard = [[{"text": f"/pin-session {r['sid']}"}] for r in rows]
+    keyboard.append([{"text": "/pin-session off"}])
+    _channel_notify(
+        cfg, chat_id, "\n".join(lines),
+        reply_markup={
+            "keyboard": keyboard,
+            "one_time_keyboard": True,
+            "resize_keyboard": True,
+        },
+        thread_id=thread_id,
+    )
+    return {"ok": True, "action": "pin_session_ask", "slug": slug,
+            "count": len(rows)}
+
+
+def _unpin_previous(cfg, chat_id: str, binding: dict) -> None:
+    """Drop the topic's previous direct-mode pin, if any.
+
+    A stale pin is worse than no pin: it is the topic's VISIBLE claim about
+    where messages go, so it must not survive a re-point or an ``off``.
+    Best-effort — a failed unpin never blocks the routing change."""
+    old = binding.get("pinned_message_id")
+    if not old:
+        return
+    try:
+        from bot_squad_worker.actions import _get_tg_client
+        _get_tg_client(cfg).unpin_message(chat_id=chat_id, message_id=int(old))
+    except Exception as e:  # noqa: BLE001
+        log.warning("tg_listener: could not unpin previous /pin-session marker "
+                    "(chat=%s message_id=%s): %s", chat_id, old, e)
+
+
+def _handle_pin_session(cfg, chat_id: str, args: str, *,
+                        thread_id: Any = None, binding: Optional[dict] = None) -> dict:
+    """``/pin-session [<sid>|<alias>|off]`` — the per-topic direct-mode toggle.
+
+    Bare: reply with the session picker. With a session: point this topic's
+    binding at it, then send a confirmation into the topic and PIN it (the
+    stakeholder's "the message about this should get pinned in the topic" — the
+    topic's own visible marker of where it routes). With ``off``: back to the
+    attendant, unpinning the marker.
+    """
+    from bot_squad_worker import tg_bindings
+    if binding is None:
+        binding = tg_bindings.resolve(cfg, chat_id, thread_id)
+    if not binding:
+        # No binding = no project = no candidate set, and inventing one is the
+        # exact silent mis-slugging T-0693 removed. Refuse, and say how to fix.
+        _notify(cfg, chat_id,
+                "/pin-session works in a topic that's bound to a project — "
+                "this one isn't bound yet. Ask an admin to run `bsq topic bind` "
+                "for it first.",
+                thread_id=thread_id)
+        return {"ok": False, "action": "pin_session_unbound"}
+    slug = binding["slug"]
+    arg = args.strip()
+    if not arg:
+        return _ask_which_session(cfg, chat_id, slug, binding, thread_id=thread_id)
+
+    if arg.lower() in _PIN_SESSION_OFF:
+        _unpin_previous(cfg, chat_id, binding)
+        tg_bindings.set_direct_session(cfg, chat_id, thread_id, None)
+        _notify(cfg, chat_id,
+                f"Direct mode off. Messages in this topic go back through the "
+                f"{slug} attendant (the default).",
+                thread_id=thread_id)
+        return {"ok": True, "action": "pin_session_cleared", "slug": slug}
+
+    sid = _resolve_pin_target(cfg, slug, arg)
+    if not sid:
+        _notify(cfg, chat_id,
+                f"No live session {arg!r} in {slug} — nothing pinned. Pick one:",
+                thread_id=thread_id)
+        _ask_which_session(cfg, chat_id, slug, binding, thread_id=thread_id)
+        return {"ok": False, "action": "pin_session_unknown", "slug": slug,
+                "arg": arg}
+
+    # Routing first, marker second: the pin is a visible label for a change
+    # that must hold even if TG refuses the pin (see below).
+    _unpin_previous(cfg, chat_id, binding)
+    tg_bindings.set_direct_session(cfg, chat_id, thread_id, sid)
+    text = (
+        f"📌 Direct mode: this topic now talks straight to {sid} ({slug}).\n"
+        "Messages here are injected into that session instead of going through "
+        "the user-conversation attendant. /pin-session off returns to the "
+        "attendant."
+    )
+    pin = _send_and_pin(cfg, chat_id, text, thread_id=thread_id)
+    if pin.get("message_id"):
+        tg_bindings.set_direct_session(
+            cfg, chat_id, thread_id, sid,
+            pinned_message_id=int(pin["message_id"]),
+        )
+    if pin.get("sent") and not pin.get("pinned"):
+        # The routing IS live; only the marker is missing. Say which, and why —
+        # the usual cause is the bot missing the can_pin_messages admin right.
+        _notify(cfg, chat_id,
+                "(Direct mode is on, but I couldn't pin the message — I likely "
+                "need the 'Pin messages' admin right in this group.)",
+                thread_id=thread_id)
+    return {"ok": True, "action": "pin_session_set", "slug": slug, "sid": sid,
+            "pinned": bool(pin.get("pinned"))}
+
+
+def _send_and_pin(cfg, chat_id: str, message: str, *, thread_id: Any = None) -> dict:
+    """Send ``message`` into the topic and pin it (T-0677).
+
+    Goes straight to the TG client rather than through `_channel_notify`:
+    pinning is a Telegram-specific affordance with no counterpart on the other
+    channels (MAX has none), and the caller needs the message_id back. A
+    transport failure is swallowed like every other outbound reply here — the
+    binding change has already been persisted."""
+    if not cfg.tg_bot_token:
+        return {"sent": False, "message_id": None, "pinned": False, "pin_error": ""}
+    try:
+        from bot_squad_worker.actions import _get_tg_client
+        return _get_tg_client(cfg).send_and_pin(
+            chat_id=chat_id, text=message, topic_id=thread_id,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort; never break routing
+        log.warning("tg_listener: /pin-session confirmation to %s dropped: %s",
+                    chat_id, e)
+        return {"sent": False, "message_id": None, "pinned": False,
+                "pin_error": str(e)}
+
+
 def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -> dict:
     """T-0639/T-0660: an unquoted message arriving in a BOUND forum topic.
 
@@ -1133,6 +1376,14 @@ def handle_update(cfg, update: dict) -> dict:
             # lands back in the topic it was typed in, not the general feed.
             if cmd == "project":
                 result = _handle_project(cfg, chat_id, gid, args, thread_id=thread_id)
+            elif cmd == "pin-session":
+                # T-0677: needs the TOPIC context (chat_id + thread_id + the
+                # binding already resolved above) — it toggles that binding's
+                # direct-mode session_id, so it can't live in the
+                # identity-less _handle_slash.
+                result = _handle_pin_session(
+                    cfg, chat_id, args, thread_id=thread_id, binding=binding,
+                )
             else:
                 result = _handle_slash(cfg, chat_id, cmd, args, thread_id=thread_id)
         elif reply:
@@ -1263,7 +1514,9 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = No
                 "Reply to a notification to inject text into the session.\n"
                 "/sessions — list active sessions\n"
                 "/say <sid> <text> — direct inject without reply-quoting\n"
-                "/state — drive on/off, quota target, core lifecycle state",
+                "/state — drive on/off, quota target, core lifecycle state\n"
+                "/pin-session — (in a bound topic) pick a session to talk to "
+                "directly; /pin-session off returns to the attendant",
                 thread_id=thread_id)
         return {"ok": True, "action": "help"}
 

@@ -539,3 +539,70 @@ def test_call_raises_for_status_on_non_json_failure(tmp_path: Path) -> None:
     with patch("httpx.post", side_effect=fake_httpx_post):
         with pytest.raises(httpx.HTTPStatusError):
             client.create_forum_topic(chat_id="-100999", name="x")
+
+
+# ---------------------------------------------------------------------------
+# T-0677: send_and_pin / pin_message / unpin_message — the /pin-session marker
+# ---------------------------------------------------------------------------
+
+def _fake_tg_transport(calls: list, *, pin_ok: bool = True, message_id: int = 4242):
+    """httpx.post double that answers sendMessage with a message_id and lets
+    pinChatMessage succeed or fail like the Bot API does."""
+    def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002
+        calls.append((url.rsplit("/", 1)[-1], json))
+        resp = MagicMock()
+        if url.endswith("sendMessage"):
+            resp.json.return_value = {"ok": True, "result": {"message_id": message_id}}
+        elif url.endswith("pinChatMessage") and not pin_ok:
+            resp.json.return_value = {"ok": False, "description": "Bad Request: CHAT_ADMIN_REQUIRED"}
+        else:
+            resp.json.return_value = {"ok": True, "result": True}
+        return resp
+    return fake_httpx_post
+
+
+def test_send_and_pin_sends_into_the_topic_then_pins_that_message(tmp_path: Path) -> None:
+    """There is no message_thread_id on pinChatMessage — a forum pin is scoped
+    by the message's OWN thread, so the send must carry the topic and the pin
+    must target the id it came back with."""
+    calls: list = []
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=_fake_tg_transport(calls)):
+        out = client.send_and_pin(chat_id="-100999", text="pinned", topic_id=42)
+
+    assert out == {"sent": True, "message_id": 4242, "pinned": True, "pin_error": ""}
+    assert [name for name, _ in calls] == ["sendMessage", "pinChatMessage"]
+    assert calls[0][1]["message_thread_id"] == 42
+    assert calls[1][1] == {"chat_id": "-100999", "message_id": 4242,
+                           "disable_notification": True}
+
+
+def test_send_and_pin_reports_a_refused_pin_instead_of_raising(tmp_path: Path) -> None:
+    """The confirmation is already delivered when the pin is refused (the bot
+    lacks can_pin_messages) — the caller needs to tell the user that, not blow
+    up the whole command."""
+    calls: list = []
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=_fake_tg_transport(calls, pin_ok=False)):
+        out = client.send_and_pin(chat_id="-100999", text="pinned", topic_id=42)
+
+    assert out["sent"] is True and out["message_id"] == 4242
+    assert out["pinned"] is False
+    assert "CHAT_ADMIN_REQUIRED" in out["pin_error"]
+
+
+def test_send_and_pin_without_token_is_a_no_op(tmp_path: Path) -> None:
+    client = TgClient(_FakeCfg(token="", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=AssertionError("must not call TG")):
+        assert client.send_and_pin(chat_id="1", text="x") == {
+            "sent": False, "message_id": None, "pinned": False, "pin_error": ""}
+
+
+def test_unpin_message_targets_one_message(tmp_path: Path) -> None:
+    """Never unpinAllChatMessages — that would clear pins this bot didn't set."""
+    calls: list = []
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=_fake_tg_transport(calls)):
+        client.unpin_message(chat_id="-100999", message_id=4242)
+
+    assert calls == [("unpinChatMessage", {"chat_id": "-100999", "message_id": 4242})]

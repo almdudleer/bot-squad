@@ -2751,3 +2751,325 @@ def test_ensure_user_conversation_backoff_maps_to_parked(monkeypatch):
 
     monkeypatch.setattr(A, "dispatch", _boom_other)
     assert TL._ensure_user_conversation(object(), "s", "g", "ref") is None
+
+
+# ---------------------------------------------------------------------------
+# T-0677 — /pin-session: the per-topic direct-mode toggle
+#
+# Stakeholder verbatim (2026-07-25): "it should be like /pin-session, replying
+# with buttons to pick the session to pin, and on choice, the message about
+# this should get pinned in the topic."
+# ---------------------------------------------------------------------------
+
+
+_PIN_CHAT = "999888"
+_PIN_THREAD = 42
+
+
+def _pin_cfg(tmp_path):
+    """A cfg whose bound forum topic is NOT the project's static tg_chat —
+    the real topology (see handle_update's allowlist comment)."""
+    return _make_cfg(tmp_path, tg_chat="12345")
+
+
+def _bind_topic(cfg, *, ticket_id=None, session_id=None):
+    from bot_squad_worker import tg_bindings
+    tg_bindings.set_binding(
+        cfg, _PIN_CHAT, _PIN_THREAD, "test-project",
+        ticket_id=ticket_id, session_id=session_id,
+    )
+
+
+def _topic_slash(text: str, *, chat_id: str = _PIN_CHAT, thread_id=_PIN_THREAD) -> dict:
+    msg = {
+        "message_id": 301,
+        "chat": {"id": int(chat_id), "type": "supergroup"},
+        "text": text,
+        "from": _from(),
+    }
+    if thread_id is not None:
+        msg["message_thread_id"] = thread_id
+    return msg
+
+
+def _row(sid: str, *, status="active", role="dev", task_id=None, archived=False) -> dict:
+    return {"sid": sid, "status": status, "role": role, "task_id": task_id,
+            "archived": archived}
+
+
+class _FakePinTg:
+    """TG client double recording send_and_pin / unpin_message calls."""
+
+    def __init__(self, *, pinned=True, message_id=777):
+        self.sent: list[dict] = []
+        self.unpinned: list[int] = []
+        self._pinned = pinned
+        self._message_id = message_id
+
+    def send_and_pin(self, **kw):
+        self.sent.append(kw)
+        return {"sent": True, "message_id": self._message_id,
+                "pinned": self._pinned,
+                "pin_error": "" if self._pinned else "CHAT_ADMIN_REQUIRED"}
+
+    def unpin_message(self, **kw):
+        self.unpinned.append(int(kw["message_id"]))
+
+
+def _install_pin_doubles(monkeypatch, rows, *, pinned=True):
+    """Wire the two collaborators /pin-session touches: the session roster and
+    the TG client. Returns (fake_tg, notices, channel_sends)."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import sessions as S
+
+    fake = _FakePinTg(pinned=pinned)
+    monkeypatch.setattr(S, "list_sessions", lambda _cfg, _slug: rows)
+    monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake)
+    notices: list[str] = []
+    monkeypatch.setattr(TL, "_notify",
+                        lambda c, chat_id, text, **k: notices.append(text))
+    sends: list[dict] = []
+    monkeypatch.setattr(
+        TL, "_channel_notify",
+        lambda c, chat_id, text, **kw: sends.append({"text": text, **kw}),
+    )
+    return fake, notices, sends
+
+
+def test_extract_slash_command_pin_session():
+    assert TL.extract_slash_command(_slash_message("/pin-session")) == ("pin-session", "")
+    assert TL.extract_slash_command(
+        _slash_message("/pin-session S-alice-dev-p3")
+    ) == ("pin-session", "S-alice-dev-p3")
+
+
+def test_extract_slash_command_pin_session_underscore_alias():
+    """TG's own command registry can't carry a dash, so the underscore form a
+    user gets from autocomplete must normalize to the dashed command."""
+    assert TL.extract_slash_command(_slash_message("/pin_session off")) == (
+        "pin-session", "off")
+    assert TL.extract_slash_command(_slash_message("/pin_session@thebot")) == (
+        "pin-session", "")
+
+
+def test_pin_session_picker_is_a_reply_keyboard(tmp_path, monkeypatch):
+    """The picker must be REPLY-keyboard buttons that send '/pin-session <sid>'
+    as a normal message — the poller runs allowed_updates:["message"] and an
+    inline/callback_query picker would be a poll-contract change (the
+    _ask_which_project precedent)."""
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    _, _, sends = _install_pin_doubles(
+        monkeypatch, [_row("S-alice-dev-p3"), _row("S-alice-operator-p1", role="operator")]
+    )
+
+    result = TL.handle_update(cfg, {"update_id": 1, "message": _topic_slash("/pin-session")})
+
+    assert result["action"] == "pin_session_ask"
+    markup = sends[-1]["reply_markup"]
+    assert "inline_keyboard" not in markup
+    btns = [b["text"] for row in markup["keyboard"] for b in row]
+    assert "/pin-session S-alice-dev-p3" in btns
+    assert "/pin-session S-alice-operator-p1" in btns
+    assert "/pin-session off" in btns          # the way back to the attendant
+    assert sends[-1]["thread_id"] == _PIN_THREAD
+
+
+def test_pin_session_picker_skips_suspended_and_archived(tmp_path, monkeypatch):
+    """A binding pointing at a dead session would make the topic silently eat
+    every message (_handle_reply's "not active — dropped" branch), so those
+    rows are never offered."""
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    _, _, sends = _install_pin_doubles(monkeypatch, [
+        _row("S-alice-dev-p3"),
+        _row("S-alice-old-p2", status="suspended"),
+        _row("S-alice-gone-p9", archived=True),
+    ])
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _topic_slash("/pin-session")})
+
+    btns = [b["text"] for row in sends[-1]["reply_markup"]["keyboard"] for b in row]
+    assert btns == ["/pin-session S-alice-dev-p3", "/pin-session off"]
+
+
+def test_pin_session_picker_offers_the_topics_own_task_session_first(tmp_path, monkeypatch):
+    """A T-0660 per-task topic binds a ticket_id — the session working THAT
+    ticket is the obvious pick, so it heads the list of look-alike SIDs."""
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg, ticket_id="T-0677")
+    _, _, sends = _install_pin_doubles(monkeypatch, [
+        _row("S-alice-aaa-p1", task_id="T-0001"),
+        _row("S-alice-zzz-p9", task_id="T-0677"),
+    ])
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _topic_slash("/pin-session")})
+
+    btns = [b["text"] for row in sends[-1]["reply_markup"]["keyboard"] for b in row]
+    assert btns[0] == "/pin-session S-alice-zzz-p9"
+
+
+def test_pin_session_sets_direct_mode_and_pins_the_confirmation(tmp_path, monkeypatch):
+    """The core of the ask: choosing a session points the topic binding at it
+    (the existing T-0660 direct-route field) AND pins the confirmation message
+    in that topic."""
+    from bot_squad_worker import tg_bindings
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg, ticket_id="T-0677")
+    fake, _, _ = _install_pin_doubles(monkeypatch, [_row("S-alice-dev-p3")])
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session S-alice-dev-p3")})
+
+    assert result == {"ok": True, "action": "pin_session_set",
+                      "slug": "test-project", "sid": "S-alice-dev-p3",
+                      "pinned": True}
+    rec = tg_bindings.resolve(cfg, _PIN_CHAT, _PIN_THREAD)
+    assert rec["session_id"] == "S-alice-dev-p3"
+    assert rec["slug"] == "test-project" and rec["ticket_id"] == "T-0677"
+    assert rec["pinned_message_id"] == 777
+    assert fake.sent[-1]["topic_id"] == _PIN_THREAD   # pinned IN the topic
+    assert "S-alice-dev-p3" in fake.sent[-1]["text"]
+
+
+def test_pin_session_flips_routing_to_the_pinned_session(tmp_path, monkeypatch):
+    """The payoff: after pinning, a plain message in the topic is injected
+    straight into that session instead of waking the project's attendant."""
+    import bot_squad_worker.actions as A
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    _install_pin_doubles(monkeypatch, [_row("S-alice-dev-p3")])
+    TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session S-alice-dev-p3")})
+
+    injected: list[dict] = []
+    monkeypatch.setattr(A, "dispatch",
+                        lambda name, params: injected.append((name, params)) or {"ok": True})
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug="": {"global_user_id": "gu_1", "created": False})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: None)
+    ensured: list = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: ensured.append(a) or None)
+
+    plain = _topic_slash("what's the status?")
+    result = TL.handle_update(cfg, {"update_id": 2, "message": plain})
+
+    assert result["action"] == "task_topic_inject"
+    assert injected == [("inject_input",
+                         {"sid": "S-alice-dev-p3", "text": "what's the status?"})]
+    assert not ensured, "direct mode must bypass the user-conversation attendant"
+
+
+def test_pin_session_off_returns_to_the_attendant_and_unpins(tmp_path, monkeypatch):
+    """Attendant-routed is the DEFAULT, so there must be a way back — and the
+    stale pin must go with it (it is the topic's visible claim about routing)."""
+    from bot_squad_worker import tg_bindings
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    fake, notices, _ = _install_pin_doubles(monkeypatch, [_row("S-alice-dev-p3")])
+    TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session S-alice-dev-p3")})
+
+    result = TL.handle_update(
+        cfg, {"update_id": 2, "message": _topic_slash("/pin-session off")})
+
+    assert result["action"] == "pin_session_cleared"
+    rec = tg_bindings.resolve(cfg, _PIN_CHAT, _PIN_THREAD)
+    assert rec["session_id"] is None and rec["pinned_message_id"] is None
+    assert rec["slug"] == "test-project"
+    assert fake.unpinned == [777]
+    assert "attendant" in notices[-1]
+
+
+def test_pin_session_repoint_unpins_the_previous_marker(tmp_path, monkeypatch):
+    """Two pins claiming two different targets is worse than one — re-pointing
+    drops the old marker first."""
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    fake, _, _ = _install_pin_doubles(
+        monkeypatch, [_row("S-alice-dev-p3"), _row("S-alice-other-p4")])
+    TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session S-alice-dev-p3")})
+    TL.handle_update(
+        cfg, {"update_id": 2, "message": _topic_slash("/pin-session S-alice-other-p4")})
+
+    assert fake.unpinned == [777]
+    assert len(fake.sent) == 2
+
+
+def test_pin_session_unknown_session_refuses_and_reoffers_the_picker(tmp_path, monkeypatch):
+    from bot_squad_worker import tg_bindings
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    fake, notices, sends = _install_pin_doubles(monkeypatch, [_row("S-alice-dev-p3")])
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session S-nope-p0")})
+
+    assert result["action"] == "pin_session_unknown"
+    assert tg_bindings.resolve(cfg, _PIN_CHAT, _PIN_THREAD)["session_id"] is None
+    assert not fake.sent, "nothing may be pinned when nothing was bound"
+    assert "S-nope-p0" in notices[-1]
+    assert sends[-1]["reply_markup"]["keyboard"]      # picker re-offered
+
+
+def test_pin_session_resolves_a_session_alias(tmp_path, monkeypatch):
+    """T-0662 aliases exist so a session can be addressed by a short nickname
+    instead of a long SID — accept one here too."""
+    from bot_squad_worker import session_aliases, tg_bindings
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    _install_pin_doubles(monkeypatch, [_row("S-alice-dev-p3")])
+    session_aliases.set_alias(cfg.data_dir, "builder", "S-alice-dev-p3")
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session builder")})
+
+    assert result["action"] == "pin_session_set"
+    assert tg_bindings.resolve(cfg, _PIN_CHAT, _PIN_THREAD)["session_id"] == "S-alice-dev-p3"
+
+
+def test_pin_session_in_an_unbound_chat_refuses(tmp_path, monkeypatch):
+    """No binding = no project = no candidate set. Refuse and say how to fix it
+    rather than guessing a project for the topic (the T-0693 lesson)."""
+    cfg = _pin_cfg(tmp_path)
+    fake, notices, _ = _install_pin_doubles(monkeypatch, [_row("S-alice-dev-p3")])
+
+    result = TL.handle_update(cfg, {
+        "update_id": 1,
+        "message": _topic_slash("/pin-session", chat_id="12345", thread_id=None),
+    })
+
+    assert result["action"] == "pin_session_unbound"
+    assert not fake.sent
+    assert "bsq topic bind" in notices[-1]
+
+
+def test_pin_session_reports_a_failed_pin_but_keeps_the_routing(tmp_path, monkeypatch):
+    """A missing can_pin_messages right must not swallow the toggle — the
+    routing change stands and the user is told the marker is missing."""
+    from bot_squad_worker import tg_bindings
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    _, notices, _ = _install_pin_doubles(
+        monkeypatch, [_row("S-alice-dev-p3")], pinned=False)
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_slash("/pin-session S-alice-dev-p3")})
+
+    assert result["ok"] is True and result["pinned"] is False
+    assert tg_bindings.resolve(cfg, _PIN_CHAT, _PIN_THREAD)["session_id"] == "S-alice-dev-p3"
+    assert "Pin messages" in notices[-1]
+
+
+def test_pin_session_with_no_live_sessions_says_so(tmp_path, monkeypatch):
+    cfg = _pin_cfg(tmp_path)
+    _bind_topic(cfg)
+    _, notices, sends = _install_pin_doubles(monkeypatch, [])
+
+    result = TL.handle_update(cfg, {"update_id": 1, "message": _topic_slash("/pin-session")})
+
+    assert result["action"] == "pin_session_no_candidates"
+    assert not sends, "no picker without candidates"
+    assert "No live sessions" in notices[-1]

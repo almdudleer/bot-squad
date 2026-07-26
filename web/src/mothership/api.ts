@@ -37,6 +37,7 @@ import type {
   WorkerModel,
 } from "../api";
 import { normalizeSessionsPayload } from "../api";
+import { redirectOn401 } from "../authRedirect";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -214,10 +215,12 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (res.status === 401) {
-    window.location.href = "/login";
-    throw new Error("not authenticated");
-  }
+  // T-0714: this mirror of `call()` is the one that kept /help broken after the
+  // fix landed in ../api — on a mothership build the Shell's GlobalBusyIndicator
+  // always reaches it (fanOutInFlight -> listServers) and its unconditional
+  // bounce fired before an anonymous visitor could read the manual. The gate is
+  // shared now; do not re-inline the redirect here. See ../authRedirect.
+  if (res.status === 401) redirectOn401(path);
   if (!res.ok) {
     throw new Error(`API error ${res.status}: ${await res.text()}`);
   }
@@ -469,7 +472,8 @@ export class ProxyError extends Error {
 
 /**
  * Per-server `call()` variant. The shared `call` in this module redirects
- * to /login on any 401 — appropriate for mothership-direct endpoints but
+ * to /login on a 401 (outside a public route — T-0714) — appropriate for
+ * mothership-direct endpoints but
  * wrong for the proxy, where 401 means "the *peer* rejected our bearer"
  * (the mothership session is fine; you wouldn't want a peer-side bearer
  * rotation to log you out of the mothership UI). We classify auth-relevant

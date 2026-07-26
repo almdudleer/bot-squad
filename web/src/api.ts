@@ -1,3 +1,15 @@
+import { redirectOn401 } from "./authRedirect";
+
+// T-0714: the 401 -> /login policy now lives in ONE module (see authRedirect.ts
+// for why). Re-exported here because this module is the frontend's canonical
+// API surface and several callers/tests already import the predicates from it.
+export {
+  PUBLIC_ROUTES,
+  isPublicRoute,
+  redirectOn401,
+  shouldRedirectOn401,
+} from "./authRedirect";
+
 type Json = Record<string, unknown> | unknown[];
 
 // T-0138/T-0139: pages distinguish "the slug/task doesn't exist" (render a
@@ -28,54 +40,13 @@ export function errorDetail(err: unknown): string {
   return msg;
 }
 
-// T-0714: routes that must render for an anonymous visitor. `/help` says so in
-// its own first paragraph ("always reachable at /help — no login required") and
-// the server does serve it unauthenticated — but the Shell wraps every route,
-// so its background fetches (/api/health, /api/auth/me, /api/projects,
-// /api/autoupdate/status) all 401 and the FIRST one to land used to navigate the
-// whole app to /login. Every one of those callers already handles the rejection
-// (empty rail, no username), so suppressing only the *navigation* is enough.
-export const PUBLIC_ROUTES: readonly string[] = ["/help"];
-
-export function isPublicRoute(pathname: string | null | undefined): boolean {
-  if (!pathname) return false;
-  // Tolerate a trailing slash; "/" itself is not public.
-  const clean = pathname.replace(/\/+$/, "");
-  return PUBLIC_ROUTES.includes(clean);
-}
-
-// T-0601 (F4): the ONE call that must not trigger the global 401-redirect is
-// the login attempt itself — redirecting there turned a wrong password into a
-// silent form reload. Exported for unit tests.
-// T-0609 breadcrumb: /api/auth/attach is the next candidate for this
-// exemption — it 401s on bad GLOBAL credentials while the caller's LOCAL
-// session cookie is still valid, so redirecting would bounce a logged-in
-// user to /login over a typo. No web caller goes through call() for it yet;
-// add the exemption here when one lands.
-// T-0714: the exemption is keyed on the PAGE route, not the API path — the
-// same endpoints must still bounce an expired session off a private page.
-export function shouldRedirectOn401(
-  path: string,
-  pagePath?: string | null,
-): boolean {
-  // T-0601 (F4): the login attempt itself is exempt on every route.
-  if (path === "/api/auth/login") return false;
-  const page =
-    pagePath ??
-    (typeof window !== "undefined" ? window.location?.pathname : undefined);
-  return !isPublicRoute(page);
-}
-
 async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     credentials: "include",
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (res.status === 401 && shouldRedirectOn401(path)) {
-    window.location.href = "/login";
-    throw new Error("not authenticated");
-  }
+  if (res.status === 401) redirectOn401(path);
   if (!res.ok) {
     throw new Error(`API error ${res.status}: ${await res.text()}`);
   }
@@ -1093,14 +1064,18 @@ export const api = {
     ),
   runs: (slug: string, limit = 50, offset = 0) =>
     call<RunRow[]>(`/api/projects/${slug}/runs?limit=${limit}&offset=${offset}`),
-  runLog: (slug: string, id: string, full = false) =>
-    fetch(`/api/projects/${slug}/runs/${encodeURIComponent(id)}/log${full ? "?full=1" : ""}`, {
+  runLog: (slug: string, id: string, full = false) => {
+    const path = `/api/projects/${slug}/runs/${encodeURIComponent(id)}/log${full ? "?full=1" : ""}`;
+    return fetch(path, {
       credentials: "include",
     }).then(async (res) => {
-      if (res.status === 401) { window.location.href = "/login"; throw new Error("not authenticated"); }
+      // T-0714: same shared gate as call() — this one hand-rolls the fetch
+      // because it returns text, not JSON.
+      if (res.status === 401) redirectOn401(path);
       if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
       return res.text();
-    }),
+    });
+  },
   sessionMessages: (
     slug: string,
     claudeUuid: string,

@@ -17,6 +17,8 @@
  * build with no registry, the backend falls through to the legacy
  * UserMeta.tg_chat_id surface, so the same FE call works on both.
  */
+import { redirectOn401 } from "./authRedirect";
+
 type Json = Record<string, unknown> | unknown[];
 
 async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
@@ -25,10 +27,8 @@ async function call<T = Json>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (res.status === 401) {
-    window.location.href = "/login";
-    throw new Error("not authenticated");
-  }
+  // T-0714: shared 401 gate — third copy of `call()`, same policy module.
+  if (res.status === 401) redirectOn401(path);
   if (!res.ok) {
     throw new Error(`API error ${res.status}: ${await res.text()}`);
   }

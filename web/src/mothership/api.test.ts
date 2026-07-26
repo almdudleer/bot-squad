@@ -636,3 +636,63 @@ describe("fanOut", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// T-0714 regression: this module's `call()` is a SECOND, independent copy of
+// the one in ../api. The public-route exemption first shipped in ../api only,
+// and /help stayed broken on staging because a mothership build's Shell always
+// reaches THIS copy (GlobalBusyIndicator -> fanOutInFlight -> listServers) and
+// its unconditional 401-bounce fired first. Both directions are asserted here
+// so the mirror can't silently diverge from the shared gate again.
+// ---------------------------------------------------------------------------
+describe("T-0714 public-route 401 exemption (mothership mirror)", () => {
+  beforeEach(() => {
+    invalidateServersCache();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function mock401(): FetchSpy {
+    const spy = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      text: async () => '{"detail":"not authenticated"}',
+    } as Response);
+    globalThis.fetch = spy as unknown as typeof fetch;
+    return spy;
+  }
+
+  test("listServers on /help rejects without navigating away", async () => {
+    const loc = { href: "https://host/help", pathname: "/help" };
+    vi.stubGlobal("window", { location: loc });
+    mock401();
+    await expect(mothershipApi.listServers()).rejects.toThrow(/API error 401/);
+    expect(loc.href).toBe("https://host/help");
+  });
+
+  test("listServers on a private page still redirects to /login", async () => {
+    const loc = { href: "https://host/p/bot-squad", pathname: "/p/bot-squad" };
+    vi.stubGlobal("window", { location: loc });
+    mock401();
+    await expect(mothershipApi.listServers()).rejects.toThrow(
+      "not authenticated",
+    );
+    expect(loc.href).toBe("/login");
+  });
+
+  // The fan-out's second hop goes through proxyCall, which never redirected on
+  // 401 by design (there a 401 means "the PEER rejected our bearer"). Pinned
+  // so the other half of the fan-out can't start bouncing anonymous visitors.
+  test("the per-server proxy client never navigates on 401", async () => {
+    const loc = { href: "https://host/help", pathname: "/help" };
+    vi.stubGlobal("window", { location: loc });
+    mock401();
+    await expect(
+      apiFor("srv_a").call<unknown>("/api/projects"),
+    ).rejects.toThrow("access_denied");
+    expect(loc.href).toBe("https://host/help");
+  });
+});

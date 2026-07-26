@@ -346,6 +346,22 @@ def test_in_quiet_hours_respects_args(monkeypatch) -> None:
         assert tg_module._in_quiet_hours(near_start, near_end) is True
 
 
+def test_in_quiet_hours_disabled_when_start_equals_end(monkeypatch) -> None:
+    """T-0690: start_utc == end_utc means quiet hours are disabled entirely.
+
+    Without the explicit equal-values check, this falls into the wrap-around
+    branch (h >= start or h < end), which is True for every hour when the two
+    are equal — the opposite of "disabled". The equal-values check returns
+    before the current hour is even read, so this holds regardless of when
+    the test runs.
+    """
+    from bot_squad_worker import tg as tg_module
+    monkeypatch.delenv("BOT_SQUAD_DISABLE_QUIET_HOURS", raising=False)
+
+    for value in (0, 12, 17, 22, 23):
+        assert tg_module._in_quiet_hours(value, value) is False
+
+
 def test_tg_client_picks_up_configured_quiet_hours(tmp_path: Path) -> None:
     """TgClient stores quiet hours from cfg."""
     class _Cfg:

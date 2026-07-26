@@ -259,9 +259,16 @@ def _in_quiet_hours(start_utc: int = 17, end_utc: int = 5) -> bool:
     Disabled when env var ``BOT_SQUAD_DISABLE_QUIET_HOURS`` is set — used by
     the test suite, which exercises send paths without time-dependent
     skips.
+
+    T-0690: ``start_utc == end_utc`` means quiet hours are disabled entirely
+    (zero-width window), not a 24h window. Without this check the wrap-around
+    branch below (``h >= start_utc or h < end_utc``) is true for every hour
+    when the two are equal, which is the opposite of "disabled".
     """
     import os
     if os.environ.get("BOT_SQUAD_DISABLE_QUIET_HOURS"):
+        return False
+    if start_utc == end_utc:
         return False
     from datetime import datetime, timezone
     h = datetime.now(timezone.utc).hour

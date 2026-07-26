@@ -35,13 +35,21 @@ import type { TelemetryQuota, TelemetryCaps } from "../api";
 import {
   PARALLEL_SESSION_CEILING,
   ProjectUtilization,
+  admissionLimit,
   aggregateUtilization,
   capInputError,
   capSoftWarning,
-  isOverCap,
+  isAtCapacity,
+  isThrottled,
   sanitizeCapInput,
+  utilizationPct,
   utilizationRatio,
 } from "../pages/resourceCaps";
+
+// T-0282: how often the LIVE readouts (enforced caps + quota) re-fetch. 10s
+// matches the Sessions page's own telemetry cadence (Sessions.tsx) so the strip
+// can't sit visibly staler than the session rows next to it.
+const CAPS_POLL_MS = 10_000;
 
 // Roll large token counts into k/M/B tiers (T-0267; shared shape with
 // Sessions.tsx's fmtContextTokens — the dissolved TelemetryPanel's original).
@@ -59,26 +67,54 @@ function fmtTokens(n: number): string {
  *
  * Exported so SystemSettings.tsx reuses the SAME bar (DRY — T-0339 moved it out
  * of that page so the admin view and the process view can't drift).
+ *
+ * T-0282: optional `effectiveLimit` draws the WS-4 backoff governor's
+ * "throttled to N" BAND onto the bar — the capacity the governor is currently
+ * withholding, shown where the operator reads the utilization rather than only
+ * as a separate badge. Red now means CAPACITY REACHED (at or above the limit
+ * admission gates on), not merely over-cap.
  */
 export function CapMeter({
   label,
   used,
   cap,
+  effectiveLimit = 0,
   format = (n: number) => n.toLocaleString(),
 }: {
   label: string;
   used: number | null;
   cap: number;
+  effectiveLimit?: number;
   format?: (n: number) => string;
 }) {
+  const throttled = isThrottled(cap, effectiveLimit);
+  // The bar is drawn against the CONFIGURED cap only. Deliberately NOT rescaled
+  // to the effective limit when the cap is unlimited: on a live system the AIMD
+  // limit mid-ramp is a large number (e.g. 1806 while 12 sessions run), so
+  // scaling to it yields a permanently ~empty bar and drops the honest
+  // "Unlimited" target. An unlimited cap keeps today's no-bar rendering; the
+  // throttle is carried by the note below (and the band, when a finite cap gives
+  // it something to be a fraction of).
   const ratio = used === null ? null : utilizationRatio(used, cap);
-  const over = used !== null && isOverCap(used, cap);
+  const limit = admissionLimit(cap, effectiveLimit);
+  const reached = used !== null && isAtCapacity(used, limit);
   const fill = ratio === null ? 0 : Math.min(100, ratio * 100);
-  const barColor = over
+  const barColor = reached
     ? "var(--mc-accent-danger, #d33)"
     : fill >= 80
       ? "var(--mc-accent-warn, #e0a000)"
       : "var(--mc-accent, #2f6feb)";
+  // Where the withheld-capacity band starts, as a % of the bar. Only meaningful
+  // when a FINITE hard cap gives the bar a scale wider than the throttle; when
+  // the cap is unlimited the bar already ends at the effective limit, so the
+  // whole bar is the throttled ceiling and there is no band to draw.
+  const bandStart = throttled && cap > 0 ? (effectiveLimit / cap) * 100 : null;
+  const capText =
+    cap === 0
+      ? throttled
+        ? `∞ → ${format(effectiveLimit)}`
+        : "Unlimited"
+      : format(cap);
   return (
     <div style={{ marginBottom: "0.6rem" }}>
       <div
@@ -89,10 +125,10 @@ export function CapMeter({
         <span
           style={{
             fontFamily: "var(--mc-mono)",
-            color: over ? "var(--mc-accent-danger, #d33)" : "var(--mc-text-mid)",
+            color: reached ? "var(--mc-accent-danger, #d33)" : "var(--mc-text-mid)",
           }}
         >
-          {used === null ? "—" : format(used)} / {cap === 0 ? "Unlimited" : format(cap)}
+          {used === null ? "—" : format(used)} / {capText}
         </span>
       </div>
       <div
@@ -103,10 +139,49 @@ export function CapMeter({
           background: "var(--mc-border)",
           overflow: "hidden",
         }}
-        title={cap === 0 ? "Unlimited (no cap)" : `${used ?? "—"} of ${cap}`}
+        title={
+          limit === 0
+            ? "Unlimited (no cap)"
+            : throttled
+              ? `${used ?? "—"} of ${effectiveLimit} admitted (backoff governor throttled the ceiling${cap > 0 ? ` down from ${cap}` : ""})`
+              : `${used ?? "—"} of ${cap}`
+        }
+        data-testid="cap-meter-bar"
       >
         <div style={{ position: "absolute", inset: 0, width: `${fill}%`, background: barColor }} />
+        {/* Withheld-capacity band: everything above the effective limit is
+            currently unavailable, hatched so it reads as "not yours to use"
+            rather than as headroom. */}
+        {bandStart !== null && (
+          <div
+            data-testid="cap-meter-throttle-band"
+            style={{
+              position: "absolute",
+              top: 0,
+              bottom: 0,
+              left: `${bandStart}%`,
+              right: 0,
+              backgroundImage:
+                "repeating-linear-gradient(45deg, var(--mc-accent-warn, #e0a000) 0 2px, transparent 2px 5px)",
+              opacity: 0.55,
+              borderLeft: "1px solid var(--mc-accent-warn, #e0a000)",
+            }}
+          />
+        )}
       </div>
+      {throttled && (
+        <div
+          data-testid="cap-meter-throttle-note"
+          style={{
+            fontSize: "0.64rem",
+            color: "var(--mc-accent-warn, #e0a000)",
+            marginTop: 2,
+          }}
+        >
+          ⚠ admission throttled to {format(effectiveLimit)} by the backoff governor
+          {cap > 0 ? ` (hard cap ${format(cap)})` : ""}
+        </div>
+      )}
     </div>
   );
 }
@@ -148,7 +223,10 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       ? null
       : capSoftWarning(parallelNum, PARALLEL_SESSION_CEILING, "Max parallel sessions");
 
-  // Caps + admin flag: cheap, needed for the always-visible summary header.
+  // Configured caps + admin flag. LOAD-ONCE ON PURPOSE (T-0282): these seed the
+  // EDITABLE inputs, so re-fetching them on a timer would overwrite whatever the
+  // operator is mid-way through typing. The live readouts poll separately below;
+  // a save round-trips its own fresh values back into these fields.
   useEffect(() => {
     let alive = true;
     api
@@ -171,20 +249,44 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       .catch(() => {
         /* non-admin / anon — inputs stay read-only */
       });
-    // This project's quota rollup for the anchor/projection reconciliation.
-    api
-      .telemetry(slug)
-      .then((d) => {
-        if (alive) {
-          setQuota(d.quota ?? null);
-          setCaps(d.caps ?? null); // server-wide enforced caps (items 7+22)
-        }
-      })
-      .catch(() => {
-        /* no telemetry yet — anchor status shows "unknown/none" */
-      });
     return () => {
       alive = false;
+    };
+  }, [slug]);
+
+  // T-0282: POLL the live readouts — the enforced caps (live count, AIMD
+  // effective_limit) and this project's quota rollup. The strip is a
+  // Task-Manager-style gauge, so it has to stay fresh while the operator watches
+  // the page; before this it loaded once on mount and then silently rotted (the
+  // DoD's "SystemSettings currently loads its meter once" complaint, which moved
+  // to this panel with D-0056/T-0629). Read-only data only — see above.
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      api
+        .telemetry(slug)
+        .then((d) => {
+          if (!alive) return;
+          // KEEP-LAST-GOOD (T-0282): a worker timeout/crash behind this route
+          // answers HTTP 200 with `{"caps": {}, "quota": {}}`
+          // (routes_sessions.py) — not an error the catch below would see. Under
+          // a 10s poll, writing that through would blank the strip back to its
+          // skeleton on every transient blip. An EMPTY object means "no fresh
+          // reading", so hold the previous one; only a populated payload wins.
+          const freshCaps = d.caps && Object.keys(d.caps).length > 0 ? d.caps : null;
+          const freshQuota = d.quota && Object.keys(d.quota).length > 0 ? d.quota : null;
+          if (freshCaps) setCaps(freshCaps); // server-wide enforced caps (items 7+22)
+          if (freshQuota) setQuota(freshQuota);
+        })
+        .catch(() => {
+          /* transient/no telemetry yet — keep the last good readout */
+        });
+    };
+    load();
+    const id = window.setInterval(load, CAPS_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
     };
   }, [slug]);
 
@@ -256,19 +358,32 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   const hardCap = caps?.max_parallel_sessions ?? parallelNum ?? 0;
   const effLimit = caps?.effective_limit ?? 0;
   const liveCount = caps?.live_sessions;
-  // P2-02: hardCap==0 means UNLIMITED (∞), not "no throttle". The shipped
-  // default is caps 0/0 with backoff ON, so the AIMD governor can depress an
-  // otherwise-unlimited ceiling to a finite effective_limit — that IS a throttle
-  // and must be visible. Treat hardCap 0 as Infinity so the badge renders
-  // whenever a finite effective_limit sits below the (possibly ∞) ceiling.
-  // (effective_limit 0 = unlimited/no pressure → not throttled.)
-  const throttled = effLimit > 0 && effLimit < (hardCap || Infinity);
+  // P2-02 (now `isThrottled`, T-0282): hardCap==0 means UNLIMITED (∞), not "no
+  // throttle" — the shipped default is caps 0/0 with backoff ON, so the AIMD
+  // governor can depress an otherwise-unlimited ceiling to a finite
+  // effective_limit, and that IS a throttle that must be visible.
+  const throttled = isThrottled(hardCap, effLimit);
+  // T-0282: capacity-reached keys off the limit admission ACTUALLY gates on —
+  // the throttled effective limit when the governor is holding it down, else the
+  // hard cap. A throttle at 8 with a hard cap of 15 means 8 live sessions is
+  // capacity reached, even though 8/15 looks like headroom.
+  const admitLimit = admissionLimit(hardCap, effLimit);
+  const parallelReached = liveCount != null && isAtCapacity(liveCount, admitLimit);
   const parallelText =
     liveCount != null
       ? `${liveCount}/${hardCap === 0 ? "∞" : hardCap}`
       : hardCap === 0
         ? "∞"
         : String(hardCap);
+
+  // T-0282: the token half of the strip. The DoD asks for `tokens %` — a
+  // UTILIZATION percentage — where the badge previously showed only the
+  // configured cap VALUE (which said nothing about how much was spent). The
+  // numerator is output_since_anchor, the figure the server actually enforces.
+  const tokenCap = caps?.max_total_tokens ?? tokensNum ?? 0;
+  const tokenUsed = caps?.output_since_anchor ?? null;
+  const tokenPct = tokenUsed === null ? null : utilizationPct(tokenUsed, tokenCap);
+  const tokensReached = tokenUsed !== null && isAtCapacity(tokenUsed, tokenCap);
 
   return (
     <div
@@ -316,12 +431,25 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
                   ? <>~{fmtTokens(Math.round(burn))}/hr <span style={{ opacity: 0.7 }}>· spot</span></>
                   : "—"}
               </span>
-              {/* T-0389 item 22: live count / hard ceiling + AIMD throttle. */}
+              {/* T-0389 item 22: live count / hard ceiling + AIMD throttle.
+                  T-0282: goes RED at capacity-reached — the operator's actionable
+                  state (nothing further will admit), which a dim/warn badge
+                  showing "8/15" hid entirely. */}
               <span
-                className={`mc-badge ${throttled ? "mc-badge-warn" : "mc-badge-dim"}`}
-                title="Live processes / max simultaneously-live allowed. T-0417: the cap value is shared config, but the live count + enforcement are per-worker-user (this Linux user's worker counts its own sessions). 0 = unlimited."
+                className={`mc-badge ${
+                  parallelReached ? "mc-badge-danger" : throttled ? "mc-badge-warn" : "mc-badge-dim"
+                }`}
+                data-testid="caps-strip-parallel"
+                title={
+                  parallelReached
+                    ? `Capacity reached: ${liveCount} live of ${admitLimit} admitted${
+                        throttled ? ` (backoff-throttled from ${hardCap === 0 ? "∞" : hardCap})` : ""
+                      }. No further session will admit until one exits or the limit rises.`
+                    : "Live processes / max simultaneously-live allowed. T-0417: the cap value is shared config, but the live count + enforcement are per-worker-user (this Linux user's worker counts its own sessions). 0 = unlimited."
+                }
               >
                 parallel {parallelText}
+                {parallelReached && " · capacity reached"}
               </span>
               {throttled && (
                 <span
@@ -341,11 +469,31 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
                   throttled to {effLimit}
                 </span>
               )}
+              {/* T-0282: token UTILIZATION (was: the bare cap value). */}
               <span
-                className="mc-badge mc-badge-dim"
-                title="Per-quota-period output-token budget (output since the last anchor). Enforced at spawn-time; frees on anchor reset. 0 = unlimited."
+                className={`mc-badge ${
+                  tokensReached
+                    ? "mc-badge-danger"
+                    : tokenPct !== null && tokenPct >= 80
+                      ? "mc-badge-warn"
+                      : "mc-badge-dim"
+                }`}
+                data-testid="caps-strip-tokens"
+                title={
+                  tokenCap === 0
+                    ? `Per-quota-period output-token budget: UNLIMITED (0 = no cap).${
+                        tokenUsed !== null ? ` ${fmtTokens(tokenUsed)} spent since the anchor.` : ""
+                      }`
+                    : `${tokenUsed !== null ? fmtTokens(tokenUsed) : "—"} of ${fmtTokens(
+                        tokenCap,
+                      )} output tokens spent since the last budget anchor — the figure enforced at spawn-time. Frees on anchor reset.${
+                        tokensReached ? " Capacity reached: no further session will admit." : ""
+                      }`
+                }
               >
-                tokens {tokensNum === 0 ? "∞" : tokensNum != null ? fmtTokens(tokensNum) : "—"}
+                tokens{" "}
+                {tokenCap === 0 ? "∞" : tokenPct !== null ? `${tokenPct}%` : "—"}
+                {tokensReached && " · capacity reached"}
               </span>
             </>
           )}
@@ -405,6 +553,9 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
               label="Parallel sessions (live, this worker-user)"
               used={caps?.live_sessions ?? (util ? util.liveSessions : null)}
               cap={caps?.max_parallel_sessions ?? parallelNum ?? 0}
+              // T-0282: the AIMD throttle band rides the meter, so the withheld
+              // capacity is visible where utilization is read.
+              effectiveLimit={effLimit}
             />
             <CapMeter
               label="Output tokens this quota period (enforced vs budget)"

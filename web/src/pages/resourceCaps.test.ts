@@ -8,12 +8,16 @@ import { SessionRow, TelemetryResponse } from "../api";
 import {
   PARALLEL_SESSION_CEILING,
   ProjectUtilization,
+  admissionLimit,
   aggregateUtilization,
   capDisplay,
   capInputError,
   capSoftWarning,
+  isAtCapacity,
   isOverCap,
+  isThrottled,
   sanitizeCapInput,
+  utilizationPct,
   utilizationRatio,
   validateCapInput,
 } from "./resourceCaps";
@@ -105,6 +109,64 @@ describe("isOverCap", () => {
   test("unlimited is never over", () => expect(isOverCap(999, 0)).toBe(false));
   test("at cap is not over", () => expect(isOverCap(2, 2)).toBe(false));
   test("above cap is over", () => expect(isOverCap(3, 2)).toBe(true));
+});
+
+// T-0282 — manual walkthrough (scenarios/T-0282-*.md) passed first; these lock
+// the strip/meter logic behind the live caps + backoff readout.
+describe("isAtCapacity", () => {
+  test("unlimited never reaches capacity", () => expect(isAtCapacity(999, 0)).toBe(false));
+  test("AT the cap IS capacity reached (unlike isOverCap)", () =>
+    expect(isAtCapacity(2, 2)).toBe(true));
+  test("above the cap is still capacity reached", () => expect(isAtCapacity(3, 2)).toBe(true));
+  test("below the cap is not", () => expect(isAtCapacity(1, 2)).toBe(false));
+});
+
+describe("isThrottled", () => {
+  test("finite effective limit below a finite cap = throttled", () =>
+    expect(isThrottled(15, 8)).toBe(true));
+  test("effective_limit 0 means unlimited/no pressure, never a throttle", () =>
+    expect(isThrottled(15, 0)).toBe(false));
+  test("an UNLIMITED cap depressed to a finite limit IS a throttle (shipped default caps 0/0)", () =>
+    expect(isThrottled(0, 1806)).toBe(true));
+  test("effective limit equal to the cap is not a throttle", () =>
+    expect(isThrottled(15, 15)).toBe(false));
+  test("effective limit above the cap is not a throttle", () =>
+    expect(isThrottled(8, 15)).toBe(false));
+});
+
+describe("admissionLimit", () => {
+  test("throttled → the governor's depressed limit gates admission", () =>
+    expect(admissionLimit(15, 8)).toBe(8));
+  test("not throttled → the hard cap gates admission", () =>
+    expect(admissionLimit(15, 0)).toBe(15));
+  test("unlimited cap + finite throttle → the throttle", () =>
+    expect(admissionLimit(0, 1806)).toBe(1806));
+  test("wholly unlimited → 0 (capacity can never be reached)", () =>
+    expect(admissionLimit(0, 0)).toBe(0));
+});
+
+describe("utilizationPct", () => {
+  test("unlimited cap → null (no percentage; must not read as 0%)", () =>
+    expect(utilizationPct(150_000, 0)).toBeNull());
+  test("rounds to a whole percent", () => expect(utilizationPct(1_700_000, 2_000_000)).toBe(85));
+  test("not clamped — a cap lowered under current usage reads >100%", () =>
+    expect(utilizationPct(3, 2)).toBe(150));
+  test("zero usage against a finite cap is 0%", () => expect(utilizationPct(0, 10)).toBe(0));
+});
+
+describe("capacity-reached against a BACKOFF-THROTTLED ceiling (the walkthrough case)", () => {
+  // 12 live, hard cap 15, governor throttled to 8: "12/15" alone looks like
+  // headroom, but nothing further admits — the strip must go red.
+  const hardCap = 15;
+  const effLimit = 8;
+  const live = 12;
+  test("throttle is detected", () => expect(isThrottled(hardCap, effLimit)).toBe(true));
+  test("admission is gated by the throttle, not the hard cap", () =>
+    expect(admissionLimit(hardCap, effLimit)).toBe(8));
+  test("capacity IS reached even though live < hard cap", () =>
+    expect(isAtCapacity(live, admissionLimit(hardCap, effLimit))).toBe(true));
+  test("and would NOT be reported reached against the hard cap alone", () =>
+    expect(isAtCapacity(live, hardCap)).toBe(false));
 });
 
 describe("aggregateUtilization", () => {

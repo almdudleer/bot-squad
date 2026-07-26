@@ -90,6 +90,49 @@ export function isOverCap(used: number, cap: number): boolean {
   return cap > UNLIMITED && used > cap;
 }
 
+/**
+ * T-0282: CAPACITY REACHED — a finite cap is set and usage is at or above it,
+ * so nothing further admits. Distinct from `isOverCap` (strictly above): being
+ * exactly AT the cap is already the operator-relevant state ("no more spawns"),
+ * and it's the common one, since admission clamps at the limit rather than
+ * overshooting it.
+ */
+export function isAtCapacity(used: number, cap: number): boolean {
+  return cap > UNLIMITED && used >= cap;
+}
+
+/**
+ * T-0282: is the WS-4 AIMD backoff governor holding admission BELOW the hard
+ * ceiling? An `effective_limit` of 0 means unlimited/no pressure (the worker
+ * normalises its 10_000 sentinel to 0 on the wire), so it is never a throttle.
+ * A hard cap of 0 means UNLIMITED (∞), not "no throttle" — the shipped default
+ * is caps 0/0 with backoff ON, so the governor can depress an otherwise-infinite
+ * ceiling to a finite limit, and that IS a throttle the operator must see.
+ */
+export function isThrottled(hardCap: number, effectiveLimit: number): boolean {
+  return effectiveLimit > UNLIMITED && effectiveLimit < (hardCap || Infinity);
+}
+
+/**
+ * T-0282: the limit spawn admission ACTUALLY gates on — the depressed effective
+ * limit while the governor is throttling, else the hard cap. 0 = unlimited
+ * (neither is finite), which is why capacity can never be "reached".
+ */
+export function admissionLimit(hardCap: number, effectiveLimit: number): number {
+  return isThrottled(hardCap, effectiveLimit) ? effectiveLimit : hardCap;
+}
+
+/**
+ * T-0282: whole-percent utilization for the at-a-glance strip. null when the cap
+ * is unlimited — an unlimited cap has no percentage, and rendering `0%` there
+ * would read as "nothing used" rather than "no limit". Not clamped: >100% is
+ * real information (a cap lowered below current usage).
+ */
+export function utilizationPct(used: number, cap: number): number | null {
+  const ratio = utilizationRatio(used, cap);
+  return ratio === null ? null : Math.round(ratio * 100);
+}
+
 export type ProjectUtilization = {
   sessions: SessionRow[] | null;
   telemetry: TelemetryResponse | null;

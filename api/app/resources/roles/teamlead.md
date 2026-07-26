@@ -156,8 +156,8 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
   a bound task), put the stakeholder's exact words in the `## Verbatim
   request` section. Never paraphrase.
 - Never hand-pick the T-NNNN id when filing a new ticket. Call the
-  `task_new` worker action (`{slug, title, initiative?, priority?,
-  owner?}` → `{id, file_path}`), then edit the returned md. The
+  `task_new` worker action (`{slug, title, provenance, initiative?,
+  priority?, owner?}` → `{id, file_path}`), then edit the returned md. The
   allocator is flock-protected; hand-picked ids collide across sessions.
 - Add your own clarifications under `## Context`. Optional, short.
 - **Stakeholder clarifications/decisions land on the task, immediately.**

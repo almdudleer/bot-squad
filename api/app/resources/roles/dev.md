@@ -47,8 +47,8 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   else to your TL via `peer_send`.
 - If you notice work outside your scope, drop a one-pager into
   `data/<slug>/backlog/`. Never hand-pick the T-NNNN id — call the
-  `task_new` worker action (`{slug, title, initiative?, priority?,
-  owner?}` → `{id, file_path}`), then edit the returned md to add
+  `task_new` worker action (`{slug, title, provenance, initiative?,
+  priority?, owner?}` → `{id, file_path}`), then edit the returned md to add
   Verbatim/Context/DoD. The allocator is flock-protected; hand-picked
   ids collide. Don't expand your own scope.
 - The stakeholder might connect to your session in tmux and respond to 

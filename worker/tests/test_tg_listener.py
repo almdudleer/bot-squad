@@ -1505,6 +1505,124 @@ def test_handle_update_topic_in_never_bound_chat_still_falls_back(tmp_path, monk
     assert ensures == [("alpha", "gu_1")]
 
 
+# ---------------------------------------------------------------------------
+# T-0700: the SAME failure mode as T-0693 above, but for a General-feed
+# message (thread_id=None, no binding) in a chat that already routes topics —
+# the T-0693 guard was gated on `thread_id is not None` and so let this door
+# stay open. Scoped MULTI-SLUG-ONLY (operator policy call, T-0700 progress
+# notes): held only when the chat's bound topics span MORE THAN ONE distinct
+# project slug (a genuinely multi-project shared forum); a single-project
+# chat's General tab keeps working with zero added friction.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_update_general_feed_multi_project_chat_held_not_slugged(tmp_path, monkeypatch):
+    """Chat 111 statically defaults to alpha, but its bound topics span TWO
+    distinct slugs (topic 7 -> alpha, topic 8 -> beta) — a genuinely
+    multi-project shared forum. A message typed into General (thread_id=None,
+    no binding of its own, no pin) must be held unrouted too, not silently
+    mis-slugged to alpha."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")  # chat 111's static slug is alpha
+    tg_bindings.set_binding(cfg, "111", 7, "alpha")
+    tg_bindings.set_binding(cfg, "111", 8, "beta")  # a SECOND distinct slug -> multi-project forum
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not resolve identity for a held message")))
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not append a held message anywhere")))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not wake any attendant for a held message")))
+    notified = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: notified.append((a, k)))
+
+    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "unbound_topic_held"
+    assert "111" in result["reason"]
+    # The sender is told, in the same (General) feed, rather than routed silently.
+    assert len(notified) == 1
+    assert notified[0][1].get("thread_id") is None
+
+
+def test_handle_update_general_feed_single_project_chat_still_falls_back(tmp_path, monkeypatch):
+    """Same topic-routed chat 111, but its bound topics are ALL on the SAME
+    slug (a single-project chat that merely uses per-topic binding for its
+    own project) — the General tab must keep working exactly as today, zero
+    added friction (T-0700 scoping: multi-slug-only, not unconditional)."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "alpha")
+    tg_bindings.set_binding(cfg, "111", 8, "alpha")  # SAME slug both times -> single-project forum
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
+
+    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route" and result["slug"] == "alpha"
+    assert ensures == [("alpha", "gu_1")]
+
+
+def test_handle_update_general_feed_genuine_dm_unaffected(tmp_path, monkeypatch):
+    """A chat that never appears in bound_chat_ids at all (a genuine DM/plain
+    static chat, never touched by topic binding) keeps the exact pre-T-0693/
+    T-0700 fallback for its General feed too — unaffected by either guard."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")  # no tg_bindings.set_binding calls at all
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
+
+    msg = _topic_msg("hi", chat_id=111, thread_id=None)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route" and result["slug"] == "alpha"
+    assert ensures == [("alpha", "gu_1")]
+
+
+def test_handle_update_general_feed_explicit_binding_still_routes(tmp_path, monkeypatch):
+    """A chat_id with an EXPLICIT General-feed binding ((chat_id, None) ->
+    slug, T-0693 Finding B's own addition) resolves it normally — the T-0700
+    hold-and-warn only fires when `binding is None`, so an explicit General
+    binding short-circuits it regardless of how many distinct slugs the
+    chat's other topics span."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "alpha")
+    tg_bindings.set_binding(cfg, "111", 8, "beta")     # multi-project forum
+    tg_bindings.set_binding(cfg, "111", None, "beta")  # its OWN General-feed binding
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(slug))
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
+
+    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route_bound_topic" and result["slug"] == "beta"
+    assert appended == ["beta"]
+    assert ensures == [("beta", "gu_1")]
+
+
 def test_handle_update_multi_chat_per_project_binding(tmp_path, monkeypatch):
     """A project may have MULTIPLE bound (chat_id, thread_id) entries (D-0055
     §3, explicit stakeholder requirement — not 1:1); both route to it."""

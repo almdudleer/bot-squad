@@ -137,6 +137,27 @@ def bound_chat_ids(cfg: Any) -> set[str]:
     return {key.split(":", 1)[0] for key in load(cfg)}
 
 
+def bound_topic_slugs(cfg: Any, chat_id: Any) -> set[str]:
+    """Distinct slugs bound to REAL forum topics (``thread_id is not None``)
+    of ``chat_id`` — deliberately excludes any ``(chat_id, None)`` General-feed
+    entry, which isn't a topic.
+
+    T-0700: lets the listener tell a genuinely multi-project shared forum
+    (bound topics pointing at MORE THAN ONE distinct slug — the live
+    incident's topology) apart from a single-project chat that merely also
+    has one or more topics bound to its own project. Used to gate the
+    General-feed (``thread_id=None``) hold-and-warn onto only the former, so a
+    single-project chat's General tab keeps working with zero added friction.
+    """
+    chat_id = str(chat_id)
+    slugs: set[str] = set()
+    for key, rec in load(cfg).items():
+        bound_chat, _, thread_part = key.partition(":")
+        if bound_chat == chat_id and thread_part:
+            slugs.add(rec["slug"])
+    return slugs
+
+
 def find_by_ticket(cfg: Any, ticket_id: str) -> Optional[dict]:
     """Reverse lookup: the topic bound to ``ticket_id`` (T-0660 direct-write,
     ``bsq topic say``/``tg_notify``'s ``ticket_id`` param) — a dev/TL/

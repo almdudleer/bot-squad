@@ -194,7 +194,9 @@ def _unbound_topics_path(cfg) -> Path:
     return cfg.data_dir / "_worker" / "tg_unbound_topics.json"
 
 
-def _record_unbound_topic(cfg, chat_id: str, thread_id: Any, chat: dict) -> None:
+def _record_unbound_topic(
+    cfg, chat_id: str, thread_id: Any, chat: dict, *, is_general_feed: bool = False,
+) -> None:
     """T-0693: a message arrived on a forum topic of a chat that already
     participates in per-topic routing (D-0055 §2-3 — it has at least one
     OTHER bound topic), but THIS ``(chat_id, thread_id)`` has no tg_bindings
@@ -205,6 +207,11 @@ def _record_unbound_topic(cfg, chat_id: str, thread_id: Any, chat: dict) -> None
     conversation store with zero error signal, discovered only because he
     noticed his question went unanswered.
 
+    ``is_general_feed=True`` (T-0700): the message arrived on the chat's
+    General feed (``thread_id=None``) rather than a named topic — there is no
+    TG "topic" here, so the warning/log copy says "General"/"no topic"
+    instead, but the discovery-record shape and hold behavior are identical.
+
     Logs a WARNING (grep-able) and persists a per-(chat_id, thread_id)
     discovery record so a freshly created/renamed topic is self-service
     discoverable (bind it via ``bsq topic bind``) instead of silently
@@ -212,13 +219,23 @@ def _record_unbound_topic(cfg, chat_id: str, thread_id: Any, chat: dict) -> None
     Mirrors ``_record_unknown_chat``'s shape/best-effort/atomic-write
     contract."""
     title = chat.get("title") or chat.get("username") or ""
-    log.warning(
-        "tg_listener: UNBOUND TOPIC chat_id=%s thread_id=%s (title=%r) — this "
-        "chat already routes other topics via tg_bindings, but this one has "
-        "no binding; message HELD UNROUTED (not mis-slugged to the chat's "
-        "static default project). Bind it: bsq topic bind %s %s <slug>",
-        chat_id, thread_id, title, chat_id, thread_id,
-    )
+    if is_general_feed:
+        log.warning(
+            "tg_listener: UNBOUND GENERAL (no topic) chat_id=%s (title=%r) — "
+            "this chat's bound topics span more than one project, but its "
+            "General feed has no binding of its own; message HELD UNROUTED "
+            "(not mis-slugged to the chat's static default project). Bind "
+            "it: bsq topic bind %s None <slug>",
+            chat_id, title, chat_id,
+        )
+    else:
+        log.warning(
+            "tg_listener: UNBOUND TOPIC chat_id=%s thread_id=%s (title=%r) — this "
+            "chat already routes other topics via tg_bindings, but this one has "
+            "no binding; message HELD UNROUTED (not mis-slugged to the chat's "
+            "static default project). Bind it: bsq topic bind %s %s <slug>",
+            chat_id, thread_id, title, chat_id, thread_id,
+        )
     import json
     import os
     try:
@@ -1000,10 +1017,25 @@ def handle_update(cfg, update: dict) -> dict:
     # static tg_chat map (D-0055 §2 step 1) — consulted FIRST, falling back to
     # the legacy `_slug_for_chat` so existing per-project chats are unchanged.
     binding = tg_bindings.resolve(cfg, chat_id, thread_id)
-    if thread_id is not None and binding is None and chat_id in tg_bindings.bound_chat_ids(cfg):
-        # T-0693: this chat already participates in per-topic routing (it has
-        # at least one OTHER bound topic), but THIS topic was never bound. The
-        # OLD unconditional fallback below (`... or _slug_for_chat(...)`)
+    is_general_feed = thread_id is None
+    # T-0700: the General feed (thread_id=None, no binding) has the exact same
+    # failure mode as an unbound topic below — but ONLY in a chat whose bound
+    # topics span MORE THAN ONE distinct project slug (a genuinely
+    # multi-project shared forum, the live incident's topology). A chat that
+    # hosts exactly one project's topics is already functionally correct via
+    # the static-default fallback further down, so gating this unconditionally
+    # would add hold+prompt friction to every single-project chat's General
+    # tab for zero benefit (operator policy call, T-0700 progress notes).
+    general_feed_multi_project = (
+        is_general_feed and len(tg_bindings.bound_topic_slugs(cfg, chat_id)) > 1
+    )
+    if binding is None and chat_id in tg_bindings.bound_chat_ids(cfg) and (
+        thread_id is not None or general_feed_multi_project
+    ):
+        # T-0693 (+ T-0700 for the General-feed branch above): this chat
+        # already participates in per-topic routing (it has at least one
+        # OTHER bound topic), but THIS (chat_id, thread_id) was never bound.
+        # The OLD unconditional fallback below (`... or _slug_for_chat(...)`)
         # would silently impersonate the chat's static default project for
         # it — exactly the live incident (a stakeholder's watchrobot question
         # in a freshly-created, not-yet-bound topic got mis-slugged into
@@ -1012,14 +1044,24 @@ def handle_update(cfg, update: dict) -> dict:
         # message unrouted rather than guessing a project for it. A chat that
         # has NEVER used per-topic binding at all (not in bound_chat_ids)
         # keeps the exact pre-T-0693 fallback below, unaffected.
-        _record_unbound_topic(cfg, chat_id, thread_id, chat)
-        _channel_notify(
-            cfg, chat_id,
-            "Эта тема ещё не привязана ни к одному проекту, поэтому "
-            "сообщение не маршрутизировано. Попросите админа выполнить "
-            "`bsq topic bind` для этой темы.",
-            thread_id=thread_id,
-        )
+        _record_unbound_topic(cfg, chat_id, thread_id, chat, is_general_feed=is_general_feed)
+        if is_general_feed:
+            _channel_notify(
+                cfg, chat_id,
+                "Это форум с несколькими проектами, а General (без темы) не "
+                "привязан ни к одному из них, поэтому сообщение не "
+                "маршрутизировано. Ответьте в теме нужного проекта или "
+                "попросите админа привязать General командой `bsq topic bind`.",
+                thread_id=thread_id,
+            )
+        else:
+            _channel_notify(
+                cfg, chat_id,
+                "Эта тема ещё не привязана ни к одному проекту, поэтому "
+                "сообщение не маршрутизировано. Попросите админа выполнить "
+                "`bsq topic bind` для этой темы.",
+                thread_id=thread_id,
+            )
         return {
             "ok": True, "action": "unbound_topic_held",
             "reason": f"chat {chat_id} thread {thread_id} has no binding",

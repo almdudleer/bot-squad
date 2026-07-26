@@ -78,6 +78,36 @@ def test_bound_chat_ids(tmp_path):
     assert TB.bound_chat_ids(cfg) == {"111", "222"}
 
 
+def test_bound_topic_slugs_excludes_general_feed_entry(tmp_path):
+    """T-0700: only REAL topics (thread_id is not None) count — a chat's own
+    General-feed (chat_id, None) binding is excluded, since it isn't a topic
+    and the caller (the multi-project-forum check) must not conflate the two."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 1, "alpha")
+    TB.set_binding(cfg, "111", None, "gamma")  # General-feed entry, not a topic
+    TB.set_binding(cfg, "222", 9, "beta")      # a different chat, irrelevant
+    assert TB.bound_topic_slugs(cfg, "111") == {"alpha"}
+
+
+def test_bound_topic_slugs_multiple_distinct(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 1, "alpha")
+    TB.set_binding(cfg, "111", 2, "beta")
+    assert TB.bound_topic_slugs(cfg, "111") == {"alpha", "beta"}
+
+
+def test_bound_topic_slugs_same_slug_collapses_to_one(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 1, "alpha")
+    TB.set_binding(cfg, "111", 2, "alpha")
+    assert TB.bound_topic_slugs(cfg, "111") == {"alpha"}
+
+
+def test_bound_topic_slugs_no_bindings_returns_empty(tmp_path):
+    cfg = _cfg(tmp_path)
+    assert TB.bound_topic_slugs(cfg, "111") == set()
+
+
 def test_persists_across_reload(tmp_path):
     """A fresh ``load()`` call (simulating a new process) sees the same data —
     single-writer JSON in the data dir, not in-memory state."""

@@ -865,7 +865,7 @@ export function Sessions() {
             }}
           >
             <dt>SID</dt>
-            <dd style={{ margin: 0, wordBreak: "break-all", color: "var(--mc-text)" }}>{s.sid}</dd>
+            <dd style={{ margin: 0, wordBreak: "break-all", color: "var(--mc-text)" }}>{s.sid_label ?? s.sid}</dd>
             {/* T-0281: surface role + what this process is bound to (task /
                 initiative) right in the process panel, so one place answers
                 "what is this process and what is it working on". */}
@@ -995,11 +995,11 @@ export function Sessions() {
                 to={`/p/${slug}/sessions/${encodeURIComponent(s.claude_uuid)}/messages`}
                 style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-accent)" }}
               >
-                {s.sid}
+                {s.sid_label ?? s.sid}
               </Link>
             ) : (
               <code style={{ fontFamily: "var(--mc-mono)", fontSize: "0.78rem", color: "var(--mc-text-mid)" }}>
-                {s.sid}
+                {s.sid_label ?? s.sid}
               </code>
             )}
           </td>
@@ -1096,7 +1096,7 @@ export function Sessions() {
                 color: "var(--mc-text-dim)",
               }}
             >
-              {s.sid}
+              {s.sid_label ?? s.sid}
             </code>
           </td>
           {/* T-0363: Window column cut (SID already encodes the window). */}
@@ -1658,7 +1658,7 @@ export function Sessions() {
                           onClick={() => jumpToWaiting(s.sid)}
                           title="Jump to this session in the table"
                         >
-                          {s.sid}
+                          {s.sid_label ?? s.sid}
                         </button>
                       </div>
                     </div>

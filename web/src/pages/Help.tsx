@@ -53,9 +53,10 @@ export function Help() {
           A sticky header bar is visible on every authenticated page. It shows:
         </p>
         <ul>
-          <li><strong>BOT·SQUAD wordmark</strong> (top of sidebar) — returns to the project picker. The LED dot beside it shows worker liveness (green = operational, red = offline).</li>
-          <li><strong>[PROJECT] section</strong> — shown when you are inside a project. Lists the per-project pages (BOARD, VISION, FEEDBACK, SESSIONS, RUNS). The selected project stays pinned even if you click a [SYSTEM] item.</li>
-          <li><strong>[SYSTEM] section</strong> — always visible. ALL PROJECTS returns to the picker; HELP is this page. (Worker/scheduler state lives on each project&apos;s home page.)</li>
+          <li><strong>BOT·SQUAD wordmark</strong> (top of sidebar) — returns to the project picker.</li>
+          <li><strong>Header icon cluster</strong> beside the wordmark — <strong>▦ Fleet / admin</strong> (super-admin only, on multi-server installs), <strong>⚙ Server settings</strong> (admin-only — scheduler jobs, global resource-cap notes), and <strong>? Help</strong> (this page, always visible).</li>
+          <li><strong>Worker-health pill</strong> — appears below the header only when something&apos;s wrong (no recent heartbeat, or the worker&apos;s running build drifted from the API image). Silent when healthy.</li>
+          <li><strong>Project section</strong> — shown when you are inside a project. Primary rail: <strong>BOARD, VISION, PROCESSES</strong>. A collapsible <strong>More / Ops</strong> disclosure holds the lower-frequency lookup surfaces: DOCS (includes Feedback), ANALYTICS, DEPLOYMENT QUEUE. The selected project stays pinned even if you click a header icon.</li>
           <li><strong>Footer</strong> — your username + Sign out.</li>
         </ul>
         <p>
@@ -85,23 +86,12 @@ export function Help() {
         </ul>
         <p>
           The four canonical states are the conceptual model; the internal statuses are a
-          non-destructive refinement (no task is renamed). <strong>Drag</strong> a card
-          between columns to change its internal status.
+          non-destructive refinement (no task is renamed).
         </p>
-        <h3>Adding a task</h3>
         <p>
-          Click <strong>+ New task</strong> (top-right of the board). Fill in a title (required),
-          an optional body (markdown, used as the spec for agents), and choose an initial status.
-        </p>
-        <h3>Editing a task</h3>
-        <p>
-          Click the <code>⋯</code> menu on any task card to: change status, edit body, add a
-          comment, or delete. Clicking the card itself navigates to the full task detail view.
-        </p>
-        <h3>Deleting a task</h3>
-        <p>
-          Open the <code>⋯</code> menu → <strong>Delete</strong>. A confirmation prompt appears.
-          Deletion is permanent.
+          The board is <strong>read-only</strong>: click a card to open its full detail
+          view. Creating a task, editing its body/status, or adding a comment all happen
+          via the Telegram dialog — reply in chat and the change lands on the task.
         </p>
       </section>
 
@@ -112,11 +102,15 @@ export function Help() {
           Navigate to any task card to open its detail view at <code>/p/&lt;slug&gt;/t/&lt;id&gt;</code>.
         </p>
         <ul>
-          <li><strong>Title</strong> — click the title text to edit inline; press Enter or click away to save.</li>
-          <li><strong>Status</strong> — change via the dropdown in the top-right of the detail view.</li>
-          <li><strong>Body</strong> — click <strong>Edit</strong> to open a full-text editor (markdown). The body is the specification that agents read; keep it precise and actionable.</li>
-          <li><strong>Comments</strong> — append timestamped notes. Comments are appended to the body as <code>### heading / text</code> blocks; they are never overwritten by agents.</li>
+          <li><strong>Title, status, initiative binding</strong> — read-only facts.</li>
+          <li><strong>The ask</strong> — the original verbatim request, read-only.</li>
+          <li><strong>Process working area</strong> — the progress-note / negotiation log, plus past comments (newest first), read-only.</li>
         </ul>
+        <p>
+          Editing the body, changing status, or adding a comment all happen via the
+          Telegram dialog now — the task detail page is for looking things up, not
+          driving them.
+        </p>
       </section>
 
       {/* ------------------------------------------------------------------ */}
@@ -140,21 +134,20 @@ export function Help() {
 
       {/* ------------------------------------------------------------------ */}
       <section className="mc-help-section" id="feedback">
-        <h2>Feedback</h2>
+        <h2>Docs &amp; Feedback</h2>
         <p>
-          The feedback section at <code>/p/&lt;slug&gt;/feedback</code> holds raw markdown notes —
-          user research, bug reports, observations — that have not yet been turned into tasks.
-        </p>
-        <h3>Promote to task</h3>
-        <p>
-          Click <strong>Promote to task</strong> on any feedback file. A modal appears with the
-          extracted title (from the first H1) and the full content pre-filled as the task body.
-          Adjust the title if needed and click <strong>Create task</strong>. The new task appears
-          on the backlog board at status <em>open</em>, and the feedback file is retained for reference.
+          The <strong>Docs &amp; Artifacts</strong> view at <code>/p/&lt;slug&gt;/docs</code>{" "}
+          is one read-first lookup surface over a shared, cross-linked tree of two artifact
+          kinds: <strong>📄 Docs</strong> (design docs, decisions) and{" "}
+          <strong>💬 Feedback</strong> (raw notes — user research, bug reports, observations —
+          not yet turned into tasks). Use the <strong>All / 📄 Docs / 💬 Feedback</strong>{" "}
+          filter to narrow the tree to one kind; a <strong>show closed</strong> checkbox
+          reveals resolved feedback when the Feedback (or All) filter is active.
         </p>
         <p>
-          This pattern makes it easy to turn evidence-backed observations into actionable work
-          without losing the original context.
+          This page is pure read/lookup — creating a doc, editing one, promoting a
+          feedback item to a task, or linking a doc to a ticket all happen via the
+          Telegram dialog now.
         </p>
       </section>
 
@@ -164,28 +157,17 @@ export function Help() {
         <h2>Processes</h2>
         <p>
           Sessions are Claude agent processes running inside tmux panes on the server.
-          The sessions list at <code>/p/&lt;slug&gt;/sessions</code> shows all active and paused
-          panes for a project.
+          The processes list at <code>/p/&lt;slug&gt;/sessions</code> is a live, read-only
+          status board for all active and paused panes whose CWD is this project&apos;s
+          repo — the system spawns, reuses, and reaps them for you.
         </p>
         <ul>
           <li><strong>active</strong> — Claude is running; the pane is live.</li>
-          <li><strong>paused</strong> — the pane has been killed; Claude session state (the <code>--resume</code> UUID) is preserved. You can resume it later.</li>
+          <li><strong>paused</strong> — the pane has been killed; Claude session state (the <code>--resume</code> UUID) is preserved so the system can resume it later.</li>
         </ul>
-        <h3>Pause</h3>
         <p>
-          Click <strong>Pause</strong> on an active session. The tmux pane is destroyed but the
-          Claude UUID is saved so the session can be resumed from where it left off.
-        </p>
-        <h3>Resume</h3>
-        <p>
-          Click <strong>Resume</strong> on a paused session. A new tmux pane is opened and
-          Claude is launched with <code>--resume &lt;UUID&gt;</code>.
-        </p>
-        <h3>New session</h3>
-        <p>
-          Click <strong>+ New session</strong>. Provide a window name (used as the tmux window
-          name, e.g. <code>spec7-work</code>) and an optional initial prompt that will be sent
-          to Claude immediately after it starts.
+          Pausing, resuming, and starting new sessions are no longer web actions —
+          steer day-to-day via the Telegram dialog instead.
         </p>
         <div className="mc-help-callout">
           <strong>Telegram tip:</strong> when Claude needs your input it sends a Telegram
@@ -193,6 +175,16 @@ export function Help() {
           message — your text is routed into that session automatically. No need to open the web
           UI just to answer a question.
         </div>
+
+        <h3>Resource caps</h3>
+        <p>
+          One write control remains on this page: the <strong>Resources &amp; quota</strong>{" "}
+          panel lets an admin edit <strong>Max parallel sessions</strong>,{" "}
+          <strong>Max total tokens</strong>, and the <strong>Idle-suspend window</strong> in
+          place, next to the usage numbers it&apos;s constraining. Click{" "}
+          <strong>Save caps</strong> to apply — it&apos;s a fresh read on each spawn, no
+          restart needed.
+        </p>
 
         <h3 id="tmux-cheatsheet">Tmux cheatsheet</h3>
         <p>
@@ -216,9 +208,9 @@ export function Help() {
 
       {/* ------------------------------------------------------------------ */}
       <section className="mc-help-section" id="runs">
-        <h2>Runs</h2>
+        <h2>Deployment Queue</h2>
         <p>
-          The runs list at <code>/p/&lt;slug&gt;/runs</code> shows the deploy history.
+          The deployment queue at <code>/p/&lt;slug&gt;/runs</code> shows the deploy history.
           Each row is a deploy request with status, target environment, reason, timing, and a
           link to the full log.
         </p>
@@ -269,19 +261,19 @@ git commit -m "feat: concise description of what this branch does"</code></pre>
       <section className="mc-help-section" id="scheduler">
         <h2>Scheduler</h2>
         <p>
-          Scheduler state renders on each project&apos;s <strong>home page</strong>{" "}
-          (<code>/p/&lt;project&gt;</code>, the Board) — expand the{" "}
-          <em>Scheduler</em> section of the observability panel above the board.
-          It displays:
+          Scheduler jobs live on <code>/system-settings</code> (admin-only) — expand the{" "}
+          <strong>▸ Scheduler jobs</strong> disclosure near the bottom of the page. It lists
+          every registered job with its <strong>trigger</strong> (cron/interval) and{" "}
+          <strong>next run</strong> time, refreshed every 30 seconds.
         </p>
-        <ul>
-          <li><strong>Worker uptime</strong> — how long the worker process has been running.</li>
-          <li><strong>Last heartbeat</strong> — seconds since the last heartbeat tick. Green (healthy) means &lt; 2 minutes. Red means the worker may be stuck or down.</li>
-          <li><strong>Scheduled jobs</strong> — each registered job with its cron/interval trigger and next scheduled run time.</li>
-        </ul>
+        <p>
+          Worker uptime and heartbeat health aren&apos;t shown there — that&apos;s the
+          failure-only worker-health pill in the sidebar header instead (see{" "}
+          <a href="#navigating">Navigating</a>), silent while the worker is healthy.
+        </p>
         <p>
           The scheduler drives autopilot watchdog ticks, session health checks, and background
-          maintenance tasks. It refreshes automatically every 30 seconds.
+          maintenance tasks.
         </p>
       </section>
 
@@ -303,6 +295,7 @@ git commit -m "feat: concise description of what this branch does"</code></pre>
         <ul>
           <li><code>/sessions</code> — list active and paused sessions across all projects.</li>
           <li><code>/say &lt;sid&gt; &lt;text&gt;</code> — send text to a specific session by SID.</li>
+          <li><code>/state</code> — drive on/off, quota target, core lifecycle state.</li>
           <li><code>/help</code> — show bot command reference.</li>
         </ul>
       </section>
@@ -318,7 +311,7 @@ git commit -m "feat: concise description of what this branch does"</code></pre>
         <pre><code>ops/bot-squad-bin/deploy &lt;target&gt; "&lt;reason&gt;"</code></pre>
         <p>
           Queues a deploy run. <code>target</code> is typically <code>staging</code> or
-          <code>prod</code>. The reason is logged and shown in the Runs table.
+          <code>prod</code>. The reason is logged and shown in the Deployment Queue table.
         </p>
         <h3>Squash before deploy</h3>
         <pre><code>BASE=$(git merge-base HEAD master)
@@ -341,7 +334,7 @@ git commit -m "feat(scope): one-line summary of the branch"</code></pre>
         <p>
           When a feature is complete and deployed to staging, the stakeholder reviews and merges
           the branch to <code>master</code> manually, then triggers a production deploy via the
-          Runs interface or directly.
+          Deployment Queue interface or directly.
         </p>
         <p>
           Agents also never amend commits on <code>master</code> or rewrite shared history.

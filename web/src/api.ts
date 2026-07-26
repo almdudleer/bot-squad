@@ -284,6 +284,12 @@ export type DocDetail = {
 
 export type SessionRow = {
   sid: string;
+  // T-0636/T-0654: slug-qualified display label ("[<slug>] <sid>"), computed
+  // worker-side by sessions.sid_display_label and included on every
+  // list_sessions() row. Display-only — routing/keys/attach commands stay on
+  // the raw `sid`. Optional so a pre-T-0636 worker doesn't break the type
+  // contract; render code falls back to `sid`.
+  sid_label?: string;
   // Raw md/zombie-reclassified status. Kept for back-compat and for
   // action-button routing (Pause/Resume/Resurrect read this). Display
   // labels go through `activity` (T-0104) instead.

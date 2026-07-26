@@ -89,10 +89,11 @@ def test_put_writes_settings_and_creates_file(tmp_bot_squad: Path, monkeypatch) 
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
-    # PASS-2 P2-01-BE: quiet_hours/ttl/coordinator are fresh-read by their
-    # consumers — no worker restart needed (only boot-cached bot_token/proxy_url
-    # require one).
-    assert body["restart_required"] is False
+    # T-0691: quiet_hours_start_utc/end_utc are boot-cached (TgClient/MaxClient
+    # read them once at construction, and the module-level client singleton
+    # isn't rebuilt by reload_projects) — a real change here DOES need a
+    # restart, same as bot_token/proxy_url.
+    assert body["restart_required"] is True
     assert body["tg"]["quiet_hours_start_utc"] == 18
     assert body["tg"]["quiet_hours_end_utc"] == 6
     assert body["session"]["ttl"] == "14d"
@@ -106,9 +107,11 @@ def test_put_writes_settings_and_creates_file(tmp_bot_squad: Path, monkeypatch) 
 
 # ---------------------------------------------------------------------------
 # PASS-2 P2-01-BE: restart_required must reflect the SOURCE OF TRUTH — true ONLY
-# when a boot-cached field (tg.bot_token / tg.proxy_url) actually changed. Caps +
-# ttl + quiet_hours + coordinator are fresh-read per spawn/tick, so a caps-only
-# save needs no restart (else the two caps editors contradict each other).
+# when a boot-cached field actually changed. Caps + ttl + coordinator are
+# fresh-read per spawn/tick, so a caps-only save needs no restart (else the two
+# caps editors contradict each other). T-0691: tg.bot_token / tg.proxy_url /
+# tg.quiet_hours_start_utc / tg.quiet_hours_end_utc are ALL boot-cached (see
+# TgClient/MaxClient.__init__) and DO need one.
 # ---------------------------------------------------------------------------
 
 def test_caps_only_save_needs_no_restart(tmp_bot_squad: Path, monkeypatch) -> None:
@@ -174,6 +177,35 @@ def test_bot_token_change_requires_restart(tmp_bot_squad: Path, monkeypatch) -> 
         r = client.put("/api/system-settings", json={"tg": {"bot_token": "123:newtoken"}})
     assert r.status_code == 200, r.text
     assert r.json()["restart_required"] is True
+
+
+def test_quiet_hours_change_requires_restart(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0691: quiet_hours_start_utc/end_utc are boot-cached by TgClient/
+    MaxClient — a live worker keeps using the OLD value (Config.load() via
+    reload_projects doesn't reconstruct those module-level singletons), so a
+    PUT changing them must report restart_required, not silently claim it
+    took effect."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"tg": {"quiet_hours_start_utc": 20}})
+    assert r.status_code == 200, r.text
+    assert r.json()["restart_required"] is True
+
+
+def test_quiet_hours_unchanged_resend_needs_no_restart(tmp_bot_squad: Path, monkeypatch) -> None:
+    """The System-Settings panel resends the whole tg form; quiet_hours values
+    matching the persisted ones must NOT trigger a restart prompt."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        client.put("/api/system-settings",
+                    json={"tg": {"quiet_hours_start_utc": 20, "quiet_hours_end_utc": 8}})
+        r = client.put("/api/system-settings",
+                        json={"tg": {"quiet_hours_start_utc": 20, "quiet_hours_end_utc": 8}})
+    assert r.status_code == 200, r.text
+    assert r.json()["restart_required"] is False
 
 
 def test_put_preserves_unmanaged_max_section(tmp_bot_squad: Path, monkeypatch) -> None:

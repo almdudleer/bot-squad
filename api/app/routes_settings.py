@@ -284,8 +284,17 @@ def put_settings(request: Request, payload: dict) -> dict:
     # PASS-2 P2-01-BE: only a BOOT-CACHED field change needs a worker restart.
     # tg.proxy_url is read once at listener/worker boot; capture its old value
     # now (before validation overwrites it) to detect a real change. Caps + ttl +
-    # quiet_hours + coordinator are fresh-read per spawn/tick → no restart.
+    # coordinator are fresh-read per spawn/tick → no restart.
+    # T-0691: quiet_hours_start_utc/end_utc are ALSO boot-cached — TgClient/
+    # MaxClient.__init__ read cfg.tg_quiet_hours_*_utc into instance attrs once,
+    # and the module-level client is a lazy singleton (_get_tg_client /
+    # _get_max_client in actions.py) that reload_projects's Config.load() does
+    # NOT reconstruct — so there is no hot-reload path for this field despite
+    # what this endpoint used to report. Capture old values the same way as
+    # proxy_url so a real change is correctly flagged restart_required below.
     old_proxy_url = str((current.get("tg") or {}).get("proxy_url") or "")
+    old_quiet_start = int((current.get("tg") or {}).get("quiet_hours_start_utc", 17))
+    old_quiet_end = int((current.get("tg") or {}).get("quiet_hours_end_utc", 5))
 
     tg_in = (payload.get("tg") or {}) if isinstance(payload.get("tg"), dict) else {}
     sess_in = (
@@ -406,8 +415,14 @@ def put_settings(request: Request, payload: dict) -> dict:
     # new token); proxy_url is shown + resent by the System-Settings form, so
     # compare to the pre-write value. Everything else is fresh-read → no restart,
     # so a caps-only save reports False and the two caps editors stop contradicting.
-    boot_cached_changed = ("bot_token" in tg_in) or (
-        "proxy_url" in tg_in and str(tg_in["proxy_url"]).strip() != old_proxy_url
+    # T-0691: quiet_hours_start_utc/end_utc are boot-cached too (see the
+    # old_quiet_start/end comment above) — a value change must set
+    # restart_required, same as proxy_url.
+    boot_cached_changed = (
+        ("bot_token" in tg_in)
+        or ("proxy_url" in tg_in and str(tg_in["proxy_url"]).strip() != old_proxy_url)
+        or ("quiet_hours_start_utc" in tg_in and tg_in["quiet_hours_start_utc"] != old_quiet_start)
+        or ("quiet_hours_end_utc" in tg_in and tg_in["quiet_hours_end_utc"] != old_quiet_end)
     )
     result["restart_required"] = bool(boot_cached_changed)
     return result

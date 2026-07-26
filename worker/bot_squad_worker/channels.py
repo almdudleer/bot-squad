@@ -132,6 +132,12 @@ class TgChannel(Channel):
             opt["reply_markup"] = extra["reply_markup"]
         if "debounce" in extra:
             opt["debounce"] = extra["debounce"]
+        # T-0719: the RAW routing SID behind the display `sid` label, forwarded
+        # so the send can pin message_id -> session for reply routing. Same
+        # opt-in shape as above: absent unless a caller asks for it, so fakes
+        # with fixed signatures keep working.
+        if "route_sid" in extra:
+            opt["route_sid"] = extra["route_sid"]
         return self._client().send(
             chat_id=chat_id,
             text=text,

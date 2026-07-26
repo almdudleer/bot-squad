@@ -306,16 +306,54 @@ def poll_updates(cfg, last_update_id: int, timeout: int = 25) -> list[dict]:
         return []
 
 
-def extract_reply_target(message: dict) -> Optional[tuple[str, str]]:
-    """Extract (sid, text) if this is a reply to a worker notification."""
+def extract_reply_target(message: dict, cfg: Any = None) -> Optional[tuple[str, str]]:
+    """Extract (sid, text) if this is a reply to a worker notification.
+
+    T-0719 — resolution order, message-id FIRST:
+
+    1. ``tg_reply_map``: the ``(chat_id, reply_to.message_id)`` the sender
+       recorded when it sent the message. Presentation-independent, so it
+       survives any change to how the prefix renders. This is the path that
+       must carry the common case.
+    2. :data:`SID_RE` over the quoted text — the legacy path. Kept as a
+       FALLBACK, not deleted: messages sent before the map existed, and the
+       non-compact bracket form ``[<slug>] S-...-pNNN`` some callers still
+       use, have to keep resolving.
+
+    Why the order matters: the regex was the ONLY path until now, and T-0676
+    item 5's compact ``"<slug> <role>"`` label removed the raw SID from the
+    text entirely — so every reply silently stopped matching and fell through
+    to the attendant. Routing must not read display text to work.
+
+    ``cfg`` is optional so the pure-parse contract (and its callers/tests)
+    still holds when there's no data dir on hand; without it only step 2 runs.
+    """
     reply_to = message.get("reply_to_message")
     if not reply_to:
         return None
+    text = message.get("text", "").strip()
+
+    data_dir = getattr(cfg, "data_dir", None)
+    if data_dir is not None:
+        try:
+            from bot_squad_worker import tg_reply_map
+
+            chat_id = (message.get("chat") or {}).get("id")
+            if chat_id is None:
+                chat_id = (reply_to.get("chat") or {}).get("id")
+            sid = tg_reply_map.lookup(
+                data_dir, chat_id=chat_id, message_id=reply_to.get("message_id"),
+            )
+            if sid:
+                return (sid, text)
+        except Exception:  # noqa: BLE001 — never lose the regex fallback to a store hiccup
+            log.exception("extract_reply_target: reply-map lookup failed")
+
     quoted = reply_to.get("text") or ""
     m = SID_RE.match(quoted)
     if not m:
         return None
-    return (m.group(1), message.get("text", "").strip())
+    return (m.group(1), text)
 
 
 def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
@@ -1335,7 +1373,7 @@ def handle_update(cfg, update: dict) -> dict:
         )
 
     slash = extract_slash_command(msg)
-    reply = extract_reply_target(msg) if not slash else None
+    reply = extract_reply_target(msg, cfg) if not slash else None
     # T-0386 Phase 2 / T-0569: a voice message. Flag-off-safe: gated on
     # [voice].enabled (default off) so deploying the voice code is a no-op
     # until the 1-time stakeholder TG setup flips it on. T-0569 splits the

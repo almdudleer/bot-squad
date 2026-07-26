@@ -199,10 +199,15 @@ class _FakeTgClient:
         self.calls: list[dict] = []
         self._suppress = False  # when True, send() returns False (debounce sim)
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True) -> bool:
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None,
+             debounce=True, route_sid="") -> bool:
+        # T-0719: `route_sid` is the RAW routing sid behind the display `sid`
+        # label — recorded so tests can pin that reply-routing gets the real
+        # session, not the (compact, sid-less) label.
         self.calls.append({
             "chat_id": chat_id, "text": text, "sid": sid, "user": user,
             "urgent": urgent, "topic_id": topic_id, "debounce": debounce,
+            "route_sid": route_sid,
         })
         return not self._suppress
 
@@ -4155,3 +4160,99 @@ def test_session_alias_actions_registered_coordinator_only():
     ):
         assert name in ACTION_REGISTRY
         assert ACTION_MODES[name] == "coordinator_only"
+
+
+# ---------------------------------------------------------------------------
+# T-0719 REGRESSION — the page funnel must hand the send the RAW routing sid
+#
+# `_send_stakeholder_dm` is the SSOT every tg_notify / tg_ping / topic-say /
+# relay / needs-input page funnels through. Since T-0676 item 5 the `sid` it
+# puts on the wire is a compact DISPLAY label with no SID in it, so the raw
+# routing sid has to travel separately (`route_sid`) or replies cannot come
+# back. These pin exactly that split.
+# ---------------------------------------------------------------------------
+
+def test_send_stakeholder_dm_forwards_raw_route_sid_beside_compact_label(
+        tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+
+    A._send_stakeholder_dm(
+        A._get_config(), message="operator here", tg_chat_id="-100",
+        sid="S-almdudleer-operator-p241", slug="test-project", do_slim=False,
+    )
+    call = fake_tg.calls[0]
+    # Display label stays compact (T-0676 item 5 is NOT reverted) …
+    assert call["sid"] == "test-project operator"
+    # … and the routing key rides alongside it.
+    assert call["route_sid"] == "S-almdudleer-operator-p241"
+
+
+@pytest.mark.parametrize("sid,role", [
+    ("S-almdudleer-t-0719-dev-p260", "dev"),
+    ("S-almdudleer-gateway-routing-tl-p23", "teamlead"),
+    ("S-almdudleer-operator-p241", "operator"),
+    ("S-almdudleer-gu_dc8262b6-user-conversation-p5", "user-conversation"),
+])
+def test_send_stakeholder_dm_route_sid_for_every_sender_kind(
+        tmp_config_dir, monkeypatch, sid, role):
+    """The break was system-wide — every sender kind derives a role and so gets
+    the SID-less compact label."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+
+    A._send_stakeholder_dm(
+        A._get_config(), message="paging you", tg_chat_id="-100",
+        sid=sid, slug="test-project", do_slim=False,
+    )
+    call = fake_tg.calls[0]
+    assert call["sid"] == f"test-project {role}"   # no raw SID in the label
+    assert call["route_sid"] == sid
+
+
+def test_send_stakeholder_dm_omits_route_sid_for_synthetic_senders(
+        tmp_config_dir, monkeypatch):
+    """`deploy_monitor` / `autopilot` / `oauth_refresh` are not sessions: there
+    is no pane to inject into, so nothing is routed and no kwarg is forwarded
+    (which also keeps fixed-signature transports working)."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+
+    for synthetic in ("deploy_monitor", "autopilot", "oauth_refresh"):
+        A._send_stakeholder_dm(
+            A._get_config(), message=f"from {synthetic}", tg_chat_id="-100",
+            sid=synthetic, slug="test-project", do_slim=False,
+        )
+    assert [c["route_sid"] for c in fake_tg.calls] == ["", "", ""]
+
+
+def test_peer_send_tg_mirror_forwards_route_sid(tmp_path, tmp_config_dir, monkeypatch):
+    """A mirrored peer message is also a page the stakeholder can reply to —
+    the reply must reach the SENDING session, not the attendant."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[users]\n'
+        'alexey = "hash"\n'
+        '\n'
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "404580642"\n'
+    )
+    (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    _write_session_metadata(
+        tmp_path / "data" / "test-project" / "sessions" / "S-alexey-ui-p0.md",
+        {"sid": "S-alexey-ui-p0", "status": "active"},
+    )
+    _, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+
+    A.dispatch("peer_send", {
+        "slug": "test-project",
+        "from_sid": "S-almdudleer-operator-p23",
+        "to": "S-alexey-ui-p0",
+        "text": "ack — got your ping",
+    })
+    call = fake.calls[0]
+    assert call["sid"] == "test-project operator"          # compact label
+    assert call["route_sid"] == "S-almdudleer-operator-p23"

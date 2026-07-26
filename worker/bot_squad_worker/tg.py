@@ -19,7 +19,7 @@ import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from bot_squad_worker.config import Config
@@ -37,6 +37,7 @@ class TgClient:
 
     def __init__(self, cfg: "Config", cooldown_sec: int = 60) -> None:
         self._token: str = cfg.tg_bot_token
+        self._data_dir: Path = cfg.data_dir
         self._debounce_dir: Path = cfg.data_dir / "_worker" / "tg_debounce"
         self._cooldown: int = cooldown_sec
         self._quiet_start_utc: int = getattr(cfg, "tg_quiet_hours_start_utc", 17)
@@ -60,6 +61,7 @@ class TgClient:
         topic_id: int | None = None,
         debounce: bool = True,
         reply_markup: dict | None = None,
+        route_sid: str = "",
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -80,6 +82,14 @@ class TgClient:
         once per 60s. ``reply_markup`` (T-0513) carries a TG keyboard/inline
         markup verbatim into the send (e.g. the project-picker keyboard);
         ``None`` sends a plain message unchanged.
+
+        ``route_sid`` (T-0719): the RAW routing SID this message came from —
+        kept separate from ``sid``, which is a DISPLAY label and since T-0676
+        item 5 no longer contains the SID at all. Recorded against the returned
+        ``message_id`` in ``tg_reply_map`` so a stakeholder reply resolves back
+        to this session by message id, not by re-parsing the prefix. Empty (or
+        a non-routing name like ``deploy_monitor``) → nothing recorded, and the
+        reply falls through to the legacy regex/attendant path as before.
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
@@ -95,12 +105,33 @@ class TgClient:
             log.debug("tg.send: debounced (same payload within %ds)", self._cooldown)
             return False
 
-        self._post(
+        data = self._post(
             chat_id=chat_id, text=full_text, topic_id=topic_id, reply_markup=reply_markup
         )
+        self._record_reply_route(chat_id=chat_id, data=data, route_sid=route_sid)
         if debounce:
             self._record(chat_id=chat_id, sid=sid, text=text)
         return True
+
+    def _record_reply_route(self, *, chat_id: str, data: Any, route_sid: str) -> None:
+        """T-0719: pin ``result.message_id`` -> ``route_sid`` so a reply to this
+        message routes back here regardless of how the prefix renders.
+
+        Best-effort by design: a bad/absent message_id or a store hiccup must
+        never turn a delivered page into a failed send."""
+        if not route_sid:
+            return
+        try:
+            from bot_squad_worker import tg_reply_map
+
+            message_id = ((data or {}).get("result") or {}).get("message_id")
+            if message_id is None:
+                return
+            tg_reply_map.record(
+                self._data_dir, chat_id=chat_id, message_id=message_id, sid=route_sid,
+            )
+        except Exception:  # noqa: BLE001 — observability only, never fail the send
+            log.exception("tg.send: could not record reply route for %s", route_sid)
 
     # ------------------------------------------------------------------
     # Forum-topic CRUD (T-0386 / INI-04) — per-project topic provisioning.

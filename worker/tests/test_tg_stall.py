@@ -38,7 +38,8 @@ class _FakeTg:
     def __init__(self):
         self.sent = []
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True):
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None,
+             debounce=True, route_sid=""):  # route_sid: T-0719 raw routing sid
         full = f"[{sid}] {text}" if sid else text
         self.sent.append({"chat_id": chat_id, "text": full, "topic_id": topic_id})
         return True

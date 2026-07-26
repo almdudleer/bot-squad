@@ -104,6 +104,147 @@ def test_extract_reply_target_strips_text_whitespace():
 
 
 # ---------------------------------------------------------------------------
+# T-0719 REGRESSION: reply routing vs. the T-0676 item 5 COMPACT label
+#
+# T-0676 item 5 made the TG prefix compact ("<slug> <role>"), which removed the
+# raw SID from the message text entirely. SID_RE — the only resolver at the
+# time — could no longer match, so EVERY session's replies silently fell
+# through to the user-conversation attendant. These tests pin routing against
+# that exact label format, which is the gap that let the regression ship.
+# ---------------------------------------------------------------------------
+
+# What _prefix actually puts on the wire for a compact label (T-0676 item 5):
+# sessions.sid_display_label(sid, slug, compact=True) -> "bot-squad operator",
+# then tg._prefix -> "[bot-squad operator] <message>".
+COMPACT_QUOTED = "[bot-squad operator] operator here — please confirm"
+
+
+def _compact_reply_message(reply_text: str, *, chat_id: int = 12345,
+                           quoted: str = COMPACT_QUOTED,
+                           quoted_message_id: int = 900) -> dict:
+    """A reply to a page whose prefix carries NO raw SID (the compact form)."""
+    return {
+        "message_id": 201,
+        "chat": {"id": chat_id, "type": "private"},
+        "from": _from(),
+        "text": reply_text,
+        "reply_to_message": {
+            "message_id": quoted_message_id,
+            "chat": {"id": chat_id, "type": "private"},
+            "text": quoted,
+        },
+    }
+
+
+def test_compact_label_is_genuinely_unparseable_by_the_regex():
+    """The premise of the whole ticket, pinned: text-based resolution CANNOT
+    work against the compact label. If this ever starts passing, the label
+    changed shape and the rest of these tests are testing the wrong thing."""
+    assert TL.SID_RE.match(COMPACT_QUOTED) is None
+    assert TL.extract_reply_target(_compact_reply_message("yes")) is None
+
+
+def test_extract_reply_target_resolves_compact_label_via_message_id(tmp_path):
+    """THE regression: a reply to a compact-labelled page must still reach the
+    session that sent it — resolved from reply_to_message.message_id, not from
+    the (SID-less) quoted text."""
+    from bot_squad_worker import tg_reply_map
+
+    cfg = _make_cfg(tmp_path)
+    sid = "S-almdudleer-operator-p241"
+    tg_reply_map.record(cfg.data_dir, chat_id=12345, message_id=900, sid=sid)
+
+    msg = _compact_reply_message("yes, go ahead")
+    assert TL.extract_reply_target(msg, cfg) == (sid, "yes, go ahead")
+
+
+@pytest.mark.parametrize("kind,sid", [
+    ("dev", "S-almdudleer-t-0719-dev-p260"),
+    ("teamlead", "S-almdudleer-gateway-routing-tl-p23"),
+    ("operator", "S-almdudleer-operator-p241"),
+    ("user-conversation", "S-almdudleer-gu_dc8262b6-user-conversation-p5"),
+])
+def test_compact_label_reply_resolves_for_every_sender_kind(tmp_path, kind, sid):
+    """The break was SYSTEM-WIDE, not operator-specific — every sender kind
+    that pages the stakeholder derives a role and so gets the compact label."""
+    from bot_squad_worker import tg_reply_map
+
+    cfg = _make_cfg(tmp_path)
+    quoted = f"[bot-squad {kind}] paging you about T-0719"
+    assert TL.SID_RE.match(quoted) is None          # compact ⇒ no raw SID
+    tg_reply_map.record(cfg.data_dir, chat_id=12345, message_id=901, sid=sid)
+
+    msg = _compact_reply_message("ack", quoted=quoted, quoted_message_id=901)
+    assert TL.extract_reply_target(msg, cfg) == (sid, "ack")
+
+
+def test_reply_falls_back_to_regex_when_no_map_entry(tmp_path):
+    """Messages sent BEFORE the map existed (and the non-compact bracket form
+    still used by some callers) must keep resolving — the regex path stays."""
+    cfg = _make_cfg(tmp_path)
+    msg = _reply_message("S-alice-spec5-p3", "sure")
+    assert TL.extract_reply_target(msg, cfg) == ("S-alice-spec5-p3", "sure")
+
+
+def test_map_wins_over_a_stale_sid_in_the_quoted_text(tmp_path):
+    """Message-id resolution is authoritative: it is the presentation-
+    independent key, so it must not be second-guessed by whatever the text
+    happens to say."""
+    from bot_squad_worker import tg_reply_map
+
+    cfg = _make_cfg(tmp_path)
+    tg_reply_map.record(
+        cfg.data_dir, chat_id=12345, message_id=100, sid="S-real-target-p9")
+    msg = _reply_message("S-alice-spec5-p3", "go")     # quoted says p3…
+    assert TL.extract_reply_target(msg, cfg) == ("S-real-target-p9", "go")
+
+
+def test_synthetic_sender_reply_still_falls_through(tmp_path):
+    """`deploy_monitor` is not a session: nothing is recorded for it, and its
+    replies keep falling through to the attendant path — unchanged behaviour."""
+    cfg = _make_cfg(tmp_path)
+    msg = _compact_reply_message(
+        "ok", quoted="[[bot-squad] deploy_monitor] deploy finished",
+        quoted_message_id=902)
+    assert TL.extract_reply_target(msg, cfg) is None
+
+
+def test_corrupt_reply_map_falls_back_to_regex(tmp_path):
+    """A broken store must cost us the message-id path only, never the whole
+    inbound route."""
+    from bot_squad_worker import tg_reply_map
+
+    cfg = _make_cfg(tmp_path)
+    tg_reply_map.map_path(cfg.data_dir).write_text("{not json")
+    msg = _reply_message("S-alice-spec5-p3", "sure")
+    assert TL.extract_reply_target(msg, cfg) == ("S-alice-spec5-p3", "sure")
+
+
+def test_handle_update_injects_compact_label_reply_into_originating_session(tmp_path):
+    """End-to-end through handle_update: a reply to a compact-labelled page is
+    dispatched as inject_input to THAT session, not routed to the attendant."""
+    from bot_squad_worker import tg_reply_map
+
+    cfg = _make_cfg(tmp_path)
+    sid = "S-almdudleer-operator-p241"
+    tg_reply_map.record(cfg.data_dir, chat_id=12345, message_id=900, sid=sid)
+
+    calls: list[tuple[str, dict]] = []
+
+    def _fake_dispatch(action, params):
+        calls.append((action, params))
+        return {"ok": True}
+
+    import bot_squad_worker.actions as A
+    with patch.object(A, "dispatch", _fake_dispatch):
+        result = TL.handle_update(cfg, {"message": _compact_reply_message("do it")})
+
+    assert result["action"] == "inject"
+    assert result["sid"] == sid
+    assert calls == [("inject_input", {"sid": sid, "text": "do it"})]
+
+
+# ---------------------------------------------------------------------------
 # extract_slash_command
 # ---------------------------------------------------------------------------
 

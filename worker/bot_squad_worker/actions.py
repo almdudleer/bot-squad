@@ -579,12 +579,25 @@ def _send_stakeholder_dm(
         if slug else sid
     )
 
+    # T-0719: `sid_label` is DISPLAY only (compact since T-0676 item 5 — no raw
+    # SID in it), so hand the send the real routing sid separately for the
+    # reply-map. This is the SSOT funnel for every tg_notify/tg_ping/topic-say/
+    # relay/needs-input page, so wiring it here covers every sender kind that
+    # pages the stakeholder. Passed ONLY for a real routing SID: a synthetic
+    # sender (`deploy_monitor`, `oauth_refresh`, …) is not a session, has no
+    # pane to inject into, and its replies belong on the attendant path exactly
+    # as before — so there is nothing to record and no kwarg to forward.
+    from bot_squad_worker import tg_reply_map as _tg_reply_map
+    _route: dict[str, Any] = (
+        {"route_sid": sid} if _tg_reply_map.is_routing_sid(sid) else {}
+    )
+
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:
             return None
         sent = _get_tg_client(cfg).send(
             chat_id=tg_chat_id, text=message, sid=sid_label, user=user,
-            urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
+            urgent=urgent, topic_id=tg_topic_id, debounce=debounce, **_route,
         )
         return {"ok": True, "sent": sent, "channel": "tg"}
 
@@ -2361,6 +2374,9 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
                 sid=_sessions.sid_display_label(
                     params["from_sid"], delivery_slug, compact=True, data_dir=cfg.data_dir,
                 ),
+                # T-0719: raw sender sid for the reply-map, so replying to a
+                # mirrored peer message reaches the session that sent it.
+                route_sid=str(params["from_sid"]),
                 user=username,
             )
         except Exception:  # noqa: BLE001 — never let TG hiccups corrupt the bus reply

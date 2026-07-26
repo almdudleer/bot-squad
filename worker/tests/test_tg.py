@@ -606,3 +606,81 @@ def test_unpin_message_targets_one_message(tmp_path: Path) -> None:
         client.unpin_message(chat_id="-100999", message_id=4242)
 
     assert calls == [("unpinChatMessage", {"chat_id": "-100999", "message_id": 4242})]
+
+
+# ---------------------------------------------------------------------------
+# T-0719 — send() pins message_id -> raw routing SID for reply routing
+#
+# The display `sid` and the routing `route_sid` are DIFFERENT things since
+# T-0676 item 5: the label carries no SID at all. These pin that send() records
+# the routing key rather than anything derived from the rendered text.
+# ---------------------------------------------------------------------------
+
+def _sendmessage_transport(message_id: int = 7777):
+    """httpx.post stand-in returning a real-shaped sendMessage response."""
+    def _post(url, json=None, timeout=None, **kw):  # noqa: A002
+        resp = MagicMock()
+        resp.json.return_value = {
+            "ok": True,
+            "result": {"message_id": message_id, "text": json["text"]},
+        }
+        return resp
+    return _post
+
+
+def test_send_records_reply_route_under_the_compact_label(tmp_path: Path) -> None:
+    from bot_squad_worker import tg_reply_map
+
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=_sendmessage_transport(7777)):
+        sent = client.send(
+            chat_id="404580642",
+            text="operator here",
+            sid="bot-squad operator",                 # T-0676 compact DISPLAY label
+            route_sid="S-almdudleer-operator-p241",   # T-0719 real routing key
+        )
+
+    assert sent is True
+    # The wire text is unchanged — the compact label stays (DoD: do NOT revert).
+    assert tg_reply_map.lookup(
+        tmp_path, chat_id="404580642", message_id=7777,
+    ) == "S-almdudleer-operator-p241"
+
+
+def test_send_without_route_sid_records_nothing(tmp_path: Path) -> None:
+    from bot_squad_worker import tg_reply_map
+
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=_sendmessage_transport(7778)):
+        client.send(chat_id="404580642", text="hi", sid="bot-squad operator")
+
+    assert tg_reply_map.load(tmp_path) == {}
+
+
+def test_send_survives_a_response_without_message_id(tmp_path: Path) -> None:
+    """Recording is best-effort: a delivered page must not be reported as
+    failed just because the reply-map entry could not be written."""
+    def _post(url, json=None, timeout=None, **kw):  # noqa: A002
+        resp = MagicMock()
+        resp.json.return_value = {"ok": True}       # no `result`
+        return resp
+
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path))
+    with patch("httpx.post", side_effect=_post):
+        assert client.send(
+            chat_id="1", text="hi", route_sid="S-almdudleer-operator-p241") is True
+
+
+def test_debounced_send_records_no_route(tmp_path: Path) -> None:
+    """A suppressed send never reaches Telegram, so there is no message id to
+    map — the store must not gain a bogus entry."""
+    from bot_squad_worker import tg_reply_map
+
+    client = TgClient(_FakeCfg(token="T:ok", data_dir=tmp_path), cooldown_sec=60)
+    with patch("httpx.post", side_effect=_sendmessage_transport(7779)):
+        assert client.send(chat_id="1", text="hi",
+                           route_sid="S-almdudleer-operator-p241") is True
+        assert client.send(chat_id="1", text="hi",
+                           route_sid="S-almdudleer-operator-p241") is False
+
+    assert list(tg_reply_map.load(tmp_path)) == ["1:7779"]

@@ -11,24 +11,17 @@ description: Use when you are a bot-squad session and need to interact with the 
 
 ## Which verb when
 
-| Need | Verb |
+`bsq --help` lists every verb with a one-line description; `bsq <verb>
+--help` gives that verb's flags — that's the source of truth, not a
+hand-maintained list here (it drifts). Only the bits `--help` doesn't
+make obvious:
+
+| Verb | Non-obvious bit |
 |------|------|
-| Drain mail addressed to you | `bsq inbox check` |
-| Long-poll for mail (opt-in) | `bsq inbox wait [--timeout N]` (cap 7200s) |
-| Message a peer / broadcast | `bsq peer send <SID\|teamlead\|dev> "<text>"` |
-| Typed operator→TL hand-off | `bsq peer dispatch <to> <action> ...` |
-| DM the stakeholder | `bsq tg ping "<message>"` |
-| Spawn a dev/TL session | `bsq spawn <ticket> [--role tl] [--bundle ids] [--initiative x.md]` |
-| Find a resumable expert | `bsq expert find <ticket>` |
-| Session roster | `bsq team status [--all]` / `bsq team list` |
-| Search buried stakeholder guidance | `bsq guidance search <keywords>` |
-| Ticket status/update/note | `bsq ticket status\|update\|note <id> ...` |
-| New ticket (atomic id) | `bsq task new "<title>"` (never hand-pick `T-NNNN`) |
-| Manual-test scenario template | `bsq scenario new <ticket>` |
-| Report process/product friction | `bsq feedback submit "<note>"` |
-| Docs | `bsq doc new <category> <title>` |
-| Commit your work | `bsq commit -m MSG --ack <explicit files>` |
-| Full orientation on demand | `bsq brief` |
+| `bsq inbox wait [--timeout N]` | opt-in long-poll; `--timeout` capped at 7200s (2h) |
+| `bsq peer send <to> "<text>"` | also nudges the recipient's live pane — see "check mail" below |
+| `bsq spawn <ticket>` | defaults to AUTO-RESUMING a matching expert session, not a fresh spawn (T-0150) — `--fresh` forces new |
+| `bsq task new "<title>"` | allocates the id atomically — never hand-pick `T-NNNN` |
 
 ## The "check mail" signal (primary channel)
 

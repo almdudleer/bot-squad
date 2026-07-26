@@ -525,12 +525,13 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
 
     # T-0394: page the human via the _send_stakeholder_dm SSOT (T-0610:
     # TG-primary, MAX reserve). T-0386: the group target is the project's
-    # #team-queries forum topic. T-0610 review fix: slim the QUESTION before
-    # composing — the SSOT's blanket slim would cut the tmux-attach footer off
-    # the end, which is the escalation's whole point.
-    from bot_squad_worker.actions import _send_stakeholder_dm, _slim_page
+    # #team-queries forum topic. T-0721: the SSOT no longer truncates (it splits
+    # into numbered parts), so the question is composed in full — pre-slimming
+    # it to protect the tmux-attach footer is no longer needed, and would now
+    # be the only place still dropping content.
+    from bot_squad_worker.actions import _send_stakeholder_dm
     from bot_squad_worker import tg_topics as _tg_topics
-    body = build_escalation_text(cfg, sid, _slim_page(str(data.get("text", ""))), pane.session)
+    body = build_escalation_text(cfg, sid, str(data.get("text", "")), pane.session)
     result = _send_stakeholder_dm(
         cfg, message=body, sid=sid, tg_chat_id=chat_id,
         tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),

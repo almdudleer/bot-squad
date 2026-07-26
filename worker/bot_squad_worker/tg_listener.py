@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 import httpx
 
+from bot_squad_worker import tg as _tg
+
 log = logging.getLogger(__name__)
 
 SID_RE = re.compile(r"\[(S-[A-Za-z0-9_-]+?-p\d+)")
@@ -1662,7 +1664,9 @@ def _channel_notify(
 # TG rejects messages over 4096 chars (API 400). Echoes of long voice
 # transcripts must be split, not silently lost — cut at the cap with headroom
 # for the 🎙 prefix + part markers.
-_TG_MSG_CAP = 4096
+# T-0721: the cap and the splitter itself now live in ``tg`` and are shared with
+# the stakeholder-page path (actions._split_page) — one chunker, no drift.
+_TG_MSG_CAP = _tg.TG_MSG_CAP
 _ECHO_CHUNK = 3900
 
 
@@ -1674,10 +1678,10 @@ def _echo_transcript(cfg, chat_id: str, transcript: str) -> None:
     if len(prefix) + len(transcript) + 2 <= _TG_MSG_CAP:
         _channel_notify(cfg, chat_id, f"{prefix}«{transcript}»")
         return
-    chunks = [transcript[i:i + _ECHO_CHUNK] for i in range(0, len(transcript), _ECHO_CHUNK)]
+    chunks = _tg.split_for_tg(transcript, limit=_ECHO_CHUNK)
     total = len(chunks)
     for n, chunk in enumerate(chunks, 1):
-        _channel_notify(cfg, chat_id, f"{prefix}({n}/{total}) «{chunk}»")
+        _channel_notify(cfg, chat_id, f"{prefix}{_tg.part_marker(n, total)} «{chunk}»")
 
 
 def tick(cfg) -> dict:

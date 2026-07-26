@@ -336,6 +336,68 @@ class TgClient:
 
 
 # ------------------------------------------------------------------
+# Long-message splitting (T-0721) — the ONE chunker every sender uses
+# ------------------------------------------------------------------
+
+# Telegram rejects a sendMessage over 4096 chars with an API 400. That cap is a
+# transport fact, so the splitter that respects it lives with the transport and
+# is shared — T-0586's 🎙-echo chunker and the stakeholder-page chunker are the
+# same code, not two implementations that can drift apart (T-0714).
+TG_MSG_CAP = 4096
+# Default per-part budget: cap minus headroom for the ``[<sid>]`` prefix
+# ``send`` prepends, the ``(n/N)`` part marker, and multi-byte slack.
+TG_PART_CHUNK = 3800
+
+# Break candidates, best first: paragraph, line, sentence, clause, word. A part
+# is cut at the last one that lands past ``_MIN_PART_FRACTION`` of the budget,
+# so splitting never produces a runt part just because a boundary sat early.
+_BREAKS = ("\n\n", "\n", ". ", "! ", "? ", "… ", "; ", ", ", " ")
+_MIN_PART_FRACTION = 0.5
+
+
+def part_marker(n: int, total: int) -> str:
+    """The shared numbered-part marker (T-0586's convention, now shared).
+
+    Every multi-part send carries it so the reader sees one long message split
+    across N deliveries, not N unrelated alerts — and, incidentally, so the
+    parts are never byte-identical to each other (which would let ``send``'s
+    same-payload debounce silently swallow a repeat chunk).
+    """
+    return f"({n}/{total})"
+
+
+def split_for_tg(text: str, *, limit: int = TG_PART_CHUNK) -> list[str]:
+    """Split ``text`` into TG-sized parts. NEVER truncates (T-0721).
+
+    Text that already fits comes back as a single unchanged element, so the
+    common short send stays byte-identical. Longer text is cut at the latest
+    sentence/line boundary inside each window (see ``_BREAKS``) rather than
+    mid-word; text with no boundary at all (one long unbroken token) is hard-cut
+    at ``limit`` — the API cap leaves no other option.
+    """
+    t = text or ""
+    if len(t) <= limit:
+        return [t]
+    floor = max(1, int(limit * _MIN_PART_FRACTION))
+    parts: list[str] = []
+    rest = t
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = limit
+        for sep in _BREAKS:
+            i = window.rfind(sep)
+            if i >= floor:
+                cut = i + len(sep)
+                break
+        head, rest = rest[:cut].rstrip(), rest[cut:].lstrip()
+        if head:
+            parts.append(head)
+    if rest:
+        parts.append(rest)
+    return parts or [t]
+
+
+# ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 

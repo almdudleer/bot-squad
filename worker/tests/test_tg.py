@@ -684,3 +684,64 @@ def test_debounced_send_records_no_route(tmp_path: Path) -> None:
                            route_sid="S-almdudleer-operator-p241") is False
 
     assert list(tg_reply_map.load(tmp_path)) == ["1:7779"]
+
+
+# ---------------------------------------------------------------------------
+# split_for_tg / part_marker (T-0721) — the ONE long-message chunker
+# ---------------------------------------------------------------------------
+
+def test_split_for_tg_short_text_is_one_unchanged_part():
+    """The common short send must stay byte-identical — no marker, no strip."""
+    from bot_squad_worker.tg import split_for_tg
+    assert split_for_tg("  привет  ") == ["  привет  "]
+
+
+def test_split_for_tg_never_truncates_and_respects_the_api_cap():
+    """T-0721: «long ones should just split, that's it». Every char of the
+    input comes back across the parts, and no part can trip TG's 4096 API
+    cap."""
+    from bot_squad_worker.tg import TG_MSG_CAP, split_for_tg
+    text = "Предложение номер один. " * 800            # ~19k chars
+    parts = split_for_tg(text)
+    assert len(parts) > 4
+    assert all(len(p) <= TG_MSG_CAP for p in parts)
+    assert "".join("".join(p.split()) for p in parts) == "".join(text.split())
+
+
+def test_split_for_tg_cuts_on_sentence_and_line_boundaries():
+    """Splits land on a boundary, not mid-word: each part ends a sentence/line
+    and no part starts mid-word."""
+    from bot_squad_worker.tg import split_for_tg
+    text = ("Абзац с деталями. " * 100 + "\n") * 6
+    parts = split_for_tg(text, limit=1000)
+    assert len(parts) > 1
+    for p in parts[:-1]:
+        assert p.endswith(".")
+    for p in parts:
+        assert p.startswith("Абзац")
+
+
+def test_split_for_tg_hard_cuts_unbreakable_text():
+    """A single boundary-free token (a base64 blob, a stack-free log line) is
+    hard-cut at the limit — the API cap leaves no alternative — but still
+    loses nothing."""
+    from bot_squad_worker.tg import split_for_tg
+    blob = "x" * 9000
+    parts = split_for_tg(blob, limit=4000)
+    assert [len(p) for p in parts] == [4000, 4000, 1000]
+    assert "".join(parts) == blob
+
+
+def test_split_for_tg_no_runt_parts_from_an_early_boundary():
+    """A boundary in the first half of the window is ignored, so an early
+    newline can't produce a 5-char part followed by a full one."""
+    from bot_squad_worker.tg import split_for_tg
+    text = "hi\n" + "a" * 3000
+    parts = split_for_tg(text, limit=1000)
+    assert parts[0].startswith("hi\n")
+    assert len(parts[0]) == 1000
+
+
+def test_part_marker_is_the_shared_numbered_convention():
+    from bot_squad_worker.tg import part_marker
+    assert part_marker(2, 7) == "(2/7)"

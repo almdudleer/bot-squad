@@ -2697,6 +2697,37 @@ def test_private_voice_long_transcript_echo_is_chunked(tmp_path, monkeypatch):
     assert "".join(bodies) == long_transcript
 
 
+def test_private_voice_long_transcript_echo_uses_the_shared_splitter(tmp_path, monkeypatch):
+    """T-0721: the 🎙-echo and the stakeholder-page path now share ONE chunker
+    (``tg.split_for_tg``) — so the echo inherits its sentence-boundary cuts
+    instead of the old fixed-width slicing, and the two can't drift apart
+    (T-0714's lesson). Nothing is lost either way."""
+    from bot_squad_worker import tg as _tg
+    cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    long_transcript = "Это предложение из диктовки. " * 400   # ~11.6k, has boundaries
+    from bot_squad_worker import voice_intake as VI
+    monkeypatch.setattr(
+        VI, "transcribe_only",
+        lambda c, slug, msg: {"ok": True, "transcript": long_transcript, "lang": "ru",
+                              "engine": "faster-whisper:small", "duration": 810})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg()})
+
+    assert len(echoes) > 1 and all(len(e) <= _tg.TG_MSG_CAP for e in echoes)
+    import re as _re
+    bodies = [_re.search("«(.*)»$", e, _re.S).group(1) for e in echoes]
+    for b in bodies[:-1]:
+        assert b.endswith("диктовки.")            # cut on a sentence boundary
+    assert "".join("".join(b.split()) for b in bodies) == "".join(long_transcript.split())
+
+
 def test_private_voice_short_transcript_echo_single_message(tmp_path, monkeypatch):
     """The common case stays a single 🎙-echo message (no part markers)."""
     cfg = _make_cfg(tmp_path, tg_chat="12345", voice_enabled=True)

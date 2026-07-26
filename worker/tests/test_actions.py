@@ -3593,42 +3593,104 @@ def test_send_stakeholder_dm_mode_max_temporary_switch(tmp_config_dir, monkeypat
     assert out2["channel"] == "tg" and len(fake_tg.calls) == 1
 
 
-def test_send_stakeholder_dm_slims_long_pages(tmp_config_dir, monkeypatch):
-    """T-0610: pages are short-form — a verbose work summary is cut at a
-    boundary with an explicit continuation pointer.
+# T-0721: a page long enough to need more than one TG message (the chunk
+# budget is ~3800 chars, TG's hard API cap 4096).
+def _oversize_page(head: str = "Сводка по работе. ") -> str:
+    return head + "Сделал шаг и проверил результат. " * 300
 
-    T-0635: on a single-project install the pointer is a real staging-web
-    link (built from the sole registered project), not the bare words
-    "см. задачу/тред"."""
+
+def _joined(calls: list[dict]) -> str:
+    """Every delivered part, markers stripped, in send order."""
+    import re as _re
+    return " ".join(_re.sub(r"^\(\d+/\d+\)\s*", "", c["text"]) for c in calls)
+
+
+def test_send_stakeholder_dm_splits_long_pages_instead_of_truncating(
+        tmp_config_dir, monkeypatch):
+    """T-0721 (stakeholder override of T-0610): «long ones should just split,
+    that's it». A verbose page arrives COMPLETE as N sequential numbered
+    messages — no ellipsis, no dropped tail, every part under TG's 4096 cap."""
     import bot_squad_worker.actions as A
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
-    verbose = "Сводка по работе. " + "Сделал шаг и проверил результат. " * 40
+    verbose = _oversize_page()
     A._send_stakeholder_dm(A._get_config(), message=verbose, tg_chat_id="-100")
-    sent_text = fake_tg.calls[0]["text"]
-    assert len(sent_text) < len(verbose)
-    assert len(sent_text) <= A._PAGE_SLIM_LIMIT + 80
-    assert "детали: см. задачу/тред" not in sent_text
-    assert "https://staging.example.com/p/test-project/sessions" in sent_text
+
+    assert len(fake_tg.calls) > 1                       # it split
+    texts = [c["text"] for c in fake_tg.calls]
+    assert all(len(t) <= 4096 for t in texts)           # TG's hard API cap
+    # Parts are identifiable as parts, in order.
+    total = len(texts)
+    for n, t in enumerate(texts, 1):
+        assert t.startswith(f"({n}/{total}) ")
+    # Nothing was lost: every sentence of the original is somewhere in the set.
+    assert _joined(fake_tg.calls).startswith(verbose[:200].strip())
+    assert "".join(verbose.split()) in "".join(_joined(fake_tg.calls).split())
+    assert "…" not in "".join(texts[:-1])               # no truncation ellipsis
 
 
-def test_slim_page_appends_real_link_when_given(tmp_config_dir, monkeypatch):
-    """T-0635: _slim_page appends the caller-supplied link verbatim instead of
-    the plain-text 'см. задачу/тред' pointer."""
+def test_send_stakeholder_dm_first_part_failure_still_fails_over(
+        tmp_config_dir, monkeypatch):
+    """T-0721 must not weaken the T-0394 failover: when the FIRST part fails,
+    nothing was delivered on TG, so the whole page goes to the MAX reserve."""
     import bot_squad_worker.actions as A
-    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
-    out = A._slim_page(long_text, link="https://staging.example.com/p/test-project/t/T-1")
-    assert out.endswith("https://staging.example.com/p/test-project/t/T-1")
-    assert "см. задачу/тред" not in out
+
+    class _BoomOnFirst:
+        def send(self, **kw):
+            raise RuntimeError("tg ConnectTimeout")
+
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomOnFirst())
+    out = A._send_stakeholder_dm(A._get_config(), message=_oversize_page(),
+                                  sid="S-x-p1", tg_chat_id="-100")
+    assert out["channel"] == "max" and out["sent"] is True
+    assert "".join(_oversize_page().split()) in "".join(_joined(fake_max.calls).split())
 
 
-def test_slim_page_falls_back_to_generic_text_without_a_link(tmp_config_dir, monkeypatch):
-    """T-0635: an unresolvable link (e.g. multi-project install, no chat
-    match) falls back to the old generic pointer rather than a dangling
-    'подробнее: ' with nothing after it."""
+def test_send_stakeholder_dm_mid_page_failure_does_not_redeliver_on_max(
+        tmp_config_dir, monkeypatch):
+    """A failure AFTER some parts landed must not fail over — that would
+    re-deliver the earlier parts on the reserve channel. The page is reported
+    partial (and logged) instead."""
     import bot_squad_worker.actions as A
-    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
-    out = A._slim_page(long_text)
-    assert out.endswith("(детали: см. задачу/тред)")
+
+    class _BoomOnSecond:
+        def __init__(self):
+            self.n = 0
+
+        def send(self, **kw):
+            self.n += 1
+            if self.n > 1:
+                raise RuntimeError("tg 502 mid-page")
+            return True
+
+    _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
+    _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomOnSecond())
+    out = A._send_stakeholder_dm(A._get_config(), message=_oversize_page(),
+                                  sid="S-x-p1", tg_chat_id="-100")
+    assert out["channel"] == "tg" and out["sent"] is True and out["partial"] is True
+    assert fake_max.calls == []
+
+
+def test_split_page_appends_link_on_the_final_part_only(tmp_config_dir, monkeypatch):
+    """T-0635 pointer survives T-0721 — but as an AFFORDANCE on the last part
+    of a split page, never as a replacement for the content."""
+    import bot_squad_worker.actions as A
+    link = "https://staging.example.com/p/test-project/t/T-1"
+    parts = A._split_page(_oversize_page("Заголовок. "), link=link)
+    assert len(parts) > 1
+    assert parts[-1].endswith(link)
+    assert not any(link in p for p in parts[:-1])
+    assert "см. задачу/тред" not in "".join(parts)
+
+
+def test_split_page_short_text_is_one_unchanged_part(tmp_config_dir, monkeypatch):
+    """A page that fits in one message is sent byte-identical: no part marker,
+    and no "подробнее" pointer (there is no continuation to point at)."""
+    import bot_squad_worker.actions as A
+    short = "Готово: T-0721 в totest."
+    assert A._split_page(short, link="https://example.com/x") == [short]
 
 
 def test_send_stakeholder_dm_link_targets_explicit_task_id(tmp_config_dir, monkeypatch):
@@ -3636,17 +3698,16 @@ def test_send_stakeholder_dm_link_targets_explicit_task_id(tmp_config_dir, monke
     the SSOT), the pointer links straight to that task.
 
     T-0665: exercised directly against ``_send_stakeholder_dm`` (do_slim=True)
-    rather than via the ``tg_notify`` action dispatch — the action itself no
-    longer slims (every ``tg_notify`` caller is an explicitly-addressed
-    conversational send), but automated pages that call the SSOT directly
-    still slim and still need a working link."""
+    rather than via the ``tg_notify`` action dispatch — the action itself is
+    never treated as a page (every ``tg_notify`` caller is an
+    explicitly-addressed conversational send), but automated pages that call
+    the SSOT directly still carry a working link. T-0721: the link now rides
+    the final part of a SPLIT page."""
     import bot_squad_worker.actions as A
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
-    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
-    A._send_stakeholder_dm(A._get_config(), message=long_text, tg_chat_id="-100",
-                            slug="test-project", task_id="T-0635")
-    sent = fake_tg.calls[0]["text"]
-    assert "https://staging.example.com/p/test-project/t/T-0635" in sent
+    A._send_stakeholder_dm(A._get_config(), message=_oversize_page("Заголовок. "),
+                            tg_chat_id="-100", slug="test-project", task_id="T-0635")
+    assert "https://staging.example.com/p/test-project/t/T-0635" in fake_tg.calls[-1]["text"]
 
 
 def test_send_stakeholder_dm_link_scoped_to_real_session_sid(tmp_config_dir, monkeypatch):
@@ -3654,16 +3715,17 @@ def test_send_stakeholder_dm_link_scoped_to_real_session_sid(tmp_config_dir, mon
     sessions-page link; a synthetic label sid (e.g. "autopilot") does not."""
     import bot_squad_worker.actions as A
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
-    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
+    long_text = _oversize_page("Заголовок. ")
     A._send_stakeholder_dm(A._get_config(), message=long_text, tg_chat_id="-100",
                             sid="S-almdudleer-dev-p1")
-    sent = fake_tg.calls[0]["text"]
-    assert "https://staging.example.com/p/test-project/sessions?sid=S-almdudleer-dev-p1" in sent
+    assert ("https://staging.example.com/p/test-project/sessions?sid=S-almdudleer-dev-p1"
+            in fake_tg.calls[-1]["text"])
 
+    fake_tg.calls.clear()
     A._send_stakeholder_dm(A._get_config(), message=long_text, tg_chat_id="-100",
                             sid="autopilot")
-    sent2 = fake_tg.calls[1]["text"]
-    assert sent2.endswith("https://staging.example.com/p/test-project/sessions")
+    assert fake_tg.calls[-1]["text"].endswith(
+        "https://staging.example.com/p/test-project/sessions")
 
 
 def test_page_detail_link_uses_mothership_host_for_other_project(tmp_path):
@@ -3718,17 +3780,20 @@ def test_page_detail_link_uses_mothership_host_for_other_project(tmp_path):
 def test_send_stakeholder_dm_link_present_via_max_transport_too(tmp_config_dir, monkeypatch):
     """T-0635 DoD: the link must resolve for both TG and MAX transports (the
     T-0610 page-mode switch) — it's baked into ``message`` before the
-    tg/max branch split, so a MAX-routed page carries it too."""
+    tg/max branch split, so a MAX-routed page carries it too.
+
+    T-0721: the MAX reserve splits the same way TG does (parts, then the link
+    on the last one) — a failover must not reintroduce truncation."""
     import bot_squad_worker.actions as A
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
     monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())
-    long_text = "Заголовок. " + "Много подробностей подряд. " * 40
-    out = A._send_stakeholder_dm(A._get_config(), message=long_text, sid="S-x-p1",
-                                  tg_chat_id="-100")
+    out = A._send_stakeholder_dm(A._get_config(), message=_oversize_page("Заголовок. "),
+                                  sid="S-x-p1", tg_chat_id="-100")
     assert out["channel"] == "max"
-    sent = fake_max.calls[0]["text"]
-    assert "https://staging.example.com/p/test-project/sessions?sid=S-x-p1" in sent
+    assert len(fake_max.calls) > 1
+    assert ("https://staging.example.com/p/test-project/sessions?sid=S-x-p1"
+            in fake_max.calls[-1]["text"])
 
 
 def test_send_stakeholder_dm_prefer_tg_never_slimmed(tmp_config_dir, monkeypatch):
@@ -3746,24 +3811,42 @@ def test_tg_notify_slug_only_never_slimmed(tmp_config_dir, monkeypatch):
     """T-0665: `bsq tg ping` dispatches ``tg_notify`` with only slug/message/
     sid/urgent — no chat_id/topic_id, so it used to fall through to the
     alert-page ``_slim_page`` cut at 400 chars even though it's a live,
-    explicitly-addressed conversational send. A long message must now arrive
+    explicitly-addressed conversational send. A long message must arrive
     byte-identical: no cut, no dangling "… подробнее" continuation tail."""
     import bot_squad_worker.actions as A
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
     long_reply = ("Статус деплоя. Вариант 1: откатить. Вариант 2: катить дальше. "
                   + "Ещё немного контекста по решению. " * 20)
-    assert len(long_reply) > A._PAGE_SLIM_LIMIT
     A.dispatch("tg_notify", {"slug": "test-project", "message": long_reply,
                               "sid": "S-x-p1", "urgent": True})
+    assert len(fake_tg.calls) == 1
     sent = fake_tg.calls[0]["text"]
     assert sent == long_reply
     assert "подробнее" not in sent
 
 
-def test_tg_notify_needs_input_footer_survives_slim(tmp_config_dir, monkeypatch):
-    """T-0610 review P2-1: on a needs-input page, the QUESTION is slimmed but
-    the tmux-attach escalation footer survives — a blanket slim after
-    composition would cut the footer off the end."""
+def test_tg_notify_over_tg_cap_splits_without_a_pointer(tmp_config_dir, monkeypatch):
+    """T-0721: the T-0665 exemption is about never TRUNCATING, not about
+    ignoring TG's 4096-char hard cap — a `bsq tg ping` longer than one message
+    is split into numbered parts (it used to be an API 400), still with no
+    "подробнее" pointer, since it isn't an automated page."""
+    import bot_squad_worker.actions as A
+    _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
+    huge = "Разбор ситуации. " + "Ещё немного контекста по решению. " * 300
+    A.dispatch("tg_notify", {"slug": "test-project", "message": huge,
+                              "sid": "S-x-p1", "urgent": True})
+    texts = [c["text"] for c in fake_tg.calls]
+    assert len(texts) > 1 and all(len(t) <= 4096 for t in texts)
+    assert texts[0].startswith(f"(1/{len(texts)}) ")
+    assert "подробнее" not in "".join(texts)
+    assert "".join(huge.split()) in "".join(_joined(fake_tg.calls).split())
+
+
+def test_tg_notify_needs_input_question_and_footer_both_survive(tmp_config_dir, monkeypatch):
+    """T-0610 review P2-1 pre-slimmed the QUESTION so the tmux-attach footer
+    couldn't be cut off the end. T-0721 removed truncation entirely: a long
+    needs-input page keeps the FULL question AND the footer, split across
+    parts — the footer landing on the last one."""
     import bot_squad_worker.actions as A
     from bot_squad_worker import tg_stall as TS
     _, fake_tg, _ = _inject_both_channels(monkeypatch, tmp_config_dir)
@@ -3771,14 +3854,17 @@ def test_tg_notify_needs_input_footer_survives_slim(tmp_config_dir, monkeypatch)
     monkeypatch.setattr(
         TS, "build_escalation_text",
         lambda cfg, sid, text, session: f"{text}\n\n▶ tmux attach -t {session}")
-    long_question = "Нужен твой выбор по деплою. " + "Контекст решения и варианты. " * 40
+    long_question = "Нужен твой выбор по деплою. " + "Контекст решения и варианты. " * 300
     out = A.dispatch("tg_notify", {"message": long_question, "sid": "S-x-p1",
                                    "needs_input": True})
     assert out["channel"] == "tg"
-    sent = fake_tg.calls[0]["text"]
-    assert "tmux attach -t bot-squad" in sent          # footer survived
-    assert len(sent) < len(long_question)              # question was slimmed
-    assert "детали: см. задачу/тред" in sent           # via _slim_page, not a raw cut
+    texts = [c["text"] for c in fake_tg.calls]
+    assert len(texts) > 1
+    assert "tmux attach -t bot-squad" in texts[-1]     # footer survived, on the tail
+    # …and so did the whole question (whitespace-insensitive: parts are
+    # rstripped at their split boundary).
+    assert "".join(long_question.split()) in "".join(_joined(fake_tg.calls).split())
+    assert "детали: см. задачу/тред" not in "".join(texts)
 
 
 def test_page_channel_action_set_read_persists(tmp_config_dir, monkeypatch):

@@ -273,6 +273,29 @@ def test_tick_window_hidden_escalates_once(tmp_path, faketg, monkeypatch):
     assert len(faketg.sent) == 1
 
 
+def test_tick_long_block_reason_splits_instead_of_being_cut(tmp_path, faketg, monkeypatch):
+    """T-0721: the stall escalation used to pre-truncate the blocked session's
+    reason at 400 chars (to protect the tmux-attach footer from the SSOT's
+    blanket slim). Neither cut exists now — the whole reason AND the footer
+    arrive, across numbered parts."""
+    cfg = _make_cfg(tmp_path)
+    reason = "Нужен твой выбор по деплою. " + "Вот весь контекст решения. " * 300
+    TS.mark_blocked(cfg, "bot-squad", DEV, reason)
+    _age_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False)
+
+    assert TS.tick(cfg)["escalated"] == 1
+    texts = [s["text"] for s in faketg.sent]
+    assert len(texts) > 1 and all(len(t) <= 4096 for t in texts)
+    assert "Remote-control" in texts[-1]                 # footer survived
+    import re as _re
+    bodies = [_re.sub(r"^(\[[^\]]+\] )?(\(\d+/\d+\) )?", "", t) for t in texts]
+    assert bodies[0].startswith("🔔")
+    joined = "".join("".join(b.split()) for b in bodies)
+    assert "".join(reason.split()) in joined            # nothing dropped
+    assert "…подробнее" not in joined and "деталисм.задачу/тред" not in joined
+
+
 def test_escalation_routes_to_team_queries_topic(tmp_path, faketg, monkeypatch):
     """T-0386: a needs-input escalation lands in the #team-queries forum topic."""
     from bot_squad_worker import tg_topics

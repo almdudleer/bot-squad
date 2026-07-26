@@ -25,6 +25,11 @@ import tomllib
 from pathlib import Path
 from typing import Any, Callable
 
+# T-0721: the TG transport module owns the message cap + the ONE long-message
+# splitter (see tg.split_for_tg). Import-safe at module level — tg imports
+# nothing from this package at import time.
+from bot_squad_worker import tg as _tg_mod
+
 log = logging.getLogger(__name__)
 
 
@@ -208,12 +213,14 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     project's tg_chat (there is usually only one project).  Unknown slug
     raises ActionError.
 
-    T-0665: this action never page-slims (``_slim_page``'s 400-char cut) —
-    every caller of the ``tg_notify`` action is an explicitly-addressed,
-    agent/API-initiated conversational send (``bsq tg ping``, ``bsq topic
-    say``, the T-0569 relay, admin test-pings), not an automated stall/
-    deploy/autopilot alert page. Those alert pages call
-    ``_send_stakeholder_dm`` directly and keep their own slimming.
+    T-0665: this action is never treated as an automated PAGE — every caller of
+    the ``tg_notify`` action is an explicitly-addressed, agent/API-initiated
+    conversational send (``bsq tg ping``, ``bsq topic say``, the T-0569 relay,
+    admin test-pings), not an automated stall/deploy/autopilot alert page.
+    Those alert pages call ``_send_stakeholder_dm`` directly. The distinction
+    used to decide who got truncated; since T-0721 nothing is truncated
+    anywhere, and it decides only whether a split message carries the
+    "подробнее" detail link on its final part.
 
     Returns {ok: true, sent: <bool>}.
     """
@@ -328,11 +335,13 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         session_name = params.get("tmux_session") or _resolve_tmux_session(
             cfg, params.get("slug", ""), params.get("sid", "")
         )
-        # T-0610 review fix: slim the QUESTION before the escalation footer is
-        # composed — the SSOT's blanket slim would cut the tmux-attach footer
-        # off the end, which is the page's whole point.
+        # T-0610 pre-slimmed the QUESTION here so the SSOT's blanket slim
+        # couldn't cut the tmux-attach footer off the end. T-0721 removed the
+        # blanket slim: the composed page is now split into numbered parts, so
+        # a long question no longer costs the footer — and no longer costs the
+        # question either. Compose from the full text.
         message = _tg_stall.build_escalation_text(
-            cfg, params.get("sid", ""), _slim_page(message), session_name
+            cfg, params.get("sid", ""), message, session_name
         )
         urgent = True
 
@@ -393,9 +402,13 @@ def _fyi_record_task_topic_direct_write(cfg: Any, slug: str, *, sid: str, ticket
 
 
 _PAGE_MODES = ("auto", "tg", "max")
-# T-0610: stakeholder-facing pages are short-form — headline + refs; detail
-# stays in tasks/threads ("слишком подробные сводки ... очень много подробностей").
-_PAGE_SLIM_LIMIT = 400
+# T-0610 wanted stakeholder-facing pages short-form (headline + refs, detail in
+# tasks/threads) and enforced it by TRUNCATING at 400 chars. T-0721 (stakeholder,
+# 2026-07-26: "long ones should just split, that's it") overrode that: the limit
+# is now a per-part CHUNK SIZE, not a cutoff, and it sits just under TG's 4096
+# hard cap so a long page becomes a couple of full messages instead of a swarm
+# of 400-char fragments. Brevity stays a writing concern, not a delivery one.
+_PAGE_CHUNK_LIMIT = _tg_mod.TG_PART_CHUNK
 
 
 def _page_mode_path(cfg: Any) -> Path:
@@ -423,31 +436,36 @@ def _set_page_mode(cfg: Any, mode: str, *, by: str = "") -> dict[str, Any]:
     return payload
 
 
-def _slim_page(text: str, link: str = "") -> str:
-    """T-0610: cap a page at headline size. Over-limit text is cut at a
-    line/sentence boundary with an explicit continuation pointer — pages must
-    be short, but never silently truncated mid-word.
+def _split_page(text: str, link: str = "") -> list[str]:
+    """T-0721: a page that doesn't fit one TG message is SPLIT into numbered
+    parts — never truncated.
 
-    T-0635: the pointer is a real clickable ``link`` (staging web URL to the
-    task/session), not the bare words "см. задачу/тред" — a plain-text
-    pointer read as evasive/broken to the stakeholder. ``link`` is best-effort
-    (built by ``_page_detail_link`` from whatever the call site has on hand);
-    an empty link falls back to the old generic phrasing rather than emitting
-    a dangling "подробнее: " with nothing after it.
+    Stakeholder, 2026-07-26: «Bot-squad messages are all getting cut off with
+    an ellipsis now. That's pointless — long ones should just split, that's
+    it.» That is an explicit override of T-0610's slim-page design (cut at 400
+    chars + a "… подробнее" pointer *instead of* the rest), so the whole text
+    now arrives; the old cutoff is gone.
+
+    Chunking is the shared ``tg.split_for_tg`` (same code as the T-0586
+    🎙-echo, per-part budget ~3800 so each part fills a TG message rather than
+    emitting a swarm of tiny 400-char ones), with ``tg.part_marker``'s ``(n/N)``
+    prefix so a split page reads as one message, not N unrelated alerts.
+
+    A text that fits comes back as ONE unchanged element (byte-identical send,
+    no marker). ``link`` (T-0635, best-effort, built by ``_page_detail_link``)
+    is kept as a pointer to the full record — but only on the FINAL part of a
+    page that actually split, where it is an affordance rather than a
+    replacement for the content.
     """
-    t = (text or "").strip()
-    if len(t) <= _PAGE_SLIM_LIMIT:
-        return t
-    cut = t[:_PAGE_SLIM_LIMIT]
-    for sep in ("\n", ". "):
-        i = cut.rfind(sep)
-        if i > 100:
-            cut = cut[:i]
-            break
-    cut = cut.rstrip(" .")
+    body = text or ""
+    chunks = _tg_mod.split_for_tg(body, limit=_PAGE_CHUNK_LIMIT)
+    if len(chunks) == 1:
+        return [body]
+    total = len(chunks)
+    parts = [f"{_tg_mod.part_marker(n, total)} {c}" for n, c in enumerate(chunks, 1)]
     if link:
-        return f"{cut}\n… подробнее: {link}"
-    return cut + "\n… (детали: см. задачу/тред)"
+        parts[-1] = f"{parts[-1]}\nподробнее: {link}"
+    return parts
 
 
 def _page_detail_link(cfg: Any, *, slug: str = "", tg_chat_id: str = "",
@@ -542,17 +560,24 @@ def _send_stakeholder_dm(
     no-op — the TG-primary delivery already lands in the group/topic the
     record used to go to.
 
-    Pages are SHORT-FORM (``_slim_page``): headline + refs, detail in tasks.
-    Slimming applies only to default-routed PAGES: an explicitly-addressed
-    send (``prefer_tg``, e.g. the T-0569 conversation-relay replies to the
-    stakeholder's DM) is conversational content, not a page — never truncated.
-    ``do_slim=False`` lets a caller that already slimmed its question part
-    (needs-input escalations, whose tmux-attach footer must survive) opt out.
+    NOTHING IS EVER TRUNCATED HERE (T-0721, stakeholder override of T-0610's
+    slim-page cut): a message too long for one TG send goes out as sequential
+    numbered parts via ``_split_page``. This covers every sender kind, page and
+    conversational alike — the T-0665 ``bsq tg ping`` exemption is untouched
+    (an explicitly-addressed send was never slimmed and still isn't; it is now
+    merely split when it exceeds TG's hard 4096-char API cap instead of being
+    rejected with an API 400).
+
+    ``do_slim`` no longer slims — it marks a DEFAULT-ROUTED PAGE, the only kind
+    that gets the ``_page_detail_link`` pointer appended to its final part when
+    it splits. ``do_slim=False`` (explicitly-addressed sends, needs-input
+    escalations that already carry their own tmux-attach footer) just means "no
+    pointer"; the full text arrives either way.
 
     ``slug``/``task_id`` (T-0635, both optional) feed ``_page_detail_link`` so
-    a truncated page's continuation pointer is a real staging-web link instead
-    of the bare words "см. задачу/тред" — see that function for the fallback
-    chain when a caller doesn't have them on hand.
+    a split page's pointer is a real staging-web link instead of the bare words
+    "см. задачу/тред" — see that function for the fallback chain when a caller
+    doesn't have them on hand.
 
     ``prefer_tg`` (an explicit group/forum target MAX can't honor) stays
     TG-only: no MAX fallback for group-addressed content; TG errors propagate
@@ -562,11 +587,16 @@ def _send_stakeholder_dm(
     transport could deliver — logged loudly, never a silent no-op.
     """
     del group_record  # T-0610: compat no-op — one page, one delivery
-    if do_slim and not prefer_tg:
-        link = _page_detail_link(
+    link = (
+        _page_detail_link(
             cfg, slug=slug, tg_chat_id=tg_chat_id, sid=sid, task_id=task_id,
         )
-        message = _slim_page(message, link)
+        if do_slim and not prefer_tg
+        else ""
+    )
+    # One page can be several DELIVERIES when it's long (T-0721) — that is not
+    # the T-0610 duplicate (which was the same text twice on two channels).
+    parts = _split_page(message, link)
 
     # T-0644: slug-qualified label for the [<sid>] prefix — falls back to the
     # bare sid when no slug is on hand (see sid_display_label). T-0676 item 5:
@@ -592,24 +622,52 @@ def _send_stakeholder_dm(
         {"route_sid": sid} if _tg_reply_map.is_routing_sid(sid) else {}
     )
 
+    def _deliver(channel: str, send_part: Callable[[str], bool]) -> dict[str, Any]:
+        """Send every part in order over one channel (T-0721).
+
+        Failure policy mirrors the single-message case: if the FIRST part
+        fails, the exception propagates so the reserve channel gets its chance
+        (nothing was delivered yet). Once any part has landed, a later failure
+        is logged and the page is reported delivered-but-partial instead —
+        failing over mid-page would re-deliver the earlier parts on the other
+        channel, which is worse than a gap the log names.
+        """
+        sent = False
+        for n, part in enumerate(parts, 1):
+            try:
+                sent = send_part(part) or sent
+            except Exception:
+                if not sent:
+                    raise
+                log.exception(
+                    "_send_stakeholder_dm: %s part %d/%d failed after %d "
+                    "delivered (sid=%s) — page is incomplete",
+                    channel, n, len(parts), n - 1, sid)
+                return {"ok": True, "sent": True, "channel": channel, "partial": True}
+        return {"ok": True, "sent": sent, "channel": channel}
+
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:
             return None
-        sent = _get_tg_client(cfg).send(
-            chat_id=tg_chat_id, text=message, sid=sid_label, user=user,
+        # Named `tg_client`, not `client`: the P2-08 guard
+        # (test_notify_ssot_guard) tracks TG-bound variable NAMES module-wide,
+        # so binding the TG client to a name another function also uses for its
+        # MAX client would flag that one as a hidden bare-chat pager.
+        tg_client = _get_tg_client(cfg)
+        return _deliver("tg", lambda part: tg_client.send(
+            chat_id=tg_chat_id, text=part, sid=sid_label, user=user,
             urgent=urgent, topic_id=tg_topic_id, debounce=debounce, **_route,
-        )
-        return {"ok": True, "sent": sent, "channel": "tg"}
+        ))
 
     def _try_max() -> dict[str, Any] | None:
         max_chat = getattr(cfg, "max_default_chat_id", "") or ""
         if not max_chat:
             return None
-        sent = _get_max_client(cfg).send(
-            chat_id=max_chat, text=message, sid=sid_label, user=user, urgent=urgent,
+        max_client = _get_max_client(cfg)
+        return _deliver("max", lambda part: max_client.send(
+            chat_id=max_chat, text=part, sid=sid_label, user=user, urgent=urgent,
             recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
-        )
-        return {"ok": True, "sent": sent, "channel": "max"}
+        ))
 
     if prefer_tg:
         out = _try_tg()

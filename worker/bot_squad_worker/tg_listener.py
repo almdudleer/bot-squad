@@ -190,6 +190,62 @@ def _record_unknown_chat(cfg, chat_id: str, chat: dict) -> None:
         pass
 
 
+def _unbound_topics_path(cfg) -> Path:
+    return cfg.data_dir / "_worker" / "tg_unbound_topics.json"
+
+
+def _record_unbound_topic(cfg, chat_id: str, thread_id: Any, chat: dict) -> None:
+    """T-0693: a message arrived on a forum topic of a chat that already
+    participates in per-topic routing (D-0055 §2-3 — it has at least one
+    OTHER bound topic), but THIS ``(chat_id, thread_id)`` has no tg_bindings
+    entry. Before this, ``handle_update`` silently fell back to the chat's
+    STATIC default project (``_slug_for_chat``) for such a message — the live
+    incident this closes: a stakeholder's watchrobot question, typed into a
+    freshly-created but not-yet-bound topic, was mis-slugged into bot-squad's
+    conversation store with zero error signal, discovered only because he
+    noticed his question went unanswered.
+
+    Logs a WARNING (grep-able) and persists a per-(chat_id, thread_id)
+    discovery record so a freshly created/renamed topic is self-service
+    discoverable (bind it via ``bsq topic bind``) instead of silently
+    mis-slugging every message on it until someone notices by accident.
+    Mirrors ``_record_unknown_chat``'s shape/best-effort/atomic-write
+    contract."""
+    title = chat.get("title") or chat.get("username") or ""
+    log.warning(
+        "tg_listener: UNBOUND TOPIC chat_id=%s thread_id=%s (title=%r) — this "
+        "chat already routes other topics via tg_bindings, but this one has "
+        "no binding; message HELD UNROUTED (not mis-slugged to the chat's "
+        "static default project). Bind it: bsq topic bind %s %s <slug>",
+        chat_id, thread_id, title, chat_id, thread_id,
+    )
+    import json
+    import os
+    try:
+        p = _unbound_topics_path(cfg)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            state = json.loads(p.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        now = _now_iso()
+        key = f"{chat_id}:{thread_id}"
+        entry = state.get(key) or {"first_seen_at": now, "count": 0}
+        entry["chat_id"] = chat_id
+        entry["thread_id"] = thread_id
+        entry["title"] = title
+        entry["last_seen_at"] = now
+        entry["count"] = entry.get("count", 0) + 1
+        state[key] = entry
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def _read_last_update_id(cfg) -> int:
     p = _last_update_id_path(cfg)
     if not p.exists():
@@ -358,6 +414,7 @@ def _msg_attachments(msg: dict) -> list[dict]:
 
 def append_conversation(
     cfg, slug: str, global_user_id: str, msg: dict, *, thread_id: Any = None,
+    general_feed: bool = False,
 ) -> Optional[bool]:
     """T-0489: record one inbound TG user message to the per-(project, user)
     conversation history store — the durable thread "we can always look up"
@@ -373,6 +430,12 @@ def append_conversation(
     (see ``conversation_store.conv_path``) instead of the project's mixed
     history. Omitted from the request body when ``None`` (DM / non-topic
     message), so an existing caller's request is byte-identical to before.
+
+    ``general_feed`` (T-0693 Finding B): marks this append as arriving via an
+    explicit ``tg_bindings`` General-feed binding rather than a genuine
+    DM/non-topic message — both have ``thread_id=None``, otherwise
+    indistinguishable. Omitted from the request body when ``False`` (every
+    pre-T-0693 caller).
 
     Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
     ``global_user_id``, or the API base / worker token aren't configured — so a
@@ -394,6 +457,8 @@ def append_conversation(
     }
     if thread_id is not None and str(thread_id).strip() != "":
         payload["thread_id"] = thread_id
+    if general_feed:
+        payload["general_feed"] = True
     try:
         r = httpx.post(
             url,
@@ -645,6 +710,34 @@ def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
     return None
 
 
+def _warn_if_general_feed_collides(cfg, slug: str, chat_id: str) -> None:
+    """T-0693 Finding B: a General-feed ``tg_bindings`` entry (``thread_id=
+    None``) and one or more per-topic bindings on the SAME project ``slug``
+    would both accrue durable-store/locus records that are only distinguished
+    by the additive ``general_feed`` marker (see ``append_conversation`` /
+    ``conversation_locus.set_locus``), not by isolated storage keys — a
+    General-feed message and a plain DM for that slug still land in the SAME
+    file. Not exercised in production today (every live binding's General
+    entry and per-topic entries are on DIFFERENT slugs) — this makes the
+    coexistence loud instead of silent if it ever does happen. Best-effort
+    scan of the runtime binding map; never raises."""
+    from bot_squad_worker import tg_bindings
+    try:
+        for key, rec in tg_bindings.load(cfg).items():
+            bound_chat, _, thread_part = key.partition(":")
+            if bound_chat == str(chat_id) and thread_part and rec.get("slug") == slug:
+                log.warning(
+                    "tg_listener: slug=%r has BOTH a General-feed binding and a "
+                    "per-topic binding (chat_id=%s thread=%s) — General-feed and "
+                    "per-topic messages for this slug are only distinguished by "
+                    "a marker (T-0693 Finding B), not isolated storage keys",
+                    slug, bound_chat, thread_part,
+                )
+                return
+    except Exception:  # noqa: BLE001 — best-effort diagnostic, never break routing
+        pass
+
+
 def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -> dict:
     """T-0639/T-0660: an unquoted message arriving in a BOUND forum topic.
 
@@ -686,11 +779,22 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     # from the rest of the project's (mixed) history — see append_conversation
     # / _ensure_user_conversation / conversation_locus docstrings.
     bound_thread_id = msg.get("message_thread_id")
-    append_conversation(cfg, slug, gid, msg, thread_id=bound_thread_id)
+    # T-0693 Finding B: reaching this function AT ALL means `binding` resolved
+    # (tg_bindings.resolve found an entry) — so `bound_thread_id is None` here
+    # means the MATCHED binding is an explicit General-feed one (thread_id=
+    # None, bound ON PURPOSE), not "no thread info available" the way it would
+    # mean for a genuine DM in `_handle_unquoted`. Mark it so the two stay
+    # distinguishable in the durable record/locus (see their docstrings), and
+    # surface the one coexistence risk that isn't just cosmetic (a General-feed
+    # binding sharing a slug with per-topic bindings) loudly instead of never.
+    is_general_feed = bound_thread_id is None
+    if is_general_feed:
+        _warn_if_general_feed_collides(cfg, slug, chat_id)
+    append_conversation(cfg, slug, gid, msg, thread_id=bound_thread_id, general_feed=is_general_feed)
     # T-0667: remember where this landed so an OUTGOING reply follows the
     # same chat/topic instead of falling back to the project's static DM.
     from bot_squad_worker import conversation_locus
-    conversation_locus.set_locus(cfg, slug, gid, chat_id, bound_thread_id)
+    conversation_locus.set_locus(cfg, slug, gid, chat_id, bound_thread_id, general_feed=is_general_feed)
     message_ref = _msg_ts(msg)
     ensured = _ensure_user_conversation(cfg, slug, gid, message_ref, thread_id=bound_thread_id)
     if isinstance(ensured, dict) and ensured.get("parked"):
@@ -741,13 +845,26 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     # to the (continued-or-spawned) user-conversation session on the SAME
     # project. message_ref points at that just-appended store record (its
     # timestamp keys it in the (por, gid) thread).
-    append_conversation(cfg, por, gid, msg)
+    #
+    # T-0693 Finding B (case "thread_id dropped/omitted by mistake"): the
+    # SAME real thread_id must reach append_conversation, conversation_locus,
+    # AND _ensure_user_conversation below — not just the locus call. Before
+    # this fix, append_conversation's call here omitted it while the locus
+    # call two lines down did not, so the durable record landed in the bare
+    # per-user file while the locus claimed a real thread — exactly the
+    # append/locus mismatch the live T-0693 incident needed a manual store
+    # backfill to untangle. (The only way this function still sees a
+    # non-None thread_id at all is a legacy chat with native TG topics that
+    # has never used tg_bindings — any ALREADY topic-routed chat's unbound
+    # topics are now held earlier in handle_update, never reaching here.)
+    bound_thread_id = msg.get("message_thread_id")
+    append_conversation(cfg, por, gid, msg, thread_id=bound_thread_id)
     # T-0667: remember where this landed so an OUTGOING reply follows the
     # same chat/topic instead of falling back to the project's static DM.
     from bot_squad_worker import conversation_locus
-    conversation_locus.set_locus(cfg, por, gid, chat_id, msg.get("message_thread_id"))
+    conversation_locus.set_locus(cfg, por, gid, chat_id, bound_thread_id)
     message_ref = _msg_ts(msg)
-    ensured = _ensure_user_conversation(cfg, por, gid, message_ref)
+    ensured = _ensure_user_conversation(cfg, por, gid, message_ref, thread_id=bound_thread_id)
     if isinstance(ensured, dict) and ensured.get("parked"):
         # T-0570: spawn refused under backoff/saturation. The message IS durably
         # recorded and the spawn retries on ramp-up — but the user must hear
@@ -883,6 +1000,30 @@ def handle_update(cfg, update: dict) -> dict:
     # static tg_chat map (D-0055 §2 step 1) — consulted FIRST, falling back to
     # the legacy `_slug_for_chat` so existing per-project chats are unchanged.
     binding = tg_bindings.resolve(cfg, chat_id, thread_id)
+    if thread_id is not None and binding is None and chat_id in tg_bindings.bound_chat_ids(cfg):
+        # T-0693: this chat already participates in per-topic routing (it has
+        # at least one OTHER bound topic), but THIS topic was never bound. The
+        # OLD unconditional fallback below (`... or _slug_for_chat(...)`)
+        # would silently impersonate the chat's static default project for
+        # it — exactly the live incident (a stakeholder's watchrobot question
+        # in a freshly-created, not-yet-bound topic got mis-slugged into
+        # bot-squad's conversation store with zero error signal). Loud +
+        # held: log a grep-able warning, tell the sender, and hold the
+        # message unrouted rather than guessing a project for it. A chat that
+        # has NEVER used per-topic binding at all (not in bound_chat_ids)
+        # keeps the exact pre-T-0693 fallback below, unaffected.
+        _record_unbound_topic(cfg, chat_id, thread_id, chat)
+        _channel_notify(
+            cfg, chat_id,
+            "Эта тема ещё не привязана ни к одному проекту, поэтому "
+            "сообщение не маршрутизировано. Попросите админа выполнить "
+            "`bsq topic bind` для этой темы.",
+            thread_id=thread_id,
+        )
+        return {
+            "ok": True, "action": "unbound_topic_held",
+            "reason": f"chat {chat_id} thread {thread_id} has no binding",
+        }
     chat_slug = (binding.get("slug") if binding else None) or _slug_for_chat(cfg, chat_id)
 
     # T-0488: recognize the TG sender as a cross-server GlobalUser (link on first

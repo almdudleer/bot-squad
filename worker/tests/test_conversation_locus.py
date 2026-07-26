@@ -130,3 +130,65 @@ def test_latest_for_slug_scoped_to_slug(tmp_path):
 def test_latest_for_slug_none_when_unset(tmp_path):
     cfg = _cfg(tmp_path)
     assert CL.latest_for_slug(cfg, "bot-squad") is None
+
+
+# ---------------------------------------------------------------------------
+# T-0693 Finding B: thread_id=None is overloaded (a genuine DM AND an
+# explicit General-feed tg_bindings entry both key to the bare slug:gid
+# entry) — the additive `general_feed` marker makes them distinguishable.
+# ---------------------------------------------------------------------------
+
+
+def test_set_locus_general_feed_flag_omitted_by_default(tmp_path):
+    """The overwhelmingly common case (a genuine DM/non-topic message) is
+    byte-identical to before this flag existed — no `general_feed` key at
+    all, not even `False`."""
+    cfg = _cfg(tmp_path)
+    rec = CL.set_locus(cfg, "bot-squad", "gu_1", "555222111", None)
+    assert "general_feed" not in rec
+    assert "general_feed" not in CL.get_locus(cfg, "bot-squad", "gu_1")
+
+
+def test_set_locus_general_feed_flag_recorded_when_true(tmp_path):
+    cfg = _cfg(tmp_path)
+    rec = CL.set_locus(cfg, "bot-squad", "gu_1", "111", None, general_feed=True)
+    assert rec["general_feed"] is True
+    assert CL.get_locus(cfg, "bot-squad", "gu_1")["general_feed"] is True
+
+
+def test_general_feed_and_dm_still_share_the_bare_key(tmp_path):
+    """The marker distinguishes WHY thread_id is None on the record — it does
+    NOT isolate storage (that would require rewiring the attendant-spawn/
+    relay plumbing, out of scope here, see conversation_locus module
+    docstring). A General-feed write and a subsequent DM write for the SAME
+    (slug, gid) still collapse onto one entry — the marker on that entry is
+    what keeps the two traceable/distinguishable instead of silently
+    identical."""
+    cfg = _cfg(tmp_path)
+    CL.set_locus(cfg, "bot-squad", "gu_1", "111", None, general_feed=True)
+    CL.set_locus(cfg, "bot-squad", "gu_1", "555222111", None)  # a later plain DM
+    assert len(CL.load(cfg)) == 1
+    rec = CL.get_locus(cfg, "bot-squad", "gu_1")
+    assert rec["chat_id"] == "555222111"
+    assert "general_feed" not in rec  # the later (DM) write's own flag wins
+
+
+def test_load_preserves_general_feed_across_reload(tmp_path):
+    cfg = _cfg(tmp_path)
+    CL.set_locus(cfg, "bot-squad", "gu_1", "111", None, general_feed=True)
+    reloaded = CL.load(cfg)
+    assert reloaded["bot-squad:gu_1"]["general_feed"] is True
+
+
+def test_load_drops_general_feed_when_falsy_on_disk(tmp_path):
+    """Back-compat: a pre-T-0693 record on disk has no `general_feed` key at
+    all — load() must not invent a `False` one (mirrors how `thread_id`/`at`
+    are read straight from the raw dict, not defaulted)."""
+    cfg = _cfg(tmp_path)
+    p = CL.locus_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({
+        "bot-squad:gu_1": {"chat_id": "111", "thread_id": None},
+    }))
+    loaded = CL.load(cfg)
+    assert "general_feed" not in loaded["bot-squad:gu_1"]

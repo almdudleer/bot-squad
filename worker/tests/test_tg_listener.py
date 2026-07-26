@@ -1159,7 +1159,7 @@ def test_handle_update_unquoted_routes_to_user_conversation(tmp_path, monkeypatc
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
     calls = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: calls.append((slug, gid, ref)))
+                        lambda c, slug, gid, ref, **k: calls.append((slug, gid, ref)))
 
     msg = _dated_msg()
     update = {"update_id": 1, "message": msg}
@@ -1181,7 +1181,7 @@ def test_handle_update_unquoted_burst_routes_to_one_session(tmp_path, monkeypatc
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
     routed = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: routed.append((slug, gid)))
+                        lambda c, slug, gid, ref, **k: routed.append((slug, gid)))
 
     for i, txt in enumerate(["problem 1", "problem 2", "problem 3"]):
         TL.handle_update(cfg, {"update_id": i, "message": _dated_msg(text=txt)})
@@ -1273,7 +1273,7 @@ def test_handle_update_unquoted_cross_project_mention_routes_no_reroute(tmp_path
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")  # pinned alpha
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
     notified = []
     monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: notified.append(a))
 
@@ -1294,7 +1294,7 @@ def test_handle_update_unquoted_no_cross_mention_routes_normally(tmp_path, monke
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
     msg = _dated_msg(text="fix the deploy timeout bug")
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
@@ -1385,9 +1385,120 @@ def test_handle_update_unbound_thread_falls_back_to_static_slug(tmp_path, monkey
     monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: ensures.append((slug, gid)))
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
     msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route" and result["slug"] == "alpha"
+    assert ensures == [("alpha", "gu_1")]
+
+
+# ---------------------------------------------------------------------------
+# T-0693: an unbound topic in a chat that ALREADY does per-topic routing must
+# NOT silently impersonate the chat's static default project (the live
+# incident this closes — a stakeholder's watchrobot question in a
+# freshly-created, not-yet-bound topic was mis-slugged into bot-squad's
+# conversation store with zero error signal). A chat that has NEVER used
+# per-topic binding at all keeps the pre-T-0693 fallback (test immediately
+# above, unaffected).
+# ---------------------------------------------------------------------------
+
+
+def test_handle_update_unbound_topic_in_topic_routed_chat_held_not_slugged(tmp_path, monkeypatch):
+    """Chat 111 already routes topic 7 to `beta` — it's a topic-routed chat.
+    A message on topic 999, which was NEVER bound, must be held unrouted, not
+    silently mis-slugged to alpha (chat 111's static default project)."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")  # chat 111's static slug is alpha
+    tg_bindings.set_binding(cfg, "111", 7, "beta")  # SOME other topic IS bound
+
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not resolve identity for a held message")))
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not append a held message anywhere")))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not wake any attendant for a held message")))
+    notified = []
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: notified.append((a, k)))
+
+    msg = _topic_msg("watchrobot question", chat_id=111, thread_id=999)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "unbound_topic_held"
+    assert "111" in result["reason"] and "999" in result["reason"]
+    # The sender is told, IN THE SAME TOPIC, rather than routed silently.
+    assert len(notified) == 1
+    assert notified[0][1].get("thread_id") == 999
+
+
+def test_handle_update_unbound_topic_logs_warning(tmp_path, caplog):
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+
+    msg = _topic_msg("watchrobot question", chat_id=111, thread_id=999)
+    with caplog.at_level("WARNING"):
+        TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert any("UNBOUND TOPIC" in r.message and "111" in r.message and "999" in r.message
+               for r in caplog.records)
+
+
+def test_handle_update_unbound_topic_writes_discovery_record(tmp_path):
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+
+    msg = _topic_msg("watchrobot question", chat_id=111, thread_id=999)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    import json
+    record = json.loads(TL._unbound_topics_path(cfg).read_text())
+    entry = record["111:999"]
+    assert entry["chat_id"] == "111" and entry["thread_id"] == 999
+    assert entry["count"] == 1
+    assert entry["first_seen_at"] == entry["last_seen_at"]
+
+
+def test_handle_update_unbound_topic_second_message_updates_in_place(tmp_path, monkeypatch):
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+
+    msg = _topic_msg("watchrobot question", chat_id=111, thread_id=999)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    times = iter(["2026-07-26T00:00:00Z", "2026-07-26T00:05:00Z"])
+    monkeypatch.setattr(TL, "_now_iso", lambda: next(times))
+    TL.handle_update(cfg, {"update_id": 2, "message": msg})
+
+    import json
+    record = json.loads(TL._unbound_topics_path(cfg).read_text())
+    assert len(record) == 1
+    assert record["111:999"]["count"] == 2
+
+
+def test_handle_update_topic_in_never_bound_chat_still_falls_back(tmp_path, monkeypatch):
+    """No regression: a chat with NO bindings at all (not `_make_multi_cfg`'s
+    topic-routed chat, a plain static per-project one) keeps the exact
+    pre-T-0693 fallback — this is the same scenario as
+    ``test_handle_update_unbound_thread_falls_back_to_static_slug`` above,
+    restated here to sit next to the new unbound-topic-HELD tests so the two
+    outcomes (held vs. falls back) are contrasted side by side."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")  # no tg_bindings.set_binding calls at all
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
+
+    msg = _topic_msg("some other topic message", chat_id=111, thread_id=42)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert result["action"] == "route" and result["slug"] == "alpha"
@@ -1681,6 +1792,128 @@ def test_handle_unquoted_records_locus_thread_id_when_present(tmp_path, monkeypa
 
     rec = conversation_locus.get_locus(cfg, "alpha", "gu_1", 999)
     assert rec["chat_id"] == "111" and rec["thread_id"] == 999
+
+
+def test_handle_unquoted_forwards_thread_id_to_append_matching_locus(tmp_path, monkeypatch):
+    """T-0693 Finding B ('dropped/omitted by mistake'): append_conversation
+    must get the SAME thread_id conversation_locus does, not a silently
+    omitted one — before this fix, the live incident's message landed in the
+    bare per-user store file while the locus claimed a real thread, and
+    untangling it needed a manual backfill."""
+    from bot_squad_worker import conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(k.get("thread_id")) or True)
+
+    msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert appended == [999]  # matches the locus's thread_id (999), not omitted/None
+    locus_rec = conversation_locus.get_locus(cfg, "alpha", "gu_1", 999)
+    assert locus_rec["thread_id"] == 999
+
+
+# ---------------------------------------------------------------------------
+# T-0693 Finding B: conversation_locus/conversation_store treat "no thread_id"
+# as one generic bare key regardless of WHY it's absent — a genuine DM, an
+# intentional General-feed tg_bindings entry (thread_id=None bound on
+# purpose), or a real thread dropped by mistake all looked identical. The
+# `general_feed` marker (set only when `_handle_topic_bound` — reachable ONLY
+# via a resolved binding — matches on thread_id=None) makes the General-feed
+# case distinguishable; `_warn_if_general_feed_collides` makes the one actual
+# collision risk (a General-feed binding sharing a slug with per-topic
+# bindings) loud instead of silent.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_topic_bound_general_feed_binding_marks_general_feed(tmp_path, monkeypatch):
+    """A message that matches an EXPLICIT General-feed binding (thread_id=
+    None, bound on purpose) is marked general_feed=True — distinguishing it
+    from a genuine DM, which also has thread_id=None but is NOT bound at all
+    and never reaches _handle_topic_bound."""
+    from bot_squad_worker import tg_bindings, conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", None, "beta")  # General-feed binding
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(k.get("general_feed")) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route_bound_topic" and result["slug"] == "beta"
+    assert appended == [True]
+    rec = conversation_locus.get_locus(cfg, "beta", "gu_1")
+    assert rec.get("general_feed") is True
+
+
+def test_handle_topic_bound_numbered_topic_does_not_mark_general_feed(tmp_path, monkeypatch):
+    """A REAL numbered-topic binding must NOT be marked general_feed — only
+    an explicit thread_id=None binding match is a General-feed case."""
+    from bot_squad_worker import tg_bindings, conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(k.get("general_feed")) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("topic 7 message", chat_id=111, thread_id=7)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert appended == [False]
+    rec = conversation_locus.get_locus(cfg, "beta", "gu_1", 7)
+    assert "general_feed" not in rec
+
+
+def test_handle_topic_bound_general_feed_collision_with_same_slug_warns(tmp_path, monkeypatch, caplog):
+    """The one actual collision risk (Finding B): a General-feed binding AND a
+    per-topic binding on the SAME slug, in the SAME chat — not exercised in
+    production today, but if it ever happens it must not be silent."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", None, "shared")  # General-feed -> shared
+    tg_bindings.set_binding(cfg, "111", 5, "shared")     # ALSO a per-topic binding -> shared
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    with caplog.at_level("WARNING"):
+        TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert any("shared" in r.message and "General-feed" in r.message for r in caplog.records)
+
+
+def test_handle_topic_bound_general_feed_different_slugs_no_collision_warning(tmp_path, monkeypatch, caplog):
+    """Mirrors the LIVE bot-squad setup: a General-feed binding on one slug
+    (bot-squad) coexists in the SAME chat with per-topic bindings on a
+    DIFFERENT slug (watchrobot) — not a collision, must stay quiet."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", None, "alpha")  # General-feed -> alpha
+    tg_bindings.set_binding(cfg, "111", 5, "beta")      # per-topic -> a DIFFERENT slug
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    with caplog.at_level("WARNING"):
+        TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert not any("General-feed" in r.message for r in caplog.records)
 
 
 def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
@@ -2081,10 +2314,10 @@ def test_handle_update_private_voice_routes_transcript_like_text(tmp_path, monke
     recorded = []
     monkeypatch.setattr(
         TL, "append_conversation",
-        lambda c, slug, gid, msg: recorded.append((slug, gid, msg.get("text"), msg.get("voice"))) or True)
+        lambda c, slug, gid, msg, **k: recorded.append((slug, gid, msg.get("text"), msg.get("voice"))) or True)
     routed = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref: routed.append((slug, gid)))
+                        lambda c, slug, gid, ref, **k: routed.append((slug, gid)))
     echoes = []
     monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
 

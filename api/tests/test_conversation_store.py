@@ -233,3 +233,50 @@ def test_thread_id_path_nested_under_gid(tmp_path: Path):
     p = CS.conv_path(tmp_path, "proj", "gu_abc", 7)
     assert p.parent.name == "gu_abc"
     assert p.name == "t7.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# T-0693 Finding B: thread_id=None is overloaded — a genuine DM/non-topic
+# message and an explicit tg_bindings General-feed binding (thread_id=None
+# bound on purpose) both land in the same bare (slug, gid) file. `general_feed`
+# marks a record as the latter so the two are distinguishable on read.
+# ---------------------------------------------------------------------------
+
+
+def test_append_defaults_general_feed_omitted(tmp_path: Path):
+    """The overwhelmingly common case (a plain DM) is byte-identical to
+    before this flag existed — no `general_feed` key on the stored record."""
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi")
+    assert "general_feed" not in rec
+
+
+def test_append_records_explicit_general_feed(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi", general_feed=True)
+    assert rec["general_feed"] is True
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["general_feed"] is True
+
+
+def test_read_normalizes_missing_general_feed_to_false(tmp_path: Path):
+    """A record written before this field existed has no `general_feed` key
+    on disk — reads must still expose False, not a missing/None field
+    (mirrors the fyi/channel back-compat pattern)."""
+    p = CS.conv_path(tmp_path, "proj", "gu_abc")
+    p.parent.mkdir(parents=True)
+    p.write_text('{"timestamp": "2026-06-01T00:00:00Z", "author": "user", '
+                 '"text": "pre-migration", "attachments": []}\n', encoding="utf-8")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["general_feed"] is False
+
+
+def test_general_feed_and_dm_still_share_the_bare_thread(tmp_path: Path):
+    """The marker distinguishes WHY thread_id is None on each record — it does
+    NOT isolate storage (see conversation_store module docstring on why: that
+    would require rewiring the attendant-spawn/relay plumbing, out of scope).
+    A General-feed message and a plain DM for the same (slug, gid) still
+    accrue into the SAME file; the marker keeps each record's origin
+    traceable instead of silently indistinguishable."""
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="general feed msg", general_feed=True)
+    CS.append(tmp_path, "proj", "gu_abc", author="user", text="dm msg")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert [m["general_feed"] for m in out["messages"]] == [True, False]

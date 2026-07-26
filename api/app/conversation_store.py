@@ -126,6 +126,7 @@ def append(
     channel: str | None = None,
     fyi: bool = False,
     thread_id: Any = None,
+    general_feed: bool = False,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
@@ -138,6 +139,13 @@ def append(
     record when False. ``thread_id`` (T-0676 items 3/6) isolates a bound forum
     topic's thread from the rest of the (slug, global_user_id) history — see
     :func:`conv_path`; omitted from the stored record when ``None``.
+
+    ``general_feed`` (T-0693 Finding B): ``thread_id=None`` is overloaded — a
+    genuine DM/non-topic message and an explicit ``tg_bindings`` General-feed
+    binding (bound ON PURPOSE with no thread) both land in the SAME bare
+    ``(slug, global_user_id)`` file. This flag marks the record as the latter,
+    so the two are distinguishable on read instead of silently identical;
+    omitted from the stored record when ``False`` (every pre-T-0693 caller).
     """
     record = {
         "timestamp": timestamp or _now_iso(),
@@ -149,6 +157,8 @@ def append(
     }
     if thread_id is not None and thread_id != "":
         record["thread_id"] = thread_id
+    if general_feed:
+        record["general_feed"] = True
     p = conv_path(data_dir, slug, global_user_id, thread_id)
     line = json.dumps(record, ensure_ascii=False)
     with _append_lock:
@@ -184,6 +194,7 @@ def _read_all(
         if isinstance(rec, dict):
             rec.setdefault("channel", "tg")  # T-0631: pre-migration records are TG-origin
             rec.setdefault("fyi", False)  # T-0660: absent -> not a passive/FYI append
+            rec.setdefault("general_feed", False)  # T-0693: absent -> not a General-feed binding
             out.append(rec)
     return out
 

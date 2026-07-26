@@ -262,12 +262,20 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     belongs to, when any — isolates the record into that topic's OWN thread
     and scopes the relay/attendant-wake to it, instead of the project's
     mixed history. Omitted / ``None`` (DM, non-topic message — every
-    pre-T-0676 caller) behaves byte-identically to before this change."""
+    pre-T-0676 caller) behaves byte-identically to before this change.
+
+    ``general_feed`` (T-0693 Finding B): marks the record as arriving via an
+    explicit ``tg_bindings`` General-feed binding (``thread_id=None`` bound on
+    purpose) rather than a genuine DM/non-topic message — the two are
+    otherwise indistinguishable once ``thread_id`` is ``None`` either way.
+    Optional; defaults to ``False``, byte-identical to every pre-T-0693
+    caller."""
     _authenticate_worker(request)
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
     fyi = bool(payload.get("fyi", False))
     thread_id = payload.get("thread_id")
+    general_feed = bool(payload.get("general_feed", False))
     try:
         record = CS.append(
             _data_dir(request),
@@ -280,6 +288,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             channel=payload.get("channel"),
             fyi=fyi,
             thread_id=thread_id,
+            general_feed=general_feed,
         )
     except ValueError as e:
         # An unsafe slug / global_user_id segment.

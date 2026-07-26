@@ -665,6 +665,24 @@ def test_append_with_thread_id_isolates_from_bare_thread(tmp_bot_squad: Path, mo
     assert [m["text"] for m in topic["messages"]] == ["topic message"]
 
 
+def test_worker_append_forwards_general_feed_flag(tmp_bot_squad: Path, monkeypatch):
+    """T-0693 Finding B: the append endpoint forwards `general_feed` from the
+    request body to the store, so a message routed via an explicit
+    tg_bindings General-feed binding is distinguishable, on the stored
+    record, from a genuine DM (both have no thread_id)."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    client.post(CONV, json={"author": "user", "text": "general feed msg", "general_feed": True},
+                headers=_worker_auth())
+    client.post(CONV, json={"author": "user", "text": "dm msg"}, headers=_worker_auth())
+
+    out = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    assert [(m["text"], m["general_feed"]) for m in out["messages"]] == [
+        ("general feed msg", True), ("dm msg", False),
+    ]
+
+
 def test_worker_list_with_thread_id_reads_isolated_thread(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     d = tmp_bot_squad / "data"

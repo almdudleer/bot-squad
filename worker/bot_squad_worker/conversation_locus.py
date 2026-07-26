@@ -25,6 +25,17 @@ Worker-owned, single-writer JSON in the data dir, atomic write — mirrors
 Shape on disk (``data/_worker/conversation_locus.json``)::
 
     { "<slug>:<global_user_id>": {"chat_id": "...", "thread_id": 7|null, "at": "..."} }
+
+T-0693 Finding B: ``thread_id: null`` is overloaded — it means "a genuine DM
+or non-topic message" (the overwhelming case) OR "an explicit General-feed
+``tg_bindings`` entry" (``thread_id=None`` bound ON PURPOSE, D-0055 §3), and
+both key to the SAME ``slug:gid`` entry. The optional ``general_feed`` flag
+(set only by ``tg_listener._handle_topic_bound``, which is only ever reached
+via a RESOLVED binding) makes the two cases distinguishable on read instead of
+silently indistinguishable; see ``tg_listener._warn_if_general_feed_collides``
+for the loud-not-silent guard on the specific risk this was written for: a
+General-feed binding and one or more per-topic bindings coexisting on the
+SAME project slug (not exercised in production today).
 """
 from __future__ import annotations
 
@@ -78,11 +89,14 @@ def load(cfg: Any) -> dict[str, dict]:
     for k, v in raw.items():
         if not isinstance(v, dict) or not v.get("chat_id"):
             continue
-        out[str(k)] = {
+        entry = {
             "chat_id": v["chat_id"],
             "thread_id": v.get("thread_id"),
             "at": v.get("at"),
         }
+        if v.get("general_feed"):
+            entry["general_feed"] = True
+        out[str(k)] = entry
     return out
 
 
@@ -95,7 +109,10 @@ def _save(cfg: Any, mapping: dict[str, dict]) -> None:
     os.replace(tmp, p)
 
 
-def set_locus(cfg: Any, slug: str, global_user_id: str, chat_id: Any, thread_id: Any) -> dict:
+def set_locus(
+    cfg: Any, slug: str, global_user_id: str, chat_id: Any, thread_id: Any,
+    *, general_feed: bool = False,
+) -> dict:
     """Record ``(chat_id, thread_id)`` as the last-seen locus for
     ``(slug, global_user_id[, thread_id])``. Idempotent — always overwrites
     with the latest inbound message's origin for that key. Returns the stored
@@ -106,9 +123,18 @@ def set_locus(cfg: Any, slug: str, global_user_id: str, chat_id: Any, thread_id:
     see :func:`_key`. The stored record still names its own ``thread_id`` (as
     before), so a caller resolving without a thread (e.g. ``latest_for_slug``)
     can still see which topic a match came from.
-    """
+
+    ``general_feed`` (T-0693 Finding B): marks a record written via an
+    EXPLICIT ``tg_bindings`` General-feed binding (``thread_id=None`` bound
+    on purpose, D-0055) as distinct from an ordinary DM/no-thread record
+    (``thread_id`` is ``None`` in BOTH cases — the key alone can't tell them
+    apart, see module docstring). Additive: omitted from the stored record
+    when ``False`` (every pre-T-0693 caller), so an existing record's shape
+    is unaffected."""
     mapping = load(cfg)
     rec = {"chat_id": str(chat_id), "thread_id": thread_id, "at": _now_iso()}
+    if general_feed:
+        rec["general_feed"] = True
     mapping[_key(slug, global_user_id, thread_id)] = rec
     _save(cfg, mapping)
     return rec

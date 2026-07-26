@@ -2832,6 +2832,81 @@ def test_spawn_model_alias_sonnet_and_opus_resolve(tmp_path, monkeypatch):
     assert "--model claude-opus-4-8" in cmd
 
 
+def test_spawn_model_alias_persists_canonical_not_raw(tmp_path, monkeypatch):
+    """T-0698 audit: `spawn(model="sonnet")`'s OWN launch command resolves the
+    alias correctly (T-0694), but the session md must ALSO store the
+    canonical name, not the raw alias — `resume()` reads this field straight
+    onto `claude --model` with no resolution step of its own (see
+    `test_resume_of_alias_spawned_session_uses_canonical_model` below), so a
+    raw 'sonnet' surviving into the md would silently reproduce the exact
+    T-0694 bug (claude ignores an unrecognized --model value and falls back
+    to the account default with zero warning) the moment this session's
+    window recycles."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%6|w|123|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    res = spawn(cfg, "test-project", "w", model="sonnet")
+    md_path = cfg.data_dir / "test-project" / "sessions" / f"{res['sid']}.md"
+    meta = _read_session_metadata(md_path)
+    assert meta.get("model") == "claude-sonnet-5"
+
+
+def test_resume_of_alias_spawned_session_uses_canonical_model(tmp_path, monkeypatch):
+    """T-0698 audit regression: before the fix, a session spawned with an
+    alias (`model="sonnet"`) stored the RAW alias on its md; resume() then
+    put that raw value straight onto `claude --model` with no resolution —
+    reproducing the exact silent-fallback bug T-0694 fixed for the initial
+    spawn, on every subsequent resume of that same session (the common case
+    for an idle-recycled dev/TL/attendant, unlike the operator role's
+    full-respawn path which re-enters spawn()'s own resolution)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
+        "sid": "S-alice-w-p2", "status": "suspended", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
+        "model": "claude-sonnet-5",  # what a fixed spawn() persists
+    })
+
+    captured_shell_cmd = []
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            i = args.index("-lc")
+            captured_shell_cmd.append(args[i + 1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "list-panes" in args:
+            return subprocess.CompletedProcess(args, 0, f"%9|w|11|{repo}|claude\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "alice")
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    resume(cfg, "test-project", "S-alice-w-p2")
+
+    assert captured_shell_cmd
+    assert "--model claude-sonnet-5" in captured_shell_cmd[0]
+    assert "--model sonnet" not in captured_shell_cmd[0]
+
+
 def test_spawn_rejects_unrecognized_model_value(tmp_path, monkeypatch):
     """An unresolvable --model value must error loudly, not silently launch
     on the wrong (account-default) model — matching `bsq model set`'s

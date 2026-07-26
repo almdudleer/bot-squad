@@ -2404,9 +2404,16 @@ def spawn(
     # honors it. A caller that omitted `model` gets no field here, so it
     # keeps following whatever the role/fleet default is at RESUME time,
     # rather than freezing today's fallback onto the session forever.
-    _explicit_model = (model or "").strip()
-    if _explicit_model:
-        seed_meta["model"] = _explicit_model
+    # T-0698 audit: stamp the RESOLVED `_model` (already canonicalized above
+    # via fleet_model.resolve_model, e.g. "sonnet" -> "claude-sonnet-5"), not
+    # the raw `model` argument. `resume()` reads this field straight onto
+    # `claude --model` with no resolution step of its own, so persisting an
+    # unresolved alias here would silently reproduce the exact T-0694 bug
+    # (claude ignores an unrecognized --model value and falls back to the
+    # account default with zero warning) the very first time this session
+    # resumes.
+    if (model or "").strip():
+        seed_meta["model"] = _model
     # T-0157: stamp the spawning linux user so the SessionMd carries an
     # explicit user mark (the SID prefix already encodes it, but the field
     # makes per-user listing/grouping robust to SID rotation).

@@ -5793,8 +5793,11 @@ def test_morph_upserts_md_for_unregistered_session(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-0575 — recycle-v2 resume side: resumable_sessions() finder +
-# recycled_resume_eligible() (<50k gate) + resume() consuming the state
+# T-0575 — recycle-v2 resume side: recycled_resume_eligible() (<50k gate) +
+# resume() consuming the state. The standalone resumable_sessions() finder that
+# shipped with them was removed under T-0720 along with its only caller (the
+# unreachable user-conversation resume path); decide_dispatch is the live
+# consumer of the remembered stamp and scans the mds itself.
 # ---------------------------------------------------------------------------
 
 def _write_transcript(home: Path, uuid: str, window_tokens: int | None) -> None:
@@ -5814,56 +5817,6 @@ def _write_transcript(home: Path, uuid: str, window_tokens: int | None) -> None:
             }},
         }))
     (d / f"{uuid}.jsonl").write_text("\n".join(lines) + "\n")
-
-
-def test_resumable_sessions_finds_recycled_newest_first(tmp_path):
-    """Only suspended+resumable mds with a real claude_uuid are returned,
-    sorted newest recycled_at first; task_id '~' normalises to None."""
-    import bot_squad_worker.sessions as S
-    cfg = _make_cfg(tmp_path)
-    sess = cfg.data_dir / "test-project" / "sessions"
-    _write_session_metadata(sess / "S-u-older-p1.md", {
-        "sid": "S-u-older-p1", "status": "suspended", "window": "older",
-        "cwd": "/tmp", "claude_uuid": "uu-1", "resumable": True,
-        "recycled_at": "2026-07-04T10:00:00Z", "resume_hint": "h1",
-        "task_id": "T-0001",
-    })
-    _write_session_metadata(sess / "S-u-newer-p2.md", {
-        "sid": "S-u-newer-p2", "status": "suspended", "window": "newer",
-        "cwd": "/tmp", "claude_uuid": "uu-2", "resumable": True,
-        "recycled_at": "2026-07-04T12:00:00Z", "resume_hint": "h2",
-        "task_id": "~",
-    })
-    # Excluded: still active, suspended without the resumable stamp, and
-    # resumable but uuid-less (--resume has no target).
-    _write_session_metadata(sess / "S-u-live-p3.md", {
-        "sid": "S-u-live-p3", "status": "active", "window": "live",
-        "cwd": "/tmp", "claude_uuid": "uu-3", "resumable": True,
-    })
-    _write_session_metadata(sess / "S-u-plain-p4.md", {
-        "sid": "S-u-plain-p4", "status": "suspended", "window": "plain",
-        "cwd": "/tmp", "claude_uuid": "uu-4",
-    })
-    _write_session_metadata(sess / "S-u-nouuid-p5.md", {
-        "sid": "S-u-nouuid-p5", "status": "suspended", "window": "nouuid",
-        "cwd": "/tmp", "claude_uuid": "~", "resumable": True,
-        "recycled_at": "2026-07-04T13:00:00Z",
-    })
-
-    rows = S.resumable_sessions(cfg, "test-project")
-    assert [r["sid"] for r in rows] == ["S-u-newer-p2", "S-u-older-p1"]
-    assert rows[0]["task_id"] is None
-    assert rows[1]["task_id"] == "T-0001"
-    assert rows[1]["claude_uuid"] == "uu-1"
-    assert rows[1]["window"] == "older"
-    assert rows[1]["resume_hint"] == "h1"
-
-
-def test_resumable_sessions_missing_dir_returns_empty(tmp_path):
-    import types
-    import bot_squad_worker.sessions as S
-    cfg = types.SimpleNamespace(data_dir=tmp_path / "nope")
-    assert S.resumable_sessions(cfg, "test-project") == []
 
 
 def test_recycled_resume_eligible_under_budget(tmp_path):

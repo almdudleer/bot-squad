@@ -1573,49 +1573,23 @@ def suspend(cfg: Any, slug: str, sid: str, *,
 
 # --- T-0575: recycle-v2 resume side ----------------------------------------
 # idle_timeout's compact-terminate-remember (T-0566) stamps ``resumable: true``
-# + ``recycled_at`` + ``resume_hint`` on the md it suspends. These helpers are
-# the act-on-it half: find the remembered sessions and gate the resume-vs-fresh
-# choice on the stakeholder's rule (2026-07-04: "<50k tokens context → resume
-# the same user's last session instead of spawning fresh").
+# + ``recycled_at`` + ``resume_hint`` on the md it suspends. This is the
+# act-on-it half: gate the resume-vs-fresh choice on the stakeholder's rule
+# (2026-07-04: "<50k tokens context → resume the same user's last session
+# instead of spawning fresh").
+#
+# The CONSUMER of that stamp is ``dispatch.decide_dispatch`` (T-0575 wiring
+# "(b)"), which scans session mds itself and surfaces a ``resume_recommended``
+# hint when a remembered session ran THIS task and fits the budget. A standalone
+# ``resumable_sessions()`` finder shipped alongside it at 74eef0f for wiring
+# "(a)" — the user-conversation attendant path — and was removed under T-0720
+# once that path was shown to be structurally unreachable (T-0564 exempts the
+# role from every recycle path, so no attendant md is ever stamped); see the
+# T-0720 note above ``_action_ensure_user_conversation``. decide_dispatch does
+# not need the finder: it needs per-session task/initiative matching and already
+# walks the mds for its other hints.
 
 RESUME_MAX_CONTEXT_TOKENS = 50_000
-
-
-def resumable_sessions(cfg: Any, slug: str) -> list[dict]:
-    """Recycled-but-resumable sessions of a project: ``status: suspended`` +
-    ``resumable: true`` + a real ``claude_uuid`` in the session md (without a
-    uuid ``--resume`` has no target, so a fresh spawn is strictly better).
-    Sorted newest ``recycled_at`` first.
-
-    No ``role`` in the rows — ``suspend()`` rewrites the md without it. The
-    identity carrier is ``window`` (preserved across suspend), e.g.
-    ``<gid>-user-conversation`` for attendants; match on
-    ``_window_from_sid(sid)`` like :func:`live_user_conversation_sid` does.
-    """
-    sess_dir = Path(cfg.data_dir) / slug / "sessions"
-    if not sess_dir.exists():
-        return []
-    out: list[dict] = []
-    for md in sorted(sess_dir.glob("*.md")):
-        meta = _read_session_metadata(md)
-        if meta is None:
-            continue
-        if meta.get("status") != "suspended" or not meta.get("resumable"):
-            continue
-        uuid = meta.get("claude_uuid")
-        if not uuid or uuid == "~":
-            continue
-        sid = str(meta.get("sid") or md.stem)
-        tid = meta.get("task_id")
-        out.append({
-            "sid": sid,
-            "window": meta.get("window") or _window_from_sid(sid),
-            "claude_uuid": uuid,
-            "recycled_at": meta.get("recycled_at"),
-            "resume_hint": meta.get("resume_hint"),
-            "task_id": tid if (tid and tid != "~") else None,
-        })
-    return sorted(out, key=lambda r: str(r.get("recycled_at") or ""), reverse=True)
 
 
 def recycled_resume_eligible(claude_uuid: str | None,
@@ -1826,7 +1800,7 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
 
     # Update metadata
     # T-0575: this resurrect CONSUMES the recycle-v2 "remembered" state — drop
-    # it so resumable_sessions() never offers an already-resumed session again.
+    # it so decide_dispatch never offers an already-resumed session again.
     for _k in ("resumable", "recycled_at", "resume_hint"):
         meta.pop(_k, None)
     meta["status"] = "active"

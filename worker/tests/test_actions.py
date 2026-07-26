@@ -1868,181 +1868,53 @@ def test_ensure_user_conversation_concurrent_no_fanout(tmp_path, monkeypatch):
     assert len(mds) == 1, f"expected 1 user-conversation md, got {len(mds)}"
 
 
-def _seed_recycled_attendant(cfg, gid: str, *, sid_pane="p4", uuid="uu-att"):
-    """A recycle-v2 remembered attendant md for gid (T-0566 stamp shape)."""
+def test_ensure_user_conversation_never_resumes_a_recycled_attendant(
+        tmp_path, monkeypatch):
+    """T-0720 ruling (operator, 2026-07-26): ensure_user_conversation ALWAYS
+    fresh-spawns — there is no resume-the-recycled-attendant preference, and
+    re-adding one is a deliberate decision, not a bugfix.
+
+    T-0575 shipped that preference at 74eef0f; T-0564 exempts every
+    ``user-conversation`` session from all three recycle paths, so
+    ``idle_timeout``'s terminate-and-remember (the only writer of
+    ``resumable: true``) never runs for the role and no attendant md can ever
+    carry the stamp. This test seeds the impossible md ANYWAY and asserts the
+    ensure still spawns fresh, so a reader can't mistake "unreachable" for
+    "broken" and wire it back up without narrowing recycle_gate first.
+    """
+    import bot_squad_worker.actions as A
     import bot_squad_worker.sessions as S
-    sid = f"S-u-{gid}-user-conversation-{sid_pane}"
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    gid = "gu_t720"
+    sid = f"S-u-{gid}-user-conversation-p4"
     S._write_session_metadata(
         cfg.data_dir / "test-project" / "sessions" / f"{sid}.md", {
             "sid": sid, "status": "suspended",
             "window": f"{gid}-user-conversation", "cwd": "/tmp",
-            "claude_uuid": uuid, "suspended_at": "2026-07-04T10:00:00Z",
-            "resumable": True, "recycled_at": "2026-07-04T10:00:00Z",
+            "claude_uuid": "uu-att", "suspended_at": "2026-07-26T10:00:00Z",
+            "resumable": True, "recycled_at": "2026-07-26T10:00:00Z",
             "resume_hint": "idle cache-window recycle (compacted)",
         })
-    return sid
-
-
-def test_ensure_user_conversation_resumes_recycled_attendant(tmp_path, monkeypatch):
-    """T-0575: a recycled (compact-terminate-remembered) attendant for this gid
-    under the <50k budget is RESUMED with a wake prompt — never a fresh spawn."""
-    import bot_squad_worker.actions as A
-    import bot_squad_worker.sessions as S
-
-    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
-    sid = _seed_recycled_attendant(cfg, "gu_r1")
 
     monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
-    monkeypatch.setattr(S, "recycled_resume_eligible",
-                        lambda uuid, user_home=None: (True, 12_000))
 
-    captured = {}
+    def boom_resume(*a, **k):
+        raise AssertionError(
+            "ensure_user_conversation must not resume — see T-0720")
 
-    def fake_resume(cfg, slug, sid, initial_prompt=None, **kw):
-        captured.update(slug=slug, sid=sid, initial_prompt=initial_prompt)
-        return {"ok": True, "sid": sid.replace("-p4", "-p9")}
-
-    def boom_spawn(*a, **k):
-        raise AssertionError("must resume the recycled attendant, not spawn")
-
-    monkeypatch.setattr(S, "resume", fake_resume)
-    monkeypatch.setattr(S, "spawn", boom_spawn)
+    monkeypatch.setattr(S, "resume", boom_resume)
+    monkeypatch.setattr(
+        S, "spawn",
+        lambda cfg, slug, window, initial_prompt=None, **kw:
+            {"ok": True, "sid": f"S-u-{window}-p8"})
 
     result = A.dispatch("ensure_user_conversation", {
-        "slug": "test-project", "global_user_id": "gu_r1",
+        "slug": "test-project", "global_user_id": gid,
         "message_ref": "hello again"})
     assert result["ok"] is True
-    assert result["spawned"] is False
-    assert result["resumed"] is True
-    assert captured["sid"] == sid
-    assert "RESUMED" in captured["initial_prompt"]
-    assert "hello again" in captured["initial_prompt"]
-
-
-def test_ensure_user_conversation_fat_recycled_attendant_spawns_fresh(
-        tmp_path, monkeypatch):
-    """T-0575: remembered context ≥50k → the stakeholder rule says fresh spawn."""
-    import bot_squad_worker.actions as A
-    import bot_squad_worker.sessions as S
-
-    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
-    _seed_recycled_attendant(cfg, "gu_fat")
-
-    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
-    monkeypatch.setattr(S, "recycled_resume_eligible",
-                        lambda uuid, user_home=None: (False, 120_000))
-
-    def boom_resume(*a, **k):
-        raise AssertionError("must NOT resume an over-budget session")
-
-    monkeypatch.setattr(S, "resume", boom_resume)
-    monkeypatch.setattr(
-        S, "spawn",
-        lambda cfg, slug, window, initial_prompt=None, **kw:
-            {"ok": True, "sid": f"S-u-{window}-p8"})
-
-    result = A.dispatch("ensure_user_conversation", {
-        "slug": "test-project", "global_user_id": "gu_fat",
-        "message_ref": "hi"})
-    assert result["ok"] is True
     assert result["spawned"] is True
-
-
-def test_ensure_user_conversation_ignores_recycled_other_user(tmp_path, monkeypatch):
-    """A recycled attendant of a DIFFERENT gid (or a recycled dev) never
-    matches — the window key scopes the resume preference to the same user."""
-    import bot_squad_worker.actions as A
-    import bot_squad_worker.sessions as S
-
-    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
-    _seed_recycled_attendant(cfg, "gu_other")
-
-    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
-
-    def boom_resume(*a, **k):
-        raise AssertionError("must NOT resume another user's attendant")
-
-    monkeypatch.setattr(S, "resume", boom_resume)
-    monkeypatch.setattr(
-        S, "spawn",
-        lambda cfg, slug, window, initial_prompt=None, **kw:
-            {"ok": True, "sid": f"S-u-{window}-p8"})
-
-    result = A.dispatch("ensure_user_conversation", {
-        "slug": "test-project", "global_user_id": "gu_mine",
-        "message_ref": "hi"})
-    assert result["spawned"] is True
-
-
-def test_ensure_user_conversation_resume_failure_falls_back_to_spawn(
-        tmp_path, monkeypatch):
-    """T-0575 DoD: a failing resume (dead uuid, tmux hiccup) that left no live
-    attendant falls back to a FRESH spawn — the ensure never errors out."""
-    import bot_squad_worker.actions as A
-    import bot_squad_worker.sessions as S
-
-    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
-    _seed_recycled_attendant(cfg, "gu_dead")
-
-    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
-    monkeypatch.setattr(S, "recycled_resume_eligible",
-                        lambda uuid, user_home=None: (True, 1_000))
-
-    def boom_resume(*a, **k):
-        raise ActionError("resume: tmux new-window failed")
-
-    monkeypatch.setattr(S, "resume", boom_resume)
-    monkeypatch.setattr(
-        S, "spawn",
-        lambda cfg, slug, window, initial_prompt=None, **kw:
-            {"ok": True, "sid": f"S-u-{window}-p8"})
-
-    result = A.dispatch("ensure_user_conversation", {
-        "slug": "test-project", "global_user_id": "gu_dead",
-        "message_ref": "hi"})
-    assert result["ok"] is True
-    assert result["spawned"] is True
-
-
-def test_ensure_user_conversation_late_resume_failure_returns_live_attendant(
-        tmp_path, monkeypatch):
-    """T-0575: a LATE resume failure (composer-ready timeout — the pane IS up)
-    must return the now-live attendant, not spawn a duplicate next to it."""
-    import bot_squad_worker.actions as A
-    import bot_squad_worker.sessions as S
-
-    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
-    _seed_recycled_attendant(cfg, "gu_late")
-    live_after = "S-u-gu_late-user-conversation-p9"
-
-    calls = {"n": 0}
-
-    def live_sid(cfg, slug, gid):
-        calls["n"] += 1
-        # First call (reuse check): nothing live; after the resume attempt the
-        # resurrected pane IS live even though prompt delivery timed out.
-        return None if calls["n"] == 1 else live_after
-
-    monkeypatch.setattr(S, "live_user_conversation_sid", live_sid)
-    monkeypatch.setattr(S, "recycled_resume_eligible",
-                        lambda uuid, user_home=None: (True, 1_000))
-
-    def late_boom_resume(*a, **k):
-        raise ActionError("resume: claude composer never showed ❯")
-
-    def boom_spawn(*a, **k):
-        raise AssertionError("must NOT spawn a duplicate next to the live pane")
-
-    monkeypatch.setattr(S, "resume", late_boom_resume)
-    monkeypatch.setattr(S, "spawn", boom_spawn)
-
-    result = A.dispatch("ensure_user_conversation", {
-        "slug": "test-project", "global_user_id": "gu_late",
-        "message_ref": "hi"})
-    assert result["ok"] is True
-    assert result["spawned"] is False
-    assert result["resumed"] is True
-    assert result["sid"] == live_after
+    assert "resumed" not in result
 
 
 def test_resume_session_action_accepts_initial_prompt(tmp_path, monkeypatch):

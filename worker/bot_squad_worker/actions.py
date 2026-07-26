@@ -1781,70 +1781,27 @@ the product/protocol. Your mandate, in short:
 {new_msg}{thread_block}{group_block}"""
 
 
-def _user_conversation_resume_prompt(
-    cfg: Any, slug: str, gid: str, message_ref: Any, thread_id: Any = None,
-) -> str:
-    """Wake prompt for a RESUMED (recycled) attendant. Unlike the fresh-spawn
-    boot prompt it re-orients rather than onboards — the conversation context
-    rides in via ``claude --resume``."""
-    new_msg = ""
-    if message_ref and str(message_ref).strip():
-        new_msg = (
-            "\nThe message that triggered this resume:\n"
-            f"  {str(message_ref).strip()}\n"
-        )
-    group_block = _group_prompt_block(cfg, slug, gid)
-    thread_block = _thread_scoped_read_write_block(slug, gid, thread_id)
-    return (
-        f"Your user-conversation session (user `{gid}`, project `{slug}`) was "
-        "recycled and has now been RESUMED on new incoming mail. Re-read this "
-        f"user's thread (GET /api/conversations/{slug}/{gid}/messages) and "
-        f"respond to the new message.\n{new_msg}{thread_block}{group_block}"
-    )
-
-
-def _resume_recycled_user_conversation(
-    cfg: Any, slug: str, gid: str, message_ref: Any, thread_id: Any = None,
-) -> str | None:
-    """T-0575: resume the newest recycled (compact-terminate-remembered)
-    attendant for ``(slug, gid)`` when its remembered context fits the <50k
-    budget. Returns the resumed SID, or None when there is no eligible
-    candidate / the resume failed without leaving a live attendant — the
-    caller then falls back to a fresh spawn."""
-    from bot_squad_worker import sessions as _sessions
-
-    want = _sessions.user_conversation_window(gid)
-    cand = next(
-        (r for r in _sessions.resumable_sessions(cfg, slug)
-         if _sessions._window_from_sid(r["sid"]) == want),
-        None,
-    )
-    if cand is None:
-        return None
-    ok, tokens = _sessions.recycled_resume_eligible(cand["claude_uuid"])
-    if not ok:
-        log.info(
-            "ensure_user_conversation: recycled %s not resume-eligible "
-            "(context=%s tokens) — fresh spawn", cand["sid"], tokens)
-        return None
-    try:
-        res = _sessions.resume(
-            cfg, slug, cand["sid"],
-            initial_prompt=_user_conversation_resume_prompt(
-                cfg, slug, gid, message_ref, thread_id),
-        )
-        return res.get("sid")
-    except Exception:  # noqa: BLE001 — resume failure must never fail the ensure
-        log.exception(
-            "ensure_user_conversation: resume of recycled %s failed", cand["sid"])
-        # A LATE failure (e.g. composer-ready timeout delivering the wake
-        # prompt) leaves the resumed pane LIVE — a fresh spawn then would
-        # violate single-attendant. Re-check liveness: only a truly dead
-        # resume falls back to the spawn path.
-        try:
-            return _sessions.live_user_conversation_sid(cfg, slug, gid)
-        except Exception:  # noqa: BLE001
-            return None
+# T-0720 (operator ruling 2026-07-26): there is deliberately NO
+# resume-a-recycled-attendant path here. T-0575 shipped one at 74eef0f
+# (``_resume_recycled_user_conversation`` + a resume wake prompt); it was
+# removed because it is STRUCTURALLY unreachable, not merely unused:
+#
+#   ``recycle_gate.role_exempt()`` returns True for every ``user-conversation``
+#   session (T-0564 — "the human's own live chat is never auto-recycled"), and
+#   ``idle_timeout``'s compact-terminate-remember flow is the ONLY writer of the
+#   ``resumable: true`` / ``recycled_at`` stamp this path searched for. So an
+#   attendant can never reach that state: the finder always came back empty.
+#   Confirmed by 12 days of production journal (T-0575 progress, 2026-07-18: 27
+#   recycles, zero user-conversation) and by an operator-approved staged live
+#   test (2026-07-26, synthetic attendant idle 85 min → compact-and-stay only).
+#
+# The ruling is that T-0564's exemption STANDS and this role loses nothing:
+# T-0617's compact-and-stay is the better strategy here — it compacts context
+# in place and never terminates, so the human's pane is never traded for a
+# resume that might fail. The stakeholder's T-0575 ask ("compact, terminate,
+# --resume") is served for RECYCLING roles instead, by T-0150 expert-resume and
+# by ``dispatch.decide_dispatch``'s resume hints (both live). Re-adding a resume
+# preference here requires narrowing ``recycle_gate`` first — do not.
 
 
 def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
@@ -1949,17 +1906,10 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                     pass
             return {"ok": True, "sid": existing, "spawned": False}
 
-        # T-0575: prefer RESUMING this user's recycled attendant over a fresh
-        # spawn (stakeholder 2026-07-04: "<50k tokens context → resume the same
-        # user's last session"). Still under the flock, so the resumed pane
-        # can't race a concurrent ensure into a duplicate. Any ineligibility
-        # or failure falls through to the fresh-spawn path below.
-        resumed = _resume_recycled_user_conversation(cfg, slug, gid, message_ref, thread_id)
-        if resumed is not None:
-            return {"ok": True, "sid": resumed, "spawned": False,
-                    "resumed": True}
-
-        # Spawn: no live attendant → open one in the gid-keyed window.
+        # Spawn: no live attendant → open one in the gid-keyed window. A
+        # recycled-attendant resume is deliberately NOT attempted first —
+        # see the T-0720 note above this function for why that state can
+        # never exist for this role.
         result = _sessions.spawn(
             cfg,
             slug,

@@ -48,16 +48,7 @@ the prod contour.
 
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 
-When the stakeholder references "the concept", the original framing, or
-the one-brain idea — it IS recorded; failing to recall it is a system
-defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус
-системы"). Before answering or acting, look it up (paths relative to the
-project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md`
-(Part A = his original structured ENGLISH concept message, verbatim;
-Part C indexes the raw voice transcripts),
-`docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts
-themselves), and `bsq guidance search "<terms>"` (prior stakeholder
-comments) plus existing tasks under `data/<slug>/backlog/`.
+See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 — "the concept" is recorded; look it up, never treat it as unknown.
 
 ## Quick checklist on session start
 
@@ -68,8 +59,4 @@ comments) plus existing tasks under `data/<slug>/backlog/`.
 
 ## Feedback is welcome and expected
 
-If you hit product friction, a confusing flow, a missing capability, or a
-broken process/recipe, run `bsq feedback submit "<your note>"` to send it
-upstream to the operator/stakeholder. You don't need permission, and small
-notes are valuable — it lands in the project feedback queue. This is how the
-process improves; don't silently absorb friction.
+See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 5 — submit friction via `bsq feedback submit` any time, no permission needed.

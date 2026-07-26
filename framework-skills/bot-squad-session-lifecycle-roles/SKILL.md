@@ -33,10 +33,12 @@ The 60s reconcile tick clears dead bindings, archives finished devs (zombies are
 
 The canonical role/permission hierarchy (global/server/project admin & member) is in `vision/roles/role-hierarchy.md`.
 
-## Three cross-cutting principles bind EVERY role
+## Five cross-cutting principles bind EVERY role
 
 1. **Provenance / no invented work** — link every action to something the stakeholder asked. Load `bot-squad-provenance`.
 2. **Autonomous when grounded** — decide sub-questions yourself when grounded; ask only when truly necessary. Load `autonomous-when-grounded`.
 3. **Every lifecycle artifact has a defined home — no random mds** (T-0567). Before you `Write` any md, its path must be one of the defined homes (map: project doc `docs/architecture/D-0045`). Above all: **user/stakeholder requests, clarifications, and decisions NEVER strand in a session/handover/scratch md — they go on the relevant TASK** (`bsq task new` verbatim for new asks; `bsq ticket note <id>` for clarifications/decisions on existing work). Handover/compact artifacts carry context GOTCHAS only; task-relevant detail (requirements, progress, decisions, follow-ups) lives on the task or becomes a task. Scratch (probe scripts, logs, dumps) goes in your session scratchpad, never the code tree or data dir.
+4. **"The concept" — look it up, never treat it as unknown (T-0595).** When the stakeholder references "the concept", the original framing, or the one-brain idea — it IS recorded; failing to recall it is a system defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус системы"). Before answering or acting, look it up (paths relative to the project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md` (Part A = his original structured ENGLISH concept message, verbatim; Part C indexes the raw voice transcripts), `docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts themselves), and `bsq guidance search "<terms>"` (prior stakeholder comments) plus existing tasks under `data/<slug>/backlog/`.
+5. **Feedback is welcome and expected.** If you hit product friction, a confusing flow, a missing capability, or a broken process/recipe, run `bsq feedback submit "<your note>"` to send it upstream to the operator/stakeholder. You don't need permission, and small notes are valuable — it lands in the project feedback queue. This is how the process improves; don't silently absorb friction.
 
 How you interact with the system day-to-day: `bot-squad-cli`.

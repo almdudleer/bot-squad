@@ -311,8 +311,4 @@ dispatch to it.
 
 ## Feedback is welcome and expected
 
-If you hit product friction, a confusing flow, a missing capability, or a
-broken process/recipe, run `bsq feedback submit "<your note>"` to send it
-upstream to the operator/stakeholder. You don't need permission, and small
-notes are valuable — it lands in the project feedback queue. This is how the
-process improves; don't silently absorb friction.
+See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 5 — submit friction via `bsq feedback submit` any time, no permission needed.

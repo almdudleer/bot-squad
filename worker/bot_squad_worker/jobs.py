@@ -673,6 +673,26 @@ def tg_stall_tick(cfg: Config) -> None:
         log.exception("tg_stall_tick error")
 
 
+def stall_sweep_tick(cfg: Config) -> None:
+    """T-0696: sweep every live pane for a known stuck-interactive-TUI prompt
+    (e.g. the Fable-5 usage-credits gate) and auto-answer it in the safe
+    direction.
+
+    Invisible to drift-check (ticket/commit timestamps) and idle-timeout
+    (blocked on stdin before a first turn -- never idle by the jsonl/hook
+    clock) -- this is the dedicated sweep for that stall class. Fires every
+    60s; each marker self-throttles (retry cooldown + a capped attempt count
+    before escalating instead of hammering the pane). No-op under
+    BOT_SQUAD_STALL_SWEEP=0. Errors are caught so one bad sweep never kills
+    the scheduler.
+    """
+    from bot_squad_worker import stall_sweep as _stall_sweep
+    try:
+        _stall_sweep.tick(cfg)
+    except Exception:
+        log.exception("stall_sweep_tick error")
+
+
 def backoff_tick(cfg: Config) -> None:
     """WS-4 S2 (T-0249): run-survival parallelism-backoff governor.
 

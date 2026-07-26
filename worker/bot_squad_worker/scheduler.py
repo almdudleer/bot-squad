@@ -30,6 +30,7 @@ from bot_squad_worker.jobs import (
     idle_timeout_tick,
     input_flush_tick,
     oauth_refresh,
+    stall_sweep_tick,
     telemetry_tick,
     tg_listener_tick,
     tg_stall_tick,
@@ -289,6 +290,23 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="tg_stall",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # stall_sweep_tick: T-0696 — capture every live pane and auto-answer a
+    # known stuck-interactive-TUI prompt (e.g. the Fable-5 usage-credits
+    # gate) that would otherwise sit blocked on stdin forever, invisible to
+    # drift-check/idle-timeout. Self-throttling per-marker (retry cooldown +
+    # capped attempts before escalating), so 60s is safe. No-op under
+    # BOT_SQUAD_STALL_SWEEP=0.
+    sched.add_job(
+        stall_sweep_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="stall_sweep",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

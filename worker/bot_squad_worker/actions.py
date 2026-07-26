@@ -1009,7 +1009,9 @@ def _tg_call(fn, *, action: str):
 
 
 _TG_TOPIC_CREATE_REQUIRED = {"chat_id", "slug"}
-_TG_TOPIC_CREATE_ALLOWED = _TG_TOPIC_CREATE_REQUIRED | {"name", "ticket_id", "session_id"}
+_TG_TOPIC_CREATE_ALLOWED = (
+    _TG_TOPIC_CREATE_REQUIRED | {"name", "ticket_id", "session_id", "caller_sid"}
+)
 
 # T-0669: a topic name that IS a raw routing SID (optionally wrapped in the
 # '[<slug>] ' bracket sid_display_label itself produces) — the exact shape of
@@ -1029,6 +1031,38 @@ def _looks_like_sid_name(name: str) -> bool:
         if rest.strip():
             candidate = rest.strip()
     return bool(_SID_NAME_RE.match(candidate))
+
+
+def _looks_like_own_compact_label(
+    name: str, caller_sid: str | None, slug: str, cfg: Any,
+) -> bool:
+    """T-0701: catch T-0669's regression under T-0676 item 5's NEW compact
+    label shape (``"<slug> <role>"``, e.g. ``"watchrobot operator"``) —
+    ``_looks_like_sid_name``'s ``_SID_NAME_RE`` only recognises the OLD
+    bracket+raw-SID shape and no longer matches what a TG-facing session's
+    own label actually looks like post-T-0676.
+
+    Design call (see T-0701 "why not fixed inline"): thread the CALLING
+    session's own sid through as an explicit ``caller_sid`` param rather than
+    a generic "looks like `<slug> <role>`" regex — a generic heuristic would
+    false-positive on any short legitimate topic title that happens to start
+    with the project slug (e.g. a project literally named its General topic
+    "watchrobot standup"). Threading the caller's own sid means this only
+    ever rejects a name that is a LITERAL match of what ``caller_sid``'s own
+    label renders as right now (both the compact and bracket forms — a
+    caller could be running either), never a lookalike. No ``caller_sid`` ⇒
+    no check here (falls back to the shape-only ``_looks_like_sid_name``
+    guard above), so old/other callers that don't pass it are unaffected.
+    """
+    if not caller_sid:
+        return False
+    from bot_squad_worker import sessions as _sessions
+    candidate = name.strip().casefold()
+    own_compact = _sessions.sid_display_label(
+        caller_sid, slug, compact=True, data_dir=cfg.data_dir
+    )
+    own_bracket = _sessions.sid_display_label(caller_sid, slug, compact=False)
+    return candidate in (own_compact.strip().casefold(), own_bracket.strip().casefold())
 
 
 def _derive_task_topic_name(cfg: Any, slug: str, ticket_id: str) -> str:
@@ -1073,15 +1107,21 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
     binds ``{slug, ticket_id}`` instead of just ``{slug}``); session_id
     (Phase 2 — the ORIGINATING session working the task, so an inbound
     message in the new topic routes straight to it instead of the project's
-    user-conversation attendant, see ``tg_listener._handle_topic_bound``).
+    user-conversation attendant, see ``tg_listener._handle_topic_bound``);
+    caller_sid (T-0701 — the CALLING session's own routing sid, used ONLY to
+    detect it naming the topic after itself; distinct from session_id, which
+    may name a different originating session).
 
     ``name``: for a per-task topic (``ticket_id`` given), the name is ALWAYS
     DERIVED from the ticket's own title (T-0669 — a caller-supplied ``name``
     is accepted but ignored, so an old caller isn't broken by the param
     becoming non-required). For a project-level topic (no ``ticket_id``),
-    ``name`` is required and a SID-shaped name is rejected (T-0669: the exact
-    phantom-topic bug — a session named a topic with its own
-    sid_display_label instead of a real title).
+    ``name`` is required and is rejected if it looks like a raw session SID
+    (T-0669: the exact phantom-topic bug — a session named a topic with its
+    own sid_display_label instead of a real title) or, when ``caller_sid`` is
+    given, if it matches that session's own display label in either the
+    bracket or compact form (T-0701 — the same mistake under T-0676 item 5's
+    newer compact label shape, which doesn't match the SID-shape regex).
 
     Returns ``{ok, chat_id, thread_id, slug, name}``.
     """
@@ -1111,6 +1151,12 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
             raise ActionError(
                 f"tg_topic_create: name {caller_name!r} looks like a raw session "
                 "SID, not a topic title (T-0669) — pass a real name"
+            )
+        if _looks_like_own_compact_label(caller_name, params.get("caller_sid"), slug, cfg):
+            raise ActionError(
+                f"tg_topic_create: name {caller_name!r} looks like the calling "
+                "session's own display label, not a topic title (T-0701) — "
+                "pass a real name"
             )
         name = caller_name
 

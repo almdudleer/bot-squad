@@ -552,6 +552,9 @@ def cmd_topic_create(args) -> None:
         params["ticket_id"] = args.ticket
     if args.session:
         params["session_id"] = args.session
+    caller_sid = my_sid()
+    if caller_sid:
+        params["caller_sid"] = caller_sid
     res = post("tg_topic_create", params)
     extra = ""
     if args.ticket:

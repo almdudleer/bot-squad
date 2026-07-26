@@ -3399,6 +3399,81 @@ def test_tg_topic_create_without_ticket_id_accepts_real_title(tmp_config_dir, mo
 
 
 # ---------------------------------------------------------------------------
+# T-0701: T-0669's SID-shape guard (_SID_NAME_RE) only recognises the OLD
+# bracket+raw-SID label. T-0676 item 5 introduced a NEW compact label
+# ("<slug> <role>", e.g. "watchrobot operator") for every TG-facing path — a
+# session repeating T-0669's original mistake under the new label regime
+# produces a name that the shape regex does NOT match. Fix: when the caller
+# threads its own sid through as `caller_sid`, reject a name that equals that
+# sid's OWN rendered label (compact or bracket form) — a literal self-match,
+# not a generic "looks like <slug> <role>" heuristic (which would false-
+# positive on legitimate short titles).
+# ---------------------------------------------------------------------------
+
+
+def test_tg_topic_create_rejects_own_compact_label_when_caller_sid_given(tmp_config_dir, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    caller_sid = "S-almdudleer-operator-p160"
+    with pytest.raises(ActionError, match="own display label"):
+        A.dispatch("tg_topic_create", {
+            "chat_id": "111", "slug": "test-project", "name": "test-project operator",
+            "caller_sid": caller_sid,
+        })
+    assert fake.created == []
+
+
+def test_tg_topic_create_rejects_own_bracket_label_when_caller_sid_given(tmp_config_dir, monkeypatch):
+    """The caller might still be on the OLD bracket-form label — the
+    shape-based guard already catches this (any bracket+raw-SID name, not
+    just the caller's own), and passing caller_sid alongside it must not
+    regress that existing coverage."""
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    caller_sid = "S-almdudleer-operator-p160"
+    with pytest.raises(ActionError, match="looks like a raw session SID"):
+        A.dispatch("tg_topic_create", {
+            "chat_id": "111", "slug": "test-project",
+            "name": f"[test-project] {caller_sid}", "caller_sid": caller_sid,
+        })
+    assert fake.created == []
+
+
+def test_tg_topic_create_compact_label_of_a_DIFFERENT_sid_is_not_rejected(tmp_config_dir, monkeypatch):
+    """The guard is a literal self-match, not a generic "<slug> <role>"
+    pattern — a name that happens to render as another session's compact
+    label (different role) is a real candidate title, not a repeat of the
+    T-0669 mistake, and must still be accepted."""
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "slug": "test-project", "name": "test-project operator",
+        "caller_sid": "S-almdudleer-dev-p9",
+    })
+    assert out["name"] == "test-project operator"
+
+
+def test_tg_topic_create_compact_label_name_accepted_without_caller_sid(tmp_config_dir, monkeypatch):
+    """No caller_sid ⇒ no self-match check is possible, so an old/other
+    caller that doesn't pass it is unaffected (falls back to the shape-only
+    guard, which a compact label never matches)."""
+    import bot_squad_worker.actions as A
+
+    fake = _FakeForumTg()
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    out = A.dispatch("tg_topic_create", {
+        "chat_id": "111", "slug": "test-project", "name": "test-project operator",
+    })
+    assert out["name"] == "test-project operator"
+
+
+# ---------------------------------------------------------------------------
 # T-0669/T-0676 item 1: rename a REGULAR forum topic (editForumTopic) — the
 # capability the TL uses to relabel the live phantom-SID-named T-0270 topic.
 # ---------------------------------------------------------------------------

@@ -37,9 +37,14 @@ missing/ambiguous value stops and prompts instead of silently guessing.
 
 ## Playbook for applying the two override files
 
-`install.sh` has no native hook for a compose override with an arbitrary
-name, or a per-host systemd unit — both need a one-time manual step at the
-right point in the checkpoint sequence:
+See `PHASE2-RUNBOOK.md` for the full ordered, checkpoint-by-checkpoint
+walk-through of every `install.sh` step with these fit in at the right
+point (and everything else worth knowing about how linza's specifics
+interact with each checkpoint — e.g. `install_nodejs`/`install_claude_code`
+re-interpreting P7, the expected `install_docker` re-login halt). Short
+version: `install.sh` has no native hook for a compose override with an
+arbitrary name, or a per-host systemd unit — both need a one-time manual
+step at the right point in the checkpoint sequence:
 
 1. Run `install.sh` normally through `clone_repo`.
 2. **Before** the `systemd_unit` checkpoint runs: copy

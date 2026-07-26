@@ -37,6 +37,16 @@ def _set_target(cfg, pct):
         f"[operator]\nweekly_quota_target_pct = {pct}\n", encoding="utf-8")
 
 
+def _no_target(cfg):
+    """Write a ``system_settings.toml`` with no ``[operator]`` section into the
+    tmp config_dir — the explicit "no weekly target set" fixture. T-0697:
+    ``_system_settings_path`` now honors an explicit ``cfg.config_dir`` even
+    when the file is absent there, so these tests must not lean on that
+    absence to get a None target; they write their own isolated file instead,
+    same as ``_set_target`` does for the "target set" case."""
+    (cfg.config_dir / "system_settings.toml").write_text("", encoding="utf-8")
+
+
 def _set_quota(cfg, *, burn=None, remaining=None, r429=0, budget=None):
     data = {
         "burn_tokens_per_hr": burn, "remaining_tokens": remaining,
@@ -52,6 +62,7 @@ def _set_quota(cfg, *, burn=None, remaining=None, r429=0, budget=None):
 def test_fresh_project_degrades_to_ok(cfg, monkeypatch):
     """No cap, no target, no telemetry -> a usable all-defaults dashboard, 'ok'."""
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
+    _no_target(cfg)
     st = ord_.pacing_status(cfg, SLUG)
     assert st["max_in_progress"] == 0 and st["in_progress"] == 0
     assert st["at_cap"] is False
@@ -80,6 +91,7 @@ def test_at_cap_throttles(cfg, monkeypatch):
 
 def test_under_cap_is_ok(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 3)
+    _no_target(cfg)
     _task(cfg, "T-1", status="in_progress")
     st = ord_.pacing_status(cfg, SLUG)
     assert st["at_cap"] is False

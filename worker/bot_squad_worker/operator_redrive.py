@@ -209,13 +209,17 @@ def _in_progress_count(cfg: Any, slug: str) -> int:
 
 
 def _system_settings_path(cfg: Any) -> Optional[Path]:
-    """Best-effort locate ``system_settings.toml`` — ``cfg.config_dir`` if present,
-    else the conventional install path. None if neither is usable."""
+    """Best-effort locate ``system_settings.toml`` — ``cfg.config_dir`` if set,
+    else the conventional install path. A set ``cfg.config_dir`` is authoritative
+    even when the file doesn't exist there yet (e.g. a fresh/isolated config
+    dir): callers already handle a missing file (read failure -> None), and
+    falling back past an explicit config_dir would leak the conventional
+    install's file into a config_dir-scoped caller — exactly the T-0697 bug
+    (an 'isolated' test fixture silently reading the real production
+    system_settings.toml). None if neither is usable."""
     cdir = getattr(cfg, "config_dir", None)
     if cdir:
-        p = Path(cdir) / "system_settings.toml"
-        if p.exists():
-            return p
+        return Path(cdir) / "system_settings.toml"
     p = Path("/home/www/bot-squad/config/system_settings.toml")
     return p if p.exists() else None
 

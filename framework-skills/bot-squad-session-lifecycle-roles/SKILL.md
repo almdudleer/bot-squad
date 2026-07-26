@@ -41,4 +41,22 @@ The canonical role/permission hierarchy (global/server/project admin & member) i
 4. **"The concept" — look it up, never treat it as unknown (T-0595).** When the stakeholder references "the concept", the original framing, or the one-brain idea — it IS recorded; failing to recall it is a system defect ("вот то, что ты не помнишь эту концепцию, это как раз тоже минус системы"). Before answering or acting, look it up (paths relative to the project data dir): `vision/INI-XX-process-paradigm-SOURCE-VERBATIM.md` (Part A = his original structured ENGLISH concept message, verbatim; Part C indexes the raw voice transcripts), `docs/raw-user-input/process-paradigm-initiative/` (the raw transcripts themselves), and `bsq guidance search "<terms>"` (prior stakeholder comments) plus existing tasks under `data/<slug>/backlog/`.
 5. **Feedback is welcome and expected.** If you hit product friction, a confusing flow, a missing capability, or a broken process/recipe, run `bsq feedback submit "<your note>"` to send it upstream to the operator/stakeholder. You don't need permission, and small notes are valuable — it lands in the project feedback queue. This is how the process improves; don't silently absorb friction.
 
+## Two more bind every role that RECEIVES stakeholder steering directly
+
+Operator, team-lead, user-conversation — any session the stakeholder talks *into* (pane drops, TG, voice notes, peer relays carrying his words). Your role doc states your own delta on top of these; the rule itself lives here.
+
+6. **Dictated priorities — take up vs clarify (stakeholder 2026-07-05, T-0595).** When the stakeholder dictates new PRIORITIES, recording them is not enough — JUDGE them against in-flight work, don't just queue them.
+   - **Take up directly** — the DEFAULT posture — when in-flight work is light or the dictation clearly outranks it ("сейчас вроде текущих задач особо нет, поэтому вот то, что я сейчас наговорил, нужно принять к сведению прямо").
+   - **Ask to clarify** only when current in-flight tasks may legitimately outrank the new dictation and the trade-off is genuinely not obvious ("иногда текущие задачи … могут быть важнее, чем то, что я наговорил") — ONE focused question naming the competing in-flight work, not a re-litigation of the whole board.
+   - **Never silently ignore** a dictated priority. Every one is either taken up (visibly moving) or explicitly queried back — there is no third state.
+
+   He should not have to dictate the ops moves themselves ("нужно, чтобы я вот этого не говорил") — the system makes this judgement itself.
+
+7. **Steering comments — every one lands in a durable home (stakeholder 2026-07-05, T-0590).** "Чтобы у каждого моего комментария который я оставляю было своё место в этой системе … и чтобы она реально слушалась" (T-0587 #4). Some comments don't ask for work — they steer HOW the system works (framing, standing rules). For those, capturing verbatim on a ticket is step one, not the whole job: a standing rule that lives only on a ticket dies when the ticket closes. Full recipe: `docs/architecture/D-0050`.
+   1. **Capture verbatim** on a source ticket (principle 3 — unchanged).
+   2. **Classify + split.** One voice note usually carries several directions; route each piece by what it steers: *how a ROLE must behave, across tasks* → role doc SSOT (`api/app/resources/roles/<role>.md`), via a build ticket quoting his words + date + source ticket (deploy-gated; T-0597 is the pattern); *how work is done in THIS project* (recipes, constraints, gotchas) → `AGENT_INSTRUCTIONS.md` (constitution for governance); *what the product IS / the concept* → vision docs (SOURCE-VERBATIM addendum, initiative md, or `bsq doc new`); *framework how-to, any project* → framework skill (D-0040); *one task's scope/decisions* → that ticket (`bsq ticket note`); *priorities* → principle 6 above.
+   3. **Record the landing on the source ticket** — one note per routed piece: `routed: <piece> -> <home path / ticket id>`. A steering comment with no recorded landing is a defect, same as a dropped user request (D-0045).
+
+   Never leave steering only in the conversation thread, a pane, or your own context — those evaporate. The durable homes are the ones the next session is automatically served: role docs ride the spawn brief, `AGENT_INSTRUCTIONS.md` rides orientation, vision rides the concept-lookup rule (principle 4), tickets ride `bsq guidance search` (which since T-0590 also indexes tickets' harvested-comments sections).
+
 How you interact with the system day-to-day: `bot-squad-cli`.

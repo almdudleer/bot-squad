@@ -63,14 +63,17 @@ it on resume.
   running, UI-addressable in bot-squad's session list, tmux-attachable
   by the stakeholder), spawn it via the `bsq` CLI instead:
 
-      bsq spawn T-NNNN --window <feature-name> \
-        --initiative <your-init.md> \
-        --prompt "<one-paragraph brief>"
+      bsq spawn T-NNNN --window <feature-name> --initiative <your-init.md>
 
-  (`bsq spawn` resolves the slug/socket/wire shape itself and assembles
-  a deterministic dev prompt for the ticket. Pass `--role tl` to spawn a
-  TL, `--prompt-file <path>` for a long brief, `--bundle T-A,T-B` to bind
-  extra tickets. `bsq spawn --help` for the rest.)
+  `bsq spawn` resolves the slug/socket/wire shape and assembles the
+  deterministic brief for the ticket itself — role contract, scope, DoD,
+  prior guidance. Do NOT reflexively pass `--prompt`: it REPLACES that
+  assembly. Flags: `bsq spawn --help`; verb semantics (resume-by-default,
+  `--bundle`, the `--prompt` replacement rule): the `bot-squad-cli` skill.
+  The full recipe with both shapes lives in the operator role doc
+  (`api/app/resources/roles/operator.md` → "Spawn-session recipes" — the
+  git SSOT, not the drifting `vision/roles/` copy); this section states
+  only the TL-side choice.
 
   Use this fallback for: persistent operators, project-side roles
   that must outlive a TL crash, anything the stakeholder needs to
@@ -93,17 +96,19 @@ it on resume.
 Bot-squad runs a cross-session message bus. Your first action in every
 session start should be:
 
-1. `peer_inbox_read` to drain any messages queued while you were away.
-2. Arm `peer_inbox_wait` with `run_in_background: true` and a 1800-sec
-   timeout. When the inbox grows, the bash exits and Claude Code wakes
-   you autonomously — even between user turns.
-3. After handling each batch, re-arm a fresh `peer_inbox_wait` in the
+1. `bsq inbox check` to drain any messages queued while you were away.
+2. Arm `bsq inbox wait --timeout 1800` in the background. When the inbox
+   grows, the bash exits and Claude Code wakes you autonomously — even
+   between user turns.
+3. After handling each batch, re-arm a fresh `bsq inbox wait` in the
    background. Treat it as your "always-listening" channel for both
    peer TLs and your own workers when they can't reach you via the
    agent-teams native chat.
 
-Use `peer_send to=<sid>` for direct, `to=teamlead` to broadcast to peer
-TLs, `to=dev` to reach all dev workers across teams.
+Use `bsq peer send <sid> "<text>"` for direct, `bsq peer send teamlead` to
+broadcast to peer TLs, `bsq peer send dev` to reach all dev workers across
+teams. (These wrap the `peer_inbox_read` / `peer_inbox_wait` / `peer_send`
+worker actions; call the CLI, not the socket.)
 
 ## Handling DEV SPAWN REQUEST messages
 
@@ -120,31 +125,23 @@ via your peer inbox, treat it as a delegated spawn. Steps:
      verbatim section).
    - If not found: create a new T-NNNN-<slug>.md with status: open and the
      stakeholder's instructions verbatim as the body.
-3. Spawn a dev worker via `bsq spawn` (see the example above). The
+3. Spawn a dev worker via `bsq spawn` (see "Spawning devs" above). The
    `--window` name should describe the feature, not contain the task id.
-   Pass the ticket id, `--initiative`, and a `--prompt` (or
-   `--prompt-file`) that briefs the worker on:
-   - their task id and the path to its md file
-   - the stakeholder's additional instructions (if any)
-   - the DoD
-   The worker lands in the same cwd as you (no worktree).
-4. After spawning, send a peer_send back to `stakeholder` confirming the
-   spawn and identifying the worker SID (so the stakeholder can find
-   the new session in the UI).
+   Put the stakeholder's additional instructions ON THE TICKET rather
+   than into a `--prompt` — the assembled brief carries the ticket's
+   scope, DoD and context to the worker, and a `--prompt` would replace
+   that assembly. The worker lands in the same cwd as you (no worktree).
+4. After spawning, `bsq peer send stakeholder "<confirmation>"` naming the
+   worker SID (so the stakeholder can find the new session in the UI).
 
-## Dictated priorities — take up vs clarify (stakeholder 2026-07-05, T-0595)
+## Dictated priorities (T-0595)
 
-When the stakeholder dictates new priorities into your scope — pane
-drops, TG relays, peer messages carrying his words — judge them against
-your in-flight work, don't just queue them. Default = **take up
-directly** when in-flight work is light or the dictation clearly
-outranks it ("сейчас вроде текущих задач особо нет, поэтому вот то, что
-я сейчас наговорил, нужно принять к сведению прямо"). **Ask to clarify**
-only when a current task may legitimately outrank the new dictation and
-the trade-off is genuinely not obvious ("иногда текущие задачи … могут
-быть важнее, чем то, что я наговорил") — one focused question naming the
-competing work. **Never silently ignore** a dictated priority: taken up
-or explicitly queried, no third state.
+See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 6 —
+judge a dictated priority against in-flight work; take up (default) or ask ONE
+focused question, never silently ignore. TL delta: judge it against **your
+scope's** in-flight work only — a dictation that reaches past your
+initiative belongs to the operator, so relay it rather than re-planning
+the board yourself.
 
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 
@@ -169,7 +166,7 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
   (T-0567; artifact-kind→home map: `docs/architecture/D-0045`). Deferred /
   out-of-scope follow-ups become tickets via `task_new`, not TODO lists
   inside an artifact.
-- Use `task_progress_add` (`bsq ticket note <id> "<note>"`) to log shipped
+- Use `bsq ticket note <id> "<note>"` (the `task_progress_add` action) to log shipped
   milestones / decisions / blockers. This is **your continuity artifact**
   (see "Your transient contract" above): a fresh TL incarnation re-drives
   from these notes, so record dispatches, review/accept/push decisions, and

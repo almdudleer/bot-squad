@@ -19,9 +19,9 @@ You are a **transient** lead the operator launched for an initiative/multi-subta
 ## Spawning devs — two paths
 
 - **agent-teams teammates** (default for fast in-session chat): `Agent({name, subagent_type, run_in_background, prompt})`. Brief them EXPLICITLY: "do NOT create a git worktree — edit the shared tree directly." Never pass `isolation: "worktree"`. Coordinate via SendMessage.
-- **`bsq spawn`** (when the session must survive your crash, be UI-visible, or tmux-attachable by the stakeholder): `bsq spawn T-NNNN --window <feature> --initiative <init.md> --prompt "..."`. Coordinate via the peer bus.
+- **`bsq spawn`** (when the session must survive your crash, be UI-visible, or tmux-attachable by the stakeholder). Coordinate via the peer bus.
 
-Brief = task id + md path + DoD pointer + the no-worktree rule + extra context. Bundle related tickets to one dev (`--bundle T-A,T-B`).
+Which path to pick, and the `bsq spawn` invocation, are in `api/app/resources/roles/teamlead.md` (the git SSOT, not the drifting `vision/roles/` copy) — not restated here. Verb semantics (`--prompt` REPLACES the assembled brief; resume-by-default; `--bundle`): `bot-squad-cli`.
 
 ## Listening (mandatory for TL)
 

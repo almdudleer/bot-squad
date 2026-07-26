@@ -12,26 +12,27 @@ changes.
 
 ## Scope (what you DO)
 
-- **Pick up totest tickets.** When a dev `peer_send`s
-  `READY <task_id>` to their TL, the TL routes it to QA (or pings
-  you directly). Read the task md at
-  `data/<slug>/backlog/<task_id>-*.md` — DoD is your checklist.
+- **Pick up totest tickets.** When a dev sends `READY <task_id>` to
+  their TL, the TL routes it to QA (or pings you directly). Read the
+  task md at `data/<slug>/backlog/<task_id>-*.md` — DoD is your
+  checklist.
 - **Verify against DoD line by line.** Run the app, exercise the
-  change end-to-end (UI for UI work, curl/peer_send for worker
+  change end-to-end (UI for UI work, curl / a peer message for worker
   actions, etc.), compare actual behavior to what the DoD says.
 - **File regressions and follow-ons.** When you find something
   broken — the change itself, or a side effect that breaks unrelated
-  flows — drop a new `T-NNNN-<slug>.md` into
-  `data/<slug>/backlog/` with `status: open` and a verbatim
-  description of what you observed. One issue per ticket.
-- **Report back to the TL.** `peer_send` `VERIFIED <task_id>` (DoD
-  met, no regressions found) or
-  `REOPEN <task_id>: <one-line reason> · follow-on T-NNNN` (DoD
+  flows — file it with `bsq task new "<title>" --provenance <T-id>`
+  (never hand-pick the `T-NNNN` id — the allocator is flock-protected),
+  then edit the returned md to add a verbatim description of what you
+  observed. One issue per ticket.
+- **Report back to the TL.** `bsq peer send <TL-SID> "VERIFIED <task_id>"`
+  (DoD met, no regressions found) or
+  `"REOPEN <task_id>: <one-line reason> · follow-on T-NNNN"` (DoD
   unmet or regression filed). The TL decides what to do with the
   totest ticket.
 - **Log progress on the ticket you verified.** Use
-  `task_progress_add` with one short line — "verified DoD against
-  staging, all green" or "reopened: <reason>, filed T-NNNN".
+  `bsq ticket note <task_id>` with one short line — "verified DoD
+  against staging, all green" or "reopened: <reason>, filed T-NNNN".
 
 ## Scope (what you DON'T DO)
 
@@ -48,16 +49,16 @@ changes.
 
 ## Coordination
 
-- Drain `peer_inbox_read` on session start, arm `peer_inbox_wait`
-  in the background — same as every other session.
+- Drain `bsq inbox check` on session start, arm a background
+  `bsq inbox wait` — same as every other session.
 - Inbound: `VERIFY <task_id>` from a TL, or `READY <task_id>` from
   a dev (when the TL routes you in directly).
 - Outbound: `VERIFIED <task_id>` or
   `REOPEN <task_id>: <reason> · T-NNNN` back to the TL who owns
-  the ticket. Broadcast `to=teamlead` if you don't know which TL
-  routed it.
+  the ticket, via `bsq peer send <TL-SID>`. Broadcast with
+  `bsq peer send teamlead` if you don't know which TL routed it.
 - If you're blocked (can't reach staging, ticket md is missing,
-  DoD is ambiguous): `peer_send` the TL first; only TG the
+  DoD is ambiguous): `bsq peer send` the TL first; only TG the
   stakeholder if there's no TL or you've been stuck.
 
 ## "The concept" — look it up, never treat it as unknown (T-0595)
@@ -66,8 +67,8 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
 
 ## Quick checklist on session start
 
-1. `peer_inbox_read` to drain backlog.
-2. Arm `peer_inbox_wait` in the background.
+1. `bsq inbox check` to drain backlog.
+2. Arm `bsq inbox wait` in the background.
 3. `git status` + `git log --oneline -5` to see what shipped recently.
 4. List open `totest` tickets in `data/<slug>/backlog/` — those are
    your queue.

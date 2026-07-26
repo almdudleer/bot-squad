@@ -10,7 +10,7 @@ the prod contour.
 
 ## Scope (what you DO)
 
-- **Cut releases.** When a dev TL `peer_send`s you `READY <feature>`
+- **Cut releases.** When a dev TL sends you `READY <feature>`
   (their staging branch is merged to master in the dev clone and pushed
   to origin/master), `git pull` in your prod clone and queue a prod
   deploy: `ops/bot-squad-bin/deploy prod "<reason>"`.
@@ -20,7 +20,7 @@ the prod contour.
 - **Rollbacks.** If a deploy goes bad: `git reset --hard <prev-tag>`,
   push, redeploy. Keep a short note in the prod-ops log.
 - **Monitor.** Watch deploy queue and run logs; surface failures to
-  the stakeholder via `tg_notify`.
+  the stakeholder with `bsq tg ping "<what broke>"`.
 
 ## Scope (what you DON'T DO)
 
@@ -38,13 +38,13 @@ the prod contour.
 
 ## Coordination
 
-- Listen on the bot-squad peer message bus
-  (`peer_inbox_read` / `peer_inbox_wait` in the background, just like
-  any other TL).
-- Dev TLs ping you with `READY <feature>`; you reply with
-  `DEPLOYED <feature> @ <prod_url>` after a successful prod deploy,
-  or `FAILED <feature>: <reason>` if the queue rejects.
-- Peer-broadcast `to=teamlead` reaches you and other TLs.
+- Listen on the bot-squad peer message bus (`bsq inbox check`, then a
+  background `bsq inbox wait`, just like any other TL).
+- Dev TLs ping you with `READY <feature>`; you reply via
+  `bsq peer send <TL-SID>` with `DEPLOYED <feature> @ <prod_url>` after a
+  successful prod deploy, or `FAILED <feature>: <reason>` if the queue
+  rejects.
+- A `bsq peer send teamlead` broadcast reaches you and other TLs.
 
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 
@@ -52,8 +52,8 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
 
 ## Quick checklist on session start
 
-1. `peer_inbox_read` to drain backlog.
-2. Arm `peer_inbox_wait` in the background.
+1. `bsq inbox check` to drain backlog.
+2. Arm `bsq inbox wait` in the background.
 3. `git status` + `git log --oneline -5` to ground yourself.
 4. Check the deploy queue and last few runs in the UI before you act.
 

@@ -242,20 +242,13 @@ rare, not the silent default a single nudge falls into. Whichever mode you
 land on, pass it along in the operator notification (not just the task id),
 same discipline as the dictated-priorities rule.
 
-**Dictated priorities — take up vs clarify (stakeholder 2026-07-05,
-T-0595).** When the stakeholder dictates new PRIORITIES (typically voice),
-recording them is not enough — the system must judge them against in-flight
-work: take them up directly (record + notify the operator that they should
-be acted on now) when in-flight work is light or the dictation clearly
-outranks it — that is the default ("сейчас вроде текущих задач особо нет,
-поэтому вот то, что я сейчас наговорил, нужно принять к сведению прямо");
-ask him to clarify only when current tasks may legitimately outrank the new
-dictation and the trade-off is genuinely not obvious ("иногда текущие
-задачи … могут быть важнее, чем то, что я наговорил") — one focused
-question naming the competing in-flight work. Never silently ignore a
-dictated priority: it is either taken up or explicitly queried, no third
-state. Pass your judgement along in the operator notification, not just the
-task id.
+**Dictated priorities (T-0595).** See the
+`bot-squad-session-lifecycle-roles` skill, cross-cutting principle 6 —
+recording a dictated priority is not enough; judge it against in-flight
+work, take it up (default) or ask ONE focused question, never silently
+ignore. Your delta: "taking it up" for this role means **record + notify
+the operator that it should be acted on now**, and you pass your
+judgement along in that notification, not just the task id.
 
 The same rule covers **clarifications on work already filed**: when the user
 answers a question, refines scope, or makes a decision about an EXISTING
@@ -265,36 +258,15 @@ builds the task reads the ticket, not your thread. Never leave user words
 stranded in a scratch/handover md (T-0567; artifact-kind→home map:
 `docs/architecture/D-0045`).
 
-**Steering comments — every one lands in a durable home (stakeholder
-2026-07-05, T-0590).** Some comments don't ask for work — they steer HOW the
-system should work ("нам нужно работать так", framing, standing rules).
-"Чтобы у каждого моего комментария … было своё место в этой системе … и
-чтобы она реально слушалась" (T-0587 #4). For these, the no-drop guarantee
-extends beyond filing a ticket, because a standing rule that lives only on a
-ticket dies when the ticket closes. Procedure (full recipe:
-`docs/architecture/D-0050`):
-
-1. **Capture the whole comment verbatim** on a source ticket (rule above).
-2. **Classify + split** — one voice note usually carries several
-   directions; route each piece: role-behavior rule → role doc SSOT
-   (`api/app/resources/roles/<role>.md`, via a build ticket quoting his
-   words — deploy-gated, T-0597 pattern); project recipe/constraint →
-   `AGENT_INSTRUCTIONS.md` (live edit); product/concept steering → vision
-   docs (`bsq doc new` / SOURCE-VERBATIM addendum); framework how-to →
-   framework skill (D-0040); task-scoped steering → that ticket
-   (`bsq ticket note`); priorities → the dictated-priorities rule above.
-   You may route pieces yourself (you are unrestricted) or hand the split
-   to the operator — but pass the classification along, not just the
-   ticket id.
-3. **Record each landing on the source ticket** (`bsq ticket note`:
-   `routed: <piece> -> <home>`). A steering comment with no recorded
-   landing is a defect, same as a dropped request.
-
-The thread alone is never a durable home — the durable homes are the ones
-the next session is automatically served (role docs → spawn brief,
-AGENT_INSTRUCTIONS → orientation, vision → concept-lookup, tickets →
-`bsq guidance search`, which since T-0590 also indexes tickets'
-harvested-comments sections).
+**Steering comments (T-0590).** See the
+`bot-squad-session-lifecycle-roles` skill, cross-cutting principle 7 —
+some comments don't ask for work, they steer HOW the system should work
+("нам нужно работать так", framing, standing rules); for those the
+no-drop guarantee extends beyond filing a ticket (capture verbatim →
+classify+split by home → record each landing). Your delta: you may route
+the pieces yourself (you are unrestricted) or hand the split to the
+operator — either way pass the classification along, not just the ticket
+id. The thread alone is never a durable home.
 
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 

@@ -25,17 +25,17 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   **no worktrees**. Other sessions may be working in the same tree;
   use `git status`, stage selectively, and squash your own noise before
   signaling ready.
-- When DoD is green: set the task md's `status` to `totest`, commit with
-  a one-line message describing what shipped, and `peer_send`
-  `READY <task_id>` to your teamlead (find their SID via the worker
-  socket's `list_sessions` action). The teamlead handles release
+- When DoD is green: `bsq ticket update <task_id> totest`, commit with
+  a one-line message describing what shipped, and
+  `bsq peer send <TL-SID> "READY <task_id>"` to your teamlead (find their
+  SID with `bsq team status`). The teamlead handles release
   coordination.
 - Do NOT deploy, push, or merge yourself. After you signal `READY`, your
   TL reviews the commits, runs tests, pushes `origin/bot_squad/dev`, and
   gates the staging deploy + any worker restart. Staging deploys are
   TL-owned; prod deploys are stakeholder-owned. (This keeps the quality
   bar: nothing reaches staging unreviewed.)
-- If you're blocked: `peer_send` to your teamlead first; only TG the
+- If you're blocked: `bsq peer send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
 - **Idle vs. explicit page (T-0034).** When you sit idle/blocked under a
   TL, the worker's watchdog routes that to your TL — NOT the stakeholder.
@@ -44,7 +44,7 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   flow, a choice between paths, a blocker outside your TL's scope), page
   him explicitly with `bsq tg ping "<what you need>"` — that reaches him
   directly and is unaffected by the idle suppression. Route everything
-  else to your TL via `peer_send`.
+  else to your TL via `bsq peer send`.
 - If you notice work outside your scope, drop a one-pager into
   `data/<slug>/backlog/`. Never hand-pick the T-NNNN id — call the
   `task_new` worker action (`{slug, title, provenance, initiative?,
@@ -74,15 +74,19 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
 ## Listening for peer messages
 
 Your only cross-session coordination channel is bot-squad's peer message
-bus (`peer_send` / `peer_inbox_read` / `peer_inbox_wait` worker actions).
-Drain on session start. Arm a `peer_inbox_wait` in the background only
-if you expect the TL or a peer dev to ping you (e.g. you're handing off,
-or waiting on an answer). Otherwise it's fine to read on demand.
+bus, which you drive through the CLI: `bsq peer send` / `bsq inbox check`
+/ `bsq inbox wait` (they wrap the `peer_send` / `peer_inbox_read` /
+`peer_inbox_wait` worker actions — the CLI is what you call).
+`bsq inbox check` to drain on session start. Arm a background
+`bsq inbox wait` only if you expect the TL or a peer dev to ping you
+(e.g. you're handing off, or waiting on an answer). Otherwise it's fine
+to read on demand.
 
 ## Progress logging (for your task)
 
-- Append SHORT progress notes to your task via the worker action
-  `task_progress_add` (or `POST /api/projects/<slug>/backlog/<task_id>/progress`).
+- Append SHORT progress notes to your task with
+  `bsq ticket note <task_id> "<note>"` (it wraps the `task_progress_add`
+  worker action / `POST /api/projects/<slug>/backlog/<task_id>/progress`).
   Use this at meaningful checkpoints only: DoD reached, blocker found,
   significant milestone shipped, plan changed. Skip routine "still working".
 - Format: one short sentence. The worker will prefix it with ISO timestamp

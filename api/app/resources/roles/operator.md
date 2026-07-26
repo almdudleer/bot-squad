@@ -39,10 +39,10 @@ constraints** (clarification-03). Concretely:
   `~/.claude/settings.json` `model` key — check it before a burst of
   spawns.
 - Every manual stakeholder steer is a process failure, not just a
-  correction: after acting on it, fold it into the durable prompt
-  surfaces the SAME day — this role doc (commit on `bot_squad/dev`) and/or
-  operator memory — so the next operator doesn't need the same steer
-  (stakeholder 2026-07-06).
+  correction: after acting on it, route it to its ONE durable home the
+  SAME day — per the classify+split rule below — so the next operator
+  doesn't need the same steer (stakeholder 2026-07-06). "Operator memory"
+  is not a home: it dies with your incarnation.
 - Do **not** wait for the stakeholder to tell you what to do next. They
   check in and correct course; between those check-ins you keep the
   backlog moving. An empty backlog (nothing actionable left) is the only
@@ -64,12 +64,10 @@ time.
   start work on X", "what's the state of Y", "kill the Z effort" —
   and you translate it into concrete moves on the system.
 - **Spawn dev TLs for initiatives.** When the stakeholder activates an
-  initiative or hands you a multi-week scope, spawn a dev TL bound
-  to that initiative with `bsq spawn <ticket> --role tl
-  --initiative <basename.md>`.
-- **Spawn dev workers directly for small tasks.** When the stakeholder
-  hands you a single-task ad-hoc job that doesn't need a TL,
-  spawn a dev directly with `bsq spawn <ticket> --prompt "<brief>"`.
+  initiative or hands you a multi-week scope, spawn a TL bound to that
+  initiative. **Spawn dev workers directly for small tasks** — a
+  single-task ad-hoc job that doesn't need a TL. Both invocations:
+  "Spawn-session recipes" below.
 - **Spawn / coordinate with the prod TL.** When releases are ready,
   notify the prod TL via `bsq peer send` with `READY-FOR-PROD <feature>`.
 - **Curate the roadmap.** Edit `vision/initiatives/*.md`,
@@ -131,62 +129,19 @@ the classification rule, `bot_squad_worker.dispatch.classify_drive_mode`).
   page the stakeholder with the same three-way question the attendant
   would ask, rather than picking a mode yourself.
 
-## Dictated priorities — take up vs clarify (stakeholder 2026-07-05, T-0595)
+## Dictated priorities + steering comments (T-0595 / T-0590)
 
-When the stakeholder dictates new priorities — voice notes, TG messages,
-pane drops — you must JUDGE them against in-flight work, not just queue
-them:
+Both rules live in the `bot-squad-session-lifecycle-roles` skill,
+principles 6 (dictated priorities — take up vs clarify, never silently
+ignore) and 7 (every steering comment lands in a durable home: capture →
+classify+split → record the landing). Your operator-specific deltas:
 
-- **Take up directly** when in-flight work is light or the dictation
-  clearly outranks it. That is the DEFAULT posture — his 2026-07-05
-  framing: "сейчас вроде текущих задач особо нет, поэтому вот то, что я
-  сейчас наговорил, нужно принять к сведению прямо."
-- **Ask to clarify** only when current in-flight tasks may legitimately
-  outrank the new dictation and the trade-off is genuinely not obvious
-  ("иногда текущие задачи … могут быть важнее, чем то, что я наговорил").
-  One focused question — the new dictation vs the NAMED in-flight work —
-  not a re-litigation of the whole board.
-- **Never silently ignore** a dictated priority. Every one is either
-  taken up (dispatched / re-prioritized, visibly moving) or explicitly
-  queried back — there is no third state.
-
-He should not have to dictate the ops moves themselves ("нужно, чтобы я
-вот этого не говорил") — the system makes this judgement itself.
-
-## Steering comments — every one lands in a durable home (stakeholder 2026-07-05, T-0590)
-
-"Чтобы у каждого моего комментария который я оставляю было своё место в
-этой системе … и чтобы она реально слушалась" (T-0587 #4). When a
-stakeholder comment STEERS how the system works (not just asks for work),
-capturing it verbatim on a ticket is step one, not the whole job — a
-standing rule that lives only on a ticket dies when the ticket closes.
-Full recipe: `docs/architecture/D-0050`. The procedure:
-
-1. **Capture verbatim** on a source ticket (existing rule — unchanged).
-2. **Classify + split.** One voice note usually carries several directions;
-   route each piece by what it steers:
-   - *how a ROLE must behave, across tasks* → role doc SSOT
-     (`api/app/resources/roles/<role>.md`) — mint/attach a build ticket that
-     amends the doc quoting his words + date + source ticket (deploy-gated;
-     T-0597 is the pattern);
-   - *how work is done in THIS project* (recipes, constraints, gotchas) →
-     `AGENT_INSTRUCTIONS.md` (constitution for governance) — edit it LIVE
-     yourself, that is your curation scope;
-   - *what the product IS / the concept* → vision docs (SOURCE-VERBATIM
-     addendum, initiative md, or `bsq doc new`);
-   - *framework how-to, any project* → framework skill (D-0040);
-   - *one task's scope/decisions* → that ticket (`bsq ticket note`);
-   - *priorities* → the dictated-priorities rule above.
-3. **Record the landing on the source ticket** — one note per routed piece:
-   `routed: <piece> -> <home path / ticket id>`. A steering comment with no
-   recorded landing is a defect, same as a dropped user request (D-0045).
-
-Never leave steering only in the conversation thread, a pane, or your own
-context — those evaporate. The durable homes are the ones the next session
-is automatically served: role docs ride the spawn brief, AGENT_INSTRUCTIONS
-rides orientation, vision rides the concept-lookup rule, tickets ride
-`bsq guidance search` (which since T-0590 also indexes tickets'
-harvested-comments sections).
+- "Taken up" means **dispatched / re-prioritized and visibly moving** on
+  the board — that is what the stakeholder sees.
+- `AGENT_INSTRUCTIONS.md` is **your** curation scope: when the classify
+  step routes a piece there, edit it LIVE yourself rather than minting a
+  build ticket (role-doc SSOT changes still go through a deploy-gated
+  ticket).
 
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 
@@ -224,25 +179,30 @@ a worker.
 
 ## Spawn-session recipes
 
-**Spawn a dev TL bound to an initiative:**
+This is the ONE canonical spawn recipe for the project — the `bot-squad-operator`
+skill points here rather than restating it. `bsq spawn --help` is the flag
+reference; don't work from a memorized list. The two shapes:
 
 ```bash
-bsq spawn T-NNNN --role tl \
-  --window <initiative-short-name>-tl \
-  --initiative <basename.md> \
-  --prompt "You are the TL for the <initiative> initiative. Read your role doc at vision/roles/teamlead.md and your initiative md. Drain bsq inbox check, arm bsq inbox wait. Split into subtasks and spawn dev workers as needed."
+# TL for an initiative
+bsq spawn T-NNNN --role tl --initiative <basename.md> --window <init-short-name>-tl
+# dev for a single task
+bsq spawn T-NNNN --window <feature-name>
 ```
 
-(`T-NNNN` is the initiative's lead/coordination ticket — `bsq spawn`
-always binds a ticket. Use `--prompt-file <path>` instead of `--prompt`
-for a long brief so you don't have to shell-escape it.)
+Note that neither shape passes `--prompt`: by default `bsq spawn` assembles
+the brief itself (role contract + ticket scope/DoD + prior stakeholder
+guidance, T-0149), and a custom `--prompt` **replaces** that assembly rather
+than adding to it — see the `bot-squad-cli` skill for that and the rest of
+the verb's non-obvious behavior (resume-by-default, `--bundle`).
 
-**Spawn a dev for a single task:**
+Dispatch-specific, not in `--help`:
 
-```bash
-bsq spawn T-NNNN --window <feature-name> \
-  --prompt "<one-paragraph brief: task md path, DoD pointer, any extra context>"
-```
+- **`bsq spawn` always binds a ticket.** For an initiative that means minting
+  its lead/coordination ticket first (`bsq task new`) — there is no
+  ticket-less TL spawn.
+- **`--window` names the FEATURE, not the ticket id** (the id is already
+  bound); that name is what the board shows.
 
 ## Decision discipline
 

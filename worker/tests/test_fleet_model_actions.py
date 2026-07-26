@@ -32,16 +32,25 @@ def test_fleet_model_set_preserves_other_keys_on_disk(_home):
     p.parent.mkdir(parents=True)
     p.write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
 
-    act_dispatch("fleet_model_set", {"model": "claude-fable-5"})
+    act_dispatch("fleet_model_set", {"model": "claude-opus-4-8"})
 
     data = json.loads(p.read_text())
-    assert data["model"] == "claude-fable-5"
+    assert data["model"] == "claude-opus-4-8"
     assert data["permissions"] == {"allow": ["Bash"]}
 
 
 def test_fleet_model_set_rejects_bad_model(_home):
     with pytest.raises(ActionError, match="not allowed"):
         act_dispatch("fleet_model_set", {"model": "gpt-5"})
+
+
+def test_fleet_model_set_rejects_gated_class(_home):
+    """T-0707: Fable 5 requires usage credits unavailable on this account —
+    fleet_model_set must reject it loudly, not persist a fleet default that
+    hangs every future spawn falling through to it."""
+    with pytest.raises(ActionError, match="usage credits"):
+        act_dispatch("fleet_model_set", {"model": "fable"})
+    assert act_dispatch("fleet_model_get", {}) == {"ok": True, "model": ""}
 
 
 def test_fleet_model_set_missing_required_param(_home):

@@ -2814,15 +2814,17 @@ def test_spawn_explicit_model_overrides_role_default(tmp_path, monkeypatch):
 
 
 def test_spawn_model_alias_passes_through_to_launch_command(tmp_path, monkeypatch):
-    """T-0704 (supersedes T-0694's expand-on-launch): `spawn(model="fable")`
+    """T-0704 (supersedes T-0694's expand-on-launch): `spawn(model="opus")`
     bakes the BARE class alias onto the assembled `claude --model` launch
-    command. The claude binary (v2.1.220+) resolves 'fable' to latest-in-class
+    command. The claude binary (v2.1.220+) resolves 'opus' to latest-in-class
     itself, so passing the alias through — rather than pinning a canonical id —
     keeps the launch from going stale on a new release. A genuinely bogus
-    value still errors loudly (see test_spawn_rejects_unrecognized_model_value)."""
-    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="fable")
-    assert "--model fable" in cmd
-    assert "--model claude-fable-5" not in cmd
+    value still errors loudly (see test_spawn_rejects_unrecognized_model_value);
+    an account-gated class (e.g. 'fable', T-0707) errors loudly too — see
+    test_spawn_rejects_unavailable_model_class."""
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="opus")
+    assert "--model opus" in cmd
+    assert "--model claude-opus-5" not in cmd
 
 
 def test_spawn_model_alias_sonnet_and_opus_passthrough(tmp_path, monkeypatch):
@@ -2933,6 +2935,36 @@ def test_spawn_rejects_unrecognized_model_value(tmp_path, monkeypatch):
 
     with pytest.raises(ActionError, match="model not allowed"):
         spawn(cfg, "test-project", "w", model="bogus-model-name")
+    assert not launched, "must reject before ever opening the tmux window"
+
+
+@pytest.mark.parametrize("model", ["fable", "claude-fable-5"])
+def test_spawn_rejects_unavailable_model_class(tmp_path, monkeypatch, model):
+    """T-0707: Fable 5 requires usage credits this account doesn't have —
+    a fresh/resumed spawn on it parks on Claude Code's own blocking
+    interactive gate and hangs (the incident that filed this ticket). spawn()
+    must reject it loudly at dispatch, before ever opening the tmux window,
+    same as a genuinely unrecognized value."""
+    from bot_squad_worker.actions import ActionError
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    launched = []
+
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        if "new-window" in args:
+            launched.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
+
+    with pytest.raises(ActionError, match="usage credits"):
+        spawn(cfg, "test-project", "w", model=model)
     assert not launched, "must reject before ever opening the tmux window"
 
 
@@ -3705,9 +3737,9 @@ def test_set_model_round_trip(tmp_path):
         "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
     })
 
-    res = set_model(cfg, "test-project", "S-alice-w-p2", "claude-fable-5")
-    assert res["ok"] and res["model"] == "claude-fable-5"
-    assert _read_session_metadata(md).get("model") == "claude-fable-5"
+    res = set_model(cfg, "test-project", "S-alice-w-p2", "claude-opus-4-8")
+    assert res["ok"] and res["model"] == "claude-opus-4-8"
+    assert _read_session_metadata(md).get("model") == "claude-opus-4-8"
 
     res = set_model(cfg, "test-project", "S-alice-w-p2", "")
     assert res["model"] == ""
@@ -3731,6 +3763,27 @@ def test_set_model_rejects_disallowed_model(tmp_path):
     from bot_squad_worker.actions import ActionError
     with pytest.raises(ActionError, match="not allowed"):
         set_model(cfg, "test-project", "S-alice-w-p2", "gpt-5")
+
+
+def test_set_model_rejects_unavailable_model_class(tmp_path):
+    """T-0707: bsq model set must reject an account-gated class (Fable 5's
+    usage-credits requirement) the same way spawn() does — one SSOT
+    (fleet_model.resolve_model), not a second bypassable copy of the check."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+
+    sessions_dir = cfg.data_dir / "test-project" / "sessions"
+    md = sessions_dir / "S-alice-w-p2.md"
+    _write_session_metadata(md, {
+        "sid": "S-alice-w-p2", "status": "active", "window": "w",
+        "cwd": str(repo), "claude_uuid": "u-1",
+    })
+
+    from bot_squad_worker.actions import ActionError
+    with pytest.raises(ActionError, match="usage credits"):
+        set_model(cfg, "test-project", "S-alice-w-p2", "fable")
+    assert "model" not in (_read_session_metadata(md) or {})
 
 
 def test_last_operator_model_returns_most_recent_stamped_value(tmp_path):
@@ -3794,10 +3847,10 @@ def test_spawn_stamps_explicit_model_onto_session_md(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
     monkeypatch.setattr(S.time, "sleep", lambda x: None)
 
-    spawn(cfg, "test-project", "w", model="claude-fable-5")
+    spawn(cfg, "test-project", "w", model="claude-opus-4-8")
 
     md = cfg.data_dir / "test-project" / "sessions" / "S-u-w-p9.md"
-    assert _read_session_metadata(md).get("model") == "claude-fable-5"
+    assert _read_session_metadata(md).get("model") == "claude-opus-4-8"
 
 
 def test_spawn_without_explicit_model_does_not_stamp_one(tmp_path, monkeypatch):

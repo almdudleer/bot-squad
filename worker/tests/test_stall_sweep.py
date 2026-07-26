@@ -77,6 +77,17 @@ def test_match_signature_none_for_empty_or_unrelated_text():
     assert SS._match_signature("Running tests, all green\n❯ ") is None
 
 
+def test_no_signature_ever_sends_the_billing_option():
+    """T-0707: option 1 on the fable5 gate is a BILLING action (set up usage
+    credits) — no auto-answer signature may ever send it. This guards every
+    CURRENT and FUTURE entry in SIGNATURES, not just the fable5 one, so a
+    later signature addition can't accidentally wire up a billing keypress."""
+    for sig in SS.SIGNATURES:
+        assert "1" not in sig.keys, (
+            f"{sig.name} sends '1' -- must never auto-trigger a billing action"
+        )
+
+
 def test_match_signature_swallows_a_raising_signature(monkeypatch):
     bad = SS.StallSignature(
         name="broken", match=lambda buf: (_ for _ in ()).throw(RuntimeError("boom")),

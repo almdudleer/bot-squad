@@ -3388,8 +3388,13 @@ def set_model(cfg: Any, slug: str, sid: str, model: str) -> dict:
     from bot_squad_worker.actions import ActionError
     from bot_squad_worker import fleet_model as _fleet_model
 
-    if model not in _fleet_model.ALLOWED_MODELS:
-        raise ActionError(f"set_model: model not allowed: {model!r}")
+    # T-0707: resolve_model also enforces the account-level availability
+    # gate (e.g. Fable 5's usage-credits requirement) — one SSOT with the
+    # spawn seam, not a second allowlist-only copy of it here.
+    try:
+        model = _fleet_model.resolve_model(model)
+    except ValueError as exc:
+        raise ActionError(f"set_model: {exc}") from exc
 
     project = cfg.projects.get(slug)
     if project is None:

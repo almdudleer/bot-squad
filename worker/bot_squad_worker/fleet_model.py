@@ -44,6 +44,64 @@ ALLOWED_MODELS = frozenset({
     "claude-opus-4-8", "claude-fable-5", "opus[1m]",  # explicit pins
 })
 
+# T-0707: which CLASS an explicit pinned id belongs to, for the
+# availability gate below. Bare aliases map to themselves via CLASS_ALIASES.
+_EXPLICIT_ID_CLASS = {
+    "claude-sonnet-5": "sonnet",
+    "claude-opus-5": "opus",
+    "claude-opus-4-8": "opus",
+    "opus[1m]": "opus",
+    "claude-fable-5": "fable",
+}
+
+# T-0707: account-level availability gate — ORTHOGONAL to ALLOWED_MODELS
+# (syntax: is this a recognized value) and CLASS_ALIASES (which classes
+# passthrough to latest-in-class). This is a FACT about the account's
+# billing state, not a version pin: this account has never purchased Fable
+# 5 usage credits, so a fresh/resumed spawn on that class parks on Claude
+# Code's own interactive "requires usage credits" gate and hangs until a
+# human answers it (observed live 2026-07-26, see stall_sweep.py). Gating
+# the CLASS (not a specific model id) means it doesn't regress T-0704's
+# staleness fix either way — lifting this gate once credits are purchased
+# is a one-line removal from this set, no id-pinning involved.
+UNAVAILABLE_CLASSES = frozenset({"fable"})
+
+# Display name for the error message only — purely cosmetic, falls back to
+# the bare class name for anything not listed.
+_CLASS_DISPLAY_NAME = {"fable": "Fable 5"}
+
+
+def _class_of(value: str) -> str:
+    """The model CLASS ``value`` belongs to (bare alias or explicit pin);
+    "" for blank/unrecognized values."""
+    if value in CLASS_ALIASES:
+        return value
+    return _EXPLICIT_ID_CLASS.get(value, "")
+
+
+def is_available(value: str) -> bool:
+    """False iff ``value`` names a model class gated by
+    :data:`UNAVAILABLE_CLASSES` (T-0707). Distinct from membership in
+    :data:`ALLOWED_MODELS`, which only checks syntax."""
+    cls = _class_of(value)
+    return not (cls and cls in UNAVAILABLE_CLASSES)
+
+
+def check_available(value: str) -> None:
+    """Raise ``ValueError`` if ``value``'s model class is account-gated
+    (T-0707). Called from both :func:`resolve_model` (the spawn seam) and
+    :func:`set_model` (the fleet-default seam) so neither choke point can
+    hand out a class known to hang on a blocking interactive prompt.
+    """
+    cls = _class_of(value)
+    if cls and cls in UNAVAILABLE_CLASSES:
+        name = _CLASS_DISPLAY_NAME.get(cls, cls)
+        raise ValueError(
+            f"{name} requires usage credits, unavailable on this account "
+            "-- spawn with a different --model (sonnet/opus), or set up "
+            "usage credits on claude.ai first"
+        )
+
 
 def resolve_model(value: str) -> str:
     """Validate a ``--model`` value; return it unchanged if allowed.
@@ -54,13 +112,16 @@ def resolve_model(value: str) -> str:
     alias (not a pinned id) keeps the choice from going stale on a new release
     (T-0704). "" (or whitespace-only) passes through as "" (no override).
     Anything else raises ``ValueError`` so garbage fails loudly here rather
-    than silently reaching the launch command (T-0694).
+    than silently reaching the launch command (T-0694). A syntactically
+    valid value whose CLASS is account-gated (T-0707, e.g. Fable 5's usage
+    credits) also raises ``ValueError`` — see :func:`check_available`.
     """
     v = (value or "").strip()
     if not v:
         return ""
     if v not in ALLOWED_MODELS:
         raise ValueError(f"model not allowed: {value!r}")
+    check_available(v)
     return v
 
 
@@ -84,10 +145,12 @@ def set_model(model: str) -> None:
 
     Atomic read-modify-write (unique tmp + ``os.replace``, T-0373 convention)
     that preserves every other key already in the file. Raises ``ValueError``
-    if ``model`` is not in ``ALLOWED_MODELS``.
+    if ``model`` is not in ``ALLOWED_MODELS`` or (T-0707) its class is
+    account-gated — routed through :func:`resolve_model`, the same
+    validation the spawn seam uses, so this isn't a second copy of either
+    check.
     """
-    if model not in ALLOWED_MODELS:
-        raise ValueError(f"model not allowed: {model!r}")
+    model = resolve_model(model)
 
     path = _settings_path()
     with task_lock(path):

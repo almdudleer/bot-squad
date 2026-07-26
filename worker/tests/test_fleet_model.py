@@ -95,7 +95,8 @@ def test_get_model_non_dict_json_returns_empty(_home):
     assert fleet_model.get_model() == ""
 
 
-@pytest.mark.parametrize("model", sorted(fleet_model.ALLOWED_MODELS))
+@pytest.mark.parametrize(
+    "model", sorted(m for m in fleet_model.ALLOWED_MODELS if fleet_model.is_available(m)))
 def test_all_allowed_models_accepted(_home, model):
     fleet_model.set_model(model)
     assert fleet_model.get_model() == model
@@ -109,16 +110,19 @@ def test_all_allowed_models_accepted(_home, model):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("alias", sorted(fleet_model.CLASS_ALIASES))
+@pytest.mark.parametrize(
+    "alias", sorted(a for a in fleet_model.CLASS_ALIASES if fleet_model.is_available(a)))
 def test_resolve_model_passes_class_alias_through_unchanged(alias):
     # T-0704: the bare alias must reach `claude --model` UNexpanded — claude
     # itself resolves it to latest-in-class. Expanding to a pinned id here is
-    # exactly the staleness bug this change removes.
+    # exactly the staleness bug this change removes. Gated classes (T-0707)
+    # are excluded here and covered by the dedicated gate tests below.
     assert fleet_model.resolve_model(alias) == alias
     assert alias in fleet_model.ALLOWED_MODELS
 
 
-@pytest.mark.parametrize("model", sorted(m for m in fleet_model.ALLOWED_MODELS if m))
+@pytest.mark.parametrize(
+    "model", sorted(m for m in fleet_model.ALLOWED_MODELS if m and fleet_model.is_available(m)))
 def test_resolve_model_passes_through_allowed_values(model):
     assert fleet_model.resolve_model(model) == model
 
@@ -131,3 +135,36 @@ def test_resolve_model_empty_string_passes_through():
 def test_resolve_model_rejects_unrecognized_value():
     with pytest.raises(ValueError, match="not allowed"):
         fleet_model.resolve_model("gpt-5")
+
+
+# ---------------------------------------------------------------------------
+# T-0707: account-level availability gate — Fable 5 requires usage credits
+# this account has never purchased, so a fable spawn/resume parks on Claude
+# Code's own blocking interactive gate and hangs (see stall_sweep.py). This
+# is orthogonal to ALLOWED_MODELS (syntax): resolve_model/set_model must
+# reject a *recognized* value whose CLASS is gated, not just an unrecognized
+# one.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["fable", "claude-fable-5"])
+def test_resolve_model_rejects_gated_class(value):
+    with pytest.raises(ValueError, match="usage credits"):
+        fleet_model.resolve_model(value)
+
+
+def test_set_model_rejects_gated_class(_home):
+    with pytest.raises(ValueError, match="usage credits"):
+        fleet_model.set_model("fable")
+    # No partial write on rejection.
+    assert not _settings_path(_home).exists()
+
+
+def test_is_available_false_only_for_gated_classes():
+    assert fleet_model.is_available("fable") is False
+    assert fleet_model.is_available("claude-fable-5") is False
+    assert fleet_model.is_available("sonnet") is True
+    assert fleet_model.is_available("opus") is True
+    assert fleet_model.is_available("claude-opus-4-8") is True
+    assert fleet_model.is_available("") is True  # no class -> nothing to gate
+    assert fleet_model.is_available("gpt-5") is True  # unrecognized -> no class either

@@ -2438,14 +2438,15 @@ def spawn(
     # honors it. A caller that omitted `model` gets no field here, so it
     # keeps following whatever the role/fleet default is at RESUME time,
     # rather than freezing today's fallback onto the session forever.
-    # T-0698 audit: stamp the RESOLVED `_model` (already canonicalized above
-    # via fleet_model.resolve_model, e.g. "sonnet" -> "claude-sonnet-5"), not
-    # the raw `model` argument. `resume()` reads this field straight onto
-    # `claude --model` with no resolution step of its own, so persisting an
-    # unresolved alias here would silently reproduce the exact T-0694 bug
-    # (claude ignores an unrecognized --model value and falls back to the
-    # account default with zero warning) the very first time this session
-    # resumes.
+    # T-0698 audit: stamp the `_model` value already validated above via
+    # fleet_model.resolve_model, not the raw `model` argument. `resume()`
+    # reads this field straight onto `claude --model` with no validation step
+    # of its own, so persisting an outright-bogus value would silently
+    # reproduce the exact T-0694 bug (claude ignores an unrecognized --model
+    # value and falls back to the account default with zero warning) the very
+    # first time this session resumes. T-0704: a class alias like "opus" is a
+    # deliberately UNexpanded passthrough here — `claude` resolves it to
+    # latest-in-class at resume time, which is the point (never goes stale).
     if (model or "").strip():
         seed_meta["model"] = _model
     # T-0157: stamp the spawning linux user so the SessionMd carries an
@@ -2791,12 +2792,15 @@ def _read_caps(config_dir: Path) -> dict:
 # T-0623: per-role default `claude --model` value, keyed by the same role
 # strings `_derive_role` returns (operator/prod-teamlead/qa/teamlead/dev/
 # user-conversation). Ships with ONE built-in default (user-conversation →
-# claude-sonnet-5, the stakeholder's explicit ask) so a fresh/legacy install without
+# Sonnet, the stakeholder's explicit ask) so a fresh/legacy install without
 # a [models] section in system_settings.toml still gets it; every other role
 # is unset (falls through to the spawn's explicit `model` or the per-
 # linux-user settings.json default). Deliberately no built-in default ever
 # names Fable — that model is only ever used via an explicit spawn `model`.
-_DEFAULT_MODEL_DEFAULTS: dict[str, str] = {"user-conversation": "claude-sonnet-5"}
+# T-0704: the value is the BARE class alias "sonnet" (not the pinned
+# claude-sonnet-5) so it auto-tracks latest-in-class and never goes stale —
+# fleet_model.resolve_model passes it through and `claude` resolves it.
+_DEFAULT_MODEL_DEFAULTS: dict[str, str] = {"user-conversation": "sonnet"}
 
 
 def _read_model_defaults(config_dir: Path) -> dict[str, str]:

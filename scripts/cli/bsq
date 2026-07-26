@@ -4386,7 +4386,7 @@ def build_parser() -> argparse.ArgumentParser:
     md_p = sub.add_parser("model", help="durable per-session claude --model override (T-0678)")
     md_sub = md_p.add_subparsers(dest="sub", required=True)
     mds = md_sub.add_parser("set", help="set this session's sticky model override")
-    mds.add_argument("model", help="model string, e.g. claude-fable-5, claude-opus-4-8")
+    mds.add_argument("model", help="model string: a class alias 'sonnet'/'opus'/'fable' (auto-tracks latest-in-class, T-0704) or a pinned id like 'claude-opus-5'/'claude-opus-4-8'")
     mds.add_argument("--sid", help="target SID (default: this session)")
     mds.set_defaults(func=cmd_model_set)
     mdc = md_sub.add_parser("clear", help="clear this session's model override (revert to fleet/role default)")

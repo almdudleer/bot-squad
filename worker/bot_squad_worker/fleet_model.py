@@ -19,43 +19,49 @@ from pathlib import Path
 from bot_squad_worker import sessions as _sessions
 from bot_squad_worker.mdlock import atomic_write, task_lock
 
-# "" clears the key (spawned claude falls back to its own built-in default).
-# claude-fable-5 is a valid fleet default value here, but T-0623 deliberately
-# never assigns it as a per-ROLE default — this is the explicit fleet-wide
-# opt-in that role defaults intentionally don't provide.
-ALLOWED_MODELS = frozenset({
-    "", "claude-sonnet-5", "claude-opus-4-8", "opus[1m]", "claude-fable-5",
-})
+# T-0704: the class aliases pass STRAIGHT THROUGH to ``claude`` unchanged.
+# ``claude`` (verified on CLI v2.1.220 via a live ``--model X --output-format
+# json`` probe reading ``modelUsage[..].canonicalModel``) resolves each to the
+# LATEST model in its class at BOTH consumption sites — the ``--model`` flag
+# AND the ``settings.json`` ``model``-key read: opus -> claude-opus-5, sonnet
+# -> claude-sonnet-5, fable -> claude-fable-5. Storing the BARE alias (rather
+# than pinning a canonical id, as T-0694 originally did) keeps the fleet/role
+# default auto-tracking latest-in-class so it never goes stale on a new
+# release — the exact failure where a pinned ``opus -> claude-opus-4-8`` map
+# silently missed Opus 5's 2026-07-24 launch. (T-0694's canonicalize-here step
+# was a workaround for claude's alias resolution silently failing back then;
+# that native resolution is now reliable, so the workaround is retired.)
+CLASS_ALIASES = frozenset({"sonnet", "opus", "fable"})
 
-# T-0694: the short names ``bsq spawn --model``'s own help text advertises
-# ("alias like 'sonnet'/'opus'/'fable', or a full name") but that nothing
-# ever actually translated to a canonical ALLOWED_MODELS entry — the raw
-# alias reached the ``claude --model <m>`` launch command, ``claude`` didn't
-# recognize it, and silently fell back to the account default with zero
-# error. One SSOT for the mapping; resolve_model is the single choke point
-# every caller (bsq spawn's CLI, sessions.spawn's role-default fallback)
-# routes through before the value reaches a launch command.
-MODEL_ALIASES = {
-    "sonnet": "claude-sonnet-5",
-    "opus": "claude-opus-4-8",
-    "fable": "claude-fable-5",
-}
+# "" clears the key (spawned claude falls back to its own built-in default).
+# The bare class aliases above are the staleness-proof choice. Explicit full
+# ids stay allowed for anyone who deliberately wants to PIN a specific version
+# (e.g. stay on claude-opus-4-8, or the 1M-context ``opus[1m]`` variant).
+ALLOWED_MODELS = frozenset({
+    "",
+    "sonnet", "opus", "fable",                       # passthrough -> latest
+    "claude-sonnet-5", "claude-opus-5",
+    "claude-opus-4-8", "claude-fable-5", "opus[1m]",  # explicit pins
+})
 
 
 def resolve_model(value: str) -> str:
-    """Canonicalize a ``--model`` value: alias -> canonical name; a name
-    already in :data:`ALLOWED_MODELS` passes through unchanged; "" (or
-    whitespace-only) passes through as "" (no override). Raises
-    ``ValueError`` for anything else — an unresolved value must fail loudly
-    here rather than silently reach the launch command (T-0694).
+    """Validate a ``--model`` value; return it unchanged if allowed.
+
+    A class alias (``sonnet``/``opus``/``fable``) or an explicit id in
+    :data:`ALLOWED_MODELS` passes through unchanged — ``claude`` itself
+    resolves a class alias to the latest-in-class model, so passing the BARE
+    alias (not a pinned id) keeps the choice from going stale on a new release
+    (T-0704). "" (or whitespace-only) passes through as "" (no override).
+    Anything else raises ``ValueError`` so garbage fails loudly here rather
+    than silently reaching the launch command (T-0694).
     """
     v = (value or "").strip()
     if not v:
         return ""
-    canonical = MODEL_ALIASES.get(v, v)
-    if canonical not in ALLOWED_MODELS:
+    if v not in ALLOWED_MODELS:
         raise ValueError(f"model not allowed: {value!r}")
-    return canonical
+    return v
 
 
 def _settings_path() -> Path:

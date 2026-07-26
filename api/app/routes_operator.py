@@ -41,8 +41,15 @@ router = APIRouter(
 # module docstring), so this is a literal mirror purely so a bad value gets a
 # real 400 here instead of surfacing as an opaque 502 from the worker socket.
 # The worker action is still the enforcing SSOT (re-validated worker-side).
+# T-0704: kept in lockstep with fleet_model.ALLOWED_MODELS — the bare class
+# aliases (sonnet/opus/fable) pass through to `claude`, which resolves each to
+# latest-in-class, so `bsq model set opus` never goes stale; explicit ids stay
+# allowed for deliberate pinning.
 _ALLOWED_MODELS = frozenset({
-    "", "claude-sonnet-5", "claude-opus-4-8", "opus[1m]", "claude-fable-5",
+    "",
+    "sonnet", "opus", "fable",
+    "claude-sonnet-5", "claude-opus-5",
+    "claude-opus-4-8", "claude-fable-5", "opus[1m]",
 })
 
 

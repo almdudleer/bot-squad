@@ -2795,12 +2795,14 @@ def test_spawn_without_model_omits_flag_for_dev_role(tmp_path, monkeypatch):
     assert "--model" not in cmd
 
 
-def test_spawn_user_conversation_window_gets_sonnet5_default(tmp_path, monkeypatch):
-    """T-0623: the user-conversation role's built-in default is claude-sonnet-5,
-    applied even when the caller passes no explicit model."""
+def test_spawn_user_conversation_window_gets_sonnet_default(tmp_path, monkeypatch):
+    """T-0623/T-0704: the user-conversation role's built-in default is the bare
+    class alias "sonnet" (applied even with no explicit model) — passed
+    through so claude resolves it to latest-in-class instead of pinning."""
     cmd = _spawn_and_capture_shell_cmd(
         tmp_path, monkeypatch, "gu_a1b2c3-user-conversation")
-    assert "--model claude-sonnet-5" in cmd
+    assert "--model sonnet" in cmd
+    assert "--model claude-sonnet-5" not in cmd
 
 
 def test_spawn_explicit_model_overrides_role_default(tmp_path, monkeypatch):
@@ -2811,37 +2813,38 @@ def test_spawn_explicit_model_overrides_role_default(tmp_path, monkeypatch):
     assert "claude-sonnet-5" not in cmd
 
 
-def test_spawn_model_alias_resolves_on_launch_command(tmp_path, monkeypatch):
-    """T-0694: `spawn(model="fable")` must bake the CANONICAL name onto the
-    assembled `claude --model` launch command, not the raw alias — a bare
-    'fable' on the actual command line is silently ignored by the claude
-    binary (falls back to the account default with zero error), which is
-    exactly the bug this regression test targets. Inspecting only the
-    stored session-md model field would NOT have caught the original bug
-    (the md said 'fable' correctly; only the launch command was wrong)."""
+def test_spawn_model_alias_passes_through_to_launch_command(tmp_path, monkeypatch):
+    """T-0704 (supersedes T-0694's expand-on-launch): `spawn(model="fable")`
+    bakes the BARE class alias onto the assembled `claude --model` launch
+    command. The claude binary (v2.1.220+) resolves 'fable' to latest-in-class
+    itself, so passing the alias through — rather than pinning a canonical id —
+    keeps the launch from going stale on a new release. A genuinely bogus
+    value still errors loudly (see test_spawn_rejects_unrecognized_model_value)."""
     cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="fable")
-    assert "--model claude-fable-5" in cmd
-    assert "--model fable" not in cmd
+    assert "--model fable" in cmd
+    assert "--model claude-fable-5" not in cmd
 
 
-def test_spawn_model_alias_sonnet_and_opus_resolve(tmp_path, monkeypatch):
+def test_spawn_model_alias_sonnet_and_opus_passthrough(tmp_path, monkeypatch):
+    # T-0704: a class alias reaches `claude --model` UNexpanded — claude
+    # resolves it to latest-in-class, so the launch stays staleness-proof.
     cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="sonnet")
-    assert "--model claude-sonnet-5" in cmd
+    assert "--model sonnet" in cmd
+    assert "--model claude-sonnet-5" not in cmd
 
     cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w2", model="opus")
-    assert "--model claude-opus-4-8" in cmd
+    assert "--model opus" in cmd
 
 
-def test_spawn_model_alias_persists_canonical_not_raw(tmp_path, monkeypatch):
-    """T-0698 audit: `spawn(model="sonnet")`'s OWN launch command resolves the
-    alias correctly (T-0694), but the session md must ALSO store the
-    canonical name, not the raw alias — `resume()` reads this field straight
-    onto `claude --model` with no resolution step of its own (see
-    `test_resume_of_alias_spawned_session_uses_canonical_model` below), so a
-    raw 'sonnet' surviving into the md would silently reproduce the exact
-    T-0694 bug (claude ignores an unrecognized --model value and falls back
-    to the account default with zero warning) the moment this session's
-    window recycles."""
+def test_spawn_model_alias_persists_bare_alias(tmp_path, monkeypatch):
+    """T-0704: `spawn(model="sonnet")` persists the BARE class alias on the
+    session md, NOT a pinned canonical id. `resume()` reads this field
+    straight onto `claude --model`, and claude resolves the alias to
+    latest-in-class natively (verified on CLI v2.1.220) — so persisting the
+    bare alias is what keeps the session auto-tracking latest and never going
+    stale. (This inverts the T-0698 assumption that a raw alias on the md
+    would silently break; that was true only while claude's native alias
+    resolution was unreliable, which it no longer is.)"""
     repo = tmp_path / "repo"
     repo.mkdir()
     cfg = _make_cfg(tmp_path, repo)
@@ -2862,17 +2865,16 @@ def test_spawn_model_alias_persists_canonical_not_raw(tmp_path, monkeypatch):
     res = spawn(cfg, "test-project", "w", model="sonnet")
     md_path = cfg.data_dir / "test-project" / "sessions" / f"{res['sid']}.md"
     meta = _read_session_metadata(md_path)
-    assert meta.get("model") == "claude-sonnet-5"
+    assert meta.get("model") == "sonnet"
 
 
-def test_resume_of_alias_spawned_session_uses_canonical_model(tmp_path, monkeypatch):
-    """T-0698 audit regression: before the fix, a session spawned with an
-    alias (`model="sonnet"`) stored the RAW alias on its md; resume() then
-    put that raw value straight onto `claude --model` with no resolution —
-    reproducing the exact silent-fallback bug T-0694 fixed for the initial
-    spawn, on every subsequent resume of that same session (the common case
-    for an idle-recycled dev/TL/attendant, unlike the operator role's
-    full-respawn path which re-enters spawn()'s own resolution)."""
+def test_resume_of_alias_spawned_session_passes_bare_alias(tmp_path, monkeypatch):
+    """T-0704: a session whose md carries a bare class alias (`model="sonnet"`)
+    resumes with that alias put straight onto `claude --model` — claude
+    resolves it to latest-in-class natively, so no expansion step is needed
+    or wanted (expanding would re-pin it and reintroduce staleness). This
+    supersedes the T-0698 regression which asserted the opposite back when
+    claude's native alias resolution was unreliable."""
     repo = tmp_path / "repo"
     repo.mkdir()
     cfg = _make_cfg(tmp_path, repo)
@@ -2881,7 +2883,7 @@ def test_resume_of_alias_spawned_session_uses_canonical_model(tmp_path, monkeypa
     _write_session_metadata(sessions_dir / "S-alice-w-p2.md", {
         "sid": "S-alice-w-p2", "status": "suspended", "window": "w",
         "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
-        "model": "claude-sonnet-5",  # what a fixed spawn() persists
+        "model": "sonnet",  # T-0704: spawn() persists the bare class alias
     })
 
     captured_shell_cmd = []
@@ -2903,8 +2905,8 @@ def test_resume_of_alias_spawned_session_uses_canonical_model(tmp_path, monkeypa
     resume(cfg, "test-project", "S-alice-w-p2")
 
     assert captured_shell_cmd
-    assert "--model claude-sonnet-5" in captured_shell_cmd[0]
-    assert "--model sonnet" not in captured_shell_cmd[0]
+    assert "--model sonnet" in captured_shell_cmd[0]
+    assert "--model claude-sonnet-5" not in captured_shell_cmd[0]
 
 
 def test_spawn_rejects_unrecognized_model_value(tmp_path, monkeypatch):
@@ -2937,7 +2939,8 @@ def test_spawn_rejects_unrecognized_model_value(tmp_path, monkeypatch):
 def test_read_model_defaults_missing_file_returns_builtin(tmp_path):
     from bot_squad_worker.sessions import _read_model_defaults
     defaults = _read_model_defaults(tmp_path / "no-such-config-dir")
-    assert defaults["user-conversation"] == "claude-sonnet-5"
+    # T-0704: built-in default is the bare "sonnet" alias (auto-tracks latest).
+    assert defaults["user-conversation"] == "sonnet"
 
 
 def test_read_model_defaults_toml_override(tmp_path):

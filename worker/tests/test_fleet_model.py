@@ -102,17 +102,24 @@ def test_all_allowed_models_accepted(_home, model):
 
 
 # ---------------------------------------------------------------------------
-# T-0694: resolve_model — alias -> canonical, single SSOT for spawn/set_model
+# T-0694 / T-0704: resolve_model — validate + passthrough, single SSOT for
+# spawn/set_model. T-0704 switched class aliases from pinned-id expansion to
+# bare passthrough (claude resolves them to latest-in-class), so they never
+# go stale on a new release.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("alias, canonical", sorted(fleet_model.MODEL_ALIASES.items()))
-def test_resolve_model_translates_alias_to_canonical(alias, canonical):
-    assert fleet_model.resolve_model(alias) == canonical
+@pytest.mark.parametrize("alias", sorted(fleet_model.CLASS_ALIASES))
+def test_resolve_model_passes_class_alias_through_unchanged(alias):
+    # T-0704: the bare alias must reach `claude --model` UNexpanded — claude
+    # itself resolves it to latest-in-class. Expanding to a pinned id here is
+    # exactly the staleness bug this change removes.
+    assert fleet_model.resolve_model(alias) == alias
+    assert alias in fleet_model.ALLOWED_MODELS
 
 
 @pytest.mark.parametrize("model", sorted(m for m in fleet_model.ALLOWED_MODELS if m))
-def test_resolve_model_passes_through_canonical_names(model):
+def test_resolve_model_passes_through_allowed_values(model):
     assert fleet_model.resolve_model(model) == model
 
 

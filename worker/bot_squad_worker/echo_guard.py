@@ -53,9 +53,10 @@ What it does NOT do
   independently of the append's author) — the stakeholder forwarded it FOR a
   reason. Only the attribution changes.
 * It does not add a fourth author class. Our own text becomes
-  ``system:bot-echo``; a forward of somebody ELSE's message stays
-  ``author="user"`` (a human did write it) and is merely annotated with
-  ``forwarded_from`` so a reader is not told the sender composed it.
+  ``system:bot-echo`` and another BOT's relayed output ``system:bot-relay``;
+  a forward of another HUMAN's message stays ``author="user"`` (a human did
+  write it) and is merely annotated with ``forwarded_from`` so a reader is not
+  told the sender composed it.
 * It never raises. A guard that can break inbound routing is a worse bug than
   a mislabelled line, so every entry point falls back to "the sender composed
   it" — the pre-T-0746 behaviour — on any failure.
@@ -73,6 +74,15 @@ ECHO_AUTHOR = "system:bot-echo"
 
 #: ``forwarded_from`` value for our own bot, on either rung.
 ECHO_ORIGIN = "bot"
+
+#: The author for a forward of ANOTHER bot's output. Not ``ECHO_AUTHOR`` — it
+#: is not our own text coming back — but emphatically not ``user`` either: a
+#: bot is not a human, and the "somebody else wrote it, so `user` is still
+#: true" rule below holds only for HUMAN origins. Found by re-scanning the
+#: live store on a class predicate (T-0746, operator p298's steer): watchrobot's
+#: own news alerts sit in topic 11 as ``author="user"``, full alert body plus
+#: its LLM analysis, not one word of which the stakeholder wrote.
+RELAY_AUTHOR = "system:bot-relay"
 
 #: How far back the delivery match looks. The spool keeps 14 days
 #: (``outbound_log.SPOOL_RETENTION_DAYS``); 7 covers any plausible "look at
@@ -149,6 +159,22 @@ def forward_provenance(msg: dict) -> str:
     if msg.get("forward_date"):
         return "hidden"
     return ""
+
+
+def forward_origin_is_bot(msg: dict) -> bool:
+    """True when the forwarded content was authored by a BOT (any bot).
+
+    Only the ``user``-origin encodings carry an ``is_bot`` flag to read: a
+    forward from a channel or a hidden sender says nothing about it, and
+    guessing is what this module refuses to do everywhere else.
+    """
+    origin = msg.get("forward_origin")
+    if isinstance(origin, dict) and str(origin.get("type") or "") == "user":
+        return bool((origin.get("sender_user") or {}).get("is_bot"))
+    frm = msg.get("forward_from")
+    if isinstance(frm, dict):
+        return bool(frm.get("is_bot"))
+    return False
 
 
 def is_own_bot_forward(msg: dict, cfg: Any) -> bool:
@@ -247,11 +273,17 @@ def classify_inbound(cfg: Any, msg: dict, *, chat_id: Any = None) -> dict:
                        reason="outbound-match")
             return out
         if provenance:
-            # Somebody ELSE's message, relayed by the sender. A human did write
-            # it, so `user` stays correct — but the record must not imply the
-            # sender composed it.
+            # Somebody ELSE's message, relayed by the sender.
             out["forwarded_from"] = provenance
-            out["reason"] = "forwarded"
+            if forward_origin_is_bot(msg):
+                # A BOT wrote it. Not our echo, but not a human either — and
+                # `user` means "a HUMAN wrote this content", full stop.
+                out["author"] = RELAY_AUTHOR
+                out["reason"] = "forwarded-bot"
+            else:
+                # A human did write it, so `user` stays correct — the record
+                # just must not imply the SENDER composed it.
+                out["reason"] = "forwarded"
         return out
     except Exception:  # noqa: BLE001 — never break inbound routing over a label
         log.exception("echo_guard: classify_inbound failed; treating as user-authored")

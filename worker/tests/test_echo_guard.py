@@ -250,3 +250,61 @@ def test_echo_author_obeys_the_t0755_vocabulary():
     from bot_squad_worker import outbound_log
     assert outbound_log.is_valid_author(EG.ECHO_AUTHOR)
     assert outbound_log.author_class(EG.ECHO_AUTHOR) == "system"
+
+
+# ---------------------------------------------------------------------------
+# T-0746 (re-scan): a forward from ANOTHER bot. Found by re-running the store
+# scan on a CLASS predicate instead of the ❌ notice's shape — watchrobot's own
+# news alerts sit in topic 11 as author="user", full alert body plus its LLM
+# analysis, not one word of it his.
+# ---------------------------------------------------------------------------
+
+WR_ALERT = ("🟠 Важная новость\n\nРастут ожидания повышения ставки ФРС перед "
+            "заседанием 29 июля\n\n📰 MarketTwits (Telegram) · 27.07.2026 09:54 МСК")
+
+
+def test_a_third_party_bots_forward_is_not_user_authored(tmp_path):
+    cfg = _cfg(tmp_path)
+    msg = _msg(WR_ALERT, forward_origin={
+        "type": "user", "date": 1,
+        "sender_user": {"id": 5551212, "is_bot": True, "username": "watchrobot_bot"}})
+    v = EG.classify_inbound(cfg, msg)
+    assert v["author"] == EG.RELAY_AUTHOR
+    assert v["forwarded_from"] == "user:5551212"
+    assert v["reason"] == "forwarded-bot"
+
+
+def test_our_own_bot_still_wins_over_the_generic_bot_rule(tmp_path):
+    """Rung 1 is checked first, so OUR text is `bot-echo`, not `bot-relay` —
+    the incident's own case must stay distinguishable from a relayed alert."""
+    cfg = _cfg(tmp_path)
+    msg = _msg(NOTICE, forward_origin={
+        "type": "user", "date": 1, "sender_user": {"id": int(BOT_ID), "is_bot": True}})
+    assert EG.classify_inbound(cfg, msg)["author"] == EG.ECHO_AUTHOR
+
+
+def test_a_humans_forward_is_still_user_authored(tmp_path):
+    """The rule turns on is_bot, not on "was forwarded" — a human's words
+    relayed by another human are still a human's words."""
+    cfg = _cfg(tmp_path)
+    msg = _msg("глянь что пишут", forward_origin={
+        "type": "user", "date": 1, "sender_user": {"id": 999, "is_bot": False}})
+    v = EG.classify_inbound(cfg, msg)
+    assert v["author"] == "user" and v["forwarded_from"] == "user:999"
+
+
+def test_forward_origin_is_bot_only_reads_what_tg_actually_states(tmp_path):
+    """A channel post or a hidden sender says nothing about bot-ness, and
+    guessing there is what this module refuses to do everywhere else."""
+    assert EG.forward_origin_is_bot(_msg("x", forward_origin={
+        "type": "hidden_user", "date": 1, "sender_user_name": "Someone"})) is False
+    assert EG.forward_origin_is_bot(_msg("x", forward_origin={
+        "type": "channel", "date": 1, "chat": {"id": -7}, "message_id": 3})) is False
+    assert EG.forward_origin_is_bot(_msg("x", forward_from={"id": 7, "is_bot": True})) is True
+    assert EG.forward_origin_is_bot(_msg("x")) is False
+
+
+def test_relay_author_obeys_the_closed_vocabulary():
+    from bot_squad_worker import outbound_log
+    assert outbound_log.is_valid_author(EG.RELAY_AUTHOR)
+    assert outbound_log.author_class(EG.RELAY_AUTHOR) == "system"

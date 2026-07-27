@@ -1435,14 +1435,39 @@ def _record_voice_rejection(cfg, chat_slug: str, gid: str, msg: dict, reason: st
     file_id makes late recovery from TG possible at all. Without this the
     thread is blind to the refusal (the 2026-07-05 376s incident: 6 minutes of
     stakeholder direction gone with only a TG error toast). Best-effort, same
-    as append_conversation itself."""
-    marker = dict(msg)
+    as append_conversation itself.
+
+    T-0746 item (c), found by re-scanning the store on a CLASS predicate rather
+    than the ❌ notice's shape (operator p298's steer): this text is entirely
+    OURS — a diagnostic ABOUT a message, not a message — and it was being
+    written with ``author="user"``, so the live thread holds
+    ``{"author": "user", "text": "[голосовое 1540 сек НЕ обработано: too_long
+    …]"}`` from 2026-07-05. Same lie as the ❌ line, different producer, and
+    unlike that one it is a code path that would have kept emitting them.
+    ``system:voice-rejected`` with ``direction="in"`` (T-0755 derives
+    ``system:`` as outbound; this one is our note about something that reached
+    us and was never sent anywhere).
+
+    The attendant WAKE is now explicit. It used to ride on the append being
+    ``author="user"`` — the endpoint auto-wakes only for that author — so
+    simply correcting the attribution would have silently un-done T-0586's
+    entire point (the attendant seeing the drop). The voice ATTACHMENT is
+    preserved for the same reason it was added: the ``file_id`` is what makes
+    late recovery from TG possible at all."""
     dur = int(out.get("duration") or (msg.get("voice") or {}).get("duration") or 0)
-    marker["text"] = (
-        f"[голосовое {dur} сек НЕ обработано: {reason} — содержимое не транскрибировано]"
-    )
     por = get_current_project(cfg, gid) or chat_slug
-    append_conversation(cfg, por, gid, marker)
+    message_ref = _msg_ts(msg)
+    _post_conversation(cfg, por, gid, {
+        "author": "system:voice-rejected",
+        "text": (
+            f"[голосовое {dur} сек НЕ обработано: {reason} — "
+            f"содержимое не транскрибировано]"
+        ),
+        "attachments": _msg_attachments(msg),
+        "timestamp": message_ref,
+        "direction": "in",
+    })
+    _ensure_user_conversation(cfg, por, gid, message_ref)
 
 
 def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:

@@ -2761,11 +2761,15 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
     monkeypatch.setattr(TL, "_notify",
                         lambda c, chat, text, **k: notified.append(text))
     routed = []
-    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: routed.append(1))
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: routed.append((slug, gid)))
+    unquoted = []
+    monkeypatch.setattr(TL, "_handle_unquoted",
+                        lambda *a, **k: unquoted.append(1) or {"ok": True})
     recorded = []
     monkeypatch.setattr(
-        TL, "append_conversation",
-        lambda c, slug, gid, msg: recorded.append((slug, gid, msg.get("text"), msg.get("voice"))) or True)
+        TL, "_post_conversation",
+        lambda c, slug, gid, payload: recorded.append((slug, gid, payload)) or True)
 
     update = {"update_id": 1, "message": _voice_msg()}
     result = TL.handle_update(cfg, update)
@@ -2774,13 +2778,22 @@ def test_handle_update_private_voice_transcription_failure_notifies(tmp_path, mo
     assert result["action"] == "voice_private_failed"
     assert result["reason"] == "download_failed"
     assert notified and "скачать" in notified[0]  # honest cause, not a generic decode error
-    assert routed == []
+    # Nothing is ROUTED — there is no transcript to route.
+    assert unquoted == []
+    # T-0746: the attendant wake is now EXPLICIT. It always happened; it just
+    # used to be a server-side side effect of the marker being author="user",
+    # so asserting `_ensure_user_conversation` was never called conflated "no
+    # transcript routed" with "attendant not told". Correcting the attribution
+    # (system:voice-rejected) removes the implicit wake, so T-0586's actual
+    # property — the attendant SEES the drop — has to be asserted directly.
+    assert routed == [("test-project", "gu_1")]
     # T-0586 no-drop: the refusal itself is recorded — marker text + attachment.
     assert len(recorded) == 1
-    slug, gid, text, voice = recorded[0]
+    slug, gid, payload = recorded[0]
     assert (slug, gid) == ("test-project", "gu_1")
-    assert "НЕ обработано" in text and "download_failed" in text
-    assert voice["file_id"] == "VID"
+    assert "НЕ обработано" in payload["text"] and "download_failed" in payload["text"]
+    assert payload["author"] == "system:voice-rejected"
+    assert payload["attachments"] == [{"type": "voice", "file_id": "VID"}]
 
 
 def test_handle_update_private_voice_too_big_honest_no_retry_lie(tmp_path, monkeypatch):
@@ -2798,10 +2811,16 @@ def test_handle_update_private_voice_too_big_honest_no_retry_lie(tmp_path, monke
     notified = []
     monkeypatch.setattr(TL, "_notify",
                         lambda c, chat, text, **k: notified.append(text))
+    # T-0746: the refusal marker is SYSTEM text about an inbound message, so it
+    # is written through _post_conversation as system:voice-rejected rather
+    # than as the stakeholder's own words. It used to ride on author="user".
     recorded = []
     monkeypatch.setattr(
-        TL, "append_conversation",
-        lambda c, slug, gid, msg: recorded.append((msg.get("text"), msg.get("voice"))) or True)
+        TL, "_post_conversation",
+        lambda c, slug, gid, payload: recorded.append(payload) or True)
+    woken = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: woken.append((slug, gid)) or {"ok": True})
 
     result = TL.handle_update(cfg, {"update_id": 1, "message": _voice_msg()})
 
@@ -2809,8 +2828,12 @@ def test_handle_update_private_voice_too_big_honest_no_retry_lie(tmp_path, monke
     (text_sent,) = notified
     assert "20МБ" in text_sent and "25:40" in text_sent
     assert "НЕ поможет" in text_sent  # resending is explicitly called out as futile
-    (marker_text, marker_voice) = recorded[0]
-    assert "too_big" in marker_text and marker_voice["file_id"] == "VID"
+    marker = recorded[0]
+    assert marker["author"] == "system:voice-rejected"
+    marker_text = marker["text"]
+    assert "too_big" in marker_text
+    assert marker["attachments"] == [{"type": "voice", "file_id": "VID"}]
+    assert woken == [("test-project", "gu_1")]
 
 
 def test_private_voice_long_transcript_echo_is_chunked(tmp_path, monkeypatch):
@@ -2995,10 +3018,16 @@ def test_handle_update_private_voice_too_long_names_cap_and_records(tmp_path, mo
     notified = []
     monkeypatch.setattr(TL, "_notify",
                         lambda c, chat, text, **k: notified.append(text))
+    # T-0746: the refusal marker is SYSTEM text about an inbound message, so it
+    # is written through _post_conversation as system:voice-rejected rather
+    # than as the stakeholder's own words. It used to ride on author="user".
     recorded = []
     monkeypatch.setattr(
-        TL, "append_conversation",
-        lambda c, slug, gid, msg: recorded.append((msg.get("text"), msg.get("voice"))) or True)
+        TL, "_post_conversation",
+        lambda c, slug, gid, payload: recorded.append(payload) or True)
+    woken = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: woken.append((slug, gid)) or {"ok": True})
 
     update = {"update_id": 1, "message": _voice_msg()}
     result = TL.handle_update(cfg, update)
@@ -3008,9 +3037,15 @@ def test_handle_update_private_voice_too_long_names_cap_and_records(tmp_path, mo
     assert "6:16" in text_sent  # the note's actual duration
     assert "5 мин" in text_sent  # the cap (default 300s), so the user knows the rule
     assert "попробуйте ещё раз" not in text_sent  # the old lie
-    (marker_text, marker_voice) = recorded[0]
-    assert "too_long" in marker_text and "376" in marker_text
-    assert marker_voice["file_id"] == "VID"
+    marker = recorded[0]
+    assert "too_long" in marker["text"] and "376" in marker["text"]
+    # The file_id is what makes late recovery from TG possible at all (T-0586).
+    assert marker["attachments"] == [{"type": "voice", "file_id": "VID"}]
+    assert marker["author"] == "system:voice-rejected"
+    assert marker["direction"] == "in"     # our note ABOUT something inbound
+    # T-0746: the wake used to be a side effect of author="user"; correcting the
+    # attribution without this would have silently undone T-0586's whole point.
+    assert woken == [("test-project", "gu_1")]
 
 
 def test_handle_update_group_voice_still_uses_feedback_path(tmp_path, monkeypatch):

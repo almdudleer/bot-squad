@@ -707,6 +707,36 @@ def task_lifecycle_tick(cfg: Config) -> None:
         log.exception("task_lifecycle_tick error")
 
 
+def outbound_drain_tick(cfg: Config) -> None:
+    """T-0755: mirror delivered outbound messages into the conversation store.
+
+    The transports write every send to a local spool the instant it lands (no
+    network on the send path — that path must not slow down, and a logging
+    failure must never break a delivery). This tick is the second half: it
+    appends those records into ``conversations/<slug>/<gid>[/tN].jsonl`` through
+    the API's token-gated append, so the file a human actually opens shows both
+    halves of the dialogue instead of reading like an inbox.
+
+    Cadence is 30s because the cost of lag here is an operator reading a
+    *recent* window and seeing a gap that is only a drain delay — the exact
+    false conclusion this ticket exists to prevent, in miniature. Idempotent
+    (a line-cursor, never a re-read), self-bounded (``DRAIN_BATCH``), and
+    non-raising; a stuck drain is loud in the log and in
+    ``outbound_log.spool_health``, never silent.
+    """
+    from bot_squad_worker import outbound_log as _ob
+
+    try:
+        out = _ob.drain(cfg)
+        if out.get("failed") or out.get("drops", {}).get("record"):
+            log.warning("outbound_drain_tick: %s", out)
+        elif out.get("mirrored"):
+            log.info("outbound_drain_tick: mirrored %d outbound record(s)",
+                     out["mirrored"])
+    except Exception:
+        log.exception("outbound_drain_tick error")
+
+
 def autopilot_tick(cfg: Config) -> None:
     """T-0153: per-project autopilot watchdog pass.
 

@@ -236,7 +236,14 @@ async def _relay_to_telegram(
     if not chat_id:
         return False
     client = request.app.state.worker_router.coordinator()
-    params: dict = {"chat_id": chat_id, "message": text, "urgent": True, "debounce": False}
+    params: dict = {
+        "chat_id": chat_id, "message": text, "urgent": True, "debounce": False,
+        # T-0755: the append that triggered this relay ALREADY put this exact
+        # text in this exact thread (that is what a session writeback is), so
+        # letting the transport record it too would show the reader the same
+        # message twice. The delivery is unaffected — only the second record is.
+        "record_outbound": False,
+    }
     if topic_id is not None:
         params["topic_id"] = topic_id
     try:
@@ -299,8 +306,15 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     this ONE append, and gets the same attendant-wake behavior (see
     ``_ensure_attendant``) rather than TG being special-cased.
 
-    Body: ``{author, text, attachments?, timestamp?, channel?, fyi?}`` (``text``
-    required — empty string is allowed, but the key must be present).
+    Body: ``{author, text, attachments?, timestamp?, channel?, fyi?,
+    direction?}`` (``text`` required — empty string is allowed, but the key
+    must be present). ``direction`` (T-0755) is ``"out"`` for a record of a
+    message WE already delivered — written by the worker's ``outbound_log``
+    drain so this file reads as a true interleaved transcript rather than an
+    inbox — and ``"in"`` (default, and the meaning of every pre-T-0755 record)
+    otherwise. An ``"out"`` append is never relayed (see below) and never wakes
+    an attendant. ``author`` must obey the closed T-0755 vocabulary
+    (``user`` | ``session:<sid>`` | ``system:<kind>``); anything else is a 400.
     ``channel`` (T-0631) names the inbound transport ("tg", "mcp", "api", ...);
     defaults to "tg" for back-compat with pre-T-0631 callers. ``fyi`` (T-0660)
     marks a PASSIVE, non-actionable append — a session wrote directly to the
@@ -339,6 +353,8 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     fyi = bool(payload.get("fyi", False))
     thread_id = payload.get("thread_id")
     general_feed = bool(payload.get("general_feed", False))
+    direction = payload.get("direction")
+    delivered = bool(payload.get("delivered", False))
     try:
         record = CS.append(
             _data_dir(request),
@@ -352,21 +368,37 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             fyi=fyi,
             thread_id=thread_id,
             general_feed=general_feed,
+            direction=direction,
+            delivered=delivered,
         )
     except ValueError as e:
-        # An unsafe slug / global_user_id segment.
+        # An unsafe slug / global_user_id segment, an author outside the
+        # T-0755 vocabulary, or an unknown direction.
         raise HTTPException(status_code=400, detail=str(e))
 
     relayed = False
     author = str(record.get("author") or "")
     text = str(record.get("text") or "")
-    if author.startswith("session:") and text and not fyi:
+    # T-0755: `delivered` is what makes recording an outbound send safe here.
+    # This endpoint RELAYS a session-authored append to Telegram; a delivered
+    # record is one the transport ALREADY put on the wire, so relaying it would
+    # send the stakeholder a second copy — and since the relay goes back out
+    # through the very transport that writes these records, it would not stop at
+    # two. Note this is NOT the same question as `direction`: a session
+    # writeback is outbound AND still needs delivering.
+    if author.startswith("session:") and text and not fyi and not delivered:
         try:
             relayed = await _relay_to_telegram(request, slug, global_user_id, text, thread_id)
         except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
             relayed = False
 
     out = dict(record)
+    # T-0755: the RESPONSE always states the effective direction, even when the
+    # stored line omits it as derivable. A GET already normalizes it on read, so
+    # a POST that didn't would make the two surfaces disagree and push the
+    # derivation rule onto every HTTP consumer.
+    out.setdefault("direction", CS.default_direction(author))
+    out.setdefault("delivered", False)
     out["relayed"] = relayed
     if author == "user":
         if fyi:

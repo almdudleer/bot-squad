@@ -942,3 +942,80 @@ def test_worker_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     r = client.get(CONV, params={"q": "deploy"}, headers=_worker_auth())
     assert r.status_code == 200, r.text
     assert [m["text"] for m in r.json()["messages"]] == ["deploy now", "DEPLOY tomorrow"]
+
+
+# ---------------------------------------------------------------------------
+# T-0755: recording an outbound send in this store must not RE-SEND it.
+# The endpoint relays a session-authored append to Telegram; the outbound log's
+# drain writes session-authored records of messages ALREADY on the wire. Without
+# a gate the stakeholder gets every reply twice — and because the relay goes back
+# out through the very transport that writes these records, it would not stop at
+# two.
+# ---------------------------------------------------------------------------
+
+
+def test_delivered_session_append_is_recorded_but_never_relayed(tmp_bot_squad: Path, monkeypatch):
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV,
+        json={"author": "session:S-x-p1", "text": "already sent",
+              "direction": "out", "delivered": True},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["relayed"] is False
+    assert body["delivered"] is True
+    assert body["direction"] == "out"
+    assert calls == []  # nothing was sent a second time
+    # ...and it IS durably recorded — that is the whole point.
+    got = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    assert [m["text"] for m in got["messages"]] == ["already sent"]
+
+
+def test_an_undelivered_session_append_still_relays(tmp_bot_squad: Path, monkeypatch):
+    """The gate is `delivered`, NOT `direction`: a session writeback is outbound
+    AND still needs delivering. Conflating the two would silence every reply."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "direction": "out"},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][0] == "tg_notify"
+
+
+def test_the_relay_asks_the_transport_not_to_double_record(tmp_bot_squad: Path, monkeypatch):
+    """The append that triggers the relay already put this text in this thread,
+    so the transport must not add a second near-identical line."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    client.post(CONV, json={"author": "session:S-x-p1", "text": "answer"},
+                headers=_worker_auth())
+    assert calls[0][1]["record_outbound"] is False
+
+
+def test_append_refuses_an_author_outside_the_vocabulary(tmp_bot_squad: Path, monkeypatch):
+    """T-0746 needs `author` to be trustworthy, so an invented class is a 400
+    at the one write path rather than a line nobody can classify later."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.post(CONV, json={"author": "bot:whoever", "text": "x"},
+                    headers=_worker_auth())
+    assert r.status_code == 400
+    assert "vocabulary" in r.json()["detail"]
+
+
+def test_append_refuses_to_write_as_the_stakeholder(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    r = client.post(CONV, json={"author": "user", "text": "x", "direction": "out"},
+                    headers=_worker_auth())
+    assert r.status_code == 400

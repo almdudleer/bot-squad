@@ -40,6 +40,28 @@ land, T-0490). Additive + back-compat: a record written before T-0631 has no
 pre-T-0631 record is TG-origin) so old threads don't silently look
 channel-less.
 
+``direction`` (T-0755): ``"in"`` (it reached us) or ``"out"`` (we sent it).
+Orthogonal to ``author`` and genuinely independent of it — a ``system:`` line
+can be either — which is why one field could not carry both. Before T-0755 the
+transports recorded outbound sends nowhere (only ``tg_reply_map``'s
+content-less ``message_id -> sid`` pin), so a reader of this file saw a run of
+``author=user`` lines and read it as SILENCE; on 2026-07-27 an operator did
+exactly that and escalated a three-hour non-response that had not happened.
+Additive + back-compat: absent on disk reads back as ``"in"``, which is the
+true direction of every record written before this change (all of them were
+inbound TG messages or lifecycle notices ABOUT something already delivered).
+
+``author`` vocabulary (T-0755 fixed it; T-0746 consumes it). Exactly three
+classes, validated on write so a writer cannot invent a fourth:
+``user`` (a HUMAN wrote this content — no detail segment, because a qualified
+human is not a thing this store represents), ``session:<sid>`` (an agent
+session authored it), ``system:<kind>`` (the system composed it — e.g.
+``system:task-lifecycle``). Validation is deliberately shape-only: it cannot
+tell that a SYSTEM diagnostic arriving as inbound TG text was mislabelled
+``user`` (the live ``"❌ session … not active — message dropped"`` line), because
+that writer believes it is recording human text. Fixing THAT is the delivery
+half, T-0746 item (c).
+
 ``fyi`` (T-0660): a PASSIVE, non-actionable append — a session wrote directly
 to the stakeholder, or the stakeholder replied directly to a session,
 bypassing this thread's own attendant. Recorded here for context but must
@@ -82,6 +104,60 @@ def _safe_segment(value: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# T-0755: the closed author vocabulary (see module docstring). Mirrored by
+# ``bot_squad_worker.outbound_log.is_valid_author`` — the worker composes
+# authors and the API stores them, so the two must agree; ``AUTHOR_CLASSES``
+# is asserted identical by an agreement test on both sides.
+AUTHOR_CLASSES = ("user", "session", "system")
+
+#: Records we sent, vs records that reached us.
+DIRECTIONS = ("in", "out")
+
+
+def default_direction(author: str) -> str:
+    """The direction implied by ``author`` when a record doesn't state one.
+
+    Used on WRITE (a caller that doesn't pass ``direction``) and on READ (every
+    record written before T-0755, none of which carries the field). Deriving it
+    rather than defaulting everything to ``"in"`` is what retro-classifies the
+    existing history CORRECTLY with no migration: the 233 ``session:``-authored
+    and 198 ``system:``-authored records already on disk are all things we sent,
+    and rewriting the stakeholder's own file to say so would be exactly the kind
+    of silent edit this ticket exists to prevent.
+
+    ``user`` is the only class that is inbound by definition — a human wrote it,
+    and we never write as him (:func:`append` refuses that combination).
+    ``system:`` is outbound by default because every system record in this store
+    is a notice we DELIVERED (lifecycle notices, dropped-message diagnostics); an
+    inbound system record is possible in principle and must say ``direction="in"``
+    explicitly.
+    """
+    return "in" if author_class(author) == "user" else "out"
+
+
+def is_valid_author(author: str) -> bool:
+    """True when ``author`` obeys the T-0755 convention.
+
+    ``user`` takes no detail segment; ``session``/``system`` require one. A
+    bare ``"session"`` or an invented class is rejected — the point of a closed
+    vocabulary is that a reader can trust ``author`` to answer "did a human say
+    this?" without inspecting the text.
+    """
+    a = str(author or "").strip()
+    if a == "user":
+        return True
+    cls, sep, detail = a.partition(":")
+    return bool(sep) and cls in ("session", "system") and bool(detail.strip())
+
+
+def author_class(author: str) -> str:
+    """The class half of ``author``, or ``""`` when it breaks the convention."""
+    a = str(author or "").strip()
+    if a == "user":
+        return "user"
+    return a.partition(":")[0] if is_valid_author(a) else ""
 
 
 def conversations_root(data_dir: Path) -> Path:
@@ -127,6 +203,8 @@ def append(
     fyi: bool = False,
     thread_id: Any = None,
     general_feed: bool = False,
+    direction: str | None = None,
+    delivered: bool = False,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
@@ -140,6 +218,16 @@ def append(
     topic's thread from the rest of the (slug, global_user_id) history — see
     :func:`conv_path`; omitted from the stored record when ``None``.
 
+    ``direction`` (T-0755): ``"out"`` for something WE sent, ``"in"`` for
+    something that reached us; defaults from ``author`` (see
+    :func:`default_direction`) and is stored only when it overrides that.
+    ``delivered`` (T-0755) marks a record of a message that is ALREADY on the
+    wire, which is what stops the append endpoint from relaying it again.
+    Raises ``ValueError`` on an unknown direction, on an ``author`` outside the
+    closed vocabulary, or on ``author="user"`` with ``direction="out"`` — this
+    is the one write path into the store, so rejecting here is what makes the
+    vocabulary a guarantee rather than a convention.
+
     ``general_feed`` (T-0693 Finding B): ``thread_id=None`` is overloaded — a
     genuine DM/non-topic message and an explicit ``tg_bindings`` General-feed
     binding (bound ON PURPOSE with no thread) both land in the SAME bare
@@ -147,14 +235,42 @@ def append(
     so the two are distinguishable on read instead of silently identical;
     omitted from the stored record when ``False`` (every pre-T-0693 caller).
     """
+    author = str(author)
+    if not is_valid_author(author):
+        raise ValueError(
+            f"author {author!r} is outside the T-0755 vocabulary "
+            f"({'|'.join(AUTHOR_CLASSES)}; 'user' bare, the others '<class>:<detail>')")
+    dirn = str(direction or default_direction(author))
+    if dirn not in DIRECTIONS:
+        raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
+    if dirn == "out" and author == "user":
+        # We never send AS the stakeholder. `author="user"` means a human wrote
+        # this content, so an outbound one would be us putting words in his
+        # mouth in the very record used to audit what was said.
+        raise ValueError("author='user' cannot be direction='out'")
     record = {
         "timestamp": timestamp or _now_iso(),
-        "author": str(author),
+        "author": author,
         "text": "" if text is None else str(text),
         "attachments": list(attachments) if attachments else [],
         "channel": str(channel) if channel else "tg",
         "fyi": bool(fyi),
     }
+    # Omitted whenever the author already implies it — which is every record
+    # written today — so a new line stays BYTE-IDENTICAL to its pre-T-0755
+    # shape. Written only when a caller OVERRIDES the derivation (an inbound
+    # system diagnostic), which is the one case a reader could not infer.
+    if dirn != default_direction(author):
+        record["direction"] = dirn
+    if delivered:
+        # T-0755: this record is of a message ALREADY on the wire (the outbound
+        # log's drain, task_chat's post-send notice) — as opposed to a session
+        # writeback, which is a message to BE delivered and which this store's
+        # append endpoint relays. Without the distinction, recording a delivered
+        # send would make the endpoint deliver it a second time, and the relay
+        # goes back out through the transport that writes these records, so it
+        # would not stop at two.
+        record["delivered"] = True
     if thread_id is not None and thread_id != "":
         record["thread_id"] = thread_id
     if general_feed:
@@ -195,7 +311,29 @@ def _read_all(
             rec.setdefault("channel", "tg")  # T-0631: pre-migration records are TG-origin
             rec.setdefault("fyi", False)  # T-0660: absent -> not a passive/FYI append
             rec.setdefault("general_feed", False)  # T-0693: absent -> not a General-feed binding
+            # T-0755: absent -> derived from the author, which classifies every
+            # pre-T-0755 record correctly without touching the file. No
+            # migration is needed and none must be done: silently rewriting the
+            # record of what the stakeholder said is the class of thing this
+            # ticket exists to prevent.
+            rec.setdefault("direction", default_direction(rec.get("author", "")))
+            rec.setdefault("delivered", False)
             out.append(rec)
+    # T-0755: order by TIMESTAMP, not by arrival. Until this ticket the file was
+    # written by one lane (inbound) so append order WAS chronological; now the
+    # outbound half arrives via a drain tick that can lag its send by up to its
+    # interval, which would put a reply visibly after a message it preceded —
+    # in the one file whose job is to show who spoke when. Stable, so the three
+    # records sharing 2026-07-27T04:57:58Z keep their arrival order among
+    # themselves. A record with no timestamp (``append`` always writes one, so
+    # this means a hand-edited line) inherits its predecessor's rather than
+    # sorting to the front of the whole thread on an empty key.
+    keys: list[str] = []
+    prev = ""
+    for rec in out:
+        prev = str(rec.get("timestamp") or "") or prev
+        keys.append(prev)
+    out = [r for _, r in sorted(zip(keys, out), key=lambda kv: kv[0])]
     return out
 
 

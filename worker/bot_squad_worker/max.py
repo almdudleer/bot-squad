@@ -54,6 +54,13 @@ class MaxClient:
 
     def __init__(self, cfg: "Config", cooldown_sec: int = 60) -> None:
         self._token: str = getattr(cfg, "max_bot_token", "") or ""
+        # T-0755: the outbound record needs the data dir to write to and the
+        # cfg to redact this install's real secrets against. MAX gets the same
+        # treatment as TG deliberately — the page-channel switch (T-0610) means
+        # a stakeholder conversation can be happening HERE, and recording only
+        # one transport is how this repo's duplicated-decision bugs start.
+        self._cfg: "Config" = cfg
+        self._data_dir: Path = cfg.data_dir
         self._debounce_dir: Path = cfg.data_dir / "_worker" / "max_debounce"
         self._cooldown: int = cooldown_sec
         # Quiet hours are about the stakeholder's sleep window, not the channel,
@@ -78,6 +85,7 @@ class MaxClient:
         user: str = "",
         urgent: bool = False,
         recipient_kind: str | None = None,
+        record_outbound: bool = True,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -85,6 +93,10 @@ class MaxClient:
         quiet hours). Raises on network/API errors. ``urgent=True`` bypasses
         quiet hours. ``recipient_kind`` overrides the configured default for
         this call (``"chat_id"`` vs ``"user_id"``).
+
+        ``record_outbound`` (T-0755, default True): write this delivery to the
+        outbound log — see ``tg.TgClient.send`` for why it is opt-OUT and which
+        two callers pass False.
         """
         if not self._token:
             log.debug("max.send: no bot token configured — skipping")
@@ -105,8 +117,40 @@ class MaxClient:
             text=full_text,
             recipient_kind=recipient_kind or self._recipient_kind,
         )
+        if record_outbound:
+            self._record_outbound(chat_id=chat_id, text=full_text, sid=sid)
         self._record(chat_id=chat_id, sid=sid, text=text)
         return True
+
+    def _record_outbound(self, *, chat_id: str, text: str, sid: str) -> None:
+        """T-0755: record WHAT was delivered on MAX — the TG twin of
+        ``tg.TgClient._record_outbound``.
+
+        MAX has no ``route_sid`` seam (``tg_reply_map`` is TG-specific: it joins
+        on a Telegram ``message_id``), so ``sid`` here is the display label and
+        a MAX send is attributed as ``system:<label>`` unless that label happens
+        to be a real routing SID. That is honest rather than convenient — MAX
+        replies do not route back to a session today, so claiming a session
+        authorship the transport cannot verify would be worse than naming the
+        class.
+
+        Never raises: a logging failure must not turn a delivered message into
+        a failed send.
+        """
+        try:
+            from bot_squad_worker import outbound_log
+
+            outbound_log.record(
+                self._data_dir,
+                channel="max",
+                chat_id=chat_id,
+                text=text,
+                route_sid=sid,
+                sender_label=sid,
+                cfg=self._cfg,
+            )
+        except Exception:  # noqa: BLE001 — observability only, never fail the send
+            log.exception("max.send: could not record outbound content for %s", sid)
 
     # ------------------------------------------------------------------
     # Internals

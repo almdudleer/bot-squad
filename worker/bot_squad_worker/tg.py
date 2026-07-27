@@ -38,6 +38,10 @@ class TgClient:
     def __init__(self, cfg: "Config", cooldown_sec: int = 60) -> None:
         self._token: str = cfg.tg_bot_token
         self._data_dir: Path = cfg.data_dir
+        # T-0755: kept for the outbound record's secret redaction, which needs
+        # this install's REAL token values (a generic pattern can't anticipate
+        # every way a token gets quoted into a message).
+        self._cfg: "Config" = cfg
         self._debounce_dir: Path = cfg.data_dir / "_worker" / "tg_debounce"
         self._cooldown: int = cooldown_sec
         self._quiet_start_utc: int = getattr(cfg, "tg_quiet_hours_start_utc", 17)
@@ -63,6 +67,7 @@ class TgClient:
         reply_markup: dict | None = None,
         route_sid: str = "",
         reply_to_message_id: int | None = None,
+        record_outbound: bool = True,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -99,6 +104,15 @@ class TgClient:
         before. This addresses only the *threading* — WHERE the message goes is
         still ``chat_id``/``topic_id``, which the caller must derive from the
         inbound message rather than from a static project default.
+
+        ``record_outbound`` (T-0755, default True): write this delivery to the
+        outbound log, which is mirrored into the conversation thread so the
+        thread reads as a real transcript. False only for the callers that
+        already record this same text in that same thread themselves (the
+        session-writeback relay, ``task_chat``'s lifecycle notice) — it
+        suppresses the RECORD, never the send. Opt-out by design: a send path
+        written after today is audited unless someone says otherwise, which is
+        the inverse of how this gap happened.
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
@@ -119,9 +133,57 @@ class TgClient:
             reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
         )
         self._record_reply_route(chat_id=chat_id, data=data, route_sid=route_sid)
+        if record_outbound:
+            self._record_outbound(
+                data=data, chat_id=chat_id, text=full_text, sid=sid,
+                route_sid=route_sid, topic_id=topic_id,
+                reply_to_message_id=reply_to_message_id,
+            )
         if debounce:
             self._record(chat_id=chat_id, sid=sid, text=text)
         return True
+
+    def _record_outbound(
+        self, *, data: Any, chat_id: str, text: str, sid: str, route_sid: str,
+        topic_id: int | None, reply_to_message_id: int | None = None,
+    ) -> None:
+        """T-0755: record WHAT we sent, not just that we sent it.
+
+        Sits beside :meth:`_record_reply_route` because that is the seam the
+        gap was measured at: the reply map already pins ``message_id -> sid``
+        here and throws the body away, so an operator reading the conversation
+        store could prove only that *something* was sent at 04:58:34Z, never
+        what. Hooking the TRANSPORT rather than adding another caller-side
+        append is the point — the one caller-side path that DID append
+        (``routes_conversations``' session writeback) silently fell out of use
+        after 2026-07-18 while five other send paths never had one.
+
+        ``full_text`` is recorded, i.e. including the ``[<sid>]`` prefix as
+        delivered: this is an audit of what reached the stakeholder's screen,
+        not of what the caller composed.
+
+        Best-effort and non-raising by contract (``outbound_log.record``
+        swallows and counts its own failures) — a logging failure must never
+        turn a delivered message into a failed send.
+        """
+        try:
+            from bot_squad_worker import outbound_log
+
+            outbound_log.record(
+                self._data_dir,
+                channel="tg",
+                chat_id=chat_id,
+                text=text,
+                route_sid=route_sid,
+                sender_label=sid,
+                thread_id=topic_id,
+                message_id=((data or {}).get("result") or {}).get("message_id"),
+                reply_to_message_id=reply_to_message_id,
+                cfg=self._cfg,
+            )
+        except Exception:  # noqa: BLE001 — observability only, never fail the send
+            log.exception("tg.send: could not record outbound content for %s",
+                          route_sid or sid)
 
     def _record_reply_route(self, *, chat_id: str, data: Any, route_sid: str) -> None:
         """T-0719: pin ``result.message_id`` -> ``route_sid`` so a reply to this
@@ -224,6 +286,13 @@ class TgClient:
             log.debug("tg.send_and_pin: no bot token configured — skipping")
             return {"sent": False, "message_id": None, "pinned": False, "pin_error": ""}
         data = self._post(chat_id=chat_id, text=text, topic_id=topic_id)
+        # T-0755: this method deliberately does NOT route through `send` (see
+        # the docstring), so it needs its own outbound record — exactly the
+        # kind of second send path that made the store look like an inbox.
+        self._record_outbound(
+            data=data, chat_id=chat_id, text=text, sid="tg-listener",
+            route_sid="", topic_id=topic_id,
+        )
         message_id = ((data or {}).get("result") or {}).get("message_id")
         if message_id is None:
             return {"sent": True, "message_id": None, "pinned": False,

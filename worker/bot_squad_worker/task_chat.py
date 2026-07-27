@@ -207,6 +207,13 @@ def _notify(cfg: Any, slug: str, text: str) -> bool:
         chat_id = getattr(project, "tg_chat", "") if project else ""
         res = _send_stakeholder_dm(
             cfg, message=text, urgent=False, tg_chat_id=chat_id,
+            # T-0755: `_append_thread` below already records this exact text in
+            # the very thread the outbound log would mirror it into, with a
+            # better author (`system:task-lifecycle`, which names WHAT spoke
+            # rather than the transport's display label). Two near-identical
+            # lines per notice would make the transcript harder to read, which
+            # is the thing this is all for.
+            record_outbound=False,
         )
         return bool(res.get("ok")) and bool(res.get("sent"))
     except Exception:  # noqa: BLE001 — a channel outage never kills the sweep
@@ -256,7 +263,10 @@ def _append_thread(cfg: Any, slug: str, text: str) -> bool:
         r = httpx.post(
             f"{base}/api/m/worker/conversations/{slug}/{gid}/messages",
             json={"author": "system:task-lifecycle", "text": text,
-                  "timestamp": _now_iso()},
+                  "timestamp": _now_iso(),
+                  # T-0755: the TG send already happened above, so this is a
+                  # record of a DELIVERED message, not one to deliver.
+                  "delivered": True},
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )

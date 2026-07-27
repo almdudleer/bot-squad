@@ -30,6 +30,7 @@ from bot_squad_worker.jobs import (
     idle_timeout_tick,
     input_flush_tick,
     oauth_refresh,
+    outbound_drain_tick,
     stall_sweep_tick,
     telemetry_tick,
     tg_listener_tick,
@@ -470,6 +471,24 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="task_lifecycle",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # outbound_drain_tick: T-0755 — mirror delivered outbound messages from the
+    # transports' local spool into the conversation store, so the thread reads
+    # as a real interleaved transcript instead of an inbox. 30s: the failure
+    # this prevents is a human reading a RECENT window and mistaking drain lag
+    # for silence. max_instances=1 + coalesce; idempotent (line cursor), and the
+    # tick swallows its own errors so a store/API hiccup can't kill the
+    # scheduler thread.
+    sched.add_job(
+        outbound_drain_tick,
+        "interval",
+        seconds=30,
+        args=[cfg],
+        id="outbound_drain",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

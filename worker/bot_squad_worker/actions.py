@@ -177,6 +177,10 @@ _TG_NOTIFY_ALLOWED = {
     # topic_id from the ticket's bound topic (tg_bindings.find_by_ticket)
     # instead of the caller spelling out chat_id/topic_id itself.
     "ticket_id",
+    # T-0755: suppress the outbound-content record for a caller that already
+    # wrote this same text into the same conversation thread itself — today,
+    # only the API's session-writeback relay. Default True (audited).
+    "record_outbound",
 }
 
 
@@ -496,6 +500,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         do_slim=do_slim,
         slug=slug,
         task_id=str(params.get("task_id") or ""),
+        record_outbound=bool(params.get("record_outbound", True)),
     )
     if task_topic_binding is not None and result.get("sent"):
         # T-0723: the ticket may come from the `ticket_id` param (rung 2) or
@@ -671,6 +676,7 @@ def _send_stakeholder_dm(
     do_slim: bool = True,
     slug: str = "",
     task_id: str = "",
+    record_outbound: bool = True,
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
@@ -717,6 +723,15 @@ def _send_stakeholder_dm(
     TG-only: no MAX fallback for group-addressed content; TG errors propagate
     to the caller as before.
 
+    ``record_outbound`` (T-0755, default True): the transport now writes every
+    delivered message to the outbound log, which is then mirrored into the
+    conversation thread. Pass False for the two callers that ALREADY put this
+    exact text in that same thread themselves — the API's session-writeback
+    relay and ``task_chat``'s lifecycle notice — so the reader gets one line per
+    message instead of two near-identical ones. It suppresses the RECORD only,
+    never the delivery, and it is deliberately opt-OUT: a send path added later
+    is audited by default, which is the failure mode this ticket is about.
+
     Returns ``{ok, sent, channel}``. ``channel: "none"`` (ok=False) when no
     transport could deliver — logged loudly, never a silent no-op.
     """
@@ -755,6 +770,11 @@ def _send_stakeholder_dm(
     _route: dict[str, Any] = (
         {"route_sid": sid} if _tg_reply_map.is_routing_sid(sid) else {}
     )
+    # T-0755: same opt-IN shape as `route_sid` above, and for the same reason —
+    # test fakes have fixed `send` signatures, so a kwarg that is absent in the
+    # default case keeps every existing call shape byte-identical. Only the two
+    # callers that record this text themselves ever pass it.
+    _rec: dict[str, Any] = {} if record_outbound else {"record_outbound": False}
 
     def _deliver(channel: str, send_part: Callable[[str], bool]) -> dict[str, Any]:
         """Send every part in order over one channel (T-0721).
@@ -790,7 +810,8 @@ def _send_stakeholder_dm(
         tg_client = _get_tg_client(cfg)
         return _deliver("tg", lambda part: tg_client.send(
             chat_id=tg_chat_id, text=part, sid=sid_label, user=user,
-            urgent=urgent, topic_id=tg_topic_id, debounce=debounce, **_route,
+            urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
+            **_route, **_rec,
         ))
 
     def _try_max() -> dict[str, Any] | None:
@@ -800,7 +821,7 @@ def _send_stakeholder_dm(
         max_client = _get_max_client(cfg)
         return _deliver("max", lambda part: max_client.send(
             chat_id=max_chat, text=part, sid=sid_label, user=user, urgent=urgent,
-            recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
+            recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"), **_rec,
         ))
 
     if prefer_tg:

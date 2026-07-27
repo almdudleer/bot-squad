@@ -387,7 +387,21 @@ def catchup_deferred_worker_restart(cfg: "Config") -> str:
 
     queue_id = f"catchup-{int(time.time())}"
     try:
-        _restart_worker_detached(cfg, slug, queue_id, f"deferred restart catch-up — {reason}".strip(" —"))
+        launched = _restart_worker_detached(
+            cfg, slug, queue_id, f"deferred restart catch-up — {reason}".strip(" —")
+        )
+        if not launched:
+            # No systemd --user scope: retrying every tick would hit the same wall
+            # forever AND hold the rate-limit window each time. Drop the deferral
+            # and say so — only a human can fix this one.
+            _clear_pending_restart(cfg)
+            log.warning(
+                "deploy.catchup_deferred_worker_restart: no systemd --user scope, so "
+                "the deferred restart CANNOT be fired automatically — the worker is "
+                "on stale code until someone runs: systemctl --user restart "
+                "bot-squad-worker.service",
+            )
+            return "abandoned: no systemd scope — needs a manual restart"
     except Exception:
         log.exception(
             "deploy.catchup_deferred_worker_restart: launch failed — leaving the "
@@ -1011,6 +1025,7 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     will_restart = _should_restart_worker(cfg, ok=ok, forced=forced)
     rate_limited = False
     launch_failed = False
+    no_scope = False
     if will_restart:
         reason = payload.get("reason", "")
         tag = "restart_worker" if forced else "auto-restart: worker/ changed"
@@ -1031,7 +1046,13 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
             )
         else:
             try:
-                _restart_worker_detached(cfg, slug, queue_id, reason)
+                if not _restart_worker_detached(cfg, slug, queue_id, reason):
+                    # No systemd --user scope: nothing was launched and nothing
+                    # automatic can fix it (the catch-up tick would hit the same
+                    # wall every 60s), so DON'T record a pending retry — just tell
+                    # the truth so a human restarts by hand.
+                    no_scope = True
+                    will_restart = False
             except Exception:
                 launch_failed = True
                 will_restart = False
@@ -1050,6 +1071,7 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         "fired" if will_restart
         else "deferred: rate-limited (catch-up tick will fire it)" if rate_limited
         else "deferred: restart launch failed (catch-up tick will retry)" if launch_failed
+        else "NOT restarted: no systemd --user scope — restart by hand" if no_scope
         else ("skipped: deploy failed" if not ok else "skipped: no worker change")
     )
     # T-0717 leg 3 — the post-deploy assertion the operator asked for: a deploy
@@ -1060,7 +1082,9 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     # keyed on "boot sha == deployed sha": a fired restart is async/detached, so
     # this process's boot sha is still the old one either way — what
     # distinguishes the bad case is that nothing is going to fix it soon.
-    worker_stale = bool(ok and not will_restart and (rate_limited or launch_failed))
+    worker_stale = bool(
+        ok and not will_restart and (rate_limited or launch_failed or no_scope)
+    )
     return DeployResult(
         ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
         collapsed_count=1 + len(collapsed_processing),
@@ -1329,7 +1353,7 @@ esac
 
 def _restart_worker_detached(
     cfg: "Config", slug: str, queue_id: str, reason: str
-) -> None:
+) -> bool:
     """Launch a detached, self-surviving worker restart + smoke (T-0181).
 
     Runs only when systemd scopes are available (``_use_systemd_scope``) — the
@@ -1342,6 +1366,11 @@ def _restart_worker_detached(
     transient scope so it outlives the ``systemctl --user restart`` it issues,
     writing its progress + outcome to ``runs/<queue_id>.worker-restart.log`` and
     a ``.worker-restart.FAIL`` marker on any failure.
+
+    Returns True iff a restart was actually LAUNCHED. T-0717: the no-scope path
+    used to ``return`` bare, so the caller reported ``worker_restart_status
+    ="fired"`` when nothing had been started — the same "green line over a worker
+    running stale code" this ticket is about, just reached by a different route.
     """
     restart_log = _runs_dir(cfg, slug) / f"{queue_id}.worker-restart.log"
     fail_marker = _runs_dir(cfg, slug) / f"{queue_id}.worker-restart.FAIL"
@@ -1355,7 +1384,7 @@ def _restart_worker_detached(
         )
         log.warning("deploy._restart_worker_detached: %s", msg.strip())
         restart_log.write_text(msg)
-        return
+        return False
 
     install_root = cfg.config_dir.parent
     worker_dir = install_root / "worker"
@@ -1390,6 +1419,7 @@ def _restart_worker_detached(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    return True
 
 
 def _run_rc_path(cfg: "Config", slug: str, queue_id: str) -> Path:

@@ -1251,7 +1251,7 @@ def test_run_next_no_restart_when_flag_off(
     # _worker_subtree_changed_since_boot's real git probe mid-test and flake this.
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is True
     assert calls == []
@@ -1272,7 +1272,7 @@ def test_run_next_triggers_restart_on_success_when_flag_on(
     # T-0305 part-a: forced now also requires a real worker/ change — model one.
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: True)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is True
     assert len(calls) == 1
@@ -1325,7 +1325,7 @@ def test_run_next_no_restart_on_recipe_failure(
     enqueue(cfg, proj.slug, "staging", "broken worker change", "user", restart_worker=True)
 
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is False
     assert calls == []
@@ -1403,7 +1403,7 @@ def test_run_next_no_restart_forced_but_no_worker_change(
 
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is True
     assert calls == []  # no worker change → no restart, even forced
@@ -1473,7 +1473,7 @@ def test_run_next_second_worker_changing_deploy_rate_limited(
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
 
     enqueue(cfg, proj.slug, "staging", "worker change #1", "user", restart_worker=True)
     result1 = run_next(cfg, proj.slug)
@@ -1505,7 +1505,7 @@ def test_run_next_worker_restart_not_rate_limited_after_window(
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
 
     enqueue(cfg, proj.slug, "staging", "worker change #1", "user", restart_worker=True)
     run_next(cfg, proj.slug)
@@ -1570,7 +1570,7 @@ def test_run_next_sets_resolved_sha_and_worker_restart_status(
     recipe.chmod(0o755)
     enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: True)
 
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is True
@@ -1802,7 +1802,7 @@ def test_run_next_auto_restarts_on_worker_change_without_flag(
     monkeypatch.delenv("BOT_SQUAD_DEPLOY_AUTO_RESTART", raising=False)
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append((a, k)), True)[1])
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is True
     assert len(calls) == 1  # auto-fired
@@ -1824,7 +1824,7 @@ def test_run_next_no_auto_restart_when_worker_unchanged(
     # probe happened to also return "unchanged", which host load can flip).
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda _cfg: False)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     result = run_next(cfg, proj.slug)
     assert result is not None and result.ok is True
     assert calls == []
@@ -2349,7 +2349,7 @@ def test_deferred_restarts_coalesce_to_one_latest_wins(
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
 
     assert d._restart_rate_limited(cfg, source="deploy", reason="A") is False
     for reason in ("B", "C", "D"):
@@ -2384,7 +2384,7 @@ def test_catchup_holds_inside_the_rate_limit_window(
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
 
     assert d._restart_rate_limited(cfg, source="deploy", reason="A") is False
     assert d._restart_rate_limited(cfg, source="deploy", reason="B") is True
@@ -2406,7 +2406,7 @@ def test_catchup_holds_while_a_deploy_is_in_flight(
     cfg = _make_config(tmp_path, proj)
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
 
     processing = d._processing_dir(cfg, proj.slug)
@@ -2432,7 +2432,7 @@ def test_catchup_clears_pending_when_worker_already_converged(
     cfg = _make_config(tmp_path, proj)
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: False)
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
 
     assert d.catchup_deferred_worker_restart(cfg) == "cleared: worker already converged"
@@ -2487,7 +2487,7 @@ def test_catchup_holds_when_the_git_probe_fails(
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot",
                         lambda c: (_ for _ in ()).throw(OSError("git gone")))
     calls: list = []
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: (calls.append(a), True)[1])
     d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
 
     assert d.catchup_deferred_worker_restart(cfg) == "held: probe failed"
@@ -2528,7 +2528,7 @@ def test_catchup_falls_back_to_a_known_slug(
     monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
     calls: list = []
     monkeypatch.setattr(d, "_restart_worker_detached",
-                        lambda cfg_, slug, qid, reason: calls.append(slug))
+                        lambda cfg_, slug, qid, reason: (calls.append(slug), True)[1])
     d._record_pending_restart(cfg, source="autoupdate_apply", reason="v1.2.3")
 
     assert d.catchup_deferred_worker_restart(cfg) == "fired"
@@ -2551,7 +2551,7 @@ def test_run_next_flags_worker_stale_when_the_restart_is_deferred(
     monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
     monkeypatch.setattr(d, "boot_git_sha", lambda: "b" * 40)
     monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
-    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: None)
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: True)
 
     enqueue(cfg, proj.slug, "staging", "worker change #1", "user", restart_worker=True)
     r1 = run_next(cfg, proj.slug)
@@ -2700,3 +2700,84 @@ def test_deploy_ping_stays_green_when_the_worker_is_current(
     assert text.startswith("✅ deploy test-project/staging SUCCESS")
     assert "WORKER STALE" not in text
     assert "worker restart: fired" in text
+
+
+# --- the twin: a no-systemd-scope skip is not a "fired" restart either -------
+
+
+def test_restart_detached_reports_whether_it_launched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a systemd --user scope nothing is launched — say so, don't return
+    bare and let the caller report "fired"."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: False)
+
+    assert d._restart_worker_detached(cfg, proj.slug, "q1", "reason") is False
+    log = _runs_dir(cfg, proj.slug) / "q1.worker-restart.log"
+    assert "SKIPPING" in log.read_text()
+
+
+def test_run_next_flags_stale_when_there_is_no_systemd_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same defect class as the rate-limit drop, reached by another route: the
+    deploy used to report worker_restart_status="fired" over a worker that was
+    never restarted. No pending marker here — nothing automatic can fix it."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: False)
+
+    enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.worker_restart_status == (
+        "NOT restarted: no systemd --user scope — restart by hand"
+    )
+    assert result.worker_stale is True
+    assert not d._restart_pending_path(cfg).exists()
+
+
+def test_catchup_abandons_the_deferral_without_a_systemd_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retrying every tick would hit the same wall forever and hold the
+    rate-limit window each time. Drop it and log loudly instead."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: False)
+    d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
+
+    assert d.catchup_deferred_worker_restart(cfg) == (
+        "abandoned: no systemd scope — needs a manual restart"
+    )
+    assert not d._restart_pending_path(cfg).exists()
+
+
+def test_stale_ping_does_not_promise_recovery_that_is_not_coming(
+    tmp_config_dir, tmp_path, monkeypatch
+) -> None:
+    """A deferred restart self-converges; a no-scope skip never does. The line
+    must not tell the operator to wait 5min for something that won't happen."""
+    text = _monitor_ping_text(
+        tmp_config_dir, tmp_path, monkeypatch,
+        worker_restart_status="NOT restarted: no systemd --user scope — restart by hand",
+        worker_stale=True, worker_boot_sha="d" * 40,
+    )
+
+    assert "WORKER STALE" in text
+    assert "will NOT self-correct" in text
+    assert "converges on its own" not in text

@@ -260,12 +260,18 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
             # at all (the T-0717 verbatim complaint). Say it plainly, name both
             # shas, and give the one-liner that fixes it now rather than in ~5min.
             boot = f" running={result.worker_boot_sha[:12]}" if result.worker_boot_sha else ""
+            # Only a DEFERRED restart self-converges; a no-systemd-scope skip never
+            # will, so don't promise a recovery that isn't coming.
+            fix = (
+                "It converges on its own within ~5min (deferred restart), or now: "
+                if "deferred" in result.worker_restart_status
+                else "This will NOT self-correct — run: "
+            )
             _tg_safe(
                 f"⚠️ deploy {slug}/{target} SUCCESS but WORKER STALE "
                 f"(rc={result.returncode}){sha}{suffix}{wr}. The worker is still on"
                 f"{boot or ' the previous commit'} — new worker/ code is NOT executing "
-                f"yet. It converges on its own within ~5min (deferred restart), or now: "
-                f"systemctl --user restart bot-squad-worker.service"
+                f"yet. {fix}systemctl --user restart bot-squad-worker.service"
             )
         else:
             _tg_safe(

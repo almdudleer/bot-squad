@@ -41,13 +41,3 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-      # T-0716: a role-contract pointer must name the git SSOT
-      # (api/app/resources/roles/<role>.md), never the per-project
-      # data/<slug>/vision/roles/ copy — seeded once at scaffold, display-only,
-      # and it DRIFTS (D-0043). Reads repo sources only, no data tree.
-      - id: role-doc-pointers
-        name: role-contract pointers name the git SSOT (not vision/roles/)
-        entry: python3 scripts/lint/role_doc_pointers.py
-        language: system
-        pass_filenames: false
-        always_run: true

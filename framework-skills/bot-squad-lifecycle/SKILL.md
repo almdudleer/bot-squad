@@ -20,7 +20,7 @@ Every session — operator, TL, dev — shares ONE lifecycle. Sessions are trans
 
 ## What the 60s reconcile tick guarantees (you don't babysit this)
 
-The dispatch tick runs five ordered reconcilers (`binding_gc_tick`), so a TL/operator never hand-manages tmux/archival/stale ids (see the install's `vision/roles/session-lifecycle-contract.md`):
+The dispatch tick runs five ordered reconcilers (`binding_gc_tick`), so a TL/operator never hand-manages tmux/archival/stale ids (see `vision/roles/session-lifecycle-contract.md`):
 
 1. **`gc_sessions`** — an `active` SessionMd whose pane is gone → `suspended`.
 2. **`gc_dead_bindings`** — a session's `task_id` cleared when that task is `closed`/missing; `initiative` cleared when its file is missing; closed/missing `extra_task_ids` pruned. (Why a suspended dev no longer shows a stale task_id.) Bindings for `open`/`in_progress`/`totest`/`reopened` are preserved.
@@ -36,4 +36,4 @@ So: a dev can exit by simply finishing — no manual `suspend_session`. Verified
 - A session's name lives in three surfaces; the **tmux window name is the source of truth**. Rename only via `bsq team rename <sid> <new-name>` (→ `sync_session_name`) so surfaces can't drift.
 - `bsq team archive <sid>` = suspend + archive (binding released); `bsq team resurrect <sid>` = unarchive + resume.
 
-Full contract: the install's `vision/roles/session-lifecycle-contract.md`. The paradigm behind it: `bot-squad-session-lifecycle-roles`.
+Full contract: `vision/roles/session-lifecycle-contract.md`. The paradigm behind it: `bot-squad-session-lifecycle-roles`.

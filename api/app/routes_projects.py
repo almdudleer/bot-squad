@@ -172,24 +172,17 @@ def _load_operator_brief(cfg: ApiConfig, slug: str) -> str:
     hands the operator a small POINTER and lets it pull its full orientation on
     demand via ``bsq brief`` (which emits product + team protocol + the operator
     role contract) — no loss of guidance, far less spawn context. We still gate
-    the pointer on the install having been scaffolded (the seeded
-    ``data/bot-squad/vision/roles/operator.md`` marker) so a fresh, unseeded
-    install falls back to the self-contained placeholder (the follow-on to write
-    that doc is T-0052's sibling DoD bullet).
-
-    NOTE (T-0716/D-0043): the seeded copy is an install-shape MARKER only. The
-    contract the operator actually reads is the git SSOT
-    ``api/app/resources/roles/operator.md`` — which is what the pointer names."""
+    the pointer on the role doc existing so a fresh install without the canonical
+    ``vision/roles/operator.md`` falls back to the self-contained placeholder
+    (the follow-on to write that doc is T-0052's sibling DoD bullet)."""
     role_md = cfg.data_dir / "bot-squad" / "vision" / "roles" / "operator.md"
     if role_md.exists():
         return (
             f'You are the bot-squad project-operator for "{slug}".\n\n'
             "Run `bsq brief` to load your full orientation on demand — it prints "
             "the product overview, the team protocol, and your operator role "
-            "contract ($BOT_SQUAD/api/app/resources/roles/operator.md). "
-            "Pull other docs "
-            "(tickets, initiatives, AGENT_INSTRUCTIONS.md) only when you need "
-            "them rather "
+            "contract (vision/roles/operator.md). Pull other docs (tickets, "
+            "initiatives, AGENT_INSTRUCTIONS.md) only when you need them rather "
             "than holding them in context.\n\n"
             "You are a transient DISPATCHER, not a persistent chat: when on, your "
             "standing task is to clear the backlog autonomously — don't wait on "

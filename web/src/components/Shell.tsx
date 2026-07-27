@@ -19,8 +19,7 @@ const IS_MOTHERSHIP_BUILD = import.meta.env.VITE_MOTHERSHIP === "1";
  * Shell — left sidebar navigation present on every authenticated page.
  *
  * T-0170 (sidebar v3) collapses the IA onto the role hierarchy
- * (the install's `vision/roles/role-hierarchy.md` — a project doc, not a
- * spawnable role contract); T-0637 (D-0057 §4/§8, wave 3 declutter)
+ * (`vision/roles/role-hierarchy.md`); T-0637 (D-0057 §4/§8, wave 3 declutter)
  * further collapsed the per-project rail from 6 destinations to 3 + a low-
  * emphasis group:
  *   • PROJECT  — the prominent `[ PROJECT ]` block, primary tier: Board /

@@ -69,8 +69,7 @@ def operator_standing_task() -> str:
     empty, dispatching sessions within the parallelism + token/quota constraints.
     SSOT for the directive text so the spawn brief and the re-drive cadence
     (T-0474's scheduler tick) inject the identical standing task; the full how-to
-    lives in the role contract (``api/app/resources/roles/operator.md`` — the
-    git SSOT per D-0043, not the drifting per-project ``vision/roles/`` copy).
+    lives in the role contract (``vision/roles/operator.md``).
     """
     return (
         "Your standing task: clear the backlog autonomously. The user checks in "

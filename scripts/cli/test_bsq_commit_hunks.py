@@ -15,8 +15,11 @@ Two layers:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import re
 import subprocess
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -330,3 +333,309 @@ def test_plain_commit_unchanged_still_pathspec_commits(repo):
     cm = _run_bsq(r, bs, "commit", "--sid", "S-me-dev-p1", "-m", "add y", "y.txt")
     assert cm.returncode == 0, cm.stderr
     assert "y.txt" in _git(r, "show", "--name-only", "--format=", "HEAD")
+
+
+# ---------------------------------------------------------------------------
+# T-0752 manifestation 1/3: an isolated-index commit must leave the SHARED
+# index consistent with what it just committed.
+#
+# Before the fix the shared index kept the PRE-commit blobs, so `git diff
+# --cached` read back as the exact INVERSE of the commit and a peer's ordinary
+# `git add <file> && git commit` silently reverted the work that had landed.
+# Each of these fails against unfixed sources.
+# ---------------------------------------------------------------------------
+def _staged_names(repo: Path) -> list[str]:
+    return _git(repo, "diff", "--cached", "--name-only").split()
+
+
+def test_hunks_commit_leaves_no_inverse_in_the_shared_index(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    f = r / "shared.txt"
+    f.write_text("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n")
+    _git(r, "add", "shared.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    assert _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1",
+                    "shared.txt").returncode == 0
+    f.write_text("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8-MINE\n")
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
+                  "-m", "mine", "shared.txt")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+
+    assert "L8-MINE" in _git(r, "show", "HEAD:shared.txt")
+    # The whole point: nothing staged, and in particular not the inverse.
+    assert _staged_names(r) == []
+    assert _git(r, "diff", "--cached") == ""
+    assert _git(r, "status", "--short") == ""
+
+
+def test_peer_add_then_commit_no_longer_reverts_the_landed_hunk(repo):
+    """The actual blast radius, driven end to end: `git add <mine> && git
+    commit` is pathspec-LESS, so it commits the shared index as-is. With the
+    inverse left in it, that reverted a peer's landed work while the commit
+    looked entirely normal."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "shared.txt").write_text("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n")
+    _git(r, "add", "shared.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "shared.txt")
+    (r / "shared.txt").write_text("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8-MINE\n")
+    assert _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
+                    "-m", "mine", "shared.txt").returncode == 0
+
+    # A peer, entirely innocently, lands an unrelated file with raw git.
+    (r / "peer.txt").write_text("peer work\n")
+    _git(r, "add", "peer.txt")
+    _git(r, "commit", "-q", "-m", "peer work")
+
+    assert "L8-MINE" in _git(r, "show", "HEAD:shared.txt")   # NOT reverted
+    assert "peer.txt" in _git(r, "show", "--name-only", "--format=", "HEAD")
+
+
+def test_reconciliation_is_scoped_and_spares_a_peers_unrelated_staging(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "shared.txt").write_text("L1\nL2\n")
+    (r / "other.txt").write_text("other\n")
+    _git(r, "add", "shared.txt", "other.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "shared.txt")
+    (r / "shared.txt").write_text("L1\nL2-MINE\n")
+    (r / "other.txt").write_text("peer wip\n")
+    _git(r, "add", "other.txt")            # peer loads the shared index
+
+    # --ack past the co-edit audit: other.txt being dirty and unbaselined is
+    # exactly the "a peer is mid-edit" signal, and here it is true.
+    assert _run_bsq(r, bs, "commit", "--hunks", "--ack", "--sid", "S-me-dev-p1",
+                    "-m", "mine", "shared.txt").returncode == 0
+    # my path reconciled, THEIR staging untouched
+    assert _staged_names(r) == ["other.txt"]
+
+
+def test_reconciliation_covers_a_file_the_commit_deleted(repo):
+    """A deletion leaves the opposite lie — the index still holds the file, so
+    the peer's commit resurrects it."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "doomed.txt").write_text("bye\n")
+    (r / "kept.txt").write_text("L1\n")
+    _git(r, "add", "doomed.txt", "kept.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    (r / "doomed.txt").unlink()
+    (r / "kept.txt").write_text("L1-MINE\n")
+    patch = r / "del.patch"
+    patch.write_text(_git(r, "diff", "--", "doomed.txt", "kept.txt"))
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "delete it")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+    assert "doomed.txt" not in _git(r, "ls-tree", "--name-only", "HEAD")
+    assert "kept.txt" in _git(r, "ls-tree", "--name-only", "HEAD")
+    assert _staged_names(r) == []
+    # the patch file itself is untracked scratch; no TRACKED path is dirty
+    assert _git(r, "status", "--short", "--untracked-files=no") == ""
+
+
+def test_reconciliation_names_a_clobbered_peer_staging_of_the_same_path(repo):
+    """When the repair does drop someone's staged entry, it says so and names
+    a blob that still resolves — silence there would be a second silent loss."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "shared.txt").write_text("L1\nL2\n")
+    _git(r, "add", "shared.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "shared.txt")
+    (r / "shared.txt").write_text("L1\nL2-MINE\n")
+    _git(r, "add", "shared.txt")           # a raw `git add` on the same path
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
+                  "--ack", "-m", "mine", "shared.txt")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+    assert "NOTE (T-0752)" in cm.stderr
+    assert "shared.txt" in cm.stderr
+    assert _staged_names(r) == []
+    blob = re.search(r"blob ([0-9a-f]{40})", cm.stderr).group(1)
+    assert _git(r, "cat-file", "-t", blob).strip() == "blob"
+
+
+# ---------------------------------------------------------------------------
+# T-0752 manifestation 2: the STALE-BASELINE sweep — `--hunks` isolates you
+# only from work already in the file at edit-begin.
+# ---------------------------------------------------------------------------
+def _peer_store(bot_squad: str, sid: str, rel: str, body: str) -> None:
+    p = Path(bot_squad) / "data" / "proj" / "_worktree" / sid / "files" / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body)
+
+
+def test_hunks_stops_when_baseline_was_clean_and_a_peer_is_mid_edit(repo):
+    """The ee7ba15 shape: the file was CLEAN at edit-begin, so the commit
+    claims its entire current diff — including whatever a peer appended in the
+    meantime, without the source change those lines pin."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "src.py").write_text("def f():\n    return 1\n")
+    (r / "test_src.py").write_text("from src import f\n\n\ndef test_f():\n    assert f()\n")
+    _git(r, "add", "src.py", "test_src.py")
+    _git(r, "commit", "-q", "-m", "base")
+
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "test_src.py")
+    with (r / "test_src.py").open("a") as fh:              # mine
+        fh.write("\n\ndef test_mine():\n    assert f()\n")
+    with (r / "test_src.py").open("a") as fh:              # the peer's, pinning g()
+        fh.write("\n\ndef test_peer():\n    from src import g\n    assert g()\n")
+    with (r / "src.py").open("a") as fh:                   # …which they have NOT committed
+        fh.write("\n\ndef g():\n    return 2\n")
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
+                  "-m", "mine", "test_src.py")
+    assert cm.returncode != 0
+    assert "co-edit audit (T-0752)" in cm.stderr
+    assert "isolates nothing" in cm.stderr
+    assert "src.py" in cm.stderr                # names the peer-dirty file
+    # nothing committed — HEAD is still the base commit
+    assert "test_peer" not in _git(r, "show", "HEAD:test_src.py")
+    # …and --ack is the way through, for when the hunks really are all yours
+    assert _run_bsq(r, bs, "commit", "--hunks", "--ack", "--sid", "S-me-dev-p1",
+                    "-m", "mine", "test_src.py").returncode == 0
+
+
+def test_hunks_does_not_nag_when_nobody_else_is_editing_the_tree(repo):
+    """The caution must not become background noise: a clean baseline with no
+    foreign dirty file is the ordinary case and commits straight through."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("one\n")
+    _git(r, "add", "a.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "a.txt")
+    (r / "a.txt").write_text("two\n")
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1", "-m", "x", "a.txt")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+
+
+def test_hunks_stops_when_a_peer_committed_the_file_after_my_baseline(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "f.txt").write_text("L1\nL2\nL3\n")
+    _git(r, "add", "f.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "f.txt")
+    (r / "f.txt").write_text("L1-PEER\nL2\nL3\n")
+    _git(r, "commit", "-q", "-m", "peer landed under me", "--", "f.txt")
+    (r / "f.txt").write_text("L1-PEER\nL2\nL3-MINE\n")
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1", "-m", "mine", "f.txt")
+    assert cm.returncode != 0
+    assert "a peer COMMITTED this file after your baseline" in cm.stderr
+    assert "peer landed under me" in cm.stderr
+    assert "bsq edit-begin f.txt" in cm.stderr      # names the remedy
+
+
+def test_hunks_stops_when_a_live_peer_session_holds_a_baseline_on_the_file(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "f.txt").write_text("L1\nL2\n")
+    _git(r, "add", "f.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "f.txt")
+    _peer_store(bs, "S-peer-dev-p299", "f.txt", "L1\nL2\n")
+    (r / "f.txt").write_text("L1\nL2-MINE\n")
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1", "-m", "x", "f.txt")
+    assert cm.returncode != 0
+    assert "S-peer-dev-p299" in cm.stderr
+    assert "live edit-begin baseline" in cm.stderr
+
+
+def test_a_dead_sessions_month_old_baseline_is_not_a_co_editor(repo):
+    """Stores outlive their sessions and are never GC'd — the install still
+    holds baselines from June. Age is the liveness proxy; without it every
+    commit would block forever."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "f.txt").write_text("L1\nL2\n")
+    _git(r, "add", "f.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "f.txt")
+    _peer_store(bs, "S-dead-dev-p55", "f.txt", "L1\nL2\n")
+    corpse = Path(bs) / "data" / "proj" / "_worktree" / "S-dead-dev-p55" / "files" / "f.txt"
+    old = time.time() - 30 * 86400
+    os.utime(corpse, (old, old))
+    (r / "f.txt").write_text("L1\nL2-MINE\n")
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1", "-m", "x", "f.txt")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+
+
+def test_hunks_stops_when_the_shared_index_holds_staged_content_for_the_file(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "f.txt").write_text("L1\nL2\n")
+    _git(r, "add", "f.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "f.txt")
+    (r / "f.txt").write_text("L1\nL2-MINE\n")
+    _git(r, "add", "f.txt")
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1", "-m", "x", "f.txt")
+    assert cm.returncode != 0
+    assert "SHARED index holds staged content" in cm.stderr
+
+
+def test_patch_path_reports_when_it_claims_every_live_hunk(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "f.txt").write_text("L1\nL2\n")
+    _git(r, "add", "f.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    (r / "f.txt").write_text("L1\nL2-MINE\n")
+    _peer_store(bs, "S-peer-dev-p299", "elsewhere.txt", "x\n")   # a shared clone
+    patch = r / "mine.patch"
+    patch.write_text(_git(r, "diff", "--", "f.txt"))
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "x")
+    assert cm.returncode == 0, cm.stderr + cm.stdout   # caution, not a block
+    assert "covers ALL 1 hunk(s)" in cm.stderr
+
+
+def test_patch_hunks_per_rel_counts_per_target_file():
+    patch = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -1 +1 @@\n-x\n+y\n@@ -9 +9 @@\n-p\n+q\n"
+        "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-m\n+n\n"
+    )
+    assert bsq._patch_hunks_per_rel(patch) == {"a.py": 2, "b.py": 1}
+
+
+def test_edit_begin_records_the_head_it_baselined_against(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "f.txt").write_text("x\n")
+    _git(r, "add", "f.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "f.txt")
+    meta = json.loads(
+        (Path(bs) / "data" / "proj" / "_worktree" / "S-me-dev-p1" / "meta.json").read_text()
+    )
+    assert meta["f.txt"]["head"] == _git(r, "rev-parse", "HEAD").strip()
+    assert meta["f.txt"]["ts"].endswith("Z")
+
+
+# ---------------------------------------------------------------------------
+# T-0752 DoD item 3 — a worktree suite run does not certify a commit.
+# ---------------------------------------------------------------------------
+def test_verify_isolated_runs_against_head_not_the_dirty_worktree(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "probe.txt").write_text("committed\n")
+    _git(r, "add", "probe.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    (r / "probe.txt").write_text("a peer's uncommitted edit\n")
+
+    cm = _run_bsq(r, bs, "verify-isolated", "--", "cat", "probe.txt")
+    assert cm.returncode == 0, cm.stderr
+    assert "committed" in cm.stdout
+    assert "peer's uncommitted edit" not in cm.stdout
+
+
+def test_verify_isolated_propagates_the_commands_exit_code(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("x\n")
+    _git(r, "add", "a.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    cm = _run_bsq(r, bs, "verify-isolated", "--", "false")
+    assert cm.returncode == 1

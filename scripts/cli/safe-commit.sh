@@ -68,6 +68,20 @@
 #      is allowed, because a peer's staging cannot reach that index at all.
 #      That is what `bsq commit --hunks` does internally.
 #
+#   5. INVERSE-staged shared index after an isolated-index commit (T-0752,
+#      2026-07-27 p299/p303 incident). Defence 4's own escape hatch left a
+#      loaded gun behind. A commit built through GIT_INDEX_FILE advances HEAD
+#      without ever touching the SHARED `.git/index`, and git only refreshes
+#      the real index for paths it committed THROUGH it — so afterwards the
+#      shared index still holds the PRE-commit blobs. `git diff --cached` then
+#      reports the exact INVERSE of the commit that just landed, and `git
+#      status` shows those paths "MM". That is armed, not cosmetic: the
+#      ordinary `git add <my file> && git commit -m msg` idiom commits the
+#      index as-is and so silently REVERTS the work that just landed, while
+#      the peer's own commit looks entirely normal — no failing test, no
+#      suspicious diff. On 2026-07-27 that state sat over the P1 fix in
+#      d3de6cc. Defence: reconcile — see "Shared-index reconciliation" below.
+#
 # Overrides:
 #   BOT_SQUAD_ALLOW_COMMIT_ALL=1   permit `-a`/`--all` AND a pathspec-less
 #                                  commit of a non-empty shared index
@@ -237,6 +251,25 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# Shared-index reconciliation, part 1 of 2 (T-0752) — remember which paths the
+# SHARED index already disagreed with HEAD about BEFORE we commit.
+#
+# After the commit we bring the shared index back in line with HEAD for the
+# paths we touched. For the overwhelming case (index entry == HEAD blob, i.e.
+# nobody had staged anything there) that is a pure staleness repair and there
+# is nothing to say about it. But if a peer had genuinely `git add`ed one of
+# those paths, our repair drops their staged entry — so we have to be able to
+# tell the two apart afterwards and name the blob they can recover from.
+# Captured inside the flock, so it is a true pre-image of our own commit.
+# ---------------------------------------------------------------------------
+pre_staged_raw=""
+if [ "$index_is_shared" = "0" ] && [ -f "$SHARED_INDEX" ] \
+   && git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    pre_staged_raw="$(GIT_INDEX_FILE="$SHARED_INDEX" \
+        git diff --cached --raw --abbrev=40 --no-renames HEAD 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
 # Locked staging (T-0648) — `bsq commit` hands us its explicit path list here
 # (NUL-separated, in a temp file named by BOT_SQUAD_STAGE_PATHS_FILE) instead
 # of running `git add` itself before calling this wrapper. Staging AFTER the
@@ -294,6 +327,92 @@ if [ "$rc" = "0" ]; then
     done < <(git diff-tree --no-commit-id --name-only -r -z HEAD)
     echo "safe-commit: committed ${#committed_files[@]} file(s):"
     printf '  %s\n' "${committed_files[@]}"
+fi
+
+# ---------------------------------------------------------------------------
+# Shared-index reconciliation, part 2 of 2 (T-0752) — leave the SHARED index
+# consistent with the commit we just made.
+#
+# Only for an ISOLATED-index commit (failure mode 5 above): a pathspec commit
+# through the shared index already refreshes its own entries, and a commit OF
+# the shared index obviously does. Here git has no reason to touch the shared
+# index at all, so it keeps the pre-commit blobs and reads back as the exact
+# inverse of what landed.
+#
+# Scope is exactly the paths THIS commit touched: surviving paths get HEAD's
+# blob, paths the commit deleted are removed from the index. Every other index
+# entry, and every worktree file, is left alone — so a peer's dirty hunks and
+# their staging in other files survive untouched. Renames are disabled so the
+# name-status stream is a flat STATUS/PATH pair sequence. Still inside the
+# flock, so no peer ever observes the inverse-staged half-state.
+# ---------------------------------------------------------------------------
+if [ "$rc" = "0" ] && [ "$index_is_shared" = "0" ] && [ -f "$SHARED_INDEX" ]; then
+    reco_alive=()
+    reco_gone=()
+    while IFS= read -r -d '' _st && IFS= read -r -d '' _path; do
+        case "$_st" in
+            D*) reco_gone+=("$_path") ;;
+            *)  reco_alive+=("$_path") ;;
+        esac
+    done < <(git diff-tree --no-commit-id --name-status -r -z --root --no-renames HEAD)
+
+    reco_failed=0
+    if [ "${#reco_alive[@]}" -gt 0 ]; then
+        # --index-info ONLY, deliberately. Do NOT follow this with
+        # `git update-index --refresh -- <paths>` to re-warm the stat cache:
+        # trailing paths are update-index's *primary* argument, not a refresh
+        # scope, so that form silently re-stages the WORKTREE blob — i.e. it
+        # is `git add` wearing a refresh flag, and in a co-edited file it
+        # would stage the peer's dirty hunks we just took care not to commit.
+        # (Measured: it replaced HEAD's blob with the worktree's.) Leaving the
+        # stat cache cold only costs `git status` one re-hash of these paths.
+        git ls-tree -r -z HEAD -- "${reco_alive[@]}" \
+            | GIT_INDEX_FILE="$SHARED_INDEX" git update-index -z --index-info \
+            || reco_failed=1
+    fi
+    if [ "${#reco_gone[@]}" -gt 0 ]; then
+        printf '%s\0' "${reco_gone[@]}" \
+            | GIT_INDEX_FILE="$SHARED_INDEX" git update-index --force-remove -z --stdin \
+            || reco_failed=1
+    fi
+
+    if [ "$reco_failed" != "0" ]; then
+        cat >&2 <<EOF
+safe-commit: WARNING (T-0752) — could not reconcile the SHARED index after this
+isolated-index commit. It may now hold the INVERSE of what just landed, which a
+peer's \`git add <file> && git commit\` would silently revert. Clear it yourself,
+scoped to YOUR paths only (never a bare \`git restore --staged .\`):
+  git restore --staged -- $(printf '%s ' "${committed_files[@]}")
+  git diff --cached --stat        # must be empty for those paths afterwards
+EOF
+    else
+        # Did the repair overwrite a peer's genuinely staged entry (as opposed
+        # to a stale one that merely echoed the old HEAD)? Say so and name the
+        # blob — the object is still in the odb, so their staging is recoverable.
+        clobbered=""
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            p="${line#*$'\t'}"
+            blob="$(printf '%s' "${line%%$'\t'*}" | awk '{print $4}')"
+            for c in "${committed_files[@]}"; do
+                if [ "$c" = "$p" ]; then
+                    clobbered="${clobbered}  ${p}  (was staged as blob ${blob})"$'\n'
+                    break
+                fi
+            done
+        done <<< "$pre_staged_raw"
+        if [ -n "$clobbered" ]; then
+            cat >&2 <<EOF
+
+safe-commit: NOTE (T-0752) — the shared index held STAGED content for path(s)
+this commit also touched. They have been reset to the new HEAD, because leaving
+the index disagreeing with HEAD is what silently reverts landed work. Nothing in
+any worktree was modified, and the staged blobs are still in the object store:
+${clobbered}Recover one with:
+  git cat-file blob <blob> > /tmp/recovered && diff /tmp/recovered <path>
+EOF
+        fi
+    fi
 fi
 
 exec 9>&-

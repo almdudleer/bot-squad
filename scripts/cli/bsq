@@ -2792,7 +2792,12 @@ def cmd_pace_resume(args) -> None:
 # onto a TEMP index seeded from HEAD. The shared index and the peer's worktree
 # hunks are never touched, so a co-edited file can't sweep a peer's work.
 # Limitation: if a peer edits the SAME region AFTER your edit-begin, the apply
-# fails loud (never corrupts) and you resolve manually.
+# fails loud (never corrupts) and you resolve manually. A peer editing the same
+# FILE but a different region after your edit-begin does NOT fail — their lines
+# are inside your baseline→current diff and get committed as yours (T-0752 M2,
+# = ee7ba15). Nothing in a worktree records who wrote an uncommitted line, so
+# that cannot be resolved by attribution; _coedit_audit below reports the
+# signals that ARE measurable and stops the commit until you have looked.
 #
 # T-0732 (2026-07-27 p279/p280 incident): the POST-HOC path — you already edited
 # without an edit-begin — used to be a hand-rolled recipe that staged your hunks
@@ -2873,12 +2878,38 @@ def _repo_relpath(repo_root: str, f: str) -> str:
     return rel
 
 
+def _meta_path(store: Path) -> Path:
+    return store / "meta.json"
+
+
+def _read_meta(store: Path) -> dict:
+    try:
+        return json.loads(_meta_path(store).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_meta(store: Path, meta: dict) -> None:
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+        _meta_path(store).write_text(json.dumps(meta, indent=2, sort_keys=True))
+    except OSError:
+        pass  # the baseline itself is what matters; meta only enriches warnings
+
+
 def cmd_edit_begin(args) -> None:
     """Snapshot files' current bytes as this session's baseline for `commit --hunks`."""
     slug = resolve_slug()
     sid = require_sid(getattr(args, "sid", None))
     repo_root = _repo_root()
     store = worktree_store(slug, sid)
+    # T-0752: alongside the bytes, remember WHEN and against WHICH HEAD this
+    # baseline was taken. `commit --hunks` needs both to say anything true
+    # about what happened to the file in between — see _coedit_audit.
+    head_at_baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True
+    ).stdout.strip()
+    meta = _read_meta(store)
     absent: list[str] = []
     for f in args.files:
         rel = _repo_relpath(repo_root, f)
@@ -2891,12 +2922,246 @@ def cmd_edit_begin(args) -> None:
             if snap.exists():
                 snap.unlink()
             absent.append(rel)
+        meta[rel] = {"ts": _utc_now(), "head": head_at_baseline}
+    _write_meta(store, meta)
     if absent:
         ab = store / "absent.txt"
         have = set(ab.read_text().split()) if ab.exists() else set()
         have.update(absent)
         ab.write_text("\n".join(sorted(have)) + "\n")
     print(f"edit-begin: baselined {len(args.files)} file(s) for {sid}")
+
+
+# --------------------------------------------------------------------------
+# T-0752 manifestation 2: the STALE-BASELINE sweep.
+#
+# `--hunks` commits the diff baseline→worktree. That isolates a co-editor only
+# for work that was ALREADY in the file when you ran `bsq edit-begin`. Anything
+# a peer adds AFTERWARDS lands inside "your" diff and is swept into your commit
+# without the source change it pins — how ee7ba15 turned HEAD red on a suite its
+# author had honestly measured green. The pre-existing guard (a `git apply`
+# conflict) only fires when the peer touched the SAME REGION; the hazard is any
+# peer edit to any baselined file, which is a much bigger set.
+#
+# Nothing in the worktree records WHO wrote a given uncommitted line, so no
+# check can attribute hunks. What it CAN do is stop the tool from implying an
+# isolation it isn't providing, and surface the signals that ARE certain:
+#   ! a peer COMMITTED the file after your baseline   (git log baseline..HEAD)
+#   ! the SHARED index holds staged content for it    (someone ran `git add`)
+#   ! another live session holds an edit-begin baseline on it
+#   · your baseline was identical to HEAD, so --hunks isolates NOTHING here and
+#     your commit claims every hunk currently in the file
+# The `!` signals block until --ack; the `·` caution always prints.
+# --------------------------------------------------------------------------
+_CLAIM_MAX_AGE_S = 24 * 3600
+
+
+def _git_ok(repo_root: str, *args: str) -> str:
+    p = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def _peer_claims(slug: str, sid: str, rel: str) -> list[tuple[str, float]]:
+    """Other sessions holding a LIVE `bsq edit-begin` baseline on ``rel``.
+
+    A snapshot under another SID's store IS that session's claim on the file.
+    Stores outlive their sessions (nothing GCs them — the install still holds
+    baselines from June), so age is the liveness proxy: anything older than a
+    day is a corpse, not a co-editor. Deliberately filesystem-only, so the
+    commit path never needs the worker socket to be up.
+    """
+    root = Path(BOT_SQUAD) / "data" / slug / "_worktree"
+    me = _sanitize_sid(sid)
+    now = time.time()
+    out: list[tuple[str, float]] = []
+    try:
+        dirs = sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError:
+        return out
+    for d in dirs:
+        if d.name == me:
+            continue
+        try:
+            age = now - _snapshot_path(d, rel).stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if age <= _CLAIM_MAX_AGE_S:
+            out.append((d.name, age))
+    return out
+
+
+def _hunk_count(diff_text: str) -> int:
+    return sum(1 for ln in diff_text.splitlines() if ln.startswith("@@"))
+
+
+def _patch_hunks_per_rel(patch_text: str) -> dict[str, int]:
+    """`@@` count per target file, tracking the `+++ b/<rel>` header in force."""
+    out: dict[str, int] = {}
+    cur = ""
+    for line in patch_text.splitlines():
+        if line.startswith("+++ "):
+            t = line[4:].split("\t", 1)[0].strip()
+            cur = "" if t == "/dev/null" else (t[2:] if t.startswith("b/") else t)
+        elif line.startswith("@@") and cur:
+            out[cur] = out.get(cur, 0) + 1
+    return out
+
+
+def _audit_ctx(explicit_sid: str | None = None) -> tuple[str, str]:
+    """(slug, sid) for the co-edit audit, best-effort.
+
+    Neither is required to commit, so neither may become a new way for a commit
+    to fail: an unregistered cwd or a session with no tmux just gets the subset
+    of checks that need no project context.
+    """
+    slug = ""
+    try:
+        with open(PROJECTS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+        cwd = os.path.realpath(os.getcwd())
+        for s, p in cfg.get("projects", {}).items():
+            for key in ("repo_path", "repo_master", "repo_workspace"):
+                t = p.get(key, "")
+                if t and (cwd == os.path.realpath(t)
+                          or cwd.startswith(os.path.realpath(t) + "/")):
+                    slug = s
+                    break
+            if slug:
+                break
+    except (OSError, ValueError):
+        pass
+    return slug, (explicit_sid or my_sid() or "")
+
+
+def _shared_clone(slug: str) -> bool:
+    """True when other sessions have ever baselined here — i.e. a shared tree."""
+    try:
+        return any((Path(BOT_SQUAD) / "data" / slug / "_worktree").iterdir())
+    except OSError:
+        return False
+
+
+def _foreign_dirty(repo_root: str, mine: set[str]) -> list[str]:
+    """Tracked files dirty in the worktree that this session never baselined.
+
+    The liveness signal that costs nothing: in a clone this session is alone in,
+    every uncommitted change is its own. Files it never ran `edit-begin` on,
+    dirty right now, mean somebody ELSE is mid-edit in this tree — which is the
+    precondition that turns "my baseline gave me no isolation" from a pedantic
+    note into the ee7ba15 sweep.
+    """
+    out = _git_ok(repo_root, "diff", "--name-only", "HEAD")
+    return [p for p in out.splitlines() if p and p not in mine]
+
+
+def _coedit_audit(
+    repo_root: str, slug: str, sid: str, rels: list[str],
+    meta: dict, patch_hunks: dict[str, int] | None = None,
+) -> tuple[list[str], list[str]]:
+    """(blocking, caution) report lines for the files this commit will touch."""
+    blocking: list[str] = []
+    caution: list[str] = []
+    shared = _shared_clone(slug)
+    baselined = set(meta) | set(rels)
+    foreign = _foreign_dirty(repo_root, baselined) if shared else []
+    for rel in rels:
+        b: list[str] = []
+        c: list[str] = []
+        info = meta.get(rel) or {}
+        base_head = info.get("head") or ""
+        base_ts = info.get("ts") or "your edit-begin"
+
+        if base_head:
+            landed = _git_ok(repo_root, "log", "--oneline", "--no-decorate",
+                             f"{base_head}..HEAD", "--", rel)
+            if landed:
+                b.append(
+                    f"  ! a peer COMMITTED this file after your baseline ({base_ts}):\n"
+                    + "".join(f"      {ln}\n" for ln in landed.splitlines())
+                    + "    your patch is diffed against the PRE-commit content, so it can\n"
+                      "    re-introduce lines they removed. Re-baseline before committing:\n"
+                      f"      bsq edit-begin {rel}   # then redo your edit's diff"
+                )
+
+        if _git_ok(repo_root, "diff", "--cached", "--name-only", "HEAD", "--", rel):
+            b.append(
+                "  ! the SHARED index holds staged content for this file — someone ran\n"
+                "    a raw `git add` on it. Your commit does not include their staging,\n"
+                "    and reconciliation will reset it (safe-commit prints the blob)."
+            )
+
+        for peer, age in _peer_claims(slug, sid, rel):
+            b.append(
+                f"  ! peer session {peer} holds a live edit-begin baseline on this\n"
+                f"    file ({int(age // 60)}m old) — they are editing it right now."
+            )
+
+        # The caution: how much isolation is --hunks actually giving you here?
+        if patch_hunks is not None:
+            mine = patch_hunks.get(rel, 0)
+            total = _hunk_count(_git_ok(repo_root, "diff", "HEAD", "--", rel))
+            if total and mine >= total:
+                c.append(
+                    f"  · your patch covers ALL {total} hunk(s) currently in this file, so\n"
+                    "    it isolates nothing: every uncommitted change in it is being\n"
+                    "    claimed as yours."
+                )
+        elif base_head:
+            base_blob = _git_ok(repo_root, "rev-parse", f"{base_head}:{rel}")
+            snap_blob = _git_ok(repo_root, "hash-object",
+                                str(_snapshot_path(worktree_store(slug, sid), rel)))
+            if base_blob and base_blob == snap_blob:
+                total = _hunk_count(_git_ok(repo_root, "diff", "HEAD", "--", rel))
+                line = (
+                    f"your baseline was IDENTICAL to HEAD, so --hunks isolates nothing\n"
+                    f"    here: this commit claims all {total} hunk(s) now in the file. Any\n"
+                    f"    peer edit made since {base_ts} is inside it."
+                )
+                if foreign:
+                    # Someone else is demonstrably mid-edit in this tree, and
+                    # this file's whole diff is about to be attributed to you.
+                    b.append(
+                        f"  ! {line}\n"
+                        f"    {len(foreign)} file(s) are dirty here that you never baselined —\n"
+                        f"    a peer is editing this tree right now: "
+                        + ", ".join(foreign[:3])
+                        + (" …" if len(foreign) > 3 else "")
+                    )
+                else:
+                    c.append(f"  · {line}")
+        if not shared:
+            c = []          # solo clone: the "isolates nothing" note is noise
+        if b:
+            blocking.extend([f"── {rel} ──", *b, *c])
+        elif c:
+            caution.extend([f"── {rel} ──", *c])
+    return blocking, caution
+
+
+def _report_coedit(
+    blocking: list[str], caution: list[str], ack: bool, redo_hint: str,
+) -> None:
+    """Print the audit; abort (exit 3) on a blocking signal unless --ack."""
+    if not blocking and not caution:
+        return
+    print("\n── co-edit audit (T-0752) ──", file=sys.stderr)
+    for ln in blocking + caution:
+        print(ln, file=sys.stderr)
+    print(
+        "\nA `--hunks` commit can only isolate work that was already in the file\n"
+        "when you baselined it. Confirm the diff below is yours and nobody else's:\n"
+        "  git diff HEAD -- <file>",
+        file=sys.stderr,
+    )
+    if blocking and not ack:
+        print(
+            "\nbsq: commit --hunks stopped BEFORE committing. Every `!` above is a\n"
+            "measured fact about this tree, not a guess — what it means for your\n"
+            "hunks is yours to judge. Review, then re-run with --ack:\n"
+            f"  {redo_hint}",
+            file=sys.stderr,
+        )
+        sys.exit(3)
 
 
 def _patch_target_rels(patch_text: str) -> list[str]:
@@ -3047,10 +3312,19 @@ def _commit_hunks_from_patch(args, repo_root: str) -> None:
             die("commit --hunks --patch: the patch touches files you did not "
                 f"declare: {', '.join(stray)}\nEither add them to the command or "
                 "trim those hunks out of the patch.")
+    redo = (f"bsq commit --hunks --ack --patch {args.patch} "
+            f"-m {json.dumps(args.message)}")
+    # T-0752: no baseline exists on this path (that's the point of --patch), so
+    # the audit is limited to the signals that don't need one — plus how many of
+    # the file's live hunks this hand-trimmed patch is claiming.
+    slug, sid = _audit_ctx(getattr(args, "sid", None))
+    _report_coedit(
+        *_coedit_audit(repo_root, slug, sid, rels, {},
+                       patch_hunks=_patch_hunks_per_rel(patch_text)),
+        ack=args.ack, redo_hint=redo,
+    )
     _commit_patch_via_temp_index(
-        repo_root, patch_text, rels, args.message, args.ack,
-        redo_hint=f"bsq commit --hunks --ack --patch {args.patch} "
-                  f"-m {json.dumps(args.message)}",
+        repo_root, patch_text, rels, args.message, args.ack, redo_hint=redo,
     )
     print(f"commit --hunks --patch: committed {len(rels)} file(s) from {args.patch}")
     sys.exit(0)
@@ -3092,17 +3366,26 @@ def _commit_hunks(args, repo_root: str) -> None:
         print("commit --hunks: no changes since edit-begin; nothing to commit")
         return
 
+    redo = (f"bsq commit --hunks --ack -m {json.dumps(args.message)} "
+            f"{' '.join(args.files)}")
+    _report_coedit(
+        *_coedit_audit(repo_root, slug, sid, rels, _read_meta(store)),
+        ack=args.ack, redo_hint=redo,
+    )
     _commit_patch_via_temp_index(
-        repo_root, "".join(patches), rels, args.message, args.ack,
-        redo_hint=f"bsq commit --hunks --ack -m {json.dumps(args.message)} "
-                  f"{' '.join(args.files)}",
+        repo_root, "".join(patches), rels, args.message, args.ack, redo_hint=redo,
     )
     # Success — clear the consumed baselines so a later edit re-snapshots fresh.
+    # Dropping the snapshot also releases this session's claim on the file, so a
+    # peer's next `--hunks` audit stops naming us as a live co-editor (T-0752).
+    meta = _read_meta(store)
     for rel in rels:
         try:
             _snapshot_path(store, rel).unlink()
         except (OSError, ValueError):
             pass
+        meta.pop(rel, None)
+    _write_meta(store, meta)
     if ab.exists():
         remaining = absent - set(rels)
         if remaining:
@@ -3111,6 +3394,46 @@ def _commit_hunks(args, repo_root: str) -> None:
             ab.unlink()
     print(f"commit --hunks: committed {len(rels)} file(s)' own hunks for {sid}")
     sys.exit(0)
+
+
+def cmd_verify_isolated(args) -> None:
+    """Run a command against a `git archive` extract of a ref (T-0752).
+
+    In a clone shared by ~5 live sessions, a suite run in the WORKING TREE
+    certifies the tree, not your commit: it sees every peer's uncommitted edit,
+    and it does NOT see the state anyone else will get from HEAD. On 2026-07-27
+    that gap produced a red HEAD reported green in good faith (ee7ba15) — while
+    the one session that verified an extract instead was the only one with no
+    incident. This is the recipe, so it stops being retyped by hand.
+    """
+    repo_root = _repo_root()
+    cmd = [a for a in (args.cmd or []) if a != "--"]
+    if not cmd:
+        die("verify-isolated: nothing to run — `bsq verify-isolated -- pytest worker/tests`")
+    ref = subprocess.run(["git", "rev-parse", "--verify", args.ref],
+                         cwd=repo_root, capture_output=True, text=True)
+    if ref.returncode != 0:
+        die(f"verify-isolated: no such ref: {args.ref}")
+    sha = ref.stdout.strip()
+    dest = tempfile.mkdtemp(prefix=f"bsq-verify-{sha[:8]}-")
+    try:
+        ar = subprocess.Popen(["git", "archive", "--format=tar", sha],
+                              cwd=repo_root, stdout=subprocess.PIPE)
+        tar = subprocess.run(["tar", "-x", "-C", dest], stdin=ar.stdout)
+        ar.stdout.close()
+        if ar.wait() != 0 or tar.returncode != 0:
+            die(f"verify-isolated: could not extract {args.ref} into {dest}")
+        print(f"verify-isolated: {args.ref} ({sha[:12]}) extracted to {dest}")
+        print(f"verify-isolated: running: {' '.join(cmd)}\n")
+        rc = subprocess.run(cmd, cwd=dest).returncode
+        print(f"\nverify-isolated: exit {rc} — this certifies {sha[:12]}, "
+              "not the shared working tree.")
+        sys.exit(rc)
+    finally:
+        if args.keep:
+            print(f"verify-isolated: extract kept at {dest}")
+        else:
+            shutil.rmtree(dest, ignore_errors=True)
 
 
 def _is_install_clone(repo_root: str) -> bool:
@@ -4881,6 +5204,18 @@ def build_parser() -> argparse.ArgumentParser:
     eb.add_argument("files", nargs="+", help="files to baseline before editing")
     eb.set_defaults(func=cmd_edit_begin)
 
+    # verify-isolated (T-0752) — run a suite against HEAD, not the shared tree
+    vi = sub.add_parser(
+        "verify-isolated",
+        help="run a command against a clean `git archive` extract of a ref "
+             "(a worktree suite run does not certify a commit)")
+    vi.add_argument("--ref", default="HEAD", help="ref to extract (default HEAD)")
+    vi.add_argument("--keep", action="store_true",
+                    help="leave the extract in place and print its path")
+    vi.add_argument("cmd", nargs=argparse.REMAINDER,
+                    help="command to run inside the extract (after --)")
+    vi.set_defaults(func=cmd_verify_isolated)
+
     # commit
     # T-0482: user-controlled execution pace (Process Paradigm M3 / F3.4).
     pace = sub.add_parser(
@@ -4917,7 +5252,8 @@ def build_parser() -> argparse.ArgumentParser:
     cm.add_argument(
         "--hunks", action="store_true",
         help="T-0215: commit ONLY this session's hunks (the diff since "
-             "`bsq edit-begin`) in <files>, isolating a peer's edits in the same file")
+             "`bsq edit-begin`) in <files>, isolating a peer's edits that were "
+             "already there at edit-begin — NOT ones they add afterwards (T-0752)")
     cm.add_argument("--sid", help="session SID for --hunks (default: derived from tmux)")
     cm.add_argument(
         "--patch", metavar="FILE",

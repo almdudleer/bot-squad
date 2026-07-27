@@ -94,6 +94,7 @@ class _FakeTgClient:
         urgent: bool = False,
         topic_id: int | None = None,
         debounce: bool = True,
+        delivery: dict | None = None,
     ) -> bool:
         self.calls.append(
             {"chat_id": chat_id, "text": text, "sid": sid, "urgent": urgent}

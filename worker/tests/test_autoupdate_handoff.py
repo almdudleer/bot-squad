@@ -145,7 +145,8 @@ class _FakeTgClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True) -> bool:
+    def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None, debounce=True,
+             delivery=None) -> bool:
         self.calls.append({
             "chat_id": chat_id, "text": text,
             "sid": sid, "user": user, "urgent": urgent, "topic_id": topic_id,

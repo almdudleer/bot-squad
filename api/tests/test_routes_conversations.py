@@ -1125,3 +1125,76 @@ def test_worker_append_without_forwarded_from_is_unchanged(tmp_bot_squad: Path, 
     line = (tmp_bot_squad / "data" / "_mothership" / "conversations"
             / "test-project" / "gu_abc.jsonl").read_text(encoding="utf-8").strip()
     assert "forwarded_from" not in line
+
+
+# ---------------------------------------------------------------------------
+# T-0761: `relayed: true` was a confirmation that could not fail — it is true
+# whether the reply landed in the resolved topic or fell back to the private
+# DM. That is why every misrouted message during T-0740's lifetime reported
+# success. The response now also carries WHERE Telegram says it went.
+# ---------------------------------------------------------------------------
+
+def test_relay_response_reports_where_telegram_delivered(tmp_bot_squad: Path, monkeypatch):
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    _mock_call_action(monkeypatch, result={
+        "ok": True, "sent": True, "channel": "tg",
+        "delivery": {"thread_id": 11, "thread_known": True, "mismatch": False,
+                     "requested_thread_id": 11},
+    })
+
+    r = client.post(
+        CONV,
+        json={"author": "session:S-x-p1", "text": "here's your answer"},
+        headers=_worker_auth(),
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["relayed"] is True
+    assert body["relayed_to"]["thread_id"] == 11
+    assert body["relayed_to"]["thread_known"] is True
+
+
+def test_relay_response_surfaces_a_misroute(tmp_bot_squad: Path, monkeypatch):
+    """The T-0740 shape: asked for topic 11, Telegram says it went elsewhere.
+    `relayed` is still True — it WAS relayed — and that is precisely why the
+    bool alone could never have caught this."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    _mock_call_action(monkeypatch, result={
+        "ok": True, "sent": True, "channel": "tg",
+        "delivery": {"thread_id": None, "thread_known": False, "mismatch": True,
+                     "requested_thread_id": 11,
+                     "thread_unknown_reason": "absent-from-response"},
+    })
+
+    body = client.post(
+        CONV,
+        json={"author": "session:S-x-p1", "text": "here's your answer"},
+        headers=_worker_auth(),
+    ).json()
+
+    assert body["relayed"] is True
+    assert body["relayed_to"]["mismatch"] is True
+    assert body["relayed_to"]["thread_known"] is False
+
+
+def test_a_worker_without_the_field_omits_it_rather_than_claiming_nowhere(
+        tmp_bot_squad: Path, monkeypatch):
+    """The negative guard, and the reason the key is optional: an older worker
+    reports no `delivery`, and an ABSENT key must read as "not stated" — never
+    as "delivered nowhere", which is the silent-None failure this whole ticket
+    is about, one layer up."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+    client = _client(tmp_bot_squad, monkeypatch)
+    _mock_call_action(monkeypatch, result={"ok": True, "sent": True, "channel": "tg"})
+
+    body = client.post(
+        CONV,
+        json={"author": "session:S-x-p1", "text": "here's your answer"},
+        headers=_worker_auth(),
+    ).json()
+
+    assert body["relayed"] is True
+    assert "relayed_to" not in body

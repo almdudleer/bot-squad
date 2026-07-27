@@ -32,6 +32,124 @@ _TG_API = "https://api.telegram.org/bot{token}/sendMessage"
 _TG_METHOD = "https://api.telegram.org/bot{token}/{method}"
 
 
+#: ``delivery_receipt`` reasons for having no thread from Telegram. Named
+#: rather than boolean because "TG did not say" has genuinely different
+#: flavours, and a caller debugging a misroute needs to know which one.
+UNKNOWN_NO_RESPONSE = "no-response"        # nothing came back at all
+UNKNOWN_NO_RESULT = "no-result"            # a response, but no `result` object
+UNKNOWN_ABSENT = "absent-from-response"    # a Message, with no message_thread_id
+
+
+def _read_echoed_text(result: dict) -> tuple[str, bool, str]:
+    """``(text, known, unknown_reason)`` from a sendMessage ``result``.
+
+    Telegram's Message object echoes the text AS DELIVERED, which for one
+    message class is the ONLY witness of the bytes that reached the wire: the
+    T-0758 ``📋 <ticket> → <status>`` notice applies its sender tag at the
+    transport, stores the RAW UNTAGGED text via ``task_chat._append_thread``,
+    and passes ``record_outbound=False`` — so the spool has nothing and the
+    stored copy proves nothing either way.
+
+    Asserted, not assumed, for the same reason as the thread id: a silently
+    missing echo reads identically to "nothing was sent".
+    """
+    if "text" not in result:
+        return "", False, UNKNOWN_ABSENT
+    raw = result.get("text")
+    if not isinstance(raw, str):
+        return "", False, UNKNOWN_ABSENT
+    return raw, True, ""
+
+
+def delivery_receipt(
+    data: Any, *, chat_id: Any = "", requested_thread_id: Any = None,
+) -> dict:
+    """Where TELEGRAM says the message landed, next to where we asked (T-0761).
+
+    Every delivery artefact this system keeps records INTENT — the chat and
+    topic we addressed — and none record OUTCOME. Conflating the two is what
+    let T-0740 run unnoticed: an attendant writeback that fell back to the
+    private DM still reported ``relayed: true``, because that bool is true in
+    both outcomes. It is a confirmation that cannot fail. ``sendMessage``
+    answers with a Message object carrying ``message_thread_id``, which is
+    Telegram's own statement of destination, and the transport was discarding
+    it.
+
+    THE FIELD IS ASSERTED, NOT PLUCKED. When it is absent — a DM has no thread,
+    an error path returned early, the API shape changed — this returns an
+    EXPLICIT UNKNOWN (``thread_known: False`` plus a reason) and never a bare
+    ``None``. That distinction is the whole point of the function: a silent
+    ``None`` reads identically to "was not in a topic", which would make this
+    witness lie in precisely the situation it exists for. Telegram never states
+    a negative (a General-topic message, a DM and a non-forum group all simply
+    omit the field), so "in no topic" is a conclusion this system is not
+    entitled to draw and does not.
+
+    ``mismatch`` is the auditable question: we asked for topic N, did TG confirm
+    N? ``True`` means it reported something else — the T-0740 shape, caught
+    after the fact for the first time. Unknown-when-a-topic-was-requested also
+    counts as a mismatch (an unconfirmed delivery is not a confirmed one), and
+    the two are told apart by ``thread_known``.
+
+    Pure and non-raising: it is called on the send path, where an observability
+    failure must never turn a delivered message into a failed one.
+    """
+    req = None
+    if requested_thread_id not in (None, ""):
+        try:
+            req = int(requested_thread_id)
+        except (TypeError, ValueError):
+            req = None
+
+    out: dict[str, Any] = {
+        "chat_id": str(chat_id or ""),
+        "requested_thread_id": req,
+        "thread_id": None,
+        "thread_known": False,
+        "thread_unknown_reason": UNKNOWN_NO_RESPONSE,
+        "mismatch": req is not None,
+        "text": "",
+        "text_known": False,
+        "text_unknown_reason": UNKNOWN_NO_RESPONSE,
+        "message_id": None,
+    }
+    if not isinstance(data, dict):
+        return out
+    result = data.get("result")
+    if not isinstance(result, dict):
+        out["thread_unknown_reason"] = UNKNOWN_NO_RESULT
+        out["text_unknown_reason"] = UNKNOWN_NO_RESULT
+        return out
+
+    mid = result.get("message_id")
+    if mid is not None:
+        try:
+            out["message_id"] = int(mid)
+        except (TypeError, ValueError):
+            out["message_id"] = None
+
+    text, text_known, text_reason = _read_echoed_text(result)
+    out["text"] = text
+    out["text_known"] = text_known
+    out["text_unknown_reason"] = text_reason
+
+    raw = result.get("message_thread_id")
+    if raw is None:
+        out["thread_unknown_reason"] = UNKNOWN_ABSENT
+        return out
+    try:
+        out["thread_id"] = int(raw)
+    except (TypeError, ValueError):
+        # A present-but-unparseable field is a shape change, and calling that
+        # "no topic" is exactly the silent lie this function refuses.
+        out["thread_unknown_reason"] = UNKNOWN_ABSENT
+        return out
+    out["thread_known"] = True
+    out["thread_unknown_reason"] = ""
+    out["mismatch"] = req is not None and out["thread_id"] != req
+    return out
+
+
 class TgClient:
     """Outbound TG sender bound to a single bot token + data dir."""
 
@@ -69,11 +187,23 @@ class TgClient:
         reply_to_message_id: int | None = None,
         record_outbound: bool = True,
         sender_sid: str = "",
+        delivery: dict | None = None,
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
         Returns True if the message was sent, False if suppressed (empty
         token, debounce, or quiet hours).  Raises on network/API errors.
+
+        ``delivery`` (T-0761): an optional dict this fills in with
+        :func:`delivery_receipt` — Telegram's own statement of where the message
+        landed, for the caller that needs the OUTCOME and not just "a send
+        happened". An out-parameter rather than a richer return value on
+        purpose: the bool contract is relied on by every call site and by test
+        fakes with fixed signatures, and widening it to carry an audit field
+        would be a large blast radius for an observability addition. Untouched
+        when the send is suppressed — a message that never left has no
+        destination to report, and writing an empty receipt there would invent
+        one.
 
         ``urgent=True`` bypasses quiet hours (use for hard failures the
         stakeholder explicitly asked to be paged on; not for routine
@@ -154,15 +284,22 @@ class TgClient:
             chat_id=chat_id, text=full_text, topic_id=topic_id,
             reply_markup=reply_markup, reply_to_message_id=reply_to_message_id,
         )
+        receipt = self._receipt(data, chat_id=chat_id, topic_id=topic_id)
+        if delivery is not None:
+            delivery.update(receipt)
         self._record_reply_route(chat_id=chat_id, data=data, route_sid=route_sid)
         if record_outbound:
             self._record_outbound(
                 data=data, chat_id=chat_id, text=full_text, sid=sid,
                 route_sid=route_sid, topic_id=topic_id,
-                reply_to_message_id=reply_to_message_id,
+                reply_to_message_id=reply_to_message_id, delivery=receipt,
             )
         else:
             self._note_unspooled()
+            self._record_response(
+                receipt, chat_id=chat_id, sid=sid, route_sid=route_sid,
+                topic_id=topic_id,
+            )
         if debounce:
             self._record(chat_id=chat_id, sid=sid, text=text)
         return True
@@ -170,6 +307,7 @@ class TgClient:
     def _record_outbound(
         self, *, data: Any, chat_id: str, text: str, sid: str, route_sid: str,
         topic_id: int | None, reply_to_message_id: int | None = None,
+        delivery: dict | None = None,
     ) -> None:
         """T-0755: record WHAT we sent, not just that we sent it.
 
@@ -204,10 +342,79 @@ class TgClient:
                 message_id=((data or {}).get("result") or {}).get("message_id"),
                 reply_to_message_id=reply_to_message_id,
                 cfg=self._cfg,
+                # T-0761: where TELEGRAM says it landed, beside where WE asked
+                # for it to go. `thread_id` above is intent; this is outcome.
+                delivery=delivery,
             )
         except Exception:  # noqa: BLE001 — observability only, never fail the send
             log.exception("tg.send: could not record outbound content for %s",
                           route_sid or sid)
+
+    def _receipt(self, data: Any, *, chat_id: str, topic_id: int | None) -> dict:
+        """:func:`delivery_receipt` plus the one log line worth emitting.
+
+        WARNING only for a DEFINITE misroute — we asked for topic N and
+        Telegram named a different one. That is the T-0740 shape and it should
+        be impossible to miss.
+
+        An unconfirmed delivery (we asked for a topic, TG's echo carries no
+        ``message_thread_id``) is INFO, deliberately: it is fully recorded and
+        fully explicit in the receipt, and if Telegram turns out not to echo the
+        field for our send shape at all, a WARNING would fire on every topic
+        send and get muted — which is how a real alarm dies. The record is the
+        witness; the log is only the nudge.
+
+        Never raises: the receipt is observability and the message is already
+        delivered by the time we get here.
+        """
+        try:
+            receipt = delivery_receipt(
+                data, chat_id=chat_id, requested_thread_id=topic_id)
+            if receipt.get("mismatch"):
+                if receipt.get("thread_known"):
+                    log.warning(
+                        "tg.send: MISROUTED — asked for topic %s, Telegram "
+                        "delivered into topic %s (chat=%s, message_id=%s)",
+                        receipt["requested_thread_id"], receipt["thread_id"],
+                        chat_id, receipt.get("message_id"))
+                else:
+                    log.info(
+                        "tg.send: destination UNCONFIRMED — asked for topic %s, "
+                        "Telegram's response carries no message_thread_id (%s, "
+                        "chat=%s)", receipt["requested_thread_id"],
+                        receipt.get("thread_unknown_reason"), chat_id)
+            return receipt
+        except Exception:  # noqa: BLE001 — never fail a delivered send
+            log.exception("tg.send: could not read the delivery receipt")
+            return {}
+
+    def _record_response(
+        self, receipt: dict, *, chat_id: str, sid: str, route_sid: str,
+        topic_id: int | None,
+    ) -> None:
+        """T-0761: for an unspooled send, Telegram's answer is the only witness.
+
+        Paired with :meth:`_note_unspooled` rather than replacing it: the marker
+        says a delivery happened at all (T-0759's discriminator, and the only
+        thing left when there is no usable response), while this says WHERE it
+        went and WHAT bytes went. The receipt also lands in the spool, so an
+        unspooled send now has a real record too — the marker stops being the
+        sole evidence on this path without ceasing to be evidence.
+
+        Non-raising by contract; the message is already delivered.
+        """
+        if not receipt:
+            return
+        try:
+            from bot_squad_worker import outbound_log
+
+            outbound_log.record_response(
+                self._data_dir, channel="tg", chat_id=chat_id, delivery=receipt,
+                route_sid=route_sid, sender_label=sid, thread_id=topic_id,
+                cfg=self._cfg,
+            )
+        except Exception:  # noqa: BLE001 — observability only, never fail the send
+            log.exception("tg.send: could not record the delivery receipt")
 
     def _note_unspooled(self) -> None:
         """T-0759: declare the deliberate opt-out so a silence stays readable.
@@ -344,6 +551,11 @@ class TgClient:
         self._record_outbound(
             data=data, chat_id=chat_id, text=text, sid="tg-listener",
             route_sid="", topic_id=topic_id,
+            # T-0761: this path bypasses `send`, so it needs the destination
+            # capture for the same reason it needed its own outbound record —
+            # a second send path that audits less than the first is how the
+            # gap re-opens.
+            delivery=self._receipt(data, chat_id=chat_id, topic_id=topic_id),
         )
         message_id = ((data or {}).get("result") or {}).get("message_id")
         if message_id is None:

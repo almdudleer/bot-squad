@@ -305,6 +305,7 @@ def record(
     reply_to_message_id: Any = None,
     cfg: Any = None,
     timestamp: str | None = None,
+    delivery: dict | None = None,
 ) -> dict | None:
     """Record one DELIVERED outbound message. Returns the stored record.
 
@@ -314,6 +315,12 @@ def record(
     process that writes here), no network, no read-modify-write — the store is
     read live by several sessions on every check and this must not be something
     they queue behind.
+
+    ``delivery`` (T-0761): the transport's ``tg.delivery_receipt`` — where
+    TELEGRAM said the message landed, stored as ``delivered_to`` beside the
+    ``thread_id`` we addressed. Two fields, not one merged "destination",
+    because reading intent as outcome is the defect that made a misrouted
+    message indistinguishable from a delivered one.
 
     NEVER raises. A logging failure that broke a send would be strictly worse
     than the gap it is fixing, so every failure is caught, counted in
@@ -345,6 +352,25 @@ def record(
             rec["redacted"] = kinds
         if orig_len:
             rec["truncated"] = {"orig_len": orig_len, "cap": BODY_CAP}
+        if delivery:
+            # T-0761: OUTCOME, kept separate from INTENT rather than folded
+            # into it. ``thread_id`` above is the topic we ADDRESSED; this is
+            # what Telegram said about where the message actually went. They
+            # are stored as two fields precisely because the whole defect was
+            # reading one as the other — and ``thread_known`` is what stops an
+            # absent value being read as "it was not in a topic".
+            rec["delivered_to"] = _delivered_to(delivery)
+            # The echoed text is NOT stored beside our own copy — `text` above
+            # already holds these bytes (T-0758 composes once and hands the same
+            # string to `_post` and to here, so spool == wire). It is recorded
+            # only when Telegram's echo DISAGREES, which is the case that would
+            # otherwise be invisible. Both sides are redacted, so a difference
+            # here is a difference in structure, never in a stripped secret.
+            if delivery.get("text_known"):
+                echoed, _ = redact(delivery.get("text") or "", cfg=cfg)
+                if _cap_body(echoed)[0] != rec["text"]:
+                    rec["delivered_to"]["wire_text_differs"] = True
+                    rec["delivered_to"]["wire_text"] = _cap_body(echoed)[0]
         path = _spool_path(data_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -363,6 +389,111 @@ def stats() -> dict:
     """Drop counters, for the loud half of best-effort (surfaced by the tick's
     audit dict and readable from any session)."""
     return dict(DROPS)
+
+
+# ---------------------------------------------------------------------------
+# The delivery receipt — what TELEGRAM said, for a send we do not spool
+# ---------------------------------------------------------------------------
+
+#: ``kind`` marking a record as an AUDIT of a delivery rather than a message to
+#: show a reader. The drain skips these (see :func:`drain`): mirroring one into
+#: the conversation store would put a second copy of the line in the transcript,
+#: which is the exact thing ``record_outbound=False`` exists to prevent.
+RECEIPT_KIND = "delivery-receipt"
+
+
+def record_response(
+    data_dir: Any,
+    *,
+    channel: str,
+    chat_id: Any,
+    delivery: dict,
+    route_sid: str = "",
+    sender_label: str = "",
+    thread_id: Any = None,
+    cfg: Any = None,
+    timestamp: str | None = None,
+) -> dict | None:
+    """Record Telegram's own answer for a send that is NOT spooled (T-0761).
+
+    Why this exists at all, and why only here. ``record_outbound=False`` says
+    the CALLER already recorded this text, so the transport does not — and for
+    one class that leaves the delivered bytes witnessed nowhere. ``task_chat``'s
+    ``📋 <ticket> → <status>`` notice applies its T-0758 sender tag at the
+    TRANSPORT, stores the raw UNTAGGED text via ``_append_thread``, and opts out
+    of the spool: tag only on the wire. Telegram's response echoes the text as
+    delivered, so this record is the only copy of those bytes that can ever
+    exist. For every other class the spool already holds the tagged bytes, which
+    is why this is written ONLY on the opt-out path — a receipt beside every
+    normal record would be a second copy of content that is already recorded,
+    and that is the parallel record T-0759 was careful not to become.
+
+    IN THE SPOOL TREE, not a new store, and that is load-bearing: it inherits
+    :func:`redact` (below), :data:`SPOOL_RETENTION_DAYS` pruning, and a reader's
+    attention. A side file would inherit none of the three and would outlive the
+    redaction policy it was written under.
+
+    WHAT "RAW" MEANS HERE — read this before writing any comparison. The
+    STRUCTURE is raw (whatever Telegram sent, asserted field by field, with an
+    absent field surfacing as an explicit unknown), but the TEXT has been
+    through :func:`redact`. So this is raw structure with redacted values, NOT
+    raw bytes. Anything that ever compares this text against the conversation
+    store's copy must consult ``redacted`` first: a naive byte-equality check
+    would fail spuriously on any message that happened to contain a secret, and
+    it would fail *as a difference in the tag* — precisely the false positive
+    this record exists to prevent.
+
+    Never raises, like every other writer here.
+    """
+    try:
+        rec: dict[str, Any] = {
+            "timestamp": timestamp or _now_iso(),
+            "direction": "out",
+            "kind": RECEIPT_KIND,
+            "author": author_for_send(route_sid=route_sid, sender_label=sender_label),
+            "channel": str(channel or "tg"),
+            "chat_id": str(chat_id),
+            "delivered_to": _delivered_to(delivery),
+        }
+        if thread_id is not None and str(thread_id).strip() != "":
+            rec["thread_id"] = thread_id
+        if delivery.get("message_id") is not None:
+            rec["message_id"] = delivery["message_id"]
+        if delivery.get("text_known"):
+            body, kinds = redact(delivery.get("text") or "", cfg=cfg)
+            body, orig_len = _cap_body(body)
+            # Stored as `text` on purpose rather than under a private key: this
+            # IS what we sent, so `echo_guard` rung 2 should recognise it coming
+            # back — the 📋 notice is otherwise the one class a forward of our
+            # own words could never be matched against.
+            rec["text"] = body
+            if kinds:
+                rec["redacted"] = kinds
+            if orig_len:
+                rec["truncated"] = {"orig_len": orig_len, "cap": BODY_CAP}
+        path = _spool_path(data_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return rec
+    except Exception:  # noqa: BLE001 — an audit failure must never break a SEND
+        DROPS["record"] += 1
+        log.exception(
+            "outbound_log.record_response DROPPED a delivery receipt (chat=%s) "
+            "— drops=%d", chat_id, DROPS["record"])
+        return None
+
+
+def _delivered_to(delivery: dict) -> dict:
+    """The destination half of a receipt, as stored.
+
+    ``thread_known`` travels with ``thread_id`` always, because that is the
+    field that stops an absent value being read as "it was not in a topic".
+    """
+    return {k: delivery[k] for k in
+            ("thread_id", "thread_known", "thread_unknown_reason", "mismatch",
+             "requested_thread_id", "text_known", "text_unknown_reason")
+            if k in delivery}
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +717,16 @@ def drain(cfg: Any, *, limit: int = DRAIN_BATCH) -> dict:
                     log.warning("outbound_log.drain: skipping torn line %s:%d",
                                 path.name, idx + 1)
                     cursor[path.name] = idx + 1
+                    continue
+                if rec.get("kind") == RECEIPT_KIND:
+                    # T-0761: an audit of a delivery, not a message for a
+                    # reader. Its send was deliberately unspooled BECAUSE the
+                    # caller already put that line in this very thread, so
+                    # mirroring the receipt would restore the duplicate the
+                    # opt-out exists to avoid. Counted as unresolved (nothing
+                    # was owed to the transcript) and the cursor advances.
+                    cursor[path.name] = idx + 1
+                    out["unresolved"] += 1
                     continue
                 try:
                     mirrored = _mirror(cfg, rec)

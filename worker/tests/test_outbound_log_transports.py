@@ -114,11 +114,25 @@ def test_tg_send_still_succeeds_when_logging_blows_up(tmp_path: Path, sent, monk
 def test_tg_record_outbound_false_suppresses_the_record_not_the_send(
         tmp_path: Path, sent) -> None:
     """For the two callers that already wrote this same text into this same
-    thread (the session-writeback relay, task_chat's lifecycle notice)."""
+    thread (the session-writeback relay, task_chat's lifecycle notice).
+
+    UPDATED BY T-0761, and the distinction is the point rather than a
+    weakening. This used to assert the spool was EMPTY. It is no longer: an
+    unspooled send now leaves a `delivery-receipt`, because for the 📋
+    lifecycle notice — tag applied at the transport, untagged copy in the
+    store, nothing in the spool — Telegram's response echo is the only witness
+    of the bytes that reached the wire. What T-0755 actually protects is that
+    the READER does not see the line twice, and that still holds exactly: the
+    drain skips receipts, so no ordinary message record exists to be mirrored.
+    """
     assert TG.TgClient(_cfg(tmp_path)).send(
         chat_id=CHAT, text="ответ", sid="x", urgent=True,
         record_outbound=False) is True
-    assert sent and _spool(tmp_path) == []
+
+    assert sent
+    recs = _spool(tmp_path)
+    assert [r.get("kind") for r in recs] == [OB.RECEIPT_KIND]
+    assert not [r for r in recs if r.get("kind") != OB.RECEIPT_KIND]
 
 
 def test_send_and_pin_records_too(tmp_path: Path, sent) -> None:
@@ -189,6 +203,37 @@ def test_max_opt_out_declares_itself(tmp_path: Path, sent) -> None:
         record_outbound=False) is True
 
     assert OB.unspooled_marker(tmp_path).exists()
+    assert OB.unspooled_marker(tmp_path).stat().st_size == 0
+
+
+@pytest.mark.parametrize("transport", ["tg", "max"])
+def test_the_marker_stays_contentless_on_both_transports(
+        tmp_path: Path, sent, transport: str) -> None:
+    """THE property that justifies this file existing at all, pinned rather than
+    described (T-0761, p330's review of T-0759).
+
+    p298's rule bans a SECOND PARALLEL RECORD — a second place where the content
+    of what we told the stakeholder lives, because two copies silently diverge.
+    An empty file cannot diverge from anything: it makes no claim about content,
+    only about WHEN. That is the entire argument for it being inside the rule
+    rather than around it, and until now it was prose. A later change adding
+    `chat_id` "for debuggability" would have passed every other test and quietly
+    turned it into exactly what was forbidden.
+
+    Both transports, because the chokepoint is the thing worth pinning and
+    one-path-covered-and-the-other-not is the failure that created T-0755.
+    """
+    if transport == "tg":
+        TG.TgClient(_cfg(tmp_path)).send(
+            chat_id=CHAT, text="ответ", sid="x", urgent=True, record_outbound=False)
+    else:
+        MX.MaxClient(_cfg(tmp_path)).send(
+            chat_id="42", text="ответ", sid="x", urgent=True, record_outbound=False)
+
+    marker = OB.unspooled_marker(tmp_path)
+    assert marker.exists()
+    assert marker.stat().st_size == 0
+    assert marker.read_bytes() == b""
 
 
 def test_a_recorded_send_declares_no_opt_out(tmp_path: Path, sent) -> None:

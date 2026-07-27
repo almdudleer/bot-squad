@@ -212,7 +212,7 @@ def _resolve_relay_target(
 async def _relay_to_telegram(
     request: Request, slug: str, global_user_id: str, text: str, thread_id: Any = None,
     sender_sid: str = "",
-) -> bool:
+) -> tuple[bool, dict]:
     """Best-effort writeback (T-0569): relay a session-authored conversation
     reply to the user's Telegram chat via the worker's ``tg_notify`` action, so
     the user actually SEES the reply (before this, nothing surfaced a
@@ -248,7 +248,7 @@ async def _relay_to_telegram(
     """
     chat_id, topic_id = _resolve_relay_target(request, slug, global_user_id, thread_id)
     if not chat_id:
-        return False
+        return False, {}
     client = request.app.state.worker_router.coordinator()
     params: dict = {
         "chat_id": chat_id, "message": text, "urgent": True, "debounce": False,
@@ -265,10 +265,16 @@ async def _relay_to_telegram(
     try:
         result = await client.call_action("tg_notify", params)
     except WorkerError:
-        return False
+        return False, {}
     except Exception:  # noqa: BLE001 — best-effort; must never fail the append
-        return False
-    return bool(result.get("ok")) and bool(result.get("sent", True))
+        return False, {}
+    relayed = bool(result.get("ok")) and bool(result.get("sent", True))
+    # T-0761: the destination Telegram itself reported, so `relayed` stops being
+    # a confirmation that cannot fail. It was true in BOTH outcomes — a reply
+    # that fell back to the private DM instead of the resolved topic still
+    # returned true — which is why T-0740 ran unnoticed for as long as it did.
+    delivery = result.get("delivery")
+    return relayed, delivery if isinstance(delivery, dict) else {}
 
 
 async def _ensure_attendant(
@@ -414,9 +420,10 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     # through the very transport that writes these records, it would not stop at
     # two. Note this is NOT the same question as `direction`: a session
     # writeback is outbound AND still needs delivering.
+    relayed_to: dict = {}
     if author.startswith("session:") and text and not fyi and not delivered:
         try:
-            relayed = await _relay_to_telegram(
+            relayed, relayed_to = await _relay_to_telegram(
                 request, slug, global_user_id, text, thread_id,
                 # T-0758: `author` is `session:<sid>` here by the branch
                 # condition above, so the SID is the part after the colon.
@@ -424,6 +431,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             )
         except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
             relayed = False
+            relayed_to = {}
 
     out = dict(record)
     # T-0755: the RESPONSE always states the effective direction, even when the
@@ -433,6 +441,12 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     out.setdefault("direction", CS.default_direction(author))
     out.setdefault("delivered", False)
     out["relayed"] = relayed
+    # T-0761: WHERE it went, when the transport could say. Empty when nothing
+    # was relayed, or when the worker predates this field — an absent key means
+    # "not stated", never "delivered nowhere". `thread_known` inside it is what
+    # separates "Telegram named a topic" from "Telegram did not say".
+    if relayed_to:
+        out["relayed_to"] = relayed_to
     if author == "user":
         if fyi:
             out["ensured"] = {"ok": True, "skipped": "fyi"}

@@ -821,8 +821,23 @@ def _send_stakeholder_dm(
                     "_send_stakeholder_dm: %s part %d/%d failed after %d "
                     "delivered (sid=%s) — page is incomplete",
                     channel, n, len(parts), n - 1, sid)
-                return {"ok": True, "sent": True, "channel": channel, "partial": True}
-        return {"ok": True, "sent": sent, "channel": channel}
+                out = {"ok": True, "sent": True, "channel": channel, "partial": True}
+                return _with_delivery(out)
+        return _with_delivery({"ok": True, "sent": sent, "channel": channel})
+
+    # T-0761: where Telegram says the page LANDED, not just that it was sent.
+    # Collected per part and reported for the FIRST delivered one: every part
+    # of one page goes to the same chat and topic, so the first receipt answers
+    # "where did this page go" — and taking the first rather than the last
+    # means a partial page still reports the destination it reached.
+    receipts: list[dict[str, Any]] = []
+
+    def _with_delivery(out: dict[str, Any]) -> dict[str, Any]:
+        for r in receipts:
+            if r:
+                out["delivery"] = r
+                break
+        return out
 
     def _try_tg() -> dict[str, Any] | None:
         if not tg_chat_id:
@@ -832,11 +847,22 @@ def _send_stakeholder_dm(
         # so binding the TG client to a name another function also uses for its
         # MAX client would flag that one as a hidden bare-chat pager.
         tg_client = _get_tg_client(cfg)
-        return _deliver("tg", lambda part: tg_client.send(
-            chat_id=tg_chat_id, text=part, sid=sid_label, user=user,
-            urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
-            **_route, **_rec, **_sender,
-        ))
+
+        def _send_one(part: str) -> bool:
+            # T-0761: a fresh receipt per part. `send` leaves it untouched when
+            # the send is suppressed (debounce/quiet hours), so an empty dict
+            # here means "nothing left" rather than "landed nowhere" — which is
+            # why `_with_delivery` skips falsy receipts instead of reporting the
+            # first one blindly.
+            receipt: dict[str, Any] = {}
+            receipts.append(receipt)
+            return tg_client.send(
+                chat_id=tg_chat_id, text=part, sid=sid_label, user=user,
+                urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
+                delivery=receipt, **_route, **_rec, **_sender,
+            )
+
+        return _deliver("tg", _send_one)
 
     def _try_max() -> dict[str, Any] | None:
         max_chat = getattr(cfg, "max_default_chat_id", "") or ""

@@ -202,7 +202,7 @@ class _FakeTgClient:
         self._suppress = False  # when True, send() returns False (debounce sim)
 
     def send(self, *, chat_id, text, sid="", user="", urgent=False, topic_id=None,
-             debounce=True, route_sid="") -> bool:
+             debounce=True, route_sid="", delivery=None) -> bool:
         # T-0719: `route_sid` is the RAW routing sid behind the display `sid`
         # label — recorded so tests can pin that reply-routing gets the real
         # session, not the (compact, sid-less) label.

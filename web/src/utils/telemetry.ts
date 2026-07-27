@@ -37,16 +37,37 @@ export function freshTelemetryReading<T extends object>(
 }
 
 /**
- * The Sessions/Processes consumer's write rule (T-0726): the per-session
- * telemetry it needs lives in `sessions`, so an empty `sessions` array means
- * the whole response carries nothing worth writing — keep `prev`.
+ * The Sessions/Processes consumer's write rule (T-0726): hold `prev` only for a
+ * response that carries NOTHING — every block empty.
+ *
+ * Deliberately not "sessions is empty" alone. An empty `sessions` array is
+ * genuinely ambiguous: it is what the degraded 200 sends, but it is ALSO the
+ * honest answer in two healthy cases —
+ *
+ *  1. a truly idle install with zero live sessions;
+ *  2. a NON-ADMIN caller whose owner-gate filtered every row out
+ *     (`routes_sessions.py` scopes `sessions` per owner but returns `quota` and
+ *     `caps` to everyone) — live-reachable today, not hypothetical.
+ *
+ * Holding on those would pin a stale reading with no way to fall out of it. The
+ * whole-payload test disambiguates exactly, because the degraded shape is
+ * `{"sessions": [], "quota": {}, "caps": {}}` from the route's two `except`
+ * branches and NOTHING else produces it: on the healthy path `caps` comes from
+ * `sessions.py::caps_utilization`, which always returns a populated dict (cap
+ * config + live counts) even when zero sessions are live. So "all three empty"
+ * means "the worker did not answer", and an empty `sessions` next to populated
+ * caps is a real reading that writes through — rows correctly fall to `—`.
  */
 export function keepLastGoodTelemetry(
   prev: TelemetryResponse | null,
   incoming: TelemetryResponse | null | undefined,
 ): TelemetryResponse | null {
   if (!incoming) return prev;
-  return freshTelemetryReading(incoming.sessions) ? incoming : prev;
+  const carriesNothing =
+    !freshTelemetryReading(incoming.sessions) &&
+    !freshTelemetryReading(incoming.caps) &&
+    !freshTelemetryReading(incoming.quota);
+  return carriesNothing ? prev : incoming;
 }
 
 /**

@@ -67,6 +67,26 @@ describe("keepLastGoodTelemetry (Sessions consumer)", () => {
     expect(keepLastGoodTelemetry(null, EMPTY_200)).toBeNull();
   });
 
+  // T-0726 follow-up (raised by the T-0331 dogfood finder on review): an empty
+  // `sessions` array alone must NOT mean "no reading" — it is also the honest
+  // answer for an idle install and for a non-admin whose owner-gate filtered
+  // every row out. Only the all-empty degraded shape holds.
+  test("zero live sessions with populated caps is a REAL reading (writes through)", () => {
+    const idle: TelemetryResponse = {
+      sessions: [],
+      quota: { output_tokens_cum_total: 0 },
+      caps: { max_parallel_sessions: 0, live_sessions: 0 },
+    };
+    expect(keepLastGoodTelemetry(GOOD, idle)).toBe(idle);
+    expect(contextCeilingOf(keepLastGoodTelemetry(GOOD, idle))).toBe(0);
+  });
+
+  test("non-admin owner-gate filtering every row out also writes through", () => {
+    // routes_sessions.py scopes `sessions` per owner but returns caps to everyone.
+    const scoped: TelemetryResponse = { sessions: [], quota: {}, caps: { live_sessions: 10 } };
+    expect(keepLastGoodTelemetry(GOOD, scoped)).toBe(scoped);
+  });
+
   test("a populated payload wins — including the recovery tick", () => {
     expect(keepLastGoodTelemetry(null, GOOD)).toBe(GOOD);
     const next: TelemetryResponse = { ...GOOD, sessions: [session("S-a", 500_000)] };

@@ -16,7 +16,13 @@
 import { describe, expect, test } from "vitest";
 
 import { SessionRow } from "../api";
-import { computeTlBindings, isPersistentInitiative, initiativeDisplayName } from "./Vision";
+import {
+  computeTlBindings,
+  initiativeDisplayName,
+  initiativeKindBadge,
+  isPersistentInitiative,
+  memberCountLabel,
+} from "./Vision";
 
 function tl(overrides: Partial<SessionRow>): SessionRow {
   return {
@@ -147,5 +153,41 @@ describe("initiativeDisplayName", () => {
     expect(initiativeDisplayName("initiatives/multi-server-installation-process.md")).toBe("Multi Server Installation Process");
     expect(initiativeDisplayName("INI-01-persistent-initiatives.md")).toBe("INI 01 Persistent Initiatives");
     expect(initiativeDisplayName("operator-ux-and-session-mgmt.md")).toBe("Operator Ux And Session Mgmt");
+  });
+});
+
+// T-0295 (a): EVERY initiative row gets a kind badge. Before this, only
+// persistent rows were badged, so "no badge" was ambiguous between "this
+// initiative ends" and "the kind never reached the FE" — which, post-T-0480,
+// is what it usually meant.
+describe("initiativeKindBadge", () => {
+  test("persistent → PERSISTENT", () => {
+    expect(initiativeKindBadge({ initiative_kind: "persistent" }).label).toBe("PERSISTENT");
+  });
+  test("one-shot → ENDING", () => {
+    expect(initiativeKindBadge({ initiative_kind: "one-shot" }).label).toBe("ENDING");
+  });
+  test("absent kind → ENDING, never blank", () => {
+    expect(initiativeKindBadge({}).label).toBe("ENDING");
+    expect(initiativeKindBadge(undefined).label).toBe("ENDING");
+    expect(initiativeKindBadge(null).label).toBe("ENDING");
+  });
+  test("the two kinds are visually distinct", () => {
+    expect(initiativeKindBadge({ initiative_kind: "persistent" }).cls).not.toBe(
+      initiativeKindBadge({ initiative_kind: "one-shot" }).cls,
+    );
+  });
+});
+
+// T-0295 (b): the member count reads against the team_size cap.
+describe("memberCountLabel", () => {
+  test("renders live vs cap", () => {
+    expect(memberCountLabel(1, 2)).toBe("1/2 members");
+  });
+  test("says so when live exceeds the cap instead of reading as normal", () => {
+    expect(memberCountLabel(3, 1)).toBe("3/1 members (over cap)");
+  });
+  test("no cap known (orphan tick state) → plain count, no fake denominator", () => {
+    expect(memberCountLabel(2, null)).toBe("2 member(s)");
   });
 });

@@ -7,6 +7,7 @@ import {
   type VisionFile,
 } from "../api";
 import { useApiClient } from "../apiContext";
+import { taskInitiativeKey } from "../initiativeTasks";
 import { BoardColumn, sortByPriority } from "../components/BoardColumn";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
 import { ObservabilityPanel } from "../components/ObservabilityPanel";
@@ -305,7 +306,7 @@ export function Project() {
   // Single source of truth for "does this task pass the current filter".
   function passesFilter(t: Task): boolean {
     if (!filterInit) return true;
-    const init = (t.initiative ?? "").trim();
+    const init = taskInitiativeKey(t);
     if (filterInit === UNATTACHED) return !init;
     if (filterInit === ACTIVE_ONLY) return Boolean(init) && activeInitiativeKeys.has(init);
     return init === filterInit;
@@ -318,7 +319,9 @@ export function Project() {
     const out: Record<string, Task[]> = { [UNATTACHED]: [] };
     for (const m of initiativeMeta) out[m.key] = [];
     for (const t of enrichedTasks ?? []) {
-      const init = (t.initiative ?? "").trim();
+      // T-0295 (c): shared with the Vision page's bound-tasks list, so the
+      // expanded initiative row shows exactly this lane's contents.
+      const init = taskInitiativeKey(t);
       if (init && out[init] !== undefined) {
         out[init].push(t);
       } else if (init) {

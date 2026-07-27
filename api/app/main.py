@@ -70,6 +70,8 @@ def build_app() -> FastAPI:
     app.include_router(analytics_router, prefix="/api")
 
     from app.routes_vision import router as vision_router
+    # T-0295 (b): constant-team tick state (read-only health surface).
+    from app.routes_constant_teams import router as constant_teams_router
     from app.routes_feedback import router as feedback_router
     from app.routes_docs import router as docs_router
     from app.routes_sessions import router as sessions_router, dev_spawn_router
@@ -77,6 +79,7 @@ def build_app() -> FastAPI:
     from app.routes_messages import router as messages_router
     from app.routes_scheduler import router as scheduler_router
     app.include_router(vision_router, prefix="/api")
+    app.include_router(constant_teams_router, prefix="/api")
     app.include_router(feedback_router, prefix="/api")
     app.include_router(docs_router, prefix="/api")
     app.include_router(sessions_router, prefix="/api")

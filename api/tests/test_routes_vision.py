@@ -90,6 +90,48 @@ def test_vision_initiative_kind_persistent(tmp_bot_squad: Path, monkeypatch):
     assert entry["initiative_kind"] == "persistent"
 
 
+# T-0295 (a): the kind flag must reach EVERY initiative entry, so the FE can
+# badge ENDING vs PERSISTENT on every row. Two extra sources beyond T-0354's
+# `initiative_kind`: a legacy vision-FILE initiative's `constant_team:`
+# frontmatter (still the only config the worker's constant-team tick reads),
+# and the same flag carried over on a migrated initiative task.
+def test_vision_legacy_file_constant_team_surfaces_as_persistent(
+        tmp_bot_squad: Path, monkeypatch):
+    vision = tmp_bot_squad / "data" / "test-project" / "vision"
+    (vision / "initiatives").mkdir(parents=True, exist_ok=True)
+    (vision / "initiatives" / "triage.md").write_text(
+        "---\nname: triage\nconstant_team: true\nconsume: q/*.md\n---\n\nmission\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    entry = next(x for x in r.json() if x["name"] == "initiatives/triage.md")
+    assert entry["initiative_kind"] == "persistent"
+
+
+def test_vision_legacy_file_without_flag_is_one_shot(tmp_bot_squad: Path, monkeypatch):
+    """Every initiative entry carries a kind — a missing field would render as
+    an unbadged row, which reads as 'unknown' rather than 'ending'."""
+    vision = tmp_bot_squad / "data" / "test-project" / "vision"
+    (vision / "initiatives").mkdir(parents=True, exist_ok=True)
+    (vision / "initiatives" / "plain.md").write_text("# no frontmatter at all\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    entry = next(x for x in r.json() if x["name"] == "initiatives/plain.md")
+    assert entry["initiative_kind"] == "one-shot"
+
+
+def test_vision_task_constant_team_flag_surfaces_as_persistent(
+        tmp_bot_squad: Path, monkeypatch):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-0600-standing.md").write_text(
+        "---\nid: T-0600\ntitle: standing\nstatus: open\nkind: initiative\n"
+        "aka: [standing]\nconstant_team: true\n---\n\nbody\n")
+    with _logged_in(tmp_bot_squad, monkeypatch) as c:
+        r = c.get("/api/projects/test-project/vision")
+    entry = next(x for x in r.json() if x["name"] == "initiatives/standing.md")
+    assert entry["initiative_kind"] == "persistent"
+
+
 def test_vision_dedupes_task_against_dir(tmp_bot_squad: Path, monkeypatch):
     """During the 3a transition both the task AND the legacy dir file exist —
     the initiative must appear exactly ONCE (sourced from the task)."""

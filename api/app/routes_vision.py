@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.frontmatter import parse_or_none
 from app.markdown_writer import slugify
 from app.payload_guard import opt_str_field, str_field
 from app.project_authz import require_project_member
@@ -122,6 +123,35 @@ def _write_finished_initiatives(vision_dir: Path, names: set[str]) -> None:
     os.rename(tmp, p)
 
 
+def _truthy(value) -> bool:
+    """Mirror of the worker's ``constant_teams._truthy`` (constant_teams.py)."""
+    return str(value).strip().lower() in ("true", "yes", "1", "on")
+
+
+def _initiative_kind(meta: dict) -> str:
+    """T-0295 (a): the ENDING-vs-PERSISTENT kind for one initiative entry.
+
+    Two sources, in order:
+      1. ``initiative_kind: persistent|one-shot`` — the T-0354 field on a
+         ``kind: initiative`` task (the post-T-0480 home of initiatives).
+      2. ``constant_team: <truthy>`` — the LEGACY frontmatter flag on a
+         ``vision/initiatives/<x>.md`` file, which is still the only config
+         source the worker's constant-team tick reads (constant_teams.py
+         ``constant_team_stems``). Surfacing it here is what lets a legacy
+         initiative row carry a kind badge at all.
+
+    Everything else is ENDING ("one-shot") — an initiative that reaches a
+    finished state. This is a total function on purpose: every initiative row
+    gets exactly one badge, so "no badge" can never be misread as "unknown".
+    """
+    declared = str(meta.get("initiative_kind") or "").strip().lower()
+    if declared == "persistent":
+        return "persistent"
+    if _truthy(meta.get("constant_team")):
+        return "persistent"
+    return "one-shot"
+
+
 def _initiative_entries_from_tasks(project_data_dir: Path) -> list[dict]:
     """T-0480 Phase-3a: kind:initiative TASKS are the initiatives now. Surface
     each as a vision-list initiative entry (keyed by its legacy basename stem,
@@ -158,7 +188,9 @@ def _initiative_entries_from_tasks(project_data_dir: Path) -> list[dict]:
             # T-0354: persistent (standing responsibility) vs the default
             # one-shot; replaces the dead constant_team-in-body regex the FE
             # used to parse (T-0411) — that source never populated post-T-0480.
-            "initiative_kind": t.get("initiative_kind") or "one-shot",
+            # T-0295 (a): also honour a `constant_team:` flag carried over by a
+            # migrated initiative task, so the two sources can't disagree.
+            "initiative_kind": _initiative_kind(t),
         })
     return out
 
@@ -205,11 +237,18 @@ def list_vision(slug: str, request: Request) -> list[dict]:
         for f in sorted(initiatives_dir.glob("*.md")):
             if f.stem in task_stems:
                 continue  # already surfaced via its kind:initiative task (dedup)
+            content = f.read_text()
+            # T-0295 (a): plumb the legacy `constant_team:` frontmatter flag
+            # through as a kind, so a vision-FILE initiative row badges the
+            # same way a task-backed one does.
+            parsed = parse_or_none(content)
+            meta = parsed[0] if parsed else {}
             out.append({
                 "name": f"initiatives/{f.name}",
-                "content": f.read_text(),
+                "content": content,
                 "active": f.name in active_set,
                 "finished": f.name in finished_set,
+                "initiative_kind": _initiative_kind(meta),
             })
     roles_dir = vision_dir / "roles"
     if roles_dir.exists():

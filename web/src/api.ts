@@ -215,7 +215,46 @@ export type VisionFile = {
   finished?: boolean;
   // T-0354: persistent (standing responsibility) vs one-shot, set on
   // kind:initiative tasks; absent/"one-shot" for non-initiative vision files.
+  // T-0295: also derived from a legacy `constant_team:` frontmatter flag on a
+  // vision-FILE initiative, so every initiative row carries a kind.
   initiative_kind?: "persistent" | "one-shot";
+};
+
+// T-0295 (b): one constant team's tick state, as the worker's constant_team
+// tick sees it (GET /api/projects/<slug>/constant-teams). Read-only health —
+// no control affordance rides on this. Fields mirror
+// api/app/routes_constant_teams.py.
+export type ConstantTeam = {
+  name: string;
+  // Initiative file stem — the join key to a session's `initiative` binding.
+  stem: string;
+  // "initiatives/<file>.md", or null for an orphan state file with no config.
+  initiative: string | null;
+  configured: boolean;
+  config_source: string | null;
+  team_size: number | null;
+  team_role: string | null;
+  window_prefix: string;
+  consume: string | null;
+  consume_kind: "log" | "glob" | null;
+  queue_depth: number | null;
+  cursor_lines: number | null;
+  last_spawn_at: number | null;
+  last_spawn_iso: string | null;
+  state_file: string;
+  state_present: boolean;
+  retired: boolean;
+  finished: boolean;
+  // False when the tick refuses to staff this team (retired / finished /
+  // no consume source) — `not_staffable_reason` says which.
+  staffable: boolean;
+  not_staffable_reason: string | null;
+};
+
+export type ConstantTeamsResponse = {
+  teams: ConstantTeam[];
+  config_dir: string;
+  state_dir: string;
 };
 
 // T-0283 (Pillar C / D-0029): the unified cross-store artifact kind. Every
@@ -919,6 +958,9 @@ export const api = {
       `/api/projects/${slug}/backlog/${id}/progress`,
       { method: "POST", body: JSON.stringify({ sid, text }) },
     ),
+  // T-0295 (b): constant-team tick state (read-only).
+  constantTeams: (slug: string) =>
+    call<ConstantTeamsResponse>(`/api/projects/${slug}/constant-teams`),
   putVision: (slug: string, name: string, content: string) =>
     call(`/api/projects/${slug}/vision/${name}`, { method: "PUT", body: JSON.stringify({ content }) }),
   newInitiative: (slug: string, name: string, content: string) =>

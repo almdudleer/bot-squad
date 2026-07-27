@@ -818,3 +818,82 @@ def test_confirm_failure_outcomes_stay_single_messages(tmp_path, monkeypatch):
                                             "message_id": 555})
         assert len(sent) == 1, f"{outcome} should send exactly one message"
         assert needle in sent[0]["text"], f"{outcome} wording changed"
+
+
+# --- T-0747: the [voice] glossary reaches BOTH transcribing twins -----------
+
+def _stub_for_transcribe(monkeypatch):
+    """Stub download + capture the kwargs the seam is called with."""
+    from bot_squad_worker import voice_intake as _VI, transcribe as _T, actions as A
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    seen = {}
+
+    def fake_transcribe(p, **kw):
+        seen.update(kw)
+        return {"text": "расшифровка", "lang": "ru", "engine": "faster-whisper:small"}
+    monkeypatch.setattr(_T, "transcribe", fake_transcribe)
+    monkeypatch.setattr(A, "_get_tg_client",
+                        lambda c: types.SimpleNamespace(send=lambda **k: True))
+    return seen
+
+
+def _drive(path: str, cfg, monkeypatch):
+    from bot_squad_worker import voice_intake as _VI
+    if path == "process_voice":
+        return _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-07-27T09:00:00Z")
+    return _VI.transcribe_only(cfg, "bot-squad", _voice_msg())
+
+
+@pytest.mark.parametrize("path", ["process_voice", "transcribe_only"])
+def test_voice_glossary_reaches_both_twins(tmp_path, monkeypatch, path):
+    """T-0747 DoD 2 — the ANTI-DIVERGENCE guard. `process_voice` (group/topic)
+    and `transcribe_only` (DM) are twins, and T-0741 happened because a fix
+    landed on one and not the other. Both must carry a configured
+    [voice].initial_prompt into the seam; parametrized so a future knob added to
+    one path alone fails here."""
+    cfg = _cfg(tmp_path)
+    cfg.voice_initial_prompt = "bot-squad, Claude, tmux, sudo"
+    cfg.voice_vad_filter = True
+    seen = _stub_for_transcribe(monkeypatch)
+
+    _drive(path, cfg, monkeypatch)
+    assert seen["initial_prompt"] == "bot-squad, Claude, tmux, sudo"
+    assert seen["vad_filter"] is True
+
+
+@pytest.mark.parametrize("path", ["process_voice", "transcribe_only"])
+def test_voice_no_glossary_configured_is_inert_on_both_twins(tmp_path, monkeypatch, path):
+    """T-0747 DoD 3: with no [voice].initial_prompt (today's live config), both
+    paths call the seam with the inert values — nothing to bias the decode."""
+    cfg = _cfg(tmp_path)  # no voice_* attrs at all, as an old cfg would be
+    seen = _stub_for_transcribe(monkeypatch)
+
+    _drive(path, cfg, monkeypatch)
+    assert seen["initial_prompt"] is None
+    assert seen["vad_filter"] is False
+
+
+@pytest.mark.parametrize("path", ["process_voice", "transcribe_only"])
+def test_voice_blank_glossary_is_inert_on_both_twins(tmp_path, monkeypatch, path):
+    """A whitespace-only key an operator left behind must not be sent as a
+    prompt — that is a real (if odd) bias on the decode, not a no-op."""
+    cfg = _cfg(tmp_path)
+    cfg.voice_initial_prompt = "   "
+    seen = _stub_for_transcribe(monkeypatch)
+
+    _drive(path, cfg, monkeypatch)
+    assert seen["initial_prompt"] is None
+
+
+def test_stt_settings_is_the_single_read_for_both_twins(tmp_path):
+    """One decision written ONCE: the knob read is a single function whose
+    return shape is exactly the _transcribe_with_timeout kwargs."""
+    import inspect
+    cfg = _cfg(tmp_path)
+    cfg.voice_initial_prompt = "glossary"
+    stt = VI.stt_settings(cfg)
+    params = set(inspect.signature(VI._transcribe_with_timeout).parameters) - {"dest"}
+    assert set(stt) == params, "stt_settings drifted from the seam-call signature"

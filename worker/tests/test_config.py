@@ -171,6 +171,37 @@ def test_voice_from_system_settings(tmp_config_dir: Path) -> None:
     assert cfg.voice_enabled is True
 
 
+def test_voice_prompt_defaults_inert(tmp_config_dir: Path) -> None:
+    # T-0747 DoD 3: absent config → no glossary, no VAD. Deploying the key must
+    # change nothing until an operator writes one.
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.voice_initial_prompt == ""
+    assert cfg.voice_vad_filter is False
+
+
+def test_voice_prompt_inert_when_voice_block_has_no_prompt(tmp_config_dir: Path) -> None:
+    # T-0747: a [voice] block that predates this key (the LIVE install's shape)
+    # still yields the inert default rather than tripping on the missing key.
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[voice]\nenabled = true\nengine = "faster-whisper"\nmodel = "small"\n'
+        'max_duration_sec = 0\ntranscribe_timeout_sec = 900\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.voice_initial_prompt == ""
+    assert cfg.voice_vad_filter is False
+    assert cfg.voice_model == "small"
+
+
+def test_voice_initial_prompt_from_system_settings(tmp_config_dir: Path) -> None:
+    # T-0747: the glossary is an operator-editable [voice] key, read like model/engine.
+    (tmp_config_dir / "system_settings.toml").write_text(
+        '[voice]\ninitial_prompt = "bot-squad, Claude, sudo, tmux"\nvad_filter = true\n'
+    )
+    cfg = Config.load(tmp_config_dir)
+    assert cfg.voice_initial_prompt == "bot-squad, Claude, sudo, tmux"
+    assert cfg.voice_vad_filter is True
+
+
 def test_stall_settings_from_system_settings(tmp_config_dir: Path) -> None:
     # T-0155: admin overrides via [tg] in system_settings.toml.
     (tmp_config_dir / "system_settings.toml").write_text(

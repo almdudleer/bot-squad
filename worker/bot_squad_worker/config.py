@@ -168,6 +168,17 @@ class Config:
     # actually used.
     voice_engine: str = "faster-whisper"
     voice_model: str = "small"
+    # T-0747: domain-glossary hint handed to the STT backend, and a best-effort
+    # VAD pre-filter. [voice].initial_prompt / [voice].vad_filter. Both default
+    # INERT — empty/false transcribes exactly as before the key existed — so a
+    # deploy changes nothing until an operator writes a glossary. Measured
+    # end-to-end through this path on T-0741's four saved notes (T-0747): on the
+    # CURRENT `small` model a glossary recovers "voice intake", "Расшифровки",
+    # "Claude", "Считывание", "tmux" and "Telegram" at flat wall-clock (23.9s ->
+    # 24.9s for all four) and no extra memory. "sudo" is NOT recoverable on
+    # `small` at any prompt. The recommended string is in runbook D-0036 B2a.
+    voice_initial_prompt: str = ""
+    voice_vad_filter: bool = False
     # T-0386 P2 flag-off-safe kill-switch: voice intake is OFF by default and is
     # flipped on as part of the 1-time stakeholder TG setup, so deploying the
     # voice code never silently starts transcribing before setup. [voice].enabled.
@@ -263,6 +274,8 @@ class Config:
         max_recipient_kind = "chat_id"
         voice_engine = "faster-whisper"
         voice_model = "small"
+        voice_initial_prompt = ""
+        voice_vad_filter = False
         voice_enabled = False
         voice_max_duration_sec = 300
         voice_transcribe_timeout_sec = 120
@@ -287,6 +300,8 @@ class Config:
             voice_block = sys_raw.get("voice", {}) or {}
             voice_engine = str(voice_block.get("engine", voice_engine))
             voice_model = str(voice_block.get("model", voice_model))
+            voice_initial_prompt = str(voice_block.get("initial_prompt", voice_initial_prompt))
+            voice_vad_filter = bool(voice_block.get("vad_filter", voice_vad_filter))
             voice_enabled = bool(voice_block.get("enabled", voice_enabled))
             voice_max_duration_sec = int(voice_block.get("max_duration_sec", voice_max_duration_sec))
             voice_transcribe_timeout_sec = int(voice_block.get("transcribe_timeout_sec", voice_transcribe_timeout_sec))
@@ -319,6 +334,8 @@ class Config:
             max_recipient_kind=max_recipient_kind,
             voice_engine=voice_engine,
             voice_model=voice_model,
+            voice_initial_prompt=voice_initial_prompt,
+            voice_vad_filter=voice_vad_filter,
             voice_enabled=voice_enabled,
             voice_max_duration_sec=voice_max_duration_sec,
             voice_transcribe_timeout_sec=voice_transcribe_timeout_sec,

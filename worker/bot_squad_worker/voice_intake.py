@@ -174,7 +174,36 @@ def download_voice(cfg: Any, file_id: str, dest_path: Path) -> Path:
     return dest_path
 
 
-def _transcribe_with_timeout(dest: Path, *, engine: str, model: str, timeout_sec: float) -> dict[str, Any]:
+def stt_settings(cfg: Any) -> dict[str, Any]:
+    """The [voice] STT knobs, read ONCE here for every transcribing path.
+
+    ``process_voice`` and ``transcribe_only`` are twins, and T-0741 was caused
+    by exactly that pair diverging (the DM path got chunked echo, the group path
+    never did). So the settings read lives in ONE function both call, and its
+    return shape is the ``_transcribe_with_timeout`` kwargs — a new knob added
+    here reaches both paths or neither, never one.
+    """
+    return {
+        "engine": getattr(cfg, "voice_engine", "faster-whisper"),
+        "model": getattr(cfg, "voice_model", "small"),
+        # T-0747. Empty/false is inert: the seam then does not pass them down at
+        # all, so the decode is byte-identical to a build without these keys.
+        "initial_prompt": (getattr(cfg, "voice_initial_prompt", "") or "").strip() or None,
+        "vad_filter": bool(getattr(cfg, "voice_vad_filter", False)),
+        "timeout_sec": float(
+            getattr(cfg, "voice_transcribe_timeout_sec", _DEFAULT_TRANSCRIBE_TIMEOUT_SEC) or 0),
+    }
+
+
+def _transcribe_with_timeout(
+    dest: Path,
+    *,
+    engine: str,
+    model: str,
+    timeout_sec: float,
+    initial_prompt: str | None = None,
+    vad_filter: bool = False,
+) -> dict[str, Any]:
     """Run the (synchronous, CPU-bound) transcribe seam with a wall-clock ceiling.
 
     T-0433 P2: process_voice runs inside the tg_listener getUpdates poll loop, so
@@ -187,14 +216,16 @@ def _transcribe_with_timeout(dest: Path, *, engine: str, model: str, timeout_sec
     """
     from bot_squad_worker import transcribe as _transcribe
 
+    kw = dict(engine=engine, model=model, lang_hint=None,
+              initial_prompt=initial_prompt, vad_filter=vad_filter)
     if timeout_sec and timeout_sec > 0:
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(_transcribe.transcribe, dest, engine=engine, model=model, lang_hint=None)
+        fut = ex.submit(_transcribe.transcribe, dest, **kw)
         try:
             return fut.result(timeout=timeout_sec)
         finally:
             ex.shutdown(wait=False)
-    return _transcribe.transcribe(dest, engine=engine, model=model, lang_hint=None)
+    return _transcribe.transcribe(dest, **kw)
 
 
 def transcribe_only(cfg: Any, slug: str, message: dict) -> dict[str, Any]:
@@ -241,11 +272,11 @@ def transcribe_only(cfg: Any, slug: str, message: dict) -> dict[str, Any]:
         return {"ok": False, "reason": "download_failed", "transcript": "",
                  "duration": v["duration"], "error": str(e)}
 
-    engine = getattr(cfg, "voice_engine", "faster-whisper")
-    model = getattr(cfg, "voice_model", "small")
-    timeout_sec = float(getattr(cfg, "voice_transcribe_timeout_sec", _DEFAULT_TRANSCRIBE_TIMEOUT_SEC) or 0)
+    stt = stt_settings(cfg)
+    engine = stt["engine"]
+    timeout_sec = stt["timeout_sec"]
     try:
-        res = _transcribe_with_timeout(dest, engine=engine, model=model, timeout_sec=timeout_sec)
+        res = _transcribe_with_timeout(dest, **stt)
     except concurrent.futures.TimeoutError:
         log.warning("voice_intake: transcribe_only timed out (>%ss) for %s", timeout_sec, dest)
         return {"ok": False, "reason": "transcription_timeout", "transcript": "", "duration": v["duration"]}
@@ -312,13 +343,13 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
         return {"ok": False, "reason": "download_failed", "error": str(e)}
 
     audio_ref = f"feedback/_audio/{v['file_unique_id']}.oga"
-    engine = getattr(cfg, "voice_engine", "faster-whisper")
-    model = getattr(cfg, "voice_model", "small")
-    timeout_sec = float(getattr(cfg, "voice_transcribe_timeout_sec", _DEFAULT_TRANSCRIBE_TIMEOUT_SEC) or 0)
+    stt = stt_settings(cfg)
+    engine = stt["engine"]
+    timeout_sec = stt["timeout_sec"]
 
     failed = timed_out = False
     try:
-        res = _transcribe_with_timeout(dest, engine=engine, model=model, timeout_sec=timeout_sec)
+        res = _transcribe_with_timeout(dest, **stt)
         transcript = (res.get("text") or "").strip()
         lang = res.get("lang")
         used_engine = res.get("engine") or engine

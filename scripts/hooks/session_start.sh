@@ -66,6 +66,66 @@ fi
 
 DATA="$BOT_SQUAD/data/$slug"
 
+# T-0713: the EDIT-surface path, surfaced in the banner below. Every existing
+# workspace guard is DOWNSTREAM of the mistake — `bsq commit` refuses commits
+# made in the install clone (T-0651), the deploy aborts on local-only install
+# commits (T-0110), a dirty clone gates deploys (T-0225). Nothing fires at EDIT
+# time, which is where the wrong turn actually happens: a real near-miss had a
+# session make its whole first edit pass against the deploy TARGET
+# /home/www/bot-squad because the "edit here, not there" rule is buried ~20
+# lines into AGENT_INSTRUCTIONS.md's Workspace-layout section. So name the
+# correct clone up front, at session start, instead of adding another
+# after-the-fact refusal (deliberately NOT a PreToolUse hook on every Edit
+# call — the cost of that on every edit is not worth a P3).
+# IN_MASTER tells us which clone this session actually sits in, so a prod/hotfix
+# session in the master clone is not told "edit in dev" (its edit surface IS
+# master). Emitted as three lines: repo_path, repo_master, and "1"/"" for
+# cwd-is-under-master.
+_clone_info=$(python3 - "$CFG" "$slug" "$PWD" 2>/dev/null <<'PY'
+import os, sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+    p = cfg.get("projects", {}).get(sys.argv[2]) or {}
+    dev, master = p.get("repo_path", "") or "", p.get("repo_master", "") or ""
+    real_cwd = os.path.realpath(sys.argv[3])
+    in_master = ""
+    if master:
+        rm = os.path.realpath(master)
+        if real_cwd == rm or real_cwd.startswith(rm.rstrip("/") + "/"):
+            in_master = "1"
+    print(dev); print(master); print(in_master)
+except Exception:
+    print(); print(); print()
+PY
+)
+REPO_PATH=$(printf '%s\n' "$_clone_info" | sed -n 1p)
+REPO_MASTER=$(printf '%s\n' "$_clone_info" | sed -n 2p)
+IN_MASTER=$(printf '%s\n' "$_clone_info" | sed -n 3p)
+
+# Print the edit-surface guard line(s). Skipped when the clone path is unknown
+# or IS the install (nothing to warn about then — no clone/target split).
+print_edit_surface() {
+    local surface note
+    if [ -n "$IN_MASTER" ]; then
+        surface="$REPO_MASTER"
+        note="the MASTER clone — prod releases/hotfixes; ordinary dev work belongs in $REPO_PATH"
+    else
+        surface="$REPO_PATH"
+        note="the dev clone — ALL code edits land here"
+    fi
+    [ -n "$surface" ] || return 0
+    [ "$surface" != "$BOT_SQUAD" ] || return 0
+    echo "- EDIT SURFACE       : $surface  ($note)"
+    # The install is a deploy TARGET for CODE only: its data/ ops dir (backlog,
+    # vision, sessions, scenarios) is explicitly editable in place, and sessions
+    # write there constantly — so do NOT blanket-forbid the whole path or the
+    # line contradicts the documented rule and gets discounted wholesale.
+    echo "  NOT $BOT_SQUAD — that install is a deploy TARGET: code edits there are wiped"
+    echo "  by the next deploy and a dirty target blocks deploys. Its data/ ops dir IS"
+    echo "  editable in place; everything else there is read-only to you. (T-0713)"
+}
+
 # --- Registry write -------------------------------------------------------
 # Compute SID from tmux context (skip if not in tmux). Write/update the
 # session md so the registry has the real claude_session_id from start time.
@@ -624,6 +684,11 @@ if [ "$HOOK_SOURCE" = "resume" ] || [ "$HOOK_SOURCE" = "compact" ]; then
         echo "  the ask (or \`bsq ticket note ${task_id}\` WHY you defer). See the bot-squad-provenance skill."
     fi
     echo "Message bus = \`bsq\`: \`bsq inbox check\` drains mail; \`bsq peer send <to> \"…\"\` sends."
+    # T-0713: repeated on resume/compact even though this branch is deliberately
+    # lean. A compact is precisely when a remembered PATH goes stale, and the
+    # near-miss (a first edit pass into the deploy target) costs more than the
+    # ~30 tokens: the downstream guards only catch it after the work is wasted.
+    print_edit_surface
     echo
     echo "Your role contract, AGENT_INSTRUCTIONS.md and the team protocol are UNCHANGED"
     echo "from before the ${HOOK_SOURCE}. Re-read a specific file — or run \`bsq brief\` for"
@@ -659,6 +724,9 @@ if [ -n "${BOT_SQUAD_INITIATIVE:-}" ]; then
 fi
 
 print_section "ORIENTATION — read on demand (not piped in every turn, to keep context lean)"
+# T-0713: FIRST line of the section on purpose — this is the one path rule a
+# session needs BEFORE its first Edit call, not on demand.
+print_edit_surface
 echo "- Your role contract : $BOT_SQUAD/api/app/resources/roles/$ROLE.md  (git-tracked SSOT — what your spawn brief uses; T-0198)"
 echo "  (your rules — read on your FIRST action if this session wasn't spawned with a brief)"
 echo "- AGENT_INSTRUCTIONS  : $DATA/AGENT_INSTRUCTIONS.md  (recipes/paths — open on the specific need)"

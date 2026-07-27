@@ -352,7 +352,10 @@ deploy prod.
 ## When you need more (not every-turn — read on demand)
 
 - `{ops}/vision/team_protocol.md` — working conventions for every session
-- `{ops}/vision/roles/` — role contracts (operator, teamlead, dev)
+- `$BOT_SQUAD/api/app/resources/roles/` — role contracts (operator, teamlead,
+  dev): the git SSOT every spawn brief reads (D-0043;
+  `$BOT_SQUAD` = the bot-squad install root, default `/home/www/bot-squad`).
+  NOT `{ops}/vision/roles/`, which is a scaffold-time display copy and drifts.
 - `{ops}/backlog/` — all open work, one .md per task, incl. `kind: initiative`
   (discrete strategic bets; `{ops}/vision/initiatives/` is the legacy home
   for a project that hasn't migrated to task-based initiatives yet)

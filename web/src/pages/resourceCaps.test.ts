@@ -16,6 +16,7 @@ import {
   isAtCapacity,
   isOverCap,
   isThrottled,
+  THROTTLE_VISIBILITY_LIMIT,
   sanitizeCapInput,
   utilizationPct,
   utilizationRatio,
@@ -126,12 +127,38 @@ describe("isThrottled", () => {
     expect(isThrottled(15, 8)).toBe(true));
   test("effective_limit 0 means unlimited/no pressure, never a throttle", () =>
     expect(isThrottled(15, 0)).toBe(false));
-  test("an UNLIMITED cap depressed to a finite limit IS a throttle (shipped default caps 0/0)", () =>
-    expect(isThrottled(0, 1806)).toBe(true));
+  test("an UNLIMITED cap depressed to a LOW finite limit IS a throttle (shipped default caps 0/0)", () =>
+    expect(isThrottled(0, 6)).toBe(true));
   test("effective limit equal to the cap is not a throttle", () =>
     expect(isThrottled(15, 15)).toBe(false));
   test("effective limit above the cap is not a throttle", () =>
     expect(isThrottled(8, 15)).toBe(false));
+});
+
+// T-0718: the AIMD mid-ramp tail under default 0/0 caps satisfied the plain
+// finite-below-infinite test, so the strip read "throttled to 1944" when
+// nothing was meaningfully throttled. Threshold = PARALLEL_SESSION_CEILING,
+// the DOCUMENTED live-session ceiling (a recorded product decision reused, not
+// a fresh magic number) — above it a limit cannot bite, so it is noise.
+describe("isThrottled — visibility threshold under an unlimited cap (T-0718)", () => {
+  test("the live default-caps case: ∞ cap, mid-ramp 1944, 12 live → NOT shown as throttled", () =>
+    expect(isThrottled(0, 1944)).toBe(false));
+  test("astronomically-high limits under ∞ are noise, not throttles", () => {
+    expect(isThrottled(0, 1806)).toBe(false);
+    expect(isThrottled(0, THROTTLE_VISIBILITY_LIMIT + 1)).toBe(false);
+  });
+  test("a limit AT the documented ceiling still shows (boundary is inclusive)", () =>
+    expect(isThrottled(0, THROTTLE_VISIBILITY_LIMIT)).toBe(true));
+  test("every genuine multiplicative decrease stays visible — max(2, floor(live*0.5)) for live within the ceiling", () => {
+    for (let live = 0; live <= PARALLEL_SESSION_CEILING; live++) {
+      const decreased = Math.max(2, Math.floor(live * 0.5));
+      expect(isThrottled(0, decreased)).toBe(true);
+    }
+  });
+  test("a FINITE hard cap keeps the exact T-0282 rule — the operator's own band, no threshold applied", () => {
+    expect(isThrottled(5000, 1806)).toBe(true);
+    expect(isThrottled(30, 20)).toBe(true);
+  });
 });
 
 describe("admissionLimit", () => {
@@ -139,8 +166,10 @@ describe("admissionLimit", () => {
     expect(admissionLimit(15, 8)).toBe(8));
   test("not throttled → the hard cap gates admission", () =>
     expect(admissionLimit(15, 0)).toBe(15));
-  test("unlimited cap + finite throttle → the throttle", () =>
-    expect(admissionLimit(0, 1806)).toBe(1806));
+  test("unlimited cap + a meaningful finite throttle → the throttle", () =>
+    expect(admissionLimit(0, 6)).toBe(6));
+  test("T-0718: unlimited cap + a noise-level mid-ramp limit → still unlimited (0), so the meter shows no phantom cap", () =>
+    expect(admissionLimit(0, 1944)).toBe(0));
   test("wholly unlimited → 0 (capacity can never be reached)", () =>
     expect(admissionLimit(0, 0)).toBe(0));
 });

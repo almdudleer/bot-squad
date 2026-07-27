@@ -113,6 +113,44 @@ def test_sid_display_label_falls_back_to_sid_when_slug_empty():
 
 
 # ---------------------------------------------------------------------------
+# T-0724: an EMPTY sid must not be interpolated into the label. The old code
+# rendered "[bot-squad] " (dangling bracket + trailing space), which
+# tg._prefix wrapped into the malformed "[[bot-squad] ] <text>".
+# ---------------------------------------------------------------------------
+
+
+def test_sid_display_label_empty_sid_renders_slug_only_not_dangling_bracket():
+    for empty in ("", "   ", None):
+        label = sid_display_label(empty, "bot-squad")  # type: ignore[arg-type]
+        assert label == "[bot-squad]"
+        assert label == label.strip()  # no trailing space where the sid used to go
+
+
+def test_sid_display_label_compact_empty_sid_renders_bare_slug():
+    for empty in ("", "   ", None):
+        assert sid_display_label(empty, "bot-squad", compact=True) == "bot-squad"  # type: ignore[arg-type]
+
+
+def test_sid_display_label_empty_sid_survives_the_tg_prefix_wrap():
+    """The live shape of the bug: autoupdate_apply._notify_failure pages with
+    sid="" and tg._prefix wraps the label in brackets. The prefixed text must
+    be a clean '[bot-squad] …', never '[[bot-squad] ] …'."""
+    from bot_squad_worker.tg import _prefix
+
+    label = sid_display_label("", "bot-squad", compact=True)
+    assert _prefix("apply failed", sid=label, user="") == "[bot-squad] apply failed"
+
+
+def test_sid_display_label_empty_sid_and_empty_slug_yields_nothing_to_show():
+    """Neither half known -> empty label, which tg._prefix drops entirely
+    (no bare '[] ' prefix)."""
+    from bot_squad_worker.tg import _prefix
+
+    assert sid_display_label("", "") == ""
+    assert _prefix("hi", sid=sid_display_label("", ""), user="") == "hi"
+
+
+# ---------------------------------------------------------------------------
 # T-0676 item 5: compact '<slug> <role>' style (stakeholder found '[watchrobot]
 # S-almdudleer-operator-p160' noisy). Opt-in via compact=True — the default
 # (bracket) form above is UNCHANGED.

@@ -102,15 +102,54 @@ export function isAtCapacity(used: number, cap: number): boolean {
 }
 
 /**
+ * T-0718: when a finite `effective_limit` under an INFINITE hard cap is worth
+ * SHOWING as a throttle. This is a presentation threshold, not a governor
+ * change — and deliberately not an invented magic number.
+ *
+ * Under the shipped default caps (0/0 = unlimited) the governor's ceiling is
+ * its own 10_000 sentinel, and its AIMD ramp is +2 per 120s. So after any past
+ * pressure event the effective limit spends DAYS climbing back — it sits at
+ * ~1800-1900 with 12 sessions live and "hold (clear …)" as its reason. That
+ * satisfies the plain finite-below-infinite test, so the strip read
+ * "throttled to 1944" while nothing was being throttled at all (T-0282's
+ * P2-02 rule, correct for a finite cap, over-fires here).
+ *
+ * The threshold: a throttle is worth showing when the limit could plausibly
+ * BITE — i.e. when it lands inside the band the system actually operates in.
+ * With no operator-declared cap, that band is `PARALLEL_SESSION_CEILING` (15),
+ * the documented hard ceiling for simultaneously-live sessions — an already-
+ * recorded product decision, reused rather than a fresh number. A limit above
+ * it cannot constrain admission any more than the documented policy already
+ * does, so it is noise.
+ *
+ * This costs no real throttle: the multiplicative decrease lands at
+ * `max(2, floor(live * 0.5))` (backoff.py), which for any live count within
+ * the documented ceiling is <= 7 — comfortably visible. Only the long ramp
+ * TAIL, after the throttle has stopped mattering, goes quiet. Known edge: a
+ * genuine decrease with >31 sessions live (twice the documented ceiling, which
+ * the panel itself soft-warns about) would land above 15 and stay hidden.
+ * Accepted — that regime is outside the documented operating range, and an
+ * operator running it can declare a finite cap, which restores the exact
+ * finite-cap rule below.
+ */
+export const THROTTLE_VISIBILITY_LIMIT = PARALLEL_SESSION_CEILING;
+
+/**
  * T-0282: is the WS-4 AIMD backoff governor holding admission BELOW the hard
  * ceiling? An `effective_limit` of 0 means unlimited/no pressure (the worker
  * normalises its 10_000 sentinel to 0 on the wire), so it is never a throttle.
  * A hard cap of 0 means UNLIMITED (∞), not "no throttle" — the shipped default
  * is caps 0/0 with backoff ON, so the governor can depress an otherwise-infinite
- * ceiling to a finite limit, and that IS a throttle the operator must see.
+ * ceiling to a finite limit, and that IS a throttle the operator must see —
+ * but only while it is low enough to mean something (T-0718, above).
  */
 export function isThrottled(hardCap: number, effectiveLimit: number): boolean {
-  return effectiveLimit > UNLIMITED && effectiveLimit < (hardCap || Infinity);
+  if (effectiveLimit <= UNLIMITED) return false;
+  // A FINITE hard cap is the operator's own declared band: any effective limit
+  // below it is meaningful news, however large. Unchanged from T-0282.
+  if (hardCap > UNLIMITED) return effectiveLimit < hardCap;
+  // Unlimited cap (∞): no declared band, so fall back to the documented one.
+  return effectiveLimit <= THROTTLE_VISIBILITY_LIMIT;
 }
 
 /**

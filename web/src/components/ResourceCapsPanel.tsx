@@ -90,9 +90,11 @@ export function CapMeter({
   const throttled = isThrottled(cap, effectiveLimit);
   // The bar is drawn against the CONFIGURED cap only. Deliberately NOT rescaled
   // to the effective limit when the cap is unlimited: on a live system the AIMD
-  // limit mid-ramp is a large number (e.g. 1806 while 12 sessions run), so
+  // limit mid-ramp is a large number (e.g. 1944 while 12 sessions run), so
   // scaling to it yields a permanently ~empty bar and drops the honest
-  // "Unlimited" target. An unlimited cap keeps today's no-bar rendering; the
+  // "Unlimited" target. (T-0718 now also stops CALLING that tail a throttle at
+  // all, so the ∞-cap case usually renders a plain "Unlimited" here.)
+  // An unlimited cap keeps today's no-bar rendering; the
   // throttle is carried by the note below (and the band, when a finite cap gives
   // it something to be a fraction of).
   const ratio = used === null ? null : utilizationRatio(used, cap);
@@ -362,6 +364,13 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   // throttle" — the shipped default is caps 0/0 with backoff ON, so the AIMD
   // governor can depress an otherwise-unlimited ceiling to a finite
   // effective_limit, and that IS a throttle that must be visible.
+  // T-0718 narrows WHEN, without touching the governor: under an ∞ cap the
+  // AIMD ramp tail sits in the thousands for days after pressure clears, so
+  // this strip read "throttled to 1944" with 12 sessions live. `isThrottled`
+  // now shows it only while the limit is inside the documented operating band
+  // (see THROTTLE_VISIBILITY_LIMIT) — a real decrease still surfaces, the
+  // meaningless tail goes quiet, and `admissionLimit` follows suit so the meter
+  // reports "Unlimited" instead of a phantom 1944-wide cap.
   const throttled = isThrottled(hardCap, effLimit);
   // T-0282: capacity-reached keys off the limit admission ACTUALLY gates on —
   // the throttled effective limit when the governor is holding it down, else the

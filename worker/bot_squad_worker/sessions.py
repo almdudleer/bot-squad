@@ -283,9 +283,22 @@ def sid_display_label(sid: str, slug: str | None, *, compact: bool = False, data
     no role segment to derive). Pass ``data_dir`` to let a T-0662
     stakeholder-assigned alias win over the derived role (``compact`` only —
     the bracket form never substitutes an alias, unaffected either way).
+
+    T-0724: an EMPTY/blank ``sid`` is not a session and must not be
+    interpolated. Real callers pass one — ``autoupdate_apply._notify_failure``
+    pages with ``sid=""`` (an apply failure is the install's, not any
+    session's) — and the old code rendered ``"[bot-squad] "``, a dangling
+    bracket plus trailing space, which ``tg._prefix`` then wrapped into the
+    malformed ``"[[bot-squad] ] <text>"``. Degrade to a slug-ONLY label
+    instead (``"[<slug>]"`` / compact ``"<slug>"``): the project is still
+    named, no session is claimed, and the TG prefix reads ``"[bot-squad]
+    <text>"``. Mirrors the empty-``slug`` fallback above — an absent half of
+    the label drops out rather than rendering as empty punctuation.
     """
     if not slug:
         return sid
+    if not (sid or "").strip():
+        return slug if compact else f"[{slug}]"
     if not compact:
         return f"[{slug}] {sid}"
     if data_dir is not None:

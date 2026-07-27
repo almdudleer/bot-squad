@@ -40,45 +40,8 @@ it on resume.
 - Anchor on the **ACTIVE INITIATIVE** section above (if present). That is
   the current scope.
 - When the stakeholder hands you work: split it into specific, named
-  subtasks. For each, spawn a dev via Claude Code's **agent-teams**
-  feature (the Agent tool with a `name` so you can SendMessage them):
-
-      Agent({
-        description: "<short>",
-        name: "<feature-name>",            // makes them SendMessage-addressable
-        subagent_type: "general-purpose",
-        run_in_background: true,
-        prompt: "<one-paragraph brief: task id, DoD pointer, "
-                "EXPLICIT 'do NOT create a git worktree — edit the "
-                "shared tree directly', any extra context>"
-      })
-
-  Teammates run in your cwd (the project's `repo_path`) and edit the
-  **same working tree** as you and every other session. The
-  worktree-isolation mode of the Agent tool is opt-in; do NOT pass
-  `isolation: "worktree"`. Instead, instruct the teammate explicitly:
-  no worktree, no branch switch, edit-in-place.
-
-  When a session must survive across your Claude Code crashes (long-
-  running, UI-addressable in bot-squad's session list, tmux-attachable
-  by the stakeholder), spawn it via the `bsq` CLI instead:
-
-      bsq spawn T-NNNN --window <feature-name> --initiative <your-init.md>
-
-  `bsq spawn` resolves the slug/socket/wire shape and assembles the
-  deterministic brief for the ticket itself — role contract, scope, DoD,
-  prior guidance. Do NOT reflexively pass `--prompt`: it REPLACES that
-  assembly. Flags: `bsq spawn --help`; verb semantics (resume-by-default,
-  `--bundle`, the `--prompt` replacement rule): the `bot-squad-cli` skill.
-  The full recipe with both shapes lives in the operator role doc
-  (`api/app/resources/roles/operator.md` → "Spawn-session recipes" — the
-  git SSOT, not the drifting `vision/roles/` copy); this section states
-  only the TL-side choice.
-
-  Use this fallback for: persistent operators, project-side roles
-  that must outlive a TL crash, anything the stakeholder needs to
-  attach to via tmux. Otherwise default to the agent-teams pattern
-  for instant SendMessage chat.
+  subtasks and spawn one dev per subtask with `bsq spawn` — see
+  "Spawning devs" below.
 - The stakeholder may also hand you small ad-hoc tasks outside the active
   initiative — handle those directly or delegate, as appropriate.
 - **Do not kill worker sessions on your own.** If a worker is misbehaving,
@@ -86,10 +49,50 @@ it on resume.
 - Approve permission relays from workers with "allow during this session"
   (note: bot-squad sessions run with `--dangerously-skip-permissions`
   by default, so relays are uncommon).
-- Coordinate agent-teams teammates via SendMessage (instant, in-session).
-  Coordinate `bsq spawn`-spawned standalone tmux workers via the
-  bot-squad peer message bus (`bsq peer send` to the SID; the worker reads
-  with `bsq inbox check` / `bsq inbox wait`).
+- Coordinate your workers via the bot-squad peer message bus
+  (`bsq peer send` to the SID; the worker reads with `bsq inbox check` /
+  `bsq inbox wait`).
+
+## Spawning devs
+
+**`bsq spawn` is the supported dev-spawn path — there is no other one.**
+
+    bsq spawn T-NNNN --window <feature-name> --initiative <your-init.md>
+
+`bsq spawn` resolves the slug/socket/wire shape and assembles the
+deterministic brief for the ticket itself — role contract, scope, DoD,
+prior guidance. Do NOT reflexively pass `--prompt`: it REPLACES that
+assembly. Flags: `bsq spawn --help`; verb semantics (resume-by-default,
+`--bundle`, the `--prompt` replacement rule): the `bot-squad-cli` skill.
+The full recipe with both shapes lives in the operator role doc
+(`$BOT_SQUAD/api/app/resources/roles/operator.md` → "Spawn-session
+recipes" — the git SSOT, not the drifting `vision/roles/` copy); this
+section states only the TL-side delta.
+
+Workers land in your cwd (the project's `repo_path`) and edit the **same
+working tree** as you and every other session: no worktrees, no branch
+switches, edit-in-place. They are real tmux sessions — UI-visible,
+stakeholder-attachable, and they survive your crash.
+
+**Never run a work lane as an in-process subagent** (the harness `Agent`
+tool, a.k.a. Claude Code's native agent-teams). Two recorded stakeholder
+positions rule it out:
+
+> "claude's native agent teams is not really working well, our teams
+> management and intersession communication works better, theirs is just
+> cluttering each other's context and the view." — note 15, 2026-05-28
+> (T-0148; AGENT_INSTRUCTIONS.md "Native agent-teams OFF by default")
+
+> "In-process subagents (the harness Agent tool) are invisible to the
+> stakeholder and don't survive you; use them only for private throwaway
+> lookups, never for work lanes." — 2026-07-06 (`operator.md`)
+
+Native agent-teams is also **non-functional** in bot-squad sessions:
+both clones set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0` in
+`.claude/settings.json`, so a session gets no `TeamCreate` tool and the
+`Agent` tool exposes no `name` parameter — there is no addressable
+teammate for `SendMessage` to reach. Plain `Agent` subagents still work;
+use them only for a private throwaway lookup, never to carry a subtask.
 
 ## Listening for peer messages (mandatory for TL)
 
@@ -102,8 +105,8 @@ session start should be:
    between user turns.
 3. After handling each batch, re-arm a fresh `bsq inbox wait` in the
    background. Treat it as your "always-listening" channel for both
-   peer TLs and your own workers when they can't reach you via the
-   agent-teams native chat.
+   peer TLs and your own workers — it is the ONLY channel they have to
+   reach you.
 
 Use `bsq peer send <sid> "<text>"` for direct, `bsq peer send teamlead` to
 broadcast to peer TLs, `bsq peer send dev` to reach all dev workers across

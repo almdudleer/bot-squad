@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pre-push hook — cross-module attribute smoke (T-0186).
+# pre-push hook — the invariant gates (T-0186 attr smoke, T-0738 task_body mirror).
 #
 # The shared dev clone is edited by many concurrent bot-squad sessions. A
 # peer's raw `git add -A` / `git add <dir>` can sweep ANOTHER session's
@@ -10,17 +10,30 @@
 # `Config` field while the `config.py` that defines it does not (the live
 # `fb01921` / T-0171 break → AttributeError on origin, after deploy).
 #
-# This hook runs the cross-module attribute smoke before a push reaches
-# origin (and thus before the deploy, which builds from origin). It statically
-# proves every `cfg.<attr>` access in a consumer resolves to a real member of
-# the provider class. A split is caught HERE, not at runtime on staging.
+# The related failure is a *duplicate divergence*: this repo keeps several
+# modules in two copies on purpose (worker vs api, independent packages), and a
+# fix that lands in only one copy ships broken. T-0733 did exactly that to
+# `task_body.py` in 5fe547f, with CI green — the guard existed and was silent
+# because nothing ran it, until a session ran the full worker suite by hand
+# hours later (T-0736 / T-0738).
 #
-# Pure stdlib (ast only) — no deps, no data tree, fast. Blocks the push on a
-# failure. CI (.github/workflows/lint.yml) runs the same check as
-# defense-in-depth for pushes that bypass the hook.
+# So this hook runs the cheap invariant gates before a push reaches origin (and
+# thus before the deploy, which builds from origin):
+#
+#   cross_module_attr_smoke.py  proves every `cfg.<attr>` access in a consumer
+#                               resolves to a real member of the provider class
+#   task_body_mirror.py         proves the worker/api `task_body.py` copies are
+#                               still byte-identical below their docstrings
+#
+# Both are pure stdlib — no deps, no venv, no data tree, sub-second. They are
+# the class of check that belongs on EVERY push. Full suites (worker ~137s and
+# needing its venv, api needing its image) deliberately do NOT run here; see
+# .github/workflows/lint.yml. Any failure blocks the push. CI runs the same two
+# scripts as defense-in-depth for pushes that bypass the hook.
 #
 # Enable in this clone with: git config core.hooksPath .githooks
-# Skip per-push (not recommended) with: BOT_SQUAD_SKIP_ATTR_SMOKE=1
+# Skip per-push (not recommended): BOT_SQUAD_SKIP_ATTR_SMOKE=1 skips both gates
+# (the historical name, kept working; it is the documented override).
 
 set -uo pipefail
 
@@ -29,15 +42,34 @@ set -uo pipefail
 # Resolve the repo root from the hook's location (.githooks/ is at the top).
 hook_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$hook_dir/.." && pwd)
-smoke="$repo_root/scripts/lint/cross_module_attr_smoke.py"
 
-[ -f "$smoke" ] || exit 0  # smoke absent (older checkout) → don't block
+failed=0
 
-python3 "$smoke" --root "$repo_root"
-rc=$?
-if [ "$rc" -ne 0 ]; then
+# run_gate <script-basename> <block-message>
+# A missing script (older checkout) is skipped, not a block.
+run_gate() {
+    local script="$repo_root/scripts/lint/$1"
+    local message="$2"
+
+    [ -f "$script" ] || return 0
+
+    python3 "$script" --root "$repo_root"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '\033[31m%s\033[0m\n' "$message"
+        failed=1
+    fi
+}
+
+run_gate cross_module_attr_smoke.py \
+    "pre-push BLOCKED by cross-module attribute smoke (T-0186): a consumer references a provider member that does not exist — likely a wide-add absorption split. Fix the missing field/import and re-push."
+
+run_gate task_body_mirror.py \
+    "pre-push BLOCKED by the task_body mirror gate (T-0738): worker/bot_squad_worker/task_body.py and api/app/task_body.py have diverged — a fix landed in only one copy (the T-0714 / T-0733 failure). Mirror the change into the other copy and re-push."
+
+if [ "$failed" -ne 0 ]; then
     printf '\033[31m%s\033[0m\n' \
-        "pre-push BLOCKED by cross-module attribute smoke (T-0186): a consumer references a provider member that does not exist — likely a wide-add absorption split. Fix the missing field/import (or set BOT_SQUAD_SKIP_ATTR_SMOKE=1 to override) and re-push."
-    exit "$rc"
+        "(override with BOT_SQUAD_SKIP_ATTR_SMOKE=1 — not recommended: every gate above is a bug that has already shipped to origin once)"
+    exit 1
 fi
 exit 0

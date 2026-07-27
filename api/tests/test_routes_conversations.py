@@ -1019,3 +1019,59 @@ def test_append_refuses_to_write_as_the_stakeholder(tmp_bot_squad: Path, monkeyp
     r = client.post(CONV, json={"author": "user", "text": "x", "direction": "out"},
                     headers=_worker_auth())
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# T-0746 item (c): the endpoint carries `forwarded_from` through, and our own
+# echoed text (`system:bot-echo`) is inert on both side effects — it is not a
+# session writeback (nothing to relay) and it is not the stakeholder speaking
+# (nothing to wake HERE; the TG handlers wake the attendant themselves, so a
+# forward is still attended to — only the attribution changes).
+# ---------------------------------------------------------------------------
+
+
+def test_worker_append_persists_forwarded_from(tmp_bot_squad: Path, monkeypatch):
+    client = _client(tmp_bot_squad, monkeypatch)
+    _mock_call_action(monkeypatch)
+    r = client.post(
+        CONV,
+        json={"author": "user", "text": "глянь что пишут", "forwarded_from": "user:999"},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["forwarded_from"] == "user:999"
+    out = CS.list_messages(tmp_bot_squad / "data", "test-project", "gu_abc")
+    assert out["messages"][0]["forwarded_from"] == "user:999"
+
+
+def test_worker_append_of_our_own_echo_is_inert(tmp_bot_squad: Path, monkeypatch):
+    """The live line, stored the T-0746 way. Neither relayed (that would send
+    the stakeholder his own forward back) nor attendant-woken from here."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+    notice = ("❌ session S-almdudleer-rv-pair-trading-signals-poc-review-real--p266 "
+              "not active — message dropped")
+    r = client.post(
+        CONV,
+        json={"author": "system:bot-echo", "text": notice, "direction": "in",
+              "forwarded_from": "bot"},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["relayed"] is False
+    assert "ensured" not in body
+    assert body["direction"] == "in"
+    assert calls == []
+
+
+def test_worker_append_without_forwarded_from_is_unchanged(tmp_bot_squad: Path, monkeypatch):
+    """NEGATIVE GUARD — a caller that never heard of this field gets exactly
+    the pre-T-0746 stored record."""
+    client = _client(tmp_bot_squad, monkeypatch)
+    _mock_call_action(monkeypatch)
+    r = client.post(CONV, json={"author": "user", "text": "hi"}, headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    line = (tmp_bot_squad / "data" / "_mothership" / "conversations"
+            / "test-project" / "gu_abc.jsonl").read_text(encoding="utf-8").strip()
+    assert "forwarded_from" not in line

@@ -507,10 +507,58 @@ def append_conversation(
     indistinguishable. Omitted from the request body when ``False`` (every
     pre-T-0693 caller).
 
+    AUTHORSHIP (T-0746 item c). The author is no longer hardcoded ``"user"``.
+    ``msg["from"]`` says who SENT the message, which is not the same question as
+    who WROTE it, and assuming they were the same is how the live
+    ``"❌ session … not active — message dropped"`` notice came to be recorded as
+    the stakeholder's own words. ``echo_guard.classify_inbound`` answers the
+    right question — see that module for the two rungs and why a shape-only
+    validator in the store could never have caught this. Its verdict for a
+    genuine, self-composed message is ``author="user"`` with no
+    ``forwarded_from``, i.e. exactly this function's pre-T-0746 payload, so
+    nothing changes for the overwhelming common case.
+
     Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
     ``global_user_id``, or the API base / worker token aren't configured — so a
     record failure NEVER blocks inbound routing. Returns ``True`` on a recorded
     append."""
+    from bot_squad_worker import echo_guard
+    verdict = echo_guard.classify_inbound(cfg, msg)
+    payload = {
+        "author": verdict["author"],
+        "text": msg.get("text") or "",
+        "attachments": _msg_attachments(msg),
+        "timestamp": _msg_ts(msg),
+    }
+    if verdict["forwarded_from"]:
+        payload["forwarded_from"] = verdict["forwarded_from"]
+    if verdict["author"] != "user":
+        # T-0755's derivation makes `system:` outbound by default (every system
+        # record in this store used to be a notice we DELIVERED). This one
+        # REACHED us — it came back in on the inbound channel — and the store's
+        # own docstring is explicit that such a record must say so explicitly.
+        payload["direction"] = "in"
+    if thread_id is not None and str(thread_id).strip() != "":
+        payload["thread_id"] = thread_id
+    if general_feed:
+        payload["general_feed"] = True
+    return _post_conversation(cfg, slug, global_user_id, payload)
+
+
+def _post_conversation(cfg, slug: str, global_user_id: str, payload: dict) -> Optional[bool]:
+    """POST one already-built record to the API's token-gated append endpoint.
+
+    The API owns the store (single-writer); the worker POSTs over the same
+    worker->API path T-0488 established (httpx, base=MOTHERSHIP_BASE_URL,
+    Bearer=WORKER_API_TOKEN) — NOT through the TG egress proxy (this is a
+    local-API call, not Telegram traffic).
+
+    Extracted by T-0746 because this ticket adds a THIRD writer with a
+    different body shape (the undelivered-message fallback, which appends a
+    system context line and then the user's own text). The env-gating and the
+    swallow-everything contract are the load-bearing part and must not be
+    re-implemented per caller: a record failure never blocks inbound routing.
+    Returns ``True`` on a recorded append, ``None`` on a no-op or failure."""
     gid = str(global_user_id or "").strip()
     if not gid or not str(slug or ""):
         return None
@@ -519,16 +567,6 @@ def append_conversation(
     if not base or not token:
         return None
     url = f"{base}/api/m/worker/conversations/{slug}/{gid}/messages"  # T-0529: /worker prefix
-    payload = {
-        "author": "user",
-        "text": msg.get("text") or "",
-        "attachments": _msg_attachments(msg),
-        "timestamp": _msg_ts(msg),
-    }
-    if thread_id is not None and str(thread_id).strip() != "":
-        payload["thread_id"] = thread_id
-    if general_feed:
-        payload["general_feed"] = True
     try:
         r = httpx.post(
             url,
@@ -553,7 +591,10 @@ def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
       - a dev/TL/orchestrator session wrote directly to the stakeholder
         (``author="session:<sid>"``), or
       - the stakeholder replied directly to a session, bypassing the
-        attendant (``author="user"``).
+        attendant (``author="system:direct-reply"`` — T-0746 corrected this
+        from ``"user"``: the record's text is the SYSTEM's summary of what
+        happened, wrapping his words, so attributing the whole line to him was
+        the same lie item (c) is about, one file over).
 
     Marked ``fyi=True`` on the API append (T-0660) so the endpoint records it
     for context but suppresses the side effects a normal append of that
@@ -566,29 +607,11 @@ def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
 
     Same best-effort/env-gated contract as ``append_conversation``: a no-op
     when unconfigured or on failure, never blocks the caller."""
-    gid = str(global_user_id or "").strip()
-    if not gid or not str(slug or ""):
-        return None
-    base = _api_base_url()
-    token = _worker_api_token()
-    if not base or not token:
-        return None
-    url = f"{base}/api/m/worker/conversations/{slug}/{gid}/messages"  # T-0529: /worker prefix
-    try:
-        r = httpx.post(
-            url,
-            json={
-                "author": author,
-                "text": f"{_FYI_PREFIX} {text}",
-                "fyi": True,
-            },
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        r.raise_for_status()
-    except (httpx.HTTPError, ValueError):
-        return None
-    return True
+    return _post_conversation(cfg, slug, global_user_id, {
+        "author": author,
+        "text": f"{_FYI_PREFIX} {text}",
+        "fyi": True,
+    })
 
 
 # ---- T-0492: hardwired project routing --------------------------------------
@@ -1232,13 +1255,39 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     session_id = binding.get("session_id")
     if session_id:
         text = msg.get("text") or ""
-        result = _handle_reply(cfg, chat_id, session_id, text)
+        # T-0746: `gid` so an undeliverable message can fall back to the target
+        # session's user-conversation instead of evaporating, and `thread_id`
+        # so the outcome notice lands in the TASK TOPIC the user is looking at
+        # rather than the forum's general feed (this call site was the one that
+        # never passed it — the same omission T-0740 fixed on the other paths).
+        result = _handle_reply(
+            cfg, chat_id, session_id, text,
+            thread_id=msg.get("message_thread_id"), gid=gid,
+        )
         result["action"] = f"task_topic_{result.get('action', 'inject')}"
         result["slug"] = slug
-        append_conversation_fyi(
-            cfg, slug, gid, author="user",
-            text=f"Пользователь ответил сессии {session_id} напрямую: {text}",
-        )
+        if result.get("fallback") is None:
+            # T-0746, the same defect item (c) is about, found in this file:
+            # this record's text is SYSTEM prose ("Пользователь ответил сессии
+            # … напрямую:") wrapping his words, and it was stored as
+            # `author="user"` — a line the stakeholder never wrote, attributed
+            # to him. `system:direct-reply` is what it has always been. Side
+            # effects are unchanged (an `fyi` append neither relays nor wakes
+            # either way); what DOES change, correctly, is that `uc_redrive`
+            # stops treating a record explicitly marked "ответ не требуется" as
+            # an unanswered stakeholder message and nagging the attendant to
+            # answer it.
+            #
+            # Skipped entirely when the message FELL BACK: this summary exists
+            # to give the attendant context about text that went straight to a
+            # session, and if that never happened the fallback's own records
+            # are the account — repeating his words inside a "no reply needed"
+            # wrapper would tell the attendant to ignore the very message it
+            # was just woken for.
+            append_conversation_fyi(
+                cfg, slug, gid, author="system:direct-reply",
+                text=f"Пользователь ответил сессии {session_id} напрямую: {text}",
+            )
         return result
     # T-0676 items 3/6: isolate this bound topic's record + attendant-read
     # from the rest of the project's (mixed) history — see append_conversation
@@ -1630,9 +1679,12 @@ def handle_update(cfg, update: dict) -> dict:
                     cfg, chat_id, args, thread_id=thread_id, binding=binding,
                 )
             else:
-                result = _handle_slash(cfg, chat_id, cmd, args, thread_id=thread_id)
+                result = _handle_slash(cfg, chat_id, cmd, args, thread_id=thread_id,
+                                       gid=gid)
         elif reply:
-            result = _handle_reply(cfg, chat_id, *reply, thread_id=thread_id)
+            # T-0746: `gid` is what makes the undelivered-message fallback
+            # possible at all — the store is keyed (slug, global_user_id).
+            result = _handle_reply(cfg, chat_id, *reply, thread_id=thread_id, gid=gid)
         else:  # group/topic voice
             from bot_squad_worker import voice_intake as _vi
             r = _vi.process_voice(cfg, chat_slug, msg, ts=_msg_ts(msg))
@@ -1680,8 +1732,24 @@ def _msg_ts(msg: dict) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _handle_reply(cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = None) -> dict:
-    """Find the pane by SID and inject the text."""
+def _handle_reply(
+    cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = None, gid: str = "",
+) -> dict:
+    """Find the pane by SID and inject the text; on failure, DON'T drop it.
+
+    T-0746 item (a). Before this, an undeliverable message evaporated: we told
+    the sender "message dropped" and that was the whole of it — the text was
+    gone, nothing downstream had it, and the only trace was a TG notice that
+    (item c) then came back in and corrupted the record. Sessions are reaped
+    routinely, so aiming a reply at one that has since gone is the NORMAL case,
+    not an edge one.
+
+    The fallback destination is the TARGET SESSION'S project (item e) — see
+    ``sessions.project_of_sid`` for why that and not the arrival store. ``gid``
+    is required to have one: the conversation store is keyed
+    ``(slug, global_user_id)``, so an unrecognized sender has no thread to fall
+    back INTO.
+    """
     from bot_squad_worker import actions as A
     try:
         result = A.dispatch("inject_input", {"sid": sid, "text": text})
@@ -1690,9 +1758,125 @@ def _handle_reply(cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = No
         _clear_stall(cfg, chat_id, sid, thread_id=thread_id)
         return {"ok": True, "action": "inject", "sid": sid, "result": result}
     except A.ActionError as e:
-        _notify(cfg, chat_id, f"❌ session {sid} not active — message dropped",
-                thread_id=thread_id)
-        return {"ok": False, "action": "inject_failed", "sid": sid, "error": str(e)}
+        fb = _fallback_undelivered(
+            cfg, chat_id, sid, text, gid=gid, thread_id=thread_id, error=str(e),
+        )
+        out = {"sid": sid, "error": str(e)}
+        out.update(fb)  # carries `ok` + `action` for both outcomes
+        return out
+
+
+#: Marker for the store record that says WHO a fallen-back message was aimed
+#: at. A separate ``system:``-authored line rather than a prefix on the user's
+#: own text, because T-0746 item (c) is precisely about system prose being
+#: mixed into a record that claims the stakeholder wrote it.
+_UNDELIVERED_AUTHOR = "system:undelivered"
+
+
+def _fallback_undelivered(
+    cfg, chat_id: str, sid: str, text: str, *, gid: str = "",
+    thread_id: Any = None, error: str = "",
+) -> dict:
+    """Hand a message we could not deliver to ``sid`` to that project's
+    user-conversation attendant, and tell the sender what happened.
+
+    Two records, in this order, into ``(slug, gid)``:
+
+    1. ``system:undelivered`` (``direction="in"``) naming the intended SID and
+       why it could not be delivered — the context the attendant needs to
+       answer usefully rather than just report a failure, and the reason item
+       (a) says the fallback must "name the intended SID".
+    2. The user's ORIGINAL text, ``author="user"``. Unprefixed and unedited:
+       the whole point of the store is that it holds what he actually said, so
+       the system's account of the situation belongs in record 1, not stapled
+       onto his words.
+
+    Deliberately THREADLESS. The sender may have been writing in a forum topic
+    bound to a DIFFERENT project (the live incident exactly: a watchrobot
+    session addressed from a bot-squad-bound feed), and a thread id is only
+    meaningful inside its own chat — reusing it here would file the message
+    under a topic of the target project that does not exist. The project's main
+    ``(slug, gid)`` thread is the one destination that is always correct, which
+    is what makes item (e)'s "deterministic" true rather than aspirational.
+
+    On item (b): when no fallback exists — an unrecognized sender, or a SID no
+    project claims — nothing is written to the store at all and the sender is
+    told plainly that the message was NOT delivered. The failure is surfaced as
+    a failure; it is never smuggled into the thread as content.
+    """
+    from bot_squad_worker import sessions as S
+
+    body = str(text or "").strip()
+    slug = ""
+    try:
+        slug = S.project_of_sid(cfg, sid)
+    except Exception:  # noqa: BLE001 — an unreadable data dir is "no project"
+        log.exception("tg_listener: project_of_sid failed for %s", sid)
+    reason = ""
+    if not body:
+        reason = "нечего передавать (пустой текст)"
+    elif not gid:
+        reason = "отправитель не опознан"
+    elif not slug:
+        reason = f"не найден проект сессии {sid}"
+    if reason:
+        _notify(
+            cfg, chat_id,
+            f"❌ Сессия {sid} не активна, и передать сообщение в "
+            f"user-conversation не удалось: {reason}. Сообщение НЕ доставлено — "
+            f"напиши его обычным сообщением в нужном топике.",
+            thread_id=thread_id,
+        )
+        return {"ok": False, "action": "inject_failed", "fallback": "impossible",
+                "reason": reason}
+
+    _post_conversation(cfg, slug, gid, {
+        "author": _UNDELIVERED_AUTHOR,
+        "text": (
+            f"Сообщение было адресовано сессии {sid} (проект {slug}), но она не "
+            f"активна ({error or 'нет живой панели'}). Оригинальный текст — "
+            f"следующим сообщением; ответь на него сам."
+        ),
+        # T-0755 derives `system:` as outbound; this one was never sent
+        # anywhere — it is our note ABOUT an inbound message, so it must say so.
+        "direction": "in",
+    })
+    message_ref = _now_iso()
+    recorded = _post_conversation(cfg, slug, gid, {
+        "author": "user",
+        "text": body,
+        "timestamp": message_ref,
+    })
+    if not recorded:
+        _notify(
+            cfg, chat_id,
+            f"❌ Сессия {sid} не активна, и записать сообщение в "
+            f"user-conversation проекта «{slug}» не удалось. Сообщение НЕ "
+            f"доставлено — напиши его обычным сообщением в нужном топике.",
+            thread_id=thread_id,
+        )
+        return {"ok": False, "action": "inject_failed", "fallback": "store_failed",
+                "fallback_slug": slug}
+
+    ensured = _ensure_user_conversation(cfg, slug, gid, message_ref)
+    if isinstance(ensured, dict) and ensured.get("parked"):
+        _notify(
+            cfg, chat_id,
+            f"⚠️ Сессия {sid} не активна. Сообщение записано в "
+            f"user-conversation проекта «{slug}», но все воркеры сейчас заняты — "
+            f"займусь, как только освободится слот.",
+            thread_id=thread_id,
+        )
+        return {"ok": True, "action": "inject_fallback", "fallback": "parked",
+                "fallback_slug": slug}
+    _notify(
+        cfg, chat_id,
+        f"⚠️ Сессия {sid} не активна — передал сообщение в user-conversation "
+        f"проекта «{slug}».",
+        thread_id=thread_id,
+    )
+    return {"ok": True, "action": "inject_fallback", "fallback": "routed",
+            "fallback_slug": slug}
 
 
 def _clear_stall(cfg, chat_id: str, sid: str, *, thread_id: Any = None) -> None:
@@ -1724,8 +1908,13 @@ def _clear_stall(cfg, chat_id: str, sid: str, *, thread_id: Any = None) -> None:
         pass
 
 
-def _handle_slash(cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = None) -> dict:
-    """Implement /sessions, /say, /help."""
+def _handle_slash(
+    cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = None, gid: str = "",
+) -> dict:
+    """Implement /sessions, /say, /help.
+
+    ``gid`` (T-0746): only ``/say`` uses it, and only on the failure path — see
+    there for why the undelivered-message fallback covers this verb too."""
     from bot_squad_worker import actions as A, sessions as S
     if cmd == "sessions":
         # List all sessions across all registered projects
@@ -1748,8 +1937,23 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = No
             result = A.dispatch("inject_input", {"sid": sid, "text": text})
             return {"ok": True, "action": "say", "sid": sid, "result": result}
         except A.ActionError as e:
-            _notify(cfg, chat_id, f"❌ /say failed: {e}", thread_id=thread_id)
-            return {"ok": False, "action": "say_failed", "error": str(e)}
+            # T-0746: /say is the SAME verb as a reply-quote — "a message
+            # addressed to a session" — so it gets the same fallback rather
+            # than being left as the unfixed twin of the bug this ticket is
+            # about. T-0659's "never append a slash command" is not in tension:
+            # that rule is about routinely dumping contextless control commands
+            # into a project's store, and this appends only the message BODY,
+            # only when delivery has already failed.
+            fb = _fallback_undelivered(
+                cfg, chat_id, sid, text, gid=gid, thread_id=thread_id, error=str(e),
+            )
+            out = dict(fb)
+            out.update({
+                "action": "say_fallback" if fb.get("ok") else "say_failed",
+                "sid": sid,
+                "error": str(e),
+            })
+            return out
 
     if cmd == "help":
         _notify(cfg, chat_id,

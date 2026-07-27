@@ -2773,6 +2773,56 @@ def live_user_conversation_sid(
     return None
 
 
+def project_of_sid(cfg: Any, sid: str) -> str:
+    """The project slug that OWNS ``sid``, or ``""`` when nothing claims it.
+
+    T-0746 item (e): a message aimed at a session must fall back to a
+    DETERMINISTIC project — specifically the one the TARGET session belongs to,
+    never the one whose conversation store the sender happened to write into.
+    The live incident is exactly that pair pulled apart: the reaped session was
+    watchrobot's while the message (and the "dropped" notice) landed in
+    bot-squad's store, because the chat the stakeholder typed in is bound to
+    bot-squad. Routing the fallback by the ARRIVAL store would have handed
+    watchrobot's question to bot-squad's attendant.
+
+    Ownership is read off disk, not off tmux: ``data/<slug>/sessions/<sid>.md``
+    is written at spawn and SURVIVES the reap (verified on the live install —
+    the p266 md is still there), which is what makes this resolvable for
+    exactly the sessions this is for: the ones that are no longer running.
+
+    Determinism has two halves. Projects are scanned in sorted slug order, and
+    the direct ``<sid>.md`` hit wins over the rename-tolerant ``sid:``-field
+    scan (:func:`_find_session_md`'s uuid fallback problem in reverse) — so a
+    SID that somehow exists under two projects always resolves the same way
+    rather than depending on dict ordering. Tolerant of a missing data dir /
+    sessions dir / unreadable md (→ skipped, never raises).
+    """
+    want = str(sid or "").strip()
+    if not want:
+        return ""
+    try:
+        data_dir = Path(cfg.data_dir)
+        slugs = sorted(cfg.projects)
+    except (AttributeError, TypeError):
+        return ""
+    # Pass 1: the file is named for the SID — the normal case.
+    for slug in slugs:
+        if (data_dir / slug / "sessions" / f"{want}.md").is_file():
+            return slug
+    # Pass 2: a tmux window rename leaves the md at the PRE-rename filename
+    # while its `sid:` field was rewritten (the mirror of the _find_session_md
+    # case). Cheap enough — this only runs when pass 1 found nothing at all.
+    for slug in slugs:
+        sess_dir = data_dir / slug / "sessions"
+        if not sess_dir.is_dir():
+            continue
+        for md in sorted(sess_dir.glob("*.md")):
+            meta = _read_session_metadata(md)
+            if meta is not None and str(meta.get("sid") or "") == want:
+                return slug
+    return ""
+
+
 # T-0239 slice 2: enforce the user-set resource caps at spawn-time. The caps
 # live in the API's system_settings.toml ([caps] section, written by
 # /api/system-settings); the worker reads them FRESH on each spawn so a cap

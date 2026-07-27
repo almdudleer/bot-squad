@@ -341,6 +341,17 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     mixed history. Omitted / ``None`` (DM, non-topic message — every
     pre-T-0676 caller) behaves byte-identically to before this change.
 
+    ``forwarded_from`` (T-0746 item c): where the content came from when the
+    SENDER did not compose it (``"bot"`` for our own output echoed back,
+    ``"user:<id>"``/``"chat:<id>"``/a hidden-sender name for a relayed
+    message) — see ``conversation_store.append`` and
+    ``bot_squad_worker.echo_guard``. Optional; omitted/empty is byte-identical
+    to every pre-T-0746 caller. Note this is orthogonal to ``author``: our own
+    echoed text arrives as ``system:bot-echo`` with ``direction="in"``, so it
+    is neither relayed (not a session writeback) nor treated as the
+    stakeholder's own words — but the TG handlers still wake the attendant
+    themselves, so a forward is never silently swallowed.
+
     ``general_feed`` (T-0693 Finding B): marks the record as arriving via an
     explicit ``tg_bindings`` General-feed binding (``thread_id=None`` bound on
     purpose) rather than a genuine DM/non-topic message — the two are
@@ -370,6 +381,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             general_feed=general_feed,
             direction=direction,
             delivered=delivered,
+            forwarded_from=payload.get("forwarded_from"),
         )
     except ValueError as e:
         # An unsafe slug / global_user_id segment, an author outside the

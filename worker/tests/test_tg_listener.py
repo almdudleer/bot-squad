@@ -574,6 +574,11 @@ def test_handle_update_dispatches_say_slash(tmp_path, monkeypatch):
 
 
 def test_handle_update_inject_failed_notifies(tmp_path, monkeypatch):
+    """T-0746 item (b): this message carries no ``from``, so there is no
+    recognized sender and therefore no ``(slug, gid)`` thread to fall back
+    into. The failure must then reach the SENDER as a failure — never silently,
+    and (unlike the pre-T-0746 "message dropped" notice, which came back in and
+    corrupted the record) never written to the store as content."""
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     msg = _reply_message("S-alice-spec5-p3", "text", chat_id=12345)
     update = {"update_id": 6, "message": msg}
@@ -583,12 +588,17 @@ def test_handle_update_inject_failed_notifies(tmp_path, monkeypatch):
 
     notify_calls = []
     monkeypatch.setattr(TL, "_notify", lambda cfg, chat_id, text, **k: notify_calls.append(text))
+    posts = []
+    monkeypatch.setattr(TL, "_post_conversation",
+                        lambda *a, **k: posts.append(a) or True)
 
     result = TL.handle_update(cfg, update)
     assert result["ok"] is False
     assert result["action"] == "inject_failed"
+    assert result["fallback"] == "impossible"
     assert len(notify_calls) == 1
-    assert "not active" in notify_calls[0]
+    assert "не активна" in notify_calls[0] and "НЕ доставлено" in notify_calls[0]
+    assert posts == []
 
 
 def test_handle_update_skips_plain_message(tmp_path):
@@ -1946,32 +1956,55 @@ def test_handle_topic_bound_session_id_records_fyi_to_attendant_thread(tmp_path,
     call = fyi_calls[0]
     assert call["slug"] == "beta"
     assert call["gid"] == "gu_1"
-    assert call["author"] == "user"
+    # T-0746: the text is the SYSTEM's summary of what happened, wrapping his
+    # words — it was never something he wrote, so it is no longer stored as if
+    # it were (item c, applied to this file's own writer).
+    assert call["author"] == "system:direct-reply"
     assert "S-dev-p9" in call["text"]
     assert "looks good, ship it" in call["text"]
 
 
-def test_handle_topic_bound_session_id_records_fyi_even_on_inject_failure(tmp_path, monkeypatch):
-    """The attendant should still learn the stakeholder tried to reach the
-    session, even if that session is no longer active to receive it."""
+def test_handle_topic_bound_session_id_falls_back_on_inject_failure(tmp_path, monkeypatch):
+    """T-0746 (was: "records fyi even on inject failure"). The attendant must
+    still learn the stakeholder tried to reach a session that is no longer
+    active — but the FYI summary was a WEAKER form of that: marked "ответ не
+    требуется", it told the attendant to ignore it. The fallback now records
+    the situation AND his verbatim text and wakes the attendant, so the FYI
+    would only repeat his words inside a no-reply-needed wrapper."""
     from bot_squad_worker import tg_bindings
     import bot_squad_worker.actions as A
     cfg = _make_multi_cfg(tmp_path, chat="111")
     tg_bindings.set_binding(cfg, "111", 42, "beta", session_id="S-gone-p1")
+    (cfg.data_dir / "beta" / "sessions").mkdir(parents=True, exist_ok=True)
+    (cfg.data_dir / "beta" / "sessions" / "S-gone-p1.md").write_text(
+        "---\nsid: S-gone-p1\n---\n", encoding="utf-8")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
 
     def _raise(name, params):
         raise A.ActionError("no such pane")
     monkeypatch.setattr(A, "dispatch", _raise)
-    monkeypatch.setattr(TL, "_notify", lambda *a, **k: None)
+    notices = []
+    monkeypatch.setattr(TL, "_notify", lambda c, ch, t, **k: notices.append((k.get("thread_id"), t)))
     fyi_calls = []
     monkeypatch.setattr(TL, "append_conversation_fyi",
                         lambda *a, **k: fyi_calls.append((a, k)))
+    posts = []
+    monkeypatch.setattr(TL, "_post_conversation",
+                        lambda c, slug, gid, payload: posts.append((slug, payload)) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: {"ok": True, "spawned": False})
 
     msg = _topic_msg("hello?", chat_id=111, thread_id=42)
-    TL.handle_update(cfg, {"update_id": 1, "message": msg})
-    assert len(fyi_calls) == 1
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "task_topic_inject_fallback"
+    assert fyi_calls == []
+    assert [p[0] for p in posts] == ["beta", "beta"]
+    assert posts[0][1]["author"] == "system:undelivered"
+    assert posts[1][1]["author"] == "user" and posts[1][1]["text"] == "hello?"
+    # The outcome lands in the TASK TOPIC he is looking at, not the general feed.
+    assert notices and notices[0][0] == 42
 
 
 def test_handle_topic_bound_plain_project_topic_never_records_fyi(tmp_path, monkeypatch):
@@ -3659,3 +3692,114 @@ def test_help_lists_remote_control(tmp_path, monkeypatch):
     TL._handle_slash(cfg, "12345", "help", "")
 
     assert "/remote-control" in notices[-1]
+
+
+# ---------------------------------------------------------------------------
+# T-0746 item (c): append_conversation asks WHO WROTE this, not who sent it.
+# The live record it prevents is a machine-generated notice stored as the
+# stakeholder's own words — see bot_squad_worker.echo_guard.
+# ---------------------------------------------------------------------------
+
+_T0746_NOTICE = ("❌ session S-almdudleer-rv-pair-trading-signals-poc-review-real--p266 "
+                 "not active — message dropped")
+
+
+def _capture_post(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    return captured, fake_post
+
+
+def test_append_conversation_records_our_echoed_notice_as_system(tmp_path, monkeypatch):
+    """THE regression. Our own notice, forwarded back from our own bot, must
+    never land as author=user."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    msg = {
+        "from": _from(), "text": _T0746_NOTICE, "date": 1750000000,
+        "forward_origin": {"type": "user", "date": 1750000000,
+                           "sender_user": {"id": 8206895402, "is_bot": True}},
+    }
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert captured["json"]["author"] == "system:bot-echo"
+    assert captured["json"]["forwarded_from"] == "bot"
+    # T-0755 derives `system:` as OUTBOUND; this one reached us, so it must say so.
+    assert captured["json"]["direction"] == "in"
+    # The body is preserved verbatim — the attribution changed, not the record.
+    assert captured["json"]["text"] == _T0746_NOTICE
+
+
+def test_append_conversation_annotates_someone_elses_forward(tmp_path, monkeypatch):
+    """A human wrote it, so `user` stays right — but the record must not imply
+    the SENDER composed it."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    msg = {"from": _from(), "text": "глянь что пишут", "date": 1750000000,
+           "forward_origin": {"type": "user", "date": 1750000000,
+                              "sender_user": {"id": 999, "is_bot": False}}}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert captured["json"]["author"] == "user"
+    assert captured["json"]["forwarded_from"] == "user:999"
+    assert "direction" not in captured["json"]
+
+
+def test_append_conversation_payload_unchanged_for_a_typed_message(tmp_path, monkeypatch):
+    """NEGATIVE GUARD — passes before AND after T-0746. A genuine message's
+    request body must be byte-identical to the pre-fix one; this is the
+    overwhelming common case and the fix must not touch it."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    msg = {"from": _from(), "text": "deploy please", "date": 1750000000}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert captured["json"] == {
+        "author": "user", "text": "deploy please",
+        "attachments": [], "timestamp": TL._msg_ts(msg),
+    }
+
+
+def test_append_conversation_echo_keeps_thread_and_general_feed(tmp_path, monkeypatch):
+    """The routing fields are orthogonal to authorship — an echo arriving in a
+    bound topic still belongs to that topic's thread."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    msg = {"from": _from(), "text": _T0746_NOTICE, "date": 1750000000,
+           "forward_origin": {"type": "user", "date": 1,
+                              "sender_user": {"id": 8206895402, "is_bot": True}}}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg, thread_id=275)
+
+    assert captured["json"]["thread_id"] == 275
+    assert captured["json"]["author"] == "system:bot-echo"
+
+
+def test_append_conversation_survives_a_broken_echo_guard(tmp_path, monkeypatch):
+    """A classifier failure must degrade to the pre-T-0746 behaviour, not break
+    inbound routing."""
+    from bot_squad_worker import echo_guard
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    monkeypatch.setattr(echo_guard, "is_own_bot_forward",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    msg = {"from": _from(), "text": "deploy please", "date": 1750000000}
+    with patch("httpx.post", side_effect=fake_post):
+        ok = TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert ok is True
+    assert captured["json"]["author"] == "user"

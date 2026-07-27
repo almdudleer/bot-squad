@@ -205,6 +205,7 @@ def append(
     general_feed: bool = False,
     direction: str | None = None,
     delivered: bool = False,
+    forwarded_from: str | None = None,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
@@ -234,6 +235,16 @@ def append(
     ``(slug, global_user_id)`` file. This flag marks the record as the latter,
     so the two are distinguishable on read instead of silently identical;
     omitted from the stored record when ``False`` (every pre-T-0693 caller).
+
+    ``forwarded_from`` (T-0746 item c): where this content came from when the
+    SENDER did not compose it — ``"bot"`` for our own output that re-entered on
+    the inbound channel, ``"user:<id>"`` / ``"chat:<id>"`` / a hidden-sender
+    name for somebody else's message the sender relayed. The author vocabulary
+    cannot express this on its own: a forward of another human's words is still
+    ``author="user"`` (a human did write them) and would otherwise read as the
+    sender's own. Set by ``tg_listener`` via ``echo_guard.classify_inbound``;
+    omitted from the stored record when empty, so every record whose sender DID
+    compose it stays byte-identical to its pre-T-0746 shape.
     """
     author = str(author)
     if not is_valid_author(author):
@@ -275,6 +286,8 @@ def append(
         record["thread_id"] = thread_id
     if general_feed:
         record["general_feed"] = True
+    if forwarded_from:
+        record["forwarded_from"] = str(forwarded_from)
     p = conv_path(data_dir, slug, global_user_id, thread_id)
     line = json.dumps(record, ensure_ascii=False)
     with _append_lock:
@@ -318,6 +331,11 @@ def _read_all(
             # ticket exists to prevent.
             rec.setdefault("direction", default_direction(rec.get("author", "")))
             rec.setdefault("delivered", False)
+            # T-0746: absent -> the sender composed it, which is true of every
+            # record written before the guard existed EXCEPT the one line it
+            # exists for. That line is deliberately left as it stands: rewriting
+            # the stakeholder's own file is the failure this ticket is about.
+            rec.setdefault("forwarded_from", "")
             out.append(rec)
     # T-0755: order by TIMESTAMP, not by arrival. Until this ticket the file was
     # written by one lane (inbound) so append order WAS chronological; now the

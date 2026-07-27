@@ -280,3 +280,59 @@ def test_general_feed_and_dm_still_share_the_bare_thread(tmp_path: Path):
     CS.append(tmp_path, "proj", "gu_abc", author="user", text="dm msg")
     out = CS.list_messages(tmp_path, "proj", "gu_abc")
     assert [m["general_feed"] for m in out["messages"]] == [True, False]
+
+
+# ---------------------------------------------------------------------------
+# T-0746 item (c): `forwarded_from` — the content did not originate with the
+# sender. The author vocabulary alone cannot say this: a forward of another
+# human's words is still author="user" and would otherwise read as the
+# sender's own. See bot_squad_worker.echo_guard for how it is decided.
+# ---------------------------------------------------------------------------
+
+
+def test_append_omits_forwarded_from_when_the_sender_composed_it(tmp_path: Path):
+    """NEGATIVE GUARD — the common case stays byte-identical to its pre-T-0746
+    shape, so no existing record's meaning shifts."""
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="hi")
+    assert "forwarded_from" not in rec
+
+
+def test_append_records_forwarded_from(tmp_path: Path):
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="user", text="глянь",
+                    forwarded_from="user:999")
+    assert rec["forwarded_from"] == "user:999"
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["forwarded_from"] == "user:999"
+
+
+def test_read_normalizes_missing_forwarded_from(tmp_path: Path):
+    p = CS.conv_path(tmp_path, "proj", "gu_abc")
+    p.parent.mkdir(parents=True)
+    p.write_text('{"timestamp": "2026-06-01T00:00:00Z", "author": "user", '
+                 '"text": "pre-migration", "attachments": []}\n', encoding="utf-8")
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["forwarded_from"] == ""
+
+
+def test_our_own_echoed_notice_is_storable_as_an_inbound_system_record(tmp_path: Path):
+    """The exact live line that started this ticket, stored the way T-0746
+    records it: a system author (no new class), inbound direction, and the body
+    preserved verbatim."""
+    notice = ("❌ session S-almdudleer-rv-pair-trading-signals-poc-review-real--p266 "
+              "not active — message dropped")
+    rec = CS.append(tmp_path, "proj", "gu_abc", author="system:bot-echo",
+                    text=notice, direction="in", forwarded_from="bot")
+    assert rec["author"] == "system:bot-echo"
+    assert rec["direction"] == "in"     # explicit: `system:` derives to "out"
+    assert rec["text"] == notice
+    out = CS.list_messages(tmp_path, "proj", "gu_abc")
+    assert out["messages"][0]["direction"] == "in"
+
+
+def test_echo_author_passes_the_closed_vocabulary(tmp_path: Path):
+    """p312's instruction: consume the T-0755 vocabulary, do not add a fourth
+    class. `system:bot-echo` is a `system:<kind>`, so the existing gate accepts
+    it and an invented class still 400s."""
+    assert CS.is_valid_author("system:bot-echo")
+    with pytest.raises(ValueError):
+        CS.append(tmp_path, "proj", "gu_abc", author="bot:echo", text="x")

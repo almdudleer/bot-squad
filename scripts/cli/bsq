@@ -3004,14 +3004,48 @@ def _hunk_count(diff_text: str) -> int:
     return sum(1 for ln in diff_text.splitlines() if ln.startswith("@@"))
 
 
+def _patch_header_rel(minus_line: str, plus_line: str) -> str:
+    """Repo-relative path a `--- `/`+++ ` header PAIR names, deletions included.
+
+    T-0753: a DELETION's `+++` side is `/dev/null`, so the path exists only on
+    the `--- a/<rel>` side. Reading the `+++` side alone — which both patch
+    parsers here used to do — made a delete-only patch look like it had no file
+    targets at all, and made a mixed patch's deleted path invisible to every
+    check keyed on that list (`--files` stray, the co-edit audit, the T-0732
+    absorption check, the "committed N file(s)" line).
+
+    The `---` is read only from the line immediately before the `+++`, which is
+    the pairing unified diff guarantees. That is a narrowing, not a parser: a
+    `--- `/`+++ ` pair inside a hunk BODY (diffing a patch file against itself
+    does produce one) is still read as a header, exactly as the `+++`-only
+    version was. `git apply` remains the authority on what the patch does; this
+    list only has to name the files, and it is checked against what actually
+    landed by `_verify_commit_scope` after the commit.
+    """
+    def one(line: str) -> str:
+        if not line.startswith(("--- ", "+++ ")):
+            return ""
+        t = line[4:].split("\t", 1)[0].strip()
+        if t == "/dev/null":
+            return ""
+        return t[2:] if t[:2] in ("a/", "b/") else t
+    return one(plus_line) or one(minus_line)
+
+
 def _patch_hunks_per_rel(patch_text: str) -> dict[str, int]:
-    """`@@` count per target file, tracking the `+++ b/<rel>` header in force."""
+    """`@@` count per target file, tracking the file header pair in force.
+
+    A deletion's single `@@` counts toward the file it removes (T-0753): the
+    audit uses this to say whether a patch claims every hunk currently in a
+    file, and a delete claims the whole file by definition — including any dirty
+    peer edit in it, which is exactly the case worth being told about.
+    """
     out: dict[str, int] = {}
     cur = ""
-    for line in patch_text.splitlines():
+    lines = patch_text.splitlines()
+    for i, line in enumerate(lines):
         if line.startswith("+++ "):
-            t = line[4:].split("\t", 1)[0].strip()
-            cur = "" if t == "/dev/null" else (t[2:] if t.startswith("b/") else t)
+            cur = _patch_header_rel(lines[i - 1] if i else "", line)
         elif line.startswith("@@") and cur:
             out[cur] = out.get(cur, 0) + 1
     return out
@@ -3200,15 +3234,19 @@ def _report_coedit(
 
 
 def _patch_target_rels(patch_text: str) -> list[str]:
-    """Repo-relative paths a `-p1` patch writes to, in first-seen order."""
+    """Repo-relative paths a `-p1` patch CHANGES, in first-seen order.
+
+    Deleting a file is one of the things a patch does to a path (T-0753), so a
+    delete-only patch has a non-empty target list like any other. Every caller
+    treats this as "the files this commit is about", and a path that landed
+    without being on it is what the absorption check shouts about.
+    """
     rels: list[str] = []
-    for line in patch_text.splitlines():
+    lines = patch_text.splitlines()
+    for i, line in enumerate(lines):
         if not line.startswith("+++ "):
             continue
-        target = line[4:].split("\t", 1)[0].strip()
-        if target == "/dev/null":
-            continue
-        rel = target[2:] if target.startswith("b/") else target
+        rel = _patch_header_rel(lines[i - 1] if i else "", line)
         if rel and rel not in rels:
             rels.append(rel)
     return rels

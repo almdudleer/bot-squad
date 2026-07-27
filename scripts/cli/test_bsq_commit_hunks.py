@@ -205,9 +205,36 @@ def test_patch_target_rels_reads_plus_headers():
     assert bsq._patch_target_rels(patch) == ["pkg/a.py", "new.txt"]
 
 
-def test_patch_target_rels_skips_deleted_file_marker():
+def test_patch_target_rels_reads_the_minus_side_of_a_deletion():
+    """T-0753: this used to assert `== []` — the deletion target was skipped, so
+    a delete-only patch had no file targets and was rejected outright."""
     patch = "--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
-    assert bsq._patch_target_rels(patch) == []
+    assert bsq._patch_target_rels(patch) == ["gone.txt"]
+
+
+def test_patch_target_rels_keeps_deletion_in_order_among_edits():
+    patch = (
+        "diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n"
+        "@@ -1 +1 @@\n-x\n+y\n"
+        "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n"
+        "--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n"
+        "diff --git a/new.txt b/new.txt\n--- /dev/null\n+++ b/new.txt\n"
+        "@@ -0,0 +1 @@\n+hello\n"
+    )
+    assert bsq._patch_target_rels(patch) == ["pkg/a.py", "gone.txt", "new.txt"]
+    # a creation still reads its path off the `+++` side, not `--- /dev/null`
+    assert bsq._patch_hunks_per_rel(patch) == {"pkg/a.py": 1, "gone.txt": 1,
+                                               "new.txt": 1}
+
+
+def test_patch_header_rel_prefers_the_plus_side():
+    assert bsq._patch_header_rel("--- a/old.txt", "+++ b/new.txt") == "new.txt"
+    assert bsq._patch_header_rel("--- /dev/null", "+++ b/new.txt") == "new.txt"
+    assert bsq._patch_header_rel("--- a/gone.txt", "+++ /dev/null") == "gone.txt"
+    # both sides absent is not a target at all (nothing to commit under a name)
+    assert bsq._patch_header_rel("--- /dev/null", "+++ /dev/null") == ""
+    # a `+++` with no `---` before it (patch starts mid-stream) still resolves
+    assert bsq._patch_header_rel("", "+++ b/a.py") == "a.py"
 
 
 def test_commit_hunks_patch_isolates_peer_hunk_and_peer_staging(repo):
@@ -437,6 +464,96 @@ def test_reconciliation_covers_a_file_the_commit_deleted(repo):
     assert _staged_names(r) == []
     # the patch file itself is untracked scratch; no TRACKED path is dirty
     assert _git(r, "status", "--short", "--untracked-files=no") == ""
+    # T-0753: the deleted path was missing from the patch's target list, so the
+    # absorption check saw it land un-intended and cried peer-sweep over a file
+    # this very patch removed. Both counts told the same lie ("1 file(s)").
+    assert "ABSORPTION WARNING" not in cm.stderr
+    assert "committed 2 file(s) from" in cm.stdout
+
+
+# ---------------------------------------------------------------------------
+# T-0753: a patch that ONLY deletes. The path lives on the `--- a/<rel>` side,
+# so a target list read off `+++` alone came back empty and the commit was
+# rejected before it began.
+# ---------------------------------------------------------------------------
+def test_delete_only_patch_commits_and_leaves_no_index_entry(repo):
+    """The ticket's own repro, end to end: the commit lands, and the SHARED
+    index no longer holds the deleted path (the T-0752 invariant — an index
+    entry surviving here is what a peer's pathspec-less commit resurrects)."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "doomed.txt").write_text("bye\n")
+    (r / "kept.txt").write_text("L1\n")
+    _git(r, "add", "doomed.txt", "kept.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    (r / "doomed.txt").unlink()
+    patch = r / "del.patch"
+    patch.write_text(_git(r, "diff", "--", "doomed.txt"))
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "delete it")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+    assert "no file targets" not in cm.stderr
+
+    assert "doomed.txt" not in _git(r, "ls-tree", "--name-only", "HEAD")
+    assert "kept.txt" in _git(r, "ls-tree", "--name-only", "HEAD")
+    # the invariant: gone from the index, not merely gone from HEAD
+    assert "doomed.txt" not in _git(r, "ls-files").split()
+    assert _staged_names(r) == []
+    assert _git(r, "status", "--short", "--untracked-files=no") == ""
+    # and the deletion is claimed as intended work, not shouted about
+    assert "ABSORPTION WARNING" not in cm.stderr
+    assert "committed 1 file(s) from" in cm.stdout
+
+
+def test_delete_only_patch_survives_a_peers_pathspecless_commit(repo):
+    """Why the index entry matters, driven the whole way: with the deleted path
+    left in the shared index, a peer's `git add x && git commit` (no pathspec,
+    so it commits the index as-is) puts the file straight back."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "doomed.txt").write_text("bye\n")
+    _git(r, "add", "doomed.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    (r / "doomed.txt").unlink()
+    patch = r / "del.patch"
+    patch.write_text(_git(r, "diff", "--", "doomed.txt"))
+    assert _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                    "--sid", "S-me-dev-p1", "-m", "delete it").returncode == 0
+
+    (r / "peer.txt").write_text("peer work\n")
+    _git(r, "add", "peer.txt")
+    _git(r, "commit", "-q", "-m", "peer work")
+
+    assert "doomed.txt" not in _git(r, "ls-tree", "--name-only", "HEAD")
+    assert "peer.txt" in _git(r, "ls-tree", "--name-only", "HEAD")
+
+
+def test_delete_only_patch_rejects_an_undeclared_deletion(repo):
+    """The `--files` declaration gate has to see deletions too — while the
+    deleted path was invisible, naming a DIFFERENT file let the patch delete
+    one the caller never declared, with no stray to show for it."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "doomed.txt").write_text("bye\n")
+    (r / "kept.txt").write_text("L1\n")
+    _git(r, "add", "doomed.txt", "kept.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    (r / "doomed.txt").unlink()
+    (r / "kept.txt").write_text("L1-MINE\n")
+    patch = r / "mix.patch"
+    patch.write_text(_git(r, "diff", "--", "doomed.txt", "kept.txt"))
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "mixed", "kept.txt")
+    assert cm.returncode != 0
+    assert "did not declare: doomed.txt" in cm.stderr
+    assert _git(r, "log", "--oneline").count("\n") == 1     # nothing committed
+
+    # declaring it is accepted — a deleted path is nameable though it is gone
+    ok = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "mixed", "kept.txt", "doomed.txt")
+    assert ok.returncode == 0, ok.stderr + ok.stdout
+    assert "doomed.txt" not in _git(r, "ls-files").split()
 
 
 def test_reconciliation_names_a_clobbered_peer_staging_of_the_same_path(repo):

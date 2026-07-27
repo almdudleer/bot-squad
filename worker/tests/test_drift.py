@@ -406,3 +406,130 @@ def test_initiative_stem_delegates_to_normalize_id(monkeypatch):
     out = drift._initiative_stem("anything.md")
     assert out == "SENTINEL"
     assert calls == ["anything.md"]
+
+
+# ---------------------------------------------------------------------------
+# T-0735: the STALE anchor counts progress reported ANYWHERE, not just on the
+# session's own bound ticket. A dogfood/QA/audit role files its findings against
+# the tickets it verifies, so a ticket-scoped clock never reset for it.
+# ---------------------------------------------------------------------------
+
+
+def _note_line(epoch: float, sid: str, text: str = "did a thing") -> str:
+    return f"- {_iso(epoch)} · {sid} · {text}\n"
+
+
+def _write_other_ticket(cfg, slug, task_id: str, notes: str) -> Path:
+    md = cfg.data_dir / slug / "backlog" / f"{task_id}-something-else.md"
+    md.write_text(
+        f"---\nid: {task_id}\ntitle: Something else\nstatus: in_progress\n---\n\n"
+        f"## Progress\n\n{notes}"
+    )
+    return md
+
+
+def _write_feedback(cfg, slug, name: str, sid: str, epoch: float) -> Path:
+    fb_dir = cfg.data_dir / slug / "feedback"
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    md = fb_dir / f"{name}.md"
+    md.write_text(
+        f"---\nsource: bsq feedback\nsubmitted_at: {_iso(epoch)}\n"
+        f"submitted_by: {sid}\n---\n\nsome feedback\n"
+    )
+    return md
+
+
+def _run_stale_case(tmp_path, monkeypatch, *, seed):
+    """Bound ticket 90min stale + a fresh reported-progress source from ``seed``."""
+    cfg, slug, now, ticket, patch = _setup(tmp_path, updated_ago_min=90, activity_ago_sec=30)
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_COOLDOWN_MINUTES", "30")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    seed(cfg, slug, now)
+    delivered: list[tuple[str, str]] = []
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
+    return drift.drift_check(cfg, slug), delivered
+
+
+def test_note_on_another_ticket_resets_the_stale_clock(tmp_path, monkeypatch):
+    """The T-0735 core: a finding filed on someone else's ticket IS progress."""
+    res, delivered = _run_stale_case(
+        tmp_path, monkeypatch,
+        seed=lambda cfg, slug, now: _write_other_ticket(
+            cfg, slug, "T-0500", _note_line(now - 5 * 60, SID)),
+    )
+    assert res["nudged"] == [] and not delivered
+
+
+def test_feedback_submission_resets_the_stale_clock(tmp_path, monkeypatch):
+    res, delivered = _run_stale_case(
+        tmp_path, monkeypatch,
+        seed=lambda cfg, slug, now: _write_feedback(
+            cfg, slug, "F-2026-07-27-bsq-abc123", SID, now - 5 * 60),
+    )
+    assert res["nudged"] == [] and not delivered
+
+
+def test_another_sessions_note_does_not_reset_the_clock(tmp_path, monkeypatch):
+    """No free ride: only progress THIS sid authored counts."""
+    res, delivered = _run_stale_case(
+        tmp_path, monkeypatch,
+        seed=lambda cfg, slug, now: _write_other_ticket(
+            cfg, slug, "T-0500", _note_line(now - 5 * 60, "S-tester-someone-else-p1")),
+    )
+    assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+
+
+def test_stale_note_elsewhere_still_goes_stale_when_old(tmp_path, monkeypatch):
+    """The verify-only role is NOT exempted — reporting nothing recently still nags."""
+    res, delivered = _run_stale_case(
+        tmp_path, monkeypatch,
+        seed=lambda cfg, slug, now: _write_other_ticket(
+            cfg, slug, "T-0500", _note_line(now - 80 * 60, SID)),
+    )
+    assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+    # Anchored on the off-ticket note (80min), not the ticket's updated: (90min).
+    assert res["nudged"][0]["stale_min"] == 80
+
+
+def test_stale_text_names_what_the_clock_measures(tmp_path, monkeypatch):
+    """The nag must not claim 'since you last updated ticket X' — that was the lie."""
+    res, delivered = _run_stale_case(tmp_path, monkeypatch, seed=lambda *_a: None)
+    assert len(res["nudged"]) == 1
+    text = delivered[0][1]
+    assert "reported ANY progress" in text and "any other ticket" in text
+    assert "since you last updated ticket" not in text
+
+
+def test_reported_progress_index_picks_latest_per_sid(tmp_path, monkeypatch):
+    cfg, slug, now, ticket, patch = _setup(tmp_path, updated_ago_min=90, activity_ago_sec=30)
+    other = "S-tester-other-p2"
+    _write_other_ticket(cfg, slug, "T-0500",
+                        _note_line(now - 90 * 60, SID) + _note_line(now - 10 * 60, SID))
+    _write_other_ticket(cfg, slug, "T-0501", _note_line(now - 30 * 60, other))
+    _write_feedback(cfg, slug, "F-1", other, now - 3 * 60)
+
+    index = drift._reported_progress_index(cfg, slug)
+    assert index[SID] == pytest.approx(now - 10 * 60, abs=1)   # latest of two notes
+    assert index[other] == pytest.approx(now - 3 * 60, abs=1)  # feedback beats note
+
+
+def test_reported_progress_index_survives_missing_dirs(tmp_path, monkeypatch):
+    cfg, slug, now, ticket, patch = _setup(tmp_path, updated_ago_min=1, activity_ago_sec=30)
+    # No feedback/ dir exists in the fixture — must not raise.
+    assert isinstance(drift._reported_progress_index(cfg, slug), dict)
+
+
+def test_index_not_built_when_nothing_is_stale(tmp_path, monkeypatch):
+    """Lazy: a fresh ticket must not pay for the backlog sweep."""
+    cfg, slug, now, ticket, patch = _setup(tmp_path, updated_ago_min=1, activity_ago_sec=30)
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    monkeypatch.setattr(S, "_deliver_prompt", lambda *_a, **_kw: None)
+    calls = []
+    monkeypatch.setattr(drift, "_reported_progress_index",
+                        lambda c, s: calls.append(s) or {})
+    drift.drift_check(cfg, slug)
+    assert calls == []

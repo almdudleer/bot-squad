@@ -9,11 +9,13 @@ a live session's composer when it has gone too long without touching its
 ticket, or when its recent activity is off-task.
 
 Signals (per live, task-bound session):
-  1. STALE     — now - last-ticket-touch > BOT_SQUAD_DRIFT_MINUTES, where a
-                 ticket-touch = the latest of the ticket md ``updated:`` and
-                 its last ``## Progress`` note. Only fires while the session is
-                 actively working (recent jsonl activity), so a session idle at
-                 a prompt is left alone.
+  1. STALE     — now - last-reported-progress > BOT_SQUAD_DRIFT_MINUTES. The
+                 anchor is the latest of: the bound ticket's ``updated:`` and
+                 its last ``## Progress`` note, AND (T-0735) any progress THIS
+                 session reported elsewhere — a note it authored on any other
+                 ticket, or a feedback submission. Only fires while the session
+                 is actively working (recent jsonl activity), so a session idle
+                 at a prompt is left alone.
   2. SUPERPOWERS — recent Edit/Write to ``~/.claude/superpowers/*`` (T-0152):
                  task tracking belongs on the bot-squad ticket, not doc folders.
   3. AUTOMATION — recent write of test/automation code (``*.mjs`` / playwright /
@@ -40,6 +42,17 @@ guards now bound the blast radius:
 Two structural guards also suppress *meaningless* nags (T-0185): constant-team /
 queue-consumer sessions (no single-ticket DoD to re-anchor to) are skipped, and
 a session is only nagged about a ticket whose initiative matches its own.
+
+T-0735 (the anchor counts progress reported ANYWHERE): the STALE clock keyed
+solely on the session's OWN bound ticket, so a role whose output lands on OTHER
+tickets — the T-0331 dogfood loop, and any QA / audit / verification session,
+which file findings against the tickets they verify rather than their own — kept
+tripping it however much they reported. A recurring false positive for a whole
+role class is the expensive kind: it trains everyone to dismiss the signal (a
+prior dogfood session turned drift off outright over exactly this), and then a
+real drift goes unseen. Fixed by broadening the anchor, NOT by exempting the
+role — a verify session that reports nothing anywhere still goes stale, which is
+the genuinely-stalled case worth catching.
 """
 from __future__ import annotations
 
@@ -172,6 +185,83 @@ def _ticket_last_touch(ticket_path: Path) -> float | None:
     return max(candidates) if candidates else None
 
 
+# T-0735: a progress note as written by ``task_progress_add`` —
+# ``- <iso-ts> · <sid> · <text>``. ``_ticket_last_touch`` above matches only the
+# timestamp because it reads ONE ticket; the sweep below needs the author too.
+_AUTHORED_NOTE_RE = re.compile(
+    r"^-\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*·\s*([^\s·]+)\s*·", re.MULTILINE
+)
+
+
+def _reported_progress_index(cfg: Any, slug: str) -> dict[str, float]:
+    """T-0735: sid → epoch of the LATEST progress this session reported ANYWHERE.
+
+    The staleness clock used to key solely on the session's OWN bound ticket
+    (``_ticket_last_touch``, one file). That silently under-counts an entire
+    class of role: a dogfood / QA / audit session's work product is findings
+    filed AGAINST OTHER tickets — a note on the ticket it just verified, a
+    ``bsq feedback submit``. Both are the session visibly reporting progress,
+    and neither touched its own ticket, so the clock never reset and the nag
+    recurred every cooldown no matter how much it reported — the T-0735
+    complaint.
+
+    NOT counted, verified rather than assumed: filing a ticket with ``task_new``
+    on its own. That path stamps ``provenance:``/``created:`` into frontmatter
+    and writes no progress note, and records no author SID anywhere on the md,
+    so there is nothing to attribute it by without a schema change. In practice
+    a filer adds a note too (which does count); the gap is recorded on T-0735
+    rather than papered over.
+
+    So the anchor becomes "time since this session last reported ANY progress".
+    Deliberately NOT a role exemption: a session that reports nothing anywhere
+    still goes stale on schedule, which is the genuinely-stalled case the
+    stakeholder explicitly asked to keep catching.
+
+    Sources, both keyed by the authoring SID:
+      * ``backlog/*.md`` — every ``- <ts> · <sid> · <text>`` progress note.
+      * ``feedback/*.md`` — the ``submitted_by`` / ``submitted_at`` frontmatter.
+
+    Built at most once per :func:`drift_check` pass, and only when some session
+    is already about to be flagged stale, so the common (fresh-ticket) path
+    never pays for the sweep.
+    """
+    index: dict[str, float] = {}
+
+    def _bump(sid: str, ts: float | None) -> None:
+        sid = (sid or "").strip()
+        if not sid or ts is None:
+            return
+        if ts > index.get(sid, 0.0):
+            index[sid] = ts
+
+    backlog = cfg.data_dir / slug / "backlog"
+    if backlog.is_dir():
+        for md in backlog.glob("*.md"):
+            try:
+                text = md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in _AUTHORED_NOTE_RE.finditer(text):
+                _bump(m.group(2), _parse_iso(m.group(1)))
+
+    feedback = cfg.data_dir / slug / "feedback"
+    if feedback.is_dir():
+        for md in feedback.glob("*.md"):
+            try:
+                text = md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            fm = re.match(r"\A---\n(.*?)\n---\n", text, re.DOTALL)
+            if not fm:
+                continue
+            by = re.search(r"^submitted_by:\s*(.+)$", fm.group(1), re.MULTILINE)
+            at = re.search(r"^submitted_at:\s*(.+)$", fm.group(1), re.MULTILINE)
+            if by and at:
+                _bump(by.group(1), _parse_iso(at.group(1)))
+
+    return index
+
+
 def _jsonl_path(cwd: str, claude_uuid: str | None, user_home: str) -> Path | None:
     if not claude_uuid or claude_uuid == "~":
         return None
@@ -241,12 +331,18 @@ def _classify(cfg: Any, slug: str, task_id: str, title: str, stale_min: int,
                 f"manual pass first."
                 + _OFF_RAMP_FOOTER)
     if stale_min >= drift_minutes():
+        # T-0735: say what the clock ACTUALLY measures. It used to claim "since
+        # you last updated ticket X" while a note this session had filed on
+        # ANOTHER ticket went uncounted — a verify-only role read that as a lie
+        # and learned to dismiss the signal. It is now time-since-any-report,
+        # and the text names every way to reset it.
         return ("stale",
                 f"⚠️ DRIFT CHECK (T-0149, enforced): ~{stale_min}min since you last "
-                f"updated ticket {task_id} ({title}). Re-read its DoD. Are you still on "
-                f"the original task, or have you drifted/deferred something? Log "
-                f"progress with `bsq ticket note {task_id} <text>`, or note explicitly "
-                f"why you deferred. Don't lose the thread."
+                f"reported ANY progress — no note on {task_id} ({title}) or on any "
+                f"other ticket, and no feedback submitted. Re-read {task_id}'s DoD. "
+                f"Are you still on the original task, or have you drifted/deferred "
+                f"something? Log progress with `bsq ticket note {task_id} <text>`, or "
+                f"note explicitly why you deferred. Don't lose the thread."
                 + _OFF_RAMP_FOOTER)
     return (None, "")
 
@@ -297,6 +393,10 @@ def drift_check(cfg: Any, slug: str) -> dict:
     except Exception:
         log.exception("drift_check: constant_team_stems failed for %s", slug)
         const_stems = set()
+
+    # T-0735: sid → last-reported-progress-anywhere. None until a session is
+    # actually about to be flagged stale (see below), then built once per pass.
+    reported_index: dict[str, float] | None = None
 
     nudged: list[dict] = []
     for row in rows:
@@ -369,6 +469,19 @@ def drift_check(cfg: Any, slug: str) -> dict:
 
         last_touch = _ticket_last_touch(ticket_path) or _parse_iso(row.get("started_at")) or now
         stale_min = int((now - last_touch) / 60)
+
+        # T-0735: the bound ticket looks stale — but "stale" must mean "reported
+        # nothing ANYWHERE", not "didn't touch this one file". Consult the
+        # session's own reporting record (notes on any ticket + feedback) before
+        # calling it drift. Built lazily and once per pass: only a would-be nag
+        # pays for the backlog sweep.
+        if stale_min >= drift_minutes():
+            if reported_index is None:
+                reported_index = _reported_progress_index(cfg, slug)
+            reported_at = reported_index.get(sid)
+            if reported_at is not None and reported_at > last_touch:
+                last_touch = reported_at
+                stale_min = int((now - last_touch) / 60)
 
         jpath = _jsonl_path(row.get("cwd", ""), row.get("claude_uuid"), user_home)
         targets = _recent_write_targets(jpath) if jpath else []

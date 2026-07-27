@@ -84,3 +84,53 @@ def test_append_progress_collapses_newlines():
 def test_append_progress_empty_text_raises():
     with pytest.raises(ValueError):
         append_progress("## Verbatim request\n\nv\n", "T1", "S1", "   ")
+
+
+# --- T-0729: ANY level-2 heading ends a section (mirror of the api tests) ----
+
+def test_parse_stops_verbatim_at_dod_heading():
+    body = "## Verbatim request\n\nI want X.\n\n## DoD\n\n- ship it\n"
+    assert parse_body(body)["verbatim"] == "I want X."
+
+
+def test_parse_stops_verbatim_at_observed_heading():
+    body = "## Verbatim request\n\nI want X.\n\n## Observed\n\nit exploded\n"
+    assert parse_body(body)["verbatim"] == "I want X."
+
+
+def test_parse_decorated_context_heading_is_context():
+    body = (
+        "## Verbatim request\n\nI want X.\n\n"
+        "## Context (WS-1 gap analysis)\n\nthe gap\n\n## DoD\n\n- ship it\n"
+    )
+    out = parse_body(body)
+    assert out["verbatim"] == "I want X."
+    assert out["context"] == "the gap"
+
+
+def test_parse_decorated_verbatim_heading_is_verbatim():
+    body = (
+        "## Verbatim request — source of truth (human-only, do not edit)\n\n"
+        "I want X.\n\n## DoD\n\n- ship it\n"
+    )
+    assert parse_body(body)["verbatim"] == "I want X."
+
+
+def test_parse_legacy_body_with_agent_headings_keeps_whole_body():
+    body = "The plan.\n\n## Scope\n\n- a\n\n## DoD\n\n- b\n"
+    assert parse_body(body)["verbatim"] == body.strip()
+
+
+def test_append_progress_preserves_non_canonical_sections():
+    """A progress note must not delete `## DoD` / `## Scope` — the worker is
+    the writer for `task_progress_add`, so this is where the loss would land."""
+    body = (
+        "## Verbatim request\n\nask\n\n## DoD\n\n- ship it\n\n"
+        "## Progress\n\n- T0 · S0 · old\n\n## Scope\n\n- only this\n"
+    )
+    new = append_progress(body, "T1", "S1", "new note")
+    assert "## DoD\n\n- ship it" in new
+    assert "## Scope\n\n- only this" in new
+    assert parse_body(new)["verbatim"] == "ask"
+    assert "- T0 · S0 · old" in parse_body(new)["progress"]
+    assert "- T1 · S1 · new note" in parse_body(new)["progress"]

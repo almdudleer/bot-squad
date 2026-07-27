@@ -862,13 +862,14 @@ def test_patch_body_non_canonical_sections_survive(tmp_bot_squad: Path, monkeypa
         f"/api/projects/test-project/backlog/{tid}", json={"body": edited}
     )
     assert r.status_code == 200, r.text
-    # The non-canonical sections (Finding/DoD) parse into `verbatim` since they
-    # aren't recognized headings — assert the original verbatim words survive,
-    # the tamper is dropped, and the edited DoD + Finding content is intact.
-    verbatim = r.json()["verbatim"]
-    assert "SACRED" in verbatim and "TAMPER" not in verbatim
-    assert "new dod text" in verbatim
-    assert "## Finding" in verbatim
+    got = r.json()
+    # T-0729: non-canonical sections are now BOUNDARIES, not verbatim content —
+    # `verbatim` is the ask alone. They must still survive on the body (the md
+    # is their SSOT), and the tamper must still be rejected.
+    assert got["verbatim"] == "SACRED"
+    assert "TAMPER" not in got["body"]
+    assert "new dod text" in got["body"]
+    assert "## Finding" in got["body"]
 
 
 # T-0481 / M3+M8: frontmatter-only write paths must leave the body (hence

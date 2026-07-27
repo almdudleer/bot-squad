@@ -55,6 +55,80 @@ def test_parse_case_insensitive_and_order():
     assert out["progress"] == "- 2026-05-12T00:00:00Z · S-1 · x"
 
 
+# --- T-0729: ANY level-2 heading ends a section -----------------------------
+# The green "what you asked for" block on the task page renders `verbatim`.
+# Before T-0729 only `## Verbatim request` / `## Context` / `## Progress` (exact
+# match) were boundaries, so `## DoD`, `## Observed`, … got absorbed into the
+# stakeholder's words on 414 of 700 live tickets.
+
+def test_parse_stops_verbatim_at_dod_heading():
+    body = "## Verbatim request\n\nI want X.\n\n## DoD\n\n- ship it\n"
+    out = parse_body(body)
+    assert out["verbatim"] == "I want X."
+    assert "DoD" not in out["verbatim"]
+
+
+def test_parse_stops_verbatim_at_observed_heading():
+    body = (
+        "## Verbatim request\n\nI want X.\n\n"
+        "## Observed\n\nit exploded\n\n## Expected\n\nit works\n"
+    )
+    assert parse_body(body)["verbatim"] == "I want X."
+
+
+def test_parse_decorated_context_heading_is_context():
+    """`## Context (WS-1 gap analysis)` is the Context section, not an unknown
+    one — and it still terminates verbatim."""
+    body = (
+        "## Verbatim request\n\nI want X.\n\n"
+        "## Context (WS-1 gap analysis)\n\nthe gap\n\n"
+        "## DoD\n\n- ship it\n"
+    )
+    out = parse_body(body)
+    assert out["verbatim"] == "I want X."
+    assert out["context"] == "the gap"
+
+
+def test_parse_decorated_verbatim_heading_is_verbatim():
+    """60 live tickets head the ask `## Verbatim request — source of truth
+    (human-only, do not edit)`. That must parse as verbatim (not vanish)."""
+    body = (
+        "## Verbatim request — source of truth (human-only, do not edit)\n\n"
+        "I want X.\n\n## DoD\n\n- ship it\n"
+    )
+    out = parse_body(body)
+    assert out["verbatim"] == "I want X."
+
+
+def test_parse_non_canonical_sections_are_not_surfaced():
+    """Excluded from `verbatim`, and not returned anywhere else — the md on
+    disk stays the SSOT for agent-authored sections."""
+    body = "## Verbatim request\n\nask\n\n## DoD\n\n- d\n\n## Scope\n\n- s\n"
+    out = parse_body(body)
+    assert set(out) == {"verbatim", "context", "progress"}
+    assert not any("DoD" in v or "Scope" in v for v in out.values())
+
+
+def test_parse_legacy_body_with_agent_headings_keeps_whole_body():
+    """No `## Verbatim request` heading at all → today's whole-body behaviour
+    is preserved (13 live planning tickets whose ask IS the whole body)."""
+    body = "The plan.\n\n## Scope\n\n- a\n\n## DoD\n\n- b\n"
+    out = parse_body(body)
+    assert out["verbatim"] == body.strip()
+
+
+def test_parse_legacy_body_stops_at_first_canonical_heading():
+    body = "Legacy ask.\n\n## Progress\n\n- T1 · S1 · note\n"
+    out = parse_body(body)
+    assert out["verbatim"] == "Legacy ask."
+    assert out["progress"] == "- T1 · S1 · note"
+
+
+def test_parse_h3_is_not_a_boundary():
+    body = "## Verbatim request\n\nI want X.\n\n### sub-point\n\nstill the ask\n"
+    assert parse_body(body)["verbatim"] == "I want X.\n\n### sub-point\n\nstill the ask"
+
+
 def test_compose_skips_empty():
     assert compose_body("v", "", "") == "## Verbatim request\n\nv\n"
     assert compose_body("", "", "") == ""
@@ -118,6 +192,28 @@ def test_append_progress_legacy_body_promotes_to_schema():
     parsed = parse_body(new)
     assert parsed["verbatim"] == "Legacy free-form body."
     assert "- T1 · S1 · first note" in parsed["progress"]
+
+
+def test_append_progress_preserves_non_canonical_sections():
+    """T-0729 regression: a progress note must not delete `## DoD` / `## Scope`.
+
+    `append_progress` used to parse→compose from the three canonical sections;
+    once non-canonical sections stopped being absorbed into verbatim, that
+    round-trip would have dropped them from 414 live tickets.
+    """
+    body = (
+        "## Verbatim request\n\nask\n\n"
+        "## DoD\n\n- ship it\n\n"
+        "## Progress\n\n- T0 · S0 · old\n\n"
+        "## Scope\n\n- only this\n"
+    )
+    new = append_progress(body, "T1", "S1", "new note")
+    assert "## DoD\n\n- ship it" in new
+    assert "## Scope\n\n- only this" in new
+    assert parse_body(new)["verbatim"] == "ask"
+    progress = parse_body(new)["progress"]
+    assert "- T0 · S0 · old" in progress
+    assert "- T1 · S1 · new note" in progress
 
 
 def test_append_progress_empty_text_raises():
@@ -207,3 +303,15 @@ def test_regraft_verbatim_preserves_non_canonical_sections():
     out = regraft_verbatim(original, edited)
     assert "SACRED" in out and "TAMPER" not in out
     assert "new dod" in out and "## Finding" in out
+
+
+def test_regraft_verbatim_protects_decorated_heading():
+    """T-0729: the write-protection path recognises the same decorated headings
+    the read-parse path does — 60 live tickets had NO verbatim protection
+    because their heading carried a suffix."""
+    head = "## Verbatim request — source of truth (human-only, do not edit)"
+    original = f"{head}\n\nSACRED\n\n## DoD\n\nold dod\n"
+    edited = f"{head}\n\nTAMPER\n\n## DoD\n\nnew dod\n"
+    out = regraft_verbatim(original, edited)
+    assert "SACRED" in out and "TAMPER" not in out
+    assert "new dod" in out

@@ -763,6 +763,176 @@ def test_user_authored_append_with_thread_id_passes_thread_id_to_ensure(
     assert calls[0][1]["thread_id"] == 7
 
 
+# ---------------------------------------------------------------------------
+# T-0740: a threaded reply whose topic has NO locus yet must still be
+# delivered into that topic — not the user's private DM.
+#
+# The live bug: a session created a fresh task topic and posted the first
+# message into it. By construction nobody had written there, so the
+# thread-scoped locus key didn't exist; the relay dropped the thread it had
+# been handed and fell through to the GlobalUser's tg_user_id, i.e. the
+# private DM ("some messages still land in the private DM with the bot
+# instead of the group topic"). The topic's chat is knowable without a locus
+# — it's in the worker's tg_bindings store — so the thread is now honoured.
+# ---------------------------------------------------------------------------
+
+
+def _write_binding(tmp_bot_squad: Path, chat_id: str, thread_id, slug: str) -> None:
+    """Write the worker-owned tg_bindings.json directly — mirrors what
+    ``bot_squad_worker.tg_bindings.set_binding`` persists (key
+    ``"<chat_id>:<thread_id>"``), exercised without spinning up the worker
+    (the API reads this file directly, T-0740)."""
+    import json
+    p = tmp_bot_squad / "data" / "_worker" / "tg_bindings.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = json.loads(p.read_text()) if p.is_file() else {}
+    existing[f"{chat_id}:{'' if thread_id is None else thread_id}"] = {
+        "slug": slug, "ticket_id": None, "session_id": None, "pinned_message_id": None,
+    }
+    p.write_text(json.dumps(existing))
+
+
+def test_session_append_threaded_reply_with_no_locus_goes_to_topic_not_dm(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """THE reported bug, minimally: a reply naming thread 278, a binding for
+    it, no locus for it (the user has never written there), and a linked DM
+    chat_id sitting in rung 3. Before the fix this relayed to the DM."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")  # the private DM
+    _write_binding(tmp_bot_squad, "-1003761939853", 278, "test-project")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 278},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][1]["chat_id"] == "-1003761939853"
+    assert calls[0][1]["topic_id"] == 278
+
+
+def test_session_append_threaded_reply_prefers_locus_over_binding(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """Rung 1 still beats the new rung 2: when the topic HAS a locus, it is
+    used, so T-0667/T-0676 behaviour is untouched where it already worked."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")
+    _write_threaded_locus(tmp_bot_squad, "test-project", "gu_abc", 7, "-100777")
+    _write_binding(tmp_bot_squad, "-100999", 7, "test-project")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 7},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "-100777"
+
+
+def test_session_append_threaded_reply_ignores_another_projects_binding(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """A thread bound to a DIFFERENT project is not this project's
+    destination — sending there would leak one project's reply into
+    another's topic. Falls through to the DM as before."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")
+    _write_binding(tmp_bot_squad, "-1003761939853", 278, "some-other-project")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 278},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "404580642"
+    assert "topic_id" not in calls[0][1]
+
+
+def test_session_append_threaded_reply_unbound_thread_falls_back_unchanged(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """No locus AND no binding for the thread — nothing to resolve a chat
+    from, so the pre-T-0740 fallback chain applies exactly as before."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 278},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "404580642"
+
+
+def test_session_append_thread_less_reply_never_uses_a_binding(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """A reply with NO thread must not acquire one from the binding store —
+    a thread-less relay behaves byte-identically to before this change."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")
+    _write_binding(tmp_bot_squad, "-1003761939853", 278, "test-project")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"}, headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "404580642"
+    assert "topic_id" not in calls[0][1]
+
+
+def test_session_append_threaded_reply_ignores_general_feed_binding(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """The General-feed binding key is ``"<chat>:"`` (empty thread segment).
+    It must never match a real numeric thread id."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")
+    _write_binding(tmp_bot_squad, "-1003761939853", None, "test-project")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 278},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert calls[0][1]["chat_id"] == "404580642"
+
+
+def test_session_append_threaded_reply_corrupt_bindings_file_falls_back(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """An unreadable tg_bindings.json must never break the relay — same
+    best-effort contract as the locus read."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "404580642")
+    p = tmp_bot_squad / "data" / "_worker" / "tg_bindings.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer", "thread_id": 278},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    assert calls[0][1]["chat_id"] == "404580642"
+
+
 def test_worker_list_search_filters(tmp_bot_squad: Path, monkeypatch):
     client = _client(tmp_bot_squad, monkeypatch)
     d = tmp_bot_squad / "data"

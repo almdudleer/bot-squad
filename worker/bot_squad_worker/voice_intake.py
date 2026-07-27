@@ -363,7 +363,19 @@ def process_voice(cfg: Any, slug: str, message: dict, *, ts: str) -> dict[str, A
         if ident and ident.get("global_user_id"):
             conv_msg = dict(message)
             conv_msg["text"] = transcript  # voice has no text; the transcript IS the message
-            _tl.append_conversation(cfg, slug, ident["global_user_id"], conv_msg)
+            # T-0740: file it in the topic the note arrived in (T-0676 items
+            # 3/6) — the same thread `_confirm` above already answers into.
+            # This append dropped it, so the transcript of a note sent in a
+            # topic landed in the project's COLLAPSED history, the attendant
+            # woken by it read/answered unscoped, and its reply relayed to the
+            # stale project-level locus. That is the ack and the answer
+            # disagreeing about the destination for ONE note — the reported
+            # "voice note answered correctly in the topic, then the actual
+            # reply went to a different topic".
+            _tl.append_conversation(
+                cfg, slug, ident["global_user_id"], conv_msg,
+                thread_id=message.get("message_thread_id"),
+            )
     except Exception:  # noqa: BLE001
         log.debug("voice_intake: conversation-store append skipped (non-fatal)", exc_info=True)
 

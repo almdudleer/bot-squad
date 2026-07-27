@@ -351,12 +351,49 @@ def test_process_voice_records_transcript_to_conversation_store(tmp_path, monkey
                         lambda c, m, s: {"global_user_id": "gu_voice", "created": False, "slug": s})
     captured = {}
     monkeypatch.setattr(_TL, "append_conversation",
-                        lambda c, slug, gid, msg: captured.update(slug=slug, gid=gid, text=msg.get("text")) or True)
+                        lambda c, slug, gid, msg, **k: captured.update(
+                            slug=slug, gid=gid, text=msg.get("text"),
+                            thread_id=k.get("thread_id")) or True)
 
     out = _VI.process_voice(cfg, "bot-squad", _voice_msg(), ts="2026-06-21T13:00:00Z")
     assert out["ok"] is True
     # The transcript (not the empty voice 'text') landed in the conversation store.
-    assert captured == {"slug": "bot-squad", "gid": "gu_voice", "text": "dark mode please"}
+    assert captured == {"slug": "bot-squad", "gid": "gu_voice",
+                        "text": "dark mode please", "thread_id": None}
+
+
+def test_process_voice_records_transcript_under_the_notes_thread(tmp_path, monkeypatch):
+    """T-0740: a note sent IN A TOPIC files its transcript under that topic's
+    own thread — the same destination `_confirm` already answers into.
+
+    This append dropped `message_thread_id`, so the transcript went into the
+    project's collapsed history; the attendant woken by it then read and
+    answered unscoped, and its reply relayed to a stale project-level locus.
+    The ack landing in the right topic while the answer landed in another one,
+    for the SAME note, is what the stakeholder reported."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import (
+        voice_intake as _VI, transcribe as _T, tg_topics, actions as A,
+        tg_listener as _TL,
+    )
+    tg_topics.save(cfg, "bot-squad", {"feedback": 9001})
+
+    def fake_download(c, file_id, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(b"OGG"); return dest
+    monkeypatch.setattr(_VI, "download_voice", fake_download)
+    monkeypatch.setattr(_T, "transcribe", lambda p, **kw: {"text": "group it with AI", "lang": "en", "engine": "faster-whisper:small"})
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(send=lambda **kw: True))
+    monkeypatch.setattr(_TL, "resolve_or_link_sender",
+                        lambda c, m, s: {"global_user_id": "gu_voice", "created": False, "slug": s})
+    captured = {}
+    monkeypatch.setattr(_TL, "append_conversation",
+                        lambda c, slug, gid, msg, **k: captured.update(
+                            thread_id=k.get("thread_id")) or True)
+
+    out = _VI.process_voice(
+        cfg, "bot-squad", _voice_msg(message_thread_id=278), ts="2026-07-27T04:05:55Z")
+    assert out["ok"] is True
+    assert captured == {"thread_id": 278}
 
 
 def test_process_voice_download_failure_confirms_resend(tmp_path, monkeypatch):

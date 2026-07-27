@@ -1578,8 +1578,34 @@ def handle_update(cfg, update: dict) -> dict:
         # clarification it can't act on (the slash-routing context lives only
         # here, never in the store). The stakeholder hit this every time he
         # used /project to switch.
+        #
+        # T-0740: pass `thread_id` — this branch was the one inbound path that
+        # DROPPED it. `_handle_topic_bound` and `_handle_unquoted` below both
+        # thread it through (T-0676 items 3/6); a reply-quote or a GROUP VOICE
+        # NOTE typed in a bound topic was recorded into the project's collapsed
+        # thread-less history instead, so the attendant woke unscoped and its
+        # answer relayed to whatever the stale project-level locus pointed at —
+        # the observed "voice note answered correctly in the topic, then the
+        # actual reply landed in a different topic entirely". The thread is
+        # right here in scope; it just was never handed over. Whenever
+        # `thread_id` is set in this branch the chat is a forum whose binding
+        # (resolved above) supplied `chat_slug`, so the record and the topic
+        # agree on the project.
         if gid and not slash:
-            append_conversation(cfg, chat_slug, gid, msg)
+            append_conversation(cfg, chat_slug, gid, msg, thread_id=thread_id)
+            if thread_id is not None:
+                # T-0740: and remember WHERE he wrote. This branch never
+                # recorded the locus either, so after a reply-quote or a voice
+                # note in a topic the project's locus still named whatever
+                # topic (or DM) he last used on the OTHER paths — days stale in
+                # the live case. Gated on `thread_id is not None` deliberately:
+                # only a bound topic makes `chat_slug` authoritative (it came
+                # from the binding). For a thread-less message in this branch
+                # the slug is the "incidental" static one this code is
+                # explicitly told not to trust, so the locus is left alone —
+                # unchanged from before this fix.
+                from bot_squad_worker import conversation_locus
+                conversation_locus.set_locus(cfg, chat_slug, gid, chat_id, thread_id)
         if slash:
             cmd, args = slash
             # T-0492: /project pins/switches the user's current project (needs

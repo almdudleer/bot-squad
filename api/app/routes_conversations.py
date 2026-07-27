@@ -109,6 +109,46 @@ def _read_conversation_locus(
     return {"chat_id": rec["chat_id"], "thread_id": rec.get("thread_id")}
 
 
+def _read_topic_binding_chat(request: Request, slug: str, thread_id: Any) -> str:
+    """T-0740: the chat_id that ``thread_id`` is a forum topic OF, for ``slug``.
+
+    Read-only lookup of the worker-owned topic-binding store
+    (``bot_squad_worker.tg_bindings``, ``data/_worker/tg_bindings.json``) —
+    same direct-read-of-a-shared-file pattern, and same best-effort contract,
+    as :func:`_read_conversation_locus` above (a missing/corrupt file is "no
+    binding", never an error). Key derivation mirrors ``tg_bindings._key``:
+    ``"<chat_id>:<thread_id>"``.
+
+    A thread id is only meaningful INSIDE its chat, so relaying into a topic
+    requires both halves. The locus supplies both when it has an entry; this
+    supplies the chat half from the binding when it does not (see
+    :func:`_resolve_relay_target` rung 2 — the "session speaks first in a
+    freshly-created topic" case). ``slug`` is checked, not assumed: a thread
+    bound to a DIFFERENT project must never be used as this project's
+    destination.
+    """
+    if thread_id is None or str(thread_id).strip() == "":
+        return ""
+    cfg = request.app.state.api_config
+    path = cfg.data_dir / "_worker" / "tg_bindings.json"
+    if not path.is_file():
+        return ""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("routes_conversations: could not parse %s: %s", path, e)
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    for key, rec in raw.items():
+        if not isinstance(rec, dict) or rec.get("slug") != slug:
+            continue
+        chat_id, _, bound_thread = str(key).rpartition(":")
+        if chat_id and bound_thread == str(thread_id):
+            return chat_id
+    return ""
+
+
 def _resolve_relay_target(
     request: Request, slug: str, global_user_id: str, thread_id: Any = None,
 ) -> tuple[str, int | None]:
@@ -122,18 +162,41 @@ def _resolve_relay_target(
        Without this, a reply always landed in the user's DM even when they'd
        just written in a bound forum topic, splitting the conversation (the
        live gap this ticket fixes).
-    2. The GlobalUser's ``tg_user_id`` (a DM chat id IS the TG user id — every
+    2. (T-0740) The ``thread_id`` THIS reply was appended for, paired with the
+       chat that topic is bound to — see :func:`_read_topic_binding_chat`.
+    3. The GlobalUser's ``tg_user_id`` (a DM chat id IS the TG user id — every
        TG user has an implicit private chat with the bot at that same id) —
        the right default for a user who has never written into a bound topic.
-    3. The project's configured ``tg_chat``/``tg_topic_id`` (legacy static
+    4. The project's configured ``tg_chat``/``tg_topic_id`` (legacy static
        fallback, e.g. when the user record predates linkage).
     ``("", None)`` when nothing resolves — the caller treats that as "can't
     relay" (``relayed: false``), never an error.
+
+    Rung 2 is the T-0740 fix, and it is about ``thread_id`` being an INPUT to
+    this function that rung 1 used only as a lookup KEY. When the user has
+    never written in that topic there is no locus entry for it, so rung 1
+    missed and the thread was then DISCARDED — dropping straight to rung 3,
+    the user's private DM. That is the reported bug: a session opening a
+    freshly-created task topic and posting the first message into it (nobody
+    can have written there yet, by construction) had that message delivered
+    to the DM instead. A reply that NAMES the topic it belongs to must be
+    delivered there; only a reply with no thread at all may fall through to
+    the DM. Rungs 1/3/4 are untouched, so a thread-less relay behaves exactly
+    as before this change.
     """
     cfg = request.app.state.api_config
     locus = _read_conversation_locus(request, slug, global_user_id, thread_id)
     if locus:
         return locus["chat_id"], locus.get("thread_id")
+    bound_chat = _read_topic_binding_chat(request, slug, thread_id)
+    if bound_chat:
+        try:
+            return bound_chat, int(thread_id)
+        except (TypeError, ValueError):
+            # A binding key whose thread segment isn't an integer can't name a
+            # real TG forum topic — fall through rather than send a bad topic_id.
+            log.warning("routes_conversations: non-integer thread_id %r for %s",
+                        thread_id, slug)
     try:
         user = _users_store(request).get_user(global_user_id)
     except (OSError, ValueError):

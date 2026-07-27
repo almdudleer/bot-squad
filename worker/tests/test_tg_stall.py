@@ -678,3 +678,54 @@ def test_escalation_tg_primary_single_delivery(tmp_path, monkeypatch):
     assert len(tg_calls) == 1                        # personal page via TG
     assert tg_calls[0]["topic_id"] == 3131           # into #team-queries
     assert max_calls == []                           # one page = one delivery (T-0610)
+
+
+# ---------------------------------------------------------------------------
+# T-0300 — remote_control_line is THE single composer of the handoff
+#
+# The escalation footer and the tg_listener `/remote-control` command both emit
+# this. One decision written twice is this repo's #1 bug class, so these pin
+# that they cannot drift apart.
+# ---------------------------------------------------------------------------
+
+def test_remote_control_line_configured_url_substitutes(tmp_path):
+    cfg = _make_cfg(tmp_path, remote_url="https://claude.ai/code?s={sid}&w={session}")
+    line = TS.remote_control_line(cfg, DEV, "some-window")
+    assert line == f"🖥 Remote-control (Claude app): https://claude.ai/code?s={DEV}&w=some-window"
+
+
+def test_remote_control_line_falls_back_to_tmux_attach(tmp_path):
+    cfg = _make_cfg(tmp_path, remote_url="")
+    assert TS.remote_control_line(cfg, DEV, "some-window") == (
+        "🖥 Remote-control: tmux attach -t some-window")
+
+
+def test_remote_control_line_empty_when_nothing_to_offer(tmp_path):
+    """No configured URL and no live pane — callers append it only when truthy."""
+    cfg = _make_cfg(tmp_path, remote_url="")
+    assert TS.remote_control_line(cfg, DEV, "") == ""
+
+
+def test_remote_control_line_resolves_session_name_when_not_given(tmp_path, monkeypatch):
+    """`/remote-control` has no PaneInfo in hand, so None means 'look it up'."""
+    cfg = _make_cfg(tmp_path, remote_url="")
+    monkeypatch.setattr(TS, "_pane_for_sid",
+                        lambda sid: types.SimpleNamespace(session="looked-up"))
+    assert TS.remote_control_line(cfg, DEV) == (
+        "🖥 Remote-control: tmux attach -t looked-up")
+
+
+@pytest.mark.parametrize("url", ["", "https://claude.ai/code?session={sid}"])
+def test_escalation_footer_is_the_same_line_the_command_emits(tmp_path, url):
+    """The drift guard: the footer must CONTAIN the composer's output verbatim."""
+    cfg = _make_cfg(tmp_path, remote_url=url)
+    body = TS.build_escalation_text(cfg, DEV, "need call", "bot-squad")
+    assert TS.remote_control_line(cfg, DEV, "bot-squad") in body
+
+
+def test_escalation_text_drops_handoff_when_nothing_to_offer(tmp_path):
+    """Unchanged pre-T-0300 behaviour: no url + no session name -> no footer."""
+    cfg = _make_cfg(tmp_path, remote_url="")
+    body = TS.build_escalation_text(cfg, DEV, "need call", "")
+    assert "Remote-control" not in body
+    assert "#team-queries" in body

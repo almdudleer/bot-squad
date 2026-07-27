@@ -398,6 +398,38 @@ def _redirect_to_upstream(
 # Escalation message
 # ---------------------------------------------------------------------------
 
+def remote_control_line(cfg: Any, sid: str, session_name: Optional[str] = None) -> str:
+    """THE handoff line for ``sid`` — "continue this session in the Claude app".
+
+    T-0300: this is the SINGLE composer of the remote-control handoff. It used
+    to be inlined in `build_escalation_text` only, i.e. the handoff existed
+    solely as a passive footer on an escalation the stakeholder had to wait
+    for. `/remote-control` (tg_listener) now lets him ask for it on demand —
+    and it calls THIS, rather than re-deriving the URL. One decision written
+    twice is this repo's #1 bug class; the escalation footer and the command
+    must never be able to disagree about where a session is picked up.
+
+    ``session_name`` is the tmux session name. Pass it when the caller already
+    has it (the escalation path holds a ``PaneInfo``); leave it ``None`` and it
+    is resolved from the live panes. Returns ``""`` when there is nothing to
+    offer — no configured URL and no live pane to attach to — so callers append
+    it only when truthy.
+    """
+    if session_name is None:
+        pane = _pane_for_sid(sid)
+        session_name = getattr(pane, "session", "") or ""
+    url = getattr(cfg, "tg_remote_control_url", "") or ""
+    if url:
+        try:
+            url = url.format(sid=sid, session=session_name)
+        except (KeyError, IndexError):
+            pass
+        return f"🖥 Remote-control (Claude app): {url}"
+    if session_name:
+        return f"🖥 Remote-control: tmux attach -t {session_name}"
+    return ""
+
+
 def build_escalation_text(cfg: Any, sid: str, text: str, session_name: str) -> str:
     """Body for the escalation page (the client adds the ``[<SID>]`` prefix).
 
@@ -407,15 +439,9 @@ def build_escalation_text(cfg: Any, sid: str, text: str, session_name: str) -> s
     "reply to this message" would be a false affordance (P2-03).
     """
     lines = [f"🔔 {text}".rstrip(), ""]
-    url = getattr(cfg, "tg_remote_control_url", "") or ""
-    if url:
-        try:
-            url = url.format(sid=sid, session=session_name)
-        except (KeyError, IndexError):
-            pass
-        lines.append(f"🖥 Remote-control (Claude app): {url}")
-    elif session_name:
-        lines.append(f"🖥 Remote-control: tmux attach -t {session_name}")
+    handoff = remote_control_line(cfg, sid, session_name)
+    if handoff:
+        lines.append(handoff)
     lines.append("💬 To answer: attach above, or post on the board / #team-queries.")
     return "\n".join(lines)
 

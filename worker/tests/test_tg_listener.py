@@ -617,7 +617,7 @@ def test_handle_update_project_slash_not_appended_to_store(tmp_path, monkeypatch
                         lambda *a, **k: {"global_user_id": "gu_test"})
     append_calls = []
     monkeypatch.setattr(TL, "append_conversation",
-                        lambda cfg, slug, gid, m: append_calls.append((slug, gid)))
+                        lambda cfg, slug, gid, m, **k: append_calls.append((slug, gid)))
     # _handle_project reads/sets the pin over HTTP — stub it out.
     monkeypatch.setattr(TL, "_handle_project",
                         lambda cfg, chat_id, gid, args, **k: {"ok": True, "action": "project", "slug": args})
@@ -638,7 +638,7 @@ def test_handle_update_reply_still_appended_to_store(tmp_path, monkeypatch):
                         lambda *a, **k: {"global_user_id": "gu_test"})
     append_calls = []
     monkeypatch.setattr(TL, "append_conversation",
-                        lambda cfg, slug, gid, m: append_calls.append((slug, gid)))
+                        lambda cfg, slug, gid, m, **k: append_calls.append((slug, gid)))
     import bot_squad_worker.actions as A
     monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "pane_id": "%3", "lines_sent": 1})
 
@@ -2078,6 +2078,121 @@ def test_handle_unquoted_forwards_thread_id_to_append_matching_locus(tmp_path, m
 
 
 # ---------------------------------------------------------------------------
+# T-0740: the reply-quote / GROUP-VOICE branch of handle_update was the last
+# inbound path still dropping the origin thread. _handle_topic_bound and
+# _handle_unquoted (above) both carry thread_id into the store AND record the
+# locus; this branch did neither, so a voice note or a reply typed in a bound
+# topic was filed into the project's collapsed thread-less history and left
+# the locus naming whatever topic (or DM) was last used on the OTHER paths.
+# The attendant then woke unscoped and its answer relayed to that stale
+# locus — the reported "the voice ack landed in the right topic, then the
+# actual answer went to a different one".
+# ---------------------------------------------------------------------------
+
+
+def _voice_topic_msg(chat_id, thread_id):
+    return {
+        "message_id": 9, "date": 1_700_000_000,
+        "chat": {"id": chat_id, "type": "supergroup"},
+        "from": _from(),
+        "message_thread_id": thread_id,
+        "voice": {"file_id": "VID", "file_unique_id": "u", "duration": 3},
+    }
+
+
+def test_group_voice_in_bound_topic_appends_with_thread_id(tmp_path, monkeypatch):
+    """The record for a voice note sent in a topic belongs to THAT topic's
+    isolated thread, not the project's mixed history."""
+    from bot_squad_worker import tg_bindings, voice_intake as VI
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    cfg.voice_enabled = True
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(VI, "process_voice", lambda *a, **k: {"ok": True})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, k.get("thread_id"))) or True)
+
+    out = TL.handle_update(cfg, {"update_id": 1, "message": _voice_topic_msg(111, 7)})
+
+    assert out["action"] == "voice"
+    assert appended == [("beta", 7)]
+
+
+def test_group_voice_in_bound_topic_records_locus(tmp_path, monkeypatch):
+    """...and the locus now names that topic, so a later slug-only send (and
+    the API relay's bare-key lookup) no longer resolves a days-stale topic."""
+    from bot_squad_worker import tg_bindings, conversation_locus, voice_intake as VI
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    cfg.voice_enabled = True
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    # A pre-existing, STALE project-level locus pointing at a different topic —
+    # exactly the live shape (a bare `slug:gid` entry from days earlier).
+    conversation_locus.set_locus(cfg, "beta", "gu_1", "111", 23)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(VI, "process_voice", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _voice_topic_msg(111, 7)})
+
+    rec = conversation_locus.get_locus(cfg, "beta", "gu_1", 7)
+    assert rec["chat_id"] == "111" and rec["thread_id"] == 7
+
+
+def test_reply_quote_in_bound_topic_appends_with_thread_id_and_records_locus(
+    tmp_path, monkeypatch,
+):
+    """The TEXT twin of the voice case: a reply-quote typed in a bound topic
+    goes through the same branch and was losing the thread the same way."""
+    from bot_squad_worker import tg_bindings, conversation_locus
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "lines_sent": 1})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, k.get("thread_id"))) or True)
+
+    msg = _reply_message("S-alice-spec5-p3", "go ahead", chat_id=111)
+    msg["chat"]["type"] = "supergroup"
+    msg["message_thread_id"] = 7
+    out = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert out["action"] == "inject"
+    assert appended == [("beta", 7)]
+    rec = conversation_locus.get_locus(cfg, "beta", "gu_1", 7)
+    assert rec["chat_id"] == "111" and rec["thread_id"] == 7
+
+
+def test_thread_less_reply_quote_does_not_touch_the_locus(tmp_path, monkeypatch):
+    """Deliberate limit of the fix: with no thread there is no binding, so
+    `chat_slug` is the "incidental" static one this branch is explicitly told
+    not to trust. Writing a locus under it could point a project's replies at
+    a chat the user never addressed it in — so a thread-less message in this
+    branch leaves the locus exactly as it was before this change."""
+    from bot_squad_worker import conversation_locus
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "lines_sent": 1})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(k.get("thread_id")) or True)
+
+    out = TL.handle_update(cfg, {"update_id": 1,
+                                 "message": _reply_message("S-a-p3", "ok", chat_id=111)})
+
+    assert out["action"] == "inject"
+    assert appended == [None]
+    assert conversation_locus.load(cfg) == {}
+
+
+# ---------------------------------------------------------------------------
 # T-0693 Finding B: conversation_locus/conversation_store treat "no thread_id"
 # as one generic bare key regardless of WHY it's absent — a genuine DM, an
 # intentional General-feed tg_bindings entry (thread_id=None bound on
@@ -3327,3 +3442,220 @@ def test_pin_session_with_no_live_sessions_says_so(tmp_path, monkeypatch):
     assert result["action"] == "pin_session_no_candidates"
     assert not sends, "no picker without candidates"
     assert "No live sessions" in notices[-1]
+
+
+# ---------------------------------------------------------------------------
+# T-0300 — `/remote-control`: continue a session in the Claude app
+#
+# Stakeholder verbatim (T-0155): "...which might also be a /remote-control
+# command for me to continue in the claude app". Until T-0300 the handoff was
+# only a footer on a stall escalation; these pin it as an on-demand command.
+# ---------------------------------------------------------------------------
+
+def _rc_cfg(tmp_path: Path, *, url: str = "", projects=("test-project",)):
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    cfg.tg_remote_control_url = url
+    cfg.projects = {s: types.SimpleNamespace(tg_chat="12345") for s in projects}
+    return cfg
+
+
+def _rc_sessions(monkeypatch, by_slug: dict):
+    """Stub the live-session source `_pinnable_sessions` reads."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(
+        S, "list_sessions",
+        lambda _cfg, slug: [
+            {"sid": sid, "window": sid, "status": "active", "role": "dev"}
+            for sid in by_slug.get(slug, [])
+        ],
+    )
+
+
+def _rc_capture(monkeypatch):
+    """Capture the two outbound funnels; return (notices, pickers)."""
+    notices: list[str] = []
+    pickers: list[dict] = []
+    monkeypatch.setattr(TL, "_notify",
+                        lambda cfg, chat_id, text, **k: notices.append(text))
+    monkeypatch.setattr(
+        TL, "_channel_notify",
+        lambda cfg, chat_id, text, *, reply_markup=None, **k:
+            pickers.append({"text": text, "markup": reply_markup}),
+    )
+    return notices, pickers
+
+
+def _rc_pane(monkeypatch, session_name):
+    import bot_squad_worker.tg_stall as TS
+    monkeypatch.setattr(
+        TS, "_pane_for_sid",
+        lambda sid: types.SimpleNamespace(session=session_name) if session_name else None,
+    )
+
+
+def test_extract_slash_command_remote_control():
+    assert TL.extract_slash_command({"text": "/remote-control S-a-b-p1"}) == (
+        "remote-control", "S-a-b-p1")
+    # TG autocomplete can only offer [a-z0-9_]; both spellings normalize.
+    assert TL.extract_slash_command({"text": "/remote_control"}) == (
+        "remote-control", "")
+    assert TL.extract_slash_command({"text": "/remote-control@thebot S-x"}) == (
+        "remote-control", "S-x")
+
+
+def test_remote_control_bare_offers_picker(tmp_path, monkeypatch):
+    cfg = _rc_cfg(tmp_path)
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1", "S-a-two-p2"]})
+    notices, pickers = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "")
+
+    assert r["ok"] and r["action"] == "remote_control_ask" and r["count"] == 2
+    buttons = [b[0]["text"] for b in pickers[0]["markup"]["keyboard"]]
+    assert buttons == ["/remote-control S-a-one-p1", "/remote-control S-a-two-p2"]
+    # No `off` button — unlike /pin-session this toggles nothing.
+    assert all(b.startswith("/remote-control S-") for b in buttons)
+
+
+def test_remote_control_named_session_emits_tmux_fallback(tmp_path, monkeypatch):
+    """No remote_control_url configured (the LIVE install today) -> tmux attach."""
+    cfg = _rc_cfg(tmp_path, url="")
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"]})
+    _rc_pane(monkeypatch, "one-window")
+    notices, _ = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "S-a-one-p1")
+
+    assert r["ok"] and r["sid"] == "S-a-one-p1"
+    assert "tmux attach -t one-window" in notices[-1]
+    assert "S-a-one-p1" in notices[-1]
+
+
+def test_remote_control_named_session_emits_claude_app_url(tmp_path, monkeypatch):
+    cfg = _rc_cfg(tmp_path, url="https://claude.ai/code?session={sid}")
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"]})
+    _rc_pane(monkeypatch, "one-window")
+    notices, _ = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "S-a-one-p1")
+
+    assert r["ok"]
+    assert "https://claude.ai/code?session=S-a-one-p1" in notices[-1]
+    assert "tmux attach" not in notices[-1]
+
+
+def test_remote_control_resolves_a_sid_from_another_project(tmp_path, monkeypatch):
+    """Regression for a defect the T-0158 manual walkthrough found on LIVE.
+
+    The stakeholder's chat statically resolves to ONE project (`watchrobot` on
+    the live install), so a project-scoped lookup refused a bot-squad SID typed
+    in that very chat. A SID is globally unique and this command changes no
+    routing, so it resolves across projects — chat's own project first."""
+    cfg = _rc_cfg(tmp_path, projects=("test-project", "other-project"))
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"],
+                               "other-project": ["S-a-far-p9"]})
+    _rc_pane(monkeypatch, "far-window")
+    notices, _ = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "S-a-far-p9")
+
+    assert r["ok"] and r["sid"] == "S-a-far-p9"
+    assert r["slug"] == "other-project", "must report the OWNING project"
+    assert "tmux attach -t far-window" in notices[-1]
+
+
+def test_remote_control_picker_spans_projects_local_first(tmp_path, monkeypatch):
+    cfg = _rc_cfg(tmp_path, projects=("test-project", "other-project"))
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"],
+                               "other-project": ["S-a-far-p9"]})
+    _rc_capture(monkeypatch)
+    notices, pickers = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "")
+
+    assert r["count"] == 2
+    buttons = [b[0]["text"] for b in pickers[0]["markup"]["keyboard"]]
+    assert buttons[0].endswith("S-a-one-p1"), "chat's own project ranks first"
+    # The list mixes projects, so each row must name its own.
+    assert "test-project" in pickers[0]["text"]
+    assert "other-project" in pickers[0]["text"]
+
+
+def test_remote_control_unknown_session_refuses_and_re_offers(tmp_path, monkeypatch):
+    cfg = _rc_cfg(tmp_path)
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"]})
+    notices, pickers = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "nonsense")
+
+    assert not r["ok"] and r["action"] == "remote_control_unknown"
+    assert "No live session 'nonsense'" in notices[0]
+    # Never emit a handoff line with an empty target.
+    assert not any("Remote-control" in n for n in notices)
+    assert pickers, "re-offers the picker"
+
+
+def test_remote_control_bare_in_pinned_topic_uses_that_session(tmp_path, monkeypatch):
+    """He is already talking to the pinned session — re-asking would be noise."""
+    cfg = _rc_cfg(tmp_path)
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1", "S-a-two-p2"]})
+    _rc_pane(monkeypatch, "two-window")
+    notices, pickers = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(
+        cfg, "12345", "", thread_id=7,
+        binding={"slug": "test-project", "session_id": "S-a-two-p2"},
+    )
+
+    assert r["ok"] and r["sid"] == "S-a-two-p2"
+    assert not pickers, "no picker when the topic already names a session"
+    assert "tmux attach -t two-window" in notices[-1]
+
+
+def test_remote_control_without_url_or_pane_says_so(tmp_path, monkeypatch):
+    """Neither affordance exists — say which, don't send an empty handoff."""
+    cfg = _rc_cfg(tmp_path, url="")
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"]})
+    _rc_pane(monkeypatch, None)          # no live tmux pane
+    notices, _ = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "12345", "S-a-one-p1")
+
+    assert not r["ok"] and r["action"] == "remote_control_unavailable"
+    assert "nothing to hand over" in notices[-1]
+    assert "Remote-control" not in notices[-1]
+
+
+def test_remote_control_unregistered_chat_refuses(tmp_path, monkeypatch):
+    cfg = _rc_cfg(tmp_path)
+    notices, _ = _rc_capture(monkeypatch)
+
+    r = TL._handle_remote_control(cfg, "99999", "")
+
+    assert not r["ok"] and r["action"] == "remote_control_no_project"
+    assert "isn't linked to a registered project" in notices[-1]
+
+
+def test_handle_update_dispatches_remote_control_slash(tmp_path, monkeypatch):
+    """End-to-end through handle_update — the command is actually wired."""
+    cfg = _rc_cfg(tmp_path, url="https://claude.ai/code?session={sid}")
+    _rc_sessions(monkeypatch, {"test-project": ["S-a-one-p1"]})
+    _rc_pane(monkeypatch, "one-window")
+    notices, _ = _rc_capture(monkeypatch)
+
+    result = TL.handle_update(cfg, {
+        "update_id": 9,
+        "message": _slash_message("/remote-control S-a-one-p1", chat_id=12345),
+    })
+
+    assert result["ok"] and result["action"] == "remote_control"
+    assert "https://claude.ai/code?session=S-a-one-p1" in notices[-1]
+
+
+def test_help_lists_remote_control(tmp_path, monkeypatch):
+    cfg = _rc_cfg(tmp_path)
+    notices, _ = _rc_capture(monkeypatch)
+
+    TL._handle_slash(cfg, "12345", "help", "")
+
+    assert "/remote-control" in notices[-1]

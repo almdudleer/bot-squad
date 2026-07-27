@@ -360,7 +360,7 @@ def extract_reply_target(message: dict, cfg: Any = None) -> Optional[tuple[str, 
 
 def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
     """Extract (cmd, args_str) if this is a /sessions, /say, /help, /project,
-    /state or /pin-session command."""
+    /state, /pin-session or /remote-control command."""
     text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return None
@@ -374,8 +374,14 @@ def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
     # dashed name the picker buttons emit.
     if cmd == "pin_session":
         cmd = "pin-session"
+    # T-0300: same dash/underscore split for `/remote-control` — the
+    # stakeholder's verbatim (T-0155) spells it with a dash, TG autocomplete
+    # can only offer the underscore. Both normalize to the dashed name.
+    if cmd == "remote_control":
+        cmd = "remote-control"
     # T-0655 (Addendum 1): /state — drive on/off, quota target, lifecycle state.
-    if cmd not in {"sessions", "say", "help", "project", "state", "pin-session"}:
+    if cmd not in {"sessions", "say", "help", "project", "state", "pin-session",
+                   "remote-control"}:
         return None
     return (cmd, args)
 
@@ -842,11 +848,15 @@ def _pinnable_sessions(cfg, slug: str) -> list[dict]:
     ]
 
 
-def _pin_session_candidates(cfg, slug: str, binding: dict) -> list[dict]:
+def _session_candidates(cfg, slug: str, binding: dict) -> list[dict]:
     """`_pinnable_sessions` ordered most-relevant-first: the session already
     pinned, then the one working THIS topic's ticket (a T-0660 per-task topic
     binds a ``ticket_id``), then the rest — so the obvious choice is the first
-    button rather than somewhere down a list of look-alike SIDs."""
+    button rather than somewhere down a list of look-alike SIDs.
+
+    T-0300: shared with `/remote-control`, which wants the same ordering for
+    the same reason. An empty ``binding`` (an unbound DM) simply ranks
+    everything equal and falls through to the SID sort."""
     current = binding.get("session_id")
     ticket_id = binding.get("ticket_id")
 
@@ -861,13 +871,17 @@ def _pin_session_candidates(cfg, slug: str, binding: dict) -> list[dict]:
     return sorted(_pinnable_sessions(cfg, slug), key=rank)
 
 
-def _resolve_pin_target(cfg, slug: str, arg: str) -> Optional[str]:
-    """Resolve a `/pin-session` argument to a live SID of ``slug``.
+def _resolve_session_arg(cfg, slug: str, arg: str) -> Optional[str]:
+    """Resolve a session-naming command argument to a live SID of ``slug``.
 
     Accepts a full SID (what the picker buttons send) or a T-0662 session
     alias. Returns ``None`` when it names nothing pinnable — the caller
     refuses and re-offers the picker rather than binding the topic to a
-    session that can't receive anything."""
+    session that can't receive anything.
+
+    Shared by `/pin-session` and (T-0300) `/remote-control`: both take the
+    same "which live session of this project" argument and both must reject
+    the same dead ones, so they resolve through one function."""
     from bot_squad_worker import session_aliases
     candidate = arg.strip()
     if not candidate.lower().startswith("s-"):
@@ -880,8 +894,15 @@ def _resolve_pin_target(cfg, slug: str, arg: str) -> Optional[str]:
 
 
 def _describe_session(row: dict) -> str:
-    """One picker line: the SID plus just enough to tell look-alikes apart."""
+    """One picker line: the SID plus just enough to tell look-alikes apart.
+
+    T-0300: a ``slug`` key (which `sessions.list_sessions` never sets — only
+    the cross-project `/remote-control` picker adds it) is shown too, since
+    that picker mixes projects and the SID alone doesn't say which."""
     bits = [str(row.get("sid") or "")]
+    slug = str(row.get("slug") or "")
+    if slug:
+        bits.append(slug)
     role = str(row.get("role") or "")
     if role:
         bits.append(role)
@@ -892,12 +913,39 @@ def _describe_session(row: dict) -> str:
     return "  ·  ".join(b for b in bits if b)
 
 
+def _offer_session_picker(cfg, chat_id: str, rows: list[dict], *, command: str,
+                          lines: list[str], extra_buttons: tuple[str, ...] = (),
+                          thread_id: Any = None) -> None:
+    """Send a reply-keyboard of ``<command> <sid>`` buttons, one per row.
+
+    T-0300: extracted so `/pin-session` and `/remote-control` share ONE picker.
+    Reply-keyboard (not inline buttons) for the T-0677 reason: the poller runs
+    ``allowed_updates:["message"]``, so each button has to arrive as a normal
+    message — which also means the SID text the button sends is exactly what
+    the command's own argument parser accepts."""
+    body = list(lines)
+    body.append("")
+    body += [_describe_session(r) for r in rows]
+    keyboard = [[{"text": f"{command} {r['sid']}"}] for r in rows]
+    for extra in extra_buttons:
+        keyboard.append([{"text": extra}])
+    _channel_notify(
+        cfg, chat_id, "\n".join(body),
+        reply_markup={
+            "keyboard": keyboard,
+            "one_time_keyboard": True,
+            "resize_keyboard": True,
+        },
+        thread_id=thread_id,
+    )
+
+
 def _ask_which_session(cfg, chat_id: str, slug: str, binding: dict, *,
                        thread_id: Any = None) -> dict:
     """The picker: a reply-keyboard of `/pin-session <sid>` buttons (plus an
     ``off`` button back to attendant routing). Best-effort, like every other
     interactive reply here."""
-    rows = _pin_session_candidates(cfg, slug, binding)
+    rows = _session_candidates(cfg, slug, binding)
     if not rows:
         _notify(cfg, chat_id,
                 f"No live sessions in {slug} to pin right now — messages in "
@@ -910,19 +958,8 @@ def _ask_which_session(cfg, chat_id: str, slug: str, binding: dict, *,
         f"Now: {current} (direct)" if current
         else "Now: the user-conversation attendant (default)"
     )
-    lines.append("")
-    lines += [_describe_session(r) for r in rows]
-    keyboard = [[{"text": f"/pin-session {r['sid']}"}] for r in rows]
-    keyboard.append([{"text": "/pin-session off"}])
-    _channel_notify(
-        cfg, chat_id, "\n".join(lines),
-        reply_markup={
-            "keyboard": keyboard,
-            "one_time_keyboard": True,
-            "resize_keyboard": True,
-        },
-        thread_id=thread_id,
-    )
+    _offer_session_picker(cfg, chat_id, rows, command="/pin-session", lines=lines,
+                          extra_buttons=("/pin-session off",), thread_id=thread_id)
     return {"ok": True, "action": "pin_session_ask", "slug": slug,
             "count": len(rows)}
 
@@ -980,7 +1017,7 @@ def _handle_pin_session(cfg, chat_id: str, args: str, *,
                 thread_id=thread_id)
         return {"ok": True, "action": "pin_session_cleared", "slug": slug}
 
-    sid = _resolve_pin_target(cfg, slug, arg)
+    sid = _resolve_session_arg(cfg, slug, arg)
     if not sid:
         _notify(cfg, chat_id,
                 f"No live session {arg!r} in {slug} — nothing pinned. Pick one:",
@@ -1014,6 +1051,134 @@ def _handle_pin_session(cfg, chat_id: str, args: str, *,
                 thread_id=thread_id)
     return {"ok": True, "action": "pin_session_set", "slug": slug, "sid": sid,
             "pinned": bool(pin.get("pinned"))}
+
+
+# ---- T-0300: `/remote-control` — continue a session in the Claude app -------
+# Stakeholder, verbatim (T-0155, 2026-06-02): "...and be able to receive a
+# response from my tg reply to their tmux, which might also be a
+# /remote-control command for me to continue in the claude app".
+#
+# The handoff itself has existed since T-0155 — but only as a FOOTER that
+# `tg_stall.build_escalation_text` appends when the stall watchdog pages him.
+# That made it reachable only for a session the watchdog happened to escalate,
+# and only in the moment it did so. This turns it into a command he can issue
+# for ANY live session at any time, which is what the verbatim actually asks
+# for. The URL is NOT recomposed here: `tg_stall.remote_control_line` is the
+# single composer and this calls it (operator p298's explicit instruction —
+# the footer and the command must never disagree about where a session is
+# picked up).
+
+
+def _project_order(cfg, slug: str) -> list[str]:
+    """``slug`` first, then every other registered project."""
+    return [slug] + [s for s in cfg.projects if s != slug]
+
+
+def _resolve_remote_control_target(cfg, slug: str, arg: str) -> Optional[tuple[str, str]]:
+    """Resolve ``arg`` to ``(slug, sid)`` across ALL projects, ``slug`` first.
+
+    A SID is globally unique and `/remote-control` changes no routing, so
+    scoping the lookup to the chat's project can only ever refuse a handoff the
+    stakeholder may legitimately ask for. That is not hypothetical: measured on
+    the live install, the project chat statically resolves to ``watchrobot``
+    (`_slug_for_chat` is the "incidental" mapping this module elsewhere says
+    not to trust), so a bot-squad SID typed in that very chat was refused.
+
+    `/pin-session` deliberately keeps the single-project `_resolve_session_arg`:
+    it BINDS a topic to a session, and binding a topic across projects would be
+    a routing bug, not a convenience."""
+    for candidate in _project_order(cfg, slug):
+        sid = _resolve_session_arg(cfg, candidate, arg)
+        if sid:
+            return (candidate, sid)
+    return None
+
+
+def _remote_control_candidates(cfg, slug: str, binding: dict) -> list[dict]:
+    """Picker rows across all projects, the chat's own project first.
+
+    Each row is tagged with its ``slug`` so `_describe_session` can name the
+    project — the list mixes them, and SIDs alone don't say which."""
+    rows: list[dict] = []
+    for s in _project_order(cfg, slug):
+        # Only the chat's OWN project gets the binding-aware ranking (pinned
+        # session / this topic's ticket first); it says nothing about others.
+        for row in _session_candidates(cfg, s, binding if s == slug else {}):
+            rows.append({**row, "slug": s})
+    return rows
+
+
+def _handle_remote_control(cfg, chat_id: str, args: str, *,
+                           thread_id: Any = None,
+                           binding: Optional[dict] = None) -> dict:
+    """``/remote-control [<sid>|<alias>]`` — hand a session to the Claude app.
+
+    Bare in a topic already pinned to a session (T-0677 direct mode): hands
+    over THAT session — it is the one he is talking to, so re-asking would be
+    noise. Bare anywhere else: the session picker. With a session: the handoff
+    line for it.
+    """
+    from bot_squad_worker import tg_bindings, tg_stall as _tg_stall
+    if binding is None:
+        binding = tg_bindings.resolve(cfg, chat_id, thread_id)
+    binding = binding or {}
+    # Unlike /pin-session this does NOT require a bound topic: it changes no
+    # routing, so a plain DM (where the escalation footer lands today) is a
+    # first-class place to ask. Fall back to the chat's static project.
+    slug = binding.get("slug") or _slug_for_chat(cfg, chat_id)
+    if not slug:
+        _notify(cfg, chat_id,
+                "❌ /remote-control: this chat isn't linked to a registered project",
+                thread_id=thread_id)
+        return {"ok": False, "action": "remote_control_no_project"}
+
+    arg = args.strip() or str(binding.get("session_id") or "")
+    if not arg:
+        rows = _remote_control_candidates(cfg, slug, binding)
+        if not rows:
+            _notify(cfg, chat_id,
+                    "No live sessions to remote-control right now.",
+                    thread_id=thread_id)
+            return {"ok": False, "action": "remote_control_no_candidates",
+                    "slug": slug}
+        _offer_session_picker(
+            cfg, chat_id, rows, command="/remote-control",
+            lines=["Which session do you want to continue in the Claude app?"],
+            thread_id=thread_id,
+        )
+        return {"ok": True, "action": "remote_control_ask", "slug": slug,
+                "count": len(rows)}
+
+    found = _resolve_remote_control_target(cfg, slug, arg)
+    if not found:
+        _notify(cfg, chat_id,
+                f"No live session {arg!r}. Pick one:",
+                thread_id=thread_id)
+        rows = _remote_control_candidates(cfg, slug, binding)
+        if rows:
+            _offer_session_picker(
+                cfg, chat_id, rows, command="/remote-control",
+                lines=["Live sessions:"], thread_id=thread_id,
+            )
+        return {"ok": False, "action": "remote_control_unknown", "slug": slug,
+                "arg": arg}
+    slug, sid = found
+
+    handoff = _tg_stall.remote_control_line(cfg, sid)
+    if not handoff:
+        # Neither affordance exists: no `tg.remote_control_url` configured for
+        # this install AND no live tmux pane to attach to. Say which, rather
+        # than sending a handoff line with an empty target.
+        _notify(cfg, chat_id,
+                f"{sid}: nothing to hand over — no remote_control_url is "
+                "configured for this install and the session has no live tmux "
+                "pane to attach to.",
+                thread_id=thread_id)
+        return {"ok": False, "action": "remote_control_unavailable",
+                "slug": slug, "sid": sid}
+
+    _notify(cfg, chat_id, f"{sid}  ({slug})\n{handoff}", thread_id=thread_id)
+    return {"ok": True, "action": "remote_control", "slug": slug, "sid": sid}
 
 
 def _send_and_pin(cfg, chat_id: str, message: str, *, thread_id: Any = None) -> dict:
@@ -1431,6 +1596,13 @@ def handle_update(cfg, update: dict) -> dict:
                 result = _handle_pin_session(
                     cfg, chat_id, args, thread_id=thread_id, binding=binding,
                 )
+            elif cmd == "remote-control":
+                # T-0300: same reason it can't live in _handle_slash — it reads
+                # the binding (its slug, and the pinned session that makes a
+                # bare `/remote-control` unambiguous in a topic).
+                result = _handle_remote_control(
+                    cfg, chat_id, args, thread_id=thread_id, binding=binding,
+                )
             else:
                 result = _handle_slash(cfg, chat_id, cmd, args, thread_id=thread_id)
         elif reply:
@@ -1563,7 +1735,9 @@ def _handle_slash(cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = No
                 "/say <sid> <text> — direct inject without reply-quoting\n"
                 "/state — drive on/off, quota target, core lifecycle state\n"
                 "/pin-session — (in a bound topic) pick a session to talk to "
-                "directly; /pin-session off returns to the attendant",
+                "directly; /pin-session off returns to the attendant\n"
+                "/remote-control [<sid>] — continue a session in the Claude "
+                "app (or attach to its tmux); bare = pick from a list",
                 thread_id=thread_id)
         return {"ok": True, "action": "help"}
 

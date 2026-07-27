@@ -356,6 +356,9 @@ deploy prod.
   dev): the git SSOT every spawn brief reads (D-0043;
   `$BOT_SQUAD` = the bot-squad install root, default `/home/www/bot-squad`).
   NOT `{ops}/vision/roles/`, which is a scaffold-time display copy and drifts.
+- `$BOT_SQUAD/api/app/resources/specs/` — framework specs no session is briefed
+  from but shipped code cites as canonical: `role-hierarchy.md` (the six fixed
+  user/permission roles) and `session-lifecycle-contract.md` (T-0730).
 - `{ops}/backlog/` — all open work, one .md per task, incl. `kind: initiative`
   (discrete strategic bets; `{ops}/vision/initiatives/` is the legacy home
   for a project that hasn't migrated to task-based initiatives yet)

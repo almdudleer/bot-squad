@@ -26,9 +26,14 @@ are legal on purpose — the fixed pointers say "the git SSOT, **not** the
 drifting ``vision/roles/`` copy", and the scaffold/seeding code has to name the
 directory it writes.
 
-Docs that live ONLY in the live tree and have no SSOT counterpart
-(``role-hierarchy.md``, ``session-lifecycle-contract.md``) are not role
-contracts a session is spawned with, so they are out of scope by construction.
+T-0730 extended the same guard to ``api/app/resources/specs/``. Those two docs
+(``role-hierarchy.md``, ``session-lifecycle-contract.md``) used to live ONLY in
+the live tree with no git counterpart at all; they are framework specs cited by
+shipped code, not role contracts a session is spawned with, so they got their
+own SSOT dir rather than being dropped into ``roles/`` (which is *enumerated* —
+by this lint and by ``_seed_vision_roles``). Both dirs are scanned the same way:
+a stem covered by either one may not be pointed at via ``vision/roles/``.
+``specs/README.md`` documents the split and is not itself a spec stem.
 
 ``ALLOWLIST`` carries the few sites whose SUBJECT is the seeded copy itself
 (the seeder, its tests, the install-shape marker) — each with a reason.
@@ -49,6 +54,11 @@ import sys
 from pathlib import Path
 
 SSOT_DIR = "api/app/resources/roles"
+# T-0730: framework specs that are NOT spawnable contracts get their own git
+# SSOT dir (see its README) — same no-live-pointer rule, different home.
+SPECS_DIR = "api/app/resources/specs"
+# Not a spec stem: the dir's own explainer.
+SPECS_NON_STEMS = frozenset({"README"})
 
 # Paths (repo-relative) whose subject IS the seeded live copy, not a pointer
 # telling a reader where a contract lives. Keep this list short and reasoned.
@@ -93,6 +103,21 @@ def ssot_roles(root: Path) -> set[str]:
     return {p.stem for p in d.glob("*.md")} if d.is_dir() else set()
 
 
+def ssot_specs(root: Path) -> set[str]:
+    """T-0730: framework-spec stems with a git SSOT under ``specs/``. Same
+    rule as the contracts — a ``vision/roles/<stem>.md`` pointer is an error —
+    but a different home, because these are not spawnable role contracts."""
+    d = root / SPECS_DIR
+    if not d.is_dir():
+        return set()
+    return {p.stem for p in d.glob("*.md")} - SPECS_NON_STEMS
+
+
+def ssot_home(root: Path, stem: str) -> str:
+    """Which git dir a given stem's SSOT lives in (for the failure message)."""
+    return SPECS_DIR if stem in ssot_specs(root) else SSOT_DIR
+
+
 def _pattern(roles: set[str]) -> re.Pattern[str] | None:
     if not roles:
         return None
@@ -117,7 +142,7 @@ def _candidates(root: Path):
 
 def scan(root: Path) -> list[tuple[str, int, str]]:
     """Return [(rel_path, lineno, matched_text)] for every offending pointer."""
-    pat = _pattern(ssot_roles(root))
+    pat = _pattern(ssot_roles(root) | ssot_specs(root))
     if pat is None:
         return []
     findings: list[tuple[str, int, str]] = []
@@ -152,12 +177,14 @@ def main(argv: list[str] | None = None) -> int:
     if not findings:
         return 0
     print(
-        f"role-contract pointers must name the git SSOT ({SSOT_DIR}/<role>.md), "
-        "not the drifting per-project vision/roles/ copy (D-0043):",
+        f"role-doc pointers must name the git SSOT ({SSOT_DIR}/<role>.md for "
+        f"contracts, {SPECS_DIR}/<name>.md for framework specs), not the "
+        "drifting per-project vision/roles/ copy (D-0043, T-0730):",
         file=sys.stderr,
     )
     for rel, lineno, match in findings:
-        print(f"  {rel}:{lineno}  {match}", file=sys.stderr)
+        stem = match[len("vision/roles/"):-len(".md")]
+        print(f"  {rel}:{lineno}  {match}  → {ssot_home(root, stem)}/{stem}.md", file=sys.stderr)
     print(
         "\nFix the pointer, or — if the line's subject really IS the seeded "
         "display copy — add the file to ALLOWLIST in "

@@ -1,9 +1,10 @@
 """T-0216 Phase A — the fixed user/permission role taxonomy.
 
-Canonical spec: the install's ``vision/roles/role-hierarchy.md`` (stakeholder
-verbatim 2026-06-02) — a project doc, NOT a spawnable role contract, so it has
-no ``api/app/resources/roles`` SSOT counterpart (D-0043 covers the contracts,
-which are always read from there).
+Canonical spec: ``api/app/resources/specs/role-hierarchy.md`` (stakeholder
+verbatim 2026-06-02). T-0730 moved it there from the live tree, where it was
+untracked; it is a framework spec, NOT a spawnable role contract, so it sits in
+``resources/specs/`` rather than ``resources/roles/`` (D-0043 covers the
+contracts, which the spawn assembler reads from ``roles/`` by role name).
 
 Six FIXED roles = global/server/project × admin/member. This
 module is the single home for the role enums and the legacy-bool dual-read

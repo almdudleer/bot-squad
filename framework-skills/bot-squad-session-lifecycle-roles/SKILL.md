@@ -33,7 +33,7 @@ The 60s reconcile tick clears dead bindings, archives finished devs (zombies are
 
 `$BOT_SQUAD` is the bot-squad install root (default `/home/www/bot-squad`) — the same alias the SessionStart hook prints, so these paths resolve from ANY project's session; inside a bot-squad clone the contracts are the repo-relative `api/app/resources/roles/`. That directory is the **git SSOT** for every role contract (D-0043): the spawn brief, `bsq brief`, and the SessionStart pointer all read it, so editing it in one place is what a spawned session receives. The per-project `data/<slug>/vision/roles/` copy is seeded once at scaffold, is Vision-tab **display only**, and drifts — never send a reader there for a contract.
 
-The canonical role/permission hierarchy (global/server/project admin & member) is in the install's `vision/roles/role-hierarchy.md` — a project doc with no SSOT counterpart, not a spawnable role contract.
+The canonical role/permission hierarchy (global/server/project admin & member) is in `$BOT_SQUAD/api/app/resources/specs/role-hierarchy.md` — a framework spec, not a spawnable role contract, which is why it sits in `resources/specs/` (git SSOT, T-0730) rather than `resources/roles/`. Same for the session-lifecycle contract, `specs/session-lifecycle-contract.md`.
 
 ## Five cross-cutting principles bind EVERY role
 

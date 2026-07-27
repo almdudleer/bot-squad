@@ -1,10 +1,10 @@
 """T-0716: tests for scripts/lint/role_doc_pointers.py (D-0043 pointer guard).
 
-The lint fails any prose that sends a reader to ``vision/roles/<role>.md`` when
-that role has a git SSOT contract under ``api/app/resources/roles/``. Same
-shape as the backlog lints: locate the script, load it, drive it over synthetic
-fixture trees — plus one scan of the REAL repo so a re-introduced pointer
-breaks CI.
+The lint fails any prose that sends a reader to ``vision/roles/<name>.md`` when
+that name has a git SSOT — a role contract under ``api/app/resources/roles/``,
+or (T-0730) a framework spec under ``api/app/resources/specs/``. Same shape as
+the backlog lints: locate the script, load it, drive it over synthetic fixture
+trees — plus one scan of the REAL repo so a re-introduced pointer breaks CI.
 """
 from __future__ import annotations
 
@@ -56,11 +56,17 @@ lint = _load_lint_module()
 
 
 def _fake_repo(tmp_path: Path, files: dict[str, str]) -> Path:
-    """A minimal tree with an SSOT roles dir plus the given repo-relative files."""
+    """A minimal tree with the SSOT roles + specs dirs plus the given files."""
     ssot = tmp_path / "api" / "app" / "resources" / "roles"
     ssot.mkdir(parents=True, exist_ok=True)
     for role in ("operator", "teamlead", "dev"):
         (ssot / f"{role}.md").write_text(f"# Role: {role}\n", encoding="utf-8")
+    # T-0730: the framework-spec SSOT dir, policed by the same rule.
+    specs = tmp_path / "api" / "app" / "resources" / "specs"
+    specs.mkdir(parents=True, exist_ok=True)
+    for name in ("role-hierarchy", "session-lifecycle-contract"):
+        (specs / f"{name}.md").write_text(f"# Spec: {name}\n", encoding="utf-8")
+    (specs / "README.md").write_text("# what this dir is\n", encoding="utf-8")
     for rel, body in files.items():
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -114,9 +120,10 @@ def test_bare_directory_mention_is_legal(tmp_path):
     assert lint.scan(root) == []
 
 
-def test_doc_without_an_ssot_counterpart_is_out_of_scope(tmp_path):
-    """role-hierarchy.md / session-lifecycle-contract.md live only in the live
-    tree and are not spawnable contracts — pointing at them is fine."""
+def test_framework_specs_are_policed_too(tmp_path):
+    """T-0730 gave role-hierarchy.md / session-lifecycle-contract.md a git SSOT
+    under specs/ and deleted the live originals, so a live-tree pointer at
+    either one is now an error — the exact inverse of the T-0716 state."""
     root = _fake_repo(
         tmp_path,
         {
@@ -125,7 +132,47 @@ def test_doc_without_an_ssot_counterpart_is_out_of_scope(tmp_path):
                 "`vision/roles/session-lifecycle-contract.md`.\n"
         },
     )
+    assert lint.scan(root) == [
+        ("framework-skills/some-skill/SKILL.md", 1, "vision/roles/role-hierarchy.md"),
+        (
+            "framework-skills/some-skill/SKILL.md",
+            1,
+            "vision/roles/session-lifecycle-contract.md",
+        ),
+    ]
+    assert lint.main(["--root", str(root)]) == 1
+
+
+def test_specs_ssot_list_read_from_the_tree_minus_the_readme(tmp_path):
+    """Same tree-driven discovery as the contracts, so a new spec is covered
+    the day it lands — but the dir's own explainer is not a spec stem."""
+    root = _fake_repo(tmp_path, {})
+    assert lint.ssot_specs(root) == {"role-hierarchy", "session-lifecycle-contract"}
+    assert lint.ssot_home(root, "role-hierarchy") == lint.SPECS_DIR
+    assert lint.ssot_home(root, "operator") == lint.SSOT_DIR
+
+
+def test_pointer_at_the_specs_readme_is_not_flagged(tmp_path):
+    """`vision/roles/README.md` isn't a spec pointer — README is excluded from
+    the policed stems, so the dir explainer can't widen the pattern."""
+    root = _fake_repo(
+        tmp_path,
+        {"framework-skills/some-skill/SKILL.md": "see `vision/roles/README.md`\n"},
+    )
     assert lint.scan(root) == []
+
+
+def test_accepts_the_specs_ssot_path(tmp_path):
+    root = _fake_repo(
+        tmp_path,
+        {
+            "framework-skills/some-skill/SKILL.md":
+                "Full contract: `$BOT_SQUAD/api/app/resources/specs/"
+                "session-lifecycle-contract.md`.\n"
+        },
+    )
+    assert lint.scan(root) == []
+    assert lint.main(["--root", str(root)]) == 0
 
 
 def test_allowlisted_file_is_exempt(tmp_path, monkeypatch):
@@ -172,6 +219,7 @@ def test_the_real_repo_has_no_live_copy_pointers():
         pytest.skip("bot-squad checkout not available in this test environment")
     findings = lint.scan(root)
     assert findings == [], (
-        "role-contract pointers must name api/app/resources/roles/<role>.md "
-        f"(D-0043), found: {findings}"
+        "role-doc pointers must name api/app/resources/roles/<role>.md "
+        "(contracts) or api/app/resources/specs/<name>.md (framework specs) "
+        f"— D-0043 / T-0730; found: {findings}"
     )

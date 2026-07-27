@@ -24,7 +24,8 @@ import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
 import { Task } from "../api";
-import { LEGACY_BODY_COLLAPSE_CHARS, TaskBodyBlock } from "./TaskDetail";
+import { BODY_COLLAPSE_CHARS } from "../components/MarkdownBody";
+import { TaskBodyBlock } from "./TaskDetail";
 
 const CAPTION = "Ticket body — no separate request recorded";
 
@@ -57,13 +58,13 @@ describe("legacy body (no `## Verbatim request` heading)", () => {
   test("a wall of text is collapsed, and the expander names its real size", () => {
     const html = render({ verbatim: long, verbatim_is_legacy: true });
     expect(html).toContain("max-height:18rem");
-    expect(html).toContain("mc-legacy-body-fade");
+    expect(html).toContain("mc-md-body-fade");
     expect(html).toContain(`Show full body (${long.trim().length.toLocaleString()} chars)`);
   });
 
   test("a short legacy body is labelled but gets no expander it doesn't need", () => {
     const short = "run-survival-hardening\n\n(filed via initiative_new)";
-    expect(short.length).toBeLessThan(LEGACY_BODY_COLLAPSE_CHARS);
+    expect(short.length).toBeLessThan(BODY_COLLAPSE_CHARS);
     const html = render({ verbatim: short, verbatim_is_legacy: true });
     expect(html).toContain(CAPTION);
     expect(html).not.toContain("Show full body");
@@ -90,11 +91,12 @@ describe("a recorded ask (the `## Verbatim request` branch) is untouched", () =>
   test("is never markdown-rendered — the stakeholder's syntax is his text", () => {
     const html = render({ verbatim: ask, verbatim_is_legacy: false });
     expect(html).not.toContain("<strong>");
+    expect(html).not.toContain("mc-md-body");
     expect(html).not.toContain("mc-legacy-body");
   });
 
   test("is never captioned or collapsed, however long it runs", () => {
-    expect(ask.length).toBeGreaterThan(LEGACY_BODY_COLLAPSE_CHARS);
+    expect(ask.length).toBeGreaterThan(BODY_COLLAPSE_CHARS);
     const html = render({ verbatim: ask, verbatim_is_legacy: false });
     expect(html).not.toContain(CAPTION);
     expect(html).not.toContain("Show full body");

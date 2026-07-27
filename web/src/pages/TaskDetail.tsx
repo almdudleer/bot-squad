@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isNotFoundError, SessionRow, Task } from "../api";
-import { Markdown } from "../components/Markdown";
+import { MarkdownBody } from "../components/MarkdownBody";
 import {
   CANONICAL_LABELS,
   CANONICAL_STATE,
@@ -73,12 +73,6 @@ export function firstTouchTs(
 // "you" rather than as an agent.
 export const STAKEHOLDER_SID = "S-stakeholder";
 
-// T-0733: a legacy body longer than this collapses behind an expander. The
-// live offenders are 7.6k–11.4k chars (T-0553/T-0555/T-0558) — ~4000px of wall
-// above the working area. Anything under the threshold is short enough to read
-// in place, so it never gets a control it doesn't need.
-export const LEGACY_BODY_COLLAPSE_CHARS = 1200;
-
 /**
  * The body text in the user-facing header — the ask, or the ticket body.
  *
@@ -97,9 +91,12 @@ export const LEGACY_BODY_COLLAPSE_CHARS = 1200;
  *
  * Which branch applies is the API's call (`verbatim_is_legacy`, from
  * `task_body.is_legacy_body`) — the heading rule is not re-implemented here.
+ *
+ * T-0737: the legacy branch's render+collapse now lives in `MarkdownBody`,
+ * shared with Vision's initiative bodies. What stays here is the part that is
+ * genuinely about tickets: which branch applies, and the caption.
  */
 export function TaskBodyBlock({ task, slug }: { task: Task; slug: string }) {
-  const [expanded, setExpanded] = useState(false);
   const text = task.verbatim?.trim() ?? "";
 
   if (!text || !task.verbatim_is_legacy) {
@@ -121,9 +118,6 @@ export function TaskBodyBlock({ task, slug }: { task: Task; slug: string }) {
     );
   }
 
-  const collapsible = text.length > LEGACY_BODY_COLLAPSE_CHARS;
-  const collapsed = collapsible && !expanded;
-
   return (
     <div>
       <div
@@ -132,25 +126,7 @@ export function TaskBodyBlock({ task, slug }: { task: Task; slug: string }) {
       >
         ▪ Ticket body — no separate request recorded
       </div>
-      <div
-        className="mc-legacy-body"
-        style={collapsed ? { maxHeight: "18rem", overflow: "hidden" } : undefined}
-      >
-        <Markdown source={text} slug={slug} />
-        {collapsed && <div className="mc-legacy-body-fade" />}
-      </div>
-      {collapsible && (
-        <button
-          type="button"
-          className="btn btn-sm btn-outline-secondary mt-2"
-          style={{ fontFamily: "var(--mc-mono)", fontSize: "0.7rem" }}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          {expanded
-            ? "Collapse body"
-            : `Show full body (${text.length.toLocaleString()} chars)`}
-        </button>
-      )}
+      <MarkdownBody source={text} slug={slug} collapsible />
     </div>
   );
 }

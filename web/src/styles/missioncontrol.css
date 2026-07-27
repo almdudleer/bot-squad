@@ -1210,11 +1210,16 @@ pre.mc-pre {
   line-height: 1.6;
   white-space: pre-wrap;
 }
-/* T-0733: LEGACY ticket body — a ticket with no `## Verbatim request` heading,
-   whose whole body is shown via the parser's legacy fallback. This is NOT the
-   stakeholder's ask, so it must not wear the ask's green rule: neutral rail,
-   its own caption, rendered markdown, and a collapse for the 7k–11k-char
-   planning docs that are the live cases. */
+/* A STORED MARKDOWN BODY, rendered in place — the `MarkdownBody` component's
+   box. Two callers, one look (T-0737):
+     - TaskDetail's legacy ticket body (T-0733): a ticket with no
+       `## Verbatim request` heading, whose whole body is shown via the parser's
+       legacy fallback. It is NOT the stakeholder's ask, so it must not wear the
+       ask's green rule — hence the neutral rail here, plus its own caption
+       (`.mc-legacy-body-tag`, the one ticket-specific rule left in this block).
+     - Vision's initiative + product bodies, which used to be raw `<pre>` dumps.
+   Both are 1k–20k-char planning documents, so this styles for structure at a
+   readable density and pairs with the collapse. */
 .mc-legacy-body-tag {
   font-family: var(--mc-mono);
   font-size: 0.6rem;
@@ -1224,7 +1229,7 @@ pre.mc-pre {
   margin-bottom: 0.35rem;
   cursor: help;
 }
-.mc-legacy-body {
+.mc-md-body {
   position: relative;
   background-color: var(--mc-surface-raised);
   color: var(--mc-text-dim);
@@ -1236,8 +1241,9 @@ pre.mc-pre {
   line-height: 1.6;
 }
 /* The doc's own heading scale would be 2rem bootstrap headlines inside a task
-   card — bigger than the wall we're fixing. Render structure, not headlines. */
-.mc-legacy-body :is(h1, h2, h3, h4, h5, h6) {
+   card / an initiative row — bigger than the wall we're fixing, and on Vision
+   they'd outweigh the row headers they sit under. Structure, not headlines. */
+.mc-md-body :is(h1, h2, h3, h4, h5, h6) {
   font-family: var(--mc-mono);
   font-size: 0.78rem;
   font-weight: 600;
@@ -1245,8 +1251,8 @@ pre.mc-pre {
   letter-spacing: 0.02em;
   margin: 0.9rem 0 0.3rem;
 }
-.mc-legacy-body :is(p, li, td, th) { font-size: 0.8rem; }
-.mc-legacy-body pre {
+.mc-md-body :is(p, li, td, th) { font-size: 0.8rem; }
+.mc-md-body pre {
   background: var(--mc-surface-deep);
   border: 1px solid var(--mc-border);
   border-radius: 3px;
@@ -1254,11 +1260,11 @@ pre.mc-pre {
   font-size: 0.72rem;
   overflow-x: auto;
 }
-.mc-legacy-body code { font-size: 0.74rem; }
+.mc-md-body code { font-size: 0.74rem; }
 /* These docs carry GFM tables wider than a phone. Without their own scroller a
    table is clipped at the block edge and unreachable (the page itself must not
    scroll sideways). `display: block` makes the table its own scroll container. */
-.mc-legacy-body table {
+.mc-md-body table {
   font-size: 0.75rem;
   display: block;
   width: max-content;
@@ -1266,11 +1272,11 @@ pre.mc-pre {
   overflow-x: auto;
 }
 /* Long unbroken tokens (paths, ids) wrap instead of pushing the block wide. */
-.mc-legacy-body :is(p, li, h1, h2, h3, h4, h5, h6) { overflow-wrap: anywhere; }
-.mc-legacy-body .mc-markdown > :first-child { margin-top: 0; }
-.mc-legacy-body .mc-markdown > :last-child { margin-bottom: 0; }
+.mc-md-body :is(p, li, h1, h2, h3, h4, h5, h6) { overflow-wrap: anywhere; }
+.mc-md-body .mc-markdown > :first-child { margin-top: 0; }
+.mc-md-body .mc-markdown > :last-child { margin-bottom: 0; }
 /* Collapsed state: the cut edge fades instead of guillotining a line of text. */
-.mc-legacy-body-fade {
+.mc-md-body-fade {
   position: absolute;
   left: 0;
   right: 0;

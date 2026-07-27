@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, ConstantTeam, SessionRow, Task, VisionFile } from "../api";
+import { MarkdownBody } from "../components/MarkdownBody";
 import { PageHelp } from "../components/PageHelp";
 import { CANONICAL_LABELS, canonicalOf } from "../canonicalStatus";
 import { constantTeamFor, constantTeamMembers, unmatchedConstantTeams } from "../constantTeams";
@@ -109,6 +110,29 @@ export function memberCountLabel(live: number, teamSize: number | null): string 
   return `${live}/${teamSize} members${suffix}`;
 }
 
+/**
+ * T-0737: the body of a vision file — an initiative, or the product
+ * description — rendered as markdown.
+ *
+ * This was a raw `<pre className="mc-pre">` dump, so an initiative body showed
+ * `# Operator UX & Session Management Overhaul` / `## Origin` / `## Tickets`
+ * literally, one page over from TaskDetail where T-0733 had just started
+ * rendering the SAME content class (a stored md body) properly. Nothing about
+ * an initiative body makes it a different kind of text from a ticket body, so
+ * it goes through the SAME `MarkdownBody` T-0733's block now uses — a second
+ * renderer here would be the fifth two-places-one-decision divergence of the
+ * night (T-0714/T-0719/T-0729/T-0731).
+ *
+ * `collapsible` is the caller's judgement, not the component's — see
+ * MarkdownBody. Exported so the render lock can assert on it directly (the
+ * page's own body only reaches these rows after an async fetch).
+ */
+export function VisionFileBody(
+  { file, slug, collapsible }: { file: VisionFile; slug: string; collapsible?: boolean },
+) {
+  return <MarkdownBody source={file.content} slug={slug} collapsible={collapsible} />;
+}
+
 export function Vision() {
   const { slug = "" } = useParams();
   const navigate = useNavigate();
@@ -202,10 +226,6 @@ export function Vision() {
     teams,
     initiatives.map((f) => f.name),
   );
-
-  function renderFileBody(f: VisionFile) {
-    return <pre className="mc-pre">{f.content}</pre>;
-  }
 
   // T-0709: this page is observability-only (D-0057 §8) — binding/unbinding
   // a lead is a write action and lives in TG/CLI (`bsq spawn --initiative`),
@@ -486,7 +506,11 @@ export function Vision() {
                 <>
                   {renderTeamHealth(f, base)}
                   {renderBoundTasks(base)}
-                  {renderFileBody(f)}
+                  {/* Collapsed above the threshold: the live initiative bodies
+                      run 3.8k–20.2k chars (T-0551 the worst), and this page
+                      stacks every row in one column — one expanded wall puts
+                      the next initiative several screens away. */}
+                  <VisionFileBody file={f} slug={slug} collapsible />
                 </>
               )}
             </div>
@@ -546,7 +570,9 @@ export function Vision() {
       {product && (
         <section className="mb-4">
           {fileHeader(product)}
-          {renderFileBody(product)}
+          {/* NOT collapsible — the product description is the page's lede and
+              is written short (~1.4k). See MarkdownBody's `collapsible`. */}
+          <VisionFileBody file={product} slug={slug} />
         </section>
       )}
 

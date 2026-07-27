@@ -16,7 +16,8 @@ import { Route, Routes } from "react-router-dom";
 import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
-import { Vision } from "./Vision";
+import { VisionFile } from "../api";
+import { Vision, VisionFileBody } from "./Vision";
 
 function renderVision(): string {
   return renderToStaticMarkup(
@@ -40,5 +41,54 @@ describe("Vision", () => {
 
     expect(html).toContain("Vision");
     expect(html).toContain("/ bot-squad");
+  });
+});
+
+/**
+ * T-0737 — the initiative/product body is RENDERED markdown, not a raw dump.
+ *
+ * The row bodies only exist after the async files fetch, so they're out of
+ * reach of renderVision() above; VisionFileBody is exported precisely so the
+ * decision "this content class gets rendered" is locked at the seam where it
+ * was wrong. What it must NOT do is grow its own renderer — hence the
+ * assertion on the shared block's class.
+ */
+describe("vision file body", () => {
+  const body = "# Operator UX & Session Management Overhaul\n\n## Origin\n\nfiled 2026-07.\n\n## Tickets\n";
+
+  function renderBody(collapsible?: boolean): string {
+    return renderToStaticMarkup(
+      <StaticRouter location="/p/bot-squad/vision">
+        <VisionFileBody
+          file={{ name: "initiatives/x.md", content: body } as VisionFile}
+          slug="bot-squad"
+          collapsible={collapsible}
+        />
+      </StaticRouter>,
+    );
+  }
+
+  test("renders the markdown — no literal '# '/'## ' on the page", () => {
+    const html = renderBody(true);
+
+    expect(html).toContain("<h1>");
+    expect(html).toContain("<h2>");
+    expect(html).not.toContain("## Origin");
+    expect(html).not.toContain("## Tickets");
+  });
+
+  test("goes through the shared block, not a second renderer", () => {
+    const html = renderBody(true);
+
+    expect(html).toContain("mc-md-body");
+    expect(html).not.toContain('class="mc-pre"');
+  });
+
+  test("read-only — the body carries no write affordance (T-0709 holds)", () => {
+    const html = renderBody(true);
+
+    expect(html).not.toContain("<textarea");
+    expect(html).not.toContain("Save");
+    expect(html).not.toContain("Edit");
   });
 });

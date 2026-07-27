@@ -1688,8 +1688,12 @@ def _channel_notify(
 # for the 🎙 prefix + part markers.
 # T-0721: the cap and the splitter itself now live in ``tg`` and are shared with
 # the stakeholder-page path (actions._split_page) — one chunker, no drift.
+# T-0741: so does the RENDER (fit-or-numbered-parts), now shared with the
+# GROUP/topic ACK — see ``tg.render_transcript_echo``.
 _TG_MSG_CAP = _tg.TG_MSG_CAP
-_ECHO_CHUNK = 3900
+_ECHO_CHUNK = _tg.ECHO_CHUNK
+
+_ECHO_PREFIX = "\U0001f399 Распознал так: "
 
 
 def _echo_transcript(
@@ -1704,16 +1708,13 @@ def _echo_transcript(
     multi-part echo whose tail floated free of the note is the same detachment
     complaint at a smaller scale. The DM path's ``chat_id`` was already
     correct, so this adds threading only; nothing about where it goes changes.
+
+    T-0741: the render moved to ``tg.render_transcript_echo`` verbatim — the
+    GROUP/topic path's ACK had never been given this treatment and was still
+    showing 140 chars, so the two now render through one function.
     """
-    prefix = "\U0001f399 Распознал так: "
-    if len(prefix) + len(transcript) + 2 <= _TG_MSG_CAP:
-        _channel_notify(cfg, chat_id, f"{prefix}«{transcript}»",
-                        reply_to_message_id=reply_to_message_id)
-        return
-    chunks = _tg.split_for_tg(transcript, limit=_ECHO_CHUNK)
-    total = len(chunks)
-    for n, chunk in enumerate(chunks, 1):
-        _channel_notify(cfg, chat_id, f"{prefix}{_tg.part_marker(n, total)} «{chunk}»",
+    for body in _tg.render_transcript_echo(transcript, prefix=_ECHO_PREFIX):
+        _channel_notify(cfg, chat_id, body,
                         reply_to_message_id=reply_to_message_id)
 
 

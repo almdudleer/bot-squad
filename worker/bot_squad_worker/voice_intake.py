@@ -390,7 +390,7 @@ def _confirm(
     TG update) — a caller passing no ``origin`` gets the old destination.
     """
     try:
-        from bot_squad_worker import channels as _channels, tg_topics
+        from bot_squad_worker import channels as _channels, tg as _tg_mod, tg_topics
         project = cfg.projects.get(slug)
         origin = origin or {}
         chat_id = str(origin.get("chat_id") or "")
@@ -404,33 +404,53 @@ def _confirm(
         if not chat_id:
             return
         duration = v["duration"]
+        texts: list[str]
         if outcome == "too_long":
             # T-0433 P2: rejected pre-download for exceeding the duration cap.
             cap = int(getattr(cfg, "voice_max_duration_sec", _DEFAULT_MAX_DURATION_SEC) or 0)
-            text = (f"⚠️ voice note too long ({duration}s > {cap}s cap) — please split "
-                    f"into shorter notes.")
+            texts = [f"⚠️ voice note too long ({duration}s > {cap}s cap) — please split "
+                     f"into shorter notes."]
         elif outcome == "too_big":
             # T-0611: over the Bot API 20MB getFile cap — a resend can never
             # pass; the honest remedy is splitting into shorter notes.
-            text = (f"⚠️ voice note too big for Telegram's bot file limit (20MB, "
-                    f"{duration}s) — resending won't help; please split into "
-                    f"shorter notes (≤15 min is safe).")
+            texts = [f"⚠️ voice note too big for Telegram's bot file limit (20MB, "
+                     f"{duration}s) — resending won't help; please split into "
+                     f"shorter notes (≤15 min is safe)."]
         elif outcome == "download_failed":
-            text = (f"⚠️ couldn't fetch your voice note ({duration}s) — the TG file "
-                    f"download failed (proxy?). Please resend.")
+            texts = [f"⚠️ couldn't fetch your voice note ({duration}s) — the TG file "
+                     f"download failed (proxy?). Please resend."]
         elif outcome == "transcribe_failed":
-            text = (f"⚠️ got your voice note ({duration}s) but transcription "
-                    f"failed — audio saved & flagged for triage.")
+            texts = [f"⚠️ got your voice note ({duration}s) but transcription "
+                     f"failed — audio saved & flagged for triage."]
         else:
-            snippet = transcript[:140] + ("…" if len(transcript) > 140 else "")
-            text = f"✅ got your voice note ({duration}s): {snippet}"
+            # T-0741: the whole recognition, split if it does not fit — NOT a
+            # 140-char snippet. This is what the stakeholder kept reporting as
+            # "всё ещё обрезанное получается": his 37s and 41s notes
+            # transcribed to 456 and 444 chars and came back cut to 140 with a
+            # "…", while the DM path had had T-0586's chunked echo since
+            # 2026-07-05. The transcript itself was never truncated (a re-run
+            # of the saved audio reproduces the stored text byte-identically) —
+            # only this ACK was. Rendered by the SAME function as the DM echo
+            # so the two cannot drift apart again.
+            texts = _tg_mod.render_transcript_echo(
+                transcript,
+                prefix=f"✅ got your voice note ({duration}s): ",
+                quote=False,
+                # `send` prepends "[voice_intake] " — room the cap check would
+                # otherwise not know about.
+                reserve=len("[voice_intake] "),
+            )
         # T-0591 (F5.3): routed through the channel abstraction instead of a
         # raw TgClient — matches tg_listener._channel_notify's pattern.
         extra: dict[str, Any] = {}
         if reply_to is not None:
             extra["reply_to_message_id"] = reply_to
-        _channels.get_channel(cfg, project=slug).send(
-            text, chat_id=chat_id, sid="voice_intake", topic_id=topic, **extra)
+        channel = _channels.get_channel(cfg, project=slug)
+        for body in texts:
+            # Every part replies to the note, as on the DM path (T-0725) — a
+            # tail floating free of the note is the detachment complaint again.
+            channel.send(body, chat_id=chat_id, sid="voice_intake",
+                         topic_id=topic, **extra)
     except Exception:  # noqa: BLE001
         log.exception("voice_intake: confirmation send failed")
 

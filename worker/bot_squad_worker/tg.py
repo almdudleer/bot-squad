@@ -415,6 +415,48 @@ def split_for_tg(text: str, *, limit: int = TG_PART_CHUNK) -> list[str]:
     return parts or [t]
 
 
+# The 🎙-echo's per-part budget (T-0586). Deliberately looser than
+# ``TG_PART_CHUNK``: an echo carries no ``[<sid>]`` prefix worth budgeting for
+# on the DM path, and callers that DO get one pass ``reserve``.
+ECHO_CHUNK = 3900
+
+
+def render_transcript_echo(
+    transcript: str,
+    *,
+    prefix: str,
+    quote: bool = True,
+    limit: int = ECHO_CHUNK,
+    reserve: int = 0,
+) -> list[str]:
+    """Render a voice transcript as 1..N ready-to-send TG message bodies.
+
+    ONE decision for "the user is shown the WHOLE recognition" — shared by both
+    voice paths. T-0741: the GROUP/topic ACK (``voice_intake._confirm``) still
+    carried T-0386's ``transcript[:140] + "…"`` while only the DM echo had ever
+    been given T-0586's chunking, so every group-topic note over 140 chars came
+    back visibly cut. That was the stakeholder's recurring "обрезанное"
+    complaint — distinct from T-0721 (page truncation) and T-0725 (routing) —
+    and it is exactly this repo's duplicated-decision failure mode, so the
+    render lives here with the splitter rather than in either caller.
+
+    ``prefix`` leads every part; ``quote`` wraps each part in «» (the DM echo's
+    convention). ``reserve`` is extra room the transport will consume that is
+    not in ``prefix`` — notably ``send``'s ``[<sid>] `` label — so a transcript
+    that fits only without it still gets split instead of hitting an API 400.
+    """
+    open_q, close_q = ("«", "»") if quote else ("", "")
+    single = f"{prefix}{open_q}{transcript}{close_q}"
+    if len(single) + reserve <= TG_MSG_CAP:
+        return [single]
+    chunks = split_for_tg(transcript, limit=limit)
+    total = len(chunks)
+    return [
+        f"{prefix}{part_marker(n, total)} {open_q}{c}{close_q}"
+        for n, c in enumerate(chunks, 1)
+    ]
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------

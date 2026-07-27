@@ -698,3 +698,86 @@ def test_confirm_falls_back_to_static_chat_without_an_origin(tmp_path, monkeypat
     assert sent and sent[0]["chat_id"] == "-100777"
     assert sent[0]["topic_id"] == 9001
     assert "reply_to_message_id" not in sent[0]
+
+
+def test_confirm_sends_the_whole_transcript_not_a_140_char_snippet(tmp_path, monkeypatch):
+    """T-0741 REGRESSION GUARD — the stakeholder's recurring "Считывание
+    голоса … всё ещё обрезанное получается" (2026-07-27T04:05:31Z).
+
+    The GROUP/topic ACK sent ``transcript[:140] + "…"``. His 37s note
+    transcribed to 456 chars and came back cut to 140 — while the DM path had
+    had T-0586's chunked echo since 2026-07-05. Only THIS ack was ever cut: a
+    re-run of the saved audio through the current seam reproduces the stored
+    transcript byte-identically, so nothing upstream truncated anything.
+
+    Distinct from T-0721 (stakeholder-page truncation) and T-0725 (the ack
+    going to the wrong chat) — same word from him, three different defects.
+    """
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, actions as A
+
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    transcript = "По суда, я не понимаю, зачем нам нужна суда в целом. " * 9
+    assert len(transcript) > 140, "the fixture must exceed the old snippet cap"
+
+    _VI._confirm(cfg, "bot-squad", {"duration": 37}, outcome="ok",
+                 transcript=transcript,
+                 origin={"chat_id": "-100999", "thread_id": 77, "message_id": 555})
+
+    assert len(sent) == 1, "a 456-char note fits one TG message; do not split it"
+    body = sent[0]["text"]
+    assert transcript in body, (
+        f"the ack dropped {len(transcript) - len(body)} chars of the transcript")
+    assert "…" not in body, "the ack still truncates"
+    assert sent[0]["reply_to_message_id"] == 555
+
+
+def test_confirm_splits_an_over_cap_transcript_across_replies_to_the_note(tmp_path, monkeypatch):
+    """A transcript past TG's 4096-char cap goes out as numbered parts —
+    EVERY one threaded to the note (T-0725), none dropped (T-0721). A single
+    over-cap send would take an API 400 and lose the ack entirely."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, actions as A
+    from bot_squad_worker.tg import TG_MSG_CAP
+
+    sent = []
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+        send=lambda **k: sent.append(k) or True))
+
+    transcript = "Ещё такой момент, что открывается и закрывается много топиков. " * 120
+    assert len(transcript) > TG_MSG_CAP
+
+    _VI._confirm(cfg, "bot-squad", {"duration": 600}, outcome="ok",
+                 transcript=transcript,
+                 origin={"chat_id": "-100999", "thread_id": 77, "message_id": 555})
+
+    assert len(sent) > 1
+    assert all(len(s["text"]) <= TG_MSG_CAP for s in sent)
+    assert all(s["reply_to_message_id"] == 555 for s in sent), \
+        "a part floating free of the note is the detachment complaint again"
+    assert all(s["topic_id"] == 77 for s in sent)
+    joined = "".join(s["text"] for s in sent)
+    for word in ("открывается", "закрывается", "топиков"):
+        assert word in joined
+
+
+def test_confirm_failure_outcomes_stay_single_messages(tmp_path, monkeypatch):
+    """The refusal texts (T-0586's honest-reject UX) are unaffected by the
+    T-0741 render — one message each, wording unchanged."""
+    cfg = _cfg(tmp_path)
+    from bot_squad_worker import voice_intake as _VI, actions as A
+
+    for outcome, needle in (("too_long", "too long"), ("too_big", "too big"),
+                            ("download_failed", "couldn't fetch"),
+                            ("transcribe_failed", "transcription")):
+        sent = []
+        monkeypatch.setattr(A, "_get_tg_client", lambda c: types.SimpleNamespace(
+            send=lambda **k: sent.append(k) or True))
+        _VI._confirm(cfg, "bot-squad", {"duration": 900}, outcome=outcome,
+                     transcript="", origin={"chat_id": "-100999", "thread_id": 77,
+                                            "message_id": 555})
+        assert len(sent) == 1, f"{outcome} should send exactly one message"
+        assert needle in sent[0]["text"], f"{outcome} wording changed"

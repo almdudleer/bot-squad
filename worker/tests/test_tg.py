@@ -797,3 +797,64 @@ def test_split_for_tg_no_runt_parts_from_an_early_boundary():
 def test_part_marker_is_the_shared_numbered_convention():
     from bot_squad_worker.tg import part_marker
     assert part_marker(2, 7) == "(2/7)"
+
+
+# --------------------------------------------------------------------------
+# render_transcript_echo (T-0741) — the ONE voice-echo render, shared by the
+# DM 🎙-echo and the group/topic ACK.
+# --------------------------------------------------------------------------
+
+def test_render_transcript_echo_short_note_is_one_message():
+    from bot_squad_worker.tg import render_transcript_echo
+    out = render_transcript_echo("тёмная тема", prefix="🎙 Распознал так: ")
+    assert out == ["🎙 Распознал так: «тёмная тема»"]
+
+
+def test_render_transcript_echo_unquoted_for_the_ack():
+    from bot_squad_worker.tg import render_transcript_echo
+    out = render_transcript_echo("hi", prefix="✅ got your voice note (5s): ", quote=False)
+    assert out == ["✅ got your voice note (5s): hi"]
+
+
+def test_render_transcript_echo_never_truncates_a_real_note():
+    """T-0741 REGRESSION GUARD — the stakeholder's exact complaint, "всё ещё
+    обрезанное получается".
+
+    His 2026-07-27T04:04:47Z note transcribed to 456 chars and the group/topic
+    ACK sent back 140 of them plus a "…". Any render that drops a character of
+    a note this size is that bug. 456 chars is nowhere near TG's 4096 cap —
+    there was never a transport reason to cut it.
+    """
+    from bot_squad_worker.tg import render_transcript_echo
+    transcript = "По суда, я не понимаю, в целом, зачем нам нужна суда. " * 9  # ~477
+    assert 140 < len(transcript) < 4000
+    out = render_transcript_echo(transcript, prefix="✅ got your voice note (37s): ",
+                                 quote=False)
+    assert len(out) == 1, "a note well under the cap must not be split"
+    assert transcript in out[0], "the ACK dropped part of the transcript"
+    assert "…" not in out[0]
+
+
+def test_render_transcript_echo_splits_over_the_cap_and_keeps_every_char():
+    """Over the API cap it becomes numbered parts — never a truncation."""
+    from bot_squad_worker.tg import TG_MSG_CAP, render_transcript_echo
+    transcript = "Длинная фраза про воркеры и топики. " * 300
+    out = render_transcript_echo(transcript, prefix="🎙 Распознал так: ")
+    assert len(out) > 1
+    assert all(len(p) <= TG_MSG_CAP for p in out)
+    assert out[0].startswith("🎙 Распознал так: (1/")
+    # Every part is prefix + (n/N) + «chunk»; strip the frame and rejoin.
+    bodies = [p.split("«", 1)[1].rsplit("»", 1)[0] for p in out]
+    assert "".join(bodies).replace(" ", "") == transcript.replace(" ", ""), \
+        "chunking lost characters"
+
+
+def test_render_transcript_echo_reserve_accounts_for_the_sid_prefix():
+    """``send`` prepends "[<sid>] ". A transcript that fits only WITHOUT that
+    label must still split, or TG answers 400 and the whole ACK is lost."""
+    from bot_squad_worker.tg import TG_MSG_CAP, render_transcript_echo
+    prefix = "✅ got your voice note (900s): "
+    transcript = "я" * (TG_MSG_CAP - len(prefix) - 5)
+    assert len(render_transcript_echo(transcript, prefix=prefix, quote=False)) == 1
+    assert len(render_transcript_echo(transcript, prefix=prefix, quote=False,
+                                      reserve=len("[voice_intake] "))) > 1

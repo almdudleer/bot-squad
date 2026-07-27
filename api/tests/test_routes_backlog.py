@@ -482,6 +482,31 @@ def test_list_legacy_body_goes_to_verbatim(tmp_bot_squad: Path, monkeypatch):
     assert t["verbatim"] == "Legacy free body."
     assert t["context"] == ""
     assert t["progress"] == ""
+    # T-0733: and it is FLAGGED as legacy, so the UI can label it "ticket body"
+    # instead of asserting it's the stakeholder's ask.
+    assert t["verbatim_is_legacy"] is True
+
+
+def test_verbatim_is_legacy_false_when_the_heading_is_present(
+    tmp_bot_squad: Path, monkeypatch
+):
+    """T-0733: a real recorded ask must never be labelled a legacy body — on
+    the list (which is what TaskDetail reads) or after a body PATCH."""
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
+        "## Verbatim request\n\nI want X.\n\n## DoD\n\n- d\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        assert client.get("/api/projects/test-project/backlog").json()[0][
+            "verbatim_is_legacy"
+        ] is False
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"body": "## Verbatim request\n\nhijacked\n\n## Context\n\nc\n"},
+        )
+        assert r.status_code == 200
+        assert r.json()["verbatim_is_legacy"] is False
 
 
 def test_create_with_verbatim_request_composes_body(tmp_bot_squad: Path, monkeypatch):

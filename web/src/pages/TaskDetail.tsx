@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, isNotFoundError, SessionRow, Task } from "../api";
+import { Markdown } from "../components/Markdown";
 import {
   CANONICAL_LABELS,
   CANONICAL_STATE,
@@ -71,6 +72,88 @@ export function firstTouchTs(
 // stakeholder's comments carry this sentinel so the feed can label them
 // "you" rather than as an agent.
 export const STAKEHOLDER_SID = "S-stakeholder";
+
+// T-0733: a legacy body longer than this collapses behind an expander. The
+// live offenders are 7.6k–11.4k chars (T-0553/T-0555/T-0558) — ~4000px of wall
+// above the working area. Anything under the threshold is short enough to read
+// in place, so it never gets a control it doesn't need.
+export const LEGACY_BODY_COLLAPSE_CHARS = 1200;
+
+/**
+ * The body text in the user-facing header — the ask, or the ticket body.
+ *
+ * T-0733: two different things share this slot and must NOT look the same.
+ *
+ * - A ticket WITH `## Verbatim request` shows the stakeholder's exact words:
+ *   raw `<pre>`, green rule, never reflowed or markdown-rendered. Untouched.
+ * - A LEGACY ticket (no such heading) falls back to its whole body, which on
+ *   the live board means planning documents — `## 0. Headline framing`,
+ *   dependency-order prose, code fences. Labelling that "what you asked for"
+ *   is the same mislabelling T-0729 existed to stop, just arriving via the
+ *   parser's legacy fallback instead of section absorption. So the primary fix
+ *   is the LABEL: say it's the ticket body and that no separate request was
+ *   recorded. Rendering the markdown and collapsing the wall are additions on
+ *   top of the honest label, never substitutes for it.
+ *
+ * Which branch applies is the API's call (`verbatim_is_legacy`, from
+ * `task_body.is_legacy_body`) — the heading rule is not re-implemented here.
+ */
+export function TaskBodyBlock({ task, slug }: { task: Task; slug: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const text = task.verbatim?.trim() ?? "";
+
+  if (!text || !task.verbatim_is_legacy) {
+    return (
+      <pre
+        className="mc-pre"
+        style={{
+          borderLeft: "3px solid var(--mc-accent-success, #4ade80)",
+          paddingLeft: "0.75rem",
+          marginBottom: 0,
+        }}
+      >
+        {text ? task.verbatim : (
+          <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic" }}>
+            (no request recorded)
+          </span>
+        )}
+      </pre>
+    );
+  }
+
+  const collapsible = text.length > LEGACY_BODY_COLLAPSE_CHARS;
+  const collapsed = collapsible && !expanded;
+
+  return (
+    <div>
+      <div
+        className="mc-legacy-body-tag"
+        title="This ticket predates the `## Verbatim request` section, so what you see is its whole body — a working document, not words recorded from you."
+      >
+        ▪ Ticket body — no separate request recorded
+      </div>
+      <div
+        className="mc-legacy-body"
+        style={collapsed ? { maxHeight: "18rem", overflow: "hidden" } : undefined}
+      >
+        <Markdown source={text} slug={slug} />
+        {collapsed && <div className="mc-legacy-body-fade" />}
+      </div>
+      {collapsible && (
+        <button
+          type="button"
+          className="btn btn-sm btn-outline-secondary mt-2"
+          style={{ fontFamily: "var(--mc-mono)", fontSize: "0.7rem" }}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded
+            ? "Collapse body"
+            : `Show full body (${text.length.toLocaleString()} chars)`}
+        </button>
+      )}
+    </div>
+  );
+}
 
 export function TaskDetail() {
   const { slug = "", id = "" } = useParams();
@@ -197,7 +280,15 @@ export function TaskDetail() {
           plain facts now; task mutation happens via the TG dialog (R5).
           ================================================================== */}
       <div className="mc-task-zone mc-zone-header">
-        <div className="mc-zone-tag">▸ User-facing — what you asked for</div>
+        {/* T-0733: the zone tag makes the same claim the body block does, so it
+            has to tell the same truth. A legacy ticket has no recorded ask —
+            calling the zone "what you asked for" is the mislabel arriving via
+            the header instead of the block. */}
+        <div className="mc-zone-tag">
+          {task.verbatim_is_legacy
+            ? "▸ User-facing — the ticket as recorded"
+            : "▸ User-facing — what you asked for"}
+        </div>
 
         {/* Title row — id + title */}
         <div className="d-flex align-items-start gap-2 mb-3">
@@ -312,21 +403,9 @@ export function TaskDetail() {
           );
         })()}
 
-        {/* The ask — verbatim, read-only (T-0674: edit moved to the TG dialog). */}
-        <pre
-          className="mc-pre"
-          style={{
-            borderLeft: "3px solid var(--mc-accent-success, #4ade80)",
-            paddingLeft: "0.75rem",
-            marginBottom: 0,
-          }}
-        >
-          {task.verbatim?.trim() ? task.verbatim : (
-            <span style={{ color: "var(--mc-text-dim)", fontStyle: "italic" }}>
-              (no request recorded)
-            </span>
-          )}
-        </pre>
+        {/* The ask — verbatim, read-only (T-0674: edit moved to the TG dialog).
+            T-0733: legacy-shape tickets get a different label + rendering. */}
+        <TaskBodyBlock task={task} slug={slug} />
       </div>
 
       {/* ==================================================================

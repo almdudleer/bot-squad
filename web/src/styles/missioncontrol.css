@@ -1210,6 +1210,76 @@ pre.mc-pre {
   line-height: 1.6;
   white-space: pre-wrap;
 }
+/* T-0733: LEGACY ticket body — a ticket with no `## Verbatim request` heading,
+   whose whole body is shown via the parser's legacy fallback. This is NOT the
+   stakeholder's ask, so it must not wear the ask's green rule: neutral rail,
+   its own caption, rendered markdown, and a collapse for the 7k–11k-char
+   planning docs that are the live cases. */
+.mc-legacy-body-tag {
+  font-family: var(--mc-mono);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--mc-text-dim);
+  margin-bottom: 0.35rem;
+  cursor: help;
+}
+.mc-legacy-body {
+  position: relative;
+  background-color: var(--mc-surface-raised);
+  color: var(--mc-text-dim);
+  border: 1px solid var(--mc-border);
+  border-left: 3px solid var(--mc-border-strong);
+  border-radius: 4px;
+  padding: 0.875rem 1rem;
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+/* The doc's own heading scale would be 2rem bootstrap headlines inside a task
+   card — bigger than the wall we're fixing. Render structure, not headlines. */
+.mc-legacy-body :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--mc-mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--mc-text);
+  letter-spacing: 0.02em;
+  margin: 0.9rem 0 0.3rem;
+}
+.mc-legacy-body :is(p, li, td, th) { font-size: 0.8rem; }
+.mc-legacy-body pre {
+  background: var(--mc-surface-deep);
+  border: 1px solid var(--mc-border);
+  border-radius: 3px;
+  padding: 0.5rem 0.625rem;
+  font-size: 0.72rem;
+  overflow-x: auto;
+}
+.mc-legacy-body code { font-size: 0.74rem; }
+/* These docs carry GFM tables wider than a phone. Without their own scroller a
+   table is clipped at the block edge and unreachable (the page itself must not
+   scroll sideways). `display: block` makes the table its own scroll container. */
+.mc-legacy-body table {
+  font-size: 0.75rem;
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+/* Long unbroken tokens (paths, ids) wrap instead of pushing the block wide. */
+.mc-legacy-body :is(p, li, h1, h2, h3, h4, h5, h6) { overflow-wrap: anywhere; }
+.mc-legacy-body .mc-markdown > :first-child { margin-top: 0; }
+.mc-legacy-body .mc-markdown > :last-child { margin-bottom: 0; }
+/* Collapsed state: the cut edge fades instead of guillotining a line of text. */
+.mc-legacy-body-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3.5rem;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--mc-surface-raised));
+}
+
 /* Override bootstrap bg-light pre */
 pre.bg-light {
   background-color: var(--mc-surface-raised) !important;

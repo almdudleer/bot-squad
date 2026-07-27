@@ -16,9 +16,11 @@ Body layout (canonical):
     - ...
 
 Legacy bodies without `## Verbatim request` are tolerated: the whole body
-is treated as verbatim and the other sections are empty. Section headings
-are case-insensitive; sections may appear in any order; missing sections
-become empty strings.
+is treated as verbatim and the other sections are empty. `is_legacy_body`
+reports that branch so a consumer can label such text as the ticket body
+rather than as the stakeholder's ask (T-0733). Section headings are
+case-insensitive; sections may appear in any order; missing sections become
+empty strings.
 
 A section ends at the NEXT level-2 heading of any name (T-0729). Non-canonical
 sections an agent added (`## DoD`, `## Observed`, `## Scope`, …) are therefore
@@ -98,6 +100,24 @@ def parse_body(text: str) -> dict[str, str]:
         out[key] = text[start:end].strip()
 
     return out
+
+
+def is_legacy_body(text: str) -> bool:
+    """True when ``text`` has NO ``## Verbatim request`` heading — i.e.
+    :func:`parse_body`'s ``verbatim`` came from the legacy whole-body fallback,
+    not from a recorded request (T-0733).
+
+    Read-only companion to the parser: it changes nothing about how a body is
+    split, it only reports WHICH branch produced ``verbatim`` so consumers can
+    LABEL it honestly. Presenting a legacy planning document (T-0553 is 11k
+    chars of ``## 0. Headline framing`` / dependency-order prose) as "what you
+    asked for" is the same mislabelling T-0729 existed to stop, arriving by a
+    different route.
+
+    Shares :func:`_section_span` with the parser and the write-protection path,
+    so the three can never disagree about what counts as a verbatim heading.
+    """
+    return _section_span(text or "", "verbatim") is None
 
 
 def _section_span(body: str, key: str) -> tuple[int, int] | None:

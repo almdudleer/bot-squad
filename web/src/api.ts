@@ -84,6 +84,11 @@ export type Task = {
   verbatim?: string;
   context?: string;
   progress?: string;
+  // T-0733: true when the ticket has no `## Verbatim request` heading, so
+  // `verbatim` is the whole body via the parser's legacy fallback — a ticket
+  // body, NOT a recorded ask. Label it as such; don't claim it's what the
+  // stakeholder asked for.
+  verbatim_is_legacy?: boolean;
   // Phase 8: int sort key for Kanban ordering. null = unset (sorts last).
   priority?: number | null;
   // T-0038: first-class linkage. `initiative` is a basename under

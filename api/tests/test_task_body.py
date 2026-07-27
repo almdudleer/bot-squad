@@ -6,6 +6,7 @@ import pytest
 from app.task_body import (
     append_progress,
     compose_body,
+    is_legacy_body,
     parse_body,
     regraft_progress,
     regraft_verbatim,
@@ -122,6 +123,47 @@ def test_parse_legacy_body_stops_at_first_canonical_heading():
     out = parse_body(body)
     assert out["verbatim"] == "Legacy ask."
     assert out["progress"] == "- T1 · S1 · note"
+
+
+# ---------------------------------------------------------------------------
+# T-0733 — is_legacy_body: which branch produced `verbatim`, so a consumer can
+# label a whole-body planning doc as the ticket body instead of as the ask.
+
+
+def test_is_legacy_body_true_when_no_verbatim_heading():
+    assert is_legacy_body("The plan.\n\n## Scope\n\n- a\n")
+    assert is_legacy_body("Legacy ask.\n\n## Progress\n\n- T1 · S1 · note\n")
+    assert is_legacy_body("just prose, no headings at all")
+    assert is_legacy_body("")
+    assert is_legacy_body(None)  # type: ignore[arg-type]
+
+
+def test_is_legacy_body_false_for_canonical_and_decorated_headings():
+    assert not is_legacy_body("## Verbatim request\n\nI want X.\n")
+    # Decorated heading — 60 live tickets carry this exact form.
+    assert not is_legacy_body(
+        "## Verbatim request — source of truth (human-only, do not edit)\n\nI want X.\n"
+    )
+    assert not is_legacy_body("## Progress\n\n- x\n\n## verbatim request\n\nask\n")
+
+
+@pytest.mark.parametrize(
+    "body,legacy,verbatim",
+    [
+        # Canonical: verbatim comes from the heading's section.
+        ("## Verbatim request\n\nask\n\n## Progress\n\n- a\n", False, "ask"),
+        # Legacy: verbatim is the leading text (up to the first CANONICAL heading).
+        ("The plan.\n\n## Scope\n\n- a\n", True, "The plan.\n\n## Scope\n\n- a"),
+        ("Legacy ask.\n\n## Context\n\nctx\n", True, "Legacy ask."),
+        ("## DoD\n\n- d\n", True, "## DoD\n\n- d"),
+        ("", True, ""),
+    ],
+)
+def test_is_legacy_body_agrees_with_the_branch_parse_body_took(body, legacy, verbatim):
+    """The flag must never disagree with which branch actually produced
+    `verbatim` — that divergence is exactly what T-0729 cost us."""
+    assert is_legacy_body(body) is legacy
+    assert parse_body(body)["verbatim"] == verbatim
 
 
 def test_parse_h3_is_not_a_boundary():

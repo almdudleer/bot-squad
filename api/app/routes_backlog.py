@@ -20,7 +20,13 @@ from app.markdown_writer import (
 from app.payload_guard import opt_str_field, str_field
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
-from app.task_body import compose_body, parse_body, regraft_progress, regraft_verbatim
+from app.task_body import (
+    compose_body,
+    is_legacy_body,
+    parse_body,
+    regraft_progress,
+    regraft_verbatim,
+)
 from app.worker_client import WorkerClient, WorkerError
 
 log = logging.getLogger(__name__)
@@ -84,12 +90,19 @@ def _validate_task_id(task_id: str) -> None:
 
 
 def _enrich_with_sections(task: dict) -> dict:
-    """Attach parsed body sections to a task dict (in-place + return)."""
+    """Attach parsed body sections to a task dict (in-place + return).
+
+    `verbatim_is_legacy` (T-0733) says WHERE `verbatim` came from: True means
+    the ticket has no `## Verbatim request` heading, so its text is the whole
+    body via the legacy fallback — a planning document, not the stakeholder's
+    recorded words. Consumers must label those two cases differently.
+    """
     body = task.get("body", "") or ""
     sections = parse_body(body)
     task["verbatim"] = sections["verbatim"]
     task["context"] = sections["context"]
     task["progress"] = sections["progress"]
+    task["verbatim_is_legacy"] = is_legacy_body(body)
     return task
 
 

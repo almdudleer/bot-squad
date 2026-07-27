@@ -10,7 +10,7 @@ NOT widened and are out of scope here.
 from __future__ import annotations
 
 from app import routes_backlog, routes_docs
-from app.artifact_nesting import _id_from_stem
+from app.artifact_nesting import id_from_stem
 from app.markdown_writer import _TASK_ID_RE as MW_TASK_ID_RE
 
 
@@ -21,9 +21,19 @@ def test_task_id_re_accepts_5_digits():
     assert not routes_backlog._TASK_ID_RE.match("T-abcd")
 
 
-def test_doc_id_re_accepts_5_digits():
-    assert routes_backlog._DOC_ID_RE.match("D-10000")
-    assert routes_docs._DOC_ID_RE.match("D-99999")
+def test_doc_id_gate_accepts_5_digits():
+    """T-0751 retired both `_DOC_ID_RE` copies; the shape gate replaced them.
+
+    The 5-digit concern survives in the DERIVATION (`id_from_stem` still keeps
+    `\\d{4,}`) — the gate itself no longer restricts digits at all, because a
+    doc id is a filename, not an allocated number.
+    """
+    from app import artifact_nesting as AN
+
+    assert AN.is_valid_artifact_id("D-10000")
+    assert AN.is_valid_artifact_id("D-99999")
+    assert not hasattr(routes_docs, "_DOC_ID_RE")
+    assert not hasattr(routes_backlog, "_DOC_ID_RE")
     assert routes_docs._TASK_ID_RE.match("T-12345")
 
 
@@ -35,5 +45,5 @@ def test_markdown_writer_task_id_captures_5_digits():
 
 
 def test_id_from_stem_canonicalises_5_digit_id():
-    assert _id_from_stem("D-10000-some-slug") == "D-10000"
-    assert _id_from_stem("D-0001-x") == "D-0001"  # 4-digit unchanged
+    assert id_from_stem("D-10000-some-slug") == "D-10000"
+    assert id_from_stem("D-0001-x") == "D-0001"  # 4-digit unchanged

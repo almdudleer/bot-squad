@@ -61,10 +61,42 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
     return meta, m.group(2)
 
 
-def _id_from_stem(stem: str) -> str:
-    """``D-0001-some-slug`` -> ``D-0001``; ``UC-0002`` / ``F-x`` -> unchanged."""
+def id_from_stem(stem: str) -> str:
+    """``D-0001-some-slug`` -> ``D-0001``; ``UC-0002`` / ``F-x`` -> unchanged.
+
+    T-0751 made this THE derivation for docs too. ``routes_docs`` used to carry
+    its own copy (``stem.split("-", 2)[:2]``) which assumed every filename is
+    ``D-NNNN-<slug>``, so ``roadmap/03-docs-artifacts.md`` listed as ``03-docs``
+    — an id no endpoint could resolve. A stem that is not an allocated id IS
+    its own id; that is what makes the list and the detail endpoint agree.
+    """
     m = re.match(r"^([A-Za-z]+-\d{4,})(?:-.*)?$", stem)  # T-0371: ids cross 9999
     return m.group(1) if m else stem
+
+
+#: Longest artifact id we will consider — a filename component's practical cap.
+_MAX_ARTIFACT_ID_BYTES = 255
+
+
+def is_valid_artifact_id(artifact_id: str) -> bool:
+    """The ONE shape gate for a caller-supplied artifact id (T-0751).
+
+    Deliberately NOT a charset whitelist. Ids are DERIVED from filenames by
+    :func:`id_from_stem`, so any charset narrower than "what a filename may
+    hold" re-creates the bug this replaced: a doc the list endpoint advertises
+    and the detail endpoint then 400s. What is excluded is only what can never
+    BE a single filename component — a path separator, a NUL, the two dot
+    entries, empty, or longer than a name a filesystem will store.
+
+    This is defence in depth, not the traversal barrier: :func:`find_doc` never
+    interpolates an id into a path, it compares against ids derived from files
+    it enumerated itself.
+    """
+    if not artifact_id or artifact_id in {".", ".."}:
+        return False
+    if "/" in artifact_id or "\\" in artifact_id or "\x00" in artifact_id:
+        return False
+    return len(artifact_id.encode("utf-8")) <= _MAX_ARTIFACT_ID_BYTES
 
 
 def _ref_for(kind: str, path: Path) -> ArtifactRef:
@@ -77,7 +109,7 @@ def _ref_for(kind: str, path: Path) -> ArtifactRef:
         # stored parent refs disagree with the children/parent endpoints.
         art_id = stem
     else:
-        art_id = str(meta.get("id") or _id_from_stem(stem))
+        art_id = str(meta.get("id") or id_from_stem(stem))
     parent = meta.get("parent_doc_id")
     parent = str(parent).strip() if parent else None
     title = str(meta.get("title") or art_id)
@@ -112,13 +144,41 @@ def ref_for_path(kind: str, path: Path) -> ArtifactRef:
     return _ref_for(kind, path)
 
 
+def iter_docs(project_root: Path) -> Iterator[ArtifactRef]:
+    """Yield every DOC artifact, in the storage layout's own order.
+
+    One level of category dirs, exactly what ``routes_docs.list_docs`` walks —
+    so "listed" and "resolvable" cover the same set of files by construction.
+    """
+    docs = _docs_root(project_root)
+    if not docs.exists():
+        return
+    for cdir in sorted(p for p in docs.iterdir() if p.is_dir()):
+        for f in sorted(cdir.glob("*.md")):
+            yield _ref_for(KIND_DOC, f)
+
+
+def find_doc(project_root: Path, doc_id: str) -> ArtifactRef | None:
+    """Resolve a doc id to its file WITHOUT putting the id in a path (T-0751).
+
+    The old resolver globbed ``docs/*/{doc_id}-*.md`` — a caller-controlled
+    string interpolated into a path pattern, with a ``^D-\\d{4,}$`` regex as the
+    only thing between it and traversal. That same regex is what made 19 listed
+    docs unopenable. Enumerating the tree and comparing DERIVED ids drops both
+    problems at once: the id shape may widen to whatever filenames exist, and no
+    caller string ever reaches the filesystem.
+    """
+    if not is_valid_artifact_id(doc_id):
+        return None
+    for ref in iter_docs(project_root):
+        if ref.id == doc_id:
+            return ref
+    return None
+
+
 def iter_artifacts(project_root: Path) -> Iterator[ArtifactRef]:
     """Yield every artifact across the stores."""
-    docs = _docs_root(project_root)
-    if docs.exists():
-        for cdir in sorted(p for p in docs.iterdir() if p.is_dir()):
-            for f in sorted(cdir.glob("*.md")):
-                yield _ref_for(KIND_DOC, f)
+    yield from iter_docs(project_root)
     fb = _fb_root(project_root)
     if fb.exists():
         for f in sorted(fb.glob("*.md")):

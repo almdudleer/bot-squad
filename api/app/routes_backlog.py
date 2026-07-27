@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app import task_search
+from app import artifact_nesting as AN, task_search
 from app.canonical_status import derive_parent_status
 from app.frontmatter import as_list, parse_or_none
 from app.markdown_parser import ParseError, parse_task
@@ -52,12 +52,11 @@ def _invalid_status_detail(value: object) -> str:
 _TASK_ID_RE = re.compile(r"^T-\d{4,}$")  # T-0371: \d{4,} — ids cross the 9999 ceiling
 
 # T-0038: optional linkage fields settable via PATCH alongside title/status.
-# T-0172: `related_docs` (list of D-NNNN) — the ticket→doc half of the
+# T-0172: `related_docs` (list of doc ids; T-0751: not necessarily D-NNNN) —
+# the ticket→doc half of the
 # bidirectional mention. The doc→ticket half lives in routes_docs link/unlink,
 # which keeps both sides in sync; this key lets the UI edit it directly too.
 _LINKAGE_PATCH_KEYS = frozenset({"initiative", "parent_task", "blocked_by", "related_docs"})
-
-_DOC_ID_RE = re.compile(r"^D-\d{4,}$")  # T-0371
 
 # Permissive — basename of a vision/initiatives/<name> .md file. Empty string
 # allowed (callers must pass null to clear, not empty).
@@ -465,10 +464,14 @@ def patch_task(
             raise HTTPException(status_code=400, detail="blocked_by must be a list of T-NNNN ids")
     if "related_docs" in payload and payload["related_docs"] is not None:
         v = payload["related_docs"]
+        # T-0751: a doc id is whatever `artifact_nesting` derives from a doc
+        # FILENAME, not `D-NNNN`. `POST /docs/{id}/link` writes this same field
+        # for any doc the tree lists (roadmap chapters, gap matrices), so a
+        # D-NNNN-only gate here would 400 a value the link endpoint just wrote.
         if not isinstance(v, list) or not all(
-            isinstance(x, str) and _DOC_ID_RE.match(x) for x in v
+            isinstance(x, str) and AN.is_valid_artifact_id(x) for x in v
         ):
-            raise HTTPException(status_code=400, detail="related_docs must be a list of D-NNNN ids")
+            raise HTTPException(status_code=400, detail="related_docs must be a list of doc ids")
 
     backlog_dir = _backlog_dir(request, slug)
     path = _find_task_file(backlog_dir, task_id)

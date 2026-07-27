@@ -4269,19 +4269,48 @@ def _docs_dir(slug: str) -> Path:
 
 
 def _doc_id_from_stem(stem: str) -> str:
-    """`D-NNNN-<slug>` → `D-NNNN`; bare `D-NNNN` passes through."""
-    parts = stem.split("-", 2)
-    return "-".join(parts[:2]) if len(parts) >= 2 else stem
+    """`D-NNNN-<slug>` → `D-NNNN`; any other stem IS its own id.
+
+    T-0751: this is the third copy of the derivation the api's
+    `artifact_nesting.id_from_stem` owns — scripts/cli cannot import across the
+    api/worker package boundary, so the copy is pinned by
+    `test_bsq_doc_id_derivation.py` instead. The old `split("-", 2)[:2]`
+    assumed every doc filename is `D-NNNN-<slug>`, so `bsq docs list` printed
+    `03-docs` for `roadmap/03-docs-artifacts.md` — an id the API 400'd.
+    """
+    m = re.match(r"^([A-Za-z]+-\d{4,})(?:-.*)?$", stem)  # T-0371: ids cross 9999
+    return m.group(1) if m else stem
+
+
+def _doc_id_is_linkable(doc_id: str) -> bool:
+    """Mirrors the api's `artifact_nesting.is_valid_artifact_id` (T-0751).
+
+    `bsq docs link` used to demand `D-NNNN`, so the 19 docs `bsq docs list`
+    printed with a filename-derived id could not be linked from the CLI at all
+    — while the web's `POST /docs/{id}/link` now accepts them. Excludes only
+    what can never be a filename component.
+    """
+    if not doc_id or doc_id in {".", ".."}:
+        return False
+    if "/" in doc_id or "\\" in doc_id or "\x00" in doc_id:
+        return False
+    return len(doc_id.encode("utf-8")) <= 255
 
 
 def _find_doc_file(slug: str, doc_id: str) -> Path | None:
+    """Resolve a doc id to its file by comparing DERIVED ids (T-0751).
+
+    Was two globs over `*/{doc_id}-*.md` — which only ever matched an
+    allocated id, and interpolated the caller's string into a path pattern.
+    """
     root = _docs_dir(slug)
-    if not root.exists():
+    if not root.exists() or not _doc_id_is_linkable(doc_id):
         return None
-    for f in root.glob(f"*/{doc_id}-*.md"):
-        return f
-    for f in root.glob(f"*/{doc_id}.md"):
-        return f
+    for cdir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for f in sorted(cdir.glob("*.md")):
+            fm = read_frontmatter(f)
+            if (fm.get("id") or _doc_id_from_stem(f.stem)) == doc_id:
+                return f
     return None
 
 
@@ -4346,10 +4375,15 @@ def cmd_doc_list(args) -> None:
 
 def cmd_doc_link(args) -> None:
     slug = resolve_slug()
-    doc_id = args.doc_id.upper()
+    doc_id = args.doc_id
+    # T-0371: ids cross 9999. T-0751: only an ALLOCATED id is case-normalised —
+    # every other doc id is a filename stem (`03-docs-artifacts`,
+    # `verbatim-contract`), and upper-casing those makes them unresolvable.
+    if re.match(r"^[dD]-\d{4,}$", doc_id):
+        doc_id = doc_id.upper()
     ticket = args.ticket.upper()
-    if not re.match(r"^D-\d{4,}$", doc_id):  # T-0371: ids cross 9999
-        die(f"invalid doc id: {doc_id!r} (expect D-NNNN)")
+    if not _doc_id_is_linkable(doc_id):
+        die(f"invalid doc id: {doc_id!r}")
     if not re.match(r"^T-\d{4,}$", ticket):  # T-0371
         die(f"invalid ticket id: {ticket!r} (expect T-NNNN)")
     doc_path = _find_doc_file(slug, doc_id)

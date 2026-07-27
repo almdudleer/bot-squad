@@ -39,7 +39,6 @@ router = APIRouter(
 )
 
 _MAX_CONTENT_BYTES = 200 * 1024
-_DOC_ID_RE = re.compile(r"^D-\d{4,}$")  # T-0371: ids cross 9999
 _CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _TASK_ID_RE = re.compile(r"^T-\d{4,}$")  # T-0371
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)\Z", re.DOTALL)
@@ -76,7 +75,17 @@ def _backlog_dir(request: Request, slug: str) -> Path:
 
 
 def _validate_doc_id(doc_id: str) -> None:
-    if not _DOC_ID_RE.match(doc_id):
+    """Reject an id that could not name a doc file at all (T-0751).
+
+    Was ``^D-\\d{4,}$``, which the LIST endpoint never applied: it advertised
+    ``roadmap/03-docs-artifacts.md`` as ``03-docs`` and this then 400'd it —
+    19 of 74 live docs (26%), across roadmap / design / qa / operator. Both
+    ends now defer to ``artifact_nesting``: :func:`AN.id_from_stem` says what an
+    id IS, :func:`AN.is_valid_artifact_id` says which strings can be one. The
+    traversal guard the old regex doubled as moved into :func:`AN.find_doc`,
+    which resolves by enumerating the tree instead of globbing the id.
+    """
+    if not AN.is_valid_artifact_id(doc_id):
         raise HTTPException(status_code=400, detail=f"invalid doc id: {doc_id!r}")
 
 
@@ -94,10 +103,10 @@ def _parse(path: Path) -> dict:
         if not isinstance(meta, dict):
             meta = {}
         body = m.group(2).lstrip("\n")
-    # The filename stem is `D-NNNN-<slug>`; the id is the `D-NNNN` prefix.
-    stem = path.stem
-    file_id = stem.split("-", 2)[:2]
-    derived_id = "-".join(file_id) if len(file_id) == 2 else stem
+    # T-0751: ONE derivation, shared with the detail endpoint and the
+    # cross-store walk — an allocated `D-NNNN-<slug>` stem yields `D-NNNN`, and
+    # any other stem (`03-docs-artifacts`, `verbatim-contract`) IS its own id.
+    derived_id = AN.id_from_stem(path.stem)
     parent = meta.get("parent_doc_id")
     parent = str(parent).strip() if parent else None
     return {
@@ -114,16 +123,17 @@ def _parse(path: Path) -> dict:
     }
 
 
-def _find_doc(docs_root: Path, doc_id: str) -> Path | None:
-    """Locate ``D-NNNN-*.md`` under any category dir, or None."""
-    if not docs_root.exists():
-        return None
-    for f in docs_root.glob(f"*/{doc_id}-*.md"):
-        return f
-    # tolerate a bare `D-NNNN.md` (no slug suffix)
-    for f in docs_root.glob(f"*/{doc_id}.md"):
-        return f
-    return None
+def _find_doc(project_root: Path, doc_id: str) -> Path | None:
+    """Locate the doc file for ``doc_id`` under any category dir, or None.
+
+    T-0751: delegates to ``artifact_nesting``, which enumerates the tree and
+    compares DERIVED ids rather than globbing ``*/{doc_id}-*.md``. The id never
+    reaches a path, so `..`, separators and glob metacharacters have nothing to
+    act on — and the resolver matches whatever the list endpoint advertises,
+    because both read the same derivation over the same walk.
+    """
+    ref = AN.find_doc(project_root, doc_id)
+    return ref.path if ref is not None else None
 
 
 def _write_frontmatter(path: Path, meta: dict, body: str) -> None:
@@ -176,8 +186,7 @@ def list_categories(slug: str, request: Request) -> list[str]:
 @router.get("/{doc_id}")
 def get_doc(slug: str, doc_id: str, request: Request) -> dict:
     _validate_doc_id(doc_id)
-    root = _docs_dir(request, slug)
-    path = _find_doc(root, doc_id)
+    path = _find_doc(_project_root(request, slug), doc_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
     out = _parse(path)
@@ -286,8 +295,7 @@ def delete_doc(slug: str, doc_id: str, request: Request,
     (no counter rollback, no collision risk).
     """
     _validate_doc_id(doc_id)
-    root = _docs_dir(request, slug)
-    path = _find_doc(root, doc_id)
+    path = _find_doc(_project_root(request, slug), doc_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
 
@@ -333,7 +341,7 @@ def put_doc(slug: str, doc_id: str, request: Request, body: PutDoc,
         raise HTTPException(status_code=400, detail="content must not be empty")
     if len(content.encode("utf-8")) > _MAX_CONTENT_BYTES:
         raise HTTPException(status_code=400, detail="content exceeds 200 KB limit")
-    path = _find_doc(_docs_dir(request, slug), doc_id)
+    path = _find_doc(_project_root(request, slug), doc_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
     tmp = path.with_suffix(".md.tmp")
@@ -377,8 +385,7 @@ def set_doc_parent(slug: str, doc_id: str, request: Request, body: SetParent,
     the doc itself, and must not close a cycle (any depth).
     """
     _validate_doc_id(doc_id)
-    root = _docs_dir(request, slug)
-    doc_path = _find_doc(root, doc_id)
+    doc_path = _find_doc(_project_root(request, slug), doc_id)
     if doc_path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
 
@@ -451,7 +458,7 @@ def link_doc(slug: str, doc_id: str, request: Request, body: LinkBody,
     if not _TASK_ID_RE.match(ticket):
         raise HTTPException(status_code=400, detail=f"invalid ticket id: {ticket!r}")
 
-    doc_path = _find_doc(_docs_dir(request, slug), doc_id)
+    doc_path = _find_doc(_project_root(request, slug), doc_id)
     if doc_path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
     task_path = _find_task_file(_backlog_dir(request, slug), ticket)
@@ -471,7 +478,7 @@ def unlink_doc(slug: str, doc_id: str, ticket: str, request: Request,
     if not _TASK_ID_RE.match(ticket):
         raise HTTPException(status_code=400, detail=f"invalid ticket id: {ticket!r}")
 
-    doc_path = _find_doc(_docs_dir(request, slug), doc_id)
+    doc_path = _find_doc(_project_root(request, slug), doc_id)
     if doc_path is None:
         raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
     _mutate_list_field(doc_path, "related_tickets", ticket, add=False)

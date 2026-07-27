@@ -15,8 +15,8 @@
  */
 import { describe, expect, test } from "vitest";
 
-import { normalizeAutoupdateStatus, type AutoupdateStatus } from "../api";
-import { pickKind, pillLabel } from "./AutoupdatePill";
+import { api, normalizeAutoupdateStatus, type AutoupdateStatus } from "../api";
+import { isAutoupdateUnavailable, pickKind, pillLabel } from "./AutoupdatePill";
 
 const VALID: AutoupdateStatus = {
   installed_version: "1.4.2",
@@ -141,5 +141,69 @@ describe("pillLabel — never throws across the payload categories", () => {
     expect(() => pillLabel(normalizeAutoupdateStatus(missing), now)).not.toThrow();
     expect(() => pillLabel(normalizeAutoupdateStatus(VALID), now)).not.toThrow();
     expect(pillLabel(VALID, now)).toContain("1.4.2");
+  });
+});
+
+/**
+ * T-0731: the pill's mothership gate is BUILD-time (`VITE_MOTHERSHIP`, via the
+ * Shell's tree-shake); the server's is RUNTIME (`MOTHERSHIP=1` → every
+ * /api/autoupdate/* route 404s by design). When a bundle built without the flag
+ * is served by a mothership API — a local `npm run dev` against the live
+ * install, `multiserver_install_docker.sh`'s `--build-arg VITE_MOTHERSHIP=0`, a
+ * stale docker layer — the pill polls a route that 404s every 30s forever.
+ *
+ * These pin the runtime half of the gate: `call()` tags its rejection with the
+ * HTTP status, and only a 404 means "this install has no autoupdate — stop
+ * asking". Everything else stays a transient failure the poll retries.
+ */
+describe("T-0731 — 404 means 'not on this install', not 'retry'", () => {
+  const apiError = (status: number): Error =>
+    new Error(`API error ${status}: nope`);
+
+  test("ONLY 404 latches the poll off — the mothership's by-design answer", () => {
+    expect(isAutoupdateUnavailable(apiError(404))).toBe(true);
+  });
+
+  test("transient failures do NOT latch it off (the poll must keep retrying)", () => {
+    for (const status of [500, 502, 503, 504, 429, 400, 403]) {
+      expect(isAutoupdateUnavailable(apiError(status))).toBe(false);
+    }
+    // A network failure / abort is not a 404 either.
+    expect(isAutoupdateUnavailable(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isAutoupdateUnavailable(undefined)).toBe(false);
+    // A 404 mentioned mid-message is not a 404 status (the decoder anchors).
+    expect(isAutoupdateUnavailable(new Error("API error 500: upstream said 404"))).toBe(
+      false,
+    );
+  });
+
+  test("the real /status rejection is classified as unavailable", async () => {
+    // Drives `call()` end-to-end so the decoder can't drift from the error
+    // shape it decodes — the hand-built fixtures above pin the branches, this
+    // pins that they match reality.
+    const prev = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response("autoupdate not available on mothership", {
+        status: 404,
+      })) as unknown as typeof fetch;
+    try {
+      await expect(api.autoupdateStatus()).rejects.toThrow(/API error 404/);
+      const caught = await api.autoupdateStatus().catch((e: unknown) => e);
+      expect(isAutoupdateUnavailable(caught)).toBe(true);
+    } finally {
+      globalThis.fetch = prev;
+    }
+  });
+
+  test("a 500 from the same route is NOT classified as unavailable", async () => {
+    const prev = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    try {
+      const caught = await api.autoupdateStatus().catch((e: unknown) => e);
+      expect(isAutoupdateUnavailable(caught)).toBe(false);
+    } finally {
+      globalThis.fetch = prev;
+    }
   });
 });

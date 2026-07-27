@@ -239,6 +239,12 @@ def _notify_stakeholder(cfg: Any, slug: str, text: str) -> None:
         chat_id = getattr(project, "tg_chat", "") if project else ""
         _send_stakeholder_dm(
             cfg, message=text, sid="autopilot",
+            # T-0758 follow-up: the unfixed twin of the lifecycle-notice case.
+            # `[autopilot]` says WHAT is speaking but not WHICH PROJECT, and
+            # autopilot is per-project — this alert is about `slug`. Same
+            # unprompted-message reasoning as `task_chat._notify`; renders
+            # `[<slug> autopilot]`.
+            slug=slug,
             tg_chat_id=chat_id,
             tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
             group_record=bool(chat_id),

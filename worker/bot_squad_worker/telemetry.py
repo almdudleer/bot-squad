@@ -667,6 +667,10 @@ def _human_tg(cfg: Any, slug: str, text: str, urgent: bool = True) -> None:
     try:
         _send_stakeholder_dm(
             cfg, message=text, sid="telemetry", urgent=urgent,
+            # T-0758 follow-up: same twin as autopilot — a per-project alert
+            # whose `[telemetry]` label named the class but not the project.
+            # Renders `[<slug> telemetry]`.
+            slug=slug,
             tg_chat_id=chat_id, tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
             group_record=True,
         )

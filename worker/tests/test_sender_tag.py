@@ -232,15 +232,52 @@ def test_split_part_marker_survives_when_no_sender_is_named(cfg, wire) -> None:
 # (c) — what is already identified is left alone
 # ---------------------------------------------------------------------------
 
-def test_lifecycle_notice_is_untouched(cfg, wire) -> None:
-    """Passes on BOTH sources. `task_chat._notify` names no sender, so there is
-    no session to name — this falls out of the identity rule, NOT from
-    matching the 📋 glyph."""
+def test_a_send_that_names_nobody_is_untouched(cfg, wire) -> None:
+    """Passes on BOTH sources. `tg_listener`'s command replies state no
+    identity, so there is nothing to name — this falls out of the identity
+    rule, not from any per-class exemption."""
     TgClient(cfg).send(
         chat_id="404580642", text="📋 T-0746 → closed — сообщение сессии",
         debounce=False,
     )
     assert wire[0]["text"] == "📋 T-0746 → closed — сообщение сессии"
+
+
+def test_system_notice_with_a_declared_project_is_tagged_slug_only(cfg, wire) -> None:
+    """The lifecycle-notice shape (T-0758 follow-up): no session composed it,
+    so `_send_stakeholder_dm` renders the slug alone as the label. The tag
+    names the project and stops short of inventing a role."""
+    TgClient(cfg).send(
+        chat_id="404580642", text="📋 T-0320 → totest — RV pair-trading PoC",
+        sid="watchrobot", debounce=False,
+    )
+    assert wire[0]["text"] == "[watchrobot] 📋 T-0320 → totest — RV pair-trading PoC"
+
+
+def test_the_same_ticket_id_in_two_projects_reads_differently(cfg, wire) -> None:
+    """WHY the notice needed the tag, in one assertion. Operator p298 measured
+    189 of watchrobot's 192 ticket ids also present in bot-squad — so the id in
+    a `📋` notice identifies almost nothing, and both projects deliver into the
+    same supergroup."""
+    client = TgClient(cfg)
+    for slug in ("bot-squad", "watchrobot"):
+        client.send(chat_id="404580642", text="📋 T-0320 → totest", sid=slug,
+                    debounce=False)
+    assert [m["text"] for m in wire] == [
+        "[bot-squad] 📋 T-0320 → totest",
+        "[watchrobot] 📋 T-0320 → totest",
+    ]
+
+
+def test_class_sender_with_a_project_is_combined_not_replaced(cfg, wire) -> None:
+    """The autopilot/telemetry twins. `[autopilot]` answers WHAT is speaking
+    but not WHICH project, and both are per-project alerts — so the project is
+    added rather than the class dropped."""
+    TgClient(cfg).send(
+        chat_id="404580642", text="⚠️ 3 sessions idle > 2h",
+        sid="[watchrobot] autopilot", debounce=False,
+    )
+    assert wire[0]["text"] == "[watchrobot autopilot] ⚠️ 3 sessions idle > 2h"
 
 
 def test_class_sender_keeps_its_own_name(cfg, wire) -> None:

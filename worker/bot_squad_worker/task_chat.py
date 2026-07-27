@@ -207,6 +207,19 @@ def _notify(cfg: Any, slug: str, text: str) -> bool:
         chat_id = getattr(project, "tg_chat", "") if project else ""
         res = _send_stakeholder_dm(
             cfg, message=text, urgent=False, tg_chat_id=chat_id,
+            # T-0758 follow-up: name the PROJECT so the notice carries the
+            # sender tag. It was originally excluded as "already identified" —
+            # it names a ticket — but operator p298 measured the premise and it
+            # is false: 189 of watchrobot's 192 ticket ids also exist in
+            # bot-squad (98%), so "📋 T-0320 → totest" identifies essentially
+            # nothing about WHICH project is talking. Both projects share one
+            # supergroup, and this notice arrives UNPROMPTED, so there is no
+            # surrounding turn to disambiguate it either. The tag is still
+            # applied at the transport; what is stated here is only the
+            # identity — the same division as the API relay's `sender_sid`.
+            # No session composed this, so the label is the slug alone
+            # (`[bot-squad]`): claiming a role would be inventing one.
+            slug=slug,
             # T-0755: `_append_thread` below already records this exact text in
             # the very thread the outbound log would mirror it into, with a
             # better author (`system:task-lifecycle`, which names WHAT spoke

@@ -38,24 +38,48 @@ project, never as the reason to tag.
 
 Which classes get a tag, and why (T-0758 DoD c)
 -----------------------------------------------
-The tag answers **"which session is speaking"**. So it is applied when, and
-only when, the send names a sender — and it is deliberately NOT a shape match
-on any message's text:
+The tag answers **"who is speaking"**. It is applied when, and only when, the
+send NAMES a sender, and it is deliberately never a shape match on the
+message's text — keying on, say, the ``📋`` glyph would fix precisely the one
+class already known about, the anti-pattern T-0746 was rebuilt around.
 
-* **Tagged** — a send that carries a session identity: ``sender_sid`` (the raw
-  SID of the session that composed the text), a ``sid`` display label, or a
-  ``route_sid``. That is every stakeholder-facing message a session produces.
-* **Untagged** — a send that names no sender at all: ``task_chat``'s
-  ``📋 <ticket> → <status>`` lifecycle notices and ``tg_listener``'s
-  interactive command replies. No session composed them, so there is no
-  session to name, and this falls out of the identity rule rather than from
-  matching the ``📋`` glyph. Keying on the glyph would fix precisely the one
-  notice class we already know about — the anti-pattern T-0746 was rebuilt to
-  avoid.
-* **Left as it labels itself** — a class sender like ``voice_intake`` or
-  ``deploy_monitor`` keeps its own name (``[voice_intake] ✅ …``, unchanged).
-  It already says what it is; putting a second bracket in front of it makes
-  the channel noisier, which is the opposite of the ask.
+* **Tagged** — a send that carries an identity. A session: ``sender_sid`` (the
+  raw SID of whoever composed the text), a ``sid`` display label, or a
+  ``route_sid``, resolved to ``[<slug> <role>]``. Or, for something the SYSTEM
+  composed, a caller-declared ``slug``, rendered ``[<slug>]`` — no session
+  wrote it, so claiming a role would be inventing one.
+* **Untagged** — a send that names nobody. ``tg_listener``'s interactive
+  command replies, and any future path that states no identity.
+* **Left as it labels itself** — nothing, once a project is known. A class
+  name is combined with the project rather than replaced by it
+  (``[<slug> autopilot]``), because a class alone answers *what* and not
+  *which project*.
+
+The exclusion list this module shipped with was narrower, and the correction
+is worth keeping because the reasoning generalises. ``📋 <ticket> → <status>``
+was originally left bare as "already identified — it names a ticket". Operator
+p298 then measured it: **189 of watchrobot's 192 ticket ids also exist in
+bot-squad (98%)**, so a ticket id identifies almost nothing about which
+project is talking. The premise was false, not the rule.
+
+What survives the correction is a real line, and it is about the READER, not
+the message class:
+
+    An UNPROMPTED message must name its project. A direct answer to something
+    he just did need not.
+
+``[voice_intake] ✅ got your voice note`` lands seconds after he sent that
+note, in the thread he sent it to; the surrounding turn disambiguates it and a
+project tag is noise. A lifecycle notice, an autopilot alert and a telemetry
+alert arrive out of nowhere into a supergroup that serves both projects, with
+nothing around them to say whose they are. Those now carry the project;
+command replies and the voice echo stay bare.
+
+One case names nobody ON PURPOSE: ``jobs.oauth_refresh``'s failure page picks
+whichever project sorts first purely to get a chat to page into, but an OAuth
+failure breaks every session on the install. Tagging it with that project
+would name the wrong owner, which is worse than naming none — the same call
+T-0724 made for ``autoupdate_apply``.
 
 No double-tagging (T-0758 DoD b)
 ---------------------------------

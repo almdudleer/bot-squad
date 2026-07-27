@@ -67,8 +67,12 @@ class _RecorderDm:
         self.calls: list[dict] = []
 
     def __call__(self, cfg, *, message, urgent=False, tg_chat_id="", **kw):
+        # `slug` is captured (T-0758 follow-up) because it is what makes the
+        # transport stamp the project onto the notice — see the sender-tag test
+        # below. Everything else still lands in `kw` untouched.
         self.calls.append({"message": message, "urgent": urgent,
-                           "tg_chat_id": tg_chat_id})
+                           "tg_chat_id": tg_chat_id, "slug": kw.get("slug", ""),
+                           "kw": kw})
         return {"ok": True, "sent": self.deliver,
                 "channel": "tg" if self.deliver else "tg"}
 
@@ -191,6 +195,23 @@ def test_transition_notifies_once_and_stamps(cfg, backlog, dm):
     # dedupe: unchanged status never re-fires
     out2 = task_chat.lifecycle_tick_one(cfg, "test-project")
     assert out2["transitions"] == 0 and len(dm.calls) == 1
+
+
+def test_lifecycle_notice_declares_its_project(cfg, backlog, dm):
+    """T-0758 follow-up. The notice used to page with no `slug`, so the
+    transport had nothing to build a sender tag from and it went out bare —
+    and `📋 T-0001 → in_progress` does not say WHICH project, because ticket
+    ids are not unique across them (measured: 189 of watchrobot's 192 ids also
+    exist in bot-squad). The tag is still stamped at the transport; this pins
+    only that the caller states the identity the transport needs."""
+    _write_task(backlog, "T-0001", title="Voice ask")
+    task_chat.lifecycle_tick_one(cfg, "test-project")  # baseline
+    _flip(backlog, "T-0001", "in_progress")
+    task_chat.lifecycle_tick_one(cfg, "test-project")
+    assert dm.calls[0]["slug"] == "test-project"
+    # And it stays a RECORD opt-out: `_append_thread` already writes this exact
+    # text into the same thread, so the transport must not mirror it twice.
+    assert dm.calls[0]["kw"]["record_outbound"] is False
 
 
 def test_non_stakeholder_provenance_ignored(cfg, backlog, dm):

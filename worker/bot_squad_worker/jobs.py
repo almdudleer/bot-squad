@@ -884,6 +884,14 @@ def oauth_refresh(cfg: Config) -> None:
             cfg,
             message=f"❌ oauth_refresh FAILED: {detail}",
             sid="oauth_refresh",
+            # T-0758 follow-up: deliberately NOT slug-tagged, unlike the
+            # autopilot/telemetry twins. `slug` here is whichever project
+            # happens to sort first — it is only a source of a chat to page
+            # into. An OAuth failure breaks EVERY session on the install, so
+            # `[bot-squad oauth_refresh]` would name a project that has no more
+            # to do with it than the other one. Same call T-0724 made for
+            # `autoupdate_apply` ("an apply failure is the install's, not any
+            # session's"). Naming nobody is honest; naming the wrong one is not.
             urgent=True,
             tg_chat_id=getattr(project, "tg_chat", "") if project else "",
             tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries") if slug else None,

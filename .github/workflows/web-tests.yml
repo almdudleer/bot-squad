@@ -1,0 +1,55 @@
+# T-0738 tier 2: run the web suite on every push that touches web/.
+#
+# Why this workflow exists
+# ------------------------
+# Until T-0738, `lint` was the only test workflow: four api LINT tests and
+# nothing else. The entire web suite — 557 vitest tests across 49 files — ran
+# only when a session chose to run it by hand before reporting READY. The night
+# of 2026-07-26 makes the case: essentially every defect that reached staging
+# was web-side (T-0714's mothership mirror, T-0726's Context column, T-0733's
+# 390px table overflow, T-0737's raw markdown walls), and every one was caught
+# by a human walkthrough rather than by anything automated.
+#
+# This suite is the cheapest coverage in the repo by a wide margin — measured
+# from a clean checkout in a node:20 container: `npm ci` ~36s, `npm test` 2.6s,
+# 557 passed. Path-filtered to web/** so it stays off the ~35 pushes a day that
+# never touch the frontend.
+#
+# NOT a build check: `npm run build` (tsc -b && vite build) is a separate,
+# slower thing and is not wired here. This is the test suite only.
+name: web-tests
+
+on:
+  push:
+    branches: [master, bot_squad/dev]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-tests.yml"
+  pull_request:
+    paths:
+      - "web/**"
+      - ".github/workflows/web-tests.yml"
+
+jobs:
+  vitest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        # Full repo, not a sparse web/ checkout: web/vite.config.ts aliases
+        # `@install` to ../scripts/install (T-0050), so a web-only tree fails at
+        # collection with "Cannot find module '@install/chat-agent-prompt.txt?raw'".
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install pinned deps
+        # `ci`, not `install` — installs web/package-lock.json exactly. The local
+        # dev tree and the lockfile have drifted before; the lockfile is what CI
+        # must gate on.
+        working-directory: web
+        run: npm ci
+      - name: Run the web suite (vitest)
+        working-directory: web
+        run: npm test

@@ -1,0 +1,117 @@
+# T-0738 tier 3: run the FULL suites once a night, unfiltered.
+#
+# Why nightly and not per-push
+# ----------------------------
+# T-0736's task_body divergence shipped in 5fe547f and survived until a session
+# happened to run the worker suite by hand, hours later, on an unrelated ticket.
+# The fix for that is a bounded detection window, not necessarily an instant
+# one. Per-push these two suites cost ~7k billed Actions minutes/month (the repo
+# is private, so minutes are billed and rounded up per job per run); nightly
+# costs ~330. Nightly caps the "a break lived undetected" window at <24h for
+# EVERY test in the repo at roughly 5% of the per-push price. The cheap
+# invariant gates that belong on every push are in `lint`, and the web suite —
+# 557 tests in under 3s — is per-push in `web-tests`.
+#
+# Web is repeated here deliberately: `web-tests` is path-filtered to web/**, so
+# a worker or api change that breaks the frontend is invisible to it. Nightly is
+# the unfiltered pass, and 3 seconds is not worth optimising away.
+#
+# !! THIS WORKFLOW CANNOT FIRE UNTIL IT EXISTS ON `master` !!
+# GitHub runs `schedule:` and `workflow_dispatch:` only from the copy of the
+# workflow on the repository's DEFAULT branch, which is `master`. `master` is
+# currently 620 commits behind `bot_squad/dev` and carries no `.github/`
+# directory at all, so committing this on the dev branch is necessary but NOT
+# sufficient — it will sit here silently doing nothing, which is exactly the
+# false-confidence failure T-0738 is about. Someone with push rights must
+# cherry-pick this file onto `master` (or the default branch must be changed).
+# Until then, treat the nightly as NOT RUNNING. `push:`-triggered workflows
+# (`lint`, `web-tests`) are unaffected — those use the file from the pushed ref,
+# which is why `lint` works from `bot_squad/dev` today.
+#
+# Every command below was verified green from a clean checkout in a container
+# before being wired (T-0738, 2026-07-27): worker 2466 passed / 114s,
+# api 1149 passed / 294s, web 557 passed / 3s.
+name: nightly-suites
+
+on:
+  schedule:
+    # 02:30 UTC. Off the hour on purpose — GitHub delays scheduled runs that
+    # pile up on :00.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Schedules run from master; the work happens on bot_squad/dev, so
+          # test that branch explicitly rather than 620-commits-stale master.
+          ref: bot_squad/dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system tools the suite shells out to
+        # Measured, not guessed: without these the suite reports 216 failed /
+        # 151 errors, and every one is a FileNotFoundError for one of these
+        # three binaries. git and rsync are on the runner image already; tmux is
+        # installed explicitly rather than assumed.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux rsync git
+      - name: Install the worker package + test deps
+        run: |
+          pip install --upgrade pip
+          pip install -e worker[dev]
+      - name: Run the worker suite
+        run: |
+          pytest worker/tests -q
+
+  api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bot_squad/dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the api package + test deps
+        # NOTE (T-0738): the project convention that "api tests run inside the
+        # bot-squad-api docker image" is a HOST convention — the host has no api
+        # venv. It does not apply to CI, and the image recipe cannot run the
+        # whole suite anyway (its api/-only mount 4-errors at collection on the
+        # tests that reach for scripts/). A plain editable install at the repo
+        # root passes 1149/1149.
+        run: |
+          pip install --upgrade pip
+          pip install -e api[dev]
+      - name: Run the api suite
+        # BUILD_AT_IMPORT=0 keeps `from app.main import build_app` from calling
+        # build_app() at import time, which explodes before pytest can collect.
+        env:
+          BUILD_AT_IMPORT: "0"
+        run: |
+          cd api && pytest -q
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bot_squad/dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install pinned deps
+        working-directory: web
+        run: npm ci
+      - name: Run the web suite (vitest)
+        working-directory: web
+        run: npm test

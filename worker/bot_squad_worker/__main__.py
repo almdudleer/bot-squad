@@ -107,11 +107,15 @@ def main() -> int:
     # fooling the Fork-5/T-0445 auto-restart-skip into leaving stale code live.
     from bot_squad_worker import deploy as _deploy
     _deploy.freeze_boot_git_sha()
-    # T-0739: whatever restart was in flight has landed — this process IS the
-    # result. Clearing here (rather than on a timer) is what keeps the
-    # "restart_pending" health state honest: it lasts exactly as long as the
-    # restart actually takes, and a restart that never lands never clears it.
-    _deploy.clear_restart_inflight(cfg)
+    # T-0744: the in-flight-restart marker is deliberately NOT cleared here.
+    # T-0739 did, reasoning that this process IS the result of whatever restart
+    # was in flight — true, but the API cannot SEE this process until a heartbeat
+    # file lands, and none has been written yet at this point in boot. Clearing
+    # here therefore ended the "restart_pending" state ~60s before the API could
+    # tell the new worker was up, and health spent that gap emitting the bare
+    # sha_drift T-0739 exists to distinguish from it (measured: 62s of a 73s
+    # window). ``jobs.heartbeat`` clears it on its first successful write
+    # instead — the same event the API measures. Do not move it back.
 
     # T-0086 integration check: warn early if mothership flag and prod
     # deploy_targets disagree for bot-squad itself.

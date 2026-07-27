@@ -6,10 +6,23 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import time as _time
 
 from bot_squad_worker.config import Config
 
 log = logging.getLogger(__name__)
+
+# T-0744: the wall-clock moment THIS worker process began (module import happens
+# during boot, before the scheduler exists). It is the cutoff that tells an
+# in-flight-restart marker written BEFORE we started — the restart that produced
+# us, ours to clear once we are observable — from one written by US after we
+# started, for a restart we launched and are about to be SIGTERM-ed by. Never
+# clear the latter: see clear_restart_inflight.
+_PROCESS_STARTED_AT = _time.time()
+# Flipped by the first heartbeat that successfully writes the file. Makes "the
+# marker is cleared at the FIRST successful heartbeat" literal rather than
+# "on every heartbeat, incidentally".
+_inflight_marker_cleared = False
 
 
 def heartbeat(cfg: Config) -> None:
@@ -26,6 +39,16 @@ def heartbeat(cfg: Config) -> None:
     check is unchanged. The sha lookup is guarded: a missing-git edge falls back to
     an empty body rather than losing the heartbeat (liveness must survive). The
     write is atomic (tmp + os.replace) so the API never reads a torn body.
+
+    T-0744: this job also CLEARS the in-flight-restart marker, on its first
+    successful run. The file written here IS the API's view of "the worker is
+    up", so the instant it lands carrying our sha is the instant a restart has
+    demonstrably landed — one step later than T-0739's clear-at-process-start,
+    and the step that matters. The ordering is load-bearing and pinned by test:
+    the clear sits AFTER the write and nowhere else in the worker, so a restart
+    that never comes up never clears anything, its ``expected_by`` lapses, and
+    health reverts to a bare ``sha_drift`` exactly as T-0739 designed. This is
+    not a post-deploy grace period: nothing here is excused by elapsed time.
     """
     import os
 
@@ -40,6 +63,28 @@ def heartbeat(cfg: Config) -> None:
     tmp = cfg.heartbeat_path.with_name(cfg.heartbeat_path.name + ".tmp")
     tmp.write_text(sha + "\n")
     os.replace(tmp, cfg.heartbeat_path)
+    _clear_landed_restart(cfg)
+
+
+def _clear_landed_restart(cfg: Config) -> None:
+    """Retire the in-flight-restart marker now that this process is observable.
+
+    Called ONLY from ``heartbeat``, only after the write succeeded (T-0744). Best
+    effort by design: failing to clear the marker costs at most one ``expected_by``
+    window of a stale "restarting" label, whereas letting an exception escape
+    would cost the heartbeat itself.
+    """
+    global _inflight_marker_cleared
+    if _inflight_marker_cleared:
+        return
+    try:
+        from bot_squad_worker.deploy import clear_restart_inflight
+
+        clear_restart_inflight(cfg, recorded_before=_PROCESS_STARTED_AT)
+    except Exception:
+        log.exception("heartbeat: clearing the in-flight restart marker failed")
+        return
+    _inflight_marker_cleared = True
 
 
 def deploy_monitor(cfg: Config) -> None:

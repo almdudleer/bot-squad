@@ -380,10 +380,12 @@ def _record_restart_inflight(
     to the failure this ticket exists to distinguish it from.
 
     Written by the process that is about to be killed; CLEARED by the process
-    that comes up (``clear_restart_inflight`` at startup). If the restart never
-    lands, nobody clears it — and ``expected_by`` lapses, so health goes back to
-    a bare ``sha_drift``. That is deliberate: a launched-but-failed restart must
-    end up looking like the alarm it is, not like a promise still in progress.
+    that comes up, from its FIRST heartbeat (``clear_restart_inflight``, T-0744 —
+    the heartbeat file is what the API measures, so that is the moment the new
+    worker becomes observable). If the restart never lands, nobody clears it —
+    and ``expected_by`` lapses, so health goes back to a bare ``sha_drift``. That
+    is deliberate: a launched-but-failed restart must end up looking like the
+    alarm it is, not like a promise still in progress.
     """
     marker = _restart_inflight_path(cfg)
     try:
@@ -405,15 +407,41 @@ def _record_restart_inflight(
         )
 
 
-def clear_restart_inflight(cfg: "Config") -> None:
-    """Drop the in-flight marker — called at worker STARTUP (T-0739).
+def clear_restart_inflight(cfg: "Config", *, recorded_before: float | None = None) -> None:
+    """Drop the in-flight marker — called from the FIRST successful heartbeat of
+    a newly-started worker (``jobs.heartbeat``), NOT at process start (T-0744).
 
-    Whatever restart was in flight has now demonstrably landed: this process IS
-    the result. Also clears a marker left by a restart that failed and was later
-    cured by hand, so the next real one starts from a clean slate.
+    T-0739 cleared this in ``__main__`` right after ``freeze_boot_git_sha()``, on
+    the reasoning that "this process IS the result" of whatever restart was in
+    flight. True, but a step too early to be useful: the API's entire notion of
+    "the worker is up" is the heartbeat FILE, and a freshly-started process has
+    not written one yet. Measured on the T-0743 staging deploy, that left 62 of a
+    73-second restart window reporting a bare ``sha_drift`` — the precise false
+    alarm T-0739 exists to prevent. Clearing on the first heartbeat ties the
+    marker's lifetime to the event the API actually measures, which is what
+    T-0739's own docstring already claimed ("lasts exactly as long as the restart
+    actually takes").
+
+    ``recorded_before`` guards the other direction: pass the clearing process's
+    own start time and a marker written AFTER that is left alone. The process
+    that LAUNCHES a restart keeps heartbeating until systemd stops it, and it
+    must never clear the marker it just wrote for itself — that would drop the
+    "a restart was launched and is now OVERDUE" record on a restart that fails to
+    land, i.e. the T-0717 alarm. A missing/corrupt marker reads as ``at=0`` and
+    is removed: it explains nothing to anyone (``restart_pending_state`` skips it
+    too), so leaving it would only strand garbage.
     """
+    marker = _restart_inflight_path(cfg)
+    if recorded_before is not None:
+        try:
+            raw = json.loads(marker.read_text())
+            at = float(raw.get("at") or 0.0) if isinstance(raw, dict) else 0.0
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            at = 0.0
+        if at >= recorded_before:
+            return
     try:
-        _restart_inflight_path(cfg).unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
     except OSError:
         log.exception("deploy.clear_restart_inflight: unlink failed")
 

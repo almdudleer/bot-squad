@@ -2926,7 +2926,7 @@ def test_a_no_scope_skip_records_no_in_flight_window(
     assert d.restart_pending_state(cfg) is None
 
 
-def test_worker_startup_clears_the_in_flight_marker(
+def test_a_landed_restart_clears_the_in_flight_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cleared by the process that comes UP, not on a timer: the pending state
@@ -2944,6 +2944,37 @@ def test_worker_startup_clears_the_in_flight_marker(
     d.clear_restart_inflight(cfg)
     assert d.restart_pending_state(cfg) is None
     d.clear_restart_inflight(cfg)  # idempotent — a cold boot with no marker
+
+
+def test_the_launching_process_never_clears_its_own_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0744's counterweight to moving the clear later.
+
+    The clear now rides the heartbeat — and the process that LAUNCHES a restart
+    keeps heartbeating until systemd stops it. If it cleared the marker it had
+    just written for its own successor, a restart that never lands would lose the
+    "launched at X, now OVERDUE" record — the T-0717 alarm, deleted by the fix
+    meant to protect it. ``recorded_before`` (the caller's own start time) is what
+    stops that: only a marker predating the caller is theirs to clear.
+    """
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    launcher_started_at = time.time() - 600  # a long-running worker...
+    d._record_restart_inflight(              # ...that launches a restart NOW
+        cfg, queue_id="q1", slug=proj.slug, reason="r", target_sha="f" * 40
+    )
+
+    d.clear_restart_inflight(cfg, recorded_before=launcher_started_at)
+    assert d.restart_pending_state(cfg)["state"] == "in_flight", (
+        "the launching process cleared the marker it wrote for its successor"
+    )
+
+    # The successor — started AFTER the marker was written — does clear it.
+    d.clear_restart_inflight(cfg, recorded_before=time.time())
+    assert d.restart_pending_state(cfg) is None
 
 
 def test_the_later_deadline_wins_when_both_markers_exist(

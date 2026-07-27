@@ -88,6 +88,14 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         args=[cfg],
         id="heartbeat",
         replace_existing=True,
+        # T-0744: fire the FIRST heartbeat NOW, not 60s in (apscheduler's default
+        # for an interval trigger is start + interval). The API learns a worker is
+        # up only from this file, so a 60s-late first write meant every restart
+        # looked unconverged for a full extra minute — 62 of the 73 seconds
+        # measured on the T-0743 deploy. It also gates the in-flight marker's
+        # clear, which now rides this job. Idempotent (an atomic overwrite of one
+        # small file), so an extra run at boot costs nothing.
+        next_run_time=datetime.now(timezone.utc),
     )
     # deploy_monitor (T-0212): ONE job PER PROJECT, not a single serial sweep.
     # Previously a lone deploy_monitor job (apscheduler default max_instances=1)

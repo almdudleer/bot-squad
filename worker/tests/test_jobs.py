@@ -172,6 +172,163 @@ def test_heartbeat_falls_back_to_empty_on_sha_error(tmp_config_dir: Path, monkey
 
 
 # ---------------------------------------------------------------------------
+# T-0744: the heartbeat — not process start — is what retires an in-flight
+# restart marker. The API's whole notion of "the worker is up" is this file, so
+# clearing any earlier hands health a window where a SUCCESSFUL restart reports
+# the bare sha_drift that means the opposite (62s of a measured 73s window).
+# ---------------------------------------------------------------------------
+
+
+def _write_inflight(cfg: Config, at: float) -> Path:
+    """Drop an in-flight-restart marker recorded at `at`, as the dying worker would."""
+    import json as _j
+
+    p = cfg.data_dir / "_worker" / "restart_inflight.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_j.dumps({
+        "at": at, "queue_id": "q1", "slug": "test-project",
+        "reason": "worker change", "target_sha": "f" * 40,
+        "expected_by": at + 180,
+    }))
+    return p
+
+
+def _fresh_process(monkeypatch: pytest.MonkeyPatch, started_at: float) -> None:
+    """Pretend this interpreter is a worker that booted at `started_at`.
+
+    Both bits of state are per-PROCESS in production (set once at import); the
+    test suite shares one interpreter, so they have to be reset explicitly.
+    """
+    import bot_squad_worker.jobs as J
+
+    monkeypatch.setattr(J, "_PROCESS_STARTED_AT", started_at)
+    monkeypatch.setattr(J, "_inflight_marker_cleared", False)
+
+
+def test_heartbeat_clears_the_marker_of_the_restart_that_produced_it(
+    tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core boundary move: the marker survives right up to the first
+    heartbeat and is gone the moment that heartbeat lands — so `restart_pending`
+    covers the whole span in which the API still sees the OLD worker."""
+    import bot_squad_worker.deploy as D
+
+    cfg = Config.load(tmp_config_dir)
+    now = time.time()
+    marker = _write_inflight(cfg, at=now - 30)       # written by the dying worker
+    _fresh_process(monkeypatch, started_at=now - 10)  # ...we booted after it
+
+    assert D.restart_pending_state(cfg)["state"] == "in_flight"
+    heartbeat(cfg)
+    assert not marker.exists()
+    assert D.restart_pending_state(cfg) is None
+    heartbeat(cfg)  # idempotent — a steady-state worker with nothing to clear
+
+
+def test_a_failed_heartbeat_write_leaves_the_marker_alone(
+    tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE ORDERING PIN the DoD asks for, at runtime: clearing is not reachable
+    before a heartbeat has actually been written. If the write fails the worker
+    is not observable to the API, so the restart has NOT landed and the marker
+    must survive — and the next heartbeat gets another go at it."""
+    import os
+
+    import bot_squad_worker.deploy as D
+
+    cfg = Config.load(tmp_config_dir)
+    now = time.time()
+    marker = _write_inflight(cfg, at=now - 30)
+    _fresh_process(monkeypatch, started_at=now - 10)
+
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(OSError):
+        heartbeat(cfg)
+    assert marker.exists(), "the marker was cleared without the worker becoming visible"
+    assert D.restart_pending_state(cfg)["state"] == "in_flight"
+
+    monkeypatch.setattr(os, "replace", real_replace)
+    heartbeat(cfg)
+    assert not marker.exists()
+
+
+def test_heartbeat_never_clears_a_marker_this_process_wrote(
+    tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The honest-lifetime guard in the other direction (T-0717's alarm).
+
+    A worker that LAUNCHES a restart writes the marker and then keeps
+    heartbeating until systemd stops it. Those heartbeats must not clear it: if
+    the restart fails to land, the "launched at X and never came up" record is
+    the whole alarm. Only a marker predating this process is ours to retire.
+    """
+    import bot_squad_worker.deploy as D
+
+    cfg = Config.load(tmp_config_dir)
+    now = time.time()
+    _fresh_process(monkeypatch, started_at=now - 600)  # long-running worker...
+    marker = _write_inflight(cfg, at=now)              # ...launches a restart now
+
+    heartbeat(cfg)
+    assert marker.exists()
+    state = D.restart_pending_state(cfg)
+    assert state["state"] == "in_flight" and state["overdue"] is False
+    # ...and once expected_by lapses it is overdue → health reverts to a bare
+    # sha_drift. Nothing here is a blanket post-deploy grace period.
+    _write_inflight(cfg, at=now - 10_000)
+    assert D.restart_pending_state(cfg)["overdue"] is True
+
+
+def test_only_the_heartbeat_may_clear_the_in_flight_marker(
+    tmp_config_dir: Path,
+) -> None:
+    """The ordering pin at the source level, and the one that survives a refactor.
+
+    T-0739 cleared the marker from ``__main__`` at process start, ~60s before the
+    API could see the new worker. The runtime tests above pin the heartbeat path;
+    this pins that no OTHER caller reintroduces an earlier one — a second clear
+    site anywhere in the worker silently restores the bug with nothing red to
+    notice, which is exactly how it survived T-0739 review.
+    """
+    import bot_squad_worker
+
+    pkg = Path(bot_squad_worker.__file__).parent
+    callers = sorted(
+        p.name for p in pkg.glob("*.py")
+        if "clear_restart_inflight(" in p.read_text()
+    )
+    # deploy.py DEFINES it; jobs.py (the heartbeat) is the only caller.
+    assert callers == ["deploy.py", "jobs.py"], (
+        f"unexpected clear_restart_inflight call site(s): {callers}"
+    )
+    assert "clear_restart_inflight" not in (pkg / "__main__.py").read_text()
+
+
+def test_scheduler_fires_the_first_heartbeat_immediately(
+    tmp_config_dir: Path,
+) -> None:
+    """T-0744: apscheduler's interval trigger defaults the first run to
+    start+interval, so the new worker stayed invisible to the API for a full 60s
+    after boot — most of every measured restart window, and (now that the clear
+    rides the heartbeat) it would also hold the marker open that long."""
+    import datetime as _dt
+
+    from bot_squad_worker.scheduler import build_scheduler
+
+    cfg = Config.load(tmp_config_dir)
+    sched = build_scheduler(cfg)
+    hb = next(j for j in sched.get_jobs() if j.id == "heartbeat")
+    # A job the scheduler has not started yet only carries next_run_time when one
+    # was passed explicitly — absent IS the bug (apscheduler would then compute
+    # start+interval, i.e. 60s out) so say so rather than raising AttributeError.
+    first_run = getattr(hb, "next_run_time", None)
+    assert first_run is not None, "heartbeat job has no explicit first run time"
+    lead = (first_run - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+    assert lead < 5, f"first heartbeat is {lead:.0f}s away; must be ~immediate"
+
+
+# ---------------------------------------------------------------------------
 # deploy_monitor tests
 # ---------------------------------------------------------------------------
 

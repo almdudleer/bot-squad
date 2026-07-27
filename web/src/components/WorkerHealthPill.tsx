@@ -23,7 +23,16 @@ import { api, type HealthResponse } from "../api";
  * `sha_drift`/`dead_heartbeat` stays red. Still no green noise: healthy renders
  * nothing at all, and the muted chip disappears the moment the restart lands.
  */
-const POLL_MS = 30_000;
+/**
+ * T-0744: 10s, not the 30s this shipped with. The muted `restart_pending` state
+ * is by construction SHORT — a successful worker restart now converges in the
+ * 12-30s range (measured windows before the fix: 20/60/40/73s), so a 30s poll
+ * could step straight over the window and never render the chip at all. A UI
+ * state that is never observed is not much better than the red one it replaced.
+ * `GET /api/health` is three stats and a small read, and 10s is already the
+ * house cadence for live panels (ResourceCapsPanel, Sessions).
+ */
+const POLL_MS = 10_000;
 
 const FLAG_LABEL: Record<string, string> = {
   dead_heartbeat: "worker down: dead_heartbeat (no recent heartbeat)",

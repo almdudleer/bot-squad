@@ -45,6 +45,7 @@ import {
   utilizationPct,
   utilizationRatio,
 } from "../pages/resourceCaps";
+import { freshTelemetryReading } from "../utils/telemetry";
 
 // T-0282: how often the LIVE readouts (enforced caps + quota) re-fetch. 10s
 // matches the Sessions page's own telemetry cadence (Sessions.tsx) so the strip
@@ -275,8 +276,11 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
           // a 10s poll, writing that through would blank the strip back to its
           // skeleton on every transient blip. An EMPTY object means "no fresh
           // reading", so hold the previous one; only a populated payload wins.
-          const freshCaps = d.caps && Object.keys(d.caps).length > 0 ? d.caps : null;
-          const freshQuota = d.quota && Object.keys(d.quota).length > 0 ? d.quota : null;
+          // T-0726: the rule now lives in utils/telemetry and is shared with
+          // the Sessions Context column, which had hand-rolled the opposite
+          // behaviour off the very same payload.
+          const freshCaps = freshTelemetryReading(d.caps);
+          const freshQuota = freshTelemetryReading(d.quota);
           if (freshCaps) setCaps(freshCaps); // server-wide enforced caps (items 7+22)
           if (freshQuota) setQuota(freshQuota);
         })
@@ -719,8 +723,17 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
           <small
             style={{ display: "block", color: "var(--mc-text-dim)", marginTop: "0.4rem", fontSize: "0.66rem" }}
           >
-            Caps are a <strong>server-wide</strong> policy enforced at spawn-time; restart the
-            worker after saving.{!isAdmin && " Admin-only."} Also editable in{" "}
+            {/* T-0728: this line used to end "…restart the worker after saving." —
+                pre-P2-01 copy left behind when the BE `restart_required` flag became
+                the source of truth. It is FALSE for a caps-only save (caps are
+                fresh-read at each spawn), so the footer contradicted both the Save
+                tooltip and the post-save notice on this same panel, and told the
+                operator to bounce the worker — killing live sessions — after every
+                cap tweak. The restart caveat now lives ONLY in the post-save notice,
+                conditional on that flag; the footer states the standing fact. */}
+            Caps are a <strong>server-wide</strong> policy enforced at spawn-time: each spawn
+            fresh-reads them, so no worker restart is needed.{!isAdmin && " Admin-only."} Also
+            editable in{" "}
             <Link to="/system-settings">System Settings</Link>; the budget anchor lives in
             System Settings <code>[quota]</code>.
           </small>

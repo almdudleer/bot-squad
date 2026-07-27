@@ -20,6 +20,7 @@ import {
   sessionRole,
   sessionRoleLabel,
 } from "../utils/sessionStatus";
+import { contextCeilingOf, keepLastGoodTelemetry } from "../utils/telemetry";
 
 import { PageHelp } from "../components/PageHelp";
 import { PeerInbox } from "../components/PeerInbox";
@@ -157,7 +158,9 @@ function ContextCell({
 // T-0141: role badge keyed off the worker-derived `role` (falls back to the
 // legacy task_id inference for a pre-T-0141 worker). Teamlead = green,
 // operator = amber, dev = blue. T-0197: prod-teamlead = red (prod caution),
-// qa = active/purple. `dim` mutes the badge for archived rows.
+// qa = active/purple. T-0727: user-conversation = magenta (system-spawned
+// user-intake session — must not read as a dev worker).
+// `dim` mutes the badge for archived rows.
 export function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean }) {
   const role = sessionRole(row);
   // T-0220: the worker neutralized an elevated window-derived role on this
@@ -189,7 +192,10 @@ export function RoleBadge({ row, dim = false }: { row: SessionRow; dim?: boolean
           ? "mc-badge mc-badge-danger"
           : role === "qa"
             ? "mc-badge mc-badge-active"
-            : "mc-badge mc-badge-info";
+            // T-0727: user-conversation = magenta, never dev-blue.
+            : role === "user-conversation"
+              ? "mc-badge mc-badge-user"
+              : "mc-badge mc-badge-info";
   return (
     <span className={cls} title={title}>
       {label}
@@ -595,7 +601,17 @@ export function Sessions() {
     const loadTelemetry = () => {
       api
         .telemetry(slug)
-        .then((d) => { if (!cancelled) setTelemetry(d); })
+        .then((d) => {
+          if (cancelled) return;
+          // KEEP-LAST-GOOD (T-0726) — the SAME rule ResourceCapsPanel applies
+          // to caps/quota, shared via utils/telemetry so a third consumer
+          // can't drift again. An empty `sessions` array is the route's
+          // worker-timeout 200, not a reading; writing it through blanked
+          // every row's Context cell and collapsed contextCeiling (the shared
+          // denominator, T-0264) to 0 for up to one 10s tick — one row below a
+          // caps strip still correctly reporting N live sessions.
+          setTelemetry((prev) => keepLastGoodTelemetry(prev, d));
+        })
         .catch(() => { /* silent — cell just shows "—" until next poll */ });
     };
     loadTelemetry();
@@ -609,11 +625,9 @@ export function Sessions() {
   }, [telemetry]);
   // T-0230/T-0264 (carried over): the contract ceiling is tunable and worker-
   // stamped per session — derive the column's shared denominator from the
-  // payload itself rather than hard-coding it.
-  const contextCeiling = useMemo(
-    () => Math.max(0, ...(telemetry?.sessions ?? []).map((s) => s.context?.ceiling ?? 0)),
-    [telemetry],
-  );
+  // payload itself rather than hard-coding it. T-0726 moved the derivation
+  // into utils/telemetry alongside the keep-last-good rule that feeds it.
+  const contextCeiling = useMemo(() => contextCeilingOf(telemetry), [telemetry]);
 
   // Initiative list for grouping/filter. Loaded once per slug; cheap to
   // refetch occasionally but we don't need real-time refreshes here.

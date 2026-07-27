@@ -160,12 +160,18 @@ export function sessionNeedsInput(
 // ---------------------------------------------------------------------------
 // T-0197: prod-teamlead + qa become first-class spawnable roles. Mirror the
 // worker's `_derive_role` enum (operator|prod-teamlead|qa|teamlead|dev).
+// T-0727: …and `user-conversation` (T-0478 / M2 F2.4 — the system-spawned
+// user-intake session, keyed off the `<gu_id>-user-conversation` window
+// marker in sessions.py::_derive_role). This union falling behind the worker
+// enum IS the bug class: a KNOWN role that isn't listed here silently lands in
+// the T-0175 unknown-role fallback below and gets painted as a dev worker.
 export type SessionRoleName =
   | "teamlead"
   | "dev"
   | "operator"
   | "prod-teamlead"
-  | "qa";
+  | "qa"
+  | "user-conversation";
 
 export function sessionRole(
   src: { role?: string | null; task_id?: string | null } | null | undefined,
@@ -177,7 +183,8 @@ export function sessionRole(
     r === "dev" ||
     r === "operator" ||
     r === "prod-teamlead" ||
-    r === "qa"
+    r === "qa" ||
+    r === "user-conversation"
   )
     return r;
   // T-0175: a missing/unknown role defaults to dev, never teamlead. The old
@@ -197,6 +204,11 @@ export function sessionRoleLabel(role: SessionRoleName): string {
       return "Prod-TL";
     case "qa":
       return "QA";
+    // T-0727: distinct from Dev — this is the system-spawned user-facing
+    // intake session, not a dev worker the operator assigned project work to
+    // (it does still burn a parallel slot, sessions.py:2621).
+    case "user-conversation":
+      return "User chat";
     case "dev":
       return "Dev";
   }

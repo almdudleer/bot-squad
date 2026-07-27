@@ -346,7 +346,15 @@ export type SessionRow = {
   // "task-less ⟹ teamlead" inference that leaked nearly every agent-teams
   // dive as a teamlead. Optional so a pre-T-0141 worker doesn't break the
   // contract; the UI falls back to the legacy inference when absent.
-  role?: "teamlead" | "dev" | "operator";
+  // T-0727: deliberately a bare `string`, not a union. This is the WIRE shape —
+  // whatever `sessions.py::_derive_role` emits today, including roles this
+  // bundle predates. A union here was a third copy of that enum (it still read
+  // teamlead|dev|operator, having missed qa, prod-teamlead AND
+  // user-conversation), and it made an unknown role unrepresentable — which is
+  // absurd for the field whose whole point is that it may be unknown. Narrow it
+  // in ONE place: `sessionRole()` (utils/sessionStatus) validates against
+  // SessionRoleName and applies the T-0175 dev fallback.
+  role?: string;
   // T-0220: set true when the worker neutralized an elevated window-derived
   // role on a SUSPENDED row because the persisted cwd didn't match the
   // project (the role above is already the safe "dev" fallback). Lets the UI

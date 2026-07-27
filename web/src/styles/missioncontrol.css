@@ -730,6 +730,16 @@ a.active .mc-nav-diamond {
   color: var(--mc-text-dim);
   background: transparent;
 }
+/* T-0727: the system-spawned user-conversation (user-intake) session. Magenta
+   is the palette's "rare, special markers" hue — deliberately NOT the cyan
+   .mc-badge-info a dev row wears, since the whole bug was these reading as
+   dev workers on the Processes surface. */
+.mc-badge-user {
+  border-color: var(--mc-magenta);
+  border-left-color: var(--mc-magenta);
+  color: var(--mc-magenta);
+  background: rgba(240, 171, 252, 0.06);
+}
 .mc-badge-active {
   border-color: var(--mc-cyan);
   border-left-color: var(--mc-cyan);

@@ -39,6 +39,15 @@ describe("sessionRole", () => {
     expect(sessionRole({ role: "qa", task_id: "~" })).toBe("qa");
   });
 
+  // T-0727: the FE union fell behind the worker enum — `user-conversation`
+  // (T-0478 / M2 F2.4, derived in sessions.py::_derive_role) reached the
+  // unknown-role fallback and every intake session was badged "Dev" on the
+  // Processes surface. This pins the role so that drift can't recur silently.
+  it("recognises the T-0478 user-conversation role", () => {
+    expect(sessionRole({ role: "user-conversation", task_id: "~" })).toBe("user-conversation");
+    expect(sessionRole({ role: "user-conversation", task_id: null })).not.toBe("dev");
+  });
+
   it("handles null/undefined input", () => {
     expect(sessionRole(null)).toBe("dev");
     expect(sessionRole(undefined)).toBe("dev");
@@ -52,6 +61,9 @@ describe("sessionRoleLabel", () => {
     expect(sessionRoleLabel("operator")).toBe("Operator");
     expect(sessionRoleLabel("prod-teamlead")).toBe("Prod-TL");
     expect(sessionRoleLabel("qa")).toBe("QA");
+    // T-0727: distinct from "Dev" — it is a system-spawned user-facing intake
+    // session, not a dev worker the operator can assign.
+    expect(sessionRoleLabel("user-conversation")).toBe("User chat");
   });
 });
 

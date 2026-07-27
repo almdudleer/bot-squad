@@ -161,6 +161,8 @@ class TgClient:
                 route_sid=route_sid, topic_id=topic_id,
                 reply_to_message_id=reply_to_message_id,
             )
+        else:
+            self._note_unspooled()
         if debounce:
             self._record(chat_id=chat_id, sid=sid, text=text)
         return True
@@ -206,6 +208,27 @@ class TgClient:
         except Exception:  # noqa: BLE001 — observability only, never fail the send
             log.exception("tg.send: could not record outbound content for %s",
                           route_sid or sid)
+
+    def _note_unspooled(self) -> None:
+        """T-0759: declare the deliberate opt-out so a silence stays readable.
+
+        ``record_outbound=False`` means this delivery is recorded by its CALLER
+        (in the conversation thread) rather than by the transport, so it leaves
+        a debounce witness and no spool line. The liveness check compares
+        witnesses against sends ACCOUNTED FOR — measured live before this
+        existed, a lifecycle notice at 19:48:55Z against a newest spool record
+        of 18:35:40Z read as 73 minutes of decay while everything was working.
+
+        Contentless by construction (see ``outbound_log.note_unspooled``): an
+        mtime, never a second copy of the message. Non-raising like its
+        siblings — bookkeeping must not fail a delivered send.
+        """
+        try:
+            from bot_squad_worker import outbound_log
+
+            outbound_log.note_unspooled(self._data_dir)
+        except Exception:  # noqa: BLE001 — observability only, never fail the send
+            log.exception("tg.send: could not note an unspooled delivery")
 
     def _record_reply_route(self, *, chat_id: str, data: Any, route_sid: str) -> None:
         """T-0719: pin ``result.message_id`` -> ``route_sid`` so a reply to this

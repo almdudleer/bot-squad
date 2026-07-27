@@ -737,6 +737,31 @@ def outbound_drain_tick(cfg: Config) -> None:
         log.exception("outbound_drain_tick error")
 
 
+def outbound_liveness_tick(cfg: Config) -> None:
+    """T-0759: is the outbound log still recording what we send?
+
+    T-0755's own defect was a recording path that fell out of use unnoticed for
+    a month; a fix that can decay the same way has only reset that clock. Since
+    T-0746 the spool is also load-bearing for CORRECTNESS — ``echo_guard``
+    rung 2 reads it, and it is the only rung that catches a copy-paste or
+    hide-sender forward — so a silent decay re-attributes our own text to the
+    stakeholder with no failing test and nothing announcing it.
+
+    Cheap by construction: a directory scan and two mtimes, no network and no
+    AI, and it announces only on a transition that has HELD (see
+    ``outbound_liveness.PERSIST_S``). 5 minutes because the thing being watched
+    decays over weeks — detection latency here is irrelevant next to the
+    false-alarm cost of watching it twitch. Non-raising; the module already
+    reports its own failure as BLIND rather than as health.
+    """
+    from bot_squad_worker import outbound_liveness as _ol
+
+    try:
+        _ol.tick(cfg)
+    except Exception:
+        log.exception("outbound_liveness_tick error")
+
+
 def autopilot_tick(cfg: Config) -> None:
     """T-0153: per-project autopilot watchdog pass.
 

@@ -2182,6 +2182,31 @@ def _action_scheduler_state(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# outbound_liveness action (T-0759)
+# ---------------------------------------------------------------------------
+
+def _action_outbound_liveness(params: dict[str, Any]) -> dict[str, Any]:
+    """Is the outbound log still recording what we send?
+
+    Takes no params. Returns the full verdict — ``{state, reason, scan,
+    witness, last_accounted_ts, last_send_ts, lag_s, health}``, where ``state``
+    is ok/idle/decayed/blind.
+
+    READ-ONLY, and deliberately NOT the tick: it announces nothing and touches
+    no state file, so an operator can ask the question by hand — which is what
+    p298 did at 12:18 on 2026-07-27 — without perturbing the alarm's own
+    persist window. ``scan`` rides on every answer because a zero from this
+    read is only believable once the read is proven live.
+    """
+    if params:
+        raise ActionError(f"outbound_liveness takes no params, got: {sorted(params)}")
+
+    from bot_squad_worker import outbound_liveness as _ol
+
+    return _ol.check(_get_config())
+
+
+# ---------------------------------------------------------------------------
 # inject_input action (spec #7)
 # ---------------------------------------------------------------------------
 
@@ -4646,6 +4671,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0478 (M2/F2.4): ensure a user-conversation session attends a user.
     "ensure_user_conversation": _action_ensure_user_conversation,
     "scheduler_state": _action_scheduler_state,
+    # T-0759: read-only liveness of the outbound log (ok/idle/decayed/blind).
+    "outbound_liveness": _action_outbound_liveness,
     "inject_input": _action_inject_input,
     # T-0469 (M1/F1.6): multiplexed queue-backed input (coalesce + caption +
     # defer-on-busy). Agents write via `bsq send-input`, not raw send-keys.
@@ -4796,6 +4823,10 @@ ACTION_MODES: dict[str, str] = {
     "spawn_session": "tmux_only",
     "ensure_user_conversation": "tmux_only",
     "scheduler_state": "coordinator_only",
+    # T-0759: reads the SHARED install data dir (one outbound spool + witness
+    # files for the whole install), so a single coordinator read like
+    # telemetry_get — a per-user fan-out would answer the same question N times.
+    "outbound_liveness": "coordinator_only",
     "inject_input": "tmux_only",
     # T-0469: enqueues + delivers to a LOCAL pane (list_panes/compute_sid), same
     # per-user tmux view as inject_input → tmux_only.

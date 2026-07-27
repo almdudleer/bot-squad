@@ -161,3 +161,48 @@ def test_max_record_outbound_false_suppresses_the_record_not_the_send(
         chat_id="42", text="ответ", sid="x", urgent=True,
         record_outbound=False) is True
     assert sent and _spool(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# T-0759: the DECLARED opt-out. `record_outbound=False` used to be invisible —
+# the send left a debounce witness and no trace of why it was not spooled, so a
+# liveness check comparing witnesses against the spool read a healthy lifecycle
+# notice as decay (measured live 2026-07-27: witness 19:48:55Z vs newest spool
+# record 18:35:40Z, a 73-minute "gap" with nothing wrong).
+# ---------------------------------------------------------------------------
+
+def test_tg_opt_out_declares_itself(tmp_path: Path, sent) -> None:
+    assert TG.TgClient(_cfg(tmp_path)).send(
+        chat_id=CHAT, text="ответ", sid="x", urgent=True,
+        record_outbound=False) is True
+
+    marker = OB.unspooled_marker(tmp_path)
+    assert marker.exists()
+    assert marker.read_bytes() == b""  # a timestamp, NOT a second copy of the message
+
+
+def test_max_opt_out_declares_itself(tmp_path: Path, sent) -> None:
+    """The twin — MAX writes its debounce marker unconditionally too, so an
+    undeclared opt-out reads as decay on exactly the install's primary channel."""
+    assert MX.MaxClient(_cfg(tmp_path)).send(
+        chat_id="42", text="ответ", sid="x", urgent=True,
+        record_outbound=False) is True
+
+    assert OB.unspooled_marker(tmp_path).exists()
+
+
+def test_a_recorded_send_declares_no_opt_out(tmp_path: Path, sent) -> None:
+    """The negative guard: if every send touched the marker it would account
+    for its own witness and the alarm could never fire."""
+    TG.TgClient(_cfg(tmp_path)).send(chat_id=CHAT, text="ответ", sid="x", urgent=True)
+
+    assert _spool(tmp_path)
+    assert not OB.unspooled_marker(tmp_path).exists()
+
+
+def test_a_marker_failure_never_breaks_the_send(tmp_path: Path, sent, monkeypatch) -> None:
+    monkeypatch.setattr(OB, "note_unspooled",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert TG.TgClient(_cfg(tmp_path)).send(
+        chat_id=CHAT, text="важное", sid="x", urgent=True,
+        record_outbound=False) is True

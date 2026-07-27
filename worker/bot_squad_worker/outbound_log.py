@@ -366,6 +366,50 @@ def stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# The declared opt-out — "we sent this and deliberately did NOT spool it"
+# ---------------------------------------------------------------------------
+
+def unspooled_marker(data_dir: Any) -> Path:
+    """Path of the marker whose MTIME is the last deliberate non-record.
+
+    See :func:`note_unspooled`.
+    """
+    return spool_dir(data_dir) / ".unspooled"
+
+
+def note_unspooled(data_dir: Any) -> None:
+    """A send landed and ``record_outbound=False`` said not to spool it.
+
+    THIS IS NOT A RECORD OF A MESSAGE, and the distinction is the whole reason
+    it is allowed to exist (T-0759 forbids a second parallel record, correctly).
+    The file is empty; it carries no chat, no sender, no text, and cannot answer
+    what was said. All it holds is an mtime: *when* the transport last delivered
+    something it was told not to spool.
+
+    Why the liveness check cannot work without it, measured on the live install
+    2026-07-27: the newest ``tg_debounce`` witness was 19:48:55Z while the
+    newest spool record was 18:35:40Z. That 73-minute gap is CORRECT — the
+    19:48:55 send was ``task_chat``'s lifecycle notice, which passes
+    ``record_outbound=False`` because it appends the same line to the same
+    thread itself. Without this marker, "a witness newer than the newest spool
+    record" — the obvious discriminator, and the one an operator ran by hand —
+    reads that healthy state as decay and pages a false alarm. With it, the
+    comparison is against sends ACCOUNTED FOR rather than sends spooled.
+
+    A ``touch`` on purpose, not a counter file: it is one syscall with no
+    read-modify-write, so several worker threads can call it concurrently
+    without a lock and without losing an update — the same primitive
+    ``tg._record`` already uses for the debounce witness. Never raises.
+    """
+    try:
+        p = unspooled_marker(data_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.touch()
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a SEND
+        log.exception("outbound_log.note_unspooled failed (data_dir=%s)", data_dir)
+
+
+# ---------------------------------------------------------------------------
 # The drain — spool -> the conversation store, so the transcript interleaves
 # ---------------------------------------------------------------------------
 
@@ -611,22 +655,56 @@ def _epoch_day(ts: float) -> str:
 
 
 def spool_health(data_dir: Any) -> dict:
-    """``{files, undrained, oldest_undrained_age_s, drops}`` — the one call a
-    monitor or a session needs to see the log is actually working."""
+    """``{dir, exists, files, records, last_record_ts, last_unspooled_ts,
+    undrained, oldest_undrained_age_s, drops}`` — the one call a monitor or a
+    session needs to see the log is actually working.
+
+    ``files`` and ``records`` are the POSITIVE CONTROL on this read and are why
+    they are reported even though nothing acts on them directly (T-0759). A
+    caller that hands this the wrong directory — ``…/data/_worker`` instead of
+    ``…/data``, since :func:`spool_dir` appends ``_worker/outbound`` itself —
+    gets a perfectly well-formed answer with every count at zero and no
+    exception raised. That is byte-identical to a genuinely silent install, and
+    it is *most* convincing during a real outage, i.e. exactly when the reader
+    is being trusted. So a zero here is only believable once ``files`` and
+    ``records`` prove the read reached a live store; ``exists`` and ``dir`` say
+    which directory was actually consulted.
+    """
     cursor = _load_cursor(data_dir)
-    files = sorted(spool_dir(data_dir).glob("*.jsonl"))
+    sdir = spool_dir(data_dir)
+    files = sorted(sdir.glob("*.jsonl"))
     undrained = 0
+    records = 0
+    last_ts = ""
     oldest = 0.0
     now = time.time()
     for p in files:
         try:
-            total = sum(1 for line in p.read_text(encoding="utf-8").splitlines()
-                        if line.strip())
+            lines = [line for line in p.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
         except OSError:
             continue
-        pending = max(0, total - cursor.get(p.name, 0))
+        records += len(lines)
+        for line in reversed(lines):
+            try:
+                ts = str(json.loads(line).get("timestamp") or "")
+            except ValueError:
+                continue
+            if ts > last_ts:
+                last_ts = ts
+            break
+        pending = max(0, len(lines) - cursor.get(p.name, 0))
         if pending:
             undrained += pending
             oldest = max(oldest, now - p.stat().st_mtime)
-    return {"files": len(files), "undrained": undrained,
+    marker = unspooled_marker(data_dir)
+    try:
+        last_unspooled = datetime.fromtimestamp(
+            marker.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        last_unspooled = ""
+    return {"dir": str(sdir), "exists": sdir.is_dir(),
+            "files": len(files), "records": records,
+            "last_record_ts": last_ts, "last_unspooled_ts": last_unspooled,
+            "undrained": undrained,
             "oldest_undrained_age_s": int(oldest), "drops": stats()}

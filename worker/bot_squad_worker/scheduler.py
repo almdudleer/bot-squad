@@ -31,6 +31,7 @@ from bot_squad_worker.jobs import (
     input_flush_tick,
     oauth_refresh,
     outbound_drain_tick,
+    outbound_liveness_tick,
     stall_sweep_tick,
     telemetry_tick,
     tg_listener_tick,
@@ -489,6 +490,25 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=30,
         args=[cfg],
         id="outbound_drain",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # outbound_liveness_tick: T-0759 — watch the outbound log for SILENT DECAY.
+    # The tick above records; this one asks whether it still is, by comparing
+    # independent witnesses that a send happened (tg_reply_map, the debounce
+    # markers) against sends the log accounts for. 300s: what it watches decays
+    # over weeks, and it announces only a state that has held, so a tighter
+    # cadence would buy nothing but flap. max_instances=1 + coalesce; the tick
+    # swallows its own errors and the check reports its own blindness rather
+    # than reporting health it cannot see.
+    sched.add_job(
+        outbound_liveness_tick,
+        "interval",
+        seconds=300,
+        args=[cfg],
+        id="outbound_liveness",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

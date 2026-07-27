@@ -137,8 +137,25 @@ class MaxClient:
         )
         if record_outbound:
             self._record_outbound(chat_id=chat_id, text=full_text, sid=sid)
+        else:
+            self._note_unspooled()
         self._record(chat_id=chat_id, sid=sid, text=text)
         return True
+
+    def _note_unspooled(self) -> None:
+        """T-0759: the TG twin — declare the deliberate opt-out.
+
+        MAX writes its own debounce marker unconditionally (below), so an
+        opt-out send leaves a witness here exactly as it does on TG, and the
+        liveness check would read that unexplained witness as decay. Same
+        contentless mtime, same non-raising contract.
+        """
+        try:
+            from bot_squad_worker import outbound_log
+
+            outbound_log.note_unspooled(self._data_dir)
+        except Exception:  # noqa: BLE001 — observability only, never fail the send
+            log.exception("max.send: could not note an unspooled delivery")
 
     def _record_outbound(self, *, chat_id: str, text: str, sid: str) -> None:
         """T-0755: record WHAT was delivered on MAX — the TG twin of

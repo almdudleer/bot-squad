@@ -384,3 +384,48 @@ def test_read_spool_is_the_lookup_that_needs_no_routing(tmp_path: Path) -> None:
               timestamp="2026-07-27T05:01:02Z")
     got = OB.read_spool(tmp_path, since="2026-07-27T04:47:00Z", chat_id=CHAT)
     assert [r["text"] for r in got] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# T-0759: the read has to prove itself
+# ---------------------------------------------------------------------------
+
+def test_spool_health_carries_the_proof_that_the_read_was_live(tmp_path: Path) -> None:
+    """``files``/``records``/``dir``/``exists`` are the positive control.
+
+    Measured on the live install 2026-07-27: ``read_spool(<data>)`` returned 21
+    records and ``read_spool(<data>/_worker)`` returned 0 — silently, no
+    exception, because ``spool_dir`` appends ``_worker/outbound`` itself. A
+    monitor built on the wrong argument reports "no sends" forever, and does it
+    most convincingly during a real outage. So a zero is only believable once
+    these say the read reached a live store.
+    """
+    OB.record(tmp_path, channel="tg", chat_id=CHAT, text="письмо", route_sid=SID)
+
+    good = OB.spool_health(tmp_path)
+    assert good["exists"] is True
+    assert (good["files"], good["records"]) == (1, 1)
+    assert good["last_record_ts"]
+
+    blind = OB.spool_health(tmp_path / "_worker")
+    assert blind["exists"] is False
+    assert (blind["files"], blind["records"]) == (0, 0)
+    assert blind["dir"].endswith("_worker/_worker/outbound")
+
+
+def test_note_unspooled_is_a_timestamp_not_a_record(tmp_path: Path) -> None:
+    """It exists so a liveness check can tell "we did not send" from "we sent
+    and did not record". It must never become a second copy of the message —
+    that is the parallel record T-0759 explicitly forbids."""
+    OB.note_unspooled(tmp_path)
+
+    marker = OB.unspooled_marker(tmp_path)
+    assert marker.exists() and marker.read_bytes() == b""
+    assert OB.spool_health(tmp_path)["last_unspooled_ts"]
+    assert OB.spool_health(tmp_path)["records"] == 0  # not a spool line
+
+
+def test_note_unspooled_never_raises(tmp_path: Path) -> None:
+    """Called from the send path; a bookkeeping failure must not fail a
+    delivered message."""
+    OB.note_unspooled(tmp_path / "nope" / "\0bad")

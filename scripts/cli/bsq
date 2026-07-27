@@ -3886,8 +3886,15 @@ def cmd_task_digest(args) -> None:
 
 def cmd_doc_new(args) -> None:
     slug = resolve_slug()
-    res = post("doc_new", {"slug": slug, "category": args.category, "title": args.title})
-    print(f"{res['id']}  ({res['category']})  ->  {res['file_path']}")
+    payload = {"slug": slug, "category": args.category, "title": args.title}
+    # T-0290 (a): nest under a mother artifact. Only sent when given, so the
+    # worker's optional-param contract stays "absent == root doc".
+    if args.parent:
+        payload["parent_doc_id"] = args.parent
+    res = post("doc_new", payload)
+    parent = res.get("parent_doc_id")
+    suffix = f"  (under {parent})" if parent else ""
+    print(f"{res['id']}  ({res['category']})  ->  {res['file_path']}{suffix}")
 
 
 def _docs_dir(slug: str) -> Path:
@@ -4641,6 +4648,9 @@ def build_parser() -> argparse.ArgumentParser:
     dnn = dn_sub.add_parser("new", help="allocate the next D-NNNN + write a stub doc")
     dnn.add_argument("category", help="doc category, e.g. architecture/design/support/runbook/product")
     dnn.add_argument("title", help="single-line doc title")
+    dnn.add_argument(
+        "--parent",
+        help="mother artifact to nest the new doc under — a D-NNNN doc or a feedback file stem (cross-store, T-0283); must already exist")
     dnn.set_defaults(func=cmd_doc_new)
     dnl = dn_sub.add_parser("list", help="list this project's docs (optionally by category)")
     dnl.add_argument("--category", help="filter to a single category")

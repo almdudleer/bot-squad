@@ -3034,6 +3034,144 @@ def test_doc_new_allocates_and_writes_stub(tmp_path, tmp_config_dir, monkeypatch
     assert (proj / "_counters" / "doc.txt").read_text().strip() == "1"
 
 
+def test_doc_new_nests_under_an_existing_parent(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0290 (a): `bsq doc new` can author the nested tree the web API could.
+
+    The gap was one missing key: `_DOC_NEW_ALLOWED` omitted `parent_doc_id`, so
+    the agent path could only ever create ROOT docs while `POST /docs` accepted
+    a mother. Both paths now write the same frontmatter field.
+    """
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    mother = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Mother doc",
+    })
+    assert mother["parent_doc_id"] is None                      # a root doc stays root
+    assert "parent_doc_id" not in Path(mother["file_path"]).read_text()
+
+    child = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Child doc",
+        "parent_doc_id": mother["id"],
+    })
+    assert child["parent_doc_id"] == mother["id"]
+    assert f"parent_doc_id: {mother['id']}" in Path(child["file_path"]).read_text()
+
+
+def test_doc_new_child_is_visible_to_the_web_apis_nesting_view(
+    tmp_path, tmp_config_dir, monkeypatch
+):
+    """The edge an agent writes is the edge the web docs tree reads.
+
+    Both sides resolve parent/child through `artifact_nesting`, which is a
+    declared MIRROR pair (worker ⇄ api, see test_module_mirrors.MIRRORS) — so
+    this asserts the point of the mirror: a CLI-created child shows up under
+    its mother in exactly the view `GET /docs/<id>/children` serves.
+    """
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import artifact_nesting as AN
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    mother = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Mother doc",
+    })
+    child = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "design", "title": "Child doc",
+        "parent_doc_id": mother["id"],
+    })
+
+    kids = AN.children_of(proj, mother["id"])
+    assert [k["id"] for k in kids] == [child["id"]]
+    assert kids[0]["parent_doc_id"] == mother["id"]
+
+
+def test_doc_new_rejects_an_unknown_parent_without_burning_an_id(
+    tmp_path, tmp_config_dir, monkeypatch
+):
+    """Same rule as routes_docs.create_doc: the mother must already exist.
+
+    The id allocation happens AFTER the check, so a rejected create leaves the
+    monotonic counter where it was — a typo'd parent doesn't punch a hole in
+    the D-NNNN sequence.
+    """
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Mother doc",
+    })
+    counter = proj / "_counters" / "doc.txt"
+    before = counter.read_text().strip()
+
+    with pytest.raises(ActionError, match="parent artifact not found"):
+        A.dispatch("doc_new", {
+            "slug": "test-project", "category": "architecture", "title": "Orphan",
+            "parent_doc_id": "D-9999",
+        })
+    assert counter.read_text().strip() == before
+
+
+def test_doc_new_cannot_self_parent_or_close_a_cycle(tmp_path, tmp_config_dir, monkeypatch):
+    """The DoD's cycle clause, and why no cycle WALK is needed on create.
+
+    A doc being created has no id yet, so naming the id it is about to receive
+    (or any id that doesn't exist) is rejected by the same existence check. A
+    fresh child cannot be an ancestor of anything, so no loop can be closed.
+    """
+    import bot_squad_worker.actions as A
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Mother doc",
+    })
+    next_id = "D-%04d" % (int((proj / "_counters" / "doc.txt").read_text().strip()) + 1)
+
+    with pytest.raises(ActionError, match="parent artifact not found"):
+        A.dispatch("doc_new", {
+            "slug": "test-project", "category": "architecture", "title": "Self parent",
+            "parent_doc_id": next_id,
+        })
+
+
+def test_doc_new_parent_may_live_in_another_store(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0283 cross-store nesting: a doc may hang off a FEEDBACK artifact."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import artifact_nesting as AN
+
+    proj = _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    fb_dir = proj / "feedback"
+    fb_dir.mkdir(parents=True)
+    (fb_dir / "F-2026-07-27-docs-tree.md").write_text(
+        "---\nid: F-2026-07-27-docs-tree\ntitle: \"tree gripe\"\n---\n\nbody\n"
+    )
+
+    child = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Answer doc",
+        "parent_doc_id": "F-2026-07-27-docs-tree",
+    })
+    assert child["parent_doc_id"] == "F-2026-07-27-docs-tree"
+    kids = AN.children_of(proj, "F-2026-07-27-docs-tree")
+    assert [k["id"] for k in kids] == [child["id"]]
+
+
+def test_doc_new_blank_parent_is_the_same_as_none(tmp_path, tmp_config_dir, monkeypatch):
+    """A caller passing an empty/whitespace parent gets a ROOT doc, not a 404.
+
+    Mirrors the web API, where `(body.parent_doc_id or "").strip() or None`
+    makes an empty string mean "no mother" — a CLI flag defaulting to "" must
+    not become an unfindable parent id.
+    """
+    import bot_squad_worker.actions as A
+
+    _setup_entity_new(tmp_path, tmp_config_dir, monkeypatch)
+    out = A.dispatch("doc_new", {
+        "slug": "test-project", "category": "architecture", "title": "Root doc",
+        "parent_doc_id": "   ",
+    })
+    assert out["parent_doc_id"] is None
+    assert "parent_doc_id" not in Path(out["file_path"]).read_text()
+
+
 def test_doc_new_rejects_bad_category(tmp_path, tmp_config_dir, monkeypatch):
     import bot_squad_worker.actions as A
 

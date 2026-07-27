@@ -3426,14 +3426,20 @@ def _now_iso() -> str:
 
 
 _DOC_NEW_REQUIRED = {"slug", "category", "title"}
-_DOC_NEW_ALLOWED = _DOC_NEW_REQUIRED
+# T-0290 (a): `parent_doc_id` was the one thing the web create accepted and the
+# agent path did not, so `bsq doc new` could not author the nested tree the UI
+# renders. Optional — a doc with no parent is still a root doc.
+_DOC_NEW_ALLOWED = _DOC_NEW_REQUIRED | {"parent_doc_id"}
 
 
 def _action_doc_new(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate the next D-NNNN id and write a stub doc md (composes T-0172).
 
     Required params: slug, category, title
-    Returns: {ok, id, file_path, category}
+    Optional: parent_doc_id (T-0290) — the mother artifact the new doc nests
+      under. Cross-store (T-0283): any artifact ``artifact_nesting`` walks, so
+      a D-NNNN doc or a feedback file stem.
+    Returns: {ok, id, file_path, category, parent_doc_id}
 
     Storage: ``data/<slug>/docs/<category>/D-NNNN-<slug>.md``. Category must be
     a safe dir token (lowercase, ``[a-z0-9_-]``); the T-0172 docs system gives
@@ -3449,22 +3455,43 @@ def _action_doc_new(params: dict[str, Any]) -> dict[str, Any]:
         )
     title = _require_str(params, "title", "doc_new")
 
+    # T-0290 (a): the parent must already EXIST, and may live in any store —
+    # the same rule routes_docs.create_doc applies, decided by the same
+    # cross-store resolver (artifact_nesting is a declared mirror pair, so the
+    # two paths cannot drift into disagreeing about what a valid parent is).
+    #
+    # That existence check IS the self-parent/cycle rejection: the child's id
+    # is allocated BELOW, after the check, so a doc being created cannot name
+    # itself (its id does not exist yet) and cannot close a loop (every
+    # ancestor of an existing parent predates it).
+    parent_doc_id = params.get("parent_doc_id")
+    parent_doc_id = (str(parent_doc_id).strip() or None) if parent_doc_id is not None else None
+    if parent_doc_id is not None:
+        from bot_squad_worker import artifact_nesting
+
+        if artifact_nesting.find_artifact(cfg.data_dir / slug, parent_doc_id) is None:
+            raise ActionError(f"doc_new: parent artifact not found: {parent_doc_id!r}")
+
     docs_dir = cfg.data_dir / slug / "docs" / category
     docs_dir.mkdir(parents=True, exist_ok=True)
     new_id = idalloc.allocate_id(cfg.data_dir, slug, "doc")
     file_path = docs_dir / f"{new_id}-{_slugify_title(title)}.md"
 
-    fm = "\n".join([
+    fm_lines = [
         f"id: {new_id}",
         f"title: {_yaml_quote(title)}",
         f"category: {category}",
         "status: draft",
         f"created: {_now_iso()}",
         "related_tickets: []",
-    ])
+    ]
+    if parent_doc_id is not None:
+        fm_lines.append(f"parent_doc_id: {parent_doc_id}")
+    fm = "\n".join(fm_lines)
     content = f"---\n{fm}\n---\n\n# {title}\n\n(filed via doc_new — T-0172 docs system)\n"
     _atomic_write_new(file_path, content)
-    return {"ok": True, "id": new_id, "file_path": str(file_path), "category": category}
+    return {"ok": True, "id": new_id, "file_path": str(file_path), "category": category,
+            "parent_doc_id": parent_doc_id}
 
 
 _INITIATIVE_NEW_REQUIRED = {"slug", "name"}

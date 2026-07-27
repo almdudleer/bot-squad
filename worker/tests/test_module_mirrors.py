@@ -104,6 +104,13 @@ MIRRORS: tuple[Mirror, ...] = (
         why="old-initiative-ref resolution (T-0480) — a split resolves an agent read and a web read to different tasks",
     ),
     Mirror(
+        name="artifact_nesting",
+        left="worker/bot_squad_worker/artifact_nesting.py",
+        right="api/app/artifact_nesting.py",
+        split_marker=None,
+        why="cross-store parent/child resolution (T-0283) — T-0290 gave `bsq doc new` a parent, and a split lets the CLI accept a parent the web says does not exist",
+    ),
+    Mirror(
         name="task_search",
         left="scripts/cli/task_search.py",
         right="worker/bot_squad_worker/task_search.py",

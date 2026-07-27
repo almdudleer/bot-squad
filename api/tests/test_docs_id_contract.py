@@ -329,3 +329,47 @@ def test_artifact_id_shape_gate(candidate, ok):
     narrower charset re-creates this ticket for the next unusual filename.
     """
     assert AN.is_valid_artifact_id(candidate) is ok
+
+
+# ---------------------------------------------------------------------------
+# 4. T-0756 — the list endpoint ships the STEM the id was derived FROM
+# ---------------------------------------------------------------------------
+def test_listed_doc_carries_its_filename_stem(tmp_bot_squad: Path, monkeypatch):
+    """Doc bodies cross-link by relative FILENAME; ids are what the app routes on.
+
+    Something has to bridge the two, and `id_from_stem` is a python function
+    the web bundle cannot call. Re-implementing it in TypeScript would be the
+    second copy this whole module exists to prevent (T-0751 deleted three), so
+    the list endpoint ships the stem instead and the renderer resolves by
+    LOOKUP. That makes this field load-bearing for T-0756, not decoration:
+    without it a link to `D-0057-t-0637-….md` cannot find `D-0057`.
+    """
+    _seed_live_shapes(tmp_bot_squad)
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        listed = client.get("/api/projects/test-project/docs").json()
+
+    by_stem = {d["stem"]: d for d in listed}
+    assert len(by_stem) == len(listed), "stems must be unique per listing"
+    for category, stem, expected_id in LIVE_SHAPES:
+        row = by_stem[stem]
+        assert row["category"] == category
+        # The pair is the contract: this id came from THIS stem, by the one
+        # shared derivation. A consumer joining on stem lands on the same doc
+        # the detail endpoint would serve.
+        assert row["id"] == expected_id == AN.id_from_stem(stem)
+
+
+def test_every_listed_stem_resolves_through_its_id(tmp_bot_squad: Path, monkeypatch):
+    """Stated as a property: stem -> id -> GET is a 200 for every doc.
+
+    This is the round trip the renderer performs on every relative `.md` link.
+    """
+    _seed_live_shapes(tmp_bot_squad)
+    with _client(tmp_bot_squad, monkeypatch) as client:
+        _login(client)
+        listed = client.get("/api/projects/test-project/docs").json()
+        for row in listed:
+            resolved = AN.id_from_stem(row["stem"])
+            assert resolved == row["id"]
+            assert client.get(f"/api/projects/test-project/docs/{resolved}").status_code == 200

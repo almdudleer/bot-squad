@@ -167,6 +167,16 @@ def list_docs(slug: str, request: Request, category: str | None = None) -> list[
                 "related_tickets": d.get("related_tickets", []),
                 # T-0234: nesting key so the UI can build the doc tree.
                 "parent_doc_id": d.get("parent_doc_id"),
+                # T-0756: the FILENAME stem, alongside the id derived from it.
+                # Doc bodies link to each other by relative filename
+                # (`01-sessions-task-manager.md`) because that is what makes
+                # them readable in an editor and on GitHub. The renderer has to
+                # turn that filename into a doc id — and `id_from_stem` is a
+                # PYTHON function it cannot call. Shipping the stem lets the web
+                # side resolve by LOOKUP instead of re-deriving the rule in
+                # TypeScript, which is how T-0751's bug (two copies of one
+                # derivation, quietly disagreeing) got made in the first place.
+                "stem": f.stem,
             })
     return out
 

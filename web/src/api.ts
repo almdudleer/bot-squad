@@ -301,6 +301,12 @@ export type DocSummary = {
   parent_doc_id?: string | null;
   // T-0283: kind discriminator for the cross-store tree (defaults to "doc").
   kind?: ArtifactKind;
+  // T-0756: the doc's FILENAME stem, next to the id the BE derived from it
+  // (`artifact_nesting.id_from_stem`). Doc bodies cross-link by relative
+  // filename; this is what lets the renderer resolve one by LOOKUP instead of
+  // re-deriving a python rule in TypeScript. Optional — a pre-T-0756 backend
+  // omits it and `buildDocIndex` falls back to the id.
+  stem?: string;
 };
 export type DocDetail = {
   id: string;

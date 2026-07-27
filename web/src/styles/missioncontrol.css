@@ -1258,23 +1258,55 @@ pre.mc-pre {
   border-radius: 3px;
   padding: 0.5rem 0.625rem;
   font-size: 0.72rem;
-  overflow-x: auto;
 }
 .mc-md-body code { font-size: 0.74rem; }
-/* These docs carry GFM tables wider than a phone. Without their own scroller a
-   table is clipped at the block edge and unreachable (the page itself must not
-   scroll sideways). `display: block` makes the table its own scroll container. */
-.mc-md-body table {
-  font-size: 0.75rem;
+.mc-md-body table { font-size: 0.75rem; }
+.mc-md-body .mc-markdown > :first-child { margin-top: 0; }
+.mc-md-body .mc-markdown > :last-child { margin-bottom: 0; }
+
+/* ---- Markdown CONTAINMENT (T-0757) -----------------------------
+   These rules used to sit on `.mc-md-body` — the collapsible WRAPPER, which
+   only Vision and TaskDetail use. The three surfaces that render `<Markdown>`
+   directly (Docs, Feedback, the observability operator-state panel) got none
+   of it, so on Docs a 352px GFM table escaped a 102px content pane at 390px
+   with the page itself reporting zero overflow (T-0757). Containment belongs to
+   the RENDERER's own root, not to one caller's wrapper: put it here and every
+   surface that ever renders a stored body inherits it — which is also the
+   answer the Sessions view already ships (a wide table scrolls itself; the page
+   does not). One answer per app.
+   Sizing/typography stays on `.mc-md-body` above: that IS a per-caller
+   judgement (a doc reads at its own scale; a ticket body must not shout). */
+.mc-markdown { max-width: 100%; }
+/* Wider-than-the-pane blocks scroll INSIDE themselves. `display: block` is what
+   makes a <table> an actual scroll container — an unmodified table ignores
+   overflow-x and simply overhangs its parent. */
+.mc-markdown table {
   display: block;
   width: max-content;
   max-width: 100%;
   overflow-x: auto;
 }
-/* Long unbroken tokens (paths, ids) wrap instead of pushing the block wide. */
-.mc-md-body :is(p, li, h1, h2, h3, h4, h5, h6) { overflow-wrap: anywhere; }
-.mc-md-body .mc-markdown > :first-child { margin-top: 0; }
-.mc-md-body .mc-markdown > :last-child { margin-bottom: 0; }
+.mc-markdown pre { max-width: 100%; overflow-x: auto; }
+.mc-markdown :is(img, video) { max-width: 100%; height: auto; }
+/* Long unbroken tokens (paths, ids, URLs) wrap instead of pushing the block
+   wide. A scroll container alone would not save these: they'd widen the pane's
+   own content box before any child ever got a scrollbar. */
+.mc-markdown :is(p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote) {
+  overflow-wrap: anywhere;
+}
+
+/* T-0756: a relative cross-doc link with no document behind it. It must be
+   visibly dead — the defect this replaces was a link that silently navigated
+   to the project board, which is worse than a 404 precisely because it looks
+   like it worked. */
+.mc-doclink-broken {
+  color: var(--mc-text-dim);
+  text-decoration: line-through;
+  text-decoration-color: var(--mc-red);
+  cursor: help;
+}
+/* Index not loaded yet — inert, but not accused of being broken. */
+.mc-doclink-pending { color: var(--mc-text-dim); }
 /* Collapsed state: the cut edge fades instead of guillotining a line of text. */
 .mc-md-body-fade {
   position: absolute;
@@ -1922,6 +1954,44 @@ hr { border-color: var(--mc-border); opacity: 1; }
 .bg-dark  { background-color: var(--mc-surface-deep) !important; }
 .text-light { color: var(--mc-text) !important; }
 
+/* ---- Docs & Artifacts: rail + detail row (T-0757) ---------
+   Was a bare bootstrap `d-flex gap-4` with the rail pinned at
+   `flex: 0 0 240px`. That row NEVER stacks, so at 390px the rail kept 264 of
+   366 available px and the content pane — the point of the page — got 102px.
+   The h1 wrapped one word per line and a 352px table escaped the pane, while
+   the PAGE reported zero overflow, which is why every page-level responsive
+   check passed on it. The narrow behaviour now lives in the media query below,
+   next to the app shell's own collapse, instead of in inline styles that no
+   breakpoint can reach. */
+.mc-docs-layout {
+  display: flex;
+  gap: 1.5rem;
+}
+.mc-docs-rail {
+  flex: 0 0 240px;
+  min-width: 240px;
+}
+/* `min-width: 0` is what lets a flex child be NARROWER than its content — the
+   detail pane must be allowed to shrink and let its own children scroll. */
+.mc-docs-detail {
+  flex: 1;
+  min-width: 0;
+}
+/* Narrow-only control; the media query turns it on. */
+.mc-docs-rail-toggle {
+  display: none;
+  width: 100%;
+  text-align: left;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border-strong);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.5rem;
+  color: var(--mc-amber);
+  font-family: var(--mc-mono);
+  font-size: 0.72rem;
+}
+
 /* ---- Responsive: mobile hamburger ----------------------- */
 .mc-sidebar-toggle {
   display: none;
@@ -1972,6 +2042,25 @@ hr { border-color: var(--mc-border); opacity: 1; }
     padding-top: 3rem;
   }
   .mc-help-page { padding: 1.25rem 1rem 3rem; }
+
+  /* T-0757: the docs rail/content row STACKS below the same breakpoint the app
+     shell already collapses its sidebar at. Above it nothing here applies and
+     the two-column reading layout is untouched. */
+  .mc-docs-layout {
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .mc-docs-rail {
+    flex: 0 0 auto;
+    min-width: 0;
+    width: 100%;
+  }
+  /* Stacking alone would put the whole artifact tree between the reader and the
+     doc they just opened, on every open. So on narrow screens the rail also
+     collapses behind a control: the doc IS the content, the rail is how you got
+     there. */
+  .mc-docs-rail-toggle { display: block; }
+  .mc-docs-rail-body.mc-docs-rail-collapsed { display: none; }
 }
 
 /* Coachmark — T-0012 onboarding framework. Minimal surface; spotlight beats

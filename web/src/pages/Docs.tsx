@@ -91,8 +91,11 @@ export function Docs() {
             </div>
           </div>
 
-          {/* T-0275: render the doc body as markdown. */}
-          <Markdown source={detail.raw} slug={slug} />
+          {/* T-0275: render the doc body as markdown.
+              T-0756: `baseCategory` is this doc's own category dir, so a
+              relative cross-doc link resolves against the directory the file
+              actually sits in (sibling first, `../design/x.md` across). */}
+          <Markdown source={detail.raw} slug={slug} baseCategory={detail.category} />
         </>
       )}
     </>

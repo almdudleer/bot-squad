@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Outlet, useLocation, useParams, useSearchParams } from "react-router-dom";
 import { ArtifactKind } from "../api";
 import { PageHelp } from "../components/PageHelp";
@@ -82,6 +82,15 @@ export function DocsSection() {
     [view.rootsBySection],
   );
 
+  // T-0757: on a phone the rail collapses behind a control (CSS decides when —
+  // this state is inert above the breakpoint, where the rail is always shown).
+  // It opens when nothing is selected, because then the index IS the page; it
+  // closes the moment a doc is opened, because then the doc is.
+  const [railOpen, setRailOpen] = useState(selectedId === null);
+  useEffect(() => {
+    if (selectedId !== null) setRailOpen(false);
+  }, [selectedId]);
+
   return (
     <div className="container py-4" style={{ maxWidth: "980px" }}>
       <h2 style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "0.5rem" }}>
@@ -96,9 +105,27 @@ export function DocsSection() {
         edit, promote/dismiss and delete all happen via the TG dialog.
       </PageHelp>
 
-      <div className="d-flex gap-4">
+      {/* T-0757: `mc-docs-layout` replaces `d-flex gap-4` + inline flex bases.
+          Identical two-column reading layout above 900px; below it the row
+          stacks and the rail folds behind the toggle, so the detail pane — the
+          content of the page — gets the full width instead of 102 of 366px. */}
+      <div className="mc-docs-layout">
         {/* Shared left rail: type filter · the one cross-store tree */}
-        <div style={{ minWidth: "240px", flex: "0 0 240px" }}>
+        <div className="mc-docs-rail">
+          <button
+            type="button"
+            className="mc-docs-rail-toggle"
+            aria-expanded={railOpen}
+            aria-controls="mc-docs-rail-body"
+            onClick={() => setRailOpen((v) => !v)}
+          >
+            {railOpen ? "▾" : "▸"} Browse artifacts
+            {view.nodes !== null && ` (${view.nodes.length})`}
+          </button>
+          <div
+            id="mc-docs-rail-body"
+            className={`mc-docs-rail-body${railOpen ? "" : " mc-docs-rail-collapsed"}`}
+          >
           {/* Type filter (replaces the 3 tabs) */}
           <div className="btn-group btn-group-sm d-flex mb-2" role="group" aria-label="Artifact type filter">
             {FILTERS.map((f) => (
@@ -144,11 +171,12 @@ export function DocsSection() {
             selectedId={selectedId}
             defaultCollapsedSections={filter === "all" ? allCollapsedSections : []}
           />
+          </div>
         </div>
 
         {/* Detail pane — the active kind's page renders here, reading the shared
             tree from Outlet context. */}
-        <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="mc-docs-detail">
           <Outlet context={{ tree } satisfies DocsOutletContext} />
         </div>
       </div>

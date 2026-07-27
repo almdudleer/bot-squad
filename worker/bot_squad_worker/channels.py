@@ -145,6 +145,12 @@ class TgChannel(Channel):
         # notion (MAX) simply never receive it.
         if "reply_to_message_id" in extra:
             opt["reply_to_message_id"] = extra["reply_to_message_id"]
+        # T-0758: the raw SID of the session that COMPOSED the text, for the
+        # sender tag the transport applies. Same opt-in shape once more, same
+        # reason — a kwarg that is absent by default keeps every existing call
+        # (and every fake with a fixed signature) byte-identical.
+        if "sender_sid" in extra:
+            opt["sender_sid"] = extra["sender_sid"]
         return self._client().send(
             chat_id=chat_id,
             text=text,
@@ -190,6 +196,9 @@ class MaxChannel(Channel):
         recipient_kind = extra.get("recipient_kind") or getattr(
             self._cfg, "max_recipient_kind", "chat_id"
         )
+        opt: dict[str, Any] = {}
+        if "sender_sid" in extra:  # T-0758 — see TgChannel.send
+            opt["sender_sid"] = extra["sender_sid"]
         return self._client().send(
             chat_id=chat_id,
             text=text,
@@ -197,6 +206,7 @@ class MaxChannel(Channel):
             user=user,
             urgent=urgent,
             recipient_kind=recipient_kind,
+            **opt,
         )
 
 

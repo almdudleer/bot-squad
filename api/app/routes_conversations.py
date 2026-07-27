@@ -211,6 +211,7 @@ def _resolve_relay_target(
 
 async def _relay_to_telegram(
     request: Request, slug: str, global_user_id: str, text: str, thread_id: Any = None,
+    sender_sid: str = "",
 ) -> bool:
     """Best-effort writeback (T-0569): relay a session-authored conversation
     reply to the user's Telegram chat via the worker's ``tg_notify`` action, so
@@ -231,6 +232,19 @@ async def _relay_to_telegram(
     ``topic_id`` (T-0667): when the resolved target carries a forum thread
     (locus or static ``tg_topic_id``), the reply is delivered into THAT thread
     instead of the chat's general feed.
+
+    ``sender_sid`` (T-0758): the session whose writeback this is, taken from
+    the append's own ``author`` (``session:<sid>``) — the ONLY place the
+    author is known, since this relay spells out an explicit ``chat_id`` and
+    passes no ``sid``/``slug`` at all. That is exactly why the stakeholder saw
+    ``[bot-squad user-conversation]`` on one project and nothing on the other:
+    the tag was a typing habit, and this path had no identity to tag with. The
+    tag itself is still applied at the TRANSPORT (``sender_tag.compose``) —
+    what is added here is the fact of WHO wrote it, which no other layer has.
+    It is deliberately not passed as ``sid``: that would also enter
+    ``tg_notify``'s destination ladder and pin ``tg_reply_map``, re-routing
+    the user's next quoted reply down the direct-to-session path instead of
+    the attendant's — a change this ticket has no business making.
     """
     chat_id, topic_id = _resolve_relay_target(request, slug, global_user_id, thread_id)
     if not chat_id:
@@ -244,6 +258,8 @@ async def _relay_to_telegram(
         # message twice. The delivery is unaffected — only the second record is.
         "record_outbound": False,
     }
+    if sender_sid:
+        params["sender_sid"] = sender_sid
     if topic_id is not None:
         params["topic_id"] = topic_id
     try:
@@ -400,7 +416,12 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     # writeback is outbound AND still needs delivering.
     if author.startswith("session:") and text and not fyi and not delivered:
         try:
-            relayed = await _relay_to_telegram(request, slug, global_user_id, text, thread_id)
+            relayed = await _relay_to_telegram(
+                request, slug, global_user_id, text, thread_id,
+                # T-0758: `author` is `session:<sid>` here by the branch
+                # condition above, so the SID is the part after the colon.
+                sender_sid=author.split(":", 1)[1].strip(),
+            )
         except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
             relayed = False
 

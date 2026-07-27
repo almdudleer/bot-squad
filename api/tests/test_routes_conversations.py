@@ -516,6 +516,56 @@ def test_session_append_falls_back_to_project_tg_chat(tmp_bot_squad: Path, monke
 
 
 # ---------------------------------------------------------------------------
+# T-0758: the relay names WHO composed the reply, so the transport can stamp
+# the `[<slug> <role>]` sender tag. This path is why the tag was a typing
+# habit: it spells out an explicit chat_id and passes neither `sid` nor `slug`,
+# so `tg._prefix` had nothing to render and only hand-typed tags ever appeared.
+# The tag itself is applied at the transport (`worker.sender_tag.compose`) —
+# what is added here is the author, which no other layer knows.
+# ---------------------------------------------------------------------------
+
+
+def test_session_append_relay_names_the_composing_session(tmp_bot_squad: Path, monkeypatch):
+    """RED before T-0758: the relay sent no sender identity at all."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV,
+        json={"author": "session:S-almdudleer-gu_abc-user-conversation-p70",
+              "text": "Понял, делаю."},
+        headers=_worker_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["relayed"] is True
+    params = calls[0][1]
+    assert params["sender_sid"] == "S-almdudleer-gu_abc-user-conversation-p70"
+
+
+def test_session_append_relay_does_not_route_by_the_sender(tmp_bot_squad: Path, monkeypatch):
+    """The sender is passed as `sender_sid`, NOT `sid`, and that distinction is
+    load-bearing: `sid` also enters `tg_notify`'s destination ladder and pins
+    `tg_reply_map`, which would send the user's next quoted reply down the
+    direct-to-session path instead of the attendant's. Naming the author must
+    not silently re-route the conversation."""
+    _seed_tg_linked_user(tmp_bot_squad, "gu_abc", "555222111")
+
+    client = _client(tmp_bot_squad, monkeypatch)
+    calls = _mock_call_action(monkeypatch)
+
+    r = client.post(
+        CONV, json={"author": "session:S-x-p1", "text": "answer"},
+        headers=_worker_auth())
+    assert r.status_code == 200, r.text
+    params = calls[0][1]
+    assert "sid" not in params
+    assert "slug" not in params
+    assert params["chat_id"] == "555222111"
+
+
+# ---------------------------------------------------------------------------
 # T-0667: outgoing relay follows the conversation LOCUS (worker-recorded
 # last-seen chat_id/thread_id per (slug,gid)) ahead of the tg_user_id DM and
 # the project's static tg_chat — so a reply lands where the user last wrote,

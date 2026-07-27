@@ -181,6 +181,10 @@ _TG_NOTIFY_ALLOWED = {
     # wrote this same text into the same conversation thread itself — today,
     # only the API's session-writeback relay. Default True (audited).
     "record_outbound",
+    # T-0758: the raw SID of the session that COMPOSED the text, for the
+    # transport's sender tag. NOT a second `sid` — it is label-only and has no
+    # destination or reply-map effect, which is exactly what the relay needs.
+    "sender_sid",
 }
 
 
@@ -281,6 +285,12 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         debounce : bool — default True; T-0569 pass False to force delivery
                    even if the exact same payload was just sent (an interactive
                    relay reply must not be silently deduped).
+        sender_sid : str — T-0758; the raw SID of the session that COMPOSED
+                   the message, used ONLY for the transport's `[<slug> <role>]`
+                   sender tag. Pass it when the destination is already spelled
+                   out (an explicit `chat_id`) and only the AUTHOR is missing —
+                   putting the sid in `sid` instead would also enter the
+                   destination ladder and the reply map.
 
     If neither ``chat_id`` nor ``slug`` is given, falls back to the first
     project's tg_chat (there is usually only one project).  Unknown slug
@@ -501,6 +511,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         slug=slug,
         task_id=str(params.get("task_id") or ""),
         record_outbound=bool(params.get("record_outbound", True)),
+        sender_sid=str(params.get("sender_sid") or ""),
     )
     if task_topic_binding is not None and result.get("sent"):
         # T-0723: the ticket may come from the `ticket_id` param (rung 2) or
@@ -677,6 +688,7 @@ def _send_stakeholder_dm(
     slug: str = "",
     task_id: str = "",
     record_outbound: bool = True,
+    sender_sid: str = "",
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
@@ -732,6 +744,14 @@ def _send_stakeholder_dm(
     never the delivery, and it is deliberately opt-OUT: a send path added later
     is audited by default, which is the failure mode this ticket is about.
 
+    ``sender_sid`` (T-0758): the raw SID of the session that COMPOSED this
+    text, forwarded to the transport for the ``[<slug> <role>]`` sender tag.
+    Distinct from ``sid`` on purpose — ``sid`` is a display label that ALSO
+    drives ``tg_notify``'s destination ladder and the reply map, so a caller
+    that knows only the author (the API's session-writeback relay) can state it
+    here without also re-routing the message. Absent → the tag falls back to
+    ``sid_label``, exactly as every send behaves today.
+
     Returns ``{ok, sent, channel}``. ``channel: "none"`` (ok=False) when no
     transport could deliver — logged loudly, never a silent no-op.
     """
@@ -775,6 +795,10 @@ def _send_stakeholder_dm(
     # default case keeps every existing call shape byte-identical. Only the two
     # callers that record this text themselves ever pass it.
     _rec: dict[str, Any] = {} if record_outbound else {"record_outbound": False}
+    # T-0758: same opt-IN shape a third time. Only forwarded when a caller
+    # actually names the composing session, so a fake `send` with a fixed
+    # signature — and every send that names nobody — is untouched.
+    _sender: dict[str, Any] = {"sender_sid": sender_sid} if sender_sid else {}
 
     def _deliver(channel: str, send_part: Callable[[str], bool]) -> dict[str, Any]:
         """Send every part in order over one channel (T-0721).
@@ -811,7 +835,7 @@ def _send_stakeholder_dm(
         return _deliver("tg", lambda part: tg_client.send(
             chat_id=tg_chat_id, text=part, sid=sid_label, user=user,
             urgent=urgent, topic_id=tg_topic_id, debounce=debounce,
-            **_route, **_rec,
+            **_route, **_rec, **_sender,
         ))
 
     def _try_max() -> dict[str, Any] | None:
@@ -821,7 +845,8 @@ def _send_stakeholder_dm(
         max_client = _get_max_client(cfg)
         return _deliver("max", lambda part: max_client.send(
             chat_id=max_chat, text=part, sid=sid_label, user=user, urgent=urgent,
-            recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"), **_rec,
+            recipient_kind=getattr(cfg, "max_recipient_kind", "chat_id"),
+            **_rec, **_sender,
         ))
 
     if prefer_tg:

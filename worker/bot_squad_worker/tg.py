@@ -68,6 +68,7 @@ class TgClient:
         route_sid: str = "",
         reply_to_message_id: int | None = None,
         record_outbound: bool = True,
+        sender_sid: str = "",
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -113,6 +114,16 @@ class TgClient:
         suppresses the RECORD, never the send. Opt-out by design: a send path
         written after today is audited unless someone says otherwise, which is
         the inverse of how this gap happened.
+
+        ``sender_sid`` (T-0758): the RAW SID of the session that COMPOSED this
+        text, for the sender tag only. A third sid-ish kwarg earns its keep by
+        being the one with NO side effects — ``sid`` is a display label that
+        also steers ``tg_notify``'s destination ladder, ``route_sid`` pins the
+        reply map — so a caller that knows only *who wrote this* (the API's
+        session-writeback relay, which passes an explicit chat and must not
+        change where a reply lands) can say so without moving anything else.
+        Absent → the tag falls back to ``sid``, then ``route_sid``, then to no
+        tag at all; see ``sender_tag.resolve_label``.
         """
         if not self._token:
             log.debug("tg.send: no bot token configured — skipping")
@@ -122,7 +133,18 @@ class TgClient:
             log.info("tg.send: dropped (quiet hours — user is asleep)")
             return False
 
-        full_text = _prefix(text, sid=sid, user=user)
+        # T-0758: the sender tag is composed ONCE here and the same string
+        # goes to `_post` and to `_record_outbound` below. That ordering is
+        # load-bearing, not incidental: `echo_guard.recent_send_match` asks
+        # "did we send these EXACT BYTES to this chat", so a spool holding the
+        # untagged body while the wire carried the tagged one would blind the
+        # guard against every forwarded reply.
+        from bot_squad_worker import sender_tag as _sender_tag
+
+        full_text = _sender_tag.compose(
+            self._cfg, text, sid=sid, user=user, sender_sid=sender_sid,
+            route_sid=route_sid, chat_id=chat_id, topic_id=topic_id,
+        )
 
         if debounce and self._debounced(chat_id=chat_id, sid=sid, text=text):
             log.debug("tg.send: debounced (same payload within %ds)", self._cooldown)
@@ -281,6 +303,13 @@ class TgClient:
         REPORTED, not raised: the confirmation itself is already delivered and
         the user must be told the marker is missing rather than see the whole
         command blow up.
+
+        No T-0758 sender tag, and the reason is the rule rather than an
+        exemption: this method takes no sender at all (it answers the user's
+        own ``/pin-session``, so the system is speaking, not a session), and
+        the tag is applied exactly when a send names who composed it. Should a
+        caller ever need one here, give this method a ``sender_sid`` and route
+        the text through ``sender_tag.compose`` — do not re-derive a tag.
         """
         if not self._token:
             log.debug("tg.send_and_pin: no bot token configured — skipping")
@@ -531,7 +560,13 @@ def render_transcript_echo(
 # ------------------------------------------------------------------
 
 def _prefix(text: str, *, sid: str, user: str) -> str:
-    """Add [<sid> @ <user>] or [<sid>] prefix when relevant."""
+    """Add [<sid> @ <user>] or [<sid>] prefix when relevant.
+
+    The rendering primitive only — since T-0758 the transports call
+    ``sender_tag.compose``, which decides WHAT the label is (and whether there
+    should be one) and then calls this to render it. Kept separate so the
+    "how it looks" and "who it names" questions stay in one place each.
+    """
     if sid and user:
         return f"[{sid} @ {user}] {text}"
     if sid:

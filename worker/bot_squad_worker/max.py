@@ -34,9 +34,11 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-# Reuse the TG helpers so the two channels share one SID-prefix + quiet-hours
-# implementation (no drift between the stakeholder's notification channels).
-from bot_squad_worker.tg import _in_quiet_hours, _prefix
+# Reuse the TG quiet-hours helper so both channels answer "is he asleep" the
+# same way (no drift between the stakeholder's notification channels). The
+# sender-tag half moved to `sender_tag.compose` in T-0758 and is shared the
+# same way, from one module rather than two copies of a prefix rule.
+from bot_squad_worker.tg import _in_quiet_hours
 
 if TYPE_CHECKING:
     from bot_squad_worker.config import Config
@@ -86,6 +88,7 @@ class MaxClient:
         urgent: bool = False,
         recipient_kind: str | None = None,
         record_outbound: bool = True,
+        sender_sid: str = "",
     ) -> bool:
         """Send ``text`` to ``chat_id``, prefixed by SID if given.
 
@@ -97,6 +100,15 @@ class MaxClient:
         ``record_outbound`` (T-0755, default True): write this delivery to the
         outbound log — see ``tg.TgClient.send`` for why it is opt-OUT and which
         two callers pass False.
+
+        ``sender_sid`` (T-0758): the raw SID of the session that composed the
+        text, for the sender tag. The TG twin, on purpose — the stakeholder's
+        ask is about knowing WHICH PROJECT answered, and that question does not
+        change with the transport, so both channels apply one rule from one
+        module. MAX passes no chat/topic to the resolver because it has no
+        forum bindings to resolve a slug FROM; the label therefore comes from
+        the sending session alone, which is where it should come from anyway
+        (see ``sender_tag``).
         """
         if not self._token:
             log.debug("max.send: no bot token configured — skipping")
@@ -106,7 +118,13 @@ class MaxClient:
             log.info("max.send: dropped (quiet hours — user is asleep)")
             return False
 
-        full_text = _prefix(text, sid=sid, user=user)
+        # T-0758: same single composition point as tg.py — the tagged string
+        # is what goes on the wire AND what `_record_outbound` spools.
+        from bot_squad_worker import sender_tag as _sender_tag
+
+        full_text = _sender_tag.compose(
+            self._cfg, text, sid=sid, user=user, sender_sid=sender_sid,
+        )
 
         if self._debounced(chat_id=chat_id, sid=sid, text=text):
             log.debug("max.send: debounced (same payload within %ds)", self._cooldown)

@@ -35,6 +35,7 @@ from bot_squad_worker.jobs import (
     tg_listener_tick,
     tg_stall_tick,
     voice_audio_gc_tick,
+    worker_restart_catchup_tick,
 )
 
 if TYPE_CHECKING:
@@ -110,6 +111,21 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
             coalesce=True,
             replace_existing=True,
         )
+    # worker_restart_catchup (T-0717): fire a worker restart that T-0305's
+    # rate-limit cap DEFERRED, once the window elapses and no deploy is in
+    # flight. Without this the deferral was a silent DROP — a worker-code deploy
+    # landing inside the 5-min window left the worker running the previous
+    # commit indefinitely while the deploy reported success.
+    sched.add_job(
+        worker_restart_catchup_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="worker_restart_catchup",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
     # oauth_refresh: v1 placeholder — checks claude binary reachable.
     # Full token-rotation port from cctv-backend deferred to a later spec.
     sched.add_job(

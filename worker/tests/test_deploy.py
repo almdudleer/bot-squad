@@ -1460,8 +1460,11 @@ def test_run_next_second_worker_changing_deploy_rate_limited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Two back-to-back worker-changing deploys within the window: the first
-    fires, the second is skipped as rate-limited (NOT double-restarted) — and
-    is distinguishable in worker_restart_status from a no-worker-change skip."""
+    fires, the second is DEFERRED as rate-limited (NOT double-restarted) — and
+    is distinguishable in worker_restart_status from a no-worker-change skip.
+
+    T-0717: the deferral is also recorded (pending marker) and flagged
+    (worker_stale), so it can't silently leave the worker on stale code."""
     import bot_squad_worker.deploy as d
 
     proj = _make_project(tmp_path)
@@ -1479,8 +1482,14 @@ def test_run_next_second_worker_changing_deploy_rate_limited(
 
     enqueue(cfg, proj.slug, "staging", "worker change #2", "user", restart_worker=True)
     result2 = run_next(cfg, proj.slug)
-    assert result2 is not None and result2.worker_restart_status == "skipped: rate-limited"
+    assert result2 is not None
+    assert result2.worker_restart_status == (
+        "deferred: rate-limited (catch-up tick will fire it)"
+    )
     assert len(calls) == 1  # NOT fired a second time
+    # T-0717: deferred, not dropped — the catch-up tick has something to act on.
+    assert d._restart_pending_path(cfg).exists()
+    assert result2.worker_stale is True
 
 
 def test_run_next_worker_restart_not_rate_limited_after_window(
@@ -1891,6 +1900,7 @@ def test_deploy_monitor_sends_carry_deploy_logs_topic(tmp_config_dir, tmp_path, 
         lambda c, s: SimpleNamespace(
             ok=True, returncode=0, collapsed_count=1, killed_reason=None,
             resolved_sha="", worker_restart_status="",  # T-0446: terminal-ping fields
+            worker_stale=False, worker_boot_sha="",  # T-0717 leg 3
         ),
     )
     rec = _RecordingTg()
@@ -2080,3 +2090,613 @@ def test_reconcile_norc_no_release_log_left_inflight(tmp_path: Path) -> None:
 
     assert out == []
     assert f.exists()
+
+
+# ---------------------------------------------------------------------------
+# T-0717: a deploy must never silently leave the worker on stale code, and a
+# deploy that legitimately skipped the restart must not report false sha_drift.
+#
+# Live evidence (2026-07-26, staging): four deploys in ~30min, all with
+# restart_worker:true. One shipped no worker/ change (restart correctly skipped
+# → boot sha frozen forever → permanent false sha_drift). Two shipped REAL
+# worker code and were silently swallowed by T-0305's 300s rate-limit cap while
+# the deploy reported SUCCESS; only a manual systemctl restart fixed them.
+# ---------------------------------------------------------------------------
+
+
+def _worker_tree_repo(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """A real git repo with a ``worker/`` subtree and three commits:
+
+    base → docs_only (worker/ byte-identical) → worker_change (worker/ edited).
+    Returns (repo, base_sha, docs_only_sha, worker_change_sha). Real commits, so
+    the git-diff probes under test run for real rather than against a stub.
+    """
+    repo = tmp_path / "install"
+    (repo / "worker" / "bot_squad_worker").mkdir(parents=True)
+    (repo / "docs").mkdir()
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True)
+
+    def _head() -> str:
+        out = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    _git("init", "-q")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    (repo / "worker" / "bot_squad_worker" / "sessions.py").write_text("v1\n")
+    (repo / "docs" / "roles.md").write_text("roles v1\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "base")
+    base = _head()
+    # A docs/roles-only commit — exactly the shape of the live a534b6c8 deploy.
+    (repo / "docs" / "roles.md").write_text("roles v2\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "docs only")
+    docs_only = _head()
+    (repo / "worker" / "bot_squad_worker" / "sessions.py").write_text("v2\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "worker change")
+    worker_change = _head()
+    return repo, base, docs_only, worker_change
+
+
+# --- leg 1: the reported sha advances when worker/ is byte-identical ---------
+
+
+def test_effective_sha_advances_when_worker_subtree_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live bug: a deploy shipped a docs-only commit, the restart was
+    (correctly) skipped, and the worker then reported its frozen boot sha
+    forever → permanent false sha_drift that no restart ever cleared.
+
+    The running process's worker code IS the deployed commit's worker code, so
+    the REPORTED sha must advance to it."""
+    import bot_squad_worker.deploy as d
+
+    repo, base, docs_only, _ = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: docs_only)
+
+    assert d.effective_worker_git_sha() == docs_only
+
+
+def test_effective_sha_stays_at_boot_when_worker_subtree_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: when worker/ DID change, the reported sha must NOT
+    advance — that drift is real and is the signal a restart is owed."""
+    import bot_squad_worker.deploy as d
+
+    repo, base, _, worker_change = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: worker_change)
+
+    assert d.effective_worker_git_sha() == base
+
+
+def test_effective_sha_falls_back_to_boot_on_probe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable probe must report the boot sha (a false ALARM), never the
+    deployed sha (a false ALL-CLEAR). _worker_subtree_identical is not the
+    negation of _worker_subtree_changed precisely so this direction is safe."""
+    import bot_squad_worker.deploy as d
+
+    repo, base, docs_only, _ = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: docs_only)
+    monkeypatch.setattr(d, "_worker_subtree_identical",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("git gone")))
+
+    with pytest.raises(OSError):
+        d.effective_worker_git_sha()
+
+    # …and the real probe swallows its own errors, so the wired path degrades to
+    # the boot sha rather than propagating.
+    monkeypatch.undo()
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "not-a-sha")
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: docs_only)
+    assert d.effective_worker_git_sha() == "not-a-sha"
+
+
+def test_effective_sha_is_boot_sha_when_tree_has_not_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No deploy since boot → nothing to advance to, and no git probe at all."""
+    import bot_squad_worker.deploy as d
+
+    repo, base, _, _ = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: base)
+    monkeypatch.setattr(d, "_worker_subtree_identical",
+                        lambda *a, **k: pytest.fail("probed needlessly"))
+
+    assert d.effective_worker_git_sha() == base
+
+
+def test_effective_sha_caches_per_deployed_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 60s heartbeat and every /health hit call this — it must not shell out
+    to git each time."""
+    import bot_squad_worker.deploy as d
+
+    repo, base, docs_only, _ = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: docs_only)
+    probes: list = []
+    real = d._worker_subtree_identical
+    monkeypatch.setattr(d, "_worker_subtree_identical",
+                        lambda *a, **k: (probes.append(a), real(*a, **k))[1])
+
+    assert d.effective_worker_git_sha() == docs_only
+    assert d.effective_worker_git_sha() == docs_only
+    assert d.effective_worker_git_sha() == docs_only
+    assert len(probes) == 1
+
+
+def test_heartbeat_writes_effective_sha_not_frozen_boot_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end for leg 1 through the surface /api/health actually reads: the
+    heartbeat BODY is what produces (or clears) the sha_drift signal."""
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import jobs
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    repo, base, docs_only, _ = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: docs_only)
+
+    jobs.heartbeat(cfg)
+
+    assert cfg.heartbeat_path.read_text().strip() == docs_only
+
+
+def test_heartbeat_survives_sha_lookup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness must outrank the sha: a broken lookup writes an empty body (read
+    as "unknown", never a false drift) instead of losing the heartbeat."""
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import jobs
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "effective_worker_git_sha",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    jobs.heartbeat(cfg)
+
+    assert cfg.heartbeat_path.exists()
+    assert cfg.heartbeat_path.read_text().strip() == ""
+
+
+def test_restart_gate_ignores_the_advanced_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reporting fix must never suppress a NEEDED restart: the gate keeps
+    comparing the RAW frozen boot sha, so a worker-code deploy still fires."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    repo, base, _, worker_change = _worker_tree_repo(tmp_path)
+    monkeypatch.setattr(d, "_install_root", lambda: repo)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: base)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None, raising=False)
+    monkeypatch.setattr(d, "_git_head_sha", lambda root: worker_change)
+
+    assert d._worker_subtree_changed_since_boot(cfg) is True
+    assert d._should_restart_worker(cfg, ok=True, forced=True) is True
+
+
+# --- leg 2: a rate-limited restart is DEFERRED, never dropped ----------------
+
+
+def test_rate_limited_restart_records_a_pending_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core of the live bug: the cap said "skip" and nothing ever
+    re-triggered. It must now leave a record for the catch-up tick."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+
+    assert d._restart_rate_limited(cfg, source="deploy", reason="first") is False
+    assert not d._restart_pending_path(cfg).exists()  # it FIRED; nothing pending
+
+    assert d._restart_rate_limited(cfg, source="deploy", reason="second",
+                                   slug=proj.slug) is True
+    pending = json.loads(d._restart_pending_path(cfg).read_text())
+    assert pending["reason"] == "second"
+    assert pending["slug"] == proj.slug
+
+
+def test_deferred_restarts_coalesce_to_one_latest_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three deploys inside one window must collapse to ONE later restart, not
+    three queued ones — and the marker carries the newest reason (a restart
+    picks up whatever is on disk, so the earlier changes ride along)."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+
+    assert d._restart_rate_limited(cfg, source="deploy", reason="A") is False
+    for reason in ("B", "C", "D"):
+        assert d._restart_rate_limited(cfg, source="deploy", reason=reason,
+                                       slug=proj.slug) is True
+    assert json.loads(d._restart_pending_path(cfg).read_text())["reason"] == "D"
+
+    # Window elapses; the catch-up tick fires exactly once for B+C+D.
+    marker = d._restart_rate_limit_path(cfg)
+    stamped = json.loads(marker.read_text())
+    marker.write_text(json.dumps({**stamped, "at": stamped["at"] - 301}))
+
+    assert d.catchup_deferred_worker_restart(cfg) == "fired"
+    assert len(calls) == 1
+    assert not d._restart_pending_path(cfg).exists()
+
+    # And it does not fire again on the next tick.
+    assert d.catchup_deferred_worker_restart(cfg) == "idle: nothing deferred"
+    assert len(calls) == 1
+
+
+def test_catchup_holds_inside_the_rate_limit_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0305's anti-storm cap is preserved: the catch-up guarantees the restart
+    EVENTUALLY happens, never that it happens sooner."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+
+    assert d._restart_rate_limited(cfg, source="deploy", reason="A") is False
+    assert d._restart_rate_limited(cfg, source="deploy", reason="B") is True
+
+    assert d.catchup_deferred_worker_restart(cfg) == "held: rate-limit window not elapsed"
+    assert calls == []
+    # Held, not discarded — the marker survives for the next tick.
+    assert d._restart_pending_path(cfg).exists()
+
+
+def test_catchup_holds_while_a_deploy_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounce restarts the whole worker cgroup, which would kill an unrelated
+    build already running under it. Wait a tick instead."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
+
+    processing = d._processing_dir(cfg, proj.slug)
+    processing.mkdir(parents=True, exist_ok=True)
+    (processing / "1700000000000-inflight.json").write_text(
+        json.dumps({"queue_id": "inflight", "target": "staging"})
+    )
+
+    assert d.catchup_deferred_worker_restart(cfg) == "held: deploy in flight"
+    assert calls == []
+    assert d._restart_pending_path(cfg).exists()
+
+
+def test_catchup_clears_pending_when_worker_already_converged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual `systemctl --user restart` is a valid cure — it does NOT claim
+    the rate-limit window, so the tick detects the convergence and drops the
+    deferred restart instead of bouncing a worker that's already current."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: False)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
+
+    assert d.catchup_deferred_worker_restart(cfg) == "cleared: worker already converged"
+    assert calls == []
+    assert not d._restart_pending_path(cfg).exists()
+
+
+def test_catchup_is_a_noop_with_nothing_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Steady state: one stat, no git probe, no restart."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot",
+                        lambda c: pytest.fail("probed with nothing deferred"))
+    monkeypatch.setattr(d, "_restart_worker_detached",
+                        lambda *a, **k: pytest.fail("restarted with nothing deferred"))
+
+    assert d.catchup_deferred_worker_restart(cfg) == "idle: nothing deferred"
+
+
+def test_catchup_retains_pending_when_the_launch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed launch must not consume the deferral — the next tick retries."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
+    monkeypatch.setattr(d, "_restart_worker_detached",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no scope")))
+    d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
+
+    assert d.catchup_deferred_worker_restart(cfg) == "failed: launch error"
+    assert d._restart_pending_path(cfg).exists()
+
+
+def test_catchup_holds_when_the_git_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flaky probe never bounces the worker (the standing rule in this module),
+    and never silently eats the deferral either."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot",
+                        lambda c: (_ for _ in ()).throw(OSError("git gone")))
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: calls.append(a))
+    d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
+
+    assert d.catchup_deferred_worker_restart(cfg) == "held: probe failed"
+    assert calls == []
+    assert d._restart_pending_path(cfg).exists()
+
+
+def test_autoupdate_rate_limited_apply_also_defers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """autoupdate_apply shares the cap and had the same false self-healing claim
+    ("the NEXT successful apply catches it" — no guarantee when no further
+    release is published). It must record the deferral too."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+
+    assert d._restart_rate_limited(cfg, source="deploy", reason="a deploy") is False
+    assert d._restart_rate_limited(cfg, source="autoupdate_apply", reason="v1.2.3") is True
+
+    pending = json.loads(d._restart_pending_path(cfg).read_text())
+    assert pending["source"] == "autoupdate_apply"
+    assert pending["reason"] == "v1.2.3"
+
+
+def test_catchup_falls_back_to_a_known_slug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The autoupdate caller has no slug; the restart log still needs a home."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
+    calls: list = []
+    monkeypatch.setattr(d, "_restart_worker_detached",
+                        lambda cfg_, slug, qid, reason: calls.append(slug))
+    d._record_pending_restart(cfg, source="autoupdate_apply", reason="v1.2.3")
+
+    assert d.catchup_deferred_worker_restart(cfg) == "fired"
+    assert calls == [proj.slug]
+
+
+# --- leg 3: a stale worker must not read as a green success ------------------
+
+
+def test_run_next_flags_worker_stale_when_the_restart_is_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator's ask: a worker-touching deploy must REFUSE to report plain
+    success while the running worker is still on the previous commit."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "b" * 40)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    monkeypatch.setattr(d, "_restart_worker_detached", lambda *a, **k: None)
+
+    enqueue(cfg, proj.slug, "staging", "worker change #1", "user", restart_worker=True)
+    r1 = run_next(cfg, proj.slug)
+    assert r1 is not None and r1.worker_stale is False  # restart fired
+
+    enqueue(cfg, proj.slug, "staging", "worker change #2", "user", restart_worker=True)
+    r2 = run_next(cfg, proj.slug)
+    assert r2 is not None
+    assert r2.ok is True  # the recipe DID succeed — we don't lie about that
+    assert r2.worker_stale is True
+    assert r2.worker_boot_sha == "b" * 40
+
+
+def test_run_next_not_stale_on_a_no_worker_change_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No new worker code → nothing stale → still a plain green success. This is
+    the case the ticket was originally (mis)filed as, and it must stay quiet."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: False)
+
+    enqueue(cfg, proj.slug, "staging", "docs only", "user", restart_worker=True)
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.worker_restart_status == "skipped: no worker change"
+    assert result.worker_stale is False
+
+
+def test_run_next_defers_and_flags_a_failed_restart_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch failure used to report worker_restart_status="fired" — a flat
+    lie that left the worker on stale code with no signal and no retry."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_restart_worker_detached",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no scope")))
+
+    enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.worker_restart_status == (
+        "deferred: restart launch failed (catch-up tick will retry)"
+    )
+    assert result.worker_stale is True
+    assert d._restart_pending_path(cfg).exists()
+
+
+def test_run_next_never_flags_stale_on_a_failed_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed deploy shipped nothing, so the worker isn't stale — the failure
+    is the signal, and a stale-worker warning on top would be noise."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=1)
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+
+    enqueue(cfg, proj.slug, "staging", "worker change", "user", restart_worker=True)
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is False
+    assert result.worker_restart_status == "skipped: deploy failed"
+    assert result.worker_stale is False
+
+
+def _monitor_ping_text(tmp_config_dir, tmp_path, monkeypatch, **result_fields) -> str:
+    """Drive _run_project_deploy with a canned DeployResult and return the single
+    TG line it emits — the thing the operator actually reads after a deploy."""
+    from bot_squad_worker.config import Config
+    from bot_squad_worker import jobs, deploy as _deploy
+    import bot_squad_worker.actions as A
+    from types import SimpleNamespace
+
+    cfg = Config.load(tmp_config_dir)
+    project = cfg.projects["test-project"]
+    qfile = tmp_path / "q.json"
+    qfile.write_text(json.dumps({"target": "staging"}))
+
+    monkeypatch.setattr(_deploy, "list_queued", lambda c, s: [qfile])
+    monkeypatch.setattr(_deploy, "is_paused", lambda c, s: None)
+    monkeypatch.setattr(_deploy, "is_clean_for_target", lambda c, s, t: True)
+    fields = dict(
+        ok=True, returncode=0, collapsed_count=1, killed_reason=None,
+        resolved_sha="", worker_restart_status="", worker_stale=False,
+        worker_boot_sha="",
+    )
+    fields.update(result_fields)
+    monkeypatch.setattr(_deploy, "run_next", lambda c, s: SimpleNamespace(**fields))
+    rec = _RecordingTg()
+    monkeypatch.setattr(A, "_get_tg_client", lambda c: rec)
+
+    jobs._run_project_deploy(cfg, "test-project", project)
+
+    # calls[0] is the "starting deploy" ping; the TERMINAL line is the last one.
+    assert len(rec.calls) == 2, rec.calls
+    return rec.calls[-1]["text"]
+
+
+def test_deploy_ping_warns_instead_of_green_when_worker_is_stale(
+    tmp_config_dir, tmp_path, monkeypatch
+) -> None:
+    """The T-0717 verbatim complaint: "anyone trusting the deploy's own output
+    would ship a fix that never takes effect and have no signal at all." The
+    line must say the worker is stale, name what's actually running, and give
+    the immediate fix."""
+    text = _monitor_ping_text(
+        tmp_config_dir, tmp_path, monkeypatch,
+        resolved_sha="3df3402e844336b5d338d0a35621660e2c286032",
+        worker_restart_status="deferred: rate-limited (catch-up tick will fire it)",
+        worker_stale=True,
+        worker_boot_sha="db6f7517e3972bd6ddf2d17f97eb3f26eca54b3d",
+    )
+
+    assert "✅" not in text
+    assert "WORKER STALE" in text
+    assert "3df3402e8443" in text   # what was deployed
+    assert "db6f7517e397" in text   # what is actually running
+    assert "systemctl --user restart bot-squad-worker.service" in text
+
+
+def test_deploy_ping_stays_green_when_the_worker_is_current(
+    tmp_config_dir, tmp_path, monkeypatch
+) -> None:
+    """No regression in the normal path — a fired restart is still a green
+    SUCCESS (T-0446 kept it self-explaining to avoid false stale-worker panic)."""
+    text = _monitor_ping_text(
+        tmp_config_dir, tmp_path, monkeypatch,
+        resolved_sha="3df3402e844336b5d338d0a35621660e2c286032",
+        worker_restart_status="fired",
+    )
+
+    assert text.startswith("✅ deploy test-project/staging SUCCESS")
+    assert "WORKER STALE" not in text
+    assert "worker restart: fired" in text

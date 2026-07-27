@@ -13,8 +13,14 @@ log = logging.getLogger(__name__)
 
 
 def heartbeat(cfg: Config) -> None:
-    """Write the worker's boot git_sha into the heartbeat file so the API can show
-    worker liveness AND detect API/worker sha drift at runtime (T-0456).
+    """Write the worker's running git_sha into the heartbeat file so the API can
+    show worker liveness AND detect API/worker sha drift at runtime (T-0456).
+
+    T-0717: writes the EFFECTIVE sha, not the raw frozen boot sha — after a deploy
+    whose commit changed nothing under ``worker/`` the running process IS on that
+    commit's worker code, and reporting the frozen boot sha there produced a
+    permanent false ``sha_drift`` that no restart ever cleared. See
+    ``deploy.effective_worker_git_sha``.
 
     The mtime still freshens on every write, so the existing >300s-stale liveness
     check is unchanged. The sha lookup is guarded: a missing-git edge falls back to
@@ -25,11 +31,11 @@ def heartbeat(cfg: Config) -> None:
 
     cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        from bot_squad_worker.deploy import boot_git_sha
+        from bot_squad_worker.deploy import effective_worker_git_sha
 
-        sha = (boot_git_sha() or "").strip()
+        sha = (effective_worker_git_sha() or "").strip()
     except Exception:
-        log.exception("heartbeat: boot_git_sha lookup failed; writing empty body")
+        log.exception("heartbeat: git_sha lookup failed; writing empty body")
         sha = ""
     tmp = cfg.heartbeat_path.with_name(cfg.heartbeat_path.name + ".tmp")
     tmp.write_text(sha + "\n")
@@ -247,9 +253,24 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
         # (no false stale-worker panic — the T-0436 operational residue).
         sha = f" @{result.resolved_sha[:12]}" if result.resolved_sha else ""
         wr = f" — worker restart: {result.worker_restart_status}" if result.worker_restart_status else ""
-        _tg_safe(
-            f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}"
-        )
+        if result.worker_stale:
+            # T-0717 leg 3: the recipe succeeded but the worker is still running the
+            # PREVIOUS commit's code, so a green ✅ would be a lie — an operator who
+            # trusts it ships a worker fix that isn't executing and gets no signal
+            # at all (the T-0717 verbatim complaint). Say it plainly, name both
+            # shas, and give the one-liner that fixes it now rather than in ~5min.
+            boot = f" running={result.worker_boot_sha[:12]}" if result.worker_boot_sha else ""
+            _tg_safe(
+                f"⚠️ deploy {slug}/{target} SUCCESS but WORKER STALE "
+                f"(rc={result.returncode}){sha}{suffix}{wr}. The worker is still on"
+                f"{boot or ' the previous commit'} — new worker/ code is NOT executing "
+                f"yet. It converges on its own within ~5min (deferred restart), or now: "
+                f"systemctl --user restart bot-squad-worker.service"
+            )
+        else:
+            _tg_safe(
+                f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}"
+            )
     elif result.killed_reason:
         # A watchdog (not the recipe) killed this build — the loud, TARGETED
         # operator alert path (T-0212), not the routine project-channel ping.
@@ -363,6 +384,20 @@ def autoupdate_apply_tick(cfg: Config) -> None:
         _apply.tick(cfg)
     except Exception:
         log.exception("autoupdate_apply_tick error")
+
+
+def worker_restart_catchup_tick(cfg: Config) -> None:
+    """T-0717 leg 2: fire a worker restart the rate limiter deferred, once safe.
+
+    Cheap no-op in the steady state (one stat of the pending marker), so a 60s
+    cadence is fine. All the decision logic — already-converged, deploy in flight,
+    window not yet elapsed — lives in ``deploy.catchup_deferred_worker_restart``.
+    """
+    from bot_squad_worker import deploy as _deploy
+    try:
+        _deploy.catchup_deferred_worker_restart(cfg)
+    except Exception:
+        log.exception("worker_restart_catchup_tick error")
 
 
 def binding_gc_tick(cfg: Config) -> None:

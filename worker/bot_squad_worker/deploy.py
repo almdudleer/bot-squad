@@ -138,6 +138,49 @@ def freeze_boot_git_sha() -> str:
     return sha
 
 
+_EFFECTIVE_SHA_CACHE: tuple[str, str] | None = None  # (deployed_sha, effective_sha)
+
+
+def effective_worker_git_sha() -> str:
+    """The sha to REPORT for the running worker: its frozen boot sha, advanced to
+    the live deployed sha whenever the ``worker/`` subtree is byte-identical
+    between the two.
+
+    T-0717 leg 1. ``boot_git_sha()`` is frozen for a reason (it's how the restart
+    gate knows the process is on stale code) but it is the WRONG thing to report
+    once a deploy has landed a commit that changed nothing under ``worker/``:
+    ``_should_restart_worker`` correctly skips the bounce, so the boot sha stays
+    frozen at the old commit FOREVER, and ``/api/health`` compares it against the
+    api's new sha and reports a permanent false ``sha_drift`` (T-0456) — which
+    trips the R-0005 monitor and, worse, teaches the operator to ignore the one
+    signal that would catch a REAL drift. Reporting the deployed sha here is
+    truthful, not a papering-over: the running process's worker code is
+    byte-identical to that commit's worker code, so it IS running that commit.
+
+    Deliberately NOT used by the restart gate — that keeps comparing the raw
+    frozen boot sha (see ``_worker_subtree_changed_since_boot``), so advancing
+    what we REPORT can never suppress a restart the worker genuinely needs.
+
+    Falls back to the raw boot sha whenever the answer isn't clearly "identical"
+    (git absent, bad rev, probe error) — reporting a stale sha is a false alarm,
+    reporting a sha the process might not be running would be a false all-clear.
+    Cached per deployed sha so the 60s heartbeat and every ``/health`` hit don't
+    each shell out to ``git diff``.
+    """
+    global _EFFECTIVE_SHA_CACHE
+    boot = boot_git_sha()
+    root = _install_root()
+    deployed = _git_head_sha(root)
+    if not boot or not deployed or boot == deployed:
+        return boot
+    cached = _EFFECTIVE_SHA_CACHE
+    if cached is not None and cached[0] == deployed:
+        return cached[1]
+    effective = deployed if _worker_subtree_identical(root, boot, deployed) else boot
+    _EFFECTIVE_SHA_CACHE = (deployed, effective)
+    return effective
+
+
 def _worker_subtree_changed(root: Path, a: str, b: str) -> bool:
     """True iff the ``worker/`` subtree differs between commits ``a`` and ``b``.
 
@@ -156,6 +199,25 @@ def _worker_subtree_changed(root: Path, a: str, b: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return out.returncode == 1
+
+
+def _worker_subtree_identical(root: Path, a: str, b: str) -> bool:
+    """True only when ``git diff`` DEFINITIVELY says ``worker/`` is unchanged
+    between ``a`` and ``b`` (exit 0).
+
+    Not the negation of ``_worker_subtree_changed``: both probes treat an error
+    exit (bad rev, git missing, timeout) as "unknown" and return False, because
+    each is written so that "unknown" is its own safe answer — "don't bounce the
+    worker" there, "don't advance the reported sha" here (T-0717 leg 1).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "diff", "--quiet", a, b, "--", "worker/"],
+            capture_output=True, timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return out.returncode == 0
 
 
 def _worker_needs_restart(cfg: "Config") -> bool:
@@ -215,7 +277,134 @@ def _restart_rate_limit_path(cfg: "Config") -> Path:
     return cfg.data_dir / "_worker" / "restart_rate_limit.json"
 
 
-def _restart_rate_limited(cfg: "Config", *, source: str, reason: str = "") -> bool:
+def _restart_pending_path(cfg: "Config") -> Path:
+    return cfg.data_dir / "_worker" / "restart_pending.json"
+
+
+def _record_pending_restart(
+    cfg: "Config", *, source: str, reason: str, slug: str = ""
+) -> None:
+    """Remember that a QUALIFYING worker restart was rate-limited, so the catch-up
+    tick can fire it once the window elapses (T-0717 leg 2).
+
+    ONE marker, overwritten latest-wins: N triggers deferred inside the same
+    window collapse into a SINGLE later restart. That's not lossy — a restart
+    picks up whatever is on disk at the moment it fires, so the newest reason is
+    the only one worth carrying, and the earlier changes ride along.
+    """
+    marker = _restart_pending_path(cfg)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.parent / f"{marker.name}.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps(
+            {"at": time.time(), "source": source, "reason": reason, "slug": slug}
+        ))
+        os.replace(tmp, marker)
+    except OSError:
+        log.exception(
+            "deploy._record_pending_restart: could not record the deferred restart "
+            "(source=%s) — the worker may stay on stale code until the next "
+            "qualifying trigger", source,
+        )
+
+
+def _clear_pending_restart(cfg: "Config") -> None:
+    try:
+        _restart_pending_path(cfg).unlink(missing_ok=True)
+    except OSError:
+        log.exception("deploy._clear_pending_restart: unlink failed")
+
+
+def _any_deploy_in_flight(cfg: "Config") -> bool:
+    """True iff ANY project has a deploy in its processing dir right now.
+
+    Guards the catch-up restart from SIGTERM-ing a live build (the restart bounces
+    the whole worker cgroup; T-0213's scope detach protects a build the restart
+    itself launched, not an unrelated one already running under the worker).
+    Any probe error answers True — holding the restart one more tick costs 60s,
+    breaking a build costs the whole deploy.
+    """
+    try:
+        for slug in cfg.projects:
+            processing = _processing_dir(cfg, slug)
+            if processing.exists() and any(processing.glob("*.json")):
+                return True
+    except Exception:  # noqa: BLE001
+        log.exception("deploy._any_deploy_in_flight: probe failed — assuming in flight")
+        return True
+    return False
+
+
+def catchup_deferred_worker_restart(cfg: "Config") -> str:
+    """Fire a worker restart that the rate limiter DEFERRED, once it's safe to.
+
+    T-0717 leg 2 — the convergence guarantee the rate limiter's docstring used to
+    claim but never implemented. Runs on a 60s tick and is a no-op unless a
+    pending marker exists, so the steady-state cost is one file stat.
+
+    Order of checks matters:
+      1. no marker            → nothing deferred, idle.
+      2. worker already on the deployed worker code → the deferred restart is moot
+         (another restart landed, or an operator hand-restarted). Clear and idle.
+         This is what makes a manual ``systemctl --user restart`` a valid cure.
+      3. a deploy is in flight → hold; a bounce now would kill that build.
+      4. still inside the rate-limit window → hold. The cap is T-0305's
+         deliberate anti-storm behaviour and this must not defeat it; we only
+         guarantee the restart EVENTUALLY happens, never that it happens sooner.
+      5. otherwise fire ONE restart and clear the marker. N deferrals inside one
+         window already collapsed into this single marker, so N triggers produce
+         exactly one bounce.
+
+    Returns a short status string, for the log line and for tests to assert on.
+    """
+    marker = _restart_pending_path(cfg)
+    try:
+        pending = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "idle: nothing deferred"
+    reason = str(pending.get("reason") or "") if isinstance(pending, dict) else ""
+    slug = str(pending.get("slug") or "") if isinstance(pending, dict) else ""
+    if not slug:
+        slug = next(iter(cfg.projects), "bot-squad")
+
+    try:
+        if not _worker_subtree_changed_since_boot(cfg):
+            _clear_pending_restart(cfg)
+            log.info(
+                "deploy.catchup_deferred_worker_restart: worker already converged on "
+                "the deployed worker code — dropping the deferred restart",
+            )
+            return "cleared: worker already converged"
+    except Exception:  # noqa: BLE001 — a flaky git probe never bounces the worker
+        log.exception("deploy.catchup_deferred_worker_restart: worker-change probe failed")
+        return "held: probe failed"
+
+    if _any_deploy_in_flight(cfg):
+        return "held: deploy in flight"
+
+    if _restart_rate_limited(cfg, source="restart_catchup", reason=reason, slug=slug):
+        return "held: rate-limit window not elapsed"
+
+    queue_id = f"catchup-{int(time.time())}"
+    try:
+        _restart_worker_detached(cfg, slug, queue_id, f"deferred restart catch-up — {reason}".strip(" —"))
+    except Exception:
+        log.exception(
+            "deploy.catchup_deferred_worker_restart: launch failed — leaving the "
+            "pending marker so the next tick retries",
+        )
+        return "failed: launch error"
+    _clear_pending_restart(cfg)
+    log.info(
+        "deploy.catchup_deferred_worker_restart: fired the deferred worker restart "
+        "(slug=%s, reason=%r)", slug, reason,
+    )
+    return "fired"
+
+
+def _restart_rate_limited(
+    cfg: "Config", *, source: str, reason: str = "", slug: str = ""
+) -> bool:
     """T-0305 part-b: minimum-interval gate shared by EVERY worker-restart
     trigger (deploy's ``_restart_worker_detached`` AND autoupdate_apply's
     ``_schedule_worker_restart``) — caps how often ANY of them may actually
@@ -231,15 +420,24 @@ def _restart_rate_limited(cfg: "Config", *, source: str, reason: str = "") -> bo
 
     Returns True (rate-limited — caller must SKIP the restart) iff a restart
     already fired within ``BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS``
-    (default 300s = 5min; <=0 disables the gate entirely). Self-healing: a
-    skipped restart is never lost — the worker stays on stale code until the
-    NEXT qualifying trigger fires past the window, and that one restart picks
-    up everything accumulated since boot (deploy's gate compares boot sha to
-    live HEAD, not to any single deploy's diff).
+    (default 300s = 5min; <=0 disables the gate entirely).
+
+    DEFERRED, NOT DROPPED (T-0717). This docstring used to claim the skip was
+    "self-healing — the NEXT qualifying trigger picks it up". It was not: nothing
+    re-triggered, so a worker-code deploy that landed inside the window left the
+    worker running stale code INDEFINITELY while the deploy reported success —
+    observed live three times in one hour on 2026-07-26. The cap is still
+    enforced (that's T-0305's deliberate anti-storm intent), but a rate-limited
+    call now records a pending marker that ``catchup_deferred_worker_restart``
+    fires once the window elapses. Convergence no longer depends on someone
+    happening to deploy worker code again.
 
     On an ALLOWED call this atomically claims the window (writes ``now`` as
     the new stamp) — never call this speculatively; only when the caller is
-    committed to actually firing the restart.
+    committed to actually firing the restart. Note a manual ``systemctl --user
+    restart`` does NOT claim the window: hand-restarting is a valid cure (the
+    catch-up tick notices the convergence and drops the pending marker) but it
+    also masks this bug from anyone debugging it by hand.
     """
     interval = int(os.environ.get("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300"))
     if interval <= 0:
@@ -251,6 +449,7 @@ def _restart_rate_limited(cfg: "Config", *, source: str, reason: str = "") -> bo
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         last = 0.0
     if now - last < interval:
+        _record_pending_restart(cfg, source=source, reason=reason, slug=slug)
         return True
     marker.parent.mkdir(parents=True, exist_ok=True)
     tmp = marker.parent / f"{marker.name}.tmp.{os.getpid()}"
@@ -356,8 +555,16 @@ class DeployResult:
     # The post-deploy worker-restart decision, surfaced so the terminal status
     # explains the (async, detached) restart instead of a green "release
     # deployed" preceding the bounce → the T-0436 false stale-worker panic. One
-    # of: "fired" | "skipped: no worker change" | "skipped: deploy failed".
+    # of: "fired" | "deferred: rate-limited (…)" | "deferred: restart launch
+    # failed (…)" | "skipped: no worker change" | "skipped: deploy failed".
     worker_restart_status: str = ""
+    # T-0717 leg 3: this deploy shipped new worker/ code but did NOT restart the
+    # worker, so the running process is on stale code and will stay there until
+    # the catch-up tick fires. The caller MUST NOT report a plain green success.
+    worker_stale: bool = False
+    # The sha the running worker is actually on, populated only when worker_stale
+    # — so the alert can name what's executing vs. what was just deployed.
+    worker_boot_sha: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -803,39 +1010,57 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     forced = bool(payload.get("restart_worker"))
     will_restart = _should_restart_worker(cfg, ok=ok, forced=forced)
     rate_limited = False
+    launch_failed = False
     if will_restart:
         reason = payload.get("reason", "")
         tag = "restart_worker" if forced else "auto-restart: worker/ changed"
         reason = f"{tag} — {reason}".strip(" —")
         # T-0305 part-b: a qualifying (worker-changed, not-killswitched) restart
         # can still be part of a burst of a few-minutes-apart deploys during a
-        # busy run — cap the actual bounce rate. Self-healing: the NEXT
-        # qualifying deploy's restart (once the window elapses) still catches
-        # this one's worker/ change, since the gate compares boot sha to live
-        # HEAD, not to any single deploy's diff.
-        if _restart_rate_limited(cfg, source="deploy", reason=reason):
+        # busy run — cap the actual bounce rate. T-0717: the cap DEFERS the
+        # restart (pending marker → catchup_deferred_worker_restart) rather than
+        # dropping it; it used to be dropped, silently leaving the worker on
+        # stale code after a deploy that reported success.
+        if _restart_rate_limited(cfg, source="deploy", reason=reason, slug=slug):
             rate_limited = True
             will_restart = False
             log.info(
                 "deploy.run_next: %s/%s worker restart RATE-LIMITED (min interval "
-                "not yet elapsed since the last restart) — skipping; the next "
-                "qualifying deploy still catches this change", slug, target,
+                "not yet elapsed since the last restart) — DEFERRED; the catch-up "
+                "tick fires it once the window elapses", slug, target,
             )
         else:
             try:
                 _restart_worker_detached(cfg, slug, queue_id, reason)
             except Exception:
+                launch_failed = True
+                will_restart = False
+                # T-0717: record it as pending so the catch-up tick retries —
+                # a launch failure used to leave the worker on stale code with
+                # worker_restart_status still claiming "fired".
+                _record_pending_restart(cfg, source="deploy-launch-failed",
+                                        reason=reason, slug=slug)
                 log.exception(
                     "deploy.run_next: %s/%s post-deploy worker restart launch failed "
-                    "(deploy itself succeeded — restart the worker manually)", slug, target,
+                    "(deploy itself succeeded — the catch-up tick will retry)", slug, target,
                 )
     # T-0446: surface which commit shipped + the worker-restart decision so the
     # terminal #deploy-logs ping is self-explaining (no false stale-worker panic).
     worker_restart_status = (
         "fired" if will_restart
-        else "skipped: rate-limited" if rate_limited
+        else "deferred: rate-limited (catch-up tick will fire it)" if rate_limited
+        else "deferred: restart launch failed (catch-up tick will retry)" if launch_failed
         else ("skipped: deploy failed" if not ok else "skipped: no worker change")
     )
+    # T-0717 leg 3 — the post-deploy assertion the operator asked for: a deploy
+    # that landed NEW worker code and did NOT fire a restart must not read as a
+    # plain green success. The running worker is on stale code RIGHT NOW; the
+    # deferral guarantees it converges, but the operator has to know that the
+    # commit they just shipped is not yet the one executing. Deliberately NOT
+    # keyed on "boot sha == deployed sha": a fired restart is async/detached, so
+    # this process's boot sha is still the old one either way — what
+    # distinguishes the bad case is that nothing is going to fix it soon.
+    worker_stale = bool(ok and not will_restart and (rate_limited or launch_failed))
     return DeployResult(
         ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
         collapsed_count=1 + len(collapsed_processing),
@@ -843,6 +1068,8 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         killed_reason=killed_reason,
         resolved_sha=_parse_resolved_sha(log_path),
         worker_restart_status=worker_restart_status,
+        worker_stale=worker_stale,
+        worker_boot_sha=boot_git_sha() if worker_stale else "",
     )
 
 

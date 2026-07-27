@@ -5,8 +5,11 @@ BYTE-IDENTICAL MIRROR. This file is duplicated, byte-for-byte, at:
   - worker/bot_squad_worker/secret_crypto.py  (reader: config.load)
 The API (docker) and worker (systemd) run in separate environments and do not
 import each other, so the helper is mirrored — same discipline as idalloc.py /
-the frontmatter pair. A drift test (test_secret_crypto.py) fails CI if the two
-copies diverge. EDIT BOTH COPIES TOGETHER.
+the frontmatter pair. EDIT BOTH COPIES TOGETHER: the mirror registry in
+`worker/tests/test_module_mirrors.py` pins them, and `scripts/lint/module_mirrors.py`
+runs it on every push (T-0743). Until then this docstring claimed a CI gate that
+did not exist — the drift assert lived in test_secret_crypto.py, in a worker
+suite no CI job has ever run.
 
 == Scheme ==
 Fernet (AES-128-CBC + HMAC-SHA256) from the `cryptography` package. Encrypted

@@ -106,16 +106,7 @@ def test_concurrent_allocation_no_collisions(tmp_path):
     assert set(ids) == {f"D-{i:04d}" for i in range(1, 51)}
 
 
-def test_worker_and_api_copies_are_byte_identical():
-    """The worker (systemd) and API (docker) run in separate environments and
-    do not import each other, so the allocator is duplicated. The two copies
-    MUST stay byte-identical — otherwise web creates and agent creates could
-    diverge on the shared counter file."""
-    repo = Path(__file__).resolve().parents[2]
-    worker_copy = repo / "worker" / "bot_squad_worker" / "idalloc.py"
-    api_copy = repo / "api" / "app" / "idalloc.py"
-    assert api_copy.exists(), f"API mirror missing: {api_copy}"
-    assert worker_copy.read_bytes() == api_copy.read_bytes(), (
-        "worker/bot_squad_worker/idalloc.py and api/app/idalloc.py have drifted "
-        "— re-sync them (they must be byte-identical)."
-    )
+# The worker/api byte-identical mirror check for idalloc.py used to live here as
+# its own copy of the comparison. T-0743 moved it to the single registry in
+# `worker/tests/test_module_mirrors.py`, which also runs on every push via
+# `scripts/lint/module_mirrors.py` — this one never did.

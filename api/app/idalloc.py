@@ -5,9 +5,11 @@ MIRROR:          api/app/idalloc.py
 
 These two files MUST stay byte-identical — the worker (systemd) and the API
 (docker) run in separate Python environments and do not import each other, so
-the only thing they share is the on-disk data mount. `test_idalloc_mirror`
-asserts the two files match byte-for-byte; keep this module dependency-free
-(stdlib only, no package-relative imports) so the copy stays valid in both.
+the only thing they share is the on-disk data mount. The mirror registry in
+`worker/tests/test_module_mirrors.py` (T-0743) asserts the two files match
+byte-for-byte, and `scripts/lint/module_mirrors.py` runs that on every push;
+keep this module dependency-free (stdlib only, no package-relative imports) so
+the copy stays valid in both.
 
 Why this exists
 ---------------

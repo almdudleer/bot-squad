@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pre-push hook — the invariant gates (T-0186 attr smoke, T-0738 task_body mirror).
+# pre-push hook — the invariant gates (T-0186 attr smoke, T-0738/T-0743 mirrors).
 #
 # The shared dev clone is edited by many concurrent bot-squad sessions. A
 # peer's raw `git add -A` / `git add <dir>` can sweep ANOTHER session's
@@ -15,15 +15,19 @@
 # fix that lands in only one copy ships broken. T-0733 did exactly that to
 # `task_body.py` in 5fe547f, with CI green — the guard existed and was silent
 # because nothing ran it, until a session ran the full worker suite by hand
-# hours later (T-0736 / T-0738).
+# hours later (T-0736 / T-0738). T-0743 widened that gate from `task_body.py`
+# alone to every duplicated-by-design pair in the repo; each pair's own check
+# had been sitting in the same never-run worker suite, and `frontmatter.py` had
+# no check at all.
 #
 # So this hook runs the cheap invariant gates before a push reaches origin (and
 # thus before the deploy, which builds from origin):
 #
 #   cross_module_attr_smoke.py  proves every `cfg.<attr>` access in a consumer
 #                               resolves to a real member of the provider class
-#   task_body_mirror.py         proves the worker/api `task_body.py` copies are
-#                               still byte-identical below their docstrings
+#   module_mirrors.py           proves every declared duplicated-by-design pair
+#                               (worker/tests/test_module_mirrors.py::MIRRORS)
+#                               is still identical
 #
 # Both are pure stdlib — no deps, no venv, no data tree, sub-second. They are
 # the class of check that belongs on EVERY push. Full suites (worker ~137s and
@@ -64,8 +68,8 @@ run_gate() {
 run_gate cross_module_attr_smoke.py \
     "pre-push BLOCKED by cross-module attribute smoke (T-0186): a consumer references a provider member that does not exist — likely a wide-add absorption split. Fix the missing field/import and re-push."
 
-run_gate task_body_mirror.py \
-    "pre-push BLOCKED by the task_body mirror gate (T-0738): worker/bot_squad_worker/task_body.py and api/app/task_body.py have diverged — a fix landed in only one copy (the T-0714 / T-0733 failure). Mirror the change into the other copy and re-push."
+run_gate module_mirrors.py \
+    "pre-push BLOCKED by the duplicated-module mirror gate (T-0738/T-0743): a module this repo keeps in two copies on purpose has diverged — a change landed in only one copy (the T-0714 / T-0733 failure). The offending pair(s) are named above. Mirror the change into the other copy and re-push."
 
 if [ "$failed" -ne 0 ]; then
     printf '\033[31m%s\033[0m\n' \

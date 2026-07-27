@@ -86,18 +86,6 @@ def test_load_alias_index_missing_is_empty(tmp_path: Path):
 
 
 # --- byte-identical worker/api mirror ---------------------------------------
-
-def test_worker_and_api_copies_are_byte_identical():
-    """The worker (systemd) and API (docker) run in separate environments and do
-    not import each other, so the resolver is duplicated. The two copies MUST
-    stay byte-identical — otherwise an agent read and a web read could resolve an
-    old initiative ref to different tasks."""
-    repo = Path(__file__).resolve().parents[2]
-    worker_copy = repo / "worker" / "bot_squad_worker" / "initiative_resolver.py"
-    api_copy = repo / "api" / "app" / "initiative_resolver.py"
-    assert api_copy.exists(), f"API mirror missing: {api_copy}"
-    assert worker_copy.read_bytes() == api_copy.read_bytes(), (
-        "worker/bot_squad_worker/initiative_resolver.py and "
-        "api/app/initiative_resolver.py have drifted — re-sync them "
-        "(they must be byte-identical)."
-    )
+# Checked by the single registry in `worker/tests/test_module_mirrors.py` since
+# T-0743, which also runs on every push via `scripts/lint/module_mirrors.py`.
+# It used to be a fourth copy of the same comparison, right here.

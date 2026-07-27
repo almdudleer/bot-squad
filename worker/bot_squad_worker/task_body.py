@@ -2,9 +2,10 @@
 
 Mirror of `api/app/task_body.py`. Duplicated by design to keep worker
 and api independent — see Phase 7 spec. The two files are pinned
-byte-identical from `from __future__ import annotations` onward by
-`worker/tests/test_task_body_mirror.py` (T-0729): a fix that lands in
-only one copy is exactly how T-0714 shipped broken.
+byte-identical from `from __future__ import annotations` onward by the
+mirror registry in `worker/tests/test_module_mirrors.py` (T-0729/T-0743),
+gated on every push by `scripts/lint/module_mirrors.py`: a fix that lands
+in only one copy is exactly how T-0714 shipped broken.
 """
 from __future__ import annotations
 

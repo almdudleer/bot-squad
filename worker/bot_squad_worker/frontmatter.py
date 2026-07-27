@@ -3,7 +3,10 @@
 SINGLE SOURCE OF TRUTH (T-0075). This module is byte-identical mirrored at
 ``worker/bot_squad_worker/frontmatter.py`` and ``api/app/frontmatter.py`` —
 edit BOTH copies together (same convention as ``idalloc.py``). It imports only
-the stdlib + ``yaml`` so the two copies can stay identical.
+the stdlib + ``yaml`` so the two copies can stay identical. Pinned below the
+docstring by the mirror registry in ``worker/tests/test_module_mirrors.py``,
+gated on every push by ``scripts/lint/module_mirrors.py`` (T-0743) — before that
+this pair had no guard of any kind.
 
 WHY THIS EXISTS
 ---------------

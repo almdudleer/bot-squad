@@ -33,14 +33,19 @@ jobs:
         # actions.py without its config.py field BEFORE deploy (origin build).
         run: |
           python3 scripts/lint/cross_module_attr_smoke.py
-      - name: task_body worker/api mirror gate (T-0738)
-        # Stdlib-only: imports mirror_failure() from the T-0729 mirror TEST (the
-        # SSOT of the invariant) and calls it, so this gate and that test can
-        # never disagree. Wired because T-0733 pushed a divergence in 5fe547f
-        # with this workflow green — the guard was correct and silent, since
-        # nothing but a hand-run of the full worker suite ever executed it.
+      - name: Duplicated-module mirror gate (T-0738 / T-0743)
+        # Stdlib-only: imports MIRRORS + mirror_failure() from the mirror TEST
+        # (the SSOT of both the pair list and the comparison) and calls them, so
+        # this gate and that test can never disagree. Wired because T-0733
+        # pushed a divergence in 5fe547f with this workflow green — the guard
+        # was correct and silent, since nothing but a hand-run of the full
+        # worker suite ever executed it. T-0743 generalised it from task_body
+        # alone to every duplicated-by-design pair (frontmatter, secret_crypto,
+        # idalloc, initiative_resolver, task_search), whose own hand-rolled
+        # checks lived in the same never-run worker suite.
         run: |
-          python3 scripts/lint/task_body_mirror.py
+          python3 scripts/lint/module_mirrors.py --list
+          python3 scripts/lint/module_mirrors.py
       - name: Role-contract pointers name the git SSOT (T-0716 / D-0043)
         # Repo-source scan (no data tree): fails if any prose sends a reader to
         # the drifting per-project vision/roles/<role>.md copy.

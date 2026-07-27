@@ -2,12 +2,11 @@
 
 The module is a BYTE-IDENTICAL mirror across api/app/secret_crypto.py and
 worker/bot_squad_worker/secret_crypto.py — same discipline as idalloc.py.
-These tests exercise the worker copy; the byte-identical guard at the bottom
-proves the API copy can't drift.
+These tests exercise the worker copy; that the API copy can't drift is proved
+by the mirror registry in `test_module_mirrors.py` (T-0743), which runs on every
+push via `scripts/lint/module_mirrors.py`.
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
@@ -116,17 +115,8 @@ def test_rotation_new_writes_use_primary(monkeypatch) -> None:
     assert secret_crypto.decrypt(enc_new) == "SECRET"
 
 
-def test_worker_and_api_copies_are_byte_identical() -> None:
-    """The worker (systemd) and API (docker) run in separate environments and
-    do not import each other, so the crypto helper is duplicated. The two
-    copies MUST stay byte-identical — otherwise the writer (API) and reader
-    (worker) could disagree on the on-disk format and silently break the
-    bot token."""
-    repo = Path(__file__).resolve().parents[2]
-    worker_copy = repo / "worker" / "bot_squad_worker" / "secret_crypto.py"
-    api_copy = repo / "api" / "app" / "secret_crypto.py"
-    assert api_copy.exists(), f"API mirror missing: {api_copy}"
-    assert worker_copy.read_bytes() == api_copy.read_bytes(), (
-        "worker/bot_squad_worker/secret_crypto.py and api/app/secret_crypto.py "
-        "have drifted — re-sync them (they must be byte-identical)."
-    )
+# The worker/api byte-identical mirror check for secret_crypto.py used to live
+# here as its own copy of the comparison — and this module's docstring claimed it
+# "fails CI", which was false: no CI job has ever run the worker suite. T-0743
+# moved it to the single registry in `worker/tests/test_module_mirrors.py`, which
+# `scripts/lint/module_mirrors.py` runs in CI and pre-push for real.

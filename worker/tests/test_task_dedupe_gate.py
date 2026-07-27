@@ -14,7 +14,6 @@ so only near-total-token, near-duplicate titles trip the gate.
 """
 from __future__ import annotations
 
-import filecmp
 from pathlib import Path
 
 import pytest
@@ -286,18 +285,8 @@ def test_dedupe_listing_still_capped_after_filter(tmp_path, tmp_config_dir, monk
 
 
 # --- worker/scripts-cli mirror -----------------------------------------------
-
-
-def test_task_search_worker_mirror_is_byte_identical():
-    """``worker/bot_squad_worker/task_search.py`` is a byte-identical copy of
-    the canonical ``scripts/cli/task_search.py`` (same convention as
-    ``idalloc.py`` / T-0174) — the worker package cannot import across the
-    ``scripts/`` boundary cleanly, so we replicate instead."""
-    here = Path(__file__).resolve()
-    root = here.parents[2]  # worker/tests/ -> repo root
-    canonical = root / "scripts" / "cli" / "task_search.py"
-    mirror = root / "worker" / "bot_squad_worker" / "task_search.py"
-    assert filecmp.cmp(canonical, mirror, shallow=False), (
-        f"{canonical} and {mirror} have drifted — re-sync them "
-        "(they must be byte-identical)."
-    )
+# ``worker/bot_squad_worker/task_search.py`` is a byte-identical copy of the
+# canonical ``scripts/cli/task_search.py``. Checked by the single registry in
+# `worker/tests/test_module_mirrors.py` since T-0743, which also runs on every
+# push via `scripts/lint/module_mirrors.py`. It used to be a fifth copy of the
+# same comparison, right here.

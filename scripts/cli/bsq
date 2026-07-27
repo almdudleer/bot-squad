@@ -3425,7 +3425,16 @@ def cmd_verify_isolated(args) -> None:
             die(f"verify-isolated: could not extract {args.ref} into {dest}")
         print(f"verify-isolated: {args.ref} ({sha[:12]}) extracted to {dest}")
         print(f"verify-isolated: running: {' '.join(cmd)}\n")
-        rc = subprocess.run(cmd, cwd=dest).returncode
+        try:
+            rc = subprocess.run(cmd, cwd=dest).returncode
+        except FileNotFoundError:
+            # Overwhelmingly: a relative interpreter path. The extract holds
+            # only what is COMMITTED, and a venv is not — that is the point.
+            die(f"verify-isolated: {cmd[0]!r} does not exist inside the extract.\n"
+                "The extract contains only what is committed at that ref — your venv\n"
+                "is not in git, so name its interpreter by ABSOLUTE path:\n"
+                f"  bsq verify-isolated -- {Path(repo_root) / 'worker/.venv/bin/python'} "
+                "-m pytest -q <tests>", code=127)
         print(f"\nverify-isolated: exit {rc} — this certifies {sha[:12]}, "
               "not the shared working tree.")
         sys.exit(rc)

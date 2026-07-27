@@ -28,6 +28,7 @@ Verbs:
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
   bsq model set/clear/status         durable per-session claude --model override (T-0678)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
+  bsq commit --hunks [--patch P]    co-edited file: commit ONLY your hunks via a temp index
 
 Conventions shared with the other ops shims:
   - $BOT_SQUAD       install root (default /home/www/bot-squad)
@@ -2792,6 +2793,14 @@ def cmd_pace_resume(args) -> None:
 # hunks are never touched, so a co-edited file can't sweep a peer's work.
 # Limitation: if a peer edits the SAME region AFTER your edit-begin, the apply
 # fails loud (never corrupts) and you resolve manually.
+#
+# T-0732 (2026-07-27 p279/p280 incident): the POST-HOC path — you already edited
+# without an edit-begin — used to be a hand-rolled recipe that staged your hunks
+# into the SHARED index and committed it with no pathspec. The index is shared,
+# so a peer's staging seconds earlier rode along (0e20d32 swept 17 files of peer
+# WIP). `bsq commit --hunks --patch <patch>` gives the post-hoc path the SAME
+# temp-index isolation the edit-begin path already had, and every hunks commit
+# now verifies its own scope out loud against the file set it intended.
 # --------------------------------------------------------------------------
 def _sanitize_sid(sid: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", sid or "")
@@ -2890,7 +2899,166 @@ def cmd_edit_begin(args) -> None:
     print(f"edit-begin: baselined {len(args.files)} file(s) for {sid}")
 
 
+def _patch_target_rels(patch_text: str) -> list[str]:
+    """Repo-relative paths a `-p1` patch writes to, in first-seen order."""
+    rels: list[str] = []
+    for line in patch_text.splitlines():
+        if not line.startswith("+++ "):
+            continue
+        target = line[4:].split("\t", 1)[0].strip()
+        if target == "/dev/null":
+            continue
+        rel = target[2:] if target.startswith("b/") else target
+        if rel and rel not in rels:
+            rels.append(rel)
+    return rels
+
+
+def _verify_commit_scope(repo_root: str, expected: list[str]) -> None:
+    """T-0732: print what actually landed, and SHOUT if it isn't what we meant.
+
+    The 2026-07-27 sweep was caught only because a human ran
+    `git show --stat HEAD` by hand afterwards. That last line of defence is the
+    one control that turned a silent corruption into a recoverable incident, so
+    it runs automatically now instead of living in a doc as an optional step.
+    """
+    stat = subprocess.run(
+        ["git", "show", "--stat", "--oneline", "HEAD"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if stat.stdout:
+        print("\nverify — what actually landed at HEAD:")
+        print(stat.stdout.rstrip())
+    actual = subprocess.run(
+        # --root so a root commit (no parent) still reports its files rather
+        # than an empty diff, which would make this check silently pass.
+        ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD"],
+        cwd=repo_root, capture_output=True, text=True,
+    ).stdout.split()
+    # A declared path may be a directory pathspec, so its children count as
+    # intended too — otherwise `bsq commit -m msg docs/` would cry absorption.
+    exact = set(expected)
+    extra = [
+        f for f in actual
+        if f not in exact and not any(f.startswith(e.rstrip("/") + "/") for e in exact)
+    ]
+    if not extra:
+        return
+    print(
+        "\n*** ABSORPTION WARNING (T-0732) ***\n"
+        f"This commit contains {len(extra)} file(s) you did NOT intend to commit:\n"
+        + "".join(f"  {f}\n" for f in extra)
+        + "They are almost certainly a peer's in-flight work, swept from the shared\n"
+          "index. Their author may now believe their work is at HEAD when it is not.\n"
+          "Recover WITHOUT rewriting history — reverse those paths out in a chore\n"
+          "commit on top, then tell the peer:\n"
+          "  git show HEAD -- " + " ".join(extra[:3]) + (" ...\n" if len(extra) > 3 else "\n")
+        + "  git show HEAD -- <their paths> | git apply -R --cached\n"
+          "  bsq commit -m 'chore: un-sweep peer WIP from <sha>' <their paths>\n"
+          "  # then md5sum their worktree files to prove nothing was lost\n",
+        file=sys.stderr,
+    )
+
+
+def _commit_patch_via_temp_index(
+    repo_root: str,
+    patch_text: str,
+    expected_rels: list[str],
+    message: str,
+    ack: bool,
+    redo_hint: str,
+) -> None:
+    """Commit `patch_text` applied onto a TEMP index seeded from HEAD.
+
+    The temp index is the whole point (T-0215, hardened by T-0732): the commit
+    is built from HEAD + exactly these hunks, in an index no peer can reach, so
+    neither a peer's staged files nor their dirty hunks in a co-edited file can
+    ride along. Never stage into `.git/index` and commit that with no pathspec —
+    safe-commit refuses it precisely because that index is shared.
+
+    Returns on success; exits non-zero on a failed apply or commit.
+    """
+    pf = tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False)
+    pf.write(patch_text)
+    pf.close()
+    tmp_index = pf.name + ".index"
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = tmp_index
+    try:
+        rt = subprocess.run(["git", "read-tree", "HEAD"], cwd=repo_root, env=env,
+                            capture_output=True, text=True)
+        if rt.returncode != 0:
+            die(f"commit --hunks: git read-tree HEAD failed: {rt.stderr.strip()}")
+        ap = subprocess.run(
+            ["git", "apply", "--cached", "--recount", "--whitespace=nowarn", pf.name],
+            cwd=repo_root, env=env, capture_output=True, text=True,
+        )
+        if ap.returncode != 0:
+            die("commit --hunks: could not apply your hunks onto HEAD — your edit "
+                "likely overlaps a peer's concurrent change in the same region; "
+                f"resolve manually.\n{ap.stderr.strip()}")
+        safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
+        if not os.path.exists(safe_commit):
+            safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
+        if ack:
+            env["BOT_SQUAD_ACK_PEERS"] = "1"
+        # No pathspec — safe here, and ONLY here, because GIT_INDEX_FILE points
+        # at our private index holding EXACTLY HEAD + our hunks.
+        rc = subprocess.run([safe_commit, "-m", message], cwd=repo_root, env=env).returncode
+        if rc != 0:
+            if not ack:
+                print(
+                    "\nbsq: commit --hunks blocked by the peer-activity hook (expected "
+                    "on the first attempt). Review the report above, then re-run with "
+                    f"--ack:\n  {redo_hint}",
+                    file=sys.stderr,
+                )
+            sys.exit(rc)
+    finally:
+        for p in (pf.name, tmp_index):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    _verify_commit_scope(repo_root, expected_rels)
+
+
+def _commit_hunks_from_patch(args, repo_root: str) -> None:
+    """Post-hoc hunk-isolated commit: you already edited, without an edit-begin.
+
+    You hand-build a patch of just YOUR hunks (`git diff <file>`, delete the
+    `@@` hunks that aren't yours) and this applies it onto a temp index. Same
+    isolation as the edit-begin path — which the old documented recipe did NOT
+    have, because it staged into the shared index and committed it whole
+    (T-0732).
+    """
+    patch_file = Path(args.patch)
+    if not patch_file.is_file():
+        die(f"commit --hunks --patch: no such patch file: {args.patch}")
+    patch_text = patch_file.read_text()
+    rels = _patch_target_rels(patch_text)
+    if not rels:
+        die(f"commit --hunks --patch: {args.patch} contains no file targets — "
+            "expected a `git diff` patch with `+++ b/<path>` headers")
+    if args.files:
+        declared = {_repo_relpath(repo_root, f) for f in args.files}
+        stray = [r for r in rels if r not in declared]
+        if stray:
+            die("commit --hunks --patch: the patch touches files you did not "
+                f"declare: {', '.join(stray)}\nEither add them to the command or "
+                "trim those hunks out of the patch.")
+    _commit_patch_via_temp_index(
+        repo_root, patch_text, rels, args.message, args.ack,
+        redo_hint=f"bsq commit --hunks --ack --patch {args.patch} "
+                  f"-m {json.dumps(args.message)}",
+    )
+    print(f"commit --hunks --patch: committed {len(rels)} file(s) from {args.patch}")
+    sys.exit(0)
+
+
 def _commit_hunks(args, repo_root: str) -> None:
+    if getattr(args, "patch", None):
+        return _commit_hunks_from_patch(args, repo_root)
     slug = resolve_slug()
     sid = require_sid(getattr(args, "sid", None))
     if not args.files:
@@ -2924,48 +3092,11 @@ def _commit_hunks(args, repo_root: str) -> None:
         print("commit --hunks: no changes since edit-begin; nothing to commit")
         return
 
-    pf = tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False)
-    pf.write("".join(patches))
-    pf.close()
-    tmp_index = pf.name + ".index"
-    env = dict(os.environ)
-    env["GIT_INDEX_FILE"] = tmp_index
-    try:
-        rt = subprocess.run(["git", "read-tree", "HEAD"], cwd=repo_root, env=env,
-                            capture_output=True, text=True)
-        if rt.returncode != 0:
-            die(f"commit --hunks: git read-tree HEAD failed: {rt.stderr.strip()}")
-        ap = subprocess.run(
-            ["git", "apply", "--cached", "--recount", "--whitespace=nowarn", pf.name],
-            cwd=repo_root, env=env, capture_output=True, text=True,
-        )
-        if ap.returncode != 0:
-            die("commit --hunks: could not apply your hunks onto HEAD — your edit "
-                "likely overlaps a peer's concurrent change in the same region; "
-                f"resolve manually.\n{ap.stderr.strip()}")
-        safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
-        if not os.path.exists(safe_commit):
-            safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
-        if args.ack:
-            env["BOT_SQUAD_ACK_PEERS"] = "1"
-        # No pathspec: the temp index already holds EXACTLY HEAD + my hunks.
-        rc = subprocess.run([safe_commit, "-m", args.message], cwd=repo_root, env=env).returncode
-        if rc != 0:
-            if not args.ack:
-                print(
-                    "\nbsq: commit --hunks blocked by the peer-activity hook (expected "
-                    "on the first attempt). Review the report above, then re-run with "
-                    f"--ack:\n  bsq commit --hunks --ack -m {json.dumps(args.message)} "
-                    f"{' '.join(args.files)}",
-                    file=sys.stderr,
-                )
-            sys.exit(rc)
-    finally:
-        for p in (pf.name, tmp_index):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+    _commit_patch_via_temp_index(
+        repo_root, "".join(patches), rels, args.message, args.ack,
+        redo_hint=f"bsq commit --hunks --ack -m {json.dumps(args.message)} "
+                  f"{' '.join(args.files)}",
+    )
     # Success — clear the consumed baselines so a later edit re-snapshots fresh.
     for rel in rels:
         try:
@@ -3023,6 +3154,9 @@ def cmd_commit(args) -> None:
         )
     if getattr(args, "hunks", False):
         return _commit_hunks(args, repo_root)
+    if getattr(args, "patch", None):
+        die("commit --patch only applies to the hunk-isolated form — use "
+            "`bsq commit --hunks --patch <patch> -m MSG`")
     if not args.files:
         die("commit needs explicit file paths (never wide-add)")
     safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
@@ -3067,6 +3201,8 @@ def cmd_commit(args) -> None:
             f"  bsq commit --ack -m {json.dumps(args.message)} {' '.join(args.files)}",
             file=sys.stderr,
         )
+    if rc == 0:
+        _verify_commit_scope(repo_root, [_repo_relpath(repo_root, f) for f in args.files])
     sys.exit(rc)
 
 
@@ -4773,6 +4909,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="T-0215: commit ONLY this session's hunks (the diff since "
              "`bsq edit-begin`) in <files>, isolating a peer's edits in the same file")
     cm.add_argument("--sid", help="session SID for --hunks (default: derived from tmux)")
+    cm.add_argument(
+        "--patch", metavar="FILE",
+        help="T-0732: post-hoc --hunks — you forgot `bsq edit-begin`, so hand it a "
+             "patch of just YOUR hunks; it is applied onto a temp index seeded from "
+             "HEAD (never the shared index)")
     cm.add_argument("files", nargs="*", help="explicit file paths to stage + commit")
     cm.set_defaults(func=cmd_commit)
 

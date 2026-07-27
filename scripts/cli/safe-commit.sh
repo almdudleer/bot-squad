@@ -37,9 +37,10 @@
 #          ...edit...
 #          bsq commit --hunks -- <files>   # commits ONLY your hunks
 #      Post-hoc fallback (you forgot edit-begin): build a patch of only your
-#      hunks and `git apply --cached --recount` it, then run THIS wrapper with
-#      no pathspec to commit the staged index as-is. See AGENT_INSTRUCTIONS.md
-#      "Concurrent-commit safety" for the full recipe.
+#      hunks and hand it to `bsq commit --hunks --patch <patch> -m MSG`, which
+#      applies it onto a TEMP index seeded from HEAD. Never stage the patch into
+#      the shared index and commit that with no pathspec — see failure mode 4.
+#      See AGENT_INSTRUCTIONS.md "Concurrent-commit safety" for the full recipe.
 #
 #   3. unlocked-stage race (T-0648, 2026-07-18 p31/p34 incident). Pathspec
 #      commit is only absorb-proof from the *commit* step onward; the earlier
@@ -56,9 +57,22 @@
 #      safe-commit also echoes the resulting commit's file list so
 #      attribution is verifiable at a glance.
 #
+#   4. pathspec-LESS commit of the shared index (T-0732, 2026-07-27 p279/p280
+#      incident). `safe-commit -m MSG` with no `-- <paths>` commits the shared
+#      `.git/index` AS-IS. AGENT_INSTRUCTIONS' post-hoc hunk recipe told every
+#      session to do exactly that ("your hunks only") — but the index is shared,
+#      so anything a peer staged seconds earlier rides along: 0e20d32 swept 17
+#      files of a peer's in-flight WIP. This wrapper only WARNED. Defence: with
+#      a non-empty SHARED index and no pathspec, REFUSE (exit 3). The sanctioned
+#      escape is an isolated index — `GIT_INDEX_FILE=<tmp> safe-commit -m MSG`
+#      is allowed, because a peer's staging cannot reach that index at all.
+#      That is what `bsq commit --hunks` does internally.
+#
 # Overrides:
-#   BOT_SQUAD_ALLOW_COMMIT_ALL=1   permit `-a`/`--all` (single-tenant clone,
-#                                  you own every pending change).
+#   BOT_SQUAD_ALLOW_COMMIT_ALL=1   permit `-a`/`--all` AND a pathspec-less
+#                                  commit of a non-empty shared index
+#                                  (single-tenant clone, you own every
+#                                  pending change).
 #   BOT_SQUAD_COMMIT_TIMEOUT=N     flock wait seconds (default 120).
 #
 # Pass-through: every arg goes straight to `git commit`; exit code is git's
@@ -134,14 +148,6 @@ EOF
     exit 3
 fi
 
-if [ "$saw_pathspec" = "0" ] && [ "${BOT_SQUAD_ALLOW_COMMIT_ALL:-}" != "1" ]; then
-    # No `-- <paths>`: the commit takes the shared index AS-IS, which may hold a
-    # peer's staged files. Warn but don't block — legacy callers and `--amend`
-    # fixups land here, and the pre-commit peer-activity hook is the backstop.
-    # `bsq commit` always passes a pathspec, so it never trips this.
-    echo "safe-commit: WARNING — no '-- <paths>' given; committing the current shared index as-is. If a peer staged files here they'll be absorbed. Prefer: safe-commit -m MSG -- <paths>" >&2
-fi
-
 # ---------------------------------------------------------------------------
 # flock serialization (T-0093)
 # ---------------------------------------------------------------------------
@@ -163,6 +169,74 @@ if ! flock --timeout="$TIMEOUT" 9; then
 fi
 
 # ---------------------------------------------------------------------------
+# Shared-index guard (T-0732) — refuse a pathspec-less commit of a non-empty
+# SHARED index.
+#
+# `git commit` with no `-- <paths>` commits whatever is in the index. In this
+# clone that index is shared by every live session, so "commit the index as-is"
+# means "commit whatever any peer staged in the last few seconds" — the
+# 2026-07-27 incident, where a post-hoc hunk commit swept 17 files of a peer's
+# WIP. Checked INSIDE the flock so a peer's `git add` can't land between the
+# check and the commit.
+#
+# An ISOLATED index is the sanctioned way to do this: point GIT_INDEX_FILE at
+# your own temp index (seeded `git read-tree HEAD`, then `git apply --cached`
+# your hunks) and a peer's staging is unreachable by construction. That form is
+# allowed through untouched — it is what `bsq commit --hunks` uses.
+# ---------------------------------------------------------------------------
+GIT_DIR_ABS="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "${REPO_ROOT}/.git")"
+SHARED_INDEX="${GIT_DIR_ABS}/index"
+ACTIVE_INDEX="${GIT_INDEX_FILE:-$SHARED_INDEX}"
+index_is_shared=0
+if [ "$(readlink -f "$ACTIVE_INDEX" 2>/dev/null || echo "$ACTIVE_INDEX")" = \
+     "$(readlink -f "$SHARED_INDEX" 2>/dev/null || echo "$SHARED_INDEX")" ]; then
+    index_is_shared=1
+fi
+
+if [ "$saw_pathspec" = "0" ] && [ "$index_is_shared" = "1" ] \
+   && [ "${BOT_SQUAD_ALLOW_COMMIT_ALL:-}" != "1" ]; then
+    # Anything staged? (An empty index with no pathspec is harmless — that's
+    # `--amend --no-edit` / `--allow-empty`, which absorb nothing.)
+    if git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        git diff --cached --quiet HEAD -- 2>/dev/null
+        index_dirty=$?
+    else
+        [ -n "$(git ls-files --cached 2>/dev/null)" ] && index_dirty=1 || index_dirty=0
+    fi
+    if [ "$index_dirty" != "0" ]; then
+        staged_now="$(git diff --cached --name-only 2>/dev/null | sed 's/^/  /')"
+        cat >&2 <<EOF
+safe-commit: REFUSED — no '-- <paths>' given, and the SHARED index is not empty.
+
+Committing the index as-is means committing whatever ANY live session staged in
+this clone, not just your work. That is the T-0732 failure mode: on 2026-07-27
+this exact form swept 17 files of a peer's in-flight WIP into one commit and
+produced a false "my work is at HEAD" report for its real author.
+
+Currently staged in the shared index (this is what would be committed):
+${staged_now}
+
+Commit by explicit pathspec:
+  bsq commit -m "msg" path/to/file.py [more/files ...]
+
+Co-editing ONE file with a peer, so a pathspec would sweep their hunks?
+Use an ISOLATED index — a peer's staging cannot reach it:
+  bsq commit --hunks -- <files>              # after 'bsq edit-begin <files>'
+  bsq commit --hunks --patch <patch> -m MSG  # post-hoc, no edit-begin needed
+Raw equivalent, if you must build it by hand:
+  idx=\$(mktemp); export GIT_INDEX_FILE=\$idx
+  git read-tree HEAD && git apply --cached --recount my-hunks.patch
+  BOT_SQUAD_ACK_PEERS=1 safe-commit -m "msg"   # allowed: the index is yours
+
+Override (single-tenant clone, you own every pending change):
+  BOT_SQUAD_ALLOW_COMMIT_ALL=1 safe-commit ...
+EOF
+        exec 9>&-
+        exit 3
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Locked staging (T-0648) — `bsq commit` hands us its explicit path list here
 # (NUL-separated, in a temp file named by BOT_SQUAD_STAGE_PATHS_FILE) instead
 # of running `git add` itself before calling this wrapper. Staging AFTER the
@@ -171,12 +245,19 @@ fi
 # shared `.git/index` (the 2026-07-18 p31/p34 incident — an unlocked `git add`
 # racing a locked commit for `.git/index.lock`).
 # ---------------------------------------------------------------------------
+stage_paths=()
+prior_index_entries=""
 if [ -n "${BOT_SQUAD_STAGE_PATHS_FILE:-}" ]; then
-    stage_paths=()
     while IFS= read -r -d '' p; do
         stage_paths+=("$p")
     done < "$BOT_SQUAD_STAGE_PATHS_FILE"
     if [ "${#stage_paths[@]}" -gt 0 ]; then
+        # Remember what the shared index held for these paths BEFORE we stage,
+        # so a failed commit can put it back (T-0732 / p279's feedback: the
+        # pre-commit hook blocks the first attempt by design and tells you to
+        # review, which used to leave your files staged in the shared index —
+        # a loaded index sitting unattended for the whole review window).
+        prior_index_entries="$(git ls-files --stage -- "${stage_paths[@]}" 2>/dev/null)"
         if ! git add -- "${stage_paths[@]}"; then
             echo "safe-commit: git add failed for staged paths" >&2
             exec 9>&-
@@ -187,6 +268,21 @@ fi
 
 git commit "$@"
 rc=$?
+
+# Failed commit (usually the peer-activity hook's deliberate first-attempt
+# block) — roll the shared index back to what it held for our paths before we
+# staged, so nothing of ours is left loaded in it while we review. Still inside
+# the flock, so no peer can observe the half-state. `bsq commit` re-stages on
+# the --ack re-run.
+if [ "$rc" != "0" ] && [ "${#stage_paths[@]}" -gt 0 ]; then
+    if git update-index --force-remove -- "${stage_paths[@]}" 2>/dev/null; then
+        if [ -n "$prior_index_entries" ]; then
+            printf '%s\n' "$prior_index_entries" | git update-index --index-info 2>/dev/null || true
+        fi
+    else
+        echo "safe-commit: WARNING — could not unstage after a failed commit; your paths are still in the shared index" >&2
+    fi
+fi
 
 # Echo the resulting commit's file list (T-0648) so attribution is verifiable
 # at a glance — a dev can see at commit time exactly what landed, instead of

@@ -189,6 +189,140 @@ def test_commit_hunks_requires_prior_edit_begin(repo):
     assert "edit-begin" in (cm.stderr + cm.stdout)
 
 
+# ---------------------------------------------------------------------------
+# T-0732: the POST-HOC path (--patch) gets the same temp-index isolation
+# ---------------------------------------------------------------------------
+def test_patch_target_rels_reads_plus_headers():
+    patch = (
+        "diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n"
+        "@@ -1 +1 @@\n-x\n+y\n"
+        "diff --git a/new.txt b/new.txt\n--- /dev/null\n+++ b/new.txt\n"
+        "@@ -0,0 +1 @@\n+hello\n"
+    )
+    assert bsq._patch_target_rels(patch) == ["pkg/a.py", "new.txt"]
+
+
+def test_patch_target_rels_skips_deleted_file_marker():
+    patch = "--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+    assert bsq._patch_target_rels(patch) == []
+
+
+def test_commit_hunks_patch_isolates_peer_hunk_and_peer_staging(repo):
+    """The 2026-07-27 incident, driven through the fix. No edit-begin was run
+    (that's the whole point of the post-hoc path); a peer is dirty in the SAME
+    file AND has an unrelated file staged in the shared index. Neither may
+    land in my commit."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    f = r / "shared.txt"
+    f.write_text("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n")
+    _git(r, "add", "shared.txt")
+    _git(r, "commit", "-q", "-m", "base")
+
+    f.write_text("L1\nL2-PEER\nL3\nL4\nL5\nL6\nL7\nL8-MINE\n")   # both edits, mine + theirs
+    (r / "peer_wip.txt").write_text("peer's in-flight work\n")
+    _git(r, "add", "peer_wip.txt")                                # peer loads the shared index
+
+    # I hand-build a patch of ONLY my hunk (what a dev does by trimming `@@`s).
+    patch = r / "mine.patch"
+    patch.write_text(
+        "diff --git a/shared.txt b/shared.txt\n"
+        "--- a/shared.txt\n"
+        "+++ b/shared.txt\n"
+        "@@ -8 +8 @@\n"
+        "-L8\n"
+        "+L8-MINE\n"
+    )
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "mine only")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+
+    committed = _git(r, "show", "HEAD:shared.txt")
+    assert "L8-MINE" in committed         # my hunk landed
+    assert "L2-PEER" not in committed     # peer's hunk in the same file: not swept
+    assert "peer_wip.txt" not in _git(r, "show", "--name-only", "--format=", "HEAD")
+    # peer's staging survives, still theirs to commit
+    assert "peer_wip.txt" in _git(r, "diff", "--cached", "--name-only")
+
+
+def test_commit_hunks_patch_rejects_undeclared_files(repo):
+    """If you name files, the patch may not reach past them — a mis-trimmed
+    patch is caught before it becomes a commit."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("a\n")
+    (r / "b.txt").write_text("b\n")
+    _git(r, "add", "a.txt", "b.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    patch = r / "two.patch"
+    patch.write_text(
+        "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+a2\n"
+        "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-b\n+b2\n"
+    )
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "only a", "a.txt")
+    assert cm.returncode != 0
+    assert "b.txt" in (cm.stderr + cm.stdout)
+
+
+def test_commit_hunks_patch_needs_a_real_patch_file(repo):
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("a\n")
+    _git(r, "add", "a.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(r / "nope.patch"),
+                  "--sid", "S-me-dev-p1", "-m", "x")
+    assert cm.returncode != 0
+    assert "no such patch file" in (cm.stderr + cm.stdout)
+
+
+def test_patch_without_hunks_is_rejected(repo):
+    """--patch is meaningless outside the hunk-isolated form; say so rather
+    than silently doing a plain pathspec commit."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("a\n")
+    cm = _run_bsq(r, bs, "commit", "--patch", "x.patch",
+                  "--sid", "S-me-dev-p1", "-m", "x", "a.txt")
+    assert cm.returncode != 0
+    assert "--hunks" in (cm.stderr + cm.stdout)
+
+
+# ---------------------------------------------------------------------------
+# T-0732: the verify step runs itself instead of living in a doc as advice
+# ---------------------------------------------------------------------------
+def test_verify_commit_scope_is_quiet_when_scope_matches(repo, capsys):
+    r = repo["repo"]
+    (r / "a.txt").write_text("a\n")
+    _git(r, "add", "a.txt")
+    _git(r, "commit", "-q", "-m", "just a")
+    bsq._verify_commit_scope(str(r), ["a.txt"])
+    out = capsys.readouterr()
+    assert "verify — what actually landed" in out.out
+    assert "ABSORPTION WARNING" not in out.err
+
+
+def test_verify_commit_scope_shouts_on_an_unintended_file(repo, capsys):
+    """The last line of defence that caught the real incident, automated."""
+    r = repo["repo"]
+    (r / "mine.txt").write_text("mine\n")
+    (r / "peer_wip.txt").write_text("peer\n")
+    _git(r, "add", "mine.txt", "peer_wip.txt")
+    _git(r, "commit", "-q", "-m", "swept a peer's file in")
+    bsq._verify_commit_scope(str(r), ["mine.txt"])
+    err = capsys.readouterr().err
+    assert "ABSORPTION WARNING" in err
+    assert "peer_wip.txt" in err
+    assert "git apply -R --cached" in err  # names the non-rewriting recovery
+
+
+def test_verify_commit_scope_accepts_children_of_a_declared_directory(repo, capsys):
+    r = repo["repo"]
+    (r / "docs").mkdir()
+    (r / "docs" / "x.md").write_text("x\n")
+    _git(r, "add", "docs/x.md")
+    _git(r, "commit", "-q", "-m", "docs")
+    bsq._verify_commit_scope(str(r), ["docs"])
+    assert "ABSORPTION WARNING" not in capsys.readouterr().err
+
+
 def test_plain_commit_unchanged_still_pathspec_commits(repo):
     r, bs = repo["repo"], repo["bot_squad"]
     f = r / "y.txt"

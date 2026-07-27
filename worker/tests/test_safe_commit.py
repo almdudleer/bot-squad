@@ -8,8 +8,16 @@ throwaway git repo (no mocks). They lock in the two T-0145 guarantees:
   * serialization: concurrent safe-commits queue on the flock instead of
     crashing on `.git/index.lock` (T-0093).
 
+and the two T-0732 guarantees added after the 2026-07-27 sweep:
+
+  * shared-index guard: a pathspec-LESS commit of a non-empty SHARED index is
+    refused; the same commit against an isolated GIT_INDEX_FILE is allowed.
+  * no loaded index: a commit the pre-commit hook blocks leaves nothing of ours
+    staged in the shared index while we review.
+
 Manual-first (T-0158): the same scenarios were walked through by hand in a
-scratch repo before being encoded here.
+scratch repo before being encoded here — including a replay of the real
+incident (peer stages WIP, I commit the index with no pathspec).
 """
 from __future__ import annotations
 
@@ -137,6 +145,152 @@ def test_pathspec_message_backward_compatible(repo: Path) -> None:
     res = _run(repo, "-m", "plain pathspec commit", "--", "fileD.txt")
     assert res.returncode == 0, res.stderr
     assert "fileD.txt" in _tracked(repo)
+
+
+# ---------------------------------------------------------------------------
+# Shared-index guard (T-0732 / the 2026-07-27 p279+p280 sweep)
+# ---------------------------------------------------------------------------
+
+
+def _staged(repo: Path) -> set[str]:
+    out = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout
+    return set(out.split())
+
+
+def test_refuses_pathspecless_commit_of_loaded_shared_index(repo: Path) -> None:
+    """Replay of the incident: a peer has staged their WIP; the documented
+    post-hoc recipe (`safe-commit -m MSG` with NO pathspec) must now be
+    REFUSED instead of committing that peer's work."""
+    (repo / "peer_wip.txt").write_text("peer WIP\n")
+    (repo / "mine.txt").write_text("my hunk\n")
+    subprocess.run(["git", "add", "--", "peer_wip.txt", "mine.txt"],
+                   cwd=str(repo), check=True)
+    before = _ncommits(repo)
+
+    res = _run(repo, "-m", "mine only (or so I thought)")
+
+    assert res.returncode == 3
+    assert "REFUSED" in res.stderr
+    # It names what would have been swept, so the refusal is actionable.
+    assert "peer_wip.txt" in res.stderr
+    assert _ncommits(repo) == before        # nothing committed
+    assert "peer_wip.txt" in _staged(repo)  # peer's staging left intact
+
+
+def test_pathspecless_commit_allowed_against_isolated_index(repo: Path) -> None:
+    """The sanctioned escape: build the commit in your OWN index (what
+    `bsq commit --hunks` does). A peer's staging can't reach it, so no pathspec
+    is needed and the guard stays out of the way."""
+    (repo / "peer_wip.txt").write_text("peer WIP\n")
+    subprocess.run(["git", "add", "--", "peer_wip.txt"], cwd=str(repo), check=True)
+    (repo / "base.txt").write_text("base\nmine\n")
+
+    tmp_index = repo / ".git" / "t0732-tmp-index"
+    env = {"GIT_INDEX_FILE": str(tmp_index)}
+    subprocess.run(["git", "read-tree", "HEAD"], cwd=str(repo), check=True,
+                   env={**os.environ, **env})
+    subprocess.run(["git", "add", "--", "base.txt"], cwd=str(repo), check=True,
+                   env={**os.environ, **env})
+
+    res = _run(repo, "-m", "hunk-isolated commit", env_extra=env)
+
+    assert res.returncode == 0, res.stderr
+    assert "peer_wip.txt" not in _tracked(repo)  # peer WIP NOT absorbed
+    assert "peer_wip.txt" in _staged(repo)       # still theirs to commit
+
+
+def test_pathspecless_commit_allowed_when_shared_index_is_empty(repo: Path) -> None:
+    """`--amend`-style fixups absorb nothing, so the guard must not fire on an
+    empty index — otherwise it would block ordinary history touch-ups."""
+    (repo / "base.txt").write_text("base\namended\n")
+    subprocess.run(["git", "add", "--", "base.txt"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-qm", "to be amended"], cwd=str(repo), check=True)
+
+    res = _run(repo, "--amend", "--no-edit")
+    assert res.returncode == 0, res.stderr
+
+
+def test_shared_index_guard_respects_the_override(repo: Path) -> None:
+    (repo / "solo.txt").write_text("single-tenant clone\n")
+    subprocess.run(["git", "add", "--", "solo.txt"], cwd=str(repo), check=True)
+    res = _run(repo, "-m", "solo", env_extra={"BOT_SQUAD_ALLOW_COMMIT_ALL": "1"})
+    assert res.returncode == 0, res.stderr
+    assert "solo.txt" in _tracked(repo)
+
+
+# ---------------------------------------------------------------------------
+# No loaded index while a blocked commit is being reviewed (T-0732 / p279)
+# ---------------------------------------------------------------------------
+
+
+def _block_commits(repo: Path) -> None:
+    """Install a pre-commit hook that always fails — stands in for the
+    peer-activity hook's deliberate first-attempt block, without depending on
+    its recent-activity heuristics."""
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/usr/bin/env bash\nexit 1\n")
+    hook.chmod(0o755)
+
+
+def _stage_paths_file(tmp: Path, *paths: str) -> str:
+    f = tmp / "stage-paths"
+    f.write_bytes(b"".join(p.encode() + b"\0" for p in paths))
+    return str(f)
+
+
+def test_blocked_commit_leaves_nothing_of_ours_staged(repo: Path, tmp_path: Path) -> None:
+    """p279's feedback: the hook blocks attempt #1 and tells you to review —
+    which used to leave your files sitting staged in the SHARED index for the
+    whole review window, where a peer's commit could sweep them."""
+    _block_commits(repo)
+    (repo / "base.txt").write_text("base\nmy edit\n")
+    env = {
+        "BOT_SQUAD_STAGE_PATHS_FILE": _stage_paths_file(tmp_path, "base.txt"),
+        "BOT_SQUAD_SKIP_PEER_CHECK": "0",
+    }
+    res = _run(repo, "-m", "will be blocked", "--", "base.txt", env_extra=env)
+
+    assert res.returncode != 0
+    assert _staged(repo) == set()  # index handed back clean
+
+
+def test_blocked_commit_restores_a_peers_prior_staged_entry(repo: Path, tmp_path: Path) -> None:
+    """Rolling back our staging must put the index back the way we found it —
+    not blanket-unstage a peer's entry for the same path."""
+    _block_commits(repo)
+    (repo / "base.txt").write_text("base\npeer staged this\n")
+    subprocess.run(["git", "add", "--", "base.txt"], cwd=str(repo), check=True)
+    peer_entry = subprocess.run(
+        ["git", "ls-files", "--stage", "--", "base.txt"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout
+    (repo / "base.txt").write_text("base\nmy own edit on top\n")
+
+    env = {
+        "BOT_SQUAD_STAGE_PATHS_FILE": _stage_paths_file(tmp_path, "base.txt"),
+        "BOT_SQUAD_SKIP_PEER_CHECK": "0",
+    }
+    res = _run(repo, "-m", "will be blocked", "--", "base.txt", env_extra=env)
+
+    assert res.returncode != 0
+    after = subprocess.run(
+        ["git", "ls-files", "--stage", "--", "base.txt"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout
+    assert after == peer_entry
+
+
+def test_successful_commit_keeps_its_staging(repo: Path, tmp_path: Path) -> None:
+    """The rollback is failure-only — a commit that lands must not be undone."""
+    (repo / "ok.txt").write_text("landed\n")
+    env = {"BOT_SQUAD_STAGE_PATHS_FILE": _stage_paths_file(tmp_path, "ok.txt")}
+    res = _run(repo, "-m", "lands fine", "--", "ok.txt", env_extra=env)
+    assert res.returncode == 0, res.stderr
+    assert "ok.txt" in _tracked(repo)
 
 
 # ---------------------------------------------------------------------------

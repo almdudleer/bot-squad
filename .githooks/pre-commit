@@ -101,15 +101,18 @@ This hook fires because bot-squad sessions share a working tree and
 typically the same git identity. A peer may have landed code in these
 files since you last looked — your commit may silently delete it.
 
-Review the diff carefully:
-  git diff --cached --stat
-  git diff --cached -- <file>
+Review the diff carefully. NOTE (T-0732): safe-commit unstages your
+paths again as soon as this blocked attempt exits, so the shared index
+isn't left loaded while you read — review against HEAD, not --cached:
+  git diff HEAD --stat -- <your files>
+  git diff HEAD -- <file>
 
 Especially confirm no infrastructure (env-var gates, kill switches,
 schedulers, lifecycle hooks) is being removed by accident.
 
 If your removals are intentional, re-run the commit with:
   BOT_SQUAD_ACK_PEERS=1 git commit ...
+  # or, preferred: bsq commit --ack -m "msg" <files>   (re-stages for you)
 
 Concurrent commits in this clone collide on .git/index.lock (only one
 holder at a time). Prefer the safe-commit wrapper, which takes an

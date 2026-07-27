@@ -78,6 +78,24 @@ def parse_body(text: str) -> dict[str, str]:
     return out
 
 
+def is_legacy_body(text: str) -> bool:
+    """True when ``text`` has NO ``## Verbatim request`` heading — i.e.
+    :func:`parse_body`'s ``verbatim`` came from the legacy whole-body fallback,
+    not from a recorded request (T-0733).
+
+    Read-only companion to the parser: it changes nothing about how a body is
+    split, it only reports WHICH branch produced ``verbatim`` so consumers can
+    LABEL it honestly. Presenting a legacy planning document (T-0553 is 11k
+    chars of ``## 0. Headline framing`` / dependency-order prose) as "what you
+    asked for" is the same mislabelling T-0729 existed to stop, arriving by a
+    different route.
+
+    Shares :func:`_section_span` with the parser and the write-protection path,
+    so the three can never disagree about what counts as a verbatim heading.
+    """
+    return _section_span(text or "", "verbatim") is None
+
+
 def _section_span(body: str, key: str) -> tuple[int, int] | None:
     """Char span of canonical section ``key`` — its heading through just before
     the NEXT ``## `` heading (or EOF). ``None`` if absent."""

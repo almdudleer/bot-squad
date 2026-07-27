@@ -26,12 +26,14 @@ The 60s reconcile tick clears dead bindings, archives finished devs (zombies are
 
 | You are the… | Trigger / who you are | Load skill | Doc |
 |---|---|---|---|
-| **Operator** | project dispatcher; human-facing; coordinates all work | `bot-squad-operator` | `vision/roles/operator.md` |
-| **Team-lead** | transient lead the operator spawned for an initiative | `bot-squad-team-lead` | `vision/roles/teamlead.md` |
-| **Dev** | assigned one task to build/test/commit | `bot-squad-dev` | `vision/roles/dev.md` |
-| **User-conversation** | user-initiated; unrestricted; can spawn any of the above | — (see initiative M5) | — |
+| **Operator** | project dispatcher; human-facing; coordinates all work | `bot-squad-operator` | `$BOT_SQUAD/api/app/resources/roles/operator.md` |
+| **Team-lead** | transient lead the operator spawned for an initiative | `bot-squad-team-lead` | `$BOT_SQUAD/api/app/resources/roles/teamlead.md` |
+| **Dev** | assigned one task to build/test/commit | `bot-squad-dev` | `$BOT_SQUAD/api/app/resources/roles/dev.md` |
+| **User-conversation** | user-initiated; unrestricted; can spawn any of the above | — (see initiative M5) | `$BOT_SQUAD/api/app/resources/roles/user-conversation.md` |
 
-The canonical role/permission hierarchy (global/server/project admin & member) is in `vision/roles/role-hierarchy.md`.
+`$BOT_SQUAD` is the bot-squad install root (default `/home/www/bot-squad`) — the same alias the SessionStart hook prints, so these paths resolve from ANY project's session; inside a bot-squad clone the contracts are the repo-relative `api/app/resources/roles/`. That directory is the **git SSOT** for every role contract (D-0043): the spawn brief, `bsq brief`, and the SessionStart pointer all read it, so editing it in one place is what a spawned session receives. The per-project `data/<slug>/vision/roles/` copy is seeded once at scaffold, is Vision-tab **display only**, and drifts — never send a reader there for a contract.
+
+The canonical role/permission hierarchy (global/server/project admin & member) is in the install's `vision/roles/role-hierarchy.md` — a project doc with no SSOT counterpart, not a spawnable role contract.
 
 ## Five cross-cutting principles bind EVERY role
 
@@ -54,7 +56,7 @@ Operator, team-lead, user-conversation — any session the stakeholder talks *in
 
 7. **Steering comments — every one lands in a durable home (stakeholder 2026-07-05, T-0590).** "Чтобы у каждого моего комментария который я оставляю было своё место в этой системе … и чтобы она реально слушалась" (T-0587 #4). Some comments don't ask for work — they steer HOW the system works (framing, standing rules). For those, capturing verbatim on a ticket is step one, not the whole job: a standing rule that lives only on a ticket dies when the ticket closes. Full recipe: `docs/architecture/D-0050`.
    1. **Capture verbatim** on a source ticket (principle 3 — unchanged).
-   2. **Classify + split.** One voice note usually carries several directions; route each piece by what it steers: *how a ROLE must behave, across tasks* → role doc SSOT (`api/app/resources/roles/<role>.md`), via a build ticket quoting his words + date + source ticket (deploy-gated; T-0597 is the pattern); *how work is done in THIS project* (recipes, constraints, gotchas) → `AGENT_INSTRUCTIONS.md` (constitution for governance); *what the product IS / the concept* → vision docs (SOURCE-VERBATIM addendum, initiative md, or `bsq doc new`); *framework how-to, any project* → framework skill (D-0040); *one task's scope/decisions* → that ticket (`bsq ticket note`); *priorities* → principle 6 above.
+   2. **Classify + split.** One voice note usually carries several directions; route each piece by what it steers: *how a ROLE must behave, across tasks* → role doc SSOT (`$BOT_SQUAD/api/app/resources/roles/<role>.md`), via a build ticket quoting his words + date + source ticket (deploy-gated; T-0597 is the pattern); *how work is done in THIS project* (recipes, constraints, gotchas) → `AGENT_INSTRUCTIONS.md` (constitution for governance); *what the product IS / the concept* → vision docs (SOURCE-VERBATIM addendum, initiative md, or `bsq doc new`); *framework how-to, any project* → framework skill (D-0040); *one task's scope/decisions* → that ticket (`bsq ticket note`); *priorities* → principle 6 above.
    3. **Record the landing on the source ticket** — one note per routed piece: `routed: <piece> -> <home path / ticket id>`. A steering comment with no recorded landing is a defect, same as a dropped user request (D-0045).
 
    Never leave steering only in the conversation thread, a pane, or your own context — those evaporate. The durable homes are the ones the next session is automatically served: role docs ride the spawn brief, `AGENT_INSTRUCTIONS.md` rides orientation, vision rides the concept-lookup rule (principle 4), tickets ride `bsq guidance search` (which since T-0590 also indexes tickets' harvested-comments sections).

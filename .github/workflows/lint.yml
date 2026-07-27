@@ -33,10 +33,15 @@ jobs:
         # actions.py without its config.py field BEFORE deploy (origin build).
         run: |
           python3 scripts/lint/cross_module_attr_smoke.py
+      - name: Role-contract pointers name the git SSOT (T-0716 / D-0043)
+        # Repo-source scan (no data tree): fails if any prose sends a reader to
+        # the drifting per-project vision/roles/<role>.md copy.
+        run: |
+          python3 scripts/lint/role_doc_pointers.py
       - name: Install api test deps
         run: |
           pip install --upgrade pip
           pip install -e api[dev]
       - name: Run lint script unit tests
         run: |
-          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py -x -q
+          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py tests/test_role_doc_pointers_lint.py -x -q

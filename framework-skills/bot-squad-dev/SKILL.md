@@ -39,4 +39,4 @@ When DoD (incl. manual walkthrough) is green:
 - Don't expand your own scope. Work outside scope → file a one-pager: `bsq task new` (never hand-pick the id), then edit the returned md.
 - Friction/bug/missing-capability → `bsq feedback submit "<note>"`. Don't silently absorb it.
 
-Full contract: `vision/roles/dev.md`. CLI: `bot-squad-cli`. Decision rules: `bot-squad-provenance`, `autonomous-when-grounded`.
+Full contract: `$BOT_SQUAD/api/app/resources/roles/dev.md` (the git SSOT — D-0043; never the per-project `vision/roles/` copy, which is display-only and drifts). CLI: `bot-squad-cli`. Decision rules: `bot-squad-provenance`, `autonomous-when-grounded`.

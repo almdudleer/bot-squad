@@ -389,7 +389,8 @@ def cmd_inbox_wait(args) -> None:
 # which was unreliable. A dispatch is now a typed envelope: a one-line marker
 # + single-line JSON `{action, payload, note}`, embedded in the peer message so
 # it still rides the normal inbox/`check mail` bus. The marker is greppable and
-# the JSON parses with a plain split — see vision/roles/teamlead.md for the
+# the JSON parses with a plain split — see api/app/resources/roles/teamlead.md
+# (git SSOT, D-0043) for the
 # action vocabulary (assign / archive_team / status / message).
 ENVELOPE_MARKER = "[[bsq-dispatch v1]]"
 

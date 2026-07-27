@@ -276,8 +276,9 @@ export function Shell() {
           </div>
           <GlobalBusyIndicator myUsername={username} />
           {/* T-0456: failure-only worker-health pill — renders nothing while
-              healthy, lights red on dead_heartbeat / sha_drift. Consumer-only
-              like the autoupdate pill (local /api/health). */}
+              healthy, lights red on dead_heartbeat / sha_drift. T-0739: a drift
+              a pending restart already explains renders MUTED instead of red.
+              Consumer-only like the autoupdate pill (local /api/health). */}
           {!IS_MOTHERSHIP_BUILD && <WorkerHealthPill />}
           {/* T-0089: consumer-only autoupdate status pill. Skipped on the
               mothership build so we don't poll a 404 endpoint forever. */}

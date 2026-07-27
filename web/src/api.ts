@@ -695,6 +695,15 @@ export type HealthResponse = {
     last_heartbeat?: number | null;
     git_sha?: string | null;
     health?: string[];
+    // T-0739: present only alongside a drift flag — the restart the worker has
+    // recorded as owed, so `restart_pending` can be told from bare `sha_drift`.
+    restart?: {
+      state?: "in_flight" | "deferred";
+      since?: number;
+      expected_by?: number;
+      overdue?: boolean;
+      reason?: string;
+    } | null;
   };
 };
 

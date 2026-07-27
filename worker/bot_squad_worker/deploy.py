@@ -281,6 +281,49 @@ def _restart_pending_path(cfg: "Config") -> Path:
     return cfg.data_dir / "_worker" / "restart_pending.json"
 
 
+def _restart_inflight_path(cfg: "Config") -> Path:
+    return cfg.data_dir / "_worker" / "restart_inflight.json"
+
+
+# T-0739: how long AFTER the moment a restart becomes fireable we still call the
+# resulting sha drift "expected". Covers the 60s catch-up tick granularity, the
+# systemd stop/start + pip sync, and the ~60-90s lag between the worker writing
+# its heartbeat and /api/health reading it. Past this the drift stops being
+# explained by a pending restart and goes back to being an alarm — that boundary
+# is the whole point: a pending restart may NEVER silence drift indefinitely, or
+# we'd have re-created the T-0717 bug behind a nicer word.
+_RESTART_CONVERGENCE_GRACE_SECONDS = 180
+
+
+def _restart_min_interval() -> int:
+    """T-0305's minimum restart interval in seconds (<=0 disables the gate)."""
+    try:
+        return int(os.environ.get("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300"))
+    except ValueError:
+        return 300
+
+
+def _restart_window_ends_at(cfg: "Config") -> float:
+    """Unix ts at which the rate-limit window elapses — i.e. the EARLIEST moment
+    the catch-up tick is allowed to fire a deferred restart. ``now`` when the
+    window has already elapsed (or the gate is disabled).
+
+    T-0739: this is what makes the pending marker's ``expected_by`` honest. A
+    deferral recorded 10s into a 300s window has ~290s to go, not 180 — promising
+    convergence sooner than the cap allows would make health flip back to
+    ``sha_drift`` while the deferral is still perfectly on schedule.
+    """
+    now = time.time()
+    interval = _restart_min_interval()
+    if interval <= 0:
+        return now
+    try:
+        last = float(json.loads(_restart_rate_limit_path(cfg).read_text()).get("at", 0.0))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        last = 0.0
+    return max(now, last + interval)
+
+
 def _record_pending_restart(
     cfg: "Config", *, source: str, reason: str, slug: str = ""
 ) -> None:
@@ -291,14 +334,22 @@ def _record_pending_restart(
     window collapse into a SINGLE later restart. That's not lossy — a restart
     picks up whatever is on disk at the moment it fires, so the newest reason is
     the only one worth carrying, and the earlier changes ride along.
+
+    T-0739 adds ``expected_by``: the deadline by which this deferral must have
+    produced a converged worker. ``/api/health`` reads it to report the resulting
+    drift as ``restart_pending`` (expected, self-healing) instead of a bare
+    ``sha_drift`` — and, once it passes, to go BACK to ``sha_drift``. The worker
+    computes it rather than the API because only this side knows the rate-limit
+    window; the API just compares it to the clock.
     """
     marker = _restart_pending_path(cfg)
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         tmp = marker.parent / f"{marker.name}.tmp.{os.getpid()}"
-        tmp.write_text(json.dumps(
-            {"at": time.time(), "source": source, "reason": reason, "slug": slug}
-        ))
+        tmp.write_text(json.dumps({
+            "at": time.time(), "source": source, "reason": reason, "slug": slug,
+            "expected_by": _restart_window_ends_at(cfg) + _RESTART_CONVERGENCE_GRACE_SECONDS,
+        }))
         os.replace(tmp, marker)
     except OSError:
         log.exception(
@@ -313,6 +364,110 @@ def _clear_pending_restart(cfg: "Config") -> None:
         _restart_pending_path(cfg).unlink(missing_ok=True)
     except OSError:
         log.exception("deploy._clear_pending_restart: unlink failed")
+
+
+def _record_restart_inflight(
+    cfg: "Config", *, queue_id: str, slug: str, reason: str, target_sha: str
+) -> None:
+    """Record that a worker restart was actually LAUNCHED and the new process has
+    not come up yet (T-0739).
+
+    The deferred marker covers "a restart is owed but the window hasn't elapsed".
+    This covers the OTHER self-healing state, and the one p281 actually observed:
+    the restart fired, the old process is being SIGTERM-ed, and for the seconds
+    between the launch and the new process's first heartbeat ``/api/health``
+    honestly still sees the old boot sha. That reads as ``sha_drift`` — identical
+    to the failure this ticket exists to distinguish it from.
+
+    Written by the process that is about to be killed; CLEARED by the process
+    that comes up (``clear_restart_inflight`` at startup). If the restart never
+    lands, nobody clears it — and ``expected_by`` lapses, so health goes back to
+    a bare ``sha_drift``. That is deliberate: a launched-but-failed restart must
+    end up looking like the alarm it is, not like a promise still in progress.
+    """
+    marker = _restart_inflight_path(cfg)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.parent / f"{marker.name}.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps({
+            "at": time.time(), "queue_id": queue_id, "slug": slug, "reason": reason,
+            "target_sha": target_sha,
+            "expected_by": time.time() + _RESTART_CONVERGENCE_GRACE_SECONDS,
+        }))
+        os.replace(tmp, marker)
+    except OSError:
+        # Non-fatal: the restart still happens, health just falls back to
+        # reporting the drift as a bare sha_drift for the in-flight window.
+        log.exception(
+            "deploy._record_restart_inflight: could not record the in-flight "
+            "restart (queue=%s) — the transient drift will read as sha_drift",
+            queue_id,
+        )
+
+
+def clear_restart_inflight(cfg: "Config") -> None:
+    """Drop the in-flight marker — called at worker STARTUP (T-0739).
+
+    Whatever restart was in flight has now demonstrably landed: this process IS
+    the result. Also clears a marker left by a restart that failed and was later
+    cured by hand, so the next real one starts from a clean slate.
+    """
+    try:
+        _restart_inflight_path(cfg).unlink(missing_ok=True)
+    except OSError:
+        log.exception("deploy.clear_restart_inflight: unlink failed")
+
+
+def restart_pending_state(cfg: "Config") -> dict | None:
+    """The self-healing-restart state a drift reading should be interpreted
+    against, or ``None`` when nothing is coming (T-0739).
+
+    Returns ``{"state": "in_flight"|"deferred", "since", "expected_by",
+    "overdue", ...}``. ``overdue`` is True once ``expected_by`` has passed — the
+    marker still explains WHY a human is looking at drift, but it no longer
+    excuses it, and callers must treat that as a plain ``sha_drift``.
+
+    Both markers can briefly coexist (the catch-up tick launches the restart
+    before clearing its deferral), so the one with the LATER deadline wins — it
+    is the one that still has time to make good.
+
+    MIRRORED in ``api/app/routes_health.py::_restart_state`` — the API is a
+    separate deployable and cannot import this package, so the two files agree
+    only by the on-disk JSON contract (``at`` / ``expected_by``). Rename a key
+    here and /api/health silently falls back to its legacy deadline and starts
+    reporting sha_drift through every restart again; ``test_deploy.py::
+    test_the_marker_field_contract_the_api_reads`` is the guard.
+    """
+    best: dict | None = None
+    for path, state in (
+        (_restart_inflight_path(cfg), "in_flight"),
+        (_restart_pending_path(cfg), "deferred"),
+    ):
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        since = float(raw.get("at") or 0.0)
+        # A pre-T-0739 marker has no expected_by. Deriving one from `at` would be
+        # guessing at a window we can't see, so give it the grace it would have
+        # had at worst and let it expire — never treat it as open-ended.
+        expected_by = float(
+            raw.get("expected_by")
+            or (since + _restart_min_interval() + _RESTART_CONVERGENCE_GRACE_SECONDS)
+        )
+        row = {
+            "state": state,
+            "since": since,
+            "expected_by": expected_by,
+            "overdue": time.time() > expected_by,
+            "source": str(raw.get("source") or raw.get("queue_id") or ""),
+            "reason": str(raw.get("reason") or ""),
+        }
+        if best is None or row["expected_by"] > best["expected_by"]:
+            best = row
+    return best
 
 
 def _any_deploy_in_flight(cfg: "Config") -> bool:
@@ -453,7 +608,7 @@ def _restart_rate_limited(
     catch-up tick notices the convergence and drops the pending marker) but it
     also masks this bug from anyone debugging it by hand.
     """
-    interval = int(os.environ.get("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300"))
+    interval = _restart_min_interval()
     if interval <= 0:
         return False
     marker = _restart_rate_limit_path(cfg)
@@ -1418,6 +1573,12 @@ def _restart_worker_detached(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+    )
+    # T-0739: mark the in-flight window BEFORE we get SIGTERM-ed, so the drift
+    # the API sees between now and the new process's first heartbeat reads as
+    # "restart pending" rather than as the failure mode T-0717 fixed.
+    _record_restart_inflight(
+        cfg, queue_id=str(queue_id), slug=slug, reason=reason, target_sha=expected_sha,
     )
     return True
 

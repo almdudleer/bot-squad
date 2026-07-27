@@ -2781,3 +2781,253 @@ def test_stale_ping_does_not_promise_recovery_that_is_not_coming(
     assert "WORKER STALE" in text
     assert "will NOT self-correct" in text
     assert "converges on its own" not in text
+
+
+# ---------------------------------------------------------------------------
+# T-0739: "restart pending" vs bare "sha_drift"
+#
+# After T-0717 a post-deploy sha_drift is USUALLY the expected tail of a restart
+# that fired or was deferred — but it emitted the identical signal as the
+# failure T-0717 fixed, so neither an operator nor R-0005 could tell "wait 20s"
+# from "the restart was dropped and nobody is coming". These markers are what
+# makes the two nameable apart. The load-bearing invariant in every test below:
+# a pending restart may narrow the alarm, never silence it indefinitely.
+# ---------------------------------------------------------------------------
+
+
+def test_restart_pending_state_is_none_when_nothing_is_owed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The T-0717 shape — real drift with no restart coming — must stay a bare
+    alarm. This is the one case that must NOT be softened."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    assert d.restart_pending_state(cfg) is None
+
+
+def test_deferred_marker_carries_the_rate_limit_window_not_a_flat_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """expected_by must be window-end + grace, NOT now + grace.
+
+    A deferral recorded 10s into a 300s window has ~290s to go. Promising
+    convergence sooner would flip health back to sha_drift while the deferral is
+    still perfectly on schedule — a false alarm manufactured by this ticket."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    now = time.time()
+    d._restart_rate_limit_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    d._restart_rate_limit_path(cfg).write_text(json.dumps({"at": now - 10}))
+
+    assert d._restart_rate_limited(cfg, source="deploy", reason="r", slug=proj.slug) is True
+    state = d.restart_pending_state(cfg)
+    assert state is not None and state["state"] == "deferred"
+    assert state["overdue"] is False
+    # 290s of window left + 180s grace ≈ 470s out; a flat grace would be ~180s.
+    assert 440 < state["expected_by"] - now < 500
+
+
+def test_restart_pending_expires_and_goes_back_to_being_an_alarm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE anti-regression for this whole ticket: 'restart pending' is bounded.
+
+    The operator's explicit constraint was 'do NOT solve it by suppressing drift
+    reporting during a blanket post-deploy grace period — that would re-hide the
+    original bug'. Once the deadline lapses the marker goes overdue, and every
+    consumer is required to treat overdue as a plain sha_drift."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    d._record_pending_restart(cfg, source="deploy", reason="r", slug=proj.slug)
+    assert d.restart_pending_state(cfg)["overdue"] is False
+
+    marker = d._restart_pending_path(cfg)
+    raw = json.loads(marker.read_text())
+    raw["expected_by"] = time.time() - 1
+    marker.write_text(json.dumps(raw))
+    assert d.restart_pending_state(cfg)["overdue"] is True
+
+
+def test_a_marker_without_expected_by_still_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-T-0739 marker (or one written by an older worker mid-upgrade) has no
+    deadline. Deriving one is a guess — but treating it as open-ended would make
+    the drift alarm permanently silenceable by a stale file."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "300")
+    marker = d._restart_pending_path(cfg)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"at": time.time() - 10, "source": "deploy"}))
+    assert d.restart_pending_state(cfg)["overdue"] is False
+
+    marker.write_text(json.dumps({"at": time.time() - 5000, "source": "deploy"}))
+    assert d.restart_pending_state(cfg)["overdue"] is True
+
+
+def test_a_corrupt_marker_degrades_to_the_alarm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0717's degradation rule, applied one level up: an unreadable marker
+    means a false ALARM (sha_drift), never a false all-clear."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    marker = d._restart_pending_path(cfg)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    for junk in ("{not json", "[]", '"a string"', ""):
+        marker.write_text(junk)
+        assert d.restart_pending_state(cfg) is None
+
+
+def test_a_launched_restart_records_the_in_flight_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case p281 actually observed on 6b0fc20: the restart FIRED and drift
+    was visible for the seconds before the new process's heartbeat landed. The
+    deferred marker doesn't cover that — nothing is deferred, it's in flight."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: True)
+    monkeypatch.setattr(d, "_git_head_sha", lambda p: "f" * 40)
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **k: None)
+
+    assert d._restart_worker_detached(cfg, proj.slug, "q1", "worker change") is True
+    state = d.restart_pending_state(cfg)
+    assert state is not None
+    assert state["state"] == "in_flight" and state["overdue"] is False
+
+
+def test_a_no_scope_skip_records_no_in_flight_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The T-0717 twin, at this level: nothing was launched, so nothing is
+    coming — the drift must read as a bare sha_drift, not as 'restarting'."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: False)
+
+    assert d._restart_worker_detached(cfg, proj.slug, "q1", "worker change") is False
+    assert d.restart_pending_state(cfg) is None
+
+
+def test_worker_startup_clears_the_in_flight_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleared by the process that comes UP, not on a timer: the pending state
+    then lasts exactly as long as the restart really takes, and a restart that
+    never lands never clears it (so it goes overdue → alarm)."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    d._record_restart_inflight(
+        cfg, queue_id="q1", slug=proj.slug, reason="r", target_sha="f" * 40
+    )
+    assert d.restart_pending_state(cfg) is not None
+
+    d.clear_restart_inflight(cfg)
+    assert d.restart_pending_state(cfg) is None
+    d.clear_restart_inflight(cfg)  # idempotent — a cold boot with no marker
+
+
+def test_the_later_deadline_wins_when_both_markers_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-up tick launches the restart BEFORE clearing its deferral, so
+    both markers coexist for a moment. The one with time left to make good is
+    the honest answer."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    inflight = d._restart_inflight_path(cfg)
+    inflight.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    inflight.write_text(json.dumps({"at": now, "expected_by": now + 180}))
+    d._restart_pending_path(cfg).write_text(
+        json.dumps({"at": now - 300, "expected_by": now - 1, "source": "deploy"})
+    )
+    assert d.restart_pending_state(cfg)["state"] == "in_flight"
+
+    # ...and the other way round: an overdue launch must not mask a deferral
+    # that is still on schedule.
+    inflight.write_text(json.dumps({"at": now - 300, "expected_by": now - 1}))
+    d._restart_pending_path(cfg).write_text(
+        json.dumps({"at": now, "expected_by": now + 400, "source": "deploy"})
+    )
+    state = d.restart_pending_state(cfg)
+    assert state["state"] == "deferred" and state["overdue"] is False
+
+
+def test_catchup_firing_leaves_an_in_flight_marker_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end on the worker side: a deferral that the catch-up tick converts
+    into a real restart hands the pending state over from 'deferred' to
+    'in_flight' — the drift stays explained across the whole handoff, with no
+    window where it reads as the failure mode."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setenv("BOT_SQUAD_WORKER_RESTART_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setattr(d, "_worker_subtree_changed_since_boot", lambda c: True)
+    monkeypatch.setattr(d, "_any_deploy_in_flight", lambda c: False)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: True)
+    monkeypatch.setattr(d, "_git_head_sha", lambda p: "f" * 40)
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **k: None)
+    d._record_pending_restart(cfg, source="deploy", reason="B", slug=proj.slug)
+    assert d.restart_pending_state(cfg)["state"] == "deferred"
+
+    assert d.catchup_deferred_worker_restart(cfg) == "fired"
+    assert not d._restart_pending_path(cfg).exists()
+    assert d.restart_pending_state(cfg)["state"] == "in_flight"
+
+
+def test_the_marker_field_contract_the_api_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the on-disk JSON contract between the worker and the API.
+
+    `api/app/routes_health.py::_restart_state` mirrors `restart_pending_state`
+    because the API is a separate deployable that cannot import this package.
+    The two agree only by these key names — and the failure mode of a rename is
+    SILENT: the API just falls back to its legacy deadline and starts reporting
+    sha_drift through every restart again, i.e. exactly the bug this ticket
+    fixed, with nothing red to notice. Duplicate divergence is this repo's top
+    bug class (cf T-0729/T-0736), so the seam gets an explicit guard.
+    """
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    monkeypatch.setattr(d, "_use_systemd_scope", lambda: True)
+    monkeypatch.setattr(d, "_git_head_sha", lambda p: "f" * 40)
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **k: None)
+
+    d._record_pending_restart(cfg, source="deploy", reason="r", slug=proj.slug)
+    d._restart_worker_detached(cfg, proj.slug, "q1", "worker change")
+
+    for path in (d._restart_pending_path(cfg), d._restart_inflight_path(cfg)):
+        raw = json.loads(path.read_text())
+        # The exact fields api/app/routes_health.py::_restart_state reads.
+        assert isinstance(raw.get("at"), float), path.name
+        assert isinstance(raw.get("expected_by"), float), path.name
+        assert raw["expected_by"] > raw["at"], path.name
+        assert isinstance(raw.get("reason"), str), path.name

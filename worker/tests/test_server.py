@@ -49,3 +49,47 @@ def test_actions_bad_params_returns_400():
     with TestClient(app) as client:
         r = client.post("/actions/noop", json={"oops": 1})
     assert r.status_code == 400
+
+
+def test_health_surfaces_a_pending_restart(tmp_path, monkeypatch) -> None:
+    """T-0739: the worker's own /health makes the same restart_pending vs
+    sha_drift discrimination /api/health does.
+
+    An operator debugging a drift reaches for whichever surface is closest;
+    having only one of the two carry the answer is how the T-0717 confusion got
+    re-derived from scratch. Absent when nothing is owed (no green noise)."""
+    import json
+    import time
+    from types import SimpleNamespace
+
+    from bot_squad_worker import actions as A
+
+    wdir = tmp_path / "data" / "_worker"
+    wdir.mkdir(parents=True)
+    cfg = SimpleNamespace(data_dir=tmp_path / "data")
+    monkeypatch.setattr(A, "_CONFIG", cfg)
+
+    with TestClient(build_app()) as client:
+        assert "restart_pending" not in client.get("/health").json()
+
+        (wdir / "restart_inflight.json").write_text(
+            json.dumps({"at": time.time(), "expected_by": time.time() + 180,
+                        "queue_id": "q1"})
+        )
+        body = client.get("/health").json()
+
+    assert body["restart_pending"]["state"] == "in_flight"
+    assert body["restart_pending"]["overdue"] is False
+
+
+def test_health_never_fails_on_a_broken_restart_probe(monkeypatch) -> None:
+    """/health is what the deploy smoke asserts against — a probe error here
+    must degrade to 'no pending restart', never to a 500 that reads as a failed
+    restart and marks the deploy broken."""
+    from bot_squad_worker import actions as A
+
+    monkeypatch.setattr(A, "_CONFIG", None)  # raises ActionError in _get_config
+    with TestClient(build_app()) as client:
+        r = client.get("/health")
+    assert r.status_code == 200
+    assert "restart_pending" not in r.json()

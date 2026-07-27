@@ -30,14 +30,27 @@ def build_app() -> FastAPI:
         # (correctly) skipped the restart doesn't read as permanent drift.
         # boot_sha stays exposed alongside it: it's what the restart gate compares,
         # so an operator debugging a skipped/needed restart can still see it.
-        from bot_squad_worker.deploy import boot_git_sha, effective_worker_git_sha
-        return {
+        from bot_squad_worker.deploy import (
+            boot_git_sha, effective_worker_git_sha, restart_pending_state,
+        )
+        body = {
             "ok": True,
             "version": _pkg_version(),
             "uptime": time.monotonic() - started,
             "git_sha": effective_worker_git_sha(),
             "boot_git_sha": boot_git_sha(),
         }
+        # T-0739: same discrimination the API's /api/health makes, on the surface
+        # an operator debugging from the worker side reaches for. Present only
+        # when a restart is genuinely owed/in flight — absent is the healthy case.
+        from bot_squad_worker.actions import _get_config
+        try:
+            pending = restart_pending_state(_get_config())
+        except Exception:  # noqa: BLE001 — /health must never fail on a probe
+            pending = None
+        if pending:
+            body["restart_pending"] = pending
+        return body
 
     @app.post("/actions/{name}")
     def call_action(name: str, params: dict | None = None) -> dict:

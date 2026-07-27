@@ -395,20 +395,23 @@ def test_peer_add_then_commit_no_longer_reverts_the_landed_hunk(repo):
 
 def test_reconciliation_is_scoped_and_spares_a_peers_unrelated_staging(repo):
     r, bs = repo["repo"], repo["bot_squad"]
-    (r / "shared.txt").write_text("L1\nL2\n")
+    base = "".join(f"L{i}\n" for i in range(1, 13))
+    (r / "shared.txt").write_text(base)
     (r / "other.txt").write_text("other\n")
     _git(r, "add", "shared.txt", "other.txt")
     _git(r, "commit", "-q", "-m", "base")
 
+    peer = base.replace("L1\n", "L1-PEER\n")      # peer already dirty…
+    (r / "shared.txt").write_text(peer)
     _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "shared.txt")
-    (r / "shared.txt").write_text("L1\nL2-MINE\n")
+    # …so my baseline isolates it. Far from their hunk, so no apply conflict.
+    (r / "shared.txt").write_text(peer.replace("L12\n", "L12-MINE\n"))
     (r / "other.txt").write_text("peer wip\n")
     _git(r, "add", "other.txt")            # peer loads the shared index
 
-    # --ack past the co-edit audit: other.txt being dirty and unbaselined is
-    # exactly the "a peer is mid-edit" signal, and here it is true.
-    assert _run_bsq(r, bs, "commit", "--hunks", "--ack", "--sid", "S-me-dev-p1",
-                    "-m", "mine", "shared.txt").returncode == 0
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
+                  "-m", "mine", "shared.txt")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
     # my path reconciled, THEIR staging untouched
     assert _staged_names(r) == ["other.txt"]
 
@@ -488,15 +491,66 @@ def test_hunks_stops_when_baseline_was_clean_and_a_peer_is_mid_edit(repo):
 
     cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
                   "-m", "mine", "test_src.py")
-    assert cm.returncode != 0
+    assert cm.returncode == 3
     assert "co-edit audit (T-0752)" in cm.stderr
     assert "isolates nothing" in cm.stderr
     assert "src.py" in cm.stderr                # names the peer-dirty file
-    # nothing committed — HEAD is still the base commit
     assert "test_peer" not in _git(r, "show", "HEAD:test_src.py")
-    # …and --ack is the way through, for when the hunks really are all yours
-    assert _run_bsq(r, bs, "commit", "--hunks", "--ack", "--sid", "S-me-dev-p1",
-                    "-m", "mine", "test_src.py").returncode == 0
+
+
+def test_the_zero_isolation_refusal_is_not_openable_with_ack(repo):
+    """operator p298, 2026-07-27: --ack must NOT open this one. A session in a
+    hurry acks uniformly, which is how a warning decays into noise — and here
+    there is nothing to weigh, because --hunks is not isolating anything."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "src.py").write_text("x = 1\n")
+    (r / "mine.py").write_text("y = 1\n")
+    _git(r, "add", "src.py", "mine.py")
+    _git(r, "commit", "-q", "-m", "base")
+
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "mine.py")
+    (r / "mine.py").write_text("y = 2\n")
+    (r / "src.py").write_text("x = 2\n")          # a peer, mid-edit, unbaselined
+
+    acked = _run_bsq(r, bs, "commit", "--hunks", "--ack", "--sid", "S-me-dev-p1",
+                     "-m", "mine", "mine.py")
+    assert acked.returncode == 3
+    assert "--ack does" in acked.stderr and "NOT open this one" in acked.stderr
+    assert _git(r, "log", "--oneline").count("\n") == 1     # nothing committed
+
+    # …and the escape it names inline actually works: name the paths.
+    assert "bsq commit -m MSG mine.py" in acked.stderr
+    esc = _run_bsq(r, bs, "commit", "--ack", "--sid", "S-me-dev-p1",
+                   "-m", "mine", "mine.py")
+    assert esc.returncode == 0, esc.stderr + esc.stdout
+    assert "mine.py" in _git(r, "show", "--name-only", "--format=", "HEAD")
+    assert "src.py" not in _git(r, "show", "--name-only", "--format=", "HEAD")
+
+
+def test_the_refusal_also_names_the_trimmed_patch_route(repo):
+    """The other escape: commit only your hunks. A refusal that leaves you
+    stuck gets worked around, and the workaround would be worse."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "src.py").write_text("x = 1\n")
+    (r / "mine.py").write_text("a\nb\n")
+    _git(r, "add", "src.py", "mine.py")
+    _git(r, "commit", "-q", "-m", "base")
+    _run_bsq(r, bs, "edit-begin", "--sid", "S-me-dev-p1", "mine.py")
+    (r / "mine.py").write_text("a-MINE\nb\n")
+    (r / "src.py").write_text("x = 2\n")
+
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--sid", "S-me-dev-p1",
+                  "-m", "mine", "mine.py")
+    assert cm.returncode == 3
+    assert "bsq commit --hunks --patch /tmp/mine.patch -m MSG mine.py" in cm.stderr
+
+    patch = r / "mine.patch"
+    patch.write_text(_git(r, "diff", "--", "mine.py"))
+    ok = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "mine", "mine.py")
+    assert ok.returncode == 0, ok.stderr + ok.stdout
+    assert "a-MINE" in _git(r, "show", "HEAD:mine.py")
+    assert "x = 2" not in _git(r, "show", "HEAD:src.py")   # peer's edit untouched
 
 
 def test_hunks_does_not_nag_when_nobody_else_is_editing_the_tree(repo):

@@ -2946,12 +2946,22 @@ def cmd_edit_begin(args) -> None:
 # Nothing in the worktree records WHO wrote a given uncommitted line, so no
 # check can attribute hunks. What it CAN do is stop the tool from implying an
 # isolation it isn't providing, and surface the signals that ARE certain:
+#   ✗ your baseline was identical to HEAD, so --hunks isolates NOTHING here,
+#     AND files you never baselined are dirty — a peer is demonstrably mid-edit
 #   ! a peer COMMITTED the file after your baseline   (git log baseline..HEAD)
 #   ! the SHARED index holds staged content for it    (someone ran `git add`)
 #   ! another live session holds an edit-begin baseline on it
-#   · your baseline was identical to HEAD, so --hunks isolates NOTHING here and
-#     your commit claims every hunk currently in the file
-# The `!` signals block until --ack; the `·` caution always prints.
+#   · your baseline was identical to HEAD (nobody else is editing this tree)
+#
+# The `!` signals block until --ack: they are ambiguous evidence, and weighing
+# them is a human judgement. The `✗` one is NOT ackable (operator p298's call,
+# 2026-07-27) — it is not ambiguous. In that state `--hunks` is not doing what
+# its name promises; it commits whatever happens to be dirty in the file, which
+# IS the sweep, so there is nothing for a human to weigh. `--ack` would just be
+# agreed to uniformly by a session in a hurry, which is how a warning decays
+# into noise. The escape is naming what you are committing — an explicit-path
+# commit, or a trimmed `--patch` — and the refusal prints both inline, because
+# a refusal that leaves you stuck gets worked around.
 # --------------------------------------------------------------------------
 _CLAIM_MAX_AGE_S = 24 * 3600
 
@@ -3057,14 +3067,16 @@ def _foreign_dirty(repo_root: str, mine: set[str]) -> list[str]:
 def _coedit_audit(
     repo_root: str, slug: str, sid: str, rels: list[str],
     meta: dict, patch_hunks: dict[str, int] | None = None,
-) -> tuple[list[str], list[str]]:
-    """(blocking, caution) report lines for the files this commit will touch."""
+) -> tuple[list[str], list[str], list[str]]:
+    """(refusing, blocking, caution) report lines for the files being committed."""
+    refusing: list[str] = []
     blocking: list[str] = []
     caution: list[str] = []
     shared = _shared_clone(slug)
     baselined = set(meta) | set(rels)
     foreign = _foreign_dirty(repo_root, baselined) if shared else []
     for rel in rels:
+        x: list[str] = []
         b: list[str] = []
         c: list[str] = []
         info = meta.get(rel) or {}
@@ -3120,8 +3132,9 @@ def _coedit_audit(
                 if foreign:
                     # Someone else is demonstrably mid-edit in this tree, and
                     # this file's whole diff is about to be attributed to you.
-                    b.append(
-                        f"  ! {line}\n"
+                    # Not ackable — see the header block.
+                    x.append(
+                        f"  ✗ {line}\n"
                         f"    {len(foreign)} file(s) are dirty here that you never baselined —\n"
                         f"    a peer is editing this tree right now: "
                         + ", ".join(foreign[:3])
@@ -3131,21 +3144,25 @@ def _coedit_audit(
                     c.append(f"  · {line}")
         if not shared:
             c = []          # solo clone: the "isolates nothing" note is noise
-        if b:
-            blocking.extend([f"── {rel} ──", *b, *c])
+        if x or b:
+            refused_here = bool(x)
+            (refusing if refused_here else blocking).extend(
+                [f"── {rel} ──", *x, *b, *c]
+            )
         elif c:
             caution.extend([f"── {rel} ──", *c])
-    return blocking, caution
+    return refusing, blocking, caution
 
 
 def _report_coedit(
-    blocking: list[str], caution: list[str], ack: bool, redo_hint: str,
+    refusing: list[str], blocking: list[str], caution: list[str],
+    ack: bool, redo_hint: str, rels: list[str],
 ) -> None:
-    """Print the audit; abort (exit 3) on a blocking signal unless --ack."""
-    if not blocking and not caution:
+    """Print the audit; abort (exit 3) on `✗` always, on `!` unless --ack."""
+    if not (refusing or blocking or caution):
         return
     print("\n── co-edit audit (T-0752) ──", file=sys.stderr)
-    for ln in blocking + caution:
+    for ln in refusing + blocking + caution:
         print(ln, file=sys.stderr)
     print(
         "\nA `--hunks` commit can only isolate work that was already in the file\n"
@@ -3153,6 +3170,24 @@ def _report_coedit(
         "  git diff HEAD -- <file>",
         file=sys.stderr,
     )
+    if refusing:
+        paths = " ".join(rels)
+        first = rels[0] if rels else "<file>"
+        print(
+            "\nbsq: commit --hunks REFUSED for the file(s) marked ✗ — and --ack does\n"
+            "NOT open this one. There, --hunks isolates nothing: it commits whatever\n"
+            "happens to be dirty in the file, which is the sweep it exists to prevent.\n"
+            "So name what you are committing instead:\n"
+            "\n  1. Commit only YOUR hunks — trim the diff down to them:\n"
+            f"       git diff -- {first} > /tmp/mine.patch"
+            "     # delete the @@ hunks that aren't yours\n"
+            f"       bsq commit --hunks --patch /tmp/mine.patch -m MSG {paths}\n"
+            "\n  2. If the whole current diff really is yours, say so by naming the\n"
+            "     paths — an explicit-path commit, which claims no isolation:\n"
+            f"       bsq commit -m MSG {paths}\n",
+            file=sys.stderr,
+        )
+        sys.exit(3)
     if blocking and not ack:
         print(
             "\nbsq: commit --hunks stopped BEFORE committing. Every `!` above is a\n"
@@ -3321,7 +3356,7 @@ def _commit_hunks_from_patch(args, repo_root: str) -> None:
     _report_coedit(
         *_coedit_audit(repo_root, slug, sid, rels, {},
                        patch_hunks=_patch_hunks_per_rel(patch_text)),
-        ack=args.ack, redo_hint=redo,
+        ack=args.ack, redo_hint=redo, rels=rels,
     )
     _commit_patch_via_temp_index(
         repo_root, patch_text, rels, args.message, args.ack, redo_hint=redo,
@@ -3370,7 +3405,7 @@ def _commit_hunks(args, repo_root: str) -> None:
             f"{' '.join(args.files)}")
     _report_coedit(
         *_coedit_audit(repo_root, slug, sid, rels, _read_meta(store)),
-        ack=args.ack, redo_hint=redo,
+        ack=args.ack, redo_hint=redo, rels=rels,
     )
     _commit_patch_via_temp_index(
         repo_root, "".join(patches), rels, args.message, args.ack, redo_hint=redo,

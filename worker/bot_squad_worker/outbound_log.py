@@ -152,18 +152,55 @@ def author_class(author: str) -> str:
     return cls if is_valid_author(a) else ""
 
 
-def author_for_send(*, route_sid: str, sender_label: str) -> str:
+def author_for_send(
+    *, route_sid: str = "", sender_label: str = "", sender_sid: str = "",
+) -> str:
     """The convention-valid author for one outbound send.
 
-    ``route_sid`` is the RAW routing SID when the sender is a real session (the
-    same value ``tg_reply_map`` requires before it will pin a reply route).
-    Anything else — ``deploy_monitor``, ``voice_intake``, a display label like
-    ``"bot-squad operator"``, or nothing at all — is the system speaking, and
-    is recorded as ``system:<kind>`` rather than being dropped: what the deploy
-    monitor told the stakeholder is as unauditable as what a session told him.
+    ``sender_sid`` (T-0762) is the RAW SID of the session that COMPOSED the
+    text, and it is consulted FIRST because it answers this exact question
+    directly. The other two answer it only by implication: ``route_sid`` is the
+    RAW routing SID (the same value ``tg_reply_map`` requires before it will pin
+    a reply route), which happens to name the composer on the paths that set it;
+    ``sender_label`` is a display name.
+
+    ``sender_sid`` IS ``sender_tag.resolve_label``'s TOP RUNG, and taking it
+    here too is the whole of T-0762. The defect was two sources for one
+    question inside one function: ``tg.send``
+    tagged the TEXT from ``sender_sid`` and derived the AUTHOR from
+    ``sid``/``route_sid``, so a live receipt read ``author=system:unattributed``
+    while its own text read ``[bot-squad user-conversation]``. The API's
+    session-writeback relay passes NEITHER ``sid`` NOR ``route_sid`` — T-0758
+    established that it must not, because ``sid`` also enters ``tg_notify``'s
+    destination ladder and pins ``tg_reply_map``, and re-routing the
+    stakeholder's next quoted reply is a far worse bug than a vague author
+    field. ``sender_sid`` exists precisely to carry identity with no routing
+    effect, which is why reading it here fixes the attribution without touching
+    a single routing surface.
+
+    Anything else — ``deploy_monitor``, ``voice_intake``, a caller-declared slug
+    like ``task_chat``'s, a display label like ``"bot-squad operator"``, or
+    nothing at all — is the system speaking, and is recorded as ``system:<kind>``
+    rather than being dropped: what the deploy monitor told the stakeholder is as
+    unauditable as what a session told him. A system sender never sets
+    ``sender_sid``, so this rung is invisible to every one of those paths — the
+    ``📋`` lifecycle notice's ``system:bot-squad`` is CORRECT and stays.
+
+    The rest of the ladder is UNCHANGED, and deliberately does NOT copy the
+    tag's remaining order: ``route_sid`` still beats ``sender_label``. The tag
+    prefers the display label because that is what the reader sees; an author
+    field prefers the raw SID because it is the joinable key, and demoting it
+    under a display name would turn every routed send into ``system:<label>``.
+
+    Note the gate is the SHAPE of a routing SID, not the presence of a reply-map
+    entry: this states who wrote the message, never a promise that a reply will
+    route back to them.
     """
     from bot_squad_worker import tg_reply_map
 
+    composer = str(sender_sid or "").strip()
+    if tg_reply_map.is_routing_sid(composer):
+        return f"session:{composer}"
     sid = str(route_sid or "").strip()
     if tg_reply_map.is_routing_sid(sid):
         return f"session:{sid}"
@@ -300,6 +337,7 @@ def record(
     text: str,
     route_sid: str = "",
     sender_label: str = "",
+    sender_sid: str = "",
     thread_id: Any = None,
     message_id: Any = None,
     reply_to_message_id: Any = None,
@@ -322,6 +360,14 @@ def record(
     because reading intent as outcome is the defect that made a misrouted
     message indistinguishable from a delivered one.
 
+    ``sender_sid`` (T-0762): the SID of the session that COMPOSED this text,
+    when the transport was told one — see :func:`author_for_send`. No caller
+    pairs it with ``record_outbound=True`` today (the one path that states it is
+    the relay, which is unspooled and lands in :func:`record_response`), so this
+    is the twin closed BEFORE it bites: a send path written later that names its
+    composer gets a real author here instead of the same ``unattributed`` this
+    ticket exists to remove.
+
     NEVER raises. A logging failure that broke a send would be strictly worse
     than the gap it is fixing, so every failure is caught, counted in
     :data:`DROPS` and logged at ERROR (T-0586: the drop must be diagnosable).
@@ -333,7 +379,9 @@ def record(
         rec: dict[str, Any] = {
             "timestamp": timestamp or _now_iso(),
             "direction": "out",
-            "author": author_for_send(route_sid=route_sid, sender_label=sender_label),
+            "author": author_for_send(
+                route_sid=route_sid, sender_label=sender_label,
+                sender_sid=sender_sid),
             "channel": str(channel or "tg"),
             "chat_id": str(chat_id),
             "text": body,
@@ -410,6 +458,7 @@ def record_response(
     delivery: dict,
     route_sid: str = "",
     sender_label: str = "",
+    sender_sid: str = "",
     thread_id: Any = None,
     cfg: Any = None,
     timestamp: str | None = None,
@@ -443,6 +492,18 @@ def record_response(
     it would fail *as a difference in the tag* — precisely the false positive
     this record exists to prevent.
 
+    WHO SENT IT (T-0762). This path is where the attribution gap was MEASURED,
+    on two live receipts minutes apart: the ``📋`` lifecycle notice recorded
+    ``author=system:bot-squad`` (``task_chat`` declares its slug, which reaches
+    ``sender_label``) while the attendant writeback recorded
+    ``system:unattributed`` — the one send with a real named author was the one
+    recorded as belonging to nobody, because the relay states its composer in
+    ``sender_sid`` alone and this function was not handed it. Both receipts are
+    now right, and they are right in DIFFERENT vocabularies on purpose: a
+    session send is ``session:<sid>``, a system send keeps naming its class or
+    project. Forcing the second into a session form would trade one wrong
+    author for another.
+
     Never raises, like every other writer here.
     """
     try:
@@ -450,7 +511,9 @@ def record_response(
             "timestamp": timestamp or _now_iso(),
             "direction": "out",
             "kind": RECEIPT_KIND,
-            "author": author_for_send(route_sid=route_sid, sender_label=sender_label),
+            "author": author_for_send(
+                route_sid=route_sid, sender_label=sender_label,
+                sender_sid=sender_sid),
             "channel": str(channel or "tg"),
             "chat_id": str(chat_id),
             "delivered_to": _delivered_to(delivery),

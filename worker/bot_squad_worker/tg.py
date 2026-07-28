@@ -293,12 +293,13 @@ class TgClient:
                 data=data, chat_id=chat_id, text=full_text, sid=sid,
                 route_sid=route_sid, topic_id=topic_id,
                 reply_to_message_id=reply_to_message_id, delivery=receipt,
+                sender_sid=sender_sid,
             )
         else:
             self._note_unspooled()
             self._record_response(
                 receipt, chat_id=chat_id, sid=sid, route_sid=route_sid,
-                topic_id=topic_id,
+                topic_id=topic_id, sender_sid=sender_sid,
             )
         if debounce:
             self._record(chat_id=chat_id, sid=sid, text=text)
@@ -307,7 +308,7 @@ class TgClient:
     def _record_outbound(
         self, *, data: Any, chat_id: str, text: str, sid: str, route_sid: str,
         topic_id: int | None, reply_to_message_id: int | None = None,
-        delivery: dict | None = None,
+        delivery: dict | None = None, sender_sid: str = "",
     ) -> None:
         """T-0755: record WHAT we sent, not just that we sent it.
 
@@ -324,6 +325,12 @@ class TgClient:
         delivered: this is an audit of what reached the stakeholder's screen,
         not of what the caller composed.
 
+        ``sender_sid`` (T-0762) is forwarded for the AUTHOR field, the same
+        value the tag above was composed from — see
+        ``outbound_log.author_for_send``. No caller pairs it with
+        ``record_outbound=True`` today; it is wired here anyway so the twin of
+        the receipt bug cannot appear in this method the day one does.
+
         Best-effort and non-raising by contract (``outbound_log.record``
         swallows and counts its own failures) — a logging failure must never
         turn a delivered message into a failed send.
@@ -338,6 +345,7 @@ class TgClient:
                 text=text,
                 route_sid=route_sid,
                 sender_label=sid,
+                sender_sid=sender_sid,
                 thread_id=topic_id,
                 message_id=((data or {}).get("result") or {}).get("message_id"),
                 reply_to_message_id=reply_to_message_id,
@@ -390,7 +398,7 @@ class TgClient:
 
     def _record_response(
         self, receipt: dict, *, chat_id: str, sid: str, route_sid: str,
-        topic_id: int | None,
+        topic_id: int | None, sender_sid: str = "",
     ) -> None:
         """T-0761: for an unspooled send, Telegram's answer is the only witness.
 
@@ -401,6 +409,17 @@ class TgClient:
         unspooled send now has a real record too — the marker stops being the
         sole evidence on this path without ceasing to be evidence.
 
+        ``sender_sid`` (T-0762): WHO. This method is the one T-0762 was filed
+        against, and the fix is that it now derives the author from the SAME
+        value ``send`` tagged the text from, a few lines up. Before, the text
+        said ``[bot-squad user-conversation]`` and the author field of that very
+        record said ``system:unattributed`` — because the attendant relay
+        deliberately passes neither ``sid`` nor ``route_sid`` (T-0758: ``sid``
+        also steers ``tg_notify``'s destination ladder and pins the reply map,
+        so passing it to fix an author field would silently re-route the
+        stakeholder's next quoted reply). ``sender_sid`` has no routing effect
+        at all, which is exactly why it is the one that may be read here.
+
         Non-raising by contract; the message is already delivered.
         """
         if not receipt:
@@ -410,8 +429,8 @@ class TgClient:
 
             outbound_log.record_response(
                 self._data_dir, channel="tg", chat_id=chat_id, delivery=receipt,
-                route_sid=route_sid, sender_label=sid, thread_id=topic_id,
-                cfg=self._cfg,
+                route_sid=route_sid, sender_label=sid, sender_sid=sender_sid,
+                thread_id=topic_id, cfg=self._cfg,
             )
         except Exception:  # noqa: BLE001 — observability only, never fail the send
             log.exception("tg.send: could not record the delivery receipt")

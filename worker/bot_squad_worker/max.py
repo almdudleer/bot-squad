@@ -136,7 +136,8 @@ class MaxClient:
             recipient_kind=recipient_kind or self._recipient_kind,
         )
         if record_outbound:
-            self._record_outbound(chat_id=chat_id, text=full_text, sid=sid)
+            self._record_outbound(
+                chat_id=chat_id, text=full_text, sid=sid, sender_sid=sender_sid)
         else:
             self._note_unspooled()
         self._record(chat_id=chat_id, sid=sid, text=text)
@@ -157,7 +158,9 @@ class MaxClient:
         except Exception:  # noqa: BLE001 — observability only, never fail the send
             log.exception("max.send: could not note an unspooled delivery")
 
-    def _record_outbound(self, *, chat_id: str, text: str, sid: str) -> None:
+    def _record_outbound(
+        self, *, chat_id: str, text: str, sid: str, sender_sid: str = "",
+    ) -> None:
         """T-0755: record WHAT was delivered on MAX — the TG twin of
         ``tg.TgClient._record_outbound``.
 
@@ -168,6 +171,18 @@ class MaxClient:
         replies do not route back to a session today, so claiming a session
         authorship the transport cannot verify would be worse than naming the
         class.
+
+        THE T-0762 TWIN, and the reason the paragraph above does NOT cover it.
+        ``sender_sid`` is a session's own statement that it composed this text —
+        it was already used for the tag a few lines up, and it says nothing
+        about where a reply goes, so recording it as the author claims nothing
+        the transport cannot verify. Without it a session-composed MAX send is
+        attributed from ``sid`` alone: ``system:<display-label>`` when a label is
+        on hand, and ``system:unattributed`` on the relay path, which passes no
+        ``sid`` at all — bit for bit the TG receipt defect this ticket was filed
+        for. MAX is the RESERVE channel, so it carries exactly the traffic TG
+        could not, which is when an audit needs the author most and is least
+        likely to be looked at.
 
         Never raises: a logging failure must not turn a delivered message into
         a failed send.
@@ -182,6 +197,7 @@ class MaxClient:
                 text=text,
                 route_sid=sid,
                 sender_label=sid,
+                sender_sid=sender_sid,
                 cfg=self._cfg,
             )
         except Exception:  # noqa: BLE001 — observability only, never fail the send

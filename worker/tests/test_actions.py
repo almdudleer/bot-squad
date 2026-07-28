@@ -1555,6 +1555,14 @@ def test_deploy_action_echoes_target_sha(tmp_path, monkeypatch):
     assert out["ok"] is True
     assert out["target_sha"] == head
 
+    # T-0754: the SAME value is what got persisted. The echo and the payload are
+    # one resolution — resolving twice around a push landing in between would let
+    # /api/health interpret drift against a commit the requester never saw.
+    import json
+    queue_dir = cfg.data_dir / "deploy-test" / "_jobs" / "deploy" / "queue"
+    payload = json.loads(next(queue_dir.glob("*.json")).read_text())
+    assert payload["target_sha"] == out["target_sha"] == head
+
 
 def test_deploy_action_rejects_bad_target(tmp_path, monkeypatch):
     import bot_squad_worker.actions as A

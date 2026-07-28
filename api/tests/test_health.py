@@ -282,3 +282,274 @@ def test_the_later_deadline_wins_when_both_markers_exist(
         worker = client.get("/api/health").json()["worker"]
     assert worker["health"] == ["restart_pending"]
     assert worker["restart"]["state"] == "deferred"
+
+
+# ---------------------------------------------------------------------------
+# T-0754: deploy_pending vs bare sha_drift
+#
+# The case the restart markers CANNOT cover, because there is correctly no
+# marker to write: a deploy whose worker/ subtree is byte-identical skips the
+# restart, so the worker's effective sha follows the new checkout immediately
+# while the OLD API container keeps answering /api/health with its own baked-in
+# sha until it is recreated. Measured on the 75dc01a deploy: 62.3s of continuous
+# bare sha_drift with marker=none on every one of 106 samples, on a deploy where
+# nothing was wrong.
+#
+# The evidence used instead is the deploy job the API can already see — but only
+# when its recorded `target_sha` equals the side that has ALREADY converged.
+# "A deploy is happening" alone would excuse any drift that merely coincides
+# with one, which is the blanket post-deploy grace this system has refused.
+# ---------------------------------------------------------------------------
+
+WORKER_SHA = "a" * 40    # what `_drifting_client` writes to the heartbeat
+API_SHA = "b" * 40       # what it bakes into BOT_SQUAD_GIT_SHA
+
+
+def _job(
+    tmp_bot_squad: Path,
+    *,
+    target_sha: str | None = WORKER_SHA,
+    slug: str = "bot-squad",
+    state: str = "processing",
+    queued_at: float | None = None,
+    log_age: float | None = 5.0,
+    **extra,
+) -> Path:
+    """Write a deploy job file the way `deploy.enqueue` + `run_next` would.
+
+    ``log_age`` seconds ago is when the recipe last wrote to its run log — the
+    deploy's sign of life. None = no log yet (a job still sitting in queue/).
+    """
+    queued_at = time.time() - 65 if queued_at is None else queued_at
+    base = tmp_bot_squad / "data" / slug / "_jobs" / "deploy"
+    (base / state).mkdir(parents=True, exist_ok=True)
+    queue_id = f"qid-{state}-{slug}-{target_sha}"
+    payload = {
+        "queue_id": queue_id,
+        "slug": slug,
+        "target": "staging",
+        "reason": "ship it",
+        "requested_by": "S-test",
+        "queued_at": queued_at,
+        "restart_worker": False,
+        **extra,
+    }
+    if target_sha is not None:
+        payload["target_sha"] = target_sha
+    path = base / state / f"{int(queued_at * 1000)}-{queue_id}.json"
+    path.write_text(json.dumps(payload))
+    if log_age is not None:
+        (base / "runs").mkdir(parents=True, exist_ok=True)
+        log = base / "runs" / f"{queue_id}.log"
+        log.write_text("#5 [api 3/8] RUN pip install\n")
+        os.utime(log, (time.time() - log_age, time.time() - log_age))
+    return path
+
+
+def test_drift_during_an_in_flight_deploy_of_that_commit_is_not_an_alarm(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """THE TICKET. The exact 75dc01a shape: worker already on the deployed
+    commit, API not yet recreated, and no restart marker anywhere because no
+    restart is owed. Today that is a bare sha_drift for a minute-plus."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    _job(tmp_bot_squad, target_sha=WORKER_SHA)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["deploy_pending"]
+    assert worker["deploy"]["state"] == "in_flight"
+    assert worker["deploy"]["converged"] == "worker"
+    assert worker["deploy"]["target_sha"] == WORKER_SHA
+    assert worker["deploy"]["overdue"] is False
+    assert "restart" not in worker    # nothing was owed; nothing is claimed
+
+
+def test_the_deploy_may_be_the_one_the_API_has_already_landed(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """The other direction, which p343's measurement corrected the model on:
+    the converged side can be the API. Naming WHICH is what keeps the record
+    diagnosable instead of just 'a deploy is happening'."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    _job(tmp_bot_squad, target_sha=API_SHA)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["deploy_pending"]
+    assert worker["deploy"]["converged"] == "api"
+
+
+def test_a_deploy_of_a_DIFFERENT_commit_does_not_excuse_the_drift(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """The line between this and the refused blanket grace. A deploy in flight
+    is not evidence about THIS drift unless one side is already on its target;
+    otherwise any drift that happened to coincide with a deploy would be
+    silenced, which is the time-based excuse this system has refused."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    _job(tmp_bot_squad, target_sha="c" * 40)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["sha_drift"]
+    assert "deploy" not in worker
+
+
+def test_a_payload_without_a_target_sha_buys_no_excuse(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """A pre-T-0754 worker persisted no target_sha — every job file already on
+    disk at deploy time looks like this. It must degrade to the ALARM, not to
+    'a deploy is running, near enough'. Same for a malformed one: an
+    unparseable probe yields a false alarm, never a false all-clear (T-0717)."""
+    import shutil
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    d = tmp_bot_squad / "data" / "bot-squad" / "_jobs" / "deploy" / "processing"
+    for bad in (None, "", "unknown", "a" * 39, "zzzzzzzz" * 5, WORKER_SHA[:12]):
+        shutil.rmtree(d, ignore_errors=True)
+        _job(tmp_bot_squad, target_sha=bad)
+        assert _flags(app) == ["sha_drift"], f"target_sha={bad!r} bought an excuse"
+
+
+def test_a_corrupt_job_file_degrades_to_the_alarm(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Junk on disk must not be able to silence drift."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    d = tmp_bot_squad / "data" / "bot-squad" / "_jobs" / "deploy" / "processing"
+    d.mkdir(parents=True, exist_ok=True)
+    for junk in ("{not json", "[]", '"str"', "", json.dumps({"target_sha": 5})):
+        (d / "1-x.json").write_text(junk)
+        assert _flags(app) == ["sha_drift"]
+
+
+def test_a_stranded_deploy_stops_excusing_before_R0005_could_breach(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """THE BOUND, and it is pinned against a number rather than a feeling.
+
+    A job stranded in processing/ (worker killed mid-run) is not swept for 2h.
+    If that silenced health for 2h it would hide the wedged deploy R-0005 exists
+    to catch. The excuse lapses 300s after the deploy's last sign of life —
+    strictly inside R-0005's persist_s of 600 — so the monitor's power over a
+    wedged deploy is unchanged. The block is still REPORTED while overdue,
+    because 'a deploy of X has been in flight since 07:43 and never converged'
+    is the headline for whoever gets paged."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    stale = time.time() - 1200
+    _job(tmp_bot_squad, queued_at=stale, log_age=1200.0)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["sha_drift"]
+    assert worker["deploy"]["overdue"] is True
+    from app.routes_health import _DEPLOY_PROGRESS_DEADLINE_SECONDS
+    assert _DEPLOY_PROGRESS_DEADLINE_SECONDS < 600   # R-0005 persist_s
+
+
+def test_a_long_but_LIVE_build_keeps_its_excuse(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """The other half of that bound. signal-tracker's image build runs ~17min;
+    anchoring the deadline on ENQUEUE would strip the excuse off every healthy
+    long deploy. The anchor is the run log — the same sign of life the worker's
+    own no-progress watchdog measures — so a build still writing keeps it."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    _job(tmp_bot_squad, queued_at=time.time() - 1200, log_age=3.0)
+    assert _flags(app) == ["deploy_pending"]
+
+
+def test_a_job_still_in_the_queue_counts(tmp_bot_squad: Path, monkeypatch) -> None:
+    """queue/ as well as processing/ — a deploy that has not started yet still
+    explains a drift its target sha matches, and expires on queued_at alone
+    (which is also what expires a job parked behind a paused queue)."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    _job(tmp_bot_squad, state="queue", log_age=None)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["deploy_pending"]
+    assert worker["deploy"]["state"] == "queued"
+    assert worker["deploy"]["last_progress"] is None
+
+
+def test_another_projects_deploy_is_not_an_excuse(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """The scan covers every slug rather than guessing which one owns this
+    install — the sha match does the selecting, on evidence. watchrobot
+    deploying its own commit says nothing about bot-squad's drift."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    _job(tmp_bot_squad, slug="watchrobot", target_sha="d" * 40)
+    assert _flags(app) == ["sha_drift"]
+
+
+def test_a_pending_restart_is_the_more_specific_statement_and_wins(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """A restart_worker deploy has both. The restart marker names the action
+    that will close the drift, so it leads — and the deploy block is then
+    ABSENT because the API did not look, not because no deploy is running."""
+    app, wdir = _drifting_client(tmp_bot_squad, monkeypatch)
+    now = time.time()
+    (wdir / "restart_pending.json").write_text(
+        json.dumps({"at": now, "expected_by": now + 300})
+    )
+    _job(tmp_bot_squad)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["restart_pending"]
+    assert "deploy" not in worker
+
+
+def test_an_OVERDUE_restart_falls_through_to_the_deploy(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Once the restart marker lapses it no longer excuses anything, so the
+    deploy gets its turn — a stale marker from an earlier deploy must not
+    condemn the drift the CURRENT one is explaining."""
+    app, wdir = _drifting_client(tmp_bot_squad, monkeypatch)
+    (wdir / "restart_pending.json").write_text(
+        json.dumps({"at": time.time() - 900, "expected_by": time.time() - 1})
+    )
+    _job(tmp_bot_squad)
+    with TestClient(app) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert worker["health"] == ["deploy_pending"]
+    assert worker["restart"]["overdue"] is True   # still reported
+
+
+def test_a_deploy_never_softens_a_dead_heartbeat(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """A dead worker is actionable on its own. A deploy running through it is
+    more evidence, not a reassurance."""
+    app, wdir = _drifting_client(tmp_bot_squad, monkeypatch)
+    os.utime(wdir / "heartbeat", (time.time() - 9999, time.time() - 9999))
+    _job(tmp_bot_squad)
+    assert _flags(app) == ["dead_heartbeat"]
+
+
+def test_no_drift_means_no_flags_even_mid_deploy(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """The no-green-noise close (T-0456). Once the shas agree there is nothing
+    to explain, and a deploy still running must not conjure a pill."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    monkeypatch.setenv("BOT_SQUAD_GIT_SHA", API_SHA)
+    wdir = tmp_bot_squad / "data" / "_worker"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "heartbeat").write_text(API_SHA)
+    _job(tmp_bot_squad, target_sha=API_SHA)
+    with TestClient(build_app()) as client:
+        worker = client.get("/api/health").json()["worker"]
+    assert "health" not in worker
+    assert "deploy" not in worker
+
+
+def test_no_job_dirs_at_all_is_a_plain_sha_drift(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """A fresh install that has never deployed. The scan must return nothing and
+    say nothing — not raise, and not invent an explanation."""
+    app, _ = _drifting_client(tmp_bot_squad, monkeypatch)
+    assert _flags(app) == ["sha_drift"]

@@ -710,6 +710,23 @@ export type HealthResponse = {
       overdue?: boolean;
       reason?: string;
     } | null;
+    // T-0754: present only alongside a drift flag, and only when the API found
+    // an in-flight deploy whose recorded target_sha equals the side that has
+    // ALREADY converged — so `deploy_pending` can be told from bare `sha_drift`
+    // on a deploy that correctly skips the worker restart (no marker exists).
+    deploy?: {
+      state?: "in_flight" | "queued";
+      slug?: string;
+      queue_id?: string;
+      target_sha?: string;
+      /** Which side already reports target_sha; its counterpart is catching up. */
+      converged?: "worker" | "api";
+      since?: number;
+      last_progress?: number | null;
+      expected_by?: number;
+      overdue?: boolean;
+      reason?: string;
+    } | null;
   };
 };
 

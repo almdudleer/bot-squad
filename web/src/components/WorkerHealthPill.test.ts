@@ -106,3 +106,84 @@ describe("workerHealthView — restart_pending (T-0739)", () => {
     expect(workerHealthView({ worker: { restart: { state: "in_flight" } } })).toBeNull();
   });
 });
+
+describe("workerHealthView — deploy_pending (T-0754)", () => {
+  const now = Date.now() / 1000;
+  const deploy = {
+    state: "in_flight" as const,
+    slug: "bot-squad",
+    queue_id: "q1",
+    target_sha: "75dc01ac24554b4aa3a4e49910e669eaf75bc76d",
+    converged: "worker" as const,
+    since: now - 65,
+    expected_by: now + 240,
+    overdue: false,
+  };
+
+  test("deploy_pending alone → MUTED 'deploy landing', not the red alarm", () => {
+    // The whole harm this ticket records is a HUMAN reading an alarming chip on
+    // a deploy where nothing is wrong — measured at 62.3s on the 75dc01a
+    // deploy. The pill is where that harm lands, so the fix has to reach it.
+    const v = workerHealthView({ worker: { health: ["deploy_pending"], deploy } });
+    expect(v?.danger).toBe(false);
+    expect(v?.label).toBe("deploy landing");
+  });
+
+  test("the tooltip names the commit and WHICH side is already on it", () => {
+    const v = workerHealthView({ worker: { health: ["deploy_pending"], deploy } });
+    expect(v?.title).toContain("75dc01a");
+    expect(v?.title).toContain("the worker is already on it");
+  });
+
+  test("the converged side can be the API — p343's correction to the model", () => {
+    const v = workerHealthView({
+      worker: { health: ["deploy_pending"], deploy: { ...deploy, converged: "api" } },
+    });
+    expect(v?.title).toContain("the API is already on it");
+  });
+
+  test("deploy_pending + another flag → RED wins", () => {
+    for (const other of ["dead_heartbeat", "sha_drift", "some_future_flag"]) {
+      const v = workerHealthView({ worker: { health: ["deploy_pending", other], deploy } });
+      expect(v?.danger).toBe(true);
+      expect(v?.label).not.toBe("deploy landing");
+    }
+  });
+
+  test("an OVERDUE deploy is red AND says it never converged", () => {
+    // The bound. Past its deadline the job no longer excuses the drift — but it
+    // is still the headline for whoever gets paged.
+    const v = workerHealthView({
+      worker: {
+        health: ["sha_drift"],
+        deploy: { ...deploy, since: now - 1200, expected_by: now - 1, overdue: true },
+      },
+    });
+    expect(v?.danger).toBe(true);
+    expect(v?.title).toContain("OVERDUE");
+    expect(v?.title).toContain("has not converged");
+  });
+
+  test("both explanations can ride one sha_drift without colliding", () => {
+    const v = workerHealthView({
+      worker: {
+        health: ["sha_drift"],
+        restart: { state: "deferred", since: now - 900, expected_by: now - 1, overdue: true },
+        deploy: { ...deploy, overdue: true, expected_by: now - 1 },
+      },
+    });
+    expect(v?.title).toContain("did not land on its own");
+    expect(v?.title).toContain("has not converged");
+  });
+
+  test("a pre-T-0754 API (no deploy key) is unchanged", () => {
+    const v = workerHealthView({ worker: { health: ["sha_drift"] } });
+    expect(v?.danger).toBe(true);
+    expect(v?.label).toBe("worker stale");
+    expect(v?.title).not.toContain("deploy of");
+  });
+
+  test("healthy still renders nothing mid-deploy", () => {
+    expect(workerHealthView({ worker: { deploy } })).toBeNull();
+  });
+});

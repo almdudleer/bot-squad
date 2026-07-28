@@ -865,6 +865,7 @@ def enqueue(
     reason: str,
     requested_by: str,
     restart_worker: bool = False,
+    target_sha: str | None = None,
 ) -> str:
     """Write a deploy request file and return its queue_id.
 
@@ -873,6 +874,21 @@ def enqueue(
     bot-squad-worker (in a detached scope so it survives) and re-smokes the
     worker. The agent opts in only when the diff touches worker-loaded code
     (e.g. ``worker/.../actions.py``); most web/api deploys leave it off.
+
+    ``target_sha`` (T-0754) is PERSISTED into the payload, not just echoed to
+    the caller. ``/api/health`` reads it to tell "this drift is a deploy landing
+    right now" from "nothing is coming": the mid-deploy window has one side
+    already on the deployed commit, so a job whose recorded target matches that
+    side EXPLAINS the drift. Without it on disk the API can only see THAT a
+    deploy is happening, which would excuse any drift that merely coincides with
+    one — the blanket grace this system has refused five times.
+
+    Pass it in to reuse a resolution the caller already made (``_action_deploy``
+    echoes the same value it stores, so the response and the payload cannot
+    disagree about which commit this deploy ships). Left None it resolves itself.
+    Best-effort by construction: ``resolve_target_sha`` returns "" rather than
+    raising, and an empty/absent value simply means health falls back to a bare
+    ``sha_drift`` — a false alarm, never a false all-clear (T-0717's rule).
 
     Raises ValueError if ``target`` is not in the project's deploy_targets.
     Raises KeyError if ``slug`` is not registered.
@@ -886,6 +902,9 @@ def enqueue(
 
     queue_dir = _queue_dir(cfg, slug)
     queue_dir.mkdir(parents=True, exist_ok=True)
+
+    if target_sha is None:
+        target_sha = resolve_target_sha(cfg, slug, target)
 
     queue_id = str(uuid.uuid4())
     queued_at = time.time()
@@ -901,6 +920,7 @@ def enqueue(
         "requested_by": requested_by,
         "queued_at": queued_at,
         "restart_worker": bool(restart_worker),
+        "target_sha": target_sha or "",
     }
     (queue_dir / filename).write_text(json.dumps(payload, indent=2))
     log.info("deploy.enqueue: %s/%s queued as %s", slug, target, queue_id)

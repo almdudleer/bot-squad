@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from importlib.metadata import version, PackageNotFoundError
 from pathlib import Path
@@ -67,6 +68,146 @@ def _restart_state(worker_dir: Path) -> dict | None:
     return best
 
 
+# ---------------------------------------------------------------------------
+# T-0754: drift explained by a deploy that is landing RIGHT NOW
+# ---------------------------------------------------------------------------
+# The markers above cover a drift a RESTART will close. They cannot cover the
+# case measured on the 75dc01a deploy (web-only, worker/ byte-identical): T-0717
+# leg 1 correctly skipped the restart, so there was correctly no marker to write
+# — and health reported a bare `sha_drift` for a continuous 62.3s while nothing
+# whatsoever was wrong.
+#
+# What that measurement CORRECTED, and why it is what makes this fix possible:
+# the lagging side was the API, not the worker. worker/ being byte-identical
+# means the worker's effective sha follows the new checkout immediately, while
+# the OLD API container keeps answering /api/health with its own baked-in sha
+# until it is recreated. So the process REPORTING the drift is the one that is
+# behind, and it is behind because A DEPLOY IS IN FLIGHT — a fact already on
+# disk, in the same job files routes_runs.py reads.
+#
+# NOT the blanket post-deploy grace period (refused five times). Nothing is
+# excused by elapsed time since a deploy. The excuse requires a job file the
+# system itself wrote AND that job's recorded `target_sha` to equal the sha of
+# the side that has ALREADY converged — i.e. the deploy has to explain THIS
+# drift, not merely coincide with it. When the job leaves queue/processing the
+# excuse ends on its own; there is no timer to tune.
+#
+# The coverage is STRUCTURAL, not lucky: the staging recipe asserts the running
+# container's BOT_SQUAD_GIT_SHA equals the deployed sha (T-0379) and then smokes
+# /api/health, so the API cannot still be reporting the old sha by the time the
+# recipe exits and `_finish` moves the job out of processing/. Measured on
+# 75dc01a: job in processing 07:43:55.5 → 07:46:02.9, drift 07:44:51.7 →
+# ≤07:46:02.2 — strictly contained, with ~56s of lead-in.
+_DEPLOY_JOB_STATES = (("processing", "in_flight"), ("queue", "queued"))
+# A full 40-hex sha, matched EXACTLY. A prefix match would weaken the one thing
+# this excuse rests on — that the deploy's target and the converged side are the
+# same commit — so a short or malformed sha buys no excuse at all.
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# The bound, and it is chosen against a number rather than by feel: R-0005 needs
+# the breach condition to HOLD FOR 600s before it fires. Lapsing the excuse at
+# 300s from the deploy's last sign of life guarantees a wedged deploy is back to
+# a bare `sha_drift` well before the monitor could ever have breached on it —
+# so this cannot hide the failure it is meant to explain away. (A deploy has its
+# own supervision: two watchdogs and the 2h orphan reaper. A marker stranded in
+# processing/ by a killed worker must not silence health for those two hours.)
+_DEPLOY_PROGRESS_DEADLINE_SECONDS = 300
+
+
+def _deploy_row(
+    path: Path, state: str, slug: str, api_sha: str, worker_sha: str
+) -> dict | None:
+    """One in-flight deploy job, IF it explains the drift we are looking at.
+
+    Returns None — i.e. no excuse, fall back to the alarm — for every degraded
+    input: unreadable/corrupt payload, a pre-T-0754 worker that persisted no
+    `target_sha`, a malformed one, or a perfectly good deploy of some OTHER
+    commit. That last case is the point of form (b): a deploy merely being in
+    progress is not evidence about this drift.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    target_sha = raw.get("target_sha")
+    if not isinstance(target_sha, str) or not _SHA_RE.match(target_sha.strip().lower()):
+        return None
+    target_sha = target_sha.strip().lower()
+    # Which side has already reached the deploy's target? That is the side the
+    # deploy has landed on, and its counterpart is the one still catching up.
+    # On the measured shape it is the WORKER (byte-identical subtree, no
+    # restart); on a restart-bearing deploy it is the API. Both are real, and
+    # naming which keeps the record diagnosable instead of just "a deploy".
+    if target_sha == worker_sha.strip().lower():
+        converged = "worker"
+    elif target_sha == api_sha.strip().lower():
+        converged = "api"
+    else:
+        return None
+    try:
+        queued_at = float(raw.get("queued_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    # Anchor the deadline on the deploy's last SIGN OF LIFE, not on enqueue: the
+    # run log is appended to continuously by the recipe (it is what the worker's
+    # own no-progress watchdog measures), so a long-but-healthy build keeps its
+    # excuse while a wedged one loses it. A queued job has no log yet and falls
+    # back to queued_at — which also expires a job parked behind a paused queue.
+    last_progress = None
+    queue_id = raw.get("queue_id")
+    if isinstance(queue_id, str) and queue_id:
+        try:
+            last_progress = (
+                path.parent.parent / "runs" / f"{queue_id}.log"
+            ).stat().st_mtime
+        except OSError:
+            last_progress = None
+    expected_by = max(queued_at, last_progress or 0.0) + _DEPLOY_PROGRESS_DEADLINE_SECONDS
+    return {
+        "state": state,
+        "slug": slug,
+        "queue_id": queue_id if isinstance(queue_id, str) else "",
+        "target_sha": target_sha,
+        "converged": converged,
+        "since": queued_at,
+        "last_progress": last_progress,
+        "expected_by": expected_by,
+        "overdue": time.time() > expected_by,
+        "reason": str(raw.get("reason") or ""),
+    }
+
+
+def _deploy_state(data_dir: Path, api_sha: str, worker_sha: str) -> dict | None:
+    """The in-flight deploy a drift reading should be interpreted against.
+
+    Scans every project's job dirs rather than guessing which slug owns this
+    install: the sha match does the selecting on evidence, and another project's
+    deploy can never carry a `target_sha` equal to this install's api/worker sha.
+    Only reached when a drift has already been detected, so the cost is paid on
+    the rare path — never on a healthy poll.
+    """
+    best: dict | None = None
+    try:
+        slug_dirs = sorted(p for p in data_dir.iterdir() if p.is_dir())
+    except OSError:
+        return None
+    for slug_dir in slug_dirs:
+        base = slug_dir / "_jobs" / "deploy"
+        for dirname, state in _DEPLOY_JOB_STATES:
+            try:
+                jobs = sorted((base / dirname).glob("*.json"))
+            except OSError:
+                continue
+            for job in jobs:
+                row = _deploy_row(job, state, slug_dir.name, api_sha, worker_sha)
+                if row is None:
+                    continue
+                if best is None or row["expected_by"] > best["expected_by"]:
+                    best = row
+    return best
+
+
 def _pkg_version() -> str:
     try:
         return version("bot-squad-api")
@@ -113,17 +254,44 @@ def health(request: Request) -> dict:
     # this is NOT: a blanket post-deploy grace period. Nothing is suppressed by
     # elapsed time since a deploy — only by a marker the worker wrote saying a
     # specific restart is coming, and only until that restart is overdue.
+    #
+    # T-0754 adds the third reading, for the drift NO restart will ever close
+    # because none is owed. See `_deploy_state` — an in-flight deploy job whose
+    # recorded target_sha equals the side that has already converged reports
+    # `deploy_pending`. Same principle as the restart marker, same bound: an
+    # explanation the system wrote down, and only while it is still current.
     problems = []
     restart = None
+    deploy = None
     if not alive:
         problems.append("dead_heartbeat")
     elif worker_sha and api_sha and api_sha != "unknown" and worker_sha != api_sha:
         restart = _restart_state(heartbeat.parent)
-        problems.append(
-            "restart_pending" if restart and not restart["overdue"] else "sha_drift"
-        )
+        if restart and not restart["overdue"]:
+            # A restart the worker recorded is the more specific statement — it
+            # names the action that will close this drift. The deploy is not
+            # consulted at all here, so an absent `deploy` key on this path
+            # means "not looked at", never "no deploy is running".
+            problems.append("restart_pending")
+        else:
+            # Deliberately derived from the HEARTBEAT path, not from
+            # `api_config.data_dir` (which is `CONFIG_DIR.parent / "data"`, a
+            # different derivation that agrees only by convention). This reader
+            # must answer about the same install the drift was measured on;
+            # pointed elsewhere it would return a well-formed EMPTY result and
+            # silently report `sha_drift` forever — most convincingly during a
+            # real deploy.
+            deploy = _deploy_state(heartbeat.parent.parent, api_sha, worker_sha)
+            problems.append(
+                "deploy_pending" if deploy and not deploy["overdue"] else "sha_drift"
+            )
     if problems:
         worker["health"] = problems
+    if deploy:
+        # Carried on the OVERDUE case too, for the same reason the restart block
+        # is: "a deploy of <sha> has been in flight since 07:43 and still has
+        # not converged" is the headline for whoever R-0005 pages.
+        worker["deploy"] = deploy
     if restart:
         # Carried on the OVERDUE case too: "a restart has been pending since
         # 03:34 and never landed" is the single most useful line for whoever

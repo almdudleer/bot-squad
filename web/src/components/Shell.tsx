@@ -277,7 +277,9 @@ export function Shell() {
           <GlobalBusyIndicator myUsername={username} />
           {/* T-0456: failure-only worker-health pill — renders nothing while
               healthy, lights red on dead_heartbeat / sha_drift. T-0739: a drift
-              a pending restart already explains renders MUTED instead of red.
+              a pending restart already explains renders MUTED instead of red;
+              T-0754 does the same for a drift an in-flight deploy of that exact
+              commit explains (the case with no restart marker to read).
               Consumer-only like the autoupdate pill (local /api/health). */}
           {!IS_MOTHERSHIP_BUILD && <WorkerHealthPill />}
           {/* T-0089: consumer-only autoupdate status pill. Skipped on the

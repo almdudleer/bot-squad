@@ -38,7 +38,18 @@ const FLAG_LABEL: Record<string, string> = {
   dead_heartbeat: "worker down: dead_heartbeat (no recent heartbeat)",
   sha_drift: "worker stale: sha_drift (worker sha != API image; nothing is coming to fix this on its own)",
   restart_pending: "worker restarting: sha differs but a restart is already pending — expected, converges on its own",
+  deploy_pending: "deploy landing: sha differs but a deploy of that exact commit is in flight — expected, converges on its own",
 };
+
+/**
+ * T-0754: the flags that are an EXPECTED, self-healing state rather than an
+ * alarm. `deploy_pending` joins `restart_pending` because it is the same shape
+ * — the API's own sha is stale for the seconds its container takes to come up
+ * mid-deploy — and because the pill IS the surface where this ticket's harm
+ * lands: a human reading an alarming chip on a deploy where nothing is wrong.
+ * Measured window on the 75dc01a deploy: 62.3s of it.
+ */
+const CALM_FLAGS = new Set(["restart_pending", "deploy_pending"]);
 
 export type WorkerHealthView = {
   label: string;
@@ -68,6 +79,26 @@ function restartDetail(health: HealthResponse | null): string {
 }
 
 /**
+ * T-0754: the deploy that explains the drift, when one does. Names the commit
+ * and which side already reached it — "the worker is on 75dc01a and the API
+ * hasn't come up on it yet" is the whole story, and it is the difference
+ * between reading this chip as noise and reading it as a deploy in progress.
+ */
+function deployDetail(health: HealthResponse | null): string {
+  const d = health?.worker?.deploy;
+  if (!d) return "";
+  const sha = typeof d.target_sha === "string" ? d.target_sha.slice(0, 7) : "?";
+  const side = d.converged === "api" ? "the API" : "the worker";
+  if (d.overdue) {
+    const since = typeof d.since === "number" && d.since > 0
+      ? new Date(d.since * 1000).toLocaleTimeString()
+      : "an earlier request";
+    return ` — NOTE: a deploy of ${sha} has been in flight since ${since} and is now OVERDUE; it has not converged`;
+  }
+  return ` (deploy of ${sha} landing; ${side} is already on it)`;
+}
+
+/**
  * Pure mapping from a /health payload to the pill view. Returns null (render
  * nothing) when healthy or when the payload lacks a non-empty `worker.health`.
  * Exported for unit testing.
@@ -77,17 +108,30 @@ export function workerHealthView(health: HealthResponse | null): WorkerHealthVie
   if (!Array.isArray(flags) || flags.length === 0) return null;
   // dead_heartbeat is the more severe signal — lead the label with it.
   const down = flags.includes("dead_heartbeat");
-  // Muted ONLY when restart_pending is the whole story. Any other flag present
-  // (including a future one we don't know) keeps the chip red — an unrecognised
-  // problem must never be softened by a restart that happens to be pending.
-  const pendingOnly = flags.length === 1 && flags[0] === "restart_pending";
-  const label = down ? "worker down" : pendingOnly ? "worker restarting" : "worker stale";
+  // Muted ONLY when a self-healing flag is the WHOLE story. Any other flag
+  // present (including a future one we don't know) keeps the chip red — an
+  // unrecognised problem must never be softened by a restart or deploy that
+  // happens to be in flight.
+  const pendingOnly = flags.length === 1 && CALM_FLAGS.has(flags[0]);
+  const label = down
+    ? "worker down"
+    : !pendingOnly
+      ? "worker stale"
+      : flags[0] === "deploy_pending"
+        ? "deploy landing"
+        : "worker restarting";
   // The restart detail rides along on the drift flags in BOTH directions: it
   // says "wait ~Ns" while pending, and "owed since X, OVERDUE" once it isn't.
-  const drift = flags.includes("restart_pending") || flags.includes("sha_drift");
+  // The deploy detail does the same, and both can appear on one bare sha_drift:
+  // the API only omits a block it did not look at, so whichever explanations
+  // are present are the ones it actually found.
+  const drift =
+    flags.includes("restart_pending") ||
+    flags.includes("deploy_pending") ||
+    flags.includes("sha_drift");
   const title =
     flags.map((f) => FLAG_LABEL[f] ?? `worker: ${f}`).join("; ") +
-    (drift ? restartDetail(health) : "");
+    (drift ? restartDetail(health) + deployDetail(health) : "");
   return { label, title, danger: !pendingOnly };
 }
 

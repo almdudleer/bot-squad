@@ -582,6 +582,86 @@ def test_resolve_target_sha_empty_on_unknown_slug_or_target(tmp_path: Path) -> N
     assert resolve_target_sha(cfg, proj.slug, "prod") == ""  # not a deploy_target
 
 
+# ---------------------------------------------------------------------------
+# T-0754: the queue payload PERSISTS target_sha
+#
+# T-0458 resolved the to-be-built commit and echoed it to the requester, then
+# threw it away. /api/health needs it ON DISK: mid-deploy, one side is already
+# on the deployed commit, so a job whose recorded target matches that side is
+# what tells "a deploy is landing right now" from "nothing is coming". Without
+# it the API could see only THAT a deploy is running — which would excuse any
+# drift that merely coincides with one, the blanket grace this system refuses.
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_persists_the_target_sha(tmp_path: Path) -> None:
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+
+    enqueue(cfg, proj.slug, "staging", "web-only", "user")
+
+    data = json.loads(next(queue_dir.glob("*.json")).read_text())
+    assert data["target_sha"] == _head(proj.repo_path)
+
+
+def test_enqueue_takes_a_caller_supplied_target_sha(tmp_path: Path) -> None:
+    """So the action's ECHO and the persisted payload are one resolution. Two
+    rev-parses around a push landing in between would let health compare drift
+    against a commit the requester was never told about."""
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _attach_origin(proj.repo_path, tmp_path)
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+
+    enqueue(cfg, proj.slug, "staging", "r", "user", target_sha="e" * 40)
+
+    data = json.loads(next(queue_dir.glob("*.json")).read_text())
+    assert data["target_sha"] == "e" * 40
+
+
+def test_an_unresolvable_target_sha_is_recorded_as_empty_not_omitted(
+    tmp_path: Path,
+) -> None:
+    """Best-effort by construction: no origin ref → "". The KEY is still written,
+    so a reader can tell "this worker records target_sha and could not resolve
+    one" from "this file predates T-0754". Health treats both as no excuse — a
+    false alarm, never a false all-clear (T-0717's degradation rule)."""
+    proj = _make_deploy_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    # deliberately no origin attached
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+
+    enqueue(cfg, proj.slug, "staging", "r", "user")
+
+    data = json.loads(next(queue_dir.glob("*.json")).read_text())
+    assert data["target_sha"] == ""
+
+
+def test_the_persisted_target_sha_survives_into_processing(tmp_path: Path) -> None:
+    """The API reads the file in processing/, not the one in queue/. run_next
+    RENAMES rather than rewrites, so the sha has to arrive intact — this is the
+    one hop between the two halves of the fix, and it is worth pinning."""
+    import bot_squad_worker.deploy as d
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    # A recipe that blocks long enough to observe the processing/ state.
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+    enqueue(cfg, proj.slug, "staging", "r", "user", target_sha="f" * 40)
+
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+    processing_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "processing"
+    processing_dir.mkdir(parents=True, exist_ok=True)
+    qf = next(queue_dir.glob("*.json"))
+    qf.rename(processing_dir / qf.name)   # exactly what run_next does
+
+    data = json.loads(next(processing_dir.glob("*.json")).read_text())
+    assert data["target_sha"] == "f" * 40
+    assert d._queue_id_of(next(processing_dir.glob("*.json"))) == data["queue_id"]
+
+
 def test_run_next_provisions_deploy_clone_on_first_deploy(tmp_path: Path) -> None:
     proj = _make_deploy_project(tmp_path)
     cfg = _make_config(tmp_path, proj)

@@ -1641,6 +1641,15 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"deploy: unknown project slug {slug!r}")
 
     from bot_squad_worker import deploy as _deploy
+    # T-0458: echo the to-be-built commit (origin/<deploy_branch> tip) so the
+    # requester sees WHICH commit this deploy will ship up front. Best-effort —
+    # "" if it can't be resolved; the authoritative sha is re-parsed post-build.
+    #
+    # T-0754 moved this ABOVE the enqueue and hands the same value in, so the
+    # echoed sha and the one persisted in the queue payload are one resolution.
+    # Resolving twice around a push landing in between would let /api/health
+    # compare drift against a commit the requester was never told about.
+    target_sha = _deploy.resolve_target_sha(cfg, slug, target)
     try:
         queue_id = _deploy.enqueue(
             cfg,
@@ -1649,14 +1658,10 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
             reason=params["reason"],
             requested_by=params["requested_by"],
             restart_worker=bool(params.get("restart_worker", False)),
+            target_sha=target_sha,
         )
     except ValueError as e:
         raise ActionError(f"deploy: {e}") from e
-
-    # T-0458: echo the to-be-built commit (origin/<deploy_branch> tip) so the
-    # requester sees WHICH commit this deploy will ship up front. Best-effort —
-    # "" if it can't be resolved; the authoritative sha is re-parsed post-build.
-    target_sha = _deploy.resolve_target_sha(cfg, slug, target)
 
     import time as _time
     return {

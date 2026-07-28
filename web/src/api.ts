@@ -858,23 +858,60 @@ export type WorkerModel = { model: string };
 // populates a module-level cache; consumers seed their initial state from
 // `cachedProjects()` for an instant paint, then call api.projects() to
 // revalidate (stale-while-revalidate). Cleared on logout via clearProjectsCache.
+//
+// T-0763: that cache seeds the FIRST PAINT synchronously — it does not stop two
+// consumers mounting in the same tick from each issuing their own request. On
+// /p/:slug exactly that happened: useProjectExists is instantiated twice (the
+// App.tsx route guard and the Shell's rail suppression), so every page load
+// fetched /api/projects TWICE and never again. `_projectsInFlight` shares the
+// pending request between concurrent callers.
+//
+// IN-FLIGHT ONLY — deliberately NOT a TTL cache (contrast mothership/api.ts's
+// T-0133 `listServersDeduped`, which adds a 5s TTL). A TTL would change what
+// every EXISTING caller gets: `api.projects()` is how Picker, HomeRedirect and
+// GlobalBusyIndicator revalidate, and they are entitled to a fresh answer per
+// call. Sharing a request that is already on the wire costs no freshness at
+// all — the observed waste was purely concurrent, so this removes all of it
+// and introduces no staleness window.
 let _projectsCache: Project[] | null = null;
+let _projectsInFlight: Promise<Project[]> | null = null;
 export function cachedProjects(): Project[] | null {
   return _projectsCache;
 }
 export function clearProjectsCache(): void {
   _projectsCache = null;
+  // Drop the shared request too. On logout a response that left BEFORE the
+  // logout must not be handed to a post-logout caller, nor repopulate the
+  // cache behind it (the currency guard in `projects()` enforces the latter).
+  _projectsInFlight = null;
 }
 
 export const api = {
   // T-0456: typed so the worker-health pill can read worker.health/git_sha.
   health: () => call<HealthResponse>("/api/health"),
   me: () => call<Me>("/api/auth/me"),
-  projects: () =>
-    call<Project[]>("/api/projects").then((rows) => {
-      _projectsCache = rows;
-      return rows;
-    }),
+  // T-0763: `fresh` bypasses the in-flight share. Needed by the ONE caller that
+  // refetches to observe its own mutation (Picker's reload() after
+  // createProject): joining a request that left before the POST would render
+  // the list WITHOUT the project just created. Incidental concurrency has no
+  // such ordering requirement and must not pay for a second round-trip.
+  projects: (opts?: { fresh?: boolean }): Promise<Project[]> => {
+    if (!opts?.fresh && _projectsInFlight) return _projectsInFlight;
+    const p: Promise<Project[]> = call<Project[]>("/api/projects")
+      .then((rows) => {
+        // Currency guard: only the request that is STILL the shared one may
+        // write the cache. Without it a superseded response (a `fresh` call
+        // overtook it, or a logout cleared it) could land last and reinstate
+        // a list the app has already moved on from.
+        if (_projectsInFlight === p) _projectsCache = rows;
+        return rows;
+      })
+      .finally(() => {
+        if (_projectsInFlight === p) _projectsInFlight = null;
+      });
+    _projectsInFlight = p;
+    return p;
+  },
   // T-0051: the wizard builds the JSON body itself (see
   // pages/projectCreateWizard.ts::payloadFromWizard) so the API
   // helper accepts the body verbatim. Back-compat: the minimal

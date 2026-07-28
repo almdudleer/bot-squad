@@ -13,7 +13,7 @@ import type {
   FanResult,
   ProjectSessions,
 } from "../components/globalBusyHelpers";
-import type { Project, SessionRow } from "../api";
+import type { Project } from "../api";
 
 export async function fanOutInFlight(): Promise<FanResult[]> {
   const servers = await mothershipApi.listServers();
@@ -29,9 +29,17 @@ export async function fanOutInFlight(): Promise<FanResult[]> {
       const projects = await apiFor(serverId).call<Project[]>("/api/projects");
       const perProject = await Promise.all(
         projects.map(async (p): Promise<ProjectSessions> => {
-          const sessions = await apiFor(serverId).call<SessionRow[]>(
-            `/api/projects/${encodeURIComponent(p.slug)}/sessions`,
-          );
+          // T-0763: use the NAMED `sessions` method, not the raw `call` escape
+          // hatch. The raw call typed the body as SessionRow[] and handed it
+          // straight through, but the server returns the T-0601 envelope
+          // `{sessions, errors}` — so `ProjectSessions.sessions` was an OBJECT
+          // and `inFlightRowsFromProject`'s for..of threw "not iterable" on
+          // every tick. The throw landed inside the indicator's own catch, so
+          // on a mothership build the fleet busy-indicator silently showed
+          // nothing, forever, with no console error. `apiFor(id).sessions()`
+          // runs normalizeSessionsPayload — the same normalization the local
+          // fetcher already gets from `api.sessions()`.
+          const sessions = await apiFor(serverId).sessions(p.slug);
           return {
             serverId,
             serverName: meta?.display_name ?? serverId,

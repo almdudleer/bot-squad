@@ -67,6 +67,15 @@ export function inFlightRowsFromProject(
   myUsername: string | null,
 ): InFlightRow[] {
   const out: InFlightRow[] = [];
+  // T-0763: tolerate a malformed `sessions` instead of throwing. This used to
+  // be a for..of straight over the field, which threw "not iterable" whenever
+  // a fetcher handed us an un-normalized payload (the mothership fan-out did
+  // exactly that — fixed at source in globalBusyMothership.ts). The throw was
+  // survivable only because aggregation ran inside the poll's try/catch; it now
+  // runs in RENDER, where the same throw takes the whole Shell down with it.
+  // A project we cannot read contributes no rows, which is what the swallowed
+  // exception effectively did anyway — minus killing the page.
+  if (!Array.isArray(payload?.sessions)) return out;
   for (const s of payload.sessions) {
     if (!isMyInFlight(s, myUsername)) continue;
     out.push({

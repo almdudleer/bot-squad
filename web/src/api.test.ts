@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { api, isNotFoundError, isPublicRoute, normalizeSessionsPayload, parseNearDuplicate, shouldRedirectOn401 } from "./api";
+import { api, cachedProjects, clearProjectsCache, isNotFoundError, isPublicRoute, normalizeSessionsPayload, parseNearDuplicate, shouldRedirectOn401 } from "./api";
 
 function mockOnce(json: unknown = {}): ReturnType<typeof vi.fn> {
   const spy = vi.fn().mockResolvedValueOnce({
@@ -330,5 +330,125 @@ describe("T-0608 parseNearDuplicate", () => {
         body: JSON.stringify({ title: "t", verbatim_request: "v", force: true }),
       }),
     );
+  });
+});
+
+/**
+ * T-0763 — `api.projects()` shares a request that is already on the wire.
+ *
+ * The measured defect: /p/:slug mounts useProjectExists TWICE (the App.tsx
+ * route guard + the Shell's rail suppression), each instance runs its own
+ * effect, and /api/projects is NOT polled — so the second fetch was pure
+ * waste on every page load.
+ *
+ * The negative guards below outnumber the positive one on purpose: the risk
+ * of this change is serving a STALE list, not serving one too often. Anything
+ * that turns the in-flight share into a time-based cache must go red here.
+ */
+describe("T-0763: api.projects() in-flight dedupe", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    clearProjectsCache();
+  });
+
+  /** fetch mock whose responses resolve only when the returned release() is
+   *  called — lets a test hold two callers concurrently in flight. */
+  function deferredFetch(rows: unknown) {
+    const releases: Array<() => void> = [];
+    const spy = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          releases.push(() =>
+            resolve({
+              ok: true,
+              status: 200,
+              json: async () => rows,
+              text: async () => "",
+            } as Response),
+          );
+        }),
+    );
+    globalThis.fetch = spy as unknown as typeof fetch;
+    return { spy, releaseAll: () => releases.forEach((r) => r()) };
+  }
+
+  test("two concurrent callers issue ONE fetch and both get the same rows", async () => {
+    const { spy, releaseAll } = deferredFetch([{ slug: "alpha" }]);
+    const a = api.projects();
+    const b = api.projects();
+    releaseAll();
+    const [ra, rb] = await Promise.all([a, b]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(ra).toEqual([{ slug: "alpha" }]);
+    expect(rb).toBe(ra);
+  });
+
+  // NEGATIVE GUARD — the whole point of "in-flight only". A sequential caller
+  // must re-hit the network: api.projects() is how Picker, HomeRedirect and
+  // the busy indicator REVALIDATE. A TTL cache would pass the test above and
+  // fail this one.
+  test("a caller AFTER the first settles issues a SECOND fetch", async () => {
+    const { spy, releaseAll } = deferredFetch([{ slug: "alpha" }]);
+    const first = api.projects();
+    releaseAll();
+    await first;
+    const second = api.projects();
+    releaseAll();
+    await second;
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  test("{fresh:true} bypasses the share even with a request in flight", async () => {
+    const { spy, releaseAll } = deferredFetch([{ slug: "alpha" }]);
+    const shared = api.projects();
+    const fresh = api.projects({ fresh: true });
+    expect(shared).not.toBe(fresh);
+    releaseAll();
+    await Promise.all([shared, fresh]);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  test("a rejection reaches BOTH sharers, and the next call retries", async () => {
+    const boom = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    globalThis.fetch = boom as unknown as typeof fetch;
+    const a = api.projects();
+    const b = api.projects();
+    await expect(a).rejects.toThrow("Failed to fetch");
+    await expect(b).rejects.toThrow("Failed to fetch");
+    expect(boom).toHaveBeenCalledTimes(1);
+    // Not wedged: the failed request must not stay parked as "in flight".
+    await expect(api.projects()).rejects.toThrow("Failed to fetch");
+    expect(boom).toHaveBeenCalledTimes(2);
+  });
+
+  test("a successful fetch still populates cachedProjects()", async () => {
+    const { releaseAll } = deferredFetch([{ slug: "alpha" }]);
+    const p = api.projects();
+    releaseAll();
+    await p;
+    expect(cachedProjects()).toEqual([{ slug: "alpha" }]);
+  });
+
+  // NEGATIVE GUARD — logout. A response that left BEFORE the logout must not
+  // repopulate the cache behind it, and a post-logout caller must not be
+  // handed the pre-logout request.
+  test("clearProjectsCache() drops the in-flight share and its late response", async () => {
+    const { spy, releaseAll } = deferredFetch([{ slug: "secret" }]);
+    const inflight = api.projects();
+    clearProjectsCache();
+    const after = api.projects();
+    expect(after).not.toBe(inflight);
+    releaseAll();
+    await Promise.all([inflight, after]);
+    expect(spy).toHaveBeenCalledTimes(2);
+    // The superseded response resolved LAST here; the currency guard means it
+    // still did not write the cache.
+    expect(cachedProjects()).toEqual([{ slug: "secret" }]);
+  });
+
+  test("hits the un-proxied /api/projects path (unchanged by the dedupe)", async () => {
+    const spy = mockOnce([]);
+    await api.projects();
+    expect(spy).toHaveBeenCalledWith("/api/projects", expect.any(Object));
   });
 });

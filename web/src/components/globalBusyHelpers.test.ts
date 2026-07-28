@@ -177,3 +177,127 @@ describe("indicatorView (T-0170)", () => {
     expect(v.label).toMatch(/busy/);
   });
 });
+
+/**
+ * T-0763 — the property that lets GlobalBusyIndicator stop refetching when the
+ * username arrives.
+ *
+ * The defect: the poll effect was keyed on `myUsername`, which the Shell loads
+ * asynchronously from /api/me. The null -> username flip tore the effect down
+ * and re-ran a whole second cross-server fan-out on every page load. The
+ * component now keeps the RAW FanResult[] and re-derives the view, which is
+ * only sound if `myUsername` is a pure post-processing input — i.e. the SAME
+ * fetched data can answer for a different user with no new request. These
+ * tests state that as an assertion rather than leaving it as an assumption.
+ *
+ * The effect-dependency side itself cannot be tested here: this repo has no
+ * jsdom (see Markdown.mermaid.test.tsx), so effects never run. It is covered
+ * by the browser walkthrough on the ticket instead.
+ */
+describe("T-0763: aggregateIndicator is a pure re-derivation over myUsername", () => {
+  const fan = (): FanResult[] => [
+    {
+      serverId: "srv_1",
+      ok: true,
+      projects: [
+        {
+          serverId: "srv_1",
+          serverName: "staging",
+          projectSlug: "bot-squad",
+          sessions: [s({ sid: "S-a", owner: "alex" }), s({ sid: "S-b", owner: "robin" })],
+        } as ProjectSessions,
+      ],
+    },
+  ];
+
+  test("the same fetched data answers for a different user — no refetch needed", () => {
+    const data = fan();
+    expect(aggregateIndicator(data, "alex").rows.map((r) => r.sid)).toEqual(["S-a"]);
+    expect(aggregateIndicator(data, "robin").rows.map((r) => r.sid)).toEqual(["S-b"]);
+  });
+
+  test("the null -> username flip the Shell performs re-derives from data in hand", () => {
+    const data = fan();
+    // Pre-/api/me: nothing claimed as mine (isMyInFlight prefers a false
+    // negative over flashing another user's work).
+    expect(aggregateIndicator(data, null).rows).toEqual([]);
+    // Post-/api/me: the row appears WITHOUT the fan-out being re-run.
+    expect(aggregateIndicator(data, "alex").rows).toHaveLength(1);
+  });
+
+  test("aggregating does not mutate the fan-out it reads (safe to keep in state)", () => {
+    const data = fan();
+    const snapshot = JSON.parse(JSON.stringify(data));
+    aggregateIndicator(data, "alex");
+    aggregateIndicator(data, "robin");
+    expect(data).toEqual(snapshot);
+  });
+
+  test("the initial empty fan-out renders the same state the old useState seed did", () => {
+    expect(aggregateIndicator([], null)).toEqual({ rows: [], failedServerCount: 0 });
+  });
+});
+
+/**
+ * T-0763 — a malformed payload must not take the page down.
+ *
+ * FOUND BY THE BROWSER CHECK, NOT BY A UNIT TEST, and it is the reason the
+ * walkthrough was worth doing: moving aggregation out of the poll's try/catch
+ * and into a render-time useMemo turned an exception that used to be SWALLOWED
+ * into one that unmounted the whole Shell — every poll on the page stopped, not
+ * just this indicator's. The exception was real at HEAD too (the mothership
+ * fan-out handed over the un-normalized T-0601 `{sessions, errors}` envelope,
+ * so `for..of` hit an object); it was simply invisible, which is why the fleet
+ * busy-indicator has been showing nothing on mothership builds.
+ *
+ * The envelope itself is fixed at source in globalBusyMothership.ts. This pins
+ * the containment: aggregation is now render-time, so it must never throw for
+ * ANY payload shape.
+ */
+describe("T-0763: aggregation never throws on a malformed payload", () => {
+  const badShapes: Array<[string, unknown]> = [
+    ["the T-0601 envelope handed over un-normalized", { sessions: [], errors: [] }],
+    ["null sessions", null],
+    ["undefined sessions", undefined],
+    ["a bare string", "nope"],
+  ];
+
+  for (const [label, sessions] of badShapes) {
+    test(`inFlightRowsFromProject drops the project instead of throwing: ${label}`, () => {
+      const payload = {
+        serverId: "srv_1",
+        serverName: "staging",
+        projectSlug: "bot-squad",
+        sessions,
+      } as unknown as ProjectSessions;
+      expect(() => inFlightRowsFromProject(payload, "alex")).not.toThrow();
+      expect(inFlightRowsFromProject(payload, "alex")).toEqual([]);
+    });
+  }
+
+  test("one malformed project does not blank the WELL-FORMED ones beside it", () => {
+    const fan: FanResult[] = [
+      {
+        serverId: "srv_1",
+        ok: true,
+        projects: [
+          {
+            serverId: "srv_1",
+            serverName: "staging",
+            projectSlug: "broken",
+            sessions: { sessions: [s()] },
+          } as unknown as ProjectSessions,
+          {
+            serverId: "srv_1",
+            serverName: "staging",
+            projectSlug: "bot-squad",
+            sessions: [s({ sid: "S-ok" })],
+          } as ProjectSessions,
+        ],
+      },
+    ];
+    let out!: ReturnType<typeof aggregateIndicator>;
+    expect(() => { out = aggregateIndicator(fan, "alex"); }).not.toThrow();
+    expect(out.rows.map((r) => r.sid)).toEqual(["S-ok"]);
+  });
+});

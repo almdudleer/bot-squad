@@ -12,6 +12,16 @@ import { api, cachedProjects } from "../api";
  * Shared by the /p/:slug route guard (App.tsx — swaps the body for a
  * not-found panel) and the Shell (suppresses the project nav rail), so both
  * ride one cached fetch.
+ *
+ * T-0763: "one fetch" was a claim this file could not keep on its own. Two
+ * instances mount in the same tick and each runs its own effect, so /p/:slug
+ * issued /api/projects TWICE on every load (measured on staging; it is never
+ * polled, so the second was pure waste). The dedupe belongs in `api.projects()`
+ * — it is the only place that can see both callers — and that is where it now
+ * lives; the module cache below still handles the synchronous first paint.
+ * Deliberately NOT fixed by deleting a consumer: the guard and the rail need
+ * the same answer independently, and hoisting it into a shared context would
+ * be the data-fetching redesign this P3 ticket explicitly excludes.
  */
 export function useProjectExists(
   slug: string | null | undefined,

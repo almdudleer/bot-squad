@@ -112,8 +112,13 @@ export function Picker() {
     createVisible: createStep.visible,
   });
 
-  function reload() {
-    api.projects().then(setProjects).catch((e) => setError(String(e)));
+  // T-0763: `fresh` after a create — api.projects() now shares a concurrent
+  // in-flight request, and on a single-install build the GlobalBusyIndicator
+  // polls the same endpoint every 8s, so a reload that joined a request issued
+  // BEFORE the POST would paint a list missing the project just created. The
+  // mount reload has no such ordering requirement and shares by design.
+  function reload(fresh = false) {
+    api.projects({ fresh }).then(setProjects).catch((e) => setError(String(e)));
   }
 
   useEffect(() => {
@@ -141,14 +146,14 @@ export function Picker() {
       // before. Deep-flow scaffolds get the success step.
       if (creating.mode === null) {
         setCreating(null);
-        reload();
+        reload(true);
       } else {
         setCreateResult({
           slug: resp.slug,
           operator_sid: resp.operator_sid ?? null,
           spawn_error: resp.spawn_error ?? null,
         });
-        reload();
+        reload(true);
       }
     } catch (e) {
       setCreateError(String(e));

@@ -696,3 +696,54 @@ describe("T-0714 public-route 401 exemption (mothership mirror)", () => {
     expect(loc.href).toBe("https://host/help");
   });
 });
+
+/**
+ * T-0763 — the local `api.projects()` in-flight dedupe must NOT reach the
+ * proxy.
+ *
+ * These are two different questions that happen to share a path suffix: the
+ * singleton asks "which projects on THIS install", `apiFor(id).projects()`
+ * asks "which projects on server <id>". A dedupe that collapsed them would
+ * hand one server's list to another — a silent wrong answer of exactly the
+ * kind the T-0068 sibling suite exists to keep out. They are separate call
+ * paths today (see `apiFor`'s own `projects`); this pins that.
+ */
+describe("T-0763: proxied projects() is independent of the local dedupe", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("two servers asked concurrently each get their OWN request and list", async () => {
+    const spy = vi.fn(async (url: string) => ({
+      ok: true,
+      status: 200,
+      text: async () => "",
+      json: async () => [{ slug: url.includes("srv_a") ? "alpha" : "beta" }],
+    } as Response));
+    globalThis.fetch = spy as unknown as typeof fetch;
+
+    const [a, b] = await Promise.all([
+      apiFor("srv_a").projects(),
+      apiFor("srv_b").projects(),
+    ]);
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(a).toEqual([{ slug: "alpha" }]);
+    expect(b).toEqual([{ slug: "beta" }]);
+    expect(spy.mock.calls[0][0]).toContain("/api/m/servers/srv_a/api/projects");
+    expect(spy.mock.calls[1][0]).toContain("/api/m/servers/srv_b/api/projects");
+  });
+
+  test("the SAME server asked twice concurrently is also not deduped here", async () => {
+    const spy = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => "",
+      json: async () => [],
+    } as Response));
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await Promise.all([apiFor("srv_a").projects(), apiFor("srv_a").projects()]);
+    // Not a defect to fix here — the T-0763 load-time double on this path was
+    // the GlobalBusyIndicator re-running its effect, fixed at that source. This
+    // states the proxy client's behaviour so a later "add a dedupe" change is a
+    // deliberate one and not an accident.
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+});

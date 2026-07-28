@@ -14,7 +14,7 @@
  * cover the in-flight definition + fan-out failure isolation without a
  * DOM (per the project's no-DOM-test convention).
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Project, type SessionRow } from "../api";
 import {
   aggregateIndicator,
@@ -62,10 +62,20 @@ export type GlobalBusyIndicatorProps = {
 };
 
 export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
-  const [state, setState] = useState<IndicatorState>({
-    rows: [],
-    failedServerCount: 0,
-  });
+  // T-0763: keep the RAW fan-out and derive the view, rather than storing the
+  // aggregated result. `myUsername` is a post-processing input — it decides
+  // which rows are "mine", nothing about WHAT is fetched — but it used to key
+  // the poll effect, and the Shell loads it asynchronously from /api/me. The
+  // null -> username flip therefore tore down the effect and re-ran a whole
+  // second fan-out on every page load: on staging that was one extra
+  // /api/m/servers/<srv>/api/projects plus one extra /sessions PER PROJECT, all
+  // of them cross-server PROXIED calls. Splitting fetch from aggregate makes
+  // the username change re-derive from data already in hand.
+  const [fanResults, setFanResults] = useState<FanResult[]>([]);
+  const state: IndicatorState = useMemo(
+    () => aggregateIndicator(fanResults, myUsername),
+    [fanResults, myUsername],
+  );
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -77,11 +87,11 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
     let cancelled = false;
     async function poll() {
       try {
-        const fanResults = fetchMothershipFanOut
+        const results = fetchMothershipFanOut
           ? await fetchMothershipFanOut()
           : await fetchLocalInFlight();
         if (cancelled) return;
-        setState(aggregateIndicator(fanResults, myUsername));
+        setFanResults(results);
       } catch {
         // Top-level fetch failure (rare — only the registry listServers
         // or local /projects would throw outside a fan-out envelope).
@@ -94,7 +104,10 @@ export function GlobalBusyIndicator({ myUsername }: GlobalBusyIndicatorProps) {
       cancelled = true;
       clearInterval(id);
     };
-  }, [myUsername]);
+    // T-0763: NO dep on myUsername — see the state comment above. Adding it
+    // back re-runs the whole cross-server fan-out for a value the fetch does
+    // not use.
+  }, []);
 
   useEffect(() => {
     if (!open) return;

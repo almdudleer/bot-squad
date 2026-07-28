@@ -496,14 +496,45 @@ def cmd_topic_bind(args) -> None:
     The runtime, configurable surface the stakeholder explicitly asked for
     ("не HardCotion, настраиваемо через чат ID") — a topic->project binding
     is set here, at runtime, never hardcoded. A project may have MULTIPLE
-    bound (chat_id, thread_id) entries; rebinding one replaces it.
+    bound (chat_id, thread_id) entries; rebinding one rewrites it.
+
+    T-0771: --ticket/--session write the per-task-topic fields (the ones
+    `topic create` sets), and --clear-ticket/--clear-session empty them. A
+    rebind that would implicitly DROP a ticket_id/session_id the key already
+    carries is refused by the worker, naming the fields — so restoring or
+    changing one field of a task topic no longer strips the rest.
     """
     thread_id = None if args.thread_id in (None, "", "none", "None") else args.thread_id
-    res = post("tg_topic_bind", {
-        "chat_id": args.chat_id, "thread_id": thread_id, "slug": args.slug,
-    })
+    params = {"chat_id": args.chat_id, "thread_id": thread_id, "slug": args.slug}
+    if args.ticket:
+        params["ticket_id"] = args.ticket
+    if args.session:
+        params["session_id"] = args.session
+    if args.clear_ticket:
+        params["clear_ticket_id"] = True
+    if args.clear_session:
+        params["clear_session_id"] = True
+    res = post("tg_topic_bind", params)
     b = res.get("binding", {})
     print(f"bound chat_id={args.chat_id} thread_id={thread_id} -> slug={b.get('slug')}")
+
+    # Say what MOVED, not just what is stored: the T-0771 failure was that a
+    # lossy write and a faithful one printed the same line.
+    changes = res.get("changes") or {}
+    for field, move in changes.items():
+        before = move.get("from")
+        after = move.get("to")
+        print(f"  {field}: {before if before is not None else '(none)'} -> "
+              f"{after if after is not None else '(cleared)'}")
+    if not changes:
+        print("  (no fields changed)")
+    for field in res.get("cleared") or []:
+        if field not in changes:
+            print(f"  {field}: already empty, nothing to clear")
+    pin = b.get("pinned_message_id")
+    if pin and "session_id" in changes:
+        print(f"  note: topic still carries the pinned direct-mode marker "
+              f"message_id={pin} — `/pin-session off` in the topic unpins it")
 
 
 def cmd_topic_unbind(args) -> None:
@@ -4768,6 +4799,18 @@ def build_parser() -> argparse.ArgumentParser:
     tpb.add_argument("thread_id", help="Telegram message_thread_id (the topic); "
                                         "'none' for the chat's non-topic feed")
     tpb.add_argument("slug", help="project slug to route this topic to")
+    tpb.add_argument("--ticket", help="ticket id this topic belongs to (T-0660 per-task "
+                                      "topic). On a rebind, naming it is also how you KEEP "
+                                      "the stored one — an unnamed existing ticket_id is "
+                                      "refused, not dropped (T-0771)")
+    tpb.add_argument("--session", help="originating session id — an inbound topic message "
+                                       "routes straight to it instead of the project's "
+                                       "user-conversation attendant (T-0677/T-0660 Phase 2)")
+    tpb.add_argument("--clear-ticket", action="store_true",
+                     help="deliberately EMPTY this binding's ticket_id (T-0771)")
+    tpb.add_argument("--clear-session", action="store_true",
+                     help="deliberately EMPTY this binding's session_id — demotes a "
+                          "direct-mode topic back to the project attendant (T-0771)")
     tpb.set_defaults(func=cmd_topic_bind)
     tpu = tp_sub.add_parser("unbind", help="clear a (chat_id, thread_id) binding")
     tpu.add_argument("chat_id", help="Telegram chat_id")

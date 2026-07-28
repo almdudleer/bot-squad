@@ -1122,16 +1122,43 @@ def _action_tg_stall_clear(params: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _TG_TOPIC_BIND_REQUIRED = {"chat_id", "thread_id", "slug"}
-_TG_TOPIC_BIND_ALLOWED = _TG_TOPIC_BIND_REQUIRED
+_TG_TOPIC_BIND_ALLOWED = _TG_TOPIC_BIND_REQUIRED | {
+    "ticket_id", "session_id", "clear_ticket_id", "clear_session_id",
+}
+
+#: How the two guarded fields are named on each surface, so a refusal can tell
+#: the caller what to type wherever it is standing (T-0771).
+_TG_BIND_FLAG = {
+    "ticket_id": ("ticket_id", "--ticket", "clear_ticket_id", "--clear-ticket"),
+    "session_id": ("session_id", "--session", "clear_session_id", "--clear-session"),
+}
 
 
 def _action_tg_topic_bind(params: dict[str, Any]) -> dict[str, Any]:
     """Bind ``(chat_id, thread_id)`` -> ``slug`` (T-0639 topic-supergroup
-    routing). Idempotent — rebinding the same key replaces it; a project may
+    routing). Idempotent — rebinding the same key rewrites it; a project may
     have multiple bound keys (a project isn't 1:1 with chat/topic ids).
 
     Required params: chat_id, thread_id, slug. ``thread_id`` may be ``None``
-    (binds the chat's non-topic/General feed). Returns {ok, binding}.
+    (binds the chat's non-topic/General feed).
+
+    Optional (T-0771): ``ticket_id``/``session_id`` — the per-task-topic fields
+    ``tg_topic_create`` writes and this verb could not, which is what made
+    every rebind of a task topic lossy AND left no supported way to restore the
+    association short of creating a NEW topic. ``clear_ticket_id``/
+    ``clear_session_id`` — the explicit opt-in to EMPTY one of them (clearing
+    ``session_id`` to demote a direct-mode topic back to the attendant is a
+    legitimate operation and must stay expressible).
+
+    A rebind that would implicitly drop a ticket_id/session_id the key
+    currently carries is REFUSED, naming the fields and their stored values —
+    the store has no backup, so a dropped field cannot be recovered or even
+    detected afterwards.
+
+    Returns {ok, binding, changes, cleared} — ``changes`` is
+    ``{field: {from, to}}`` for every field this write actually moved (empty
+    when it moved none), because a lossy write and a faithful one produce
+    records that look equally well-formed.
     """
     extra = set(params) - _TG_TOPIC_BIND_ALLOWED
     if extra:
@@ -1146,8 +1173,37 @@ def _action_tg_topic_bind(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"tg_topic_bind: unknown project slug {slug!r}")
 
     from bot_squad_worker import tg_bindings
-    rec = tg_bindings.set_binding(cfg, params["chat_id"], params["thread_id"], slug)
-    return {"ok": True, "binding": rec}
+    chat_id, thread_id = params["chat_id"], params["thread_id"]
+    before = tg_bindings.resolve(cfg, chat_id, thread_id)
+    try:
+        rec = tg_bindings.set_binding(
+            cfg, chat_id, thread_id, slug,
+            ticket_id=params.get("ticket_id"),
+            session_id=params.get("session_id"),
+            clear_ticket_id=bool(params.get("clear_ticket_id")),
+            clear_session_id=bool(params.get("clear_session_id")),
+        )
+    except tg_bindings.LossyRebindError as e:
+        raise ActionError(
+            f"tg_topic_bind: {e}. To KEEP a field, name it "
+            f"({'; '.join(f'{_TG_BIND_FLAG[f][0]}={v!r} / {_TG_BIND_FLAG[f][1]} {v}' for f, v in e.fields.items())}). "
+            f"To DROP it on purpose, say so "
+            f"({'; '.join(f'{_TG_BIND_FLAG[f][2]}=true / {_TG_BIND_FLAG[f][3]}' for f in e.fields)}). "
+            f"Nothing was written (T-0771)"
+        ) from e
+    except ValueError as e:
+        raise ActionError(f"tg_topic_bind: {e}") from e
+
+    return {
+        "ok": True,
+        "binding": rec,
+        "changes": tg_bindings.change_summary(before, rec),
+        # What the CALLER asked to empty — kept separate from `changes` on
+        # purpose: clearing a field that was already empty changes nothing, and
+        # the caller is still owed a straight answer about what it asked for.
+        "cleared": [f for f in tg_bindings.GUARDED_FIELDS
+                    if params.get(f"clear_{f}")],
+    }
 
 
 _TG_TOPIC_UNBIND_REQUIRED = {"chat_id", "thread_id"}
@@ -1444,10 +1500,23 @@ def _action_tg_topic_create(params: dict[str, Any]) -> dict[str, Any]:
     )
 
     from bot_squad_worker import tg_bindings
-    tg_bindings.set_binding(
-        cfg, params["chat_id"], thread_id, slug,
-        ticket_id=params.get("ticket_id"), session_id=params.get("session_id"),
-    )
+    try:
+        tg_bindings.set_binding(
+            cfg, params["chat_id"], thread_id, slug,
+            ticket_id=params.get("ticket_id"), session_id=params.get("session_id"),
+        )
+    except tg_bindings.LossyRebindError as e:
+        # T-0771: unreachable in practice — a freshly created forum topic has an
+        # id nothing is bound to. If it ever IS reached the map is stale for
+        # that key, and overwriting is exactly the silent strip this guard
+        # exists to stop; report the created topic so the bind can be finished
+        # by hand rather than leave a 500 and an unexplained topic.
+        raise ActionError(
+            f"tg_topic_create: created topic thread_id={thread_id} in "
+            f"chat_id={params['chat_id']}, but {e} — the topic EXISTS and is "
+            f"NOT bound; finish it with `bsq topic bind` naming the fields you "
+            f"mean to keep or clear (T-0771)"
+        ) from e
     return {
         "ok": True, "chat_id": params["chat_id"], "thread_id": thread_id,
         "slug": slug, "name": name,

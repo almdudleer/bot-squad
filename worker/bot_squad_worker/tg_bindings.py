@@ -18,12 +18,17 @@ Shape on disk (``data/_worker/tg_bindings.json``)::
     { "<chat_id>:<thread_id>": {"slug": "...", "ticket_id": null,
                                 "session_id": null, "pinned_message_id": null} }
 
-T-0660 (per-task topics, already scoped) generalizes what a binding ROUTES TO:
-a project topic binds only ``slug`` (this MVP); a task topic additionally
-carries ``ticket_id``/``session_id`` to route to one specific originating
-session rather than the project's user-conversation attendant. The record
-shape and ``resolve()`` return type already carry both fields so that layer
-bolts on with no rewrite — this slice only ever writes/reads ``slug``.
+T-0660 (per-task topics) generalizes what a binding ROUTES TO: a project topic
+binds only ``slug``; a task topic additionally carries ``ticket_id``/
+``session_id`` to route to one specific originating session rather than the
+project's user-conversation attendant.
+
+T-0771: ``set_binding`` is the ONE writer of a whole record, and every field of
+that record is reachable through it — for a while ``ticket_id``/``session_id``
+were writable only by ``tg_topic_create``, so any rebind of a per-task topic
+silently stripped it back to a bare project binding with no supported way to
+put the association back. It is now a read-modify-write that REFUSES an
+implicit drop; see :func:`set_binding`.
 """
 from __future__ import annotations
 
@@ -34,6 +39,43 @@ from pathlib import Path
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+#: The fields of a stored binding record, in report order. ONE definition, so
+#: "what a binding is made of" can't drift between the writer, the loss guard
+#: and the change report (T-0771).
+RECORD_FIELDS = ("slug", "ticket_id", "session_id", "pinned_message_id")
+
+#: The two fields :func:`set_binding` refuses to drop implicitly (T-0771).
+#: Both are ROUTING targets — ``ticket_id`` is what ``find_by_ticket`` (hence
+#: ``bsq topic say`` and ``_own_topic_binding`` rung 2) resolves on, and
+#: ``session_id`` is what ``find_by_session``/the listener's direct-mode branch
+#: resolve on. ``pinned_message_id`` is deliberately NOT here: it is a
+#: bookkeeping handle for a pin that already exists in Telegram, not a route,
+#: and it is PRESERVED rather than guarded (see :func:`set_binding`).
+GUARDED_FIELDS = ("ticket_id", "session_id")
+
+
+class LossyRebindError(ValueError):
+    """A rebind would have implicitly dropped a field the stored record
+    currently carries (T-0771).
+
+    Raised INSTEAD of writing — the caller has to say which operation it meant:
+    name the field to keep it, or ask for it to be cleared. ``fields`` maps
+    each at-risk field name to the value that would have been lost, so a caller
+    can put the real values in front of a human (there is no second copy: the
+    store is a single atomic tmp+``os.replace`` file with no backup and no
+    rotation, so a dropped field leaves NO trace to recover from afterwards —
+    which is why this refuses rather than warns).
+    """
+
+    def __init__(self, key: str, fields: dict[str, Any]) -> None:
+        self.key = key
+        self.fields = dict(fields)
+        named = ", ".join(f"{k}={v!r}" for k, v in self.fields.items())
+        super().__init__(
+            f"refusing a lossy rebind of {key}: it currently carries {named}, "
+            f"which this call does not name and would drop"
+        )
 
 
 def bindings_path(cfg: Any) -> Path:
@@ -98,22 +140,90 @@ def set_binding(
     *,
     ticket_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    clear_ticket_id: bool = False,
+    clear_session_id: bool = False,
 ) -> dict:
     """Bind ``(chat_id, thread_id)`` -> ``slug`` (+ optional ``ticket_id``/
     ``session_id`` for the T-0660 per-task-topic layer). Idempotent —
-    rebinding the same key REPLACES that one entry; a project may have
+    rebinding the same key rewrites that one entry; a project may have
     multiple bound keys simultaneously (stakeholder requirement, D-0055 §3).
+
+    T-0771 — this is a READ-MODIFY-WRITE, not a whole-record replace, and it
+    follows :func:`set_direct_session` next door (whose docstring named this
+    function's replace-everything behaviour as the hazard, and whose comment
+    saying so prevented nothing). What it does with each field:
+
+    * ``slug`` — always written; it is the point of the verb.
+    * ``ticket_id``/``session_id`` — written when NAMED; explicitly emptied
+      when the matching ``clear_*`` flag is set. When neither is given and the
+      stored record CARRIES one, this raises :class:`LossyRebindError` and
+      writes NOTHING. It does not merge: a silent merge would leave a caller
+      that MEANT to clear ``session_id`` believing it had, while the direct-mode
+      routing branch stayed live — invisible from the caller's side, where the
+      drop at least used to be visible by reading the record back. Refusing is
+      the only outcome that forces the caller to say which one it meant.
+    * ``pinned_message_id`` — always PRESERVED (never guarded, never settable
+      here). It is the id of the ``/pin-session`` confirmation pinned in the
+      topic (T-0677), kept so ``_unpin_previous`` can still take that pin down;
+      dropping it strands a pin in Telegram that claims a routing which no
+      longer exists, and no caller of this verb has any reason to name it.
+
+    Passing a field AND its ``clear_*`` flag is a contradiction, not a
+    precedence question — raises ``ValueError`` rather than picking one.
 
     Returns the stored record.
     """
+    for name, value, clear in (
+        ("ticket_id", ticket_id, clear_ticket_id),
+        ("session_id", session_id, clear_session_id),
+    ):
+        if value and clear:
+            raise ValueError(
+                f"set_binding: {name}={value!r} and clear_{name}=True contradict "
+                f"each other — pass one or the other"
+            )
+
     mapping = load(cfg)
-    rec = {
-        "slug": slug, "ticket_id": ticket_id, "session_id": session_id,
-        "pinned_message_id": None,
+    key = _key(chat_id, thread_id)
+    prev = mapping.get(key) or {}
+
+    at_risk = {
+        name: prev.get(name)
+        for name, value, clear in (
+            ("ticket_id", ticket_id, clear_ticket_id),
+            ("session_id", session_id, clear_session_id),
+        )
+        if prev.get(name) and not value and not clear
     }
-    mapping[_key(chat_id, thread_id)] = rec
+    if at_risk:
+        raise LossyRebindError(key, at_risk)
+
+    rec = {
+        "slug": slug,
+        "ticket_id": ticket_id if ticket_id else (None if clear_ticket_id else prev.get("ticket_id")),
+        "session_id": session_id if session_id else (None if clear_session_id else prev.get("session_id")),
+        "pinned_message_id": prev.get("pinned_message_id"),
+    }
+    mapping[key] = rec
     _save(cfg, mapping)
     return rec
+
+
+def change_summary(before: Optional[dict], after: dict) -> dict[str, dict]:
+    """Which fields this write actually moved: ``{field: {"from": x, "to": y}}``
+    for every :data:`RECORD_FIELDS` entry whose value differs (T-0771).
+
+    The whole failure this ticket records is that a lossy write looked exactly
+    like a faithful one, so the caller reports THIS rather than the record —
+    a record alone can't say what it used to be. An empty dict means the write
+    changed nothing, which is a true and useful thing to be told.
+    """
+    before = before or {}
+    return {
+        f: {"from": before.get(f), "to": after.get(f)}
+        for f in RECORD_FIELDS
+        if before.get(f) != after.get(f)
+    }
 
 
 def set_direct_session(
@@ -171,12 +281,12 @@ def resolve(cfg: Any, chat_id: Any, thread_id: Any) -> Optional[dict]:
     """The routing target bound to ``(chat_id, thread_id)``, or ``None`` when
     unbound.
 
-    Returns ``{slug, ticket_id, session_id}``. For this MVP (T-0639) only
-    ``slug`` is ever populated — callers that just need the project (Slice 1)
-    read ``["slug"]``. ``ticket_id``/``session_id`` stay ``None`` until the
-    T-0660 per-task-topic layer starts writing them; its resolver reads those
-    to target one specific session instead of the project's user-conversation
-    attendant.
+    Returns the stored record (``{slug, ticket_id, session_id,
+    pinned_message_id}``). Callers that just need the project (T-0639 Slice 1)
+    read ``["slug"]``, which is the only field a plain project topic carries.
+    A T-0660 per-task topic also carries ``ticket_id``/``session_id``, which
+    the listener reads to target one specific session instead of the project's
+    user-conversation attendant.
     """
     return load(cfg).get(_key(chat_id, thread_id))
 

@@ -5,6 +5,8 @@ import json
 import types
 from pathlib import Path
 
+import pytest
+
 from bot_squad_worker import tg_bindings as TB
 
 
@@ -284,3 +286,241 @@ def test_pinned_message_id_survives_a_reload(tmp_path):
     TB.set_binding(cfg, "111", 7, "bot-squad")
     TB.set_direct_session(cfg, "111", 7, "S-dev-p9", pinned_message_id=555)
     assert TB.load(cfg)["111:7"]["pinned_message_id"] == 555
+
+
+# ---------------------------------------------------------------------------
+# T-0771: a rebind may not SILENTLY drop the per-task-topic fields.
+#
+# Live reproduction (2026-07-28): topics 220 and 517 were rebound to clear
+# session_id and lost their T-0314 ticket_id too, with no error and a
+# well-formed record to read back. The store has no backup — `_save` is one
+# atomic tmp+os.replace over the only copy — so a dropped field leaves NO
+# trace, which is why these refuse rather than warn.
+# ---------------------------------------------------------------------------
+
+
+def test_rebind_refuses_to_drop_an_unnamed_ticket_id(tmp_path):
+    """THE REPRODUCTION. Rebinding a per-task topic without naming its
+    ticket_id used to succeed and strip it back to a bare project binding."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot", ticket_id="T-0314")
+
+    with pytest.raises(TB.LossyRebindError) as e:
+        TB.set_binding(cfg, "111", 517, "watchrobot")
+
+    assert e.value.fields == {"ticket_id": "T-0314"}
+    assert TB.resolve(cfg, "111", 517) == _rec("watchrobot", ticket_id="T-0314")
+
+
+def test_rebind_refuses_to_drop_an_unnamed_session_id(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot", session_id="S-x-p70")
+
+    with pytest.raises(TB.LossyRebindError) as e:
+        TB.set_binding(cfg, "111", 517, "watchrobot")
+
+    assert e.value.fields == {"session_id": "S-x-p70"}
+
+
+def test_the_refusal_names_every_at_risk_field_and_its_stored_value(tmp_path):
+    """The caller has to be able to put the real values in front of a human —
+    there is no second copy to look them up in afterwards."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot",
+                   ticket_id="T-0314", session_id="S-x-p70")
+
+    with pytest.raises(TB.LossyRebindError) as e:
+        TB.set_binding(cfg, "111", 517, "watchrobot")
+
+    assert e.value.fields == {"ticket_id": "T-0314", "session_id": "S-x-p70"}
+    assert e.value.key == "111:517"
+    for expected in ("T-0314", "S-x-p70", "ticket_id", "session_id"):
+        assert expected in str(e.value)
+
+
+def test_a_refused_rebind_writes_nothing_at_all(tmp_path):
+    """Not "writes the old values back" — does not touch the file. A partial
+    write here is unrecoverable."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot", ticket_id="T-0314")
+    before = TB.bindings_path(cfg).read_bytes()
+
+    with pytest.raises(TB.LossyRebindError):
+        TB.set_binding(cfg, "111", 517, "alpha")
+
+    assert TB.bindings_path(cfg).read_bytes() == before
+
+
+def test_naming_the_fields_preserves_them_while_the_slug_moves(tmp_path):
+    """The whole point of the verb still works: re-point a task topic at a
+    different project without losing what it is a topic FOR."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot",
+                   ticket_id="T-0314", session_id="S-x-p70")
+
+    rec = TB.set_binding(cfg, "111", 517, "bot-squad",
+                         ticket_id="T-0314", session_id="S-x-p70")
+
+    assert rec == _rec("bot-squad", ticket_id="T-0314", session_id="S-x-p70")
+
+
+def test_explicit_clear_empties_the_session_id(tmp_path):
+    """The operation p366 legitimately WANTED on 2026-07-28 — demote a
+    direct-mode topic back to the project attendant — stays expressible."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot",
+                   ticket_id="T-0314", session_id="S-x-p70")
+
+    rec = TB.set_binding(cfg, "111", 517, "watchrobot",
+                         ticket_id="T-0314", clear_session_id=True)
+
+    assert rec == _rec("watchrobot", ticket_id="T-0314")
+
+
+def test_explicit_clear_empties_the_ticket_id(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot",
+                   ticket_id="T-0314", session_id="S-x-p70")
+
+    rec = TB.set_binding(cfg, "111", 517, "watchrobot",
+                         session_id="S-x-p70", clear_ticket_id=True)
+
+    assert rec == _rec("watchrobot", session_id="S-x-p70")
+
+
+def test_clearing_one_field_still_refuses_to_drop_the_other(tmp_path):
+    """Asking to clear session_id is not permission to lose ticket_id — that
+    exact conflation is the live incident."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 517, "watchrobot",
+                   ticket_id="T-0314", session_id="S-x-p70")
+
+    with pytest.raises(TB.LossyRebindError) as e:
+        TB.set_binding(cfg, "111", 517, "watchrobot", clear_session_id=True)
+
+    assert e.value.fields == {"ticket_id": "T-0314"}
+
+
+def test_a_value_and_its_clear_flag_contradict(tmp_path):
+    """Not a precedence question — the caller does not know what it asked
+    for, so neither outcome is safe to pick."""
+    cfg = _cfg(tmp_path)
+    with pytest.raises(ValueError, match="contradict"):
+        TB.set_binding(cfg, "111", 7, "watchrobot",
+                       ticket_id="T-0314", clear_ticket_id=True)
+    with pytest.raises(ValueError, match="contradict"):
+        TB.set_binding(cfg, "111", 7, "watchrobot",
+                       session_id="S-x-p70", clear_session_id=True)
+    assert TB.load(cfg) == {}
+
+
+def test_clearing_a_field_that_is_already_empty_is_a_no_op(tmp_path):
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "watchrobot")
+
+    rec = TB.set_binding(cfg, "111", 7, "watchrobot",
+                         clear_ticket_id=True, clear_session_id=True)
+
+    assert rec == _rec("watchrobot")
+
+
+def test_binding_a_fresh_key_has_nothing_to_lose(tmp_path):
+    """NEGATIVE GUARD — the plain T-0639 project binding must not gain any
+    friction. The risk of this change is over-refusing."""
+    cfg = _cfg(tmp_path)
+    rec = TB.set_binding(cfg, "111", 7, "bot-squad")
+    assert rec == _rec("bot-squad")
+
+
+def test_rebinding_a_bare_binding_needs_no_extra_words(tmp_path):
+    """NEGATIVE GUARD — a topic carrying only a slug (8 of the 11 live
+    bindings) re-slugs exactly as it always did."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "watchrobot")
+    assert TB.set_binding(cfg, "111", 7, "bot-squad") == _rec("bot-squad")
+
+
+# --- the twin: the pinned direct-mode marker (T-0677) ----------------------
+
+
+def test_the_pinned_marker_survives_a_rebind(tmp_path):
+    """THE TWIN, same class as the reported defect and found the same way:
+    set_binding zeroed pinned_message_id on EVERY rebind, even one that named
+    both routing fields faithfully. The id is how `_unpin_previous` takes the
+    marker down — without it the pin stays in the topic advertising a routing
+    that no longer exists, unreachable forever."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "watchrobot", ticket_id="T-0314")
+    TB.set_direct_session(cfg, "111", 7, "S-x-p70", pinned_message_id=555)
+
+    rec = TB.set_binding(cfg, "111", 7, "watchrobot",
+                         ticket_id="T-0314", clear_session_id=True)
+
+    assert rec["pinned_message_id"] == 555
+    assert TB.load(cfg)["111:7"]["pinned_message_id"] == 555
+
+
+def test_the_pin_id_is_not_a_guarded_field(tmp_path):
+    """It is preserved, never refused-over: it is a bookkeeping handle for a
+    pin that already exists in Telegram, not a route, and no caller of the
+    bind verb has any reason to name it."""
+    cfg = _cfg(tmp_path)
+    TB.set_binding(cfg, "111", 7, "watchrobot")
+    TB.set_direct_session(cfg, "111", 7, None, pinned_message_id=555)
+
+    assert TB.set_binding(cfg, "111", 7, "alpha")["pinned_message_id"] == 555
+    assert "pinned_message_id" not in TB.GUARDED_FIELDS
+
+
+def test_both_writers_of_this_file_preserve_the_same_fields(tmp_path):
+    """The repo's top bug class is two writers of one file diverging, and this
+    one's divergence was DOCUMENTED IN A COMMENT (set_direct_session's
+    docstring named set_binding's replace-everything behaviour as the hazard)
+    and left standing for it to bite. Pin the property instead of restating
+    it: for a record carrying every field, neither writer may lose one it was
+    not asked to change."""
+    cfg = _cfg(tmp_path)
+    full = _rec("watchrobot", ticket_id="T-0314", session_id="S-x-p70",
+                pinned_message_id=555)
+
+    TB.set_binding(cfg, "111", 7, "watchrobot", ticket_id="T-0314")
+    TB.set_direct_session(cfg, "111", 7, "S-x-p70", pinned_message_id=555)
+    assert TB.resolve(cfg, "111", 7) == full
+
+    # set_direct_session touching only session_id/pinned_message_id ...
+    assert TB.set_direct_session(cfg, "111", 7, "S-y-p71", pinned_message_id=555) == \
+        {**full, "session_id": "S-y-p71"}
+    # ... and set_binding touching only the slug, keep the SAME other fields.
+    assert TB.set_binding(cfg, "111", 7, "bot-squad",
+                          ticket_id="T-0314", session_id="S-y-p71") == \
+        {**full, "slug": "bot-squad", "session_id": "S-y-p71"}
+
+
+# --- change_summary: a lossy write must not read like a faithful one -------
+
+
+def test_change_summary_reports_only_what_moved(tmp_path):
+    cfg = _cfg(tmp_path)
+    before = TB.set_binding(cfg, "111", 7, "watchrobot", ticket_id="T-0314")
+    after = TB.set_binding(cfg, "111", 7, "watchrobot",
+                           ticket_id="T-0314", session_id="S-x-p70")
+
+    assert TB.change_summary(before, after) == {
+        "session_id": {"from": None, "to": "S-x-p70"},
+    }
+
+
+def test_change_summary_of_an_unchanged_write_is_empty(tmp_path):
+    """"Nothing moved" is a true and useful answer — an operation that already
+    held must not read as if it rewrote something."""
+    cfg = _cfg(tmp_path)
+    before = TB.set_binding(cfg, "111", 7, "watchrobot", ticket_id="T-0314")
+    after = TB.set_binding(cfg, "111", 7, "watchrobot", ticket_id="T-0314")
+
+    assert TB.change_summary(before, after) == {}
+
+
+def test_change_summary_of_a_first_bind_reports_the_slug_arriving(tmp_path):
+    cfg = _cfg(tmp_path)
+    rec = TB.set_binding(cfg, "111", 7, "watchrobot")
+    assert TB.change_summary(None, rec) == {"slug": {"from": None, "to": "watchrobot"}}

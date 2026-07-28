@@ -4657,3 +4657,254 @@ def test_peer_send_tg_mirror_forwards_route_sid(tmp_path, tmp_config_dir, monkey
     call = fake.calls[0]
     assert call["sid"] == "test-project operator"          # compact label
     assert call["route_sid"] == "S-almdudleer-operator-p23"
+
+
+# ---------------------------------------------------------------------------
+# T-0771: `tg_topic_bind` could not express the record shape `tg_topic_create`
+# routinely produces, so every rebind of a per-task topic silently stripped it
+# back to a bare project binding — and there was no supported way to put the
+# association back short of creating a NEW topic, which is what a rebind
+# exists to avoid.
+# ---------------------------------------------------------------------------
+
+
+def _bind_cfg(monkeypatch, tmp_config_dir):
+    import bot_squad_worker.actions as A
+    cfg = Config.load(tmp_config_dir)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    return cfg
+
+
+def test_tg_topic_bind_writes_ticket_id_and_session_id(tmp_config_dir, monkeypatch):
+    """The fields tg_topic_create sets are now reachable from the bind verb."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    out = A.dispatch("tg_topic_bind", {
+        "chat_id": "111", "thread_id": 517, "slug": "test-project",
+        "ticket_id": "T-0314", "session_id": "S-x-p70",
+    })
+
+    assert out["ok"] is True
+    assert out["binding"] == {"slug": "test-project", "ticket_id": "T-0314",
+                              "session_id": "S-x-p70", "pinned_message_id": None}
+    assert tg_bindings.resolve(cfg, "111", 517) == out["binding"]
+
+
+def test_tg_topic_bind_refuses_a_lossy_rebind(tmp_config_dir, monkeypatch):
+    """THE REPRODUCTION, at the surface the operator actually used."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    tg_bindings.set_binding(cfg, "111", 517, "test-project",
+                            ticket_id="T-0314", session_id="S-x-p70")
+
+    with pytest.raises(A.ActionError) as e:
+        A.dispatch("tg_topic_bind", {
+            "chat_id": "111", "thread_id": 517, "slug": "test-project",
+        })
+
+    assert "T-0314" in str(e.value) and "S-x-p70" in str(e.value)
+    assert tg_bindings.resolve(cfg, "111", 517)["ticket_id"] == "T-0314"
+
+
+def test_tg_topic_bind_refusal_names_both_surfaces_and_both_operations(
+        tmp_config_dir, monkeypatch):
+    """The refusal has to be actionable where the caller is standing: an agent
+    reads action params, a human reads CLI flags, and BOTH need to be told how
+    to keep AND how to drop — a message that only offers "keep" would push the
+    operator who genuinely meant to clear straight back to a workaround."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    tg_bindings.set_binding(cfg, "111", 517, "test-project", session_id="S-x-p70")
+
+    with pytest.raises(A.ActionError) as e:
+        A.dispatch("tg_topic_bind", {
+            "chat_id": "111", "thread_id": 517, "slug": "test-project",
+        })
+
+    msg = str(e.value)
+    for expected in ("session_id='S-x-p70'", "--session S-x-p70",
+                     "clear_session_id=true", "--clear-session",
+                     "Nothing was written"):
+        assert expected in msg, msg
+    # ... and never advertises a field that is not at risk.
+    assert "ticket" not in msg
+
+
+def test_tg_topic_bind_clears_a_field_on_purpose_and_says_so(tmp_config_dir, monkeypatch):
+    """The negative of the refusal: the operation p366 legitimately wanted
+    (demote a direct-mode topic to the attendant) stays expressible AND is
+    reported — under a silent merge it would have believed it had cleared
+    session_id while the direct-mode routing branch stayed live."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    tg_bindings.set_binding(cfg, "111", 517, "test-project",
+                            ticket_id="T-0314", session_id="S-x-p70")
+
+    out = A.dispatch("tg_topic_bind", {
+        "chat_id": "111", "thread_id": 517, "slug": "test-project",
+        "ticket_id": "T-0314", "clear_session_id": True,
+    })
+
+    assert out["cleared"] == ["session_id"]
+    assert out["changes"] == {"session_id": {"from": "S-x-p70", "to": None}}
+    assert out["binding"]["ticket_id"] == "T-0314"
+    assert tg_bindings.resolve(cfg, "111", 517)["session_id"] is None
+
+
+def test_tg_topic_bind_reports_a_write_that_changed_nothing(tmp_config_dir, monkeypatch):
+    """A lossy write and a faithful one used to print the same line. `changes`
+    is the difference — and an empty one is a real answer, not a failure."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    tg_bindings.set_binding(cfg, "111", 517, "test-project", ticket_id="T-0314")
+
+    out = A.dispatch("tg_topic_bind", {
+        "chat_id": "111", "thread_id": 517, "slug": "test-project",
+        "ticket_id": "T-0314", "clear_session_id": True,
+    })
+
+    assert out["changes"] == {}
+    # Still answers the question it was ASKED — "clear session_id" was
+    # requested and honoured, it just moved nothing.
+    assert out["cleared"] == ["session_id"]
+
+
+def test_tg_topic_bind_restores_a_ticket_id_that_was_already_lost(
+        tmp_config_dir, monkeypatch):
+    """The half the ticket calls "there is NO supported way to restore
+    ticket_id": tonight's stripped topics get their association back WITHOUT a
+    new topic, and the ticket-resolution consumers find them again."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    tg_bindings.set_binding(cfg, "111", 220, "test-project")  # stripped, bare
+    assert tg_bindings.find_by_ticket(cfg, "T-0314") is None
+
+    A.dispatch("tg_topic_bind", {
+        "chat_id": "111", "thread_id": 220, "slug": "test-project",
+        "ticket_id": "T-0314",
+    })
+
+    found = tg_bindings.find_by_ticket(cfg, "T-0314")
+    assert found["chat_id"] == "111" and found["thread_id"] == 220
+
+
+def test_tg_topic_bind_contradiction_is_a_400_not_a_500(tmp_config_dir, monkeypatch):
+    """The store raises a plain ValueError for a contradictory call; the action
+    owes the caller an ActionError (HTTP 400 + the reason), never a traceback."""
+    import bot_squad_worker.actions as A
+
+    _bind_cfg(monkeypatch, tmp_config_dir)
+    with pytest.raises(A.ActionError, match="contradict"):
+        A.dispatch("tg_topic_bind", {
+            "chat_id": "111", "thread_id": 517, "slug": "test-project",
+            "ticket_id": "T-0314", "clear_ticket_id": True,
+        })
+
+
+def test_tg_topic_bind_still_binds_a_bare_project_topic(tmp_config_dir, monkeypatch):
+    """NEGATIVE GUARD — the T-0639 project-binding flow (8 of the 11 live
+    bindings) is unchanged. The risk of this change is over-refusing."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    cfg = _bind_cfg(monkeypatch, tmp_config_dir)
+    out = A.dispatch("tg_topic_bind", {
+        "chat_id": "111", "thread_id": 7, "slug": "test-project",
+    })
+
+    assert out["binding"] == {"slug": "test-project", "ticket_id": None,
+                              "session_id": None, "pinned_message_id": None}
+    assert out["cleared"] == []
+    assert out["changes"] == {"slug": {"from": None, "to": "test-project"}}
+    assert tg_bindings.resolve(cfg, "111", 7) == out["binding"]
+
+
+def test_tg_topic_bind_still_rejects_a_genuinely_unknown_param(
+        tmp_config_dir, monkeypatch):
+    """NEGATIVE GUARD — widening the allowed set by four names must not turn
+    the param gate off."""
+    import bot_squad_worker.actions as A
+
+    _bind_cfg(monkeypatch, tmp_config_dir)
+    with pytest.raises(A.ActionError, match="unexpected params"):
+        A.dispatch("tg_topic_bind", {
+            "chat_id": "111", "thread_id": 7, "slug": "test-project",
+            "pinned_message_id": 555,
+        })
+
+
+def test_tg_topic_create_reports_a_stale_key_instead_of_overwriting_it(
+        tmp_config_dir, monkeypatch):
+    """Unreachable in practice — a freshly created forum topic has an id
+    nothing is bound to. But if the map IS stale for that key, overwriting is
+    exactly the silent strip this guard exists to stop, and a 500 would leave a
+    created topic nobody can explain. Degrade to the alarm, naming the topic."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings
+
+    fake = _FakeForumTg()
+    stale_thread_id = fake._next_tid + 1  # the id its next create_forum_topic returns
+    cfg = Config.load(tmp_config_dir)
+    _inject_fake_tg(monkeypatch, tmp_config_dir, fake_client=fake)
+    tg_bindings.set_binding(cfg, "111", stale_thread_id, "test-project",
+                            ticket_id="T-0314")
+
+    with pytest.raises(A.ActionError) as e:
+        A.dispatch("tg_topic_create", {
+            "chat_id": "111", "slug": "test-project", "name": "[wr] General",
+        })
+
+    msg = str(e.value)
+    assert "T-0314" in msg and "NOT bound" in msg
+    assert str(stale_thread_id) in msg
+    assert tg_bindings.resolve(cfg, "111", stale_thread_id)["ticket_id"] == "T-0314"
+
+
+def test_restoring_a_stripped_ticket_id_puts_the_sends_back_in_the_topic(
+        tmp_path, monkeypatch):
+    """THE RECORDED CONSEQUENCE, end to end (T-0771 ★ "the sharp edge").
+
+    A dev working T-0723 has a per-task topic. Strip its ticket_id — what a
+    slug-only rebind used to do silently — and `_own_topic_binding` rung 2
+    goes empty, so the session's sends fall back to the project's General
+    room: from the stakeholder's seat, silence in the topic he is watching.
+    Restoring the ticket_id through the bind verb (no NEW topic) puts them
+    back, which is what unblocks repairing tonight's bindings by hand.
+    """
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_bindings
+
+    cfg_dir = _config_dir_with_topic(tmp_path)
+    cfg, fake = _inject_fake_tg(monkeypatch, cfg_dir)
+    conversation_locus.set_locus(cfg, "group-project", "gu_1", "-1001234567890", 5)
+    tg_bindings.set_binding(cfg, "-1001234567890", 77, "group-project")  # STRIPPED
+    _dev_session(cfg, "S-u-dev-p9", task_id="T-0723")
+
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "before",
+                             "sid": "S-u-dev-p9"})
+    # Names WHERE it lands instead, not just "not 77": the locus (topic 5,
+    # wherever the human last wrote) — a send that failed outright would also
+    # satisfy a bare inequality.
+    assert fake.calls[-1]["topic_id"] == 5
+
+    A.dispatch("tg_topic_bind", {
+        "chat_id": "-1001234567890", "thread_id": 77, "slug": "group-project",
+        "ticket_id": "T-0723",
+    })
+    A.dispatch("tg_notify", {"slug": "group-project", "message": "after",
+                             "sid": "S-u-dev-p9", "debounce": False})
+
+    assert fake.calls[-1]["topic_id"] == 77
+    assert fake.calls[-1]["chat_id"] == "-1001234567890"

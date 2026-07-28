@@ -41,6 +41,21 @@ nobody reads coverage into it:
 
 Tightening the response models so the schema stops saying "object, anything
 goes" is what would extend this net downward. That is not this ticket.
+
+THE GENERATION ENVIRONMENT IS DECLARED, NOT INHERITED (T-0768). ``build_app``
+registers the SPA file-server catch-all ``GET /{full_path}`` CONDITIONALLY, on
+``Path(os.environ.get("WEB_DIST", "/app/web/dist")).exists()``. The
+``bot-squad-api`` image BAKES a bundle at that default path, so whether the
+route exists — and therefore whether it lands in the generated schema —
+depended on a detail of how the suite was invoked: the documented api-only
+mount (``-v $PWD/api:/app``) SHADOWS ``/app`` and hides the bundle, while the
+equally-documented repo-root mount (``-v $PWD:/repo -w /repo/api``) leaves it
+visible. Same commit, same code, two answers; and the failure text said
+"regenerate the pin", which merely moves the breakage to the other mount.
+``_env`` therefore pins ``WEB_DIST`` at a path that cannot exist, so this file
+generates from ONE declared environment on every host, and
+``_assert_pinned_environment`` reports the CAUSE by name if that assumption
+ever stops holding.
 """
 from __future__ import annotations
 
@@ -64,6 +79,17 @@ REGEN_CMD = (
     '-v "$PWD"/api:/app -w /app --entrypoint python bot-squad-api:latest '
     "-m pytest -q tests/test_response_shape_contract.py"
 )
+
+# The SPA file-server catch-all. NOT an API endpoint — it serves index.html —
+# so its absence costs this guard no coverage. It is named here because it is
+# the one route in the app whose EXISTENCE depends on the environment rather
+# than on the code, which is what made this pin mount-sensitive (T-0768).
+SPA_CATCHALL = "GET /{full_path}"
+
+# A path that cannot exist, handed to WEB_DIST so the catch-all is
+# deterministically NOT registered while shapes are generated. Same posture as
+# the rest of the api suite (see test_routes_mothership.py and ~15 others).
+ABSENT_WEB_DIST = "nonexistent-web-dist"
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +200,44 @@ def _env(monkeypatch, root: Path, mothership: str) -> None:
     monkeypatch.setenv("WORKER_SOCK", str(root / "data" / "_sock" / "worker.sock"))
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("MOTHERSHIP", mothership)
+    # T-0768. DECLARED, never inherited: without this the answer depends on
+    # whether the runner can see a built web bundle at WEB_DIST's default
+    # (/app/web/dist, which the bot-squad-api image bakes), i.e. on the docker
+    # mount. `monkeypatch.setenv` overrides whatever the ambient environment
+    # says, which is the point — an inherited value is exactly the bug.
+    monkeypatch.setenv("WEB_DIST", str(root / ABSENT_WEB_DIST))
+
+
+def _assert_pinned_environment(actual: dict[str, str]) -> None:
+    """Fail naming the CAUSE if this run is not the environment the pin assumes.
+
+    Without this, a build that registers the SPA catch-all reports as an
+    ordinary shape diff ("NEW GET /{full_path} -> 200 no-body") — which reads
+    as an API change and invites the one remedy that makes things worse:
+    regenerating, which bakes an environment-dependent route into the pin and
+    moves the failure to every environment that does NOT have a bundle.
+    """
+    if SPA_CATCHALL in actual:
+        pytest.fail(
+            f"NOT the generation environment this pin assumes: {SPA_CATCHALL} is in "
+            "the generated schema.\n\n"
+            "That route is the SPA file-server catch-all, registered by "
+            "app/main.py only when Path(WEB_DIST) EXISTS. This file sets WEB_DIST "
+            f"to <tmp>/{ABSENT_WEB_DIST} precisely so it is never registered here, "
+            "so seeing it means the registration condition in app/main.py changed "
+            "(or something re-set WEB_DIST after the fixture did).\n\n"
+            "This is NOT a pin-refresh situation. Regenerating would record a route "
+            "whose existence depends on the environment rather than on the code, and "
+            "the pin would then fail wherever no web bundle is present (the api-only "
+            "docker mount, and CI). Fix the environment or the condition instead."
+        )
 
 
 def _shapes_for(monkeypatch, root: Path, mothership: str) -> dict[str, str]:
     _env(monkeypatch, root, mothership)
-    return response_shapes(build_app().openapi())
+    shapes = response_shapes(build_app().openapi())
+    _assert_pinned_environment(shapes)
+    return shapes
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +265,12 @@ def test_response_shapes_match_pin(tmp_bot_squad: Path, monkeypatch) -> None:
                     " is annotated `-> dict`, i.e. NOTHING below the top level is"
                     " visible here — field-level drift passes this pin and passes"
                     " web/src/apiShapeContract.test.ts. See the module docstring.",
-                    "_build": "MOTHERSHIP=1 (superset of the single-install build)",
+                    "_build": "MOTHERSHIP=1 (superset of the single-install build)"
+                    " + WEB_DIST pointed at a path that does not exist, so the SPA"
+                    " file-server catch-all GET /{full_path} is deliberately absent."
+                    " Both are set by the test fixture, NOT inherited: the catch-all"
+                    " is registered only when a web bundle is visible, which used to"
+                    " make this pin depend on the docker mount (T-0768).",
                     "shapes": dict(sorted(actual.items())),
                 },
                 indent=2,
@@ -279,6 +343,78 @@ def test_pin_is_deterministic(tmp_bot_squad: Path, monkeypatch) -> None:
     assert a == b
 
 
+def _built_bundle(root: Path) -> Path:
+    """A directory that looks enough like `web/dist` to satisfy main.py."""
+    bundle = root / "web" / "dist"
+    bundle.mkdir(parents=True, exist_ok=True)
+    (bundle / "index.html").write_text("<!doctype html><title>bundle</title>")
+    return bundle
+
+
+def test_a_visible_web_bundle_really_does_register_the_catch_all(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """POSITIVE CONTROL for the absence asserted below.
+
+    "The catch-all is not in the pin" is equally consistent with a route that
+    can never appear at all — in which case the next test would pass while
+    guarding nothing. So drive `build_app` with a bundle that DOES exist and
+    assert the route shows up, with the exact descriptor the repo-root docker
+    mount produced when this was found: ``200 no-body``.
+
+    `_env` is called first and its WEB_DIST is then deliberately overridden,
+    because this test is about the OTHER environment.
+    """
+    _env(monkeypatch, tmp_bot_squad, "1")
+    monkeypatch.setenv("WEB_DIST", str(_built_bundle(tmp_bot_squad)))
+
+    shapes = response_shapes(build_app().openapi())
+
+    assert shapes[SPA_CATCHALL] == "200 no-body"
+
+
+def test_generation_is_independent_of_the_ambient_web_dist(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """T-0768: the same commit must yield the same shapes under both docker
+    mounts.
+
+    The mount is not the variable — WEB_DIST is; the api-only mount merely
+    hides the image's baked bundle from it. So the mount is reproduced HERE by
+    driving that variable directly: generate once with a bundle visible (the
+    repo-root mount) and once without (the api-only mount) and require the two
+    to be identical. RED before this ticket, where the first generation gained
+    ``GET /{full_path}``.
+    """
+    monkeypatch.setenv("WEB_DIST", str(_built_bundle(tmp_bot_squad)))
+    as_repo_root_mount = _shapes_for(monkeypatch, tmp_bot_squad, "1")
+
+    monkeypatch.delenv("WEB_DIST")
+    as_api_only_mount = _shapes_for(monkeypatch, tmp_bot_squad, "1")
+
+    assert as_repo_root_mount == as_api_only_mount
+    assert SPA_CATCHALL not in as_repo_root_mount
+
+
+def test_the_environment_guard_names_the_variable() -> None:
+    """The guard must report the CAUSE, not a shape diff.
+
+    A future change to main.py's registration condition is the one way the
+    catch-all can come back; when it does, the message has to say WEB_DIST and
+    say "do not regenerate", because the pin's own failure text says the
+    opposite and following it inverts which environment is broken.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _assert_pinned_environment({SPA_CATCHALL: "200 no-body", "GET /api/health": "200 object(loose)"})
+
+    msg = str(excinfo.value)
+    assert "WEB_DIST" in msg
+    assert "NOT a pin-refresh situation" in msg
+
+    # ...and it stays out of the way of an ordinary shape change.
+    _assert_pinned_environment({"GET /api/health": "200 array(object(loose))"})
+
+
 def test_reducer_tells_the_T_0601_flip_apart() -> None:
     """POSITIVE CONTROL for the instrument itself: reproduce T-0601's exact
     edit on a two-route toy app and assert the descriptors differ.
@@ -330,6 +466,26 @@ def test_the_endpoint_this_ticket_came_from_is_pinned() -> None:
     """
     pinned: dict[str, str] = json.loads(PIN_PATH.read_text())["shapes"]
     assert pinned["GET /api/projects/{slug}/sessions"] == "200 object(loose)"
+
+
+def test_the_pin_carries_no_environment_dependent_route() -> None:
+    """The COMMITTED file must not contain the SPA catch-all.
+
+    The guard above protects a generation run; this protects the artifact. It
+    is the one that catches the trap this ticket is about — someone hits the
+    red test, follows its "regenerate" advice under a mount where the bundle
+    is visible, and commits a pin that now fails for everyone whose
+    environment has no bundle (the documented api-only mount, and CI).
+    """
+    pinned: dict[str, str] = json.loads(PIN_PATH.read_text())["shapes"]
+    assert SPA_CATCHALL not in pinned, (
+        f"{SPA_CATCHALL} is in the committed pin. It is the SPA file-server "
+        "catch-all, which app/main.py registers only when a web bundle exists at "
+        "WEB_DIST — so a pin containing it passes only where a bundle is present. "
+        "This pin is generated with WEB_DIST pointed at nothing on purpose; the "
+        "file was almost certainly regenerated in the wrong environment. See the "
+        "module docstring (T-0768)."
+    )
 
 
 def test_pinned_json_response_is_reachable_by_the_web_suite() -> None:

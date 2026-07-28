@@ -1,7 +1,7 @@
 {
   "_generated_by": "api/tests/test_response_shape_contract.py (UPDATE_RESPONSE_SHAPES=1) \u2014 do not hand-edit",
   "_what_this_pins": "success status code + TOP-LEVEL shape of each endpoint's JSON response. object(loose) means the route is annotated `-> dict`, i.e. NOTHING below the top level is visible here \u2014 field-level drift passes this pin and passes web/src/apiShapeContract.test.ts. See the module docstring.",
-  "_build": "MOTHERSHIP=1 (superset of the single-install build)",
+  "_build": "MOTHERSHIP=1 (superset of the single-install build) + WEB_DIST pointed at a path that does not exist, so the SPA file-server catch-all GET /{full_path} is deliberately absent. Both are set by the test fixture, NOT inherited: the catch-all is registered only when a web bundle is visible, which used to make this pin depend on the docker mount (T-0768).",
   "shapes": {
     "DELETE /api/m/projects/{slug}/groups/{group_id}": "200 object(loose)",
     "DELETE /api/m/projects/{slug}/members/{global_user_id}": "200 object(loose)",

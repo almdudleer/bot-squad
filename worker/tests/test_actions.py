@@ -65,6 +65,8 @@ def test_registry_lists_only_allowed_actions():
         # T-0478 (M2/F2.4): user-conversation intake-session ensure/spawn.
         "ensure_user_conversation",
         "scheduler_state", "inject_input",
+        # T-0770: the BLOCK sibling of inject_input — one composer submission.
+        "inject_prompt",
         # T-0759: read-only liveness of the outbound log (ok/idle/decayed/blind).
         "outbound_liveness",
         # T-0469 (M1/F1.6): multiplexed queue-backed input channel.
@@ -2506,6 +2508,97 @@ def test_inject_input_missing_params(tmp_path, monkeypatch):
 
     with pytest.raises(ActionError, match="missing required"):
         A.dispatch("inject_input", {"sid": "S-x-y-p1"})
+
+
+# ---------------------------------------------------------------------------
+# inject_prompt (T-0770) — the BLOCK sibling of inject_input
+# ---------------------------------------------------------------------------
+#
+# The measurement that made this action necessary is the pair of tests above:
+# `test_inject_input_multiline` PINS one Enter per line, which is three
+# composer submissions for a three-line payload. The stakeholder's own messages
+# on the direct-mode topic path already arrive that way, and a multi-line
+# provenance envelope on that transport would have been worse than the bare
+# text it replaces. These tests are that comparison, made explicit.
+
+
+def _patch_prompt_transport(monkeypatch):
+    """Patch the paste-primitive seams; returns the tmux call log."""
+    import subprocess
+    import bot_squad_worker.input_mux as M
+    import bot_squad_worker.sessions as S
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    # The composer: non-empty right after the paste (it landed), empty after
+    # the Enter (it submitted) — the two states _deliver_prompt polls for.
+    states = iter(["pasted", ""] * 8)
+    monkeypatch.setattr(S, "_composer_content", lambda pane: next(states))
+    # Small but NON-zero: both are divisors of their timeout when the poll
+    # budget is computed (sessions.py), so a 0.0 here is a ZeroDivisionError.
+    monkeypatch.setattr(S, "_SUBMIT_CONFIRM_POLL_INTERVAL_SEC", 0.001)
+    monkeypatch.setattr(S, "_PASTE_LANDED_POLL_INTERVAL_SEC", 0.001)
+    monkeypatch.setattr(M, "_capture_pane", lambda pane_id: "")
+    return calls
+
+
+def test_inject_prompt_delivers_a_multiline_block_as_ONE_submission(tmp_path, monkeypatch):
+    """★ The contrast with test_inject_input_multiline above: same three lines,
+    ONE Enter. A four-line envelope submitted line-by-line would have the
+    session answering the header before it had read his words."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.sessions import PaneInfo
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [
+        PaneInfo(pane_id="%7", window="win", pid="1", cwd="/tmp", command="claude")])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    calls = _patch_prompt_transport(monkeypatch)
+
+    result = A.dispatch("inject_prompt",
+                        {"sid": "S-testuser-win-p7", "text": "line1\nline2\nline3"})
+    assert result["ok"] is True and result["pane_id"] == "%7"
+    assert [c for c in calls if "send-keys" in c] == [
+        ["tmux", "send-keys", "-t", "%7", "Enter"],
+    ]
+    # …and the body went in as a bracketed PASTE, so the newlines stayed
+    # newlines instead of submitting.
+    assert any(c[:2] == ["tmux", "load-buffer"] for c in calls)
+    assert any("paste-buffer" in c for c in calls)
+
+
+def test_inject_prompt_raises_when_the_session_is_gone(tmp_path, monkeypatch):
+    """Same contract as inject_input, and it is load-bearing: tg_listener's
+    T-0746 fallback (don't drop an undeliverable message — hand it to the
+    project attendant) is driven by this exception. `send_input` would have
+    DEFERRED into a queue instead, which is the silence this ticket is about."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+
+    with pytest.raises(ActionError, match="no live pane"):
+        A.dispatch("inject_prompt", {"sid": "S-testuser-gone-p9", "text": "hi"})
+
+
+def test_inject_prompt_param_gate(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    _make_inject_cfg(tmp_path, monkeypatch)
+    with pytest.raises(ActionError, match="unexpected params"):
+        A.dispatch("inject_prompt", {"sid": "S-x-y-p1", "text": "hi", "evil": "x"})
+    with pytest.raises(ActionError, match="missing required"):
+        A.dispatch("inject_prompt", {"sid": "S-x-y-p1"})
+    with pytest.raises(ActionError, match="empty text"):
+        A.dispatch("inject_prompt", {"sid": "S-x-y-p1", "text": "  \n "})
 
 
 # ---------------------------------------------------------------------------

@@ -2358,6 +2358,64 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# inject_prompt action (T-0770) — the BLOCK sibling of inject_input
+# ---------------------------------------------------------------------------
+
+_INJECT_PROMPT_REQUIRED = {"sid", "text"}
+_INJECT_PROMPT_ALLOWED = _INJECT_PROMPT_REQUIRED
+
+
+def _action_inject_prompt(params: dict[str, Any]) -> dict[str, Any]:
+    """Deliver a multi-line block to a SID as ONE composer message.
+
+    Required params: sid, text. Returns ``{ok: true, pane_id}``.
+
+    WHY THIS EXISTS BESIDE ``inject_input`` (T-0770, measured, not assumed).
+    ``inject_input``'s transport sends one send-keys + Enter PER LINE — correct
+    for the single-line nudges it was written for ("check mail", "/compact"),
+    and wrong for anything with a newline in it: a 3-line payload becomes THREE
+    separate composer submissions, so the session starts answering line 1 while
+    lines 2-3 are still arriving. That is already true of the stakeholder's own
+    multi-line messages on the direct-mode topic path, and a multi-line
+    provenance envelope on that transport would have been strictly worse than
+    the bare text it replaces.
+
+    The transport here is ``sessions._deliver_prompt`` — the T-0144/T-0201
+    paste-buffer primitive ``drift_check`` and the spawn briefs already use:
+    bracketed paste (embedded newlines stay newlines), then a separate
+    confirm-then-Enter to submit, all under the per-sid mux delivery lock.
+
+    The CONTRACT matches ``inject_input`` exactly, and that is load-bearing
+    rather than tidy: it raises ``ActionError`` when there is no live pane and
+    when the paste/submit never lands, so ``tg_listener._handle_reply``'s
+    T-0746 undelivered fallback — the thing that stops a message evaporating
+    when a session has been reaped — keeps working unchanged for callers that
+    move from one to the other. This is deliberately NOT ``send_input``, whose
+    queue DEFERS (never raises) when no pane exists: a message that quietly sits
+    in a queue for a dead session is the silence this ticket is about."""
+    extra = set(params) - _INJECT_PROMPT_ALLOWED
+    if extra:
+        raise ActionError(f"inject_prompt got unexpected params: {sorted(extra)}")
+    missing = _INJECT_PROMPT_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"inject_prompt missing required params: {sorted(missing)}")
+
+    sid = params["sid"]
+    text = params["text"]
+    if not text.strip():
+        raise ActionError("inject_prompt: empty text")
+
+    pane_id = _send_input_pane_lookup(sid)
+    if pane_id is None:
+        raise ActionError(f"inject_prompt: no live pane for sid {sid!r}")
+
+    from bot_squad_worker import sessions as S
+    cfg = _get_config()
+    S._deliver_prompt(pane_id, text, data_dir=cfg.data_dir, sid=sid)
+    return {"ok": True, "pane_id": pane_id}
+
+
+# ---------------------------------------------------------------------------
 # send_input action (T-0469, M1/F1.6) — multiplexed, queue-backed input
 # ---------------------------------------------------------------------------
 #
@@ -4774,6 +4832,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0759: read-only liveness of the outbound log (ok/idle/decayed/blind).
     "outbound_liveness": _action_outbound_liveness,
     "inject_input": _action_inject_input,
+    # T-0770: the BLOCK sibling — a multi-line payload as ONE composer
+    # submission (inject_input submits one line at a time, which splits an
+    # envelope into N turns).
+    "inject_prompt": _action_inject_prompt,
     # T-0469 (M1/F1.6): multiplexed queue-backed input (coalesce + caption +
     # defer-on-busy). Agents write via `bsq send-input`, not raw send-keys.
     "send_input": _action_send_input,
@@ -4928,6 +4990,9 @@ ACTION_MODES: dict[str, str] = {
     # telemetry_get — a per-user fan-out would answer the same question N times.
     "outbound_liveness": "coordinator_only",
     "inject_input": "tmux_only",
+    # T-0770: same per-user tmux view as inject_input (pane lookup + paste into
+    # a LOCAL pane) → tmux_only for the same reason.
+    "inject_prompt": "tmux_only",
     # T-0469: enqueues + delivers to a LOCAL pane (list_panes/compute_sid), same
     # per-user tmux view as inject_input → tmux_only.
     "send_input": "tmux_only",

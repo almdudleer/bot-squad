@@ -621,21 +621,51 @@ def cmd_topic_rename(args) -> None:
 
 
 def cmd_topic_say(args) -> None:
-    """Post directly into a task's forum topic (T-0660 Phase 2, direct-write).
+    """Post directly into a forum topic (T-0660 Phase 2, direct-write).
 
-    A dev/TL/orchestrator session posting into ITS OWN task's topic — resolved
-    from the ticket id (the topic must already exist, `bsq topic create
-    ... --ticket <id>`), tagged with this session's SID so the stakeholder
-    sees who's writing and can reply straight back to it.
+    Two ways to name the destination:
+
+    * `bsq topic say <TICKET> "<msg>"` — resolved from the ticket id (the topic
+      must already exist, `bsq topic create ... --ticket <id>`). The original
+      form: a dev/TL/orchestrator session posting into ITS OWN task's topic.
+    * `bsq topic say --chat <id> --topic <n> "<msg>"` — the destination SPELLED
+      OUT (T-0770). This is what answers a stakeholder message that arrived in
+      a session-bound topic, and it is why the flags exist: every resolving form
+      (`--ticket`, and `bsq tg ping`'s rung-3 lookup) picks the FIRST binding
+      that names the session, so a session holding two direct-mode topics
+      answers in the wrong one — measured on the live bindings of the very
+      incident T-0770 was filed for. A direct-mode topic also frequently has no
+      ticket_id at all (`/pin-session` sets only the session), so there is
+      nothing for the resolving form to key on.
+
+    Either way the send is tagged with this session's SID, so he sees who is
+    writing and a reply to it routes straight back to this pane.
     """
     sid = require_sid(args.sid)
-    message = " ".join(args.message).strip()
+    words = list(args.words)
+    explicit = bool(args.chat) or args.topic is not None
+    if explicit:
+        if not args.chat or args.topic is None:
+            die("topic say: --chat and --topic go together (a thread id is only "
+                "meaningful inside its own chat)")
+        ticket = ""
+        message = " ".join(words).strip()
+    else:
+        ticket = words[0]
+        message = " ".join(words[1:]).strip()
     if not message:
         die("topic say: empty message")
-    res = post("tg_notify", {"ticket_id": args.ticket, "message": message, "sid": sid,
-                             "urgent": bool(args.urgent)})
+    params = {"message": message, "sid": sid, "urgent": bool(args.urgent)}
+    if explicit:
+        params["chat_id"] = str(args.chat)
+        params["topic_id"] = int(args.topic)
+        where = f"chat={args.chat} topic={args.topic}"
+    else:
+        params["ticket_id"] = ticket
+        where = f"topic for ticket={ticket}"
+    res = post("tg_notify", params)
     if res.get("sent"):
-        print(f"posted to topic for ticket={args.ticket} (sid={sid})")
+        print(f"posted to {where} (sid={sid})")
     else:
         print("post suppressed (no bot token, debounce, or quiet hours) — not sent. "
               "Reply will still route back to this session if it lands.")
@@ -4841,9 +4871,20 @@ def build_parser() -> argparse.ArgumentParser:
     tprn.add_argument("name", help="new title, e.g. '[watchrobot] Add user panel'")
     tprn.set_defaults(func=cmd_topic_rename)
     tps = tp_sub.add_parser(
-        "say", help="post directly into a task's forum topic (T-0660, direct-write)")
-    tps.add_argument("ticket", help="ticket id whose bound topic to post into")
-    tps.add_argument("message", nargs="+", help="the message text")
+        "say", help="post directly into a forum topic (T-0660, direct-write)")
+    # One positional list, split by cmd_topic_say: with --chat/--topic every
+    # word is the message; without them the first word is the ticket id. A
+    # separate optional positional cannot express that — argparse would hand
+    # the message's first word to it (T-0770).
+    tps.add_argument("words", nargs="+", metavar="[TICKET] MESSAGE",
+                     help="ticket id (omit it when --chat/--topic name the "
+                          "destination) followed by the message text")
+    tps.add_argument("--chat", help="destination chat id, spelled out — use with "
+                                    "--topic to answer a specific forum topic "
+                                    "(T-0770; no lookup, so it cannot resolve to "
+                                    "the wrong topic)")
+    tps.add_argument("--topic", type=int, help="destination forum topic id "
+                                               "(requires --chat)")
     tps.add_argument("--sid", help="override the auto-detected session id")
     tps.add_argument("--urgent", action="store_true", help="bypass quiet hours")
     tps.set_defaults(func=cmd_topic_say)

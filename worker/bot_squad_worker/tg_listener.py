@@ -10,6 +10,7 @@ from typing import Any, Optional
 import httpx
 
 from bot_squad_worker import tg as _tg
+from bot_squad_worker import tg_direct_reply
 
 log = logging.getLogger(__name__)
 
@@ -1237,12 +1238,21 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
 
     T-0660: a binding carrying a ``session_id`` is a per-TASK topic (not a
     project/General one) — it routes straight to that ORIGINATING session by
-    id (reusing the same inject_input path an explicit ``[<sid>]`` reply
-    uses), never through the project's user-conversation attendant, and does
+    id, never through the project's user-conversation attendant, and does
     NOT update the conversation locus (T-0667) — a task-topic message must
     never redirect the project's own attendant-reply relay into the task
     topic. A plain project/General binding (no session_id) keeps the T-0639
     behavior: durable append (T-0489) + ensure-session (T-0485) + locus.
+
+    T-0770: what that branch delivered was the RAW TEXT and nothing else, so
+    the receiving session could not tell a human had written it, where it had
+    arrived, or that an answer was owed back to Telegram rather than to its own
+    turn — and he experienced silence, twice, in his own words. It now delivers
+    a provenance ENVELOPE (``tg_direct_reply.compose_envelope``) as one composer
+    block, and records the answer it OWES so the silence is measured rather than
+    hoped away (``tg_direct_reply.tick``). Neither half touches the locus or any
+    reply route: the T-0667 constraint above is the reason the provenance rides
+    in the message instead.
 
     The stakeholder replying directly to a session is ALSO recorded as a
     passive FYI append into the project's OWN (slug, gid) attendant thread
@@ -1255,6 +1265,20 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     session_id = binding.get("session_id")
     if session_id:
         text = msg.get("text") or ""
+        thread_id = msg.get("message_thread_id")
+        # T-0770: the session gets his words INSIDE an envelope that says who
+        # wrote them, where they arrived, and what command answers back into
+        # that topic. Before this the payload was the bare text, and a session
+        # handed bare text in its composer does the natural thing — it answers
+        # in its own turn, the answer never leaves the process, and he sees
+        # silence ("опять игнор меня", 2026-07-28T22:33:23Z). The envelope goes
+        # as ONE block (`inject_prompt`), never one-Enter-per-line — see that
+        # action's docstring for the measurement.
+        envelope = tg_direct_reply.compose_envelope(
+            text=text, chat_id=chat_id, thread_id=thread_id, sid=session_id,
+            slug=slug, ticket_id=binding.get("ticket_id") or "",
+            sender=_sender_display_name(msg.get("from") or {}),
+        )
         # T-0746: `gid` so an undeliverable message can fall back to the target
         # session's user-conversation instead of evaporating, and `thread_id`
         # so the outcome notice lands in the TASK TOPIC the user is looking at
@@ -1262,10 +1286,20 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         # never passed it — the same omission T-0740 fixed on the other paths).
         result = _handle_reply(
             cfg, chat_id, session_id, text,
-            thread_id=msg.get("message_thread_id"), gid=gid,
+            thread_id=thread_id, gid=gid, block_text=envelope,
         )
         result["action"] = f"task_topic_{result.get('action', 'inject')}"
         result["slug"] = slug
+        if result.get("ok") and result.get("fallback") is None:
+            # T-0770: the envelope was DELIVERED — start the clock on the answer
+            # it owes. Only on success: a message the session never received is
+            # not a debt it owes, and the T-0746 fallback above has already
+            # handed that case to an attendant who WILL answer.
+            tg_direct_reply.record_owed(
+                cfg, sid=session_id, chat_id=chat_id, thread_id=thread_id,
+                text=text, slug=slug, gid=gid,
+                ticket_id=binding.get("ticket_id") or "",
+            )
         if result.get("fallback") is None:
             # T-0746, the same defect item (c) is about, found in this file:
             # this record's text is SYSTEM prose ("Пользователь ответил сессии
@@ -1759,8 +1793,17 @@ def _msg_ts(msg: dict) -> str:
 
 def _handle_reply(
     cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = None, gid: str = "",
+    block_text: str = "",
 ) -> dict:
     """Find the pane by SID and inject the text; on failure, DON'T drop it.
+
+    ``block_text`` (T-0770): deliver THIS instead of the raw ``text``, as one
+    composer submission (``inject_prompt``) rather than one submission per line
+    (``inject_input``). It is how the direct-mode topic path hands a session the
+    provenance envelope around his words. ``text`` is still what the FALLBACK
+    stores and relays: the attendant is owed what the human actually said, not
+    our wrapper around it — the T-0746 rule that system prose never enters the
+    record as his words.
 
     T-0746 item (a). Before this, an undeliverable message evaporated: we told
     the sender "message dropped" and that was the whole of it — the text was
@@ -1776,8 +1819,11 @@ def _handle_reply(
     back INTO.
     """
     from bot_squad_worker import actions as A
+    verb, payload = (
+        ("inject_prompt", block_text) if block_text else ("inject_input", text)
+    )
     try:
-        result = A.dispatch("inject_input", {"sid": sid, "text": text})
+        result = A.dispatch(verb, {"sid": sid, "text": payload})
         # T-0155: the stakeholder answered via TG — the agent is no longer
         # blocked on him; cancel any pending stall escalation.
         _clear_stall(cfg, chat_id, sid, thread_id=thread_id)

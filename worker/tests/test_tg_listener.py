@@ -1868,7 +1868,17 @@ def test_handle_topic_bound_with_session_id_injects_to_that_session(tmp_path, mo
     assert result["action"] == "task_topic_inject"
     assert result["sid"] == "S-dev-p9"
     assert result["slug"] == "beta"
-    assert injected == [("inject_input", {"sid": "S-dev-p9", "text": "fix the flaky test please"})]
+    # T-0770: this used to assert the payload was the BARE text — that pin was
+    # the defect, written down. What is delivered now is the provenance
+    # envelope, as ONE block (`inject_prompt`, not one-Enter-per-line
+    # `inject_input`), and his words are inside it verbatim.
+    assert len(injected) == 1
+    verb, params = injected[0]
+    assert verb == "inject_prompt"
+    assert params["sid"] == "S-dev-p9"
+    assert "fix the flaky test please" in params["text"]
+    assert "topic 42" in params["text"]
+    assert 'bsq topic say --chat 111 --topic 42' in params["text"]
 
 
 def test_handle_topic_bound_with_session_id_does_not_touch_locus(tmp_path, monkeypatch):
@@ -2005,6 +2015,136 @@ def test_handle_topic_bound_session_id_falls_back_on_inject_failure(tmp_path, mo
     assert posts[1][1]["author"] == "user" and posts[1][1]["text"] == "hello?"
     # The outcome lands in the TASK TOPIC he is looking at, not the general feed.
     assert notices and notices[0][0] == 42
+
+
+# ---------------------------------------------------------------------------
+# T-0770: the direct-mode injection carries its PROVENANCE, and the answer it
+# owes is written down. The defect it replaces was reproduced against a copy of
+# the live bindings before any of this was written: the session received
+# `прием-прием` and nothing else, four times, and he wrote «опять игнор меня».
+# ---------------------------------------------------------------------------
+
+
+def _direct_topic_cfg(tmp_path, monkeypatch, *, sid="S-dev-p9", ticket_id="T-0314"):
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id=ticket_id, session_id=sid)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: None)
+    return cfg
+
+
+def test_topic_bound_injection_names_the_human_the_topic_and_the_reply_command(
+        tmp_path, monkeypatch):
+    """S1+S3 end to end through the REAL handle_update."""
+    import bot_squad_worker.actions as A
+    cfg = _direct_topic_cfg(tmp_path, monkeypatch)
+    injected = []
+    monkeypatch.setattr(A, "dispatch",
+                        lambda n, p: injected.append((n, p)) or {"ok": True})
+
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _topic_msg("прием-прием", chat_id=111, thread_id=42)})
+
+    verb, params = injected[0]
+    assert verb == "inject_prompt"          # ONE submission, not one per line
+    text = params["text"]
+    assert "TELEGRAM" in text and "a human" in text
+    assert "chat 111, forum topic 42" in text
+    assert "прием-прием" in text
+    assert 'bsq topic say --chat 111 --topic 42 "<your answer>"' in text
+    # His display name, taken from the update rather than assumed.
+    assert "Alexey" in text
+
+
+def test_topic_bound_injection_records_the_answer_it_owes(tmp_path, monkeypatch):
+    """The behavioural half: the debt exists the moment the envelope lands, so
+    a session that stays quiet is detectable."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_direct_reply as TDR
+    cfg = _direct_topic_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(A, "dispatch", lambda n, p: {"ok": True})
+
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _topic_msg("ну и что тут?", chat_id=111, thread_id=42)})
+
+    entry = TDR.load(cfg)["111:42:S-dev-p9"]
+    assert entry["sid"] == "S-dev-p9" and entry["thread_id"] == 42
+    assert entry["slug"] == "beta" and entry["gid"] == "gu_1"
+    assert entry["ticket_id"] == "T-0314"
+    assert entry["text"] == "ну и что тут?"   # HIS words, not the envelope
+
+
+def test_a_message_the_session_never_received_owes_nothing(tmp_path, monkeypatch):
+    """S10. The T-0746 fallback has already handed his text to an attendant
+    that WILL answer — a debt on a session that never saw it would re-drive a
+    dead pane and then escalate a second time."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_direct_reply as TDR
+    cfg = _direct_topic_cfg(tmp_path, monkeypatch, sid="S-gone-p1")
+    (cfg.data_dir / "beta" / "sessions").mkdir(parents=True, exist_ok=True)
+    (cfg.data_dir / "beta" / "sessions" / "S-gone-p1.md").write_text(
+        "---\nsid: S-gone-p1\n---\n", encoding="utf-8")
+
+    def _raise(name, params):
+        raise A.ActionError("no such pane")
+    monkeypatch.setattr(A, "dispatch", _raise)
+    monkeypatch.setattr(TL, "_notify", lambda *a, **k: None)
+    posts = []
+    monkeypatch.setattr(TL, "_post_conversation",
+                        lambda c, s, g, payload: posts.append(payload) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: {"ok": True})
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_msg("hello?", chat_id=111, thread_id=42)})
+
+    assert result["action"] == "task_topic_inject_fallback"
+    assert TDR.load(cfg) == {}
+    # ★ The fallback stores HIS words, never our envelope around them: the
+    # T-0746 rule that system prose must not enter the record as his.
+    assert posts[1]["author"] == "user" and posts[1]["text"] == "hello?"
+    assert "TELEGRAM" not in posts[1]["text"]
+
+
+def test_the_envelope_moves_neither_the_locus_nor_a_reply_route(tmp_path, monkeypatch):
+    """★ The T-0667 constraint the ticket names as the reason this is not a
+    two-line change: a task-topic message must never redirect the project's
+    attendant-reply relay into the task topic. The provenance therefore rides
+    in the MESSAGE — nothing on this path writes the locus or the reply map."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import conversation_locus, tg_reply_map
+    cfg = _direct_topic_cfg(tmp_path, monkeypatch)
+    conversation_locus.set_locus(cfg, "beta", "gu_1", "999", None)
+    before = conversation_locus.load(cfg)
+    monkeypatch.setattr(A, "dispatch", lambda n, p: {"ok": True})
+
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _topic_msg("статус?", chat_id=111, thread_id=42)})
+
+    assert conversation_locus.load(cfg) == before
+    assert tg_reply_map.load(cfg.data_dir) == {}
+
+
+def test_a_plain_project_topic_gets_no_envelope_and_owes_nothing(tmp_path, monkeypatch):
+    """The neighbour that must not move: a binding with no session_id is the
+    T-0639 base case — attendant path, no direct injection, no debt."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker import tg_bindings, tg_direct_reply as TDR
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")           # no session_id
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    injected = []
+    monkeypatch.setattr(A, "dispatch", lambda n, p: injected.append(n) or {"ok": True})
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_msg("привет", chat_id=111, thread_id=7)})
+
+    assert result["action"] == "route_bound_topic"
+    assert injected == [] and TDR.load(cfg) == {}
 
 
 def test_handle_topic_bound_plain_project_topic_never_records_fyi(tmp_path, monkeypatch):
@@ -3393,8 +3533,13 @@ def test_pin_session_flips_routing_to_the_pinned_session(tmp_path, monkeypatch):
     result = TL.handle_update(cfg, {"update_id": 2, "message": plain})
 
     assert result["action"] == "task_topic_inject"
-    assert injected == [("inject_input",
-                         {"sid": "S-alice-dev-p3", "text": "what's the status?"})]
+    # T-0770: the pinned session gets the provenance envelope (one block), not
+    # the bare text — see the T-0770 block below for what it must contain.
+    assert len(injected) == 1
+    verb, params = injected[0]
+    assert verb == "inject_prompt"
+    assert params["sid"] == "S-alice-dev-p3"
+    assert "what's the status?" in params["text"]
     assert not ensured, "direct mode must bypass the user-conversation attendant"
 
 

@@ -12,6 +12,7 @@ from bot_squad_worker.config import Config
 from bot_squad_worker import autoupdate as _autoupdate
 from bot_squad_worker.operator_redrive import operator_tick
 from bot_squad_worker.uc_redrive import uc_redrive_tick
+from bot_squad_worker.tg_direct_reply import tick as tg_answer_owed_tick
 from bot_squad_worker.routines import monitor_tick, routine_tick
 from bot_squad_worker.jobs import (
     autopilot_tick,
@@ -416,6 +417,24 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="uc_redrive",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # tg_answer_owed tick: T-0770 — the stakeholder wrote into a topic bound
+    # DIRECTLY to one session; did that session actually answer back into the
+    # topic? uc_redrive above structurally cannot see this path (a direct-mode
+    # message is recorded as an `fyi` from `system:direct-reply`, not as an
+    # unanswered `author: "user"` record — and must stay that way). The verdict
+    # comes from the outbound spool, and a spool that cannot answer yields BLIND
+    # rather than an accusation. Kill switch: BOT_SQUAD_TG_ANSWER_OWED=0.
+    sched.add_job(
+        tg_answer_owed_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="tg_answer_owed",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

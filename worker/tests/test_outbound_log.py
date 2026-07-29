@@ -17,6 +17,22 @@ import pytest
 from bot_squad_worker import outbound_log as OB
 
 
+@pytest.fixture(autouse=True)
+def _reset_drops():
+    """DROPS is process-global, and two tests here bump it ON PURPOSE.
+
+    ``test_outbound_liveness.py`` has carried this fixture since T-0759 ("a
+    leaked count would make every later check read DECAYED for the wrong
+    reason") but the module that does the LEAKING never had it — the two only
+    coexisted because 'liveness' sorts before 'log', so the victim ran first.
+    T-0770 added a second consumer of that verdict, which sorts after both, and
+    it read DECAYED->BLIND for 13 tests. Restoring the counter here fixes it at
+    the source rather than in each new reader."""
+    before = dict(OB.DROPS)
+    yield
+    OB.DROPS.update(before)
+
+
 SID = "S-almdudleer-gu_dc8262b6cea9098d98e04d7e-user-conversation-p5"
 CHAT = "-1003761939853"
 

@@ -67,6 +67,37 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   compact. Scratch (probe scripts, logs, test dumps) goes in your session
   scratchpad, never the code working tree, never the data dir.
 
+## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
+
+You reach him rarely — `bsq tg ping` when you are genuinely blocked, per the
+idle-vs-page rule above. When you do, open on the news itself. These lead-ins
+are banned — his list, and the same shape in any language counts:
+
+- «одно изменение, о котором говорю сразу, а не молча» · «поправка, и
+  неприятная» · «лучше скажу сразу, а не потом»
+- «честно» · «честно говоря» · «если честно»
+- "I want to flag this before you find it" · "being upfront here" · "this is
+  the uncomfortable part" · "honestly" · "to be honest" · "frankly"
+
+Two reasons, so the list generalizes instead of being memorized: the wrapper
+is **self-regarding** — it advertises your candour instead of delivering the
+content, and costs him a sentence of throat-clearing before he learns what
+happened; and «честно говоря» **implies the other sentences were not**,
+manufacturing the doubt it is trying to settle.
+
+```
+BAD   Если честно, я застрял на два часа.
+GOOD  Застрял на два часа: нужен доступ к боевому токену, без него DoD не закрыть.
+```
+
+**This is a PRESENTATION rule and it never licenses omitting, delaying or
+softening the fact.** A blocker, a failed test, a wrong estimate still get
+reported, and just as fast — the message just starts at them. An agent reading
+this as "he does not want to hear bad things" has inverted it.
+
+Applies to `bsq tg ping` and to ticket text he is likely to open. Peer sends
+to your TL and to other devs are exempt — this is about what reaches HIM.
+
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 
 See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 — "the concept" is recorded; look it up, never treat it as unknown.

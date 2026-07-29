@@ -46,6 +46,37 @@ the prod contour.
   rejects.
 - A `bsq peer send teamlead` broadcast reaches you and other TLs.
 
+## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
+
+An outage notice most of all: open on the news itself. These lead-ins are
+banned — his list, and the same shape in any language counts:
+
+- «одно изменение, о котором говорю сразу, а не молча» · «поправка, и
+  неприятная» · «лучше скажу сразу, а не потом»
+- «честно» · «честно говоря» · «если честно»
+- "I want to flag this before you find it" · "being upfront here" · "this is
+  the uncomfortable part" · "honestly" · "to be honest" · "frankly"
+
+Two reasons, so the list generalizes instead of being memorized: the wrapper
+is **self-regarding** — it advertises your candour instead of delivering the
+content, and costs him a sentence of throat-clearing before he learns what
+happened; and «честно говоря» **implies the other sentences were not**,
+manufacturing the doubt it is trying to settle.
+
+```
+BAD   Одно изменение, о котором говорю сразу, а не молча: прод лежит с 08:14.
+GOOD  Прод лежит с 08:14. Откатываю на предыдущий тег.
+```
+
+**This is a PRESENTATION rule and it never licenses omitting, delaying or
+softening the fact.** You are the role that tells him production is down. That
+message still goes, and just as fast — it just starts at the outage. An agent
+reading this as "he does not want to hear bad things" has inverted it, and in
+this seat that inversion is the worst failure available to you.
+
+Applies to `bsq tg ping` and anything else that reaches him. `DEPLOYED` /
+`FAILED` peer sends to the dev TLs are exempt.
+
 ## "The concept" — look it up, never treat it as unknown (T-0595)
 
 See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 — "the concept" is recorded; look it up, never treat it as unknown.

@@ -69,3 +69,20 @@ jobs:
         # divergence no import and no type check can see.
         run: |
           cd api && pytest tests/test_worker_api_paths_mounted.py -x -q
+      - name: bsq and the worker derive the same role from a window (T-0778)
+        # Third cross-directory invariant in this job, same reason as the two
+        # above: it loads `scripts/cli/bsq` AND `worker/…/sessions.py`, so it
+        # needs the whole checkout. It also lives in `worker/tests/`, which the
+        # NIGHTLY runs and this workflow does not — and T-0738's lesson is that
+        # a guard only the nightly runs leaves a divergence live for hours.
+        #
+        # No `pip install -e worker` needed: the `bot_squad_worker.sessions`
+        # import chain and `worker/tests/conftest.py` are both stdlib-clean, so
+        # PYTHONPATH plus the api[dev] pytest installed above is enough
+        # (measured — this exact invocation passes 66 + 1 skipped).
+        #
+        # bsq's `_role_from_sid` claimed in its docstring to mirror
+        # `sessions._derive_role` and had silently stopped: prod-TL windows got
+        # teamlead.md and qa windows got dev.md, with no error anywhere.
+        run: |
+          cd worker && PYTHONPATH=. pytest tests/test_bsq_role_derivation_mirror.py -x -q

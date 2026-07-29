@@ -1661,10 +1661,35 @@ def cmd_session_alias_list(args) -> None:
         print(f"{label}  ->  {sid}")
 
 
+# Role enum → contract filename under the git-tracked SSOT (_roles_ssot_dir).
+#
+# T-0778: EVERY role `_role_from_sid` can return must have an entry here, or a
+# correctly-derived session still lands on the `.get(role, "dev.md")` fallback
+# in cmd_brief and reads someone else's contract. `prod-teamlead` and `qa`
+# became first-class spawnable roles in T-0197 and were missing from BOTH
+# halves, so `api/app/resources/roles/{prod-teamlead,qa}.md` were git-tracked
+# contracts no session was ever served. `tests/test_bsq_role_derivation_mirror.py`
+# pins the two halves together: every role the worker's `_derive_role` can
+# produce is keyed here AND its file exists.
 _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
                "operator": "operator.md",
+               # T-0197: prod-TL and QA are first-class spawnable roles.
+               "prod-teamlead": "prod-teamlead.md", "qa": "qa.md",
                # T-0478: user-conversation intake session role contract.
                "user-conversation": "user-conversation.md"}
+
+# `--role` choices for `spawn` / `cluster-launch` (T-0778 decision).
+#
+# DERIVED, not a fourth hand-written copy of the role enum — a literal list here
+# is the same divergence class this ticket exists to close, and it had already
+# opened: `--role user-conversation` was rejected at the parser even though
+# `_ROLE_FILES` mapped it. `--role` only selects which contract text
+# `_assemble_prompt` inlines; it is NOT sent to the worker (see cmd_spawn's
+# params) and does NOT name the window, so the spawned session's own later
+# `bsq brief` still resolves from its window. That role/window mismatch is
+# pre-existing and identical for the `tl`/`operator` choices that were already
+# accepted — widening adds no new class of it.
+_SPAWNABLE_ROLES = tuple(sorted(_ROLE_FILES))
 
 
 def _roles_ssot_dir() -> Path:
@@ -1798,23 +1823,79 @@ REPORT READY: when a ticket's DoD (incl. manual walkthrough) is green,
 Run `bsq --help` for the full verb reference."""
 
 
+# --------------------------------------------------------------------------
+# Window → role derivation (T-0778).
+#
+# THIS IS A DELIBERATE, HAND-MAINTAINED THIRD COPY of one rule — not a
+# delegation, and the docstring below says so because the previous one did not
+# and that is how it rotted. The canonical implementation is
+# `worker/bot_squad_worker/sessions.py::_derive_role`; the bash copy is
+# `scripts/hooks/derive_role.sh::bsq_derive_role`. Two facts make a copy the
+# right answer here rather than an import:
+#
+#   * `bsq` is stdlib-only by design — it runs on a bare `/usr/bin/env python3`
+#     with no venv and reaches the worker ONLY over its socket. Every other
+#     piece of worker logic it needs (frontmatter, pace, task_search) is
+#     likewise a mirror, never an import. Importing `bot_squad_worker` here
+#     WOULD work today (measured: ~0.1s, stdlib-clean import chain) but would
+#     make the one file every live session runs depend at runtime on a second
+#     tree being importable, and give it a new way to break for everyone at
+#     once. It would also have to CHOOSE a tree (the install's worker/ vs this
+#     clone's), and the two can legitimately differ across a deploy.
+#   * the copy that rotted was the UNPINNED one. `derive_role.sh` has been a
+#     third copy since T-0041 and never drifted, because
+#     `scripts/hooks/test_derive_role.sh` cross-checks it against the live
+#     python on a shared window table. This copy now has the same net:
+#     `worker/tests/test_bsq_role_derivation_mirror.py` drives BOTH functions
+#     over one table and requires identical answers, and also compares these
+#     regex sources + their precedence order against the worker's.
+#
+# Patterns and ORDER are byte-identical to sessions.py's module-level regexes.
+# Precedence matters: prod-TL MUST precede plain TL (T-0197), since a
+# `…-prod-tl` window also ends in `tl` — the worker suite asserts that
+# direction (test_sessions.py), and getting it backwards is the bug T-0778
+# fixed. Any change here must be made in all three copies.
+# --------------------------------------------------------------------------
+_ROLE_WINDOW_RES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("operator", re.compile(r"(?:^|[-_])operator$", re.IGNORECASE)),
+    # T-0197: BEFORE plain TL — a `prod-tl` window also ends in `tl`.
+    ("prod-teamlead", re.compile(r"(?:^|[-_])prod[-_](?:tl|teamlead)$", re.IGNORECASE)),
+    ("qa", re.compile(r"(?:^|[-_])qa$", re.IGNORECASE)),
+    # T-0478: system-spawned user-conversation intake session. Its window is
+    # `<gu_id>-user-conversation`, so the marker is matched as a SUFFIX.
+    ("user-conversation", re.compile(r"(?:^|[-_])user[-_]conversation$", re.IGNORECASE)),
+    ("teamlead", re.compile(r"(?:^|[-_])(?:tl|teamlead)$", re.IGNORECASE)),
+)
+
+
+def _role_from_window(window: str | None) -> str:
+    """Map a tmux window name → role enum, first marker wins, default ``dev``.
+
+    Behavioural mirror of ``sessions._derive_role(window, None, None)`` — see
+    the block comment above for why this is a copy and what pins it. T-0175:
+    task_id / initiative deliberately do NOT influence the role, so this takes
+    the window alone.
+    """
+    w = (window or "").strip()
+    for role, marker in _ROLE_WINDOW_RES:
+        if marker.search(w):
+            return role
+    return "dev"
+
+
 def _role_from_sid(sid: str | None) -> str:
-    """Mirror of scripts/hooks/derive_role.sh / sessions._derive_role: map a
-    session's window name → role enum. Window is the SID's middle segment
-    (S-<user>-<window>-p<pane>)."""
+    """Role of a session from its SID (``S-<user>-<window>-p<pane>``).
+
+    The marker is always a SUFFIX of the window, which is a suffix of the SID's
+    middle segment, so stripping the user is not required for correctness (the
+    worker's own ``_role_segment_of_sid`` matches the whole middle segment for
+    exactly that reason); it is kept only to narrow what a malformed SID can
+    match. A SID that doesn't parse is matched whole, and an empty one is dev.
+    """
     if not sid:
         return "dev"
     m = re.match(r"^S-[^-]+-(.*)-p\d+$", sid)
-    window = (m.group(1) if m else sid).lower()
-    if window == "operator" or re.search(r"[-_]operator$", window):
-        return "operator"
-    # T-0478: system-spawned user-conversation intake session. Its window is
-    # `<gu_id>-user-conversation`, so match the suffix (gid prefix is ignored).
-    if window == "user-conversation" or re.search(r"[-_]user[-_]conversation$", window):
-        return "user-conversation"
-    if window in ("tl", "teamlead") or re.search(r"[-_](tl|teamlead)$", window):
-        return "teamlead"
-    return "dev"
+    return _role_from_window(m.group(1) if m else sid)
 
 
 def _fm_list(raw) -> list[str]:
@@ -4896,7 +4977,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--window", help="tmux window name (default: ticket feature slug)")
     sp.add_argument("--initiative", help="initiative md (default: from ticket frontmatter)")
     sp.add_argument("--owner", help="UI username to stamp on the session")
-    sp.add_argument("--role", default="dev", choices=["dev", "tl", "teamlead", "operator"],
+    sp.add_argument("--role", default="dev", choices=_SPAWNABLE_ROLES,
                     help="role contract to assemble into the prompt (default dev)")
     sp.add_argument("--model",
                     help="claude --model override for the launch (alias like 'sonnet'/"
@@ -4936,7 +5017,7 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--spawn-dry-run", action="store_true", dest="spawn_dry_run",
                     help="confirm + reach spawn, but print the spawn plan instead of spawning")
     # spawn pass-throughs
-    cl.add_argument("--role", default="dev", choices=["dev", "tl", "teamlead", "operator"],
+    cl.add_argument("--role", default="dev", choices=_SPAWNABLE_ROLES,
                     help="role contract for the launched session (default dev)")
     cl.add_argument("--window", help="tmux window name (default: seed feature slug)")
     cl.add_argument("--initiative", help="initiative md (default: from seed frontmatter)")

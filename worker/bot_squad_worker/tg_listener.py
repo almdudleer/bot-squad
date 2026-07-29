@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import httpx
 
+from bot_squad_worker import reply_quote
 from bot_squad_worker import tg as _tg
 from bot_squad_worker import tg_direct_reply
 
@@ -519,6 +520,14 @@ def append_conversation(
     ``forwarded_from``, i.e. exactly this function's pre-T-0746 payload, so
     nothing changes for the overwhelming common case.
 
+    WHAT HE WAS ANSWERING (T-0780). A TG reply used to arrive here as its own
+    text and nothing else — the quoted original was read once for the SID regex
+    and discarded, and the store had no slot for it, so «второй вариант» was
+    recorded against a question nobody could recover. ``reply_to`` carries it as
+    a SEPARATE nested field, never concatenated into ``text``: the quoted words
+    are somebody else's (usually OURS), and folding them into a record authored
+    ``"user"`` is precisely the T-0746 defect. See ``reply_quote``.
+
     Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
     ``global_user_id``, or the API base / worker token aren't configured — so a
     record failure NEVER blocks inbound routing. Returns ``True`` on a recorded
@@ -531,6 +540,9 @@ def append_conversation(
         "attachments": _msg_attachments(msg),
         "timestamp": _msg_ts(msg),
     }
+    quote = reply_quote.extract(msg)
+    if quote:
+        payload["reply_to"] = quote
     if verdict["forwarded_from"]:
         payload["forwarded_from"] = verdict["forwarded_from"]
     if verdict["author"] != "user":
@@ -584,7 +596,8 @@ def _post_conversation(cfg, slug: str, global_user_id: str, payload: dict) -> Op
 _FYI_PREFIX = "[FYI — ответ не требуется]"
 
 
-def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str, text: str) -> Optional[bool]:
+def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
+                            text: str, reply_to: Optional[dict] = None) -> Optional[bool]:
     """T-0660: record a PASSIVE, non-actionable append into the project's
     (slug, global_user_id) attendant thread — for either of the two
     session<->stakeholder direct-contact directions the task-topic model adds
@@ -606,13 +619,24 @@ def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
     prefixed with an unambiguous marker so a reading session never mistakes
     this for something requiring a reply.
 
+    ``reply_to`` (T-0780): the message the user was answering, when this
+    summary is about a reply. It rides as the STRUCTURED field rather than
+    being appended to ``text`` — this record's text is already system prose
+    wrapping his words, and stapling a second person's words onto it is the
+    T-0746 shape all over again. It matters here specifically because on the
+    direct-mode task-topic path this fyi line is the ONLY store record of what
+    he said; without the field that path stays lossy after the fix.
+
     Same best-effort/env-gated contract as ``append_conversation``: a no-op
     when unconfigured or on failure, never blocks the caller."""
-    return _post_conversation(cfg, slug, global_user_id, {
+    payload = {
         "author": author,
         "text": f"{_FYI_PREFIX} {text}",
         "fyi": True,
-    })
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+    return _post_conversation(cfg, slug, global_user_id, payload)
 
 
 # ---- T-0492: hardwired project routing --------------------------------------
@@ -1274,10 +1298,16 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         # silence ("опять игнор меня", 2026-07-28T22:33:23Z). The envelope goes
         # as ONE block (`inject_prompt`), never one-Enter-per-line — see that
         # action's docstring for the measurement.
+        # T-0780: a message in a task topic may ALSO be a reply — to the
+        # session's own last post in that topic, most often — and until now the
+        # quoted original was dropped on this path too. `quote` is None for the
+        # ordinary un-replied message, leaving that envelope unchanged.
+        quote = reply_quote.extract(msg)
         envelope = tg_direct_reply.compose_envelope(
             text=text, chat_id=chat_id, thread_id=thread_id, sid=session_id,
             slug=slug, ticket_id=binding.get("ticket_id") or "",
             sender=_sender_display_name(msg.get("from") or {}),
+            quote=quote,
         )
         # T-0746: `gid` so an undeliverable message can fall back to the target
         # session's user-conversation instead of evaporating, and `thread_id`
@@ -1286,7 +1316,7 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         # never passed it — the same omission T-0740 fixed on the other paths).
         result = _handle_reply(
             cfg, chat_id, session_id, text,
-            thread_id=thread_id, gid=gid, block_text=envelope,
+            thread_id=thread_id, gid=gid, block_text=envelope, quote=quote,
         )
         result["action"] = f"task_topic_{result.get('action', 'inject')}"
         result["slug"] = slug
@@ -1321,6 +1351,7 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
             append_conversation_fyi(
                 cfg, slug, gid, author="system:direct-reply",
                 text=f"Пользователь ответил сессии {session_id} напрямую: {text}",
+                reply_to=quote,
             )
         return result
     # T-0676 items 3/6: isolate this bound topic's record + attendant-read
@@ -1754,20 +1785,27 @@ def handle_update(cfg, update: dict) -> dict:
             # debt (operator ruling, see `compose_light_envelope`): here he is
             # ANSWERING a question the session asked him, and nagging it to post
             # "понял" back into his thread is this branch's harm inverted.
+            #
+            # T-0780: and it carries WHAT HE WAS ANSWERING. This is the path the
+            # ticket is about — a reply resolved to a session is by definition
+            # an answer to something that session said, and «да» delivered
+            # without the question is a message the session has to guess at.
             reply_sid, reply_text = reply
+            quote = reply_quote.extract(msg)
             block = ""
             if str(reply_text or "").strip():
                 block = tg_direct_reply.compose_light_envelope(
                     text=reply_text, chat_id=chat_id, thread_id=thread_id,
                     sid=reply_sid, sender=_sender_display_name(msg.get("from") or {}),
-                    origin="reply",
+                    origin="reply", quote=quote,
                 )
             # Empty text keeps the OLD path deliberately: an envelope is never
             # empty, so wrapping unconditionally would turn the "нечего
             # передавать (пустой текст)" refusal into a header delivered with no
             # body — a silent success where there used to be a loud failure.
             result = _handle_reply(cfg, chat_id, reply_sid, reply_text,
-                                   thread_id=thread_id, gid=gid, block_text=block)
+                                   thread_id=thread_id, gid=gid, block_text=block,
+                                   quote=quote)
         else:  # group/topic voice
             from bot_squad_worker import voice_intake as _vi
             r = _vi.process_voice(cfg, chat_slug, msg, ts=_msg_ts(msg))
@@ -1817,7 +1855,7 @@ def _msg_ts(msg: dict) -> str:
 
 def _handle_reply(
     cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = None, gid: str = "",
-    block_text: str = "",
+    block_text: str = "", quote: Optional[dict] = None,
 ) -> dict:
     """Find the pane by SID and inject the text; on failure, DON'T drop it.
 
@@ -1841,6 +1879,12 @@ def _handle_reply(
     is required to have one: the conversation store is keyed
     ``(slug, global_user_id)``, so an unrecognized sender has no thread to fall
     back INTO.
+
+    ``quote`` (T-0780) rides along for the FALLBACK's sake — the injected
+    ``block_text`` already carries it when there is one. An attendant picking
+    up a message aimed at a session that has since been reaped is the reader
+    who needs the question MOST: it holds none of the dead session's context,
+    so a bare «да» in its thread is unanswerable without it.
     """
     from bot_squad_worker import actions as A
     verb, payload = (
@@ -1855,6 +1899,7 @@ def _handle_reply(
     except A.ActionError as e:
         fb = _fallback_undelivered(
             cfg, chat_id, sid, text, gid=gid, thread_id=thread_id, error=str(e),
+            quote=quote,
         )
         out = {"sid": sid, "error": str(e)}
         out.update(fb)  # carries `ok` + `action` for both outcomes
@@ -1870,7 +1915,7 @@ _UNDELIVERED_AUTHOR = "system:undelivered"
 
 def _fallback_undelivered(
     cfg, chat_id: str, sid: str, text: str, *, gid: str = "",
-    thread_id: Any = None, error: str = "",
+    thread_id: Any = None, error: str = "", quote: Optional[dict] = None,
 ) -> dict:
     """Hand a message we could not deliver to ``sid`` to that project's
     user-conversation attendant, and tell the sender what happened.
@@ -1884,7 +1929,9 @@ def _fallback_undelivered(
     2. The user's ORIGINAL text, ``author="user"``. Unprefixed and unedited:
        the whole point of the store is that it holds what he actually said, so
        the system's account of the situation belongs in record 1, not stapled
-       onto his words.
+       onto his words. T-0780 puts the quoted original on THIS record, as the
+       structured ``reply_to`` field — it belongs to his message, and it is
+       still not stapled onto his text, for the same reason.
 
     Deliberately THREADLESS. The sender may have been writing in a forum topic
     bound to a DIFFERENT project (the live incident exactly: a watchrobot
@@ -1937,11 +1984,14 @@ def _fallback_undelivered(
         "direction": "in",
     })
     message_ref = _now_iso()
-    recorded = _post_conversation(cfg, slug, gid, {
+    user_record = {
         "author": "user",
         "text": body,
         "timestamp": message_ref,
-    })
+    }
+    if quote:
+        user_record["reply_to"] = quote
+    recorded = _post_conversation(cfg, slug, gid, user_record)
     if not recorded:
         _notify(
             cfg, chat_id,

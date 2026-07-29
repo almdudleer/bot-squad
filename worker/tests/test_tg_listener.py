@@ -1971,9 +1971,15 @@ def test_handle_topic_bound_session_id_records_fyi_to_attendant_thread(tmp_path,
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True})
     fyi_calls = []
+    # T-0780 added the `reply_to` kwarg (the quoted original, when the message
+    # was a reply). The stub takes it so it stays a faithful mirror of the real
+    # signature — a `**kwargs` catch-all here would let the next kwarg drift in
+    # unnoticed, which is what this double is meant to guard against.
     monkeypatch.setattr(TL, "append_conversation_fyi",
-                        lambda cfg, slug, gid, *, author, text: fyi_calls.append(
-                            {"slug": slug, "gid": gid, "author": author, "text": text}
+                        lambda cfg, slug, gid, *, author, text, reply_to=None:
+                        fyi_calls.append(
+                            {"slug": slug, "gid": gid, "author": author,
+                             "text": text, "reply_to": reply_to}
                         ))
 
     msg = _topic_msg("looks good, ship it", chat_id=111, thread_id=42)
@@ -1989,6 +1995,8 @@ def test_handle_topic_bound_session_id_records_fyi_to_attendant_thread(tmp_path,
     assert call["author"] == "system:direct-reply"
     assert "S-dev-p9" in call["text"]
     assert "looks good, ship it" in call["text"]
+    # T-0780: this message was not a reply, so there is no quoted original.
+    assert call["reply_to"] is None
 
 
 def test_handle_topic_bound_session_id_falls_back_on_inject_failure(tmp_path, monkeypatch):

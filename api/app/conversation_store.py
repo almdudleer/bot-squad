@@ -173,6 +173,58 @@ def author_class(author: str) -> str:
     return a.partition(":")[0] if is_valid_author(a) else ""
 
 
+#: Fields a ``reply_to`` may carry. Anything else is dropped rather than
+#: stored: this is the one write path into the store, and a nested blob a
+#: caller can put arbitrary keys into is a schema that stops being one.
+REPLY_TO_FIELDS = ("text", "message_id", "author", "author_name", "fragment")
+
+#: Defensive cap on a quoted original's text. Telegram's own per-message limit
+#: is 4096 characters, so for a TG-origin record this will essentially never
+#: fire — it bounds a NON-TG caller (T-0631 makes this endpoint the intake seam
+#: for every channel), not routine trimming. The worker applies its own,
+#: much tighter cap when rendering a quote into an injected prompt
+#: (``reply_quote.QUOTE_CAP``); the two numbers bound two different things and
+#: are deliberately not shared.
+REPLY_TO_TEXT_CAP = 4096
+
+
+def _sanitize_reply_to(reply_to: Any) -> dict | None:
+    """The stored form of a quoted original, or ``None`` when there is nothing
+    to store. See :func:`append`'s ``reply_to`` paragraph for the design.
+
+    Raises ``ValueError`` on a non-dict, non-``None`` value — a caller passing a
+    bare string means it is about to fold somebody else's words into a record
+    as if they were one blob of the sender's, which is the exact confusion the
+    nested field exists to prevent. Failing loudly at the one write path is what
+    makes that a guarantee rather than a convention (same reasoning as the
+    T-0755 author vocabulary two functions up).
+    """
+    if reply_to is None:
+        return None
+    if not isinstance(reply_to, dict):
+        raise ValueError(
+            f"reply_to must be a dict of {REPLY_TO_FIELDS}, got {type(reply_to).__name__}")
+    out: dict = {}
+    for k in REPLY_TO_FIELDS:
+        if k not in reply_to or reply_to[k] is None:
+            continue
+        v = reply_to[k]
+        if k == "message_id":
+            out[k] = v
+            continue
+        s = str(v)
+        if k == "text" and len(s) > REPLY_TO_TEXT_CAP:
+            s = s[:REPLY_TO_TEXT_CAP]
+            out["truncated"] = True
+        if s:
+            out[k] = s
+    # A quote with no text is not a quote — it is an empty slot that would read
+    # on every consumer as "he replied to something blank".
+    if not out.get("text") and not out.get("fragment"):
+        return None
+    return out
+
+
 def conversations_root(data_dir: Path) -> Path:
     """Root holding every per-(project, user) conversation thread."""
     return Path(data_dir) / "_mothership" / "conversations"
@@ -219,6 +271,7 @@ def append(
     direction: str | None = None,
     delivered: bool = False,
     forwarded_from: str | None = None,
+    reply_to: dict | None = None,
 ) -> dict:
     """Append one message record to the thread; return the stored record.
 
@@ -258,6 +311,26 @@ def append(
     sender's own. Set by ``tg_listener`` via ``echo_guard.classify_inbound``;
     omitted from the stored record when empty, so every record whose sender DID
     compose it stays byte-identical to its pre-T-0746 shape.
+
+    ``reply_to`` (T-0780): the message this one was a REPLY to —
+    ``{text, message_id?, author?, author_name?, fragment?}``, built by
+    ``bot_squad_worker.reply_quote.extract``. A NESTED field, never folded into
+    ``text``, and that is the whole design: the quoted words belong to somebody
+    else (usually to us), so on a record authored ``"user"`` a concatenated
+    quote would be the T-0746 lie — the stakeholder credited with our prose —
+    in the one file whose job is to say what he actually said. Unknown keys are
+    dropped and ``text`` is capped defensively here (see
+    :data:`REPLY_TO_TEXT_CAP`) because this is the one write path into the store
+    and it must not trust a caller. Omitted from the stored record when absent
+    or when it carries no text.
+
+    **An absent ``reply_to`` is NOT evidence that a record was not a reply**, and
+    for that reason it is deliberately NOT defaulted on read the way
+    ``forwarded_from`` and ``direction`` are. Every record written before T-0780
+    dropped the quote at ingestion, so ``setdefault("reply_to", None)`` would
+    assert "this was not a reply" over 1298 historical records, some of which
+    were. That is the explicit-UNKNOWN rule: an absent field must not read as a
+    real negative.
     """
     author = str(author)
     if not is_valid_author(author):
@@ -301,6 +374,9 @@ def append(
         record["general_feed"] = True
     if forwarded_from:
         record["forwarded_from"] = str(forwarded_from)
+    quoted = _sanitize_reply_to(reply_to)
+    if quoted:
+        record["reply_to"] = quoted
     p = conv_path(data_dir, slug, global_user_id, thread_id)
     line = json.dumps(record, ensure_ascii=False)
     with _append_lock:

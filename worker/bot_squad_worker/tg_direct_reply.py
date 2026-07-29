@@ -90,6 +90,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from bot_squad_worker import reply_quote
+
 log = logging.getLogger(__name__)
 
 # How much of his text the reminder quotes back. The envelope carries the whole
@@ -150,18 +152,27 @@ def reply_command(chat_id: Any, thread_id: Any) -> str:
 
 def compose_envelope(
     *, text: str, chat_id: Any, thread_id: Any, sid: str, slug: str = "",
-    ticket_id: str = "", sender: str = "",
+    ticket_id: str = "", sender: str = "", quote: Any = None,
 ) -> str:
     """The injected message: provenance + his words + the reply contract.
 
     Deliberately ONE block delivered as ONE composer submission (see the module
     docstring). His words are fenced rather than prefixed — the T-0746 lesson
     is that system prose mixed into a human's line makes the two
-    indistinguishable, and here the session has to quote him back accurately."""
+    indistinguishable, and here the session has to quote him back accurately.
+
+    ``quote`` (T-0780): the message he was REPLYING TO, as
+    ``reply_quote.extract`` returns it — rendered ahead of his own words so the
+    block reads question-then-answer, which is the order that makes «второй
+    вариант» mean something. ``None`` (he was not replying to anything) leaves
+    the envelope byte-identical to its pre-T-0780 form. It is rendered by
+    ``reply_quote.render_block``, whose labelling is what keeps somebody else's
+    words from reading as his."""
     who = sender.strip() or "the stakeholder"
     where = f"chat {chat_id}, forum topic {thread_id}"
     tags = " · ".join(x for x in (slug, ticket_id) if x)
     body = str(text or "")
+    quoted = reply_quote.render_block(quote)
     return "\n".join([
         f"📨 TELEGRAM — {who.upper()} WROTE TO YOU. AN ANSWER IS OWED IN THAT TOPIC.",
         "",
@@ -171,6 +182,7 @@ def compose_envelope(
         "          came straight here instead of through the project's",
         "          user-conversation attendant.",
         f"Session : {sid}",
+        *(["", *quoted] if quoted else []),
         "",
         "His message, verbatim:",
         "--- 8< ---",
@@ -208,7 +220,7 @@ def answer_route(chat_id: Any, thread_id: Any) -> str:
 
 def compose_light_envelope(
     *, text: str, chat_id: Any, thread_id: Any, sid: str, sender: str = "",
-    origin: str = "reply",
+    origin: str = "reply", quote: Any = None,
 ) -> str:
     """Provenance WITHOUT a debt — the two sibling paths of T-0773.
 
@@ -247,11 +259,19 @@ def compose_light_envelope(
     line transport. That measurement is the reason this ticket exists at all:
     both paths were already splitting his multi-line messages line by line,
     envelope or no envelope.
+
+    ``quote`` (T-0780): the message being replied to. THIS path is where it
+    matters most — ``origin="reply"`` means he is answering a question the
+    session asked him, so «да» is the entire message and the question it
+    answers was, until now, nowhere in what the session received. ``None``
+    leaves the envelope byte-identical to its pre-T-0780 form, which is always
+    the case for ``origin="say"`` (``/say`` is composed, not a reply).
     """
     who = sender.strip() or "the stakeholder"
     where = (f"chat {chat_id}, forum topic {thread_id}" if thread_id is not None
              else f"chat {chat_id} (direct message)")
     body = str(text or "")
+    quoted = reply_quote.render_block(quote)
     if origin == "say":
         head = f"📨 TELEGRAM — {who.upper()} SENT THIS STRAIGHT INTO YOUR SESSION."
         why = [
@@ -281,6 +301,7 @@ def compose_light_envelope(
         f"Where   : {where}",
         *why,
         f"Session : {sid}",
+        *(["", *quoted] if quoted else []),
         "",
         "Their message, verbatim:",
         "--- 8< ---",

@@ -587,7 +587,16 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     purpose) rather than a genuine DM/non-topic message — the two are
     otherwise indistinguishable once ``thread_id`` is ``None`` either way.
     Optional; defaults to ``False``, byte-identical to every pre-T-0693
-    caller."""
+    caller.
+
+    ``reply_to`` (T-0780): the message this one REPLIED to, as
+    ``{text, message_id?, author?, author_name?, fragment?}`` — a nested object
+    and never text folded into ``text``, because the quoted words are somebody
+    else's (see ``conversation_store.append`` and
+    ``bot_squad_worker.reply_quote``). Optional; a non-dict value is a 400, and
+    unknown keys inside it are dropped. Absence means "not stated", NEVER "this
+    was not a reply" — every record written before T-0780 lost the quote at
+    ingestion."""
     _authenticate_worker(request)
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
@@ -612,10 +621,11 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
             direction=direction,
             delivered=delivered,
             forwarded_from=payload.get("forwarded_from"),
+            reply_to=payload.get("reply_to"),
         )
     except ValueError as e:
         # An unsafe slug / global_user_id segment, an author outside the
-        # T-0755 vocabulary, or an unknown direction.
+        # T-0755 vocabulary, an unknown direction, or a non-dict `reply_to`.
         raise HTTPException(status_code=400, detail=str(e))
 
     relayed = False

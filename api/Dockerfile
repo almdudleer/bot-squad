@@ -13,6 +13,15 @@ COPY web/ ./
 # the file has to live at /scripts/install/ — sibling to /web — for the
 # docker build to match local-dev layout.
 COPY scripts/install /scripts/install
+# T-0776: `npm run build` is `tsc -b && vite build`, and web/tsconfig.json
+# includes ALL of src/ — test files too. apiShapeContract.test.ts (T-0764)
+# imports the response-shape pin as `../../api/response_shapes.json`, which
+# from /web/src resolves to /api/ — so the pin has to live there, sibling to
+# /web, for the same reason scripts/install does above. Without it tsc fails
+# TS2307 and the whole deploy dies at the build, which is exactly what
+# happened on the 62d8073 batch. The vitest run never catches this: outside
+# docker the real api/ is simply there.
+COPY api/response_shapes.json /api/response_shapes.json
 RUN npm run build
 
 FROM python:3.12-slim AS api

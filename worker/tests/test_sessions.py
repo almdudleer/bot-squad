@@ -4158,14 +4158,19 @@ def test_session_history_ts_preserved_on_api_patch_roundtrip(tmp_path):
 
     # The API writer lives in the api package; import lazily so this worker test
     # only exercises it when both packages are importable.
-    pytest.importorskip("app.markdown_writer")
+    #
+    # T-0789: that skip used to lift NOWHERE — not the worker venv run, not the
+    # lint job, not the (inert, worker[dev]-only) nightly, not a verify-isolated
+    # extract — so this cross-tree contract had zero coverage while reading as a
+    # harmless "+1 skipped". The lint job now installs both trees and sets
+    # BOT_SQUAD_REQUIRE_CROSS_TREE=1, under which an unimportable `app` is a
+    # LOUD failure instead of a skip. Same reasoning as T-0749's api/worker
+    # store gate: a skip is not coverage.
+    if os.environ.get("BOT_SQUAD_REQUIRE_CROSS_TREE") != "1":
+        pytest.importorskip("app.markdown_writer")
     from app.markdown_writer import merge_task_update
     merge_task_update(task_md, {"status": "in_progress"})
     assert _read_task_session_history_ts(task_md) == {"S-alice-w-p2": "2026-06-21T01:00:00Z"}
-
-    # Re-bind same SID — still no dup.
-    bind_task(cfg, "test-project", "S-alice-w-p2", "T-0096")
-    assert _read_task_session_history(extra_md) == ["S-alice-w-p2"]
 
 
 # ---------------------------------------------------------------------------

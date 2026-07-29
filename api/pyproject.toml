@@ -20,6 +20,11 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    # T-0789: the undefined-name gate (scripts/lint/undefined_names.py) and its
+    # unit test. Lives in api's dev extra because the lint CI job already does
+    # `pip install -e api[dev]` — no second install step — and NOT in the shared
+    # worker venv, which agents must not mutate.
+    "pyflakes>=3.2",
 ]
 
 [tool.pytest.ini_options]

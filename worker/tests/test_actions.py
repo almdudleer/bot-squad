@@ -1031,6 +1031,29 @@ def test_max_notify_no_chat_and_no_default_raises(tmp_config_dir, monkeypatch):
 # install has [max].default_chat_id (TG is DPI-blocked here); TG is the fallback.
 # ---------------------------------------------------------------------------
 
+class _RecordingBoomTg:
+    """A TG client that RECORDS each send and then fails the way a DPI-block
+    does — the double for every "TG is down, fail over to MAX" test.
+
+    The record is the point. ``_send_stakeholder_dm`` swallows exceptions from
+    the tg client BY DESIGN, so ``out["channel"] == "max"`` is equally true when
+    the double was never reached at all: T-0789 found
+    ``test_send_stakeholder_dm_link_present_via_max_transport_too`` passing
+    because its monkeypatch lambda referenced an out-of-scope name, and the
+    resulting NameError was caught as the TG failure the test wanted. A tripwire
+    that only RAISES cannot discriminate inside that try/except; ``calls`` can.
+    Assert on it, not on the channel alone.
+    """
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.calls: list[dict] = []
+        self._exc = exc or RuntimeError("tg DPI-block / ConnectTimeout")
+
+    def send(self, **kw):
+        self.calls.append(kw)
+        raise self._exc
+
+
 def _inject_both_channels(monkeypatch, tmp_config_dir, max_client=None):
     import bot_squad_worker.actions as A
     cfg = Config.load(tmp_config_dir)
@@ -4182,15 +4205,17 @@ def test_send_stakeholder_dm_failover_to_max_on_tg_error(tmp_config_dir, monkeyp
     reserve instead of losing the page."""
     import bot_squad_worker.actions as A
 
-    class _BoomTg:
-        def send(self, **kw):
-            raise RuntimeError("tg DPI-block / ConnectTimeout")
-
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
-    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())
+    # T-0789: was a `_BoomTg` class defined locally here, which
+    # test_send_stakeholder_dm_link_present_via_max_transport_too further down
+    # this file referenced out of scope. Hoisted to _RecordingBoomTg so there is
+    # one failing-TG double and no shadowing name to reference by accident.
+    boom_tg = _RecordingBoomTg()
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: boom_tg)
     out = A._send_stakeholder_dm(A._get_config(), message="hi", sid="S-x-p1", tg_chat_id="-100")
     assert out["channel"] == "max" and out["sent"] is True
+    assert len(boom_tg.calls) == 1  # the failover was driven by THIS double
     assert len(fake_max.calls) == 1
 
 
@@ -4427,10 +4452,17 @@ def test_send_stakeholder_dm_link_present_via_max_transport_too(tmp_config_dir, 
     import bot_squad_worker.actions as A
     _config_dir_with_max_default(tmp_config_dir, "MAXCHAT99")
     _, _, fake_max = _inject_both_channels(monkeypatch, tmp_config_dir)
-    monkeypatch.setattr(A, "_get_tg_client", lambda _c: _BoomTg())
+    boom_tg = _RecordingBoomTg()
+    monkeypatch.setattr(A, "_get_tg_client", lambda _c: boom_tg)
     out = A._send_stakeholder_dm(A._get_config(), message=_oversize_page("Заголовок. "),
                                   sid="S-x-p1", tg_chat_id="-100")
     assert out["channel"] == "max"
+    # T-0789: `_BoomTg` was undefined at this line — a class local to the
+    # T-0610 test above — so the lambda raised NameError, _send_stakeholder_dm
+    # caught it as a TG failure, and `channel == "max"` passed for the wrong
+    # reason. This asserts the failover was driven by the tg double actually
+    # being invoked and actually failing, which the channel alone cannot show.
+    assert len(boom_tg.calls) == 1
     assert len(fake_max.calls) > 1
     assert ("https://staging.example.com/p/test-project/sessions?sid=S-x-p1"
             in fake_max.calls[-1]["text"])

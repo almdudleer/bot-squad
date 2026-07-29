@@ -55,9 +55,22 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e api[dev]
+      - name: No undefined names in the test trees (T-0789)
+        # ~1s pyflakes scan of worker/tests + api/tests + scripts, filtered to
+        # the undefined-name family. It is HERE, on every push, because an
+        # undefined name in a test never fails loudly: T-0789 found one sitting
+        # behind an importorskip that lifted nowhere, and a second one whose
+        # NameError _send_stakeholder_dm caught as the very TG failure the test
+        # was simulating — so the test was green BECAUSE of the bug in itself.
+        # Running the suite cannot find either. Measured at 28abd2a: 4 hits,
+        # both defects, no false positives (the 71 unused-import/unused-local
+        # findings are deliberately not in scope — see the script's docstring).
+        # pyflakes arrives with api[dev] installed above.
+        run: |
+          python3 scripts/lint/undefined_names.py
       - name: Run lint script unit tests
         run: |
-          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py tests/test_role_doc_pointers_lint.py -x -q
+          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py tests/test_role_doc_pointers_lint.py tests/test_undefined_names_lint.py -x -q
       - name: Worker /api paths resolve against the mounted routes (T-0775)
         # Cross-directory invariant: it reads worker/ source and builds the api
         # app, so it needs BOTH trees — which is exactly why it lives here and
@@ -109,3 +122,27 @@ jobs:
         # comparable and this layer is.
         run: |
           cd api && pytest tests/test_relay_destination_differential.py -x -q
+      - name: The api's PATCH preserves the worker's session-history ts map (T-0789)
+        # Fifth cross-directory invariant, and the same failure class as the
+        # T-0749 step above: the api writing a file whose format the worker owns.
+        # `merge_task_update` must copy `session_history_ts` — an
+        # existing-but-unlisted frontmatter key holding each SID's first-touch
+        # timestamp — through an operator PATCH verbatim. Drop it and every
+        # session's first-touch time on that task is silently gone; no import
+        # and no type check sees it.
+        #
+        # The test lives in worker/tests/test_sessions.py and guards itself with
+        # `pytest.importorskip("app.markdown_writer")`, because a worker-only
+        # venv cannot import the api. T-0789 MEASURED where that skip lifted:
+        # nowhere. Not the worker venv run (it is one of the 3 skips every dev
+        # reports), not this job before now (it ran only named files), not the
+        # nightly (worker[dev] only, so `app` is not importable there either,
+        # and it is inert per T-0738), not a verify-isolated extract.
+        #
+        # BOT_SQUAD_REQUIRE_CROSS_TREE=1 turns that skip into a hard ImportError
+        # here, so this step cannot go quietly uncovered the way the test did:
+        # if `app` ever stops being importable in this job the step goes RED
+        # rather than green-with-a-skip. `-rs` prints the reason for any skip.
+        run: |
+          cd worker && PYTHONPATH=. BOT_SQUAD_REQUIRE_CROSS_TREE=1 pytest \
+            "tests/test_sessions.py::test_session_history_ts_preserved_on_api_patch_roundtrip" -x -q -rs

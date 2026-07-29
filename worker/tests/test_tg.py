@@ -858,3 +858,79 @@ def test_render_transcript_echo_reserve_accounts_for_the_sid_prefix():
     assert len(render_transcript_echo(transcript, prefix=prefix, quote=False)) == 1
     assert len(render_transcript_echo(transcript, prefix=prefix, quote=False,
                                       reserve=len("[voice_intake] "))) > 1
+
+
+# ---------------------------------------------------------------------------
+# msg_text — his own typed words, wherever Telegram put them (T-0786)
+#
+# Every test in this block is a RED PIN against b7182ec: `tg.msg_text` does not
+# exist there, and nothing in the worker package read `msg["caption"]` for the
+# INBOUND message at all (the one `caption` read was `reply_quote.extract`,
+# which reads the QUOTED message's).
+# ---------------------------------------------------------------------------
+
+_HIS_WORDS = "вот скрин, посмотри"
+
+
+def test_msg_text_reads_a_photo_caption():
+    """THE defect. Telegram puts the words typed with a picture in `caption`,
+    so a photo-with-caption message has no `text` key at all."""
+    from bot_squad_worker.tg import msg_text
+    assert msg_text({"photo": [{"file_id": "F"}], "caption": _HIS_WORDS}) == _HIS_WORDS
+
+
+def test_msg_text_prefers_text_over_caption():
+    """THE PRECEDENCE DECISION, pinned rather than left to accident. Telegram
+    never populates both on one message, so no real payload can distinguish the
+    orders — which is exactly why the choice has to be written down."""
+    from bot_squad_worker.tg import msg_text
+    assert msg_text({"text": "typed", "caption": "captioned"}) == "typed"
+
+
+def test_msg_text_agrees_with_reply_quote_on_the_same_message():
+    """WHY that precedence and not the other: `reply_quote.extract` already
+    reads text-then-caption for the message being ANSWERED. One message read as
+    "what he just said" and as "what he was answering" must not yield two
+    different strings."""
+    from bot_squad_worker import reply_quote
+    from bot_squad_worker.tg import msg_text
+    msg = {"photo": [{"file_id": "F"}], "caption": _HIS_WORDS}
+    quote = reply_quote.extract({"text": "ok", "reply_to_message": dict(msg)})
+    assert msg_text(msg) == quote["text"] == _HIS_WORDS
+
+
+def test_msg_text_with_neither_field_is_empty_never_a_marker():
+    """ABSENT STAYS ABSENT (the T-0761/T-0780 house rule). This value is written
+    into records authored `user`; a placeholder string there would be inventing
+    words he never typed — the T-0746 defect, from the other direction."""
+    from bot_squad_worker.tg import msg_text
+    assert msg_text({"photo": [{"file_id": "F"}]}) == ""
+    assert msg_text({}) == ""
+
+
+def test_msg_text_empty_caption_stays_empty():
+    """A photo he sent WITHOUT typing anything is not a caption we lost."""
+    from bot_squad_worker.tg import msg_text
+    assert msg_text({"photo": [{"file_id": "F"}], "caption": ""}) == ""
+
+
+def test_msg_text_junk_degrades_instead_of_raising():
+    """DEFENSIVE COERCION: this runs on the inbound routing path and
+    `append_conversation`'s callers do NOT wrap it. A junk caption must cost the
+    words, never the whole message."""
+    from bot_squad_worker.tg import msg_text
+    assert msg_text({"caption": 12345}) == "12345"
+    assert msg_text({"caption": ["a", "b"]}) == "['a', 'b']"
+    assert msg_text(None) == ""
+    assert msg_text("not-a-message") == ""
+
+
+def test_msg_text_is_byte_identical_for_a_plain_text_message():
+    """GREEN-EQUIVALENT REGRESSION GUARD (it can only run post-fix, since the
+    function is new, but the property it pins is the pre-fix behaviour): for
+    every message without a caption this must equal the `msg.get("text") or ""`
+    it replaces, falsy values included."""
+    from bot_squad_worker.tg import msg_text
+    for msg in ({"text": "hello"}, {"text": ""}, {"text": None}, {},
+                {"text": "0"}, {"voice": {"file_id": "V"}}):
+        assert msg_text(msg) == (msg.get("text") or "")

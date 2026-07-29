@@ -331,11 +331,21 @@ def extract_reply_target(message: dict, cfg: Any = None) -> Optional[tuple[str, 
 
     ``cfg`` is optional so the pure-parse contract (and its callers/tests)
     still holds when there's no data dir on hand; without it only step 2 runs.
+
+    T-0786: the returned ``text`` is ``tg.msg_text`` — the reply's ``text`` OR
+    its media ``caption``. This is the SAME defect the ticket is about, on the
+    fifth carrier, found by re-scanning the file rather than stopping at the
+    four the ticket names: replying to a session's message with a photo and
+    «вот это» returned ``(sid, "")``, and `_handle_reply` then refused it as
+    «нечего передавать (пустой текст)» — his words were not merely recorded
+    empty here, they were never delivered at all. Only the REPLY's own words
+    change; the quoted message is still read by `reply_quote`, which has always
+    handled captions.
     """
     reply_to = message.get("reply_to_message")
     if not reply_to:
         return None
-    text = message.get("text", "").strip()
+    text = _tg.msg_text(message).strip()
 
     data_dir = getattr(cfg, "data_dir", None)
     if data_dir is not None:
@@ -604,6 +614,15 @@ def append_conversation(
     are somebody else's (usually OURS), and folding them into a record authored
     ``"user"`` is precisely the T-0746 defect. See ``reply_quote``.
 
+    HIS WORDS, WHEN HE TYPED THEM WITH A PICTURE (T-0786). ``text`` now comes
+    from ``tg.msg_text``, which reads a media ``caption`` when there is no
+    ``text``. This record used to store ``text: ""`` for every captioned photo,
+    so the durable thread — the one "we can always look up" (voice-04) — kept
+    the attachment descriptor and lost the sentence explaining what it was for.
+    Nothing else about the record changes: a caption IS the sender's own words,
+    so reading it keeps ``author="user"`` honest, and no placeholder is ever
+    substituted when he genuinely typed nothing.
+
     Best-effort + env-gated: returns ``None`` (no-op, no HTTP) when there's no
     ``global_user_id``, or the API base / worker token aren't configured — so a
     record failure NEVER blocks inbound routing. Returns ``True`` on a recorded
@@ -612,7 +631,7 @@ def append_conversation(
     verdict = echo_guard.classify_inbound(cfg, msg)
     payload = {
         "author": verdict["author"],
-        "text": msg.get("text") or "",
+        "text": _tg.msg_text(msg),
         "attachments": _msg_attachments(msg),
         "timestamp": _msg_ts(msg),
     }
@@ -1364,7 +1383,13 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     slug = binding["slug"]
     session_id = binding.get("session_id")
     if session_id:
-        text = msg.get("text") or ""
+        # T-0786: `tg.msg_text`, not `msg["text"]`. A photo's caption is where
+        # Telegram puts the words he typed with it, and this one `text` feeds
+        # ALL THREE writers below — the envelope's verbatim fence, the
+        # answer-owed ledger (so the T-0770 reminder stopped quoting «» back at
+        # the session), and the `system:direct-reply` FYI record whose line
+        # ended at the colon with nothing after it.
+        text = _tg.msg_text(msg)
         thread_id = msg.get("message_thread_id")
         # T-0770: the session gets his words INSIDE an envelope that says who
         # wrote them, where they arrived, and what command answers back into
@@ -1378,10 +1403,13 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         # session's own last post in that topic, most often — and until now the
         # quoted original was dropped on this path too. `quote` is None for the
         # ordinary un-replied message, leaving that envelope unchanged.
-        # T-0785: and WHAT ARRIVED WITH IT. `text` is empty for a photo, so
-        # until now a photo sent into a task topic woke the session with an
-        # envelope whose verbatim fence was empty — not "he sent a photo", not
-        # a marker, nothing to react to. The descriptor is the one T-0782
+        # T-0785: and WHAT ARRIVED WITH IT. `text` is empty for an UNCAPTIONED
+        # photo (T-0786 now reads a caption when there is one), so until then a
+        # photo sent into a task topic woke the session with an envelope whose
+        # verbatim fence was empty — not "he sent a photo", not a marker,
+        # nothing to react to. That is still the case for a photo he sent
+        # without typing anything, which is why the mention below is NOT made
+        # redundant by the caption fix. The descriptor is the one T-0782
         # already writes for the durable record (type + file_id, or type + a
         # named PHOTO_UNKNOWN_* reason); this only MENTIONS it. No download
         # path exists behind a photo, so the session still cannot look at the

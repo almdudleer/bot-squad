@@ -263,10 +263,17 @@ def classify_inbound(cfg: Any, msg: dict, *, chat_id: Any = None) -> dict:
                        reason="forward-origin")
             return out
         provenance = forward_provenance(msg)
+        # T-0786: the SAME string `append_conversation` is about to store —
+        # `tg.msg_text` reads a media caption when there is no text. Reading a
+        # different one here would leave rung 2 structurally blind to every
+        # captioned message: our own words relayed back as a photo caption
+        # would be recorded `author="user"`, which is the exact failure this
+        # module exists to prevent, just arriving through a media message.
+        from bot_squad_worker import tg as _tg
         match = recent_send_match(
             cfg,
             chat_id=chat_id if chat_id is not None else (msg.get("chat") or {}).get("id"),
-            text=msg.get("text") or "",
+            text=_tg.msg_text(msg),
         )
         if match is not None:
             out.update(author=ECHO_AUTHOR, forwarded_from=ECHO_ORIGIN,

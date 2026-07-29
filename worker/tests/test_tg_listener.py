@@ -4252,3 +4252,227 @@ def test_append_conversation_survives_a_broken_echo_guard(tmp_path, monkeypatch)
 
     assert ok is True
     assert captured["json"]["author"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# T-0786 — a photo CAPTION is his own typed words, and every inbound reader
+# asked only for `msg["text"]`.
+#
+# Reproduced against b7182ec on the FULL inbound path (`handle_update`), not on
+# the helpers: the task-topic envelope's verbatim fence came out '', the
+# answer-owed ledger stored text='' so the T-0770 reminder quoted «» back at the
+# session, the `system:direct-reply` FYI line ended at its colon, and the
+# durable store recorded text: '' on both the bound-topic and DM paths. Each
+# run below is paired with the plain-TEXT control that discriminated.
+# ---------------------------------------------------------------------------
+
+_T0786_WORDS = "вот скрин, посмотри"
+
+
+def _photo_msg_with_caption(caption, *, chat_id=111, thread_id=42):
+    """A real photo-with-caption message: no `text` key exists at all."""
+    msg = _topic_msg(None, chat_id=chat_id, thread_id=thread_id)
+    del msg["text"]
+    msg["photo"] = _photo_variants()
+    if caption is not None:
+        msg["caption"] = caption
+    return msg
+
+
+def _bound_session_probe(tmp_path, monkeypatch, *, thread_id=42):
+    """Wire the session-bound task topic and capture all three of its writers."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", thread_id, "beta",
+                            ticket_id="T-0786", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    seen = {"injected": [], "fyi": []}
+    monkeypatch.setattr(A, "dispatch", lambda name, params: (
+        seen["injected"].append((name, params)) or {"ok": True}))
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda c, s, g, *, author, text, reply_to=None: (
+                            seen["fyi"].append({"author": author, "text": text}) or True))
+    return cfg, seen
+
+
+def _fence(envelope):
+    """Only the verbatim fence — scoped to the thing under test (T-0777), so a
+    caption appearing in a header could never pass this for the wrong reason."""
+    assert "--- 8< ---" in envelope, envelope
+    return envelope.split("--- 8< ---", 1)[1].split("--- >8 ---", 1)[0].strip("\n")
+
+
+def test_photo_caption_reaches_the_session_verbatim(tmp_path, monkeypatch):
+    """RED PIN. The words that say what the picture is FOR, delivered into the
+    session's composer — measured '' at b7182ec through this exact path."""
+    cfg, seen = _bound_session_probe(tmp_path, monkeypatch)
+    result = TL.handle_update(cfg, {"update_id": 1,
+                                    "message": _photo_msg_with_caption(_T0786_WORDS)})
+
+    assert result["action"] == "task_topic_inject"
+    assert _fence(seen["injected"][0][1]["text"]) == _T0786_WORDS
+
+
+def test_photo_caption_control_plain_text_delivers_identically(tmp_path, monkeypatch):
+    """THE CONTROL that makes the pin above a reading and not a blind
+    instrument: the same words typed as ordinary text reach the same fence.
+    GREEN at b7182ec — it is the working half."""
+    cfg, seen = _bound_session_probe(tmp_path, monkeypatch)
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _topic_msg(_T0786_WORDS, chat_id=111, thread_id=42)})
+
+    assert _fence(seen["injected"][0][1]["text"]) == _T0786_WORDS
+
+
+def test_photo_caption_lands_in_the_answer_owed_ledger(tmp_path, monkeypatch):
+    """RED PIN, writer 2 of 4. `record_owed` stored text='' for a captioned
+    photo, so T-0770's re-drive nagged the session with `He wrote: «»` — a
+    reminder quoting nothing at all."""
+    from bot_squad_worker import tg_direct_reply
+    cfg, _seen = _bound_session_probe(tmp_path, monkeypatch)
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _photo_msg_with_caption(_T0786_WORDS)})
+
+    owed = list(tg_direct_reply.load(cfg).values())
+    assert len(owed) == 1 and owed[0]["text"] == _T0786_WORDS
+    reminder = tg_direct_reply.compose_reminder(owed[0], attempt=1, attempts_left=1)
+    assert f"«{_T0786_WORDS}»" in reminder and "«»" not in reminder
+
+
+def test_photo_caption_lands_in_the_direct_reply_fyi_record(tmp_path, monkeypatch):
+    """RED PIN, writer 3 of 4. The attendant's context line read «Пользователь
+    ответил сессии … напрямую: » with nothing after the colon."""
+    cfg, seen = _bound_session_probe(tmp_path, monkeypatch)
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _photo_msg_with_caption(_T0786_WORDS)})
+
+    assert len(seen["fyi"]) == 1
+    rec = seen["fyi"][0]
+    assert rec["text"].endswith(f"напрямую: {_T0786_WORDS}")
+    # T-0746 stays in force: the system prose around his words keeps the
+    # `system:` authorship it has always had. Reading a caption changes WHOSE
+    # words are quoted, never who the record says wrote the line.
+    assert rec["author"] == "system:direct-reply"
+
+
+def test_photo_caption_is_recorded_in_the_durable_store(tmp_path, monkeypatch):
+    """RED PIN, writer 4 of 4 — the store record, driven through
+    `append_conversation` itself so the payload is read as sent."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    msg = {"from": _from(), "date": 1750000000,
+           "photo": _photo_variants(), "caption": _T0786_WORDS}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    body = captured["json"]
+    assert body["text"] == _T0786_WORDS
+    # His own words, so the authorship is unchanged and NOTHING synthetic is
+    # stapled on — the record says exactly what he typed and what arrived.
+    assert body["author"] == "user"
+    assert body["attachments"] == [{"type": "photo", "file_id": "FULL_1280"}]
+
+
+def test_uncaptioned_photo_still_records_empty_text(tmp_path, monkeypatch):
+    """GREEN REGRESSION GUARD, not a defect pin — passes at b7182ec too. A photo
+    sent with nothing typed is not a caption we lost: the record stays empty
+    rather than gaining a marker. That "he sent a photo" is stated by the
+    ATTACHMENT descriptor (T-0782/T-0785), where a fact about the image
+    belongs."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc",
+                               {"from": _from(), "date": 1750000000,
+                                "photo": _photo_variants()})
+
+    assert captured["json"]["text"] == ""
+    assert captured["json"]["attachments"] == [{"type": "photo", "file_id": "FULL_1280"}]
+
+
+def test_plain_text_record_is_unchanged_by_caption_support(tmp_path, monkeypatch):
+    """GREEN REGRESSION GUARD. The overwhelming common case must be
+    byte-identical to before: an ordinary typed message has no caption, so this
+    reads exactly what `msg.get("text") or ""` read."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc",
+                               {"from": _from(), "date": 1750000000, "text": "deploy please"})
+
+    assert captured["json"]["text"] == "deploy please"
+    assert captured["json"]["attachments"] == []
+
+
+def test_bound_project_topic_records_the_caption_full_path(tmp_path, monkeypatch):
+    """RED PIN — the store record via the FULL inbound path this time (a bound
+    project topic with no session_id), so the fix is pinned at the seam it
+    ships through and not only at the function."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 43, "beta")      # no session_id
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    posted = []
+    monkeypatch.setattr(TL, "_post_conversation",
+                        lambda c, s, g, payload: (posted.append(payload) or True))
+
+    msg = _photo_msg_with_caption(_T0786_WORDS, thread_id=43)
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "route_bound_topic"
+    assert [p["text"] for p in posted] == [_T0786_WORDS]
+
+
+def test_extract_reply_target_reads_a_photo_caption():
+    """RED PIN — the FIFTH carrier, found by re-scanning the file rather than
+    stopping at the four the ticket names. A reply to a session's message with a
+    photo + «вот это» returned (sid, ''), and `_handle_reply` then refused it as
+    «нечего передавать (пустой текст)»: not recorded-empty, never delivered."""
+    msg = {"message_id": 200, "chat": {"id": 111, "type": "private"},
+           "photo": _photo_variants(), "caption": _T0786_WORDS,
+           "reply_to_message": {"message_id": 100,
+                                "text": "[S-dev-p9] needs your input — waiting"}}
+    assert TL.extract_reply_target(msg) == ("S-dev-p9", _T0786_WORDS)
+
+
+def test_extract_reply_target_plain_text_unchanged():
+    """GREEN REGRESSION GUARD for the same seam."""
+    msg = {"message_id": 200, "chat": {"id": 111, "type": "private"},
+           "text": _T0786_WORDS,
+           "reply_to_message": {"message_id": 100,
+                                "text": "[S-dev-p9] needs your input — waiting"}}
+    assert TL.extract_reply_target(msg) == ("S-dev-p9", _T0786_WORDS)
+
+
+def test_a_slash_command_in_a_caption_is_still_content_not_a_command():
+    """GREEN REGRESSION GUARD, and a SCOPE DECISION written down.
+    `extract_slash_command` deliberately keeps reading `text` only. Teaching it
+    captions would make a photo captioned "/project beta" switch projects AND —
+    because T-0659 deliberately does not append slash commands to the store —
+    stop his words being recorded at all. That inverts this ticket, so the
+    caption stays content."""
+    assert TL.extract_slash_command({"caption": "/project beta"}) is None
+    assert TL.extract_slash_command({"text": "/project beta"}) == ("project", "beta")
+
+
+def test_junk_caption_does_not_lose_the_message(tmp_path, monkeypatch):
+    """DEFENSIVE COERCION at the seam: the inbound path must degrade to "no
+    words", never raise. `append_conversation`'s callers do not wrap it."""
+    cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
+    _link_env(monkeypatch)
+    captured, fake_post = _capture_post(monkeypatch)
+    with patch("httpx.post", side_effect=fake_post):
+        ok = TL.append_conversation(cfg, "test-project", "gu_abc",
+                                    {"from": _from(), "date": 1750000000,
+                                     "photo": _photo_variants(),
+                                     "caption": {"unexpected": "shape"}})
+
+    assert ok is True
+    assert captured["json"]["attachments"] == [{"type": "photo", "file_id": "FULL_1280"}]

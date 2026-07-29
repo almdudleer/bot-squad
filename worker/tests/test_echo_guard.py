@@ -308,3 +308,42 @@ def test_relay_author_obeys_the_closed_vocabulary():
     from bot_squad_worker import outbound_log
     assert outbound_log.is_valid_author(EG.RELAY_AUTHOR)
     assert outbound_log.author_class(EG.RELAY_AUTHOR) == "system"
+
+
+# ---------------------------------------------------------------------------
+# T-0786 — the classifier must read the SAME string the record stores
+# ---------------------------------------------------------------------------
+
+def test_classify_reads_a_caption_the_same_way_the_record_will(tmp_path):
+    """RED PIN. `append_conversation` now stores a media caption as the message
+    text; rung 2 asked only for `msg["text"]`, so it was structurally blind to
+    every captioned message. Our own notice relayed back as a photo caption
+    would have been recorded `author="user"` — the exact corruption this module
+    exists to prevent, arriving through a media message instead of a text one."""
+    cfg = _cfg(tmp_path)
+    _seed_send(cfg, NOTICE)
+    msg = _msg(None, photo=[{"file_id": "F"}], caption=NOTICE)
+    del msg["text"]
+    v = EG.classify_inbound(cfg, msg)
+    assert v["author"] == EG.ECHO_AUTHOR and v["reason"] == "outbound-match"
+
+
+def test_classify_his_own_captioned_photo_stays_user_authored(tmp_path):
+    """NEGATIVE GUARD — the caption read must not turn his own words into an
+    echo. Nothing we sent matches, so the verdict is the ordinary one."""
+    cfg = _cfg(tmp_path)
+    _seed_send(cfg, NOTICE)
+    msg = _msg(None, photo=[{"file_id": "F"}], caption=HIS_OWN)
+    del msg["text"]
+    assert EG.classify_inbound(cfg, msg) == {
+        "author": "user", "forwarded_from": "", "reason": ""}
+
+
+def test_classify_an_uncaptioned_photo_is_unchanged(tmp_path):
+    """GREEN REGRESSION GUARD: no words at all is not a match on the empty
+    string — `MIN_MATCH_LEN` already held that, and it must keep holding."""
+    cfg = _cfg(tmp_path)
+    _seed_send(cfg, NOTICE)
+    msg = _msg(None, photo=[{"file_id": "F"}])
+    del msg["text"]
+    assert EG.classify_inbound(cfg, msg)["author"] == "user"

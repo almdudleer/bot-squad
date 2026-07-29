@@ -40,6 +40,60 @@ UNKNOWN_NO_RESULT = "no-result"            # a response, but no `result` object
 UNKNOWN_ABSENT = "absent-from-response"    # a Message, with no message_thread_id
 
 
+#: The fields a Telegram Message can carry the SENDER'S OWN WORDS in, in
+#: precedence order — see :func:`msg_text`.
+TEXT_FIELDS = ("text", "caption")
+
+
+def msg_text(msg: Any) -> str:
+    """The words the sender typed with THIS message: ``text``, else ``caption``.
+
+    T-0786. Telegram puts the text typed alongside a photo/video/document in
+    ``caption``, never in ``text`` — a message is *either* a text message *or*
+    media with an optional caption. Every inbound reader in the worker asked
+    only for ``msg["text"]``, so «вот скрин, посмотри» — the sentence that says
+    what the picture is FOR — was dropped at ingestion into a schema with a
+    perfectly good slot for it: the durable store recorded ``text: ""``, the
+    session-bound task topic woke a session with an empty verbatim fence, and
+    the T-0770 answer-owed reminder quoted ``«»`` back at it.
+
+    PRECEDENCE: ``text`` first. Telegram never populates both on one message,
+    so the order is unobservable on any real payload — which is exactly why it
+    has to be chosen deliberately instead of falling out of the code. ``text``
+    first is what ``reply_quote.extract`` already uses to read the QUOTED
+    message (``quoted.get("text") or quoted.get("caption")``), so one message
+    read as "what he just said" and as "what he was answering" can never yield
+    two different strings.
+
+    BOTH ABSENT → ``""``, unchanged, and an EMPTY caption stays empty. Never a
+    marker or placeholder: this value is written into records authored
+    ``"user"``, and inventing prose for one of those is the T-0746 defect
+    (never staple system prose onto his own record). "He sent a photo with no
+    caption" is stated by the ATTACHMENT descriptor (T-0782/T-0785), which is
+    where a fact about the image belongs.
+
+    Falsy values are skipped rather than returned, so for every message without
+    a caption this is byte-identical to the ``msg.get("text") or ""`` it
+    replaces. Coercion is defensive because this runs on the inbound routing
+    path and ``append_conversation``'s callers do NOT wrap it: a junk caption
+    must degrade to "no words", never raise and lose the whole message.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    for field in TEXT_FIELDS:
+        raw = msg.get(field)
+        if not raw:
+            continue
+        if isinstance(raw, str):
+            return raw
+        try:
+            return str(raw)
+        except Exception:  # noqa: BLE001 — a junk field is "no words", not a crash
+            log.exception("tg.msg_text: uncoercible %s field", field)
+            continue
+    return ""
+
+
 def _read_echoed_text(result: dict) -> tuple[str, bool, str]:
     """``(text, known, unknown_reason)`` from a sendMessage ``result``.
 

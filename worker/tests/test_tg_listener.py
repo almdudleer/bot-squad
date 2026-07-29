@@ -222,7 +222,13 @@ def test_corrupt_reply_map_falls_back_to_regex(tmp_path):
 
 def test_handle_update_injects_compact_label_reply_into_originating_session(tmp_path):
     """End-to-end through handle_update: a reply to a compact-labelled page is
-    dispatched as inject_input to THAT session, not routed to the attendant."""
+    dispatched to THAT session, not routed to the attendant.
+
+    T-0773 updated the payload assertion, not the routing claim this test was
+    written for: the verb is now ``inject_prompt`` (ONE composer submission —
+    ``inject_input`` sent one Enter per line, so his multi-line answers arrived
+    split) and his words ride inside a provenance envelope. What is asserted
+    below is that his text survives verbatim and reaches THIS sid."""
     from bot_squad_worker import tg_reply_map
 
     cfg = _make_cfg(tmp_path)
@@ -241,7 +247,11 @@ def test_handle_update_injects_compact_label_reply_into_originating_session(tmp_
 
     assert result["action"] == "inject"
     assert result["sid"] == sid
-    assert calls == [("inject_input", {"sid": sid, "text": "do it"})]
+    assert len(calls) == 1
+    verb, params = calls[0]
+    assert verb == "inject_prompt"
+    assert params["sid"] == sid
+    assert "do it" in params["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +580,14 @@ def test_handle_update_dispatches_say_slash(tmp_path, monkeypatch):
     result = TL.handle_update(cfg, update)
     assert result["ok"] is True
     assert result["action"] == "say"
-    assert dispatch_calls[0] == ("inject_input", {"sid": "S-alice-spec5-p3", "text": "hello"})
+    # T-0773: was `("inject_input", {..., "text": "hello"})`. That pin was the
+    # defect written down — the bare text over the one-Enter-per-line transport.
+    # `/say` now delivers ONE composer submission carrying a light provenance
+    # envelope; see test_tg_sibling_injection_paths.py for what is in it.
+    verb, params = dispatch_calls[0]
+    assert verb == "inject_prompt"
+    assert params["sid"] == "S-alice-spec5-p3"
+    assert "hello" in params["text"]
 
 
 def test_handle_update_inject_failed_notifies(tmp_path, monkeypatch):

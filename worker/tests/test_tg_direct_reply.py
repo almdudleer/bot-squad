@@ -192,6 +192,62 @@ def test_reminder_says_what_happens_when_it_runs_out():
 
 
 # ---------------------------------------------------------------------------
+# The LIGHT envelope (T-0773) — provenance without a debt
+# ---------------------------------------------------------------------------
+
+def test_light_envelope_says_a_human_wrote_over_telegram():
+    env = TDR.compose_light_envelope(text="да", chat_id=CHAT, thread_id=TOPIC,
+                                     sid=SID, sender="Alexey")
+    assert "TELEGRAM" in env and "a human" in env and "Alexey" in env
+    assert f"chat {CHAT}, forum topic {TOPIC}" in env
+    assert SID in env
+
+
+def test_light_envelope_keeps_a_multiline_message_intact():
+    text = "line1\nline2\nline3"
+    env = TDR.compose_light_envelope(text=text, chat_id=CHAT, thread_id=TOPIC, sid=SID)
+    body = env.split("--- 8< ---")[1].split("--- >8 ---")[0]
+    assert body.strip() == text
+
+
+@pytest.mark.parametrize("origin", ["reply", "say"])
+def test_light_envelope_never_claims_an_answer_is_owed(origin):
+    """★ The operator ruling on T-0773, pinned at the source. Both of these
+    strings are instructions to post back into his thread; the full envelope
+    carries them and this one must not, on either origin. A session told an
+    answer is owed acknowledges — which is the ticket's harm inverted."""
+    env = TDR.compose_light_envelope(text="да", chat_id=CHAT, thread_id=TOPIC,
+                                     sid=SID, origin=origin)
+    assert "AN ANSWER IS OWED" not in env
+    assert "Send it now" not in env
+    assert "remind you" not in env
+
+
+def test_the_reply_origin_offers_a_route_and_the_say_origin_does_not():
+    """`/say` is one-way by construction and the ruling explicitly did NOT
+    decide whether it should ever carry a reply back ("a different feature,
+    nobody has asked for it, and this ticket must not grow it"). So it names no
+    route at all, while a `[<sid>]` reply — where he IS reachable, in the thread
+    the bot just wrote in — gets one, conditional on having something to say."""
+    reply = TDR.compose_light_envelope(text="да", chat_id=CHAT, thread_id=TOPIC,
+                                       sid=SID, origin="reply")
+    say = TDR.compose_light_envelope(text="сделай", chat_id=CHAT, thread_id=TOPIC,
+                                     sid=SID, origin="say")
+    assert TDR.reply_command(CHAT, TOPIC) in reply
+    assert "bsq topic say" not in say and "bsq tg ping" not in say
+    assert "one-way" in say
+
+
+def test_answer_route_never_hands_a_dm_a_topic_command():
+    """`bsq topic say` refuses --chat without --topic, so `--topic None` would
+    die on arrival — a correct-looking prompt string that fails one step later
+    (the T-0775 class of defect)."""
+    assert TDR.answer_route(CHAT, TOPIC) == TDR.reply_command(CHAT, TOPIC)
+    assert TDR.answer_route(CHAT, None) == 'bsq tg ping "<your answer>"'
+    assert "--topic" not in TDR.answer_route(CHAT, None)
+
+
+# ---------------------------------------------------------------------------
 # The ledger
 # ---------------------------------------------------------------------------
 

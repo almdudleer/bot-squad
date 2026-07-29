@@ -45,6 +45,17 @@ guesswork — see the ticket for the transcripts:
   session that obeyed a destination-less instruction would have answered into
   220 — the topic he had already been ignored in — while he was writing in 517.
 
+The sibling paths, provenance only (T-0773)
+-------------------------------------------
+Two other surfaces reach a session's composer the same way: an explicit
+``[<sid>]`` reply to a bot message, and ``/say <sid> <text>``. They get
+:func:`compose_light_envelope` — the provenance half WITHOUT the ledger, by an
+operator ruling that is recorded in that function's docstring rather than here
+so it travels with the thing it governs. Both switched to ``inject_prompt`` at
+the same time, which is the part that was a plain defect: the one-Enter-per-line
+transport was splitting his multi-line messages into N submissions on those
+paths too.
+
 What this module must NOT do (T-0667, inherited)
 ------------------------------------------------
 A task-topic message must never redirect the project's attendant-reply relay
@@ -178,6 +189,104 @@ def compose_envelope(
         "destination by lookup and post into the wrong topic when your session",
         "holds more than one. If nothing lands in that topic, the system will",
         "remind you, and then answer for you — noisily.",
+    ])
+
+
+def answer_route(chat_id: Any, thread_id: Any) -> str:
+    """The command that reaches him WHERE HE WROTE, forum topic or plain DM.
+
+    :func:`reply_command` covers the forum case only — its ``--chat``/``--topic``
+    flags "go together" (``bsq topic say`` refuses one without the other,
+    because a thread id is only meaningful inside its own chat). A DM has no
+    thread, so naming ``--topic None`` there would hand the session a command
+    that dies on arrival; ``bsq tg ping`` is the DM route and always has been.
+    """
+    if thread_id is None:
+        return 'bsq tg ping "<your answer>"'
+    return reply_command(chat_id, thread_id)
+
+
+def compose_light_envelope(
+    *, text: str, chat_id: Any, thread_id: Any, sid: str, sender: str = "",
+    origin: str = "reply",
+) -> str:
+    """Provenance WITHOUT a debt — the two sibling paths of T-0773.
+
+    ``origin="reply"``  an explicit ``[<sid>]`` reply to a bot message
+                        (``tg_listener.handle_update``, the stall-escalation
+                        answer path).
+    ``origin="say"``    ``/say <sid> <text>`` — a human operator writing
+                        straight into a session.
+
+    WHY THIS IS NOT :func:`compose_envelope`, and it is a product ruling rather
+    than a size difference (operator p374 on T-0773, 2026-07-29). That envelope
+    tells a session an answer is OWED back to Telegram and
+    :func:`record_owed` then measures whether one landed. Both are justified by
+    ONE harm: he wrote into a topic and sat looking at silence. Neither of these
+    paths reproduces it —
+
+    * on a ``[<sid>]`` reply he is ANSWERING a question the session asked him
+      (``bsq tg ping "should I do X?"`` → «да»); the correct response to «да» is
+      to go do X, and posting «да, понял» back into Telegram is the ticket's own
+      harm inverted — noise pushed into the thread he is reading;
+    * ``/say`` is one-way by construction: he spoke last, deliberately.
+
+    "A backstop applied where its harm does not occur stops being a backstop and
+    becomes noise, and noise is what gets the real alarm muted." So nothing here
+    writes the ledger, and the text is careful never to IMPLY a debt: a session
+    that reads "an answer is owed" will post an acknowledgement, which is the
+    outcome the ruling refuses.
+
+    What it does keep is the half the ruling said belongs on all three paths:
+    the session is told a HUMAN wrote this and over what channel. "The value is
+    not politeness — it is that a session which knows a human is on the other
+    end behaves differently from one handed an anonymous string."
+
+    Delivered by ``inject_prompt`` (one composer submission), never
+    ``inject_input`` — see :func:`compose_envelope`'s note on the one-Enter-per-
+    line transport. That measurement is the reason this ticket exists at all:
+    both paths were already splitting his multi-line messages line by line,
+    envelope or no envelope.
+    """
+    who = sender.strip() or "the stakeholder"
+    where = (f"chat {chat_id}, forum topic {thread_id}" if thread_id is not None
+             else f"chat {chat_id} (direct message)")
+    body = str(text or "")
+    if origin == "say":
+        head = f"📨 TELEGRAM — {who.upper()} SENT THIS STRAIGHT INTO YOUR SESSION."
+        why = [
+            "Why you : a human addressed it to your SID explicitly (`/say`). That",
+            "          channel is one-way by construction — nothing is owed back",
+            "          to Telegram. Treat it as instruction/context and continue.",
+        ]
+        tail: list[str] = []
+    else:
+        head = f"📨 TELEGRAM — {who.upper()} WROTE THIS. A HUMAN, NOT A SYSTEM MESSAGE."
+        why = [
+            "Why you : they replied to a message YOUR session sent, so this is",
+            "          their answer to you. Acting on it IS the response — no",
+            "          acknowledgement is owed back to Telegram.",
+        ]
+        tail = [
+            "",
+            "If something still has to reach THEM (a question, a result they asked",
+            "for), it only counts when SENT — your own turn is invisible to them:",
+            "",
+            f"    {answer_route(chat_id, thread_id)}",
+        ]
+    return "\n".join([
+        head,
+        "",
+        f"From    : {who}, a human, via Telegram",
+        f"Where   : {where}",
+        *why,
+        f"Session : {sid}",
+        "",
+        "Their message, verbatim:",
+        "--- 8< ---",
+        body,
+        "--- >8 ---",
+        *tail,
     ])
 
 

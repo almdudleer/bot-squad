@@ -1739,11 +1739,35 @@ def handle_update(cfg, update: dict) -> dict:
                 )
             else:
                 result = _handle_slash(cfg, chat_id, cmd, args, thread_id=thread_id,
-                                       gid=gid)
+                                       gid=gid,
+                                       sender=_sender_display_name(msg.get("from") or {}))
         elif reply:
             # T-0746: `gid` is what makes the undelivered-message fallback
             # possible at all — the store is keyed (slug, global_user_id).
-            result = _handle_reply(cfg, chat_id, *reply, thread_id=thread_id, gid=gid)
+            #
+            # T-0773: and it goes as ONE composer submission inside a light
+            # provenance envelope. Until now this path handed the session the
+            # bare text over `inject_input`, whose transport sends one Enter PER
+            # LINE — measured at a real pane: his 3-line answer arrived as 3
+            # separate submissions, so the session began answering line 1 while
+            # 2 and 3 were still landing. The envelope carries NO answer-owed
+            # debt (operator ruling, see `compose_light_envelope`): here he is
+            # ANSWERING a question the session asked him, and nagging it to post
+            # "понял" back into his thread is this branch's harm inverted.
+            reply_sid, reply_text = reply
+            block = ""
+            if str(reply_text or "").strip():
+                block = tg_direct_reply.compose_light_envelope(
+                    text=reply_text, chat_id=chat_id, thread_id=thread_id,
+                    sid=reply_sid, sender=_sender_display_name(msg.get("from") or {}),
+                    origin="reply",
+                )
+            # Empty text keeps the OLD path deliberately: an envelope is never
+            # empty, so wrapping unconditionally would turn the "нечего
+            # передавать (пустой текст)" refusal into a header delivered with no
+            # body — a silent success where there used to be a loud failure.
+            result = _handle_reply(cfg, chat_id, reply_sid, reply_text,
+                                   thread_id=thread_id, gid=gid, block_text=block)
         else:  # group/topic voice
             from bot_squad_worker import voice_intake as _vi
             r = _vi.process_voice(cfg, chat_slug, msg, ts=_msg_ts(msg))
@@ -1981,11 +2005,18 @@ def _clear_stall(cfg, chat_id: str, sid: str, *, thread_id: Any = None) -> None:
 
 def _handle_slash(
     cfg, chat_id: str, cmd: str, args: str, *, thread_id: Any = None, gid: str = "",
+    sender: str = "",
 ) -> dict:
     """Implement /sessions, /say, /help.
 
     ``gid`` (T-0746): only ``/say`` uses it, and only on the failure path — see
-    there for why the undelivered-message fallback covers this verb too."""
+    there for why the undelivered-message fallback covers this verb too.
+
+    ``sender`` (T-0773): the writer's DISPLAY NAME, for ``/say``'s provenance
+    envelope. Deliberately just a label — this function stays identity-less in
+    the sense that matters (it resolves no GlobalUser and pins nothing; that is
+    why ``/project`` and ``/pin-session`` still live in ``handle_update``). A
+    provenance line saying "a human, via Telegram" is the whole use."""
     from bot_squad_worker import actions as A, sessions as S
     if cmd == "sessions":
         # List all sessions across all registered projects
@@ -2004,8 +2035,21 @@ def _handle_slash(
             _notify(cfg, chat_id, "Usage: /say <sid> <text>", thread_id=thread_id)
             return {"ok": False, "action": "say_usage"}
         sid, text = parts[0], parts[1]
+        # T-0773: same two changes as the `[<sid>]` reply path, same reasons —
+        # ONE composer submission (`inject_prompt`) instead of one Enter per
+        # line, wrapped in a light provenance envelope so the session knows a
+        # human typed this rather than being handed an anonymous string. No
+        # answer-owed debt: `/say` is one-way by construction (operator ruling
+        # on T-0773 — see `tg_direct_reply.compose_light_envelope`).
+        block = ""
+        if text.strip():
+            block = tg_direct_reply.compose_light_envelope(
+                text=text, chat_id=chat_id, thread_id=thread_id, sid=sid,
+                sender=sender, origin="say",
+            )
+        verb, payload = ("inject_prompt", block) if block else ("inject_input", text)
         try:
-            result = A.dispatch("inject_input", {"sid": sid, "text": text})
+            result = A.dispatch(verb, {"sid": sid, "text": payload})
             return {"ok": True, "action": "say", "sid": sid, "result": result}
         except A.ActionError as e:
             # T-0746: /say is the SAME verb as a reply-quote — "a message

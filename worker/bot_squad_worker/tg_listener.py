@@ -467,11 +467,79 @@ def resolve_or_link_sender(cfg, msg: dict, slug: str = "") -> Optional[dict]:
     }
 
 
+#: T-0782: why a photo descriptor can carry no handle. Named rather than
+#: boolean/absent for the same reason as ``tg.UNKNOWN_*``: "there was a photo
+#: and we could not keep its id" is a different fact from "there was a photo",
+#: and a reader must not have to guess which one an id-less record means.
+PHOTO_UNKNOWN_NOT_A_LIST = "photo-not-a-list"        # TG sent something else
+PHOTO_UNKNOWN_NO_FILE_ID = "no-file-id-in-variants"  # variants, none with an id
+
+
+def _largest_photo(photo: Any) -> tuple[str, str]:
+    """``(file_id, unknown_reason)`` for the LARGEST PhotoSize variant.
+
+    TG sends ``msg["photo"]`` as an ARRAY of PhotoSize variants — the same
+    image at several resolutions, thumbnail first — so keeping "the" file_id
+    is a choice, not a read. **We keep the largest**, deliberately: the handle
+    exists so the picture he sent can be fetched later, and a thumbnail is a
+    lossy substitute that is indistinguishable from the real thing in the
+    record (a silent ``photo[0]`` would look correct in every test). Nothing is
+    downloaded here — we store an id, not bytes — so the usual bytes-vs-fidelity
+    trade is not being paid at ingestion, and TG has already capped the
+    resolution on the sending side. If some later reader wants the cheap
+    variant it can ask TG for one; it cannot recover detail we chose to drop.
+
+    "Largest" is measured, not assumed to be last: ``width * height``, then
+    ``file_size``, then array order (max keeps the LAST on a tie, which is
+    TG's ascending order — so a payload with no dimensions at all still
+    degrades to the biggest one rather than the thumbnail).
+
+    Every size read is coerced defensively. This runs on the inbound routing
+    path — ``append_conversation``'s callers do NOT wrap it — so a junk
+    ``width`` would turn "we picked the wrong variant" into "the message was
+    never routed", which is a far worse failure than the one being fixed.
+    """
+    def _size(v: Any) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if not isinstance(photo, (list, tuple)):
+        return "", PHOTO_UNKNOWN_NOT_A_LIST
+    ranked = [
+        (i, v) for i, v in enumerate(photo)
+        if isinstance(v, dict) and v.get("file_id")
+    ]
+    if not ranked:
+        return "", PHOTO_UNKNOWN_NO_FILE_ID
+    _, best = max(
+        ranked,
+        key=lambda iv: (
+            _size(iv[1].get("width")) * _size(iv[1].get("height")),
+            _size(iv[1].get("file_size")),
+            iv[0],
+        ),
+    )
+    return str(best["file_id"]), ""
+
+
 def _msg_attachments(msg: dict) -> list[dict]:
     """Light attachment descriptors for the conversation record. We keep just
     enough to know an attachment was present (type + file_id) — the binary lives
     in TG, not the thread. Voice is the live case (T-0386); photos/documents are
-    recorded generically so the thread isn't silently lossy."""
+    recorded generically so the thread isn't silently lossy.
+
+    T-0782: a photo used to be recorded as ``{"type": "photo"}`` — the bare
+    FACT, six lines below the voice branch that keeps its handle. So the record
+    truthfully said "there was a photo" while the one thing that could ever
+    fetch it was thrown away at ingestion, permanently: across the whole
+    conversation store all 51 attachment records were voice, because a photo
+    produced a record with nothing to act on. This captures the handle. It does
+    NOT make the image retrieved — there is no download path behind photos the
+    way ``voice_intake`` sits behind voice — so what changes here is only that
+    the data stops being destroyed on arrival.
+    """
     out: list[dict] = []
     voice = msg.get("voice")
     if isinstance(voice, dict) and voice.get("file_id"):
@@ -480,7 +548,15 @@ def _msg_attachments(msg: dict) -> list[dict]:
     if isinstance(doc, dict) and doc.get("file_id"):
         out.append({"type": "document", "file_id": doc["file_id"]})
     if msg.get("photo"):
-        out.append({"type": "photo"})
+        # An EMPTY array is falsy and never gets here: no photo arrived, so no
+        # descriptor is written. Absent stays absent — it is not a photo whose
+        # id we lost. A malformed/id-less one still records the marker (losing
+        # the FACT would be a worse trade than the pre-T-0782 behaviour) and
+        # says why it has no handle instead of reading as "the id was dropped".
+        file_id, unknown = _largest_photo(msg["photo"])
+        att = {"type": "photo", "file_id": file_id} if file_id else {
+            "type": "photo", "file_id_unknown_reason": unknown}
+        out.append(att)
     return out
 
 

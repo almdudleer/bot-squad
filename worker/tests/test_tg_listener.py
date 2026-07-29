@@ -998,6 +998,126 @@ def test_append_conversation_captures_voice_attachment(tmp_path, monkeypatch):
     assert captured["json"]["attachments"] == [{"type": "voice", "file_id": "VID"}]
 
 
+# ---------------------------------------------------------------------------
+# T-0782: a photo must keep its HANDLE, not just its type. The pre-fix code
+# recorded `{"type": "photo"}` six lines below the voice branch that keeps
+# `file_id`, so the image was unreachable forever. These pin the handle AND
+# the variant choice — TG sends an ARRAY of PhotoSize variants, and a silent
+# `photo[0]` would store the thumbnail while passing any "a file_id is
+# present" assertion.
+# ---------------------------------------------------------------------------
+
+
+def _photo_variants() -> list[dict]:
+    """A real TG `photo` array: same image, thumbnail-first (ascending)."""
+    return [
+        {"file_id": "THUMB_90", "width": 90, "height": 67, "file_size": 1234},
+        {"file_id": "MID_320", "width": 320, "height": 240, "file_size": 14567},
+        {"file_id": "FULL_1280", "width": 1280, "height": 960, "file_size": 153021},
+    ]
+
+
+def test_append_conversation_captures_photo_file_id(tmp_path, monkeypatch):
+    """The whole ticket, at the seam it actually ships through."""
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    msg = {"from": _from(), "photo": _photo_variants()}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert captured["json"]["attachments"] == [
+        {"type": "photo", "file_id": "FULL_1280"}
+    ]
+
+
+def test_photo_keeps_the_largest_variant_not_the_first():
+    assert TL._msg_attachments({"photo": _photo_variants()}) == [
+        {"type": "photo", "file_id": "FULL_1280"}
+    ]
+
+
+def test_photo_largest_is_measured_not_positional():
+    """Same variants, DESCENDING. A "take the last one" shortcut passes the
+    ascending case and stores the thumbnail here."""
+    assert TL._msg_attachments({"photo": list(reversed(_photo_variants()))}) == [
+        {"type": "photo", "file_id": "FULL_1280"}
+    ]
+
+
+def test_photo_without_dimensions_falls_back_to_file_size():
+    photo = [
+        {"file_id": "SMALL", "file_size": 900},
+        {"file_id": "BIG", "file_size": 90000},
+        {"file_id": "MEDIUM", "file_size": 9000},
+    ]
+    assert TL._msg_attachments({"photo": photo}) == [
+        {"type": "photo", "file_id": "BIG"}
+    ]
+
+
+def test_photo_without_any_size_hint_degrades_to_last_not_thumbnail():
+    """No width/height/file_size anywhere: TG's own ascending order is the only
+    signal left, so the biggest is the LAST — never `photo[0]`."""
+    photo = [{"file_id": "A"}, {"file_id": "B"}, {"file_id": "C"}]
+    assert TL._msg_attachments({"photo": photo}) == [
+        {"type": "photo", "file_id": "C"}
+    ]
+
+
+def test_no_photo_records_no_descriptor():
+    """Absent records as absent — an empty array is not a photo whose id we
+    lost, and must not produce a default-shaped descriptor."""
+    assert TL._msg_attachments({"photo": []}) == []
+    assert TL._msg_attachments({"text": "hi"}) == []
+
+
+def test_photo_with_no_usable_file_id_states_why():
+    """The marker survives (losing the FACT would be worse than the pre-fix
+    behaviour) and says WHY it has no handle, so an id-less record can never
+    be misread as "we dropped the id"."""
+    assert TL._msg_attachments({"photo": [{"width": 90, "height": 67}]}) == [
+        {"type": "photo", "file_id_unknown_reason": TL.PHOTO_UNKNOWN_NO_FILE_ID}
+    ]
+    assert TL._msg_attachments({"photo": "not-an-array"}) == [
+        {"type": "photo", "file_id_unknown_reason": TL.PHOTO_UNKNOWN_NOT_A_LIST}
+    ]
+
+
+def test_photo_with_junk_dimensions_still_routes():
+    """This runs on the inbound routing path, which does NOT wrap the call —
+    so junk sizes must degrade the CHOICE, never raise and lose the message."""
+    photo = [
+        {"file_id": "A", "width": {"bad": 1}, "height": None},
+        {"file_id": "B", "width": "not-a-number", "file_size": "12"},
+    ]
+    assert TL._msg_attachments({"photo": photo}) == [
+        {"type": "photo", "file_id": "B"}
+    ]
+
+
+def test_photo_fix_leaves_the_voice_branch_alone():
+    """The asymmetry is the bug; the voice side is the working half and his
+    highest-value input. A media-group-ish message keeps BOTH handles."""
+    msg = {
+        "voice": {"file_id": "VID", "duration": 3},
+        "document": {"file_id": "DID"},
+        "photo": _photo_variants(),
+    }
+    assert TL._msg_attachments(msg) == [
+        {"type": "voice", "file_id": "VID"},
+        {"type": "document", "file_id": "DID"},
+        {"type": "photo", "file_id": "FULL_1280"},
+    ]
+
+
 def test_append_conversation_noop_without_env(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
     _link_env(monkeypatch, base=None, token=None)

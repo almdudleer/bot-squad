@@ -58,3 +58,14 @@ jobs:
       - name: Run lint script unit tests
         run: |
           cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py tests/test_role_doc_pointers_lint.py -x -q
+      - name: Worker /api paths resolve against the mounted routes (T-0775)
+        # Cross-directory invariant: it reads worker/ source and builds the api
+        # app, so it needs BOTH trees — which is exactly why it lives here and
+        # not only in the nightly. Under the api-only docker mount used on the
+        # dev host it SKIPS (worker/ is not in that mount); this job has the
+        # whole checkout, so this is where it actually runs on every push.
+        # T-0775 shipped three prompt strings naming /api/conversations/...,
+        # mounted nowhere, while the role contract named the right route — a
+        # divergence no import and no type check can see.
+        run: |
+          cd api && pytest tests/test_worker_api_paths_mounted.py -x -q

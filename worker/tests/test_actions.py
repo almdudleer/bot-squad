@@ -2101,6 +2101,110 @@ def test_ensure_user_conversation_no_thread_id_nudge_unchanged(tmp_path, monkeyp
     )
 
 
+# ---------------------------------------------------------------------------
+# T-0775: the conversation-read URL these prompts hand the attendant
+#
+# All three sites named `GET /api/conversations/<slug>/<gid>/messages`, which is
+# mounted nowhere — routes_conversations is included with prefix `/api/m`, so
+# an attendant that followed the prompt got a hard 404 (measured on the live
+# install with a valid worker token). The T-0676 tests above pass either way:
+# they assert `thread_id 7` and `thread_id=7`, never the route, which is how a
+# broken URL sat in the boot prompt of the system's highest-traffic session.
+#
+# Two wrong answers are adjacent and both look quiet from inside the session:
+# the bare prefix 404s, and the session-auth `/api/m/conversations/...` UI
+# surface answers a worker Bearer with 401 — so half-correcting the prefix
+# trades a loud failure for a silent one. These pin the delivered STRING; the
+# route it names is resolved against a real build_app() by
+# api/tests/test_worker_api_paths_mounted.py.
+# ---------------------------------------------------------------------------
+
+_WORKER_CONV_ROUTE = "/api/m/worker/conversations/test-project/gu_a1b2c3/messages"
+
+
+def _boot_prompt_via_dispatch(monkeypatch, **params) -> str:
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    captured = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        captured["initial_prompt"] = initial_prompt
+        return {"ok": True, "sid": f"S-u-{window}-p3"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+    assert A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3", **params,
+    })["ok"] is True
+    return captured["initial_prompt"]
+
+
+def test_boot_prompt_names_the_worker_token_conversation_route(tmp_path, monkeypatch):
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.delenv("WORKER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
+    prompt = _boot_prompt_via_dispatch(monkeypatch, message_ref="hi")
+
+    assert f"GET {_WORKER_CONV_ROUTE}" in prompt
+    # The two wrong answers, by construction: the bare prefix (404) and the
+    # session-auth UI surface (401 for a worker Bearer). Neither may appear.
+    assert "/api/conversations/" not in prompt
+    assert "/api/m/conversations/" not in prompt
+    # The route needs a Bearer, so a correct path with no auth hint is the
+    # 401 again one step later.
+    assert "WORKER_API_TOKEN" in prompt
+
+
+def test_boot_prompt_uses_the_configured_api_base_not_a_hardcoded_host(tmp_path, monkeypatch):
+    """The base comes from the same accessor the worker's working callers use
+    (tg_listener._api_base_url), so a moved API host moves this prompt with it."""
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.setenv("WORKER_API_BASE_URL", "http://api.internal:9999")
+    prompt = _boot_prompt_via_dispatch(monkeypatch, message_ref="hi")
+    assert f"GET http://api.internal:9999{_WORKER_CONV_ROUTE}" in prompt
+
+
+def test_boot_prompt_degrades_to_a_relative_path_when_base_unset(tmp_path, monkeypatch):
+    """Unset env yields "" — the prompt must fall back to the correct RELATIVE
+    path, never to a wrong absolute one."""
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    monkeypatch.delenv("WORKER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("MOTHERSHIP_BASE_URL", raising=False)
+    prompt = _boot_prompt_via_dispatch(monkeypatch, message_ref="hi")
+    assert f"GET {_WORKER_CONV_ROUTE}\n" in prompt
+
+
+def test_thread_scoped_block_names_the_worker_token_route(tmp_path, monkeypatch):
+    """T-0676's topic-scoped read — same defect, plus the ?thread_id= parameter
+    the mounted GET actually accepts (measured 200 on the live install)."""
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    prompt = _boot_prompt_via_dispatch(monkeypatch, message_ref="hi", thread_id=7)
+    assert f"GET {_WORKER_CONV_ROUTE}?thread_id=7" in prompt
+    assert "/api/conversations/" not in prompt
+
+
+def test_reuse_path_nudge_names_the_worker_token_route(tmp_path, monkeypatch):
+    """The third site: a live attendant nudged about a new topic message. It
+    already holds its contract, so this one carries the route only."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_a1b2c3-user-conversation-p9"
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: existing)
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "another message", "thread_id": 7,
+    })
+    assert f"GET {_WORKER_CONV_ROUTE}?thread_id=7" in nudged["text"]
+    assert "/api/conversations/" not in nudged["text"]
+
+
 def test_ensure_user_conversation_unknown_slug(tmp_path, monkeypatch):
     import bot_squad_worker.actions as A
     _make_sessions_cfg(tmp_path, monkeypatch)

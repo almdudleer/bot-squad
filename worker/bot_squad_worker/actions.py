@@ -2038,14 +2038,20 @@ def _thread_scoped_read_write_block(slug: str, global_user_id: str, thread_id: A
     cross-topic bleed (item 6) and misroutes its reply to the wrong topic
     (item 3). ``thread_id`` absent (DM / non-topic message) returns "" —
     caller falls back to the exact pre-T-0676 instructions, so a DM attendant
-    is completely unaffected."""
+    is completely unaffected.
+
+    T-0775: the route is the WORKER-token one (``/api/m/worker/...``). The
+    attendant runs in worker context and holds the Bearer, not a UI cookie —
+    see ``_user_conversation_boot_prompt`` for why the two nearby wrong
+    answers (a bare ``/api/`` 404, the session-auth surface's 401) are both
+    silent-looking to the session that hits them."""
     if thread_id is None or str(thread_id).strip() == "":
         return ""
     return (
         f"\nThis message arrived in a BOUND FORUM TOPIC (thread_id "
         f"{thread_id}) — read and reply WITHIN that topic's own isolated "
         f"thread, not the project's full history:\n"
-        f"  GET /api/conversations/{slug}/{global_user_id}/messages?thread_id={thread_id}\n"
+        f"  GET /api/m/worker/conversations/{slug}/{global_user_id}/messages?thread_id={thread_id}\n"
         f"  (reply by appending with thread_id={thread_id} so it relays back "
         f"into the SAME topic, not elsewhere)\n"
     )
@@ -2089,7 +2095,29 @@ def _user_conversation_boot_prompt(
     user-conversation.md), then read its thread + the new inbound message. The
     behavioural mandate (verbatim-into-tasks, notify-operator, unrestricted)
     lives in the role contract; this prompt points at it and supplies the
-    per-session context (which user, which message)."""
+    per-session context (which user, which message).
+
+    T-0775: the read URL is the WORKER-token route ``/api/m/worker/...`` and
+    it is spelled out with its base + auth header, because BOTH nearby wrong
+    answers are quiet to the session that hits them. The bare
+    ``/api/conversations/...`` this prompt used to emit is mounted NOWHERE —
+    measured 404 on the live install with a valid token, while
+    ``routes_conversations`` is included with prefix ``/api/m`` (main.py) —
+    and the ``/api/m/conversations/...`` UI surface answers a worker Bearer
+    with 401 (also measured), so half-correcting the prefix trades a loud
+    failure for a quieter one. An attendant that reads its contract (which has
+    named the ``/worker/`` path since T-0529) works; one that trusts this
+    prompt did not. The contract also offers "read the store JSONL directly"
+    as its API-unreachable fallback, so hitting the dead path looks exactly
+    like choosing the expensive route rather than like a broken prompt.
+
+    ``_api_base_url()`` is the same accessor the worker's own working callers
+    use (tg_listener, task_chat, outbound_log) rather than a hardcoded
+    ``127.0.0.1:8099``; unset env yields "" and the prompt degrades to the
+    correct RELATIVE path, never to a wrong absolute one."""
+    from bot_squad_worker import tg_listener as _tg_listener
+
+    api_base = _tg_listener._api_base_url()
     new_msg = ""
     if message_ref and str(message_ref).strip():
         new_msg = (
@@ -2105,7 +2133,10 @@ user mail for project `{slug}`, attending the user `{global_user_id}`.
 FIRST run `bsq brief` to load your full role contract (user-conversation.md) +
 the product/protocol. Your mandate, in short:
   - Read this user's conversation thread (your durable memory) before replying:
-    GET /api/conversations/{slug}/{global_user_id}/messages
+    GET {api_base}/api/m/worker/conversations/{slug}/{global_user_id}/messages
+    (worker-token route — send `Authorization: Bearer $WORKER_API_TOKEN`, the
+    value in the install `.env`. Your contract explains why the UI read
+    surface is not yours to call.)
   - Talk to the user; reply by appending to that same thread
     (author "session:<your-sid>") — the comms layer relays it back to them.
   - When the user ASKS FOR WORK, record it VERBATIM into a backlog task: mint
@@ -2228,10 +2259,12 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                 if thread_id is not None and str(thread_id).strip() != "":
                     # T-0676 items 3/6: point the SAME attendant at THIS
                     # topic's isolated thread, not the mixed project history.
+                    # T-0775: worker-token route — the bare /api/conversations/
+                    # prefix this used to name is mounted nowhere (404).
                     nudge_text = (
                         f"A new message arrived in topic (thread_id {thread_id}) "
                         f"of your user-conversation — read that topic's isolated "
-                        f"thread (GET /api/conversations/{slug}/{gid}/messages"
+                        f"thread (GET /api/m/worker/conversations/{slug}/{gid}/messages"
                         f"?thread_id={thread_id}) and reply into it (append with "
                         f"thread_id={thread_id})."
                     )

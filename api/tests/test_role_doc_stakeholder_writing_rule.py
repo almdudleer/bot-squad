@@ -1,4 +1,4 @@
-"""T-0777: the no-dramatising-preamble rule must stay IDENTICAL in five role docs.
+"""T-0777: the no-dramatising-preamble rule must stay IDENTICAL in six role docs.
 
 Why this exists
 ---------------
@@ -8,23 +8,28 @@ intensifier. He named the banned openers as concrete quotable phrases, twice —
 so the rule is a NAMED LIST, not a style preference, and the list is the part
 that has to be checkable.
 
-It lives inline in five role contracts because that is the only surface a
+It lives inline in six role contracts because that is the only surface a
 session is served automatically: ``bsq``'s ``_assemble_prompt`` inlines the
 role doc verbatim into the spawn brief, and ``bsq brief`` re-prints it. A
 pointer to a shared file would be read-on-demand, which is exactly the reach
 problem the ticket was opened to fix.
 
-Five copies of one list is a drift hazard — this repo's top bug class, and the
+Six copies of one list is a drift hazard — this repo's top bug class, and the
 T-0774 lesson (three overlapping DROPS fixtures, each defending a different
-reader, none reaching the source). This pin is what keeps the five honest: the
+reader, none reaching the source). This pin is what keeps the six honest: the
 prose register per role may differ (an operator pages, a prod-TL reports an
 outage, an attendant relays), the LIST may not.
 
-Scope note: ``qa.md`` is deliberately NOT required. It has no call site that
-writes to the stakeholder — the five here all do (`bsq tg ping` in dev.md,
-prod-teamlead.md, operator.md; relays in user-conversation.md; release/status
-notices in teamlead.md). Adding it later is a scope decision, not a test
-failure, so this asserts a required MINIMUM rather than an exact set.
+Scope note (T-0784): ``qa.md`` WAS excluded here, on the stated ground that it
+"has no call site that writes to the stakeholder". That claim was false and
+checkable in one grep — ``qa.md``'s escalation line ("only TG the stakeholder
+if there's no TL or you've been stuck") is the same sanctioned path as
+``dev.md``'s, which is the line used to justify putting dev in scope. What made
+it urgent rather than cosmetic: T-0778 gave qa sessions their own ``qa.md`` —
+before that they were mis-routed to ``dev.md`` and INCIDENTALLY inherited the
+rule — so the routing fix would otherwise have silently removed a coverage
+nobody recorded as depending on it. This list asserts a required MINIMUM rather
+than an exact set precisely so widening it is an addition, not a red build.
 """
 from __future__ import annotations
 
@@ -36,9 +41,11 @@ ROLES_DIR = Path(__file__).resolve().parents[1] / "app" / "resources" / "roles"
 
 HEADING = "## Writing to the stakeholder — START WITH THE FACT"
 
-# The roles whose sessions compose prose the stakeholder reads. Operator p374
-# set this scope on the call sites, not defensively (2026-07-29).
-REQUIRED_ROLES = ("operator", "teamlead", "user-conversation", "dev", "prod-teamlead")
+# The roles whose sessions compose prose the stakeholder reads — set on the
+# call sites, not defensively (2026-07-29). `qa` added by T-0784: its call site
+# is the same sanctioned "TG him if there's no TL or you've been stuck" line.
+REQUIRED_ROLES = ("operator", "teamlead", "user-conversation", "dev", "prod-teamlead",
+                  "qa")
 
 # Every opener he named, both messages. Dropping one silently would leave the
 # rule looking intact while the thing he pointed at walked out of it.
@@ -122,7 +129,7 @@ def test_every_banned_opener_is_named(role):
 
 
 def test_banned_opener_list_is_byte_identical_across_the_copies():
-    """Five copies, one list. Register may differ per role; the list may not."""
+    """Six copies, one list. Register may differ per role; the list may not."""
     lists = {role: banned_list_of(read_role(role)) for role in REQUIRED_ROLES}
     distinct = set(lists.values())
     assert len(distinct) == 1, (

@@ -178,6 +178,92 @@ def test_reply_command_is_the_one_place_the_destination_is_rendered():
     assert cmd in env and cmd in rem
 
 
+# ---------------------------------------------------------------------------
+# T-0785 — what ARRIVED with his message. A photo carries no text, so before
+# this the envelope's verbatim fence was empty and the session was woken with
+# nothing to react to. The section says a photo arrived; it does NOT let the
+# session see it, and several tests below pin exactly that limit.
+# ---------------------------------------------------------------------------
+
+def test_a_photo_only_message_no_longer_arrives_as_an_empty_envelope():
+    """The reproduction inverted. At 7deced6 this envelope's fence was empty
+    and nothing else in the block mentioned the photo."""
+    env = TDR.compose_envelope(
+        text="", chat_id=CHAT, thread_id=TOPIC, sid=SID,
+        attachments=[{"type": "photo", "file_id": "AgACAgIAAx0CFULL"}])
+    assert env.split("--- 8< ---")[1].split("--- >8 ---")[0].strip() == ""
+    assert "photo" in env and "AgACAgIAAx0CFULL" in env
+
+
+def test_the_attachment_section_says_the_session_cannot_open_it():
+    """The reporting rule of the ticket, enforced on the text itself: a session
+    that reads this must not believe it can look at the image. There is no
+    download path behind a photo (T-0782 (b), unbuilt)."""
+    env = TDR.compose_envelope(
+        text="", chat_id=CHAT, thread_id=TOPIC, sid=SID,
+        attachments=[{"type": "photo", "file_id": "FULL_1280"}])
+    assert "CANNOT open it" in env
+    assert "have NOT seen this attachment" in env
+
+
+def test_an_id_less_photo_names_why_instead_of_reading_as_a_dropped_id():
+    """T-0782's PHOTO_UNKNOWN_* case. "no file_id" and "we threw the file_id
+    away" read identically and only one of them is our fault — a session must
+    not report a handle we never had as one we lost."""
+    lines = "\n".join(TDR.render_attachments(
+        [{"type": "photo", "file_id_unknown_reason": "no-file-id-in-variants"}]))
+    assert "no usable file_id" in lines
+    assert "no-file-id-in-variants" in lines
+
+
+def test_a_descriptor_with_neither_id_nor_reason_still_mentions_the_photo():
+    """Losing the FACT would be worse than the bug being fixed — the same trade
+    ``_msg_attachments`` makes for the durable record."""
+    lines = "\n".join(TDR.render_attachments([{"type": "photo"}]))
+    assert "photo" in lines and "reason not recorded" in lines
+
+
+def test_his_words_and_the_attachment_both_survive_a_captioned_send():
+    """A photo sent alongside typed text must lose neither half."""
+    env = TDR.compose_envelope(
+        text="посмотри вот это", chat_id=CHAT, thread_id=TOPIC, sid=SID,
+        attachments=[{"type": "photo", "file_id": "FULL_1280"}])
+    assert env.split("--- 8< ---")[1].split("--- >8 ---")[0].strip() == "посмотри вот это"
+    assert "FULL_1280" in env
+
+
+def test_every_attachment_of_a_multi_part_message_is_named():
+    """Voice is mentioned like anything else — this is a RENDERING, not the
+    voice path: nothing here transcribes, downloads or gates on `[voice]`."""
+    lines = TDR.render_attachments([
+        {"type": "voice", "file_id": "VOICE_HANDLE"},
+        {"type": "document", "file_id": "DOC_HANDLE"},
+        {"type": "photo", "file_id": "PHOTO_HANDLE"},
+    ])
+    body = "\n".join(lines)
+    for handle in ("VOICE_HANDLE", "DOC_HANDLE", "PHOTO_HANDLE"):
+        assert handle in body
+
+
+def test_no_attachment_leaves_the_envelope_byte_identical():
+    """The `reply_quote.render_block` contract: a change that shows up on
+    messages it has nothing to say about is a change to every message."""
+    kw = dict(text="прием-прием", chat_id=CHAT, thread_id=TOPIC, sid=SID,
+              slug="watchrobot", ticket_id="T-0314", sender="Alexey")
+    base = TDR.compose_envelope(**kw)
+    assert TDR.compose_envelope(**kw, attachments=[]) == base
+    assert TDR.compose_envelope(**kw, attachments=None) == base
+
+
+def test_junk_descriptors_are_skipped_rather_than_raising():
+    """This runs on the inbound routing path, whose callers do not wrap it — a
+    malformed descriptor must degrade the mention, never lose the message."""
+    assert TDR.render_attachments("not-a-list") == []
+    assert TDR.render_attachments([None, 7, "photo"]) == []
+    body = "\n".join(TDR.render_attachments([None, {"file_id": "X"}]))
+    assert "attachment — Telegram file_id X" in body
+
+
 def test_reminder_quotes_him_back_capped():
     long = "x" * 900
     rem = TDR.compose_reminder({"chat_id": CHAT, "thread_id": TOPIC, "text": long},

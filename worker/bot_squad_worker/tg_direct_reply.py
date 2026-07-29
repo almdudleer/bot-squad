@@ -150,9 +150,76 @@ def reply_command(chat_id: Any, thread_id: Any) -> str:
     return f'bsq topic say --chat {chat_id} --topic {thread_id} "<your answer>"'
 
 
+#: Line marker for the attachment section. Deliberately NOT
+#: ``reply_quote.LINE_PREFIX`` and not the ``--- 8< ---`` fence: three kinds of
+#: block can share one envelope (somebody else's quoted words, his own words,
+#: and this — OUR statement about what came with them), and they must not look
+#: alike to a reader skimming it.
+ATTACHMENT_PREFIX = "    • "
+
+
+def render_attachments(attachments: Any) -> list[str]:
+    """What ARRIVED with his message, as envelope lines (T-0785).
+
+    ``[]`` when there is nothing to say, so a message with no attachment is
+    byte-identical to its pre-T-0785 envelope — the ``reply_quote.render_block``
+    contract, for the same reason.
+
+    THE FAILURE THIS FIXES. A photo carries no ``text``, and the direct-mode
+    branch forwards ``msg["text"]`` only, so a photo sent into a session-bound
+    task topic reached the session as an envelope whose verbatim fence was
+    EMPTY: it was told an answer was owed, and given nothing to answer. Not
+    "he sent a photo", not a marker — measured on the full inbound path against
+    7deced6, where the same probe with text delivered his words normally.
+
+    ★ THIS DOES NOT LET THE SESSION SEE THE ATTACHMENT, and the wording is
+    built to stop it believing otherwise. There is no download path behind a
+    photo the way ``voice_intake`` sits behind voice (T-0782 (b), unbuilt and
+    unasked-for). What changes is only that a session can now SAY «он прислал
+    фото, открыть его я не могу» and ask, instead of being woken by silence.
+    A session that reads this and claims to have looked at the image has done
+    the one thing the section is worded against.
+
+    Takes the descriptors ``tg_listener._msg_attachments`` already writes into
+    the conversation record — ``{"type", "file_id"}``, or ``{"type",
+    "file_id_unknown_reason"}`` when Telegram sent variants we could not take a
+    handle from (T-0782). The id-less case is rendered as "Telegram gave no
+    usable id", never as a missing/blank id: those read identically and only one
+    of them is our fault, and a session must not report a dropped handle we
+    never had.
+    """
+    if not isinstance(attachments, (list, tuple)):
+        return []
+    items: list[str] = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        kind = str(att.get("type") or "").strip() or "attachment"
+        file_id = str(att.get("file_id") or "").strip()
+        if file_id:
+            items.append(f"{ATTACHMENT_PREFIX}{kind} — Telegram file_id {file_id}")
+        else:
+            reason = str(att.get("file_id_unknown_reason") or "").strip() \
+                or "reason not recorded"
+            items.append(
+                f"{ATTACHMENT_PREFIX}{kind} — Telegram gave no usable file_id "
+                f"({reason})")
+    if not items:
+        return []
+    return [
+        "ATTACHED to that message — and you CANNOT open it:",
+        *items,
+        "A file_id is Telegram's handle for the file, not the file. Nothing in",
+        "this system downloads it today, so you have NOT seen this attachment.",
+        "Say that it arrived and ask him what is in it — never claim to have",
+        "looked at it, and never leave it unmentioned.",
+    ]
+
+
 def compose_envelope(
     *, text: str, chat_id: Any, thread_id: Any, sid: str, slug: str = "",
     ticket_id: str = "", sender: str = "", quote: Any = None,
+    attachments: Any = None,
 ) -> str:
     """The injected message: provenance + his words + the reply contract.
 
@@ -167,12 +234,20 @@ def compose_envelope(
     вариант» mean something. ``None`` (he was not replying to anything) leaves
     the envelope byte-identical to its pre-T-0780 form. It is rendered by
     ``reply_quote.render_block``, whose labelling is what keeps somebody else's
-    words from reading as his."""
+    words from reading as his.
+
+    ``attachments`` (T-0785): the descriptors ``tg_listener._msg_attachments``
+    wrote for this message, rendered AFTER his words by
+    :func:`render_attachments` — a photo carries no text, so without this
+    section the fence above is empty and the session is woken by nothing.
+    ``None``/``[]`` leaves the envelope byte-identical to its pre-T-0785 form.
+    """
     who = sender.strip() or "the stakeholder"
     where = f"chat {chat_id}, forum topic {thread_id}"
     tags = " · ".join(x for x in (slug, ticket_id) if x)
     body = str(text or "")
     quoted = reply_quote.render_block(quote)
+    attached = render_attachments(attachments)
     return "\n".join([
         f"📨 TELEGRAM — {who.upper()} WROTE TO YOU. AN ANSWER IS OWED IN THAT TOPIC.",
         "",
@@ -188,6 +263,7 @@ def compose_envelope(
         "--- 8< ---",
         body,
         "--- >8 ---",
+        *(["", *attached] if attached else []),
         "",
         "⚠️ HE CANNOT SEE THIS SESSION. Answering in your own turn is invisible to",
         "him — that is exactly the failure this envelope exists to prevent",

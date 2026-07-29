@@ -2018,6 +2018,71 @@ def test_handle_topic_bound_with_session_id_injects_to_that_session(tmp_path, mo
     assert 'bsq topic say --chat 111 --topic 42' in params["text"]
 
 
+def test_handle_topic_bound_photo_reaches_the_session_as_more_than_empty(tmp_path, monkeypatch):
+    """T-0785, the defect at the seam it ships through — the FULL inbound path.
+
+    A photo carries no `text`, and this branch forwards `msg["text"]` only, so
+    at 7deced6 the session was woken by an envelope whose verbatim fence was
+    empty: not "he sent a photo", not a marker, nothing to react to. Measured
+    that way against HEAD before the fix, with a text message through the same
+    probe as the control.
+
+    What it now says is that a photo ARRIVED and that the session cannot open
+    it — there is no download path behind a photo (T-0782 (b)). The file_id is
+    T-0782's descriptor, carried so a later fetch is possible at all, NOT
+    because anything fetches today."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id="T-0785", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: True)
+    injected = []
+    monkeypatch.setattr(A, "dispatch", lambda name, params: (
+        injected.append((name, params)) or {"ok": True}
+    ))
+
+    msg = _topic_msg(None, chat_id=111, thread_id=42)
+    del msg["text"]                      # a photo-only message has no text key
+    msg["photo"] = _photo_variants()
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "task_topic_inject" and result["sid"] == "S-dev-p9"
+    assert len(injected) == 1
+    verb, params = injected[0]
+    assert verb == "inject_prompt"
+    body = params["text"]
+    assert "photo" in body
+    # The LARGEST variant's handle (T-0782's decision), not the thumbnail.
+    assert "FULL_1280" in body and "THUMB_90" not in body
+    # …and it must not read as "photos work now".
+    assert "CANNOT open it" in body
+
+
+def test_handle_topic_bound_text_message_envelope_unchanged_by_attachments(tmp_path, monkeypatch):
+    """Green regression guard, not a defect pin: an ordinary typed message has
+    no attachment, so its envelope must be exactly what T-0780 left it."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id="T-0785", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: True)
+    injected = []
+    monkeypatch.setattr(A, "dispatch", lambda name, params: (
+        injected.append((name, params)) or {"ok": True}
+    ))
+
+    msg = _topic_msg("fix the flaky test please", chat_id=111, thread_id=42)
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    body = injected[0][1]["text"]
+    assert "fix the flaky test please" in body
+    assert "ATTACHED" not in body
+
+
 def test_handle_topic_bound_with_session_id_does_not_touch_locus(tmp_path, monkeypatch):
     from bot_squad_worker import tg_bindings, conversation_locus
     import bot_squad_worker.actions as A

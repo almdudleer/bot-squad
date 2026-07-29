@@ -1378,12 +1378,21 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         # session's own last post in that topic, most often — and until now the
         # quoted original was dropped on this path too. `quote` is None for the
         # ordinary un-replied message, leaving that envelope unchanged.
+        # T-0785: and WHAT ARRIVED WITH IT. `text` is empty for a photo, so
+        # until now a photo sent into a task topic woke the session with an
+        # envelope whose verbatim fence was empty — not "he sent a photo", not
+        # a marker, nothing to react to. The descriptor is the one T-0782
+        # already writes for the durable record (type + file_id, or type + a
+        # named PHOTO_UNKNOWN_* reason); this only MENTIONS it. No download
+        # path exists behind a photo, so the session still cannot look at the
+        # image — see `tg_direct_reply.render_attachments`, whose wording is
+        # what keeps a session from claiming otherwise.
         quote = reply_quote.extract(msg)
         envelope = tg_direct_reply.compose_envelope(
             text=text, chat_id=chat_id, thread_id=thread_id, sid=session_id,
             slug=slug, ticket_id=binding.get("ticket_id") or "",
             sender=_sender_display_name(msg.get("from") or {}),
-            quote=quote,
+            quote=quote, attachments=_msg_attachments(msg),
         )
         # T-0746: `gid` so an undeliverable message can fall back to the target
         # session's user-conversation instead of evaporating, and `thread_id`

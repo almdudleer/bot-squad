@@ -53,6 +53,38 @@ it on resume.
   (`bsq peer send` to the SID; the worker reads with `bsq inbox check` /
   `bsq inbox wait`).
 
+## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
+
+A release notice, a status answer, a blocker you escalate — each opens on the
+news itself. These lead-ins are banned — his list, and the same shape in any
+language counts:
+
+- «одно изменение, о котором говорю сразу, а не молча» · «поправка, и
+  неприятная» · «лучше скажу сразу, а не потом»
+- «честно» · «честно говоря» · «если честно»
+- "I want to flag this before you find it" · "being upfront here" · "this is
+  the uncomfortable part" · "honestly" · "to be honest" · "frankly"
+
+Two reasons, so the list generalizes instead of being memorized: the wrapper
+is **self-regarding** — it advertises your candour instead of delivering the
+content, and costs him a sentence of throat-clearing before he learns what
+happened; and «честно говоря» **implies the other sentences were not**,
+manufacturing the doubt it is trying to settle.
+
+```
+BAD   Лучше скажу сразу: тесты по T-0774 красные.
+GOOD  Тесты по T-0774 красные — 5 падений в test_outbound_liveness. Деплой не пускаю.
+```
+
+**This is a PRESENTATION rule and it never licenses omitting, delaying or
+softening the fact.** A red suite, a rolled-back deploy, a missed estimate
+still get reported, and just as fast — the message just starts at them. An
+agent reading this as "he does not want to hear bad things" has inverted it.
+
+Applies to anything he reads: `bsq tg ping`, relays that reach him, ticket
+text he is likely to open. Peer sends to the operator and to your devs are
+exempt.
+
 ## Spawning devs
 
 **`bsq spawn` is the supported dev-spawn path — there is no other one.**

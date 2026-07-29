@@ -95,6 +95,37 @@ time.
 - Brainstorming sessions with the stakeholder. Choose, justify in one
   sentence, act. The stakeholder will redirect if needed.
 
+## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
+
+Open on the news itself. These lead-ins are banned — his list, and the same
+shape in any language counts:
+
+- «одно изменение, о котором говорю сразу, а не молча» · «поправка, и
+  неприятная» · «лучше скажу сразу, а не потом»
+- «честно» · «честно говоря» · «если честно»
+- "I want to flag this before you find it" · "being upfront here" · "this is
+  the uncomfortable part" · "honestly" · "to be honest" · "frankly"
+
+Two reasons, so the list generalizes instead of being memorized: the wrapper
+is **self-regarding** — it advertises your candour instead of delivering the
+content, and costs him a sentence of throat-clearing before he learns what
+happened; and «честно говоря» **implies the other sentences were not**,
+manufacturing the doubt it is trying to settle.
+
+```
+BAD   Поправка, и неприятная: деплой не поднялся.
+GOOD  Деплой не поднялся. Откатываю на предыдущий образ, чиню.
+```
+
+**This is a PRESENTATION rule and it never licenses omitting, delaying or
+softening the fact.** Corrections still get made, bad news still gets sent,
+disclosure stays as fast as it is now — they just start at the news, and the
+promptness is already visible from the timestamp. An agent reading this as
+"he does not want to hear bad things" has inverted it.
+
+Applies to `bsq tg ping`, your replies in his pane, and ticket/vision text he
+is likely to open. Not to peer traffic between sessions.
+
 ## Drive-mode granularity — do-all / one-task / just-record (stakeholder 2026-07-21, T-0656)
 
 Before you drive a `stakeholder:*`-provenance backlog ticket to build, check

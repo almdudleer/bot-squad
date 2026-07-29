@@ -1322,6 +1322,12 @@ def test_list_sessions_non_admin_drops_other_owners(
         # Only the row stamped owner=testuser survives — the other-owner
         # row and the legacy unstamped row are both filtered out.
         assert sids == ["S-x-b-p2"]
+        # T-0772: and the response SAYS it filtered. Asserted here, on the test
+        # that exercises the filter itself, so the marker cannot drift away from
+        # the behaviour it describes. Without it a scoped-empty list is
+        # indistinguishable from an idle project, and the board rendered a
+        # per-user zero as a fact about the system.
+        assert r.json()["sessions_scope"] == "own"
     finally:
         server.should_exit = True
         t.join(timeout=5)
@@ -1371,6 +1377,9 @@ def test_list_sessions_admin_sees_all_owners(
         assert r.status_code == 200
         sids = sorted(row["sid"] for row in r.json()["sessions"])
         assert sids == ["S-x-a-p1", "S-x-b-p2", "S-x-c-p3"]
+        # T-0772: an admin's list is unfiltered and says so — the UI must NOT
+        # narrow the label ("YOUR live sessions") for a caller seeing every row.
+        assert r.json()["sessions_scope"] == "all"
     finally:
         server.should_exit = True
         t.join(timeout=5)

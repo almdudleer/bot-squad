@@ -136,3 +136,95 @@ def test_transparency_requires_auth(tmp_bot_squad: Path, monkeypatch):
     with _anon_client(tmp_bot_squad, monkeypatch) as client:
         r = client.get("/api/projects/test-project/transparency")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# T-0772 — the payload states WHICH policy produced its `sessions` block
+# ---------------------------------------------------------------------------
+#
+# This one response feeds two adjacent cards on the project board:
+# `quota.in_progress` (counted off the whole backlog — broad) and `sessions`
+# (owner-scoped per user, T-0080/T-0321). Measured on the live install as
+# aqice, a real non-admin account: sessions len 0 and quota.in_progress 6 IN
+# THE SAME BODY. Rendered side by side with no marker, that reads as six
+# stalled tasks — a false statement about system health, from a payload where
+# every field was individually correct.
+#
+# The gate is UNTOUCHED here. What is added is the response saying what it did.
+
+
+def test_transparency_states_the_session_scope(tmp_bot_squad: Path, monkeypatch):
+    """The scope rides the aggregate, not just the sessions route."""
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/transparency")
+    assert r.status_code == 200
+    body = r.json()
+    assert "sessions_scope" in body
+    # testuser is admin in the fixture → the list was not filtered.
+    assert body["sessions_scope"] == "all"
+
+
+def test_transparency_scope_is_own_for_a_non_admin(tmp_bot_squad: Path, monkeypatch):
+    """A non-admin's aggregate carries "own" — the marker the board needs to
+    stop rendering a per-user zero next to an install-wide task count."""
+    # Same bcrypt hash for "test" the sessions suite's _set_auth_with_meta uses —
+    # an invented hash silently fails login and the 401 would read as a scope bug.
+    (tmp_bot_squad / "config" / "auth.toml").write_text(
+        '[users]\n'
+        'testuser = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"\n'
+        '[user_meta.testuser]\n'
+        'linux_user = "tu"\n'
+        'is_admin = false\n'
+        '[session]\nttl = "7d"\n'
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/transparency")
+    assert r.status_code == 200
+    assert r.json()["sessions_scope"] == "own"
+
+
+def test_transparency_scope_is_unknown_when_the_fanout_blew_up(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """A failed session read yields scope None — NEVER "own".
+
+    The except branch already degrades `sessions` to []. If it also claimed
+    "own", the UI would explain a crash as "you own no sessions" — a confident
+    per-user statement about a read that never happened. That is the same
+    defect this ticket is closing, one level down, so the unknown is explicit.
+    """
+    async def _boom(**kwargs):
+        raise RuntimeError("every worker socket is down")
+
+    monkeypatch.setattr("app.routes_transparency.list_sessions", _boom)
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/transparency")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sessions"] == []
+    assert body["sessions_scope"] is None
+
+
+def test_transparency_still_returns_the_owner_scoped_rows_unchanged(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    """NO GATE MOVED (the ★★ constraint on the ticket).
+
+    Widening the owner scope would light the web global-busy indicator for other
+    people's work (globalBusyHelpers.isMyInFlight is defined own-only). This
+    ticket adds a label, never a row — so `sessions` stays exactly the list
+    `list_sessions` handed over.
+    """
+    seen = {}
+
+    async def _spy(**kwargs):
+        seen["called"] = True
+        return {"sessions": [{"sid": "S-mine-p1"}], "errors": [], "sessions_scope": "own"}
+
+    monkeypatch.setattr("app.routes_transparency.list_sessions", _spy)
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/transparency")
+    body = r.json()
+    assert seen.get("called") is True
+    assert body["sessions"] == [{"sid": "S-mine-p1"}]
+    assert body["sessions_scope"] == "own"

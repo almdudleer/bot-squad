@@ -201,7 +201,17 @@ async def get_transparency(
 ) -> dict:
     """The unified system-state view: operator state-doc + session tree + backlog
     + quota, in one read. Authenticated, read-only; session rows are owner-scoped
-    by the underlying ``list_sessions`` (admins see all)."""
+    by the underlying ``list_sessions`` (admins see all).
+
+    T-0772: ``sessions_scope`` states WHICH of those two happened, because this
+    payload is the one that renders the board's summary strip — ``sessions``
+    (owner-scoped, per-user) and ``quota.in_progress`` (broad, counted off the
+    backlog) sit in adjacent cards from this single response. Without the marker
+    the strip silently mixed the two policies: a non-admin read "IN PROGRESS 6"
+    beside "LIVE SESSIONS 0" and could only conclude the install was wedged.
+    ``None`` when the fan-out failed — an unknown scope must never be reported
+    as a scoped zero (that would blame the owner gate for a dead worker).
+    """
     _check_project(request, slug)
     data_dir = _data_dir(request)
 
@@ -212,9 +222,11 @@ async def get_transparency(
     try:
         payload = await list_sessions(slug=slug, request=request, user=user)
         sessions = payload.get("sessions", [])
+        sessions_scope = payload.get("sessions_scope")
     except Exception as e:  # pragma: no cover - defensive
         log.warning("transparency: session list failed for %s: %s", slug, e)
         sessions = []
+        sessions_scope = None
 
     backlog = _backlog(data_dir, slug)
     quota = _quota(data_dir, slug, backlog["counts"]["in_progress"])
@@ -223,6 +235,7 @@ async def get_transparency(
         "slug": slug,
         "operator_state": _operator_state(data_dir, slug),
         "sessions": sessions,
+        "sessions_scope": sessions_scope,
         "backlog": backlog,
         "quota": quota,
     }

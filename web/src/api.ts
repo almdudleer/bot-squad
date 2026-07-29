@@ -438,21 +438,37 @@ export type SessionRow = {
 // is partial, worker for <user> unreachable" instead of a blank board.
 export type WorkerFanoutError = { user: string; detail: string };
 
-export type SessionsPayload = { rows: SessionRow[]; errors: WorkerFanoutError[] };
+// T-0772: what the server says it did to the session list before sending it.
+// "own" = the T-0080/T-0321 owner gate filtered it to the caller's own rows;
+// "all" = unfiltered (admin). `null` = the server did not say — a legacy
+// bare-array response, or a fan-out that failed. An UNKNOWN scope is not "own":
+// a consumer must never claim the rows are the caller's when it cannot tell.
+export type SessionsScope = "own" | "all" | null;
+
+export type SessionsPayload = {
+  rows: SessionRow[];
+  errors: WorkerFanoutError[];
+  scope: SessionsScope;
+};
 
 // Accepts both server shapes: the T-0601 envelope {sessions, errors} and the
 // legacy bare array (older single-install servers reached via the mothership
 // proxy). Exported for unit tests.
 export function normalizeSessionsPayload(body: unknown): SessionsPayload {
-  if (Array.isArray(body)) return { rows: body as SessionRow[], errors: [] };
+  if (Array.isArray(body)) {
+    return { rows: body as SessionRow[], errors: [], scope: null };
+  }
   if (body && typeof body === "object") {
-    const o = body as { sessions?: unknown; errors?: unknown };
+    const o = body as { sessions?: unknown; errors?: unknown; sessions_scope?: unknown };
     return {
       rows: Array.isArray(o.sessions) ? (o.sessions as SessionRow[]) : [],
       errors: Array.isArray(o.errors) ? (o.errors as WorkerFanoutError[]) : [],
+      scope: o.sessions_scope === "own" || o.sessions_scope === "all"
+        ? o.sessions_scope
+        : null,
     };
   }
-  return { rows: [], errors: [] };
+  return { rows: [], errors: [], scope: null };
 }
 
 // T-0210: per-session resource telemetry record (worker-sampled).
@@ -838,6 +854,9 @@ export type Transparency = {
     path: string;
   };
   sessions: SessionRow[];
+  // T-0772: whether `sessions` above was owner-filtered. Absent on a pre-T-0772
+  // server; see `SessionsScope`.
+  sessions_scope?: SessionsScope;
   backlog: {
     counts: Record<string, number>;
     tasks: Task[];

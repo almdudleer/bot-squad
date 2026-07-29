@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type Transparency as TransparencyData } from "../api";
+import {
+  api,
+  type SessionsScope,
+  type Transparency as TransparencyData,
+} from "../api";
 import { Markdown } from "./Markdown";
 
 /**
@@ -71,6 +75,34 @@ function DetailSection({
 }
 
 /**
+ * T-0772 — the LIVE SESSIONS card's copy, as a function of what the server
+ * said it did to the list. Pure + exported so the wording is unit-testable
+ * without rendering the panel (mirrors `sessionsEmptyState` on the Processes
+ * page, which pulled its own ambiguity out for the same reason).
+ *
+ * THE DEFECT THIS CLOSES: the two cards in this strip come from ONE payload but
+ * obey TWO policies — `quota.in_progress` is counted off the whole backlog
+ * (broad) while `sessions` is owner-scoped per user (T-0080/T-0321). Rendered
+ * side by side with one unqualified label, a non-admin read "IN PROGRESS 6"
+ * next to "LIVE SESSIONS 0" and the only available conclusion was that six
+ * tasks were stalled — a false statement about system health, not a withheld
+ * number. Naming the scope is the whole fix: the VALUE does not move and no
+ * gate is touched (widening the owner scope would light the global busy
+ * indicator for other people's work — see components/globalBusyHelpers.ts).
+ *
+ * An UNKNOWN scope (legacy server, failed fan-out) keeps today's neutral copy.
+ * We can only claim the count is the viewer's when the server says so.
+ */
+export function liveSessionsCardCopy(
+  scope: SessionsScope | undefined,
+): { label: string; sub: string } {
+  if (scope === "own") {
+    return { label: "YOUR LIVE SESSIONS", sub: "sessions you own → Processes" };
+  }
+  return { label: "LIVE SESSIONS", sub: "→ Processes page" };
+}
+
+/**
  * The always-visible summary strip: quota (IN PROGRESS) and a LIVE SESSIONS
  * card that links to the Processes page (T-0627: the who-does-what table
  * died — Processes is that fact's home; this card carries a count + link,
@@ -81,11 +113,14 @@ function SummaryStrip({
   slug,
   quota,
   liveSessions,
+  sessionsScope,
 }: {
   slug: string;
   quota: TransparencyData["quota"];
   liveSessions: number;
+  sessionsScope: SessionsScope | undefined;
 }) {
+  const liveCopy = liveSessionsCardCopy(sessionsScope);
   const cap = quota.max_in_progress;
   const capLabel = cap === 0 ? "∞" : String(cap);
   const overCap = cap > 0 && quota.in_progress > cap;
@@ -108,9 +143,9 @@ function SummaryStrip({
         className="mc-an-card"
         style={{ textDecoration: "none", color: "inherit", display: "block" }}
       >
-        <div className="mc-an-card-label">LIVE SESSIONS</div>
+        <div className="mc-an-card-label">{liveCopy.label}</div>
         <div className="mc-an-card-value">{liveSessions}</div>
-        <div className="mc-an-card-sub">→ Processes page</div>
+        <div className="mc-an-card-sub">{liveCopy.sub}</div>
       </Link>
     </div>
   );
@@ -134,8 +169,16 @@ export function ObservabilityView({
   const live = data.sessions.filter((s) => !s.archived && s.status === "active");
   return (
     <>
-      {/* 1 — the always-visible summary strip (quota/pace + session count) */}
-      <SummaryStrip slug={slug} quota={data.quota} liveSessions={live.length} />
+      {/* 1 — the always-visible summary strip (quota/pace + session count).
+          T-0772: the strip is fed the payload's `sessions_scope` so the session
+          card can say whose count it is — the rows above are owner-scoped while
+          `quota` next to them is install-wide. */}
+      <SummaryStrip
+        slug={slug}
+        quota={data.quota}
+        liveSessions={live.length}
+        sessionsScope={data.sessions_scope}
+      />
 
       {/* 2 — operator state-doc (T-0473) */}
       <DetailSection title="Operator state-doc">

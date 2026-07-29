@@ -202,6 +202,16 @@ async def list_sessions(
     stamping landed have no owner — they are treated as admin-only so they
     don't leak to a second user. Admins still see every row.
 
+    T-0772: the envelope also carries ``sessions_scope`` — ``"own"`` when the
+    owner gate above filtered the list, ``"all"`` when it did not. The gate is
+    UNCHANGED; what was missing is that the response never SAID it had filtered,
+    so a scoped-empty list was indistinguishable from an idle project. A UI that
+    cannot tell them apart renders a per-user zero as a statement about the
+    system — on the live install the board showed a non-admin "IN PROGRESS 6"
+    beside "LIVE SESSIONS 0", which reads as six stalled tasks. The scope is
+    emitted from the two return sites themselves so it cannot drift away from
+    the filter it describes.
+
     T-0104 activity status: each row also carries a worker-derived
     ``activity`` enum (``running|idle|paused|suspended``) and an
     ``activity_at`` epoch float. Frontends display labels off ``activity``,
@@ -256,7 +266,7 @@ async def list_sessions(
             r["pinned_by"] = meta.get("by")
             r["pinned_at"] = meta.get("at")
     if user.get("is_admin"):
-        return {"sessions": rows, "errors": errors}
+        return {"sessions": rows, "errors": errors, "sessions_scope": "all"}
     # Non-admin: drop rows whose owner doesn't match. Missing owner
     # (legacy session) = admin-only. The worker emits "" for missing.
     # Errors follow the same scoping: a non-admin sees only their OWN
@@ -283,6 +293,7 @@ async def list_sessions(
     return {
         "sessions": [r for r in rows if _scope_match(r.get("owner_user"), r.get("owner"), me)],
         "errors": scoped_errors,
+        "sessions_scope": "own",
     }
 
 

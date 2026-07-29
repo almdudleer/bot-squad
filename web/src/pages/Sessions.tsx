@@ -8,6 +8,7 @@ import type {
   TelemetrySession,
   VisionFile,
   WorkerFanoutError,
+  SessionsScope,
 } from "../api";
 import { useApiClient } from "../apiContext";
 import { CopyableTmuxAttach } from "../components/CopyableTmuxAttach";
@@ -300,14 +301,28 @@ export function isLiveSession(s: SessionRow): boolean {
 // confirmed-empty project. Pulled out as a pure function (mirrors
 // `isLiveSession` above) so the empty-vs-uncertain classification is unit
 // testable without rendering the page.
-export type SessionsEmptyState = "none" | "uncertain" | null;
+//
+// T-0772 adds the THIRD reading of the same empty list, and it is the one this
+// page is the destination for: the owner gate filtered every row out. This page
+// is where the board's LIVE SESSIONS card links, so a non-admin who clicked a
+// zero used to land on "No sessions for bot-squad" — the bare copy confirming
+// the false impression the card had just created. `scope` comes from the server
+// (it is the only party that knows whether it filtered); an UNKNOWN scope keeps
+// the neutral "none" wording rather than guessing.
+//
+// PRECEDENCE IS DELIBERATE: "uncertain" still wins over "none-own". An
+// unreachable worker also yields zero rows, and reporting that as "you own
+// none" would state a per-user fact about a tick where nothing was measured.
+export type SessionsEmptyState = "none" | "none-own" | "uncertain" | null;
 
 export function sessionsEmptyState(
   sessions: SessionRow[] | null,
   fanoutErrors: WorkerFanoutError[],
+  scope: SessionsScope = null,
 ): SessionsEmptyState {
   if (sessions === null || sessions.length > 0) return null;
-  return fanoutErrors.length > 0 ? "uncertain" : "none";
+  if (fanoutErrors.length > 0) return "uncertain";
+  return scope === "own" ? "none-own" : "none";
 }
 
 // T-0347: the per-row tmux-attach affordance. Only a LIVE session has a tmux
@@ -460,6 +475,9 @@ export function Sessions() {
   // fan-out — rendered as a warning banner so a partial (or empty) list is
   // never mistaken for "no sessions".
   const [fanoutErrors, setFanoutErrors] = useState<WorkerFanoutError[]>([]);
+  // T-0772: whether the server owner-filtered the rows above. Drives the
+  // empty-state copy so a scoped-empty list stops reading as an idle project.
+  const [sessionsScope, setSessionsScope] = useState<SessionsScope>(null);
 
   // meUsername feeds PeerInbox (the kept reply surface, T-0127).
   const [meUsername, setMeUsername] = useState<string>("stakeholder");
@@ -572,9 +590,10 @@ export function Sessions() {
   const load = useCallback(() => {
     api
       .sessionsDetail(slug)
-      .then(({ rows, errors }) => {
+      .then(({ rows, errors, scope }) => {
         setSessions(rows);
         setFanoutErrors(errors);
+        setSessionsScope(scope);
         setError(null);
       })
       .catch((e: unknown) => {
@@ -583,6 +602,10 @@ export function Sessions() {
         // keeping the previous poll's banner would name sockets we can no
         // longer vouch for, alongside the error alert.
         setFanoutErrors([]);
+        // T-0772: same rule for the scope — a failed load did not tell us what
+        // the server would have filtered, so drop the claim rather than keep a
+        // stale one that would explain this tick's blank list as "yours only".
+        setSessionsScope(null);
       });
   }, [slug]);
 
@@ -1697,13 +1720,28 @@ export function Sessions() {
       {/* Empty state — T-0658: distinguishes a confirmed-empty project from
           an all-worker-socket-timeout tick (the fanout-errors banner above
           already names the unreachable sockets). */}
-      {sessionsEmptyState(sessions, fanoutErrors) === "none" && (
+      {sessionsEmptyState(sessions, fanoutErrors, sessionsScope) === "none" && (
         <div className="mc-empty">
           <div className="mc-empty-icon">◯</div>
           <div>No sessions for <strong>{slug}</strong></div>
         </div>
       )}
-      {sessionsEmptyState(sessions, fanoutErrors) === "uncertain" && (
+      {/* T-0772: the owner gate emptied the list — say so. "No sessions for
+          <slug>" here is a statement about the PROJECT, and this page is where
+          the board's LIVE SESSIONS card lands. */}
+      {sessionsEmptyState(sessions, fanoutErrors, sessionsScope) === "none-own" && (
+        <div className="mc-empty" data-testid="scoped-empty-state">
+          <div className="mc-empty-icon">◯</div>
+          <div>
+            You don&apos;t own any sessions in <strong>{slug}</strong>
+          </div>
+          <div style={{ fontSize: "0.8rem", marginTop: "0.35rem" }}>
+            This list shows only sessions you own — the project may have others
+            running.
+          </div>
+        </div>
+      )}
+      {sessionsEmptyState(sessions, fanoutErrors, sessionsScope) === "uncertain" && (
         <div className="mc-empty" data-testid="fanout-uncertain-state">
           <div className="mc-empty-icon">◇</div>
           <div>

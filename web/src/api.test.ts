@@ -132,17 +132,25 @@ describe("T-0601 sessions fan-out errors", () => {
         sessions: [row],
         errors: [{ user: "timpo", detail: "connect failed" }],
       }),
-    ).toEqual({ rows: [row], errors: [{ user: "timpo", detail: "connect failed" }] });
+    ).toEqual({
+      rows: [row],
+      errors: [{ user: "timpo", detail: "connect failed" }],
+      scope: null,
+    });
   });
 
   test("normalizeSessionsPayload: legacy bare array → rows, no errors", () => {
-    expect(normalizeSessionsPayload([row])).toEqual({ rows: [row], errors: [] });
+    expect(normalizeSessionsPayload([row])).toEqual({
+      rows: [row],
+      errors: [],
+      scope: null,
+    });
   });
 
   test("normalizeSessionsPayload: garbage → empty payload", () => {
-    expect(normalizeSessionsPayload(null)).toEqual({ rows: [], errors: [] });
-    expect(normalizeSessionsPayload("nope")).toEqual({ rows: [], errors: [] });
-    expect(normalizeSessionsPayload({})).toEqual({ rows: [], errors: [] });
+    expect(normalizeSessionsPayload(null)).toEqual({ rows: [], errors: [], scope: null });
+    expect(normalizeSessionsPayload("nope")).toEqual({ rows: [], errors: [], scope: null });
+    expect(normalizeSessionsPayload({})).toEqual({ rows: [], errors: [], scope: null });
   });
 
   test("api.sessions keeps its SessionRow[] contract over the new envelope", async () => {
@@ -155,8 +163,26 @@ describe("T-0601 sessions fan-out errors", () => {
     await expect(api.sessionsDetail("alpha")).resolves.toEqual({
       rows: [row],
       errors: [{ user: "aqice", detail: "boom" }],
+      scope: null,
     });
     expect(spy).toHaveBeenCalledWith("/api/projects/alpha/sessions", expect.any(Object));
+  });
+
+  // T-0772: the server states whether it owner-filtered the list. A consumer
+  // that cannot tell a scoped-empty list from an idle project renders a
+  // per-user zero as a fact about the system — the board's "IN PROGRESS 6 /
+  // LIVE SESSIONS 0" strip.
+  test("normalizeSessionsPayload: carries sessions_scope through", () => {
+    expect(normalizeSessionsPayload({ sessions: [], sessions_scope: "own" }).scope).toBe("own");
+    expect(normalizeSessionsPayload({ sessions: [row], sessions_scope: "all" }).scope).toBe("all");
+  });
+
+  test("normalizeSessionsPayload: an unrecognised scope is UNKNOWN, never 'own'", () => {
+    // Claiming "own" off a value we don't understand would put a false "you own
+    // none" on a page that may well be showing every row there is.
+    for (const bad of ["mine", "", 1, true, null, undefined, {}]) {
+      expect(normalizeSessionsPayload({ sessions: [row], sessions_scope: bad }).scope).toBeNull();
+    }
   });
 });
 

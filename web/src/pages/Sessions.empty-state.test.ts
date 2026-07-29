@@ -52,4 +52,42 @@ describe("sessionsEmptyState", () => {
       "uncertain",
     );
   });
+
+  /**
+   * T-0772 — the THIRD reading of the same empty list, and this page is where
+   * it lands: the T-0080/T-0321 owner gate filtered every row out. Measured on
+   * the live install as aqice (is_admin false, confirmed from /api/auth/me
+   * after garbage-cookie and no-cookie 401 controls): the board's LIVE SESSIONS
+   * card read 0, and clicking it landed here on "No sessions for bot-squad" —
+   * a statement about the PROJECT, made from a per-user list, while 6 tasks
+   * were in progress.
+   */
+  describe("T-0772: owner-scoped empty is not an empty project", () => {
+    test("scoped list, no rows → 'none-own'", () => {
+      expect(sessionsEmptyState([], [], "own")).toBe("none-own");
+    });
+
+    test("an ADMIN's empty list is still a genuinely empty project", () => {
+      expect(sessionsEmptyState([], [], "all")).toBe("none");
+    });
+
+    test("UNKNOWN scope keeps the neutral 'none' — never a false 'you own none'", () => {
+      // Legacy bare-array server / mothership proxy. Behaviour identical to
+      // before this ticket, which is what the two-arg call sites above assert.
+      expect(sessionsEmptyState([], [], null)).toBe("none");
+      expect(sessionsEmptyState([], [])).toBe("none");
+    });
+
+    test("a DEAD WORKER still wins over the scope — 'uncertain', not 'none-own'", () => {
+      // Both produce zero rows. Reporting an unreachable socket as "you own
+      // none" would blame the owner gate for a tick where nothing was measured
+      // — the same class of false statement this ticket exists to remove.
+      expect(sessionsEmptyState([], [fanoutError("aqice")], "own")).toBe("uncertain");
+    });
+
+    test("rows present → no empty state regardless of scope", () => {
+      expect(sessionsEmptyState([row()], [], "own")).toBeNull();
+      expect(sessionsEmptyState([row()], [], "all")).toBeNull();
+    });
+  });
 });

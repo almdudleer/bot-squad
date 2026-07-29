@@ -21,7 +21,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
-import { ObservabilityView } from "./ObservabilityPanel";
+import { ObservabilityView, liveSessionsCardCopy } from "./ObservabilityPanel";
 import type { Transparency as TransparencyData } from "../api";
 
 // Mirrors the real bot-squad state observed 2026-06-27 (operator-state absent,
@@ -147,5 +147,78 @@ describe("ObservabilityView", () => {
     expect(html).toContain("Ship the transparency surface.");
     expect(html).toContain("20 / 13");
     expect(html).not.toContain("hasn&#x27;t written a state-doc yet");
+  });
+});
+
+/**
+ * T-0772 — the two cards in this strip come from ONE payload and obey TWO
+ * policies. `quota.in_progress` is counted off the whole backlog; `sessions` is
+ * owner-scoped per user. Rendered side by side under one unqualified label, a
+ * non-admin read "IN PROGRESS 6" beside "LIVE SESSIONS 0" and could only
+ * conclude the install was wedged.
+ *
+ * Fixtures below are the payload MEASURED on the live install (75dc01a,
+ * 2026-07-29) for the two real accounts, negative controls (garbage cookie
+ * 401 / no cookie 401) run first and identities confirmed from /api/auth/me:
+ *
+ *   aqice  (global_member, is_admin false) → sessions [] · in_progress 6
+ *   alexey (is_admin true)                 → 3 live rows · in_progress 6
+ */
+describe("T-0772: the LIVE SESSIONS card says whose count it is", () => {
+  // aqice's live shape: the owner gate filtered every row out.
+  const SCOPED_EMPTY: TransparencyData = {
+    ...REAL_DERIVED,
+    sessions: [],
+    sessions_scope: "own",
+    quota: { ...REAL_DERIVED.quota, in_progress: 6 },
+  };
+
+  test("a non-admin's zero is labelled as HIS, not as the project's", () => {
+    const html = renderView(SCOPED_EMPTY);
+
+    // The label is the fix. `>LIVE SESSIONS<` (not `toContain("LIVE
+    // SESSIONS")`) because "YOUR LIVE SESSIONS" contains it as a substring —
+    // the assertion has to distinguish the two labels, not match both.
+    expect(html).toContain(">YOUR LIVE SESSIONS<");
+    expect(html).not.toContain(">LIVE SESSIONS<");
+
+    // ...and the broad number is still right beside it. This pairing IS the
+    // recorded defect; the test would pass vacuously if the strip lost a card.
+    expect(html).toContain("6 / ∞");
+  });
+
+  test("NO GATE MOVED: the value is still the owner-scoped zero", () => {
+    // The ticket forbids widening the owner scope — globalBusyHelpers.isMyInFlight
+    // is defined own-only, so a wider list would light the global busy indicator
+    // for other people's work. Only the RENDERING was wrong.
+    const html = renderView(SCOPED_EMPTY);
+    expect(html).toContain('<div class="mc-an-card-value">0</div>');
+  });
+
+  test("an ADMIN's card is unchanged — the count is the project's", () => {
+    const html = renderView({ ...REAL_DERIVED, sessions_scope: "all" });
+    expect(html).toContain(">LIVE SESSIONS<");
+    expect(html).not.toContain("YOUR LIVE SESSIONS");
+    expect(html).toContain(">2<"); // same live count as before this ticket
+  });
+
+  test("UNKNOWN scope keeps today's neutral copy — never a false 'YOUR'", () => {
+    // A pre-T-0772 server (or one reached through the mothership proxy) sends
+    // no scope. Claiming the rows are the viewer's own would be a new false
+    // statement, in the same shape as the one being fixed.
+    const html = renderView({ ...REAL_DERIVED, sessions_scope: undefined });
+    expect(html).toContain(">LIVE SESSIONS<");
+    expect(html).not.toContain("YOUR LIVE SESSIONS");
+  });
+
+  test("liveSessionsCardCopy: only an explicit 'own' narrows the label", () => {
+    expect(liveSessionsCardCopy("own").label).toBe("YOUR LIVE SESSIONS");
+    expect(liveSessionsCardCopy("all").label).toBe("LIVE SESSIONS");
+    expect(liveSessionsCardCopy(null).label).toBe("LIVE SESSIONS");
+    expect(liveSessionsCardCopy(undefined).label).toBe("LIVE SESSIONS");
+    // The sub-line points at Processes in every case — the card stays a link.
+    for (const s of ["own", "all", null, undefined] as const) {
+      expect(liveSessionsCardCopy(s).sub).toContain("Processes");
+    }
   });
 });

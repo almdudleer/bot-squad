@@ -86,3 +86,26 @@ jobs:
         # teamlead.md and qa windows got dev.md, with no error anywhere.
         run: |
           cd worker && PYTHONPATH=. pytest tests/test_bsq_role_derivation_mirror.py -x -q
+      - name: The api reads the worker's stores the way the worker writes them (T-0749)
+        # Fourth cross-directory invariant, same reason as the three above: it
+        # writes fixtures with `worker/…/tg_bindings.py` + `conversation_locus.py`
+        # and reads them back through the api's `_resolve_relay_target`, so it
+        # needs BOTH trees. Under the dev host's api-only docker mount it SKIPS,
+        # and a skip is not coverage — this job has the whole checkout, so this
+        # is where it runs.
+        #
+        # No PYTHONPATH: both worker store modules are stdlib-clean and the
+        # worker package's `__init__.py` is empty, so the test file puts
+        # `worker/` on sys.path itself.
+        #
+        # T-0740 found the api discarding a `thread_id` it had been handed and
+        # relaying a session's reply into the stakeholder's private DM instead
+        # of the topic — while still reporting `relayed: true`. The api's copies
+        # of `tg_bindings._key` / `conversation_locus._key` are hand-written, and
+        # T-0676 had already moved that format once. MEASURED: with the worker's
+        # binding key changed to a different separator, the whole existing
+        # T-0740 suite stays green (66/66) because it seeds the stores by hand;
+        # this file goes red. See D-0065 for why the two LADDERS are not
+        # comparable and this layer is.
+        run: |
+          cd api && pytest tests/test_relay_destination_differential.py -x -q

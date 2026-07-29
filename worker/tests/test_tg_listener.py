@@ -1118,6 +1118,122 @@ def test_photo_fix_leaves_the_voice_branch_alone():
     ]
 
 
+# ---------------------------------------------------------------------------
+# T-0787 — the unfixed twin of T-0782/0785/0786. `_msg_attachments` knew three
+# keys, so a video/animation/sticker/video_note/audio returned NO descriptor:
+# the durable record said nothing arrived, and T-0785's ATTACHED section never
+# fired, so an UNCAPTIONED one still woke a session with an empty fence.
+#
+# RED AT e243dae: every test in this block down to (and including)
+# `test_several_media_keys_all_keep_their_handles`.
+# GREEN AT e243dae (regression guards, not defect pins): the three after it —
+# they pin what must NOT change.
+# ---------------------------------------------------------------------------
+
+
+def test_video_animation_sticker_video_note_and_audio_keep_their_handles():
+    """The whole ticket at the function. Each of these returned `[]` before —
+    not a lossy descriptor, NONE."""
+    assert TL._msg_attachments({"video": {"file_id": "VID_H", "duration": 7}}) == [
+        {"type": "video", "file_id": "VID_H"}]
+    assert TL._msg_attachments({"animation": {"file_id": "ANIM_H"}}) == [
+        {"type": "animation", "file_id": "ANIM_H"}]
+    assert TL._msg_attachments({"sticker": {"file_id": "STK_H", "emoji": "🔥"}}) == [
+        {"type": "sticker", "file_id": "STK_H"}]
+    assert TL._msg_attachments({"video_note": {"file_id": "VN_H"}}) == [
+        {"type": "video_note", "file_id": "VN_H"}]
+    assert TL._msg_attachments({"audio": {"file_id": "AUD_H", "title": "t"}}) == [
+        {"type": "audio", "file_id": "AUD_H"}]
+
+
+def test_media_keeps_its_own_handle_not_the_thumbnail_one():
+    """A video carries a nested `thumbnail` with its OWN file_id. Taking that
+    would pass any "a file_id is present" assertion while recording a lossy
+    substitute indistinguishable from the real thing — `_largest_photo`'s
+    reason for refusing `photo[0]`, one media type over."""
+    msg = {"video": {"file_id": "VIDEO_HANDLE",
+                     "thumbnail": {"file_id": "VTHUMB"},
+                     "thumb": {"file_id": "VTHUMB_LEGACY"}}}
+    assert TL._msg_attachments(msg) == [{"type": "video", "file_id": "VIDEO_HANDLE"}]
+
+
+def test_id_less_media_states_why_instead_of_reading_as_a_dropped_id():
+    """The marker survives — losing the FACT would be worse than the bug being
+    fixed — and names why it has no handle, in T-0782's `PHOTO_UNKNOWN_*`
+    style. An absent handle must never read as a dropped one."""
+    assert TL._msg_attachments({"video": {"duration": 7}}) == [
+        {"type": "video", "file_id_unknown_reason": TL.MEDIA_UNKNOWN_NO_FILE_ID}]
+    assert TL._msg_attachments({"sticker": "not-an-object"}) == [
+        {"type": "sticker", "file_id_unknown_reason": TL.MEDIA_UNKNOWN_NOT_AN_OBJECT}]
+
+
+def test_id_less_media_descriptor_renders_as_an_attached_line():
+    """The reason has to survive the RENDERER too — T-0785 owns the wording and
+    T-0787 invents no new mechanism, so an id-less video must read as "Telegram
+    gave no usable file_id", never as a blank one."""
+    from bot_squad_worker import tg_direct_reply as TDR
+    lines = "\n".join(TDR.render_attachments(
+        TL._msg_attachments({"video": {"duration": 7}})))
+    assert "video" in lines and "no usable file_id" in lines
+    assert TL.MEDIA_UNKNOWN_NO_FILE_ID in lines
+
+
+def test_several_media_keys_all_keep_their_handles():
+    """The voice+document+photo precedent, extended. Order is voice first, so a
+    message that was already recorded correctly keeps its exact record."""
+    msg = {
+        "voice": {"file_id": "VOICE_H", "duration": 3},
+        "document": {"file_id": "DOC_H"},
+        "photo": _photo_variants(),
+        "video": {"file_id": "VID_H"},
+        "sticker": {"file_id": "STK_H"},
+    }
+    assert TL._msg_attachments(msg) == [
+        {"type": "voice", "file_id": "VOICE_H"},
+        {"type": "document", "file_id": "DOC_H"},
+        {"type": "video", "file_id": "VID_H"},
+        {"type": "sticker", "file_id": "STK_H"},
+        {"type": "photo", "file_id": "FULL_1280"},
+    ]
+
+
+def test_a_real_voice_note_descriptor_is_unchanged():
+    """GREEN AT e243dae. The voice path is the working half and his
+    highest-value input; this ticket must not move it. Byte-identical, alone
+    and beside the other two branches that already existed."""
+    assert TL._msg_attachments({"voice": {"file_id": "VID", "duration": 3}}) == [
+        {"type": "voice", "file_id": "VID"}]
+    assert TL._msg_attachments({
+        "voice": {"file_id": "VID", "duration": 3},
+        "document": {"file_id": "DID"},
+        "photo": _photo_variants(),
+    }) == [
+        {"type": "voice", "file_id": "VID"},
+        {"type": "document", "file_id": "DID"},
+        {"type": "photo", "file_id": "FULL_1280"},
+    ]
+
+
+def test_absent_media_stays_absent():
+    """GREEN AT e243dae. Absent is not "a handle we lost", so no descriptor —
+    including the falsy-but-present shapes (`{}`, `[]`) an empty `photo` array
+    already followed."""
+    assert TL._msg_attachments({"text": "hi"}) == []
+    assert TL._msg_attachments({"video": {}, "sticker": None, "photo": []}) == []
+
+
+def test_types_without_a_file_id_are_still_recorded_as_nothing():
+    """GREEN AT e243dae, and deliberately so. `location`/`contact`/`venue`/
+    `poll`/`dice` carry NO file_id — what their handle would be is a separate
+    judgement call (T-0787 scope: "say so rather than silently skipping"). If
+    one of them should be recorded, that is its own ticket, not a quiet branch
+    added here."""
+    assert TL._msg_attachments({"location": {"latitude": 1.0, "longitude": 2.0}}) == []
+    assert TL._msg_attachments({"contact": {"phone_number": "+1"}}) == []
+    assert TL._msg_attachments({"poll": {"question": "?"}}) == []
+    assert TL._msg_attachments({"dice": {"value": 6}}) == []
+
+
 def test_append_conversation_noop_without_env(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
     _link_env(monkeypatch, base=None, token=None)
@@ -2081,6 +2197,122 @@ def test_handle_topic_bound_text_message_envelope_unchanged_by_attachments(tmp_p
     body = injected[0][1]["text"]
     assert "fix the flaky test please" in body
     assert "ATTACHED" not in body
+
+
+def test_handle_topic_bound_video_reaches_the_session_as_more_than_empty(tmp_path, monkeypatch):
+    """T-0787 at the seam it ships through — the FULL inbound path, RED at
+    e243dae. An UNCAPTIONED video into a session-bound task topic produced no
+    descriptor, so T-0785's ATTACHED section never rendered and the session was
+    woken by an envelope whose verbatim fence was empty. Measured with a photo
+    through the same probe as the control (the test below): the photo arm
+    produced a descriptor in the same run, so this arm's `[]` is a reading and
+    not a blind instrument."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id="T-0787", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: True)
+    injected = []
+    monkeypatch.setattr(A, "dispatch", lambda name, params: (
+        injected.append((name, params)) or {"ok": True}
+    ))
+
+    msg = _topic_msg(None, chat_id=111, thread_id=42)
+    del msg["text"]                      # an uncaptioned video has no text key
+    msg["video"] = {"file_id": "VIDEO_HANDLE", "duration": 7,
+                    "thumbnail": {"file_id": "VTHUMB"}}
+    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    assert result["action"] == "task_topic_inject" and result["sid"] == "S-dev-p9"
+    body = injected[0][1]["text"]
+    assert "ATTACHED to that message" in body
+    assert "video" in body and "VIDEO_HANDLE" in body
+    assert "VTHUMB" not in body          # the media's own handle, not its thumb
+    # …and it must not read as "videos work now". Nothing downloads anything.
+    assert "CANNOT open it" in body
+
+
+def test_handle_topic_bound_sticker_and_animation_also_reach_the_session(tmp_path, monkeypatch):
+    """RED at e243dae. The same for the rest of the file_id-bearing types —
+    a partial fix is what produced this ticket in the first place."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    for key, media, handle in (
+        ("sticker", {"file_id": "STK_HANDLE", "emoji": "🔥"}, "STK_HANDLE"),
+        ("animation", {"file_id": "ANIM_HANDLE"}, "ANIM_HANDLE"),
+        ("video_note", {"file_id": "VN_HANDLE"}, "VN_HANDLE"),
+        ("audio", {"file_id": "AUD_HANDLE", "title": "t"}, "AUD_HANDLE"),
+    ):
+        cfg = _make_multi_cfg(tmp_path / key, chat="111")
+        tg_bindings.set_binding(cfg, "111", 42, "beta",
+                                ticket_id="T-0787", session_id="S-dev-p9")
+        monkeypatch.setattr(TL, "resolve_or_link_sender",
+                            lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+        monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: True)
+        injected = []
+        monkeypatch.setattr(A, "dispatch", lambda name, params: (
+            injected.append((name, params)) or {"ok": True}
+        ))
+
+        msg = _topic_msg(None, chat_id=111, thread_id=42)
+        del msg["text"]
+        msg[key] = media
+        TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+        body = injected[0][1]["text"]
+        assert "ATTACHED to that message" in body, key
+        assert key in body and handle in body, key
+
+
+def test_handle_topic_bound_photo_control_discriminates(tmp_path, monkeypatch):
+    """The CONTROL for the two above, in the same file and the same shape: at
+    e243dae a photo through this probe DID produce an ATTACHED section (T-0782/
+    T-0785) while the video produced none. Two arms agreeing on nothing would
+    be a blind instrument, not a result. GREEN at e243dae — this one is the
+    instrument's positive control, not a defect pin."""
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", ticket_id="T-0787", session_id="S-dev-p9")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: True)
+    injected = []
+    monkeypatch.setattr(A, "dispatch", lambda name, params: (
+        injected.append((name, params)) or {"ok": True}
+    ))
+
+    msg = _topic_msg(None, chat_id=111, thread_id=42)
+    del msg["text"]
+    msg["photo"] = _photo_variants()
+    TL.handle_update(cfg, {"update_id": 1, "message": msg})
+
+    body = injected[0][1]["text"]
+    assert "ATTACHED to that message" in body and "FULL_1280" in body
+
+
+def test_append_conversation_records_a_video_handle(tmp_path, monkeypatch):
+    """RED at e243dae, on the durable-record side of the same defect: the
+    store said `attachments: []` — not lossy-but-honest, false. The thread we
+    "can always look up" (voice-04) recorded that nothing arrived."""
+    cfg = _make_cfg(tmp_path)
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    msg = {"from": _from(), "video": {"file_id": "VIDEO_HANDLE", "duration": 7}}
+    with patch("httpx.post", side_effect=fake_post):
+        TL.append_conversation(cfg, "test-project", "gu_abc", msg)
+
+    assert captured["json"]["attachments"] == [
+        {"type": "video", "file_id": "VIDEO_HANDLE"}]
 
 
 def test_handle_topic_bound_with_session_id_does_not_touch_locus(tmp_path, monkeypatch):

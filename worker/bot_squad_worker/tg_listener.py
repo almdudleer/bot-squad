@@ -484,6 +484,36 @@ def resolve_or_link_sender(cfg, msg: dict, slug: str = "") -> Optional[dict]:
 PHOTO_UNKNOWN_NOT_A_LIST = "photo-not-a-list"        # TG sent something else
 PHOTO_UNKNOWN_NO_FILE_ID = "no-file-id-in-variants"  # variants, none with an id
 
+#: T-0787: the same fact for the media types TG delivers as ONE object rather
+#: than an array of variants. Same naming style, same reason — an id-less
+#: record must never read as one whose id we dropped.
+MEDIA_UNKNOWN_NOT_AN_OBJECT = "media-not-an-object"  # TG sent something else
+MEDIA_UNKNOWN_NO_FILE_ID = "no-file-id-in-object"    # an object, no id in it
+
+#: T-0787: every media key TG sends as a single object carrying a ``file_id``,
+#: IN RECORDING ORDER. ``photo`` is deliberately absent — it arrives as an
+#: ARRAY of PhotoSize variants and needs ``_largest_photo``'s choice, so it
+#: keeps its own branch below.
+#:
+#: ``voice`` and ``document`` lead because they are the pre-T-0787 order and a
+#: message carrying several media keeps its existing record byte-for-byte. The
+#: five after them are the ones this ticket adds: before it, a video, a
+#: sticker, an animation, a video note or an audio file produced NO descriptor
+#: at all — the durable thread said nothing arrived, and an uncaptioned one
+#: woke a session with the empty verbatim fence T-0785 exists to eliminate.
+#:
+#: A TABLE, not five more branches, on purpose. The defect this fixes IS the
+#: repo's top bug class — a function whose branches were extended one media
+#: type at a time until the ones nobody revisited silently dropped everything.
+#: Adding a parallel mechanism for the new types would rebuild exactly that.
+#:
+#: NOT HERE, and not by oversight: ``location``, ``contact``, ``venue``,
+#: ``poll``, ``dice`` carry NO ``file_id``. What their handle would even be is
+#: a separate judgement call and it does not belong in this diff.
+MEDIA_FILE_ID_KEYS = (
+    "voice", "document", "video", "animation", "sticker", "video_note", "audio",
+)
+
 
 def _largest_photo(photo: Any) -> tuple[str, str]:
     """``(file_id, unknown_reason)`` for the LARGEST PhotoSize variant.
@@ -549,14 +579,54 @@ def _msg_attachments(msg: dict) -> list[dict]:
     NOT make the image retrieved — there is no download path behind photos the
     way ``voice_intake`` sits behind voice — so what changes here is only that
     the data stops being destroyed on arrival.
+
+    T-0787, the unfixed twin of that fix: this function recognised exactly
+    three keys, so a ``video``, ``animation``, ``sticker``, ``video_note`` or
+    ``audio`` returned ``[]`` — NO descriptor. That is worse than the missing
+    field T-0782 fixed. A missing handle is lossy but honest; ``[]`` makes the
+    durable thread say **nothing arrived**, which is simply false, and it makes
+    T-0785's ATTACHED section never fire, so an UNCAPTIONED video sent into a
+    session-bound task topic still woke the session with the empty verbatim
+    fence T-0785 was written to eliminate. Measured that way on the full
+    inbound path against e243dae, with a photo through the same probe as the
+    control: photo produced a descriptor in the same run, video produced none.
+
+    See ``MEDIA_FILE_ID_KEYS`` for what is covered, why it is a table rather
+    than five more branches, and which types are deliberately left out.
+
+    THE ID-LESS CASE IS UNIFORM, and that is the point of doing it here rather
+    than beside the existing branches: any covered key that arrives malformed
+    or without a handle KEEPS THE FACT and names why it has none
+    (``MEDIA_UNKNOWN_*``), exactly as a photo does. This also reaches ``voice``
+    and ``document``, whose id-less payloads used to vanish silently — the same
+    defect, in the two branches that already existed. It changes nothing for
+    any real message: TG always sends a ``file_id``, so a genuine voice note's
+    descriptor is byte-identical to its pre-T-0787 one, and TRANSCRIPTION never
+    reads this function at all (``voice_intake`` takes ``msg["voice"]``
+    directly). A falsy value — absent key, ``{}`` — writes no descriptor, the
+    same "absent stays absent" rule an empty ``photo`` array follows.
+
+    Nothing here downloads anything, for the new types either. The handle is
+    kept so a fetch is POSSIBLE later; a session must still say the media
+    arrived and that it cannot open it (``tg_direct_reply.render_attachments``
+    owns that wording and needs no change — it renders whatever type it is
+    given, which is why no new mechanism was invented for these).
     """
     out: list[dict] = []
-    voice = msg.get("voice")
-    if isinstance(voice, dict) and voice.get("file_id"):
-        out.append({"type": "voice", "file_id": voice["file_id"]})
-    doc = msg.get("document")
-    if isinstance(doc, dict) and doc.get("file_id"):
-        out.append({"type": "document", "file_id": doc["file_id"]})
+    for key in MEDIA_FILE_ID_KEYS:
+        raw = msg.get(key)
+        if not raw:
+            continue
+        if not isinstance(raw, dict):
+            out.append({"type": key,
+                        "file_id_unknown_reason": MEDIA_UNKNOWN_NOT_AN_OBJECT})
+            continue
+        file_id = str(raw.get("file_id") or "").strip()
+        # The media's OWN handle, never a nested `thumbnail`/`thumb` one: a
+        # thumbnail is a lossy substitute indistinguishable from the real thing
+        # once stored — the same reason `_largest_photo` refuses `photo[0]`.
+        out.append({"type": key, "file_id": file_id} if file_id else {
+            "type": key, "file_id_unknown_reason": MEDIA_UNKNOWN_NO_FILE_ID})
     if msg.get("photo"):
         # An EMPTY array is falsy and never gets here: no photo arrived, so no
         # descriptor is written. Absent stays absent — it is not a photo whose
@@ -1415,6 +1485,12 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
         # path exists behind a photo, so the session still cannot look at the
         # image — see `tg_direct_reply.render_attachments`, whose wording is
         # what keeps a session from claiming otherwise.
+        # T-0787: and it is no longer only a photo. `_msg_attachments` knew
+        # three media keys, so an uncaptioned video/sticker/animation/
+        # video_note/audio produced no descriptor and this section never
+        # fired — i.e. the empty-fence failure above survived here for every
+        # media type except the one T-0785 was measured on. Same descriptor
+        # shape, same renderer, nothing new to render.
         quote = reply_quote.extract(msg)
         envelope = tg_direct_reply.compose_envelope(
             text=text, chat_id=chat_id, thread_id=thread_id, sid=session_id,

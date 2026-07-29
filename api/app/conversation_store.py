@@ -71,6 +71,19 @@ relay side effects a normal append of that author would otherwise trigger).
 Additive + back-compat: omitted from the record entirely when False (the
 overwhelming common case) — absent on disk reads back as ``False``, so no
 pre-T-0660 record is affected.
+
+A per-task topic file holds ONE SIDE ON PURPOSE (T-0769). When a topic's
+binding names a ``session_id``, ``tg_listener._handle_topic_bound`` delivers the
+user's message straight to that session and never appends it into
+``<gid>/t<thread>.jsonl``, while our outbound posts into the topic are stored
+normally. So that file legitimately reads as a monologue — our answers with none
+of their questions — and their words are in the ``<gid>.jsonl`` beside it, as
+``fyi`` records authored ``system:direct-reply``. Two sessions read the
+monologue as message loss on 2026-07-28 and escalated it to the stakeholder as
+urgent. Anything reading these files directly should check
+``data/_worker/tg_bindings.json`` for the thread before concluding anything from
+an absence; the HTTP reads say it outright — see
+``routes_conversations._inbound_capture``.
 """
 from __future__ import annotations
 

@@ -14,6 +14,13 @@ Two auth surfaces over the per-(project, user) conversation thread
 Mounted only on the MOTHERSHIP build (see ``main.py``): the bot's
 user-communication module is centralized on the mothership (voice-04), and the
 ``global_user_id`` key is a mothership identity (T-0488).
+
+T-0769: both READ surfaces stamp every page with ``inbound_capture`` — whether
+an inbound user message would appear in the thread just read, and where it goes
+when it would not. A per-task topic routes the user's words straight to its
+pinned session and records only OUR side, which reads as a one-sided
+conversation rather than an empty one; two sessions took that for message loss
+and escalated it to the stakeholder. See :func:`_inbound_capture`.
 """
 from __future__ import annotations
 
@@ -109,15 +116,65 @@ def _read_conversation_locus(
     return {"chat_id": rec["chat_id"], "thread_id": rec.get("thread_id")}
 
 
+def _load_topic_bindings(request: Request) -> dict | None:
+    """The worker-owned topic-binding map, or ``None`` when it could not be
+    read (T-0740 read path; ``None`` split out by T-0769).
+
+    Read-only lookup of ``data/_worker/tg_bindings.json``
+    (``bot_squad_worker.tg_bindings``) — the same direct-read-of-a-shared-file
+    pattern as :func:`_read_conversation_locus`, and the same best-effort
+    contract: a missing/corrupt file never raises.
+
+    ``None`` vs ``{}`` is load-bearing and is why this is a separate function.
+    Callers that only want a chat_id can collapse both to "no binding"
+    (:func:`_read_topic_binding_chat` does, unchanged). :func:`_inbound_capture`
+    may NOT: "I read the map and this thread is not session-routed" and "I could
+    not read the map at all" produce the same empty lookup, and reporting the
+    second as the first states a specific falsehood exactly when the instrument
+    is broken (T-0740 / T-0759's explicit-UNKNOWN rule).
+    """
+    cfg = request.app.state.api_config
+    path = cfg.data_dir / "_worker" / "tg_bindings.json"
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("routes_conversations: could not parse %s: %s", path, e)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _find_binding(
+    bindings: dict, thread_id: Any, slug: str | None = None,
+) -> tuple[str, dict] | None:
+    """The ``(chat_id, record)`` bound to ``thread_id``, or ``None``. Key
+    derivation mirrors ``tg_bindings._key``: ``"<chat_id>:<thread_id>"``.
+
+    ``slug`` filters the search; ``None`` matches any project. A thread id is
+    only unique WITHIN a chat, so two chats can legitimately carry the same
+    number — which is why the filter belongs in the scan and not in a check on
+    its result. :func:`_read_topic_binding_chat` passes a slug (a thread bound
+    elsewhere is not this project's relay destination, and must not shadow one
+    that is); :func:`_inbound_capture` searches this project first and only
+    then anywhere, because "you asked the wrong project" is one of the ways an
+    empty page gets misread as loss.
+    """
+    for key, rec in bindings.items():
+        if not isinstance(rec, dict) or not rec.get("slug"):
+            continue
+        if slug is not None and rec.get("slug") != slug:
+            continue
+        chat_id, _, bound_thread = str(key).rpartition(":")
+        if chat_id and bound_thread == str(thread_id):
+            return chat_id, rec
+    return None
+
+
 def _read_topic_binding_chat(request: Request, slug: str, thread_id: Any) -> str:
     """T-0740: the chat_id that ``thread_id`` is a forum topic OF, for ``slug``.
-
-    Read-only lookup of the worker-owned topic-binding store
-    (``bot_squad_worker.tg_bindings``, ``data/_worker/tg_bindings.json``) —
-    same direct-read-of-a-shared-file pattern, and same best-effort contract,
-    as :func:`_read_conversation_locus` above (a missing/corrupt file is "no
-    binding", never an error). Key derivation mirrors ``tg_bindings._key``:
-    ``"<chat_id>:<thread_id>"``.
 
     A thread id is only meaningful INSIDE its chat, so relaying into a topic
     requires both halves. The locus supplies both when it has an entry; this
@@ -126,27 +183,178 @@ def _read_topic_binding_chat(request: Request, slug: str, thread_id: Any) -> str
     freshly-created topic" case). ``slug`` is checked, not assumed: a thread
     bound to a DIFFERENT project must never be used as this project's
     destination.
+
+    Unchanged contract: ``""`` for "no usable binding", whatever the reason
+    (missing thread_id, unreadable store, foreign project, no match).
     """
     if thread_id is None or str(thread_id).strip() == "":
         return ""
-    cfg = request.app.state.api_config
-    path = cfg.data_dir / "_worker" / "tg_bindings.json"
-    if not path.is_file():
+    bindings = _load_topic_bindings(request)
+    if bindings is None:
         return ""
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        log.warning("routes_conversations: could not parse %s: %s", path, e)
-        return ""
-    if not isinstance(raw, dict):
-        return ""
-    for key, rec in raw.items():
-        if not isinstance(rec, dict) or rec.get("slug") != slug:
-            continue
-        chat_id, _, bound_thread = str(key).rpartition(":")
-        if chat_id and bound_thread == str(thread_id):
-            return chat_id
-    return ""
+    found = _find_binding(bindings, thread_id, slug=slug)
+    return found[0] if found else ""
+
+
+# --- T-0769: what this read DOES and DOES NOT contain -----------------------
+#
+# ``scope`` vocabulary. One value per way an inbound TG message can (not) reach
+# the thread being read. Every value is a statement the server can prove from
+# the binding store; there is no default, and no value means "probably fine".
+SCOPE_PROJECT = "project"                # not a topic read at all
+SCOPE_TOPIC = "topic"                    # bound topic, inbound recorded HERE
+SCOPE_SESSION_ROUTED = "session_routed"  # bound topic, inbound goes to a session
+SCOPE_UNBOUND = "unbound"                # no binding anywhere for this thread
+SCOPE_OTHER_PROJECT = "other_project"    # bound, but to a different slug
+SCOPE_UNKNOWN = "unknown"                # the binding store could not be read
+
+
+def _inbound_capture(
+    request: Request, slug: str, thread_id: Any,
+) -> dict:
+    """Say, on the read itself, whether an INBOUND user message would appear in
+    it — and when it would not, say where it goes instead (T-0769).
+
+    THE DEFECT THIS EXISTS FOR. A forum topic whose binding carries a
+    ``session_id`` is a T-0660 per-TASK topic: ``tg_listener._handle_topic_bound``
+    routes the user's message STRAIGHT to that session and deliberately does not
+    append it into the topic's own store (T-0667 — a task-topic message must
+    never redirect the project's attendant-reply relay). Our OUTBOUND posts into
+    that topic ARE stored. So the read comes back showing our side and not his:
+    not an empty result inviting "is my query wrong?", but a ONE-SIDED
+    conversation, which reads as "his messages were lost". On 2026-07-28 two
+    independent sessions read exactly that off topics 220 and 517, concluded the
+    inbound wiring was structurally broken, and escalated message loss to the
+    stakeholder — one of them then posted an apology into his topic for a fault
+    that had not occurred. T-0770 makes it worse rather than better: it makes
+    the session ANSWER into the topic, so the same read now accumulates a
+    growing stream of our answers with none of his questions.
+
+    The routing is correct and is NOT what changes. What was missing is that the
+    response never SAID any of this, so a correct answer and a broken one are the
+    same bytes. This is the T-0772 shape one layer down: the server emits a scope
+    marker from the return site that knows the truth, and an UNKNOWN degrades to
+    the vaguer TRUE statement instead of a specific false one.
+
+    The prose is part of the fix, not decoration. The ticket's test is whether a
+    reader who has never read ``_handle_topic_bound`` can tell a healthy
+    session-bound topic from a genuinely dead one, so ``explain`` has to carry
+    the reasoning to a reader with no worker source in front of them; the enum
+    alone would just be a new thing to look up.
+
+    ``inbound_recorded_in`` is built from ``request.url.path`` rather than a
+    hardcoded route, so it is correct for whichever surface is being read (the
+    session-auth ``/api/m/conversations/...`` and the worker-token
+    ``/api/m/worker/conversations/...`` differ, and both readers exist) and
+    cannot drift if a mount prefix moves.
+    """
+    project_read = f"GET {request.url.path} (no thread_id)"
+    tid = "" if thread_id is None else str(thread_id).strip()
+    out: dict[str, Any] = {
+        "scope": SCOPE_PROJECT,
+        "thread_id": tid,
+        "records_inbound_here": True,
+        "bound_session_id": "",
+        "bound_ticket_id": "",
+        "inbound_recorded_in": "",
+        "explain": (
+            "This is the project-level thread for this user: their DMs and "
+            "general-feed messages land here, plus passive fyi copies "
+            "(author 'system:direct-reply') of anything they wrote straight to "
+            "a session in a task topic. A bound forum topic's own messages are "
+            "NOT here — read that topic with ?thread_id=<id>."
+        ),
+    }
+    if not tid:
+        return out
+
+    bindings = _load_topic_bindings(request)
+    if bindings is None:
+        out.update(
+            scope=SCOPE_UNKNOWN,
+            records_inbound_here=None,
+            explain=(
+                f"The topic-binding store could not be read, so whether inbound "
+                f"messages for thread {tid} are recorded here or routed straight "
+                f"to a session (T-0660 per-task topic) is UNKNOWN. Do not read an "
+                f"empty or one-sided page as message loss on this evidence — it is "
+                f"unexplained, not explained. Check "
+                f"data/_worker/tg_bindings.json on the install."
+            ),
+        )
+        return out
+
+    # This project first: a thread id is unique only inside its chat, so a
+    # same-numbered topic in someone else's chat must never shadow ours and
+    # turn a healthy read into a wrong-project explanation.
+    found = _find_binding(bindings, tid, slug=slug)
+    elsewhere = None if found else _find_binding(bindings, tid)
+    if found is None and elsewhere is None:
+        out.update(
+            scope=SCOPE_UNBOUND,
+            records_inbound_here=False,
+            explain=(
+                f"No project is bound to thread {tid} in any chat, so nothing "
+                f"routes into it and this thread is expected to be empty. A "
+                f"message sent to an unbound topic is refused by the listener "
+                f"(it asks for a binding) rather than captured anywhere. If you "
+                f"expected records here, the binding is what is missing — not "
+                f"the messages."
+            ),
+        )
+        return out
+
+    if found is None:
+        out.update(
+            scope=SCOPE_OTHER_PROJECT,
+            records_inbound_here=False,
+            explain=(
+                f"Thread {tid} is a bound forum topic of a DIFFERENT project, "
+                f"and this read is scoped to {slug!r} — so it will always be "
+                f"empty here no matter what was said in that topic. This is a "
+                f"wrong-project query, not missing data. Re-read it under the "
+                f"slug that owns it."
+            ),
+        )
+        return out
+
+    _chat_id, rec = found
+    session_id = str(rec.get("session_id") or "")
+    ticket_id = str(rec.get("ticket_id") or "")
+    out["bound_ticket_id"] = ticket_id
+    if not session_id:
+        out.update(
+            scope=SCOPE_TOPIC,
+            records_inbound_here=True,
+            explain=(
+                f"Thread {tid} is bound to {slug!r} with no session pinned, so "
+                f"inbound messages from this user ARE appended here (author "
+                f"'user'). An empty or inbound-free page for this topic is a "
+                f"real absence — nothing is recording them elsewhere."
+            ),
+        )
+        return out
+
+    out.update(
+        scope=SCOPE_SESSION_ROUTED,
+        records_inbound_here=False,
+        bound_session_id=session_id,
+        inbound_recorded_in=project_read,
+        explain=(
+            f"Thread {tid} is a per-task topic pinned to session {session_id}"
+            + (f" (ticket {ticket_id})" if ticket_id else "")
+            + ". Messages the user sends here are delivered STRAIGHT to that "
+            "session and are deliberately never appended to this topic's own "
+            "record (T-0660/T-0667), while our outbound posts into the topic "
+            "ARE recorded. So this page showing only our side is the DESIGNED "
+            "state and is NOT evidence that the user's messages were lost. "
+            f"Their words are recorded as passive fyi entries (author "
+            f"'system:direct-reply') in the project thread: {project_read}. "
+            "To make this topic capture inbound like an ordinary one, unpin the "
+            "session ('/pin-session off')."
+        ),
+    )
+    return out
 
 
 def _resolve_relay_target(
@@ -481,15 +689,24 @@ def worker_list_conversation(
     ``thread_id`` (T-0676 items 3/6): read a bound topic's OWN isolated
     thread instead of the project's mixed (slug, global_user_id) history —
     see ``conversation_store.conv_path``. Empty/omitted behaves exactly as
-    before this change."""
+    before this change.
+
+    ``inbound_capture`` (T-0769): carried here for the same reason as on the
+    session-auth read — see :func:`_inbound_capture`. The user-conversation
+    ATTENDANT reads through THIS surface (it holds the worker token, not a JWT)
+    and T-0676's boot prompt points it at a topic-scoped read, so it is exactly
+    a reader that can be handed a one-sided topic."""
     _authenticate_worker(request)
     tid = thread_id or None
     try:
         if q:
-            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset, thread_id=tid)
-        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset, thread_id=tid)
+            page = CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset, thread_id=tid)
+        else:
+            page = CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset, thread_id=tid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    page["inbound_capture"] = _inbound_capture(request, slug, tid)
+    return page
 
 
 # ---- T-0492: per-(user, server) current-project routing (worker-token) -------
@@ -548,11 +765,24 @@ def list_conversation(
 
     ``thread_id`` (T-0676 items 3/6): read a bound topic's OWN isolated
     thread instead of the project's mixed history. Empty/omitted behaves
-    exactly as before this change."""
+    exactly as before this change.
+
+    ``inbound_capture`` (T-0769): every page also states whether an INBOUND
+    message from this user would appear in it, and where it goes when it would
+    not. Two sessions read message loss off a correct answer here and escalated
+    it to the stakeholder as urgent; the records were right and the response
+    simply never said what it was. See :func:`_inbound_capture` — the marker is
+    additive (the ``total``/``limit``/``offset``/``messages`` keys are byte-for-byte
+    unchanged), and it is emitted on the search path too, since grepping a
+    session-routed topic for the user's own words is the read MOST likely to be
+    mistaken for loss."""
     tid = thread_id or None
     try:
         if q:
-            return CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset, thread_id=tid)
-        return CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset, thread_id=tid)
+            page = CS.search(_data_dir(request), slug, global_user_id, q, limit=limit, offset=offset, thread_id=tid)
+        else:
+            page = CS.list_messages(_data_dir(request), slug, global_user_id, limit=limit, offset=offset, thread_id=tid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    page["inbound_capture"] = _inbound_capture(request, slug, tid)
+    return page

@@ -2147,6 +2147,65 @@ def test_a_plain_project_topic_gets_no_envelope_and_owes_nothing(tmp_path, monke
     assert injected == [] and TDR.load(cfg) == {}
 
 
+def test_session_bound_topic_never_appends_inbound_to_the_topic_store(
+    tmp_path, monkeypatch,
+):
+    """T-0769: the property the API now STATES on every read of such a topic.
+
+    ``routes_conversations._inbound_capture`` answers the question two sessions
+    got wrong on 2026-07-28 — "are his messages in this topic or not?" — with a
+    flat "not, and here is where they are". That answer is derived from the
+    BINDING, not from the routing code, so if this branch ever starts appending
+    inbound into the topic's own store the API keeps saying the opposite and
+    the marker becomes a confident lie instead of a missing one. This test is
+    the coupling: it fails the moment the statement stops being true.
+
+    Note what this does NOT say. Not appending here is deliberate (T-0660/
+    T-0667 — a task-topic message must never redirect the project's
+    attendant-reply relay), and T-0769 explicitly refused to "fix" the
+    asymmetry by writing a per-topic copy of content already recorded. So if
+    you are here because you want that copy, the marker is not what is standing
+    in your way; the ticket is.
+
+    Carries its OWN positive control (T-0740). "No append was recorded" is
+    exactly what a spy patched onto the wrong name reports, and it reports it
+    forever — so the same spy also has to be SEEN catching the append a plain
+    bound topic really does make.
+    """
+    from bot_squad_worker import tg_bindings
+    import bot_squad_worker.actions as A
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 42, "beta", session_id="S-dev-p9")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")  # plain topic: the control
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True})
+    monkeypatch.setattr(TL, "append_conversation_fyi", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    durable = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda *a, **k: durable.append(k.get("thread_id")))
+
+    TL.handle_update(cfg, {
+        "update_id": 1,
+        "message": _topic_msg("прием-прием", chat_id=111, thread_id=42),
+    })
+    assert durable == [], (
+        "a session-bound topic must not durably append inbound into its own "
+        "store — routes_conversations._inbound_capture tells every reader it "
+        "does not (T-0769)"
+    )
+
+    TL.handle_update(cfg, {
+        "update_id": 2,
+        "message": _topic_msg("прием-прием", chat_id=111, thread_id=7),
+    })
+    assert durable == [7], (
+        "positive control: the spy must be able to see an append at all, or "
+        "the assertion above pins nothing"
+    )
+
+
 def test_handle_topic_bound_plain_project_topic_never_records_fyi(tmp_path, monkeypatch):
     """A plain project/General binding (no session_id) is the T-0639 base
     case, not a task-topic direct-reply — must never trigger the FYI mechanic."""

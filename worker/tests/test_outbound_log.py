@@ -17,20 +17,13 @@ import pytest
 from bot_squad_worker import outbound_log as OB
 
 
-@pytest.fixture(autouse=True)
-def _reset_drops():
-    """DROPS is process-global, and two tests here bump it ON PURPOSE.
-
-    ``test_outbound_liveness.py`` has carried this fixture since T-0759 ("a
-    leaked count would make every later check read DECAYED for the wrong
-    reason") but the module that does the LEAKING never had it — the two only
-    coexisted because 'liveness' sorts before 'log', so the victim ran first.
-    T-0770 added a second consumer of that verdict, which sorts after both, and
-    it read DECAYED->BLIND for 13 tests. Restoring the counter here fixes it at
-    the source rather than in each new reader."""
-    before = dict(OB.DROPS)
-    yield
-    OB.DROPS.update(before)
+# T-0774: two tests here bump DROPS on purpose and this file used to restore it
+# itself (T-0770), believing that fixed the leak "at the source rather than in
+# each new reader". It did not: the deliberate bumps were never the source —
+# `test_tg.py` leaks 17 by accident, never mentioning DROPS at all. The guard is
+# now conftest-level (`_isolate_outbound_drops`) and covers every worker test,
+# including the deliberate bumps below, which assert on a DELTA and so are
+# indifferent to the starting value.
 
 
 SID = "S-almdudleer-gu_dc8262b6cea9098d98e04d7e-user-conversation-p5"

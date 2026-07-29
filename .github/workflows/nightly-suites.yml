@@ -69,6 +69,30 @@ jobs:
         run: |
           pytest worker/tests -q
 
+      # T-0774: the same suite again with the FILE ORDER REVERSED. Not
+      # redundant — on 99cb674 the forward run was 2793 passed and the reverse
+      # run was 5 failed, at the same commit, because `outbound_log.DROPS` is
+      # process-global and `tests/test_tg.py` leaked 17 into it as a side effect
+      # of exercising the transport. The plain run above was green THROUGHOUT
+      # and could never have caught it: alphabetically the victim
+      # (test_outbound_liveness.py) ran first, so the leak landed behind it.
+      # CI was safe by that same accident, and anyone who parallelises or
+      # randomises the step above would have tripped it on their first run and
+      # reasonably blamed their own change.
+      #
+      # A second step in the SAME job, not a second job: the checkout and the
+      # install are already paid for, so this costs ~2 minutes of a 30-minute
+      # budget and no extra billed job.
+      #
+      # `tests/test_drops_isolation.py` pins the specific leak in ~1s in any
+      # order; this step is the wider net, for the next order-dependence that
+      # nobody has found yet. If it goes red while the forward run is green,
+      # that is what it has caught — look for shared process-global state, not
+      # for a bug in the tests that failed.
+      - name: Run the worker suite again, in REVERSE file order
+        run: |
+          cd worker && pytest -q $(ls tests/test_*.py | tac)
+
   api:
     runs-on: ubuntu-latest
     timeout-minutes: 30

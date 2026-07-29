@@ -72,22 +72,16 @@ def _fast_knobs(monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_TG_ANSWER_OWED_GRACE_SEC", "60")
     monkeypatch.setenv("BOT_SQUAD_TG_ANSWER_OWED_COOLDOWN_SEC", "60")
     monkeypatch.setenv("BOT_SQUAD_TG_ANSWER_OWED_MAX_ATTEMPTS", "2")
-    # ``outbound_log.DROPS`` is process-global and a non-zero count makes
-    # `outbound_liveness.check` report DECAYED — which this module reads as
-    # BLIND, correctly (see `answered_since`). A leak from another test module
-    # therefore turns 13 tests here green-for-the-wrong-reason in a full-suite
-    # run and green-for-the-right-reason alone. The leak itself is fixed at its
-    # source in test_outbound_log.py; this is the belt to that's braces, because
-    # any future test that exercises a drop inherits the same trap.
-    # Zeroed for the duration, not merely restored after: a count leaked by a
-    # module that ran EARLIER is already in place by the time this fixture
-    # runs, and restoring it would preserve exactly the pollution.
-    from bot_squad_worker import outbound_log as _OB
-    before = dict(_OB.DROPS)
-    for k in _OB.DROPS:
-        _OB.DROPS[k] = 0
+    # T-0774: the DROPS-zeroing this fixture used to do inline has moved to
+    # conftest's autouse `_isolate_outbound_drops`, which covers every worker
+    # test rather than this file. Its reasoning was right on both counts and is
+    # preserved there: a non-zero `outbound_log.DROPS` makes
+    # `outbound_liveness.check` report DECAYED, which this module reads as BLIND
+    # (see `answered_since`) — turning 13 tests here green-for-the-wrong-reason
+    # in a full run — and ZEROING is required rather than restoring, because a
+    # count leaked by an earlier module is already in place by the time any
+    # fixture here runs.
     yield
-    _OB.DROPS.update(before)
 
 
 class _Doubles:

@@ -61,13 +61,13 @@ def _reply_map(tmp_path: Path, *, when: float) -> None:
         json.dumps({f"{CHAT}:1": {"sid": SID, "ts": when}}), encoding="utf-8")
 
 
-@pytest.fixture(autouse=True)
-def _reset_drops():
-    """DROPS is process-global; a leaked count would make every later check
-    read DECAYED for the wrong reason."""
-    before = dict(OB.DROPS)
-    yield
-    OB.DROPS.update(before)
+# T-0774: this file used to carry its own autouse `_reset_drops` (T-0759, "a
+# leaked count would make every later check read DECAYED for the wrong reason").
+# It was right about the hazard and could not fix it: it defended the READER,
+# while the leak comes from any test anywhere that makes the transport swallow a
+# record — and snapshot-and-restore preserves a count that arrived BEFORE it. The
+# guard is now conftest-level and applies to every worker test; see
+# `_isolate_outbound_drops` there and `test_drops_isolation.py`, which pins it.
 
 
 # ---------------------------------------------------------------------------

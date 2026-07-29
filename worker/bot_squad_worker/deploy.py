@@ -138,7 +138,16 @@ def freeze_boot_git_sha() -> str:
     return sha
 
 
-_EFFECTIVE_SHA_CACHE: tuple[str, str] | None = None  # (deployed_sha, effective_sha)
+#: ``(boot_sha, deployed_sha, effective_sha)`` — keyed on BOTH inputs the value
+#: is derived from (T-0779). It was keyed on ``deployed`` alone, which is a true
+#: statement about the real worker (``boot_git_sha()`` is frozen once per
+#: process, so there is exactly one ``boot`` per ``deployed``) but not a
+#: statement the KEY made. Any second ``boot`` in one process — i.e. any test —
+#: therefore read a cache HIT belonging to a completely different ``boot`` and
+#: got a silently wrong answer rather than an error. Naming both inputs costs
+#: nothing at runtime (the real worker still computes one entry and hits it
+#: forever) and makes the invariant hold by construction instead of by trust.
+_EFFECTIVE_SHA_CACHE: tuple[str, str, str] | None = None
 
 
 def effective_worker_git_sha() -> str:
@@ -164,8 +173,10 @@ def effective_worker_git_sha() -> str:
     Falls back to the raw boot sha whenever the answer isn't clearly "identical"
     (git absent, bad rev, probe error) — reporting a stale sha is a false alarm,
     reporting a sha the process might not be running would be a false all-clear.
-    Cached per deployed sha so the 60s heartbeat and every ``/health`` hit don't
-    each shell out to ``git diff``.
+    Cached per ``(boot, deployed)`` pair so the 60s heartbeat and every
+    ``/health`` hit don't each shell out to ``git diff`` (T-0779: the key names
+    both inputs, so a second ``boot`` in one process re-probes instead of
+    silently inheriting the first one's answer).
     """
     global _EFFECTIVE_SHA_CACHE
     boot = boot_git_sha()
@@ -174,10 +185,10 @@ def effective_worker_git_sha() -> str:
     if not boot or not deployed or boot == deployed:
         return boot
     cached = _EFFECTIVE_SHA_CACHE
-    if cached is not None and cached[0] == deployed:
-        return cached[1]
+    if cached is not None and cached[0] == boot and cached[1] == deployed:
+        return cached[2]
     effective = deployed if _worker_subtree_identical(root, boot, deployed) else boot
-    _EFFECTIVE_SHA_CACHE = (deployed, effective)
+    _EFFECTIVE_SHA_CACHE = (boot, deployed, effective)
     return effective
 
 

@@ -74,6 +74,64 @@ def _isolate_outbound_drops():
         _outbound_log.DROPS[key] = 0
 
 
+@pytest.fixture(autouse=True)
+def _isolate_deploy_sha_globals():
+    """T-0779: clear ``deploy._BOOT_GIT_SHA`` and ``deploy._EFFECTIVE_SHA_CACHE``
+    around EVERY worker test.
+
+    Both are process-global memoisations that are CORRECT for the real worker
+    and wrong for a test process. ``boot_git_sha()`` freezes the install tree's
+    HEAD on first call and never recomputes — that is the whole point (T-0461):
+    it is how the restart gate knows the running process is on stale code.
+    ``effective_worker_git_sha()`` then caches the answer it derives from it.
+    In a suite, "once per process" means "once per RUN of ~2800 tests", so the
+    first test to touch either one decides what every later test sees.
+
+    MEASURED, not inferred (T-0779, full forward run instrumented with a
+    setup/teardown probe over both globals):
+
+    * ``tests/test_channels.py::test_deploy_notifications_flow_through_channel``
+      freezes ``_BOOT_GIT_SHA`` to the real dev-clone HEAD as a side effect of
+      exercising the deploy notification path. It never mentions the global —
+      same shape as ``test_tg.py`` leaking 17 into ``outbound_log.DROPS``.
+    * ``tests/test_jobs.py::test_heartbeat_writes_boot_sha`` leaves
+      ``(<real deployed sha>, "deadbeefcafe123")`` in the cache — an entry keyed,
+      before the fix, on a sha shared by every test in the run.
+
+    That second one is why the ticket exists: with the old ``deployed``-only key
+    an earlier entry was a cache HIT for a foreign ``boot``, so a
+    ``monkeypatch.setattr(D, "boot_git_sha", ...)`` was silently ignored and the
+    test failed — but only when something happened to warm the cache first,
+    which is why it presented as an unreproducible flake rather than an order
+    dependency the T-0774 reverse-order gate could converge on.
+
+    WHY THIS LIVES HERE AND NOT IN ``test_jobs.py``. That file is the victim,
+    not the fault (the T-0774 rule in AGENT_INSTRUCTIONS). The polluter is any
+    test anywhere that calls a heartbeat, a ``/health`` handler, or a deploy
+    path with a patched boot sha, and it has no reason to know these globals
+    exist. A per-file fixture defends one reader; this defends all ~100 files.
+
+    WHY CLEAR RATHER THAN SNAPSHOT-AND-RESTORE. Restoring the pre-test value
+    faithfully preserves whatever leaked before this fixture first ran — from a
+    module-scoped fixture, or at import time during collection. Clearing gives
+    every test the same known starting state regardless of what preceded it,
+    which is the property the suite needs. (Same call, same reasons, as
+    ``_isolate_outbound_drops`` above.)
+
+    Production behaviour is deliberately unchanged: the real worker calls
+    ``freeze_boot_git_sha()`` once at startup and keeps its memoised value for
+    the life of the process. ``tests/test_effective_sha_cache_isolation.py``
+    pins this fixture and the key it depends on.
+    """
+    from bot_squad_worker import deploy as _deploy
+
+    _deploy._BOOT_GIT_SHA = None
+    _deploy._EFFECTIVE_SHA_CACHE = None
+    yield
+    _deploy._BOOT_GIT_SHA = None
+    _deploy._EFFECTIVE_SHA_CACHE = None
+
+
 @pytest.fixture
 def tmp_data_dir(tmp_path: Path) -> Path:
     """Provide a writable bot-squad data dir for a single test."""

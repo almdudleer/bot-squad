@@ -3035,12 +3035,36 @@ def _pace_fmt_set_at(set_at: str | None) -> str:
 def _pace_print_drive(drive: dict) -> None:
     """The `drive:` block of `bsq pace show` (T-0828 DoD-4).
 
-    The provenance suffix on the `scope` line is D-0069's specified shape:
-    "scope: open_reopened — set 2026-07-30 14:52 from «закончить всё что в опен»".
-    That line is the answer to "did my instruction land", which is the whole ask
-    — so it is a DoD item, not a nicety. NOTE the stamp is BLOCK-level (set_drive
-    refreshes set_at on every write, whichever axis moved); it is rendered on the
-    scope line because scope is the axis his worked example sets."""
+    ⚠ PROVENANCE BELONGS TO THE REQUEST, NOT TO THE RESULT.
+
+    In the normal case the provenance is fused onto the `scope` line, which is
+    D-0069's specified shape and the answer to "did my instruction land":
+
+        scope: open_reopened — set 2026-07-30 14:52 from «закончить всё что в опен»
+
+    The moment a stored value is REJECTED those two diverge, and fusing them
+    then manufactures a decision nobody made. The T-0828 walkthrough caught this
+    surface printing:
+
+        scope: all — set 2026-07-30 15:14 from «закончить всё что в опен»
+
+    Every field there is individually correct and the sentence is false: his
+    words asked for `open_reopened`, the stored value was rejected, and `all` is
+    OUR fallback — so the line attributes a value he never chose to words he did
+    say. That is the reported defect with a new sign, and no per-field unit test
+    sees it; only the assembled line is wrong.
+
+    So when an axis was rejected it carries BOTH facts — what was requested
+    (raw, so he sees his own typo) and what is in effect because we could not
+    read it — and the provenance verb becomes "requested", attaching to the
+    request rather than to the result. The web twin
+    (`ObservabilityPanel.driveModeCopy`) follows the same rule; keep them
+    together, and note that the DoD-6 mirror test compares NORMALISATION only —
+    it cannot see a rendering divergence between these two surfaces.
+
+    NOTE the stamp is BLOCK-level (set_drive refreshes set_at on every write,
+    whichever axis moved); in the clean case it renders on the scope line
+    because scope is the axis his worked example sets."""
     if not drive.get("configured"):
         print("  drive mode: (not set — defaults in effect: "
               f"scope={_PACE_DRIVE_DEFAULTS['scope']} "
@@ -3048,23 +3072,37 @@ def _pace_print_drive(drive: dict) -> None:
               f"on_stop={_PACE_DRIVE_DEFAULTS['on_stop']})")
         return
 
+    invalid = drive.get("invalid") or {}
+    verb = "requested" if invalid else "set"
+
     prov = ""
     stamp = _pace_fmt_set_at(drive.get("set_at"))
     if stamp:
-        prov = f" — set {stamp}"
+        prov = f"{verb} {stamp}"
         if drive.get("set_by"):
             prov += f" by {drive['set_by']}"
     if drive.get("source_text"):
-        prov += f" from «{drive['source_text']}»"
+        prov = f"{prov or verb} from «{drive['source_text']}»"
+
+    def _axis(field: str) -> str:
+        if field in invalid:
+            return (f"{invalid[field]!r} requested (not recognised) → "
+                    f"{drive[field]!r} in effect")
+        return str(drive[field])
 
     print("  drive mode:")
-    print(f"    scope:     {drive['scope']}{prov}")
-    print(f"    stop_when: {drive['stop_when']}")
-    print(f"    on_stop:   {drive['on_stop']}")
+    # Fuse the provenance onto `scope` ONLY when nothing was rejected; otherwise
+    # it goes on its own line below, attached to the request.
+    scope_suffix = f" — {prov}" if (prov and not invalid) else ""
+    print(f"    scope:     {_axis('scope')}{scope_suffix}")
+    print(f"    stop_when: {_axis('stop_when')}")
+    print(f"    on_stop:   {_axis('on_stop')}")
+    if prov and invalid:
+        print(f"    {prov}")
 
     # An out-of-set stored value is LOUD. Reporting the default as though it
     # were the setting is the silent-fallback defect D-0069 forbids.
-    for field, bad in sorted(drive.get("invalid", {}).items()):
+    for field, bad in sorted(invalid.items()):
         allowed = ", ".join(_PACE_DRIVE_CHOICES.get(field, ()))
         print(f"    ⚠ INVALID {field}={bad!r} in pace.json — NOT a recognised value, "
               f"so the default {_PACE_DRIVE_DEFAULTS.get(field)!r} is in effect. "

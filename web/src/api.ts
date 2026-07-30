@@ -869,7 +869,35 @@ export type Transparency = {
       string,
       { weight: number; priority: number; paused: boolean }
     >;
+    // T-0828 / D-0069: the standing per-project DRIVE MODE. Optional because a
+    // pre-T-0828 server does not send it — an older api must render as "unknown",
+    // never as "no mode set" (that would be a claim about his settings that the
+    // server never made).
+    drive?: DriveMode;
   };
+};
+
+/**
+ * T-0828 / D-0069 — the standing drive mode, as the transparency payload
+ * carries it. Mirrors `worker/bot_squad_worker/pace.py:_normalized_drive` and
+ * its api twin `routes_transparency.py:_normalized_drive`.
+ *
+ * `configured` is the field that answers the stakeholder's actual question
+ * («какой режим драйва щас стоит»): an unset project and one explicitly set to
+ * the widest scope BOTH read `scope: "all"`, and only this flag tells them
+ * apart. `invalid` carries out-of-set stored values with the raw value intact —
+ * the effective axis has already fallen back to its default, and the UI must
+ * SAY so rather than render the fallback as the setting.
+ */
+export type DriveMode = {
+  scope: string;
+  stop_when: string;
+  on_stop: string;
+  set_by: string | null;
+  set_at: string | null;
+  source_text: string | null;
+  configured: boolean;
+  invalid: Record<string, unknown>;
 };
 
 // T-0620/T-0630: web operator controls — pause/resume the re-drive tick and

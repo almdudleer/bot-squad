@@ -143,6 +143,29 @@ def _all_three(raw: dict) -> dict[str, dict]:
 # The pins
 # ---------------------------------------------------------------------------
 
+def test_the_denominator_three_implementations_over_a_non_empty_table():
+    """A SCANNER'S FILE COUNT IS ITS PASS COUNT (p537's rule, T-0828).
+
+    "Clean" over an unstated denominator is "no failures" wearing different
+    clothes. This differential compares whatever ``_all_three`` happens to
+    return over whatever ``RAW_CASES`` happens to hold — so if either shrank to
+    nothing, every test above would PASS over zero comparisons and the guard
+    would be ceremonial. That is the same defect class as the module's own
+    skip-is-not-coverage note, one level in.
+
+    So the denominator is asserted, not assumed: exactly THREE implementations,
+    named, and a table that actually has rows.
+    """
+    impls = _all_three({})
+    assert set(impls) == {
+        "worker/pace.py",
+        "api/routes_transparency.py",
+        "scripts/cli/bsq",
+    }, f"expected exactly the three known mirrors, got {sorted(impls)}"
+    assert len(RAW_CASES) >= 10, f"fixture table shrank to {len(RAW_CASES)} rows"
+    assert len(CASE_IDS) == len(set(CASE_IDS)), "duplicate case ids mask a lost row"
+
+
 @pytest.mark.parametrize("_name,raw", RAW_CASES, ids=CASE_IDS)
 def test_all_three_implementations_agree_exactly(_name: str, raw: dict):
     """The core differential: same input, byte-identical normalised output."""

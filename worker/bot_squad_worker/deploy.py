@@ -192,6 +192,33 @@ def effective_worker_git_sha() -> str:
     return effective
 
 
+def install_tree_git_sha() -> str:
+    """The LIVE HEAD of the install tree — the sha a deploy has actually landed.
+
+    T-0824. This is the THIRD sha, and it is the one nothing published before.
+    Distinguish it carefully from its two neighbours, because conflating it with
+    either is the defect this exists to close:
+
+    * ``boot_git_sha()`` is frozen at process start — what this process LOADED.
+    * ``effective_worker_git_sha()`` is that boot sha, advanced to the deployed
+      sha only when ``worker/`` is byte-identical — what this process IS RUNNING.
+    * this is the tree on disk RIGHT NOW — what was DEPLOYED.
+
+    Deliberately uncached and un-frozen: the whole value of the term is that it
+    moves when a deploy ff-merges the install, while the running process's own
+    shas do not. Returns "" (never a guess) when git can't answer, so a caller
+    reports an explicit unknown rather than a false equality.
+
+    ⚠ ``effective_worker_git_sha()`` returns ``boot`` EARLY when
+    ``boot == deployed``, so on a converged install the two agree without any
+    subtree probe having run. That agreement is TRIVIAL and is not independent
+    evidence that the worker is on the deployed code — it is the same number
+    twice. Only comparing THIS value against the reported worker sha answers
+    "is the running worker executing the deployed code?".
+    """
+    return _git_head_sha(_install_root())
+
+
 def _worker_subtree_changed(root: Path, a: str, b: str) -> bool:
     """True iff the ``worker/`` subtree differs between commits ``a`` and ``b``.
 
@@ -368,6 +395,65 @@ def _record_pending_restart(
             "(source=%s) — the worker may stay on stale code until the next "
             "qualifying trigger", source,
         )
+
+
+#: T-0824. The install tree's HEAD, published into the data dir so a reader that
+#: cannot see the git tree can still name the sha that was deployed. Lives beside
+#: the heartbeat on purpose: ``routes_health`` derives its whole view of this
+#: install from ``heartbeat.parent``, so the marker it finds is the marker for
+#: the same install the drift was measured on, by construction rather than by
+#: convention.
+_INSTALL_MARKER_NAME = "install_tree.json"
+
+
+def _install_marker_path(cfg: "Config") -> Path:
+    return cfg.heartbeat_path.parent / _INSTALL_MARKER_NAME
+
+
+def publish_install_tree_sha(cfg: "Config") -> str:
+    """Write the install tree's live HEAD to ``_worker/install_tree.json``.
+
+    T-0824. The API container is the consumer and it CANNOT compute this itself:
+    it mounts ``./config`` and ``./data`` and nothing else — there is no git tree
+    and no ``.git`` reachable from inside it (``/data/..`` is the container root,
+    not the install root). The worker is the only process that runs FROM the
+    install tree, so publishing the sha is the only way the term can exist on
+    that surface at all.
+
+    Written every heartbeat rather than at deploy time deliberately: it is a
+    MEASUREMENT of the tree as it is now, not a record of what some deploy
+    intended to land. A recipe that half-landed, a hand ff-merge, a rollback —
+    all of them move the tree without writing a job file, and all of them are
+    exactly the cases where "is the running worker executing the deployed code?"
+    matters most.
+
+    ⚠ The worker process writing this may itself be running STALE code (that is
+    the whole state the term exists to expose): the sha is read live from the
+    tree via ``git rev-parse`` in a subprocess, so an old process still reports
+    the NEW tree. That is what makes row 1 detectable at all.
+
+    Best-effort and non-fatal: an unwritable marker costs the install term, never
+    the heartbeat. Returns the sha written, or "" if it could not be determined
+    or stored — the caller does not need it, but a test does.
+    """
+    sha = (install_tree_git_sha() or "").strip()
+    if not sha:
+        # Explicit nothing, never a guess: no marker at all makes the API report
+        # an explicit unknown, which is the honest reading. Writing a stale or
+        # empty sha would let the API compute a comparison off a value that means
+        # "we could not look", and a false equality there IS the false all-clear.
+        log.warning("publish_install_tree_sha: could not read the install tree HEAD")
+        return ""
+    marker = _install_marker_path(cfg)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.parent / f"{marker.name}.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps({"git_sha": sha, "at": time.time()}))
+        os.replace(tmp, marker)
+    except OSError:
+        log.exception("publish_install_tree_sha: could not write %s", marker)
+        return ""
+    return sha
 
 
 def _clear_pending_restart(cfg: "Config") -> None:

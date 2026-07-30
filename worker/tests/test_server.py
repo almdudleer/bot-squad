@@ -93,3 +93,40 @@ def test_health_never_fails_on_a_broken_restart_probe(monkeypatch) -> None:
         r = client.get("/health")
     assert r.status_code == 200
     assert "restart_pending" not in r.json()
+
+
+def test_health_reports_the_install_tree_sha_as_a_THIRD_term(monkeypatch) -> None:
+    """T-0824, the twin surface. `boot_git_sha` (what this process loaded) and
+    `git_sha` (that, advanced when `worker/` is byte-identical) can BOTH be equal
+    and BOTH behind the deployed tree — which is exactly the state that read as
+    healthy for hours on /api/health. Neither answers "is this process running
+    the deployed code"; only a term for the tree does."""
+    import bot_squad_worker.deploy as d
+
+    monkeypatch.setattr(d, "boot_git_sha", lambda: "3" * 40)
+    monkeypatch.setattr(d, "effective_worker_git_sha", lambda: "3" * 40)
+    monkeypatch.setattr(d, "install_tree_git_sha", lambda: "e" * 40)
+    app = build_app()
+    with TestClient(app) as client:
+        body = client.get("/health").json()
+    assert body["boot_git_sha"] == "3" * 40
+    assert body["git_sha"] == "3" * 40
+    assert body["install_git_sha"] == "e" * 40
+    # The two old terms agree while the process is stale — the whole point.
+    assert body["git_sha"] == body["boot_git_sha"] != body["install_git_sha"]
+
+
+def test_health_install_sha_is_EMPTY_never_a_guess_when_git_cannot_answer(
+    monkeypatch,
+) -> None:
+    """An unreadable tree publishes "" so a caller can tell "unknown" from a
+    match. A fallback to either of the other two shas would manufacture the
+    false equality this ticket is about."""
+    import bot_squad_worker.deploy as d
+
+    monkeypatch.setattr(d, "effective_worker_git_sha", lambda: "3" * 40)
+    monkeypatch.setattr(d, "install_tree_git_sha", lambda: "")
+    app = build_app()
+    with TestClient(app) as client:
+        body = client.get("/health").json()
+    assert body["install_git_sha"] == ""

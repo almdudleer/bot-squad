@@ -113,8 +113,79 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DEPLOY_PROGRESS_DEADLINE_SECONDS = 300
 
 
+# ---------------------------------------------------------------------------
+# T-0824: the INSTALL TREE's sha — the term that was missing entirely
+# ---------------------------------------------------------------------------
+# Two byte-identical QUIET payloads meant opposite things, measured on this
+# install twelve hours apart:
+#
+#   12:56Z  api 3749ee8 · worker 3749ee8 · health ABSENT — worker 22 modules STALE
+#   18:53Z  api 5ae2811 · worker 5ae2811 · health ABSENT — genuinely converged
+#
+# Same keys, same absence, opposite meanings. No smarter comparison of the two
+# existing terms can separate them, because in BOTH of them those two terms are
+# equal — the state they differ on (what the install tree is at) was not on the
+# surface at all. It is a missing-DATA defect, not a comparison defect.
+#
+# The hole has a precise shape: `sha_drift` compares api-vs-worker, so it fires
+# truthfully whenever the api HAS moved, and fails exactly when NEITHER container
+# moved. That is precisely what a worker-only or roles-only deploy produces — the
+# CHEAP deploy path, taken twice in one day on purpose to skip a 35-minute docker
+# build. The blind spot is not exotic; it is the common case.
+#
+# ⚠ The sha is NOT already in hand, and assuming it was is how this stayed
+# invisible: `worker.git_sha` is `deploy.effective_worker_git_sha()` — the frozen
+# BOOT sha, advanced to the deployed sha only when `worker/` is byte-identical.
+# It reads as the tree's sha on a converged install because the two numbers
+# coincide there, and that coincidence is exactly the state where it tells you
+# nothing. Measured 2026-07-30: `_worker/heartbeat` is 41 bytes, one sha, and it
+# is the worker's, not the tree's.
+#
+# So the worker publishes the tree HEAD beside the heartbeat
+# (`deploy.publish_install_tree_sha`) and this reads it. The API cannot compute
+# it itself — the container mounts `./config` and `./data` and nothing else;
+# there is no git tree inside it.
+_INSTALL_MARKER = "install_tree.json"
+
+
+def _install_state(worker_dir: Path) -> dict:
+    """What the install tree is at, or an EXPLICIT unknown.
+
+    Never returns a bare ``None`` for "we could not look". An absent field reads
+    identically to a real negative, and the identity of a real negative and an
+    unknown IS this ticket — so the unknown carries a ``reason`` and the caller
+    raises a flag for it rather than falling quiet. A payload that cannot answer
+    "is the worker running the deployed code?" must not look like one that
+    answered "yes".
+
+    Read from the heartbeat's own directory, so it describes the same install the
+    drift was measured on by construction (the same reason ``_deploy_state`` is
+    derived from the heartbeat path rather than from ``api_config.data_dir``).
+    """
+    path = worker_dir / _INSTALL_MARKER
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        # The overwhelmingly likely cause, and worth naming separately: a worker
+        # running code older than T-0824. It clears on the next worker restart.
+        return {"git_sha": None, "reason": "no_marker"}
+    except (OSError, ValueError):
+        return {"git_sha": None, "reason": "unreadable_marker"}
+    if not isinstance(raw, dict):
+        return {"git_sha": None, "reason": "unreadable_marker"}
+    sha = raw.get("git_sha")
+    if not isinstance(sha, str) or not _SHA_RE.match(sha.strip().lower()):
+        return {"git_sha": None, "reason": "malformed_marker"}
+    try:
+        at = float(raw.get("at") or 0.0)
+    except (TypeError, ValueError):
+        at = 0.0
+    return {"git_sha": sha.strip().lower(), "at": at}
+
+
 def _deploy_row(
-    path: Path, state: str, slug: str, api_sha: str, worker_sha: str
+    path: Path, state: str, slug: str, api_sha: str, worker_sha: str,
+    install_sha: str | None = None,
 ) -> dict | None:
     """One in-flight deploy job, IF it explains the drift we are looking at.
 
@@ -143,6 +214,14 @@ def _deploy_row(
         converged = "worker"
     elif target_sha == api_sha.strip().lower():
         converged = "api"
+    elif install_sha and target_sha == install_sha.strip().lower():
+        # T-0824: the third side, and the one a worker-only deploy lands on
+        # first. Between the recipe's ff-merge and the restart it launches, the
+        # TREE is on the target and neither process is — a real, self-healing
+        # window that would otherwise read as `worker_stale` with no explanation.
+        # Same evidential bar as the other two: this deploy's own recorded target
+        # has to equal the sha of a side that has actually reached it.
+        converged = "install"
     else:
         return None
     try:
@@ -178,7 +257,9 @@ def _deploy_row(
     }
 
 
-def _deploy_state(data_dir: Path, api_sha: str, worker_sha: str) -> dict | None:
+def _deploy_state(
+    data_dir: Path, api_sha: str, worker_sha: str, install_sha: str | None = None
+) -> dict | None:
     """The in-flight deploy a drift reading should be interpreted against.
 
     Scans every project's job dirs rather than guessing which slug owns this
@@ -200,7 +281,9 @@ def _deploy_state(data_dir: Path, api_sha: str, worker_sha: str) -> dict | None:
             except OSError:
                 continue
             for job in jobs:
-                row = _deploy_row(job, state, slug_dir.name, api_sha, worker_sha)
+                row = _deploy_row(
+                    job, state, slug_dir.name, api_sha, worker_sha, install_sha
+                )
                 if row is None:
                     continue
                 if best is None or row["expected_by"] > best["expected_by"]:
@@ -260,31 +343,69 @@ def health(request: Request) -> dict:
     # recorded target_sha equals the side that has already converged reports
     # `deploy_pending`. Same principle as the restart marker, same bound: an
     # explanation the system wrote down, and only while it is still current.
-    problems = []
+    #
+    # T-0824 adds the FOURTH reading, and the one the endpoint is actually asked:
+    # `worker_stale` — the running worker is not executing the DEPLOYED code.
+    # That question has three terms and only two were on this surface, so it was
+    # unanswerable rather than answered wrongly; see `_install_state`. It is kept
+    # SEPARATE from `sha_drift` rather than folded into it because they are
+    # different questions with different consequences: `worker_stale` means live
+    # behaviour differs from the code that was shipped, `sha_drift` means the api
+    # CONTAINER is behind. Both can hold at once, and either can hold alone.
+    install = _install_state(heartbeat.parent)
+    install_sha = install.get("git_sha")
+
+    problems: list[str] = []
     restart = None
     deploy = None
+    # Evaluate the two comparisons FIRST, so the shared explanations (a restart
+    # the worker recorded, a deploy in flight) are looked up once and applied to
+    # whichever of them fired.
+    worker_stale = bool(alive and worker_sha and install_sha and worker_sha != install_sha)
+    sha_drift = bool(
+        alive and worker_sha and api_sha and api_sha != "unknown" and worker_sha != api_sha
+    )
     if not alive:
         problems.append("dead_heartbeat")
-    elif worker_sha and api_sha and api_sha != "unknown" and worker_sha != api_sha:
-        restart = _restart_state(heartbeat.parent)
-        if restart and not restart["overdue"]:
+    else:
+        if worker_sha and install_sha is None:
+            # ⚠ The unknown must NOT be silent, and it is raised INDEPENDENTLY of
+            # any drift. A missing install term makes the payload unable to answer
+            # the question, and rendering that as the same quiet payload a
+            # converged install produces would recreate this ticket's exact defect
+            # one level up — two identical readings, one meaning "converged", one
+            # meaning "we cannot see". The reason is carried in `install.reason`.
+            problems.append("install_sha_unknown")
+        if worker_stale or sha_drift:
+            restart = _restart_state(heartbeat.parent)
+            pending = bool(restart and not restart["overdue"])
+            if not pending:
+                # Deliberately derived from the HEARTBEAT path, not from
+                # `api_config.data_dir` (which is `CONFIG_DIR.parent / "data"`, a
+                # different derivation that agrees only by convention). This reader
+                # must answer about the same install the drift was measured on;
+                # pointed elsewhere it would return a well-formed EMPTY result and
+                # silently report `sha_drift` forever — most convincingly during a
+                # real deploy.
+                deploy = _deploy_state(
+                    heartbeat.parent.parent, api_sha, worker_sha, install_sha
+                )
+            landing = bool(deploy and not deploy["overdue"])
             # A restart the worker recorded is the more specific statement — it
             # names the action that will close this drift. The deploy is not
-            # consulted at all here, so an absent `deploy` key on this path
-            # means "not looked at", never "no deploy is running".
-            problems.append("restart_pending")
-        else:
-            # Deliberately derived from the HEARTBEAT path, not from
-            # `api_config.data_dir` (which is `CONFIG_DIR.parent / "data"`, a
-            # different derivation that agrees only by convention). This reader
-            # must answer about the same install the drift was measured on;
-            # pointed elsewhere it would return a well-formed EMPTY result and
-            # silently report `sha_drift` forever — most convincingly during a
-            # real deploy.
-            deploy = _deploy_state(heartbeat.parent.parent, api_sha, worker_sha)
-            problems.append(
-                "deploy_pending" if deploy and not deploy["overdue"] else "sha_drift"
-            )
+            # consulted at all when one is pending, so an absent `deploy` key on
+            # that path means "not looked at", never "no deploy is running".
+            explained = "restart_pending" if pending else "deploy_pending" if landing else ""
+            flags = []
+            if worker_stale:
+                flags.append(explained or "worker_stale")
+            if sha_drift:
+                flags.append(explained or "sha_drift")
+            for flag in flags:
+                # Both comparisons can resolve to the SAME explanation (one
+                # restart closes both); report it once.
+                if flag not in problems:
+                    problems.append(flag)
     if problems:
         worker["health"] = problems
     if deploy:
@@ -306,6 +427,14 @@ def health(request: Request) -> dict:
         # container is the commit that was deployed — closing the stale-image
         # gap where a deploy 'succeeded' but shipped an older HEAD.
         "git_sha": api_sha,
+        # T-0824: the DEPLOYED sha — what the install tree's HEAD is right now.
+        # Top-level, beside the api's own sha, because it is a property of the
+        # INSTALL and not of the worker: `git_sha` (api container), `worker.git_sha`
+        # (running worker) and this are the three sides, and every question this
+        # endpoint is asked is a comparison between two of them. Always present,
+        # carrying `{"git_sha": null, "reason": ...}` when it could not be read —
+        # an absent key would put a consumer back to guessing.
+        "install": install,
         "uptime": time.monotonic() - _STARTED_AT,
         "worker": worker,
     }

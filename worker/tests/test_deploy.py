@@ -3143,3 +3143,125 @@ def test_the_marker_field_contract_the_api_reads(
         assert isinstance(raw.get("expected_by"), float), path.name
         assert raw["expected_by"] > raw["at"], path.name
         assert isinstance(raw.get("reason"), str), path.name
+
+
+# ---------------------------------------------------------------------------
+# T-0824: publishing the INSTALL TREE's sha — the term nothing carried
+# ---------------------------------------------------------------------------
+# ⚠ The premise that made this ticket cheap-looking was WRONG and is checked
+# here rather than assumed. Operator p502 read `worker.git_sha` as the tree's
+# sha; it is not — it is `effective_worker_git_sha()`, the frozen BOOT sha
+# advanced only when `worker/` is byte-identical. The two coincide on a
+# converged install, which is precisely the state where the number tells you
+# nothing. Measured on the live install 2026-07-30: `_worker/heartbeat` is 41
+# bytes — one sha, and it is the worker's.
+#
+# So these cases drive a REAL git repo through the real divergence (boot frozen
+# at A, tree ff-moved to B) and assert the published value against B. A test
+# that stubbed `_git_head_sha` would only prove the plumbing calls something.
+
+def test_install_tree_git_sha_is_the_TREE_not_the_frozen_boot_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the term, on a real repo. Boot is frozen at A; a deploy
+    ff-moves the install to B; the process is NOT restarted. `boot_git_sha()`
+    must still say A (that is what it is for) and `install_tree_git_sha()` must
+    say B — otherwise there is no third term and row 1 stays invisible."""
+    import bot_squad_worker.deploy as d
+    monkeypatch.setattr(d, "_BOOT_GIT_SHA", None)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None)
+    root = tmp_path / "install"
+    sha_a = _init_repo_at(root, "boot-time code")
+    monkeypatch.setattr(d, "_install_root", lambda: root)
+    assert d.freeze_boot_git_sha() == sha_a
+
+    sha_b = _commit_move(root, "deployed code")
+    assert sha_b != sha_a
+
+    assert d.boot_git_sha() == sha_a           # what this process LOADED
+    assert d.install_tree_git_sha() == sha_b   # what was DEPLOYED
+
+
+def test_the_published_marker_carries_the_tree_sha_while_the_heartbeat_carries_the_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two files side by side, disagreeing — which is the entire content of
+    the fix. A converged install makes them agree trivially, so the divergent
+    case is the only one that proves the marker is not just a second copy of the
+    heartbeat.
+
+    ⚠ Note WHY the worker sha stays at A here: this repo's only commit-2 change
+    is `f.txt`, so `worker/` is byte-identical between A and B and
+    `effective_worker_git_sha()` legitimately advances... except it does not,
+    because a repo with no `worker/` directory at all diffs as unchanged. The
+    case is therefore pinned on the SUBTREE PROBE rather than left to luck: it is
+    stubbed to say `worker/` changed, which is the row-1 shape (22 modules under
+    `worker/bot_squad_worker/`)."""
+    import bot_squad_worker.deploy as d
+    from types import SimpleNamespace
+    monkeypatch.setattr(d, "_BOOT_GIT_SHA", None)
+    monkeypatch.setattr(d, "_EFFECTIVE_SHA_CACHE", None)
+    root = tmp_path / "install"
+    sha_a = _init_repo_at(root, "boot-time code")
+    monkeypatch.setattr(d, "_install_root", lambda: root)
+    d.freeze_boot_git_sha()
+    sha_b = _commit_move(root, "deployed code")
+    # worker/ changed between A and B → the effective sha correctly PINS to boot.
+    monkeypatch.setattr(d, "_worker_subtree_identical", lambda root, a, b: False)
+
+    hb = tmp_path / "data" / "_worker" / "heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    cfg = SimpleNamespace(heartbeat_path=hb)
+
+    assert d.publish_install_tree_sha(cfg) == sha_b
+    marker = json.loads((hb.parent / "install_tree.json").read_text())
+    assert marker["git_sha"] == sha_b
+    assert marker["at"] > 0
+    # …and the worker's own reported sha is the OTHER one. Same directory, same
+    # moment, two different answers — the state that had no representation.
+    assert d.effective_worker_git_sha() == sha_a
+    assert marker["git_sha"] != d.effective_worker_git_sha()
+
+
+def test_a_stale_worker_process_still_publishes_the_CURRENT_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property the detection depends on, and it is not obvious: the process
+    doing the publishing may itself be running stale code. The sha is read live
+    from the tree via `git rev-parse` in a subprocess, so a worker booted at A
+    reports B — which is what makes row 1 detectable AT ALL. A cached or
+    boot-time value here would publish A and re-create the false all-clear."""
+    import bot_squad_worker.deploy as d
+    from types import SimpleNamespace
+    monkeypatch.setattr(d, "_BOOT_GIT_SHA", None)
+    root = tmp_path / "install"
+    _init_repo_at(root, "boot-time code")
+    monkeypatch.setattr(d, "_install_root", lambda: root)
+    d.freeze_boot_git_sha()
+    hb = tmp_path / "data" / "_worker" / "heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    cfg = SimpleNamespace(heartbeat_path=hb)
+
+    for content in ("deploy one", "deploy two", "deploy three"):
+        sha = _commit_move(root, content)
+        d.publish_install_tree_sha(cfg)
+        assert json.loads((hb.parent / "install_tree.json").read_text())["git_sha"] == sha
+
+
+def test_an_unreadable_tree_publishes_NOTHING_rather_than_a_guess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No git, no repo, no answer — and no marker. An empty or stale sha here
+    would let the API compute a comparison off a value meaning "we could not
+    look", and a false equality there IS the false all-clear this ticket is
+    about. The API's explicit `install_sha_unknown` is the correct reading, and
+    it only happens if nothing is written."""
+    import bot_squad_worker.deploy as d
+    from types import SimpleNamespace
+    monkeypatch.setattr(d, "_install_root", lambda: tmp_path / "not-a-repo")
+    hb = tmp_path / "data" / "_worker" / "heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    cfg = SimpleNamespace(heartbeat_path=hb)
+
+    assert d.publish_install_tree_sha(cfg) == ""
+    assert not (hb.parent / "install_tree.json").exists()

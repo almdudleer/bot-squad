@@ -49,6 +49,14 @@ def heartbeat(cfg: Config) -> None:
     that never comes up never clears anything, its ``expected_by`` lapses, and
     health reverts to a bare ``sha_drift`` exactly as T-0739 designed. This is
     not a post-deploy grace period: nothing here is excused by elapsed time.
+
+    T-0824: this job also publishes the INSTALL TREE's HEAD, to its own file
+    (``_publish_install_tree_sha``). Note what the body written here is and is
+    NOT — it is ``effective_worker_git_sha()``, i.e. what this PROCESS is
+    running, and it is emphatically not the tree's sha. The two coincide on a
+    converged install, which is exactly the state where the number tells you
+    nothing; a health flag built on that coincidence was silent while the worker
+    ran 22 stale modules.
     """
     import os
 
@@ -63,7 +71,32 @@ def heartbeat(cfg: Config) -> None:
     tmp = cfg.heartbeat_path.with_name(cfg.heartbeat_path.name + ".tmp")
     tmp.write_text(sha + "\n")
     os.replace(tmp, cfg.heartbeat_path)
+    _publish_install_tree_sha(cfg)
     _clear_landed_restart(cfg)
+
+
+def _publish_install_tree_sha(cfg: Config) -> None:
+    """Publish the INSTALL TREE's HEAD beside the heartbeat (T-0824).
+
+    A separate file, not a second line in the heartbeat body, and that is not a
+    style choice: ``routes_health`` reads the heartbeat as ``read_text().strip()``
+    — the WHOLE body is the sha. An api container predating this change reading a
+    two-line body would compare "sha\\nsha" against its own and report a false
+    ``sha_drift``, for the entire window between a worker restart and the next api
+    rebuild. A new file is invisible to an old reader.
+
+    Runs AFTER the heartbeat write and cannot displace it: the heartbeat is the
+    liveness signal, this is a diagnostic term, and losing liveness to publish a
+    diagnostic would be a strictly worse trade. ``publish_install_tree_sha`` is
+    already best-effort internally; the wrapper catches the rest for the same
+    reason ``_clear_landed_restart`` does.
+    """
+    try:
+        from bot_squad_worker.deploy import publish_install_tree_sha
+
+        publish_install_tree_sha(cfg)
+    except Exception:
+        log.exception("heartbeat: publishing the install tree sha failed")
 
 
 def _clear_landed_restart(cfg: Config) -> None:

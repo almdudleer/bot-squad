@@ -1164,3 +1164,76 @@ def test_surface_live_dup_reconciles_alerts_only_on_live_loser(
     _surface_live_dup_reconciles(cfg, proj.slug, None)
     _surface_live_dup_reconciles(cfg, proj.slug, {})
     assert alerts == []
+
+
+# ---------------------------------------------------------------------------
+# T-0824: the heartbeat also publishes the INSTALL TREE's sha
+# ---------------------------------------------------------------------------
+# The API container cannot compute this itself — it mounts ./config and ./data
+# and nothing else, so there is no git tree inside it. The worker is the only
+# process running FROM the install tree, which is why the term has to be
+# published rather than read. It rides the heartbeat because that is the tick
+# whose output the API already treats as this install's ground truth.
+
+
+def test_heartbeat_publishes_the_install_tree_sha(tmp_config_dir: Path, monkeypatch) -> None:
+    """The term exists on disk after one tick, in its own file — and it is the
+    TREE's sha, not the worker's. Those are different values whenever it matters
+    (see test_deploy.py's real-repo cases); here they are stubbed apart so a
+    regression that published `effective_worker_git_sha()` twice is caught."""
+    import json as _j
+
+    import bot_squad_worker.deploy as D
+
+    monkeypatch.setattr(D, "effective_worker_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(D, "install_tree_git_sha", lambda: "e" * 40)
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat(cfg)
+
+    assert cfg.heartbeat_path.read_text().strip() == "a" * 40
+    marker = _j.loads((cfg.heartbeat_path.parent / "install_tree.json").read_text())
+    assert marker["git_sha"] == "e" * 40
+
+
+def test_a_separate_file_so_an_OLD_api_container_reads_an_unchanged_heartbeat(
+    tmp_config_dir: Path, monkeypatch
+) -> None:
+    """Why not a second line in the heartbeat body: `routes_health` reads that
+    file as `read_text().strip()` — the WHOLE body is the sha. An api container
+    predating T-0824 seeing a two-line body would compare "sha\\nsha" against its
+    own and report a false `sha_drift` for the entire window between a worker
+    restart and the next api rebuild. A new file is invisible to an old reader,
+    so the heartbeat body must stay exactly one sha."""
+    import bot_squad_worker.deploy as D
+
+    monkeypatch.setattr(D, "effective_worker_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(D, "install_tree_git_sha", lambda: "e" * 40)
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat(cfg)
+
+    body = cfg.heartbeat_path.read_text()
+    assert body == "a" * 40 + "\n"
+    assert body.strip().splitlines() == ["a" * 40]
+
+
+def test_a_failed_install_publish_never_costs_the_heartbeat(
+    tmp_config_dir: Path, monkeypatch
+) -> None:
+    """Ordering is load-bearing: liveness is the signal an outage depends on, the
+    install term is a diagnostic. Losing the former to publish the latter would
+    be a strictly worse trade — a dead_heartbeat alarm on a healthy worker."""
+    import bot_squad_worker.deploy as D
+
+    def _boom(_cfg):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(D, "effective_worker_git_sha", lambda: "a" * 40)
+    monkeypatch.setattr(D, "publish_install_tree_sha", _boom)
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat(cfg)
+
+    assert cfg.heartbeat_path.read_text().strip() == "a" * 40
+    assert not (cfg.heartbeat_path.parent / "install_tree.json").exists()

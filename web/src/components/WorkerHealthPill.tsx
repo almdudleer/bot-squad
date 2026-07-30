@@ -36,7 +36,20 @@ const POLL_MS = 10_000;
 
 const FLAG_LABEL: Record<string, string> = {
   dead_heartbeat: "worker down: dead_heartbeat (no recent heartbeat)",
-  sha_drift: "worker stale: sha_drift (worker sha != API image; nothing is coming to fix this on its own)",
+  sha_drift: "API container behind: sha_drift (worker sha != API image; nothing is coming to fix this on its own)",
+  // T-0824. Deliberately NOT worded as "sha drift": this is the running worker
+  // executing code that is not what was deployed — the question the endpoint is
+  // actually asked, and the one no arrangement of the other two shas could
+  // answer. Measured live: the old flag was SILENT here (22 worker modules
+  // stale, api and worker equal because neither container moved) and LOUD on a
+  // benign api lag. An operator learning the signal by experience learned it
+  // backwards.
+  worker_stale: "worker NOT running the deployed code: worker_stale (the install tree has moved and this process has not restarted onto it)",
+  // The instrument, not the subject. Says the payload CANNOT answer the
+  // question — which must not render as the same silence a converged install
+  // produces, or the defect returns one level up. Usually a worker older than
+  // T-0824; clears on the next worker restart.
+  install_sha_unknown: "cannot verify the deployed sha: install_sha_unknown (the worker is not publishing the install tree's HEAD, so 'is the worker running the deployed code?' is unanswerable here)",
   restart_pending: "worker restarting: sha differs but a restart is already pending — expected, converges on its own",
   deploy_pending: "deploy landing: sha differs but a deploy of that exact commit is in flight — expected, converges on its own",
 };
@@ -113,13 +126,22 @@ export function workerHealthView(health: HealthResponse | null): WorkerHealthVie
   // unrecognised problem must never be softened by a restart or deploy that
   // happens to be in flight.
   const pendingOnly = flags.length === 1 && CALM_FLAGS.has(flags[0]);
+  // T-0824: `install_sha_unknown` on its own is NOT "worker stale" — the whole
+  // content of that flag is that nobody can tell. Labelling it as staleness
+  // would assert the very thing the payload just said it cannot establish, and
+  // labelling it as healthy would recreate the indistinguishable pair. It gets
+  // its own word, and it stays red: an unanswerable question on the deploy path
+  // is a real problem, not a softer one.
+  const cannotTell = flags.length === 1 && flags[0] === "install_sha_unknown";
   const label = down
     ? "worker down"
-    : !pendingOnly
-      ? "worker stale"
-      : flags[0] === "deploy_pending"
-        ? "deploy landing"
-        : "worker restarting";
+    : cannotTell
+      ? "deployed sha unknown"
+      : !pendingOnly
+        ? "worker stale"
+        : flags[0] === "deploy_pending"
+          ? "deploy landing"
+          : "worker restarting";
   // The restart detail rides along on the drift flags in BOTH directions: it
   // says "wait ~Ns" while pending, and "owed since X, OVERDUE" once it isn't.
   // The deploy detail does the same, and both can appear on one bare sha_drift:
@@ -128,7 +150,13 @@ export function workerHealthView(health: HealthResponse | null): WorkerHealthVie
   const drift =
     flags.includes("restart_pending") ||
     flags.includes("deploy_pending") ||
-    flags.includes("sha_drift");
+    flags.includes("sha_drift") ||
+    // T-0824: a pending restart / landing deploy explains worker staleness for
+    // exactly the same reason it explains an api lag, so the detail rides along
+    // on this flag too — including the OVERDUE wording, which on this flag is
+    // the headline: "a restart was owed since 03:34 and the worker is still on
+    // the old code".
+    flags.includes("worker_stale");
   const title =
     flags.map((f) => FLAG_LABEL[f] ?? `worker: ${f}`).join("; ") +
     (drift ? restartDetail(health) + deployDetail(health) : "");

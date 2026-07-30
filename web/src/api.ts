@@ -712,6 +712,17 @@ export type HealthResponse = {
   version?: string;
   git_sha?: string | null;
   uptime?: number;
+  // T-0824: the DEPLOYED sha — the install tree's HEAD, published by the worker
+  // (the API container has no git tree to read). Always present; `git_sha` is
+  // null with a `reason` when it could not be read, because an absent key would
+  // put a consumer back to guessing. Together with `git_sha` (api container) and
+  // `worker.git_sha` (running worker) these are the three sides, and every
+  // question this endpoint is asked is a comparison between two of them.
+  install?: {
+    git_sha?: string | null;
+    at?: number;
+    reason?: "no_marker" | "unreadable_marker" | "malformed_marker";
+  };
   worker?: {
     alive?: boolean;
     last_heartbeat?: number | null;
@@ -735,8 +746,10 @@ export type HealthResponse = {
       slug?: string;
       queue_id?: string;
       target_sha?: string;
-      /** Which side already reports target_sha; its counterpart is catching up. */
-      converged?: "worker" | "api";
+      /** Which side already reports target_sha; its counterpart is catching up.
+       * T-0824 adds "install": the recipe ff-merged the tree and neither process
+       * has caught up yet — the window a worker-only deploy lands in first. */
+      converged?: "worker" | "api" | "install";
       since?: number;
       last_progress?: number | null;
       expected_by?: number;

@@ -30,8 +30,17 @@ def build_app() -> FastAPI:
         # (correctly) skipped the restart doesn't read as permanent drift.
         # boot_sha stays exposed alongside it: it's what the restart gate compares,
         # so an operator debugging a skipped/needed restart can still see it.
+        # T-0824: `install_git_sha` — the same missing term, on the twin surface.
+        # Neither of the two shas above answers "is this process running the
+        # DEPLOYED code": `boot_git_sha` is what it loaded and `git_sha` is that
+        # advanced only when `worker/` is byte-identical, so both can be equal
+        # AND both behind the tree. That is the state that read as healthy on
+        # /api/health for the hours before a restart. Cheaper here than there —
+        # this process runs FROM the install tree, so it just reads it, with no
+        # marker in between.
         from bot_squad_worker.deploy import (
-            boot_git_sha, effective_worker_git_sha, restart_pending_state,
+            boot_git_sha, effective_worker_git_sha, install_tree_git_sha,
+            restart_pending_state,
         )
         body = {
             "ok": True,
@@ -39,6 +48,9 @@ def build_app() -> FastAPI:
             "uptime": time.monotonic() - started,
             "git_sha": effective_worker_git_sha(),
             "boot_git_sha": boot_git_sha(),
+            # "" (never a guess) when git cannot answer — a caller comparing
+            # against it must treat empty as UNKNOWN, not as a match.
+            "install_git_sha": install_tree_git_sha(),
         }
         # T-0739: same discrimination the API's /api/health makes, on the surface
         # an operator debugging from the worker side reaches for. Present only

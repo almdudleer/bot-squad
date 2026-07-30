@@ -4065,6 +4065,187 @@ def _commit_hunks(args, repo_root: str) -> None:
     sys.exit(0)
 
 
+# --- T-0819: verify-isolated refuses a stage it did not measure -------------
+#
+# The failure this guards is NOT a wrong number. It is a NUMBER-SHAPED ABSENCE.
+# On 2026-07-30 the documented api recipe mounted `api/` alone; four modules
+# reach for `scripts/`, errored during COLLECTION, and a collection error
+# ABORTS THE WHOLE SESSION. The summary read `2 skipped, 1 warning, 4 errors in
+# 3.10s` — which looks like a nearly-clean run with one environment niggle, and
+# says nowhere that NOT ONE TEST EXECUTED. It was recorded for months as "4
+# pre-existing failures", a phrase whose bounded number implies the other ~1300
+# passed.
+#
+# The first remedy was a better document. Within hours it failed on a careful
+# dev who was carrying the lesson in writing, on a P1. So the control moved to
+# where a machine reads it: verify-isolated now parses what it just ran and
+# REFUSES to certify a sha off a run that executed nothing.
+#
+# `-q` exit codes cannot substitute for this. A collection abort exits 2, which
+# a caller reads as "tests failed" and a reader forgives as flakiness; and the
+# reverse case — a run of zero tests exiting 0 — is exactly what a partial
+# `git archive` extract produced elsewhere on this ticket.
+
+_PYTEST_OUTCOME_RE = re.compile(
+    r"(?<![\w.])(\d+)\s+"
+    r"(passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?|reruns?)"
+    r"(?![\w])"
+)
+# The elapsed-time tail is what distinguishes pytest's summary from a body line
+# that merely contains a count. Do NOT tighten this into `passed in <t>s`: the
+# warnings clause sits between them (`1336 passed, 1326 warnings in 530.26s`)
+# and a probe written that way hung forever over a fully green run (T-0819).
+_PYTEST_ELAPSED_RE = re.compile(r"\bin\s+\d+(?:\.\d+)?\s*s(?:econds)?\b")
+_PYTEST_COLLECTED_RE = re.compile(r"(?<![\w.])(\d+)\s+tests?\s+collected(?![\w])")
+_PYTEST_INTERRUPTED_RE = re.compile(
+    r"Interrupted:\s+(\d+)\s+errors?\s+during\s+collection")
+_PYTEST_NO_TESTS_RE = re.compile(r"\bno tests ran\b", re.IGNORECASE)
+
+_PYTEST_PLURALS = {"errors": "error", "warnings": "warning", "reruns": "rerun"}
+
+# Exit code for "this run was not measured / measured nothing". Distinct from
+# pytest's own 1 (failures) and 2 (interrupted) so a caller can tell a REFUSAL
+# from a red suite.
+VERIFY_UNMEASURED_RC = 3
+
+
+def _looks_like_pytest(cmd: list) -> bool:
+    """True when the command is a pytest invocation, so a summary is REQUIRED.
+
+    Deciding this from the argv rather than from the output is deliberate: if
+    we inferred "not pytest" from a MISSING summary, every fault this function
+    exists to catch would classify itself as out of scope.
+    """
+    for i, tok in enumerate(cmd):
+        base = os.path.basename(str(tok))
+        if base == "pytest" or base.startswith("pytest-"):
+            return True
+        if tok == "-m" and i + 1 < len(cmd) and str(cmd[i + 1]) == "pytest":
+            return True
+    return False
+
+
+def _measure_pytest_output(text: str) -> dict:
+    """Extract the denominator from a pytest run's output.
+
+    Returns the LAST summary line's counts — pytest prints one per session and
+    a captured sub-run could print more.
+    """
+    out = {
+        "summary_line": None, "counts": {}, "collected_only": None,
+        "interrupted": None, "executed": 0, "passed": 0,
+    }
+    m = _PYTEST_INTERRUPTED_RE.search(text)
+    if m:
+        out["interrupted"] = int(m.group(1))
+    for raw in text.splitlines():
+        line = raw.strip().strip("=").strip()
+        if not _PYTEST_ELAPSED_RE.search(line):
+            continue
+        pairs = _PYTEST_OUTCOME_RE.findall(line)
+        collected = _PYTEST_COLLECTED_RE.search(line)
+        if not pairs and not collected and not _PYTEST_NO_TESTS_RE.search(line):
+            continue
+        counts = {}
+        for num, word in pairs:
+            counts[_PYTEST_PLURALS.get(word, word)] = int(num)
+        out["summary_line"] = line
+        out["counts"] = counts
+        out["collected_only"] = int(collected.group(1)) if collected else None
+    c = out["counts"]
+    # EXECUTED, not PASSED, is the evidence that the suite ran. A run where
+    # everything failed is a real measurement; a run of 0 passed / 0 failed is
+    # an absence. Conflating them would refuse honest reds and teach people to
+    # route around the check.
+    out["executed"] = (c.get("passed", 0) + c.get("failed", 0)
+                       + c.get("xpassed", 0) + c.get("xfailed", 0))
+    out["passed"] = c.get("passed", 0)
+    return out
+
+
+def _extract_missing_paths(repo_root: str, sha: str, dest: str) -> tuple:
+    """Which of ``sha``'s tracked paths are absent from the extract at ``dest``.
+
+    Returns ``(tracked, missing)``. A `git archive | tar` that dies halfway
+    leaves a well-formed, SMALLER tree: pytest then collects nothing, exits 0,
+    and the absent files read as deleted code. Both halves of that pipeline can
+    report success and still leave this true, because tar's exit status only
+    says it extracted what it RECEIVED.
+    """
+    listed = subprocess.run(["git", "ls-tree", "-r", "--name-only", "-z", sha],
+                            cwd=repo_root, capture_output=True, text=True)
+    tracked = [p for p in listed.stdout.split("\0") if p]
+    if listed.returncode != 0 or not tracked:
+        return ([], None)  # None = could not measure, which is not "complete"
+    missing = [p for p in tracked if not os.path.lexists(os.path.join(dest, p))]
+    return (tracked, missing)
+
+
+def _certify_pytest_run(text: str, rc: int, cmd: list, sha: str) -> tuple:
+    """Decide whether a completed run may be reported. Returns (lines, exit_rc)."""
+    short = sha[:12]
+    if not _looks_like_pytest(cmd):
+        return ([
+            "verify-isolated: the command is not pytest, so NO pass-count "
+            "measurement was made.",
+            f"verify-isolated: exit {rc} is the only signal — this is an "
+            "UNMEASURED result; do not report it as a green suite.",
+            f"verify-isolated: this certifies {short}, not the shared "
+            "working tree.",
+        ], rc)
+
+    m = _measure_pytest_output(text)
+    refuse = (
+        "verify-isolated: ⛔ REFUSING TO CERTIFY {sha} — {why}\n"
+        "  A run with zero failures is not a green run; the PASS COUNT is the\n"
+        "  signal. Fix the run and try again — do not report this stage."
+    )
+    if m["interrupted"]:
+        return ([refuse.format(
+            sha=short,
+            why=f"collection was INTERRUPTED by {m['interrupted']} error(s), "
+                f"which aborts the whole session.")] + [
+            f"  pytest's summary said: {m['summary_line'] or '(none)'}",
+            "  NOT ONE TEST EXECUTED. Usual causes: the repo ROOT is not in "
+            "the run's path (4 api modules reach for scripts/), a missing "
+            "BUILD_AT_IMPORT=0, or the wrong interpreter for the suite.",
+        ], VERIFY_UNMEASURED_RC)
+
+    if m["summary_line"] is None:
+        return ([refuse.format(
+            sha=short,
+            why="no pytest summary line was found in "
+                f"{len(text)} byte(s) of output.")] + [
+            "  The command was a pytest invocation, so a summary was expected. "
+            "An unmeasured result must fail rather than pass quietly.",
+        ], VERIFY_UNMEASURED_RC)
+
+    if m["collected_only"] is not None and m["executed"] == 0:
+        return ([refuse.format(
+            sha=short,
+            why=f"this was a COLLECTION-ONLY run ({m['collected_only']} "
+                f"collected, 0 executed).")] + [
+            "  Collecting is not running. It certifies nothing.",
+        ], VERIFY_UNMEASURED_RC)
+
+    if m["executed"] == 0:
+        return ([refuse.format(
+            sha=short,
+            why="ZERO tests executed (0 passed, 0 failed).")] + [
+            f"  pytest's summary said: {m['summary_line']}",
+            "  A summary of skips, warnings and errors is an ABSENCE wearing "
+            "a result's clothes. A skip is not coverage.",
+        ], VERIFY_UNMEASURED_RC)
+
+    detail = ", ".join(f"{k}={v}" for k, v in sorted(m["counts"].items()))
+    return ([
+        f"verify-isolated: MEASURED {m['executed']} test(s) executed "
+        f"({detail}).",
+        f"verify-isolated: exit {rc} — this certifies {short}, not the "
+        "shared working tree.",
+    ], rc)
+
+
 def cmd_verify_isolated(args) -> None:
     """Run a command against a `git archive` extract of a ref (T-0752).
 
@@ -4074,6 +4255,10 @@ def cmd_verify_isolated(args) -> None:
     that gap produced a red HEAD reported green in good faith (ee7ba15) — while
     the one session that verified an extract instead was the only one with no
     incident. This is the recipe, so it stops being retyped by hand.
+
+    T-0819 added the two instruments that make its output trustworthy: the
+    extract is proven COMPLETE before the run, and the run is proven to have
+    EXECUTED something before its exit code is reported as a certification.
     """
     repo_root = _repo_root()
     cmd = [a for a in (args.cmd or []) if a != "--"]
@@ -4092,10 +4277,36 @@ def cmd_verify_isolated(args) -> None:
         ar.stdout.close()
         if ar.wait() != 0 or tar.returncode != 0:
             die(f"verify-isolated: could not extract {args.ref} into {dest}")
-        print(f"verify-isolated: {args.ref} ({sha[:12]}) extracted to {dest}")
-        print(f"verify-isolated: running: {' '.join(cmd)}\n")
+        # SOURCE instrument (T-0819) — see _extract_missing_paths. A partial
+        # extract manufactured 22 false regressions elsewhere on this ticket.
+        tracked, missing = _extract_missing_paths(repo_root, sha, dest)
+        if missing is None:
+            die(f"verify-isolated: could not list {sha[:12]}'s tree — cannot "
+                "prove the extract is complete, so nothing here would certify "
+                "anything.")
+        if missing:
+            die(f"verify-isolated: INCOMPLETE EXTRACT of {sha[:12]} — "
+                f"{len(missing)} of {len(tracked)} tracked path(s) are absent "
+                f"from {dest}, e.g. {', '.join(missing[:3])}.\n"
+                "A suite run against a partial tree reports missing code as "
+                "deleted code. Refusing to run.")
+        # flush=True is load-bearing, not tidiness. Python buffers print() while
+        # the child's bytes below are flushed as they arrive, so without it this
+        # banner lands AFTER the output it introduces — and under nohup it can
+        # be lost entirely, which already cost one session the ability to
+        # confirm its extract had happened at all (T-0819).
+        print(f"verify-isolated: {args.ref} ({sha[:12]}) extracted to {dest}",
+              flush=True)
+        print(f"verify-isolated: extract verified — all {len(tracked)} tracked "
+              "path(s) present", flush=True)
+        print(f"verify-isolated: running: {' '.join(cmd)}\n", flush=True)
+        # Captured AND streamed. Capturing is what makes the verdict below
+        # possible; streaming is what keeps the evidence readable while a long
+        # stage runs. Chunked reads rather than readline() so `-q`'s progress
+        # dots, which carry no newline, still appear as they are produced.
         try:
-            rc = subprocess.run(cmd, cwd=dest).returncode
+            proc = subprocess.Popen(cmd, cwd=dest, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT)
         except FileNotFoundError:
             # Overwhelmingly: a relative interpreter path. The extract holds
             # only what is COMMITTED, and a venv is not — that is the point.
@@ -4104,9 +4315,20 @@ def cmd_verify_isolated(args) -> None:
                 "is not in git, so name its interpreter by ABSOLUTE path:\n"
                 f"  bsq verify-isolated -- {Path(repo_root) / 'worker/.venv/bin/python'} "
                 "-m pytest -q <tests>", code=127)
-        print(f"\nverify-isolated: exit {rc} — this certifies {sha[:12]}, "
-              "not the shared working tree.")
-        sys.exit(rc)
+        chunks = []
+        with proc.stdout as pipe:
+            for block in iter(lambda: pipe.read1(65536), b""):
+                sys.stdout.buffer.write(block)
+                sys.stdout.flush()
+                chunks.append(block)
+        rc = proc.wait()
+        output = b"".join(chunks).decode("utf-8", "replace")
+        lines, exit_rc = _certify_pytest_run(output, rc, cmd, sha)
+        print("")
+        for line in lines:
+            print(line)
+        sys.stdout.flush()
+        sys.exit(exit_rc)
     finally:
         if args.keep:
             print(f"verify-isolated: extract kept at {dest}")

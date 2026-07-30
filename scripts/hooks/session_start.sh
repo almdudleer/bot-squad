@@ -853,6 +853,58 @@ if [ -d "$DATA/sessions" ]; then
     fi
 fi
 
+# 4b. Is the worktree guard actually WIRED? (T-0826)
+#
+# The guard scripts under scripts/hooks/ are git-tracked; the `PreToolUse` entry
+# that makes them fire lives in `.claude/settings.json`, which is per-clone and
+# GITIGNORED. So the two can come apart, and the way they come apart is silent:
+# `api/app/project_scaffold.py::_render_claude_settings` writes a three-hook
+# template, and it does not clobber an existing file — but a re-scaffold into a
+# fresh or emptied `.claude/` would leave the guard scripts present and NOTHING
+# CALLING THEM.
+#
+# ⚠ The defect that motivates this check is not "new clones lack the guard". It
+# is that a clone which HAD a P1 guard can lose it with no signal anywhere — a
+# protection whose absence is indistinguishable from its presence, which is the
+# exact failure class the guard itself exists to fix (a bare `git stash` swept
+# five sessions' work and the tree read CLEAN, exit 0).
+#
+# So: warn only when the guard is INSTALLED BUT UNWIRED. If the scripts are not
+# there either, this clone simply does not have the guard and there is nothing
+# to report. Arming it everywhere is a separate, larger decision — see
+# scripts/hooks/README-git-guards.md.
+if [ -n "$REPO_PATH" ] && [ -x "$REPO_PATH/scripts/hooks/bsq-worktree-guard.sh" ]; then
+    _guard_wired=$(python3 - "$REPO_PATH/.claude/settings.json" 2>/dev/null <<'GUARD_EOF' || echo unknown
+import json, sys
+try:
+    hooks = (json.load(open(sys.argv[1])).get("hooks") or {}).get("PreToolUse") or []
+except Exception:
+    print("no"); raise SystemExit(0)
+for entry in hooks:
+    for h in (entry or {}).get("hooks") or []:
+        if "bsq-pretooluse-git" in str((h or {}).get("command") or ""):
+            print("yes"); raise SystemExit(0)
+print("no")
+GUARD_EOF
+)
+    if [ "$_guard_wired" = "no" ]; then
+        print_section "⚠ WORKTREE GUARD IS INSTALLED BUT NOT ARMED (T-0826)"
+        cat <<GUARD_WARN
+scripts/hooks/bsq-worktree-guard.sh is present, but $REPO_PATH/.claude/settings.json
+has no PreToolUse hook calling bsq-pretooluse-git.py — so NOTHING refuses
+\`git stash\` / \`reset --hard\` / \`checkout -- .\` / \`restore .\` / \`clean -fd\`
+in this shared tree. On 2026-07-30 one bare stash swept 24 files across six
+tickets out of five sessions, and the tree read CLEAN afterwards.
+
+Re-arm (additive — keep SessionStart/UserPromptSubmit/Stop):
+  "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
+    "command": "$REPO_PATH/scripts/hooks/bsq-pretooluse-git.py"}]}]
+
+Then confirm: bash $REPO_PATH/scripts/hooks/test_worktree_guard.sh
+GUARD_WARN
+    fi
+fi
+
 # 5. Message bus — give every session the recipe for cross-session messaging
 # via the `bsq` CLI. TLs are expected to keep a `bsq inbox wait` armed
 # in the background; devs use it as a backup channel (their primary is the

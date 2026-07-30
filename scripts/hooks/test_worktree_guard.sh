@@ -889,6 +889,62 @@ if [ -z "$(cd "$WORK/c1" && git status --porcelain | grep -v '^??')" ]; then
     ok "CONTROL   the swept tree reads CLEAN — the silence is reproduced too"
 else bad "control tree was not clean after the sweep"; fi
 
+echo "── IS THE GUARD WIRED? the SessionStart check that makes absence loud ──"
+
+# The guard scripts are git-tracked; the PreToolUse entry that makes them fire
+# lives in .claude/settings.json, which is per-clone and GITIGNORED. So the two
+# can come apart — and the way they come apart is SILENT. A re-scaffold into a
+# fresh .claude/ leaves the scripts present with nothing calling them, and a
+# protection whose absence is indistinguishable from its presence is the exact
+# failure class this guard exists to fix. session_start.sh warns on the
+# installed-but-unwired state; these arms pin BOTH directions of that warning,
+# because a check that fires always and a check that never fires look identical
+# from a green suite.
+GW="$WORK/gw"
+mkdir -p "$GW/scripts/hooks" "$GW/.claude"
+cp "$GUARD" "$PRETOOL" "$GW/scripts/hooks/"
+sed -n '/^# 4b\. Is the worktree guard actually WIRED/,/^fi$/p' \
+    "${HOOK_DIR}/session_start.sh" > "$GW/block.sh"
+printf 'print_section() { echo; echo "=== $1 ==="; }\n' > "$GW/harness.sh"
+cat "$GW/block.sh" >> "$GW/harness.sh"
+
+if [ -s "$GW/block.sh" ]; then ok "the wiring check was found in session_start.sh"
+else bad "could not extract the wiring check — session_start.sh moved or renamed it"; fi
+
+write_settings() { python3 -c "
+import json, sys
+json.dump(json.loads(sys.argv[1]), open(sys.argv[2], 'w'))" "$1" "$GW/.claude/settings.json"; }
+
+# ARMED: silent. This is the control — without it, an always-warning check would
+# pass every 'it warns' arm below and still be useless.
+write_settings "{\"hooks\": {\"PreToolUse\": [{\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", \"command\": \"$GW/scripts/hooks/bsq-pretooluse-git.py\"}]}]}}"
+OUT="$(REPO_PATH="$GW" bash "$GW/harness.sh" 2>&1)"
+if [ -z "$OUT" ]; then ok "a correctly ARMED clone says nothing"
+else bad "the wiring check warns even when the guard IS armed — it would be ignored within a day" "$OUT"; fi
+
+# The three ways a clone loses the wiring, all of which are currently silent.
+for case in unwired missing malformed wrong_script; do
+    case "$case" in
+        unwired)      write_settings '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "/x.sh"}]}]}}' ;;
+        missing)      rm -f "$GW/.claude/settings.json" ;;
+        malformed)    printf 'not json at all' > "$GW/.claude/settings.json" ;;
+        # The subtle one: PreToolUse EXISTS, so a key-presence check would pass.
+        wrong_script) write_settings '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/some/other/hook.py"}]}]}}' ;;
+    esac
+    OUT="$(REPO_PATH="$GW" bash "$GW/harness.sh" 2>&1)"
+    if printf '%s' "$OUT" | grep -q 'INSTALLED BUT NOT ARMED'; then
+        ok "an UNARMED clone ($case) is called out loudly"
+    else bad "a $case clone was silently unguarded — the removal is invisible" "$OUT"; fi
+done
+
+# And when the guard is not installed at all there is nothing to report — the
+# check must not nag every clone in the fleet that never had it.
+rm -rf "$GW/scripts"
+write_settings '{"hooks": {}}'
+OUT="$(REPO_PATH="$GW" bash "$GW/harness.sh" 2>&1)"
+if [ -z "$OUT" ]; then ok "a clone without the guard installed is not nagged"
+else bad "the check nags clones that never had the guard" "$OUT"; fi
+
 echo "── COMMIT guard (bsq co-edit audit, T-0752) still armed ──"
 
 # Our commit guard is NOT .githooks/pre-commit — that file ships to managed

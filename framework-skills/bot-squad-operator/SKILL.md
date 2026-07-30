@@ -55,6 +55,18 @@ The normative rule — the two lines, when each fires, and what you keep — is 
 
 **Handing over is not abandoning.** The TL owes you a confirmation of what it now owns and a signal when the scope lands or blocks past its scope (`teamlead.md`). You keep that scope's priority against everything else.
 
+**The counter-argument, and the one line it earns.** A peer operator argued *against* a TL-led sub-team on the ground that a team-lead is one more forwarding node between the stakeholder and the executors, citing a message loss as proof. The citation does not hold, and knowing why should stop you being persuaded by it: that loss was T-0790, a peer-bus defect — `peer_send` wrote into a RECYCLED session's inbox and returned 200, and `operator` was never a reserved role keyword — fixed and shipped in 33f6657 + 7c16236. Decisively, **there was no team-lead anywhere on that path**; the loss was on the attendant→operator hop, so citing it against TLs is a category error, not merely stale evidence.
+
+What survives is an a priori principle, and it is now a contract line: delegation groups the WORK, and must not lengthen the path between the stakeholder and whoever holds his answer. Note that this does *not* follow from "stakeholder contact stays yours" — that is a claim about who owns the relationship, and an operator that owns the relationship but not the answer **is** the extra hop. Owning the relationship means routing him to the answer, not carrying it.
+
+## Your state artifact is forward state, not a knowledge home
+
+The prune process, its trigger, and this project's section-by-section routing table: `docs/runbook/D-0068`. The framework rule: the `bot-squad-lifecycle` skill, "Pruning the handoff artifact". The normative lines — prune by routing at every `compact-save`, enumerate the whole backlog on arrival, don't collapse symptoms into one root cause — are in `$BOT_SQUAD/api/app/resources/roles/operator.md`; not restated here.
+
+Two measurements behind them, so the lines read as consequences rather than style. **Enumerate on arrival, by status and not priority:** three of the P1 band were not P1 work, which is how a reopened P1 (T-0719) stayed invisible while six sessions passed through the handoff artifact. **Prune by routing:** on 2026-07-30 the artifact was rewritten 263 → 104 lines and two durable sections were lost outright, unrecoverable from git (T-0810) — then it refilled to 272 lines within 17 minutes. A tidy is not a prune.
+
+**And the symptom-collapsing prohibition is the same defect class as the dev-count trigger this skill rejects above** — a fresh explanation is persuasive *because* it covers the salient case, which is exactly when to check what it does NOT cover. The concurrent-count trigger explained the five-devs-on-one-initiative incident cleanly and was silent on the 7-serial one. The general version is T-0811; when it lands a home, point there instead of re-arguing it.
+
 ## Coordination
 
 - Drain `bsq inbox check` on start; arm `bsq inbox wait` in background. See `bot-squad-cli`.

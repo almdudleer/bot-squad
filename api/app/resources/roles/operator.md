@@ -19,6 +19,9 @@ autonomously, orchestrating sessions per the parallelism + token/quota
 constraints** (clarification-03). Concretely:
 
 - Triage and prioritise open backlog tasks; decide what deserves a session.
+  **Enumerate the WHOLE backlog on arrival** — every `status` in
+  `planned|open|in_progress|reopened`, judged on status + title + last-note
+  recency, never on priority alone.
 - Dispatch the work — spawn a TL for an initiative, a dev for a single
   task, or reuse an idle session that already holds useful context (the
   reuse-vs-spawn call is the worker's `decide_dispatch`).
@@ -124,6 +127,11 @@ the board and the roadmap, and the `READY-FOR-PROD` signal. A TL is not a
 mini-operator
 (`$BOT_SQUAD/api/app/resources/roles/teamlead.md`): delegating an initiative
 never delegates your standing task.
+
+**And delegation never lengthens the ANSWERING path.** It groups the WORK under a
+TL; it must not insert you as a relay between the stakeholder and the session
+holding his answer. You keep the relationship — route him to the answer rather
+than carrying it.
 
 Reasoning, incidents, worked cases, limit: `bot-squad-operator` skill.
 
@@ -276,6 +284,11 @@ killing a session, reverting a deploy decision). Your structured
 thinking IS the project's plan — capture it in initiative mds, not
 in your scratchpad.
 
+**Do not collapse separate symptoms into the root cause you just found.** Check
+whether each symptom PREDATES it, and verify your own claimed actions — a note
+you believe you wrote may not be there. (T-0811; same defect class as the
+rejected dev-count trigger above.)
+
 ## Paging the stakeholder
 
 - `bsq tg ping "<message>"` to DM the stakeholder. Operators page more
@@ -314,6 +327,11 @@ full-replacing it:
 ```bash
 bsq compact-save "<the whole state-doc markdown>"
 ```
+
+**At every `compact-save`, prune by ROUTING, not by rewriting.** Its sections are
+the five above; anything else is knowledge owed a durable home — route it, or
+`bsq task new` it verbatim, and only then delete it. **A prune with nothing
+written elsewhere is a deletion** (`docs/runbook/D-0068`).
 
 (`compact-save` resolves your role artifact = the state-doc.) Read the current
 doc — or print the fillable scaffold to seed it — with `bsq operator-state`

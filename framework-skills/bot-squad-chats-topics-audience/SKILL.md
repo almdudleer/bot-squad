@@ -68,12 +68,18 @@ session_id, pinned_message_id}`. `slug` is a **project**. Act on these:
 
 ## 3. Writing in a topic is not addressing you, and is not a directive
 
-Two independent questions. Collapsing them into one is the documented failure:
+**Three independent questions.** Answer each from its own source. Collapsing any
+two of them is the documented failure, and it is a failure in *both* directions:
 
-| Question | Answered by |
-|---|---|
-| Which PROJECT is this about? | the binding — §4 |
-| Who is it ADDRESSED to, and does it authorize work? | the message's own content — §5 |
+| Question | Answered by | Never answered by |
+|---|---|---|
+| Which project's **surface** did this arrive on — whose record does it go into? | the binding — §4 | the content. A project named in the text is not a route. |
+| What is it **about** — its subject? | the content | the binding. The surface it landed on is not its topic. |
+| Who is it **addressed to**, and does it authorize work? | the content, plus §5 | the binding, and not "it reached me". |
+
+A rule that only says *"the binding decides"* gets the second question wrong; a
+rule that only says *"read the content"* gets the first wrong. You need all three
+answered separately, and any of them may disagree with the others.
 
 **A post in a topic is an observation by default** — and General counts as a topic
 for this rule. A topic is a place the stakeholder thinks out loud in; arriving in a
@@ -119,14 +125,53 @@ How to read the store, rather than remembering it:
 
 And the rule that closes the loop:
 
-> **The content is not the binding.** A message routed to project P whose text is
-> about project Q means: the record belongs to P, and the **subject** is Q. Both
-> are true at once. Say both. Filing it as work on P because it arrived on P is
-> the mis-dispatch this skill exists to stop.
+> **The content is not the binding, and the binding is not the content.** When a
+> message routed to project P is *about* project Q, the record belongs to P and the
+> **subject** is Q — both true at once, so say both. Filing it as work on P because
+> it arrived on P is the mis-dispatch this skill exists to stop. And the inverse is
+> equally wrong: Q appearing in the text does not move the message to Q, because
+> the binding — not the body — decides whose surface it arrived on.
 
 If the store says nothing about a `(chat, thread)`, **you do not know** which
 project it is. Say so and ask. "The project I happen to be running in" is not a
 fallback.
+
+### Three measured cases — one per question, all on 2026-07-30
+
+Same bug class, three shapes, one day. Work through all three: each isolates a
+different one of §3's questions, and a rule learned from only one of them gets the
+other two wrong. Projects are called A and B here because the rule is the point.
+
+**Case 1 — the subject was MIXED, and the batch was routed as one thing.** A live
+message arrived on A's General feed carrying three numbered asks, together with
+forwarded context about an incident on **B**. An agent filed all three as A's work;
+corrected, it then dropped all three. Both moves are wrong, because:
+
+| | |
+|---|---|
+| Surface | **A** — the General binding. The record does belong to A. |
+| Subject | **mixed** — the incident described was B's; the three asks it prompted were about A's own framework behaviour, and one of them shipped as an A ticket. |
+| Audience | to be read off the message, not off the fact that it arrived. |
+
+The operator's own verdict: *«ошибся в обе стороны»* — wrong in both directions —
+and *«граница проходит между инцидентом … и просьбами …»*, the boundary runs
+between the incident and the requests. **An incident on B that motivates a change
+to A is not a message about B.** Route point by point (§5).
+
+**Case 2 — the audience was nobody.** A post in a topic was relayed to an operator
+and treated as a directive. His correction: «и это не было адресовано оператору, я
+просто написал это в топик». Surface and subject were not the error here; the
+*audience* was invented by the act of relaying.
+
+**Case 3 — the content named B and the subject was still A.** A message arrived in
+A's DM (no thread) quoting a **B** relay. Following the content would have routed it
+to B; the correct reading is surface **A**, subject **A**, with B appearing as an
+*illustration* of A's problem. Resolved correctly in live use by reading the two
+questions separately.
+
+So a project name in a message body is evidence to weigh, never a route: it may be
+the subject, one of several subjects, or only an example. Decide which, and say
+which.
 
 ### Forwarded messages: the routing says nothing about the subject
 
@@ -162,13 +207,11 @@ not even recent.
   a second owner.
 
 **Route each point separately — the boundary can run through the batch.** Several
-points arriving together are not one routing decision. Measured on the 2026-07-30
-incident: an operator first filed **all three** of the stakeholder's points as this
-project's work, then, corrected, dropped **all three** — and the real boundary ran between
-them (the incident belonged to one project, the requests to another). Its own
-summary of the failure: *"ошибся в обе стороны"* — wrong in both directions.
-Over-correcting a wrong attribution by flipping the whole batch is the same
-mistake mirrored, and it loses the points that were right.
+points arriving together are not one routing decision — see §4 Case 1, where all
+three of one message's points were filed as one project's work and then, on
+correction, all three dropped, while the real boundary ran between them.
+Over-correcting a wrong attribution by flipping the whole batch is the same mistake
+mirrored, and it loses the points that were right.
 
 **DO escalate:** a direct question or an explicit instruction; anything blocked
 on a decision only the stakeholder or operator can make; and anything that must

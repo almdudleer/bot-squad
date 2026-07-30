@@ -27,7 +27,9 @@ Design notes
 * Continue-vs-respawn rides :func:`dispatch.live_operator_sids` — the SAME seam
   the T-0472 one-operator spawn guard uses, so the tick can never double-drive.
 * The respawn brief is :func:`dispatch.operator_standing_task` — the SSOT for
-  the "clear the backlog" directive (shared with the spawn-time brief).
+  the "clear the backlog" directive (shared with the spawn-time brief) — and
+  since T-0783a it carries the CONCRETE pickup queue (:mod:`pickup`) so a fresh
+  operator is told WHICH tickets are takeable instead of re-deriving the board.
 * Purely scheduler-internal: no new worker socket action (TL directive — keep
   actions.py single-owner). The pause flag is a flag *file* with in-module
   helpers; wiring a ``bsq operator pause/resume`` verb is a follow-up.
@@ -399,6 +401,20 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
     from bot_squad_worker import dispatch as _dispatch
     from bot_squad_worker.actions import ActionError
 
+    # T-0783a: the respawn brief carries the CONCRETE pickup queue, not just the
+    # "clear the backlog" directive. This is the seam the whole ticket turns on —
+    # a re-driven operator that has to re-derive which tickets are takeable from
+    # 57 board mds is the operator that left a reopened P1 sitting until the
+    # stakeholder chased it by hand. A failure to compute it must never block the
+    # respawn (an operator with the plain directive is what we had before), so it
+    # degrades to "".
+    try:
+        from bot_squad_worker import pickup as _pickup
+        brief = _pickup.pickup_brief(_pickup.pickup_queue(cfg, slug))
+    except Exception:  # noqa: BLE001
+        log.exception("operator_redrive: pickup brief failed for %s", slug)
+        brief = ""
+
     try:
         # T-0678: carry forward a sticky per-session `model` override from the
         # operator incarnation this respawn replaces — a full respawn mints a
@@ -408,7 +424,7 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
         model = S.last_operator_model(cfg, slug) or None
         res = S.spawn(
             cfg, slug, "operator",
-            initial_prompt=_dispatch.operator_standing_task(),
+            initial_prompt=_dispatch.operator_standing_task(brief),
             owner="operator-redrive",
             model=model,
         )

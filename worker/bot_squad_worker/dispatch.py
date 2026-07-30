@@ -58,7 +58,7 @@ def reuse_max_context_pct() -> float:
 # one-per-project guard (T-0472) and the re-drive continue-vs-respawn (T-0474).
 # ---------------------------------------------------------------------------
 
-def operator_standing_task() -> str:
+def operator_standing_task(pickup_brief: str = "") -> str:
     """The operator's STANDING TASK — the one directive it ALWAYS has when on
     (clarification-03: "when on it always has a task to clear the backlog,
     orchestrating the sessions according to parallelism and token usage
@@ -71,8 +71,15 @@ def operator_standing_task() -> str:
     (T-0474's scheduler tick) inject the identical standing task; the full how-to
     lives in the role contract (``api/app/resources/roles/operator.md`` — the
     git SSOT per D-0043, not the drifting per-project ``vision/roles/`` copy).
+
+    ``pickup_brief`` (T-0783a) appends the CONCRETE pickup queue — see
+    :func:`pickup.pickup_brief`. Until it existed this directive told a fresh
+    operator to "triage and prioritise open tasks" and left it to re-derive the
+    board from 57 mds every re-drive; the stakeholder ended up being the
+    fallback dispatcher for a P1 he had reopened. Optional and empty-by-default
+    so the pure directive text stays callable (and testable) without a project.
     """
-    return (
+    base = (
         "Your standing task: clear the backlog autonomously. The user checks in "
         "and corrects you, but you do NOT wait on user input — when on, you "
         "always drive the backlog forward: triage and prioritise open tasks, and "
@@ -89,6 +96,10 @@ def operator_standing_task() -> str:
         "past it). An empty backlog (nothing actionable left) is the only idle "
         "state; otherwise there is always a next move to make."
     )
+    brief = (pickup_brief or "").strip()
+    if not brief:
+        return base
+    return base + "\n\n" + brief
 
 
 def live_operator_sids(cfg: Any, slug: str) -> list[str]:

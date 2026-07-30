@@ -12,6 +12,7 @@ Verbs:
   bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
   bsq task new <title> --provenance <src>  allocate next T-NNNN + stub (atomic — T-0174; --provenance REQUIRED)
   bsq task digest                   short backlog digest for the TG chat (T-0589)
+  bsq pickup [--triage|--all]       which tickets are takeable right now (T-0783a)
   bsq doc new <category> <title>   allocate next D-NNNN + stub doc (T-0172)
   bsq initiative new <name>        allocate next T-NNNN + stub kind:initiative task (T-0480)
   bsq spawn <ticket> [--bundle ids] spawn a dev session (auto-resumes an expert)
@@ -2384,6 +2385,41 @@ def cmd_operator_status(args) -> None:
               f"({pending} pending, no live operator)")
     else:
         print(f"operator re-drive: idle for {slug} (empty backlog)")
+
+
+def cmd_pickup(args) -> None:
+    """T-0783a: show which board tickets are takeable, and which need triage.
+
+    `--brief` prints the exact block the operator re-drive injects, so what a
+    human reads here and what a re-driven operator is told can never drift apart.
+    """
+    slug = resolve_slug()
+    band = "triage" if args.triage else ("pickup" if not args.all else None)
+    params = {"slug": slug}
+    if band:
+        params["band"] = band
+    res = post("pickup_queue", params)
+
+    if args.brief:
+        print(res.get("brief") or "")
+        return
+
+    counts = res.get("counts") or {}
+    print(f"board {slug}: {counts.get('pickup', 0)} takeable · "
+          f"{counts.get('triage', 0)} need triage · "
+          f"{counts.get('excluded', 0)} excluded · {counts.get('board', 0)} total")
+    for name, header in (("pickup", "TAKEABLE (most urgent first)"),
+                         ("triage", "NEEDS TRIAGE — look before dispatching"),
+                         ("excluded", "EXCLUDED")):
+        rows = res.get(name)
+        if rows is None:
+            continue
+        print(f"\n{header}: {len(rows)}")
+        for r in rows:
+            idle = "idle?" if r.get("idle_days") is None else f"{r['idle_days']}d"
+            why = r.get("reject") or ", ".join(r.get("sanity") or []) or ""
+            print(f"  {r['id']:9} {r['status']:12} P{r['effective_priority']} "
+                  f"{idle:>7}  {r['title'][:58]}" + (f"\n{'':13}→ {why}" if why else ""))
 
 
 #: (CLI flag attr, monitor-spec key, is-duration) — the monitor flags on
@@ -5623,6 +5659,20 @@ def build_parser() -> argparse.ArgumentParser:
     opr.set_defaults(func=cmd_operator_resume)
     ops = op_sub.add_parser("status", help="show whether re-drive is paused vs driving")
     ops.set_defaults(func=cmd_operator_status)
+
+    # pickup (T-0783a) — which tickets are takeable. `operator status` reports a
+    # COUNT of pending work; this reports WHICH work, which is the question an
+    # operator (or the stakeholder, when he ends up dispatching by hand) has.
+    pu = sub.add_parser(
+        "pickup",
+        help="which board tickets are takeable right now (+ which need triage)")
+    pu.add_argument("--triage", action="store_true",
+                    help="show only the triage band (suspect priority / stale / another project's)")
+    pu.add_argument("--all", action="store_true",
+                    help="show every band, including the excluded tickets and why each was excluded")
+    pu.add_argument("--brief", action="store_true",
+                    help="print the exact block the operator re-drive injects")
+    pu.set_defaults(func=cmd_pickup)
 
     # edit-begin (T-0215) — snapshot a baseline for a later `commit --hunks`
     eb = sub.add_parser(

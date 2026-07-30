@@ -422,6 +422,23 @@ def test_operator_standing_task_is_backlog_clearing_directive():
     assert "wait" in txt or "not" in txt
 
 
+def test_standing_task_appends_a_pickup_brief_without_replacing_the_directive():
+    """T-0783a: the queue rides ALONG with the SSOT directive, so a re-driven
+    operator gets both the how (pace, throttle) and the what (these ids)."""
+    plain = operator_standing_task()
+    with_brief = operator_standing_task("PICKUP QUEUE (1 takeable): T-0719")
+    assert with_brief.startswith(plain)
+    assert with_brief.endswith("PICKUP QUEUE (1 takeable): T-0719")
+
+
+@pytest.mark.parametrize("brief", ["", "   ", "\n"])
+def test_an_empty_pickup_brief_leaves_the_directive_byte_identical(brief):
+    """A project with no queue to report must not get a trailing blank block —
+    the callers that pass no brief and the ones that pass an empty one are the
+    same case."""
+    assert operator_standing_task(brief) == operator_standing_task()
+
+
 def test_live_operator_sids_finds_live_operator(tmp_path):
     cfg = _make_cfg(tmp_path)
     _make_session(cfg, "S-u-operator-p1", window="operator")

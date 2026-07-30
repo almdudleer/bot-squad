@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from bot_squad_worker import operator_redrive as ord_
+from bot_squad_worker import pickup
 from bot_squad_worker import sessions as S
 from bot_squad_worker import dispatch
 from bot_squad_worker.actions import ActionError
@@ -71,7 +72,10 @@ def test_pending_not_paused_redrives_operator(cfg_slug):
     assert res["action"] == "respawned"
     assert len(spawns) == 1
     assert spawns[0]["window"] == "operator"
-    assert spawns[0]["prompt"] == dispatch.operator_standing_task()
+    # T-0783a: the prompt is the standing directive PLUS the concrete pickup
+    # queue. Asserting the prefix (rather than equality against a call with no
+    # brief) keeps the SSOT pinned while letting the queue block ride along.
+    assert spawns[0]["prompt"].startswith(dispatch.operator_standing_task())
     assert spawns[0]["owner"] == "operator-redrive"
 
 
@@ -242,6 +246,57 @@ def test_kill_switch_disables(cfg_slug, monkeypatch):
     res = ord_.tick(cfg, slug)
     assert res["action"] == "disabled"
     assert spawns == []
+
+
+# --- T-0783a: the respawn brief carries the concrete pickup queue ------------
+#
+# The whole point of the ticket: a re-driven operator that has to re-derive which
+# tickets are takeable is the operator that left a reopened P1 sitting until the
+# stakeholder chased it by hand. So the queue has to be IN the prompt, and the
+# empty case has to be stated in it rather than silently absent.
+
+def test_respawn_prompt_names_the_takeable_ticket(cfg_slug, monkeypatch):
+    cfg, slug, spawns = cfg_slug
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    (cfg.data_dir / slug / "backlog" / "T-0719-x.md").write_text(
+        "---\nid: T-0719\ntitle: REGRESSION reply-by-sid routing\nstatus: reopened\n"
+        "priority: P1\nupdated: 2099-01-01T00:00:00Z\n---\n\nbody\n"
+    )
+
+    assert ord_.tick(cfg, slug)["action"] == "respawned"
+    prompt = spawns[0]["prompt"]
+    assert "PICKUP QUEUE" in prompt
+    assert "T-0719" in prompt
+    assert "[reopened]" in prompt
+
+
+def test_respawn_prompt_states_an_empty_queue_out_loud(cfg_slug, monkeypatch):
+    """Pending backlog exists (so the tick fires) but nothing is TAKEABLE — a
+    totest ticket is review work. The brief must say the queue is empty instead
+    of omitting the section, which a reader takes as "not computed"."""
+    cfg, slug, spawns = cfg_slug
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    _write_task(cfg, slug, "T-1", status="totest")
+
+    assert ord_.tick(cfg, slug)["action"] == "respawned"
+    prompt = spawns[0]["prompt"]
+    assert pickup.EMPTY_PICKUP_LINE in prompt
+    assert "T-1" not in prompt
+
+
+def test_a_broken_pickup_computation_never_blocks_the_respawn(cfg_slug, monkeypatch):
+    """Degrade to the plain directive: an operator with the old brief is what we
+    had before this wiring, and is strictly better than no operator at all."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+
+    def _boom(*a, **k):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(pickup, "pickup_queue", _boom)
+
+    assert ord_.tick(cfg, slug)["action"] == "respawned"
+    assert spawns[0]["prompt"] == dispatch.operator_standing_task()
 
 
 def test_operator_tick_sweeps_all_projects_and_swallows_errors(cfg_slug, monkeypatch):

@@ -3578,6 +3578,54 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_PICKUP_QUEUE_REQUIRED = {"slug"}
+_PICKUP_QUEUE_ALLOWED = _PICKUP_QUEUE_REQUIRED | {"band"}
+
+
+def _action_pickup_queue(params: dict[str, Any]) -> dict[str, Any]:
+    """The banded pickup queue for a project — what is takeable, what needs
+    triage, and what is excluded and why (T-0783a).
+
+    Read-only scan of the shared backlog + session mds, composed from the PUBLIC
+    ``pickup`` helpers. Answers the question ``operator_status``'s
+    ``pending_backlog`` count cannot: not "is there work" but "WHICH work is
+    takeable right now" — the gap that left a reopened P1 sitting until the
+    stakeholder dispatched it by hand.
+
+    Required params: slug. Optional: band (``pickup``/``triage``/``excluded`` —
+    return only that band; the full result is large on a mature board, and
+    ``excluded`` is ~730 rows of closed tickets). Returns the
+    :func:`pickup.pickup_queue` result plus ``brief`` (the operator-facing
+    rendering, so the CLI and the re-drive show the SAME text).
+    """
+    extra = set(params) - _PICKUP_QUEUE_ALLOWED
+    if extra:
+        raise ActionError(f"pickup_queue got unexpected params: {sorted(extra)}")
+    missing = _PICKUP_QUEUE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"pickup_queue missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"pickup_queue: unknown project slug {slug!r}")
+
+    from bot_squad_worker import pickup as _pickup
+
+    band = str(params.get("band") or "").strip().lower()
+    bands = (_pickup.BAND_PICKUP, _pickup.BAND_TRIAGE, _pickup.BAND_EXCLUDED)
+    if band and band not in bands:
+        raise ActionError(f"pickup_queue: band must be one of {list(bands)}, got {band!r}")
+
+    out = _pickup.pickup_queue(cfg, slug)
+    out["brief"] = _pickup.pickup_brief(out)
+    if band:
+        for other in bands:
+            if other != band:
+                out.pop(other, None)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # T-0630 (T-0620 seam): fleet-default `claude --model` (~/.claude/settings.json
 # `model` key of the worker linux user). Thin wrappers over fleet_model.py —
@@ -5156,6 +5204,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "operator_pause": _action_operator_pause,
     "operator_resume": _action_operator_resume,
     "operator_status": _action_operator_status,
+    # T-0783a: which board tickets are takeable / need triage / are excluded.
+    "pickup_queue": _action_pickup_queue,
     # T-0630: fleet-default `claude --model` (~/.claude/settings.json).
     "fleet_model_get": _action_fleet_model_get,
     "fleet_model_set": _action_fleet_model_set,
@@ -5333,6 +5383,10 @@ ACTION_MODES: dict[str, str] = {
     "operator_pause": "coordinator_only",
     "operator_resume": "coordinator_only",
     "operator_status": "coordinator_only",
+    # T-0783a: read-only scan of the shared install data dir (backlog/ +
+    # sessions/) — a single coordinator read, like task_digest. Sessions reach it
+    # via `bsq pickup` (the coordinator socket).
+    "pickup_queue": "coordinator_only",
     # T-0630: edits the worker linux user's OWN ~/.claude/settings.json — a
     # single coordinator-owned file, like the rest of the project-state ops.
     "fleet_model_get": "coordinator_only",

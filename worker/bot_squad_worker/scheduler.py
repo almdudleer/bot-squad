@@ -408,8 +408,10 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
     # reply turn died (e.g. a 429 storm) before it answered, so a stakeholder
     # message never sits unanswered. Gated on the SAME pressure signal the
     # backoff governor uses (never redrive into a live storm) plus the T-0104
-    # idle activity enum (never interrupt an in-flight reply); bounded
-    # retries/cooldown per (slug, gid). Kill switch: BOT_SQUAD_UC_REDRIVE=0.
+    # idle activity enum (never interrupt an in-flight reply). T-0794: the ping
+    # cadence is the stakeholder's — ~5 min, ~15 min, then every ~30 for as long
+    # as the message hangs — so the 60s interval here is the RESOLUTION of that
+    # schedule, not its rate. Kill switch: BOT_SQUAD_UC_REDRIVE=0.
     # max_instances=1 + coalesce keeps overlapping ticks from racing the nudge.
     sched.add_job(
         uc_redrive_tick,

@@ -11,31 +11,68 @@ unanswered for ~12h until a human noticed (T-0622).
 
 This tick (wired the same way as ``drift_check``/``operator_redrive`` — no new
 scheduler surface) sweeps every project's conversation threads
-(``data/_mothership/conversations/<slug>/<gid>.jsonl``) for one whose newest
-record is still ``author: "user"`` (i.e. no session reply followed it). For
-each such thread it re-drives via the EXACT mechanism a fresh inbound message
-already uses — ``ensure_user_conversation`` (its live-attendant branch is a
-best-effort pane nudge) — subject to:
+(``data/_mothership/conversations/<slug>/<gid>.jsonl``) for one that holds an
+unanswered user message (:func:`_unanswered_user_record`). For each such thread
+it re-drives via the EXACT mechanism a fresh inbound message already uses —
+``ensure_user_conversation`` (its live-attendant branch is a best-effort pane
+nudge) — subject to:
 
-  * a grace period (``BOT_SQUAD_UC_REDRIVE_GRACE_SEC``) so a message that just
-    arrived is left to the normal reply flow first;
+  * the stakeholder's ping cadence (:func:`ping_due_after_sec`) measured from
+    the unanswered message itself — the first slot doubles as the grace period
+    that leaves the normal reply flow its chance;
   * the SAME 429/5h-limit pressure signal the backoff governor consults
     (:func:`detector.session_pressure`) — never redrive INTO a live storm,
     only once THIS attendant's own pressure has cleared;
   * the live attendant being ``idle`` (T-0104 canonical activity enum,
     :func:`sessions._derive_activity`) — a genuinely in-flight reply is never
     interrupted;
-  * a per-``(slug, gid)`` cooldown + bounded retry count (state persisted
-    under ``_worker/uc_redrive/state.json``, mirroring
-    ``operator_redrive``'s state file) — reset whenever the unanswered
-    message changes, so a permanently stuck thread pages the operator once
-    its retries are exhausted instead of nagging forever.
+  * per-``(slug, gid)`` ping state (persisted under
+    ``_worker/uc_redrive/state.json``, mirroring ``operator_redrive``'s state
+    file) — reset whenever the unanswered message changes.
 
 Deliberately out of scope: a thread with NO live attendant at all (a fully
 dead/never-spawned pane, not merely idle) is left to the existing "next
 inbound message spawns/resumes" flow — the DoD's trigger condition is
 specifically an IDLE attendant, mirroring the observed incident (the pane
 survived the 429; only its reply turn died).
+
+T-0794 — his cadence, his trigger, and delivery that lands
+==========================================================
+The stakeholder asked for exactly this mechanism on 2026-07-30, not knowing it
+existed: «система ботсквод должна пинать агента раз в N минут (первый раз
+через минут 5 мб, второй через 15, потом каждые 30 или вроде того), если у него
+висят сообщения юзера, на которые он не ответил». Three things changed here so
+that the module he described IS the module that runs.
+
+**The cadence** replaced a flat 5-minute cooldown bounded at 3 attempts. Ping
+slots are now measured from the unanswered message: ~5 min, ~15 min, then every
+~30 min for as long as it hangs (:func:`ping_due_after_sec`). The bound is gone
+because the bound was the bug in the small: three nudges inside 15 minutes and
+then permanent silence is how a message that outlives one bad quarter-hour goes
+unanswered forever. What still bounds it in practice is the gate above — a
+thread with no live idle attendant is never pinged at all, which is why the one
+thread hanging on the live install (watchrobot, since 2026-07-25) draws nothing.
+
+**The trigger** was a proxy and is now his condition. The old test was "the
+NEWEST record in the thread is ``author: "user"``", which any later append
+falsifies — and ``system:task-lifecycle`` notices append into these threads
+constantly. Measured on his own thread (415 records): of 157 unanswered
+episodes, 29 had a system record land after the user's message, so ~18% of the
+time the detector went blind precisely while a message hung. The scan now walks
+back past those (they are neither an ask nor an answer) and stops at the first
+``session:`` reply, so "he has not answered" is read off the thread rather than
+inferred from the tail. Direct-mode messages stay invisible here, unchanged and
+deliberately: they arrive as ``fyi`` records from ``system:direct-reply`` and
+belong to ``tg_answer_owed`` (T-0770).
+
+**Delivery** is the half that had actually failed. This module's escalation has
+been firing for weeks into ``_chat/inbox-operator.log``, an ownerless file — 22
+of its alerts sat undrained there from 2026-07-04 to 07-27 because ``operator``
+was not a role keyword (T-0790, since fixed). It now resolves through
+:func:`dispatch.live_operator_sids`, and this module treats an escalation that
+reached NOBODY as not-yet-escalated: it retries on each following ping slot
+until a live operator sid actually receives it, rather than spending its one
+alert on an empty fan-out.
 
 Kill switch: ``BOT_SQUAD_UC_REDRIVE=0``.
 """
@@ -55,40 +92,113 @@ def enabled() -> bool:
     return os.environ.get("BOT_SQUAD_UC_REDRIVE", "1").strip() != "0"
 
 
-def grace_sec() -> int:
-    """How long an unanswered message must sit before we consider redriving —
-    gives the normal reply flow a chance first."""
+#: His cadence, verbatim: «первый раз через минут 5 мб, второй через 15, потом
+#: каждые 30 или вроде того» — first ping at ~5 min, second at ~15, then every
+#: ~30. Read as offsets FROM THE UNANSWERED MESSAGE (that is how he counts:
+#: «раз в N минут … если у него висят сообщения»), not from the previous ping,
+#: so a thread that spent its first half-hour with a busy attendant is on the
+#: steady cadence the moment the attendant frees up rather than restarting the
+#: ramp. The tuning was explicitly delegated («подумай, как лучше»); these are
+#: his numbers unchanged, because 5/15/30 already spans "it might just be slow"
+#: → "something is wrong" → "keep it visible" and nothing measured argues with
+#: them.
+DEFAULT_FIRST_PING_SEC = 300
+DEFAULT_SECOND_PING_SEC = 900
+DEFAULT_STEADY_PING_SEC = 1800
+
+#: The escalating phase is over once this many pings have failed to produce a
+#: reply — that is when a human is told. It is the ramp length (2), so the
+#: escalation rides the entry into the steady state instead of being a third
+#: independent number to keep in sync.
+ESCALATE_AFTER_PINGS = 2
+
+
+def _env_sec(name: str, default: int) -> int:
+    """A positive-seconds env override, or ``default``. Zero and negatives are
+    rejected rather than honoured — a 0 here would turn the cadence into an
+    every-tick nudge loop at the attendant."""
     try:
-        return int(os.environ.get("BOT_SQUAD_UC_REDRIVE_GRACE_SEC", 120))
+        v = int(os.environ.get(name, default))
     except (TypeError, ValueError):
-        return 120
+        return default
+    return v if v > 0 else default
 
 
-def cooldown_sec() -> int:
-    """Minimum gap between re-wake attempts for the same (slug, gid)."""
-    try:
-        return int(os.environ.get("BOT_SQUAD_UC_REDRIVE_COOLDOWN_SEC", 300))
-    except (TypeError, ValueError):
-        return 300
+def first_ping_sec() -> int:
+    return _env_sec("BOT_SQUAD_UC_REDRIVE_FIRST_SEC", DEFAULT_FIRST_PING_SEC)
 
 
-def retry_bound() -> int:
-    try:
-        v = int(os.environ.get("BOT_SQUAD_UC_REDRIVE_MAX_RETRIES", 3))
-    except (TypeError, ValueError):
-        return 3
-    return v if v > 0 else 3
+def second_ping_sec() -> int:
+    # Never earlier than the first slot: the schedule has to stay monotonic for
+    # :func:`pings_due_by` to be its inverse, and an env pair that inverted the
+    # two would otherwise skip straight into the steady state.
+    return max(_env_sec("BOT_SQUAD_UC_REDRIVE_SECOND_SEC", DEFAULT_SECOND_PING_SEC),
+               first_ping_sec())
+
+
+def steady_ping_sec() -> int:
+    return _env_sec("BOT_SQUAD_UC_REDRIVE_STEADY_SEC", DEFAULT_STEADY_PING_SEC)
+
+
+def ping_due_after_sec(pings_sent: int) -> int:
+    """Seconds after the unanswered user message at which ping number
+    ``pings_sent + 1`` falls due.
+
+    ``0 -> 300`` (5 min), ``1 -> 900`` (15 min), then +1800 per ping: 45 min,
+    75 min, 105 min… The gap STOPS widening at the steady interval — this is
+    not an exponential backoff that quietly becomes a once-a-day check, which
+    is the failure mode "then every 30 or so" rules out.
+    """
+    if pings_sent <= 0:
+        return first_ping_sec()
+    if pings_sent == 1:
+        return second_ping_sec()
+    return second_ping_sec() + (pings_sent - 1) * steady_ping_sec()
+
+
+def pings_due_by(hanging_sec: float) -> int:
+    """How many ping slots have come due by ``hanging_sec`` after the message —
+    the inverse of :func:`ping_due_after_sec`.
+
+    Slots are CONSUMED by time, not queued: an attendant that was busy or under
+    429 pressure through its first hour gets ONE ping when it frees up and then
+    rejoins the every-~30 cadence, rather than absorbing the four it missed in
+    a burst. The cadence is a schedule for a hanging message, not a debt owed
+    to it.
+    """
+    first, second, steady = first_ping_sec(), second_ping_sec(), steady_ping_sec()
+    if hanging_sec < first:
+        return 0
+    if hanging_sec < second:
+        return 1
+    return 2 + int((hanging_sec - second) // steady)
 
 
 def _conversations_dir(cfg: Any, slug: str) -> Path:
     return Path(cfg.data_dir) / "_mothership" / "conversations" / slug
 
 
-def _last_record(path: Path) -> dict | None:
-    """Newest well-formed record in a conversation thread jsonl, or None.
+def _unanswered_user_record(path: Path) -> dict | None:
+    """The newest ``author: "user"`` record that NO session reply follows, or
+    ``None`` when the thread owes nothing.
 
-    Tolerates a torn/garbage trailing line (mirrors ``conversation_store``'s
-    own read tolerance) by skipping it and looking further back.
+    This is the trigger, and it is his words rather than a stand-in for them:
+    «если у него висят сообщения юзера, на которые он не ответил». Scanning
+    backwards, the first record decides in one of three ways:
+
+    * ``session:…`` — the attendant answered after any user message further
+      back. Nothing hangs. Stop.
+    * ``user`` — an ask with no reply after it. That is the hanging message.
+    * anything else — TRANSPARENT, keep walking back. ``system:task-lifecycle``
+      notices, delivery receipts and the like append into these threads all the
+      time; they are neither an ask nor an answer, and the previous version of
+      this function (return the tail record, hanging iff it was ``user``) let
+      every one of them mask a real unanswered message. Measured on the
+      stakeholder's own thread: 29 of 157 unanswered episodes had a system
+      record land after the user's message.
+
+    Tolerates a torn/garbage line (mirrors ``conversation_store``'s own read
+    tolerance) by skipping it and looking further back.
     """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -102,7 +212,13 @@ def _last_record(path: Path) -> dict | None:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        return rec if isinstance(rec, dict) else None
+        if not isinstance(rec, dict):
+            continue
+        author = str(rec.get("author") or "")
+        if author == "user":
+            return rec
+        if author.startswith("session:"):
+            return None
     return None
 
 
@@ -134,26 +250,47 @@ def _save_state(cfg: Any, slug: str, state: dict) -> None:
     atomic_write(p, json.dumps(state, indent=1))
 
 
-def _notify_operator_stuck(cfg: Any, slug: str, gid: str, retries: int) -> None:
+def _notify_operator_stuck(
+    cfg: Any, slug: str, gid: str, *, pings: int, hanging_sec: float,
+) -> list[str]:
+    """Escalate one hanging message to a LIVE operator. Returns the sids it
+    actually reached — ``[]`` when nobody did.
+
+    The return value is the point (T-0794/T-0790). ``to="operator"`` resolves
+    through :func:`dispatch.live_operator_sids`, so with no operator on duty it
+    resolves to nothing and this alert evaporates. The caller keeps the message
+    marked un-escalated in that case and tries again on the next ping slot; an
+    escalation nobody received must not be recorded as done, which is the exact
+    shape of the failure that produced 22 undrained alerts.
+    """
+    mins = int(max(0.0, hanging_sec) // 60)
     try:
         from bot_squad_worker import intersession as _inter
-        _inter.send(
+        out = _inter.send(
             cfg, slug, to="operator",
-            text=(f"⚠️ uc_redrive: user-conversation attendant for "
-                  f"{gid} still unanswered after {retries} re-wake "
-                  f"attempt(s) — needs a human look."),
+            text=(f"⚠️ uc_redrive: {gid} has an UNANSWERED user message — "
+                  f"hanging {mins} min, {pings} re-wake ping(s) sent and the "
+                  f"attendant still has not replied. Needs a human look."),
             from_sid="S-uc-redrive",
         )
     except Exception:  # noqa: BLE001 — best-effort notify must never break the tick
         log.exception("uc_redrive: stuck-notify failed for %s/%s", slug, gid)
+        return []
+    delivered = [str(s) for s in (out or {}).get("delivered_to") or []]
+    if not delivered:
+        log.warning(
+            "uc_redrive: escalation for %s/%s reached NO live operator — the "
+            "message has hung %d min over %d ping(s); will retry the escalation "
+            "on the next ping slot", slug, gid, mins, pings,
+        )
+    return delivered
 
 
 def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
     """One unanswered-message sweep for a project. Returns a summary dict.
 
-    Idempotent + side-effecting: re-drives at most one nudge per (slug, gid)
-    per cooldown window, bounded by ``retry_bound()`` total attempts per
-    unanswered message.
+    Idempotent + side-effecting: fires at most one nudge per (slug, gid) per
+    ping slot (:func:`ping_due_after_sec`), for as long as the message hangs.
     """
     from bot_squad_worker import sessions as S
     from bot_squad_worker import detector as _detector
@@ -180,10 +317,10 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
 
     for jf in sorted(conv_dir.glob("*.jsonl")):
         gid = jf.stem
-        rec = _last_record(jf)
-        if rec is None or str(rec.get("author")) != "user":
+        rec = _unanswered_user_record(jf)
+        if rec is None:
             # Answered (or empty) thread — nothing to re-drive. Drop any
-            # stale retry-state so a LATER stuck message starts fresh.
+            # stale ping state so a LATER stuck message starts fresh.
             if gid in state:
                 del state[gid]
                 state_changed = True
@@ -191,8 +328,17 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
 
         msg_ts = str(rec.get("timestamp") or "")
         msg_at = _parse_iso(msg_ts)
-        if msg_at is None or (now - msg_at) < grace_sec():
-            continue  # too soon — give the normal reply flow a chance first
+        if msg_at is None:
+            continue  # undatable record — the cadence has nothing to count from
+
+        gid_state = state.get(gid) or {}
+        if gid_state.get("msg_ts") != msg_ts:
+            gid_state = {"msg_ts": msg_ts, "pings": 0, "last_ping_at": 0,
+                         "escalated_to": []}
+        pings = int(gid_state.get("pings") or 0)
+        due = pings_due_by(now - msg_at)
+        if due <= pings:
+            continue  # no slot has come due since the last ping
 
         try:
             sid = S.live_user_conversation_sid(cfg, slug, gid)
@@ -209,16 +355,6 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
         if row is None or row.get("activity") != "idle":
             continue  # busy (or unknown) — never interrupt an in-flight reply
 
-        gid_state = state.get(gid) or {}
-        if gid_state.get("msg_ts") != msg_ts:
-            gid_state = {"msg_ts": msg_ts, "retries": 0, "last_redrive_at": 0}
-
-        if gid_state["retries"] >= retry_bound():
-            continue  # bounded — already escalated when the bound was first hit
-
-        if now - float(gid_state.get("last_redrive_at") or 0) < cooldown_sec():
-            continue  # cooldown not elapsed since the last re-wake attempt
-
         try:
             A.dispatch("ensure_user_conversation", {
                 "slug": slug, "global_user_id": gid,
@@ -228,16 +364,21 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
             log.exception("uc_redrive: redrive dispatch failed for %s/%s", slug, gid)
             continue
 
-        gid_state["retries"] += 1
-        gid_state["last_redrive_at"] = now
+        pings = due  # slots that came due while it was busy are spent, not owed
+        gid_state["pings"] = pings
+        gid_state["last_ping_at"] = now
         state[gid] = gid_state
         state_changed = True
-        redriven.append({"gid": gid, "sid": sid, "retries": gid_state["retries"]})
-        log.warning("uc_redrive: re-woke idle attendant %s for %s/%s (retry %d)",
-                    sid, slug, gid, gid_state["retries"])
+        redriven.append({"gid": gid, "sid": sid, "pings": pings})
+        log.warning("uc_redrive: re-woke idle attendant %s for %s/%s (ping %d, "
+                    "unanswered %ds)", sid, slug, gid, pings, int(now - msg_at))
 
-        if gid_state["retries"] >= retry_bound():
-            _notify_operator_stuck(cfg, slug, gid, gid_state["retries"])
+        # Escalate once the ramp is spent — and again on every later slot until
+        # a live operator actually receives it (see _notify_operator_stuck).
+        if pings >= ESCALATE_AFTER_PINGS and not gid_state.get("escalated_to"):
+            gid_state["escalated_to"] = _notify_operator_stuck(
+                cfg, slug, gid, pings=pings, hanging_sec=now - msg_at,
+            )
 
     if state_changed:
         _save_state(cfg, slug, state)

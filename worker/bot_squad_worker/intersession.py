@@ -551,6 +551,16 @@ def send_notice(
     not a live need, and that is exactly why it must not be a comment saying
     "keep these short".
 
+    ⚠ DO NOT DELETE THIS AS DEAD CODE WHEN YOU FIND NO LIVE INSTANCE. That
+    measurement is the same one made here, and finding it again is confirmation
+    the backstop works — not evidence it is unused. A guard whose value is that
+    it has never fired is the hardest kind to keep, so the argument lives here
+    rather than waiting to be re-derived. It is not left to prose either:
+    ``test_send_notice_splits_instead_of_refusing`` and
+    ``test_send_notice_leaves_an_under_cap_notice_completely_untouched`` both go
+    red on removal, and the second is the one that catches a "simplify it back
+    to ``send``" edit, since that is what a deletion actually looks like.
+
     Returns ``{"ok": True, "delivered_to": [...], "parts": n}``. ``ok`` is False
     only when a part was itself undeliverable, which cannot happen by length.
 

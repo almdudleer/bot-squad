@@ -285,7 +285,10 @@ def test_light_envelope_says_a_human_wrote_over_telegram():
     env = TDR.compose_light_envelope(text="да", chat_id=CHAT, thread_id=TOPIC,
                                      sid=SID, sender="Alexey")
     assert "TELEGRAM" in env and "a human" in env and "Alexey" in env
-    assert f"chat {CHAT}, forum topic {TOPIC}" in env
+    # T-0795: the ids moved out of the prose `Where` row into the highlighted
+    # rendering. Their EXACT form is pinned in test_ping_ids_highlight.py; here
+    # it is enough that both are still named.
+    assert f"CHAT ID: {CHAT}" in env and f"TOPIC ID: {TOPIC}" in env
     assert SID in env
 
 

@@ -2493,7 +2493,9 @@ def test_topic_bound_injection_names_the_human_the_topic_and_the_reply_command(
     assert verb == "inject_prompt"          # ONE submission, not one per line
     text = params["text"]
     assert "TELEGRAM" in text and "a human" in text
-    assert "chat 111, forum topic 42" in text
+    # T-0795: highlighted ids instead of the prose `Where` row — exact form
+    # pinned in test_ping_ids_highlight.py.
+    assert "▶ CHAT ID: 111   ▶ TOPIC ID: 42" in text
     assert "прием-прием" in text
     assert 'bsq topic say --chat 111 --topic 42 "<your answer>"' in text
     # His display name, taken from the update rather than assumed.

@@ -90,7 +90,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bot_squad_worker import reply_quote
+from bot_squad_worker import ping_ids, reply_quote
 
 log = logging.getLogger(__name__)
 
@@ -243,16 +243,17 @@ def compose_envelope(
     ``None``/``[]`` leaves the envelope byte-identical to its pre-T-0785 form.
     """
     who = sender.strip() or "the stakeholder"
-    where = f"chat {chat_id}, forum topic {thread_id}"
+    ids = ping_ids.render(chat_id=chat_id, thread_id=thread_id)
     tags = " · ".join(x for x in (slug, ticket_id) if x)
     body = str(text or "")
     quoted = reply_quote.render_block(quote)
     attached = render_attachments(attachments)
     return "\n".join([
         f"📨 TELEGRAM — {who.upper()} WROTE TO YOU. AN ANSWER IS OWED IN THAT TOPIC.",
+        *(["", ids] if ids else []),
         "",
         f"From    : {who}, a human, via Telegram",
-        f"Where   : {where}" + (f"  [{tags}]" if tags else ""),
+        *([f"Project : {tags}"] if tags else []),
         "Why you : that topic is bound DIRECTLY to your session, so his message",
         "          came straight here instead of through the project's",
         "          user-conversation attendant.",
@@ -344,8 +345,7 @@ def compose_light_envelope(
     the case for ``origin="say"`` (``/say`` is composed, not a reply).
     """
     who = sender.strip() or "the stakeholder"
-    where = (f"chat {chat_id}, forum topic {thread_id}" if thread_id is not None
-             else f"chat {chat_id} (direct message)")
+    ids = ping_ids.render(chat_id=chat_id, thread_id=thread_id)
     body = str(text or "")
     quoted = reply_quote.render_block(quote)
     if origin == "say":
@@ -372,9 +372,9 @@ def compose_light_envelope(
         ]
     return "\n".join([
         head,
+        *(["", ids] if ids else []),
         "",
         f"From    : {who}, a human, via Telegram",
-        f"Where   : {where}",
         *why,
         f"Session : {sid}",
         *(["", *quoted] if quoted else []),
@@ -399,12 +399,14 @@ def compose_reminder(entry: dict, *, attempt: int, attempts_left: int) -> str:
         "(This was the last reminder — the topic is being told and the project "
         "attendant is being woken to answer for you.)"
     )
+    ids = ping_ids.render(chat_id=entry.get("chat_id"),
+                          thread_id=entry.get("thread_id"))
     return "\n".join([
         f"⚠️ TELEGRAM ANSWER STILL OWED (T-0770, reminder {attempt}). The "
-        "stakeholder wrote to you in",
-        f"chat {entry.get('chat_id')}, topic {entry.get('thread_id')} and NOTHING "
-        "has been posted back into",
-        "that topic since. He is looking at that topic and reads this as being ignored.",
+        "stakeholder wrote to you and NOTHING",
+        "has been posted back into that topic since. He is looking at that topic "
+        "and reads this as being ignored.",
+        *(["", ids] if ids else []),
         "",
         f"He wrote: «{quote}»",
         "",

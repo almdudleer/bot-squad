@@ -2047,10 +2047,15 @@ def _thread_scoped_read_write_block(slug: str, global_user_id: str, thread_id: A
     silent-looking to the session that hits them."""
     if thread_id is None or str(thread_id).strip() == "":
         return ""
+    # T-0795: the topic id gets the shared highlighted rendering on its own
+    # line, ahead of the prose that used to carry it mid-sentence — the ids in
+    # a new-message ping are what a session needs to find first. No chat id at
+    # this seam: see ``ping_ids.render``.
+    from bot_squad_worker import ping_ids as _ping_ids
     return (
-        f"\nThis message arrived in a BOUND FORUM TOPIC (thread_id "
-        f"{thread_id}) — read and reply WITHIN that topic's own isolated "
-        f"thread, not the project's full history:\n"
+        f"\n{_ping_ids.render(thread_id=thread_id)}\n"
+        f"This message arrived in a BOUND FORUM TOPIC — read and reply WITHIN "
+        f"that topic's own isolated thread, not the project's full history:\n"
         f"  GET /api/m/worker/conversations/{slug}/{global_user_id}/messages?thread_id={thread_id}\n"
         f"  (reply by appending with thread_id={thread_id} so it relays back "
         f"into the SAME topic, not elsewhere)\n"
@@ -2256,15 +2261,23 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                 # new message. A pane-timing hiccup must never fail the ensure
                 # (the message is already durable in the store).
                 nudge_text = "A new message arrived in your user-conversation thread — read it and respond."
-                if thread_id is not None and str(thread_id).strip() != "":
+                # T-0795: the topic id LEADS the nudge in the shared highlighted
+                # rendering instead of sitting mid-sentence. This text must stay
+                # ONE LINE — `inject_input` below is one-Enter-per-line, so a
+                # multi-line block here would arrive as N composer submissions
+                # (the transport measurement behind tg_direct_reply/T-0773),
+                # which is why the convention is a single line everywhere.
+                from bot_squad_worker import ping_ids as _ping_ids
+                ids = _ping_ids.render(thread_id=thread_id)
+                if ids:
                     # T-0676 items 3/6: point the SAME attendant at THIS
                     # topic's isolated thread, not the mixed project history.
                     # T-0775: worker-token route — the bare /api/conversations/
                     # prefix this used to name is mounted nowhere (404).
                     nudge_text = (
-                        f"A new message arrived in topic (thread_id {thread_id}) "
-                        f"of your user-conversation — read that topic's isolated "
-                        f"thread (GET /api/m/worker/conversations/{slug}/{gid}/messages"
+                        f"{ids} — a new message arrived in that topic of your "
+                        f"user-conversation. Read that topic's isolated thread "
+                        f"(GET /api/m/worker/conversations/{slug}/{gid}/messages"
                         f"?thread_id={thread_id}) and reply into it (append with "
                         f"thread_id={thread_id})."
                     )

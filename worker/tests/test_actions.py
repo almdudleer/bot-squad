@@ -2204,7 +2204,11 @@ def test_ensure_user_conversation_thread_id_in_fresh_spawn_boot_prompt(tmp_path,
         "message_ref": "hi", "thread_id": 7,
     })
     assert result["ok"] is True
-    assert "thread_id 7" in captured["initial_prompt"]
+    # T-0795: the id is now HIGHLIGHTED on its own line rather than named
+    # mid-prose as "(thread_id 7)". This assertion used to read
+    # `"thread_id 7" in ...`, which a buried id satisfies — the exact rendered
+    # line is pinned in test_ping_ids_highlight.py.
+    assert "▶ TOPIC ID: 7" in captured["initial_prompt"]
     assert "thread_id=7" in captured["initial_prompt"]
 
 
@@ -2251,7 +2255,9 @@ def test_ensure_user_conversation_thread_id_in_nudge_for_live_attendant(tmp_path
         "message_ref": "another message", "thread_id": 7,
     })
     assert result == {"ok": True, "sid": existing, "spawned": False}
-    assert "thread_id 7" in nudged["text"]
+    # T-0795, same substitution as the boot-prompt test above: highlighted, not
+    # buried. The full nudge string is pinned in test_ping_ids_highlight.py.
+    assert "▶ TOPIC ID: 7" in nudged["text"]
     assert "thread_id=7" in nudged["text"]
 
 

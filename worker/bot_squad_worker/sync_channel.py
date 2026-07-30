@@ -158,7 +158,11 @@ def _touch(ch: dict, now: float) -> None:
 def _notify(cfg: Any, slug: str, from_sid: str, to_sid: str, text: str) -> dict:
     """Durably deliver a line to ``to_sid`` via the async substrate; return the
     notify handle the CLI uses to also nudge the live pane."""
-    _is.send(cfg, slug, from_sid, to_sid, text)
+    # T-0827: send_notice — a channel-open notice is a fixed template with
+    # nobody watching this call. (The MESSAGE path at `send` below is the
+    # opposite case: agent-authored text, a caller that can act, so it gets
+    # the refusal.)
+    _is.send_notice(cfg, slug, from_sid, to_sid, text)
     return {"sid": to_sid, "text": text}
 
 

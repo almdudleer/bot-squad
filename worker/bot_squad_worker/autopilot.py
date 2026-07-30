@@ -49,6 +49,18 @@ log = logging.getLogger(__name__)
 
 _VALID_KINDS = {"team", "session", "project"}
 _MAX_PROMPT_LEN = 4000
+
+
+def _is_max_text_len() -> int:
+    """The peer bus's own cap, READ from its SSOT rather than duplicated here.
+
+    T-0827's underlying finding was four separate 4000s in four modules with no
+    shared policy, so whether the next one refuses or truncates was a coin
+    flip — a fifth literal in this file would be that same defect. Imported
+    lazily, like every other ``intersession`` use in this module.
+    """
+    from bot_squad_worker.intersession import _MAX_TEXT_LEN
+    return _MAX_TEXT_LEN
 _MAX_LOG = 50
 _DEFAULT_DURATION_HOURS = 8.0
 _DEFAULT_STALL_MINUTES = 60
@@ -206,8 +218,19 @@ def _deliver(cfg: Any, slug: str, target_sid: str, text: str) -> dict:
 
     result = {"inbox": False, "pane": False}
     try:
-        _is.send(cfg, slug, "autopilot", target_sid, text)
-        result["inbox"] = True
+        # T-0827: read the RESULT, do not infer delivery from the absence of an
+        # exception. `send` never raises — an over-cap message comes back as
+        # `ok: False` with an empty `delivered_to` — so the old
+        # `send(...); result["inbox"] = True` reported a delivery that had not
+        # happened. That is the same "caller believes it sent" claim the ticket
+        # exists to kill, one layer up from the bus.
+        sent = _is.send(cfg, slug, "autopilot", target_sid, text)
+        result["inbox"] = bool(sent.get("ok", True)) and bool(sent.get("delivered_to"))
+        if not result["inbox"]:
+            log.error(
+                "autopilot: inbox delivery to %s was REFUSED: %s",
+                target_sid, sent.get("error", "no recipient"),
+            )
     except Exception:  # noqa: BLE001
         log.exception("autopilot: inbox delivery failed for %s", target_sid)
 
@@ -485,6 +508,27 @@ def start(
         last_check_at=started_at,
     )
 
+    # T-0827: the two caps have to COMPOSE, and they did not. `compose_brief`
+    # wraps the prompt in ~735 chars of boilerplate, so a prompt that is legal
+    # at this module's own 4000 cap yields a 4735-char brief that the bus cap
+    # then refuses — and before T-0827 it did something worse, silently slicing
+    # the brief a SECOND time after `prompt[:4000]` had already sliced it once.
+    # Checked HERE rather than at delivery so the caller learns it at the CLI,
+    # before a TL is spawned for a brief that cannot be delivered whole. The
+    # message names the overhead, since "your 3900-char prompt is too long for a
+    # 4000-char cap" is otherwise unactionable.
+    brief_len = len(compose_brief(state))
+    if brief_len > _is_max_text_len():
+        raise ActionError(
+            f"autopilot.start: the composed brief is {brief_len} chars, over the "
+            f"{_is_max_text_len()}-char peer-bus cap — refusing to deliver it "
+            f"truncated (silent loss, T-0827). Your prompt is {len(prompt)} chars "
+            f"and the brief boilerplate adds {brief_len - len(prompt)}; shorten the "
+            "prompt by at least "
+            f"{brief_len - _is_max_text_len()} chars, or put the detail on a ticket "
+            "and point the prompt at it."
+        )
+
     delivery = {"inbox": False, "pane": False}
     if spawn_window is not None:
         # No live TL — spawn one with the brief as its initial prompt. The
@@ -500,8 +544,16 @@ def start(
         state.target_sid = target_sid
         spawned = True
         try:
-            _is.send(cfg, slug, "autopilot", target_sid, brief)
-            delivery = {"inbox": True, "pane": True}  # pane via spawn's initial_prompt
+            # T-0827: same as `_deliver` — the inbox flag reports what the bus
+            # actually did, not that the call returned.
+            sent = _is.send(cfg, slug, "autopilot", target_sid, brief)
+            ok = bool(sent.get("ok", True)) and bool(sent.get("delivered_to"))
+            if not ok:
+                log.error(
+                    "autopilot: inbox mirror to spawned %s was REFUSED: %s",
+                    target_sid, sent.get("error", "no recipient"),
+                )
+            delivery = {"inbox": ok, "pane": True}  # pane via spawn's initial_prompt
         except Exception:  # noqa: BLE001
             log.exception("autopilot: inbox mirror failed for spawned %s", target_sid)
             delivery = {"inbox": False, "pane": True}

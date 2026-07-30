@@ -269,7 +269,10 @@ def _alert_orphaned_handoff(cfg: Any, slug: str, sid: str, reason: str) -> None:
     this the assignment would orphan silently (mirrors recovery.py park-notify)."""
     try:
         from bot_squad_worker import intersession
-        intersession.send(
+        # T-0827: send_notice — this is the alert for a handoff that ALREADY
+        # failed; losing it silently is how the assignment orphans unseen,
+        # which is the exact thing this alert exists to prevent.
+        intersession.send_notice(
             cfg, slug, to="operator", from_sid="S-autocompact",
             text=(f"⚠️ compact handoff for {sid} cleared the pane but the relaunch "
                   f"failed ({reason}). The assignment needs a manual respawn — "

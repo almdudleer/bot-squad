@@ -3351,7 +3351,11 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     )
     try:
         from bot_squad_worker import intersession as _is
-        _is.send(cfg, slug, "stakeholder", sid, text)
+        # T-0827: send_notice — the bind notify interpolates a ticket TITLE,
+        # so it is the tick text most likely to grow, and this frame
+        # deliberately swallows everything ("best-effort; the binding is the
+        # source of truth"). A refusal here would be seen by no one.
+        _is.send_notice(cfg, slug, "stakeholder", sid, text)
     except Exception:
         # Peer notify is best-effort; the binding itself is the source of truth.
         pass
@@ -3833,7 +3837,11 @@ def bind_initiative(cfg: Any, slug: str, sid: str, initiative: str) -> dict:
     )
     try:
         from bot_squad_worker import intersession as _is
-        _is.send(cfg, slug, "stakeholder", sid, text)
+        # T-0827: send_notice — the bind notify interpolates a ticket TITLE,
+        # so it is the tick text most likely to grow, and this frame
+        # deliberately swallows everything ("best-effort; the binding is the
+        # source of truth"). A refusal here would be seen by no one.
+        _is.send_notice(cfg, slug, "stakeholder", sid, text)
     except Exception:
         pass
 

@@ -512,6 +512,94 @@ def send(
     return out
 
 
+def send_notice(
+    cfg: Any,
+    slug: str,
+    from_sid: str,
+    to: str,
+    text: str,
+    user: str | None = None,
+) -> dict:
+    """Deliver a MACHINE-GENERATED notification, SPLITTING instead of refusing.
+
+    The companion to :func:`send`, and the split of the two is by ONE question:
+    **is there anybody to tell?**
+
+    * :func:`send` refuses over-cap text. Right for a caller that owns the text
+      and can act on a failure — the ``peer_send`` action (an agent at a CLI),
+      ``sync_channel`` (an agent's live message). A refusal makes them shorten
+      and retry, and it keeps evidence off a notification channel.
+    * :func:`send_notice` splits. Right for a tick — ``telemetry``,
+      ``deploy_monitor``, ``autocompact``'s orphan alert, ``bind_task``'s notify.
+      These have NOWHERE to report a refusal: no caller frame is watching, and
+      the message is a machine-composed alert whose loss is the whole cost.
+
+    T-0827 made this distinction necessary. Handing a tick a refusal would have
+    replaced SILENT TRUNCATION with SILENT TOTAL LOSS — for those callers a
+    strictly worse outcome, introduced by the change whose purpose was to
+    abolish silent loss on this path. The bar the operator set, and the one this
+    function exists to meet: **no path may end in "the caller believes it sent
+    and the recipient got nothing."**
+
+    Splitting is acceptable HERE and not in ``send`` for the reason the
+    anti-split argument was made in the first place: the objection is
+    reordering against other traffic, which costs a human reader a coherent
+    message. A tick's alert is one machine-composed paragraph, each part is
+    labelled ``[part i/N]``, and no reader is reconstructing an argument from
+    it. Measured today, every one of these callers emits a short template well
+    under the cap — so this is a BACKSTOP against a future template growing,
+    not a live need, and that is exactly why it must not be a comment saying
+    "keep these short".
+
+    Returns ``{"ok": True, "delivered_to": [...], "parts": n}``. ``ok`` is False
+    only when a part was itself undeliverable, which cannot happen by length.
+
+    Known bound, stated rather than discovered later: each part resolves its
+    recipients independently, so a role fan-out whose roster changes mid-split
+    could deliver part 1 and part 2 to different sets. Ticks address literal
+    SIDs or ``operator``; the window is milliseconds; a split is rare. Not
+    worth a roster snapshot, worth writing down.
+    """
+    parts = _split_for_bus(text)
+    if len(parts) == 1:
+        return {**send(cfg, slug, from_sid, to, parts[0], user=user), "parts": 1}
+    delivered: list[str] = []
+    ok = True
+    for i, part in enumerate(parts, 1):
+        out = send(cfg, slug, from_sid, to, f"[part {i}/{len(parts)}] {part}", user=user)
+        ok = ok and bool(out.get("ok", True))
+        for sid in out.get("delivered_to", []):
+            if sid not in delivered:
+                delivered.append(sid)
+    log.warning(
+        "intersession: split an over-cap notification from %s to %r into %d parts "
+        "(slug=%s, %d chars) — a tick's template has outgrown the bus cap",
+        from_sid, to, len(parts), slug, len(text or ""),
+    )
+    return {"ok": ok, "delivered_to": delivered, "parts": len(parts)}
+
+
+#: Room reserved for the ``[part i/N] `` marker. Generous on purpose: the
+#: marker is added AFTER the split, so an under-estimate would push a part back
+#: over the cap and `send` would refuse it — turning the fix into the bug.
+_PART_MARKER_ROOM = 24
+
+
+def _split_for_bus(text: str) -> list[str]:
+    """Chunk ``text`` so every part fits the cap once a marker is prefixed.
+
+    Measured on the FLATTENED length, because that is what ``_sanitize``
+    produces and what the cap is checked against. Flattening only ever shortens
+    (``\\r\\n`` → one space), so chunking the raw text is conservative in the
+    safe direction.
+    """
+    text = text or ""
+    if len(text) <= _MAX_TEXT_LEN:
+        return [text]
+    size = _MAX_TEXT_LEN - _PART_MARKER_ROOM
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
 def inbox_read(cfg: Any, slug: str, sid: str) -> dict:
     """Drain inbox lines since the seen-<sid> byte offset."""
     _touch(_heartbeat_path(cfg, slug, sid))

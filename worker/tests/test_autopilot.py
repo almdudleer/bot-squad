@@ -151,6 +151,41 @@ def test_start_refuses_an_over_cap_prompt_instead_of_truncating(cfg_slug):
     assert "4001" in msg and "4000" in msg and "refusing to truncate" in msg
 
 
+def test_start_refuses_when_the_COMPOSED_brief_exceeds_the_bus_cap(cfg_slug):
+    """T-0827 follow-up: the two caps must COMPOSE.
+
+    `compose_brief` wraps the prompt in ~735 chars of boilerplate, so a prompt
+    that is legal at autopilot's own 4000 cap produced a 4735-char brief the bus
+    then refused — and before T-0827, silently sliced a second time. The refusal
+    happens at start(), before a TL is spawned for a brief that cannot be
+    delivered whole, and it names the boilerplate so the number is actionable.
+    """
+    from bot_squad_worker.actions import ActionError
+    cfg, slug, _notes = cfg_slug
+    with pytest.raises(ActionError) as exc:
+        ap.start(cfg, slug, kind="session", ref=FAKE, prompt="y" * 3900)
+    msg = str(exc.value)
+    assert "composed brief" in msg and "peer-bus cap" in msg
+    assert "3900" in msg          # the caller's own number, not just the total
+    assert "shorten the prompt by at least" in msg
+
+
+def test_deliver_reports_inbox_false_when_the_bus_refuses(cfg_slug, monkeypatch):
+    """T-0827: `_deliver` must read the RESULT, not infer success from silence.
+
+    `intersession.send` never raises — an over-cap message returns
+    `ok: False, delivered_to: []` — so the old `send(...); result["inbox"] =
+    True` reported a delivery that had not happened. That is the ticket's own
+    forbidden outcome ("caller believes it sent") one layer above the bus.
+    """
+    from bot_squad_worker import intersession as _is
+    cfg, slug, _notes = cfg_slug
+    monkeypatch.setattr(_is, "send", lambda *a, **k: {
+        "ok": False, "delivered_to": [], "reason": "text-over-cap", "error": "nope",
+    })
+    assert ap._deliver(cfg, slug, "S-a-b-p1", "anything")["inbox"] is False
+
+
 def test_notify_stakeholder_routes_tg_primary(tmp_path: Path, monkeypatch):
     """P2-08 + T-0610 inversion: autopilot's stakeholder page routes through the
     _send_stakeholder_dm SSOT — ONE TG delivery into #team-queries (TG-primary

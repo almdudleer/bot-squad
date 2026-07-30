@@ -692,7 +692,10 @@ def _peer_to(cfg: Any, slug: str, sid: str, text: str) -> None:
     """
     from bot_squad_worker import intersession as _is
     try:
-        _is.send(cfg, slug, "S-telemetry", sid, text)
+        # T-0827: send_notice, not send — a telemetry alert has nowhere to
+        # report a refusal (this frame swallows exceptions and returns), so a
+        # refusal here would be silent TOTAL loss. It splits instead.
+        _is.send_notice(cfg, slug, "S-telemetry", sid, text)
     except Exception:
         log.exception("telemetry: peer_send to %s failed (non-fatal)", sid)
         return

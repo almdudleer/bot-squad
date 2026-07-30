@@ -372,7 +372,21 @@ def _redirect_to_upstream(
     )
     try:
         from bot_squad_worker import intersession as _is
-        _is.send(cfg, slug, sid, target, body)
+        # T-0827: send_notice (splits, never refuses) AND read the result. Both
+        # halves matter here. The marker below is CONSUMED and the escalation
+        # recorded as routed on the strength of this call, so inferring delivery
+        # from "it did not raise" would record an escalation that never arrived.
+        # And a refusal would be worse than a split: this returns False to a
+        # caller that does NOT fall through to the stakeholder page (tg_stall.py
+        # line ~549 returns immediately), so the escalation would simply sit
+        # unsent until the next tick tried the same over-cap body again.
+        sent = _is.send_notice(cfg, slug, sid, target, body)
+        if not sent.get("ok", True) or not sent.get("delivered_to"):
+            log.error(
+                "tg_stall: idle redirect to %s for %s was NOT delivered: %s",
+                target, sid, sent.get("error", "no recipient"),
+            )
+            return False
     except Exception:  # noqa: BLE001
         log.exception("tg_stall: idle redirect to %s failed for %s", target, sid)
         return False

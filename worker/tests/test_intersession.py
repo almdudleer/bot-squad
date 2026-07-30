@@ -152,6 +152,55 @@ def test_over_cap_refusal_does_not_partially_fan_out(tmp_path):
         assert I.inbox_read(cfg, "p", sid)["count"] == 0
 
 
+def test_send_notice_splits_instead_of_refusing(tmp_path):
+    """T-0827 follow-up: a TICK must never end in "sent, and nothing arrived".
+
+    `send` refuses over-cap text, which is right for a caller that can act on
+    it. For the ticks — telemetry, deploy_monitor, autocompact's orphan alert,
+    bind_task's notify — a refusal is SILENT TOTAL LOSS: every one of those
+    frames swallows the outcome, so nobody hears it, and that is strictly worse
+    than the truncation this ticket set out to abolish. `send_notice` splits.
+
+    The claim asserted here is the reconstruction, not the delivery: the parts
+    rejoin to exactly what was passed.
+    """
+    import hashlib
+
+    cfg = _make_cfg(tmp_path)
+    text = "".join(chr(ord("a") + (i % 26)) for i in range(9500))
+    out = I.send_notice(cfg, "p", "S-telemetry", "S-to", text)
+    assert out["ok"] is True
+    assert out["parts"] == 3
+    assert out["delivered_to"] == ["S-to"]
+
+    msgs = I.inbox_read(cfg, "p", "S-to")["messages"]
+    assert len(msgs) == 3
+    bodies = [_stored_body(m) for m in msgs]
+    # every part carries a VISIBLE continuation marker and fits the cap
+    for i, b in enumerate(bodies, 1):
+        assert b.startswith(f"[part {i}/3] ")
+        assert len(b) <= I._MAX_TEXT_LEN
+    rejoined = "".join(b.split("] ", 1)[1] for b in bodies)
+    assert (
+        hashlib.sha256(rejoined.encode()).hexdigest()
+        == hashlib.sha256(text.encode()).hexdigest()
+    )
+
+
+def test_send_notice_leaves_an_under_cap_notice_completely_untouched(tmp_path):
+    """GREEN CONTROL: the splitting sender must be a no-op for the 100% case.
+
+    Every one of these callers emits a short template today — measured — so if
+    this arm ever goes red the split path has started firing on ordinary
+    traffic and every tick's alert has silently grown a `[part 1/1]` prefix.
+    """
+    cfg = _make_cfg(tmp_path)
+    out = I.send_notice(cfg, "p", "S-telemetry", "S-to", "\U0001f9e0 memory footprint high")
+    assert out["parts"] == 1 and out["ok"] is True
+    body = _stored_body(I.inbox_read(cfg, "p", "S-to")["messages"][0])
+    assert body == "\U0001f9e0 memory footprint high"   # no marker, byte-identical
+
+
 def test_role_fanout_teamlead_and_dev(tmp_path):
     cfg = _make_cfg(tmp_path)
     _write_session(tmp_path, "p", "S-u-tl1-p0")           # teamlead (no task_id)

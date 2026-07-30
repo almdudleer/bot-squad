@@ -450,7 +450,9 @@ def _peer_to_operators(cfg: Config, slug: str, text: str) -> None:
     ]
     for sid in dict.fromkeys(operator_sids):  # dedupe, preserve order
         try:
-            _is.send(cfg, slug, "S-deploy_monitor", sid, text)
+            # T-0827: send_notice — a deploy alert is machine-composed and
+            # this loop has nobody to report a refusal to. Splits, never drops.
+            _is.send_notice(cfg, slug, "S-deploy_monitor", sid, text)
         except Exception:
             log.exception("deploy_monitor: peer_send to %s failed (non-fatal)", sid)
 

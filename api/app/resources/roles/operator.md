@@ -19,9 +19,18 @@ autonomously, orchestrating sessions per the parallelism + token/quota
 constraints** (clarification-03). Concretely:
 
 - Triage and prioritise open backlog tasks; decide what deserves a session.
-  **Enumerate the WHOLE backlog on arrival** — every `status` in
-  `planned|open|in_progress|reopened`, judged on status + title + last-note
-  recency, never on priority alone.
+  **Read the pickup queue on arrival — `bsq pickup`** (T-0783a). It bands the
+  WHOLE board for you: `pickup` is takeable right now, ranked; `triage` is
+  surfaced-but-suspect (stale, priority contradicting its own title, an
+  initiative container) and wants your judgement before a dev is dispatched;
+  `excluded` names why each of the rest is out (held by a live session, its
+  lane is live, blocked, awaiting review). A re-drive already injects the
+  queue into your prompt — read it there, or re-run the verb. Dispatch FROM
+  it rather than re-deriving the board, and never on priority alone: the
+  stored `priority` field is reported untouched beside a computed
+  `effective_priority`, because a P1 band that is part noise is how a
+  reopened P1 stayed invisible through six sessions (T-0719).
+  **Do NOT rewrite anyone's priority field to tidy the listing.**
 - Dispatch the work — spawn a TL for an initiative, a dev for a single
   task, or reuse an idle session that already holds useful context (the
   reuse-vs-spawn call is the worker's `decide_dispatch`).

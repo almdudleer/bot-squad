@@ -4710,3 +4710,225 @@ def test_junk_caption_does_not_lose_the_message(tmp_path, monkeypatch):
 
     assert ok is True
     assert captured["json"]["attachments"] == [{"type": "photo", "file_id": "FULL_1280"}]
+
+
+# --- T-0830 / D-0069 — the intake call site for the drive-SCOPE ladder ------
+#
+# TL p534 ruled this wiring into T-0830 (14:58Z): a setter nothing calls is not
+# a delivered lane, and recognition that cannot take effect is the same silence
+# he complained about. `_maybe_switch_drive_scope` is the ONLY production caller
+# of dispatch.apply_drive_scope.
+
+# His words, 2026-07-30T07:54:16Z, verbatim. HUMAN-ONLY.
+_HIS_SENTENCE = (
+    "В третьих, нужно более чёткое понимание для меня, какой режим драйва щас "
+    "стоит, я просил закончить всё что в опен, но видимо это не "
+    "интерпретировалось как переключить режим драйва"
+)
+
+
+def _scope_cfg(tmp_path, monkeypatch):
+    """A cfg whose data dir pace.py can actually write into, with the routing
+    machinery around the seam stubbed out."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    (cfg.data_dir / "test-project" / "_worker").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        TL, "resolve_or_link_sender",
+        lambda c, m, slug: {"global_user_id": "gu_alexey", "created": False, "slug": slug},
+    )
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "test-project")
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: True)
+    from bot_squad_worker import conversation_locus
+    monkeypatch.setattr(conversation_locus, "set_locus", lambda *a, **k: None)
+    return cfg
+
+
+def _update(text: str) -> dict:
+    return {"update_id": 1,
+            "message": {"chat": {"id": 12345}, "from": _from(), "text": text}}
+
+
+def test_inbound_scope_instruction_switches_and_confirms(tmp_path, monkeypatch):
+    """THE end-to-end acceptance test: his recorded sentence arrives on the real
+    intake path, the scope is SET, and he is TOLD."""
+    from bot_squad_worker import pace
+
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **kw: echoes.append(text))
+
+    TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    block = pace.read_drive(cfg, "test-project")
+    assert block["scope"] == "open_reopened"
+    assert block["configured"] is True
+    assert block["set_by"] == "tg:gu_alexey"
+    assert block["source_text"] == "закончить всё что в опен"
+
+    # DoD 4 — the confirmation. Silence here IS the defect he reported.
+    assert echoes, "recognised switch produced NO confirmation"
+    assert any(t == "Режим драйва: Open / Reopened." for t in echoes), echoes
+
+
+def test_inbound_scope_switch_does_not_intercept_routing(tmp_path, monkeypatch):
+    """NON-INTERCEPTING. «закончить всё что в опен» is a scope switch AND work
+    he wants done — the message must still route to the attendant. T-0666 had
+    already removed one intercepting confirm prompt from this path."""
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    ensured = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: ensured.append(a) or True)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+
+    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    assert result["action"] == "route"
+    assert result["slug"] == "test-project"
+    assert ensured, "the attendant was not woken — the switch swallowed the message"
+
+
+def test_inbound_passing_remark_switches_nothing_and_stays_silent(tmp_path, monkeypatch):
+    """DoD 6 at the call site. A message that merely MENTIONS a status must not
+    re-scope the project — and must not emit a confirmation either, or he learns
+    to ignore them."""
+    from bot_squad_worker import pace
+
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    echoes = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **kw: echoes.append(text))
+
+    TL.handle_update(cfg, _update("кстати T-0719 всё ещё в опен, посмотри"))
+
+    assert pace.read_drive(cfg, "test-project")["configured"] is False
+    assert not any("Режим драйва" in t for t in echoes), echoes
+
+
+def test_inbound_scope_failure_never_breaks_intake(tmp_path, monkeypatch):
+    """Best-effort by construction: the durable record and the routing have
+    already happened when this runs, so a setting must never cost them."""
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    from bot_squad_worker import dispatch as _dispatch
+    monkeypatch.setattr(_dispatch, "apply_drive_scope",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+
+    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    assert result["action"] == "route"
+
+
+def test_inbound_confirmation_replies_in_place_to_the_same_topic(tmp_path, monkeypatch):
+    """The confirmation is a reply-in-place: it spells its own destination and
+    passes NO msg_type, so no route map can redirect it away from the topic he
+    typed in."""
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **kw: calls.append((chat, kw)))
+
+    update = _update(_HIS_SENTENCE)
+    update["message"]["message_thread_id"] = 77
+    TL.handle_update(cfg, update)
+
+    assert calls, "no confirmation was sent"
+    chat, kw = calls[-1]
+    assert chat == "12345"
+    assert kw.get("thread_id") == 77
+    assert "msg_type" not in kw
+
+
+def test_inbound_forwarded_confirmation_does_not_reswitch(tmp_path, monkeypatch):
+    """THE ECHO LOOP, closed at the call site.
+
+    Our own words DO come back on this channel — echo_guard exists because that
+    happened, through _handle_topic_bound, one of the two paths this ladder is
+    wired to. Under the CHANNEL-authority rule a re-entering echo is authorised,
+    which is exactly what makes it dangerous: nothing else rejects it.
+
+    Guard is composed-by-sender, which is class-independent — it catches any of
+    our text coming back, not one string's shape.
+    """
+    from bot_squad_worker import pace, echo_guard
+
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+    monkeypatch.setattr(
+        echo_guard, "classify_inbound",
+        lambda c, m, **k: {"author": echo_guard.ECHO_AUTHOR,
+                           "forwarded_from": echo_guard.ECHO_ORIGIN,
+                           "reason": "outbound-match"},
+    )
+
+    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    assert pace.read_drive(cfg, "test-project")["configured"] is False
+    # ...and the message still routes. The guard suppresses the SWITCH only.
+    assert result["action"] == "route"
+
+
+def test_inbound_forward_of_another_human_does_not_switch(tmp_path, monkeypatch):
+    """He did not write it, so it is not his instruction — even though the
+    author stays "user" (a human did compose it, just not the sender)."""
+    from bot_squad_worker import pace, echo_guard
+
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+    monkeypatch.setattr(
+        echo_guard, "classify_inbound",
+        lambda c, m, **k: {"author": "user", "forwarded_from": "Someone Else",
+                           "reason": "forwarded"},
+    )
+
+    TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    assert pace.read_drive(cfg, "test-project")["configured"] is False
+
+
+def test_inbound_echo_guard_failure_does_not_switch(tmp_path, monkeypatch):
+    """Fail CLOSED on the authority check specifically: if we cannot tell
+    whether he composed it, we do not re-scope the project. (The rest of the
+    helper fails open — it must never cost the record or the routing.)"""
+    from bot_squad_worker import pace, echo_guard
+
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+    monkeypatch.setattr(
+        echo_guard, "classify_inbound",
+        lambda c, m, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    assert pace.read_drive(cfg, "test-project")["configured"] is False
+    assert result["action"] == "route"
+
+
+@pytest.mark.parametrize("verdict", [
+    {},                                          # empty
+    None,                                        # not a dict at all
+    {"forwarded_from": "", "reason": "x"},       # author key missing
+    {"author": None, "forwarded_from": ""},      # author explicitly unknown
+    {"author": "system:some-future-class", "forwarded_from": ""},
+    "not-a-dict",
+])
+def test_inbound_unknown_echo_verdict_is_no_switch(tmp_path, monkeypatch, verdict):
+    """An UNKNOWN verdict must never read as permission.
+
+    The gate is a positive ALLOWLIST — author exactly "user" AND no forward
+    provenance — not a denylist of known-bad classes. So a missing key, a None,
+    a shape change, or an author class invented after this code was written all
+    land on NO SWITCH rather than falling through to the permissive branch.
+    This is the one place the fail-closed could quietly become fail-open.
+    """
+    from bot_squad_worker import pace, echo_guard
+
+    cfg = _scope_cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+    monkeypatch.setattr(echo_guard, "classify_inbound", lambda c, m, **k: verdict)
+
+    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
+
+    assert pace.read_drive(cfg, "test-project")["configured"] is False
+    assert result["action"] == "route"

@@ -265,7 +265,13 @@ def main():
         hits = [
             m for m in GIT_VERB.finditer(command)
             if not inside_quotes(command, m.start())
-            and not inside_spans(skip, m.start())
+            # The VERB's position, not the match's. A match starts at its
+            # COMMAND-POSITION DELIMITER, which for a line inside a heredoc is
+            # the preceding NEWLINE — so on some alignments m.start() lands one
+            # char outside the body span and the skip silently never fires.
+            # watchrobot's first heredoc fix shipped with exactly that, passing
+            # only for the shape their arms happened to use.
+            and not inside_spans(skip, m.start("verb"))
         ]
     except Exception:
         return 0

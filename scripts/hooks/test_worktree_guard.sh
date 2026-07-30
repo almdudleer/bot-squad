@@ -145,10 +145,16 @@ survivors() {
 
 echo "── REFUSE: git stash, the incident itself ──"
 
+# ⚠ A stash refusal now has TWO possible causes — peer activity and the
+# anonymous-label rule — and BOTH exit 3. watchrobot's arms asserted only rc=3
+# and would have kept passing with peer detection COMPLETELY BROKEN. So every
+# stash arm here names WHICH refusal it expects. A label is supplied wherever
+# the point of the arm is peer detection.
 make_repo r1
-run_guard r1 stash
-if [ "$RC" = "3" ]; then ok "bare 'git stash' with peers' work is refused (rc=3)"
-else bad "bare 'git stash' was NOT refused (rc=$RC)" "$OUT"; fi
+run_guard r1 stash -m "bsq:me:T-0826:now"
+if [ "$RC" = "3" ] && printf '%s' "$OUT" | grep -q 'would destroy other sessions'; then
+    ok "bare 'git stash' with peers' work is refused FOR PEER ACTIVITY, not for the label"
+else bad "bare 'git stash' was not refused for peer activity (rc=$RC)" "$OUT"; fi
 
 # The whole point: the peer-STAGED untracked module must be NAMED, since that is
 # the file class the incident showed vanishing silently out of a two-parent stash.
@@ -172,22 +178,26 @@ if printf '%s' "$OUT" | grep -q 'UNATTRIBUTED — open the diff, do not guess' \
     ok "an untracked file a bare stash would NOT take is not listed as at risk"
 else bad "bare stash claimed an untracked file it does not sweep" "$OUT"; fi
 
-make_repo r2; run_guard r2 stash push
-if [ "$RC" = "3" ]; then ok "'git stash push' (no pathspec) is refused"
-else bad "'git stash push' was not refused (rc=$RC)" "$OUT"; fi
+make_repo r2; run_guard r2 stash push -m "bsq:me:T-0826:now"
+if [ "$RC" = "3" ] && printf '%s' "$OUT" | grep -q 'would destroy other sessions'; then
+    ok "'git stash push' (no pathspec) is refused FOR PEER ACTIVITY"
+else bad "'git stash push' was not refused for peer activity (rc=$RC)" "$OUT"; fi
 
 make_repo r3; run_guard r3 stash save "wip on backend/app.py"
-if [ "$RC" = "3" ]; then ok "'git stash save <message>' is refused (message is not a pathspec)"
+if [ "$RC" = "3" ] && printf '%s' "$OUT" | grep -q 'would destroy other sessions'; then
+    ok "'git stash save <message>' is refused FOR PEER ACTIVITY (message is not a pathspec)"
 else bad "'git stash save' slipped through — message read as a pathspec? (rc=$RC)" "$OUT"; fi
 
-make_repo r4; run_guard r4 stash -u
-if [ "$RC" = "3" ]; then ok "'git stash -u' is refused"
-else bad "'git stash -u' was not refused (rc=$RC)" "$OUT"; fi
+make_repo r4; run_guard r4 stash -u -m "bsq:me:T-0826:now"
+if [ "$RC" = "3" ] && printf '%s' "$OUT" | grep -q 'would destroy other sessions'; then
+    ok "'git stash -u' is refused FOR PEER ACTIVITY"
+else bad "'git stash -u' was not refused for peer activity (rc=$RC)" "$OUT"; fi
 if printf '%s' "$OUT" | grep -q 'scratch.py'; then ok "'-u' widens the sweep set to the un-added file too"
 else bad "'git stash -u' did not enumerate the untracked file" "$OUT"; fi
 
 make_repo r5; run_guard r5 stash -m "backend/app.py tweak"
-if [ "$RC" = "3" ]; then ok "'git stash -m <msg>' is refused (-m value not read as a pathspec)"
+if [ "$RC" = "3" ] && printf '%s' "$OUT" | grep -q 'would destroy other sessions'; then
+    ok "'git stash -m <msg>' is refused FOR PEER ACTIVITY (-m value not read as a pathspec)"
 else bad "'git stash -m' slipped through (rc=$RC)" "$OUT"; fi
 
 echo "── REFUSE: the stash-recovery traps ──"
@@ -594,20 +604,47 @@ else bad "redirected 'stash list' was blocked (rc=$RC)" "$OUT"; fi
 # position inside one. Found the hard way: this guard refused the very Bash call
 # that was adding the tests above. Same social failure as blocking prose, one
 # quoting style over, and a guard people route around is worse than none.
+# ⚠ THE FIRST BODY LINE IS THE ALIGNMENT THAT MATTERS, and asserting only the
+# prose form would prove nothing: "Never run git reset --hard" is not at command
+# position, so it never matched in the first place. A match STARTS at its
+# command-position delimiter, which inside a heredoc is the preceding NEWLINE —
+# so on some alignments the match start lands one char outside the body span and
+# the skip silently never fires. watchrobot's first fix shipped with exactly
+# that, green on the shape their arms happened to use.
 hook_json "$WORK/h1" "cat > /tmp/doc.md <<'EOF'
-Never run git reset --hard in the shared clone.
-git clean -fd is unrecoverable.
+git reset --hard
 EOF"
-if [ "$RC" = "0" ]; then ok "a heredoc body naming the verbs passes through"
-else bad "writing a doc ABOUT the guarded verbs was refused (rc=$RC)" "$OUT"; fi
-# … but a real command AFTER the heredoc terminator must still be caught, or the
-# fix is a bypass wearing a fix's clothes.
+if [ "$RC" = "0" ]; then ok "a guarded verb on the FIRST heredoc body line passes through"
+else bad "the heredoc skip does not fire on the first body line (rc=$RC)" "$OUT"; fi
+hook_json "$WORK/h1" "cat > /tmp/doc.md <<'EOF'
+line one
+git clean -fd
+EOF"
+if [ "$RC" = "0" ]; then ok "…and on a LATER heredoc body line"
+else bad "the heredoc skip does not fire on a later body line (rc=$RC)" "$OUT"; fi
+# THE NECESSARY OTHER HALF, three ways, or the fix is a bypass wearing a fix's
+# clothes: a live command after the terminator, before the heredoc, and after
+# two of them.
 hook_json "$WORK/h1" "cat > /tmp/doc.md <<'EOF'
 git reset --hard
 EOF
 git stash"
 if [ "$RC" = "2" ]; then ok "…while a real command AFTER the terminator is still caught"
-else bad "a heredoc was used to smuggle a live command past the hook (rc=$RC)" "$OUT"; fi
+else bad "a heredoc smuggled a live command past the hook (rc=$RC)" "$OUT"; fi
+hook_json "$WORK/h1" "git stash && cat > /tmp/doc.md <<'EOF'
+text
+EOF"
+if [ "$RC" = "2" ]; then ok "…and one BEFORE the heredoc"
+else bad "a trailing heredoc hid a live command before it (rc=$RC)" "$OUT"; fi
+hook_json "$WORK/h1" "cat <<'A'
+git stash
+A
+cat <<'B'
+git clean -fd
+B
+git reset --hard"
+if [ "$RC" = "2" ]; then ok "…and one after TWO heredocs (spans do not run away)"
+else bad "two heredocs swallowed the live command after them (rc=$RC)" "$OUT"; fi
 
 # Prose must survive. Agents write about this incident constantly; a hook that
 # blocks the ticket note describing it is a hook everyone disables.

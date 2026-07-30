@@ -358,8 +358,14 @@ def test_an_empty_board_yields_an_empty_queue_and_says_so(board):
     assert q["pickup"] == []
     assert q["counts"]["pickup"] == 0
     brief = pickup.pickup_brief(q)
-    assert brief == pickup.EMPTY_PICKUP_LINE
+    # T-0829 made the DRIVE SCOPE block the brief's first line, so this is no
+    # longer a whole-string equality. What the original assertion was PROTECTING
+    # — the empty case is said out loud, and nothing in the brief suggests work
+    # was offered — is asserted directly instead.
+    assert pickup.EMPTY_PICKUP_LINE in brief
     assert "EMPTY" in brief and "Do NOT invent work" in brief
+    assert "PICKUP QUEUE (" not in brief and "NEEDS TRIAGE" not in brief
+    assert "T-1" not in brief and "T-2" not in brief
 
 
 def test_a_project_with_no_backlog_dir_is_safe(board):

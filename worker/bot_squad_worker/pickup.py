@@ -93,6 +93,34 @@ Three deliberate non-decisions
    in a new place. Every false positive of the judgement signals lands in a band
    the operator reads, which is the cheap direction to be wrong in.
 
+The drive SCOPE axis (T-0829, design D-0069)
+--------------------------------------------
+> надо предусмотреть разные режимы драйва оператора: • Закрыть все задачи в
+> Open / Reopened • Закрыть все задачи в In Progress • Закрыть все задачи
+> вообще, включая backlog — the stakeholder, 2026-07-29T12:20:46Z.
+
+Three of those bullets are one axis, and the third of them is **already this
+module's behaviour**: :data:`PICKUP_STATUSES` is exactly «все задачи вообще,
+включая backlog». So a scope is a NARROWING FILTER over the queue that already
+exists (:data:`SCOPE_STATUSES`), the default is the widest, and the seam is one
+keyword argument on :func:`pickup_queue` — not a second board-scanner. The
+setting itself lives in the pace config (T-0828, :func:`pace.read_drive`); this
+module reads it and never stores it.
+
+**What a scope may honestly promise.** Not "everything in Open will be closed" —
+see the two measured limits below, which are what make that undeliverable. Only
+"everything in Open **that is in the pickup band**". The difference is the
+in-scope TRIAGE residue, and it is published as
+``drive_scope[TRIAGE_IN_SCOPE_KEY]`` rather than left to be inferred, because
+T-0800's «ВСЁ СДЕЛАНО, ПРОВЕРЯЙ, МЫ ПРОСТАИВАЕМ» alert fires off the emptiness
+of this very queue. If in-scope triage work were invisible here, that alert
+would announce a finished board over an unfinished one.
+
+The two fixtures T-0800's predicate is accepted against are built and pinned in
+``worker/tests/test_pickup_scope.py`` (``scope_with_residue`` /
+``scope_truly_empty``) — reusable on purpose, so the alert is written against the
+same inputs this lane pinned rather than against a re-derivation of them.
+
 Two limits, stated rather than papered over
 -------------------------------------------
 * An **expired time-boxed directive** (T-0695 — "spend 70% of the week's quota in
@@ -109,11 +137,14 @@ Two limits, stated rather than papered over
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 #: Statuses whose tickets are candidates for pickup. ``totest`` is deliberately
 #: absent — it is review work awaiting a verifier, not work awaiting a doer, and
@@ -122,6 +153,42 @@ from typing import Any, Optional
 #: "ready-but-idle" half of the complaint: work that was started, abandoned when
 #: its session was reaped, and never taken up again.
 PICKUP_STATUSES = frozenset({"reopened", "open", "planned", "in_progress"})
+
+#: AXIS A of the drive modes (T-0829, design D-0069): the configured SCOPE ->
+#: the statuses it puts in play. Each value is a NARROWING filter over
+#: :data:`PICKUP_STATUSES`, in the stakeholder's own bullet order:
+#:
+#: * ``open_reopened`` — «Закрыть все задачи в Open / Reopened»
+#: * ``in_progress``   — «Закрыть все задачи в In Progress»
+#: * ``all``           — «Закрыть все задачи вообще, включая backlog»
+#:
+#: **`all` IS `PICKUP_STATUSES`, and that identity is the no-op property**
+#: (D-0069: "`all` is already today's behaviour"). Because the scope predicate
+#: runs *after* the pickup-status check, a scope whose set is the whole of
+#: PICKUP_STATUSES is vacuous — the default cannot narrow anything, by
+#: construction rather than by a branch. ``test_pickup_scope.py`` pins both the
+#: set identity and the behaviour.
+#:
+#: ``totest`` is in NO scope, for the reason stated above: review work awaiting a
+#: verifier, not work awaiting a doer. A scope mode may only ever REMOVE statuses
+#: from the pickup band; it can never readmit one.
+SCOPE_STATUSES: dict[str, frozenset] = {
+    "open_reopened": frozenset({"open", "reopened"}),
+    "in_progress": frozenset({"in_progress"}),
+    "all": PICKUP_STATUSES,
+}
+
+#: The scope in force when nothing is configured — the WIDEST one. Every
+#: fallback in this module lands here: widening on a setting we could not read
+#: costs an operator one glance, narrowing on one HIDES work, which is the
+#: defect this module exists to prevent.
+DEFAULT_SCOPE = "all"
+
+#: Where the in-scope TRIAGE residue is published in a :func:`pickup_queue`
+#: result (inside ``drive_scope``). Named as a constant because it is the
+#: contract T-0800's stall alert stands on, not an incidental field — see the
+#: comment at its assignment.
+TRIAGE_IN_SCOPE_KEY = "triage_in_scope"
 
 #: The one terminal status (task status schema: planned/open/in_progress/totest/
 #: reopened/closed) — same definition ``operator_redrive`` uses.
@@ -248,6 +315,7 @@ def classify_ticket(
     open_blockers: Any = (),
     now_epoch: float,
     stale_after_days: Optional[int] = None,
+    scope_statuses: Any = None,
 ) -> dict:
     """Classify ONE ticket's pickup eligibility from its frontmatter. Pure.
 
@@ -256,6 +324,9 @@ def classify_ticket(
     its CHILD tickets) and ``open_blockers`` (its ``blocked_by`` ids that are not
     closed) — and this decides the band. Split that way so the whole eligibility
     rule is unit-testable against a dict, with no filesystem and no tmux.
+
+    ``scope_statuses`` (T-0829) is the configured drive SCOPE as a set of
+    statuses — see :data:`SCOPE_STATUSES`. None means no scope filter at all.
 
     Returns ``{id, title, status, priority, effective_priority, band, reject,
     sanity, idle_days, rank}``. ``reject`` is the ONE mechanical reason for an
@@ -325,6 +396,15 @@ def classify_ticket(
         # work. An unrecognised status is named as itself rather than assumed.
         reject = ("awaiting-review" if status == "totest"
                   else f"not-a-pickup-status:{status or 'missing'}")
+    elif scope_statuses is not None and status not in scope_statuses:
+        # T-0829: the configured drive scope. Ranked HERE — immediately after the
+        # other status facts and before the world facts (held / lane / blocked) —
+        # for two reasons. It is a fact about the ticket's STATUS, so it belongs
+        # beside them; and first-match-wins then makes the count of this reason
+        # exactly "how many tickets the filter removed", which is what makes the
+        # filter auditable rather than invisible. The ticket is EXCLUDED with the
+        # reason named, never dropped: ``counts.board`` stays the whole board.
+        reject = f"out-of-drive-scope:{status}"
     elif held_by:
         reject = f"held-by:{held_by}"
     elif lane_held_by:
@@ -455,17 +535,96 @@ def _blocked_by_ids(meta: dict) -> list[str]:
     return out
 
 
-def pickup_queue(cfg: Any, slug: str, *, now_epoch: Optional[float] = None) -> dict:
+def resolve_drive_scope(cfg: Any, slug: str, scope: Optional[str] = None) -> dict:
+    """Which statuses the drive SCOPE puts in play, and where that came from.
+
+    ``scope=None`` reads the standing per-project setting via
+    :func:`pace.read_drive` — the T-0828 record, which is the ONLY store for it.
+    An explicit value overrides it (what the tests drive, and what a future
+    caller with a one-off scope would pass). Never raises.
+
+    Returns ``{scope, statuses, source, configured, set_by, set_at, source_text,
+    problem}``. ``statuses`` is a sorted LIST, not a set: this dict travels over
+    the worker socket inside :func:`pickup_queue`'s result and has to be
+    JSON-serialisable.
+
+    **Every failure widens to** :data:`DEFAULT_SCOPE` **and NAMES itself in
+    ``problem``** — an unreadable config, a value ``pace`` rejected, a scope
+    ``pace`` knows and this module does not. It never narrows on a value it
+    could not read: narrowing would silently hide work, which is the failure
+    this whole module exists to prevent, and it would hide it *while reporting
+    success*. ``problem`` carries the REJECTED RAW VALUE so the surface can show
+    him the typo rather than the word "invalid".
+
+    ``configured`` is passed through for the visibility surfaces only — it tells
+    "never set" from "deliberately set to the widest". **Nothing here branches
+    BEHAVIOUR on it**: an absent block and an explicit ``scope: all`` must drive
+    identically, or clearing the mode would stop being equivalent to setting the
+    default (T-0828's DoD, and the property DoD item 4 pins from this side).
+    """
+    problem: Optional[str] = None
+    prov: dict = {"set_by": None, "set_at": None, "source_text": None}
+
+    if scope is None:
+        source = "config"
+        configured = False
+        raw: Any = DEFAULT_SCOPE
+        try:
+            from bot_squad_worker import pace as _pace
+
+            drive = _pace.read_drive(cfg, slug)
+            raw = drive.get("scope", DEFAULT_SCOPE)
+            configured = bool(drive.get("configured"))
+            prov = {k: drive.get(k) for k in ("set_by", "set_at", "source_text")}
+            bad = (drive.get("invalid") or {}).get("scope")
+            if bad is not None:
+                problem = f"invalid-scope:{bad!r}"
+        except Exception as exc:  # noqa: BLE001 — a config read must not empty the board
+            log.exception("pickup: drive scope unreadable for %s", slug)
+            problem = f"drive-config-unreadable:{type(exc).__name__}"
+    else:
+        source = "explicit"
+        configured = True
+        raw = scope
+
+    name = str(raw or DEFAULT_SCOPE)
+    if name not in SCOPE_STATUSES:
+        # pace validated it against ITS closed set, so this fires only when the
+        # two sets have drifted apart (a scope added there and not mapped here).
+        # Named rather than crashed, and widened rather than narrowed.
+        problem = problem or f"unknown-scope:{name!r}"
+        name = DEFAULT_SCOPE
+
+    return {
+        "scope": name,
+        "statuses": sorted(SCOPE_STATUSES[name]),
+        "source": source,
+        "configured": configured,
+        "problem": problem,
+        **prov,
+    }
+
+
+def pickup_queue(cfg: Any, slug: str, *, now_epoch: Optional[float] = None,
+                 scope: Optional[str] = None) -> dict:
     """The whole board, banded — the answer to "what should be taken next".
 
     Returns ``{ok, slug, pickup: [...], triage: [...], excluded: [...],
-    counts: {...}}`` with ``pickup`` and ``triage`` ranked most-urgent-first.
-    Pure read: backlog mds, session mds, one tmux scan. Safe to call on a fresh
-    project with no backlog dir (every list empty).
+    counts: {...}, drive_scope: {...}}`` with ``pickup`` and ``triage`` ranked
+    most-urgent-first. Pure read: backlog mds, session mds, one tmux scan. Safe
+    to call on a fresh project with no backlog dir (every list empty).
+
+    ``scope`` (T-0829) is the drive SCOPE axis. None — the normal case — reads
+    the standing per-project setting; this is why the ``pickup_queue`` worker
+    action, the re-drive brief and T-0800's stall predicate all honour the scope
+    without any of them being edited. ``drive_scope`` reports what was applied,
+    including :data:`TRIAGE_IN_SCOPE_KEY`.
     """
     import time as _time
 
     now = _time.time() if now_epoch is None else now_epoch
+    drive_scope = resolve_drive_scope(cfg, slug, scope)
+    scope_statuses = frozenset(drive_scope["statuses"])
     metas = _backlog_metas(cfg, slug)
     held = held_task_ids(cfg, slug)
 
@@ -502,6 +661,7 @@ def pickup_queue(cfg: Any, slug: str, *, now_epoch: Optional[float] = None) -> d
             meta,
             held_by=held.get(tid), lane_held_by=lane_held.get(tid),
             open_blockers=open_blockers, now_epoch=now,
+            scope_statuses=scope_statuses,
         ))
 
     banded = {BAND_PICKUP: [], BAND_TRIAGE: [], BAND_EXCLUDED: []}
@@ -509,6 +669,23 @@ def pickup_queue(cfg: Any, slug: str, *, now_epoch: Optional[float] = None) -> d
         banded[row["band"]].append(row)
     for name in (BAND_PICKUP, BAND_TRIAGE):
         banded[name].sort(key=lambda r: r["rank"])
+
+    # The honesty half (DoD item 6; D-0069 "What a SCOPE mode may honestly
+    # promise"). The triage band holds ONLY in-scope tickets by construction —
+    # an out-of-scope one is rejected mechanically above, and a reject outranks
+    # every judgement signal — so this count IS the in-scope residue. It is
+    # reported under its own name anyway, because T-0800's stall alert reads it
+    # programmatically to decide whether an empty pickup band means DONE or
+    # means "nothing takeable and N tickets still need a human". A brief line is
+    # for a reader; the alert is a machine, and a machine that has to re-derive
+    # this number is how the two drift and «ВСЁ СДЕЛАНО» gets posted over a
+    # board that is not done. ``test_pickup_scope.py`` pins the equality so the
+    # two can never disagree.
+    drive_scope[TRIAGE_IN_SCOPE_KEY] = len(banded[BAND_TRIAGE])
+    drive_scope["out_of_scope"] = sum(
+        1 for r in banded[BAND_EXCLUDED]
+        if str(r["reject"] or "").startswith("out-of-drive-scope:")
+    )
 
     return {
         "ok": True,
@@ -522,6 +699,7 @@ def pickup_queue(cfg: Any, slug: str, *, now_epoch: Optional[float] = None) -> d
             "excluded": len(banded[BAND_EXCLUDED]),
             "board": len(rows),
         },
+        "drive_scope": drive_scope,
     }
 
 
@@ -540,18 +718,87 @@ EMPTY_PICKUP_LINE = (
 )
 
 
+def drive_scope_lines(drive_scope: dict) -> list[str]:
+    """The DRIVE SCOPE block of the brief — what :func:`pickup_queue` applied.
+
+    Stated on EVERY brief, including the default, because that is the ask:
+    «нужно более чёткое понимание для меня, какой режим драйва щас стоит» — an
+    operator incarnation must be able to READ the scope it is driving under
+    instead of inferring one from which tickets it was handed. That inference is
+    half of why he could not tell whether his instruction landed.
+
+    Three things are said, and each answers a question the mode cannot be
+    trusted without:
+
+    * the mode, its statuses, and the WORDS that set it (``source_text``) —
+      "did my instruction land";
+    * how many board tickets the scope excluded — what the filter did;
+    * the in-scope TRIAGE residue — see D-0069 "What a SCOPE mode may honestly
+      promise". A scope cannot promise "everything in Open will be closed", only
+      "everything in Open that is in the pickup band". Staleness measures the
+      last WRITE, not the last work, and an expired directive is
+      indistinguishable from live P1 work by any deterministic frontmatter read
+      (both MEASURED on T-0783a, not re-derived). So an empty pickup band inside
+      a scope with residue means "nothing takeable", never "the scope is done",
+      and the brief has to say which.
+    """
+    if not drive_scope:
+        return []
+    scope = drive_scope.get("scope") or DEFAULT_SCOPE
+    statuses = ", ".join(drive_scope.get("statuses") or ())
+    if drive_scope.get("configured"):
+        set_at = drive_scope.get("set_at")
+        set_by = drive_scope.get("set_by")
+        words = drive_scope.get("source_text")
+        prov = "set" + (f" {set_at}" if set_at else "") + (f" by {set_by}" if set_by else "")
+        if words:
+            prov += f" from «{words}»"
+        elif prov == "set":
+            # An explicit override, or a hand-written block with no provenance.
+            # Say which rather than printing a bare "set.".
+            prov = "set, with no record of who set it or when"
+    else:
+        prov = "never set — this is the default, and it is the WIDEST scope"
+    lines = [f"DRIVE SCOPE: {scope} (statuses in play: {statuses}) — {prov}."]
+
+    problem = drive_scope.get("problem")
+    if problem:
+        lines.append(
+            f"  ⚠ THE CONFIGURED SCOPE DID NOT TAKE EFFECT: {problem}. Driving "
+            f"'{DEFAULT_SCOPE}' instead, so nothing is hidden — but say so if "
+            "asked which mode is set, and get the setting fixed."
+        )
+
+    out_of_scope = drive_scope.get("out_of_scope") or 0
+    if out_of_scope:
+        lines.append(
+            f"  {out_of_scope} board ticket(s) are OUT of this scope and are not "
+            "offered below. They are not done; they are not in play."
+        )
+
+    residue = drive_scope.get(TRIAGE_IN_SCOPE_KEY) or 0
+    if residue:
+        lines.append(
+            f"  {residue} ticket(s) INSIDE this scope need triage and are not "
+            "auto-takeable. An empty pickup queue therefore means 'nothing is "
+            "takeable', NOT 'the scope is done'."
+        )
+    return lines
+
+
 def pickup_brief(queue: dict, *, limit: int = DEFAULT_BRIEF_LIMIT) -> str:
     """Render a :func:`pickup_queue` result as the block injected into the
     operator's re-drive prompt.
 
-    Names the top ``limit`` takeable tickets with the facts a dispatch decision
+    Opens with the active drive SCOPE (:func:`drive_scope_lines`, T-0829), then
+    names the top ``limit`` takeable tickets with the facts a dispatch decision
     needs (id, status, effective urgency, days idle) and states the triage count
     so the suspect band is visible without being dispatchable. The empty case is
     said out loud — see :data:`EMPTY_PICKUP_LINE`.
     """
     pick = queue.get("pickup") or []
     triage = queue.get("triage") or []
-    lines: list[str] = []
+    lines: list[str] = drive_scope_lines(queue.get("drive_scope") or {})
     if not pick:
         lines.append(EMPTY_PICKUP_LINE)
     else:

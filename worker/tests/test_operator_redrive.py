@@ -270,6 +270,50 @@ def test_respawn_prompt_names_the_takeable_ticket(cfg_slug, monkeypatch):
     assert "[reopened]" in prompt
 
 
+# --- T-0829: and it names the drive SCOPE the queue was narrowed to ----------
+#
+# «нужно более чёткое понимание для меня, какой режим драйва щас стоит, я просил
+# закончить всё что в опен, но видимо это не интерпретировалось как переключить
+# режим драйва» — 2026-07-30T07:54:16Z. Half of why he could not tell whether his
+# instruction landed is that no operator incarnation ever STATED the mode it was
+# driving under; it inferred one from the tickets it was handed.
+
+def test_respawn_prompt_states_the_configured_drive_scope(cfg_slug, monkeypatch):
+    """The configured scope reaches the operator prompt AND narrows the queue in
+    it — the two halves have to agree, or the brief describes a mode the list
+    below it does not obey."""
+    from bot_squad_worker import pace
+
+    cfg, slug, spawns = cfg_slug
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    pace.set_drive(cfg, slug, scope="open_reopened", set_by="stakeholder",
+                   source_text="закончить всё что в опен")
+    _write_task(cfg, slug, "T-1", status="open")
+    _write_task(cfg, slug, "T-2", status="planned")
+
+    assert ord_.tick(cfg, slug)["action"] == "respawned"
+    prompt = spawns[0]["prompt"]
+    assert "DRIVE SCOPE: open_reopened" in prompt
+    assert "закончить всё что в опен" in prompt
+    assert "T-1" in prompt
+    assert "T-2" not in prompt  # planned is out of this scope
+
+
+def test_respawn_prompt_states_the_scope_even_when_none_is_set(cfg_slug, monkeypatch):
+    """The unset case is the one he actually hit. An operator told nothing reads
+    the absence as "no mode", which is indistinguishable from "the widest mode"
+    — so the default is stated, and stated as the widest."""
+    cfg, slug, spawns = cfg_slug
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    _write_task(cfg, slug, "T-1", status="open")
+
+    assert ord_.tick(cfg, slug)["action"] == "respawned"
+    prompt = spawns[0]["prompt"]
+    assert "DRIVE SCOPE: all" in prompt
+    assert "never set" in prompt and "WIDEST" in prompt
+    assert "T-1" in prompt
+
+
 def test_respawn_prompt_states_an_empty_queue_out_loud(cfg_slug, monkeypatch):
     """Pending backlog exists (so the tick fires) but nothing is TAKEABLE — a
     totest ticket is review work. The brief must say the queue is empty instead

@@ -114,7 +114,13 @@ def test_an_empty_board_is_a_valid_answer_not_an_error(cfg_slug):
     out = act_dispatch("pickup_queue", {"slug": slug})
     assert out["ok"] is True
     assert out["pickup"] == []
-    assert out["brief"] == pickup.EMPTY_PICKUP_LINE
+    # The emptiness must be STATED (an absent section reads as "not computed").
+    # T-0829 prepends the DRIVE SCOPE block, so this is no longer the whole
+    # brief — the assertion that matters is that the empty line is present and
+    # that nothing else claims work exists.
+    assert pickup.EMPTY_PICKUP_LINE in out["brief"]
+    assert "PICKUP QUEUE (" not in out["brief"]
+    assert "NEEDS TRIAGE" not in out["brief"]
 
 
 # --- strict param contract + unknown-slug guard -----------------------------

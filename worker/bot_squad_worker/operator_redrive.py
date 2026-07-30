@@ -408,6 +408,15 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
     # stakeholder chased it by hand. A failure to compute it must never block the
     # respawn (an operator with the plain directive is what we had before), so it
     # degrades to "".
+    #
+    # T-0829: that same brief now OPENS with the active drive SCOPE, and the
+    # queue below it is already narrowed to that scope — `pickup_queue` reads the
+    # standing per-project setting itself (pace.read_drive), which is why no
+    # argument is threaded through here. This is the half of «какой режим драйва
+    # щас стоит» that agents read: every operator incarnation is TOLD the scope it
+    # is driving under, plus the in-scope triage residue, instead of inferring a
+    # mode from which tickets it happened to be handed. Absent config = the
+    # widest scope = the queue this line produced before the axis existed.
     try:
         from bot_squad_worker import pickup as _pickup
         brief = _pickup.pickup_brief(_pickup.pickup_queue(cfg, slug))

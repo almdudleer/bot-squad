@@ -248,6 +248,11 @@ def _notify_stakeholder(cfg: Any, slug: str, text: str) -> None:
             tg_chat_id=chat_id,
             tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
             group_record=bool(chat_id),
+            # T-0799: LOG class. Every page from here reports that an autopilot
+            # RUN ENDED (stopped / exited on its condition / completed its
+            # hours) — a record of what the system did, not a thing he must act
+            # on. It already rides the default `urgent=False`.
+            msg_type="autopilot_notice",
         )
     except Exception:  # noqa: BLE001
         log.exception("autopilot: stakeholder notify failed for %s", slug)

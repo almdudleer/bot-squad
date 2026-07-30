@@ -249,6 +249,7 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     # channel abstraction (not a direct tg.send). The factory picks the impl per
     # project — TG today; adding MAX/mail needs no change here.
     channel = _channels.get_channel(cfg, project=slug)
+    from bot_squad_worker import msg_routes as _msg_routes
     chat_id = project.tg_chat  # type: ignore[attr-defined]
     sid = "deploy_monitor"
     # T-0386: route deploy logs into the project's #deploy-logs forum topic
@@ -273,13 +274,29 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     from bot_squad_worker import sessions as _sessions
     sid_label = _sessions.sid_display_label(sid, slug)
 
-    def _tg_safe(text: str) -> None:
+    # T-0799: the destination is per-message-TYPE configurable, and this one
+    # sender emits BOTH classes — a start/success is a log entry, a failure or a
+    # stale worker is not. So `msg_type` is a required argument rather than a
+    # property of the sender: classifying by "which subsystem emitted this"
+    # would put ✅ SUCCESS on the same siren as ❌ FAILED, which is exactly what
+    # the stakeholder is trying to escape.
+    #
+    # `urgent=True` (T-0188) is UNCHANGED for every one of them, including the
+    # LOG-class ones. urgent= is the quiet-hours BYPASS and has never selected a
+    # destination, so a 03:00 deploy notice still fires — it fires wherever the
+    # type is routed. T-0188 was about the gate DROPPING these; nothing here
+    # re-introduces a drop.
+    def _tg_safe(text: str, msg_type: str) -> None:
+        routed = _msg_routes.route(
+            cfg, msg_type, slug=slug, chat_id=chat_id, topic_id=deploy_topic,
+        )
         try:
-            channel.send(text, chat_id=chat_id, sid=sid_label, urgent=True, topic_id=deploy_topic)
+            channel.send(text, chat_id=routed.chat_id, sid=sid_label, urgent=True,
+                         topic_id=routed.topic_id)
         except Exception:
             log.exception("deploy_monitor: channel.send failed (non-fatal): %s", text)
 
-    _tg_safe(f"🚚 starting deploy for {slug}/{target}")
+    _tg_safe(f"🚚 starting deploy for {slug}/{target}", "deploy_status")
 
     result = _deploy.run_next(cfg, slug)
     if result is None:
@@ -316,11 +333,17 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
                 f"⚠️ deploy {slug}/{target} SUCCESS but WORKER STALE "
                 f"(rc={result.returncode}){sha}{suffix}{wr}. The worker is still on"
                 f"{boot or ' the previous commit'} — new worker/ code is NOT executing "
-                f"yet. {fix}systemctl --user restart bot-squad-worker.service"
+                f"yet. {fix}systemctl --user restart bot-squad-worker.service",
+                # A green recipe whose worker is still on the previous commit is
+                # a FAILURE for every purpose he cares about — the fix is a
+                # command he has to run (T-0717). Classified with the failures,
+                # not with the successes it is printed next to.
+                "deploy_failed",
             )
         else:
             _tg_safe(
-                f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}"
+                f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}",
+                "deploy_status",
             )
     elif result.killed_reason:
         # A watchdog (not the recipe) killed this build — the loud, TARGETED
@@ -337,7 +360,8 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
             f"Log: {result.log_path}",
         )
     else:
-        _tg_safe(f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}")
+        _tg_safe(f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}",
+                 "deploy_failed")
 
 
 def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None:
@@ -363,6 +387,11 @@ def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None
                 tg_topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
                 group_record=True,
                 slug=slug,
+                # T-0799: URGENT class. This helper is the loud path for EVERY
+                # way a deploy goes wrong — a watchdog kill, a reaped orphan, a
+                # failed worker-restart — so one type covers all of its callers.
+                # `urgent=True` above unchanged.
+                msg_type="deploy_failed",
             )
         except Exception:
             log.exception("deploy_monitor: operator alert failed (non-fatal): %s", text)
@@ -921,4 +950,11 @@ def oauth_refresh(cfg: Config) -> None:
             tg_chat_id=getattr(project, "tg_chat", "") if project else "",
             tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries") if slug else None,
             group_record=bool(getattr(project, "tg_chat", "") if project else ""),
+            # T-0799: URGENT class — once creds expire every session on the
+            # install breaks. `route_slug` rather than `slug` for the reason the
+            # comment above gives for not tagging one: `slug` here is whichever
+            # project sorts first and is only a source of a chat, so it names
+            # the map to read without claiming the failure is that project's.
+            msg_type="oauth_expired",
+            route_slug=slug,
         )

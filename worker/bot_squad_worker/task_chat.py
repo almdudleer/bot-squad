@@ -227,6 +227,11 @@ def _notify(cfg: Any, slug: str, text: str) -> bool:
             # lines per notice would make the transcript harder to read, which
             # is the thing this is all for.
             record_outbound=False,
+            # T-0799: LOG class. A status change is the archetype of "read it
+            # when you choose to" — and it is already the one page that rides
+            # `urgent=False` on purpose, so classifying it routine changes
+            # nothing about when it fires.
+            msg_type="task_lifecycle",
         )
         return bool(res.get("ok")) and bool(res.get("sent"))
     except Exception:  # noqa: BLE001 — a channel outage never kills the sweep

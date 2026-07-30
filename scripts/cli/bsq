@@ -25,6 +25,7 @@ Verbs:
   bsq compact [--sid SID]           send /compact to a session (self by default)
   bsq compact-save "<state>"        write your forward-state to your role artifact (compact handoff)
   bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
+  bsq msg-route list/set/clear      where each automated message TYPE is delivered (T-0799)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
   bsq model set/clear/status         durable per-session claude --model override (T-0678)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
@@ -561,6 +562,106 @@ def cmd_topic_list(args) -> None:
         if rec.get("ticket_id") or rec.get("session_id"):
             extra = f"  ticket_id={rec.get('ticket_id')} session_id={rec.get('session_id')}"
         print(f"chat_id={chat_id}  thread_id={thread_id or '(none)'}  -> slug={rec.get('slug')}{extra}")
+
+
+# --- msg-route (T-0799: per-message-TYPE destination map) -------------------
+
+def _msg_route_slug(args) -> str:
+    """Which project's route map this call is about. Explicit --slug wins, else
+    the cwd-resolved project — the same precedence every other per-project verb
+    uses, so `bsq msg-route list` inside a project clone needs no flag."""
+    return args.slug or resolve_slug()
+
+
+def cmd_msg_route_list(args) -> None:
+    """Show every automated message type and where it goes today (T-0799).
+
+    Prints the RESOLVED destination per type, not the stored file: a
+    `class:log` entry governs every log-class type at once, and the file cannot
+    tell you which ones those are.
+    """
+    slug = _msg_route_slug(args)
+    res = post("msg_route_list", {"slug": slug})
+    rows = res.get("rows", [])
+    if not rows:
+        print(f"{slug}: no message types registered")
+        return
+    print(f"{slug}: automated message destinations "
+          f"('default' = the project's own chat, i.e. today's behaviour)")
+    for urg in ("urgent", "log"):
+        band = [r for r in rows if r.get("urgency") == urg]
+        if not band:
+            continue
+        print(f"\n  {urg.upper()} — "
+              + ("worth waking him for" if urg == "urgent"
+                 else "a record to read when he chooses to"))
+        for r in band:
+            dest = "default"
+            if r.get("source") != "default":
+                chat = r.get("chat_id") or "(project chat)"
+                topic = r.get("topic_id")
+                dest = f"chat={chat} topic={topic if topic is not None else '(none)'}"
+                if r.get("source") != r.get("msg_type"):
+                    dest += f"  via {r['source']}"
+            print(f"    {r['msg_type']:<20} {dest}")
+            print(f"    {'':<20} {r.get('summary', '')}")
+    print(f"\nroutable keys: {', '.join(res.get('keys', []))}")
+
+
+def cmd_msg_route_set(args) -> None:
+    """Point a message type (or a whole urgency class) at a chat/topic (T-0799).
+
+    `--chat`/`--topic` are each three-valued on purpose: absent = "this call
+    does not name the field", an id/number = that destination, and the literal
+    `default`/`none` = the explicit empty form (the project's own chat / no
+    forum thread). Both empties are real destinations, so the worker refuses a
+    write that would drop a stored value the call did not name — restate it, or
+    ask for the empty form.
+    """
+    slug = _msg_route_slug(args)
+    params: dict = {"slug": slug, "msg_type": args.msg_type}
+    if args.chat is not None:
+        params["chat_id"] = "" if args.chat in ("default", "") else args.chat
+    if args.topic is not None:
+        if args.topic in ("none", "None", ""):
+            params["topic_id"] = None
+        else:
+            try:
+                params["topic_id"] = int(args.topic)
+            except ValueError:
+                die(f"msg-route set: --topic must be a thread id or 'none', "
+                    f"got {args.topic!r}")
+    if "chat_id" not in params and "topic_id" not in params:
+        die("msg-route set: name --chat and/or --topic (to remove a route, "
+            "use `bsq msg-route clear`)")
+    res = post("msg_route_set", params)
+    rec = res.get("route", {})
+    topic = rec.get("topic_id")
+    if not rec.get("chat_id") and topic is None:
+        # An explicitly-empty route PINS the type to the project's own chat,
+        # which is how one type is exempted from a class:* entry governing it.
+        print(f"{slug}: {res.get('msg_type')} -> pinned to the project's own "
+              f"chat (exempt from any class:* route)")
+    else:
+        print(f"{slug}: {res.get('msg_type')} -> "
+              f"chat={rec.get('chat_id') or '(project chat)'} "
+              f"topic={topic if topic is not None else '(none)'}")
+    changes = res.get("changes") or {}
+    if changes:
+        for field, mv in changes.items():
+            print(f"  {field}: {mv.get('from')!r} -> {mv.get('to')!r}")
+    else:
+        print("  (no change — it already routed there)")
+
+
+def cmd_msg_route_clear(args) -> None:
+    """Drop a route, restoring that type's default destination (T-0799)."""
+    slug = _msg_route_slug(args)
+    res = post("msg_route_clear", {"slug": slug, "msg_type": args.msg_type})
+    if res.get("cleared"):
+        print(f"{slug}: {args.msg_type} -> default (the project's own chat)")
+    else:
+        print(f"{slug}: {args.msg_type} had no route (no-op)")
 
 
 def cmd_topic_create(args) -> None:
@@ -4918,6 +5019,34 @@ def build_parser() -> argparse.ArgumentParser:
                     help="omit to show the current mode; 'auto' reverts to TG-primary")
     pc.add_argument("--by", default="", help="who asked for the switch (audit stamp)")
     pc.set_defaults(func=cmd_page_channel)
+
+    # msg-route (T-0799: per-message-TYPE outbound destination map). The
+    # OUTBOUND direction — which chat/topic an automated message LEAVES to.
+    # `topic` below is the INBOUND direction (which project a topic belongs to);
+    # the two are separate stores on purpose and this one only points a type at
+    # a topic `bsq topic create`/`bind` already made.
+    mr = sub.add_parser(
+        "msg-route",
+        help="where each automated message TYPE is delivered (T-0799; default = "
+             "the project's own chat, i.e. today's behaviour)")
+    mr_sub = mr.add_subparsers(dest="sub", required=True)
+    mrl = mr_sub.add_parser(
+        "list", help="show every message type, its urgency class and its destination")
+    mrl.add_argument("--slug", default="", help="project (default: cwd's project)")
+    mrl.set_defaults(func=cmd_msg_route_list)
+    mrs = mr_sub.add_parser("set", help="point a type (or class:urgent/class:log) at a chat/topic")
+    mrs.add_argument("msg_type", help="a type key, or 'class:urgent'/'class:log' to move a "
+                                      "whole class at once (`bsq msg-route list` prints them)")
+    mrs.add_argument("--chat", default=None,
+                     help="destination chat_id, or 'default' for the project's own chat")
+    mrs.add_argument("--topic", default=None,
+                     help="destination forum thread_id, or 'none' for the chat's own feed")
+    mrs.add_argument("--slug", default="", help="project (default: cwd's project)")
+    mrs.set_defaults(func=cmd_msg_route_set)
+    mrc = mr_sub.add_parser("clear", help="drop a route, restoring that type's default")
+    mrc.add_argument("msg_type", help="the type or class key to un-route")
+    mrc.add_argument("--slug", default="", help="project (default: cwd's project)")
+    mrc.set_defaults(func=cmd_msg_route_clear)
 
     # topic (T-0639: runtime chat_id/thread_id -> project binding surface)
     tp = sub.add_parser(

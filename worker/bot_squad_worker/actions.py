@@ -497,6 +497,20 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
     # _send_stakeholder_dm SSOT (T-0394).
     explicit_tg_target = bool(params.get("chat_id")) or (params.get("topic_id") not in (None, ""))
     debounce = bool(params.get("debounce", True))
+    # T-0799: the ONE automated type that arrives through this action rather
+    # than a direct SSOT call — a process flagging `needs_input` is the
+    # "a session is blocked and waiting on YOU" page (the same composer
+    # tg_stall._escalate uses, which is tagged at its own call site). Tagged
+    # ONLY when the destination was NOT spelled out: with an explicit
+    # chat_id/topic_id the caller has already said where this goes, and the
+    # per-type map must not second-guess a stated address. Every other use of
+    # this action is an explicitly-addressed conversational send (T-0665) and
+    # deliberately carries no type at all, so it can never be re-routed.
+    msg_type = (
+        "needs_input"
+        if bool(params.get("needs_input", False)) and not explicit_tg_target
+        else ""
+    )
     result = _send_stakeholder_dm(
         cfg,
         message=message,
@@ -506,6 +520,7 @@ def _action_tg_notify(params: dict[str, Any]) -> dict[str, Any]:
         tg_chat_id=chat_id,
         tg_topic_id=topic_id,
         prefer_tg=explicit_tg_target,
+        msg_type=msg_type,
         debounce=debounce,
         do_slim=do_slim,
         slug=slug,
@@ -689,6 +704,8 @@ def _send_stakeholder_dm(
     task_id: str = "",
     record_outbound: bool = True,
     sender_sid: str = "",
+    msg_type: str = "",
+    route_slug: str = "",
 ) -> dict[str, Any]:
     """SSOT for paging the human (T-0247 lineage, T-0394 dedupe, T-0610 inversion).
 
@@ -752,13 +769,50 @@ def _send_stakeholder_dm(
     here without also re-routing the message. Absent → the tag falls back to
     ``sid_label``, exactly as every send behaves today.
 
+    ``msg_type`` (T-0799): the automated message TYPE this page is, from
+    ``msg_routes.TYPES``. Present ⇒ the per-type destination map may REPLACE
+    ``tg_chat_id``/``tg_topic_id`` with whatever the stakeholder configured for
+    that type; absent (the default) ⇒ the destination the caller computed is
+    used verbatim, exactly as it has been. So the mechanism is a no-op until a
+    type is both tagged here and routed by him — and an explicitly-addressed
+    send (``bsq tg ping --chat``, ``bsq topic say``, the relay) names no type and
+    can never be redirected.
+
+    ``route_slug`` (T-0799): which project's route map to consult, when that is
+    NOT the project this page is tagged as belonging to. Distinct from ``slug``
+    for the same reason ``sender_sid`` is distinct from ``sid`` — ``slug`` is an
+    identity claim that reaches the ``[<slug> <role>]`` sender tag, and the three
+    install-wide pagers (``oauth_refresh``, ``autoupdate_apply``,
+    ``outbound_liveness``) deliberately claim NO project while still resolving
+    their chat from one. They need to say which map to read without also
+    claiming to be about that project. Defaults to ``slug``.
+
     Returns ``{ok, sent, channel}``. ``channel: "none"`` (ok=False) when no
     transport could deliver — logged loudly, never a silent no-op.
     """
     del group_record  # T-0610: compat no-op — one page, one delivery
+    # T-0799: the per-message-TYPE destination map. `default_chat_id` keeps the
+    # PRE-route chat because `_page_detail_link` reverse-looks-up the project
+    # from it (T-0635) — a page routed into a forum supergroup that is no
+    # project's `tg_chat` would otherwise lose its detail link as a side effect
+    # of being re-routed.
+    default_chat_id = tg_chat_id
+    if msg_type:
+        from bot_squad_worker import msg_routes as _msg_routes
+        routed = _msg_routes.route(
+            cfg, msg_type, slug=route_slug or slug,
+            chat_id=tg_chat_id, topic_id=tg_topic_id,
+        )
+        tg_chat_id, tg_topic_id = routed.chat_id, routed.topic_id
+        if routed.applied and routed.topic_id is not None:
+            # A forum thread is a TG-only address — MAX has no notion of one, so
+            # failing over would deliver a message he routed to a Logs topic
+            # into his MAX DM instead. Same rule `tg_notify` already applies to
+            # an explicitly-addressed group send (`explicit_tg_target`).
+            prefer_tg = True
     link = (
         _page_detail_link(
-            cfg, slug=slug, tg_chat_id=tg_chat_id, sid=sid, task_id=task_id,
+            cfg, slug=slug, tg_chat_id=default_chat_id, sid=sid, task_id=task_id,
         )
         if do_slim and not prefer_tg
         else ""
@@ -1238,6 +1292,137 @@ def _action_tg_topic_list(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"tg_topic_list got unexpected params: {sorted(extra)}")
     from bot_squad_worker import tg_bindings
     return {"ok": True, "bindings": tg_bindings.load(_get_config())}
+
+
+# ---------------------------------------------------------------------------
+# msg_routes.py (T-0799: per-message-TYPE destination map — «конфигурируемые
+# chat_id все типы сообщений, но по дефолту всё ЛС»). Per-project, worker-owned
+# single-writer JSON, mirroring the tg_topics/tg_bindings ops above.
+# ---------------------------------------------------------------------------
+
+_MSG_ROUTE_LIST_ALLOWED = {"slug"}
+
+
+def _action_msg_route_list(params: dict[str, Any]) -> dict[str, Any]:
+    """Every automated message type for ``slug``, with where it goes today
+    (T-0799). Read-only.
+
+    Required params: slug. Returns ``{ok, slug, rows, keys}`` — ``rows`` is one
+    entry per registered type carrying its urgency class, its human summary and
+    the ROUTE KEY that decides its destination (``"default"`` when none), and
+    ``keys`` is every routable key so a caller can offer them without a second
+    copy of the list.
+
+    Reports the resolved key per type rather than the raw store on purpose: one
+    ``class:log`` entry silently governs five types, and reading the file cannot
+    tell you which.
+    """
+    extra = set(params) - _MSG_ROUTE_LIST_ALLOWED
+    if extra:
+        raise ActionError(f"msg_route_list got unexpected params: {sorted(extra)}")
+    if not params.get("slug"):
+        raise ActionError("msg_route_list missing required param: slug")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"msg_route_list: unknown project slug {slug!r}")
+    from bot_squad_worker import msg_routes as _msg_routes
+    return {
+        "ok": True,
+        "slug": slug,
+        "rows": _msg_routes.describe(cfg, slug),
+        "keys": _msg_routes.keys(),
+    }
+
+
+_MSG_ROUTE_SET_REQUIRED = {"slug", "msg_type"}
+_MSG_ROUTE_SET_ALLOWED = _MSG_ROUTE_SET_REQUIRED | {"chat_id", "topic_id"}
+
+
+def _action_msg_route_set(params: dict[str, Any]) -> dict[str, Any]:
+    """Point one message type (or a whole urgency class) at a chat/topic
+    (T-0799).
+
+    Required params: slug, msg_type — a key from ``msg_route_list``'s ``keys``,
+    i.e. a registered type or ``class:urgent`` / ``class:log``.
+    Optional params: chat_id, topic_id. At least one must be given. ``chat_id``
+    empty = "the project's own chat"; ``topic_id`` null = "no forum thread".
+    Both are real destinations, so PARAM PRESENCE (not the value) is what says
+    the caller named a field — a call that leaves a field unnamed while the
+    stored route carries a value for it is REFUSED, naming both values, rather
+    than silently dropping it (the T-0771 rule: re-pointing a type's chat while
+    forgetting its topic would move it to the new chat's General feed and look
+    exactly like a successful re-point).
+
+    Returns {ok, slug, msg_type, route, changes} — ``changes`` is
+    ``{field: {from, to}}`` for every field this write actually moved, because
+    the record alone cannot say what it used to be.
+    """
+    extra = set(params) - _MSG_ROUTE_SET_ALLOWED
+    if extra:
+        raise ActionError(f"msg_route_set got unexpected params: {sorted(extra)}")
+    missing = _MSG_ROUTE_SET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"msg_route_set missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"msg_route_set: unknown project slug {slug!r}")
+
+    from bot_squad_worker import msg_routes as _msg_routes
+    key = str(params["msg_type"])
+    before = _msg_routes.load(cfg, slug).get(key)
+    kwargs: dict[str, Any] = {}
+    if "chat_id" in params:
+        kwargs["chat_id"] = params["chat_id"]
+    if "topic_id" in params:
+        kwargs["topic_id"] = params["topic_id"]
+    try:
+        rec = _msg_routes.set_route(cfg, slug, key, **kwargs)
+    except _msg_routes.LossyRouteError as e:
+        raise ActionError(
+            f"msg_route_set: {e}. To KEEP a field, name it "
+            f"({'; '.join(f'{f}={v!r}' for f, v in e.fields.items())}). To EMPTY "
+            f"it on purpose, pass it explicitly (chat_id='' = the project's own "
+            f"chat, topic_id=null = no thread). Nothing was written"
+        ) from e
+    except ValueError as e:
+        raise ActionError(f"msg_route_set: {e}") from e
+
+    return {
+        "ok": True,
+        "slug": slug,
+        "msg_type": key,
+        "route": rec,
+        "changes": _msg_routes.change_summary(before, rec),
+    }
+
+
+_MSG_ROUTE_CLEAR_REQUIRED = {"slug", "msg_type"}
+_MSG_ROUTE_CLEAR_ALLOWED = _MSG_ROUTE_CLEAR_REQUIRED
+
+
+def _action_msg_route_clear(params: dict[str, Any]) -> dict[str, Any]:
+    """Drop one route, restoring that type's default destination (T-0799).
+
+    Required params: slug, msg_type. Idempotent. Returns {ok, cleared: bool}.
+    """
+    extra = set(params) - _MSG_ROUTE_CLEAR_ALLOWED
+    if extra:
+        raise ActionError(f"msg_route_clear got unexpected params: {sorted(extra)}")
+    missing = _MSG_ROUTE_CLEAR_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"msg_route_clear missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"msg_route_clear: unknown project slug {slug!r}")
+    from bot_squad_worker import msg_routes as _msg_routes
+    cleared = _msg_routes.clear_route(cfg, slug, str(params["msg_type"]))
+    return {"ok": True, "cleared": cleared}
 
 
 # ---------------------------------------------------------------------------
@@ -1778,11 +1963,19 @@ def _action_pause_deploys(params: dict[str, Any]) -> dict[str, Any]:
         from bot_squad_worker import sessions as _sessions
         from bot_squad_worker import tg_topics as _tg_topics
         # T-0591 (F5.3): routed through the channel abstraction.
+        # T-0799: LOG class — a queue-state flip is a record of a thing a human
+        # just did on purpose, so it is never news to the person who did it.
+        from bot_squad_worker import msg_routes as _msg_routes
+        routed = _msg_routes.route(
+            cfg, "deploy_queue", slug=slug,
+            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
+        )
         _channels.get_channel(cfg, project=slug).send(
             f"🟡 deploys paused for {slug} — {meta['reason']} (by {meta['paused_by']})",
-            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            chat_id=routed.chat_id,
             sid=_sessions.sid_display_label("deploy_monitor", slug),
-            topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
+            topic_id=routed.topic_id,
         )
 
     return {"ok": True, "paused": meta, "was_already_paused": was_paused}
@@ -1821,11 +2014,18 @@ def _action_resume_deploys(params: dict[str, Any]) -> dict[str, Any]:
         from bot_squad_worker import sessions as _sessions
         from bot_squad_worker import tg_topics as _tg_topics
         # T-0591 (F5.3): routed through the channel abstraction.
+        # T-0799: LOG class — the twin of the pause notice above.
+        from bot_squad_worker import msg_routes as _msg_routes
+        routed = _msg_routes.route(
+            cfg, "deploy_queue", slug=slug,
+            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
+        )
         _channels.get_channel(cfg, project=slug).send(
             f"🟢 deploys resumed for {slug} (by {who})",
-            chat_id=project.tg_chat,  # type: ignore[attr-defined]
+            chat_id=routed.chat_id,
             sid=_sessions.sid_display_label("deploy_monitor", slug),
-            topic_id=_tg_topics.resolve(cfg, slug, "deploy_logs"),
+            topic_id=routed.topic_id,
         )
 
     return {"ok": True, "was_paused": was_paused}
@@ -4880,6 +5080,11 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "tg_topic_bind": _action_tg_topic_bind,
     "tg_topic_unbind": _action_tg_topic_unbind,
     "tg_topic_list": _action_tg_topic_list,
+    # T-0799: per-message-TYPE destination map (configurable chat_id per type,
+    # defaulting to today's DM behaviour).
+    "msg_route_list": _action_msg_route_list,
+    "msg_route_set": _action_msg_route_set,
+    "msg_route_clear": _action_msg_route_clear,
     # T-0662: human-readable label -> session SID aliases.
     "session_alias_set": _action_session_alias_set,
     "session_alias_remove": _action_session_alias_remove,
@@ -5022,6 +5227,12 @@ ACTION_MODES: dict[str, str] = {
     "tg_topic_bind": "coordinator_only",
     "tg_topic_unbind": "coordinator_only",
     "tg_topic_list": "coordinator_only",
+    # T-0799: the route store is read on the coordinator's own send path (every
+    # automated pager resolves through it) — single writer, coordinator-only
+    # like the binding/topic stores above it.
+    "msg_route_list": "coordinator_only",
+    "msg_route_set": "coordinator_only",
+    "msg_route_clear": "coordinator_only",
     # T-0662: the alias store is GLOBAL (data/_worker/session_aliases.json,
     # not per-project) — single writer, coordinator-only like the bindings
     # store above it.

@@ -562,6 +562,12 @@ def _escalate(cfg: Any, slug: str, data: dict, marker: Path) -> bool:
         cfg, message=body, sid=sid, tg_chat_id=chat_id,
         tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
         group_record=True, do_slim=False,
+        # T-0799: URGENT class — the whole message is "a session is stopped
+        # until you answer". Nothing about `urgent=` changes here: this page is
+        # deliberately non-urgent (a quiet-hours drop leaves the marker pending
+        # so exactly one ping lands when he wakes), and the type only says WHERE
+        # it goes.
+        msg_type="needs_input", route_slug=slug,
     )
     sent = result["sent"]
 

@@ -492,8 +492,11 @@ def _announce(cfg: Any, plan: dict, verdict: dict, *, notify: Any = None) -> Non
         # outbound_log]` would name a project with no more to do with it than
         # any other, which is the call `jobs.oauth_refresh` and
         # `autoupdate_apply` already made. Naming nobody is honest.
-        _slug, project = next(iter((getattr(cfg, "projects", {}) or {}).items()),
-                              ("", None))
+        # T-0799 renamed `_slug` -> `chat_slug`: it is no longer discarded. It
+        # names which project supplied the CHAT, which is the route map to read
+        # — not a claim that this alarm is about that project (see below).
+        chat_slug, project = next(iter((getattr(cfg, "projects", {}) or {}).items()),
+                                  ("", None))
         notify(
             cfg,
             message=headline,
@@ -505,6 +508,15 @@ def _announce(cfg: Any, plan: dict, verdict: dict, *, notify: Any = None) -> Non
             # hours costs nothing the log line and `.liveness.json` do not keep.
             urgent=alarm,
             tg_chat_id=getattr(project, "tg_chat", "") if project else "",
+            # T-0799: two DIFFERENT types out of one call, on the same split the
+            # `urgent=alarm` line above already makes — an alarm about the
+            # messaging path being broken is URGENT class, the ✅ that it came
+            # back is a LOG entry. `route_slug` (not `slug`) for the same reason
+            # `slug=` is deliberately absent: this module is install-wide and
+            # claims no project, but the chat it pages came from `_slug`, so
+            # that is the map to read.
+            msg_type="outbound_decayed" if alarm else "outbound_recovered",
+            route_slug=chat_slug,
         )
     except Exception:  # noqa: BLE001 — the log line already landed
         log.exception("outbound_liveness: could not page the stakeholder")

@@ -586,6 +586,13 @@ def _notify_failure(cfg: Any, *, version: str, step: str, log_tail: str) -> None
             tg_chat_id=chat_id,
             tg_topic_id=_tg_topics.resolve(cfg, "bot-squad", "team_queries"),
             group_record=True,
+            # T-0799: URGENT class — an apply failure leaves the install
+            # half-updated and the banner is the only other recovery surface.
+            # `route_slug` rather than `slug`: T-0724 decided this page names no
+            # project on purpose (it is the install's failure, not any
+            # session's), and `bot-squad` here is only where the chat came from.
+            msg_type="autoupdate_failed",
+            route_slug="bot-squad",
         )
     except Exception:
         log.exception(

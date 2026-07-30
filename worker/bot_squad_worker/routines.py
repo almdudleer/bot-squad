@@ -1244,8 +1244,12 @@ def _monitor_notify(cfg: Any, slug: str, rid: str, text: str) -> bool:
 
         project = cfg.projects.get(slug)
         chat_id = getattr(project, "tg_chat", "") if project else ""
+        # T-0799: URGENT class — a monitor exists BECAUSE someone wanted to know
+        # the moment its threshold moves, and a monitor that went blind is worse
+        # than one that fired. `urgent=True` above is untouched.
         res = _send_stakeholder_dm(cfg, message=text, sid=f"routine:{rid}",
-                                   urgent=True, tg_chat_id=chat_id, slug=slug)
+                                   urgent=True, tg_chat_id=chat_id, slug=slug,
+                                   msg_type="monitor_breach")
         # T-0610: the SSOT no longer raises on an undeliverable page — it
         # returns {ok: False, channel: "none"}. Treat that as not-delivered so
         # the cooldown stays unstamped and the alert retries next tick.

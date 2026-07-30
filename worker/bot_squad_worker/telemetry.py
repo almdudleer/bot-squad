@@ -673,6 +673,12 @@ def _human_tg(cfg: Any, slug: str, text: str, urgent: bool = True) -> None:
             slug=slug,
             tg_chat_id=chat_id, tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
             group_record=True,
+            # T-0799: URGENT class. Both crossings that reach a human here are
+            # "the run stops soon unless you act" — quota projected to exhaust
+            # before EOD, and a 429 throttling right now. (The routine memory
+            # alert never gets here: T-0387 passes human=False.) `urgent` stays
+            # whatever alert_urgent() decided.
+            msg_type="quota_alert",
         )
     except Exception:
         log.exception("telemetry: human page failed (non-fatal): %s", text)

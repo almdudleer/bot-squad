@@ -76,4 +76,39 @@ if [ "$smoke_ok" -ne 1 ]; then
     echo "[staging] FATAL: /api/version never answered within ~90s of recreate" >&2
     exit 22
 fi
+# ── T-0390 PREREQUISITE: the `stt` speech-to-text sidecar ────────────────────
+# `docker compose up -d <named service>` does NOT start unrelated services, so
+# until these lines existed NOTHING on a deploy target ever started `stt` — the
+# service the end-user Telegram bot's voice path calls (D-0006 §1.2, T-0388).
+# It has been alive on the dev box only because someone started it by hand and
+# `restart: unless-stopped` kept it there indefinitely, and THAT is what hid
+# the gap: the voice half works on the machine it was built on and is absent
+# everywhere else, with the local success stopping anyone from noticing.
+#
+# Deliberately NO `docker rm -f stt` first, unlike the app container above.
+# `stt` is a SINGLE SHARED instance for prod + staging (see the block comment
+# in docker-compose.yml), the model costs ~36 s to load, and tearing it down on
+# every deploy would take the other environment's voice path down with it.
+# `up -d` is idempotent: a no-op when the service is already running from the
+# current image, a start when it is absent, a recreate when the image changed.
+docker compose build stt
+docker compose up -d stt
+
+# Prove it actually came up, rather than trusting that the two lines above ran.
+# /health returns 503 until the model is resident (~13-36 s on this host), so
+# this polls for a real 200. The container has no curl; it does have python.
+stt_ok=0
+for _ in $(seq 1 40); do
+    if docker exec stt python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/health', timeout=3).status == 200 else 1)" >/dev/null 2>&1; then
+        stt_ok=1
+        echo "[staging] stt sidecar healthy (model resident)"
+        break
+    fi
+    sleep 3
+done
+if [ "$stt_ok" -ne 1 ]; then
+    echo "[staging] FATAL: stt sidecar never became healthy within ~120s — the Telegram bot's voice path would be dead on this target" >&2
+    exit 23
+fi
+
 echo "[staging] release deployed: $(git rev-parse --short HEAD)"

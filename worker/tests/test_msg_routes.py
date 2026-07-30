@@ -603,9 +603,16 @@ def _untyped_ssot_calls(module: str, src: str) -> list[tuple[str, int]]:
             if isinstance(child, ast.Call):
                 name = (child.func.attr if isinstance(child.func, ast.Attribute)
                         else getattr(child.func, "id", ""))
-                # `notify(...)` — outbound_liveness imports the SSOT under an
-                # alias so the module can be driven with a fake in tests.
-                if name in ("_send_stakeholder_dm", "notify"):
+                # `notify(...)` counts ONLY in outbound_liveness, which imports
+                # the SSOT under that alias so the module can be driven with a
+                # fake. Scoping it to that one module rather than matching the
+                # name everywhere: `notify` is an obvious name for an unrelated
+                # local, and a guard that flagged one would block a peer for a
+                # send it has nothing to do with.
+                aliases = {"_send_stakeholder_dm"}
+                if module == "outbound_liveness.py":
+                    aliases.add("notify")
+                if name in aliases:
                     if not any(kw.arg == "msg_type" for kw in child.keywords):
                         if (module, func) not in UNTYPED_SEND_ALLOWED:
                             offenders.append((func, child.lineno))

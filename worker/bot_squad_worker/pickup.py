@@ -296,8 +296,14 @@ def classify_ticket(
     # is the fallback for the handful of mds predating it. Neither present is an
     # explicit UNKNOWN, never a silent "fresh" — an absent timestamp reads
     # identically to a real negative otherwise.
-    last = _parse_iso(meta.get("updated")) or _parse_iso(meta.get("created")) \
-        or _parse_iso(meta.get("created_at"))
+    # (An ``or`` chain would be wrong here: epoch 0 is falsy, so a 1970 timestamp
+    # would read as absent — no ticket carries one, but a numeric ``or`` is a trap
+    # left for the next reader.)
+    last: Optional[float] = None
+    for key in ("updated", "created", "created_at"):
+        last = _parse_iso(meta.get(key))
+        if last is not None:
+            break
     if last is None:
         idle_days: Optional[float] = None
         sanity.append("activity-unknown")

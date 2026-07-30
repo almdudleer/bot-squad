@@ -937,6 +937,24 @@ for case in unwired missing malformed wrong_script; do
     else bad "a $case clone was silently unguarded — the removal is invisible" "$OUT"; fi
 done
 
+# ★ THE STALE-PATH CASE, and it is the one a name-only check misses: the entry
+# is present and names the right script, but the path does not resolve. A RENAME
+# produces exactly this, and renaming the guard mid-ticket is how watchrobot
+# disarmed themselves. Checking that the setting MENTIONS the hook proves WHERE,
+# not WHICH.
+write_settings "{\"hooks\": {\"PreToolUse\": [{\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", \"command\": \"$GW/scripts/hooks/bsq-pretooluse-git-RENAMED.py\"}]}]}}"
+OUT="$(REPO_PATH="$GW" bash "$GW/harness.sh" 2>&1)"
+if printf '%s' "$OUT" | grep -q 'WIRED TO A PATH THAT DOES NOT RUN'; then
+    ok "a wired-but-RENAMED guard is called out (the property that matters, not the easy one)"
+else bad "a stale hook path read as armed — a rename would disarm the clone silently" "$OUT"; fi
+
+# … and the same entry with the path restored must go quiet again, or the
+# stale-path arm above would pass for a check that simply always warns.
+write_settings "{\"hooks\": {\"PreToolUse\": [{\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", \"command\": \"$GW/scripts/hooks/bsq-pretooluse-git.py\"}]}]}}"
+OUT="$(REPO_PATH="$GW" bash "$GW/harness.sh" 2>&1)"
+if [ -z "$OUT" ]; then ok "…and a resolvable path is silent again (the stale arm is not vacuous)"
+else bad "the check warns on a perfectly good wiring" "$OUT"; fi
+
 # And when the guard is not installed at all there is nothing to report — the
 # check must not nag every clone in the fleet that never had it.
 rm -rf "$GW/scripts"

@@ -874,20 +874,44 @@ fi
 # to report. Arming it everywhere is a separate, larger decision — see
 # scripts/hooks/README-git-guards.md.
 if [ -n "$REPO_PATH" ] && [ -x "$REPO_PATH/scripts/hooks/bsq-worktree-guard.sh" ]; then
-    _guard_wired=$(python3 - "$REPO_PATH/.claude/settings.json" 2>/dev/null <<'GUARD_EOF' || echo unknown
-import json, sys
+    # ⚠ CHECK THE PROPERTY THAT MATTERS, NOT THE ONE THAT IS EASY TO CHECK.
+    # "a PreToolUse entry mentioning bsq-pretooluse-git exists" is the easy one,
+    # and it is WHERE rather than WHICH: settings.json can name a path that no
+    # longer exists, which is precisely how watchrobot disarmed themselves —
+    # they RENAMED the guard mid-ticket and nothing noticed. So the command has
+    # to resolve to a file that is actually there and actually executable. This
+    # still stops short of proving the hook REFUSES anything; that costs a
+    # subprocess on every session start, and it is what
+    # scripts/hooks/test_worktree_guard.sh is for.
+    _guard_wired=$(python3 - "$REPO_PATH/.claude/settings.json" 2>/dev/null <<'GUARD_EOF' || echo no
+import json, os, sys
 try:
     hooks = (json.load(open(sys.argv[1])).get("hooks") or {}).get("PreToolUse") or []
 except Exception:
     print("no"); raise SystemExit(0)
 for entry in hooks:
     for h in (entry or {}).get("hooks") or []:
-        if "bsq-pretooluse-git" in str((h or {}).get("command") or ""):
-            print("yes"); raise SystemExit(0)
+        cmd = str((h or {}).get("command") or "")
+        if "bsq-pretooluse-git" not in cmd:
+            continue
+        path = cmd.split()[0] if cmd.split() else ""
+        print("yes" if os.access(path, os.X_OK) else "stale:%s" % path)
+        raise SystemExit(0)
 print("no")
 GUARD_EOF
 )
-    if [ "$_guard_wired" = "no" ]; then
+    if [ "${_guard_wired#stale:}" != "$_guard_wired" ]; then
+        print_section "⚠ WORKTREE GUARD IS WIRED TO A PATH THAT DOES NOT RUN (T-0826)"
+        cat <<GUARD_STALE
+$REPO_PATH/.claude/settings.json points PreToolUse at
+  ${_guard_wired#stale:}
+which is missing or not executable — so the hook fails and NOTHING refuses
+\`git stash\` / \`reset --hard\` / \`checkout -- .\` / \`restore .\` / \`clean -fd\`.
+A RENAME does this silently; it is how watchrobot disarmed themselves mid-ticket.
+Point it at $REPO_PATH/scripts/hooks/bsq-pretooluse-git.py and re-run
+  bash $REPO_PATH/scripts/hooks/test_worktree_guard.sh
+GUARD_STALE
+    elif [ "$_guard_wired" = "no" ]; then
         print_section "⚠ WORKTREE GUARD IS INSTALLED BUT NOT ARMED (T-0826)"
         cat <<GUARD_WARN
 scripts/hooks/bsq-worktree-guard.sh is present, but $REPO_PATH/.claude/settings.json

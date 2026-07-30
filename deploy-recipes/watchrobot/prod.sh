@@ -44,20 +44,15 @@ docker compose up -d signal-tracker
 # mid-warmup (curl rc=22) on EVERY prod deploy though build+swap succeeded
 # (5 false .fail.22 on 2026-06-11 alone). Poll ~90s before declaring failure,
 # matching staging.sh. (T-0203)
-smoke_ok=0
-for _ in $(seq 1 30); do
-    if curl -fsS -o /dev/null https://signal-tracker.dev.uzinvestapi.com/api/version; then
-        smoke_ok=1
-        echo "[prod] smoke /api/version OK"
-        break
-    fi
-    sleep 3
-done
-if [ "$smoke_ok" -ne 1 ]; then
-    echo "[prod] FATAL: /api/version never answered within ~90s of recreate" >&2
-    exit 22
-fi
-
+# ORDERING IS LOAD-BEARING (T-0390, fixed 2026-07-30): this block sits BEFORE
+# the app's /api/version smoke gate, not after it. It was after it for one
+# deploy, and that deploy proved why it cannot be: the smoke gate false-failed
+# on a loaded box (load avg ~50, three concurrent docker builds), exited 22,
+# and SKIPPED the sidecar entirely — the app came up fine and voice intake was
+# silently absent, which is the exact failure this block exists to prevent,
+# reintroduced one layer up by where the block was placed. The sidecar is
+# independent of the app, so nothing about the app's readiness should be able
+# to strand it. The app is already recreated above and warms up while this runs.
 # ── T-0390 PREREQUISITE: the `stt` speech-to-text sidecar ────────────────────
 # `docker compose up -d <named service>` does NOT start unrelated services, so
 # until these lines existed NOTHING on a deploy target ever started `stt` — the
@@ -92,5 +87,20 @@ if [ "$stt_ok" -ne 1 ]; then
     echo "[prod] FATAL: stt sidecar never became healthy within ~120s — the Telegram bot's voice path would be dead on this target" >&2
     exit 23
 fi
+
+smoke_ok=0
+for _ in $(seq 1 30); do
+    if curl -fsS -o /dev/null https://signal-tracker.dev.uzinvestapi.com/api/version; then
+        smoke_ok=1
+        echo "[prod] smoke /api/version OK"
+        break
+    fi
+    sleep 3
+done
+if [ "$smoke_ok" -ne 1 ]; then
+    echo "[prod] FATAL: /api/version never answered within ~90s of recreate" >&2
+    exit 22
+fi
+
 
 echo "[prod] release deployed: $(git rev-parse --short HEAD)"

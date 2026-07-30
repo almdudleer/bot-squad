@@ -810,6 +810,29 @@ def autopilot_tick(cfg: Config) -> None:
             log.exception("autopilot_tick: unhandled error for project %s", slug)
 
 
+def drive_stop_tick(cfg: Config) -> None:
+    """T-0800: per-project drive STOPPING-CONDITION pass — «stall alert /
+    alert me when done».
+
+    Announces, once per idle episode, that a project's drive has run out of
+    work («ВСЁ СДЕЛАНО, ПРОВЕРЯЙ, МЫ ПРОСТАИВАЕМ») so the idle time becomes his
+    decision rather than a silent gap. Opt-in per project: :func:`drive_stop.tick`
+    reads ``on_stop`` from the pace config FIRST and returns before scanning the
+    board when it is not ``alert``, so this costs one small JSON read per
+    project per minute until he sets the mode. The alert itself is edge-
+    triggered (fires on the transition INTO stopped, re-arms when the scope is
+    non-empty again), so a 60s cadence cannot turn it into a repeating page.
+    Per-project errors are caught inside the sweep. Kill switch:
+    ``BOT_SQUAD_DRIVE_STOP_ALERT=0``.
+    """
+    from bot_squad_worker import drive_stop as _drive_stop
+
+    try:
+        _drive_stop.drive_stop_tick(cfg)
+    except Exception:
+        log.exception("drive_stop_tick error")
+
+
 def constant_team_tick(cfg: Config) -> None:
     """T-0154: per-project constant-team maintenance pass.
 

@@ -23,6 +23,7 @@ from bot_squad_worker.jobs import (
     park_tick,
     recovery_tick,
     constant_team_tick,
+    drive_stop_tick,
     task_lifecycle_tick,
     deploy_monitor_one,
     drift_check_tick,
@@ -546,6 +547,24 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="constant_team",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # drive_stop_tick: T-0800 — the drive stopping-condition axis / stall alert
+    # («ВСЁ СДЕЛАНО, ПРОВЕРЯЙ, МЫ ПРОСТАИВАЕМ»). 60s so the news is fresh; the
+    # alert is EDGE-triggered and latched per idle episode, so the cadence
+    # decides how quickly he hears it and never how often. Opt-in per project
+    # (`on_stop: alert` in the pace config) and read cheaply first, so this is a
+    # no-op for a project that has not set it. max_instances=1 + coalesce keeps
+    # a slow send from overlapping the next pass and double-announcing.
+    sched.add_job(
+        drive_stop_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="drive_stop",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

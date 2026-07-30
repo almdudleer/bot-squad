@@ -159,6 +159,16 @@ TYPES: dict[str, MsgType] = {
         "outbound_decayed", URGENT,
         "the outbound recording path itself decayed — messages may be lost",
     ),
+    # T-0800 («ВСЁ СДЕЛАНО, ПРОВЕРЯЙ, МЫ ПРОСТАИВАЕМ»). URGENT by this module's
+    # own definition rather than by the volume it will have: "work is stopped
+    # unless a human acts" is literally what the message says. It is also the
+    # first registered type that only exists BECAUSE the map does — he asked for
+    # «какой-то оперативный канал», and pointing this one type somewhere is the
+    # whole answer. Emitter: `drive_stop._send`.
+    "drive_stopped": MsgType(
+        "drive_stopped", URGENT,
+        "the project's drive ran out of work — nothing is being taken until you look",
+    ),
     # --- LOG: a record to read when he chooses to ----------------------------
     "deploy_status": MsgType(
         "deploy_status", LOG,

@@ -4777,19 +4777,35 @@ def test_junk_caption_does_not_lose_the_message(tmp_path, monkeypatch):
     assert captured["json"]["attachments"] == [{"type": "photo", "file_id": "FULL_1280"}]
 
 
-# --- T-0830 / D-0069 — the intake call site for the drive-SCOPE ladder ------
+# --- T-0848 — NO message sets the drive scope any more ---------------------
 #
-# TL p534 ruled this wiring into T-0830 (14:58Z): a setter nothing calls is not
-# a delivered lane, and recognition that cannot take effect is the same silence
-# he complained about. `_maybe_switch_drive_scope` is the ONLY production caller
-# of dispatch.apply_drive_scope.
+# T-0830 wired a drive-SCOPE recogniser into both inbound paths here. It is
+# REMOVED (see dispatch.py's tombstone). These are the arms that hold the
+# removal at the seam where the misfire actually happened — the intake path, not
+# the classifier — because that is the only place "his message changed a
+# project setting" can be observed end to end.
+#
+# ⚠ THE OLD DoD's VERIFICATION PROSE IS SUPERSEDED. It asked for a green control
+# where «закрыть всё в open» "must still set". Under his ruling that is exactly
+# what must NOT happen any more: automatic word-recognition is gone, so a real
+# command is as inert as a UI label. `test_a_real_scope_command_also_no_longer_
+# fires` is the arm that encodes the ruling rather than the superseded remedy —
+# if you are tempted to "fix" it into a switch, read the ruling first.
 
-# His words, 2026-07-30T07:54:16Z, verbatim. HUMAN-ONLY.
-_HIS_SENTENCE = (
-    "В третьих, нужно более чёткое понимание для меня, какой режим драйва щас "
-    "стоит, я просил закончить всё что в опен, но видимо это не "
-    "интерпретировалось как переключить режим драйва"
+# HIS REAL MESSAGE, 2026-07-30T20:37:21Z, verbatim. HUMAN-ONLY — do not tidy it,
+# do not "fix" the trailing comma. This exact string set the scope to in_progress
+# two seconds after he sent it, while he was asking for a SMALLER SUMMARY BAR.
+# The words that matched were the bar's own labels: "IN PROGRESS" (status
+# target) and "DRIVE" (English directive cue).
+_HIS_UI_LAYOUT_MESSAGE = (
+    "а вот верхняя плашка где IN PROGRESS LIVE SESSIONS DRIVE MODE карточки, "
+    "может быть покомпактнее,"
 )
+
+# His real scope instruction, 2026-07-30T20:19Z — the one T-0830 caught
+# CORRECTLY. Kept because the interesting assertion is now that this one is
+# inert too.
+_HIS_REAL_COMMAND = "закрыть всё в open"
 
 
 def _scope_cfg(tmp_path, monkeypatch):
@@ -4814,9 +4830,14 @@ def _update(text: str) -> dict:
             "message": {"chat": {"id": 12345}, "from": _from(), "text": text}}
 
 
-def test_inbound_scope_instruction_switches_and_confirms(tmp_path, monkeypatch):
-    """THE end-to-end acceptance test: his recorded sentence arrives on the real
-    intake path, the scope is SET, and he is TOLD."""
+def test_his_ui_layout_message_does_not_touch_the_scope(tmp_path, monkeypatch):
+    """THE REGRESSION ARM — his real 20:37:21Z message, replayed on the real
+    intake path.
+
+    Before T-0848 this set scope=in_progress and emitted «Режим драйва: In
+    Progress.» two seconds later, overwriting a setting he had deliberately made
+    18 minutes earlier. He was asking for the summary bar to be smaller.
+    """
     from bot_squad_worker import pace
 
     cfg = _scope_cfg(tmp_path, monkeypatch)
@@ -4824,40 +4845,31 @@ def test_inbound_scope_instruction_switches_and_confirms(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "_channel_notify",
                         lambda c, chat, text, **kw: echoes.append(text))
 
-    TL.handle_update(cfg, _update(_HIS_SENTENCE))
+    result = TL.handle_update(cfg, _update(_HIS_UI_LAYOUT_MESSAGE))
 
-    block = pace.read_drive(cfg, "test-project")
-    assert block["scope"] == "open_reopened"
-    assert block["configured"] is True
-    assert block["set_by"] == "tg:gu_alexey"
-    assert block["source_text"] == "закончить всё что в опен"
-
-    # DoD 4 — the confirmation. Silence here IS the defect he reported.
-    assert echoes, "recognised switch produced NO confirmation"
-    assert any(t == "Режим драйва: Open / Reopened." for t in echoes), echoes
-
-
-def test_inbound_scope_switch_does_not_intercept_routing(tmp_path, monkeypatch):
-    """NON-INTERCEPTING. «закончить всё что в опен» is a scope switch AND work
-    he wants done — the message must still route to the attendant. T-0666 had
-    already removed one intercepting confirm prompt from this path."""
-    cfg = _scope_cfg(tmp_path, monkeypatch)
-    ensured = []
-    monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda *a, **k: ensured.append(a) or True)
-    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
-
-    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
-
+    assert pace.read_drive(cfg, "test-project")["configured"] is False
+    # And no confirmation — «Режим драйва: …» is what made the false setting
+    # look like an acknowledged instruction in the feed.
+    assert not any("Режим драйва" in t for t in echoes), echoes
+    # Still routed: the removal must not cost the message itself. It is a real
+    # UI request (T-0847) and must still reach the attendant.
     assert result["action"] == "route"
-    assert result["slug"] == "test-project"
-    assert ensured, "the attendant was not woken — the switch swallowed the message"
 
 
-def test_inbound_passing_remark_switches_nothing_and_stays_silent(tmp_path, monkeypatch):
-    """DoD 6 at the call site. A message that merely MENTIONS a status must not
-    re-scope the project — and must not emit a confirmation either, or he learns
-    to ignore them."""
+def test_a_real_scope_command_also_no_longer_fires(tmp_path, monkeypatch):
+    """THE ARM THAT ENCODES HIS RULING, and the one that looks wrong at a glance.
+
+    «закрыть всё в open» is a genuine scope instruction and T-0830 caught it
+    correctly on live traffic at 20:19Z. It is inert now ON PURPOSE:
+
+        «не надо срабатывать в контексте в целом на слова автоматически,
+         я могу явно попросить у user-сессии всё»   — 2026-07-30T20:42:37Z
+
+    The removal is not "recognise fewer things"; it is "recognise nothing". A
+    classifier that still fired on the clear cases would keep the whole failure
+    mode, because the clear cases and his UI vocabulary are the same words.
+    He sets it by asking the attendant, which runs `bsq pace drive` explicitly.
+    """
     from bot_squad_worker import pace
 
     cfg = _scope_cfg(tmp_path, monkeypatch)
@@ -4865,135 +4877,65 @@ def test_inbound_passing_remark_switches_nothing_and_stays_silent(tmp_path, monk
     monkeypatch.setattr(TL, "_channel_notify",
                         lambda c, chat, text, **kw: echoes.append(text))
 
-    TL.handle_update(cfg, _update("кстати T-0719 всё ещё в опен, посмотри"))
+    result = TL.handle_update(cfg, _update(_HIS_REAL_COMMAND))
 
     assert pace.read_drive(cfg, "test-project")["configured"] is False
     assert not any("Режим драйва" in t for t in echoes), echoes
-
-
-def test_inbound_scope_failure_never_breaks_intake(tmp_path, monkeypatch):
-    """Best-effort by construction: the durable record and the routing have
-    already happened when this runs, so a setting must never cost them."""
-    cfg = _scope_cfg(tmp_path, monkeypatch)
-    from bot_squad_worker import dispatch as _dispatch
-    monkeypatch.setattr(_dispatch, "apply_drive_scope",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
-
-    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
-
     assert result["action"] == "route"
 
 
-def test_inbound_confirmation_replies_in_place_to_the_same_topic(tmp_path, monkeypatch):
-    """The confirmation is a reply-in-place: it spells its own destination and
-    passes NO msg_type, so no route map can redirect it away from the topic he
-    typed in."""
-    cfg = _scope_cfg(tmp_path, monkeypatch)
-    calls = []
-    monkeypatch.setattr(TL, "_channel_notify",
-                        lambda c, chat, text, **kw: calls.append((chat, kw)))
+def test_a_deliberate_setting_survives_both_messages(tmp_path, monkeypatch):
+    """THE GREEN CONTROL AND THE SURVIVAL ARM IN ONE.
 
-    update = _update(_HIS_SENTENCE)
-    update["message"]["message_thread_id"] = 77
-    TL.handle_update(cfg, update)
+    Green half: the EXPLICIT path still writes — `pace.set_drive` is what
+    `bsq pace drive --scope … --source-text …` calls, and it records HIS words
+    in ``source_text`` with the executing session in ``set_by``. If this half
+    ever goes red the removal has taken the remaining path with it and he can no
+    longer set the scope at all.
 
-    assert calls, "no confirmation was sent"
-    chat, kw = calls[-1]
-    assert chat == "12345"
-    assert kw.get("thread_id") == 77
-    assert "msg_type" not in kw
-
-
-def test_inbound_forwarded_confirmation_does_not_reswitch(tmp_path, monkeypatch):
-    """THE ECHO LOOP, closed at the call site.
-
-    Our own words DO come back on this channel — echo_guard exists because that
-    happened, through _handle_topic_bound, one of the two paths this ladder is
-    wired to. Under the CHANNEL-authority rule a re-entering echo is authorised,
-    which is exactly what makes it dangerous: nothing else rejects it.
-
-    Guard is composed-by-sender, which is class-independent — it catches any of
-    our text coming back, not one string's shape.
+    Survival half: with that setting in place, both messages above leave every
+    field untouched — value, provenance and timestamp. This is what "never
+    silently overwrite an explicit setting" degrades to once nothing can write:
+    the property holds because there is no writer, not because a guard declined.
     """
-    from bot_squad_worker import pace, echo_guard
+    from bot_squad_worker import pace
 
     cfg = _scope_cfg(tmp_path, monkeypatch)
     monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
-    monkeypatch.setattr(
-        echo_guard, "classify_inbound",
-        lambda c, m, **k: {"author": echo_guard.ECHO_AUTHOR,
-                           "forwarded_from": echo_guard.ECHO_ORIGIN,
-                           "reason": "outbound-match"},
+
+    before = pace.set_drive(
+        cfg, "test-project", scope="open_reopened",
+        set_by="S-almdudleer-operator-p548", source_text=_HIS_REAL_COMMAND,
     )
+    assert before["scope"] == "open_reopened"
+    assert before["source_text"] == _HIS_REAL_COMMAND
 
-    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
+    for text in (_HIS_UI_LAYOUT_MESSAGE, _HIS_REAL_COMMAND):
+        TL.handle_update(cfg, _update(text))
 
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
-    # ...and the message still routes. The guard suppresses the SWITCH only.
-    assert result["action"] == "route"
-
-
-def test_inbound_forward_of_another_human_does_not_switch(tmp_path, monkeypatch):
-    """He did not write it, so it is not his instruction — even though the
-    author stays "user" (a human did compose it, just not the sender)."""
-    from bot_squad_worker import pace, echo_guard
-
-    cfg = _scope_cfg(tmp_path, monkeypatch)
-    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
-    monkeypatch.setattr(
-        echo_guard, "classify_inbound",
-        lambda c, m, **k: {"author": "user", "forwarded_from": "Someone Else",
-                           "reason": "forwarded"},
-    )
-
-    TL.handle_update(cfg, _update(_HIS_SENTENCE))
-
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
+    # ALL FOUR FIELDS, and that is not belt-and-braces — measured. Against the
+    # un-removed code this arm goes red on `set_by`, NOT on `scope`: the UI
+    # message set in_progress and the command right after set open_reopened
+    # back, so the VALUE ends up correct again and only the provenance still
+    # carries the overwrite. A two-field version of this test would have passed
+    # over a project that was re-scoped twice. That is T-0848's whole finding in
+    # miniature — the record looked right while the wrong thing had happened.
+    after = pace.read_drive(cfg, "test-project")
+    assert after["scope"] == "open_reopened", "his UI message re-scoped the project"
+    assert after["source_text"] == _HIS_REAL_COMMAND
+    assert after["set_by"] == "S-almdudleer-operator-p548"
+    assert after["set_at"] == before["set_at"], "the setting was rewritten"
 
 
-def test_inbound_echo_guard_failure_does_not_switch(tmp_path, monkeypatch):
-    """Fail CLOSED on the authority check specifically: if we cannot tell
-    whether he composed it, we do not re-scope the project. (The rest of the
-    helper fails open — it must never cost the record or the routing.)"""
-    from bot_squad_worker import pace, echo_guard
+def test_the_intake_path_has_no_drive_scope_writer_left(tmp_path, monkeypatch):
+    """Structural companion to the behavioural arms above.
 
-    cfg = _scope_cfg(tmp_path, monkeypatch)
-    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
-    monkeypatch.setattr(
-        echo_guard, "classify_inbound",
-        lambda c, m, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-
-    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
-
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
-    assert result["action"] == "route"
-
-
-@pytest.mark.parametrize("verdict", [
-    {},                                          # empty
-    None,                                        # not a dict at all
-    {"forwarded_from": "", "reason": "x"},       # author key missing
-    {"author": None, "forwarded_from": ""},      # author explicitly unknown
-    {"author": "system:some-future-class", "forwarded_from": ""},
-    "not-a-dict",
-])
-def test_inbound_unknown_echo_verdict_is_no_switch(tmp_path, monkeypatch, verdict):
-    """An UNKNOWN verdict must never read as permission.
-
-    The gate is a positive ALLOWLIST — author exactly "user" AND no forward
-    provenance — not a denylist of known-bad classes. So a missing key, a None,
-    a shape change, or an author class invented after this code was written all
-    land on NO SWITCH rather than falling through to the permissive branch.
-    This is the one place the fail-closed could quietly become fail-open.
+    They would still pass if the helper survived but happened to classify these
+    two strings as no_change — which is precisely the state T-0830 was already
+    in for every message its tests tried. Assert the seam is GONE, so a
+    reintroduction cannot hide behind a well-chosen fixture.
     """
-    from bot_squad_worker import pace, echo_guard
-
-    cfg = _scope_cfg(tmp_path, monkeypatch)
-    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
-    monkeypatch.setattr(echo_guard, "classify_inbound", lambda c, m, **k: verdict)
-
-    result = TL.handle_update(cfg, _update(_HIS_SENTENCE))
-
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
-    assert result["action"] == "route"
+    assert not hasattr(TL, "_maybe_switch_drive_scope"), (
+        "the drive-scope call site is back — removed by T-0848 on the "
+        "stakeholder's ruling; see dispatch.py's tombstone"
+    )

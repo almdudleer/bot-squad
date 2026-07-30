@@ -18,20 +18,11 @@ the **same initiative** as the task, and below the context-headroom cap
 Among eligible candidates the one with the **most headroom** (lowest context %)
 wins; with none, spawn fresh (a clean context is the safe default).
 
-This module also hosts the two message classifiers, which are SIBLINGS and stay
-separate objects (T-0823's named failure is merging them):
-
-* :func:`classify_drive_mode` (T-0656) — how much AUTHORITY one message grants;
-* :func:`classify_drive_scope` (T-0830) — which standing SCOPE it selects.
-
-**Who may switch the drive scope (T-0830 DoD 7, T-0655 precedent).** Only the
-stakeholder's own words. :func:`classify_drive_scope` is pure and merely reports
-what a text selects; :func:`apply_drive_scope` is the sole writer and refuses
-any ``author`` other than :data:`STAKEHOLDER_AUTHOR` — the scope is a standing
-per-project setting that redirects every session's work, so an arbitrary session
-must not be able to re-scope the project by uttering (or quoting) a phrase.
-An operator sets it explicitly through ``bsq pace``, which is a considered act
-against a named value rather than a sentence containing a status word.
+This module also hosts :func:`classify_drive_mode` (T-0656) — how much AUTHORITY
+one message grants. It has no sibling: the drive-SCOPE recogniser that used to
+sit beside it was RETIRED by T-0848; see the tombstone below the classifier for
+why, and read it before proposing anything that infers a standing setting from
+his prose.
 """
 from __future__ import annotations
 
@@ -650,384 +641,65 @@ def classify_drive_mode(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# T-0830 / D-0069 — drive SCOPE: recognise a scope instruction in his own words.
+# RETIRED — the drive-SCOPE recogniser (T-0830 L3, shipped 2026-07-30 17:41Z,
+# removed by T-0848 the same evening). ~380 lines lived here:
+# classify_drive_scope / apply_drive_scope / drive_scope_confirmation, the
+# directive-cue and status-target patterns, and STAKEHOLDER_AUTHOR.
 #
-# SIBLING of classify_drive_mode, deliberately NOT merged into it. The two
-# answer different questions about the same message:
+# T-0830 WAS BUILT TO SPEC AND WORKED AS DESIGNED. Its DoD 6 named this exact
+# hazard ("a ladder that fires on any status word will silently re-scope the
+# project off a passing remark"), TL p534 flagged it during the build, and the
+# lane answered it with a real rule: a switch needed a DIRECTIVE cue AND a
+# STATUS target in the SAME sentence, not negated, not a question, exactly one
+# value. That rule held against every passing remark the tests could invent, and
+# on live traffic at 2026-07-30T20:19Z it correctly caught «закрыть всё в open».
 #
-#   classify_drive_mode  (T-0656) — how much AUTHORITY does this message grant?
-#                                   record_only / do_all / bounded / ambiguous.
-#                                   Per-REQUEST, decides what to do with THIS
-#                                   message.
-#   classify_drive_scope (T-0830) — which SCOPE does this message select?
-#                                   open_reopened / in_progress / all.
-#                                   Sets a STANDING per-project setting that
-#                                   changes what the whole project works on.
+# WHAT KILLED IT, 18 minutes later (T-0848). He sent a UI layout request:
 #
-# Merging them makes one object that is half a parser and half a setting, which
-# is the exact failure T-0823 names. They compose instead: a record-only message
-# can never switch the scope (see RECORD_ONLY_PHRASES below).
+#     «а вот верхняя плашка где IN PROGRESS LIVE SESSIONS DRIVE MODE карточки,
+#      может быть покомпактнее,»
 #
-# THE RECORDED MISS this exists to fix, stakeholder 2026-07-30T07:54:16Z:
+# and two seconds later the scope silently changed to in_progress. Every half of
+# the co-occurrence rule was satisfied by the SUMMARY BAR'S OWN LABELS: "IN
+# PROGRESS" is the status target, "DRIVE" is the English directive cue, and a
+# comma is not a sentence terminator — deliberately, because «закончи всё, что в
+# опен» had to survive. The classifier was not sloppy; it was correct and still
+# wrong, because he types his product's vocabulary and his commands into the same
+# channel and the words are the same words.
 #
-#     «я просил закончить всё что в опен, но видимо это не интерпретировалось
-#      как переключить режим драйва»
-#     (I asked to finish everything in Open, but apparently that was not
-#      interpreted as switching the drive mode.)
+# ★ THE PART WORTH KEEPING. `bsq pace show` then rendered:
 #
-# He issued a scope instruction in the vocabulary of the four modes and the
-# system did not recognise it as one. That sentence is pinned verbatim in
-# test_dispatch.py and is this ladder's acceptance test.
+#     scope: in_progress — set 2026-07-30 20:37 by tg:gu_dc8262b6cea9098d98e04d7e
+#            from «IN PROGRESS LIVE SESSIONS DRIVE»
 #
+# Every field TRUE. He is that TG id, he did type those words, the timestamp is
+# right. T-0828's fix — provenance belongs to the REQUEST, not the RESULT — was
+# working exactly as designed, and that is what gave a misclassification a veneer
+# of auditability: a reader checking "who set this and on what basis" gets a
+# clean sourced answer and stops. Correct provenance proves the WORDS are his; it
+# cannot prove the CLASSIFICATION was right, and the surface presents the two
+# claims identically. Any future feature that infers intent from his prose
+# reproduces this trap — the provenance display will not catch it for you.
+#
+# HIS RULING, 2026-07-30T20:42:37Z, verbatim, replying to the misfire report:
+#
+#     «не надо срабатывать в контексте в целом на слова автоматически, я могу
+#      явно попросить у user-сессии всё»
+#
+# So the remedy is REMOVAL, not a smarter classifier. NOTHING in this repo may
+# infer a drive scope from his ordinary messages. The scope is set only by an
+# EXPLICIT act against a named value — `bsq pace drive --scope … --source-text
+# …` — which the attendant runs when he asks in so many words, recording HIS
+# words in `source_text` and the executing session in `set_by`. That split keeps
+# T-0828's guarantee without the inference: the provenance line still shows what
+# he said, and it no longer claims a machine understood it.
+#
+# Held by tests, not by this comment (`prose is not a control`):
+#   * test_dispatch.py::test_no_automatic_drive_scope_recogniser_exists
+#   * test_tg_listener.py::test_his_ui_layout_message_does_not_touch_the_scope
+#   * test_tg_listener.py::test_a_real_scope_command_also_no_longer_fires
+#   * test_tg_listener.py::test_a_deliberate_setting_survives_both_messages
 # ---------------------------------------------------------------------------
-# WHO MAY SWITCH IT (D-0069; T-0655 precedent). DECIDED RULE:
-#
-#   **Only the stakeholder's own words may switch the scope by phrase.**
-#
-# ``classify_drive_scope`` is pure and answers only "does this text select a
-# scope". ``apply_drive_scope`` is the only writer and REFUSES unless its
-# ``author`` argument is :data:`STAKEHOLDER_AUTHOR`. Rationale: the scope is a
-# standing per-project setting that redirects every session's work, so letting
-# an arbitrary session re-scope the project by uttering a phrase is a privilege
-# escalation by quotation — a dev peer message that quotes his sentence (this
-# module's own docstring quotes it) must not re-scope the project. The shipped
-# precedent is ``sessions.set_drive``, operator-role-only for the same class of
-# reason (T-0655).
-#
-# The escape hatch is deliberate and NOT a phrase: an operator sets the scope
-# explicitly through L1's ``bsq pace`` CLI surface, which is a considered act
-# against a named value, not a sentence that happened to contain a status word.
-# ---------------------------------------------------------------------------
-
-#: The only author whose phrasing may switch the scope. See the block above.
-STAKEHOLDER_AUTHOR = "stakeholder"
-
-# --- the two halves a scope instruction must have -------------------------
-#
-# THE SUPPRESSION RULE, stated (DoD 6 — "the harder half"). A ladder that fires
-# on any status word silently re-scopes the whole project off a passing remark
-# ("T-0719 is still open"), which is WORSE than the miss it replaces. So a
-# status word alone never switches anything. A switch requires ALL of:
-#
-#   1. a DIRECTIVE cue — an imperative or infinitive verb of the "get it done"
-#      family. Past-tense and third-person report forms are deliberately absent
-#      from the set, so "closed it yesterday" carries no cue at all;
-#   2. a STATUS target — a status word in a BUCKET position («в опен», "in
-#      progress", "включая backlog"), not as a predicate adjective. "T-0719 is
-#      still open" has the word but not the position;
-#   3. both in the SAME sentence. Sentences are split on terminators only, never
-#      on commas — «закончи всё, что в опен» is one instruction and comma-
-#      splitting would lose exactly the phrasing this ticket exists to catch;
-#   4. that sentence is not a question, not negated, and the message carries no
-#      record-only phrase;
-#   5. exactly ONE scope value matched across the message. Two different values
-#      (his own four-bullet spec message lists three) is a description of the
-#      modes, not a selection of one.
-#
-# Any failure of 1-5 is NO CHANGE, never a guess.
-
-# Imperative / infinitive only. NO past-tense or report forms — that absence is
-# what makes "closed it yesterday" and «закрыл всё что было в опен» inert.
-_DIRECTIVE_CUE = _re.compile(
-    r"\b(?:"
-    # RU — infinitive + imperative
-    r"закончить|закончи(?:те)?|заканчивать|заканчивай(?:те)?|"
-    r"закрыть|закрой(?:те)?|закрывать|закрывай(?:те)?|"
-    r"доделать|доделай(?:те)?|"
-    r"добить|добей(?:те)?|"
-    r"разгрести|разгреби(?:те)?|"
-    r"переключи(?:ть|сь|те)?|"
-    r"займись|заняться|"
-    r"дожать|дожми|поднажать|поднажми|"
-    # EN — bare imperative / infinitive
-    r"finish|close|clear|complete|wrap\s+up|"
-    r"switch|focus|drive|work\s+on|"
-    r"do\s+(?:all|everything)"
-    r")\b",
-    _re.IGNORECASE,
-)
-
-# Negation sitting immediately before a directive cue. Checked over the text
-# just left of the cue, so «не закрывай» and "don't finish" are inert.
-_NEGATION_BEFORE_CUE = _re.compile(
-    r"(?:\bне\s+(?:надо\s+|нужно\s+|стоит\s+)?|"
-    r"\b(?:don'?t|do\s+not|never|no\s+need\s+to)\s+)$",
-    _re.IGNORECASE,
-)
-
-# STATUS targets, in BUCKET position. Order matters only for readability; every
-# pattern is tried and a message matching two different scopes is a conflict.
-#
-# `в` is spelled with an explicit \s+ (never \s*) so it cannot be the `в` inside
-# another word; English "in progress" is inherently prepositional, which is why
-# rule 1 (the directive cue) is what suppresses "why is this in progress".
-_SCOPE_TARGETS: tuple[tuple[str, Any], ...] = (
-    (
-        "open_reopened",
-        _re.compile(
-            r"(?:\bв\s+|\bin\s+)"
-            r"(?:опен\w*|open\b|откры\w+|реопен\w*|reopen\w*|переоткры\w+)"
-            r"(?:\s*[/и]\s*(?:реопен\w*|reopen\w*|переоткры\w+))?"
-            r"|\bopen\s*/\s*reopened\b"
-            r"|\bопен\s*/\s*реопен\w*",
-            _re.IGNORECASE,
-        ),
-    ),
-    (
-        "in_progress",
-        _re.compile(
-            r"\bin[\s_-]*progress\b"
-            r"|\bв\s+(?:работе|процессе|ин[\s_-]*прогресс\w*|прогресс\w*)",
-            _re.IGNORECASE,
-        ),
-    ),
-    (
-        "all",
-        # `all` needs its INTENSIFIER. A bare «все задачи» is not this value —
-        # it says "a lot", not "including backlog", and D-0069's bullet for this
-        # mode is «Закрыть все задачи вообще, включая backlog». Ask-first: an
-        # unintensified "all tasks" is NO CHANGE.
-        _re.compile(
-            r"\bвкл(?:ючая|ючительно)\s+(?:и\s+)?(?:бэклог|беклог|backlog)"
-            r"|\bвс[еёя]\s+задачи\s+вообще"
-            r"|\bвс[ёе]\s+вообще"
-            r"|\bвес[ьи]\s+(?:бэклог|беклог|backlog)"
-            r"|\bincluding\s+(?:the\s+)?backlog"
-            r"|\b(?:whole|entire)\s+backlog"
-            r"|\beverything\s+including\b",
-            _re.IGNORECASE,
-        ),
-    ),
-)
-
-#: Scope value -> the label in HIS vocabulary, lifted from his own bullets
-#: (2026-07-29T12:20:46Z). The confirmation names the scope with these, not with
-#: the internal snake_case value — he never wrote "open_reopened".
-SCOPE_LABELS_RU = {
-    "open_reopened": "Open / Reopened",
-    "in_progress": "In Progress",
-    "all": "все задачи вообще, включая backlog",
-}
-
-# Sentence split: terminators and newlines ONLY. Commas are NOT terminators —
-# see suppression rule 3.
-_SENTENCE_SPLIT = _re.compile(r"[^.!?;\n]+[.!?;\n]*")
-
-
-def _sentences(text: str) -> list[str]:
-    return [m.group(0) for m in _SENTENCE_SPLIT.finditer(text) if m.group(0).strip()]
-
-
-def classify_drive_scope(text: str) -> dict:
-    """Classify whether one message SELECTS a standing drive scope (T-0830).
-
-    Sibling of :func:`classify_drive_mode`, not a rung inside it — see the
-    block comment above for why they stay separate.
-
-    Deterministic ladder, ask-first default (inherited from T-0656):
-
-    1. blank text -> ValueError (same contract as the two classifiers above);
-    2. a record-only phrase anywhere in the message (:data:`RECORD_ONLY_PHRASES`,
-       shared with :func:`classify_drive_mode`) -> ``no_change``. An explicit
-       "just a note / not now" cannot simultaneously be a standing setting
-       change;
-    3. per sentence: a DIRECTIVE cue and a STATUS target in the SAME sentence,
-       where the sentence is not a question and the cue is not negated -> that
-       sentence selects a scope;
-    4. two different scope values selected -> ``no_change`` (``scope-conflict``).
-       His own four-bullet message NAMES all three modes; describing the menu is
-       not choosing from it;
-    5. exactly one selected -> ``switch``;
-    6. nothing selected -> ``no_change``.
-
-    Returns ``{scope, decision, signals, matched_text}``:
-
-    * ``decision`` is ``"switch"`` or ``"no_change"`` and is the field callers
-      must branch on. ``scope`` is one of :data:`pace.DRIVE_SCOPES` when
-      switching and ``None`` otherwise — the two always agree, and ``decision``
-      exists so that "no scope was selected" can never be read as a silent
-      ``None`` that some caller coerces into a default;
-    * ``matched_text`` is the VERBATIM span of his message that selected the
-      scope, original casing preserved — the string stored as ``source_text``
-      so the read surfaces can print *"set from «закончить всё что в опен»"*;
-    * ``signals`` names every cue that fired or suppressed, so the WHY is
-      inspectable — including on a ``no_change``, where it is the more useful
-      half.
-    """
-    if not text or not text.strip():
-        raise ValueError("classify_drive_scope: empty text")
-    stripped = text.strip()
-    lowered = stripped.lower()
-
-    signals: list[str] = []
-
-    # Rung 2 — composes with the authority sibling rather than duplicating it.
-    record_hits = sorted({p for p in RECORD_ONLY_PHRASES if p in lowered})
-    if record_hits:
-        signals.append("record-only-phrase:" + ",".join(record_hits))
-        signals.append("suppressed:record-only")
-        return {"scope": None, "decision": "no_change",
-                "signals": signals, "matched_text": None}
-
-    # Rung 3 — per sentence, both halves required, suppressors applied.
-    hits: dict[str, str] = {}          # scope -> verbatim span
-    saw_target_without_cue = False
-    for sentence in _sentences(stripped):
-        targets = [(name, m) for name, pat in _SCOPE_TARGETS
-                   if (m := pat.search(sentence))]
-        if not targets:
-            continue
-        if sentence.rstrip().endswith("?"):
-            signals.append("suppressed:question")
-            saw_target_without_cue = True
-            continue
-        cue = _DIRECTIVE_CUE.search(sentence)
-        if cue is None:
-            signals.append(
-                "suppressed:status-word-without-directive:"
-                + ",".join(name for name, _ in targets))
-            saw_target_without_cue = True
-            continue
-        if _NEGATION_BEFORE_CUE.search(sentence[:cue.start()]):
-            signals.append("suppressed:negated-directive")
-            saw_target_without_cue = True
-            continue
-        for name, m in targets:
-            # The verbatim span runs from whichever half comes first through
-            # the end of whichever comes last, so it reads as his own phrase:
-            # «закончить всё что в опен», not two disconnected fragments.
-            lo, hi = min(cue.start(), m.start()), max(cue.end(), m.end())
-            hits.setdefault(name, sentence[lo:hi].strip())
-            signals.append(f"scope-phrase:{name}:{m.group(0).strip()}")
-            signals.append(f"directive-cue:{cue.group(0).strip()}")
-
-    # Rung 4 — describing the menu is not choosing from it.
-    if len(hits) > 1:
-        signals.append("scope-conflict:" + ",".join(sorted(hits)))
-        return {"scope": None, "decision": "no_change",
-                "signals": signals, "matched_text": None}
-
-    # Rung 5.
-    if len(hits) == 1:
-        scope, matched = next(iter(hits.items()))
-        return {"scope": scope, "decision": "switch",
-                "signals": signals, "matched_text": matched}
-
-    # Rung 6 — ask-first. `no-scope-signal` mirrors classify_drive_mode's
-    # wording for the same "nothing matched" state.
-    if not saw_target_without_cue:
-        signals.append("no-scope-signal")
-    return {"scope": None, "decision": "no_change",
-            "signals": signals, "matched_text": None}
-
-
-def drive_scope_confirmation(scope: str) -> str:
-    """The confirmation sent BACK to him when a switch is recognised (D-0069).
-
-    **This is the point of the lane, not a courtesy.** His complaint was
-    SILENCE — «видимо это не интерпретировалось» — he could not tell whether
-    the instruction landed. A classifier that switches the mode without saying
-    so reproduces the defect with the opposite sign: the system now changes
-    what it works on and he still cannot tell.
-
-    Three constraints on the wording, all load-bearing:
-
-    * it names the resulting scope in HIS vocabulary (:data:`SCOPE_LABELS_RU`,
-      lifted from his own bullets), never as ``open_reopened``;
-    * **no preamble** (AGENT_INSTRUCTIONS.md, his direct request, T-0777): the
-      first characters are the fact. «Режим драйва: …», never «честно говоря…»
-      / «лучше скажу сразу…» / "to be honest…" or that shape in any language.
-      ``test_dispatch.py`` pins the opening and asserts the banned list;
-    * **it must NOT be classifiable by this module's own ladder.** It quotes no
-      instruction — an earlier draft echoed the matching phrase back
-      («Задано из «закончить всё что в опен».») and MEASURED as a switch on all
-      nine scope×phrase combinations. Our own text does re-enter the inbound
-      channel in this system: ``echo_guard`` exists because it happened, through
-      one of the two paths this ladder is wired to, and a forwarded or
-      copy-pasted confirmation would then silently re-scope the project — DoD
-      6's named failure with our own words as the passing remark. The phrase
-      that set the mode is NOT lost: it is stored as ``source_text`` and the
-      READ surfaces print it (D-0069 "Visibility — READ"), which is where that
-      display belongs. ``test_confirmation_is_not_classifiable`` feeds every
-      confirmation back through :func:`classify_drive_scope` and pins it.
-
-    Note this is the *second* of two independent guards on that loop; the
-    primary one is the composed-by-sender check at the call site
-    (``tg_listener._maybe_switch_drive_scope``), which is class-independent and
-    catches any of our text coming back, not just this string's shape.
-    """
-    return f"Режим драйва: {SCOPE_LABELS_RU.get(scope, scope)}."
-
-
-def apply_drive_scope(
-    cfg: Any, slug: str, text: str, *,
-    author: str, set_by: str,
-) -> dict:
-    """Recognise a scope instruction in ``text`` and, if authorized, SET it.
-
-    The only writer in this module, and it writes **through L1's setter**
-    (``pace.set_drive``, T-0828) — there is no parallel store. ``source_text``
-    is recorded as the verbatim span that selected the scope, which is what
-    lets the read surfaces print *"set from «закончить всё что в опен»"*.
-
-    ``author`` must be :data:`STAKEHOLDER_AUTHOR`; anything else is refused
-    without touching the store. See the WHO MAY SWITCH IT block above.
-
-    Returns ``{applied, scope, decision, signals, matched_text}`` plus, when
-    applied, ``confirmation`` (the text to send him — the caller must actually
-    deliver it) and ``drive`` (the normalized block ``pace.set_drive``
-    returned). ``applied=False`` always carries ``reason``.
-
-    Never raises on a non-switching message — "he did not ask for a scope" is
-    the common case, not an error. ``pace.DriveModeError`` propagates, since a
-    value this module produced being rejected by the store is a code bug.
-    """
-    cls = classify_drive_scope(text)
-    out: dict[str, Any] = {
-        "applied": False,
-        "scope": cls["scope"],
-        "decision": cls["decision"],
-        "signals": cls["signals"],
-        "matched_text": cls["matched_text"],
-    }
-
-    if cls["decision"] != "switch":
-        out["reason"] = (
-            "no recognised scope instruction — NO CHANGE (ask-first: guessing "
-            "a standing setting from an ambiguous sentence is worse than "
-            "missing it)"
-        )
-        return out
-
-    if author != STAKEHOLDER_AUTHOR:
-        out["reason"] = (
-            f"author {author!r} may not switch the drive scope by phrase — "
-            f"only {STAKEHOLDER_AUTHOR!r} may; an operator sets it explicitly "
-            "via `bsq pace`"
-        )
-        return out
-
-    from bot_squad_worker import pace as _pace
-
-    before = _pace.read_drive(cfg, slug)
-    block = _pace.set_drive(
-        cfg, slug, scope=cls["scope"],
-        set_by=set_by, source_text=cls["matched_text"],
-    )
-    out["applied"] = True
-    # REPORTING ONLY — nothing branches on this, and per T-0828 nothing may
-    # branch on `configured` either: "never set" and an explicit widest-scope
-    # must drive identically. It is read here solely to tell a first-ever set
-    # apart from a re-set of the same value in the audit line.
-    out["changed"] = (
-        not before.get("configured") or before.get("scope") != cls["scope"])
-    out["drive"] = block
-    # Confirmed even when the value did not change: his question was "did my
-    # instruction land", and "it was already set to that" answers it. Silence
-    # on a repeat is the same defect he reported.
-    out["confirmation"] = drive_scope_confirmation(cls["scope"])
-    out["reason"] = f"drive scope set to {cls['scope']} from {cls['matched_text']!r}"
-    return out
 
 
 def decide_placement(
@@ -1090,15 +762,11 @@ def decide_placement(
     out["drive_mode"] = dm["mode"]
     out["drive_mode_signals"] = dm["signals"]
 
-    # T-0830: and, separately, whether it selects a standing drive SCOPE.
-    # REPORTED, never applied here — decide_placement is a pure read (see the
-    # docstring's advisory contract) and it does not know who authored the
-    # message, which is the one thing the write gate needs. A caller that holds
-    # the author identity calls apply_drive_scope.
-    ds = classify_drive_scope(text)
-    out["drive_scope"] = ds["scope"]
-    out["drive_scope_decision"] = ds["decision"]
-    out["drive_scope_signals"] = ds["signals"]
+    # T-0848: there is deliberately NO `drive_scope` key here any more. This
+    # reported one — read-only, never applied — and a read-only report is still
+    # the inference his ruling removed: it hands the next caller a scope it did
+    # not have to derive, and the write gate is one line away. The standing scope
+    # comes from `bsq pace drive` alone. See the tombstone above.
 
     if task_id:
         dispatch = decide_dispatch(cfg, slug, task_id, now_epoch=now_epoch)

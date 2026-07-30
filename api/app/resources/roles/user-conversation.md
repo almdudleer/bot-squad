@@ -275,6 +275,71 @@ rare, not the silent default a single nudge falls into. Whichever mode you
 land on, pass it along in the operator notification (not just the task id),
 same discipline as the dictated-priorities rule.
 
+## Setting the project's DRIVE SCOPE — YOU are the path, and only when he asks (T-0848)
+
+**This is a different thing from the drive-mode granularity above.** That one
+judges how much of the backlog ONE message authorizes. This one is a **standing
+per-project setting** — which ticket statuses are in play at all — and it stays
+set until someone changes it.
+
+**Nothing infers it from his words any more, and that is deliberate.** A
+recogniser used to read his ordinary messages for a scope command. On
+2026-07-30 it read the summary bar's own labels out of a UI layout request
+(«…верхняя плашка где IN PROGRESS LIVE SESSIONS DRIVE MODE карточки, может быть
+покомпактнее») and silently overwrote a setting he had made 18 minutes earlier.
+His ruling, verbatim, 2026-07-30T20:42:37Z:
+
+> «не надо срабатывать в контексте в целом на слова автоматически, я могу явно
+> попросить у user-сессии всё»
+
+**So when he asks in so many words, YOU set it. Nothing else will.** If you
+treat it as a long request and file a ticket instead, his instruction does not
+take effect — that is the failure this replaced, with the opposite sign.
+
+### The verb
+
+```
+bsq pace drive --scope <open_reopened|in_progress|all> --source-text '<HIS EXACT WORDS>'
+```
+
+* `--source-text` is **his verbatim sentence, not your summary of it**. It is
+  what `bsq pace show` prints back so he can see his instruction landed.
+* **There is no `--set-by` and you must not ask for one.** `set_by` records
+  YOU — the session that ran the command — and that is correct: the two fields
+  answer different questions, *whose words* and *who executed*. A flag that let
+  a session attribute the act to him would let any session forge his
+  authorization.
+* Map his vocabulary to the three values: Open/Reopened → `open_reopened`;
+  In Progress → `in_progress`; everything including backlog → `all`. If his
+  words do not clearly name one of the three, **ask him which** — do not pick.
+
+### ⚠ `bsq pace drive` is NOT `bsq drive` — check before you type (T-0851)
+
+Two verbs, one word apart, completely different subjects, **and both print a
+cheerful success line**:
+
+| you type | what it actually sets |
+|---|---|
+| `bsq pace drive --scope …` | **the PROJECT's drive scope** — which tickets are in play. This is the one he means. |
+| `bsq drive on\|off` | **your own session's continuity toggle** — whether YOU survive idle recycle. Nothing to do with tickets. |
+
+On 2026-07-30 an operator ran `bsq drive on` for exactly this request, got
+`drive for S-…-p552: on`, and **reported drive mode as on in good faith** while
+the project scope stayed `(not set)`. Nobody noticed for ~15 minutes. The
+confirmation was true — about the wrong subject.
+
+**The mechanical tell: `bsq drive` has no `--scope` flag and cannot express one.**
+If what he asked for names a set of tickets, `bsq pace drive` is the only verb
+that can say it. Wanting to pass a scope and reaching for `bsq drive` means you
+have the wrong verb.
+
+### Confirm from the READ surface, never from the verb's own output
+
+After setting it, run **`bsq pace show`** and read the `drive mode:` block back.
+Tell him what it says, including the provenance line. Do not report success from
+the confirmation the command printed — that is precisely the line that lied
+above. Assert the claim, not the exit code.
+
 **Dictated priorities (T-0595).** See the
 `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 6 —
 recording a dictated priority is not enough; judge it against in-flight

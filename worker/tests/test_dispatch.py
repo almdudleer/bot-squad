@@ -898,372 +898,51 @@ def test_decide_placement_carries_drive_mode_do_all(tmp_path):
     assert not out["reason"].startswith("record-only")
 
 
-# --- T-0830 / D-0069 — drive SCOPE: recognise a scope instruction in his words,
-# --- and CONFIRM the switch back to him.
-
-from bot_squad_worker.dispatch import (  # noqa: E402
-    STAKEHOLDER_AUTHOR,
-    apply_drive_scope,
-    classify_drive_scope,
-    drive_scope_confirmation,
-)
-
-# His words, 2026-07-30T07:54:16Z, verbatim. HUMAN-ONLY — this string is the
-# recorded miss T-0830 exists to fix and it is the lane's acceptance test.
-# Do not "tidy" it; a test carrying his actual sentence is worth ten synthetic
-# ones (T-0830 DoD 2).
-HIS_SENTENCE = (
-    "В третьих, нужно более чёткое понимание для меня, какой режим драйва щас "
-    "стоит, я просил закончить всё что в опен, но видимо это не "
-    "интерпретировалось как переключить режим драйва"
-)
-
-# The clause inside it that is the instruction, also verbatim.
-HIS_INSTRUCTION = "я просил закончить всё что в опен"
+# --- T-0848 — the drive-SCOPE recogniser is GONE, and stays gone ------------
+#
+# T-0830's L3 lane (classify_drive_scope / apply_drive_scope) lived here with
+# ~25 tests. It was removed on the stakeholder's ruling, 2026-07-30T20:42:37Z:
+# «не надо срабатывать в контексте в целом на слова автоматически, я могу явно
+# попросить у user-сессии всё». See dispatch.py's tombstone for the full record.
+#
+# What replaces those tests is ONE structural assertion, and it is deliberately
+# not a comment: the tombstone explains WHY the recogniser is gone, but prose is
+# not a control — a future session that re-adds a scope inference would sail past
+# a comment and must instead hit a red test.
 
 
-# ---- DoD 2: the recorded miss must classify ------------------------------
+def test_no_automatic_drive_scope_recogniser_exists():
+    """T-0848: NOTHING in dispatch may infer a drive scope from his prose.
 
-def test_scope_his_recorded_sentence_verbatim_classifies():
-    """THE acceptance test. This exact sentence was issued and NOT recognised;
-    if this ever goes red the lane has regressed to the defect it fixed."""
-    out = classify_drive_scope(HIS_SENTENCE)
-    assert out["decision"] == "switch"
-    assert out["scope"] == "open_reopened"
-    # The stored provenance must be HIS phrase, not the whole paragraph and not
-    # a normalized paraphrase — it is printed back to him inside «».
-    assert out["matched_text"] == "закончить всё что в опен"
-
-
-def test_scope_his_instruction_clause_alone_classifies():
-    out = classify_drive_scope(HIS_INSTRUCTION)
-    assert out["scope"] == "open_reopened"
-    assert out["matched_text"] == "закончить всё что в опен"
-
-
-def test_scope_comma_before_chto_still_classifies():
-    """«закончи всё, что в опен» — the natural RU phrasing puts a comma between
-    the directive and the target. Splitting sentences on commas would lose
-    exactly the instruction this ticket exists to catch."""
-    out = classify_drive_scope("закончи всё, что в опен")
-    assert out["scope"] == "open_reopened"
-
-
-# ---- DoD 1/2: all three scope values, RU and EN --------------------------
-
-@pytest.mark.parametrize("text,expected", [
-    # open_reopened — RU
-    ("закончить всё что в опен", "open_reopened"),
-    ("закрой все задачи в открытых", "open_reopened"),
-    ("Закрыть все задачи в Open / Reopened", "open_reopened"),
-    ("доделай всё в реопене", "open_reopened"),
-    ("переключись на задачи в опен/реопен", "open_reopened"),
-    # open_reopened — EN
-    ("finish everything in open", "open_reopened"),
-    ("close all tasks in Open / Reopened", "open_reopened"),
-    ("focus on what is in reopened", "open_reopened"),
-    # in_progress — RU
-    ("закончить всё что в работе", "in_progress"),
-    ("закрой все задачи в In Progress", "in_progress"),
-    ("доделай то что в процессе", "in_progress"),
-    # in_progress — EN
-    ("finish everything in progress", "in_progress"),
-    ("close all tasks in in-progress", "in_progress"),
-    # all — RU
-    ("Закрыть все задачи вообще, включая backlog", "all"),
-    ("закрой весь бэклог", "all"),
-    ("доделать всё вообще", "all"),
-    # all — EN
-    ("close everything including the backlog", "all"),
-    ("clear the whole backlog", "all"),
-])
-def test_scope_ladder_recognises_variants(text, expected):
-    out = classify_drive_scope(text)
-    assert out["decision"] == "switch", out["signals"]
-    assert out["scope"] == expected, out["signals"]
-
-
-# ---- DoD 6: the NEGATIVE case — the harder half --------------------------
-
-@pytest.mark.parametrize("text", [
-    # The three the DoD names verbatim.
-    "T-0719 is still open",
-    "why is this in progress",
-    "closed it yesterday",
-    # RU equivalents — past tense carries no directive cue by construction.
-    "T-0719 всё ещё в опен",
-    "закрыл всё что было в опен вчера",
-    "почему это в работе",
-    # A status word as a predicate, not a bucket.
-    "the ticket is open, the PR is not",
-    "этот тикет open, а тот closed",
-    # A directive with no status target at all.
-    "закрой дверь",
-    "finish the review and close the PR",
-    # A question about the scope is not an instruction to set it.
-    "закончить всё что в опен?",
-    "should we finish everything in open?",
-    # Negated directives.
-    "не закрывай задачи в опен",
-    "don't close anything in progress",
-    "пока не надо закрывать всё что в опен",
-    # An unintensified "all tasks" is NOT the `all` scope — it says "a lot",
-    # not "including backlog". Ask-first.
-    "закрой все задачи",
-    "close all tasks",
-])
-def test_scope_negative_cases_never_switch(text):
-    out = classify_drive_scope(text)
-    assert out["decision"] == "no_change", out["signals"]
-    assert out["scope"] is None
-
-
-def test_scope_status_word_in_a_different_sentence_does_not_combine():
-    """A directive in one sentence and a status word in another must not be
-    stitched into an instruction. Co-occurrence is per SENTENCE."""
-    out = classify_drive_scope("Закрой ревью. T-0719 всё ещё в опен.")
-    assert out["decision"] == "no_change"
-    assert any(s.startswith("suppressed:status-word-without-directive")
-               for s in out["signals"])
-
-
-def test_scope_record_only_phrase_suppresses_the_switch():
-    """The two classifiers COMPOSE: an explicit "just a note" cannot also be a
-    standing setting change. Same phrase list as classify_drive_mode."""
-    text = "просто заметка на будущее: закончить всё что в опен"
-    assert classify_drive_mode(text)["mode"] == "record_only"
-    out = classify_drive_scope(text)
-    assert out["decision"] == "no_change"
-    assert "suppressed:record-only" in out["signals"]
-
-
-# His four-bullet spec, 2026-07-29T12:20:46Z, verbatim INCLUDING the newline
-# formatting — the bullets are separate lines, not one run-on sentence, and the
-# sentence splitter has to treat them as separate clauses for the conflict rung
-# to see three values. HUMAN-ONLY.
-HIS_FOUR_BULLETS = """надо предусмотреть разные режимы драйва оператора:
-• Закрыть все задачи в Open / Reopened
-• Закрыть все задачи в In Progress
-• Закрыть все задачи вообще, включая backlog
-• Потратить квоту
-
-Вроде у нас еще до этого были какие-то размышления"""
-
-
-def test_scope_his_four_bullet_spec_is_a_conflict_not_a_selection():
-    """His original 2026-07-29 message NAMES all three modes. Describing the
-    menu is not choosing from it — that message must not set anything.
-
-    Pinned in his own line-broken formatting rather than a flattened paraphrase,
-    so the ladder is exercised against the shape he actually sends.
-
-    The assertion names all three values deliberately: `decision == "no_change"`
-    alone would also pass if the ladder had seen only ONE bullet and rejected it
-    for some unrelated reason. Requiring the full conflict set proves it read
-    every bullet and then refused to choose.
+    The names are asserted individually rather than as a set so a failure says
+    WHICH one came back. If you are here because you added one of these: read
+    the tombstone in dispatch.py first — the lane was removed on his explicit
+    ruling, not because it was buggy, and `bsq pace drive` is the only writer.
     """
-    out = classify_drive_scope(HIS_FOUR_BULLETS)
-    assert out["decision"] == "no_change"
-    assert out["scope"] is None
-    assert "scope-conflict:all,in_progress,open_reopened" in out["signals"]
+    from bot_squad_worker import dispatch
+
+    for gone in ("classify_drive_scope", "apply_drive_scope",
+                 "drive_scope_confirmation", "STAKEHOLDER_AUTHOR"):
+        assert not hasattr(dispatch, gone), (
+            f"dispatch.{gone} is back — the drive-scope recogniser was REMOVED "
+            "by T-0848 on the stakeholder's ruling; see the tombstone"
+        )
 
 
-def test_scope_blank_raises():
-    with pytest.raises(ValueError, match="empty text"):
-        classify_drive_scope("   ")
+def test_decide_placement_reports_no_drive_scope(tmp_path):
+    """The read-only report went too, and that is the point.
 
-
-@pytest.mark.parametrize("text", [
-    "fix the login bug",                               # rung 6 — no signal
-    "T-0719 is still open",                            # rung 3 — no directive
-    "закрой дверь",                                    # rung 3 — no target
-    "закончить всё что в опен?",                       # rung 3 — question
-    "не закрывай задачи в опен",                       # rung 3 — negated
-    "просто заметка: закончить всё что в опен",        # rung 2 — record-only
-    "Закрыть все задачи в Open / Reopened. "           # rung 4 — conflict
-    "Закрыть все задачи в In Progress.",
-])
-def test_scope_no_change_never_carries_a_scope_value(text):
-    """The silent-None trap: `scope` and `decision` must always agree on EVERY
-    no_change path, so no caller can read "nothing was selected" as a value to
-    coerce. One case per rung — a mutation that leaks a scope out of any single
-    rung must go red here, and the conflict rung is the one that leaks most
-    plausibly (it HAS candidate values in hand when it decides not to use one).
+    `decide_placement` used to publish `drive_scope`/`drive_scope_decision`
+    without applying them. A read-only inference is still the inference his
+    ruling removed: it hands the next caller a scope it did not have to derive,
+    and the write is then one line away. The AUTHORITY classifier
+    (`drive_mode`, T-0656) is a different question and SURVIVES — asserted here
+    so a future cleanup does not take it out by association.
     """
-    out = classify_drive_scope(text)
-    assert out["decision"] == "no_change", out["signals"]
-    assert out["scope"] is None, out["signals"]
-    assert out["matched_text"] is None, out["signals"]
-
-
-# ---- DoD 4: the confirmation ---------------------------------------------
-
-# His list from the role contract + AGENT_INSTRUCTIONS, plus the same shape in
-# any language. A confirmation opening with any of these has the defect the
-# no-preamble rule names: it advertises candour instead of delivering the fact.
-BANNED_OPENERS = (
-    "одно изменение", "поправка", "лучше скажу сразу", "хочу сразу сказать",
-    "честно", "честно говоря", "если честно",
-    "i want to flag", "being upfront", "this is the uncomfortable part",
-    "honestly", "to be honest", "frankly",
-)
-
-
-@pytest.mark.parametrize("scope,label", [
-    ("open_reopened", "Open / Reopened"),
-    ("in_progress", "In Progress"),
-    ("all", "все задачи вообще, включая backlog"),
-])
-def test_confirmation_names_the_scope_in_his_vocabulary(scope, label):
-    """It must never print the internal snake_case value — he never wrote
-    "open_reopened"; these labels are lifted from his own bullets."""
-    msg = drive_scope_confirmation(scope)
-    assert msg == f"Режим драйва: {label}."
-    assert scope not in msg
-
-
-def test_confirmation_starts_with_the_fact_no_preamble():
-    msg = drive_scope_confirmation("open_reopened")
-    assert msg.startswith("Режим драйва:")
-    lowered = msg.lower()
-    for opener in BANNED_OPENERS:
-        assert opener not in lowered, f"banned preamble in confirmation: {opener}"
-
-
-@pytest.mark.parametrize("scope", ["open_reopened", "in_progress", "all"])
-def test_confirmation_is_not_classifiable(scope):
-    """THE ECHO LOOP. Our own confirmation must not read as an instruction.
-
-    Measured before the fix: a confirmation that quoted the matching phrase
-    back («Задано из «закончить всё что в опен».») classified as a SWITCH on
-    all nine scope x phrase combinations. Our text does re-enter this channel —
-    echo_guard exists because it happened, via one of the two paths this ladder
-    is wired to — so a forwarded confirmation would have silently re-scoped the
-    project off our own words.
-
-    This is the SECOND guard; the primary is the composed-by-sender check in
-    tg_listener. Two independent guards because either alone has a gap: this one
-    only covers this exact string, and that one only covers the TG path.
-    """
-    out = classify_drive_scope(drive_scope_confirmation(scope))
-    assert out["decision"] == "no_change", out["signals"]
-    assert out["scope"] is None
-
-
-def test_confirmation_is_the_fact_line_and_nothing_else():
-    """No quoted instruction, one line. The phrase that set the mode lives in
-    `source_text` and is printed by the READ surfaces (D-0069), not here."""
-    assert drive_scope_confirmation("in_progress") == "Режим драйва: In Progress."
-    assert "«" not in drive_scope_confirmation("open_reopened")
-
-
-# ---- DoD 5/7: the write goes through L1's setter, and who may do it -------
-
-def _pace_cfg(tmp_path):
     cfg = _make_cfg(tmp_path)
-    (cfg.data_dir / "test-project" / "_worker").mkdir(parents=True, exist_ok=True)
-    return cfg
+    out = decide_placement(cfg, "test-project", "закончить всё что в опен")
 
-
-def test_apply_writes_through_pace_and_records_source_text(tmp_path):
-    from bot_squad_worker import pace
-
-    cfg = _pace_cfg(tmp_path)
-    out = apply_drive_scope(
-        cfg, "test-project", HIS_SENTENCE,
-        author=STAKEHOLDER_AUTHOR, set_by="S-test-p1")
-    assert out["applied"] is True
-    assert out["scope"] == "open_reopened"
-
-    # No parallel store: the value must be readable through L1's own reader.
-    block = pace.read_drive(cfg, "test-project")
-    assert block["scope"] == "open_reopened"
-    assert block["configured"] is True
-    assert block["set_by"] == "S-test-p1"
-    # THE field the read surfaces print: "set from «…»".
-    assert block["source_text"] == "закончить всё что в опен"
-
-
-def test_apply_returns_the_confirmation_to_send_him(tmp_path):
-    cfg = _pace_cfg(tmp_path)
-    out = apply_drive_scope(
-        cfg, "test-project", HIS_SENTENCE,
-        author=STAKEHOLDER_AUTHOR, set_by="S-test-p1")
-    assert out["confirmation"] == "Режим драйва: Open / Reopened."
-    # The phrase is stored, not echoed — see test_confirmation_is_not_classifiable.
-    assert out["matched_text"] == "закончить всё что в опен"
-
-
-def test_apply_confirms_even_when_the_value_did_not_change(tmp_path):
-    """Silence on a repeat is the same defect he reported. `changed` reports
-    the difference; the confirmation goes out either way."""
-    cfg = _pace_cfg(tmp_path)
-    first = apply_drive_scope(cfg, "test-project", HIS_SENTENCE,
-                              author=STAKEHOLDER_AUTHOR, set_by="S-test-p1")
-    second = apply_drive_scope(cfg, "test-project", "закончи всё, что в опен",
-                               author=STAKEHOLDER_AUTHOR, set_by="S-test-p1")
-    assert first["changed"] is True
-    assert second["changed"] is False
-    assert second["applied"] is True
-    assert second["confirmation"].startswith("Режим драйва: Open / Reopened.")
-
-
-def test_apply_no_change_leaves_the_store_untouched(tmp_path):
-    from bot_squad_worker import pace
-
-    cfg = _pace_cfg(tmp_path)
-    out = apply_drive_scope(
-        cfg, "test-project", "T-0719 is still open",
-        author=STAKEHOLDER_AUTHOR, set_by="S-test-p1")
-    assert out["applied"] is False
-    assert "NO CHANGE" in out["reason"]
-    assert "confirmation" not in out
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
-
-
-def test_apply_refuses_a_non_stakeholder_author(tmp_path):
-    """DoD 7. A dev peer message that QUOTES his sentence must not re-scope the
-    whole project — privilege escalation by quotation. Precedent: T-0655's
-    sessions.set_drive is operator-role-only for the same class of reason."""
-    from bot_squad_worker import pace
-
-    cfg = _pace_cfg(tmp_path)
-    out = apply_drive_scope(
-        cfg, "test-project", HIS_SENTENCE,
-        author="S-almdudleer-drive-words-p537", set_by="S-almdudleer-drive-words-p537")
-    assert out["applied"] is False
-    assert "may not switch the drive scope by phrase" in out["reason"]
-    # It still REPORTS what it recognised — refusing to act is not refusing to see.
-    assert out["scope"] == "open_reopened"
-    assert out["decision"] == "switch"
-    # And nothing was written.
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
-
-
-# ---- decide_placement reports the scope, and never applies it ------------
-
-def test_decide_placement_reports_drive_scope(tmp_path):
-    cfg = _make_cfg(tmp_path)
-    out = decide_placement(cfg, "test-project", HIS_SENTENCE)
-    assert out["drive_scope"] == "open_reopened"
-    assert out["drive_scope_decision"] == "switch"
-
-
-def test_decide_placement_does_not_write_the_scope(tmp_path):
-    """decide_placement is documented as a pure read and does not know the
-    author — the one thing the write gate needs. It reports only."""
-    from bot_squad_worker import pace
-
-    cfg = _pace_cfg(tmp_path)
-    decide_placement(cfg, "test-project", HIS_SENTENCE)
-    assert pace.read_drive(cfg, "test-project")["configured"] is False
-
-
-def test_decide_placement_scope_is_independent_of_drive_mode(tmp_path):
-    """The two classifiers stay separate objects: this message grants BOUNDED
-    authority (an entity ref) while selecting NO scope."""
-    cfg = _make_cfg(tmp_path)
-    out = decide_placement(cfg, "test-project", "fix T-0450, the login bug")
-    assert out["drive_mode"] == "bounded"
-    assert out["drive_scope"] is None
-    assert out["drive_scope_decision"] == "no_change"
+    assert "drive_scope" not in out
+    assert "drive_scope_decision" not in out
+    assert "drive_scope_signals" not in out
+    assert out["drive_mode"], "the T-0656 authority classifier must survive"

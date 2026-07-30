@@ -1443,110 +1443,6 @@ def _send_and_pin(cfg, chat_id: str, message: str, *, thread_id: Any = None) -> 
                 "pin_error": str(e)}
 
 
-def _maybe_switch_drive_scope(
-    cfg, slug: str, gid: str, msg: dict, chat_id: str, *, thread_id: Any = None,
-) -> Optional[dict]:
-    """T-0830: his message may be a DRIVE SCOPE instruction — recognise it, set
-    it, and CONFIRM back into the same topic.
-
-    The recorded failure this closes (2026-07-30T07:54:16Z):
-
-        «я просил закончить всё что в опен, но видимо это не интерпретировалось
-         как переключить режим драйва»
-
-    He issued a scope instruction in the vocabulary of the four modes and
-    nothing here recognised it as one. ``dispatch.classify_drive_scope`` is the
-    ladder; this is its only production call site.
-
-    **NON-INTERCEPTING.** It never replaces routing: the message still lands
-    durably and still reaches the attendant, exactly as before. «закончить всё
-    что в опен» is both a scope switch AND work he wants done, and T-0666
-    already removed one intercepting confirm prompt from this path — this must
-    not reintroduce the shape. Callers ignore the return value except for audit.
-
-    **The confirmation is a reply-in-place.** It goes back to the chat/topic the
-    instruction arrived on via :func:`_channel_notify`, spelling its own
-    destination and passing NO ``msg_type`` — a route map that redirected a
-    reply would break it (``msg_routes`` docstring). His complaint was silence;
-    a switch he cannot see reproduces it with the opposite sign.
-
-    **AUTHORITY, and what it does and does not promise (T-0830 DoD 7).** This
-    path passes :data:`dispatch.STAKEHOLDER_AUTHOR`; every other caller of
-    ``apply_drive_scope`` is refused. What that buys is precise: no SESSION can
-    re-scope the project by uttering or quoting the phrase — the threat the rule
-    exists for, since his sentence is quoted verbatim in this repo's own source
-    and tickets. What it does NOT do is authenticate a particular human: this is
-    CHANNEL authority, so anyone who can post into an allowlisted project chat
-    can switch the scope. That is the same trust boundary the surrounding code
-    already grants them — a message arriving here is handed to a session that
-    will act on it — so the gate adds no new exposure, and per-person
-    authentication would be a different (and larger) ticket.
-
-    **ONLY TEXT THE SENDER COMPOSED MAY SWITCH THE SCOPE.** ``echo_guard``
-    answers exactly that question at entry, and this consults it — it does NOT
-    already gate this path, because ``append_conversation`` calls it for
-    ATTRIBUTION only ("It does not silence anything", echo_guard docstring), so
-    without this check a forward would still reach the ladder.
-
-    The loop it closes, measured rather than assumed (TL p534 raised it; the
-    draft confirmation re-classified as a switch on all nine scope×phrase
-    combinations): our own words DO come back on the inbound channel here —
-    echo_guard exists because that happened, through ``_handle_topic_bound``,
-    one of the two paths this is wired to. A forwarded or copy-pasted
-    confirmation re-entering would re-switch the mode, and under the channel
-    authority above nothing would reject it. Requiring composed-by-sender is
-    class-independent: it catches ANY of our text coming back, not one string's
-    shape. A forward of another HUMAN's message is refused for the same reason —
-    he did not write it, so it is not his instruction.
-
-    Best-effort by construction: a failure to classify or store must never cost
-    the durable record or the routing, both of which have already happened by
-    the time this runs. Returns the audit dict on a switch, else ``None``.
-    """
-    text = _tg.msg_text(msg)
-    if not text or not text.strip():
-        return None
-    try:
-        from bot_squad_worker import echo_guard
-
-        verdict = echo_guard.classify_inbound(cfg, msg, chat_id=chat_id)
-        # An ALLOWLIST, deliberately, not a denylist of known-bad authors: the
-        # switch requires author to be exactly "user" AND no forward
-        # provenance. So an empty dict, a missing key, a None, a future author
-        # class this code has never heard of, or any raise all land on
-        # NO SWITCH. An UNKNOWN verdict must never read as permission — that
-        # is the one place this fail-closed could quietly become fail-open.
-        if not isinstance(verdict, dict) or verdict.get("author") != "user" \
-                or verdict.get("forwarded_from"):
-            log.info(
-                "drive-scope: not composed by sender (%s/%s) — no switch",
-                verdict.get("author"), verdict.get("reason"),
-            )
-            return None
-    except Exception as exc:  # noqa: BLE001 — a guard must not break intake
-        log.warning("drive-scope echo check failed for %s: %s", slug, exc)
-        return None
-    try:
-        from bot_squad_worker import dispatch as _dispatch
-
-        out = _dispatch.apply_drive_scope(
-            cfg, slug, text,
-            author=_dispatch.STAKEHOLDER_AUTHOR,
-            set_by=f"tg:{gid}" if gid else "tg",
-        )
-    except Exception as exc:  # noqa: BLE001 — never break intake over a setting
-        log.warning("drive-scope classify/apply failed for %s: %s", slug, exc)
-        return None
-    if not out.get("applied"):
-        return None
-    _channel_notify(cfg, chat_id, out["confirmation"], thread_id=thread_id)
-    log.info(
-        "drive scope set to %s for %s from %r (changed=%s)",
-        out["scope"], slug, out["matched_text"], out.get("changed"),
-    )
-    return out
-
-
 def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -> dict:
     """T-0639/T-0660: an unquoted message arriving in a BOUND forum topic.
 
@@ -1690,10 +1586,10 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     if is_general_feed:
         _warn_if_general_feed_collides(cfg, slug, chat_id)
     append_conversation(cfg, slug, gid, msg, thread_id=bound_thread_id, general_feed=is_general_feed)
-    # T-0830: AFTER the durable record, and non-intercepting — routing below
-    # runs unchanged whether or not this switched anything.
-    _maybe_switch_drive_scope(
-        cfg, slug, gid, msg, chat_id, thread_id=msg.get("message_thread_id"))
+    # T-0848: the T-0830 drive-scope recogniser used to run here, reading his
+    # message for a scope command. Removed on his ruling — «не надо срабатывать
+    # в контексте в целом на слова автоматически». Nothing on this path may
+    # infer a setting from his prose; see dispatch.py's tombstone.
     # T-0667: remember where this landed so an OUTGOING reply follows the
     # same chat/topic instead of falling back to the project's static DM.
     from bot_squad_worker import conversation_locus
@@ -1762,12 +1658,8 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     # topics are now held earlier in handle_update, never reaching here.)
     bound_thread_id = msg.get("message_thread_id")
     append_conversation(cfg, por, gid, msg, thread_id=bound_thread_id)
-    # T-0830: AFTER the durable record, and non-intercepting — routing below
-    # runs unchanged whether or not this switched anything. Keyed on the
-    # project-of-record, not the chat slug: the scope belongs to the project
-    # the message is FOR (T-0492).
-    _maybe_switch_drive_scope(
-        cfg, por, gid, msg, chat_id, thread_id=msg.get("message_thread_id"))
+    # T-0848: the second T-0830 drive-scope call site was here. Removed with the
+    # other one — the recogniser is gone, not merely unwired.
     # T-0667: remember where this landed so an OUTGOING reply follows the
     # same chat/topic instead of falling back to the project's static DM.
     from bot_squad_worker import conversation_locus

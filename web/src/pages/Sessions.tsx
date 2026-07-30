@@ -325,6 +325,66 @@ export function sessionsEmptyState(
   return scope === "own" ? "none-own" : "none";
 }
 
+// ---------------------------------------------------------------------------
+// T-0803 — a MOMENTARY socket gap must not read like a dead worker.
+//
+// Measured on 20.6 days of worker journal: the socket has two unrelated
+// failure modes, and this page rendered them identically.
+//
+//   * RESTART GAP — 72 worker restarts (one per 6.8h), socket dead a median
+//     of 1s (p90 4s). Nothing is wrong; the worker is coming back. With a 10s
+//     poll each restart has roughly a 10-40% chance of landing inside one
+//     tick.
+//   * PROCESS STALL — 15 events where the worker was alive but silent for
+//     >=30s (max 2h15m; the longest ended exactly at a host OOM-kill). Here
+//     the sessions really are unobservable, for minutes to hours.
+//
+// The old behaviour made the FIRST failing poll blank the table and raise
+// "Session list may be incomplete". A 1-second restart gap therefore cost ten
+// seconds of empty list plus an alarming banner, which then cleared itself —
+// the flapping the stakeholder reported ("это состояние flapping туда-сюда").
+//
+// Two rules, both pure and unit-tested:
+//
+//  1. classifyFanoutPhase — one bad poll is "transient" (say so quietly, keep
+//     the rows); two consecutive bad polls is "sustained" (>=~10s of real
+//     unreachability, which a restart gap essentially never reaches but a
+//     stall always does). This is the never-reachable / momentarily-unreachable
+//     distinction the ticket asks for, and it is derived from the measured
+//     duration of each mode rather than guessed.
+//
+//  2. retainRowsThroughFanoutGap — ONLY a poll that ADMITS a fan-out failure
+//     backfills rows. A clean poll is authoritative and always wins, so a
+//     genuinely-ended session still disappears immediately. Carried-over rows
+//     are stamped `retained_stale` so "we are showing you last-known state" is
+//     visible in the row, never implied. This is the direct answer to "a
+//     flapping list that silently drops rows is worse than one that says it
+//     does not know".
+// ---------------------------------------------------------------------------
+export type FanoutPhase = "ok" | "transient" | "sustained";
+
+/** Consecutive failing polls before the hard "unreachable" banner. */
+export const FANOUT_SUSTAINED_POLLS = 2;
+
+export function classifyFanoutPhase(consecutiveFailedPolls: number): FanoutPhase {
+  if (consecutiveFailedPolls <= 0) return "ok";
+  return consecutiveFailedPolls >= FANOUT_SUSTAINED_POLLS ? "sustained" : "transient";
+}
+
+export function retainRowsThroughFanoutGap(
+  prevRows: SessionRow[] | null,
+  freshRows: SessionRow[],
+  hasFanoutErrors: boolean,
+): SessionRow[] {
+  // A poll that reached every socket is the truth, including about absences.
+  if (!hasFanoutErrors) return freshRows;
+  const seen = new Set(freshRows.map((r) => r.sid));
+  const carried = (prevRows ?? [])
+    .filter((r) => !seen.has(r.sid))
+    .map((r) => ({ ...r, retained_stale: true }));
+  return [...freshRows, ...carried];
+}
+
 // T-0347: the per-row tmux-attach affordance. Only a LIVE session has a tmux
 // pane to attach to — a suspended/archived row has none, and offering the copy
 // there emitted a broken `tmux a -t …:<window>` that never attached (it ties to
@@ -475,6 +535,11 @@ export function Sessions() {
   // fan-out — rendered as a warning banner so a partial (or empty) list is
   // never mistaken for "no sessions".
   const [fanoutErrors, setFanoutErrors] = useState<WorkerFanoutError[]>([]);
+  // T-0803: consecutive polls whose fan-out reported a socket failure. The ref
+  // is the source of truth (the poll closure must read the value it just
+  // wrote, without waiting for a re-render); the state mirror is what renders.
+  const fanoutStreakRef = useRef(0);
+  const [fanoutStreak, setFanoutStreak] = useState(0);
   // T-0772: whether the server owner-filtered the rows above. Drives the
   // empty-state copy so a scoped-empty list stops reading as an idle project.
   const [sessionsScope, setSessionsScope] = useState<SessionsScope>(null);
@@ -591,13 +656,23 @@ export function Sessions() {
     api
       .sessionsDetail(slug)
       .then(({ rows, errors, scope }) => {
-        setSessions(rows);
+        // T-0803: a fan-out failure is a 200 with `errors` populated, not a
+        // rejection — so this, not the catch below, is the flapping path.
+        const failed = errors.length > 0;
+        fanoutStreakRef.current = failed ? fanoutStreakRef.current + 1 : 0;
+        setFanoutStreak(fanoutStreakRef.current);
+        setSessions((prev) => retainRowsThroughFanoutGap(prev, rows, failed));
         setFanoutErrors(errors);
         setSessionsScope(scope);
         setError(null);
       })
       .catch((e: unknown) => {
         setError(String(e));
+        // T-0803: the whole request failed, so we learned nothing about the
+        // sockets — reset the streak rather than let a network blip escalate
+        // the banner to "sustained" and accuse a worker that may be fine.
+        fanoutStreakRef.current = 0;
+        setFanoutStreak(0);
         // T-0609: a total load failure means the fan-out picture is unknown —
         // keeping the previous poll's banner would name sockets we can no
         // longer vouch for, alongside the error alert.
@@ -966,8 +1041,18 @@ export function Sessions() {
         <tr
           id={`sess-row-${s.sid}`}
           className={isFlashing ? "mc-row-flash" : undefined}
+          // T-0803: a row carried over an unreachable-socket poll is dimmed and
+          // says so on hover. Retaining it is only an improvement over dropping
+          // it if the reader can tell it is last-known rather than observed.
+          data-retained-stale={s.retained_stale ? "true" : undefined}
+          title={
+            s.retained_stale
+              ? "Last known state — the worker socket was unreachable on the latest poll"
+              : undefined
+          }
           style={{
             cursor: "pointer",
+            ...(s.retained_stale ? { opacity: 0.55 } : {}),
             // T-0141: highlight the TL row within its tmux group.
             ...(isTL && level === 0
               ? {
@@ -1595,7 +1680,25 @@ export function Sessions() {
       {/* T-0601 (F5): worker fan-out failures — the list below is PARTIAL
           (or empty) because these per-user worker sockets were unreachable.
           Without this banner a dead socket read as "No sessions". */}
-      {fanoutErrors.length > 0 && (
+      {/* T-0803: a single failing poll is now a quiet "re-checking" note that
+          KEEPS the last-known rows, because the measured median restart gap is
+          1s and the old banner turned that into 10s of empty table. Only a
+          second consecutive failure — ~10s+ of real unreachability, which a
+          restart gap essentially never reaches — escalates to the original
+          warning. */}
+      {fanoutErrors.length > 0 && classifyFanoutPhase(fanoutStreak) === "transient" && (
+        <div
+          className="alert alert-secondary"
+          role="status"
+          data-testid="fanout-transient-banner"
+          style={{ fontSize: "0.8rem" }}
+        >
+          Re-checking the worker socket
+          {fanoutErrors.length === 1 ? "" : "s"} — showing the last known
+          session list.
+        </div>
+      )}
+      {fanoutErrors.length > 0 && classifyFanoutPhase(fanoutStreak) === "sustained" && (
         <div
           className="alert alert-warning"
           role="status"
@@ -1611,9 +1714,10 @@ export function Sessions() {
                 {e.user}
               </code>
             ))}
-            {fanoutErrors.length === 1 ? "is" : "are"} unreachable — sessions
-            owned by {fanoutErrors.length === 1 ? "this user" : "these users"}{" "}
-            are missing from the list below.
+            {fanoutErrors.length === 1 ? "is" : "are"} unreachable for{" "}
+            {fanoutStreak} polls — rows still shown for{" "}
+            {fanoutErrors.length === 1 ? "this user" : "these users"} are the
+            last known state, not current.
           </div>
         </div>
       )}

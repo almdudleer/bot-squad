@@ -367,6 +367,12 @@ export type SessionRow = {
   // registry but dropped from the default view. Optional so a pre-T-0232
   // worker doesn't break the contract (UI falls back to the activity probe).
   live?: boolean;
+  // T-0803: CLIENT-SIDE ONLY — never sent by the worker. Set by the sessions
+  // page when a poll admitted a fan-out failure and this row was carried over
+  // from the last good poll rather than re-observed. Marks a row as
+  // "last known", so retaining it through a socket gap can never be mistaken
+  // for a fresh observation.
+  retained_stale?: boolean;
   window: string;
   cwd: string;
   started_at?: string | null;

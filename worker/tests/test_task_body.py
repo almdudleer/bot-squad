@@ -3,7 +3,15 @@ from __future__ import annotations
 
 import pytest
 
-from bot_squad_worker.task_body import append_progress, compose_body, parse_body
+import hashlib
+
+from bot_squad_worker.task_body import (
+    append_progress,
+    compose_body,
+    decode_progress_text,
+    encode_progress_text,
+    parse_body,
+)
 
 
 def test_parse_full_body():
@@ -73,12 +81,118 @@ def test_append_progress_overflow_raises():
         append_progress(body, "T1", "S1", "x" * 5000)
 
 
-def test_append_progress_collapses_newlines():
+def test_append_progress_single_line_prose_is_stored_unchanged():
+    """GREEN CONTROL for the round-trip below (T-0835).
+
+    A single-line prose note — the overwhelming majority of the feed — must be
+    stored byte-identically, with NO escape sequence appearing. Without this
+    arm, a red on the multi-line test could equally mean "structure is lost" or
+    "everything changed"; with it, a red means exactly the first.
+    """
     body = "## Verbatim request\n\nv\n"
-    new = append_progress(body, "T1", "S1", "line1\nline2\n\n  line3")
-    parsed = parse_body(new)
-    text_part = parsed["progress"].split(" · ", 2)[-1]
-    assert text_part == "line1 line2 line3"
+    note = "measured on disk: line 2 is 4055 bytes and ends mid-word — see re.sub(r'\\s+', ' ')"
+    new = append_progress(body, "T1", "S1", note)
+    stored = parse_body(new)["progress"].split(" · ", 2)[-1]
+    assert stored == note            # at rest: untouched, no escaping
+    assert decode_progress_text(stored) == note   # and the read half is a no-op
+
+
+def test_append_progress_multiline_note_round_trips_byte_identical():
+    """T-0835 RED ARM — the test that goes red without the encode/decode pair.
+
+    THE CLAIM, in the terms a caller cares about: a note can be READ BACK AS
+    THE THING IT WAS WRITTEN AS. Not "did the write succeed" — `ticket note`
+    already returned success while flattening, which is the whole defect — and
+    not "are all the bytes there", which was ALSO true of the flattened
+    `sweep.sh` that this pins the fix for: every byte survived and the script
+    was inert.
+
+    Against the pre-fix `re.sub(r"\\s+", " ", text)` this fails on the first
+    assert of the hash pair; the physical-shape asserts above it stay green,
+    which is the point — the storage contract is not what was broken.
+    """
+    body = "## Verbatim request\n\nv\n"
+    note = (
+        "M1-M10 sweep, verdicts:\n"
+        "\n"
+        "| id | mutation            | verdict |\n"
+        "|----|---------------------|---------|\n"
+        "| M1 | drop the hook       | RED     |\n"
+        "\n"
+        "```bash\n"
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "grep -c 'x' file\t# a tab lives here\n"
+        "```"
+    )
+    new = append_progress(body, "T1", "S1", note)
+    progress = parse_body(new)["progress"]
+
+    # STILL one physical line: the `- <ts> · <sid> · <text>` contract that
+    # TaskDetail.parseProgressList, `bsq session-search` and drift.py's two
+    # regexes all parse by line is NOT widened by this fix.
+    assert len(progress.splitlines()) == 1
+    assert progress.startswith("- T1 · S1 · ")
+
+    stored = progress.split(" · ", 2)[-1]
+    read_back = decode_progress_text(stored)
+    assert (
+        hashlib.sha256(read_back.encode("utf-8")).hexdigest()
+        == hashlib.sha256(note.encode("utf-8")).hexdigest()
+    )
+    assert read_back == note   # named explicitly so a red says WHAT differs
+
+
+def test_decode_leaves_unknown_and_literal_escapes_alone():
+    """The decoder must not invent structure that was never written (T-0835).
+
+    `\\s` is not an escape this codec defines — a note quoting
+    `re.sub(r"\\s+", ...)` must read back as those two characters. And a note
+    that literally contains a backslash followed by `n` survives as such,
+    because encode doubles the backslash first and decode is a single scan
+    rather than chained replaces.
+    """
+    assert decode_progress_text(r"re.sub(r'\s+', ' ')") == r"re.sub(r'\s+', ' ')"
+    assert encode_progress_text(r"re.sub(r'\s+', ' ')") == r"re.sub(r'\s+', ' ')"
+    literal = r"the two characters \n, written out"
+    assert decode_progress_text(encode_progress_text(literal)) == literal
+    assert "\n" not in encode_progress_text(literal)
+
+
+def test_encode_decode_round_trip_is_exhaustive_over_the_colliding_alphabet():
+    """Every string over the characters that can collide round-trips (T-0835).
+
+    The escape rule is minimal — a backslash is protected only when it precedes
+    one the decoder would claim — so "it works on my example" is not evidence.
+    This brute-forces every string up to length 4 over the alphabet where a
+    mistake could hide: backslash, the three escape letters, a real newline and
+    a real tab. 1554 cases; a chained-replace decoder fails it.
+    """
+    import itertools
+    alphabet = "\\nrt\n\ta"
+    for size in range(1, 5):
+        for combo in itertools.product(alphabet, repeat=size):
+            s = "".join(combo)
+            enc = encode_progress_text(s)
+            assert "\n" not in enc and "\r" not in enc and "\t" not in enc
+            assert decode_progress_text(enc) == s, (s, enc)
+
+
+def test_append_progress_overflow_names_both_lengths_when_escaped():
+    """The refusal must quote a number the CALLER can reconcile with its input.
+
+    The cap applies to the STORED form (that is what has to fit), but a caller
+    that passed 3990 characters and is told "4200" cannot act on it — so when
+    escaping changed the length, the message carries both.
+    """
+    body = "## Verbatim request\n\nv\n"
+    note = "\n".join(["x" * 39] * 100)   # 3999 raw, +99 escaped newlines
+    with pytest.raises(ValueError) as exc:
+        append_progress(body, "T1", "S1", note)
+    msg = str(exc.value)
+    assert f"{len(note)} chars" in msg
+    assert "stored, newlines escaped" in msg
+    assert "refusing to truncate" in msg
 
 
 def test_append_progress_empty_text_raises():

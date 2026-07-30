@@ -70,20 +70,86 @@ def test_send_to_unknown_sid_still_writes_inbox(tmp_path):
     assert read["count"] == 1
 
 
-def test_text_sanitisation(tmp_path):
+def _stored_body(message: str) -> str:
+    """The message BODY of a stored inbox line ``<ts>\\t[from <sid>]\\t<body>``.
+
+    T-0827: measure the field you are claiming about. The operator's first
+    sweep for this defect thresholded LINE length, which carries a
+    SID-length-dependent offset (SIDs here run ~26-60 chars) — it did not merely
+    miscount, it MISATTRIBUTED, making long-SID senders look like frequent
+    offenders and sending another project's session to redo work that was fine.
+    Every assertion below goes through this splitter.
+    """
+    return message.split("\t", 2)[2]
+
+
+def test_newlines_are_flattened_but_the_message_survives(tmp_path):
     cfg = _make_cfg(tmp_path)
-    long = "x" * 5000
-    I.send(cfg, "p", "S-from", "S-to", "line1\nline2\rline3\r\nline4")
-    I.send(cfg, "p", "S-from", "S-to", long)
+    out = I.send(cfg, "p", "S-from", "S-to", "line1\nline2\rline3\r\nline4")
+    assert out["ok"] is True
     read = I.inbox_read(cfg, "p", "S-to")
-    assert len(read["messages"]) == 2
-    # Newlines collapsed to spaces — message line has no embedded \n
     assert "\n" not in read["messages"][0]
-    assert "line1 line2 line3 line4" in read["messages"][0]
-    # 4000-char cap
-    assert read["messages"][1].endswith("x" * 100)
-    # Total length budget = ts + "[from S-from]\t" + body; body <= 4000
-    assert read["messages"][1].count("x") == 4000
+    assert _stored_body(read["messages"][0]) == "line1 line2 line3 line4"
+
+
+def test_under_cap_message_round_trips_byte_identical(tmp_path):
+    """GREEN CONTROL, and it runs FIRST: just under the cap still passes
+    untouched, so a red on the refusal test below cannot be read as "the cap
+    broke ordinary sends".
+
+    Hashed at both ends rather than eyeballed — a difference of one character
+    at a 4000-char boundary is exactly what nobody sees by looking (T-0827 DoD).
+    """
+    import hashlib
+
+    cfg = _make_cfg(tmp_path)
+    text = "a" * 3999
+    assert I.send(cfg, "p", "S-from", "S-to", text)["delivered_to"] == ["S-to"]
+    body = _stored_body(I.inbox_read(cfg, "p", "S-to")["messages"][0])
+    assert (
+        hashlib.sha256(body.encode("utf-8")).hexdigest()
+        == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    )
+    assert body == text
+
+
+def test_over_cap_message_is_refused_and_nothing_is_delivered(tmp_path):
+    """T-0827 RED ARM — fails against the bare slice `text[:_MAX_TEXT_LEN]`.
+
+    THE CLAIM IN WORDS: the sender is never told "sent" when the recipient
+    received less than what was passed. Asserting the exit code cannot see
+    that — the old code returned ``{"ok": True, "delivered_to": ["S-to"]}`` for
+    a message it had cut mid-word, and the CLI printed "sent to 1 inbox(es)".
+    So this asserts the CLAIM: the refusal is explicit, it names the length and
+    the cap, and the inbox gains NOTHING — a partial delivery is never
+    preferable to a failure the sender can act on.
+    """
+    cfg = _make_cfg(tmp_path)
+    out = I.send(cfg, "p", "S-from", "S-to", "x" * 4001)
+    assert out["ok"] is False
+    assert out["delivered_to"] == []           # nobody was told this arrived
+    assert out["reason"] == "text-over-cap"
+    assert "4001" in out["error"] and "4000" in out["error"]
+    assert "refusing to truncate" in out["error"]
+    inbox = tmp_path / "data" / "p" / "_chat" / "inbox-S-to.log"
+    assert not inbox.exists() or inbox.read_bytes() == b""
+    assert I.inbox_read(cfg, "p", "S-to")["count"] == 0
+
+
+def test_over_cap_refusal_does_not_partially_fan_out(tmp_path):
+    """A role fan-out must refuse for EVERY recipient, not deliver to some.
+
+    The refusal is checked before recipients are resolved, so there is no
+    ordering under which inbox 1 gets the message and inbox 2 does not — the
+    half-delivered broadcast is the multi-recipient shape of the same defect.
+    """
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-w1-p2", "T-0001")
+    _write_session(tmp_path, "p", "S-u-w2-p3", "T-0002")
+    out = I.send(cfg, "p", "S-u-tl-p0", "dev", "y" * 5000)
+    assert out["ok"] is False and out["delivered_to"] == []
+    for sid in ("S-u-w1-p2", "S-u-w2-p3"):
+        assert I.inbox_read(cfg, "p", sid)["count"] == 0
 
 
 def test_role_fanout_teamlead_and_dev(tmp_path):

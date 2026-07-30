@@ -30,6 +30,33 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
 
 export type ProgressEntry = { ts: string; sid: string; text: string };
 
+// T-0835: the RENDER half of the progress-note round-trip. A note is stored on
+// ONE physical line — the format `- <ts> · <sid> · <text>` that this parser and
+// three other consumers depend on — with its newlines/tabs escaped by
+// `task_body.encode_progress_text` instead of destroyed. Structure is preserved
+// at rest and expanded here, at render.
+//
+// A single left-to-right scan, never chained `replace`s: chaining would decode
+// the output of an earlier step (`\\n` → `\n` → newline) and turn text the
+// author wrote literally into a line break. An unknown escape (`\s` in a note
+// quoting `re.sub(r"\s+", ...)`) is left exactly as it was, which is also what
+// keeps every pre-T-0835 note rendering as it always did.
+export function decodeNoteText(text: string): string {
+  const map: Record<string, string> = { "\\": "\\", n: "\n", r: "\r", t: "\t" };
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = i + 1 < text.length ? text[i + 1] : "";
+    if (ch === "\\" && next in map) {
+      out += map[next];
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 export function parseProgressList(progress: string): ProgressEntry[] {
   if (!progress) return [];
   // Each line: "- <ts> · <sid> · <text>"
@@ -40,8 +67,12 @@ export function parseProgressList(progress: string): ProgressEntry[] {
     .map((ln) => {
       const rest = ln.slice(2);
       const parts = rest.split(" · ");
-      if (parts.length < 3) return { ts: "", sid: "", text: rest };
-      return { ts: parts[0], sid: parts[1], text: parts.slice(2).join(" · ") };
+      if (parts.length < 3) return { ts: "", sid: "", text: decodeNoteText(rest) };
+      return {
+        ts: parts[0],
+        sid: parts[1],
+        text: decodeNoteText(parts.slice(2).join(" · ")),
+      };
     });
 }
 
@@ -429,7 +460,11 @@ export function TaskDetail() {
               >
                 {formatNoteTs(p.ts)} · {mine ? "you" : p.sid}
               </span>
-              {p.text}
+              {/* T-0835: pre-wrap so a note's decoded line breaks actually
+                  render — decoding the escapes and then collapsing them in the
+                  browser would preserve the bytes and lose the shape again, one
+                  layer further out. */}
+              <span style={{ whiteSpace: "pre-wrap" }}>{p.text}</span>
             </div>
           );
         })}

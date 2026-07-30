@@ -137,6 +137,20 @@ def test_start_rejects_bad_kind_and_empty_prompt(cfg_slug):
         ap.start(cfg, slug, kind="session", ref=FAKE, prompt="   ")
 
 
+def test_start_refuses_an_over_cap_prompt_instead_of_truncating(cfg_slug):
+    """T-0827, third twin: `prompt = prompt[:_MAX_PROMPT_LEN]` was the same bare
+    slice as the peer bus's, on the payload where a dropped tail is LEAST
+    visible — a standing brief a TL then drives a team from for hours, with no
+    way to know what it was supposed to say. Refuse and name the length.
+    """
+    from bot_squad_worker.actions import ActionError
+    cfg, slug, _notes = cfg_slug
+    with pytest.raises(ActionError) as exc:
+        ap.start(cfg, slug, kind="session", ref=FAKE, prompt="z" * 4001)
+    msg = str(exc.value)
+    assert "4001" in msg and "4000" in msg and "refusing to truncate" in msg
+
+
 def test_notify_stakeholder_routes_tg_primary(tmp_path: Path, monkeypatch):
     """P2-08 + T-0610 inversion: autopilot's stakeholder page routes through the
     _send_stakeholder_dm SSOT — ONE TG delivery into #team-queries (TG-primary

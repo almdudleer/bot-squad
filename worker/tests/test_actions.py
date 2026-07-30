@@ -1200,6 +1200,46 @@ def test_peer_send_mirrors_to_telegram_for_ui_sid(tmp_path, tmp_config_dir, monk
     assert call["user"] == "alexey"
 
 
+def test_peer_send_over_cap_raises_and_mirrors_nothing(tmp_path, tmp_config_dir, monkeypatch):
+    """T-0827: the AGENT-facing layer must fail loudly, not return a 200.
+
+    The old path returned ok/delivered_to for a message it had cut mid-word and
+    the CLI printed "sent to 1 inbox(es)" — indistinguishable from a whole
+    send. It also fired the TG mirror with the sender's FULL text, so the
+    stakeholder saw content the recipient never got. Both are asserted here:
+    the call raises, and the mirror never fires.
+    """
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    (tmp_config_dir / "auth.toml").write_text(
+        '[users]\n'
+        'alexey = "hash"\n'
+        '\n'
+        '[user_meta.alexey]\n'
+        'linux_user = "almdudleer"\n'
+        'tg_chat_id = "404580642"\n'
+    )
+    (tmp_path / "data" / "test-project" / "_chat").mkdir(parents=True)
+    _write_session_metadata(
+        tmp_path / "data" / "test-project" / "sessions" / "S-alexey-ui-p0.md",
+        {"sid": "S-alexey-ui-p0", "status": "active"},
+    )
+    cfg, fake = _inject_fake_tg(monkeypatch, tmp_config_dir)
+
+    with pytest.raises(A.ActionError) as exc:
+        A.dispatch("peer_send", {
+            "slug": "test-project",
+            "from_sid": "S-almdudleer-operator-p23",
+            "to": "S-alexey-ui-p0",
+            "text": "q" * 4200,
+        })
+    assert "4200" in str(exc.value) and "refusing to truncate" in str(exc.value)
+    assert fake.calls == []
+    inbox = tmp_path / "data" / "test-project" / "_chat" / "inbox-S-alexey-ui-p0.log"
+    assert not inbox.exists() or inbox.read_bytes() == b""
+
+
 def test_peer_send_skips_tg_mirror_when_user_has_no_chat_id(tmp_path, tmp_config_dir, monkeypatch):
     """User present in user_meta but with no tg_chat_id → no TG call."""
     import bot_squad_worker.actions as A

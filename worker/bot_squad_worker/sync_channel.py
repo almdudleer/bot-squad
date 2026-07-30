@@ -311,7 +311,14 @@ def send(
         raise SyncError(f"channel {channel_id} not open (status {ch['status']})")
     peer = _peer(ch, sid)
     body = f"[sync {channel_id}] {text}"
-    _is.send(cfg, slug, sid, peer, body)
+    # T-0827: this carries AGENT-AUTHORED text, so it is the one internal caller
+    # that can genuinely hit the bus cap. A refusal must reach the sender as an
+    # error like every other sync failure here — silently dropping (or, before
+    # T-0827, silently truncating) a live channel message is exactly the
+    # "delivered, but not what you sent" outcome this bus must not produce.
+    sent = _is.send(cfg, slug, sid, peer, body)
+    if not sent.get("ok", True):
+        raise SyncError(f"sync send to {peer}: {sent.get('error', 'refused')}")
     _touch(ch, now)
     _store(_channel_path(cfg, slug, channel_id), ch)
     # notify.text for the live pane carries the sender SID (the inbox copy

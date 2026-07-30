@@ -156,6 +156,21 @@ def test_bidirectional_exchange(tmp_path):
     assert any("hey alice" in m and "[from %s]" % B in m and "SC-1" in m for m in a_msgs)
 
 
+def test_send_over_cap_raises_instead_of_truncating(tmp_path):
+    """T-0827: sync is the one INTERNAL caller carrying agent-authored text, so
+    it is the one that can actually hit the bus cap. A refusal must reach the
+    sender as a SyncError like every other failure in this module — a live
+    channel message that arrives cut mid-word is the "delivered, but not what
+    you sent" outcome the bus must not produce, and the channel's own last-touch
+    is deliberately NOT bumped for a message that never went.
+    """
+    cfg = _cfg(tmp_path)
+    _open_channel(cfg)
+    with pytest.raises(SC.SyncError, match="refusing to truncate"):
+        SC.send(cfg, "p", A, "SC-1", "w" * 4100)
+    assert _drain(cfg, B) == []
+
+
 def test_send_by_nonmember_rejected(tmp_path):
     cfg = _cfg(tmp_path)
     _open_channel(cfg)

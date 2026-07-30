@@ -12,7 +12,12 @@
  */
 import { describe, expect, test } from "vitest";
 
-import { parseProgressList, STAKEHOLDER_SID, firstTouchTs } from "./TaskDetail";
+import {
+  decodeNoteText,
+  parseProgressList,
+  STAKEHOLDER_SID,
+  firstTouchTs,
+} from "./TaskDetail";
 import { countNotes } from "../components/TaskCard";
 
 const FEED = [
@@ -29,6 +34,35 @@ describe("parseProgressList", () => {
       sid: "S-almdudleer-multi_server-TL-p67",
       text: "FORK CALL: reuse progress-notes.",
     });
+  });
+
+  // T-0835: the browser is the RENDER half of the note round-trip. The worker
+  // stores a note on one physical line with its newlines escaped
+  // (`task_body.encode_progress_text`); if this parser did not expand them the
+  // shape would be lost one layer further out, with every byte still present —
+  // which is exactly the failure being fixed, just relocated.
+  test("expands escaped structure back into a multi-line note", () => {
+    const stored =
+      "- 2026-07-30T20:00:00Z · S-x · sweep:\\n\\n```bash\\nset -e\\ngrep -c x f\\n```";
+    const out = parseProgressList(stored);
+    expect(out).toHaveLength(1); // still ONE entry, not one per line
+    expect(out[0].text).toBe("sweep:\n\n```bash\nset -e\ngrep -c x f\n```");
+  });
+
+  test("a pre-T-0835 note renders exactly as it always did", () => {
+    // GREEN CONTROL: `\s` is not an escape this codec defines, so a note
+    // quoting a regex must survive character-for-character. Nine thousand
+    // existing notes depend on this arm, not on the one above.
+    const out = parseProgressList("- 2026-07-30T20:00:00Z · S-x · re.sub(r'\\s+', ' ')");
+    expect(out[0].text).toBe("re.sub(r'\\s+', ' ')");
+  });
+
+  test("decodeNoteText never decodes its own output", () => {
+    // A literal backslash-n the author typed is stored doubled and must come
+    // back as two characters — a chained-replace decoder returns a line break.
+    expect(decodeNoteText("the two characters \\\\n, written out")).toBe(
+      "the two characters \\n, written out",
+    );
   });
 
   test("empty / blank progress yields no entries", () => {

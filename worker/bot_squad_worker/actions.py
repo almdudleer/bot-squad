@@ -2986,6 +2986,13 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
         cfg, delivery_slug, params["from_sid"], to, params["text"],
         user=params.get("user"),
     )
+    # T-0827: an over-cap message is refused whole rather than delivered
+    # truncated, and the CLI caller is the one that can act on it. Raised
+    # BEFORE the stall-watchdog hook and the TG mirror so a refused send marks
+    # nothing and mirrors nothing — the sender must see one unambiguous
+    # failure, not a 200 plus a partial side effect.
+    if not result.get("ok", True):
+        raise ActionError(f"peer_send: {result.get('error', 'refused')}")
 
     # T-0155: feed the stall-watchdog — a send to an operator-role session marks
     # the sender blocked on the stakeholder; an operator's send clears the

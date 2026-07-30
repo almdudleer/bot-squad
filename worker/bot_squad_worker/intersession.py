@@ -73,9 +73,49 @@ def _chat_dir(cfg: Any, slug: str) -> Path:
 
 
 def _sanitize(text: str) -> str:
+    """Flatten a message onto one line; REFUSE over-cap text, never truncate.
+
+    T-0827: this used to end ``text = text[:_MAX_TEXT_LEN]`` — a bare slice
+    with no error, no marker, no log line and no signal at either end. The
+    sender was told ``sent to 1 inbox(es)``; the recipient got a message
+    stopping mid-word and, BY CONSTRUCTION, could not know what it was
+    supposed to receive — a truncated brief reads as a complete brief.
+    Measured over both installs' inbox logs on 2026-07-30: 33 confirmed
+    truncations (+2 ambiguous) out of 15,744 messages, overwhelmingly
+    dev→operator, including two READY reports that were the certification
+    basis for closed tickets, and one case where an operator accepted a
+    ticket and pushed its commit on a report it could not see the end of.
+
+    The remedy is CARRIED ACROSS, not invented: ``task_body`` hit the same cap
+    constant, took the same silent loss (F-2026-07-05-bsq-30844bca41) and
+    answered it by raising. This was duplicate divergence where the fix
+    already existed in the tree — the peer bus simply never got it.
+
+    REFUSE rather than split, deliberately (T-0827 DoD item 3). A split
+    preserves content but this bus has no message framing: ``send`` appends one
+    line per message and ``inbox_read`` returns them in FILE order, so a
+    concurrent sender interleaves between parts and part 2/3 can arrive after
+    somebody else's message — the same reordering ``rebind_sid`` already
+    refuses a silent merge over. A refusal makes the SENDER act, which is what
+    every session has been doing by hand since 14:33Z today, and it pushes
+    evidence to the durable record: this bus is a NOTIFICATION channel that has
+    been used as an EVIDENCE channel, and it has no durability guarantee
+    appropriate to evidence.
+
+    Raising is safe here because ``send`` — the ONLY caller — catches it and
+    reports the refusal in its RETURN VALUE, preserving its documented "never
+    raises" contract for the ~12 internal best-effort notifiers (T-0827 DoD
+    item 4: the twin's raise is right for a CLI caller and wrong for a tick).
+    """
     text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
     if len(text) > _MAX_TEXT_LEN:
-        text = text[:_MAX_TEXT_LEN]
+        raise ValueError(
+            f"peer message is {len(text)} chars, over the {_MAX_TEXT_LEN}-char cap — "
+            "refusing to truncate (silent loss, T-0827; same refusal task_body.py "
+            "made after F-2026-07-05-bsq-30844bca41). Split it into parts under "
+            f"{_MAX_TEXT_LEN} chars, or record the long content on the ticket "
+            "(`bsq ticket note`) and send a pointer."
+        )
     return text
 
 
@@ -420,8 +460,31 @@ def send(
     T-0157: ``user`` overrides the linux-user scope for role-keyword fan-out
     (``teamlead``/``dev``/``all``); without it the scope is the sender's own
     linux user parsed from ``from_sid``. See ``_resolve_recipients``.
+
+    T-0827: over-cap text is REFUSED — ``{"ok": False, "reason":
+    "text-over-cap", "error": <what to do>, "delivered_to": []}``, and NOTHING
+    is written to any inbox. The forbidden outcome this kills is "caller
+    believes it sent, recipient got part", so the refusal is total: a partial
+    delivery is never preferable to a failure the sender can see. Callers that
+    only read ``delivered_to`` still cannot mistake it for success — it is
+    empty. The refusal is returned rather than raised so the internal
+    best-effort notifiers keep the never-raises contract above; it is also
+    logged at ERROR, because a caller that ignores the return must still leave
+    a trace rather than repeating the silence this ticket exists to end.
     """
-    sanitized = _sanitize(text)
+    try:
+        sanitized = _sanitize(text)
+    except ValueError as exc:
+        log.error(
+            "intersession: REFUSED an over-cap peer message from %s to %r "
+            "(slug=%s): %s", from_sid, to, slug, exc,
+        )
+        return {
+            "ok": False,
+            "delivered_to": [],
+            "reason": "text-over-cap",
+            "error": str(exc),
+        }
     recipients = _resolve_recipients(cfg, slug, to, from_sid=from_sid, user=user)
     line = f"{_now_iso()}\t[from {from_sid}]\t{sanitized}\n"
     delivered: list[str] = []

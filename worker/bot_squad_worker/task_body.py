@@ -176,12 +176,134 @@ def compose_body(verbatim: str, context: str, progress: str) -> str:
     return "\n".join(parts)
 
 
+# T-0835: a progress note is stored as ONE physical line — `- <ts> · <sid> ·
+# <text>` — and at least four independent consumers parse the feed line by line:
+# `web/src/pages/TaskDetail.tsx:parseProgressList`, `bsq session-search`'s
+# `_progress_lines_by_sid`, and `drift.py`'s two `^-\s*<ts>\s*·` regexes. That
+# one-line-per-note shape is a DECIDED contract, written down in
+# `docs/roadmap/verbatim-contract.md` ("- <iso_ts> · <sid> · <short note>   #
+# append-only audit feed"), not an accident — so the fix for the silent
+# flattening is NOT to widen the physical format.
+#
+# What the old code did was `re.sub(r"\s+", " ", text)`: every newline, tab and
+# run of spaces became a single space, silently, while the same function
+# REFUSED loudly to lose a single character off the end. Measured: p536's
+# 2555-char `sweep.sh` paste on T-0829 became one line beginning
+# `#!/usr/bin/env bash #`, so every byte survived and the script was INERT —
+# everything after that first `#` is a shell comment and the comment/code
+# boundaries are unrecoverable by eye. Content survived; structure did not; and
+# nothing said so, which is the defect (a well-formed success guaranteeing the
+# wrong invariant).
+#
+# So structure is preserved AT REST as an escape sequence — the note stays one
+# physical line and no consumer changes — and expanded AT RENDER by
+# `decode_progress_text`. `encode`→`decode` is byte-identity for every input
+# (pinned by an exhaustive round-trip over the alphabet that can collide).
+#
+# Known bound, stated here rather than left for someone to find: a note written
+# BEFORE this change containing the two literal characters `\` `n` decodes to a
+# line break. Four such lines exist across the live backlog's ~9000 notes
+# (measured 2026-07-30). The direction is benign — a spurious break in a
+# historical note, never lost content — and every note written after this
+# change round-trips exactly.
+#: The characters that cannot survive on a one-line record, and what they are
+#: written as. Kept tiny on purpose — the fewer characters this touches, the
+#: fewer notes it changes at rest.
+_ONELINE_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+#: Escape char → the character it stands for, plus ``\\`` for a backslash the
+#: encoder had to protect. This is the DECODER's whole alphabet: anything else
+#: after a backslash is not an escape and is passed through untouched.
+_ONELINE_DECODE = {esc[-1]: raw for raw, esc in _ONELINE_ESCAPES.items()}
+_ONELINE_DECODE["\\"] = "\\"
+
+
+def encode_progress_text(text: str) -> str:
+    """Fold ``text`` onto one physical line, losslessly and invertibly.
+
+    MINIMAL by design: a backslash is doubled ONLY when it would otherwise be
+    read as opening an escape. Doubling every backslash would also be correct,
+    but it would rewrite the durable md for a large and entirely innocent
+    population of notes — this repo's notes quote regexes
+    (``re.sub(r"\\s+", ...)``) and paths constantly, and the ticket file is a
+    HUMAN-READABLE record, not just a decoder's input. Consequence of the
+    minimal rule: a note is stored byte-identically unless it really contains a
+    newline, tab, CR, or a backslash that collides.
+
+    Built RIGHT-TO-LEFT, and that is not a style choice. Whether a backslash
+    needs protecting depends on what its neighbour looks like AFTER encoding,
+    not before: ``\\`` + a real newline encodes to ``\\`` + ``\\n``, and a
+    left-to-right pass reading the RAW neighbour sees a newline (not an escape
+    letter), leaves the backslash bare, and emits ``\\\\n`` — which decodes to
+    backslash-n, silently turning a line break into two characters. Caught by
+    the exhaustive round-trip test, not by inspection.
+    """
+    out: list[str] = []
+    for ch in reversed(text or ""):
+        esc = _ONELINE_ESCAPES.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ch == "\\" and out and out[-1][0] in _ONELINE_DECODE:
+            out.append("\\\\")
+        else:
+            out.append(ch)
+    return "".join(reversed(out))
+
+
+def decode_progress_text(text: str) -> str:
+    """Inverse of :func:`encode_progress_text` — the READ half of the round-trip.
+
+    A single left-to-right scan, never a chain of ``replace`` calls: chained
+    replaces would decode the output of an earlier step (``\\\\n`` → ``\\n`` →
+    newline) and silently un-escape text the author wrote literally.
+
+    An UNKNOWN escape is left EXACTLY as it was — ``\\s`` in a note quoting
+    ``re.sub(r"\\s+", ...)`` must survive as two characters, and pre-T-0835
+    notes are full of them.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text or "")
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in _ONELINE_DECODE:
+                out.append(_ONELINE_DECODE[nxt])
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _sanitize_progress_text(text: str) -> str:
-    """Collapse newlines to spaces, squeeze whitespace; raise on over-cap text."""
-    s = re.sub(r"\s+", " ", (text or "")).strip()
+    """Fold a note onto one line WITHOUT losing its shape; raise on over-cap text.
+
+    Two guarantees, both stated in the terms a CALLER cares about rather than
+    the terms this function happens to enforce (T-0835's reusable lesson — the
+    old docstring's "Collapse newlines to spaces" was read as a formatting
+    detail by four sessions in a row, including one that quoted the clause
+    beside it):
+
+    * NOTHING IS LOST. The stored form is reversible by
+      :func:`decode_progress_text`; a note round-trips byte-identically apart
+      from leading/trailing whitespace, which is stripped.
+    * NOTHING IS TRUNCATED SILENTLY. Over-cap text raises, naming the length,
+      the cap and the remedy (F-2026-07-05-bsq-30844bca41).
+
+    The cap is measured on the STORED form, since that is what has to fit; when
+    escaping made it longer than what the caller passed, the message says so
+    rather than quoting a number the caller cannot reconcile with their input.
+    """
+    raw = (text or "").strip()
+    s = encode_progress_text(raw)
     if len(s) > _PROGRESS_MAX_CHARS:
+        size = (
+            f"{len(s)} chars" if len(s) == len(raw)
+            else f"{len(raw)} chars ({len(s)} stored, newlines escaped)"
+        )
         raise ValueError(
-            f"progress note is {len(s)} chars, over the {_PROGRESS_MAX_CHARS}-char cap — "
+            f"progress note is {size}, over the {_PROGRESS_MAX_CHARS}-char cap — "
             "refusing to truncate (silent loss, F-2026-07-05-bsq-30844bca41). "
             "Split the note or put long content in the ticket's ## Context section."
         )
@@ -191,9 +313,9 @@ def _sanitize_progress_text(text: str) -> str:
 def append_progress(body: str, ts: str, sid: str, text: str) -> str:
     """Append `- <ts> · <sid> · <text>` to the Progress section.
 
-    Creates the Progress section (at the end) if it's missing. Text is
-    sanitised (newlines collapsed); text over _PROGRESS_MAX_CHARS raises
-    ValueError rather than truncating.
+    Creates the Progress section (at the end) if it's missing. Text is folded
+    onto one line REVERSIBLY (T-0835 — `decode_progress_text` is the read half);
+    text over _PROGRESS_MAX_CHARS raises ValueError rather than truncating.
 
     T-0729: this is a raw-text SPLICE into the Progress section, not a
     parse→compose round-trip. Recomposing from the three parsed sections would

@@ -410,8 +410,20 @@ def start(
     prompt = (prompt or "").strip()
     if not prompt:
         raise ActionError("autopilot.start: prompt is required")
+    # T-0827 (third twin of the same bare slice): this used to be
+    # `prompt = prompt[:_MAX_PROMPT_LEN]`. An autopilot prompt is a STANDING
+    # BRIEF delivered to a TL that then drives a team for hours — the one
+    # payload where a silently dropped tail is least visible and most costly,
+    # since the recipient cannot know what the brief was supposed to say. Same
+    # refusal as `task_body._sanitize_progress_text` and `intersession._sanitize`;
+    # the caller is an agent/CLI that can shorten and retry.
     if len(prompt) > _MAX_PROMPT_LEN:
-        prompt = prompt[:_MAX_PROMPT_LEN]
+        raise ActionError(
+            f"autopilot.start: prompt is {len(prompt)} chars, over the "
+            f"{_MAX_PROMPT_LEN}-char cap — refusing to truncate (silent loss, "
+            "T-0827). Shorten the brief, or put the detail on a ticket and "
+            "point the prompt at it."
+        )
     try:
         duration_hours = float(duration_hours)
     except (TypeError, ValueError):

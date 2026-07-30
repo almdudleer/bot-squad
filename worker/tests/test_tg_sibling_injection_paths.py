@@ -135,7 +135,10 @@ def test_reply_path_says_a_human_wrote_it_and_over_what_channel(tmp_path, inject
     assert "TELEGRAM" in text
     assert "a human" in text
     assert "Alexey S" in text          # from the update, not assumed
-    assert "chat 12345 (direct message)" in text
+    # T-0795: the chat id is HIGHLIGHTED, and a DM's absent topic is named as
+    # prose rather than emitted as an empty field. Exact form pinned in
+    # test_ping_ids_highlight.py.
+    assert "▶ CHAT ID: 12345   (no topic id — not a forum topic)" in text
     assert "да" in text                # his words, verbatim, still present
     assert SID in text
 
@@ -166,7 +169,8 @@ def test_a_reply_in_a_forum_topic_names_that_topic_and_its_answer_route(
     TL.handle_update(cfg, {"update_id": 5, "message": msg})
 
     text = injected[0][1]["text"]
-    assert "chat 999888, forum topic 42" in text
+    # T-0795: both ids highlighted instead of buried in the prose `Where` row.
+    assert "▶ CHAT ID: 999888   ▶ TOPIC ID: 42" in text
     assert 'bsq topic say --chat 999888 --topic 42 "<your answer>"' in text
 
 

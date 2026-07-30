@@ -182,6 +182,107 @@ def test_an_empty_queue_still_prints_the_counts_line(monkeypatch, capsys):
     assert "TAKEABLE (most urgent first): 0" in out
 
 
+# --- T-0829: the DEFAULT table names the active drive scope ------------------
+#
+# `--brief` got this for free (the server renders it). The default table is the
+# one a human types, and a scope that narrows it silently is «нужно более чёткое
+# понимание для меня, какой режим драйва щас стоит» reproduced on his own
+# surface. Both directions are pinned: it must appear when a scope IS set, and
+# must NOT be manufactured when none is.
+
+def _scope(**over):
+    ds = {"scope": "open_reopened", "statuses": ["open", "reopened"],
+          "source": "config", "configured": True, "problem": None,
+          "set_by": "stakeholder", "set_at": "2026-07-30T14:52:00Z",
+          "source_text": "закончить всё что в опен",
+          "triage_in_scope": 4, "out_of_scope": 55}
+    ds.update(over)
+    return ds
+
+
+def test_the_table_names_the_scope_that_narrowed_it(monkeypatch, capsys):
+    fake_post, _ = _record_post({"pickup_queue": {
+        "ok": True, "pickup": [_row("T-0719")], "drive_scope": _scope(),
+        "counts": {"pickup": 1, "triage": 4, "excluded": 782, "board": 787}}})
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_pickup(_args())
+
+    out = capsys.readouterr().out
+    assert "drive scope: open_reopened (open, reopened)" in out
+    assert "закончить всё что в опен" in out
+    assert "55 ticket(s) outside this scope are not listed" in out
+    assert "4 in scope need triage" in out
+    assert "NOT mean the scope is done" in out
+
+
+def test_an_unset_scope_prints_no_scope_line_at_all(monkeypatch, capsys):
+    """`configured` tells "never set" from "deliberately widest". A default view
+    that announces a mode he never chose invents a setting instead of reporting
+    one — and this is also what keeps the table byte-identical to today until he
+    sets something."""
+    fake_post, _ = _record_post({"pickup_queue": {
+        "ok": True, "pickup": [_row("T-0719")],
+        "drive_scope": _scope(scope="all", statuses=["in_progress", "open", "planned",
+                                                     "reopened"],
+                              configured=False, set_by=None, set_at=None,
+                              source_text=None, triage_in_scope=8, out_of_scope=0),
+        "counts": {"pickup": 1, "triage": 8, "excluded": 730, "board": 739}}})
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_pickup(_args())
+
+    out = capsys.readouterr().out
+    assert "drive scope" not in out
+    assert "T-0719" in out and "1 takeable" in out
+
+
+def test_a_rejected_scope_value_is_shown_raw_not_as_the_fallback(monkeypatch, capsys):
+    """Never report the fallback as if it were the setting — he has to see the
+    typo he made."""
+    fake_post, _ = _record_post({"pickup_queue": {
+        "ok": True, "pickup": [],
+        "drive_scope": _scope(scope="all", statuses=["in_progress", "open", "planned",
+                                                     "reopened"],
+                              problem="invalid-scope:'opne'", source_text=None,
+                              triage_in_scope=0, out_of_scope=0),
+        "counts": {"pickup": 0, "triage": 0, "excluded": 1, "board": 1}}})
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_pickup(_args())
+
+    out = capsys.readouterr().out
+    assert "DID NOT take effect" in out
+    assert "opne" in out
+
+
+def test_a_response_without_a_scope_block_still_renders(monkeypatch, capsys):
+    """An older worker, or any caller that does not send the block: the table
+    must not blow up in a session's face."""
+    fake_post, _ = _record_post({"pickup_queue": {
+        "ok": True, "pickup": [_row("T-1")],
+        "counts": {"pickup": 1, "triage": 0, "excluded": 0, "board": 1}}})
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_pickup(_args())
+
+    assert "T-1" in capsys.readouterr().out
+
+
+def test_brief_does_not_get_the_table_header_too(monkeypatch, capsys):
+    """One rendering per surface. `--brief` prints the server's block verbatim,
+    so the CLI header must not be prepended to it as a second, drifting copy."""
+    brief = "DRIVE SCOPE: open_reopened (statuses in play: open, reopened) — set."
+    fake_post, _ = _record_post({"pickup_queue": {
+        "ok": True, "pickup": [], "brief": brief, "drive_scope": _scope(),
+        "counts": {"pickup": 0, "triage": 4, "excluded": 782, "board": 787}}})
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_pickup(_args(brief=True))
+
+    assert capsys.readouterr().out.strip() == brief
+
+
 # --- parser wiring ----------------------------------------------------------
 
 def test_the_verb_is_wired_into_the_parser():

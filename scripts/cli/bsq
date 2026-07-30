@@ -2387,11 +2387,52 @@ def cmd_operator_status(args) -> None:
         print(f"operator re-drive: idle for {slug} (empty backlog)")
 
 
+def _pickup_scope_lines(ds: dict) -> list:
+    """The drive-scope header of the `bsq pickup` table (T-0829).
+
+    Renders from the `drive_scope` block the action already returns, and prints
+    NOTHING when no scope is configured — see `cmd_pickup`. Deliberately terser
+    than the operator brief's version: a human reading a table needs to know that
+    a filter ran, which one, and what it is not showing him; the operator needs
+    to be told what it may not conclude from an empty queue.
+    """
+    if not ds or not (ds.get("configured") or ds.get("problem")):
+        return []
+    statuses = ", ".join(ds.get("statuses") or ())
+    words = ds.get("source_text")
+    head = f"drive scope: {ds.get('scope')} ({statuses})"
+    if words:
+        head += f" — set from «{words}»"
+    elif ds.get("set_at"):
+        head += f" — set {ds['set_at']}"
+    lines = [head]
+    if ds.get("problem"):
+        # The stored value did not take effect. Never report the fallback as if
+        # it were the setting — show the raw value so he can see the typo.
+        lines.append(f"  ! the configured scope DID NOT take effect: {ds['problem']}"
+                     f" — showing the widest scope instead")
+    withheld, residue = ds.get("out_of_scope") or 0, ds.get("triage_in_scope") or 0
+    if withheld or residue:
+        lines.append(f"  {withheld} ticket(s) outside this scope are not listed · "
+                     f"{residue} in scope need triage (an empty queue here does "
+                     f"NOT mean the scope is done)")
+    return lines
+
+
 def cmd_pickup(args) -> None:
     """T-0783a: show which board tickets are takeable, and which need triage.
 
     `--brief` prints the exact block the operator re-drive injects, so what a
     human reads here and what a re-driven operator is told can never drift apart.
+
+    T-0829: the DEFAULT table names the active drive scope too. `--brief` got it
+    for free (the server renders it), but this renderer is the one a human types,
+    and under a narrowed scope it otherwise printed "1 takeable · 4 need triage ·
+    782 excluded" with nothing saying a filter had run — «нужно более чёткое
+    понимание для меня, какой режим драйва щас стоит» reproduced on the surface
+    he actually uses. An UNSET scope prints nothing: `configured` exists to tell
+    "never set" from "deliberately widest", and a default view that announces a
+    mode he never chose invents a setting instead of reporting one.
     """
     slug = resolve_slug()
     band = "triage" if args.triage else ("pickup" if not args.all else None)
@@ -2405,6 +2446,8 @@ def cmd_pickup(args) -> None:
         return
 
     counts = res.get("counts") or {}
+    for line in _pickup_scope_lines(res.get("drive_scope") or {}):
+        print(line)
     print(f"board {slug}: {counts.get('pickup', 0)} takeable · "
           f"{counts.get('triage', 0)} need triage · "
           f"{counts.get('excluded', 0)} excluded · {counts.get('board', 0)} total")

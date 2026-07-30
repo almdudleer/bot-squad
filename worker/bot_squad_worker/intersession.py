@@ -216,11 +216,10 @@ def _resolve_recipients(
     in that file, 22 of them uc_redrive escalations spanning 2026-07-04…07-27.
     It is also WHY the operator hop is the one that broke silently: with no role
     keyword for the role the product is built around, every relay to it had to
-    name a remembered SID. Resolution
-    delegates to :func:`dispatch.live_operator_sids`, the operator-identity
-    SSOT (T-0523), so this does not add divergent identity logic — which also
-    means it catches the canonical md-less operator pane that a session-md scan
-    misses.
+    name a remembered SID. Resolution delegates to
+    :func:`dispatch.live_operator_sids`, the operator-identity SSOT (T-0523), so
+    this does not add divergent identity logic — which also means it catches the
+    canonical md-less operator pane that a session-md scan misses.
 
     T-0683: role-keyword fan-out is scoped to LIVE sessions only (the same
     ``_is_live_holder`` check ``bsq team status``'s default roster and the

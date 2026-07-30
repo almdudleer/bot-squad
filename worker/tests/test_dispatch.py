@@ -1037,18 +1037,35 @@ def test_scope_record_only_phrase_suppresses_the_switch():
     assert "suppressed:record-only" in out["signals"]
 
 
+# His four-bullet spec, 2026-07-29T12:20:46Z, verbatim INCLUDING the newline
+# formatting — the bullets are separate lines, not one run-on sentence, and the
+# sentence splitter has to treat them as separate clauses for the conflict rung
+# to see three values. HUMAN-ONLY.
+HIS_FOUR_BULLETS = """надо предусмотреть разные режимы драйва оператора:
+• Закрыть все задачи в Open / Reopened
+• Закрыть все задачи в In Progress
+• Закрыть все задачи вообще, включая backlog
+• Потратить квоту
+
+Вроде у нас еще до этого были какие-то размышления"""
+
+
 def test_scope_his_four_bullet_spec_is_a_conflict_not_a_selection():
     """His original 2026-07-29 message NAMES all three modes. Describing the
-    menu is not choosing from it — that message must not set anything."""
-    out = classify_drive_scope(
-        "надо предусмотреть разные режимы драйва оператора: "
-        "Закрыть все задачи в Open / Reopened. "
-        "Закрыть все задачи в In Progress. "
-        "Закрыть все задачи вообще, включая backlog. "
-        "Потратить квоту"
-    )
+    menu is not choosing from it — that message must not set anything.
+
+    Pinned in his own line-broken formatting rather than a flattened paraphrase,
+    so the ladder is exercised against the shape he actually sends.
+
+    The assertion names all three values deliberately: `decision == "no_change"`
+    alone would also pass if the ladder had seen only ONE bullet and rejected it
+    for some unrelated reason. Requiring the full conflict set proves it read
+    every bullet and then refused to choose.
+    """
+    out = classify_drive_scope(HIS_FOUR_BULLETS)
     assert out["decision"] == "no_change"
-    assert any(s.startswith("scope-conflict:") for s in out["signals"])
+    assert out["scope"] is None
+    assert "scope-conflict:all,in_progress,open_reopened" in out["signals"]
 
 
 def test_scope_blank_raises():

@@ -693,9 +693,23 @@ def drive_stop_tick(cfg: Any) -> None:
 
     Per-project errors are caught and logged so one bad project never kills the
     sweep — the same contract as every sibling lifecycle tick.
+
+    **A blind tick says so out loud.** Every other action here is correctly
+    silent, and a suppressed stop that logged nothing would be indistinguishable
+    from a tick that correctly found work in flight — the two are different
+    facts, and telling them apart is the entire point of the gate. Nobody audits
+    1440 quiet no-ops a day, so the refusal is raised to WARNING here rather
+    than left in :func:`tick`'s return value, which nothing surfaces.
     """
     for slug in getattr(cfg, "projects", {}) or {}:
         try:
-            tick(cfg, slug)
+            res = tick(cfg, slug)
         except Exception:  # noqa: BLE001
             log.exception("drive_stop_tick: unhandled error for project %s", slug)
+            continue
+        if res.get("action") == "board-unknown":
+            log.warning(
+                "drive_stop[%s]: REFUSING to judge the drive — the board is "
+                "not readable (%s). No alert either way: 'nothing to drive' "
+                "and 'cannot tell what there is to drive' are different facts.",
+                slug, res.get("problem"))

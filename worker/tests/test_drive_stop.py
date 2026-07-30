@@ -782,6 +782,43 @@ def test_a_quota_read_that_blows_up_is_an_unknown_not_a_go_ahead(board, monkeypa
 # Wiring — the tick exists and one bad project cannot kill the sweep
 # ---------------------------------------------------------------------------
 
+def test_a_blind_tick_says_so_out_loud(board, monkeypatch, caplog):
+    """The gate being right is not enough if its output is invisible. Every
+    other action is correctly silent, so a suppressed stop that logged nothing
+    would read exactly like a tick that found work in flight — and nobody audits
+    1440 quiet no-ops a day."""
+    import logging
+
+    cfg, slug = board
+    _alert_on(cfg, slug)
+    _Recorder().install(monkeypatch)
+    monkeypatch.setattr(pickup, "pickup_queue", lambda *a, **kw: {})
+
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.drive_stop"):
+        drive_stop.drive_stop_tick(cfg)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "a board it could not read passed by without a word"
+    assert drive_stop.BOARD_MALFORMED in warnings[-1].getMessage()
+    assert slug in warnings[-1].getMessage()
+
+
+def test_a_normal_quiet_tick_stays_quiet(board, monkeypatch, caplog):
+    """The control for the test above: a tick that legitimately found work must
+    NOT log a warning, or the loud signal stops being a signal."""
+    import logging
+
+    cfg, slug = board
+    _alert_on(cfg, slug)
+    _write_task(cfg, slug, "T-0001", status="open", priority="P2")
+    _Recorder().install(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.drive_stop"):
+        drive_stop.drive_stop_tick(cfg)
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 def test_the_sweep_survives_one_bad_project(board, monkeypatch):
     cfg, slug = board
     _alert_on(cfg, slug)

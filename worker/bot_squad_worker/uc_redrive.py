@@ -69,10 +69,11 @@ belong to ``tg_answer_owed`` (T-0770).
 been firing for weeks into ``_chat/inbox-operator.log``, an ownerless file — 22
 of its alerts sat undrained there from 2026-07-04 to 07-27 because ``operator``
 was not a role keyword (T-0790, since fixed). It now resolves through
-:func:`dispatch.live_operator_sids`, and this module treats an escalation that
-reached NOBODY as not-yet-escalated: it retries on each following ping slot
-until a live operator sid actually receives it, rather than spending its one
-alert on an empty fan-out.
+:func:`dispatch.live_operator_sids`, nudges the pane it resolved to so the
+alert is read rather than merely filed, and treats an escalation that reached
+NOBODY as not-yet-escalated: it retries on each following ping slot until a live
+operator sid actually receives it, rather than spending its one alert on an
+empty fan-out.
 
 Kill switch: ``BOT_SQUAD_UC_REDRIVE=0``.
 """
@@ -283,6 +284,19 @@ def _notify_operator_stuck(
             "message has hung %d min over %d ping(s); will retry the escalation "
             "on the next ping slot", slug, gid, mins, pings,
         )
+        return delivered
+
+    # Primary cross-session signal — nudge each operator pane the way `bsq peer
+    # send` does (precedent: ``tg_stall._redirect_to_upstream``). Landing in the
+    # inbox file is delivery; the nudge is what makes it READ, and "written
+    # somewhere correct that nobody opened" is the failure this ticket is about.
+    # Best-effort: an operator with no live pane reads it on its next check.
+    for sid in delivered:
+        try:
+            from bot_squad_worker.actions import _action_inject_input
+            _action_inject_input({"sid": sid, "text": "check mail"})
+        except Exception:  # noqa: BLE001
+            log.debug("uc_redrive: pane nudge skipped for %s (no live pane?)", sid)
     return delivered
 
 
@@ -333,11 +347,16 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
 
         gid_state = state.get(gid) or {}
         if gid_state.get("msg_ts") != msg_ts:
-            gid_state = {"msg_ts": msg_ts, "pings": 0, "last_ping_at": 0,
-                         "escalated_to": []}
-        pings = int(gid_state.get("pings") or 0)
+            gid_state = {"msg_ts": msg_ts, "slot": 0, "pings": 0,
+                         "last_ping_at": 0, "escalated_to": []}
+        # ``slot`` is the position in the schedule (what time says is due);
+        # ``pings`` is how many nudges were actually SENT. They diverge whenever
+        # slots pass unusable — a message that hung five days before its
+        # attendant came back is at slot 234 having been pinged once, and the
+        # operator alert has to say one, not 234.
+        slot = int(gid_state.get("slot") or 0)
         due = pings_due_by(now - msg_at)
-        if due <= pings:
+        if due <= slot:
             continue  # no slot has come due since the last ping
 
         try:
@@ -364,7 +383,8 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
             log.exception("uc_redrive: redrive dispatch failed for %s/%s", slug, gid)
             continue
 
-        pings = due  # slots that came due while it was busy are spent, not owed
+        gid_state["slot"] = due  # slots passed while it was busy are spent, not owed
+        pings = int(gid_state.get("pings") or 0) + 1
         gid_state["pings"] = pings
         gid_state["last_ping_at"] = now
         state[gid] = gid_state

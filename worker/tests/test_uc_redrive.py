@@ -317,6 +317,13 @@ def test_slots_missed_while_busy_are_skipped_not_queued(cfg_slug, monkeypatch):
     # then straight back onto the every-30 schedule, not a replay of the ramp.
     assert fired_at == [61, 75, 105]
 
+    # The counted quantity is pings SENT, not the schedule position: five slots
+    # came due across the two hours, three nudges were actually delivered, and
+    # the operator alert has to report three.
+    state = json.loads((Path(cfg.data_dir) / slug / "_worker" / "uc_redrive"
+                        / "state.json").read_text())[GID]
+    assert (state["slot"], state["pings"]) == (5, 3)
+
 
 def test_slot_accounting_is_the_inverse_of_the_schedule():
     """``pings_due_by`` and ``ping_due_after_sec`` are one schedule read from
@@ -443,15 +450,18 @@ def _live_operator(cfg, slug, sid=OPERATOR_SID, *, status="active",
 
 def _hanging_thread(cfg, slug, monkeypatch, *, minutes_ago=20):
     """An unanswered message old enough that the 2nd ping — the one that
-    escalates — is due."""
+    escalates — is due. Returns ``(msg_at, dispatched, nudged)``."""
     msg_at = time.time() - minutes_ago * 60
     _write_thread(cfg, slug, GID, [
         {"timestamp": _iso(msg_at), "author": "user", "text": "unanswered"},
     ])
     dispatched = _stub(monkeypatch, activity="idle")
-    # Hermetic: no tmux scan for the unregistered-operator branch (T-0523).
+    # Hermetic: no tmux scan for the unregistered-operator branch (T-0523), and
+    # no real pane injection.
     monkeypatch.setattr(S, "list_panes", lambda: [])
-    return msg_at, dispatched
+    nudged: list[dict] = []
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: nudged.append(p))
+    return msg_at, dispatched, nudged
 
 
 def test_escalation_resolves_to_a_live_operator_sid(cfg_slug, monkeypatch):
@@ -460,7 +470,7 @@ def test_escalation_resolves_to_a_live_operator_sid(cfg_slug, monkeypatch):
     from bot_squad_worker import intersession as I
 
     cfg, slug = cfg_slug
-    msg_at, _ = _hanging_thread(cfg, slug, monkeypatch)
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
     _live_operator(cfg, slug)
 
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
@@ -477,6 +487,34 @@ def test_escalation_resolves_to_a_live_operator_sid(cfg_slug, monkeypatch):
     assert state[GID]["escalated_to"] == [OPERATOR_SID]
 
 
+def test_escalation_nudges_the_operator_pane_it_resolved_to(cfg_slug, monkeypatch):
+    """Landing in the inbox FILE is delivery; the "check mail" nudge is what
+    makes it read. Written-somewhere-correct-that-nobody-opened is the failure
+    this ticket exists to end, so the alert signals the pane the way
+    ``bsq peer send`` does (precedent: tg_stall._redirect_to_upstream)."""
+    cfg, slug = cfg_slug
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
+    _live_operator(cfg, slug)
+
+    UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
+    assert nudged == []  # nothing escalated yet — no nudge either
+    UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(1))
+
+    assert nudged == [{"sid": OPERATOR_SID, "text": "check mail"}]
+
+
+def test_no_operator_no_nudge(cfg_slug, monkeypatch):
+    """Nothing was delivered, so there is no pane to nudge — the escalation
+    must not fabricate one out of the role keyword."""
+    cfg, slug = cfg_slug
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
+
+    UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
+    UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(1))
+
+    assert nudged == []
+
+
 def test_escalation_reaching_nobody_is_logged_and_stays_unescalated(
         cfg_slug, monkeypatch, caplog):
     """The no-live-operator case, explicitly (precedent 33f6657). With no
@@ -484,7 +522,7 @@ def test_escalation_reaching_nobody_is_logged_and_stays_unescalated(
     must NOT be recorded as escalated, or one empty fan-out spends the only
     alert this message will ever get."""
     cfg, slug = cfg_slug
-    msg_at, _ = _hanging_thread(cfg, slug, monkeypatch)  # no operator session md
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)  # no operator md
 
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
     with caplog.at_level(logging.WARNING, logger="bot_squad_worker.uc_redrive"):
@@ -503,7 +541,7 @@ def test_escalation_retries_on_the_next_slot_until_it_lands(cfg_slug, monkeypatc
     from bot_squad_worker import intersession as I
 
     cfg, slug = cfg_slug
-    msg_at, _ = _hanging_thread(cfg, slug, monkeypatch)
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
 
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(1))  # nobody home
@@ -522,7 +560,7 @@ def test_no_escalation_before_the_ramp_is_spent(cfg_slug, monkeypatch):
     from bot_squad_worker import intersession as I
 
     cfg, slug = cfg_slug
-    msg_at, _ = _hanging_thread(cfg, slug, monkeypatch)
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
     _live_operator(cfg, slug)
 
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
@@ -535,7 +573,7 @@ def test_escalation_names_how_long_the_message_has_hung(cfg_slug, monkeypatch):
     from bot_squad_worker import intersession as I
 
     cfg, slug = cfg_slug
-    msg_at, _ = _hanging_thread(cfg, slug, monkeypatch)
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
     _live_operator(cfg, slug)
 
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))
@@ -550,7 +588,7 @@ def test_a_dead_operator_session_is_not_a_delivery(cfg_slug, monkeypatch):
     """An archived/suspended operator md must not count as reached — that is
     exactly how the alert went to an owner nobody was reading."""
     cfg, slug = cfg_slug
-    msg_at, _ = _hanging_thread(cfg, slug, monkeypatch)
+    msg_at, _, nudged = _hanging_thread(cfg, slug, monkeypatch)
     _live_operator(cfg, slug, sid="S-u-operator-p0", status="suspended")
 
     UC.check_project(cfg, slug, now=msg_at + UC.ping_due_after_sec(0))

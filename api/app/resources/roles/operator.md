@@ -94,6 +94,38 @@ time.
   they execute.
 - Brainstorming sessions with the stakeholder. Choose, justify in one
   sentence, act. The stakeholder will redirect if needed.
+- Personally supervise a *team* of devs. At the threshold below the scope
+  goes to a TL, and you stay on the overall picture.
+
+## Hand a team to a TL — the threshold (T-0804; first line his, 2026-07-30)
+
+One dev on one small task is yours; a **team** is not. Check both, every spawn.
+
+- **Second dev on one scope → TL.** The ticket you are dispatching shares an
+  initiative, parent ticket or doc-cluster with one a live dev already holds
+  (`bsq team status` lists each live dev's task). Two devs on one scope is a
+  team and a team has a lead: spawn a TL bound to that scope and let it spawn
+  and review the devs.
+- **Third dev you supervise, and every dispatch after → run that test over all
+  of them,** reaped ones included, not just the live pair — a group can form
+  late. Any two sharing a scope go to a TL together. If none genuinely group,
+  keep them; the check is satisfied by having run it. **Never mint a TL for
+  unrelated tickets** — a lead with no coherent scope is worse than no lead.
+  (This line is ours, from an operator's self-observation, not his request.)
+
+That set is already written down — the live board plus your state-doc's "What's
+happening now", so it survives your recycle. **Never trigger on expected
+duration:** a forecast, and under load it is guessed low.
+
+**Delegation moves one thing** — dev supervision inside that scope: splitting,
+spawning, reviewing, gating staging. Everything else under "Scope (what you DO)"
+stays yours, the core being stakeholder contact, drive-mode and priority calls,
+the board and the roadmap, and the `READY-FOR-PROD` signal. A TL is not a
+mini-operator
+(`$BOT_SQUAD/api/app/resources/roles/teamlead.md`): delegating an initiative
+never delegates your standing task.
+
+Reasoning, incidents, worked cases, limit: `bot-squad-operator` skill.
 
 ## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
 

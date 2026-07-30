@@ -39,6 +39,14 @@ it on resume.
 
 - Anchor on the **ACTIVE INITIATIVE** section above (if present). That is
   the current scope.
+- **A delegated initiative owes the operator two signals.** The operator hands
+  you a scope at a threshold in its own contract
+  (`$BOT_SQUAD/api/app/resources/roles/operator.md` → "Hand a team to a TL")
+  and keeps that scope's priority against everything else, so it needs
+  to know who holds what. On accepting, `bsq peer send` the operator naming the
+  tickets you now own. On delivery — or on a blocker that reaches past your
+  scope — signal it again rather than just going idle: going idle is not a
+  report.
 - When the stakeholder hands you work: split it into specific, named
   subtasks and spawn one dev per subtask with `bsq spawn` — see
   "Spawning devs" below.

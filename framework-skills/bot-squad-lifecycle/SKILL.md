@@ -1,6 +1,6 @@
 ---
 name: bot-squad-lifecycle
-description: Use when you need to understand what the bot-squad system does FOR your session automatically — the ~1h cache-timeout recycle + compact-to-artifact, the 60s reconcile tick (session GC, dead-binding clearing, dev-zombie archival, team reconcile), single-source-of-truth renaming, and which sessions run non-stop vs. exit when done. So you don't hand-manage tmux, archival, or stale task bindings.
+description: Use when you need to understand what the bot-squad system does FOR your session automatically — the ~1h cache-timeout recycle + compact-to-artifact, the 60s reconcile tick (session GC, dead-binding clearing, dev-zombie archival, team reconcile), single-source-of-truth renaming, and which sessions run non-stop vs. exit when done. So you don't hand-manage tmux, archival, or stale task bindings. ALSO use when you are about to write or boot from a handoff artifact and must decide what stays in it — "my forward-state file is bloated", "what do I keep at compact time", "where does this lesson go", "this artifact has sections that are not forward state" — see "Pruning the handoff artifact" below.
 ---
 
 # bot-squad Session Lifecycle (the mechanics you rely on)
@@ -17,6 +17,19 @@ Every session — operator, TL, dev — shares ONE lifecycle. Sessions are trans
 - **The artifact has a DEFINED home — never a random md** (T-0567). Task-bound session → `artifacts/<task_id>.md`; operator → `artifacts/operator-state.md`; other non-task roles → `artifacts/role-<role>-<sid>.md` (all system-resolved via `bsq compact-save`; overwrite in place, don't mint variants). **Content division:** the compact artifact carries context GOTCHAS only — ephemeral hints your successor needs (env quirks, mid-edit state, "X looks done but isn't"). TASK-RELEVANT detail — requirements, user clarifications/decisions, progress, follow-ups — goes on the TASK (`bsq ticket note` / `bsq task new`) BEFORE you compact; an unanswered stakeholder question parked in a handover md is a stranded request. Full kind→home map: project doc `docs/architecture/D-0045`.
 
 **Which run non-stop:** the operator "is always on when the work is on until the user paused it or it stalled itself and ran out of time" and "always drives the backlog"; TLs "always drive the initiative" until stopped; devs exit when their task is done (voice-09).
+
+## Pruning the handoff artifact (a lifecycle rule, not a tidy-up)
+
+A handoff artifact is **forward state for one successor**. It is **not** one of the durable homes for operating knowledge (project doc `docs/architecture/D-0066` owns that rule and the three-question routing test — Q1 durable past this initiative? Q2 portable to another install? Q3 must it fire without being looked up?). **Anything in the artifact that would still be true after the current initiative ends is misfiled** — and because the artifact accepts anything and nobody reviews it, that is where knowledge goes when no home is obvious.
+
+- **Prune at WRITE, audit at BOOT.** The prune is part of `bsq compact-save`, every recycle — not a size threshold. The write is happening anyway, so pruning modifies an act you must perform; a threshold makes it a separate optional act, which is what already fails. Then the *incoming* incarnation checks the file before acting: the outgoing one is context-full and degraded, the incoming one has the only fresh context.
+- **The check is one grep, against a closed section list.** An operator artifact's sanctioned sections are fixed in code (`assignment.OPERATOR_STATE_SECTIONS`, T-0473: Priorities · What's happening now · Delivered · Next · Tracked issues) and the compact prompt already ships them. `grep -n '^## ' <artifact>` — **anything off-schema is an unfiled-knowledge alarm**, not untidiness.
+- **★ A prune not paired with a WRITE somewhere else is a DELETION.** Afterwards the two are indistinguishable — both leave a shorter, better-looking file — so name the destination at prune time. Measured on 2026-07-30: an operator artifact went 263 → 104 lines with nothing written to receive the ~160 removed lines, and since `data/` is not git-tracked the text is unrecoverable. Two durable sections (a role-contract one and a project-doc one) were lost that way.
+- **From a degraded context, you are NOT required to author the new home.** Either route it now if it is a one-liner into a home that exists, or **`bsq task new` it verbatim and then delete it from the artifact.** A ticket is the one home that takes arbitrary un-routed content with an owner and a timestamp (same rule D-0045 already applies to stranded user requests). That is the step whose absence turns a prune into a loss.
+- **Check the home before you write** — several bullets in a bloated artifact are usually *already* homed, and re-authoring them creates the divergence D-0066 forbids. Verify-and-delete beats write-again.
+- **Numbers that change every commit are forward state**, not knowledge: test baselines, the live sha, host headroom. They belong in the artifact and in no durable home.
+
+This project's worked routing table — every section of `artifacts/operator-state.md` classified, with what stays, what is already homed, and where the rest goes — is the runbook `docs/runbook/D-0068`.
 
 ## What the 60s reconcile tick guarantees (you don't babysit this)
 

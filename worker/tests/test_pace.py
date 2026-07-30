@@ -33,7 +33,25 @@ def cfg_slug(tmp_path: Path):
 def test_fresh_project_is_uncapped_and_running(cfg_slug):
     cfg, slug = cfg_slug
     conf = pace.read_config(cfg, slug)
-    assert conf == {"max_in_progress": 0, "paused": False, "initiatives": {}}
+    # T-0828 grew read_config by one key (`drive`). The exact-equality assertion
+    # is KEPT rather than loosened to a subset check: this test's job is to say
+    # what the full default view IS, and a subset check would have let the drive
+    # block ship without anyone stating its defaults here.
+    assert conf == {
+        "max_in_progress": 0,
+        "paused": False,
+        "initiatives": {},
+        "drive": {
+            "scope": "all",
+            "stop_when": "scope_exhausted",
+            "on_stop": "nothing",
+            "set_by": None,
+            "set_at": None,
+            "source_text": None,
+            "configured": False,
+            "invalid": {},
+        },
+    }
     assert pace.max_in_progress(cfg, slug) == 0
 
 

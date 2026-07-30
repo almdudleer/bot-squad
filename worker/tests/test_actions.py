@@ -58,6 +58,9 @@ def test_registry_lists_only_allowed_actions():
         # + close-on-done.
         "tg_topic_create", "tg_topic_rename_general", "tg_topic_rename",
         "tg_topic_close_for_ticket",
+        # T-0799: per-message-TYPE outbound destination map — which chat/topic
+        # each automated message class is delivered to (default: unchanged).
+        "msg_route_list", "msg_route_set", "msg_route_clear",
         "pause_deploys", "resume_deploys",
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",

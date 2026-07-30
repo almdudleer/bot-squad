@@ -213,9 +213,10 @@ def _resolve_recipients(
     it that way — ``autocompact._alert_orphaned_handoff``,
     ``uc_redrive._notify_operator_stuck`` and ``recovery._do_park``, all of them
     variations on "needs a human look"; the live install had 27 undrained lines
-    in that file, 22 of them uc_redrive escalations spanning 2026-07-04…07-27. It is also WHY the operator hop is
-    the one that broke silently: with no role keyword for the role the product
-    is built around, every relay to it had to name a remembered SID. Resolution
+    in that file, 22 of them uc_redrive escalations spanning 2026-07-04…07-27.
+    It is also WHY the operator hop is the one that broke silently: with no role
+    keyword for the role the product is built around, every relay to it had to
+    name a remembered SID. Resolution
     delegates to :func:`dispatch.live_operator_sids`, the operator-identity
     SSOT (T-0523), so this does not add divergent identity logic — which also
     means it catches the canonical md-less operator pane that a session-md scan
@@ -430,6 +431,19 @@ def send(
         with inbox.open("ab") as f:
             f.write(line.encode("utf-8"))
         delivered.append(sid)
+    # T-0790: a consequence of routing ``operator`` through the identity SSOT
+    # instead of the literal-SID branch — with no live operator it now resolves
+    # to NOTHING, where before it wrote (an unread) ``inbox-operator.log``. So
+    # the one case where that matters gets a log line: the three callers using
+    # this keyword are all "needs a human look" escalations, and an escalation
+    # that reached nobody must not be silent. Deliberately NOT warned for
+    # teamlead/dev/all — an empty dev fan-out is an ordinary, frequent state.
+    if to == "operator" and not delivered:
+        log.warning(
+            "intersession: peer_send to role 'operator' reached NOBODY — no live "
+            "operator session for %s; escalation from %s was not delivered: %.200s",
+            slug, from_sid, sanitized,
+        )
     out: dict = {"ok": True, "delivered_to": delivered}
     if to not in _ROLE_KEYWORDS and delivered and delivered != [to]:
         out["redirected"] = {"from": to, "to": delivered[0], "reason": "recycled"}

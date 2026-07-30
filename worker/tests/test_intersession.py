@@ -526,3 +526,33 @@ def test_role_fanout_sets_no_redirect_field(tmp_path):
     for role in ("teamlead", "dev", "all", "operator"):
         out = I.send(cfg, "p", "S-almdudleer-uc-p5", role, "fanout")
         assert "redirected" not in out, role
+
+
+def test_operator_fanout_reaching_nobody_is_logged(tmp_path, caplog):
+    """T-0790 consequence of MY OWN change, made diagnosable: with no live
+    operator, `to="operator"` now resolves to nothing where it used to write an
+    (unread) inbox-operator.log. The three callers using this keyword are all
+    "needs a human look" escalations, so reaching nobody must not be silent."""
+    import logging
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-almdudleer-worker-x-p1", "T-0001",
+                   status="active", window="worker-x")
+
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.intersession"):
+        out = I.send(cfg, "p", "S-uc-redrive", "operator", "needs a human look")
+
+    assert out["delivered_to"] == []
+    assert any("reached NOBODY" in r.getMessage() for r in caplog.records)
+
+
+def test_empty_dev_fanout_is_not_warned(tmp_path, caplog):
+    """GREEN GUARD on log NOISE: an empty teamlead/dev/all fan-out is an
+    ordinary, frequent state and must stay quiet."""
+    import logging
+    cfg = _make_cfg(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.intersession"):
+        for role in ("teamlead", "dev", "all"):
+            assert I.send(cfg, "p", "S-orchestrator", role, "anyone?")["delivered_to"] == []
+
+    assert [r for r in caplog.records if "reached NOBODY" in r.getMessage()] == []

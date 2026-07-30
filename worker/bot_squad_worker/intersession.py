@@ -159,7 +159,9 @@ def live_successor_sid(cfg: Any, slug: str, sid: str) -> str | None:
     redirect on this bus is worse than the loss it would prevent.
 
     Deliberately NOT applied to a live target: a live holder reads its own
-    inbox, so there is nothing to redirect.
+    inbox, so there is nothing to redirect. That check is also FIRST on purpose
+    — every literal-SID send runs this, and the common case (a live target) costs
+    one file read and never reaches the sessions-dir walk below.
     """
     from bot_squad_worker.sessions import _is_live_holder
 
@@ -207,12 +209,11 @@ def _resolve_recipients(
 
     T-0790 (``operator``): ``operator`` was NOT a role keyword, so it fell
     through to the literal-SID branch and wrote ``_chat/inbox-operator.log`` —
-    a file no session owns or drains. Four internal escalation callers address
-    it that way (``autocompact._alert_orphaned_handoff``,
-    ``uc_redrive._notify_operator_stuck``, ``recovery._do_park``,
-    ``operator_redrive``), all of them variations on "needs a human look"; the
-    live install had 27 undrained lines in that file, 22 of them uc_redrive
-    escalations spanning 2026-07-04…07-27. It is also WHY the operator hop is
+    a file no session owns or drains. Three internal escalation callers address
+    it that way — ``autocompact._alert_orphaned_handoff``,
+    ``uc_redrive._notify_operator_stuck`` and ``recovery._do_park``, all of them
+    variations on "needs a human look"; the live install had 27 undrained lines
+    in that file, 22 of them uc_redrive escalations spanning 2026-07-04…07-27. It is also WHY the operator hop is
     the one that broke silently: with no role keyword for the role the product
     is built around, every relay to it had to name a remembered SID. Resolution
     delegates to :func:`dispatch.live_operator_sids`, the operator-identity

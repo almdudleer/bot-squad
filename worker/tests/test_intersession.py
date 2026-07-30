@@ -415,9 +415,9 @@ def test_operator_is_a_role_keyword_resolving_to_live_operators(tmp_path):
 
 def test_send_to_operator_never_writes_the_ownerless_inbox(tmp_path):
     """RED PIN — `to="operator"` wrote _chat/inbox-operator.log, a file no
-    session owns or drains. Four internal escalation callers address it that
-    way (autocompact, uc_redrive, recovery, operator_redrive); the live install
-    had 27 undrained lines there, 22 of them uc_redrive "needs a human look"."""
+    session owns or drains. Three internal escalation callers address it that
+    way (autocompact, uc_redrive, recovery); the live install had 27 undrained
+    lines there, 22 of them uc_redrive "needs a human look"."""
     cfg = _make_cfg(tmp_path)
     _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
 

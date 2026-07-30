@@ -178,6 +178,67 @@ def test_a_valid_axis_stays_clean_while_another_is_rejected(bsq, capsys):
     assert "'nothing' in effect" in on_stop_line
 
 
+# ---------------------------------------------------------------------------
+# REQUESTED vs IN EFFECT, one axis over — the refused stopping condition
+# ---------------------------------------------------------------------------
+# Same defect class as the provenance fix: a setting shown as active when it is
+# in fact refused. «Потратить квоту» reads one signal, and D-0069 Q2 measured
+# that signal as UNKNOWN on every project today (no _quota.json anchor, T-0695),
+# so `spend_quota` refuses to be the active condition rather than reading as
+# "not spent yet, keep going" — the unbounded-drive failure.
+
+def _render_with_spend(bsq, monkeypatch, raw, spend_pct, capsys):
+    monkeypatch.setattr(bsq, "_pace_spend_pct", lambda slug: spend_pct)
+    bsq._pace_print_drive(bsq._pace_normalized_drive(raw), "test-project")
+    return capsys.readouterr().out
+
+
+def test_spend_quota_with_no_anchor_prints_refused_with_its_reason(
+        bsq, monkeypatch, capsys):
+    """A bare "refused" reads as a bug in us. The reason is actionable — he can
+    create the anchor — so it is part of the line, not a footnote."""
+    out = _render_with_spend(
+        bsq, monkeypatch, {"drive": {"stop_when": "spend_quota"}}, None, capsys)
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("stop_when:"))
+    assert "'spend_quota' requested" in line
+    assert "REFUSED" in line
+    assert "no quota anchor" in line
+    assert "'scope_exhausted' is in effect" in line
+
+
+def test_spend_quota_with_a_readable_spend_is_NOT_marked_refused(
+        bsq, monkeypatch, capsys):
+    """The negative control. Without it this pin would pass on a renderer that
+    marked every stopping condition refused."""
+    out = _render_with_spend(
+        bsq, monkeypatch, {"drive": {"stop_when": "spend_quota"}}, 42.0, capsys)
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("stop_when:"))
+    assert line.strip() == "stop_when: spend_quota"
+    assert "REFUSED" not in out
+
+
+def test_the_default_stopping_condition_says_nothing_about_refusal(
+        bsq, monkeypatch, capsys):
+    """`scope_exhausted` is not gated on any signal, so the refusal line must be
+    silent until he actually sets the quota mode — otherwise every project shows
+    a warning about a setting nobody chose."""
+    out = _render_with_spend(
+        bsq, monkeypatch, {"drive": {"scope": "all"}}, None, capsys)
+    assert "REFUSED" not in out
+    assert "stop_when: scope_exhausted" in out
+
+
+def test_an_out_of_set_stop_when_reports_the_typo_not_a_refusal(
+        bsq, monkeypatch, capsys):
+    """Two different failures must not be conflated: an unrecognised value is
+    his typo, a refusal is our inability to act on a valid choice."""
+    out = _render_with_spend(
+        bsq, monkeypatch, {"drive": {"stop_when": "forever"}}, None, capsys)
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("stop_when:"))
+    assert "'forever' requested (not recognised)" in line
+    assert "REFUSED" not in line
+
+
 def test_an_unparseable_stamp_is_passed_through_not_dropped(bsq, capsys):
     """An unreadable stamp is still evidence of WHEN. Dropping it would be the
     same silent omission this block exists to close."""

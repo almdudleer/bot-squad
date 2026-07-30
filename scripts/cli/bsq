@@ -3032,7 +3032,33 @@ def _pace_fmt_set_at(set_at: str | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def _pace_print_drive(drive: dict) -> None:
+def _pace_stop_when_refusal(slug: str, configured: str) -> tuple[str, str] | None:
+    """T-0828 + T-0800: is the configured stopping condition actually IN EFFECT?
+
+    Returns ``(effective, reason)`` when the configured condition is REFUSED, or
+    None when it is genuinely active.
+
+    «Потратить квоту» reads exactly one signal — the spend figure `bsq pace show`
+    already prints two lines up. D-0069 Q2 measured that signal as UNKNOWN on
+    every project today (no `_quota.json` anchor, T-0695), and the mandatory
+    consequence is the most dangerous line in that design: an unknown spend must
+    NOT read as "the quota is not spent yet, keep going". So `spend_quota`
+    refuses to be the active condition and `scope_exhausted` stays in force.
+
+    This mirrors `drive_stop.resolve_stop_when` rather than importing it, for the
+    reason the role-derivation block above gives at length: `bsq` is stdlib-only
+    and reaches the worker only over its socket. The spend signal itself is
+    already mirrored here as `_pace_spend_pct` — this reads THAT, so there is no
+    second spend accounting on this side either.
+    """
+    if configured != "spend_quota":
+        return None
+    if _pace_spend_pct(slug) is None:
+        return ("scope_exhausted", "no quota anchor, so the spend is unreadable")
+    return None
+
+
+def _pace_print_drive(drive: dict, slug: str | None = None) -> None:
     """The `drive:` block of `bsq pace show` (T-0828 DoD-4).
 
     ⚠ PROVENANCE BELONGS TO THE REQUEST, NOT TO THE RESULT.
@@ -3095,7 +3121,19 @@ def _pace_print_drive(drive: dict) -> None:
     # it goes on its own line below, attached to the request.
     scope_suffix = f" — {prov}" if (prov and not invalid) else ""
     print(f"    scope:     {_axis('scope')}{scope_suffix}")
-    print(f"    stop_when: {_axis('stop_when')}")
+
+    # REQUESTED vs IN EFFECT, same rule as the provenance fix one axis over: a
+    # setting shown as active when it is in fact refused is the same false
+    # report. The REASON is printed because it is actionable — he can create the
+    # anchor — whereas a bare "refused" reads as a bug in us.
+    stop_line = _axis("stop_when")
+    refusal = (_pace_stop_when_refusal(slug, drive["stop_when"])
+               if (slug and "stop_when" not in invalid) else None)
+    if refusal:
+        effective, reason = refusal
+        stop_line = (f"{drive['stop_when']!r} requested — REFUSED ({reason}), "
+                     f"so {effective!r} is in effect")
+    print(f"    stop_when: {stop_line}")
     print(f"    on_stop:   {_axis('on_stop')}")
     if prov and invalid:
         print(f"    {prov}")
@@ -3196,7 +3234,7 @@ def cmd_pace_show(args) -> None:
         print(f"  weekly quota target: {target}%  spend-to-date: {spend_s}  "
               f"verdict: {verdict_s}")
     # T-0828: one more block in this same output — not a new verb.
-    _pace_print_drive(_pace_normalized_drive(raw))
+    _pace_print_drive(_pace_normalized_drive(raw), slug)
 
 
 def cmd_pace_set(args) -> None:
@@ -3310,7 +3348,7 @@ def cmd_pace_drive(args) -> None:
     _pace_save_raw(slug, raw)
 
     print(f"pace[{slug}]: drive mode set —")
-    _pace_print_drive(_pace_normalized_drive(raw))
+    _pace_print_drive(_pace_normalized_drive(raw), slug)
 
 
 def cmd_pace_pause(args) -> None:

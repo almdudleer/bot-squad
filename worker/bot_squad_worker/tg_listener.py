@@ -15,7 +15,23 @@ from bot_squad_worker import tg_direct_reply
 
 log = logging.getLogger(__name__)
 
-SID_RE = re.compile(r"\[(S-[A-Za-z0-9_-]+?-p\d+)")
+#: A raw routing SID inside the LEADING bracket of a quoted message — the
+#: pre-``tg_reply_map`` resolver, kept as a fallback (see
+#: :func:`extract_reply_target`). Applied with ``.match``, so the SID must sit
+#: in the prefix ``tg._prefix`` renders and never merely somewhere in the body:
+#: a session that QUOTES a sid mid-sentence must not become a routing target.
+#:
+#: The optional inner ``[<slug>] `` group is the T-0719 follow-up. ``_prefix``
+#: renders its label as ``[<label>] <text>``, so when the label is itself the
+#: nested ``sid_display_label`` bracket form the wire carries a DOUBLE bracket
+#: — ``[[bot-squad] S-…-p1] текст``. That shape is reachable today via
+#: ``sender_tag.compose``'s except-branch, which falls back to ``_prefix`` with
+#: the caller's raw ``sid``, and the previous pattern could not match it: it
+#: required the SID immediately after the first ``[``. Both docstrings here
+#: claimed the bracket form "keeps resolving" while it silently did not — the
+#: forms are now pinned as a table by
+#: ``test_tg_listener.py::test_sid_re_resolves_exactly_the_wire_forms``.
+SID_RE = re.compile(r"\[(?:\[[^\[\]\n]{1,60}\]\s+)?(S-[A-Za-z0-9_-]+?-p\d+)")
 
 # T-0682 (T-0676 item 2): TG chat/topic service-event field names — a message
 # carrying any of these is a system notice (e.g. the forum_topic_created echo
@@ -320,9 +336,20 @@ def extract_reply_target(message: dict, cfg: Any = None) -> Optional[tuple[str, 
        survives any change to how the prefix renders. This is the path that
        must carry the common case.
     2. :data:`SID_RE` over the quoted text — the legacy path. Kept as a
-       FALLBACK, not deleted: messages sent before the map existed, and the
-       non-compact bracket form ``[<slug>] S-...-pNNN`` some callers still
-       use, have to keep resolving.
+       FALLBACK, not deleted: messages sent before the map existed have to
+       keep resolving, as does any send whose wire prefix still carries a raw
+       SID.
+
+       What that fallback ACTUALLY covers is a table, not a sentence, and it
+       is pinned by ``test_sid_re_resolves_exactly_the_wire_forms`` — an
+       earlier revision of this docstring named a form (``[<slug>]
+       S-...-pNNN``) that the pattern could not match and that no renderer
+       emits, so the promise read as broader than the code. Resolving:
+       ``[S-…-p1] …``, ``[S-…-p1 @ user] …``, and the double-bracket
+       ``[[<slug>] S-…-p1] …`` ``tg._prefix`` renders when handed a nested
+       label. NOT resolving, by construction: the compact ``[<slug> <role>]``
+       label (no SID exists in the text to find — that IS this regression),
+       and a SID anywhere but the leading bracket.
 
     Why the order matters: the regex was the ONLY path until now, and T-0676
     item 5's compact ``"<slug> <role>"`` label removed the raw SID from the

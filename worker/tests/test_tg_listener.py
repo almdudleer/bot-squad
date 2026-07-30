@@ -179,11 +179,76 @@ def test_compact_label_reply_resolves_for_every_sender_kind(tmp_path, kind, sid)
 
 
 def test_reply_falls_back_to_regex_when_no_map_entry(tmp_path):
-    """Messages sent BEFORE the map existed (and the non-compact bracket form
-    still used by some callers) must keep resolving — the regex path stays."""
+    """Messages sent BEFORE the map existed must keep resolving — the regex
+    path stays. (What that path does and does NOT cover is the table in
+    `test_sid_re_resolves_exactly_the_wire_forms`; this docstring used to
+    assert coverage of a form the pattern could not match.)"""
     cfg = _make_cfg(tmp_path)
     msg = _reply_message("S-alice-spec5-p3", "sure")
     assert TL.extract_reply_target(msg, cfg) == ("S-alice-spec5-p3", "sure")
+
+
+def test_sid_re_resolves_exactly_the_wire_forms():
+    """The fallback's coverage as a TABLE, built from the REAL renderers.
+
+    T-0719 follow-up (operator p502 found the first half of this). Two
+    docstrings — here, on `SID_RE`, and on `tg_reply_map` — promised that the
+    "non-compact bracket form some callers still use" kept resolving. It did
+    not: `tg._prefix` wraps its label in brackets, so a nested
+    `sid_display_label` label reaches the wire DOUBLE-bracketed
+    (`[[bot-squad] S-…-p1] текст`), and the old pattern required the SID
+    immediately after the first `[`. Nobody noticed because no test built the
+    string the renderer actually produces — they hand-typed the easy form.
+
+    So the inputs here are COMPOSED by `sid_display_label` + `_prefix` rather
+    than written as literals: if either renderer changes shape, this test
+    follows it instead of quietly testing a string that no longer ships.
+    """
+    from bot_squad_worker import sessions as S
+    from bot_squad_worker.tg import _prefix
+
+    sid = "S-almdudleer-operator-p241"
+    nested = S.sid_display_label(sid, "bot-squad")               # "[bot-squad] S-…"
+    compact = S.sid_display_label(sid, "bot-squad", compact=True)  # "bot-squad operator"
+    assert nested == f"[bot-squad] {sid}" and compact == "bot-squad operator"
+
+    resolves = {
+        "raw sid label": _prefix("текст", sid=sid, user=""),
+        "raw sid + user": _prefix("текст", sid=sid, user="almdudleer"),
+        # Reachable today via `sender_tag.compose`'s except-branch, which falls
+        # back to `_prefix` with the caller's raw (possibly nested) label.
+        "nested bracket label": _prefix("текст", sid=nested, user=""),
+        "nested bracket + user": _prefix("текст", sid=nested, user="almdudleer"),
+    }
+    for name, wire in resolves.items():
+        m = TL.SID_RE.match(wire)
+        assert m is not None, f"{name} must resolve: {wire!r}"
+        assert m.group(1) == sid, f"{name} resolved to {m.group(1)!r}: {wire!r}"
+
+    never = {
+        # THE regression. No SID exists in this text for any regex to find —
+        # only the message-id map can route it, which is the whole ticket.
+        "compact label (T-0676)": _prefix("текст", sid=compact, user=""),
+        # Routing must never be steerable by quoting a SID mid-sentence.
+        "sid in the body": f"[bot-squad operator] см. {sid} выше",
+        "non-identity leading marker": f"[FYI — ответ не требуется] {sid}",
+        "leading whitespace": " " + _prefix("текст", sid=sid, user=""),
+    }
+    for name, wire in never.items():
+        assert TL.SID_RE.match(wire) is None, f"{name} must NOT resolve: {wire!r}"
+
+
+def test_nested_bracket_label_reply_resolves_without_a_map_entry(tmp_path):
+    """The table above, driven through the actual entry point: a pre-map (or
+    evicted) message whose prefix carries the nested label still routes."""
+    from bot_squad_worker.tg import _prefix
+
+    cfg = _make_cfg(tmp_path)
+    sid = "S-almdudleer-operator-p241"
+    quoted = _prefix("подтвердите, пожалуйста", sid=f"[bot-squad] {sid}", user="")
+    msg = _compact_reply_message("да", quoted=quoted, quoted_message_id=4242)
+
+    assert TL.extract_reply_target(msg, cfg) == (sid, "да")
 
 
 def test_map_wins_over_a_stale_sid_in_the_quoted_text(tmp_path):

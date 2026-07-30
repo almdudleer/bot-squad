@@ -14,9 +14,11 @@ Telegram hands us ``result.message_id`` on every send and echoes
 ``reply_to_message.message_id`` on every reply, so the (chat, message) pair is
 a presentation-independent join key. Record it on the way out, look it up on
 the way in, and no future label change can sever routing again. The SID_RE path
-stays as a FALLBACK — messages sent before this map existed (and the bracket
-form ``[<slug>] S-...-pNNN``, still used by non-compact callers) must keep
-resolving.
+stays as a FALLBACK for messages sent before this map existed, and for any
+prefix that still carries a raw SID; the exact forms it does and does not
+resolve are a pinned table on ``tg_listener.SID_RE``, deliberately not restated
+here — the first version of this paragraph named a form the pattern could not
+actually match, and a second copy of that claim is a second thing to go stale.
 
 Shape on disk (``data/_worker/tg_reply_map.json``)::
 

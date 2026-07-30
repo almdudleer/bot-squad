@@ -467,7 +467,8 @@ def test_ambiguous_successor_is_never_guessed(tmp_path):
     cfg = _make_cfg(tmp_path)
     _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
     _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
-    _write_session(tmp_path, "p", "S-almdudleer-operator-p456", status="active", window="operator")
+    _write_session(tmp_path, "p", "S-almdudleer-operator-p456",
+                   status="active", window="operator")
 
     out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "ambiguous")
 
@@ -481,7 +482,8 @@ def test_live_session_in_another_window_is_not_a_successor(tmp_path):
     the delivered behaviour at 423a058 too, not just the new helper."""
     cfg = _make_cfg(tmp_path)
     _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
-    _write_session(tmp_path, "p", "S-almdudleer-teamlead-p9", status="active", window="teamlead")
+    _write_session(tmp_path, "p", "S-almdudleer-teamlead-p9",
+                   status="active", window="teamlead")
 
     out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "not for the TL")
 
@@ -495,7 +497,8 @@ def test_same_window_under_another_linux_user_is_not_a_successor(tmp_path):
     T-0157 multi-user boundary must hold for the redirect too."""
     cfg = _make_cfg(tmp_path)
     _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
-    _write_session(tmp_path, "p", "S-otheruser-operator-p455", status="active", window="operator")
+    _write_session(tmp_path, "p", "S-otheruser-operator-p455",
+                   status="active", window="operator")
 
     out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "stays on this user")
 

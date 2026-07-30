@@ -17,7 +17,7 @@ def _make_cfg(tmp_path: Path) -> types.SimpleNamespace:
 
 def _write_session(
     tmp_path: Path, slug: str, sid: str, task_id: str = "",
-    *, status: str = "active", archived: bool = False,
+    *, status: str = "active", archived: bool = False, window: str = "",
 ) -> None:
     sess_dir = tmp_path / "data" / slug / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
@@ -27,6 +27,11 @@ def _write_session(
         f"status: {status}",
         f"task_id: {task_id or '~'}",
     ]
+    # T-0790: the window is what `sessions._derive_role` reads, so any test
+    # exercising role identity (the `operator` keyword) has to carry it — a real
+    # session md always does.
+    if window:
+        lines.append(f"window: {window}")
     if archived:
         lines.append("archived: true")
     lines += ["---", ""]
@@ -347,3 +352,174 @@ def test_reap_chat_sidecars_partial_missing_and_idempotent(tmp_path):
 def test_reap_chat_sidecars_empty_sid_noop(tmp_path):
     cfg = _make_cfg(tmp_path)
     assert I.reap_chat_sidecars(cfg, "p", "") == []
+
+
+# ---------------------------------------------------------------------------
+# T-0790: peer_send to a RECYCLED session wrote into the dead session's inbox
+# and returned success. Measured on the live install 2026-07-30: operator
+# `…-p374` was replaced by `…-p455` at 16:20Z; two verbatim stakeholder relays
+# sent at 20:08:49Z / 20:12:06Z landed in inbox-…-p374.log and the operator on
+# duty never learned they existed.
+#
+# A recycle is not a resume: it mints a BRAND-NEW SID in the SAME window and
+# leaves the predecessor's md as `status: suspended`, so `rebind_sid` (which
+# only fires on resume()) never moves the inbox.
+#
+# The next four tests are RED PINS — each fails at 423a058.
+# ---------------------------------------------------------------------------
+
+_DEAD = "S-almdudleer-operator-p374"
+_LIVE = "S-almdudleer-operator-p455"
+
+
+def _recycled_pair(tmp_path: Path, slug: str = "p") -> None:
+    """The measured live shape: a suspended predecessor + its live successor,
+    same linux user, same window stem, different pane."""
+    _write_session(tmp_path, slug, _DEAD, status="suspended", window="operator")
+    _write_session(tmp_path, slug, _LIVE, status="active", window="operator")
+
+
+def test_send_to_recycled_sid_routes_to_live_successor(tmp_path):
+    """RED PIN — the reported bug. A send addressed at the recycled SID must
+    reach the live holder of its window, not the dead inbox."""
+    cfg = _make_cfg(tmp_path)
+    _recycled_pair(tmp_path)
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "verbatim stakeholder relay")
+
+    assert out["delivered_to"] == [_LIVE]
+    assert I.inbox_read(cfg, "p", _LIVE)["count"] == 1
+    assert not (_chat(tmp_path) / f"inbox-{_DEAD}.log").exists()
+
+
+def test_send_to_recycled_sid_reports_the_redirect(tmp_path):
+    """RED PIN — a SILENT redirect is the same class of problem as the silent
+    loss, so the sender is told the SID it is carrying is stale."""
+    cfg = _make_cfg(tmp_path)
+    _recycled_pair(tmp_path)
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "hi")
+
+    assert out["redirected"] == {"from": _DEAD, "to": _LIVE, "reason": "recycled"}
+
+
+def test_operator_is_a_role_keyword_resolving_to_live_operators(tmp_path):
+    """RED PIN — `operator` was NOT a role keyword, so it fell through to the
+    literal-SID branch and resolved to the string "operator"."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
+
+    assert I._resolve_recipients(cfg, "p", "operator") == [_LIVE]
+    assert "operator" in I._ROLE_KEYWORDS
+
+
+def test_send_to_operator_never_writes_the_ownerless_inbox(tmp_path):
+    """RED PIN — `to="operator"` wrote _chat/inbox-operator.log, a file no
+    session owns or drains. Four internal escalation callers address it that
+    way (autocompact, uc_redrive, recovery, operator_redrive); the live install
+    had 27 undrained lines there, 22 of them uc_redrive "needs a human look"."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
+
+    out = I.send(cfg, "p", "S-uc-redrive", "operator", "needs a human look")
+
+    assert out["delivered_to"] == [_LIVE]
+    assert not (_chat(tmp_path) / "inbox-operator.log").exists()
+    assert I.inbox_read(cfg, "p", _LIVE)["count"] == 1
+
+
+# --- GREEN GUARDS: pass at 423a058 too. These fence the ways this fix could
+# --- regress the bus, which the ticket rates worse than the bug itself.
+
+
+def test_live_target_is_never_redirected(tmp_path):
+    """A live holder reads its own inbox — nothing to redirect, no field set."""
+    cfg = _make_cfg(tmp_path)
+    _recycled_pair(tmp_path)
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _LIVE, "direct")
+
+    assert out["delivered_to"] == [_LIVE]
+    assert "redirected" not in out
+
+
+def test_suspended_target_with_no_successor_still_gets_the_durable_write(tmp_path):
+    """The (b)-as-written regression, refused deliberately and pinned here.
+
+    "No live pane" is a legitimate SUCCESS on this bus: resume() rotates the SID
+    and rebind_sid MOVES the triple, so a suspended-pending-resume peer reads its
+    mail on the way back. Treating a failed inject as a delivery failure would
+    break every such send.
+    """
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "read this on resume")
+
+    assert out["delivered_to"] == [_DEAD]
+    assert "redirected" not in out
+    assert I.inbox_read(cfg, "p", _DEAD)["count"] == 1
+
+
+def test_ambiguous_successor_is_never_guessed(tmp_path):
+    """Two live sessions in one window → no redirect. A wrong redirect on this
+    bus is worse than the loss it would prevent."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
+    _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
+    _write_session(tmp_path, "p", "S-almdudleer-operator-p456", status="active", window="operator")
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "ambiguous")
+
+    assert out["delivered_to"] == [_DEAD]
+    assert "redirected" not in out
+
+
+def test_live_session_in_another_window_is_not_a_successor(tmp_path):
+    """A live session in ANOTHER window is not a successor — only the same seat
+    (same linux user + window stem) counts. Driven through `send` so this fences
+    the delivered behaviour at 423a058 too, not just the new helper."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
+    _write_session(tmp_path, "p", "S-almdudleer-teamlead-p9", status="active", window="teamlead")
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "not for the TL")
+
+    assert out["delivered_to"] == [_DEAD]
+    assert "redirected" not in out
+    assert I.inbox_read(cfg, "p", "S-almdudleer-teamlead-p9")["count"] == 0
+
+
+def test_same_window_under_another_linux_user_is_not_a_successor(tmp_path):
+    """Same window stem under a DIFFERENT linux user is a different seat — the
+    T-0157 multi-user boundary must hold for the redirect too."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _DEAD, status="suspended", window="operator")
+    _write_session(tmp_path, "p", "S-otheruser-operator-p455", status="active", window="operator")
+
+    out = I.send(cfg, "p", "S-almdudleer-uc-p5", _DEAD, "stays on this user")
+
+    assert out["delivered_to"] == [_DEAD]
+    assert "redirected" not in out
+    assert I.inbox_read(cfg, "p", "S-otheruser-operator-p455")["count"] == 0
+
+
+def test_role_keywords_reach_operator_sessions_as_before(tmp_path):
+    """Adding the `operator` keyword must not narrow teamlead/all: an operator
+    session (no task_id) is still in both fan-outs."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
+
+    assert I._resolve_recipients(cfg, "p", "teamlead") == [_LIVE]
+    assert I._resolve_recipients(cfg, "p", "all") == [_LIVE]
+
+
+def test_role_fanout_sets_no_redirect_field(tmp_path):
+    """A fan-out delivering to a SID other than the literal `to` is not a
+    redirect — the field must stay absent."""
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", _LIVE, status="active", window="operator")
+
+    for role in ("teamlead", "dev", "all", "operator"):
+        out = I.send(cfg, "p", "S-almdudleer-uc-p5", role, "fanout")
+        assert "redirected" not in out, role

@@ -1495,6 +1495,158 @@ def test_peer_send_role_fanout_still_scoped_to_sender_slug(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# T-0790: a target SID superseded by a RECYCLE passed the T-0624 guard (the
+# predecessor's md still exists) and returned 200 having written into an inbox
+# nobody drains. Same silent-success signature, different resolution path:
+# T-0624 was cross-PROJECT misfiling by slug, this is same-project misfiling by
+# STALE SESSION.
+# ---------------------------------------------------------------------------
+
+
+def test_peer_send_to_recycled_sid_delivers_to_the_live_successor(tmp_path, monkeypatch):
+    """RED PIN, end-to-end through the action: the two lost Ponytail relays.
+
+    Sent at operator `…-p374` (recycled at 16:20Z), they must reach `…-p455`,
+    the operator actually on duty — and be drainable by that session's own
+    `bsq inbox check`.
+    """
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    dead, live = "S-almdudleer-operator-p374", "S-almdudleer-operator-p455"
+    for sid, status in ((dead, "suspended"), (live, "active")):
+        _write_session_metadata(
+            cfg.data_dir / "proj-a" / "sessions" / f"{sid}.md",
+            {"sid": sid, "status": status, "window": "operator", "task_id": "~"},
+        )
+
+    out = A.dispatch("peer_send", {
+        "slug": "proj-a",
+        "from_sid": "S-almdudleer-gu_x-user-conversation-p5",
+        "to": dead,
+        "text": "Ponytail findings, verbatim",
+    })
+
+    assert out["delivered_to"] == [live]
+    assert out["redirected"] == {"from": dead, "to": live, "reason": "recycled"}
+    assert not (cfg.data_dir / "proj-a" / "_chat" / f"inbox-{dead}.log").exists()
+    drained = A.dispatch("peer_inbox_read", {"slug": "proj-a", "sid": live})
+    assert drained["count"] == 1
+    assert "Ponytail findings, verbatim" in drained["messages"][0]
+
+
+def test_peer_send_to_archived_sid_with_no_successor_refuses(tmp_path, monkeypatch):
+    """RED PIN — an ARCHIVED target's sidecars were already reaped by
+    `archive_session`, so a write mints a fresh file nobody owns and returns 200.
+    No routing can save it, so the action refuses instead."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    gone = "S-almdudleer-worker-old-ticket-p12"
+    _write_session_metadata(
+        cfg.data_dir / "proj-a" / "sessions" / f"{gone}.md",
+        {"sid": gone, "status": "suspended", "archived": "true",
+         "window": "worker-old-ticket", "task_id": "T-0001"},
+    )
+
+    with pytest.raises(ActionError, match="ARCHIVED"):
+        A.dispatch("peer_send", {
+            "slug": "proj-a",
+            "from_sid": "S-almdudleer-operator-p23",
+            "to": gone,
+            "text": "into the void",
+        })
+    assert not (cfg.data_dir / "proj-a" / "_chat" / f"inbox-{gone}.log").exists()
+
+
+def test_peer_send_operator_keyword_reaches_the_live_operator(tmp_path, monkeypatch):
+    """RED PIN — `operator` is a role keyword, so it must skip the T-0624
+    per-recipient slug lookup (which hard-errored on it) and fan out in-project."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    live = "S-almdudleer-operator-p455"
+    _write_session_metadata(
+        cfg.data_dir / "proj-a" / "sessions" / f"{live}.md",
+        {"sid": live, "status": "active", "window": "operator", "task_id": "~"},
+    )
+
+    out = A.dispatch("peer_send", {
+        "slug": "proj-a",
+        "from_sid": "S-almdudleer-worker-x-p1",
+        "to": "operator",
+        "text": "needs a human look",
+    })
+
+    assert out["delivered_to"] == [live]
+    assert not (cfg.data_dir / "proj-a" / "_chat" / "inbox-operator.log").exists()
+
+
+def test_peer_send_archived_sid_with_a_successor_is_redirected_not_refused(
+    tmp_path, monkeypatch,
+):
+    """RED PIN (it asserts the redirect, so it fails at 423a058) whose job is to
+    fence the refusal's PRECEDENCE: refusing is the last resort, not the first,
+    so an archived target whose window has a live holder still gets delivered."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    dead, live = "S-almdudleer-operator-p374", "S-almdudleer-operator-p455"
+    _write_session_metadata(
+        cfg.data_dir / "proj-a" / "sessions" / f"{dead}.md",
+        {"sid": dead, "status": "suspended", "archived": "true",
+         "window": "operator", "task_id": "~"},
+    )
+    _write_session_metadata(
+        cfg.data_dir / "proj-a" / "sessions" / f"{live}.md",
+        {"sid": live, "status": "active", "window": "operator", "task_id": "~"},
+    )
+
+    out = A.dispatch("peer_send", {
+        "slug": "proj-a",
+        "from_sid": "S-almdudleer-worker-x-p1",
+        "to": dead,
+        "text": "still lands",
+    })
+
+    assert out["delivered_to"] == [live]
+
+
+def test_peer_send_to_a_live_sid_is_unchanged(tmp_path, monkeypatch):
+    """GREEN GUARD — the common case must be byte-identical: delivered to the
+    SID addressed, no redirect field, no refusal."""
+    import bot_squad_worker.actions as A
+    from bot_squad_worker.sessions import _write_session_metadata
+
+    cfg = _two_project_config(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    live = "S-almdudleer-worker-some-ticket-p7"
+    _write_session_metadata(
+        cfg.data_dir / "proj-a" / "sessions" / f"{live}.md",
+        {"sid": live, "status": "active", "window": "worker-some-ticket",
+         "task_id": "T-0002"},
+    )
+
+    out = A.dispatch("peer_send", {
+        "slug": "proj-a",
+        "from_sid": "S-almdudleer-operator-p23",
+        "to": live,
+        "text": "READY T-0002",
+    })
+
+    assert out["delivered_to"] == [live]
+    assert "redirected" not in out
+
+
+# ---------------------------------------------------------------------------
 # deploy action tests
 # ---------------------------------------------------------------------------
 

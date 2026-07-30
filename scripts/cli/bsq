@@ -437,6 +437,7 @@ def cmd_dispatch(args) -> None:
         {"slug": slug, "from_sid": from_sid, "to": args.to, "text": text},
     )
     delivered = res.get("delivered_to", [])
+    _print_recycle_redirect(res)
     print(f"dispatched [{args.action}] to {len(delivered)} inbox(es): "
           f"{', '.join(delivered) or '(none)'}")
     if args.no_signal or not delivered:
@@ -671,6 +672,22 @@ def cmd_topic_say(args) -> None:
               "Reply will still route back to this session if it lands.")
 
 
+def _print_recycle_redirect(res: dict) -> None:
+    """T-0790: surface a peer_send that was routed past a RECYCLED target.
+
+    The SID you addressed no longer holds a session; the message went to the
+    live holder of its window instead. Printed because a silent redirect is the
+    same class of problem as the silent loss it replaces — the sender has to
+    learn that the SID it is carrying is stale.
+    """
+    redirected = res.get("redirected") or {}
+    if not redirected.get("to"):
+        return
+    print(f"⚠ {redirected.get('from')} was RECYCLED "
+          f"({redirected.get('reason', 'stale')}) — routed to its live successor "
+          f"{redirected['to']}; update the SID you're using")
+
+
 def cmd_peer_send(args) -> None:
     slug = resolve_slug()
     from_sid = require_sid(args.from_sid)
@@ -682,6 +699,7 @@ def cmd_peer_send(args) -> None:
         params["user"] = args.user
     res = post("peer_send", params)
     delivered = res.get("delivered_to", [])
+    _print_recycle_redirect(res)
     print(f"sent to {len(delivered)} inbox(es): {', '.join(delivered) or '(none)'}")
 
     if args.no_signal or not delivered:
@@ -4807,7 +4825,7 @@ def build_parser() -> argparse.ArgumentParser:
     peer = sub.add_parser("peer", help="peer messaging")
     peer_sub = peer.add_subparsers(dest="sub", required=True)
     ps = peer_sub.add_parser("send", help="send a message + signal the recipient pane")
-    ps.add_argument("to", help="target SID or role keyword (teamlead/dev/all)")
+    ps.add_argument("to", help="target SID or role keyword (teamlead/dev/all/operator)")
     ps.add_argument("text", help="message text")
     ps.add_argument("--from", dest="from_sid", help="override sender SID")
     ps.add_argument("--user", dest="user",
@@ -4820,7 +4838,7 @@ def build_parser() -> argparse.ArgumentParser:
     # dispatch (structured operator → TL envelope, T-0144)
     dp = peer_sub.add_parser("dispatch",
                              help="send a typed dispatch envelope (action + payload)")
-    dp.add_argument("to", help="target SID or role keyword (teamlead/dev/all)")
+    dp.add_argument("to", help="target SID or role keyword (teamlead/dev/all/operator)")
     dp.add_argument("action", help="dispatch action (assign/archive_team/status/message)")
     dp.add_argument("--field", action="append", metavar="K=V",
                     help="payload key=value (repeatable)")

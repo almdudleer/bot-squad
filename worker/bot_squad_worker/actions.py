@@ -2711,8 +2711,24 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     scan across every known project (``park._slug_for_sid``); an unresolvable
     recipient (no registered session anywhere) is a hard error rather than a
     silent misfile into the sender's project. Role-keyword targets
-    (``teamlead``/``dev``/``all``) keep using the caller's ``slug`` — those are
-    inherently an in-project broadcast, not addressed at a specific SID.
+    (``teamlead``/``dev``/``all``/``operator``) keep using the caller's ``slug``
+    — those are inherently an in-project broadcast, not addressed at a specific
+    SID.
+
+    T-0790: same silent-success signature, different resolution path — a target
+    SID that a RECYCLE superseded (same project, dead session, live successor in
+    its window) passed the T-0624 guard, since the predecessor's md still exists,
+    and returned 200 having written into an inbox nobody drains. Two changes,
+    both in ``intersession``'s resolution rather than here: such a target routes
+    to its live successor (reported as ``redirected`` in the result), and
+    ``operator`` became a real role keyword. This layer adds only the refusal for
+    the one target no routing can save — archived, no successor.
+
+    The ``inject_input`` 400 that pairs with this action's 200 is UNTOUCHED and
+    stays the diagnostic it has been (operator p241 logged one on 2026-07-27
+    before anyone knew what it meant). It still fires for a target with no live
+    pane; what changed is that a RECYCLED target now has a live pane to nudge,
+    so the pairing stops appearing for the case it was flagging.
     """
     extra = set(params) - _PEER_SEND_ALLOWED
     if extra:
@@ -2724,7 +2740,8 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     cfg = _get_config()
     to = params["to"]
     delivery_slug = params["slug"]
-    if to not in {"teamlead", "dev", "all"}:
+    from bot_squad_worker import intersession as _is
+    if to not in _is._ROLE_KEYWORDS:
         from bot_squad_worker.park import _slug_for_sid
         recipient_slug = _slug_for_sid(cfg, to)
         if recipient_slug is None:
@@ -2734,8 +2751,24 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
                 f"project {params['slug']!r} (would silently misfile)"
             )
         delivery_slug = recipient_slug
+        # T-0790: an ARCHIVED target with no live successor can never read the
+        # inbox we would write — ``archive_session`` already reaped its
+        # sidecars, so the write would mint a fresh file nobody owns and return
+        # 200. That is the silent-success signature this ticket exists to kill,
+        # so refuse instead, and name the successor when one exists so the
+        # sender can retry against a live seat.
+        meta = _is._session_status(cfg, delivery_slug, to) or {}
+        if (
+            str(meta.get("archived", "")).lower() == "true"
+            and _is.live_successor_sid(cfg, delivery_slug, to) is None
+        ):
+            raise ActionError(
+                f"peer_send: recipient SID {to!r} is ARCHIVED and no live "
+                f"session holds its window — refusing to write an inbox nobody "
+                f"will ever drain (address a live SID, or a role keyword: "
+                f"{', '.join(sorted(_is._ROLE_KEYWORDS))})"
+            )
 
-    from bot_squad_worker import intersession as _is
     result = _is.send(
         cfg, delivery_slug, params["from_sid"], to, params["text"],
         user=params.get("user"),

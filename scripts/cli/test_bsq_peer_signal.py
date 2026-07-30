@@ -44,16 +44,22 @@ def _stub_session_resolution(monkeypatch):
     monkeypatch.setattr(bsq, "require_sid", lambda v: v or FROM)
 
 
-def _record_post(delivered, *, raising_panes=()):
+def _record_post(delivered, *, raising_panes=(), redirected=None):
     """Return (post_fn, calls). `peer_send` reports `delivered`; an
     `inject_input` to a sid in `raising_panes` raises WorkerError (no live
-    pane), mirroring the worker's behaviour for a suspended/non-tmux target."""
+    pane), mirroring the worker's behaviour for a suspended/non-tmux target.
+
+    T-0790: `redirected` is the worker's recycled-target report, echoed back so
+    the CLI's handling of it can be pinned."""
     calls = []
 
     def fake_post(action, params, timeout=35.0, fatal=True):
         calls.append((action, params))
         if action == "peer_send":
-            return {"ok": True, "delivered_to": list(delivered)}
+            out = {"ok": True, "delivered_to": list(delivered)}
+            if redirected is not None:
+                out["redirected"] = redirected
+            return out
         if action == "inject_input":
             if params["sid"] in raising_panes:
                 raise bsq.WorkerError("no live pane")
@@ -137,3 +143,74 @@ def test_dispatch_nudges_delivered_recipients(monkeypatch):
     assert bsq.ENVELOPE_MARKER in calls[0][1]["text"]
     injects = [(p["sid"], p["text"]) for a, p in calls if a == "inject_input"]
     assert injects == [("S-u-a-p2", bsq.MAIL_SIGNAL)]
+
+
+# ---------------------------------------------------------------------------
+# T-0790: a RECYCLED target. The worker routes past the dead SID; the CLI must
+# nudge the SUCCESSOR and tell the sender its SID is stale.
+#
+# This is also the mechanism by which the 200/400 pairing stops appearing for
+# this bug: the nudge now has a live pane to reach. The `inject_input` 400
+# itself is untouched and still fires for a genuinely paneless target — pinned
+# by test_peer_send_survives_recipient_without_live_pane above.
+# ---------------------------------------------------------------------------
+
+_DEAD = "S-almdudleer-operator-p374"
+_LIVE = "S-almdudleer-operator-p455"
+_REDIRECT = {"from": _DEAD, "to": _LIVE, "reason": "recycled"}
+
+
+def test_peer_send_nudges_the_successor_not_the_recycled_sid(monkeypatch):
+    """GREEN GUARD (passes at 423a058) pinning the MECHANISM: the nudge follows
+    `delivered_to`, so redirecting delivery is what gives the nudge a live pane
+    to reach. If a future change nudged the requested `to` instead, the 400 would
+    come back and the message would be silently unread again."""
+    fake_post, calls = _record_post([_LIVE], redirected=_REDIRECT)
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_peer_send(_args(to=_DEAD, text="verbatim relay"))
+
+    nudged = [p["sid"] for a, p in calls if a == "inject_input"]
+    assert nudged == [_LIVE]
+    assert _DEAD not in nudged
+
+
+def test_peer_send_prints_the_recycle_redirect(monkeypatch, capsys):
+    """The sender has to learn the SID it is carrying is stale — a silent
+    redirect is the same class of problem as the silent loss."""
+    fake_post, _ = _record_post([_LIVE], redirected=_REDIRECT)
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_peer_send(_args(to=_DEAD, text="verbatim relay"))
+
+    warning = [ln for ln in capsys.readouterr().out.splitlines() if "RECYCLED" in ln]
+    assert len(warning) == 1
+    assert _DEAD in warning[0]
+    assert _LIVE in warning[0]
+
+
+def test_dispatch_prints_the_recycle_redirect(monkeypatch, capsys):
+    """`bsq peer dispatch` rides the same peer_send, so it reports the same way."""
+    fake_post, _ = _record_post([_LIVE], redirected=_REDIRECT)
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    d = SimpleNamespace(to=_DEAD, from_sid=FROM, action="assign",
+                        json=None, field=["task_id=T-1"], note=None,
+                        no_signal=False)
+    bsq.cmd_dispatch(d)
+
+    warning = [ln for ln in capsys.readouterr().out.splitlines() if "RECYCLED" in ln]
+    assert len(warning) == 1
+    assert _LIVE in warning[0]
+
+
+def test_peer_send_to_a_live_sid_prints_no_redirect_warning(monkeypatch, capsys):
+    """GREEN GUARD — no `redirected` in the reply means nothing extra printed."""
+    fake_post, _ = _record_post(["S-u-a-p2"])
+    monkeypatch.setattr(bsq, "post", fake_post)
+
+    bsq.cmd_peer_send(_args(to="S-u-a-p2"))
+
+    out = capsys.readouterr().out
+    assert "RECYCLED" not in out
+    assert "sent to 1 inbox(es)" in out

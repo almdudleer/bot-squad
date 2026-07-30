@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 import threading
 import time
@@ -31,6 +32,12 @@ from bot_squad_worker import frontmatter as _frontmatter
 log = logging.getLogger(__name__)
 
 _MAX_TEXT_LEN = 4000
+# Recipient specs that are a ROLE fan-out rather than a literal SID. Single
+# source of truth: ``_resolve_recipients`` dispatches on it, ``send`` uses it to
+# tell a redirect from a fan-out, and the ``peer_send`` action uses it to decide
+# whether a target needs cross-project SID resolution (T-0624). ``operator``
+# joined in T-0790 — see ``_resolve_recipients``.
+_ROLE_KEYWORDS = frozenset({"teamlead", "dev", "all", "operator"})
 # T-0091: cap raised 1800→7200 (2h). A long-blocking inbox_wait costs the
 # worker nothing (a single condition-variable wait per SID), but every clean
 # timeout fires a harness <task-notification> in the operator's pane and burns
@@ -92,6 +99,20 @@ def _list_session_sids(cfg: Any, slug: str) -> list[tuple[str, dict]]:
     return out
 
 
+# T-0790: the window stem of an SID ``S-<user>-<window>-p<pane>``. A recycle
+# mints a BRAND-NEW SID in the SAME window (operator p374 → p455), so the stem
+# is what identifies "the session now holding this seat". Same heuristic
+# ``scripts/cli/migrate_orphan_inboxes.py`` (T-0072) already uses to map an
+# orphaned inbox to its successor — reused rather than re-derived.
+_SID_STEM_RE = re.compile(r"^S-(?P<user>[^-]+)-(?P<stem>.+)-p\d+$")
+
+
+def _sid_stem(sid: str) -> tuple[str, str] | None:
+    """Return ``(linux_user, window_stem)`` parsed from ``sid``, or None."""
+    m = _SID_STEM_RE.match(sid or "")
+    return (m.group("user"), m.group("stem")) if m else None
+
+
 def _linux_user_from_sid(sid: str) -> str:
     """T-0157: linux user segment of an SID ``S-<user>-<window>-p<pane>`` ("" if none)."""
     if sid and sid.startswith("S-"):
@@ -109,6 +130,60 @@ def _session_linux_user(sid: str, meta: dict) -> str:
     return _linux_user_from_sid(sid)
 
 
+def _session_status(cfg: Any, slug: str, sid: str) -> dict | None:
+    """Frontmatter of ``data/<slug>/sessions/<sid>.md``, or None when absent."""
+    md = Path(cfg.data_dir) / slug / "sessions" / f"{sid}.md"
+    if not md.is_file():
+        return None
+    try:
+        parsed = _frontmatter.parse_or_none(md.read_text())
+    except OSError:
+        return None
+    return parsed[0] if parsed else None
+
+
+def live_successor_sid(cfg: Any, slug: str, sid: str) -> str | None:
+    """T-0790: the LIVE session now holding ``sid``'s seat, or None.
+
+    A session that is recycled is not resumed — it is REPLACED: a brand-new SID
+    is minted in the SAME tmux window (measured on the live install: operator
+    ``…-p374`` suspended at 16:20:00Z, ``…-p455`` started 16:20:10Z). The
+    predecessor's md survives as ``status: suspended`` and its inbox is never
+    renamed (``rebind_sid`` only fires on ``resume()``, which rotates in place),
+    so every later write to it is a black hole.
+
+    Returns a successor only when the answer is UNAMBIGUOUS — exactly one live
+    holder shares the target's window stem and linux user, and it is not the
+    target itself. Ambiguity (two live sessions in one window) or absence
+    resolves to None and the caller keeps its existing behaviour: a wrong
+    redirect on this bus is worse than the loss it would prevent.
+
+    Deliberately NOT applied to a live target: a live holder reads its own
+    inbox, so there is nothing to redirect.
+    """
+    from bot_squad_worker.sessions import _is_live_holder
+
+    meta = _session_status(cfg, slug, sid)
+    if meta is None or _is_live_holder(meta):
+        return None
+    want = _sid_stem(sid)
+    if want is None:
+        return None
+    matches = [
+        cand for cand, cand_meta in _list_session_sids(cfg, slug)
+        if cand != sid and _is_live_holder(cand_meta) and _sid_stem(cand) == want
+    ]
+    if len(matches) != 1:
+        if matches:
+            log.warning(
+                "intersession: %s is not live and %d live sessions share its "
+                "window %r — refusing to guess a successor (slug=%s)",
+                sid, len(matches), want[1], slug,
+            )
+        return None
+    return matches[0]
+
+
 def _resolve_recipients(
     cfg: Any,
     slug: str,
@@ -122,10 +197,28 @@ def _resolve_recipients(
       - ``teamlead``: every LIVE session with no task_id (or task_id == "~")
       - ``dev``:      every LIVE session with a real task_id
       - ``all``:      every LIVE session listed in data/<slug>/sessions/
+      - ``operator``: every LIVE operator-role session (T-0790)
 
     Anything else is treated as a literal SID (returned as-is — see ``send``
     docstring: an unknown SID still gets a per-sid inbox so the recipient
-    will pick it up on their next read).
+    will pick it up on their next read), EXCEPT a SID that has been SUPERSEDED
+    by a recycle, which resolves to its live successor (T-0790, see
+    ``live_successor_sid``).
+
+    T-0790 (``operator``): ``operator`` was NOT a role keyword, so it fell
+    through to the literal-SID branch and wrote ``_chat/inbox-operator.log`` —
+    a file no session owns or drains. Four internal escalation callers address
+    it that way (``autocompact._alert_orphaned_handoff``,
+    ``uc_redrive._notify_operator_stuck``, ``recovery._do_park``,
+    ``operator_redrive``), all of them variations on "needs a human look"; the
+    live install had 27 undrained lines in that file, 22 of them uc_redrive
+    escalations spanning 2026-07-04…07-27. It is also WHY the operator hop is
+    the one that broke silently: with no role keyword for the role the product
+    is built around, every relay to it had to name a remembered SID. Resolution
+    delegates to :func:`dispatch.live_operator_sids`, the operator-identity
+    SSOT (T-0523), so this does not add divergent identity logic — which also
+    means it catches the canonical md-less operator pane that a session-md scan
+    misses.
 
     T-0683: role-keyword fan-out is scoped to LIVE sessions only (the same
     ``_is_live_holder`` check ``bsq team status``'s default roster and the
@@ -152,6 +245,12 @@ def _resolve_recipients(
     SID anyway). A literal-SID target is never scoped: addressing a specific
     ``S-<user>-…`` SID is already an explicit choice.
     """
+    if to == "operator":
+        from bot_squad_worker.dispatch import live_operator_sids
+        return live_operator_sids(cfg, slug)
+    # NB: ``operator`` returned above — it is a role fan-out but resolves via the
+    # identity SSOT, not this task_id-shaped walk. Keep this set literal so
+    # reordering the branches can't silently route ``operator`` through here.
     if to in {"teamlead", "dev", "all"}:
         from bot_squad_worker.sessions import _is_live_holder
         rows = [
@@ -180,6 +279,13 @@ def _resolve_recipients(
             elif to == "dev" and is_dev:
                 sids.append(sid)
         return sids
+    successor = live_successor_sid(cfg, slug, to)
+    if successor is not None:
+        log.warning(
+            "intersession: %s was RECYCLED — routing to its live successor %s "
+            "instead of a dead inbox (slug=%s)", to, successor, slug,
+        )
+        return [successor]
     return [to]
 
 
@@ -299,7 +405,16 @@ def send(
 ) -> dict:
     """Append a message line to recipient inboxes.
 
-    Returns ``{"ok": True, "delivered_to": [sid, ...]}``.
+    Returns ``{"ok": True, "delivered_to": [sid, ...]}``, plus
+    ``"redirected": {"from": <requested sid>, "to": <live successor>,
+    "reason": "recycled"}`` when the requested SID had been superseded by a
+    recycle (T-0790). Callers that only read ``delivered_to`` are unaffected —
+    it already names where the message actually went.
+
+    Never raises on an undeliverable target; the routing FACTS are returned (and
+    logged) and the ``peer_send`` action turns the agent-facing ones into an
+    error. ~12 internal callers treat this as a best-effort notify, so raising
+    here would trade a message loss for a broken tick.
 
     T-0157: ``user`` overrides the linux-user scope for role-keyword fan-out
     (``teamlead``/``dev``/``all``); without it the scope is the sender's own
@@ -314,7 +429,10 @@ def send(
         with inbox.open("ab") as f:
             f.write(line.encode("utf-8"))
         delivered.append(sid)
-    return {"ok": True, "delivered_to": delivered}
+    out: dict = {"ok": True, "delivered_to": delivered}
+    if to not in _ROLE_KEYWORDS and delivered and delivered != [to]:
+        out["redirected"] = {"from": to, "to": delivered[0], "reason": "recycled"}
+    return out
 
 
 def inbox_read(cfg: Any, slug: str, sid: str) -> dict:

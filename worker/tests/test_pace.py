@@ -106,6 +106,160 @@ def test_legacy_pace_json_written_before_this_lane_still_loads(cfg_slug):
     assert conf["drive"]["scope"] == "all"
 
 
+def test_set_drive_records_the_axes_and_the_words_that_set_them(cfg_slug):
+    """T-0828 DoD-5. ``source_text`` is not decoration and not a log — it is the
+    visibility half. His complaint was «я просил закончить всё что в опен, но
+    видимо это не интерпретировалось»; storing the phrase is what lets every
+    surface answer "did my instruction land"."""
+    cfg, slug = cfg_slug
+    got = pace.set_drive(
+        cfg, slug,
+        scope="open_reopened",
+        set_by="S-almdudleer-operator-p533",
+        source_text="закончить всё что в опен",
+    )
+    assert got["scope"] == "open_reopened"
+    assert got["configured"] is True
+    assert got["set_by"] == "S-almdudleer-operator-p533"
+    assert got["source_text"] == "закончить всё что в опен"
+    assert got["set_at"].endswith("Z")
+    # Untouched axes keep their defaults rather than being blanked.
+    assert got["stop_when"] == "scope_exhausted"
+    assert got["on_stop"] == "nothing"
+    # ...and it round-trips through a fresh read, not just the return value.
+    assert pace.read_drive(cfg, slug) == got
+
+
+def test_set_drive_is_partial_and_keeps_the_axes_it_was_not_given(cfg_slug):
+    cfg, slug = cfg_slug
+    pace.set_drive(cfg, slug, scope="in_progress", source_text="в ин прогресс")
+    pace.set_drive(cfg, slug, on_stop="alert", set_by="S-other")
+    d = pace.read_drive(cfg, slug)
+    assert d["scope"] == "in_progress"      # survived the second write
+    assert d["on_stop"] == "alert"
+    assert d["source_text"] == "в ин прогресс"  # None means "leave alone"
+    assert d["set_by"] == "S-other"         # provenance is refreshed every write
+
+
+def test_set_drive_rejects_an_unknown_value_and_names_the_allowed_set(cfg_slug):
+    """T-0828 DoD-3: reject rather than coerce. A settings surface that quietly
+    ignores what you set it to reproduces the exact defect he reported, so the
+    error is NAMED and carries the closed set — the message is what the CLI
+    prints, so it has to be actionable on its own."""
+    cfg, slug = cfg_slug
+    with pytest.raises(pace.DriveModeError) as ei:
+        pace.set_drive(cfg, slug, scope="opne")
+    msg = str(ei.value)
+    assert "opne" in msg
+    assert "open_reopened" in msg and "in_progress" in msg and "all" in msg
+
+    for field, bad in (("stop_when", "forever"), ("on_stop", "ALERT!")):
+        with pytest.raises(pace.DriveModeError):
+            pace.set_drive(cfg, slug, **{field: bad})
+
+
+def test_a_rejected_write_leaves_the_store_completely_untouched(cfg_slug):
+    """Validate-all-before-writing. A call with one good and one bad axis must
+    not half-apply: a partially-applied settings write is worse than a rejected
+    one, because every surface then reports a state nobody asked for."""
+    cfg, slug = cfg_slug
+    pace.set_drive(cfg, slug, scope="open_reopened", source_text="как было")
+    before = pace.read_drive(cfg, slug)
+
+    with pytest.raises(pace.DriveModeError):
+        pace.set_drive(cfg, slug, scope="in_progress", on_stop="NOPE")
+
+    assert pace.read_drive(cfg, slug) == before  # incl. set_at — nothing was written
+
+
+def test_set_drive_refuses_a_call_that_sets_nothing(cfg_slug):
+    cfg, slug = cfg_slug
+    with pytest.raises(ValueError):
+        pace.set_drive(cfg, slug)
+
+
+def test_clear_drive_returns_to_exactly_the_never_set_state(cfg_slug):
+    """T-0828 DoD-5, the clearing half. Without it the only way out of a mode is
+    to set the default explicitly — which every surface then reports as a
+    deliberate choice (``configured: True``), so it cannot express "I have no
+    standing mode"."""
+    cfg, slug = cfg_slug
+    fresh = pace.read_drive(cfg, slug)
+
+    pace.set_drive(cfg, slug, scope="in_progress", on_stop="alert",
+                   source_text="потратить квоту")
+    assert pace.read_drive(cfg, slug)["configured"] is True
+
+    assert pace.clear_drive(cfg, slug) is True
+    assert pace.read_drive(cfg, slug) == fresh          # byte-identical to never-set
+    assert pace.clear_drive(cfg, slug) is False         # idempotent
+
+
+def test_clear_drive_keeps_the_other_pace_settings(cfg_slug):
+    """Clearing the MODE must not clear the pace config around it."""
+    cfg, slug = cfg_slug
+    pace.set_max_in_progress(cfg, slug, 4)
+    pace.set_initiative(cfg, slug, "process-paradigm", weight=3.0)
+    pace.set_drive(cfg, slug, scope="all")
+
+    pace.clear_drive(cfg, slug)
+
+    conf = pace.read_config(cfg, slug)
+    assert conf["max_in_progress"] == 4
+    assert conf["initiatives"]["process-paradigm.md"]["weight"] == 3.0
+    assert conf["drive"]["configured"] is False
+
+
+def test_an_out_of_set_value_ON_DISK_is_reported_not_silently_swapped(cfg_slug):
+    """The READ path's half of "reject, never coerce".
+
+    It must not raise — the worker tick and the UI both call this, and a
+    hand-edited file must not take the drive down. But the fallback must be
+    VISIBLE: an absent value that reads identically to a real one is the
+    silent-None failure D-0069 calls the most dangerous line in the design.
+    """
+    cfg, slug = cfg_slug
+    p = pace._config_path(cfg, slug)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('{"drive": {"scope": "opne", "on_stop": "ALERT!"}}')
+
+    d = pace.read_drive(cfg, slug)
+    assert d["scope"] == "all"                    # effective value = the default
+    assert d["on_stop"] == "nothing"
+    assert d["invalid"] == {"scope": "opne", "on_stop": "ALERT!"}  # raw values kept
+    assert d["stop_when"] == "scope_exhausted"    # the untouched axis is unaffected
+    assert d["configured"] is True
+
+
+def test_read_drive_never_raises_on_a_hostile_config(cfg_slug):
+    """Widening on an unreadable setting is safe; narrowing would HIDE work, and
+    raising would take the drive down. So this path swallows shape errors and
+    reports them, and L2 (T-0829) depends on that contract."""
+    cfg, slug = cfg_slug
+    p = pace._config_path(cfg, slug)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    for body in ('{ not json', '{"drive": "open_reopened"}', '{"drive": null}',
+                 '{"drive": {"scope": 5, "stop_when": ["x"], "on_stop": {"a": 1}}}',
+                 '[]'):
+        p.write_text(body)
+        d = pace.read_drive(cfg, slug)
+        assert d["scope"] in pace.DRIVE_SCOPES
+        assert d["stop_when"] in pace.DRIVE_STOP_WHEN
+        assert d["on_stop"] in pace.DRIVE_ON_STOP
+
+
+def test_validate_drive_value_is_the_single_gate(cfg_slug):
+    """Every accepted value is in the closed set, and an unknown FIELD is an
+    error too — so a future flag added without wiring cannot write a key nobody
+    validates."""
+    for field, choices in pace.DRIVE_CHOICES.items():
+        for good in choices:
+            assert pace.validate_drive_value(field, good) == good
+        assert pace.validate_drive_value(field, f"  {choices[0]}  ") == choices[0]
+    with pytest.raises(pace.DriveModeError):
+        pace.validate_drive_value("nonesuch", "all")
+
+
 def test_initiative_pace_defaults_for_unconfigured(cfg_slug):
     cfg, slug = cfg_slug
     assert pace.initiative_pace(cfg, slug, "anything") == {

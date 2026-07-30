@@ -122,6 +122,29 @@ jobs:
         # comparable and this layer is.
         run: |
           cd api && pytest tests/test_relay_destination_differential.py -x -q
+      - name: The three drive-mode mirrors agree — worker / api / bsq (T-0828)
+        # Sixth cross-directory invariant, same reason as the five above: it
+        # drives `worker/…/pace.py`, `api/app/routes_transparency.py` AND
+        # `scripts/cli/bsq` over one fixture table, so it needs the whole
+        # checkout. Under the dev host's api-only docker mount it SKIPS, and a
+        # skip is not coverage — this job has the whole checkout, so this is
+        # where it runs.
+        #
+        # D-0069 put the standing drive mode in the existing pace.json. Three
+        # processes read that file and none may import the others (systemd
+        # worker / docker api / stdlib-only CLI), so the normalisation exists
+        # three times by design. If they drift the failure is SILENT and it is
+        # the stakeholder's own reported defect: the UI shows a project with no
+        # drive mode set while `bsq pace show` says one is. T-0778's rule is
+        # that a hand-maintained copy is allowed only when a test pins it.
+        #
+        # ⚠ It compares NORMALISATION, not RENDERING — all three can normalise
+        # identically and still print contradictory sentences to the human. The
+        # rendering rule is pinned per surface
+        # (worker/tests/test_pace_drive_cli_render.py and the driveMode vitest);
+        # do not read this step's green as "the surfaces agree".
+        run: |
+          cd api && pytest tests/test_pace_drive_mirror.py -x -q
       - name: The api's PATCH preserves the worker's session-history ts map (T-0789)
         # Fifth cross-directory invariant, and the same failure class as the
         # T-0749 step above: the api writing a file whose format the worker owns.

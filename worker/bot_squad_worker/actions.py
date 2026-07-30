@@ -5115,6 +5115,18 @@ def _action_reload_projects(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ADDING AN ACTION? Three edits, and the third is the one people miss (T-0799):
+#   1. this registry;
+#   2. ``ACTION_MODES`` below — its parity with this dict is asserted by
+#      ``worker/tests/test_action_modes.py`` ("set(ACTION_MODES) ==
+#      set(ACTION_REGISTRY)"), so a missing mode fails there;
+#   3. the CLOSED allowlist in ``worker/tests/test_actions.py``
+#      (``test_registry_lists_only_allowed_actions``) — a hand-maintained set,
+#      so a new action fails it BY CONSTRUCTION.
+# Nothing here used to point at #3, and running only the tests near your own
+# emitter passes while the shared suite goes red for every other session. That
+# is how T-0799 and T-0783a each red-ed it within one hour; the note is here
+# rather than in a doc because this dict is where you are standing when it bites.
 ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "noop": _action_noop,
     "tg_verify_login": _action_tg_verify_login,

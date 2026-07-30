@@ -2828,10 +2828,39 @@ def cmd_model_status(args) -> None:
 # pause SSOT the re-drive cadence already honors).
 #
 # Storage shape mirrors pace.py: {max_in_progress:int, initiatives:{<.md>:{weight,
-# priority,paused}}}. Display applies the same defaults pace.read_config does.
+# priority,paused}}, drive:{...}}. Display applies the same defaults
+# pace.read_config does.
+#
+# T-0828 / D-0069 added the `drive` block — the standing per-project drive MODE
+# («какой режим драйва щас стоит»). Like everything else in this section it is a
+# DELIBERATE, HAND-MAINTAINED MIRROR of `worker/bot_squad_worker/pace.py`, not an
+# import: `bsq` is stdlib-only by design and reaches the worker only over its
+# socket (see the role-derivation block above for the full reasoning). That makes
+# the drive normalisation a THIRD copy — worker, api (routes_transparency.py),
+# and here — and by T-0778's rule a copy is only allowed when a test pins it:
+# `api/tests/test_pace_drive_mirror.py` drives ALL THREE over one fixture table
+# and goes red the moment one grows a field or a value the others lack. lint.yml
+# runs it on every push.
 # --------------------------------------------------------------------------
 _PACE_DEFAULT_WEIGHT = 1.0
 _PACE_DEFAULT_PRIORITY = 0
+
+# T-0828: the closed sets. Byte-identical to pace.DRIVE_* / routes_transparency
+# _DRIVE_* — the mirror test compares these tuples themselves, not just results.
+_PACE_DRIVE_SCOPES = ("open_reopened", "in_progress", "all")
+_PACE_DRIVE_STOP_WHEN = ("scope_exhausted", "spend_quota")
+_PACE_DRIVE_ON_STOP = ("nothing", "alert")
+_PACE_DRIVE_DEFAULTS = {
+    "scope": "all",
+    "stop_when": "scope_exhausted",
+    "on_stop": "nothing",
+}
+_PACE_DRIVE_CHOICES = {
+    "scope": _PACE_DRIVE_SCOPES,
+    "stop_when": _PACE_DRIVE_STOP_WHEN,
+    "on_stop": _PACE_DRIVE_ON_STOP,
+}
+_PACE_DRIVE_PROVENANCE_FIELDS = ("set_by", "set_at", "source_text")
 
 
 def _pace_dir(slug: str) -> Path:
@@ -2910,6 +2939,95 @@ def _pace_initiatives(raw: dict) -> dict:
     return out
 
 
+def _pace_normalized_drive(raw: dict) -> dict:
+    """T-0828: the `drive` block with defaults applied. Mirror of
+    pace.py:_normalized_drive — same keys, same fallback rule, same `invalid` map.
+
+    Out-of-set stored values are REPORTED (in `invalid`, with the raw value kept)
+    and the effective value falls back to the default; they are never silently
+    swapped, because a settings surface that quietly ignores what you set it to
+    is the defect he reported. `configured` says whether a drive block exists on
+    disk at all — that is what tells "never set" from "deliberately set to the
+    widest", and both read scope=all."""
+    out: dict = dict(_PACE_DRIVE_DEFAULTS)
+    out.update({"set_by": None, "set_at": None, "source_text": None})
+    out["configured"] = False
+    out["invalid"] = {}
+
+    src = raw.get("drive")
+    if not isinstance(src, dict):
+        return out
+    out["configured"] = True
+
+    for field, choices in _PACE_DRIVE_CHOICES.items():
+        if field not in src or src[field] is None:
+            continue
+        sval = str(src[field]).strip()
+        if sval in choices:
+            out[field] = sval
+        else:
+            out["invalid"][field] = src[field]  # effective value stays the default
+
+    for field in _PACE_DRIVE_PROVENANCE_FIELDS:
+        v = src.get(field)
+        out[field] = str(v) if v is not None else None
+    return out
+
+
+def _pace_fmt_set_at(set_at: str | None) -> str:
+    """`2026-07-30T14:52:31Z` -> `2026-07-30 14:52` (the form D-0069's example
+    line prints). Anything unparseable is passed through verbatim rather than
+    dropped — an unreadable stamp is still evidence of WHEN, and hiding it would
+    be the same silent-omission failure this whole block exists to close."""
+    if not set_at:
+        return ""
+    s = str(set_at).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return s
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _pace_print_drive(drive: dict) -> None:
+    """The `drive:` block of `bsq pace show` (T-0828 DoD-4).
+
+    The provenance suffix on the `scope` line is D-0069's specified shape:
+    "scope: open_reopened — set 2026-07-30 14:52 from «закончить всё что в опен»".
+    That line is the answer to "did my instruction land", which is the whole ask
+    — so it is a DoD item, not a nicety. NOTE the stamp is BLOCK-level (set_drive
+    refreshes set_at on every write, whichever axis moved); it is rendered on the
+    scope line because scope is the axis his worked example sets."""
+    if not drive.get("configured"):
+        print("  drive mode: (not set — defaults in effect: "
+              f"scope={_PACE_DRIVE_DEFAULTS['scope']} "
+              f"stop_when={_PACE_DRIVE_DEFAULTS['stop_when']} "
+              f"on_stop={_PACE_DRIVE_DEFAULTS['on_stop']})")
+        return
+
+    prov = ""
+    stamp = _pace_fmt_set_at(drive.get("set_at"))
+    if stamp:
+        prov = f" — set {stamp}"
+        if drive.get("set_by"):
+            prov += f" by {drive['set_by']}"
+    if drive.get("source_text"):
+        prov += f" from «{drive['source_text']}»"
+
+    print("  drive mode:")
+    print(f"    scope:     {drive['scope']}{prov}")
+    print(f"    stop_when: {drive['stop_when']}")
+    print(f"    on_stop:   {drive['on_stop']}")
+
+    # An out-of-set stored value is LOUD. Reporting the default as though it
+    # were the setting is the silent-fallback defect D-0069 forbids.
+    for field, bad in sorted(drive.get("invalid", {}).items()):
+        allowed = ", ".join(_PACE_DRIVE_CHOICES.get(field, ()))
+        print(f"    ⚠ INVALID {field}={bad!r} in pace.json — NOT a recognised value, "
+              f"so the default {_PACE_DRIVE_DEFAULTS.get(field)!r} is in effect. "
+              f"Allowed: {allowed}. Fix: bsq pace drive --{field.replace('_', '-')} <value>")
+
+
 def _pace_weekly_target_pct(slug: str) -> float | None:
     """Mirrors operator_redrive.weekly_quota_target_pct: best-effort read of
     ``[operator].weekly_quota_target_pct`` from system_settings.toml."""
@@ -2964,7 +3082,9 @@ def _pace_verdict(target_pct: float | None, spend_pct: float | None) -> str | No
 
 def cmd_pace_show(args) -> None:
     """T-0482: print the project's pace-control config (the user's pace surface).
-    T-0579/F2.7: also surfaces the weekly-quota-target pace verdict (under/on/over)."""
+    T-0579/F2.7: also surfaces the weekly-quota-target pace verdict (under/on/over).
+    T-0828/D-0069: also prints the standing `drive:` block — the READ half of
+    «нужно более чёткое понимание для меня, какой режим драйва щас стоит»."""
     slug = resolve_slug()
     raw = _pace_load_raw(slug)
     try:
@@ -2994,6 +3114,8 @@ def cmd_pace_show(args) -> None:
         verdict_s = verdict if verdict is not None else "unknown"
         print(f"  weekly quota target: {target}%  spend-to-date: {spend_s}  "
               f"verdict: {verdict_s}")
+    # T-0828: one more block in this same output — not a new verb.
+    _pace_print_drive(_pace_normalized_drive(raw))
 
 
 def cmd_pace_set(args) -> None:
@@ -3050,6 +3172,64 @@ def cmd_pace_clear(args) -> None:
     raw["initiatives"] = inits
     _pace_save_raw(slug, raw)
     print(f"pace[{slug}]: cleared {key}")
+
+
+def cmd_pace_drive(args) -> None:
+    """T-0828/D-0069: set (or clear) the standing per-project DRIVE MODE.
+
+    Mirrors pace.set_drive / pace.clear_drive. Partial — only the passed axes
+    change. REJECTS an out-of-set value rather than coercing it (argparse's
+    `choices=` does that here, and the error names the allowed set), and
+    validates every passed value BEFORE writing so a call with one good and one
+    bad axis leaves the stored config untouched instead of half-applying."""
+    slug = resolve_slug()
+
+    if getattr(args, "clear", False):
+        if args.scope or args.stop_when or args.on_stop or args.source_text:
+            die("--clear takes no other setting — it drops the whole drive block")
+        raw = _pace_load_raw(slug)
+        if "drive" not in raw:
+            print(f"pace[{slug}]: no drive mode set (already at defaults)")
+            return
+        del raw["drive"]
+        _pace_save_raw(slug, raw)
+        print(f"pace[{slug}]: cleared drive mode — back to defaults "
+              f"(scope={_PACE_DRIVE_DEFAULTS['scope']} "
+              f"stop_when={_PACE_DRIVE_DEFAULTS['stop_when']} "
+              f"on_stop={_PACE_DRIVE_DEFAULTS['on_stop']})")
+        return
+
+    given = {k: v for k, v in (("scope", args.scope),
+                               ("stop_when", args.stop_when),
+                               ("on_stop", args.on_stop)) if v is not None}
+    if not given and args.source_text is None:
+        die("nothing to set — pass --scope / --stop-when / --on-stop "
+            "(or --clear to drop the drive mode)")
+
+    # Belt-and-braces over argparse `choices=`: this is the same closed-set check
+    # pace.validate_drive_value makes, so a future flag added without `choices=`
+    # still cannot write an unrecognised value.
+    for field, val in given.items():
+        if val not in _PACE_DRIVE_CHOICES[field]:
+            die(f"invalid drive {field}: {val!r} — must be one of: "
+                f"{', '.join(_PACE_DRIVE_CHOICES[field])}")
+
+    raw = _pace_load_raw(slug)
+    block = raw.get("drive")
+    block = dict(block) if isinstance(block, dict) else {}
+    block.update(given)
+    block["set_by"] = require_sid(getattr(args, "sid", None)) or "user"
+    block["set_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z")
+    if args.source_text is not None:
+        # The words that set it, verbatim. Not decoration and not a log — this is
+        # what lets every surface answer "did my instruction land".
+        block["source_text"] = args.source_text
+    raw["drive"] = block
+    _pace_save_raw(slug, raw)
+
+    print(f"pace[{slug}]: drive mode set —")
+    _pace_print_drive(_pace_normalized_drive(raw))
 
 
 def cmd_pace_pause(args) -> None:
@@ -5698,7 +5878,7 @@ def build_parser() -> argparse.ArgumentParser:
     # T-0482: user-controlled execution pace (Process Paradigm M3 / F3.4).
     pace = sub.add_parser(
         "pace",
-        help="user-controlled execution pace: show / set / initiative / pause / resume")
+        help="user-controlled execution pace: show / set / drive / initiative / pause / resume")
     pace_sub = pace.add_subparsers(dest="sub", required=True)
     pcs = pace_sub.add_parser("show", help="print this project's pace-control config")
     pcs.set_defaults(func=cmd_pace_show)
@@ -5706,6 +5886,24 @@ def build_parser() -> argparse.ArgumentParser:
     pcset.add_argument("--max-in-progress", type=int, default=None,
                        help="max tasks kept in the in_progress board state (0 = unlimited)")
     pcset.set_defaults(func=cmd_pace_set)
+    # T-0828 / D-0069: the standing per-project DRIVE MODE. Under the existing
+    # `pace` verb deliberately — a new CLI noun would be the second settings
+    # surface both T-0823 and T-0800 warn against creating.
+    pcd = pace_sub.add_parser(
+        "drive", help="set the standing drive mode: scope x stopping condition")
+    pcd.add_argument("--scope", choices=list(_PACE_DRIVE_SCOPES), default=None,
+                     help="which ticket statuses are in play (default: all = today's behaviour)")
+    pcd.add_argument("--stop-when", dest="stop_when", choices=list(_PACE_DRIVE_STOP_WHEN),
+                     default=None, help="when the drive stops (default: scope_exhausted)")
+    pcd.add_argument("--on-stop", dest="on_stop", choices=list(_PACE_DRIVE_ON_STOP),
+                     default=None, help="what happens AT the stop (default: nothing)")
+    pcd.add_argument("--source-text", dest="source_text", default=None,
+                     help="the words that set it, VERBATIM — printed back by `bsq pace show` "
+                          "so the person who asked can see their instruction landed")
+    pcd.add_argument("--clear", action="store_true",
+                     help="drop the drive block entirely (back to defaults)")
+    pcd.add_argument("--sid", help="attributing SID (default: derived from tmux)")
+    pcd.set_defaults(func=cmd_pace_drive)
     pci = pace_sub.add_parser("initiative", help="steer one initiative's weight / priority / pause")
     pci.add_argument("name", help="initiative basename (e.g. process-paradigm or process-paradigm.md)")
     pci.add_argument("--weight", type=float, default=None, help="relative drain weight (default 1.0)")

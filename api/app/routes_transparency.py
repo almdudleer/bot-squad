@@ -10,7 +10,8 @@ needs to understand where the system IS — without talking to the operator:
   * the session tree         — the live ``list_sessions`` fan-out (reused as-is)
   * the backlog              — status counts + a light task list
   * quota / pace             — max-in-progress + global pause + per-initiative
-                               pace (T-0482 / pace.py)
+                               pace + the standing DRIVE MODE
+                               (T-0482 / T-0828 / pace.py)
 
 This surface is STRICTLY READ-ONLY — it writes nothing and owns no state.
 
@@ -180,6 +181,75 @@ def _normalized_initiatives(raw: dict) -> dict[str, dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Drive modes (T-0828 / D-0069) — mirror of pace.py's `drive` block
+# ---------------------------------------------------------------------------
+# ⚠ THE TWIN. Everything below is a SECOND implementation of
+# `worker/bot_squad_worker/pace.py`'s drive normalisation, for the same reason
+# the initiative mirror above exists: the api cannot `import bot_squad_worker`
+# (separate deployable packages / containers), so it mirrors the on-disk layout.
+#
+# If this drifts from pace.py the failure is SILENT and it is the exact defect
+# the stakeholder reported: the UI renders a project with no drive mode set,
+# while `bsq pace show` says one is. `api/tests/test_pace_drive_mirror.py`
+# drives BOTH implementations over one fixture set and goes red the moment one
+# grows a field the other lacks; lint.yml runs it on every push.
+
+_DRIVE_SCOPES = ("open_reopened", "in_progress", "all")
+_DRIVE_STOP_WHEN = ("scope_exhausted", "spend_quota")
+_DRIVE_ON_STOP = ("nothing", "alert")
+_DRIVE_DEFAULTS = {
+    "scope": "all",
+    "stop_when": "scope_exhausted",
+    "on_stop": "nothing",
+}
+_DRIVE_CHOICES = {
+    "scope": _DRIVE_SCOPES,
+    "stop_when": _DRIVE_STOP_WHEN,
+    "on_stop": _DRIVE_ON_STOP,
+}
+_DRIVE_PROVENANCE_FIELDS = ("set_by", "set_at", "source_text")
+
+
+def _normalized_drive(raw: dict) -> dict:
+    """Mirror of ``pace.py:_normalized_drive`` — defaults applied, closed sets
+    enforced, out-of-set values REPORTED rather than silently swapped.
+
+    Read-only surface, so there is no write path and no ``DriveModeError`` here:
+    an out-of-set stored value lands in ``invalid`` with its raw value intact and
+    the effective value falls back to the default. The UI must render the
+    ``invalid`` entry — reporting a fallback as if it were the setting is the
+    silent-None failure D-0069 names.
+
+    ``configured`` distinguishes "no drive block on disk" from "explicitly set
+    to the default". Both read ``scope: all``; only this flag answers his actual
+    question, «какой режим драйва щас стоит».
+    """
+    out: dict = dict(_DRIVE_DEFAULTS)
+    out.update({"set_by": None, "set_at": None, "source_text": None})
+    out["configured"] = False
+    out["invalid"] = {}
+
+    src = raw.get("drive")
+    if not isinstance(src, dict):
+        return out
+    out["configured"] = True
+
+    for field, choices in _DRIVE_CHOICES.items():
+        if field not in src or src[field] is None:
+            continue
+        sval = str(src[field]).strip()
+        if sval in choices:
+            out[field] = sval
+        else:
+            out["invalid"][field] = src[field]  # effective value stays the default
+
+    for field in _DRIVE_PROVENANCE_FIELDS:
+        v = src.get(field)
+        out[field] = str(v) if v is not None else None
+    return out
+
+
 def _quota(data_dir: Path, slug: str, in_progress: int) -> dict:
     raw = _pace_raw(data_dir, slug)
     return {
@@ -187,6 +257,7 @@ def _quota(data_dir: Path, slug: str, in_progress: int) -> dict:
         "in_progress": in_progress,
         "paused": _global_paused(data_dir, slug),
         "initiatives": _normalized_initiatives(raw),
+        "drive": _normalized_drive(raw),
     }
 
 

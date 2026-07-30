@@ -4,10 +4,53 @@
 # Project.repo_for_target("prod")). The TL is responsible for landing a
 # release commit on master before queueing this deploy — either via
 # squash-merge from bot_squad/dev or as a direct hotfix commit. This recipe
-# just pulls, builds, swaps, and smokes.
+# just pulls, builds, swaps, and gates.
+#
+# STRUCTURE — load-bearing, and identical to staging.sh on purpose (the two
+# recipes carrying independent copies of the same gate is how the same defect
+# came to exist twice; the gate itself now lives once, in lib/wait-ready.sh):
+#   PHASE 1  ACTIONS — everything that changes the target.
+#   PHASE 2  GATES — everything that VERIFIES. Every gate runs, unconditionally;
+#            one verdict at the end.
+# The one time these were interleaved (T-0427 defect 2) the `stt` sidecar block
+# sat AFTER the app's smoke gate, the smoke gate false-failed under load and
+# exited 22, and the sidecar was never started — app healthy, Telegram voice
+# path silently absent, which is precisely what the sidecar block exists to
+# prevent. Reordering the pair only moves the trap. So no gate exits early.
+#
+# Exit codes:
+#   3   cwd is not the master clone / not on master (nothing was touched)
+#   4   the master clone has diverged from origin/master
+#   20  the readiness gate library is missing/not executable
+#   22  the app never became ready INSIDE its container
+#   23  the `stt` sidecar never became healthy
+#   24  the app was ready internally but never answered on its public URL
+#       (i.e. traefik/LE, not the app)
 set -euo pipefail
 
+DEPLOY_START_S=$SECONDS
+_loadavg() { cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo "load-unknown"; }
+
 REPO="$(pwd)"
+
+APP_CONTAINER="signal-tracker"
+APP_INTERNAL_URL="http://localhost:8000/api/version"
+APP_PUBLIC_URL="https://signal-tracker.dev.uzinvestapi.com/api/version"
+STT_CONTAINER="stt"
+STT_INTERNAL_URL="http://localhost:8003/health"
+
+# Generous ON PURPOSE, and only safe because the gate has a real negative
+# signal (lib/wait-ready.sh): a dead container FATALs within one poll, so a
+# timeout no longer has to be short enough to detect failure — it only bounds a
+# hang. See staging.sh for the worker-watchdog interaction that caps these.
+APP_READY_TIMEOUT_S="${APP_READY_TIMEOUT_S:-600}"
+ROUTE_TIMEOUT_S="${ROUTE_TIMEOUT_S:-180}"
+STT_READY_TIMEOUT_S="${STT_READY_TIMEOUT_S:-300}"
+
+# WHICH FILE AM I — see staging.sh. `grep 'recipe:' <run-log>` answers "which
+# artifact executed" without inference. (T-0378, T-0427)
+echo "[prod] recipe: ${BASH_SOURCE[0]} sha256=$(sha256sum "${BASH_SOURCE[0]}" | cut -c1-16)"
+echo "[prod] deploy start $(date -u +%Y-%m-%dT%H:%M:%SZ); load $(_loadavg)"
 echo "[prod] using cwd $REPO"
 
 # Verify we're on master before doing anything destructive.
@@ -15,6 +58,13 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 if [ "$BRANCH" != "master" ]; then
     echo "[prod] FATAL: expected master clone on branch 'master', got '$BRANCH'" >&2
     exit 3
+fi
+
+GATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/wait-ready.sh"
+if [ ! -x "$GATE" ]; then
+    echo "[prod] FATAL: readiness gate $GATE is missing or not executable." >&2
+    echo "[prod] It ships alongside this recipe; a partial checkout of deploy-recipes/ is the likely cause." >&2
+    exit 20
 fi
 
 git fetch origin
@@ -34,25 +84,11 @@ fi
 export TMPDIR="$REPO/.tmp-deploy"
 mkdir -p "$TMPDIR"
 
+# ══ PHASE 1: ACTIONS ════════════════════════════════════════════════════════
 docker compose build signal-tracker
-docker rm -f signal-tracker 2>/dev/null || true
+docker rm -f "$APP_CONTAINER" 2>/dev/null || true
 docker compose up -d signal-tracker
 
-# Smoke with retry. After a container recreate, traefik label discovery + LE
-# challenge + app cold-start on this loaded host can take >60s before
-# /api/version answers; the old single `sleep 5; curl` false-failed with a 502
-# mid-warmup (curl rc=22) on EVERY prod deploy though build+swap succeeded
-# (5 false .fail.22 on 2026-06-11 alone). Poll ~90s before declaring failure,
-# matching staging.sh. (T-0203)
-# ORDERING IS LOAD-BEARING (T-0390, fixed 2026-07-30): this block sits BEFORE
-# the app's /api/version smoke gate, not after it. It was after it for one
-# deploy, and that deploy proved why it cannot be: the smoke gate false-failed
-# on a loaded box (load avg ~50, three concurrent docker builds), exited 22,
-# and SKIPPED the sidecar entirely — the app came up fine and voice intake was
-# silently absent, which is the exact failure this block exists to prevent,
-# reintroduced one layer up by where the block was placed. The sidecar is
-# independent of the app, so nothing about the app's readiness should be able
-# to strand it. The app is already recreated above and warms up while this runs.
 # ── T-0390 PREREQUISITE: the `stt` speech-to-text sidecar ────────────────────
 # `docker compose up -d <named service>` does NOT start unrelated services, so
 # until these lines existed NOTHING on a deploy target ever started `stt` — the
@@ -68,39 +104,46 @@ docker compose up -d signal-tracker
 # every deploy would take the other environment's voice path down with it.
 # `up -d` is idempotent: a no-op when the service is already running from the
 # current image, a start when it is absent, a recreate when the image changed.
+#
+# Building it here — after the app is already started — also means the app warms
+# up in parallel with this build instead of being waited on first.
 docker compose build stt
 docker compose up -d stt
 
-# Prove it actually came up, rather than trusting that the two lines above ran.
-# /health returns 503 until the model is resident (~13-36 s on this host), so
-# this polls for a real 200. The container has no curl; it does have python.
-stt_ok=0
-for _ in $(seq 1 40); do
-    if docker exec stt python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/health', timeout=3).status == 200 else 1)" >/dev/null 2>&1; then
-        stt_ok=1
-        echo "[prod] stt sidecar healthy (model resident)"
-        break
-    fi
-    sleep 3
-done
-if [ "$stt_ok" -ne 1 ]; then
-    echo "[prod] FATAL: stt sidecar never became healthy within ~120s — the Telegram bot's voice path would be dead on this target" >&2
-    exit 23
+echo "[prod] actions complete at $((SECONDS - DEPLOY_START_S))s; load $(_loadavg) — gates follow"
+
+# ══ PHASE 2: GATES ══════════════════════════════════════════════════════════
+# `|| rc=$?` keeps `set -e` from exiting here, which is the entire point: no
+# gate may pre-empt another.
+failed=""
+
+app_rc=0
+bash "$GATE" container "$APP_CONTAINER" "$APP_INTERNAL_URL" "$APP_READY_TIMEOUT_S" prod-app || app_rc=$?
+[ "$app_rc" -eq 0 ] || failed="$failed app"
+
+stt_rc=0
+bash "$GATE" container "$STT_CONTAINER" "$STT_INTERNAL_URL" "$STT_READY_TIMEOUT_S" prod-stt || stt_rc=$?
+[ "$stt_rc" -eq 0 ] || failed="$failed stt"
+
+route_rc=0
+if [ "$app_rc" -eq 0 ]; then
+    bash "$GATE" public "$APP_PUBLIC_URL" "$ROUTE_TIMEOUT_S" prod-route || route_rc=$?
+    [ "$route_rc" -eq 0 ] || failed="$failed public-route"
+else
+    echo "[prod-route] SKIPPED: the app is not ready inside its container, so a public failure would tell us nothing new."
 fi
 
-smoke_ok=0
-for _ in $(seq 1 30); do
-    if curl -fsS -o /dev/null https://signal-tracker.dev.uzinvestapi.com/api/version; then
-        smoke_ok=1
-        echo "[prod] smoke /api/version OK"
-        break
-    fi
-    sleep 3
-done
-if [ "$smoke_ok" -ne 1 ]; then
-    echo "[prod] FATAL: /api/version never answered within ~90s of recreate" >&2
-    exit 22
-fi
+ELAPSED=$((SECONDS - DEPLOY_START_S))
+# Wall clock ALWAYS with the load average — the window this gate replaced was
+# sized off an idle-box figure. (T-0427 DoD)
+echo "[prod] wall clock ${ELAPSED}s; load $(_loadavg) at finish"
 
+if [ -n "$failed" ]; then
+    echo "[prod] FATAL: deploy failed —$failed (app_rc=$app_rc stt_rc=$stt_rc route_rc=$route_rc)" >&2
+    echo "[prod] every gate above was RUN; see its own lines for which signal it got." >&2
+    [ "$app_rc" -eq 0 ] || exit 22
+    [ "$stt_rc" -eq 0 ] || exit 23
+    exit 24
+fi
 
 echo "[prod] release deployed: $(git rev-parse --short HEAD)"

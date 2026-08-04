@@ -69,6 +69,7 @@ log = logging.getLogger(__name__)
 RC_TIMEOUT = 124       # hard wall-clock backstop tripped (build ran too long)
 RC_NO_PROGRESS = 125   # no-progress watchdog: zero run-log output for N minutes
 RC_ORPHAN = 126        # stale-orphan reaper: file stranded in processing/ swept
+RC_CLONE_WEDGED = 127  # T-0453: the deploy clone could not be synced to origin
 
 # next-wave #11 (T-0451): keep-last-N retention horizon for the deploy job
 # archive (processed/ + runs/). Override via BOT_SQUAD_DEPLOY_RETENTION_N; a
@@ -859,6 +860,18 @@ class DeployResult:
     # The sha the running worker is actually on, populated only when worker_stale
     # — so the alert can name what's executing vs. what was just deployed.
     worker_boot_sha: str = ""
+    # T-0453: why the job failed, in words a human can act on — the underlying
+    # git stderr plus the remediation. Populated for failures the RECIPE never
+    # got to see (a wedged deploy clone), where the run log alone says nothing
+    # because there is no run.
+    failure_detail: str = ""
+    # The SID that asked for this deploy, so a failure can reach the requester
+    # and not only the operator channel. "" when the payload carried none.
+    requested_by: str = ""
+    # The deploy target this result belongs to (the caller peeked at the queue
+    # head, which is not necessarily what actually failed once a wedge fails the
+    # whole blocked queue in one sweep).
+    target: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +964,183 @@ def _recipe_path(cfg: "Config", slug: str, target: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Compose/env contract (T-0454)
+#
+# `docker compose` interpolates the ENTIRE compose file before it can start any
+# single service, so ONE unset `${VAR:?...}` anywhere in the file kills every
+# deploy from that clone — including deploys of services that never reference
+# it. watchrobot's staging deploy died in 0.14s naming `services.signal-tracker`
+# (the PROD service) while the recipe only ever builds `signal-tracker-staging`.
+#
+# The failure needs a home EARLIER than the recipe: a job that cannot possibly
+# run should be refused when it is REQUESTED, with the missing names, instead of
+# burning a queue slot to produce a 417-byte log nobody reads.
+# ---------------------------------------------------------------------------
+
+#: `${VAR:?msg}` — required AND non-empty (compose errors on an empty value).
+_COMPOSE_REQUIRED_NONEMPTY_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):\?[^}]*\}")
+#: `${VAR?msg}` — required to be DEFINED; an explicitly empty value satisfies it.
+_COMPOSE_REQUIRED_DEFINED_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\?[^}]*\}")
+
+COMPOSE_FILENAME = "docker-compose.yml"
+
+
+def compose_required_vars(compose_text: str) -> tuple[set[str], set[str]]:
+    """Split a compose file's hard-required interpolations into two sets.
+
+    Returns ``(required_nonempty, required_defined)``:
+
+    - ``required_nonempty`` — ``${VAR:?msg}``. Compose refuses BOTH an unset and
+      an empty value.
+    - ``required_defined`` — ``${VAR?msg}``. Only an *unset* value is refused;
+      ``VAR=`` satisfies it.
+
+    Deliberately NOT included: ``${VAR}`` and ``${VAR:-default}``. Neither can
+    fail a parse (compose substitutes empty / the default and warns), so
+    treating them as required would refuse deploys that work today — a gate that
+    false-refuses gets switched off, and then it guards nothing.
+    """
+    nonempty = set(_COMPOSE_REQUIRED_NONEMPTY_RE.findall(compose_text))
+    # `${VAR?}` also matches inside `${VAR:?}` for the DEFINED regex, so subtract.
+    defined = set(_COMPOSE_REQUIRED_DEFINED_RE.findall(compose_text)) - nonempty
+    return nonempty, defined
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a docker-compose `.env` file into {KEY: value}.
+
+    Compose's own rules, kept minimal on purpose: `KEY=value` lines, `#` comments,
+    blank lines, optional `export ` prefix, surrounding quotes stripped. A file
+    that cannot be read (missing, or a protected file this process may not open)
+    yields ``{}`` — the caller treats that as "provides nothing", never as "all
+    good".
+    """
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def _compose_text_for_target(cfg: "Config", slug: str, target: str) -> tuple[str, str]:
+    """The compose file THIS deploy would run, plus a human-readable provenance.
+
+    Read from git, not from the exec clone's working tree, and that is the whole
+    point: a deploy clone is force-synced to ``origin/<branch>`` at run time, so
+    the compose file on disk right now is the PREVIOUS release's. Checking that
+    one would have passed watchrobot's deploy straight into the wall it hit —
+    the hardening lived in origin, the clone's disk copy was still the old file
+    with the literals.
+
+    Falls back to the exec clone's working copy, then to ("", "") — a compose
+    file we cannot read yields NO required vars, so the gate stays silent rather
+    than refusing deploys for projects it cannot inspect.
+    """
+    project = cfg.projects[slug]
+    exec_repo = project.repo_for_target(target)
+    edit_repo = project.editing_repo_for_target(target)
+
+    refs: list[tuple[Path, str]] = []
+    if project.uses_deploy_clone(target):
+        # Exactly the ref _ensure_deploy_clone force-checks-out.
+        refs.append((edit_repo, f"origin/{project.deploy_branch}"))
+    else:
+        # In-place path (prod): the recipe does `git merge --ff-only origin/<branch>`.
+        branch = _current_branch(exec_repo)
+        if branch:
+            refs.append((exec_repo, f"origin/{branch}"))
+    for repo, ref in refs:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{ref}:{COMPOSE_FILENAME}"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout, f"{ref}:{COMPOSE_FILENAME} ({repo})"
+    on_disk = exec_repo / COMPOSE_FILENAME
+    try:
+        return on_disk.read_text(), f"{on_disk} (working tree)"
+    except OSError:
+        return "", ""
+
+
+def _current_branch(repo: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def compose_env_gaps(cfg: "Config", slug: str, target: str) -> dict:
+    """Answer "does this deploy's env satisfy this deploy's compose file?".
+
+    No deploy, no docker, no side effects — this is the check T-0454 asks for,
+    the one that can run before anything is queued.
+
+    Returns a dict::
+
+        {"missing": [names], "compose": provenance, "env_file": str, "checked": int}
+
+    A name counts as PROVIDED when the project dir's ``.env`` defines it (that is
+    what compose reads; on this box those are symlinks into the protected
+    ``~/.bot-squad-secrets/`` files) or when the worker's own environment carries
+    it — the recipe subprocess inherits that environment, and compose consults
+    the shell env too, so ignoring it would produce false refusals.
+    """
+    project = cfg.projects[slug]
+    exec_repo = project.repo_for_target(target)
+    compose_text, provenance = _compose_text_for_target(cfg, slug, target)
+    nonempty, defined = compose_required_vars(compose_text)
+    if not nonempty and not defined:
+        return {"missing": [], "compose": provenance, "env_file": "", "checked": 0}
+
+    env_path = exec_repo / ".env"
+    from_file = parse_env_file(env_path)
+
+    missing: list[str] = []
+    for name in sorted(nonempty):
+        value = from_file.get(name, os.environ.get(name))
+        if value is None or value == "":
+            missing.append(name)
+    for name in sorted(defined):
+        if name not in from_file and name not in os.environ:
+            missing.append(name)
+    return {
+        "missing": sorted(missing),
+        "compose": provenance,
+        "env_file": str(env_path),
+        "checked": len(nonempty) + len(defined),
+    }
+
+
+class ComposeEnvError(ValueError):
+    """Raised by ``enqueue`` when the target's env cannot satisfy its compose file."""
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -988,6 +1178,9 @@ def enqueue(
     ``sha_drift`` — a false alarm, never a false all-clear (T-0717's rule).
 
     Raises ValueError if ``target`` is not in the project's deploy_targets.
+    Raises ComposeEnvError (a ValueError, so existing callers keep catching it)
+    when the target's compose file has required ``${VAR:?}`` interpolations the
+    target's env cannot supply — T-0454, see ``compose_env_gaps``.
     Raises KeyError if ``slug`` is not registered.
     """
     project = cfg.projects[slug]
@@ -996,6 +1189,35 @@ def enqueue(
             f"unknown target {target!r} for {slug!r}; "
             f"allowed: {list(project.deploy_targets)}"
         )
+
+    # T-0454: refuse at REQUEST time, not at parse time. A deploy whose compose
+    # file has a required `${VAR:?}` that nothing can supply is not a deploy that
+    # might fail — it cannot start, and it will die in ~0.1s having consumed a
+    # queue slot and produced a log that looks like a build. Say which names are
+    # missing, to the caller, now.
+    #
+    # Fail-OPEN on anything the check itself cannot do (unreadable compose, git
+    # error, unknown layout): a gate that blocks deploys when it is confused is
+    # worse than the hole it closes. BOT_SQUAD_DEPLOY_SKIP_ENV_CHECK=1 is the
+    # escape hatch for an emergency where the operator knows better.
+    if os.environ.get("BOT_SQUAD_DEPLOY_SKIP_ENV_CHECK") != "1":
+        try:
+            gaps = compose_env_gaps(cfg, slug, target)
+        except Exception:
+            log.exception("deploy.enqueue: compose/env precheck failed for %s/%s "
+                          "(allowing the deploy — the gate is not the deploy)", slug, target)
+            gaps = {"missing": []}
+        if gaps["missing"]:
+            raise ComposeEnvError(
+                f"{slug}/{target} REFUSED at enqueue: "
+                f"{len(gaps['missing'])} required compose variable(s) have no value — "
+                f"{', '.join(gaps['missing'])}. "
+                f"compose: {gaps.get('compose') or '(unknown)'}; "
+                f"env file: {gaps.get('env_file') or '(none)'}. "
+                f"docker compose interpolates the WHOLE file before starting any service, "
+                f"so this deploy would die at parse time in under a second. "
+                f"Add the name(s) to the protected env file, then re-queue."
+            )
 
     queue_dir = _queue_dir(cfg, slug)
     queue_dir.mkdir(parents=True, exist_ok=True)
@@ -1197,13 +1419,33 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         # Provision/refresh the disposable deploy clone to origin/<branch>. The
         # force-sync guarantees a clean tree at the latest pushed commit, so the
         # shared dev tree's dirty/clean state no longer gates the deploy (T-0143).
-        if not _ensure_deploy_clone(edit_repo, repo, project.deploy_branch):
+        sync = _ensure_deploy_clone(edit_repo, repo, project.deploy_branch)
+        if not sync.ok:
+            # T-0453: "leave the queue file for retry next tick" is the right
+            # answer to a TRANSIENT fault and the wrong one to a permanent
+            # wall. Unbounded, unobserved retry is why a wedged clone burned
+            # seven minutes looking exactly like a slow build: the requester
+            # holds an {"ok": true, queue_id}, later deploys HOL-block behind a
+            # job that can never run, and no .rc/.ok file is ever written
+            # because the run never starts.
+            count = _record_clone_failure(cfg, slug, sync)
+            budget = clone_retry_budget()
+            give_up = sync.permanent or count >= budget
             log.error(
-                "deploy.run_next: %s/%s deploy-clone provisioning failed (%s) — "
-                "leaving queue file for retry next tick.",
-                slug, target, repo,
+                "deploy.run_next: %s/%s deploy-clone provisioning failed at the %s "
+                "stage (%s), attempt %d/%d, permanent=%s: %s",
+                slug, target, sync.stage, repo, count, budget, sync.permanent,
+                sync.stderr,
             )
-            return None
+            if not give_up:
+                log.error(
+                    "deploy.run_next: %s/%s treating this as TRANSIENT — leaving the "
+                    "queue file for retry next tick (%d of %d).",
+                    slug, target, count, budget,
+                )
+                return None
+            return _fail_clone_wedged(cfg, slug, target, sync, count, budget)
+        _clear_clone_failures(cfg, slug)
     else:
         # Legacy in-place deploy: the recipe runs in the editing clone, so its
         # uncommitted edits would leak in — gate on a clean tree.
@@ -1394,6 +1636,118 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         worker_restart_status=worker_restart_status,
         worker_stale=worker_stale,
         worker_boot_sha=boot_git_sha() if worker_stale else "",
+        requested_by=payload.get("requested_by", "") or "",
+        target=target,
+    )
+
+
+def _fail_clone_wedged(
+    cfg: "Config",
+    slug: str,
+    target: str,
+    sync: "CloneSyncResult",
+    count: int,
+    budget: int,
+) -> DeployResult:
+    """Terminate a wedged deploy: fail the blocked jobs and hand the caller
+    something loud to say (T-0453).
+
+    DECISION, stated because the ticket asks for it explicitly: the queue files
+    move to ``processed/*.fail.<RC_CLONE_WEDGED>``; they do NOT stay for a manual
+    retry. Leaving them is what produced the defect — the queue head-of-line
+    blocks every later deploy for the slug behind a job that cannot run, and the
+    retry is invisible. Failing them unblocks the queue immediately, and the
+    alert carries the git stderr plus the fix, so re-queueing is one command once
+    a human has removed the wall. A job silently preserved and a job silently
+    retried are the same failure from the requester's side.
+
+    Every queued job that runs from the SAME exec clone is failed together: they
+    are all blocked by the same wall, and failing them one per tick would emit
+    one alert per minute per job. Jobs for other targets (prod runs in the master
+    clone) are untouched.
+    """
+    project = cfg.projects[slug]
+    exec_repo = project.repo_for_target(target)
+
+    remediation = "Fix the clone, then re-queue the deploy."
+    if sync.wall:
+        owner = f" (owned by unix user '{sync.wall_owner}')" if sync.wall_owner else ""
+        remediation = (
+            f"BLOCKING DIRECTORY: {sync.wall}{owner} — this process cannot write in it, "
+            f"and a checkout must unlink/create entries there. Note it is the DIRECTORY, "
+            f"not the file git named: removing an entry needs write on the CONTAINING "
+            f"directory, so deleting the contents is not an option either.\n"
+            f"    mv {sync.wall} {sync.wall}.foreign.bak\n"
+            f"Rename, do not delete — a rename needs write on the PARENT, which this user "
+            f"does own, and it keeps the other user's files intact. Then re-queue the deploy."
+        )
+    if sync.foreign_paths:
+        remediation += (
+            f"\nAlso foreign-owned in {exec_repo}: "
+            f"{', '.join(sync.foreign_paths[:10])}"
+            f"{' …' if len(sync.foreign_paths) > 10 else ''}"
+        )
+    detail = (
+        f"deploy-clone sync FAILED at the {sync.stage} stage after {count} attempt(s) "
+        f"(budget {budget}, permanent={sync.permanent}).\n"
+        f"clone: {exec_repo}\n"
+        f"git stderr:\n{sync.stderr or '(empty)'}\n\n{remediation}"
+    )
+
+    processing_dir = _processing_dir(cfg, slug)
+    processing_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir = _runs_dir(cfg, slug)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    head_qid = ""
+    head_requested_by = ""
+    head_log: Path | None = None
+    failed = 0
+    for f in list_queued(cfg, slug):
+        try:
+            payload = json.loads(f.read_text())
+        except Exception:
+            continue
+        t = payload.get("target") or ""
+        if not t or project.repo_for_target(t) != exec_repo:
+            # Not blocked by THIS clone (e.g. a prod job running in the master
+            # clone) — leave it alone.
+            continue
+        qid = payload.get("queue_id") or _queue_id_of(f)
+        log_path = runs_dir / f"{qid}.log"
+        try:
+            log_path.write_text(detail + "\n")
+        except OSError:
+            log.exception("deploy._fail_clone_wedged: could not write %s", log_path)
+        processing_file = processing_dir / f.name
+        f.rename(processing_file)
+        _record_run_rc(cfg, slug, qid, RC_CLONE_WEDGED)
+        _finish(cfg, slug, processing_file, qid, rc=RC_CLONE_WEDGED)
+        failed += 1
+        if not head_qid:
+            head_qid, head_log = qid, log_path
+            head_requested_by = payload.get("requested_by") or ""
+
+    # Counter reset: the jobs it was counting are gone. A NEW deploy queued after
+    # a human has (or has not) fixed the clone gets its own fresh budget rather
+    # than inheriting a count that would fail it on attempt one for a fault that
+    # may already be repaired.
+    _clear_clone_failures(cfg, slug)
+
+    log.error(
+        "deploy.run_next: %s/%s deploy-clone is WEDGED — failed %d queued job(s) as "
+        "rc=%d and unblocked the queue. %s",
+        slug, target, failed, RC_CLONE_WEDGED, detail.replace("\n", " | "),
+    )
+    return DeployResult(
+        ok=False,
+        returncode=RC_CLONE_WEDGED,
+        queue_id=head_qid,
+        log_path=head_log,
+        collapsed_count=max(1, failed),
+        failure_detail=detail,
+        requested_by=head_requested_by,
+        target=target,
     )
 
 
@@ -2122,7 +2476,182 @@ def _origin_url(repo_path: Path) -> str | None:
     return None
 
 
-def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> bool:
+@dataclass
+class CloneSyncResult:
+    """Outcome of one deploy-clone provisioning attempt (T-0453).
+
+    ``_ensure_deploy_clone`` used to return a bare bool, so every failure looked
+    the same to the caller and got the same answer: leave the queue file, retry
+    next tick, forever. A `Permission denied` on the checkout is not a transient
+    fault — no number of retries grants the worker write access — and retrying it
+    once a minute for seven minutes is indistinguishable from a slow build.
+    """
+    ok: bool
+    stage: str = ""          # "clone" | "fetch" | "checkout" | "exception"
+    stderr: str = ""
+    permanent: bool = False  # retrying cannot possibly help
+    foreign_paths: tuple[str, ...] = ()
+    #: The first ancestor directory of the path git named that this process
+    #: cannot write to — the actual wall, which is never the file git blamed.
+    wall: str = ""
+    wall_owner: str = ""
+
+    def __bool__(self) -> bool:  # keeps `if not _ensure_deploy_clone(...)` honest
+        return self.ok
+
+
+#: Substrings that mark a clone-sync failure as PERMANENT — a filesystem
+#: permission the worker process cannot acquire by waiting. Everything else
+#: (network fetch failure, a transient lock) keeps the bounded retry.
+_PERMANENT_CLONE_ERRORS = (
+    "permission denied",
+    "operation not permitted",
+    "read-only file system",
+)
+
+
+def _classify_clone_error(stderr: str) -> bool:
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _PERMANENT_CLONE_ERRORS)
+
+
+def _foreign_owned_paths(repo: Path, limit: int = 20) -> tuple[str, ...]:
+    """Paths inside ``repo`` owned by a DIFFERENT unix user than this process.
+
+    The multi-user hazard behind T-0453: another user's untracked directory in
+    the deploy clone cannot be unlinked, cleaned, or written into by the worker,
+    because removing an entry needs write on the CONTAINING directory. The file
+    contents were byte-identical to the committed blobs; permission on the
+    directory alone wedged the checkout.
+
+    Diagnostic only, and run ONLY after a failure — a foreign-owned path the
+    checkout never has to touch is harmless, so scanning up front would refuse
+    deploys that work today. ``.git`` and ``node_modules`` are pruned (large,
+    and never the thing a checkout collides with).
+    """
+    found: list[str] = []
+    try:
+        uid = os.getuid()
+    except AttributeError:  # non-POSIX; nothing to say
+        return ()
+    try:
+        for dirpath, dirnames, filenames in os.walk(repo, topdown=True):
+            dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
+            for name in list(dirnames) + filenames:
+                p = os.path.join(dirpath, name)
+                try:
+                    if os.lstat(p).st_uid != uid:
+                        found.append(os.path.relpath(p, repo))
+                        if len(found) >= limit:
+                            return tuple(found)
+                except OSError:
+                    continue
+    except Exception:
+        log.exception("deploy._foreign_owned_paths: walk failed for %s", repo)
+    return tuple(found)
+
+
+#: The paths git names when a checkout cannot rewrite the working tree.
+_GIT_BLOCKED_PATH_RES = (
+    re.compile(r"unable to unlink old '([^']+)'"),
+    re.compile(r"unable to create file ([^\s:]+)"),
+    re.compile(r"cannot stat '([^']+)'"),
+    re.compile(r"unable to (?:write|open) '?([^'\s:]+)'?"),
+)
+
+
+def _paths_from_git_stderr(stderr: str) -> tuple[str, ...]:
+    found: list[str] = []
+    for rx in _GIT_BLOCKED_PATH_RES:
+        for m in rx.findall(stderr or ""):
+            if m not in found:
+                found.append(m)
+    return tuple(found)
+
+
+def _first_unwritable_ancestor(repo: Path, relpaths: tuple[str, ...]) -> tuple[str, str]:
+    """Locate the DIRECTORY that actually blocks the checkout, and name its owner.
+
+    git blames the file (``unable to unlink old 'backend/certs/x.pem'``) but the
+    permission that matters belongs to the directory containing it: unlinking or
+    creating an entry needs write on the PARENT. Reporting the file sends the
+    reader to chmod the wrong thing.
+
+    Returns ``("", "")`` when nothing along the path is unwritable (e.g. the
+    failure was not a permission wall at all).
+    """
+    repo = Path(repo)
+    for rel in relpaths:
+        node = (repo / rel).parent
+        while True:
+            try:
+                if node.is_dir() and not os.access(node, os.W_OK):
+                    owner = ""
+                    try:
+                        import pwd
+
+                        owner = pwd.getpwuid(node.stat().st_uid).pw_name
+                    except Exception:
+                        owner = ""
+                    return str(node), owner
+            except OSError:
+                pass
+            if node == repo or node == node.parent:
+                break
+            node = node.parent
+    return "", ""
+
+
+def _clone_failure_state_path(cfg: "Config", slug: str) -> Path:
+    return cfg.data_dir / slug / "_jobs" / "deploy" / "clone-sync-failures.json"
+
+
+def clone_failure_state(cfg: "Config", slug: str) -> dict:
+    path = _clone_failure_state_path(cfg, slug)
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _record_clone_failure(cfg: "Config", slug: str, sync: "CloneSyncResult") -> int:
+    """Bump + persist the consecutive-failure counter. Returns the new count."""
+    path = _clone_failure_state_path(cfg, slug)
+    state = clone_failure_state(cfg, slug)
+    signature = f"{sync.stage}:{sync.stderr.strip()[:400]}"
+    count = int(state.get("count", 0)) + 1 if state.get("signature") == signature else 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "count": count,
+        "signature": signature,
+        "stage": sync.stage,
+        "stderr": sync.stderr.strip()[:2000],
+        "permanent": sync.permanent,
+        "first_at": state.get("first_at", time.time()) if count > 1 else time.time(),
+        "last_at": time.time(),
+    }, indent=2))
+    return count
+
+
+def _clear_clone_failures(cfg: "Config", slug: str) -> None:
+    path = _clone_failure_state_path(cfg, slug)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.exception("deploy._clear_clone_failures: could not remove %s", path)
+
+
+def clone_retry_budget() -> int:
+    """Consecutive TRANSIENT clone-sync failures tolerated before failing the job."""
+    try:
+        return max(1, int(os.environ.get("BOT_SQUAD_DEPLOY_CLONE_MAX_RETRIES", "3")))
+    except ValueError:
+        return 3
+
+
+def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> CloneSyncResult:
     """Create-if-missing + fetch + force-checkout ``origin/<branch>`` in the
     disposable deploy clone (T-0143).
 
@@ -2132,8 +2661,10 @@ def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> boo
     commit is the correct, expected behaviour. The clone tracks the SAME origin
     as the editing clone, so ``origin/<branch>`` is the latest *pushed* code.
 
-    Returns True when the clone is ready at ``origin/<branch>``; False on any
-    git failure (the caller leaves the queue file in place to retry next tick).
+    Returns a CloneSyncResult (T-0453): truthy when the clone is ready at
+    ``origin/<branch>``; otherwise carrying the git stderr, which stage failed,
+    and whether the failure is PERMANENT — so the caller can stop retrying and
+    tell a human instead of looping once a minute forever.
     """
     deploy_repo = Path(deploy_repo)
     try:
@@ -2154,7 +2685,7 @@ def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> boo
                     "deploy._ensure_deploy_clone: clone failed (url=%s, branch=%s): %s",
                     url, branch, clone.stderr.strip(),
                 )
-                return False
+                return _clone_failed("clone", clone.stderr, deploy_repo)
         # Refresh an existing (or freshly-cloned) tree to the latest pushed tip.
         fetch = subprocess.run(
             ["git", "fetch", "origin", "--prune"],
@@ -2168,7 +2699,7 @@ def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> boo
                 "deploy._ensure_deploy_clone: fetch failed for %s: %s",
                 deploy_repo, fetch.stderr.strip(),
             )
-            return False
+            return _clone_failed("fetch", fetch.stderr, deploy_repo)
         checkout = subprocess.run(
             ["git", "checkout", "-f", "-B", branch, f"origin/{branch}"],
             cwd=str(deploy_repo),
@@ -2181,11 +2712,36 @@ def _ensure_deploy_clone(edit_repo: Path, deploy_repo: Path, branch: str) -> boo
                 "deploy._ensure_deploy_clone: checkout origin/%s failed for %s: %s",
                 branch, deploy_repo, checkout.stderr.strip(),
             )
-            return False
-        return True
-    except Exception:
+            return _clone_failed("checkout", checkout.stderr, deploy_repo)
+        return CloneSyncResult(ok=True)
+    except Exception as exc:
         log.exception("deploy._ensure_deploy_clone: unexpected error for %s", deploy_repo)
-        return False
+        return _clone_failed("exception", f"{type(exc).__name__}: {exc}", deploy_repo)
+
+
+def _clone_failed(stage: str, stderr: str, deploy_repo: Path) -> CloneSyncResult:
+    """Build the failure result, classifying it and — only when the classification
+    says a permission wall — naming the foreign-owned paths that explain it."""
+    stderr = (stderr or "").strip()
+    permanent = _classify_clone_error(stderr)
+    foreign: tuple[str, ...] = ()
+    wall = wall_owner = ""
+    if permanent:
+        wall, wall_owner = _first_unwritable_ancestor(
+            Path(deploy_repo), _paths_from_git_stderr(stderr)
+        )
+        foreign = _foreign_owned_paths(deploy_repo)
+        log.error(
+            "deploy._ensure_deploy_clone: %s failure is PERMANENT (a filesystem "
+            "permission this process cannot acquire by waiting)%s%s",
+            stage,
+            f"; blocking directory {wall} (owner {wall_owner or '?'})" if wall else "",
+            f"; foreign-owned paths in {deploy_repo}: {list(foreign)}" if foreign else "",
+        )
+    return CloneSyncResult(
+        ok=False, stage=stage, stderr=stderr, permanent=permanent,
+        foreign_paths=foreign, wall=wall, wall_owner=wall_owner,
+    )
 
 
 def _finish(

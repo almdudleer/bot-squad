@@ -378,6 +378,22 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
                 f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}",
                 "deploy_status",
             )
+    elif result.returncode == _deploy.RC_CLONE_WEDGED:
+        # T-0453: the recipe never ran — the deploy clone could not be synced, and
+        # the old answer was to retry silently once a minute forever. This is the
+        # loud path a failed deploy already uses, plus a direct word to the
+        # requester, who is otherwise holding an {"ok": true, queue_id} that
+        # nothing will ever contradict.
+        n = result.collapsed_count
+        also = f" ({n} queued job(s) failed together — all blocked by the same clone)" if n > 1 else ""
+        text = (
+            f"❌ deploy {slug}/{result.target or target} WEDGED — the deploy clone could "
+            f"not be synced to origin, so the recipe never started (rc={result.returncode})"
+            f"{also}. Retrying was stopped rather than continued: this does not clear on "
+            f"its own. The queue is now unblocked.\n\n{result.failure_detail}"
+        )
+        _alert_operators(cfg, slug, project, text)
+        _notify_requester(cfg, slug, result.requested_by, text)
     elif result.killed_reason:
         # A watchdog (not the recipe) killed this build — the loud, TARGETED
         # operator alert path (T-0212), not the routine project-channel ping.
@@ -395,6 +411,25 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     else:
         _tg_safe(f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}",
                  "deploy_failed")
+
+
+def _notify_requester(cfg: Config, slug: str, requested_by: str, text: str) -> None:
+    """Tell the SESSION that asked for the deploy that it did not happen (T-0453).
+
+    The operator alert is not enough on its own: the requester got
+    ``{"ok": true, queue_id: …}`` and has every reason to believe a deploy is
+    coming. Best-effort and never raises — a dead pane must not turn a reported
+    failure into an unreported one. Skipped when the requester is not a session
+    SID (CLI/API callers, cron) or is the deploy monitor itself.
+    """
+    if not requested_by or not str(requested_by).startswith("S-"):
+        return
+    from bot_squad_worker import intersession as _is
+
+    try:
+        _is.send_notice(cfg, slug, "S-deploy_monitor", requested_by, text)
+    except Exception:
+        log.exception("deploy_monitor: requester notice to %s failed (non-fatal)", requested_by)
 
 
 def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None:

@@ -2159,6 +2159,7 @@ _SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {
     "initial_prompt", "task_id", "initiative", "owner", "parent_sid",
     "owner_user",  # T-0321: per-user-scoping username
     "model",  # T-0623: explicit `claude --model` override; absent = role default
+    "provider",  # explicit cross-provider override; model alone stays in project provider
 }
 
 
@@ -2217,6 +2218,7 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         parent_sid=params.get("parent_sid"),
         owner_user=params.get("owner_user"),
         model=params.get("model"),
+        provider=params.get("provider"),
     )
 
 
@@ -3646,7 +3648,12 @@ def _action_fleet_model_get(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"fleet_model_get got unexpected params: {sorted(params)}")
 
     from bot_squad_worker import fleet_model
-    return {"ok": True, "model": fleet_model.get_model()}
+    from bot_squad_worker import sessions as _sessions
+    cfg = _get_config()
+    return {
+        "ok": True,
+        "model": fleet_model.get_model(_sessions._caps_config_dir(cfg)),
+    }
 
 
 _FLEET_MODEL_SET_REQUIRED = {"model"}
@@ -3664,9 +3671,11 @@ def _action_fleet_model_set(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"fleet_model_set missing required params: {sorted(missing)}")
 
     from bot_squad_worker import fleet_model
+    from bot_squad_worker import sessions as _sessions
+    cfg = _get_config()
     model = params["model"]
     try:
-        fleet_model.set_model(model)
+        fleet_model.set_model(model, _sessions._caps_config_dir(cfg))
     except ValueError as e:
         raise ActionError(str(e)) from e
     return {"ok": True, "model": model}

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from bot_squad_worker import frontmatter as _frontmatter
+from bot_squad_worker import agent_provider as _agent_provider
 
 
 # ---------------------------------------------------------------------------
@@ -341,16 +342,7 @@ def discover_claude_uuid(cwd: str, user_home: str) -> str | None:
     on disk and causes this function to always return None for real cwds.
     Returns None if no project dir or no .jsonl files exist.
     """
-    encoded = cwd.replace("/", "-")
-    proj_dir = Path(user_home) / ".claude" / "projects" / encoded
-    if not proj_dir.exists():
-        return None
-    jsonl_files = list(proj_dir.glob("*.jsonl"))
-    if not jsonl_files:
-        return None
-    # Latest by mtime → that's the active session
-    latest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
-    return latest.stem  # filename without .jsonl = UUID
+    return _agent_provider.get("claude").discover_session_id(cwd, user_home)
 
 
 _UUID_RE = re.compile(
@@ -422,7 +414,73 @@ def _pane_claude_uuid_from_proc(
     return None
 
 
-def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> float | None:
+def _pane_agent_session_id_from_proc(
+    pane_pid: str,
+    provider_name: str,
+    children: dict[int, list[int]] | None = None,
+) -> str | None:
+    """Return the provider session UUID carried by a live resume command."""
+    try:
+        target = int(pane_pid)
+    except (ValueError, TypeError):
+        return None
+    if children is None:
+        children = _proc_children_map()
+    provider = _agent_provider.get(provider_name)
+    queue: list[int] = [target]
+    seen: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            parts = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .decode("utf-8", "replace")
+                .split("\x00")
+            )
+        except OSError:
+            parts = []
+        if parts and provider.process_matches(parts[0]):
+            if provider_name == "claude":
+                markers = ("--resume", "--session-id")
+            else:
+                markers = ("resume",)
+            for i, token in enumerate(parts):
+                if token in markers and i + 1 < len(parts):
+                    candidate = parts[i + 1].strip()
+                    if _agent_provider.is_uuid(candidate):
+                        return candidate
+            if provider_name == "codex":
+                # Fresh Codex commands do not carry their generated session id
+                # in argv, but the process keeps its exact rollout jsonl open.
+                # This is pane-authoritative even when several Codex sessions
+                # share one cwd (the filesystem "newest rollout" guess is not).
+                try:
+                    for fd in Path(f"/proc/{pid}/fd").iterdir():
+                        target_path = os.readlink(fd)
+                        match = re.search(
+                            r"rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-"
+                            r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+                            target_path,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            return match.group(1)
+                except OSError:
+                    pass
+        queue.extend(children.get(pid, []))
+    return None
+
+
+def _pane_activity_at(
+    cwd: str,
+    claude_uuid: str | None,
+    user_home: str,
+    provider_name: str = "claude",
+) -> float | None:
     """T-0104: return the per-pane activity timestamp (epoch seconds) or None.
 
     Reads the mtime of the pane's own jsonl transcript file
@@ -443,9 +501,11 @@ def _pane_activity_at(cwd: str, claude_uuid: str | None, user_home: str) -> floa
     """
     if not claude_uuid:
         return None
-    # T-0118: claude keeps the leading dash on the encoded cwd. Don't strip it.
-    encoded = cwd.replace("/", "-")
-    jsonl_path = Path(user_home) / ".claude" / "projects" / encoded / f"{claude_uuid}.jsonl"
+    jsonl_path = _agent_provider.get(provider_name).transcript_path(
+        cwd, claude_uuid, user_home
+    )
+    if jsonl_path is None:
+        return None
     try:
         return jsonl_path.stat().st_mtime
     except OSError:
@@ -921,7 +981,17 @@ _CLAUDE_CMD_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 def _is_claude_command(command: str) -> bool:
-    return command == "claude" or bool(_CLAUDE_CMD_RE.match(command or ""))
+    return any(
+        _agent_provider.get(name).command_matches(command)
+        for name in _agent_provider.PROVIDERS
+    )
+
+
+def _provider_from_command(command: str) -> str | None:
+    for name in _agent_provider.PROVIDERS:
+        if _agent_provider.get(name).command_matches(command):
+            return name
+    return None
 
 
 def _ensure_project_tmux_session(slug: str, cwd: str, initiative: str | None = None) -> None:
@@ -994,8 +1064,6 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
     # attributed to this one).
     all_pane_sids = {compute_sid(user, p.window, p.pane_id) for p in panes}
 
-    import re as _re_cmd
-    _claude_version_re = _re_cmd.compile(r"^\d+\.\d+\.\d+$")
     # T-0668: build the /proc children-map ONCE for every pane's uuid walk
     # below, instead of _pane_claude_uuid_from_proc rebuilding it per pane
     # (see that function's T-0668 note; same fix T-0416 already applied to
@@ -1003,10 +1071,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
     proc_children = _proc_children_map()
     for pane in panes:
         pane_cwd = Path(pane.cwd) if pane.cwd else None
-        # Accept top-level "claude" plus the version-named binaries Claude Code
-        # uses for agent-teams subagents, e.g. "2.1.139" — these are spawned
-        # from ~/.local/share/claude/versions/<ver> and tmux reports the basename.
-        if pane.command != "claude" and not _claude_version_re.match(pane.command):
+        provider_name = _provider_from_command(pane.command)
+        if provider_name is None:
             continue
         if pane_cwd is None:
             continue
@@ -1036,8 +1102,16 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # /proc walk reads the uuid the live claude process has open — that's
         # per-pane. discover_claude_uuid stays as the fallback when the walk
         # finds nothing (e.g. claude not yet exec'd in a brand-new pane).
-        proc_uuid = _pane_claude_uuid_from_proc(pane.pid, user_home, proc_children)
-        claude_uuid = proc_uuid or discover_claude_uuid(pane.cwd, user_home)
+        proc_uuid = (
+            _pane_claude_uuid_from_proc(pane.pid, user_home, proc_children)
+            if provider_name == "claude"
+            else _pane_agent_session_id_from_proc(
+                pane.pid, provider_name, proc_children
+            )
+        )
+        claude_uuid = proc_uuid or _agent_provider.get(
+            provider_name
+        ).discover_session_id(pane.cwd, user_home)
 
         # Check for last_prompt_at via .claude/last_user_prompt_ts mtime
         last_prompt_at = None
@@ -1055,6 +1129,8 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         sessions_dir_path = data_dir / slug / "sessions"
         session_md_path = _find_session_md(sessions_dir_path, sid, claude_uuid)
         existing = _read_session_metadata(session_md_path) if session_md_path else None
+        if existing and existing.get("provider") in _agent_provider.PROVIDERS:
+            provider_name = str(existing["provider"])
 
         # T-0568 guard: the uuid FALLBACK can land on an md that belongs to a
         # DIFFERENT live pane — discover_claude_uuid is a shared-cwd mtime
@@ -1153,7 +1229,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         # `activity` is the canonical label-display enum derived from the
         # jsonl mtime probe. Two fields — not a replacement — per the
         # binding-audit "don't replace existing status logic, extend it".
-        jsonl_at = _pane_activity_at(pane.cwd, claude_uuid, user_home)
+        jsonl_at = _pane_activity_at(
+            pane.cwd, claude_uuid, user_home, provider_name
+        )
         heartbeat_at = _peer_heartbeat_at(data_dir, slug, sid)
         # Fold jsonl mtime and peer-bus heartbeat into a single timestamp.
         # max() with None: pick whichever is non-None, or the larger when both.
@@ -1186,6 +1264,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             "started_at": started_at,
             "last_prompt_at": last_prompt_at,
             "claude_uuid": claude_uuid,
+            "provider": provider_name,
             "task_id": task_id,
             "initiative": initiative,
             "extra_task_ids": extra_task_ids,
@@ -1326,6 +1405,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "started_at": meta.get("started_at"),
                 "last_prompt_at": meta.get("suspended_at") or meta.get("paused_at"),
                 "claude_uuid": meta.get("claude_uuid"),
+                "provider": meta.get("provider") or "claude",
                 "task_id": md_task_id,
                 "initiative": md_initiative,
                 "extra_task_ids": md_extra_tids,
@@ -1515,6 +1595,9 @@ def suspend(cfg: Any, slug: str, sid: str, *,
         "owner_user": owner_user_val,
         "tmux_session": tmux_sess_val,
     }
+    provider_val = existing.get("provider")
+    if provider_val in _agent_provider.PROVIDERS:
+        meta["provider"] = provider_val
     # T-0678 reopen: preserve a per-session `model` override (bsq model set)
     # across suspend the same way owner/tmux_session are preserved above —
     # this whitelist previously dropped it silently, so resume()'s
@@ -1782,32 +1865,25 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # Snapshot existing pane IDs
     pre_panes = {p.pane_id for p in list_panes()}
 
-    # Spawn new window inside the project's tmux session. Use bash -lc so
-    # the user's profile is sourced — claude lives in ~/.local/bin which is
-    # NOT on the systemd-default PATH the worker inherits.
-    # --dangerously-skip-permissions: agent-team sessions cannot pause and
-    # ask the human at night; settings.json permissions.allow doesn't cover
-    # writes to .claude/ which are needed for the task_id marker. The
-    # stakeholder has explicitly opted into this risk class.
-    if claude_uuid and claude_uuid != "~":
-        cmd = f"claude --dangerously-skip-permissions --resume {claude_uuid}"
-    else:
-        cmd = "claude --dangerously-skip-permissions"
+    provider_name = str(meta.get("provider") or "claude")
+    provider = _agent_provider.get(provider_name)
     # T-0678: a per-session `model` override (bsq model set) takes precedence
     # over the fleet-wide settings.json default resume() would otherwise
     # silently inherit — this is what makes the override "stick across
     # recycles" instead of reverting the moment the tmux window recycles.
-    resume_model = meta.get("model")
-    if resume_model and resume_model != "~":
-        cmd += f" --model {shlex.quote(str(resume_model))}"
+    resume_model = str(meta.get("model") or "")
     # T-0614: keep the /resume-picker entry readable across rotations —
     # --name combined with --resume renames the session (a fresh
     # custom-title record supersedes the old one). Uses the possibly-ADOPTED
     # primary (T-0166 set meta["task_id"] above) so an expert rebound to a
     # new ticket is titled by the ticket it now works.
     _display_name = _claude_session_name(window, meta.get("task_id"))
-    if _display_name:
-        cmd = f"{cmd} --name {shlex.quote(_display_name)}"
+    cmd = provider.launch_command(
+        resume_id=str(claude_uuid) if claude_uuid and claude_uuid != "~" else None,
+        model=resume_model if resume_model != "~" else "",
+        display_name=_display_name,
+        initial_prompt=None,
+    )
     # T-0525: when this resume ADOPTS a primary (T-0166 expert-rebind), carry it
     # to the new claude via the per-process env channel so a concurrent spawn
     # can't clobber it (the shared-marker race). Non-adopt resumes keep their
@@ -1904,10 +1980,10 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # separate Enter). If the composer never shows ❯, raise so the caller can
     # recover via inject_input — the pane is up, only the prompt didn't land.
     if initial_prompt:
-        if not _wait_for_claude_composer_ready(new_pane.pane_id):
+        if not _wait_for_agent_composer_ready(new_pane.pane_id, provider_name):
             from bot_squad_worker.actions import ActionError
             raise ActionError(
-                f"resume: claude composer never showed ❯ for sid {new_sid} within "
+                f"resume: {provider_name} composer was not ready for sid {new_sid} within "
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
@@ -2074,12 +2150,18 @@ def _wait_for_claude_composer_ready(pane_id: str) -> bool:
     at call time (not def time) so tests can monkeypatch the module-level
     constants to bound runtime.
     """
+    return _wait_for_agent_composer_ready(pane_id, "claude")
+
+
+def _wait_for_agent_composer_ready(pane_id: str, provider_name: str) -> bool:
+    """Poll until the selected provider's interactive composer is visible."""
     timeout_sec = _COMPOSER_READY_TIMEOUT_SEC
     interval_sec = _COMPOSER_READY_POLL_INTERVAL_SEC
+    markers = _agent_provider.get(provider_name).composer_markers
     iterations = max(1, int(timeout_sec / interval_sec))
     for _ in range(iterations):
         cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p"])
-        if cap.returncode == 0 and "❯" in cap.stdout:
+        if cap.returncode == 0 and any(marker in cap.stdout for marker in markers):
             return True
         time.sleep(interval_sec)
     return False
@@ -2102,10 +2184,18 @@ def _composer_content(pane_id: str) -> str | None:
     if cap.returncode != 0:
         return None
     content: str | None = None
+    markers = tuple(
+        dict.fromkeys(
+            marker
+            for name in _agent_provider.PROVIDERS
+            for marker in _agent_provider.get(name).composer_markers
+        )
+    )
     for line in cap.stdout.splitlines():
-        idx = line.find("❯")
-        if idx != -1:
-            content = line[idx + 1:].strip()
+        for marker in markers:
+            idx = line.find(marker)
+            if idx != -1:
+                content = line[idx + len(marker):].strip()
     return content
 
 
@@ -2210,6 +2300,7 @@ def spawn(
     parent_sid: str | None = None,
     owner_user: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -2396,13 +2487,10 @@ def spawn(
             raise ActionError(f"spawn: invalid owner_user {owner_user!r}")
         env_prefix_parts.append(f"BOT_SQUAD_OWNER_USER={shlex.quote(ou_clean)}")
     env_prefix = (" ".join(env_prefix_parts) + " ") if env_prefix_parts else ""
-    shell_cmd = f"{env_prefix}claude --dangerously-skip-permissions"
     # T-0614: descriptive /resume-picker name — the SID-derived window string
     # (+ task id) we already compose, so the native picker is navigable
     # instead of showing first-message snippets. claude >= 2.1.196.
     _display_name = _claude_session_name(window, task_id)
-    if _display_name:
-        shell_cmd += f" --name {shlex.quote(_display_name)}"
     # T-0623: explicit model wins; else the role-based default; else no flag
     # (settings.json default). T-0694: whichever it is, it must pass through
     # fleet_model.resolve_model before landing on the launch command below —
@@ -2412,15 +2500,41 @@ def spawn(
     # `claude --model` unresolved (silently ignored -> wrong model, zero
     # error) and a genuinely bogus value errors loudly here instead.
     _role = _derive_role(window, task_id, initiative)
-    _model = (model or "").strip() or _read_model_defaults(_caps_config_dir(cfg)).get(_role, "")
+    from bot_squad_worker import fleet_model as _fleet_model
+    _explicit_choice = (model or "").strip()
+    try:
+        _provider_name = _agent_provider.provider_for_model(
+            _explicit_choice,
+            _fleet_model.get_provider(_caps_config_dir(cfg)),
+            provider,
+        )
+    except ValueError as exc:
+        from bot_squad_worker.actions import ActionError
+        raise ActionError(f"spawn: {exc}") from exc
+    _model = ""
+    if _provider_name == "claude":
+        _model = _explicit_choice or _read_model_defaults(
+            _caps_config_dir(cfg)
+        ).get(_role, "")
+    elif _explicit_choice and _explicit_choice != "codex":
+        _model = _explicit_choice
     if _model:
-        from bot_squad_worker import fleet_model as _fleet_model
         try:
-            _model = _fleet_model.resolve_model(_model)
+            _model = _fleet_model.resolve_model(_model, provider=_provider_name)
         except ValueError as exc:
             from bot_squad_worker.actions import ActionError
             raise ActionError(f"spawn: {exc}") from exc
-        shell_cmd += f" --model {shlex.quote(_model)}"
+    _provider = _agent_provider.get(_provider_name)
+    shell_cmd = env_prefix + _provider.launch_command(
+        model=_model,
+        display_name=_display_name,
+        initial_prompt=None,
+    )
+    _provider_sessions_before = (
+        _provider.session_ids(cwd, _get_user_home())
+        if _provider_name == "codex"
+        else set()
+    )
 
     result = _run([
         "tmux", "new-window", "-d",
@@ -2457,6 +2571,18 @@ def spawn(
     seed_meta = _read_session_metadata(seed_meta_file) or {}
     seed_meta.setdefault("sid", new_sid)
     seed_meta["tmux_session"] = target_session
+    seed_meta["provider"] = _provider_name
+    seed_meta.setdefault("window", window)
+    seed_meta.setdefault("cwd", cwd)
+    seed_meta.setdefault("role", _role)
+    seed_meta.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+    seed_meta.setdefault("status", "active")
+    if owner:
+        seed_meta.setdefault("owner", owner)
+    if owner_user:
+        seed_meta.setdefault("owner_user", owner_user)
+    if initiative:
+        seed_meta.setdefault("initiative", initiative)
     # T-0678: an EXPLICIT `model` arg (not the role-based/settings.json
     # fallback `_model` resolves to when this is blank — see above) is a
     # sticky per-session override: stamp it now so a later `resume()` still
@@ -2472,8 +2598,36 @@ def spawn(
     # first time this session resumes. T-0704: a class alias like "opus" is a
     # deliberately UNexpanded passthrough here — `claude` resolves it to
     # latest-in-class at resume time, which is the point (never goes stale).
-    if (model or "").strip():
+    if _explicit_choice and _provider_name == "claude":
         seed_meta["model"] = _model
+    elif _provider_name == "codex":
+        if _model:
+            seed_meta["model"] = _model
+        else:
+            seed_meta.pop("model", None)
+    discovered_id = None
+    if _provider_name == "codex":
+        # A fresh Codex command does not carry its generated UUID in /proc.
+        # Find the new rollout by set difference so another Codex session in
+        # the same shared cwd cannot be mistaken for this pane.
+        for _ in range(10):
+            discovered_id = _pane_agent_session_id_from_proc(
+                new_pane.pid, _provider_name
+            )
+            if discovered_id:
+                break
+            new_ids = (
+                _provider.session_ids(cwd, _get_user_home())
+                - _provider_sessions_before
+            )
+            if new_ids:
+                discovered_id = sorted(new_ids)[-1]
+                break
+            time.sleep(0.2)
+    else:
+        discovered_id = _provider.discover_session_id(cwd, _get_user_home())
+    if discovered_id:
+        seed_meta["claude_uuid"] = discovered_id
     # T-0157: stamp the spawning linux user so the SessionMd carries an
     # explicit user mark (the SID prefix already encodes it, but the field
     # makes per-user listing/grouping robust to SID rotation).
@@ -2533,10 +2687,10 @@ def spawn(
     # before claude's TUI exists; if `❯` never appears, raise so the caller can
     # recover via inject_input (the pane is up).
     if initial_prompt:
-        if not _wait_for_claude_composer_ready(new_pane.pane_id):
+        if not _wait_for_agent_composer_ready(new_pane.pane_id, _provider_name):
             from bot_squad_worker.actions import ActionError
             raise ActionError(
-                f"spawn: claude composer never showed ❯ for sid {new_sid} within "
+                f"spawn: {_provider_name} composer was not ready for sid {new_sid} within "
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
@@ -2924,7 +3078,7 @@ def _proc_children_map() -> dict[int, list[int]]:
 
 
 def _pane_has_live_claude(pane_pid: str, children: dict[int, list[int]] | None = None) -> bool:
-    """True iff a live ``claude`` process exists in this pane's /proc subtree.
+    """True iff a supported live agent process exists in this pane's subtree.
 
     T-0397: pane EXISTENCE is not agent liveness. When claude exits, its tmux
     pane routinely lingers as a bash shell — that dead-claude pane holds no
@@ -2956,14 +3110,16 @@ def _pane_has_live_claude(pane_pid: str, children: dict[int, list[int]] | None =
             parts = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace").split("\x00")
         except OSError:
             parts = []
-        if parts and (parts[0] == "claude" or parts[0].endswith("/claude")):
-            return True
+        if parts:
+            for provider_name in _agent_provider.PROVIDERS:
+                if _agent_provider.get(provider_name).process_matches(parts[0]):
+                    return True
         queue.extend(children.get(pid, []))
     return False
 
 
 def _live_agent_sids() -> set[str]:
-    """SIDs whose tmux pane has a LIVE claude process — the real agent sessions
+    """SIDs whose tmux pane has a live supported agent process.
     the parallel cap should count (T-0397).
 
     Stricter than ``live_pane_map`` (which keys every pane, including the bash
@@ -3470,8 +3626,16 @@ def set_model(cfg: Any, slug: str, sid: str, model: str) -> dict:
     # T-0707: resolve_model also enforces the account-level availability
     # gate (e.g. Fable 5's usage-credits requirement) — one SSOT with the
     # spawn seam, not a second allowlist-only copy of it here.
+    raw_model = (model or "").strip()
+    requested_provider = (
+        "codex"
+        if raw_model == "codex"
+        or raw_model in _agent_provider.CODEX_MODEL_ALIASES
+        or raw_model in _agent_provider.CODEX_MODELS
+        else "claude"
+    )
     try:
-        model = _fleet_model.resolve_model(model)
+        model = _fleet_model.resolve_model(raw_model, provider=requested_provider)
     except ValueError as exc:
         raise ActionError(f"set_model: {exc}") from exc
 
@@ -3487,10 +3651,18 @@ def set_model(cfg: Any, slug: str, sid: str, model: str) -> dict:
     if meta is None:
         raise ActionError(f"set_model: unreadable session metadata for SID {sid!r}")
 
-    if model:
+    if requested_provider == "codex" and raw_model:
+        meta["provider"] = "codex"
+        if model:
+            meta["model"] = model
+        else:
+            meta.pop("model", None)
+    elif model:
+        meta["provider"] = "claude"
         meta["model"] = model
     else:
         meta.pop("model", None)
+        meta.pop("provider", None)
     _write_session_metadata(md_path, meta, atomic=True)
     return {"ok": True, "sid": meta.get("sid", sid), "model": model}
 
@@ -3517,12 +3689,14 @@ def last_operator_model(cfg: Any, slug: str) -> str:
     best: dict | None = None
     for md in sessions_dir.glob("*.md"):
         meta = _read_session_metadata(md)
-        if not meta or not meta.get("model"):
+        if not meta or not (meta.get("model") or meta.get("provider") == "codex"):
             continue
         if _role_of(meta) != "operator":
             continue
         if best is None or _started_at_key(meta.get("started_at")) > _started_at_key(best.get("started_at")):
             best = meta
+    if best and best.get("provider") == "codex":
+        return str(best.get("model") or "codex")
     return str(best.get("model")) if best else ""
 
 
@@ -4977,7 +5151,10 @@ def _session_idle_age(meta: dict, user_home: str, now_epoch: float) -> float | N
     session whose age it cannot positively establish.
     """
     act = _pane_activity_at(
-        str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
+        str(meta.get("cwd") or ""),
+        meta.get("claude_uuid"),
+        user_home,
+        str(meta.get("provider") or "claude"),
     )
     if act is not None:
         return max(0.0, now_epoch - act)
@@ -5206,7 +5383,10 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                     and _task_status(data_dir, slug, ltid) == "closed"
                 ):
                     activity_at = _pane_activity_at(
-                        str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
+                        str(meta.get("cwd") or ""),
+                        meta.get("claude_uuid"),
+                        user_home,
+                        str(meta.get("provider") or "claude"),
                     )
                     if activity_at is None or (now_epoch - activity_at) >= IDLE_AT_PROMPT_SECONDS:
                         reason = "live-last-closed"
@@ -5238,7 +5418,10 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                         _blocked = set()
                     if sid not in _blocked:
                         activity_at = _pane_activity_at(
-                            str(meta.get("cwd") or ""), meta.get("claude_uuid"), user_home
+                            str(meta.get("cwd") or ""),
+                            meta.get("claude_uuid"),
+                            user_home,
+                            str(meta.get("provider") or "claude"),
                         )
                         if activity_at is not None and (now_epoch - activity_at) >= idle_window:
                             reason = "idle-suspend"
@@ -5481,7 +5664,7 @@ def reconcile_window_names(cfg: Any, slug: str) -> dict:
     # of a full /proc rescan per pane (see _pane_claude_uuid_from_proc's note).
     proc_children = _proc_children_map()
     for pane in panes:
-        if pane.command != "claude" and not _CLAUDE_VERSION_RE.match(pane.command):
+        if not _is_claude_command(pane.command):
             continue
         if not _is_generic_window(pane.window):
             continue

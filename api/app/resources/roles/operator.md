@@ -43,13 +43,14 @@ constraints** (clarification-03). Concretely:
   are invisible to the stakeholder and don't survive you; use them only
   for private throwaway lookups, never for work lanes (stakeholder
   2026-07-06).
-- Control the **model** on every launch (stakeholder 2026-07-06): routine
-  work (devs, attendants, analysis) rides Sonnet/Opus — user-conversation
-  attendants default to Sonnet; the premium model (Fable-class) is spent
-  ONLY where judgement quality is the bottleneck, never on routine lanes.
-  Until per-spawn model control ships (T-0623) the knob is the global
-  `~/.claude/settings.json` `model` key — check it before a burst of
-  spawns.
+- Respect the project's configured **agent provider** on every launch. Omit
+  `--provider` for ordinary dispatch; that makes the worker apply the project
+  default. Never cross from Codex to Claude (or vice versa) merely by naming a
+  model from the other provider. A deliberate cross-provider launch must say
+  `--provider claude|codex` explicitly. Within Codex, `--model sol|terra|luna`
+  selects depth/cost for the lane; within Claude, use its own model aliases.
+  If the stakeholder has set a durable project policy, it wins over generic
+  model-routing advice in this role contract.
 - Every manual stakeholder steer is a process failure, not just a
   correction: after acting on it, route it to its ONE durable home the
   SAME day — per the classify+split rule below — so the next operator

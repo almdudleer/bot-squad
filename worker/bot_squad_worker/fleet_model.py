@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 from bot_squad_worker import sessions as _sessions
+from bot_squad_worker import agent_provider
 from bot_squad_worker.mdlock import atomic_write, task_lock
 
 # T-0704: the class aliases pass STRAIGHT THROUGH to ``claude`` unchanged.
@@ -37,12 +38,18 @@ CLASS_ALIASES = frozenset({"sonnet", "opus", "fable"})
 # The bare class aliases above are the staleness-proof choice. Explicit full
 # ids stay allowed for anyone who deliberately wants to PIN a specific version
 # (e.g. stay on claude-opus-4-8, or the 1M-context ``opus[1m]`` variant).
-ALLOWED_MODELS = frozenset({
+CLAUDE_MODELS = frozenset({
     "",
     "sonnet", "opus", "fable",                       # passthrough -> latest
     "claude-sonnet-5", "claude-opus-5",
     "claude-opus-4-8", "claude-fable-5", "opus[1m]",  # explicit pins
 })
+CODEX_MODELS = frozenset({
+    "codex",
+    *agent_provider.CODEX_MODEL_ALIASES,
+    *agent_provider.CODEX_MODELS,
+})
+ALLOWED_MODELS = CLAUDE_MODELS | CODEX_MODELS
 
 # T-0707: which CLASS an explicit pinned id belongs to, for the
 # availability gate below. Bare aliases map to themselves via CLASS_ALIASES.
@@ -103,7 +110,7 @@ def check_available(value: str) -> None:
         )
 
 
-def resolve_model(value: str) -> str:
+def resolve_model(value: str, provider: str | None = None) -> str:
     """Validate a ``--model`` value; return it unchanged if allowed.
 
     A class alias (``sonnet``/``opus``/``fable``) or an explicit id in
@@ -119,6 +126,23 @@ def resolve_model(value: str) -> str:
     v = (value or "").strip()
     if not v:
         return ""
+    if v == "codex":
+        if provider == "claude":
+            raise ValueError("model 'codex' belongs to provider 'codex'")
+        return ""
+    if v in agent_provider.CODEX_MODEL_ALIASES:
+        if provider == "claude":
+            raise ValueError(f"model {v!r} belongs to provider 'codex'")
+        return agent_provider.CODEX_MODEL_ALIASES[v]
+    if v in agent_provider.CODEX_MODELS:
+        if provider == "claude":
+            raise ValueError(f"model {v!r} belongs to provider 'codex'")
+        return v
+    if provider == "codex":
+        raise ValueError(
+            f"model {v!r} belongs to provider 'claude'; project default is "
+            "Codex (use sol/terra/luna, or explicitly select provider claude)"
+        )
     if v not in ALLOWED_MODELS:
         raise ValueError(f"model not allowed: {value!r}")
     check_available(v)
@@ -129,8 +153,27 @@ def _settings_path() -> Path:
     return Path(_sessions._get_user_home()) / ".claude" / "settings.json"
 
 
-def get_model() -> str:
-    """Current fleet-default ``model`` key, "" if unset/absent/unparseable."""
+def _provider_path(config_dir: Path | None = None) -> Path:
+    if config_dir is not None:
+        # Workers are systemd-hardened with config read-only and data writable.
+        # Keep this runtime selector beside the other mutable worker state.
+        return Path(config_dir).parent / "data" / "_state" / "agent_provider.json"
+    return Path(_sessions._get_user_home()) / ".config" / "bot-squad" / "agent.json"
+
+
+def get_provider(config_dir: Path | None = None) -> str:
+    """Fleet-default agent provider. Missing/invalid state means Claude."""
+    try:
+        raw = json.loads(_provider_path(config_dir).read_text())
+    except (OSError, ValueError):
+        return "claude"
+    return "codex" if isinstance(raw, dict) and raw.get("provider") == "codex" else "claude"
+
+
+def get_model(config_dir: Path | None = None) -> str:
+    """Current fleet choice. ``codex`` is the provider pseudo-model."""
+    if get_provider(config_dir) == "codex":
+        return "codex"
     try:
         raw = json.loads(_settings_path().read_text())
     except (OSError, ValueError):
@@ -140,7 +183,7 @@ def get_model() -> str:
     return str(raw.get("model") or "")
 
 
-def set_model(model: str) -> None:
+def set_model(model: str, config_dir: Path | None = None) -> None:
     """Set (or clear, for ``model == ""``) the ``model`` key.
 
     Atomic read-modify-write (unique tmp + ``os.replace``, T-0373 convention)
@@ -150,7 +193,26 @@ def set_model(model: str) -> None:
     validation the spawn seam uses, so this isn't a second copy of either
     check.
     """
-    model = resolve_model(model)
+    requested = (model or "").strip()
+    provider = (
+        "codex"
+        if requested == "codex"
+        or requested in agent_provider.CODEX_MODEL_ALIASES
+        or requested in agent_provider.CODEX_MODELS
+        else "claude"
+    )
+    model = resolve_model(requested, provider=provider)
+
+    provider_path = _provider_path(config_dir)
+    provider_path.parent.mkdir(parents=True, exist_ok=True)
+    with task_lock(provider_path):
+        atomic_write(
+            provider_path,
+            json.dumps({"provider": provider}, indent=2)
+            + "\n",
+        )
+    if provider == "codex":
+        return
 
     path = _settings_path()
     with task_lock(path):

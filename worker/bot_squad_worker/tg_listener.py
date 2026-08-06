@@ -789,7 +789,8 @@ _FYI_PREFIX = "[FYI — ответ не требуется]"
 
 
 def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
-                            text: str, reply_to: Optional[dict] = None) -> Optional[bool]:
+                            text: str, reply_to: Optional[dict] = None,
+                            thread_id: Any = None) -> Optional[bool]:
     """T-0660: record a PASSIVE, non-actionable append into the project's
     (slug, global_user_id) attendant thread — for either of the two
     session<->stakeholder direct-contact directions the task-topic model adds
@@ -819,6 +820,11 @@ def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
     direct-mode task-topic path this fyi line is the ONLY store record of what
     he said; without the field that path stays lossy after the fix.
 
+    ``thread_id`` (T-0851): the bound forum topic this reply arrived in, when
+    any — mirrors ``append_conversation``'s own param so a direct-reply FYI
+    lands in the same isolated topic thread its actionable counterpart would
+    have, instead of always falling back to the project's collapsed history.
+
     Same best-effort/env-gated contract as ``append_conversation``: a no-op
     when unconfigured or on failure, never blocks the caller."""
     payload = {
@@ -828,6 +834,8 @@ def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
     }
     if reply_to:
         payload["reply_to"] = reply_to
+    if thread_id is not None and str(thread_id).strip() != "":
+        payload["thread_id"] = thread_id
     return _post_conversation(cfg, slug, global_user_id, payload)
 
 
@@ -1952,8 +1960,31 @@ def handle_update(cfg, update: dict) -> dict:
         # `thread_id` is set in this branch the chat is a forum whose binding
         # (resolved above) supplied `chat_slug`, so the record and the topic
         # agree on the project.
+        #
+        # T-0851: a RESOLVED REPLY (``reply`` truthy) is recorded as an FYI,
+        # not a normal user-authored append. `append_conversation`'s payload
+        # is `author="user"` with no `fyi` flag, which is exactly what makes
+        # the append endpoint WAKE the attendant (`_ensure_attendant`) — but
+        # this message is already being delivered straight to the operator/
+        # dev session it replied to (below, `_handle_reply`), the same
+        # "bypasses the attendant" shape `append_conversation_fyi` exists for
+        # (T-0660). Without this, every reply to a session double-fires: the
+        # session gets it AND the user-conversation attendant wakes on a
+        # message that was never addressed to it. The quote (T-0780) still
+        # carries the replied-to message's own author/author_name, so this FYI
+        # line names both WHO he answered and WHAT they said, same as any
+        # other record's ``reply_to``.
         if gid and not slash:
-            append_conversation(cfg, chat_slug, gid, msg, thread_id=thread_id)
+            if reply:
+                append_conversation_fyi(
+                    cfg, chat_slug, gid,
+                    author="system:direct-reply",
+                    text=f"replied to session {reply[0]}: {reply[1]}",
+                    reply_to=reply_quote.extract(msg),
+                    thread_id=thread_id,
+                )
+            else:
+                append_conversation(cfg, chat_slug, gid, msg, thread_id=thread_id)
             if thread_id is not None:
                 # T-0740: and remember WHERE he wrote. This branch never
                 # recorded the locus either, so after a reply-quote or a voice

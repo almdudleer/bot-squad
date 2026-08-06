@@ -682,7 +682,7 @@ def worker_list_conversation(
     global_user_id: str,
     request: Request,
     limit: int = Query(default=200, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
+    offset: int | None = Query(default=None, ge=0),
     q: str = Query(default=""),
     thread_id: str = Query(default=""),
 ) -> dict:
@@ -700,6 +700,13 @@ def worker_list_conversation(
     thread instead of the project's mixed (slug, global_user_id) history —
     see ``conversation_store.conv_path``. Empty/omitted behaves exactly as
     before this change.
+
+    ``offset`` omitted (T-0850): the page returned is the most recent
+    ``limit`` records, not the oldest — a freshly-spawned attendant's boot
+    read hits this route with no query string at all (see
+    ``actions._user_conversation_boot_prompt``), and the oldest slice of a
+    long thread is stale context, not "no context yet". Pass ``offset=0``
+    explicitly to walk the thread forward from its start instead.
 
     ``inbound_capture`` (T-0769): carried here for the same reason as on the
     session-auth read — see :func:`_inbound_capture`. The user-conversation
@@ -757,12 +764,16 @@ def list_conversation(
     global_user_id: str,
     request: Request,
     limit: int = Query(default=200, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
+    offset: int | None = Query(default=None, ge=0),
     q: str = Query(default=""),
     thread_id: str = Query(default=""),
 ) -> dict:
     """Paginated thread lookup. With ``q`` set, returns only records whose text
     contains it (case-insensitive); otherwise the full chronological thread.
+
+    ``offset`` omitted (T-0850): returns the most recent ``limit`` records
+    (the tail), not the oldest — see ``conversation_store._paginate``. Pass
+    ``offset=0`` explicitly for forward pagination from the start.
 
     T-0493 / voice-04 privacy: the thread is per-user PRIVATE content, so the
     read is project-access-gated (``require_project_read``) — a project-limited

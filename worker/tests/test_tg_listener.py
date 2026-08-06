@@ -719,9 +719,46 @@ def test_handle_update_project_slash_not_appended_to_store(tmp_path, monkeypatch
     assert append_calls == []  # no spurious append for a control/routing command
 
 
+def test_handle_update_reply_does_not_wake_the_attendant(tmp_path, monkeypatch):
+    """T-0851 end-to-end: a reply resolved straight to a session must not ALSO
+    wake that project's user-conversation attendant. The wake trigger is the
+    append endpoint's own rule (``routes_conversations.append_message``): only
+    an ``author=="user"`` append without ``fyi`` calls ``_ensure_attendant``.
+    Asserting the actual POST payload here — not just which function was
+    called — is what pins that rule from the caller's side."""
+    cfg = _make_cfg(tmp_path, tg_chat="12345")
+    msg = _reply_message("S-alice-spec5-p3", "go ahead", chat_id=12345)
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda *a, **k: {"global_user_id": "gu_test"})
+    import bot_squad_worker.actions as A
+    monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "pane_id": "%3", "lines_sent": 1})
+    _link_env(monkeypatch)
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    with patch("httpx.post", side_effect=fake_post):
+        result = TL.handle_update(cfg, {"update_id": 21, "message": msg})
+
+    assert result["action"] == "inject"
+    assert captured["json"]["author"] != "user"
+    assert captured["json"]["fyi"] is True
+
+
 def test_handle_update_reply_still_appended_to_store(tmp_path, monkeypatch):
     """T-0659 guard: the fix skips the append for SLASH commands only — a reply
-    (real project-directed content, T-0489) must still be recorded to the store."""
+    (real project-directed content, T-0489) must still be recorded to the store.
+
+    T-0851: a resolved reply is recorded via ``append_conversation_fyi``
+    (author="system:direct-reply", fyi=True) rather than ``append_conversation``
+    — it is already being delivered straight to the session it replied to, and
+    a normal user-authored append would additionally WAKE the user-conversation
+    attendant on a message never addressed to it. See the ``append_conversation``
+    call-site comment (T-0851) for the full reasoning."""
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     msg = _reply_message("S-alice-spec5-p3", "go ahead", chat_id=12345)
     update = {"update_id": 21, "message": msg}
@@ -731,12 +768,20 @@ def test_handle_update_reply_still_appended_to_store(tmp_path, monkeypatch):
     append_calls = []
     monkeypatch.setattr(TL, "append_conversation",
                         lambda cfg, slug, gid, m, **k: append_calls.append((slug, gid)))
+    fyi_calls = []
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda cfg, slug, gid, **k: fyi_calls.append((slug, gid, k)))
     import bot_squad_worker.actions as A
     monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "pane_id": "%3", "lines_sent": 1})
 
     result = TL.handle_update(cfg, update)
     assert result["action"] == "inject"
-    assert append_calls == [("test-project", "gu_test")]  # content still recorded
+    assert append_calls == []  # not the normal user-authored path — that would wake the attendant
+    assert len(fyi_calls) == 1
+    slug, gid, kwargs = fyi_calls[0]
+    assert (slug, gid) == ("test-project", "gu_test")
+    assert kwargs["author"] == "system:direct-reply"
+    assert "S-alice-spec5-p3" in kwargs["text"]  # names WHICH session he answered
 
 
 # ---------------------------------------------------------------------------
@@ -2886,7 +2931,12 @@ def test_reply_quote_in_bound_topic_appends_with_thread_id_and_records_locus(
     tmp_path, monkeypatch,
 ):
     """The TEXT twin of the voice case: a reply-quote typed in a bound topic
-    goes through the same branch and was losing the thread the same way."""
+    goes through the same branch and was losing the thread the same way.
+
+    T-0851: the store append is now ``append_conversation_fyi`` (see the
+    sibling ``test_handle_update_reply_still_appended_to_store``) but it must
+    still carry ``thread_id`` through — the locus-recording behaviour this
+    test pins is unrelated to which append function makes the record."""
     from bot_squad_worker import tg_bindings, conversation_locus
     import bot_squad_worker.actions as A
     cfg = _make_multi_cfg(tmp_path, chat="111")
@@ -2895,8 +2945,8 @@ def test_reply_quote_in_bound_topic_appends_with_thread_id_and_records_locus(
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "lines_sent": 1})
     appended = []
-    monkeypatch.setattr(TL, "append_conversation",
-                        lambda c, slug, gid, m, **k: appended.append((slug, k.get("thread_id"))) or True)
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda c, slug, gid, **k: appended.append((slug, k.get("thread_id"))) or True)
 
     msg = _reply_message("S-alice-spec5-p3", "go ahead", chat_id=111)
     msg["chat"]["type"] = "supergroup"
@@ -2914,7 +2964,10 @@ def test_thread_less_reply_quote_does_not_touch_the_locus(tmp_path, monkeypatch)
     `chat_slug` is the "incidental" static one this branch is explicitly told
     not to trust. Writing a locus under it could point a project's replies at
     a chat the user never addressed it in — so a thread-less message in this
-    branch leaves the locus exactly as it was before this change."""
+    branch leaves the locus exactly as it was before this change.
+
+    T-0851: the store append is now ``append_conversation_fyi`` — see
+    ``test_handle_update_reply_still_appended_to_store``."""
     from bot_squad_worker import conversation_locus
     import bot_squad_worker.actions as A
     cfg = _make_multi_cfg(tmp_path, chat="111")
@@ -2922,8 +2975,8 @@ def test_thread_less_reply_quote_does_not_touch_the_locus(tmp_path, monkeypatch)
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(A, "dispatch", lambda name, params: {"ok": True, "lines_sent": 1})
     appended = []
-    monkeypatch.setattr(TL, "append_conversation",
-                        lambda c, slug, gid, m, **k: appended.append(k.get("thread_id")) or True)
+    monkeypatch.setattr(TL, "append_conversation_fyi",
+                        lambda c, slug, gid, **k: appended.append(k.get("thread_id")) or True)
 
     out = TL.handle_update(cfg, {"update_id": 1,
                                  "message": _reply_message("S-a-p3", "ok", chat_id=111)})

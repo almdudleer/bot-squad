@@ -444,10 +444,24 @@ def _read_all(
     return out
 
 
-def _paginate(records: list[dict], *, limit: int, offset: int) -> dict:
+def _paginate(records: list[dict], *, limit: int, offset: int | None) -> dict:
     total = len(records)
-    offset = max(0, int(offset))
     limit = max(0, int(limit))
+    if offset is None:
+        # T-0850: no offset named -> the caller wants recent context, not the
+        # start of a (possibly months-old) thread. A fresh user-conversation
+        # session's boot prompt hits this exact path with no query string at
+        # all, so the un-offset request must mean "the tail", not "page 0 of
+        # forward pagination" — the two used to be the same slice by
+        # accident, which is what silently handed a new attendant the OLDEST
+        # 200 messages of a long-running thread instead of its most recent
+        # ones. An explicit ``offset`` (including ``0``) is unaffected: it is
+        # what forward pagination and every existing test pass, and it keeps
+        # meaning "records[offset:offset+limit]" exactly as before.
+        resolved_offset = max(0, total - limit) if limit else 0
+        page = records[resolved_offset:resolved_offset + limit] if limit else records[:]
+        return {"total": total, "limit": limit, "offset": resolved_offset, "messages": page}
+    offset = max(0, int(offset))
     page = records[offset:offset + limit]
     return {"total": total, "limit": limit, "offset": offset, "messages": page}
 
@@ -458,7 +472,7 @@ def list_messages(
     global_user_id: str,
     *,
     limit: int = 200,
-    offset: int = 0,
+    offset: int | None = None,
     thread_id: Any = None,
 ) -> dict:
     """Return a paginated, chronological page of the thread.
@@ -467,6 +481,12 @@ def list_messages(
     drive pagination. A missing thread yields an empty page. ``thread_id``
     (T-0676) selects a bound topic's isolated thread instead of the bare
     per-user one — see :func:`conv_path`.
+
+    ``offset`` omitted/``None`` (T-0850) returns the most recent ``limit``
+    records (the tail) rather than the oldest — the right default for a
+    reader with no prior page state, like a freshly-spawned attendant's boot
+    read. Pass an explicit ``offset`` (``0`` included) for forward pagination
+    from the start of the thread.
     """
     records = _read_all(data_dir, slug, global_user_id, thread_id)
     return _paginate(records, limit=limit, offset=offset)
@@ -479,11 +499,14 @@ def search(
     query: str,
     *,
     limit: int = 200,
-    offset: int = 0,
+    offset: int | None = None,
     thread_id: Any = None,
 ) -> dict:
     """Return a paginated page of records whose ``text`` contains ``query``
-    (case-insensitive). ``total`` is the full match count."""
+    (case-insensitive). ``total`` is the full match count.
+
+    ``offset`` omitted/``None`` (T-0850) returns the most recent ``limit``
+    matches rather than the oldest — see :func:`list_messages`."""
     needle = str(query or "").lower()
     records = [r for r in _read_all(data_dir, slug, global_user_id, thread_id)
                if needle in str(r.get("text", "")).lower()]

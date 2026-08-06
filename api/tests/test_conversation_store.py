@@ -125,6 +125,28 @@ def test_offset_past_end_returns_empty_page(tmp_path: Path):
     assert page["messages"] == []
 
 
+def test_omitted_offset_returns_the_tail_not_the_head(tmp_path: Path):
+    """T-0850: a freshly-spawned attendant's boot read hits this call with no
+    offset at all — it must land on the thread's most recent messages, not
+    the oldest ones from months ago."""
+    for i in range(10):
+        CS.append(tmp_path, "proj", "gu_abc", author="user", text=f"m{i}")
+    page = CS.list_messages(tmp_path, "proj", "gu_abc", limit=3)
+    assert page["total"] == 10
+    assert page["offset"] == 7
+    assert [m["text"] for m in page["messages"]] == ["m7", "m8", "m9"]
+
+
+def test_explicit_zero_offset_still_returns_the_head(tmp_path: Path):
+    """Explicit ``offset=0`` is forward pagination from the start, unchanged
+    from before T-0850 — only an OMITTED offset means "the tail"."""
+    for i in range(10):
+        CS.append(tmp_path, "proj", "gu_abc", author="user", text=f"m{i}")
+    page = CS.list_messages(tmp_path, "proj", "gu_abc", limit=3, offset=0)
+    assert page["offset"] == 0
+    assert [m["text"] for m in page["messages"]] == ["m0", "m1", "m2"]
+
+
 def test_search_filters_case_insensitively(tmp_path: Path):
     CS.append(tmp_path, "proj", "gu_abc", author="user", text="Deploy the worker")
     CS.append(tmp_path, "proj", "gu_abc", author="user", text="unrelated chatter")

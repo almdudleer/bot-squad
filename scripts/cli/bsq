@@ -28,7 +28,7 @@ Verbs:
   bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
   bsq msg-route list/set/clear      where each automated message TYPE is delivered (T-0799)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
-  bsq model set/clear/status         durable per-session claude --model override (T-0678)
+  bsq model set/clear/status         durable per-session agent/model override (T-0678)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
   bsq commit --hunks [--patch P]    co-edited file: commit ONLY your hunks via a temp index
 
@@ -948,6 +948,30 @@ def cmd_sync_status(args) -> None:
         print(line)
 
 
+_CODEX_MODEL_NAMES = {
+    "codex", "sol", "terra", "luna",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+}
+
+
+def _project_provider_default() -> str:
+    try:
+        raw = json.loads(
+            (Path(BOT_SQUAD) / "data" / "_state" / "agent_provider.json").read_text()
+        )
+        return "codex" if raw.get("provider") == "codex" else "claude"
+    except (OSError, ValueError, AttributeError):
+        return "claude"
+
+
+def _spawn_provider(args) -> str:
+    if getattr(args, "provider", None):
+        return args.provider
+    if (getattr(args, "model", None) or "").strip().lower() in _CODEX_MODEL_NAMES:
+        return "codex"
+    return _project_provider_default()
+
+
 def cmd_spawn(args) -> None:
     slug = resolve_slug()
     ticket = args.ticket.strip()
@@ -998,6 +1022,15 @@ def cmd_spawn(args) -> None:
             sessions = post("list_sessions", {"slug": slug}).get("sessions", [])
         except WorkerError:
             sessions = []
+        # A provider session id is not portable across agent CLIs. Reusing a
+        # Claude expert under a Codex-default dispatch silently launches Claude
+        # before the fresh-spawn resolver ever sees the requested model. Only
+        # rank experts from the provider this dispatch will actually use.
+        wanted_provider = _spawn_provider(args)
+        sessions = [
+            s for s in sessions
+            if (s.get("provider") or "claude") == wanted_provider
+        ]
         ranked = _find_expert(slug, sessions, all_tickets, fms, paths, my_sid())
         if args.resume_sid:
             # Explicit override: resume this SID even if not auto-pickable.
@@ -1022,6 +1055,12 @@ def cmd_spawn(args) -> None:
     if expert is not None:
         brief = initial_prompt if custom_prompt else _assemble_delta_brief(
             slug, all_tickets, fms, paths, expert, report_to)
+        if args.model and not args.dry_run:
+            post("set_model", {
+                "slug": slug,
+                "sid": expert["sid"],
+                "model": args.model,
+            })
         _resume_expert(slug, expert, all_tickets, brief, args.dry_run)
         return
 
@@ -1032,6 +1071,8 @@ def cmd_spawn(args) -> None:
         params["owner"] = args.owner
     if args.model:
         params["model"] = args.model
+    if args.provider:
+        params["provider"] = args.provider
     # T-0128: stamp the spawning session's own SID as the new session's parent
     # so the session-tree survives a worker restart (no heuristic needed). The
     # parent of a TL-spawned dev is the TL; of an operator-spawned TL, the
@@ -1854,6 +1895,54 @@ def _cross_refs(bodies: list[str], own: set[str]) -> list[str]:
     return refs
 
 
+_H2_RE = re.compile(r"^## .*$", re.MULTILINE)
+_PROGRESS_BRIEF_CAP = 15
+_PROGRESS_BRIEF_CHAR_BUDGET = 20_000
+
+
+def _cap_progress_for_brief(body: str, max_entries: int = _PROGRESS_BRIEF_CAP,
+                            char_budget: int = _PROGRESS_BRIEF_CHAR_BUDGET) -> str:
+    """Trim a ticket's ``## Progress`` feed before inlining the body into a
+    spawn brief (T-0852): at most ``max_entries`` lines, and further trimmed
+    from the old end if even that many still exceeds ``char_budget``.
+
+    The Progress feed is append-only and never pruned (T-0238) — on a
+    long-lived ticket it grows without bound, and `_assemble_prompt` used to
+    inline it whole. Measured on T-0496: 49 entries / 144KB going into EVERY
+    new session's brief for that ticket. A count-only cap under-delivers here
+    because individual entries can themselves be huge (a whole compacted
+    session summary pasted as one physical line, per T-0835's one-line-per-note
+    contract) — the char budget is what actually bounds the worst case. This
+    only shortens what gets INLINED — storage is untouched, and the full feed
+    stays reachable via `bsq ticket status <id>`.
+    """
+    span = None
+    for m in _H2_RE.finditer(body):
+        if m.group(0).strip().lower() == "## progress":
+            nxt = _H2_RE.search(body, m.end())
+            span = (m.start(), nxt.start() if nxt else len(body))
+            break
+    if span is None:
+        return body
+    block = body[span[0]:span[1]].rstrip("\n")
+    entry_lines = [ln for ln in block.split("\n") if ln.startswith("- ")]
+    kept = entry_lines[-max_entries:] if len(entry_lines) > max_entries else list(entry_lines)
+    total = sum(len(ln) + 1 for ln in kept)
+    while len(kept) > 1 and total > char_budget:
+        total -= len(kept[0]) + 1
+        kept = kept[1:]
+    omitted = len(entry_lines) - len(kept)
+    if omitted <= 0:
+        return body
+    new_block = (
+        "## Progress\n\n"
+        f"({omitted} earlier entries omitted for brief size — full history via "
+        "`bsq ticket status <id>`)\n\n" + "\n".join(kept)
+    )
+    rest = body[span[1]:].lstrip("\n")
+    return body[:span[0]] + new_block + ("\n\n" + rest if rest else "\n")
+
+
 def _assemble_prompt(slug: str, tickets: list[str], paths: dict[str, Path],
                      fms: dict[str, dict], role: str, report_to: str) -> str:
     """T-0149: deterministic per-task/role initial-prompt assembly.
@@ -1871,7 +1960,7 @@ def _assemble_prompt(slug: str, tickets: list[str], paths: dict[str, Path],
     role_text = role_path.read_text(encoding="utf-8", errors="replace").strip() \
         if role_path.exists() else "(role file missing)"
 
-    bodies = {t: _body_after_frontmatter(paths[t]) for t in tickets}
+    bodies = {t: _cap_progress_for_brief(_body_after_frontmatter(paths[t])) for t in tickets}
     initiative = fms[primary].get("initiative") or ""
     ai_path = Path(BOT_SQUAD) / "data" / slug / "AGENT_INSTRUCTIONS.md"
     init_path = (Path(BOT_SQUAD) / "data" / slug / "vision" / "initiatives" / initiative
@@ -2045,6 +2134,9 @@ def cmd_brief(args) -> None:
 
     print(f"=== BRIEF: {slug} === role: {role.upper()}"
           + (f"  ·  {sid}" if sid else ""))
+    provider = _project_provider_default()
+    print(f"Project agent-provider default: {provider}. Ordinary `bsq spawn` "
+          "must inherit it; use `--provider` only for a deliberate override.")
 
     def _emit(title: str, path: Path) -> None:
         if path.exists():
@@ -2854,7 +2946,11 @@ def cmd_model_status(args) -> None:
     model = ""
     if md.exists():
         fm = read_frontmatter(md)
-        model = str(fm.get("model", "") or "").strip()
+        model = (
+            "codex"
+            if str(fm.get("provider", "") or "").strip() == "codex"
+            else str(fm.get("model", "") or "").strip()
+        )
     else:
         print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
     print(f"model override for {sid}: {model or '(none — follows fleet/role default)'}")
@@ -5684,10 +5780,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--role", default="dev", choices=_SPAWNABLE_ROLES,
                     help="role contract to assemble into the prompt (default dev)")
     sp.add_argument("--model",
-                    help="claude --model override for the launch (alias like 'sonnet'/"
-                         "'opus'/'fable', or a full name like 'claude-sonnet-5'); "
-                         "default: the role's configured default, else the settings.json "
-                         "default (T-0623)")
+                    help="model within the selected/project-default provider "
+                         "(Codex: sol/terra/luna; Claude: sonnet/opus/fable)")
+    sp.add_argument("--provider", choices=("claude", "codex"),
+                    help="explicit provider override; absent means the project default")
     sp.add_argument("--prompt", help="custom initial prompt (overrides deterministic assembly)")
     sp.add_argument("--prompt-file", help="read initial prompt from a file")
     sp.add_argument("--fresh", action="store_true",
@@ -5838,10 +5934,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # model (T-0678: durable per-session `claude --model` override, distinct
     # from the fleet-wide default a coordinator settings.json edit sets)
-    md_p = sub.add_parser("model", help="durable per-session claude --model override (T-0678)")
+    md_p = sub.add_parser("model", help="durable per-session agent/model override (T-0678)")
     md_sub = md_p.add_subparsers(dest="sub", required=True)
     mds = md_sub.add_parser("set", help="set this session's sticky model override")
-    mds.add_argument("model", help="model string: a class alias 'sonnet'/'opus'/'fable' (auto-tracks latest-in-class, T-0704) or a pinned id like 'claude-opus-5'/'claude-opus-4-8'")
+    mds.add_argument("model", help="provider 'codex', Claude class alias 'sonnet'/'opus'/'fable', or a pinned Claude model id")
     mds.add_argument("--sid", help="target SID (default: this session)")
     mds.set_defaults(func=cmd_model_set)
     mdc = md_sub.add_parser("clear", help="clear this session's model override (revert to fleet/role default)")

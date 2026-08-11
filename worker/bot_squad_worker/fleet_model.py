@@ -149,6 +149,52 @@ def resolve_model(value: str, provider: str | None = None) -> str:
     return v
 
 
+# ---------------------------------------------------------------------------
+# T-0871 (T-0866): reasoning effort — the twin of the model choice above, and
+# it lives here for the same reason: this module is the ONE seam every spawn
+# and resume funnels its choice through before it reaches a launch command.
+# ---------------------------------------------------------------------------
+
+# The ``claude --effort`` scale, ORDERED cheapest -> most expensive. The order
+# is load-bearing (the clamp compares by index), so do not sort or re-order.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# THE ANTI-OVERSHOOT GUARD (the stakeholder's overriding constraint on this
+# lane: "главное чтобы он не начал overshoot"). A resolved effort ranked above
+# this is CLAMPED DOWN to it — never passed through, never an error. Raising
+# the fleet past this level must be a deliberate one-line edit HERE, not
+# something a config typo, a per-session override, or a vendor default-table
+# change can do behind our backs. ``high`` is what every turn on this host
+# already runs at (measured on T-0866), so the guard ships behaviour-neutral.
+EFFORT_CEILING = "high"
+
+
+def resolve_effort(value: str) -> str:
+    """Validate a ``--effort`` value and clamp it to :data:`EFFORT_CEILING`.
+
+    "" (or whitespace-only) passes through as "" — no override. A level at or
+    below the ceiling passes through unchanged. A level ABOVE the ceiling
+    returns the ceiling. Anything unrecognized raises ``ValueError``, loudly,
+    exactly like :func:`resolve_model` — a typo must not degrade into "no
+    flag", because "no flag" is precisely the vendor-default fallback this
+    whole lane exists to close.
+
+    BOTH the config path and the explicit-override path route through here,
+    so the ceiling is not bypassable from either side.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if v not in EFFORT_LEVELS:
+        raise ValueError(
+            f"effort not allowed: {value!r} (expected one of "
+            f"{', '.join(EFFORT_LEVELS)})"
+        )
+    if EFFORT_LEVELS.index(v) > EFFORT_LEVELS.index(EFFORT_CEILING):
+        return EFFORT_CEILING
+    return v
+
+
 def _settings_path() -> Path:
     return Path(_sessions._get_user_home()) / ".claude" / "settings.json"
 

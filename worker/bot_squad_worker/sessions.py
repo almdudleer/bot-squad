@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import shlex
@@ -23,6 +24,8 @@ from typing import Any
 
 from bot_squad_worker import frontmatter as _frontmatter
 from bot_squad_worker import agent_provider as _agent_provider
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1872,6 +1875,40 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # silently inherit — this is what makes the override "stick across
     # recycles" instead of reverting the moment the tmux window recycles.
     resume_model = str(meta.get("model") or "")
+    if resume_model == "~":
+        resume_model = ""
+    resume_effort = str(meta.get("effort") or "")
+    if resume_effort == "~":
+        resume_effort = ""
+    # T-0871: `meta["model"]` is stamped ONLY for an EXPLICIT spawn model —
+    # deliberate (T-0678: a role-defaulted session should follow the role
+    # default at RESUME time, not freeze today's value). But the empty case
+    # then passed "", i.e. no `--model` flag at all, so every recycle of a
+    # role-defaulted session silently dropped to ~/.claude/settings.json. Fix
+    # is to RE-RESOLVE the role default through the same helper spawn uses,
+    # leaving the sticky-explicit path above untouched. Effort rides the same
+    # path — and re-clamping a stamped value means a stale/hand-edited md
+    # cannot reintroduce an overshoot on a recycle.
+    if provider_name == "claude":
+        _resume_role = _role_of(meta)
+        _resume_config_dir = _caps_config_dir(cfg)
+        if not resume_model:
+            resume_model, _resume_model_source = _resolve_claude_model(
+                _resume_config_dir, _resume_role, "")
+        else:
+            _resume_model_source = "session-md"
+        try:
+            resume_effort, _resume_effort_source = _resolve_claude_effort(
+                _resume_config_dir, _resume_role, resume_effort)
+        except ValueError as exc:
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(f"resume: {exc}") from exc
+        log.info(
+            "resume %s/%s role=%s model=%s (%s) effort=%s (%s)",
+            slug, sid, _resume_role,
+            resume_model or "-", _resume_model_source or "-",
+            resume_effort or "-", _resume_effort_source or "-",
+        )
     # T-0614: keep the /resume-picker entry readable across rotations —
     # --name combined with --resume renames the session (a fresh
     # custom-title record supersedes the old one). Uses the possibly-ADOPTED
@@ -1880,9 +1917,10 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     _display_name = _claude_session_name(window, meta.get("task_id"))
     cmd = provider.launch_command(
         resume_id=str(claude_uuid) if claude_uuid and claude_uuid != "~" else None,
-        model=resume_model if resume_model != "~" else "",
+        model=resume_model,
         display_name=_display_name,
         initial_prompt=None,
+        effort=resume_effort,
     )
     # T-0525: when this resume ADOPTS a primary (T-0166 expert-rebind), carry it
     # to the new claude via the per-process env channel so a concurrent spawn
@@ -2301,6 +2339,7 @@ def spawn(
     owner_user: str | None = None,
     model: str | None = None,
     provider: str | None = None,
+    effort: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -2310,9 +2349,18 @@ def spawn(
     role is derived from ``window`` the same way ``_action_spawn_session``
     derives it for the operator-singleton guard. No role default resolves to
     Fable — a fleet-wide burn is only possible via an explicit ``model``.
-    Still absent (no config entry either) → no ``--model`` flag, i.e. the
-    spawned ``claude`` inherits the per-linux-user ``~/.claude/settings.json``
-    default, matching pre-T-0623 behavior for untouched roles.
+
+    T-0871 (T-0866): a claude launch command now ALWAYS carries both
+    ``--model`` and ``--effort``. Previously, a role with no [models] entry
+    and no built-in got no ``--model`` at all and the spawned ``claude`` read
+    the worker linux user's ``~/.claude/settings.json``; and nothing anywhere
+    passed ``--effort``, so every turn ran at the CLI's own vendor-owned
+    per-model ``default_effort``. Both resolve through the four-layer order
+    ``explicit arg -> [section].<role> -> [section]."*" -> built-in <role> ->
+    built-in "*"`` (:func:`_resolve_claude_model` /
+    :func:`_resolve_claude_effort`), and effort is additionally CLAMPED to
+    :data:`fleet_model.EFFORT_CEILING` — including an explicit ``effort``
+    argument, which is deliberately not a way to bypass the ceiling.
 
     Opens a new tmux window, starts claude (no resume), and optionally
     sends an initial_prompt after a short delay.
@@ -2511,13 +2559,26 @@ def spawn(
     except ValueError as exc:
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"spawn: {exc}") from exc
+    # T-0871: for provider `claude` the model and the effort are BOTH always
+    # stated. `_resolve_claude_model` cannot return "" (see its docstring), so
+    # the launch command can no longer fall through to whatever
+    # ~/.claude/settings.json happens to hold; `_resolve_claude_effort` does
+    # the same for a flag we previously never passed at all.
     _model = ""
+    _model_source = ""
+    _effort = ""
+    _effort_source = ""
     if _provider_name == "claude":
-        _model = _explicit_choice or _read_model_defaults(
-            _caps_config_dir(cfg)
-        ).get(_role, "")
+        _model, _model_source = _resolve_claude_model(
+            _caps_config_dir(cfg), _role, _explicit_choice)
+        try:
+            _effort, _effort_source = _resolve_claude_effort(
+                _caps_config_dir(cfg), _role, effort or "")
+        except ValueError as exc:
+            from bot_squad_worker.actions import ActionError
+            raise ActionError(f"spawn: {exc}") from exc
     elif _explicit_choice and _explicit_choice != "codex":
-        _model = _explicit_choice
+        _model, _model_source = _explicit_choice, "explicit"
     if _model:
         try:
             _model = _fleet_model.resolve_model(_model, provider=_provider_name)
@@ -2525,10 +2586,20 @@ def spawn(
             from bot_squad_worker.actions import ActionError
             raise ActionError(f"spawn: {exc}") from exc
     _provider = _agent_provider.get(_provider_name)
+    # T-0871 DoD: the concrete resolved values and their PROVENANCE reach the
+    # worker log at spawn — never None/unset, so an audit of why a session ran
+    # a given model/effort does not have to reconstruct it from the config.
+    log.info(
+        "spawn %s/%s role=%s provider=%s model=%s (%s) effort=%s (%s)",
+        slug, window, _role, _provider_name,
+        _model or "-", _model_source or "-",
+        _effort or "-", _effort_source or "-",
+    )
     shell_cmd = env_prefix + _provider.launch_command(
         model=_model,
         display_name=_display_name,
         initial_prompt=None,
+        effort=_effort,
     )
     _provider_sessions_before = (
         _provider.session_ids(cwd, _get_user_home())
@@ -2598,6 +2669,20 @@ def spawn(
     # first time this session resumes. T-0704: a class alias like "opus" is a
     # deliberately UNexpanded passthrough here — `claude` resolves it to
     # latest-in-class at resume time, which is the point (never goes stale).
+    # T-0871: the effort stamp is UNCONDITIONAL, unlike `model` above, and the
+    # asymmetry is deliberate. `model` is sticky-only-when-explicit so a
+    # role-defaulted session re-reads the role default at resume time instead
+    # of freezing today's value (T-0678). Effort has no such per-session
+    # override channel, and `resume()` re-clamps whatever it reads here
+    # through `_resolve_claude_effort`, so stamping it always costs nothing
+    # and makes "what effort is this session running at" answerable from the
+    # md alone rather than from the launch command of a window that may be
+    # long gone. `model_source` rides along for the same audit reason.
+    if _provider_name == "claude":
+        if _effort:
+            seed_meta["effort"] = _effort
+        if _model_source:
+            seed_meta["model_source"] = _model_source
     if _explicit_choice and _provider_name == "claude":
         seed_meta["model"] = _model
     elif _provider_name == "codex":
@@ -3029,26 +3114,174 @@ def _read_caps(config_dir: Path) -> dict:
 # T-0704: the value is the BARE class alias "sonnet" (not the pinned
 # claude-sonnet-5) so it auto-tracks latest-in-class and never goes stale —
 # fleet_model.resolve_model passes it through and `claude` resolves it.
-_DEFAULT_MODEL_DEFAULTS: dict[str, str] = {"user-conversation": "sonnet"}
+#
+# T-0871: the ``"*"`` CATCH-ALL is what makes "bot-squad always states the
+# model" true rather than aspirational. Before it, a role with no entry here
+# and none in [models] (`qa`, `prod-teamlead`, any future role) produced NO
+# --model flag at all, and the spawned `claude` silently read the worker linux
+# user's ~/.claude/settings.json — a value bot-squad neither chose nor could
+# name. "opus" is what that settings.json currently resolves to, so adding
+# the catch-all is behaviour-neutral on this install while moving the choice
+# from the vendor's file into ours.
+_DEFAULT_MODEL_DEFAULTS: dict[str, str] = {
+    "user-conversation": "sonnet",
+    "*": "opus",
+}
+
+# T-0871: per-role default `claude --effort`, same shape and same catch-all
+# rule as the model defaults above. `high` is the level EVERY assistant turn
+# on this host already runs at (measured on T-0866: 41 082 turns over 7d,
+# zero at any other level) — it was the Claude CLI's own per-model
+# `default_effort`, never a bot-squad choice. Stating it explicitly is a
+# behaviour no-op that takes the choice back; `fleet_model.EFFORT_CEILING`
+# then keeps a future config/vendor change from raising it silently.
+_DEFAULT_EFFORT_DEFAULTS: dict[str, str] = {"*": "high"}
 
 
-def _read_model_defaults(config_dir: Path) -> dict[str, str]:
-    """Fresh-read the [models] section from system_settings.toml — role name
-    -> default model string. Missing file / unparseable / missing [models] ->
-    the built-in ``_DEFAULT_MODEL_DEFAULTS``. An explicit (even empty-string)
-    key in the file overrides the built-in for that role; roles absent from
-    both the file and the built-in resolve to "" (no --model flag)."""
+def _read_defaults_section(
+    config_dir: Path, section: str, builtin: dict[str, str]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """``(file_map, builtin_map)`` for one role->value section of
+    system_settings.toml. Kept SEPARATE (rather than merged) because the
+    resolution order in :func:`_layered_default` is not "file wins per key" —
+    a file-level ``"*"`` catch-all outranks a built-in ROLE entry, and the
+    caller has to be able to report WHICH of the two a value came from.
+    Missing file / unparseable / missing section -> an empty file map."""
     path = Path(config_dir) / "system_settings.toml"
     try:
         raw = tomllib.loads(path.read_text())
     except (OSError, ValueError):
-        return dict(_DEFAULT_MODEL_DEFAULTS)
-    models = raw.get("models")
-    if not isinstance(models, dict):
-        return dict(_DEFAULT_MODEL_DEFAULTS)
-    merged = dict(_DEFAULT_MODEL_DEFAULTS)
-    merged.update({str(k): str(v) for k, v in models.items()})
+        return {}, dict(builtin)
+    values = raw.get(section)
+    if not isinstance(values, dict):
+        return {}, dict(builtin)
+    return {str(k): str(v) for k, v in values.items()}, dict(builtin)
+
+
+def _layered_default(
+    file_map: dict[str, str], builtin_map: dict[str, str], role: str
+) -> tuple[str, str]:
+    """Resolve ``role`` through the four layers, in order, returning
+    ``(value, source)`` — e.g. ``("opus", "config:dev")`` or
+    ``("sonnet", "builtin:*")``. ``("", "")`` when every layer is blank.
+
+    Order: configured role -> configured ``"*"`` -> built-in role -> built-in
+    ``"*"``. A blank value at any layer falls through rather than terminating
+    the search: under T-0871 "no value" is never an acceptable answer, so an
+    empty ``dev = ""`` in the file means "I have no opinion", not "send no
+    flag" (which is what it used to mean, and what handed the choice back to
+    the CLI's own default).
+    """
+    for label, source_map, key in (
+        ("config", file_map, role),
+        ("config", file_map, "*"),
+        ("builtin", builtin_map, role),
+        ("builtin", builtin_map, "*"),
+    ):
+        value = (source_map.get(key) or "").strip()
+        if value:
+            return value, f"{label}:{key}"
+    return "", ""
+
+
+def _read_model_defaults(config_dir: Path) -> dict[str, str]:
+    """Fresh-read the [models] section from system_settings.toml — role name
+    -> default model string, merged over the built-in
+    ``_DEFAULT_MODEL_DEFAULTS`` (which since T-0871 carries a ``"*"``
+    catch-all). Missing file / unparseable / missing [models] -> the built-in
+    alone. Kept as the flat merged view for callers that just want the map;
+    the spawn/resume seam uses :func:`_resolve_claude_model` instead, which
+    needs the layer a value came from."""
+    file_map, builtin = _read_defaults_section(
+        config_dir, "models", _DEFAULT_MODEL_DEFAULTS)
+    merged = dict(builtin)
+    merged.update(file_map)
     return merged
+
+
+def _read_effort_defaults(config_dir: Path) -> dict[str, str]:
+    """T-0871: the [effort] twin of :func:`_read_model_defaults` — role name
+    -> ``claude --effort`` level, merged over ``_DEFAULT_EFFORT_DEFAULTS``."""
+    file_map, builtin = _read_defaults_section(
+        config_dir, "effort", _DEFAULT_EFFORT_DEFAULTS)
+    merged = dict(builtin)
+    merged.update(file_map)
+    return merged
+
+
+def _resolve_claude_model(
+    config_dir: Path, role: str, explicit: str = ""
+) -> tuple[str, str]:
+    """T-0871: the value AND the provenance of a claude session's ``--model``.
+
+    Returns ``(model, source)`` and is the ONE resolver both :func:`spawn` and
+    :func:`resume` call, so a recycle cannot resolve differently from the
+    spawn that preceded it. For provider ``claude`` the model is never "":
+    after the four config/built-in layers it falls back to the fleet default
+    (``fleet_model.get_model``) and finally to a hard-coded ``sonnet``. That
+    last rung is a should-never-happen guard, and its source string says so —
+    the point of the whole chain is that the value on the launch command is
+    always one bot-squad chose and can NAME, never one the CLI picked for us.
+    """
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit, "explicit"
+
+    file_map, builtin = _read_defaults_section(
+        config_dir, "models", _DEFAULT_MODEL_DEFAULTS)
+    value, source = _layered_default(file_map, builtin, role)
+    if value:
+        return value, source
+
+    from bot_squad_worker import fleet_model as _fleet_model
+    fleet = (_fleet_model.get_model(config_dir) or "").strip()
+    if fleet and fleet != "codex":
+        return fleet, "fleet"
+
+    log.warning(
+        "T-0871: no model default resolved for role %r (no [models] entry, no "
+        "built-in, no fleet default) — falling back to the hard-coded "
+        "'sonnet'. Add a [models] entry (or a '*' catch-all) in "
+        "system_settings.toml.", role,
+    )
+    return "sonnet", "hardcoded-fallback"
+
+
+def _resolve_claude_effort(
+    config_dir: Path, role: str, explicit: str = ""
+) -> tuple[str, str]:
+    """T-0871: ``(effort, source)`` for a claude session, clamped.
+
+    Same four-layer order as :func:`_resolve_claude_model`. Whichever layer
+    wins, the value goes through :data:`fleet_model.resolve_effort` — so the
+    ceiling applies to a per-session override exactly as it does to a config
+    entry, and an unrecognized level raises rather than silently vanishing.
+    """
+    from bot_squad_worker import fleet_model as _fleet_model
+
+    explicit = (explicit or "").strip()
+    if explicit:
+        value, source = explicit, "explicit"
+    else:
+        file_map, builtin = _read_defaults_section(
+            config_dir, "effort", _DEFAULT_EFFORT_DEFAULTS)
+        value, source = _layered_default(file_map, builtin, role)
+
+    if not value:
+        log.warning(
+            "T-0871: no effort default resolved for role %r — falling back to "
+            "the ceiling %r.", role, _fleet_model.EFFORT_CEILING,
+        )
+        return _fleet_model.EFFORT_CEILING, "hardcoded-fallback"
+
+    clamped = _fleet_model.resolve_effort(value)
+    if clamped != value:
+        log.warning(
+            "T-0871: effort %r for role %r (%s) exceeds EFFORT_CEILING — "
+            "clamped to %r.", value, role, source, clamped,
+        )
+        source = f"{source}(clamped)"
+    return clamped, source
 
 
 def _proc_children_map() -> dict[int, list[int]]:

@@ -2160,6 +2160,10 @@ _SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {
     "owner_user",  # T-0321: per-user-scoping username
     "model",  # T-0623: explicit `claude --model` override; absent = role default
     "provider",  # explicit cross-provider override; model alone stays in project provider
+    # T-0871: explicit `claude --effort` override; absent = role/catch-all
+    # default. Clamped to fleet_model.EFFORT_CEILING like any other path —
+    # this is an override of the LEVEL, not of the ceiling.
+    "effort",
 }
 
 
@@ -2219,6 +2223,7 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         owner_user=params.get("owner_user"),
         model=params.get("model"),
         provider=params.get("provider"),
+        effort=params.get("effort"),
     )
 
 

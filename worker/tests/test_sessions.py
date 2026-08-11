@@ -2826,11 +2826,16 @@ def test_spawn_explicit_model_lands_on_shell_cmd(tmp_path, monkeypatch):
     assert "--model claude-opus-4-8" in cmd
 
 
-def test_spawn_without_model_omits_flag_for_dev_role(tmp_path, monkeypatch):
-    """A plain dev window ("w") has no configured role default, so absent
-    `model` means no --model flag at all — settings.json default applies."""
+def test_spawn_without_model_still_names_the_catch_all_default(tmp_path, monkeypatch):
+    """T-0871 INVERTS this test. It used to assert the opposite — a plain dev
+    window with no configured role default got NO --model flag, i.e. the
+    spawned `claude` read the worker linux user's ~/.claude/settings.json and
+    bot-squad could not name the model its own session was running. The
+    built-in "*" catch-all closes that: the flag is always present with a
+    value bot-squad chose. Behaviour-neutral on this install, where that
+    settings.json resolves to the same "opus"."""
     cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w")
-    assert "--model" not in cmd
+    assert "--model opus" in cmd
 
 
 def test_spawn_user_conversation_window_gets_sonnet_default(tmp_path, monkeypatch):
@@ -3958,7 +3963,12 @@ def test_resume_adds_model_flag_when_override_present(tmp_path, monkeypatch):
     assert "--model claude-fable-5" in captured_shell_cmd[0]
 
 
-def test_resume_omits_model_flag_when_no_override(tmp_path, monkeypatch):
+def test_resume_without_override_re_resolves_the_role_default(tmp_path, monkeypatch):
+    """T-0871 INVERTS this test too. It used to assert `--model` was ABSENT
+    when the md carried no sticky override — which meant every recycle of a
+    role-defaulted session silently reverted to ~/.claude/settings.json.
+    resume() now re-resolves the role default through the same helper spawn
+    uses, so the flag is present and names bot-squad's own choice."""
     repo = tmp_path / "repo"
     repo.mkdir()
     cfg = _make_cfg(tmp_path, repo)
@@ -3991,7 +4001,7 @@ def test_resume_omits_model_flag_when_no_override(tmp_path, monkeypatch):
     resume(cfg, "test-project", "S-alice-w-p2")
 
     assert captured_shell_cmd
-    assert "--model" not in captured_shell_cmd[0]
+    assert "--model opus" in captured_shell_cmd[0]
 
 
 def test_session_history_rotates_on_resume(tmp_path, monkeypatch):

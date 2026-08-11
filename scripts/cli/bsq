@@ -1062,6 +1062,15 @@ def cmd_spawn(args) -> None:
                 "sid": expert["sid"],
                 "model": args.model,
             })
+        if getattr(args, "effort", None):
+            # T-0871: --model has a per-session stamp verb (set_model) the
+            # expert path can reuse; effort has none, so say so rather than
+            # swallowing the flag silently. The resumed expert keeps the
+            # effort stamped on its own md (re-clamped by resume()).
+            print(f"note: --effort {args.effort} applies to a FRESH spawn only; "
+                  f"this dispatch resumed expert {expert['sid']}, which keeps "
+                  f"its own stamped effort. Re-run with --fresh to spawn at "
+                  f"the requested level.", file=sys.stderr)
         _resume_expert(slug, expert, all_tickets, brief, args.dry_run)
         return
 
@@ -1074,6 +1083,11 @@ def cmd_spawn(args) -> None:
         params["model"] = args.model
     if args.provider:
         params["provider"] = args.provider
+    # T-0871: explicit reasoning-effort override. Still clamped worker-side to
+    # fleet_model.EFFORT_CEILING — this names a LEVEL, it does not lift the
+    # ceiling.
+    if getattr(args, "effort", None):
+        params["effort"] = args.effort
     # T-0128: stamp the spawning session's own SID as the new session's parent
     # so the session-tree survives a worker restart (no heuristic needed). The
     # parent of a TL-spawned dev is the TL; of an operator-spawned TL, the
@@ -5909,6 +5923,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "(Codex: sol/terra/luna; Claude: sonnet/opus/fable)")
     sp.add_argument("--provider", choices=("claude", "codex"),
                     help="explicit provider override; absent means the project default")
+    sp.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                    help="Claude reasoning effort for this spawn (T-0871); absent "
+                         "means the role default from system_settings.toml [effort]. "
+                         "Clamped worker-side to the fleet EFFORT_CEILING")
     sp.add_argument("--prompt", help="custom initial prompt (overrides deterministic assembly)")
     sp.add_argument("--prompt-file", help="read initial prompt from a file")
     sp.add_argument("--fresh", action="store_true",

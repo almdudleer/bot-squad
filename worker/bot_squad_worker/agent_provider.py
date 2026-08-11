@@ -49,6 +49,7 @@ class AgentProvider:
         model: str = "",
         display_name: str = "",
         initial_prompt: str | None = None,
+        effort: str = "",
     ) -> str:
         raise NotImplementedError
 
@@ -82,6 +83,7 @@ class ClaudeProvider(AgentProvider):
         model: str = "",
         display_name: str = "",
         initial_prompt: str | None = None,
+        effort: str = "",
     ) -> str:
         del initial_prompt  # delivered after the Claude composer is ready
         cmd = "claude --dangerously-skip-permissions"
@@ -89,6 +91,14 @@ class ClaudeProvider(AgentProvider):
             cmd += f" --resume {shlex.quote(resume_id)}"
         if model:
             cmd += f" --model {shlex.quote(model)}"
+        # T-0871: reasoning effort, stated by bot-squad rather than inherited.
+        # Absent, `claude` applies its own per-model `default_effort` — a
+        # vendor-owned table (v2.1.227 ships claude-opus-4-7 -> xhigh), so a
+        # model swap or a CLI update can move the whole fleet up a tier with
+        # no change on our side and no signal. The value reaching here has
+        # already passed fleet_model.resolve_effort (validated + clamped).
+        if effort:
+            cmd += f" --effort {shlex.quote(effort)}"
         if display_name:
             cmd += f" --name {shlex.quote(display_name)}"
         return cmd
@@ -134,9 +144,11 @@ class CodexProvider(AgentProvider):
         model: str = "",
         display_name: str = "",
         initial_prompt: str | None = None,
+        effort: str = "",
     ) -> str:
         del display_name  # Codex resume is identified by UUID, not --name.
         del initial_prompt  # delivered through the length-safe tmux composer path
+        del effort  # T-0871: Codex has no reasoning-effort flag.
         options = " --dangerously-bypass-approvals-and-sandbox"
         if model:
             options += f" --model {shlex.quote(model)}"

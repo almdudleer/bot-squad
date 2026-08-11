@@ -104,6 +104,35 @@ chat", so a spool holding the UNtagged body while the wire carries the tagged
 one would blind the guard against every forwarded reply. Pinned by
 ``test_sender_tag.py::test_spool_records_the_tagged_bytes_the_wire_carried``.
 
+One emoji per role (T-0867)
+---------------------------
+    И кстати, когда кастомный sender, не ты, это надо выделять, вообще
+    говоря, желательно emoji, типа отдельные сделать отличающиеся на dev,
+    TL, operator и user-conversation.
+
+Since dev/TL/operator sessions page him directly, the supergroup carries
+several voices and ``[<slug> <role>]`` is read text — he has to parse the
+bracket to learn who is talking. :data:`ROLE_EMOJI` gives each role one stable
+glyph, rendered at the FRONT of the existing label (``[🔧 bot-squad dev]``) so
+it is the first thing on the line.
+
+It is **additive**: the label's own text is unchanged and every consumer that
+parses it still sees the same thing.
+
+* ``_LEADING_TAG_RE`` still matches — the glyph is inside the bracket, not in
+  front of it, so a re-composed body still finds and REPLACES its old tag
+  rather than growing a second one. :func:`is_identity_tag` steps over a
+  leading role glyph for the same reason.
+* ``tg_listener.SID_RE`` — the legacy reply-routing fallback — needs the raw
+  SID immediately after ``[``. That is why the glyph is suppressed when the
+  label degraded to a bare routing SID (no project resolvable): those sends
+  stay byte-identical and keep resolving. Nothing is lost by it — a tag with
+  no project in it was never the readable form this ticket is about.
+
+The role is the DERIVED one, never a T-0662 alias: an alias renames a session,
+it does not change what the session is. So ``[🔧 bot-squad мойбот]`` still
+says "a dev is talking".
+
 Never raises
 ------------
 A tag is a courtesy; a delivery is not. Every entry point falls back to the
@@ -139,6 +168,24 @@ _SID_RE = re.compile(r"^S-\S+-p\d+$")
 #: The T-0724 nested form some callers still produce: ``[<slug>] <name>``.
 _NESTED_RE = re.compile(r"^\[([^\[\]\s]+)\]\s+(.+)$")
 
+#: T-0867 — one glyph per role, so WHO is talking reads before the words do.
+#: Keys are exactly ``sessions._derive_role``'s enum; a role missing from this
+#: map (or a label with no role in it) simply gets no glyph. Chosen for shape
+#: rather than theme — they are told apart at a glance in a message list, and
+#: each is emoji-presentation by default, so none needs a variation selector to
+#: render as a picture.
+ROLE_EMOJI = {
+    "dev": "🔧",
+    "teamlead": "🧭",
+    "prod-teamlead": "🚀",
+    "operator": "🎧",
+    "user-conversation": "💬",
+    "qa": "🔍",
+}
+
+#: The reverse membership test, for stepping over a glyph we ourselves wrote.
+_ROLE_GLYPHS = frozenset(ROLE_EMOJI.values())
+
 #: ``tg.part_marker``'s ``(n/N)`` on a split page's part. It sits BEFORE the
 #: body, so a hand-typed tag on part 1 of a long reply hides behind it — and
 #: without this the tag would be prepended in front of the marker and the user
@@ -172,39 +219,66 @@ def _slug_for_destination(cfg: Any, chat_id: Any, topic_id: Any) -> str:
     return str((binding or {}).get("slug") or "")
 
 
-def label_for_sid(cfg: Any, sid: str, *, chat_id: Any = "", topic_id: Any = None) -> str:
-    """The canonical ``"<slug> <role>"`` label for a routing SID.
+def _role_in_label(label: str) -> str:
+    """The role named by a plain display label's trailing word, or ``""``.
 
-    Both halves degrade independently and neither guesses: with no project
-    resolvable the bare SID comes back (the pre-T-0758 rendering), and with no
-    role parseable the slug alone does. A T-0662 stakeholder-assigned alias
-    beats the derived role, matching
+    For the rungs that never see a SID — a caller that hands the transport an
+    already-rendered ``"<slug> <role>"`` string — the label's own last token is
+    the only thing that can name the role. Deliberately matched against
+    :data:`ROLE_EMOJI` rather than "any last word", so a label ending in a free
+    -text alias contributes nothing instead of guessing.
+    """
+    parts = str(label or "").strip().rsplit(None, 1)
+    if len(parts) == 2 and parts[1] in ROLE_EMOJI:
+        return parts[1]
+    return ""
+
+
+def label_and_role_for_sid(
+    cfg: Any, sid: str, *, chat_id: Any = "", topic_id: Any = None
+) -> tuple[str, str]:
+    """The canonical ``"<slug> <role>"`` label for a routing SID, and its role.
+
+    Both halves of the LABEL degrade independently and neither guesses: with no
+    project resolvable the bare SID comes back (the pre-T-0758 rendering), and
+    with no role parseable the slug alone does. A T-0662 stakeholder-assigned
+    alias beats the derived role, matching
     ``sessions.sid_display_label(compact=True)`` — the label he already sees
     everywhere else.
+
+    The second element is the DERIVED role (T-0867), which is why it is
+    returned beside the label instead of being read back off it: an alias
+    displaces the role in the label, and the glyph must still name the role.
     """
     sid = str(sid or "").strip()
     if not sid:
-        return ""
+        return "", ""
     try:
         from bot_squad_worker import sessions as _sessions
 
         slug = _sessions.project_of_sid(cfg, sid) or _slug_for_destination(
             cfg, chat_id, topic_id
         )
+        derived = _sessions._role_segment_of_sid(sid) or ""
         role = ""
         data_dir = getattr(cfg, "data_dir", None)
         if data_dir is not None:
             role = _sessions._alias_for_sid(data_dir, sid) or ""
-        role = role or _sessions._role_segment_of_sid(sid) or ""
+        role = role or derived
     except Exception:  # noqa: BLE001 — never fail a send over a label
         log.exception("sender_tag: could not build a label for %s", sid)
-        return sid
+        return sid, ""
     if slug and role:
-        return f"{slug} {role}"
-    return slug or sid
+        return f"{slug} {role}", derived
+    return (slug or sid), derived
 
 
-def resolve_label(
+def label_for_sid(cfg: Any, sid: str, *, chat_id: Any = "", topic_id: Any = None) -> str:
+    """:func:`label_and_role_for_sid`'s label half — see it for the contract."""
+    return label_and_role_for_sid(cfg, sid, chat_id=chat_id, topic_id=topic_id)[0]
+
+
+def resolve_label_and_role(
     cfg: Any,
     *,
     sid: str = "",
@@ -212,7 +286,7 @@ def resolve_label(
     route_sid: str = "",
     chat_id: Any = "",
     topic_id: Any = None,
-) -> str:
+) -> tuple[str, str]:
     """The sender label for one send, or ``""`` when the send names no sender.
 
     Rungs, in strict order — each consulted only when no earlier one resolved:
@@ -233,27 +307,48 @@ def resolve_label(
 
     ``""`` means "nothing named a sender" and is the whole of the DoD (c)
     class rule — see the module docstring.
+
+    The second element is the sender's ROLE (T-0867), resolved on the SAME
+    ladder so the glyph and the label can never disagree about who is talking.
     """
     sender_sid = str(sender_sid or "").strip()
     if is_sid(sender_sid):
-        return label_for_sid(cfg, sender_sid, chat_id=chat_id, topic_id=topic_id)
+        return label_and_role_for_sid(cfg, sender_sid, chat_id=chat_id, topic_id=topic_id)
 
     sid = str(sid or "").strip()
     if sid:
         if is_sid(sid):
-            return label_for_sid(cfg, sid, chat_id=chat_id, topic_id=topic_id)
+            return label_and_role_for_sid(cfg, sid, chat_id=chat_id, topic_id=topic_id)
         nested = _NESTED_RE.match(sid)
         if nested:
             slug, name = nested.group(1), nested.group(2).strip()
             if is_sid(name):
-                return label_for_sid(cfg, name, chat_id=chat_id, topic_id=topic_id)
-            return f"{slug} {name}"
-        return sid
+                return label_and_role_for_sid(
+                    cfg, name, chat_id=chat_id, topic_id=topic_id
+                )
+            return f"{slug} {name}", _role_in_label(name)
+        return sid, _role_in_label(sid)
 
     route_sid = str(route_sid or "").strip()
     if is_sid(route_sid):
-        return label_for_sid(cfg, route_sid, chat_id=chat_id, topic_id=topic_id)
-    return ""
+        return label_and_role_for_sid(cfg, route_sid, chat_id=chat_id, topic_id=topic_id)
+    return "", ""
+
+
+def resolve_label(
+    cfg: Any,
+    *,
+    sid: str = "",
+    sender_sid: str = "",
+    route_sid: str = "",
+    chat_id: Any = "",
+    topic_id: Any = None,
+) -> str:
+    """:func:`resolve_label_and_role`'s label half — see it for the contract."""
+    return resolve_label_and_role(
+        cfg, sid=sid, sender_sid=sender_sid, route_sid=route_sid,
+        chat_id=chat_id, topic_id=topic_id,
+    )[0]
 
 
 def _known_slugs(cfg: Any) -> set[str]:
@@ -271,10 +366,21 @@ def is_identity_tag(cfg: Any, inner: str) -> bool:
     ``" @ <user>"`` form ``tg._prefix`` renders). Anything else — ``[FYI —
     ответ не требуется]``, ``[voice_intake]`` — is a marker naming what the
     message IS, not who sent it, and is left untouched.
+
+    T-0867: a leading role glyph is stepped over first, because from here on a
+    tag we composed ourselves OPENS with one. Without this a re-composed body
+    would read ``🔧`` as the head, fail the slug test, and be treated as a
+    class marker — i.e. the stale tag would survive instead of being replaced,
+    which is the one case that lies to the reader.
     """
     inner = str(inner or "").strip()
     if not inner:
         return False
+    head, _, rest = inner.partition(" ")
+    if head in _ROLE_GLYPHS:
+        inner = rest.strip()
+        if not inner:
+            return False
     if is_sid(inner):
         return True
     head = inner.split(None, 1)[0]
@@ -302,7 +408,7 @@ def compose(
     from bot_squad_worker.tg import _prefix
 
     try:
-        label = resolve_label(
+        label, role = resolve_label_and_role(
             cfg, sid=sid, sender_sid=sender_sid, route_sid=route_sid,
             chat_id=chat_id, topic_id=topic_id,
         )
@@ -326,7 +432,13 @@ def compose(
             else:
                 # Nothing better to say than what the session already typed.
                 return marker + body
-        return _prefix(marker + body, sid=label, user=user)
+        # T-0867: the role glyph goes INSIDE the bracket, in front of the label
+        # — first thing on the line, and still a single leading `[...]` for
+        # everything that parses one. Suppressed when the label degraded to a
+        # bare routing SID, which `tg_listener.SID_RE` reads positionally.
+        glyph = "" if is_sid(label) else ROLE_EMOJI.get(role, "")
+        return _prefix(marker + body, sid=f"{glyph} {label}" if glyph else label,
+                       user=user)
     except Exception:  # noqa: BLE001 — a tag is never worth a dropped message
         log.exception("sender_tag: compose failed; sending untagged")
         return _prefix(str(text or ""), sid=str(sid or ""), user=str(user or ""))

@@ -95,7 +95,7 @@ def test_relay_send_without_sid_is_tagged_from_sender_sid(cfg, wire) -> None:
     TgClient(cfg).send(
         chat_id="404580642", text="Понял, делаю.", sender_sid=WR_ATT, debounce=False,
     )
-    assert wire[0]["text"] == "[watchrobot user-conversation] Понял, делаю."
+    assert wire[0]["text"] == "[💬 watchrobot user-conversation] Понял, делаю."
 
 
 def test_same_window_different_project_reads_as_its_own_project(cfg, wire) -> None:
@@ -106,15 +106,15 @@ def test_same_window_different_project_reads_as_its_own_project(cfg, wire) -> No
     client.send(chat_id="404580642", text="ответ", sender_sid=BS_ATT, debounce=False)
     client.send(chat_id="404580642", text="ответ", sender_sid=WR_ATT, debounce=False)
     assert [m["text"] for m in wire] == [
-        "[bot-squad user-conversation] ответ",
-        "[watchrobot user-conversation] ответ",
+        "[💬 bot-squad user-conversation] ответ",
+        "[💬 watchrobot user-conversation] ответ",
     ]
 
 
 def test_max_applies_the_same_tag(cfg, wire) -> None:
     """(a) — both channels, one rule, one module."""
     MaxClient(cfg).send(chat_id="404580642", text="Понял.", sender_sid=WR_ATT)
-    assert wire[0]["text"] == "[watchrobot user-conversation] Понял."
+    assert wire[0]["text"] == "[💬 watchrobot user-conversation] Понял."
 
 
 def test_raw_sid_as_display_label_is_resolved_not_printed(cfg, wire) -> None:
@@ -123,7 +123,7 @@ def test_raw_sid_as_display_label_is_resolved_not_printed(cfg, wire) -> None:
         chat_id="404580642", text="привет", sid="S-almdudleer-operator-p298",
         debounce=False,
     )
-    assert wire[0]["text"] == "[bot-squad operator] привет"
+    assert wire[0]["text"] == "[🎧 bot-squad operator] привет"
 
 
 def test_stall_escalation_stops_leaking_a_raw_sid(cfg, wire) -> None:
@@ -141,7 +141,7 @@ def test_stall_escalation_stops_leaking_a_raw_sid(cfg, wire) -> None:
         chat_id="404580642", text="⏳ сессия не отвечает 15 мин", sid=sid,
         debounce=False,
     )
-    assert wire[0]["text"] == "[watchrobot dev] ⏳ сессия не отвечает 15 мин"
+    assert wire[0]["text"] == "[🔧 watchrobot dev] ⏳ сессия не отвечает 15 мин"
 
 
 def test_route_sid_alone_still_tags(cfg, wire) -> None:
@@ -149,7 +149,7 @@ def test_route_sid_alone_still_tags(cfg, wire) -> None:
     TgClient(cfg).send(
         chat_id="404580642", text="привет", route_sid=WR_ATT, debounce=False,
     )
-    assert wire[0]["text"] == "[watchrobot user-conversation] привет"
+    assert wire[0]["text"] == "[💬 watchrobot user-conversation] привет"
 
 
 def test_topic_binding_names_the_project_when_the_sid_does_not(cfg, wire) -> None:
@@ -166,7 +166,7 @@ def test_topic_binding_names_the_project_when_the_sid_does_not(cfg, wire) -> Non
         chat_id="-100999", topic_id=23, text="привет",
         sender_sid="S-nobody-ghost-p9", debounce=False,
     )
-    assert wire[0]["text"] == "[watchrobot dev] привет"
+    assert wire[0]["text"] == "[🔧 watchrobot dev] привет"
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +178,8 @@ def test_hand_typed_tag_is_replaced_not_duplicated(cfg, wire) -> None:
         chat_id="404580642", text="[bot-squad user-conversation] Понял.",
         sender_sid=BS_ATT, debounce=False,
     )
-    assert wire[0]["text"] == "[bot-squad user-conversation] Понял."
-    assert wire[0]["text"].count("[bot-squad user-conversation]") == 1
+    assert wire[0]["text"] == "[💬 bot-squad user-conversation] Понял."
+    assert wire[0]["text"].count("bot-squad user-conversation") == 1
 
 
 def test_a_wrong_hand_typed_tag_is_corrected(cfg, wire) -> None:
@@ -189,7 +189,7 @@ def test_a_wrong_hand_typed_tag_is_corrected(cfg, wire) -> None:
         chat_id="404580642", text="[bot-squad user-conversation] Понял.",
         sender_sid=WR_ATT, debounce=False,
     )
-    assert wire[0]["text"] == "[watchrobot user-conversation] Понял."
+    assert wire[0]["text"] == "[💬 watchrobot user-conversation] Понял."
 
 
 def test_hand_typed_tag_survives_when_no_sender_is_named(cfg, wire) -> None:
@@ -216,8 +216,8 @@ def test_every_part_of_a_split_page_carries_the_tag(cfg, wire) -> None:
     for part in parts:
         client.send(chat_id="404580642", text=part, sender_sid=WR_ATT, debounce=False)
     assert [m["text"] for m in wire] == [
-        "[watchrobot user-conversation] (1/2) начало",
-        "[watchrobot user-conversation] (2/2) конец",
+        "[💬 watchrobot user-conversation] (1/2) начало",
+        "[💬 watchrobot user-conversation] (2/2) конец",
     ]
 
 
@@ -304,7 +304,7 @@ def test_a_leading_markdown_link_is_not_a_marker(cfg, wire) -> None:
         chat_id="404580642", text="[T-0758](https://x/t) готово",
         sender_sid=WR_ATT, debounce=False,
     )
-    assert wire[0]["text"] == "[watchrobot user-conversation] [T-0758](https://x/t) готово"
+    assert wire[0]["text"] == "[💬 watchrobot user-conversation] [T-0758](https://x/t) готово"
 
 
 def test_interactive_command_reply_stays_bare(cfg, wire) -> None:
@@ -330,7 +330,7 @@ def test_user_component_survives(cfg, wire) -> None:
         chat_id="404580642", text="привет", sid="bot-squad dev", user="alexey",
         debounce=False,
     )
-    assert wire[0]["text"] == "[bot-squad dev @ alexey] привет"
+    assert wire[0]["text"] == "[🔧 bot-squad dev @ alexey] привет"
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ def test_spool_records_the_tagged_bytes_the_wire_carried(cfg, wire) -> None:
     spooled = outbound_log.read_spool(cfg.data_dir, chat_id="404580642")
     assert len(spooled) == 1
     assert spooled[0]["text"] == wire[0]["text"]
-    assert spooled[0]["text"].startswith("[watchrobot user-conversation] ")
+    assert spooled[0]["text"].startswith("[💬 watchrobot user-conversation] ")
 
 
 def test_echo_guard_matches_a_forward_of_the_tagged_message(cfg, wire) -> None:
@@ -429,7 +429,7 @@ def test_compose_never_raises_and_falls_back(cfg, monkeypatch) -> None:
     def _boom(*a, **kw):
         raise RuntimeError("session store on fire")
 
-    monkeypatch.setattr(sender_tag, "resolve_label", _boom)
+    monkeypatch.setattr(sender_tag, "resolve_label_and_role", _boom)
     assert sender_tag.compose(cfg, "привет", sid="bot-squad operator") == (
         "[bot-squad operator] привет"
     )
@@ -441,7 +441,7 @@ def test_send_survives_a_broken_tag_resolver(cfg, wire, monkeypatch) -> None:
     def _boom(*a, **kw):
         raise RuntimeError("session store on fire")
 
-    monkeypatch.setattr(sender_tag, "resolve_label", _boom)
+    monkeypatch.setattr(sender_tag, "resolve_label_and_role", _boom)
     assert TgClient(cfg).send(chat_id="404580642", text="привет",
                               sender_sid=WR_ATT, debounce=False) is True
     assert wire[0]["text"] == "привет"
@@ -463,3 +463,167 @@ def test_is_identity_tag_distinguishes_sender_from_class(cfg) -> None:
     for inner in ("voice_intake", "FYI — ответ не требуется", "routine:R-0007",
                   "1/2", ""):
         assert sender_tag.is_identity_tag(cfg, inner) is False, inner
+
+
+# ---------------------------------------------------------------------------
+# T-0867 — one distinguishing glyph per role
+#
+#   «когда кастомный sender, не ты, это надо выделять, вообще говоря,
+#    желательно emoji, типа отдельные сделать отличающиеся на dev, TL,
+#    operator и user-conversation»
+#
+# The property under test is not "an emoji appears" — it is that the FOUR he
+# named (and the two he did not, which also send) are told apart, and that the
+# label they are told apart in did not change.
+# ---------------------------------------------------------------------------
+
+#: A window marker per role, fed through `sessions._derive_role` rather than
+#: asserted — the roles are its enum, so a marker that stops deriving what it
+#: claims fails here instead of silently re-labelling live sends.
+_ROLE_WINDOWS = {
+    "dev": "T-0867-build",
+    "teamlead": "sender-tags-TL",
+    "prod-teamlead": "release-prod-tl",
+    "operator": "operator",
+    "user-conversation": "gu_dc8262b6cea9098d98e04d7e-user-conversation",
+    "qa": "walkthrough-qa",
+}
+
+
+def _session(cfg, slug: str, window: str) -> str:
+    """Register a real session md for ``slug`` and hand back its SID."""
+    sid = f"S-almdudleer-{window}-p{abs(hash(window)) % 900 + 10}"
+    sess = Path(cfg.data_dir) / slug / "sessions"
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / f"{sid}.md").write_text(f"---\nsid: {sid}\n---\n")
+    return sid
+
+
+def test_role_windows_derive_the_roles_they_claim() -> None:
+    """The fixture above is only evidence if its markers really derive."""
+    from bot_squad_worker.sessions import _derive_role
+
+    for role, window in _ROLE_WINDOWS.items():
+        assert _derive_role(window, None, None) == role, window
+
+
+def test_every_sending_role_gets_its_own_glyph(cfg, wire) -> None:
+    """His ask, end to end through the transport: four named roles + the two
+    other spawnable ones, each arriving under a DIFFERENT glyph."""
+    seen: dict[str, str] = {}
+    for role, window in _ROLE_WINDOWS.items():
+        sid = _session(cfg, "bot-squad", window)
+        wire.clear()
+        TgClient(cfg).send(
+            chat_id="404580642", text="привет", sender_sid=sid, debounce=False,
+        )
+        text = wire[0]["text"]
+        assert text.endswith(f" bot-squad {role}] привет"), text
+        seen[role] = text[1]
+
+    assert set(seen) == set(sender_tag.ROLE_EMOJI)
+    assert len(set(seen.values())) == len(seen), f"glyphs collide: {seen}"
+    for role, glyph in seen.items():
+        assert glyph == sender_tag.ROLE_EMOJI[role]
+
+
+def test_the_glyph_is_additive_the_label_text_is_unchanged(cfg, wire) -> None:
+    """DoD (b) — anything that parses `[<slug> <role>]` still reads it.
+
+    Pinned as an EQUALITY against the label the pre-T-0867 resolver produces,
+    not as a hand-typed string: strip the glyph and its space and you are back
+    to byte-identical output, whatever `resolve_label` grows next.
+    """
+    sid = _session(cfg, "watchrobot", _ROLE_WINDOWS["teamlead"])
+    TgClient(cfg).send(
+        chat_id="404580642", text="готово", sender_sid=sid, debounce=False,
+    )
+    label = sender_tag.resolve_label(cfg, sender_sid=sid)
+    assert label == "watchrobot teamlead"
+    assert wire[0]["text"] == f"[🧭 {label}] готово"
+    assert "[" + wire[0]["text"][3:] == f"[{label}] готово"
+
+
+def test_a_composed_tag_is_replaced_not_doubled(cfg, wire) -> None:
+    """The glyph must not defeat the T-0758 no-double-tagging contract.
+
+    A body that already carries a tag WE wrote opens with a glyph, so the
+    identity test has to step over it — otherwise `[🔧 …]` reads as a class
+    marker and the stale (here: wrong) tag survives, which is the one case
+    that lies to the reader.
+    """
+    dev = _session(cfg, "watchrobot", _ROLE_WINDOWS["dev"])
+    TgClient(cfg).send(
+        chat_id="404580642", text="[🎧 bot-squad operator] Понял.",
+        sender_sid=dev, debounce=False,
+    )
+    assert wire[0]["text"] == "[🔧 watchrobot dev] Понял."
+    assert wire[0]["text"].count("[") == 1
+
+
+def test_is_identity_tag_steps_over_a_leading_glyph(cfg) -> None:
+    for inner in ("🔧 bot-squad dev", "💬 watchrobot user-conversation",
+                  f"🎧 {BS_ATT}"):
+        assert sender_tag.is_identity_tag(cfg, inner) is True, inner
+    # A glyph alone claims no identity, and a glyph in front of a CLASS marker
+    # does not promote it into one.
+    for inner in ("🔧", "🔧 voice_intake", "🚀 FYI — ответ не требуется"):
+        assert sender_tag.is_identity_tag(cfg, inner) is False, inner
+
+
+def test_an_alias_keeps_the_role_glyph(cfg, wire) -> None:
+    """T-0662 renames a session; it does not change what the session IS. The
+    label follows the alias (unchanged behaviour), the glyph follows the role."""
+    from bot_squad_worker import session_aliases
+
+    sid = _session(cfg, "bot-squad", _ROLE_WINDOWS["dev"])
+    session_aliases.set_alias(cfg.data_dir, "mybot", sid)
+    TgClient(cfg).send(
+        chat_id="404580642", text="привет", sender_sid=sid, debounce=False,
+    )
+    assert wire[0]["text"] == "[🔧 bot-squad mybot] привет"
+
+
+def test_a_bare_sid_label_stays_byte_identical_for_the_reply_resolver(cfg, wire) -> None:
+    """DoD (b), the consumer that would actually have broken.
+
+    `tg_listener.SID_RE` reads the SID POSITIONALLY — immediately after the
+    leading `[`. A glyph in front of it would kill the legacy reply-routing
+    fallback for every send whose project could not be resolved, so the glyph
+    is suppressed exactly there. Composed by the real transport, then handed
+    to the real regex.
+    """
+    from bot_squad_worker import tg_listener as TL
+
+    TgClient(cfg).send(
+        chat_id="404580642", text="привет", sender_sid="S-nobody-ghost-p9",
+        debounce=False,
+    )
+    assert wire[0]["text"] == "[S-nobody-ghost-p9] привет"
+    m = TL.SID_RE.match(wire[0]["text"])
+    assert m is not None and m.group(1) == "S-nobody-ghost-p9"
+
+
+def test_a_send_naming_nobody_gains_no_glyph(cfg, wire) -> None:
+    """Negative guard. No sender ⇒ no label ⇒ nothing to decorate; the send is
+    byte-identical to its pre-T-0867 shape."""
+    TgClient(cfg).send(chat_id="404580642", text="привет", debounce=False)
+    assert wire[0]["text"] == "привет"
+
+
+def test_the_glyph_map_covers_every_derivable_role() -> None:
+    """A seventh role added to `_derive_role` with no glyph would ship a tag
+    that reads like the others but says nothing — caught here, at the map."""
+    import inspect
+
+    from bot_squad_worker import sessions as S
+
+    returns = {
+        node.value.value
+        for node in __import__("ast").walk(
+            __import__("ast").parse(inspect.getsource(S._derive_role))
+        )
+        if isinstance(node, __import__("ast").Return)
+        and isinstance(node.value, __import__("ast").Constant)
+    }
+    assert returns == set(sender_tag.ROLE_EMOJI), returns

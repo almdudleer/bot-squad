@@ -80,7 +80,7 @@ def test_tg_records_the_text_as_DELIVERED_including_the_prefix(tmp_path: Path, s
     the caller composed — the `[<label>]` prefix is part of what he saw."""
     TG.TgClient(_cfg(tmp_path)).send(
         chat_id=CHAT, text="ответ", sid="bot-squad operator", urgent=True)
-    assert _spool(tmp_path)[0]["text"] == "[bot-squad operator] ответ"
+    assert _spool(tmp_path)[0]["text"] == "[🎧 bot-squad operator] ответ"
     assert _spool(tmp_path)[0]["text"] == sent[0]["json"]["text"]
 
 

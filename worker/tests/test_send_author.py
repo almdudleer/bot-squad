@@ -135,7 +135,7 @@ def test_the_receipts_two_fields_stop_contradicting_each_other(cfg, wire) -> Non
     )
 
     (rec,) = _spool(cfg.data_dir)
-    assert rec["text"] == "[bot-squad user-conversation] Понял, делаю."
+    assert rec["text"] == "[💬 bot-squad user-conversation] Понял, делаю."
     assert rec["author"] == f"session:{ATTENDANT}"
 
 
@@ -214,7 +214,7 @@ def test_max_records_the_composing_session_too(cfg, wire) -> None:
 
     (rec,) = _spool(cfg.data_dir)
     assert rec["channel"] == "max"
-    assert rec["text"] == "[bot-squad user-conversation] Понял."
+    assert rec["text"] == "[💬 bot-squad user-conversation] Понял."
     assert rec["author"] == f"session:{ATTENDANT}"
 
 

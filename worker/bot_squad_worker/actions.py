@@ -3499,17 +3499,26 @@ _COMPACT_WRITE_STATE_ALLOWED = _COMPACT_WRITE_STATE_REQUIRED
 
 
 def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
-    """Write a session's full forward-state into its ROLE artifact (T-0467, F1.4).
+    """Write a TASK-LESS session's full forward-state into its ROLE artifact
+    (T-0467, F1.4).
 
     The "write everything down" half of the universal compact: on context-full /
     timeout the session is asked to dump its complete forward-state so a fresh
-    incarnation can boot from it. Role-agnostic — unlike ``assignment_write_result``
-    (which needs an assignment_id), this resolves the session's role + task from
-    its session md so a *task-less* role (e.g. the operator) can save too. Backed
-    by the SAME reusable ``Artifact`` seam (no second store).
+    incarnation can boot from it. It resolves the session's role + task from its
+    session md, so a role with no assignment_id (e.g. the operator) can save
+    too. Backed by the reusable ``Artifact`` seam.
 
-    A dev's role artifact IS its T-0463 result sidecar; an operator's is the
-    state-doc (``artifacts/operator-state.md``, schema = T-0473).
+    T-0863 SCOPES THIS TO TASK-LESS SESSIONS and refuses for a task-bound one.
+    A session that owns a task hands off through that ticket's ``## Context``
+    instead — *«на одну задачу один артефакт — контекст, он же на тикете в UI
+    виден»* — so writing ``artifacts/<task_id>.md`` would mint a second,
+    invisible copy of the same forward-state, which is the duplication the
+    correction removed. The refusal is loud and names the replacement rather
+    than silently no-op'ing: a handoff that reports success and stores nothing
+    is exactly the failure T-0858 measured.
+
+    An operator's artifact is the state-doc (``artifacts/operator-state.md``,
+    schema = T-0473); any other task-less role gets a per-assignment file.
 
     Required params: slug, sid, content
     Returns: {ok, role, assignment_id, artifact_path, bytes_written}
@@ -3542,6 +3551,13 @@ def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
     task_id = meta.get("task_id")
     role = meta.get("role") or _sessions._derive_role(
         meta.get("window"), task_id, meta.get("initiative"))
+
+    if task_id and task_id != "~":
+        raise ActionError(
+            f"compact_write_state: {sid} is bound to {task_id} — a task-bound "
+            f"session's forward-state goes in that ticket's `## Context`, not "
+            f"an artifact file (T-0863: one task, one artifact). Run "
+            f"`bsq ticket context {task_id} --file <f>` instead.")
 
     art = role_artifact(cfg.data_dir, slug, role=role, sid=sid, task_id=task_id)
     if art is None:

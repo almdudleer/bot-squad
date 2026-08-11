@@ -399,9 +399,20 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
     this test still asserts.
     """
     compacted = []
-    monkeypatch.setattr(A, "_pane_for", lambda sid: "%9")
-    monkeypatch.setattr(A, "_capture_pane", lambda pane: "❯ ready\n")
+    asked = []
+    monkeypatch.setattr(A, "_pane_for", lambda sid, **kw: "%9")
+    monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: "❯ ready\n")
     monkeypatch.setattr(A, "_send_compact", lambda sid: compacted.append(sid))
+    # T-0863: the recycle ARM asks a task-LESS role (this TL) to write its
+    # forward-state to its role artifact instead of sending /compact. What this
+    # test guards is unchanged — that the TL is SWEPT, not exempted — so it
+    # asserts on whichever action the recycle took, and still fails if the
+    # retired /compact comes back.
+    monkeypatch.setattr(A, "_inject_handoff",
+                        lambda sid, art, role=None, *, relaunch=True:
+                        asked.append(sid))
+    monkeypatch.setattr(A, "_inject_context_handoff",
+                        lambda sid, task_id, *, relaunch=True: asked.append(sid))
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: 25000)
     monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: False)
     monkeypatch.setattr(S, "_pane_activity_at",
@@ -414,4 +425,5 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert compacted == [sid]  # teamlead recycled → not exempt
+    assert asked == [sid]  # teamlead recycled → not exempt
+    assert compacted == []  # ...and never via the retired /compact (T-0863)

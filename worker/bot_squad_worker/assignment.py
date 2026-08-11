@@ -421,7 +421,14 @@ def role_artifact(
     the ONE reusable ``Artifact`` seam (no second store):
 
       * a task-bound session (a dev — task-binding is authoritative) → the T-0463
-        task sidecar ``artifacts/<task_id>.md`` (same sink as its result);
+        task sidecar ``artifacts/<task_id>.md`` (same sink as its result).
+        **T-0863 RETIRED THIS AS A HANDOFF DESTINATION**: a task-bound session's
+        forward-state now goes into the ticket's own ``## Context``
+        (``autocompact._resolve_compact_target``), and ``compact_write_state``
+        refuses to write here. The branch stays because it is still the
+        assignment-RESULT sidecar (T-0463, a different writer) and because
+        ``recovery.py`` must keep booting a crashed session from a sidecar
+        written before that change — it is a READ path now, not a write one;
       * an operator → ``artifacts/operator-state.md`` (the state-doc seam; schema
         = T-0473);
       * any other role with no task → a stable per-assignment

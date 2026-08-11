@@ -255,7 +255,7 @@ _MANAGED = {
     "owner_user", "tmux_session", "linux_user",
 }
 _INFLIGHT_RECYCLE = {
-    "idle_recycle_phase", "idle_recycle_armed_at",
+    "idle_recycle_phase", "idle_recycle_armed_at", "idle_recycle_mark",
     "compact_stay_phase", "compact_stay_armed_at",
 }
 hook_source = os.environ.get("HOOK_SOURCE") or ""

@@ -118,8 +118,16 @@ def _seed_md(sessions_dir: Path, repo: Path, extra: str = "") -> Path:
     return md
 
 
-INFLIGHT = ("idle_recycle_phase: compacting\n"
-            "idle_recycle_armed_at: 2026-07-05T14:00:00Z\n")
+# T-0863 adds `idle_recycle_mark` — the ARM-time snapshot of the handoff
+# destination — to the in-flight set. It has the SAME clobber exposure as the
+# other two and a nastier failure mode if it is dropped: FINALIZE compares the
+# live mark against this one, so a missing mark compares unequal and reads as
+# "the session wrote its forward-state", terminating it on the spot with
+# nothing recorded. That is D-0053's shape (hook drops a stamp → the next tick
+# misreads the state) pointed at the write instead of the arm.
+INFLIGHT = ("idle_recycle_phase: finalizing\n"
+            "idle_recycle_armed_at: 2026-07-05T14:00:00Z\n"
+            "idle_recycle_mark: ctx:9f86d081884c7d659a2feaa0c55ad015\n")
 DURABLE = ("role: operator\n"
            "idle_postpone_until: 2026-07-05T09:00:00Z\n"
            "recycle_exempt: true\n")
@@ -133,8 +141,9 @@ def test_compact_fire_preserves_unknown_fields(hook_env):
     res = run_hook(source="compact")
     assert res.returncode == 0, res.stderr
     text = md.read_text()
-    assert "idle_recycle_phase: compacting" in text
+    assert "idle_recycle_phase: finalizing" in text
     assert "idle_recycle_armed_at: 2026-07-05T14:00:00Z" in text
+    assert "idle_recycle_mark: ctx:9f86d081884c7d659a2feaa0c55ad015" in text
     assert "role: operator" in text
     assert "idle_postpone_until: 2026-07-05T09:00:00Z" in text
     assert "recycle_exempt: true" in text
@@ -177,12 +186,21 @@ def test_non_compact_fire_clears_inflight_phase_keeps_durable(hook_env, source):
 @pytest.fixture
 def seams(monkeypatch):
     """Same seam set as test_idle_timeout: no real tmux/telemetry/suspend."""
-    calls = {"compact": [], "terminate": []}
+    calls = {"compact": [], "terminate": [], "handoff": []}
     state = {"pane": "%7", "buf": "❯ ready\n", "idle_age": 7200.0,
              "tokens": 60000}
-    monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
-    monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
+    monkeypatch.setattr(A, "_pane_for", lambda sid, **kw: state["pane"])
+    monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: calls["compact"].append(sid))
+    # T-0863: the recycle ARM now asks for a handoff instead of sending
+    # /compact. `compact` stays wired so a regression that brings it back on
+    # this path fails loudly rather than passing unnoticed.
+    monkeypatch.setattr(A, "_inject_handoff",
+                        lambda sid, art, role=None, *, relaunch=True:
+                        calls["handoff"].append((sid, art, relaunch)))
+    monkeypatch.setattr(A, "_inject_context_handoff",
+                        lambda sid, task_id, *, relaunch=True:
+                        calls["handoff"].append((sid, task_id, relaunch)))
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: state["tokens"])
     monkeypatch.setattr(G, "is_attached", lambda target, **kw: False)
     monkeypatch.setattr(S, "_pane_activity_at",
@@ -222,32 +240,68 @@ def _tick(data_dir: Path, md: Path) -> bool:
 
 def test_clobber_sequence_no_second_arm(hook_env, seams):
     """The exact p11/p23/p29 double-compact shape, made impossible:
-    tick #1 ARMS (sends /compact, stamps the phase) → the compact completes
-    and fires the REAL hook with source=compact (this used to clobber the
-    stamp) → tick #2 must FINALIZE (terminate-and-remember), never re-arm.
-    Exactly ONE /compact per recycle episode."""
+    tick #1 ARMS (asks for the handoff, stamps the phase + mark) → the session
+    writes and a SessionStart(source=compact) fires the REAL hook (this used to
+    clobber the stamp) → tick #2 must FINALIZE (terminate-and-remember), never
+    re-arm. Exactly ONE arm per recycle episode.
+
+    T-0863 keeps the shape and swaps the mechanism: the arm is a handoff
+    request, not a ``/compact``, and the episode now carries a THIRD in-flight
+    field (``idle_recycle_mark``). The mark is asserted across the hook fire
+    explicitly — dropping it would not re-arm (the phase still guards that), it
+    would make FINALIZE read an unequal mark as "the forward-state was written"
+    and terminate the session having recorded nothing. Same clobber, quieter
+    damage.
+    """
     run_hook, repo, sessions_dir = hook_env
     md = _seed_md(sessions_dir, repo)
     data_dir = sessions_dir.parent.parent  # $BOT_SQUAD/data
 
-    # tick #1: over-threshold idle session → ARM
+    # tick #1: over-threshold idle session → ARM (a handoff ask, never /compact)
     assert _tick(data_dir, md) is True
-    assert seams["calls"]["compact"] == [_sid()]
-    assert (S._read_session_metadata(md) or {}).get("idle_recycle_phase") == "compacting"
+    assert len(seams["calls"]["handoff"]) == 1
+    assert seams["calls"]["handoff"][0][0] == _sid()
+    # the idle trigger ENDS the session — it must not promise a relaunch
+    assert seams["calls"]["handoff"][0][2] is False
+    assert seams["calls"]["compact"] == [], "the idle path never sends /compact"
+    armed = S._read_session_metadata(md) or {}
+    assert armed.get("idle_recycle_phase") == "finalizing"
+    arm_mark = armed.get("idle_recycle_mark")
+    assert arm_mark, "the ARM must snapshot its destination"
 
-    # the /compact completes → Claude Code fires SessionStart(source=compact)
+    # the session writes its forward-state, then SessionStart(source=compact)
+    # fires the REAL hook over the md
+    # Resolve the destination the SAME way `_start_recycle` did — via the
+    # derived role, not a hand-passed one. A literal here would pin a
+    # destination the recycler may not actually have chosen.
+    role = S._derive_role(WINDOW, None, None)
+    target = A._resolve_compact_target(
+        types.SimpleNamespace(projects={"bot-squad": {}}, data_dir=data_dir),
+        "bot-squad", {"sid": _sid(), "role": role, "task_id": None,
+                      "window": WINDOW})
+    assert target["kind"] == "artifact", target  # task-less session
+    art = Path(target["artifact_path"])
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_text("forward-state the successor boots from\n")
+
     res = run_hook(source="compact")
     assert res.returncode == 0, res.stderr
-    assert (S._read_session_metadata(md) or {}).get("idle_recycle_phase") == \
-        "compacting", "hook rewrite must not clobber the in-flight phase"
+    survived = S._read_session_metadata(md) or {}
+    assert survived.get("idle_recycle_phase") == "finalizing", \
+        "hook rewrite must not clobber the in-flight phase"
+    assert survived.get("idle_recycle_mark") == arm_mark, \
+        "hook rewrite must not clobber the ARM-time destination snapshot"
 
-    # tick #2: composer ready again → FINALIZE, not a second arm
+    # tick #2: the write landed and the composer is ready → FINALIZE, not a
+    # second arm
     assert _tick(data_dir, md) is True
-    assert seams["calls"]["compact"] == [_sid()], "no second /compact — ever"
+    assert len(seams["calls"]["handoff"]) == 1, "no second arm — ever"
+    assert seams["calls"]["compact"] == []
     assert seams["calls"]["terminate"] == [_sid()]
     after = S._read_session_metadata(md) or {}
     assert after.get("status") == "suspended"
     assert after.get("resumable") is True
+    assert "forward-state written" in after.get("resume_hint", "")
 
 
 def test_pre_hook_md_without_extras_roundtrips(hook_env):

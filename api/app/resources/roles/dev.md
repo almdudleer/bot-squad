@@ -63,12 +63,17 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   A user request that lives only in your context, a handover md, or a
   scratch file is a stranded request — the worst drift case (T-0567).
 - **Every artifact you write has a defined home — no random mds** (T-0567;
-  the kind→home map is the project doc `docs/architecture/D-0045`). Your
-  compact/handover artifact is `artifacts/<task_id>.md`, overwritten in
-  place, and carries context GOTCHAS only (env quirks, mid-edit state);
-  task-relevant detail — requirements, decisions, follow-ups, current state —
-  goes on the task BEFORE you compact: `bsq ticket context` for the working
-  area, `bsq ticket quote` for his words, `task_new` for a new ask. Scratch (probe scripts, logs, test dumps) goes in your session
+  the kind→home map is the project doc `docs/architecture/D-0045`).
+  **ONE TASK, ONE ARTIFACT: your ticket's `## Context`** (T-0863,
+  stakeholder). There is no handover file — `artifacts/<task_id>.md` and
+  `bsq compact-save` are retired for you, and the worker refuses them if you
+  try. Everything a successor needs goes in `bsq ticket context <id> --file
+  <f>`, which REPLACES the section, so keep it describing what is TRUE NOW:
+  goal, what's done, what's in progress, exact next steps, key paths,
+  decisions, gotchas. His words go to `bsq ticket quote`, a new ask to
+  `task_new`. When the system asks you to finalize (context full, or your
+  ~1h cache window expiring) that write IS the handoff — do it before you
+  answer. Scratch (probe scripts, logs, test dumps) goes in your session
   scratchpad, never the code working tree, never the data dir.
 
 ## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)

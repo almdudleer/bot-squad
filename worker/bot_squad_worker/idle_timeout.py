@@ -53,16 +53,33 @@ the above, all gated the same:
   verbatim): *"the autocompact loop is worse than claude's internal compact,
   so probably it should work like IF there are more than 20k tokens in context
   AND the cache is expiring soon, we call /compact, then we terminate the
-  session and remember it to be --resume'd"*. So: context over threshold
-  (``[recycle].compact_min_context_tokens``, default 20000) → send Claude's
-  native ``/compact`` (reusing autocompact's safe-send primitives), wait
-  (bounded) for the pane to go composer-ready again, THEN terminate
-  (``sessions.suspend``) and stamp ``resumable: true`` / ``recycled_at`` /
-  ``resume_hint`` on the session md. Below threshold → skip ``/compact``,
-  terminate + stamp immediately (nothing worth compacting). NO respawn is ever
-  triggered from here — a future resume (``sessions.resume``, which already
-  prefers ``claude --resume <uuid>``) is a separate, human-or-automation-driven
-  act reading these md fields.
+  session and remember it to be --resume'd"*. NO respawn is ever triggered from
+  here — a future resume (``sessions.resume``, which already prefers ``claude
+  --resume <uuid>``) is a separate, human-or-automation-driven act reading
+  these md fields.
+
+T-0863 (2026-08-11) REPLACES the ``/compact``-then-terminate half of T-0566
+above, on the stakeholder's own correction. Two quotes, hours apart:
+*«нативный компакт через 55 минут — кринж, пустая трата токенов. Надо чтобы
+писал в задачу офк, и сессия завершалась, никакого компакта»*, then *«он должен
+просто обновлять контекст по задаче, и всё, никаких файлов, никаких notes, на
+одну задачу один артефакт — контекст, он же на тикете в UI виден»*. The native
+``/compact`` on this path was always pure waste — the pane is suspended a tick
+later, so the squeezed context is paid for and then discarded — and T-0858
+measured what it cost: 20 consecutive recycles that each logged success while
+recording nothing a successor could read. So the flow is now: over threshold
+(``[recycle].compact_min_context_tokens``, still 20000, now read as "is there
+forward-state worth writing down") → inject the FINALIZE handoff
+(:func:`autocompact.context_handoff_prompt` for a task-bound session, asking it
+to run ``bsq ticket context <id>``; :func:`autocompact.handoff_prompt` for a
+task-LESS one, which has no ticket to write onto) and stamp
+``idle_recycle_phase: finalizing`` + the ARM-time ``idle_recycle_mark``; then
+FINALIZE terminates once the write lands (or the bounded wait times out — never
+wedge). Below threshold, or with no destination at all, terminate straight away
+— never a ``/compact`` whose output nothing will ever read. The ceiling trigger
+in :mod:`autocompact` takes the SAME correction, so both recyclers again share
+one exit; the destination logic itself lives there
+(:func:`autocompact._resolve_compact_target`) and is imported, not forked.
 
 T-0617 COMPACT-AND-STAY (2026-07-18): the T-0566 verdict above was written for
 ordinary task sessions, where terminate-and-remember is fine — a future resume
@@ -253,6 +270,11 @@ def tracking_long_job(cfg: Any, slug: str, sid: str) -> bool:
 _RECYCLE_FIELDS = (
     "idle_recycle_phase",
     "idle_recycle_armed_at",
+    # T-0863: the ARM-time snapshot of the handoff destination (a `## Context`
+    # digest, or the role artifact's mtime) — one flat string, so FINALIZE can
+    # tell "the session wrote its forward-state" from "the wait timed out"
+    # without a nested mapping the hook reader cannot parse.
+    "idle_recycle_mark",
 )
 
 
@@ -326,12 +348,13 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     action was taken this tick (compact sent, or terminate+record finalized).
     Every gate fails closed.
 
-    T-0566: drives a tiny 2-phase machine on the session md only when a
-    ``/compact`` is worth sending (context over threshold) — START sends
-    ``/compact`` and stamps ``idle_recycle_phase: compacting``; FINALIZE waits
-    for the pane to go composer-ready again then terminates + records resume
-    state. A below-threshold session skips the wait entirely: START terminates
-    + records in the same tick.
+    Drives a tiny 2-phase machine on the session md only when there is
+    forward-state worth recording (context over threshold) — START asks the
+    session to write it and stamps ``idle_recycle_phase: finalizing``; FINALIZE
+    waits for that write to land, then terminates + records resume state. A
+    below-threshold session skips the wait entirely: START terminates + records
+    in the same tick. (T-0566 shape, T-0863 content: the ask used to be
+    Claude's native ``/compact``, whose output this path then discarded.)
     """
     if not idle_timeout_enabled():
         return False
@@ -374,9 +397,11 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     if recycle_gate.operator_drive_on(role=role, meta=meta):
         return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
 
-    # A compact-wait already in flight → drive its finalize half (independent
-    # of the idle window; the phase field is its own guard).
-    if meta.get("idle_recycle_phase") == "compacting":
+    # A handoff already in flight → drive its finalize half (independent of the
+    # idle window; the phase field is its own guard). `compacting` is the
+    # pre-T-0863 stamp — still accepted so a worker restart mid-recycle
+    # converges rather than leaving the session armed forever.
+    if meta.get("idle_recycle_phase") in ("finalizing", "compacting"):
         return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane, role=role)
 
     # Otherwise decide whether to START a recycle this tick.
@@ -421,11 +446,23 @@ def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None
 
 def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path,
                    now: float, pane: str | None, *, role: str | None = None) -> bool:
-    """T-0566: START the cache-window recycle. Only ever acts on an idle,
-    composer-ready pane — never cut mid-turn. Context over threshold → send
-    Claude's native ``/compact`` and stamp ``idle_recycle_phase: compacting``
-    (finalized on a later tick by :func:`_finalize_compact`). Context at/below
-    threshold → nothing worth compacting, terminate + record immediately.
+    """START the cache-window recycle. Only ever acts on an idle,
+    composer-ready pane — never cut mid-turn.
+
+    T-0863: context over threshold → ASK the session to write its forward-state
+    where that session's forward-state lives (a task-bound one: its ticket's
+    ``## Context``, via ``bsq ticket context``; a task-less one: its role
+    artifact) and stamp ``idle_recycle_phase: finalizing`` plus the ARM-time
+    ``idle_recycle_mark``, finalized on a later tick by
+    :func:`_finalize_compact`. Context at/below threshold, or no destination at
+    all → nothing worth recording, terminate immediately.
+
+    NO ``/compact`` is sent from this path any more, at any threshold. It used
+    to be, and it was always waste: this trigger suspends the pane a tick or
+    two later, so the squeezed context was paid for and then thrown away
+    («кринж, пустая трата токенов»). The token cost bought nothing a successor
+    could read — which is the same gap from the other side, and what T-0858
+    measured.
 
     T-0655: ``role`` is threaded through to :func:`_terminate_and_remember` so
     a drive=off operator (the only way an operator reaches this function at
@@ -441,29 +478,68 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
 
     tokens = _context_tokens(cfg, slug, sid)
     threshold = compact_min_context_tokens(cfg)
-    if tokens > threshold:
-        try:
-            autocompact._send_compact(sid)
-        except Exception:
-            log.exception("idle_timeout: /compact send failed for %s (will retry)", sid)
-            return False
-        meta["idle_recycle_phase"] = "compacting"
-        meta["idle_recycle_armed_at"] = _now_iso()
-        sessions._write_session_metadata(md_path, meta, atomic=True)
-        log.info("idle_timeout: sent /compact to %s (%d tokens > %d threshold) — "
-                 "awaiting completion", sid, tokens, threshold)
-        return True
+    if tokens <= threshold:
+        # Below threshold — no forward-state worth writing down; terminate now.
+        return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
+                                       wrote_state=False,
+                                       self_terminate=(role == "operator"))
 
-    # Below threshold — nothing worth compacting; terminate + record now.
-    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
-                                   compacted=False,
-                                   self_terminate=(role == "operator"))
+    target = autocompact._resolve_compact_target(cfg, slug, {
+        "sid": sid, "role": role or meta.get("role") or "",
+        "task_id": meta.get("task_id"), "window": meta.get("window"),
+    })
+    if target["kind"] == "none":
+        # Nowhere to write it. Terminating straight away is the whole point of
+        # T-0863's correction: the old code sent Claude's native `/compact`
+        # here and then suspended the pane a tick later, so the compacted
+        # context was discarded seconds after being paid for — «нативный
+        # компакт через 55 минут — кринж, пустая трата токенов».
+        log.info("idle_timeout: no handoff destination for %s — terminating "
+                 "without a compact", sid)
+        return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
+                                       wrote_state=False,
+                                       self_terminate=(role == "operator"))
+
+    try:
+        if target["kind"] == "context":
+            autocompact._inject_context_handoff(sid, target["task_id"],
+                                                relaunch=False)
+        else:
+            autocompact._inject_handoff(sid, target["artifact_path"],
+                                        target["role"], relaunch=False)
+    except Exception:
+        log.exception("idle_timeout: finalize inject failed for %s (will retry)",
+                      sid)
+        return False
+    meta["idle_recycle_phase"] = "finalizing"
+    meta["idle_recycle_armed_at"] = _now_iso()
+    meta["idle_recycle_mark"] = autocompact.handoff_mark(target)
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: asked %s to finalize into %s (%d tokens > %d "
+             "threshold) — awaiting the write", sid,
+             f"{target['task_id']} ## Context" if target["kind"] == "context"
+             else target["artifact_path"], tokens, threshold)
+    return True
 
 
 def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
                       pane: str | None, *, role: str | None = None) -> bool:
-    """FINALIZE an in-flight ``/compact`` wait: once the pane is composer-ready
-    again (or the bounded wait times out — never wedge), terminate + record."""
+    """FINALIZE an in-flight handoff wait: once the session has written its
+    forward-state and the pane is composer-ready again (or the bounded wait
+    times out — never wedge), terminate + record.
+
+    T-0863: the destination is RE-RESOLVED here rather than carried across
+    ticks. It is a pure function of the session md (task-bound → that ticket's
+    ``## Context``; task-less → the role artifact), so only the ARM-time
+    snapshot needs persisting — one flat ``idle_recycle_mark`` instead of the
+    four fields a carried destination would cost, on an md whose reader
+    (``session_start.sh``) can only hold flat scalars.
+
+    An md carrying the pre-T-0863 ``idle_recycle_phase: compacting`` stamp has
+    no mark, so the "did it write" test passes immediately and this degrades to
+    exactly the old composer-ready wait — a worker restart mid-recycle
+    converges instead of wedging.
+    """
     armed_at = sessions._parse_ts_epoch(meta.get("idle_recycle_armed_at")) or now
     timed_out = (now - armed_at) > autocompact.handoff_timeout_sec()
 
@@ -473,28 +549,50 @@ def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: f
         sessions._write_session_metadata(md_path, meta, atomic=True)
         return False
 
+    target = autocompact._resolve_compact_target(cfg, slug, {
+        "sid": sid, "role": role or meta.get("role") or "",
+        "task_id": meta.get("task_id"), "window": meta.get("window"),
+    })
+    # `handoff_mark` returns "" for a destination that no longer resolves (the
+    # ticket was deleted or renamed mid-handoff). That differs from the armed
+    # mark, so a plain `!=` would report "it wrote its forward-state" about a
+    # write that cannot have happened — a false success is worse here than the
+    # timeout, because it is what a later reader trusts.
+    mark = autocompact.handoff_mark(target)
+    wrote_state = bool(mark) and mark != meta.get("idle_recycle_mark")
     ready = autocompact.composer_ready(autocompact._capture_pane(pane),
                                        sid=sid, now=now)
-    if not ready and not timed_out:
-        return False  # still compacting — retry next tick
 
-    if not ready and timed_out:
-        log.warning("idle_timeout: /compact wait timed out for %s — terminating "
-                    "anyway (never wedge)", sid)
+    if not timed_out and not (wrote_state and ready):
+        return False  # still writing — retry next tick
+
+    if timed_out and not wrote_state:
+        log.warning("idle_timeout: %s never wrote its forward-state within the "
+                    "handoff window — terminating anyway (never wedge)", sid)
 
     return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
-                                   compacted=True,
+                                   wrote_state=wrote_state,
                                    self_terminate=(role == "operator"))
 
 
 def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
-                            *, compacted: bool, self_terminate: bool = False) -> bool:
+                            *, wrote_state: bool, self_terminate: bool = False) -> bool:
     """T-0566: terminate the session (``sessions.suspend`` — same graceful
     C-c/exit/kill-pane sequence autocompact uses) and stamp the resume state on
     its md: ``resumable: true``, ``recycled_at``, ``resume_hint``.
     ``claude_uuid`` is already carried by ``sessions.suspend``. NEVER
     respawns — a future resume is a separate, deliberate act (``sessions.resume``
     already prefers ``claude --resume <uuid>`` over a fresh spawn).
+
+    T-0863 ``wrote_state``: True when the session actually wrote its
+    forward-state before this terminate (ticket ``## Context`` for a task-bound
+    session, role artifact for a task-less one). It replaces the old
+    ``compacted`` flag, which said whether a native ``/compact`` had been sent
+    — a fact about token spend that told a later reader nothing about whether
+    anything survives. Carried into the resume hint and the lifecycle event so
+    "recycled" and "recycled having recorded its state" stay distinguishable in
+    the record; T-0858 was opened because 20 consecutive recycles read as
+    successes while writing nothing.
 
     T-0655 ``self_terminate``: True only for an operator that reached here
     with ``drive: off`` already stamped (the only way an operator role gets
@@ -522,19 +620,21 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
     fresh = sessions._read_session_metadata(md_path) or meta
     fresh["recycled_at"] = _now_iso()
     if not self_terminate:
+        where = (f"{task_id}'s ## Context" if task_id and task_id != "~"
+                 else "its role artifact")
         fresh["resumable"] = True
         fresh["resume_hint"] = (
             f"idle cache-window recycle "
-            f"({'compacted' if compacted else 'no-compact, below threshold'}) — "
-            f"resume via sessions.resume to continue {task_id or role or sid}.")
+            f"({'forward-state written to ' + where if wrote_state else 'no forward-state written'})"
+            f" — resume via sessions.resume to continue {task_id or role or sid}.")
     sessions._write_session_metadata(md_path, fresh, atomic=True)
 
     # T-0470: a cache-window recycle finalized → record it on the unified surface.
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_RECYCLED,
-                          now=now, cause="idle_timeout", compacted=compacted,
+                          now=now, cause="idle_timeout", wrote_state=wrote_state,
                           self_terminate=self_terminate)
-    log.info("idle_timeout: recycled %s (compacted=%s, self_terminate=%s) — %s",
-             sid, compacted, self_terminate,
+    log.info("idle_timeout: recycled %s (wrote_state=%s, self_terminate=%s) — %s",
+             sid, wrote_state, self_terminate,
              "no resume state (deliberate stop)" if self_terminate
              else "recorded resumable state")
     return True

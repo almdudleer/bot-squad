@@ -24,7 +24,8 @@ Verbs:
   bsq team resurrect <sid>          bring a session back (unarchive + resume)
   bsq team rename <sid> <name>      rename a session (tmux + UI + registry sync)
   bsq compact [--sid SID]           send /compact to a session (self by default)
-  bsq compact-save "<state>"        write your forward-state to your role artifact (compact handoff)
+  bsq compact-save "<state>"        task-LESS handoff: forward-state -> your role artifact
+                                    (task-bound? use `bsq ticket context <id>` instead — T-0863)
   bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
   bsq msg-route list/set/clear      where each automated message TYPE is delivered (T-0799)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
@@ -2419,12 +2420,17 @@ def cmd_compact(args) -> None:
 
 
 def cmd_compact_save(args) -> None:
-    """T-0467: write this session's full forward-state into its role artifact.
+    """T-0467: write a TASK-LESS session's forward-state into its role artifact.
 
     The "write everything down" half of the universal compact — call this when
-    the system asks you to hand off before being relaunched fresh. Role-agnostic:
-    the worker resolves your role artifact (dev = task sidecar, operator =
-    state-doc) from your session md, so you don't pass an assignment id."""
+    the system asks you to hand off before being relaunched fresh. The worker
+    resolves your role artifact (operator = state-doc, other task-less roles =
+    a per-assignment file) from your session md, so you don't pass an id.
+
+    T-0863: if you are bound to a TASK this is the wrong verb and the worker
+    says so — your forward-state belongs in that ticket's `## Context`
+    (`bsq ticket context <id> --file <f>`), which is one artifact per task and
+    is what the board already renders."""
     slug = resolve_slug()
     sid = require_sid(getattr(args, "sid", None))
     res = post("compact_write_state", {"slug": slug, "sid": sid,
@@ -6242,10 +6248,12 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--sid", help="target SID (default: this session)")
     cp.set_defaults(func=cmd_compact)
 
-    # compact-save (T-0467) — write this session's forward-state to its role artifact
+    # compact-save (T-0467) — a TASK-LESS session's forward-state -> its role
+    # artifact. A task-bound session hands off through its ticket `## Context`
+    # instead (T-0863); the worker refuses this verb for one and says so.
     cs = sub.add_parser(
         "compact-save",
-        help="write your full forward-state to your role artifact (compact handoff)")
+        help="task-less handoff: write your full forward-state to your role artifact")
     cs.add_argument("content", help="your complete forward-state markdown")
     cs.add_argument("--sid", help="session SID (default: derived from tmux)")
     cs.set_defaults(func=cmd_compact_save)

@@ -83,7 +83,8 @@ def test_registry_lists_only_allowed_actions():
         "task_progress_add",
         # T-0767: the working area + stakeholder-quote writers, so a session
         # has somewhere to put durable detail other than the progress feed.
-        "task_context_set", "task_stakeholder_note_add",
+        # T-0863 added the third: the one-paragraph status HE reads.
+        "task_context_set", "task_summary_set", "task_stakeholder_note_add",
         # T-0589: on-demand short backlog digest for the TG conversation.
         "task_digest",
         # T-0463: assignment-interface write-result primitive (F1.1-d).

@@ -3261,6 +3261,48 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
             "bytes_written": len(new_body), "path": str(path)}
 
 
+_TASK_SUMMARY_SET_REQUIRED = {"slug", "task_id", "text"}
+_TASK_SUMMARY_SET_ALLOWED = _TASK_SUMMARY_SET_REQUIRED | {"sid"}
+
+
+def _action_task_summary_set(params: dict[str, Any]) -> dict[str, Any]:
+    """REPLACE a task's `## Executive summary` — the one-paragraph status (T-0863).
+
+    Required params: slug, task_id, text (optional: sid, for the audit line)
+    Returns: {ok, task_id, bytes_written}
+
+    The third section, and the only one written for the STAKEHOLDER to read
+    rather than for the next session to work from: «жестко один параграф,
+    который в задаче буду читать я, и там именно не в чем суть задачи, а какой
+    прогресс по ней уже сделан, и что осталось» (stakeholder, 2026-08-11).
+
+    `set_summary` raises ValueError on anything that is not one paragraph, and
+    `_rewrite_task_body` turns that into an ActionError — so a caller gets a
+    loud refusal naming the rule, never a quietly reshaped summary. Parallel to
+    `task_context_set` in every other respect, including that an empty `text`
+    CLEARS the section rather than erroring.
+    """
+    extra = set(params) - _TASK_SUMMARY_SET_ALLOWED
+    if extra:
+        raise ActionError(f"task_summary_set got unexpected params: {sorted(extra)}")
+    missing = _TASK_SUMMARY_SET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"task_summary_set missing required params: {sorted(missing)}")
+    text = params["text"]
+    if not isinstance(text, str):
+        raise ActionError("task_summary_set: text must be a string")
+
+    from datetime import datetime, timezone
+    from bot_squad_worker.task_body import set_summary
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path, new_body = _rewrite_task_body(
+        "task_summary_set", params["slug"], params["task_id"], ts,
+        lambda body: set_summary(body, text))
+    return {"ok": True, "task_id": params["task_id"],
+            "bytes_written": len(new_body), "path": str(path)}
+
+
 _TASK_STAKEHOLDER_NOTE_REQUIRED = {"slug", "task_id", "text"}
 _TASK_STAKEHOLDER_NOTE_ALLOWED = _TASK_STAKEHOLDER_NOTE_REQUIRED | {"source", "sid"}
 
@@ -5436,7 +5478,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "sync_status": _action_sync_status,
     "task_progress_add": _action_task_progress_add,
     # T-0767: the two authored artifacts' writers (working area + his quotes).
+    # T-0863 added the third: the one-paragraph status the stakeholder reads.
     "task_context_set": _action_task_context_set,
+    "task_summary_set": _action_task_summary_set,
     "task_stakeholder_note_add": _action_task_stakeholder_note_add,
     # T-0589: on-demand short backlog digest for the TG conversation surface.
     "task_digest": _action_task_digest,
@@ -5618,6 +5662,7 @@ ACTION_MODES: dict[str, str] = {
     # contend on the very same task md. Sessions reach them via
     # `bsq ticket context` / `bsq ticket quote`.
     "task_context_set": "coordinator_only",
+    "task_summary_set": "coordinator_only",
     "task_stakeholder_note_add": "coordinator_only",
     # T-0589: read-only scan of the shared install data dir (backlog/) — a
     # single coordinator read, like telemetry_get. Sessions reach it via

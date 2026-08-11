@@ -82,6 +82,10 @@ export type Task = {
   body: string;
   // Phase 7: parsed body sections — verbatim is the stakeholder's exact words.
   verbatim?: string;
+  // T-0863: `## Executive summary` — ONE paragraph saying where the work
+  // stands (progress made + what remains). Written for the stakeholder to read
+  // on the board, not for the next session; the detail lives in `context`.
+  summary?: string;
   context?: string;
   progress?: string;
   // T-0733: true when the ticket has no `## Verbatim request` heading, so

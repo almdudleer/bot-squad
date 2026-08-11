@@ -1,4 +1,9 @@
-"""Parse + compose the three-section task body schema (worker copy).
+"""Parse + compose the task body schema (worker copy).
+
+Four canonical sections: `## Stakeholder notes` (his words), `## Executive
+summary` (one-paragraph status, T-0863), `## Context` (the working area) and
+`## Progress` (the append-only machine feed). The api copy's docstring carries
+the full rationale for each.
 
 Mirror of `api/app/task_body.py`. Duplicated by design to keep worker
 and api independent — see Phase 7 spec. The two files are pinned
@@ -28,11 +33,22 @@ _ANY_H2_RE = re.compile(r"(?im)^##\s+\S")
 # SECTION — the stakeholder artifact — and both map to the `verbatim` key. The
 # alias is what makes the rename free: no live ticket has to be rewritten, and
 # a ticket carrying the old heading keeps every protection it had.
+#
+# T-0863 adds `executive summary` — the STATUS artifact, the one section
+# written for the stakeholder to read rather than for a session to work from
+# («мб какой-то можно сделать правда третий executive summary/status, где
+# жестко один параграф, который в задаче буду читать я», then «## Executive
+# summary делайте», 2026-08-11). It is canonical for the same reason the other
+# three are: an unrecognised `## ` heading is a section BOUNDARY, so leaving it
+# out would make it silently truncate whatever section preceded it.
 _CANONICAL_HEADING_RE = re.compile(
-    r"(?i)^##\s+(stakeholder notes|verbatim request|context|progress)\b")
+    r"(?i)^##\s+(stakeholder notes|verbatim request|executive summary|context|progress)\b")
 
 #: Heading emitted for the stakeholder artifact on anything written from now on.
 STAKEHOLDER_HEADING = "## Stakeholder notes"
+
+#: Heading for the status artifact (T-0863). His spelling, verbatim.
+SUMMARY_HEADING = "## Executive summary"
 
 #: A level-2 heading inside text destined for INSIDE a section. Demoted to `###`
 #: by `set_context`, because `_ANY_H2_RE` would otherwise treat it as the end of
@@ -73,7 +89,8 @@ def _heading_line(text: str, m: re.Match[str]) -> str:
 
 
 def _section_key(heading_line: str) -> str | None:
-    """`verbatim` / `context` / `progress` for a canonical heading, else None.
+    """`verbatim` / `summary` / `context` / `progress` for a canonical heading,
+    else None.
 
     `## Stakeholder notes` and `## Verbatim request` both answer `verbatim`
     (T-0767) — one artifact, two spellings, so every consumer of the parse and
@@ -84,11 +101,20 @@ def _section_key(heading_line: str) -> str | None:
     if m is None:
         return None
     key = m.group(1).lower()
-    return "verbatim" if key in ("verbatim request", "stakeholder notes") else key
+    if key in ("verbatim request", "stakeholder notes"):
+        return "verbatim"
+    return "summary" if key == "executive summary" else key
+
+
+#: The canonical sections, in the order :func:`compose_body` emits them. ALSO
+#: the keys :func:`parse_body` always returns — declared once so a section
+#: added to the heading regex and forgotten here cannot silently vanish from
+#: every reader (T-0863).
+SECTION_KEYS: tuple[str, ...] = ("verbatim", "summary", "context", "progress")
 
 
 def parse_body(text: str) -> dict[str, str]:
-    """Split a task body into {verbatim, context, progress}.
+    """Split a task body into {verbatim, summary, context, progress}.
 
     Each section runs from its heading to the next level-2 heading of ANY name
     (or EOF), so agent-authored sections are excluded rather than absorbed.
@@ -99,12 +125,13 @@ def parse_body(text: str) -> dict[str, str]:
     planning tickets whose ask genuinely IS the whole body).
     """
     text = text or ""
+    empty = {k: "" for k in SECTION_KEYS}
     heads = list(_ANY_H2_RE.finditer(text))
     if not heads:
-        return {"verbatim": text.strip(), "context": "", "progress": ""}
+        return {**empty, "verbatim": text.strip()}
 
     keys = [_section_key(_heading_line(text, m)) for m in heads]
-    out: dict[str, str] = {"verbatim": "", "context": "", "progress": ""}
+    out: dict[str, str] = dict(empty)
 
     if "verbatim" not in keys:
         # Legacy body: verbatim is whatever precedes the first CANONICAL
@@ -243,20 +270,29 @@ def regraft_progress(original_body: str, new_body: str) -> str:
     return new_body[:new[0]] + orig_block + "\n\n" + new_body[new[1]:].lstrip("\n")
 
 
-def compose_body(verbatim: str, context: str, progress: str) -> str:
+def compose_body(verbatim: str, context: str, progress: str,
+                 *, summary: str = "") -> str:
     """Emit canonical body. Empty sections are skipped entirely.
 
     New bodies get `## Stakeholder notes` (T-0767). Nothing re-reads the
     spelling to decide anything — `_section_key` maps both to `verbatim` — so
     this changes what fresh tickets LOOK like without splitting the corpus into
     two behaviours.
+
+    `summary` is KEYWORD-ONLY (T-0863) even though it is emitted SECOND, and
+    that mismatch is deliberate: a fourth positional would silently re-bind
+    every existing three-argument call to the wrong sections. Reading order is
+    the ask, then where it stands, then the working area, then the feed.
     """
     parts: list[str] = []
     v = (verbatim or "").strip()
+    s = (summary or "").strip()
     c = (context or "").strip()
     p = (progress or "").strip()
     if v:
         parts.append(f"{STAKEHOLDER_HEADING}\n\n{v}\n")
+    if s:
+        parts.append(f"{SUMMARY_HEADING}\n\n{s}\n")
     if c:
         parts.append(f"## Context\n\n{c}\n")
     if p:
@@ -355,6 +391,110 @@ def set_context(body: str, text: str) -> str:
     rest = body[span[1]:].lstrip("\n")
     block = f"## Context\n\n{new}\n" if new else ""
     return body[:span[0]] + block + ("\n" + rest if rest else "")
+
+
+#: How long "жестко один параграф" is allowed to be (T-0863). Not a number he
+#: gave — he gave the SHAPE ("hard, one paragraph") and the PURPOSE (the thing
+#: he reads on the ticket to see where it stands). A paragraph with no length
+#: bound is an essay, which is the working area he already has; ~180 words is a
+#: dense paragraph and still glanceable. Over-cap REFUSES, never truncates, and
+#: names `bsq ticket context` — the section that exists for the long version.
+_SUMMARY_MAX_CHARS = 1200
+
+#: Line starts that END a markdown paragraph: a heading, any bullet or ordered
+#: list marker, a blockquote, a fence, a table row, a thematic break. A summary
+#: containing one is not one paragraph however it is punctuated.
+_SUMMARY_BLOCK_RE = re.compile(
+    r"(?m)^\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s|>|```|~~~|\||-{3,}\s*$|\*{3,}\s*$)")
+
+#: Two newlines with only whitespace between = a paragraph break.
+_SUMMARY_BREAK_RE = re.compile(r"\n[ \t]*\n")
+
+
+def _sanitize_summary_text(text: str) -> str:
+    """Return ``text`` as ONE paragraph, or raise naming what broke the rule.
+
+    Every violation REFUSES rather than repairing, and that is the whole design
+    (F-2026-07-05-bsq-30844bca41, T-0835): the two repairs available here —
+    joining paragraphs with a space, or keeping only the first — both produce a
+    well-formed result that no longer says what the author wrote, and neither
+    tells anyone. A refusal costs one retry; a silent repair costs the meaning
+    of the one section the stakeholder reads.
+
+    Single newlines are kept as-is: markdown renders them inside one paragraph,
+    so a wrapped sentence is not a violation and rewrapping it would be exactly
+    the pointless mangling above.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if _SUMMARY_BREAK_RE.search(s):
+        raise ValueError(
+            "executive summary must be ONE paragraph and this has a blank line "
+            "in it — refusing to join or clip it (silent loss). It is the "
+            "one-glance status: what progress has been made and what remains. "
+            "Everything that needs structure belongs in `## Context` "
+            "(`bsq ticket context <id> --file <f>`)."
+        )
+    m = _SUMMARY_BLOCK_RE.search(s)
+    if m is not None:
+        raise ValueError(
+            f"executive summary must be ONE paragraph and this line starts a "
+            f"markdown block ({m.group(1).strip()!r}) — headings, lists, quotes "
+            f"and tables end a paragraph. Write it as prose; the structured "
+            f"version belongs in `## Context`."
+        )
+    if len(s) > _SUMMARY_MAX_CHARS:
+        raise ValueError(
+            f"executive summary is {len(s)} chars, over the "
+            f"{_SUMMARY_MAX_CHARS}-char cap — refusing to truncate (silent "
+            f"loss, F-2026-07-05-bsq-30844bca41). It is a one-paragraph status "
+            f"for the stakeholder, not the working area — put the detail in "
+            f"`## Context` (`bsq ticket context <id> --file <f>`)."
+        )
+    return s
+
+
+def set_summary(body: str, text: str) -> str:
+    """Replace the `## Executive summary` section wholesale (T-0863).
+
+    The STATUS artifact — the third section, and the only one written FOR the
+    stakeholder rather than for the next session. His spec, verbatim: *«жестко
+    один параграф, который в задаче буду читать я, и там именно не в чем суть
+    задачи, а какой прогресс по ней уже сделан, и что осталось, суть задачи в
+    verbatim я увижу сам и загляну в контекст если нужно»*.
+
+    So it answers ONE question — where does this stand — and deliberately does
+    NOT restate the ask. That is not a style note: a summary that re-describes
+    the task duplicates `## Stakeholder notes`, which is the overlap T-0767 was
+    opened to remove, arriving by a new route.
+
+    Replace-on-write, like :func:`set_context`, for the same reason: a status
+    is what is true now. Unlike Context there is NO heading demotion — a
+    one-paragraph section cannot contain a heading at all, so
+    :func:`_sanitize_summary_text` refuses instead of quietly reshaping.
+
+    Placement is fixed at SECOND — after the stakeholder's words, before the
+    working area — so the ticket reads ask → status → detail → feed. An empty
+    `text` clears the section.
+    """
+    new = _sanitize_summary_text(text)
+    span = _section_span(body or "", "summary")
+    block = f"{SUMMARY_HEADING}\n\n{new}\n" if new else ""
+    if span is not None:
+        rest = body[span[1]:].lstrip("\n")
+        return body[:span[0]] + block + ("\n" + rest if rest else "")
+    if not block:
+        return body
+    # Insert before the first section it must precede. Falling through to an
+    # append would put the status BELOW a 7KB working area and a 3000-line
+    # feed, where the person it was written for will not see it.
+    for after in ("context", "progress"):
+        nxt = _section_span(body or "", after)
+        if nxt is not None:
+            return body[:nxt[0]] + block + "\n" + body[nxt[0]:]
+    head = (body or "").rstrip("\n")
+    return (head + "\n\n" if head else "") + block
 
 
 # T-0835: a progress note is stored as ONE physical line — `- <ts> · <sid> ·

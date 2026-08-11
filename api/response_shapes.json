@@ -145,6 +145,7 @@
     "PUT /api/me/project/{slug}/tg-chat-id": "200 object(loose)",
     "PUT /api/me/tg-chat-id": "200 object(loose)",
     "PUT /api/projects/{slug}/backlog/{task_id}/context": "200 object(loose)",
+    "PUT /api/projects/{slug}/backlog/{task_id}/summary": "200 object(loose)",
     "PUT /api/projects/{slug}/docs/{doc_id}": "200 object(loose)",
     "PUT /api/projects/{slug}/docs/{doc_id}/parent": "200 object(loose)",
     "PUT /api/projects/{slug}/feedback/{fid}/parent": "200 object(loose)",

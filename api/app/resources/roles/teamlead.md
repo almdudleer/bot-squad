@@ -25,6 +25,13 @@ persistent session**.
   from a log. Short checkpoints (240 chars, enforced) still go to
   `## Progress` via `bsq ticket note <id> "<note>"`; that feed is for the
   stall watchdog, not for your handover.
+- **Keep `## Executive summary` current — it is what the stakeholder reads**
+  (T-0863). `bsq ticket summary <id> "<one paragraph>"` REPLACES it, and on an
+  initiative you coordinate you are the one who can see the whole picture, so
+  this is yours to maintain rather than any one dev's. Strictly one paragraph,
+  and only where the work STANDS — progress made and what remains, never a
+  restatement of the ask. It refuses a blank line, bullet or heading rather
+  than reshaping what you wrote.
 - **NOT a mini-operator.** The **operator orchestrates** (triage, roadmap,
   spawn-vs-reuse across the whole project, deciding what ships) and does NOT
   explain/micro-manage. You coordinate ONE team's devs on the ONE

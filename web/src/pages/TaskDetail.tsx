@@ -413,6 +413,51 @@ export function TaskDetail() {
         {/* The ask — verbatim, read-only (T-0674: edit moved to the TG dialog).
             T-0733: legacy-shape tickets get a different label + rendering. */}
         <TaskBodyBlock task={task} slug={slug} />
+
+        {/* T-0863: where the work STANDS, in one paragraph. It lives in the
+            user-facing zone rather than beside Context on purpose — this is
+            the section written FOR him («который в задаче буду читать я»),
+            while Context is the successor session's working area. Rendered
+            directly under the ask, the same order the md carries.
+
+            Absent is shown, not hidden: a ticket with no summary means nobody
+            has said where it stands, and silently rendering nothing makes that
+            indistinguishable from a ticket that has not started. */}
+        <div style={{ marginTop: "0.75rem" }}>
+          <div
+            className="mc-zone-tag"
+            style={{ marginBottom: "0.4rem" }}
+            title="One paragraph: what progress has been made and what remains. Written by the session that last worked the ticket."
+          >
+            ▸ Where it stands
+          </div>
+          {task.summary?.trim() ? (
+            <p
+              style={{
+                margin: 0,
+                fontSize: "0.86rem",
+                lineHeight: 1.5,
+                borderLeft: "3px solid var(--mc-accent, #60a5fa)",
+                paddingLeft: "0.75rem",
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {task.summary}
+            </p>
+          ) : (
+            <p
+              style={{
+                margin: 0,
+                fontSize: "0.8rem",
+                color: "var(--mc-text-dim)",
+                fontStyle: "italic",
+                paddingLeft: "0.75rem",
+              }}
+            >
+              (no status recorded yet)
+            </p>
+          )}
+        </div>
       </div>
 
       {/* ==================================================================

@@ -13,7 +13,10 @@ from bot_squad_worker.task_body import (
     decode_progress_text,
     encode_progress_text,
     parse_body,
+    SECTION_KEYS,
+    SUMMARY_HEADING,
     set_context,
+    set_summary,
 )
 
 
@@ -278,3 +281,119 @@ def test_set_context_replaces_and_keeps_the_feed():
     out = set_context(body, "NEW")
     assert "OLD" not in out and "NEW" in out
     assert "- a" in parse_body(out)["progress"]
+
+
+# --- T-0863: `## Executive summary`, the one-paragraph status ---------------
+#
+# Every arm below states the PROPERTY it pins in words first, because the
+# defect class this section can carry is a well-formed result that no longer
+# says what its author wrote (F-2026-07-05-bsq-30844bca41 / T-0835). A test
+# asserting only "a summary came back" cannot see that.
+
+
+def _summary_body() -> str:
+    return ("## Stakeholder notes\n\nask\n\n## Context\n\nwork\n\n"
+            "## Progress\n\n- 2026-08-11T00:00:00Z · S-x-p1 · note\n")
+
+
+def test_summary_is_parsed_as_its_own_section_not_absorbed():
+    """The heading must be CANONICAL. An unrecognised `## ` heading is a
+    section boundary, so a non-canonical `## Executive summary` would end the
+    section above it and its own text would belong to nobody."""
+    out = set_summary(_summary_body(), "Half done.")
+    parsed = parse_body(out)
+    assert parsed["summary"] == "Half done."
+    assert parsed["verbatim"] == "ask"
+    assert parsed["context"] == "work"
+    assert "Half done." not in parsed["verbatim"]
+    assert "Half done." not in parsed["context"]
+
+
+def test_summary_sits_between_the_ask_and_the_working_area():
+    """Ordering is a product requirement, not cosmetics: he reads it on the
+    ticket, so it must not land under a long Context and a long feed."""
+    out = set_summary(_summary_body(), "Half done.")
+    assert (out.index("## Stakeholder notes")
+            < out.index("## Executive summary")
+            < out.index("## Context")
+            < out.index("## Progress"))
+
+
+def test_summary_is_inserted_before_progress_when_there_is_no_context():
+    out = set_summary("## Stakeholder notes\n\nask\n\n## Progress\n\n- a\n", "S.")
+    assert out.index("## Executive summary") < out.index("## Progress")
+    assert parse_body(out)["progress"] == "- a"
+
+
+def test_summary_replaces_rather_than_appends():
+    """A status says what is true NOW. Two paragraphs of history is the feed."""
+    once = set_summary(_summary_body(), "First.")
+    twice = set_summary(once, "Second.")
+    assert "First." not in twice
+    assert parse_body(twice)["summary"] == "Second."
+    assert twice.count("## Executive summary") == 1
+
+
+def test_summary_write_leaves_every_other_section_byte_identical():
+    body = _summary_body()
+    out = set_summary(body, "Half done.")
+    for key in ("verbatim", "context", "progress"):
+        assert parse_body(out)[key] == parse_body(body)[key]
+
+
+def test_empty_summary_clears_the_section():
+    out = set_summary(set_summary(_summary_body(), "Half done."), "")
+    assert "## Executive summary" not in out
+    assert parse_body(out)["context"] == "work"
+
+
+def test_two_paragraphs_are_REFUSED_not_joined():
+    """The two available repairs — join with a space, or keep the first — both
+    produce something well-formed that no longer says what was written, and
+    neither tells anyone. Refusing costs one retry."""
+    with pytest.raises(ValueError) as e:
+        set_summary(_summary_body(), "First para.\n\nSecond para.")
+    assert "ONE paragraph" in str(e.value)
+    assert "blank line" in str(e.value)
+
+
+def test_a_bullet_list_is_REFUSED():
+    with pytest.raises(ValueError) as e:
+        set_summary(_summary_body(), "Done so far:\n- a\n- b")
+    assert "ONE paragraph" in str(e.value)
+
+
+def test_a_heading_is_REFUSED():
+    with pytest.raises(ValueError):
+        set_summary(_summary_body(), "## Status\nall good")
+
+
+def test_over_cap_summary_is_REFUSED_and_names_the_remedy():
+    """Never truncated. The message must name the section that holds the long
+    version, or the caller's only option is to guess."""
+    with pytest.raises(ValueError) as e:
+        set_summary(_summary_body(), "x" * 1201)
+    msg = str(e.value)
+    assert "1201 chars" in msg and "refusing to truncate" in msg
+    assert "## Context" in msg
+
+
+def test_a_wrapped_sentence_is_one_paragraph_and_survives_verbatim():
+    """Single newlines render inside one paragraph, so rewrapping them would be
+    exactly the pointless mangling the refusals exist to avoid."""
+    text = "Shipped the writer and the CLI;\nthe board render is what remains."
+    assert parse_body(set_summary(_summary_body(), text))["summary"] == text
+
+
+def test_compose_body_emits_the_summary_second():
+    out = compose_body("v", "c", "- p", summary="s")
+    assert out.index(STAKEHOLDER_HEADING) < out.index(SUMMARY_HEADING)
+    assert out.index(SUMMARY_HEADING) < out.index("## Context")
+    assert compose_body("v", "", "") == "## Stakeholder notes\n\nv\n"
+
+
+def test_parse_body_always_returns_every_declared_section_key():
+    """A key added to the heading regex and forgotten in the parser's dict
+    would KeyError every reader — or, worse, be silently absent."""
+    for body in ("", "no headings at all", _summary_body()):
+        assert set(parse_body(body)) == set(SECTION_KEYS)

@@ -9,7 +9,7 @@ description: Use when you are running as a bot-squad TEAM-LEAD (TL) session — 
 
 > "The team lead role should be also transient... this team lead will be on operator's behalf coordinate the work of other dev sessions doing some tasks." — voice-03 (verbatim)
 
-You are a **transient** lead the operator launched for an initiative/multi-subtask scope, so the operator can stay focused on the project's general state. You split the scope into named subtasks, spawn devs, review, and coordinate the release. You ride the same universal lifecycle as every session (see `bot-squad-session-lifecycle-roles`): document progress + decisions into the **task updates** (`bsq ticket note`), not a private log — so the user and other sessions can see task state at a glance (voice-03).
+You are a **transient** lead the operator launched for an initiative/multi-subtask scope, so the operator can stay focused on the project's general state. You split the scope into named subtasks, spawn devs, review, and coordinate the release. You ride the same universal lifecycle as every session (see `bot-squad-session-lifecycle-roles`): document progress + decisions into the **task itself**, not a private log — so the user and other sessions can see task state at a glance (voice-03). Three writers, three readers: `bsq ticket summary <id> "<one paragraph>"` is the status the STAKEHOLDER reads (progress made + what remains, T-0863), `bsq ticket context <id> --file <f>` is the working area a successor boots from, and `bsq ticket note` is a 240-char checkpoint for the stall watchdog.
 
 ## Anchor + bindings
 

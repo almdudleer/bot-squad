@@ -70,10 +70,11 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   try. Everything a successor needs goes in `bsq ticket context <id> --file
   <f>`, which REPLACES the section, so keep it describing what is TRUE NOW:
   goal, what's done, what's in progress, exact next steps, key paths,
-  decisions, gotchas. His words go to `bsq ticket quote`, a new ask to
-  `task_new`. When the system asks you to finalize (context full, or your
-  ~1h cache window expiring) that write IS the handoff — do it before you
-  answer. Scratch (probe scripts, logs, test dumps) goes in your session
+  decisions, gotchas. Beside it, `bsq ticket summary <id> "<one paragraph>"`
+  keeps the one-line-of-sight status HE reads (T-0863). His words go to
+  `bsq ticket quote`, a new ask to `task_new`. When the system asks you to finalize (context full, or your
+  ~1h cache window expiring) those two writes ARE the handoff — do them
+  before you answer. Scratch (probe scripts, logs, test dumps) goes in your session
   scratchpad, never the code working tree, never the data dir.
 
 ## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
@@ -122,12 +123,17 @@ bus, which you drive through the CLI: `bsq peer send` / `bsq inbox check`
 (e.g. you're handing off, or waiting on an answer). Otherwise it's fine
 to read on demand.
 
-## A ticket has TWO authored areas, and they do not overlap (T-0767)
+## A ticket has THREE authored areas, and they do not overlap (T-0767/T-0863)
 
 The stakeholder asked for exactly this split, because a single chronological
 feed was burying his own guidance in session narration — measured at **57.4% of
 all backlog bytes**, which he reads as «тонны мусорного текста» and pays for in
 every spawn.
+
+Each answers a DIFFERENT question, which is the test for where something goes:
+what was asked (his words), where it stands (one paragraph, for him), and what
+a successor needs to continue (the working area). If what you are writing
+answers a question one of the others already answers, you are duplicating.
 
 **1. `## Stakeholder notes` — his words. Never yours.**
 
@@ -142,7 +148,20 @@ every spawn.
   filing his guidance in the session feed is precisely how it used to get
   diluted and trimmed.
 
-**2. `## Context` — the working area, shared by every session on this task.**
+**2. `## Executive summary` — one paragraph, and HE is the reader.**
+
+- `bsq ticket summary <task_id> "<one paragraph>"` **REPLACES** it.
+- Only two things go in it: **what progress has been made, and what remains.**
+  Do **not** restate what the ticket is about — «суть задачи в verbatim я увижу
+  сам и загляну в контекст если нужно». A summary that re-describes the task is
+  a duplicate of the section above it and tells him nothing.
+- Strictly one paragraph. It **refuses** a blank line, a bullet, or a heading
+  rather than reshaping what you wrote — if it needs structure, it belongs in
+  Context.
+- Write it at every real checkpoint, and always at finalize. It is the only
+  place on the ticket that answers "where does this stand" at a glance.
+
+**3. `## Context` — the working area, shared by every session on this task.**
 
 - `bsq ticket context <task_id> --file <f>` (or pipe on stdin) **REPLACES** it.
 - Keep it describing **what is true now**: current state, decisions that stand,

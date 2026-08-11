@@ -267,6 +267,16 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool) -> str:
     is a write against the same md that holds his words, and the one failure
     mode worth a sentence of prompt is a degraded, context-full session
     rewriting them (T-0729 shipped exactly that, on 414 tickets).
+
+    T-0863 also asks for ``## Executive summary``. Finalize is the RIGHT moment
+    for it and close to the only reliable one: it is the one point in a
+    session's life where it is required to state where the work stands, so
+    hanging the status write here costs no new discipline. THE WAIT STILL
+    WATCHES ONLY THE CONTEXT DIGEST, deliberately — a summary is one cheap
+    paragraph, so gating on either-one-changed would let a session satisfy
+    FINALIZE with the status line and lose the forward state, which is the
+    whole failure this path exists to prevent. A session that writes only the
+    summary runs out the bounded wait and is recorded ``wrote_state=False``.
     """
     after = (
         "The system then clears this pane and relaunches you FRESH on the same "
@@ -291,7 +301,15 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool) -> str:
         "One ticket, one artifact: do NOT write a handoff file, and do NOT file "
         "a progress note about this — the Context IS the handoff. Do NOT touch "
         "`## Stakeholder notes`; those are his words and are human-only.\n\n"
-        f"After it returns ok, reply: CONTEXT WRITTEN. {after}"
+        "Then run:\n"
+        f"  bsq ticket summary {task_id} \"<one paragraph>\"\n\n"
+        "That REPLACES `## Executive summary` — the STAKEHOLDER reads this one, "
+        "not your successor. Strictly ONE paragraph, and only where the work "
+        "STANDS: what progress has been made and what remains. Do NOT restate "
+        "what the ticket is about — he sees that in `## Stakeholder notes` and "
+        "opens the Context himself if he wants the detail. It refuses anything "
+        "with a blank line, a bullet or a heading in it.\n\n"
+        f"After both return ok, reply: CONTEXT WRITTEN. {after}"
     )
 
 

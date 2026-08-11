@@ -99,6 +99,7 @@ def _enrich_with_sections(task: dict) -> dict:
     body = task.get("body", "") or ""
     sections = parse_body(body)
     task["verbatim"] = sections["verbatim"]
+    task["summary"] = sections["summary"]  # T-0863: one-paragraph status
     task["context"] = sections["context"]
     task["progress"] = sections["progress"]
     task["verbatim_is_legacy"] = is_legacy_body(body)
@@ -610,6 +611,48 @@ async def set_task_context(
     client = request.app.state.worker_router.coordinator()
     try:
         result = await client.call_action("task_context_set", {
+            "slug": slug,
+            "task_id": task_id,
+            "text": text,
+        })
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result
+
+
+@router.put("/{task_id}/summary")
+async def set_task_summary(
+    slug: str,
+    task_id: str,
+    request: Request,
+    payload: dict,
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
+) -> dict:
+    """REPLACE `## Executive summary` — the one-paragraph status (T-0863).
+
+    Same PUT-is-the-contract reasoning as `set_task_context`: a status is what
+    is true now, so the write replaces and is idempotent, and an empty `text`
+    clears the section but must be sent explicitly.
+
+    A body that is not one paragraph comes back as a **502 naming the rule**,
+    not a 400, because the refusal is the worker's `set_summary` speaking
+    through `WorkerError` — the same message a CLI caller gets. Re-deriving the
+    paragraph rule here to answer 400 would be a second copy of it, free to
+    drift from the one that actually gates the write.
+    """
+    _validate_task_id(task_id)
+    if "text" not in payload:
+        raise HTTPException(status_code=400, detail="text is required (send \"\" to clear)")
+    text = payload["text"]
+    if not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="text must be a string")
+
+    backlog_dir = _backlog_dir(request, slug)
+    _find_task_file(backlog_dir, task_id)
+
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action("task_summary_set", {
             "slug": slug,
             "task_id": task_id,
             "text": text,

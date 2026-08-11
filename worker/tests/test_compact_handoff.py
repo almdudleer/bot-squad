@@ -490,6 +490,28 @@ def test_context_handoff_prompt_names_the_one_verb_and_forbids_the_old_ones():
     assert "## Stakeholder notes" in p
 
 
+def test_context_handoff_prompt_asks_for_the_executive_summary_too(): 
+    """T-0863: finalize is where the status paragraph gets written, so the
+    prompt has to ask for it — and has to say what it is FOR.
+
+    The distinguishing sentence is the reader: a prompt that asked for "a
+    summary" without saying he reads it produces a second, shorter Context,
+    which is the duplication the section was designed not to be.
+    """
+    p = A.context_handoff_prompt("T-0042", relaunch=True)
+    assert "bsq ticket summary T-0042" in p
+    assert "`## Executive summary`" in p
+    assert "STAKEHOLDER reads this one" in p
+    assert "ONE paragraph" in p
+    # what it must NOT contain: he was explicit that restating the ask is the
+    # one thing this section is not for
+    assert "Do NOT restate" in p
+    # both writes are named, and the completion signal waits for BOTH — a
+    # session that reports done after one of them defeats the point of asking
+    assert "bsq ticket context T-0042" in p
+    assert "After both return ok" in p
+
+
 def test_context_handoff_prompt_tells_the_truth_about_what_happens_next():
     """The ceiling path relaunches, the idle path stops. A session told it will
     be relaunched when it is about to be ended writes for a successor that

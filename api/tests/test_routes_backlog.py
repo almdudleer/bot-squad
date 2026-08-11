@@ -1042,3 +1042,124 @@ def test_backlog_list_derives_done_when_all_children_done(tmp_bot_squad: Path, m
         r = client.get("/api/projects/test-project/backlog")
     by_id = {t["id"]: t for t in r.json()}
     assert by_id["T-0001"]["derived_status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# T-0863 — `## Executive summary`: the read field and the PUT writer.
+#
+# T-0767 shipped `PUT /{id}/context` with no route test at all; these cover the
+# new twin AND, through the shared `_enrich_with_sections`, the read half that
+# was equally uncovered.
+# ---------------------------------------------------------------------------
+
+class _FakeCoordinator:
+    """Stands in for the worker socket: records the action + params, and lets a
+    test make the worker REFUSE, which is the interesting half here."""
+
+    def __init__(self, error: str | None = None):
+        self.calls: list[tuple[str, dict]] = []
+        self.error = error
+
+    async def call_action(self, action: str, params: dict) -> dict:
+        self.calls.append((action, params))
+        if self.error is not None:
+            from app.worker_client import WorkerError
+            raise WorkerError(self.error)
+        return {"ok": True, "task_id": params["task_id"], "bytes_written": 42}
+
+
+def _with_fake_worker(client, error: str | None = None) -> _FakeCoordinator:
+    fake = _FakeCoordinator(error)
+    client.app.state.worker_router.coordinator = lambda *a, **k: fake
+    return fake
+
+
+def _summary_ticket(tmp_bot_squad: Path) -> None:
+    (tmp_bot_squad / "data" / "test-project" / "backlog" / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
+        "## Stakeholder notes\n\nDo the thing.\n\n"
+        "## Executive summary\n\nWriter shipped; the board render remains.\n\n"
+        "## Context\n\nlong working area\n"
+    )
+
+
+def test_backlog_read_exposes_the_summary_as_its_own_field(
+        tmp_bot_squad: Path, monkeypatch):
+    """It must not arrive folded into `context` or `verbatim` — the board
+    renders it in a different place, for a different reader."""
+    _summary_ticket(tmp_bot_squad)
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog")
+    assert r.status_code == 200
+    task = {t["id"]: t for t in r.json()}["T-0001"]
+    assert task["summary"] == "Writer shipped; the board render remains."
+    assert task["context"] == "long working area"
+    assert task["verbatim"] == "Do the thing."
+    assert "Writer shipped" not in task["context"]
+
+
+def test_backlog_read_returns_an_empty_summary_rather_than_omitting_it(
+        tmp_bot_squad: Path, monkeypatch):
+    """Absent must be an empty string, not a missing key: the board draws "(no
+    status recorded yet)" from it, and a missing key would render as though the
+    field did not exist rather than as an unanswered question."""
+    (tmp_bot_squad / "data" / "test-project" / "backlog" / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n## Stakeholder notes\n\nx\n")
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get("/api/projects/test-project/backlog")
+    assert r.json()[0]["summary"] == ""
+
+
+def test_put_summary_proxies_to_the_worker_action(tmp_bot_squad: Path, monkeypatch):
+    _summary_ticket(tmp_bot_squad)
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        fake = _with_fake_worker(client)
+        r = client.put("/api/projects/test-project/backlog/T-0001/summary",
+                       json={"text": "Half done."})
+    assert r.status_code == 200
+    assert fake.calls == [("task_summary_set", {
+        "slug": "test-project", "task_id": "T-0001", "text": "Half done."})]
+
+
+def test_put_summary_requires_the_text_field_explicitly(
+        tmp_bot_squad: Path, monkeypatch):
+    """A missing field must be a 400, never a silent clear — the write is
+    idempotent and replacing, so an accidental empty body would wipe it."""
+    _summary_ticket(tmp_bot_squad)
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        fake = _with_fake_worker(client)
+        r = client.put("/api/projects/test-project/backlog/T-0001/summary", json={})
+    assert r.status_code == 400
+    assert fake.calls == []  # and it never reached the worker
+
+
+def test_put_summary_surfaces_the_one_paragraph_refusal(
+        tmp_bot_squad: Path, monkeypatch):
+    """The refusal must reach the CALLER with its reason intact. A 502 whose
+    body dropped the message would leave a board user with a failed write and
+    no way to know a blank line caused it."""
+    _summary_ticket(tmp_bot_squad)
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        _with_fake_worker(client, error="task_summary_set: executive summary "
+                                        "must be ONE paragraph")
+        r = client.put("/api/projects/test-project/backlog/T-0001/summary",
+                       json={"text": "a\n\nb"})
+    assert r.status_code == 502
+    assert "ONE paragraph" in r.json()["detail"]
+
+
+def test_put_summary_404s_on_an_unknown_ticket(tmp_bot_squad: Path, monkeypatch):
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        fake = _with_fake_worker(client)
+        r = client.put("/api/projects/test-project/backlog/T-9999/summary",
+                       json={"text": "x"})
+    assert r.status_code == 404
+    assert fake.calls == []
+
+
+def test_put_summary_requires_auth(tmp_bot_squad: Path, monkeypatch):
+    _summary_ticket(tmp_bot_squad)
+    with _anon_client(tmp_bot_squad, monkeypatch) as client:
+        r = client.put("/api/projects/test-project/backlog/T-0001/summary",
+                       json={"text": "x"})
+    assert r.status_code in (401, 403)

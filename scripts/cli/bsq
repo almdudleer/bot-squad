@@ -1545,7 +1545,9 @@ Why you (overlap with your prior work): {overlap}
   paths/rules is stale, re-read AGENT_INSTRUCTIONS.md ({ai_path}).
 - Track ALL work on the ticket. Durable state goes in the WORKING AREA —
   `bsq ticket context <id> --file <f>` REPLACES `## Context` with what is true
-  now (T-0767). `bsq ticket note` is a 240-char checkpoint for the watchdog,
+  now (T-0767). Keep the one-paragraph status HE reads current too:
+  `bsq ticket summary <id> "<progress made + what remains>"` (T-0863).
+  `bsq ticket note` is a 240-char checkpoint for the watchdog,
   not where findings live. Never plan into superpowers/* docs (T-0152).
 - ANCHOR ON THE ASK (T-0483): read the new ticket's `## Stakeholder notes`
   FIRST (`## Verbatim request` on older tickets) — his exact words (relayed
@@ -2031,12 +2033,17 @@ If he answers something new, record HIS WORDS with `bsq ticket quote {primary}
 '<verbatim>'` — never as a progress note, which is how his guidance used to get
 buried in session narration.
 
-A TICKET HAS TWO AUTHORED AREAS, AND THEY DO NOT OVERLAP (T-0767):
+A TICKET HAS THREE AUTHORED AREAS, AND THEY DO NOT OVERLAP (T-0767/T-0863).
+Each answers a different question — that is the test for where something goes:
   • `## Stakeholder notes` — his words. Human-only. You append quotes, never prose.
+  • `## Executive summary` — WHERE IT STANDS, and HE is the reader.
+    `bsq ticket summary {primary} "<one paragraph>"` REPLACES it. Progress made
+    + what remains, ONLY — never a restatement of the ask; he reads that above.
+    Refuses a blank line, bullet or heading rather than reshaping what you wrote.
   • `## Context` — the WORKING AREA, shared by every session on this ticket.
     Keep it describing what is TRUE NOW: `bsq ticket context {primary} --file <f>`
     REPLACES it. Edit the final state; do not narrate how it got there.
-`## Progress` is neither. It is a one-line-per-checkpoint machine feed the stall
+`## Progress` is none of those. It is a one-line-per-checkpoint machine feed the stall
 watchdog reads — notes are capped at 240 chars and the durable version of
 anything longer belongs in `## Context`, where the next session will actually
 read it.
@@ -5219,6 +5226,39 @@ def cmd_ticket_context(args) -> None:
     print(f"context set on {tid} ({res.get('bytes_written', 0)} bytes of body)")
 
 
+def cmd_ticket_summary(args) -> None:
+    """T-0863: REPLACE a ticket's `## Executive summary` — the status paragraph.
+
+    The section written for the STAKEHOLDER, not for your successor: «жестко
+    один параграф, который в задаче буду читать я, и там именно не в чем суть
+    задачи, а какой прогресс по ней уже сделан, и что осталось». So say where
+    the work STANDS — done, in flight, what remains — and do not restate the
+    ask; he reads that in `## Stakeholder notes` and opens `## Context` when he
+    wants the detail.
+
+    Text comes from argv here, unlike `bsq ticket context`, and the asymmetry
+    is the point: one paragraph is quotable on a command line, and needing a
+    file for it would push people back to a progress note. `--file` and stdin
+    still work for the awkward-quoting cases.
+    """
+    slug = resolve_slug()
+    tid = args.id.strip()
+    if args.clear:
+        text = ""
+    elif args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    elif (args.text or "").strip():
+        text = args.text
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        die("no text: pass the paragraph as an argument, use --file <path>, "
+            "pipe it on stdin, or --clear to empty the section")
+    res = post("task_summary_set", {"slug": slug, "task_id": tid, "text": text})
+    print(f"executive summary set on {tid} "
+          f"({res.get('bytes_written', 0)} bytes of body)")
+
+
 def cmd_ticket_quote(args) -> None:
     """T-0767: record the STAKEHOLDER'S OWN WORDS under `## Stakeholder notes`.
 
@@ -6124,6 +6164,16 @@ def build_parser() -> argparse.ArgumentParser:
     tkc.add_argument("--file", help="read the new Context from this file (else stdin)")
     tkc.add_argument("--clear", action="store_true", help="empty the section")
     tkc.set_defaults(func=cmd_ticket_context)
+    tksm = tk_sub.add_parser(
+        "summary",
+        help="REPLACE a ticket's ## Executive summary (ONE paragraph: progress "
+             "made + what remains — the status the stakeholder reads)")
+    tksm.add_argument("id", help="ticket id, e.g. T-0123")
+    tksm.add_argument("text", nargs="?", default="",
+                      help="the one-paragraph status (else --file or stdin)")
+    tksm.add_argument("--file", help="read the summary from this file instead")
+    tksm.add_argument("--clear", action="store_true", help="empty the section")
+    tksm.set_defaults(func=cmd_ticket_summary)
     tkq = tk_sub.add_parser(
         "quote", help="record the STAKEHOLDER's own words under ## Stakeholder notes")
     tkq.add_argument("id", help="ticket id, e.g. T-0123")

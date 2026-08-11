@@ -3689,12 +3689,18 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     ``state`` is the one-word steer:
       * ``paused``             — user paused; re-drive is off.
       * ``driving``            — an operator is currently live.
+      * ``direct-tier``        — backlog has work and no operator BY DESIGN: the
+                                 flow is small and a user-conversation session is
+                                 driving devs directly (T-0855). Reported before
+                                 ``pending-redrive`` because the two look
+                                 identical from outside and only one of them is
+                                 a project waiting on something.
       * ``pending-redrive``    — backlog has work but no live operator (between
                                  re-drives / waiting on spawn capacity).
       * ``idle-empty-backlog`` — nothing to clear; the only idle state.
 
     Required params: slug. Returns: {ok, paused, state, live_operators,
-    pending_backlog}.
+    pending_backlog, topology?}.
     """
     extra = set(params) - _OPERATOR_STATUS_ALLOWED
     if extra:
@@ -3715,22 +3721,42 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     live = _dispatch.live_operator_sids(cfg, slug)
     pending = _ord.count_pending_backlog(cfg, slug)
 
+    topo = None
+    if not paused and not live and pending > 0:
+        # T-0855: distinguish "no operator yet" from "no operator on purpose".
+        # A read that cannot tell them apart reports a healthy direct-tier
+        # project as one stuck waiting for a spawn. Never fatal: an unreadable
+        # topology falls back to the pre-T-0855 answer.
+        try:
+            topo = _dispatch.decide_topology(cfg, slug)
+        except Exception:  # noqa: BLE001 — status must not break on an extra
+            topo = None
+
     if paused:
         state = "paused"
     elif live:
         state = "driving"
     elif pending > 0:
-        state = "pending-redrive"
+        state = "direct-tier" if (topo and not topo["operator_needed"]) \
+            else "pending-redrive"
     else:
         state = "idle-empty-backlog"
 
-    return {
+    out = {
         "ok": True,
         "paused": paused,
         "state": state,
         "live_operators": live,
         "pending_backlog": pending,
     }
+    if topo is not None:
+        out["topology"] = {
+            "tier": topo["tier"],
+            "operator_needed": topo["operator_needed"],
+            "counts": topo["counts"],
+            "attending_user_session_sids": topo["attending_user_session_sids"],
+        }
+    return out
 
 
 _PICKUP_QUEUE_REQUIRED = {"slug"}

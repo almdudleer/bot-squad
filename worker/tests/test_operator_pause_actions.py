@@ -130,3 +130,61 @@ def test_operator_pause_rejects_unexpected_params(cfg_slug):
 def test_operator_status_unknown_slug(cfg_slug):
     with pytest.raises(ActionError, match="unknown project slug"):
         act_dispatch("operator_status", {"slug": "no-such-proj"})
+
+
+# --- T-0855: "no operator yet" vs "no operator on purpose" -------------------
+
+def _write_attendant(cfg, slug, sid="S-u-gu_x-user-conversation-p9"):
+    from bot_squad_worker import sessions as S
+    (cfg.data_dir / slug / "sessions").mkdir(parents=True, exist_ok=True)
+    S._write_session_metadata(
+        cfg.data_dir / slug / "sessions" / f"{sid}.md",
+        {"sid": sid, "status": "active", "window": "gu_x-user-conversation",
+         "cwd": "/tmp", "claude_uuid": "uuid-uc", "task_id": "~",
+         "initiative": "~", "started_at": "2026-08-11T00:00:00Z"},
+    )
+
+
+def test_operator_status_direct_tier_is_not_reported_as_pending(cfg_slug):
+    """Same board, same empty operator roster, opposite meaning: with a user
+    session driving a small flow the absence of an operator is the design, and
+    calling it `pending-redrive` reads as a project stuck waiting on a spawn."""
+    cfg, slug = cfg_slug
+    _write_task(cfg, slug)
+    _write_attendant(cfg, slug)
+
+    out = act_dispatch("operator_status", {"slug": slug})
+
+    assert out["state"] == "direct-tier"
+    assert out["pending_backlog"] == 1
+    assert out["live_operators"] == []
+    assert out["topology"]["operator_needed"] is False
+    assert out["topology"]["attending_user_session_sids"] == [
+        "S-u-gu_x-user-conversation-p9"]
+
+
+def test_operator_status_still_says_pending_when_nobody_is_driving(cfg_slug):
+    """The negative control for the arm above — remove the attendant and the
+    pre-T-0855 answer must come back, or the new state would mask a real stall."""
+    cfg, slug = cfg_slug
+    _write_task(cfg, slug)
+
+    out = act_dispatch("operator_status", {"slug": slug})
+
+    assert out["state"] == "pending-redrive"
+    assert out["topology"]["operator_needed"] is True
+
+
+def test_operator_status_survives_a_broken_topology_read(cfg_slug, monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("gate exploded")
+
+    cfg, slug = cfg_slug
+    _write_task(cfg, slug)
+    _write_attendant(cfg, slug)
+    monkeypatch.setattr(dispatch, "decide_topology", _boom)
+
+    out = act_dispatch("operator_status", {"slug": slug})
+
+    assert out["state"] == "pending-redrive"      # the pre-T-0855 answer
+    assert "topology" not in out

@@ -2479,6 +2479,45 @@ def cmd_operator_status(args) -> None:
         print(f"operator re-drive: idle for {slug} (empty backlog)")
 
 
+# --------------------------------------------------------------------------
+# T-0855: which rung of the scaling ladder this project is on — may a
+# user-conversation session spawn/steer a dev session DIRECTLY, or must the
+# request go through the operator? The thresholds and the verdict come from the
+# worker (`dispatch.decide_topology`), the SAME read the operator re-drive gate
+# makes, so what a session is told here and what the scheduler does cannot
+# diverge. Read-only: this verb spawns nothing.
+# --------------------------------------------------------------------------
+
+def cmd_route(args) -> None:
+    slug = resolve_slug()
+    res = post("topology_decision", {"slug": slug})
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, sort_keys=True))
+        return
+    c = res.get("counts") or {}
+    t = res.get("thresholds") or {}
+    ops = res.get("live_operator_sids") or []
+    ucs = res.get("attending_user_session_sids") or []
+    print(f"dispatch topology for {slug}:")
+    print(f"  tasks in flight   : {c.get('tasks_in_flight')}  "
+          f"(direct while < {t.get('max_tasks')})"
+          + (f"  {', '.join(res.get('tasks_in_flight') or [])}"
+             if res.get("tasks_in_flight") else ""))
+    print(f"  live dev sessions : {c.get('live_devs')}  "
+          f"(direct while < {t.get('max_devs')})")
+    print(f"  live operator     : {ops[0] if ops else '(none)'}")
+    print(f"  attending user s. : {ucs[0] if ucs else '(none)'}")
+    # Reported because it drifts (a dev that died leaves the label behind) and
+    # is the number a reader would otherwise assume this decision used.
+    print(f"  board in_progress : {c.get('board_in_progress')}  "
+          f"(observed only — does NOT gate)")
+    if not t.get("enabled"):
+        print("  direct dispatch   : DISABLED (BOT_SQUAD_DIRECT_DISPATCH)")
+    print(f"  tier              : {res.get('tier')}")
+    print(f"  route             : {res.get('route')}")
+    print(f"  → {res.get('reason')}")
+
+
 def _pickup_scope_lines(ds: dict) -> list:
     """The drive-scope header of the `bsq pickup` table (T-0829).
 
@@ -6276,6 +6315,16 @@ def build_parser() -> argparse.ArgumentParser:
     opr.set_defaults(func=cmd_operator_resume)
     ops = op_sub.add_parser("status", help="show whether re-drive is paused vs driving")
     ops.set_defaults(func=cmd_operator_status)
+
+    # route (T-0855) — WHO dispatches: you (a user-conversation session driving
+    # a dev directly, when the task flow is small) or the operator. Not a
+    # settings surface — a read of the load, so it does not duplicate `pace`.
+    rt = sub.add_parser(
+        "route",
+        help="who dispatches this work: you directly (small flow) or the operator")
+    rt.add_argument("--json", action="store_true",
+                    help="print the raw decision (counts, thresholds, signals)")
+    rt.set_defaults(func=cmd_route)
 
     # pickup (T-0783a) — which tickets are takeable. `operator status` reports a
     # COUNT of pending work; this reports WHICH work, which is the question an

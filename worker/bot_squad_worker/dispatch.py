@@ -702,6 +702,282 @@ def classify_drive_mode(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# T-0855 — the scaling ladder's first rung: WHO dispatches the work, the
+# user-conversation session DIRECTLY or an operator tier in between.
+#
+# Stakeholder, 2026-08-11, verbatim (T-0855):
+#   «когда поток задач маленький, не устраивать цепочку из юзер-сессия ->
+#    оператор -> дев-сессия, 80% времени такая длинная цепочка не нужна, она
+#    нужна в оставшиеся 20% когда я прямо сижу и в потоке работаю над кучей
+#    задач сразу»
+#   «качество, скорее всего, вырастет из-за предотвращения глухого телефона, а
+#    траты токенов сократятся из-за убирания затрат на координацию»
+#
+# WHY THIS IS CODE AND NOT A ROLE-DOC PARAGRAPH. The operator hop was
+# unconditional, and not because any contract demanded it: ``operator_redrive``
+# respawns an operator whenever the board holds ANY non-closed task, so the
+# ladder's own «оператора может не быть, если низкий параллелизм на входе»
+# (F-2026-08-06-bsq-6c16cca10b) was mechanically unreachable — the tier came
+# back inside 60s however small the flow was. A user-conversation session
+# reading a doc that says "you may dispatch directly" would still find an
+# operator on the roster a minute later. So the rule lives here, one
+# deterministic function, and the role contracts POINT at it rather than
+# restating it.
+#
+# WHAT IS MEASURED — roster state, never his prose. T-0848 removed the last
+# classifier that inferred a standing setting from his ordinary messages («не
+# надо срабатывать в контексте в целом на слова автоматически»); this one reads
+# no message text at all, so nothing he types can promote or demote a tier.
+# Signals:
+#   * tasks in flight — the distinct tasks held by LIVE dev sessions;
+#   * live devs — live dev sessions holding this project (a dev with no task
+#     bound is still load, and a bundled dev holding three tasks is more);
+#   * live operators / attending user-conversation sessions — the roster.
+#
+# ★ WHY NOT THE BOARD'S ``in_progress`` COUNT, the obvious candidate (and what
+# ``pace.max_in_progress`` throttles). Measured against the live install on
+# 2026-08-11, before this was written:
+#     bot-squad  board in_progress 3 — actually held by a live dev: 2
+#     guestent   board in_progress 4 — actually held by a live dev: 0
+#     watchrobot board in_progress 3 — actually held by a live dev: 0
+# The status is a LABEL a dev leaves behind when it dies or forgets to move the
+# ticket; it drifts up and never comes down on its own. Gating on it would have
+# pinned all three projects to the operator tier permanently — the feature would
+# have shipped, passed its tests, and never once fired. Sessions holding tasks
+# are the thing that cannot lie: a dead dev's session md stops being a live
+# holder. (Board ``in_progress`` is still REPORTED under ``counts`` so the drift
+# stays visible to whoever reads `bsq route`; it does not gate.)
+#
+# THE RULE (defaults below, both env-tunable on a live worker):
+#     tier = direct   iff  tasks_in_flight < max_tasks AND live_devs < max_devs
+#            operator otherwise
+# The comparison is STRICT, so the count after one more direct dispatch still
+# honours the ceiling: at the default 3, one user session steers up to three
+# dev sessions and the fourth dispatch promotes the operator tier — his 20%,
+# «когда я прямо сижу и в потоке работаю над кучей задач сразу».
+#
+# Two answers come out of one read, because two callers ask different questions:
+#   * ``operator_needed`` — "must this project have an operator?" — the gate
+#     ``operator_redrive.tick`` consults. TRUE whenever the tier is ``operator``
+#     OR no ATTENDING user-conversation session exists to drive directly: nobody
+#     drives a backlog by itself, and the base state of an unattended project is
+#     still the operator clearing it. "Attending" means status ``active`` — a
+#     PAUSED attendant is a parked process, not a driver, and this install has
+#     one such md sitting in the roster right now. Nothing here probes how
+#     recently it spoke: ``gc_sessions`` keeps ``status`` synced to real panes
+#     and the ~1h idle recycle removes an attendant that stopped attending, so
+#     the de-escalation path already exists — a transcript-freshness probe would
+#     add an instrument whose null reading silently disables the feature.
+#   * ``route`` — "what should I, the asking user session, do with this?" —
+#     ``direct`` (spawn/steer the dev yourself) only when the tier is direct AND
+#     no operator is already live. A live operator keeps the request: it is
+#     already driving the board and a second dispatcher would double-drive it
+#     (the T-0472 invariant). That tier then de-escalates on its own — the next
+#     re-drive after it recycles finds a direct tier and does not bring it back.
+# ---------------------------------------------------------------------------
+
+# At most this many tasks held by live dev sessions under direct drive.
+DEFAULT_DIRECT_MAX_TASKS = 3
+# At most this many live dev sessions under direct drive. Both are ceilings on
+# what ONE user-conversation session can steer without the coordination cost
+# that pays for an operator; both read per-call so a live worker can be retuned
+# without a redeploy.
+DEFAULT_DIRECT_MAX_DEVS = 3
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    try:
+        val = int(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+def direct_max_tasks() -> int:
+    """In-flight task ceiling for direct (operator-less) drive.
+    ``BOT_SQUAD_DIRECT_MAX_TASKS``."""
+    return _positive_env_int("BOT_SQUAD_DIRECT_MAX_TASKS", DEFAULT_DIRECT_MAX_TASKS)
+
+
+def direct_max_devs() -> int:
+    """Live-dev ceiling for direct (operator-less) drive.
+    ``BOT_SQUAD_DIRECT_MAX_DEVS``."""
+    return _positive_env_int("BOT_SQUAD_DIRECT_MAX_DEVS", DEFAULT_DIRECT_MAX_DEVS)
+
+
+def direct_dispatch_enabled() -> bool:
+    """False iff the kill switch ``BOT_SQUAD_DIRECT_DISPATCH`` is off — every
+    project then routes through the operator exactly as it did before T-0855.
+    One env var is the whole rollback."""
+    raw = os.environ.get("BOT_SQUAD_DIRECT_DISPATCH")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def live_role_sids(
+    cfg: Any, slug: str, role: str, *, active_only: bool = False,
+) -> list[tuple[str, dict]]:
+    """``(sid, meta)`` of LIVE sessions holding ``slug`` whose role is ``role``.
+
+    Pure session-md scan, keyed off the same role SSOT (``sessions._role_of``,
+    which honours a morph stamp) the rest of this module uses. Devs and
+    user-conversation sessions are always spawn-registered, so — unlike the
+    canonical operator (see :func:`live_operator_sids`) — no tmux scan is
+    needed; for ``role == "operator"`` call ``live_operator_sids`` instead, it
+    catches the unregistered pane too.
+
+    ``active_only`` drops PAUSED sessions. ``_is_live_holder`` counts
+    active+paused, which is right for "does this session still hold a task"
+    and wrong for "is anyone driving": a paused attendant is a parked process.
+    """
+    out: list[tuple[str, dict]] = []
+    sess_dir = cfg.data_dir / slug / "sessions"
+    if not sess_dir.exists():
+        return out
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = S._read_session_metadata(md)
+        if meta is None or not S._is_live_holder(meta):
+            continue
+        if active_only and str(meta.get("status", "")).strip().lower() != "active":
+            continue
+        if S._role_of(meta) == role:
+            out.append((meta.get("sid", md.stem), meta))
+    return out
+
+
+def decide_topology(cfg: Any, slug: str) -> dict:
+    """Does ``slug`` need an OPERATOR tier right now, or can a live
+    user-conversation session drive dev sessions directly? (T-0855)
+
+    Returns ``{ok, tier, route, operator_needed, may_dispatch_directly, counts,
+    thresholds, live_operator_sids, live_user_session_sids, signals, reason}``.
+    ``tier`` is ``direct``/``operator`` (the load verdict), ``route`` is
+    ``direct``/``via_operator`` (what the ASKING user session should do) — see
+    the section comment above for why they are two answers, not one.
+
+    Pure read (board mds + session mds + one tolerant live-pane scan), advisory
+    in the same sense as :func:`decide_dispatch`: it spawns nothing and files
+    nothing. Raises ActionError on an unknown project slug.
+    """
+    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker import operator_redrive as _ord
+
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"decide_topology: unknown project slug {slug!r}")
+
+    max_tasks = direct_max_tasks()
+    max_devs = direct_max_devs()
+    enabled = direct_dispatch_enabled()
+
+    devs = live_role_sids(cfg, slug, "dev")
+    in_flight: set[str] = set()
+    for _sid, meta in devs:
+        in_flight |= {t for t in S._full_task_set(meta) if t and t != "~"}
+    attending = [sid for sid, _m in
+                 live_role_sids(cfg, slug, "user-conversation", active_only=True)]
+    operators = live_operator_sids(cfg, slug)
+
+    counts = {
+        "tasks_in_flight": len(in_flight),
+        "live_devs": len(devs),
+        "live_operators": len(operators),
+        "attending_user_sessions": len(attending),
+        # Reported, never gated on — see the ★ note above: this is the number
+        # that drifts, and seeing it beside the real one is how the drift stays
+        # visible instead of silently steering the topology.
+        "board_in_progress": _ord._in_progress_count(cfg, slug),
+    }
+    thresholds = {
+        "max_tasks": max_tasks,
+        "max_devs": max_devs,
+        "enabled": enabled,
+    }
+
+    signals: list[str] = []
+    if not enabled:
+        tier = "operator"
+        signals.append("direct-dispatch-disabled")
+    elif len(in_flight) >= max_tasks:
+        tier = "operator"
+        signals.append(f"tasks-in-flight:{len(in_flight)}>=max:{max_tasks}")
+    elif len(devs) >= max_devs:
+        tier = "operator"
+        signals.append(f"live-devs:{len(devs)}>=max:{max_devs}")
+    else:
+        tier = "direct"
+        signals.append(f"tasks-in-flight:{len(in_flight)}<max:{max_tasks}")
+        signals.append(f"live-devs:{len(devs)}<max:{max_devs}")
+
+    if not attending:
+        signals.append("no-attending-user-session")
+    if operators:
+        signals.append("operator-live:" + operators[0])
+
+    operator_needed = tier == "operator" or not attending
+    may_direct = tier == "direct" and not operators
+    route = "direct" if may_direct else "via_operator"
+
+    if route == "direct":
+        reason = (
+            f"small flow ({len(in_flight)} task(s) in flight < {max_tasks}, "
+            f"{len(devs)} live dev(s) < {max_devs}) and no operator on the "
+            "roster — spawn/steer the dev session yourself (`bsq spawn`) and "
+            "do NOT spawn an operator to relay"
+        )
+        if not attending:
+            # `route` answers the ASKING session (whoever runs `bsq route` is by
+            # definition present, and a terminal stakeholder session bound by the
+            # user-conversation contract has no `user-conversation` window to be
+            # counted by). `operator_needed` answers the scheduler, which can
+            # only see the roster. Saying so keeps the two from reading as a
+            # contradiction when they diverge.
+            reason += (
+                " — note: no user-conversation session is REGISTERED as "
+                "attending this project, so the re-drive still brings an "
+                "operator onto the board; expect one shortly"
+            )
+    elif tier == "direct" and operators:
+        reason = (
+            f"load is small enough for direct drive, but operator "
+            f"{operators[0]} is already driving this board — route through it "
+            "(a second dispatcher double-drives the backlog, T-0472). The tier "
+            "de-escalates by itself: once it recycles, the re-drive gate leaves "
+            "it off while the flow stays small"
+        )
+    elif not enabled:
+        reason = (
+            "direct dispatch is disabled (BOT_SQUAD_DIRECT_DISPATCH) — route "
+            "through the operator"
+        )
+    else:
+        reason = (
+            f"load justifies the operator tier ({len(in_flight)} task(s) in "
+            f"flight, {len(devs)} live dev(s); ceilings {max_tasks}/"
+            f"{max_devs}) — route through the operator"
+            + (f" ({operators[0]})" if operators else
+               " (none live — ensure/await one rather than steering the devs "
+               "yourself)")
+        )
+
+    return {
+        "ok": True,
+        "tier": tier,
+        "route": route,
+        "operator_needed": operator_needed,
+        "may_dispatch_directly": may_direct,
+        "counts": counts,
+        "thresholds": thresholds,
+        "live_operator_sids": operators,
+        "attending_user_session_sids": attending,
+        "tasks_in_flight": sorted(in_flight),
+        "signals": signals,
+        "reason": reason,
+    }
+
+
 def decide_placement(
     cfg: Any, slug: str, text: str, *,
     task_id: str | None = None, now_epoch: float | None = None,
@@ -762,6 +1038,27 @@ def decide_placement(
     out["drive_mode"] = dm["mode"]
     out["drive_mode_signals"] = dm["signals"]
 
+    # T-0855: a long request also needs a DISPATCH ROUTE — does the asking user
+    # session drive the dev itself, or hand it to the operator? Every intake
+    # surface sees it here, so the 3-hop relay stops being the default the way
+    # the classification stops being per-session judgement. Advisory extra: a
+    # failed read reports itself (explicit unknown, never a silent None) rather
+    # than sinking the placement answer.
+    try:
+        topo = decide_topology(cfg, slug)
+    except Exception as exc:  # noqa: BLE001 — advisory, must not break placement
+        out["topology"] = None
+        out["topology_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        out["topology"] = {
+            "tier": topo["tier"],
+            "route": topo["route"],
+            "may_dispatch_directly": topo["may_dispatch_directly"],
+            "counts": topo["counts"],
+            "thresholds": topo["thresholds"],
+            "reason": topo["reason"],
+        }
+
     # T-0848: there is deliberately NO `drive_scope` key here any more. This
     # reported one — read-only, never applied — and a read-only report is still
     # the inference his ruling removed: it hands the next caller a scope it did
@@ -794,6 +1091,13 @@ def decide_placement(
         out["reason"] = (
             "record-only — file it, take NO build action without a further "
             "explicit go. " + out["reason"]
+        )
+    elif out.get("topology") and out["topology"]["route"] == "direct":
+        # Only on a mode that authorizes building at all — a record_only /
+        # ambiguous message must not read as "go dispatch it, just faster".
+        out["reason"] += (
+            " — and dispatch it DIRECTLY, no operator hop: "
+            + out["topology"]["reason"]
         )
 
     return out

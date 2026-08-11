@@ -458,7 +458,7 @@ def tick(cfg: Any, slug: str) -> dict:
     ``{action, ...}`` describing what the pass decided (for tests + the journal).
 
     actions: ``disabled`` | ``paused`` | ``idle-empty-backlog`` | ``continue`` |
-    ``cooldown`` | ``deferred`` | ``respawned``.
+    ``direct-tier`` | ``cooldown`` | ``deferred`` | ``respawned``.
     """
     if not _enabled():
         return {"action": "disabled"}
@@ -480,6 +480,32 @@ def tick(cfg: Any, slug: str) -> dict:
     live = _dispatch.live_operator_sids(cfg, slug)
     if live:
         return {"action": "continue", "operator": live[0], "pending": pending}
+
+    # T-0855 — the SCALING-LADDER gate, and the reason this ticket is code and
+    # not a role-doc edit. Everything above says "there is pending work and no
+    # operator", which used to mean "spawn one" unconditionally: a project with
+    # ONE open task and a live user-conversation session got an operator back
+    # within 60s, so «когда поток задач маленький, не устраивать цепочку из
+    # юзер-сессия -> оператор -> дев-сессия» could not hold however the contracts
+    # were worded. Now the tier is promoted only when the load justifies it
+    # (dispatch.decide_topology) — and only ever suppressed while a live
+    # user-conversation session exists to drive the board directly, so an
+    # unattended project still gets its operator exactly as before.
+    #
+    # A failure here must NEVER strand the backlog: any error falls through to
+    # the respawn, i.e. to pre-T-0855 behaviour.
+    try:
+        topo = _dispatch.decide_topology(cfg, slug)
+    except Exception:  # noqa: BLE001 — a broken gate must not stop the operator
+        log.exception("operator_redrive: topology gate failed for %s", slug)
+        topo = None
+    if topo is not None and not topo["operator_needed"]:
+        return {
+            "action": "direct-tier",
+            "pending": pending,
+            "topology": topo,
+            "user_sessions": topo["attending_user_session_sids"],
+        }
 
     # Cooldown gate (belt-and-braces against overlapping ticks / a fast-exiting
     # operator stampeding the spawn path).

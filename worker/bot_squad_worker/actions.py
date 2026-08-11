@@ -3153,6 +3153,152 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "task_id": task_id, "line_appended": line}
 
 
+# ---------------------------------------------------------------------------
+# T-0767: the two authored artifacts get write paths of their own.
+#
+# Until now `task_progress_add` was the ONLY ergonomic writer on a ticket, and
+# that is the whole reason `## Progress` grew to 57.4% of the backlog: appending
+# was one command, editing the working area needed a whole-body PATCH. Sessions
+# were not choosing narration over state, they were choosing the verb that
+# existed. These two close that gap.
+# ---------------------------------------------------------------------------
+
+def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
+                       transform) -> tuple["Path", str]:
+    """Read → `transform(body)` → atomically write one backlog task md.
+
+    Factored out of `_action_task_progress_add`'s body rather than copied a
+    third time: the lock, the `id:`-strict resolution, the frontmatter patch and
+    the atomic write are the parts that MUST be identical across every writer,
+    and a divergent copy of exactly this dance is how T-0714 shipped broken.
+
+    Holds `task_lock` across the whole read-modify-write so concurrent writers
+    (worker AND api, T-0373) can never lose each other's edits.
+    """
+    cfg = _get_config()
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"{action}: unknown project slug {slug!r}")
+
+    backlog_dir: Path = cfg.data_dir / slug / "backlog"
+    from bot_squad_worker import frontmatter as _fm
+    try:
+        path = _fm.resolve_id_file(backlog_dir, task_id, strict=True)
+    except _fm.AmbiguousIdError as e:
+        raise ActionError(f"{action}: {e}") from e
+    if path is None:
+        raise ActionError(f"{action}: task not found: {task_id}")
+
+    import re as _re
+    from bot_squad_worker.mdlock import task_lock, atomic_write
+
+    with task_lock(path):
+        text_raw = path.read_text()
+        fm_match = _re.match(r"\A---\n(.*?)\n---\n(.*)", text_raw, _re.DOTALL)
+        if not fm_match:
+            raise ActionError(f"{action}: no frontmatter in {path}")
+        fm_block = fm_match.group(1)
+        body = fm_match.group(2).lstrip("\n")
+
+        try:
+            new_body = transform(body)
+        except ValueError as e:
+            raise ActionError(f"{action}: {e}") from e
+
+        fm_lines = fm_block.splitlines()
+        for i, ln in enumerate(fm_lines):
+            if ln.lstrip().startswith("updated:"):
+                fm_lines[i] = f"updated: {ts}"
+                break
+        else:
+            fm_lines.append(f"updated: {ts}")
+
+        atomic_write(path, f"---\n{chr(10).join(fm_lines)}\n---\n\n{new_body}")
+    return path, new_body
+
+
+_TASK_CONTEXT_SET_REQUIRED = {"slug", "task_id", "text"}
+_TASK_CONTEXT_SET_ALLOWED = _TASK_CONTEXT_SET_REQUIRED | {"sid"}
+
+
+def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
+    """REPLACE a task's `## Context` — the working area every session shares.
+
+    Required params: slug, task_id, text (optional: sid, for the audit line)
+    Returns: {ok, task_id, bytes_written}
+
+    Replaces rather than appends, deliberately: Context is meant to say what is
+    TRUE NOW, so the next session reads a current state instead of
+    reconstructing it from a chronology («пусть редактируют конечное состояние
+    сразу, эта история не важна» — stakeholder, 2026-08-11).
+
+    An empty `text` CLEARS the section, which is a legitimate edit and not an
+    error — but it is also the one call that can lose work, so it must be
+    explicit rather than a side effect of a missing field.
+    """
+    extra = set(params) - _TASK_CONTEXT_SET_ALLOWED
+    if extra:
+        raise ActionError(f"task_context_set got unexpected params: {sorted(extra)}")
+    missing = _TASK_CONTEXT_SET_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"task_context_set missing required params: {sorted(missing)}")
+    text = params["text"]
+    if not isinstance(text, str):
+        raise ActionError("task_context_set: text must be a string")
+
+    from datetime import datetime, timezone
+    from bot_squad_worker.task_body import set_context
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path, new_body = _rewrite_task_body(
+        "task_context_set", params["slug"], params["task_id"], ts,
+        lambda body: set_context(body, text))
+    return {"ok": True, "task_id": params["task_id"],
+            "bytes_written": len(new_body), "path": str(path)}
+
+
+_TASK_STAKEHOLDER_NOTE_REQUIRED = {"slug", "task_id", "text"}
+_TASK_STAKEHOLDER_NOTE_ALLOWED = _TASK_STAKEHOLDER_NOTE_REQUIRED | {"source", "sid"}
+
+
+def _action_task_stakeholder_note_add(params: dict[str, Any]) -> dict[str, Any]:
+    """Append a stakeholder QUOTE to the task's `## Stakeholder notes`.
+
+    Required params: slug, task_id, text (optional: source, sid)
+    Returns: {ok, task_id, line_appended}
+
+    This is the path that stops his words being filed as session narration. A
+    clarification he gives mid-ticket used to be recorded by whichever session
+    heard it as an ordinary progress note — so it aged, diluted and got trimmed
+    with the feed, which is the failure T-0767 was opened about.
+
+    `text` must be HIS WORDS, not a session's summary of them. The cap is far
+    higher than a progress note's for exactly that reason, and over-cap refuses
+    rather than truncating.
+    """
+    extra = set(params) - _TASK_STAKEHOLDER_NOTE_ALLOWED
+    if extra:
+        raise ActionError(
+            f"task_stakeholder_note_add got unexpected params: {sorted(extra)}")
+    missing = _TASK_STAKEHOLDER_NOTE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(
+            f"task_stakeholder_note_add missing required params: {sorted(missing)}")
+    text = params["text"]
+    if not isinstance(text, str) or not text.strip():
+        raise ActionError("task_stakeholder_note_add: empty text")
+
+    from datetime import datetime, timezone
+    from bot_squad_worker.task_body import append_stakeholder_quote
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    source = (params.get("source") or "stakeholder").strip() or "stakeholder"
+    _rewrite_task_body(
+        "task_stakeholder_note_add", params["slug"], params["task_id"], ts,
+        lambda body: append_stakeholder_quote(body, ts, source, text))
+    return {"ok": True, "task_id": params["task_id"],
+            "line_appended": f"- {ts} · {source} · {text[:80]}"}
+
+
 _TASK_DIGEST_ALLOWED = {"slug"}
 
 
@@ -4409,6 +4555,34 @@ def _action_placement_decision(params: dict[str, Any]) -> dict[str, Any]:
         cfg, params["slug"], params["text"], task_id=params.get("task_id"))
 
 
+_TOPOLOGY_DECISION_REQUIRED = {"slug"}
+_TOPOLOGY_DECISION_ALLOWED = _TOPOLOGY_DECISION_REQUIRED
+
+
+def _action_topology_decision(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0855: does this project need an OPERATOR tier right now, or may a live
+    user-conversation session spawn/steer dev sessions directly?
+
+    Required params: slug. Returns ``{ok, tier, route, operator_needed,
+    may_dispatch_directly, counts, thresholds, live_operator_sids,
+    live_user_session_sids, signals, reason}``. Backs ``bsq route`` and is the
+    same read the operator re-drive gate makes, so a session and the scheduler
+    can never disagree about which rung of the ladder the project is on.
+    Advisory + pure read, like ``dispatch_decision`` / ``placement_decision``:
+    it spawns nothing.
+    """
+    extra = set(params) - _TOPOLOGY_DECISION_ALLOWED
+    if extra:
+        raise ActionError(f"topology_decision got unexpected params: {sorted(extra)}")
+    missing = _TOPOLOGY_DECISION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"topology_decision missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import dispatch as _dispatch
+    return _dispatch.decide_topology(cfg, params["slug"])
+
+
 _SET_DRIFT_PAUSED_REQUIRED = {"slug", "sid", "paused"}
 _SET_DRIFT_PAUSED_ALLOWED = _SET_DRIFT_PAUSED_REQUIRED
 
@@ -5214,6 +5388,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "sync_exit": _action_sync_exit,
     "sync_status": _action_sync_status,
     "task_progress_add": _action_task_progress_add,
+    # T-0767: the two authored artifacts' writers (working area + his quotes).
+    "task_context_set": _action_task_context_set,
+    "task_stakeholder_note_add": _action_task_stakeholder_note_add,
     # T-0589: on-demand short backlog digest for the TG conversation surface.
     "task_digest": _action_task_digest,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
@@ -5247,6 +5424,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "dispatch_decision": _action_dispatch_decision,
     # T-0576 (M11/F11.3): instant-tweak vs long-request placement guarantee.
     "placement_decision": _action_placement_decision,
+    # T-0855: which rung of the scaling ladder this project is on — direct
+    # (user-session drives devs) vs operator tier. Backs `bsq route`.
+    "topology_decision": _action_topology_decision,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
     # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
@@ -5344,6 +5524,9 @@ ACTION_MODES: dict[str, str] = {
     # T-0576: same read-only profile as dispatch_decision (session mds + a
     # tolerant live-pane scan for the operator target) — no coordinator state.
     "placement_decision": "tmux_only",
+    # T-0855: same read-only profile — board mds + session mds + the tolerant
+    # live-operator pane scan; no coordinator state.
+    "topology_decision": "tmux_only",
     # telemetry_get reads the SHARED install data dir (all users' sampled
     # records land there) → a single coordinator read, not a per-user fan-out.
     "telemetry_get": "coordinator_only",
@@ -5383,6 +5566,12 @@ ACTION_MODES: dict[str, str] = {
     "sync_exit": "coordinator_only",
     "sync_status": "coordinator_only",
     "task_progress_add": "coordinator_only",
+    # T-0767: write the shared install data dir (backlog/) under the same lock
+    # as task_progress_add — same single-coordinator-writer reason, and they
+    # contend on the very same task md. Sessions reach them via
+    # `bsq ticket context` / `bsq ticket quote`.
+    "task_context_set": "coordinator_only",
+    "task_stakeholder_note_add": "coordinator_only",
     # T-0589: read-only scan of the shared install data dir (backlog/) — a
     # single coordinator read, like telemetry_get. Sessions reach it via
     # `bsq task digest` (the coordinator socket).

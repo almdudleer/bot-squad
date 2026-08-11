@@ -145,6 +145,33 @@ than carrying it.
 
 Reasoning, incidents, worked cases, limit: `bot-squad-operator` skill.
 
+## You are a LOAD tier now, not a fixture (T-0855, stakeholder 2026-08-11)
+
+The re-drive no longer puts an operator on every project that has a non-closed
+task. When the flow is small — tasks held by live devs and the number of live devs
+both under the ceilings in `dispatch.decide_topology` — **and** an active
+user-conversation session is attending, that session spawns and steers the dev itself and no
+operator is respawned. His reason, verbatim:
+
+> «когда поток задач маленький, не устраивать цепочку из юзер-сессия ->
+> оператор -> дев-сессия, 80% времени такая длинная цепочка не нужна»
+> … «качество … вырастет из-за предотвращения глухого телефона, а траты токенов
+> сократятся из-за убирания затрат на координацию»
+
+What this changes for you:
+
+- **A project running without an operator is not a fault.** Don't "fix" it,
+  don't page him about it, and don't spawn yourself back in on a quiet board.
+- **You are still spawned the moment the load justifies it** — the tier
+  promotes automatically past the ceilings, and on any project with no live
+  user-conversation session (an unattended backlog always gets its operator).
+- **While you ARE live, everything routes through you as before.** A user
+  session with a live operator hands the request over rather than dispatching
+  around you — one dispatcher per board (T-0472) is unchanged. De-escalation
+  happens after you finish and recycle, never by cutting your work short.
+- A dev you did not spawn may therefore be on the board legitimately, driven by
+  the user session. `bsq route` shows the current tier and the counts behind it.
+
 ## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
 
 Open on the news itself. These lead-ins are banned — his list, and the same

@@ -354,3 +354,137 @@ def test_operator_tick_sweeps_all_projects_and_swallows_errors(cfg_slug, monkeyp
     monkeypatch.setattr(ord_, "tick", _boom)
     # Must not raise.
     ord_.operator_tick(cfg)
+
+
+# ---------------------------------------------------------------------------
+# T-0855 — the scaling-ladder gate. THIS is the mechanism that made the
+# operator hop unconditional: pending work + no live operator used to mean
+# "spawn one", so a project with one open task and a live user-conversation
+# session got an operator back inside 60s no matter what any role contract
+# said. «когда поток задач маленький, не устраивать цепочку из юзер-сессия ->
+# оператор -> дев-сессия» (stakeholder, 2026-08-11).
+# ---------------------------------------------------------------------------
+
+def _write_session(cfg, slug, sid, window, *, status="active", task_id="~"):
+    S._write_session_metadata(
+        cfg.data_dir / slug / "sessions" / f"{sid}.md",
+        {"sid": sid, "status": status, "window": window, "cwd": "/tmp",
+         "claude_uuid": "uuid-" + sid[-3:], "task_id": task_id, "initiative": "~",
+         "started_at": "2026-08-11T00:00:00Z"},
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_stray_panes(monkeypatch):
+    """The topology read scans live panes for an unregistered operator — keep
+    it hermetic, like test_dispatch's fixture does."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+
+def test_small_flow_with_a_live_user_session_gets_no_operator(cfg_slug):
+    """The ticket's core claim, at the layer that decides it: one open task, a
+    live user session to drive it, no operator spawned."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+    _write_session(cfg, slug, "S-u-gu_x-user-conversation-p9",
+                   "gu_x-user-conversation")
+
+    res = ord_.tick(cfg, slug)
+
+    assert res["action"] == "direct-tier"
+    assert spawns == [], "an operator was spawned for a one-task flow"
+    assert res["user_sessions"] == ["S-u-gu_x-user-conversation-p9"]
+
+
+def test_unattended_project_still_gets_its_operator(cfg_slug):
+    """No user session = no direct driver. The backlog must never be left with
+    no dispatcher at all — this is the pre-T-0855 behaviour, preserved."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+
+    res = ord_.tick(cfg, slug)
+
+    assert res["action"] == "respawned"
+    assert len(spawns) == 1
+
+
+def test_real_parallel_load_promotes_the_operator(cfg_slug):
+    """The 20% case, in his words — «когда я прямо сижу и в потоке работаю над
+    кучей задач сразу». An attending user session does NOT suppress the tier
+    when the load is what the tier is for. Load is LIVE DEVS holding tasks, not
+    the board's in_progress labels — see the ★ note in dispatch.py."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="in_progress")
+    _write_session(cfg, slug, "S-u-gu_x-user-conversation-p9",
+                   "gu_x-user-conversation")
+    for n in (1, 2, 3):
+        _write_session(cfg, slug, f"S-u-d{n}-dev-p{n}", f"d{n}-dev",
+                       task_id=f"T-{n}")
+
+    res = ord_.tick(cfg, slug)
+
+    assert res["action"] == "respawned"
+    assert len(spawns) == 1
+
+
+def test_a_broken_topology_gate_never_strands_the_backlog(cfg_slug, monkeypatch):
+    """Fail-safe direction: any error in the new gate falls through to the
+    respawn, i.e. to exactly what the tick did before this ticket."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+    _write_session(cfg, slug, "S-u-gu_x-user-conversation-p9",
+                   "gu_x-user-conversation")
+
+    def _boom(*a, **k):
+        raise RuntimeError("gate exploded")
+
+    monkeypatch.setattr(dispatch, "decide_topology", _boom)
+    res = ord_.tick(cfg, slug)
+
+    assert res["action"] == "respawned"
+    assert len(spawns) == 1
+
+
+def test_kill_switch_restores_the_unconditional_operator_hop(cfg_slug, monkeypatch):
+    """One env var is the whole rollback."""
+    cfg, slug, spawns = cfg_slug
+    monkeypatch.setenv("BOT_SQUAD_DIRECT_DISPATCH", "0")
+    _write_task(cfg, slug, "T-1", status="open")
+    _write_session(cfg, slug, "S-u-gu_x-user-conversation-p9",
+                   "gu_x-user-conversation")
+
+    res = ord_.tick(cfg, slug)
+
+    assert res["action"] == "respawned"
+    assert len(spawns) == 1
+
+
+def test_a_live_operator_still_just_continues(cfg_slug, monkeypatch):
+    """The gate sits BELOW the T-0472 one-operator check: a live operator is
+    left alone to finish, and de-escalation happens on its next recycle, not by
+    killing it mid-work."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+    _write_session(cfg, slug, "S-u-gu_x-user-conversation-p9",
+                   "gu_x-user-conversation")
+    monkeypatch.setattr(dispatch, "live_operator_sids", lambda c, s: ["S-op-live"])
+
+    res = ord_.tick(cfg, slug)
+
+    assert res["action"] == "continue"
+    assert spawns == []
+
+
+def test_the_tier_deescalates_after_that_operator_exits(cfg_slug, monkeypatch):
+    """The other half of the same story: the same project, one tick later with
+    the operator gone, does NOT bring it back."""
+    cfg, slug, spawns = cfg_slug
+    _write_task(cfg, slug, "T-1", status="open")
+    _write_session(cfg, slug, "S-u-gu_x-user-conversation-p9",
+                   "gu_x-user-conversation")
+    monkeypatch.setattr(dispatch, "live_operator_sids", lambda c, s: ["S-op-live"])
+    assert ord_.tick(cfg, slug)["action"] == "continue"
+
+    monkeypatch.setattr(dispatch, "live_operator_sids", lambda c, s: [])
+    assert ord_.tick(cfg, slug)["action"] == "direct-tier"
+    assert spawns == []

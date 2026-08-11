@@ -81,6 +81,9 @@ def test_registry_lists_only_allowed_actions():
         "sync_request", "sync_ack", "sync_enter", "sync_send",
         "sync_exit", "sync_status",
         "task_progress_add",
+        # T-0767: the working area + stakeholder-quote writers, so a session
+        # has somewhere to put durable detail other than the progress feed.
+        "task_context_set", "task_stakeholder_note_add",
         # T-0589: on-demand short backlog digest for the TG conversation.
         "task_digest",
         # T-0463: assignment-interface write-result primitive (F1.1-d).
@@ -109,6 +112,9 @@ def test_registry_lists_only_allowed_actions():
         "dispatch_decision",
         # T-0576 (M11/F11.3): instant-tweak vs long-request placement guarantee.
         "placement_decision",
+        # T-0855: direct (user-session drives devs) vs operator tier — the
+        # scaling ladder's first rung. Backs `bsq route`.
+        "topology_decision",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
         # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
@@ -3012,8 +3018,8 @@ def test_task_progress_add_long_note_roundtrips_byte_identical(tmp_path, monkeyp
         "---\nid: T-0001\ntitle: Foo\nstatus: open\n---\n\n"
         "## Verbatim request\n\nI want X.\n"
     )
-    note = ("stakeholder said this exact sacred thing " * 8).strip()
-    assert len(note) > 300
+    note = ("stakeholder said this sacred thing " * 6).strip()
+    assert 200 < len(note) <= 240
     out = A.dispatch("task_progress_add", {
         "slug": "test-project",
         "task_id": "T-0001",

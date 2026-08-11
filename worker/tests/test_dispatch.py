@@ -946,3 +946,326 @@ def test_decide_placement_reports_no_drive_scope(tmp_path):
     assert "drive_scope_decision" not in out
     assert "drive_scope_signals" not in out
     assert out["drive_mode"], "the T-0656 authority classifier must survive"
+
+
+from bot_squad_worker import dispatch  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# T-0855 — the scaling ladder's first rung: direct dispatch vs the operator tier
+#
+# «когда поток задач маленький, не устраивать цепочку из юзер-сессия ->
+#  оператор -> дев-сессия» (stakeholder, 2026-08-11). The rule these tests pin
+# is `dispatch.decide_topology`; the gate that acts on it lives in
+# test_operator_redrive.py — a rule nothing consults would be prose.
+# ---------------------------------------------------------------------------
+
+def _make_in_progress(cfg, task_id: str) -> None:
+    """A board ticket LABELLED in_progress — with nobody holding it. This is the
+    shape that made board status unusable as the load signal (see the ★ note in
+    dispatch.py): on the live install every project carried some."""
+    (cfg.data_dir / "test-project" / "backlog" / f"{task_id}-wip.md").write_text(
+        f"---\nid: {task_id}\ntitle: T\nstatus: in_progress\ninitiative: ~\n---\nbody\n"
+    )
+
+
+def _make_working_dev(cfg, n: int, task_id: str):
+    """A LIVE dev session actually holding a task — one unit of real load."""
+    return _make_session(cfg, f"S-u-d{n}-dev-p{n}", window=f"d{n}-dev",
+                         task_id=task_id)
+
+
+def _make_user_session(cfg, sid="S-u-gu_x-user-conversation-p9"):
+    return _make_session(cfg, sid, window="gu_x-user-conversation")
+
+
+def test_topology_small_flow_with_a_user_session_dispatches_direct(tmp_path):
+    """One task in flight, one attending user session, no operator: the user
+    session drives the dev itself — the whole point of the ticket."""
+    cfg = _make_cfg(tmp_path)
+    _make_working_dev(cfg, 1, "T-0001")
+    _make_user_session(cfg)
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["tier"] == "direct"
+    assert out["route"] == "direct"
+    assert out["may_dispatch_directly"] is True
+    assert out["operator_needed"] is False
+    assert out["counts"]["tasks_in_flight"] == 1
+    assert out["tasks_in_flight"] == ["T-0001"]
+    assert "bsq spawn" in out["reason"]
+
+
+def test_topology_tasks_in_flight_at_the_ceiling_promotes_the_operator(tmp_path):
+    """The ceiling is STRICT — at max_tasks the tier promotes, so the count
+    after one more direct dispatch could never exceed it. A dev holding several
+    bundled tasks is more load than a dev holding one, which is why tasks are
+    counted and not just sessions."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+    _write_session_metadata(
+        cfg.data_dir / "test-project" / "sessions" / "S-u-d1-dev-p1.md",
+        {"sid": "S-u-d1-dev-p1", "status": "active", "window": "d1-dev",
+         "cwd": "/tmp", "claude_uuid": "uuid-d1", "task_id": "T-0001",
+         "extra_task_ids": ["T-0002", "T-0003"], "initiative": "~",
+         "started_at": "2026-08-11T00:00:00Z"})
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["counts"]["tasks_in_flight"] == 3 == out["thresholds"]["max_tasks"]
+    assert out["counts"]["live_devs"] == 1, "one session, three tasks"
+    assert out["tier"] == "operator"
+    assert out["route"] == "via_operator"
+    assert out["operator_needed"] is True
+    assert any(s.startswith("tasks-in-flight:3>=max:3") for s in out["signals"])
+
+
+def test_topology_ignores_a_stale_board_in_progress_label(tmp_path):
+    """★ The finding that reshaped this rule: on the live install every project
+    carried in_progress tickets held by NOBODY (guestent: 4 labelled, 0 held).
+    Gating on the label would have pinned every project to the operator tier
+    forever — shipped, green, and never once fired."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+    for tid in ("T-0501", "T-0502", "T-0503", "T-0504"):
+        _make_in_progress(cfg, tid)
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["counts"]["board_in_progress"] == 4, "still reported…"
+    assert out["counts"]["tasks_in_flight"] == 0, "…never counted as load"
+    assert out["tier"] == "direct"
+    assert out["route"] == "direct"
+
+
+def test_topology_live_devs_at_the_ceiling_promotes_the_operator(tmp_path):
+    """Load is two-dimensional: an idle board with two dev sessions already
+    running is still more than one user session should be steering."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+    for n in (1, 2, 3):
+        _make_session(cfg, f"S-u-d{n}-dev-p{n}", window=f"d{n}-dev")
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["counts"]["live_devs"] == 3
+    assert out["counts"]["tasks_in_flight"] == 0, "task-less devs are load too"
+    assert out["tier"] == "operator"
+    assert any(s.startswith("live-devs:3>=max:3") for s in out["signals"])
+
+
+def test_topology_exited_dev_sessions_do_not_count_as_load(tmp_path):
+    """Load is LIVE sessions. A finished dev's md must not keep a project on
+    the operator rung forever."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+    _make_session(cfg, "S-u-d1-dev-p1", window="d1-dev", status="exited",
+                  task_id="T-0001")
+    _make_session(cfg, "S-u-d2-dev-p2", window="d2-dev", status="active",
+                  archived=True, task_id="T-0002")
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["counts"]["live_devs"] == 0
+    assert out["counts"]["tasks_in_flight"] == 0
+    assert out["tier"] == "direct"
+
+
+def test_topology_live_operator_keeps_the_request_even_on_a_small_flow(tmp_path):
+    """A live operator is already driving this board; a second dispatcher would
+    double-drive it (T-0472). The LOAD verdict still reads `direct`, which is
+    what lets the tier de-escalate once that operator recycles."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+    _make_session(cfg, "S-u-operator-p1", window="operator")
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["tier"] == "direct"
+    assert out["route"] == "via_operator"
+    assert out["may_dispatch_directly"] is False
+    assert out["live_operator_sids"] == ["S-u-operator-p1"]
+    assert "de-escalates" in out["reason"]
+
+
+def test_topology_unattended_project_still_needs_an_operator(tmp_path):
+    """No attending user-conversation session = nobody to drive directly. A
+    backlog is never left with no dispatcher at all — the base state of an
+    unattended project stays the operator clearing it."""
+    cfg = _make_cfg(tmp_path)
+    _make_working_dev(cfg, 1, "T-0001")
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["tier"] == "direct"          # the LOAD is small…
+    assert out["operator_needed"] is True   # …but there is no direct driver
+    assert "no-attending-user-session" in out["signals"]
+
+
+def test_topology_a_paused_attendant_is_not_a_driver(tmp_path):
+    """`_is_live_holder` counts active+paused — right for "still holds a task",
+    wrong for "is anyone driving". The live install has exactly such a parked
+    attendant md sitting in its roster; treating it as a driver would suppress
+    the operator with nobody actually at the wheel."""
+    cfg = _make_cfg(tmp_path)
+    _make_session(cfg, "S-u-gu_x-user-conversation-p8",
+                  window="gu_x-user-conversation", status="paused")
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["counts"]["attending_user_sessions"] == 0
+    assert out["operator_needed"] is True
+    assert "no-attending-user-session" in out["signals"]
+
+
+def test_topology_kill_switch_restores_the_unconditional_operator_hop(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_DIRECT_DISPATCH", "0")
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["tier"] == "operator"
+    assert out["operator_needed"] is True
+    assert out["thresholds"]["enabled"] is False
+    assert "direct-dispatch-disabled" in out["signals"]
+
+
+def test_topology_thresholds_are_env_tunable(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+    for n, tid in ((1, "T-0001"), (2, "T-0002"), (3, "T-0003")):
+        _make_working_dev(cfg, n, tid)
+    assert dispatch.decide_topology(cfg, "test-project")["tier"] == "operator"
+
+    monkeypatch.setenv("BOT_SQUAD_DIRECT_MAX_TASKS", "5")
+    monkeypatch.setenv("BOT_SQUAD_DIRECT_MAX_DEVS", "5")
+    out = dispatch.decide_topology(cfg, "test-project")
+    assert out["thresholds"]["max_tasks"] == 5
+    assert out["tier"] == "direct"
+
+
+def test_topology_reports_the_board_count_it_deliberately_ignores(tmp_path):
+    """The rejected signal stays VISIBLE: `bsq route` prints it beside the real
+    one, so the drift that disqualified it is legible instead of invisible."""
+    from bot_squad_worker import operator_redrive as ord_
+    cfg = _make_cfg(tmp_path)
+    _make_in_progress(cfg, "T-0001")
+    _make_user_session(cfg)
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["counts"]["board_in_progress"] == ord_._in_progress_count(
+        cfg, "test-project") == 1
+
+
+def test_topology_unknown_slug_raises(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    with pytest.raises(ActionError, match="unknown project slug"):
+        dispatch.decide_topology(cfg, "nope")
+
+
+def test_topology_decision_action_validates_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    with pytest.raises(ActionError, match="missing required"):
+        A._action_topology_decision({})
+    with pytest.raises(ActionError, match="unexpected params"):
+        A._action_topology_decision({"slug": "test-project", "nope": 1})
+
+
+def test_topology_decision_action_passthrough(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    _make_user_session(cfg)
+
+    out = A._action_topology_decision({"slug": "test-project"})
+
+    assert out["ok"] is True and out["route"] == "direct"
+
+
+def test_topology_decision_action_is_tmux_only(tmp_path):
+    """Same read-only profile as its siblings — a user-worker must be able to
+    ask, or a live user session cannot use the rule at all."""
+    import bot_squad_worker.actions as A
+    assert A.ACTION_MODES["topology_decision"] == "tmux_only"
+    assert "topology_decision" in A.ACTION_REGISTRY
+
+
+def test_decide_placement_carries_the_direct_route(tmp_path):
+    """Every intake surface sees the route, so the 3-hop relay stops being the
+    default the same way the placement classification stopped being judgement.
+
+    Only on a drive mode that authorizes building — see the record_only sibling
+    below, and note that an `ambiguous` message is not urged either."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+
+    out = decide_placement(cfg, "test-project", "fix the login bug in T-0009")
+
+    assert out["drive_mode"] == "bounded"
+    assert out["route"] == "file_task"
+    assert out["topology"]["route"] == "direct"
+    assert "dispatch it DIRECTLY" in out["reason"]
+
+
+def test_decide_placement_does_not_tell_a_record_only_message_to_dispatch(tmp_path):
+    """record_only means take NO build action. Adding "dispatch it directly"
+    would read as "go build it, just faster" — the T-0655 incident with a
+    shorter chain."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+
+    out = decide_placement(
+        cfg, "test-project", "просто заметка: надо бы починить логин")
+
+    assert out["drive_mode"] == "record_only"
+    assert out["topology"]["route"] == "direct"   # still reported…
+    assert "dispatch it DIRECTLY" not in out["reason"]   # …never urged
+    assert "record-only" in out["reason"]
+
+
+def test_decide_placement_survives_a_broken_topology_read(tmp_path, monkeypatch):
+    """Advisory extra: it reports its own failure (explicit unknown) instead of
+    sinking the placement answer or reading as 'no direct route'."""
+    cfg = _make_cfg(tmp_path)
+
+    def _boom(*a, **k):
+        raise RuntimeError("gate exploded")
+
+    monkeypatch.setattr(dispatch, "decide_topology", _boom)
+    out = decide_placement(cfg, "test-project", "fix the login bug")
+
+    assert out["route"] == "file_task"
+    assert out["topology"] is None
+    assert "RuntimeError: gate exploded" in out["topology_error"]
+
+
+def test_decide_placement_does_not_urge_dispatch_on_an_ambiguous_message(tmp_path):
+    """`ambiguous` means ASK him which scope before driving anything. A faster
+    route must not turn that into a go."""
+    cfg = _make_cfg(tmp_path)
+    _make_user_session(cfg)
+
+    out = decide_placement(cfg, "test-project", "fix the login bug")
+
+    assert out["drive_mode"] == "ambiguous"
+    assert out["topology"]["route"] == "direct"
+    assert "dispatch it DIRECTLY" not in out["reason"]
+    assert "ask the stakeholder" in out["reason"]
+
+
+def test_topology_direct_route_says_so_when_no_attendant_is_registered(tmp_path):
+    """`route` answers the asking session, `operator_needed` answers the
+    scheduler; when they diverge the reason must say why, or a reader takes
+    "direct" to mean no operator is coming."""
+    cfg = _make_cfg(tmp_path)
+
+    out = dispatch.decide_topology(cfg, "test-project")
+
+    assert out["route"] == "direct" and out["operator_needed"] is True
+    assert "re-drive still brings an operator" in out["reason"]

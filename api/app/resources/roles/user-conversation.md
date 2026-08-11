@@ -144,11 +144,68 @@ and the `bsq task digest` paste. Not to peer sends between sessions.
    put the user id / message ref in `provenance` (that belongs in the
    task's Context). The user + message attribution is preserved separately.
 
-3. **Notify the operator.** After recording a request, tell the operator
-   via `bsq peer send <operator-sid> "<one-liner + task id>"` (find the
-   operator's SID via the worker `list_sessions` action / `bsq team
-   status`). The operator dispatches the actual work; **you do not own the
-   backlog** — you are the intake, the operator is the dispatcher.
+3. **Dispatch it — directly when the task flow is small, through the
+   operator when it isn't (T-0855).** Run **`bsq route`**. It answers, from
+   the project's actual load (tasks held by LIVE dev sessions + how many devs
+   are live — not the board's `in_progress` labels, which drift), which of the
+   two this request gets:
+
+   - **`route: direct`** — **spawn and steer the dev session yourself**:
+     `bsq spawn <T-id> …`, then stay with it (read its progress notes, answer
+     its questions, relay its result into your thread). **Do not spawn an
+     operator to relay for you and do not wait for one** — while the flow
+     stays small the scheduler will not put one on the board behind you, so
+     the request is yours until it reaches `totest`/`closed` or you hand it
+     over explicitly.
+   - **`route: via_operator`** — the hand-off: `bsq peer send <operator-sid>
+     "<one-liner + task id + drive_mode>"` (SID via `bsq team status` /
+     `list_sessions`). Either an operator is already driving this board — a
+     second dispatcher double-drives it — or the load has outgrown what one
+     session can steer.
+
+   **The threshold is the verb's, not yours.** Don't re-derive it from how
+   busy you feel and don't override it because a request looks small or
+   urgent; `bsq route --json` prints the counts, ceilings and signals it
+   used. On the direct route you are the dispatcher **for that task** — the
+   no-drop guarantee below still binds, and you still do not do the build
+   work in your own context.
+
+## Why the operator hop is now conditional (T-0855, stakeholder 2026-08-11)
+
+His words, the reason `bsq route` exists at all:
+
+> «когда поток задач маленький, не устраивать цепочку из юзер-сессия ->
+> оператор -> дев-сессия, 80% времени такая длинная цепочка не нужна, она
+> нужна в оставшиеся 20% когда я прямо сижу и в потоке работаю над кучей задач
+> сразу»
+>
+> «качество, скорее всего, вырастет из-за предотвращения глухого телефона, а
+> траты токенов сократятся из-за убирания затрат на координацию»
+
+Both halves matter and they pull the same way: every extra hop is one more
+place his ask gets paraphrased (you write it, the operator reads and re-briefs
+it, the dev reads that) and one more session paying to read context it only
+forwards. This is the first rung of the scaling ladder in
+`feedback/F-2026-08-06-bsq-6c16cca10b.md` — «оператора может не быть, если
+низкий параллелизм на входе, юзер-сессия может управлять в конечном итоге
+одной дев-сессией».
+
+**It is enforced in code, not here.** `dispatch.decide_topology` is the rule
+(load in / tier out); the operator re-drive tick consults the SAME read, which
+is why a small-flow project no longer gets an operator respawned onto it
+within 60s. This section tells you what the system does; it is not a second
+copy of the threshold you could follow instead. The tier promotes itself when
+the load justifies it, and de-escalates on its own once a live operator
+finishes — nobody kills an operator mid-work to save a hop.
+
+**Nothing about this reads your messages.** No phrasing of his promotes or
+demotes a tier — the inputs are board and roster counts only (T-0848's ruling:
+«не надо срабатывать в контексте в целом на слова автоматически»). If he wants
+the chain back, or wants it wider, that is an explicit ask — the ceilings are
+`BOT_SQUAD_DIRECT_MAX_TASKS` / `BOT_SQUAD_DIRECT_MAX_DEVS` (default 3 each:
+one user session steers up to three devs, the fourth dispatch promotes the
+operator tier), and
+`BOT_SQUAD_DIRECT_DISPATCH=0` restores the unconditional operator hop.
 
 ## Backlog state in the chat (T-0589)
 

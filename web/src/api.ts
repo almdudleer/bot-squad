@@ -485,7 +485,7 @@ export type TelemetrySession = {
   context: {
     tokens: number;
     pct: number;        // % of ceiling
-    ceiling: number;    // tunable contract ceiling (700_000 as of contract v3.1), worker-stamped
+    ceiling: number;    // tunable contract ceiling (300_000 since T-0857; 700_000 before), worker-stamped
     model?: string | null;
   };
   memory: { files: number; bytes: number; tokens_est: number };

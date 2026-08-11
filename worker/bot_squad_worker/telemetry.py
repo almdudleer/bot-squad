@@ -5,7 +5,8 @@ threshold alerts to the operator + each TL.
 Research (full notes on the ticket) bottomed out three data sources:
 
 * **Context usage** — the Claude transcript jsonl. The number that grows
-  toward the compaction ceiling (``context_ceiling()``; default 700k, T-0210)
+  toward the compaction ceiling (``context_ceiling()``; default 300k — T-0210
+  set 700k, T-0857 lowered it)
   is the *latest* ``type:"assistant"``
   line's ``usage.input_tokens + cache_read_input_tokens +
   cache_creation_input_tokens`` (cache_read already carries the running prior
@@ -53,12 +54,36 @@ from bot_squad_worker import autocompact
 
 log = logging.getLogger(__name__)
 
-# --- thresholds (T-0210; stakeholder 2026-06-19: 700k context ceiling) -------
+# --- thresholds (T-0210; T-0857 lowered the ceiling 700k → 300k) -------------
 # The ceiling is the 100% / "compact now" line; warn fires at CONTEXT_WARN_RATIO
-# of it (0.8 preserves the historical 400k:500k ratio → 560k at the 700k default).
-# Tunable per-install WITHOUT a redeploy via the BOT_SQUAD_CONTEXT_CEILING env
-# (read per-call), so the threshold can be retuned with a worker env change.
-DEFAULT_CONTEXT_CEILING = 700_000
+# of it (0.8 → 240k at the 300k default). Tunable per-install WITHOUT a redeploy
+# via the BOT_SQUAD_CONTEXT_CEILING env (read per-call), so the threshold can be
+# retuned with a worker env change.
+#
+# T-0857 (stakeholder 2026-08-11T13:09:02Z, verbatim on the ticket): «давай самое
+# простое снизим потолок контекста до 300к токенов что ли». The audit behind that
+# decision (D-0071 §b4, 29,768 assistant turns over 2026-08-04 → 08-11) is why the
+# value is the single biggest quota lever we have, and the reasoning is worth
+# keeping next to the number because it is NOT the usual "a bigger window is
+# free" intuition:
+#
+#   * Cost is context_size × turns × 0.1 — a cache HIT is still charged at 0.1×
+#     on EVERY turn, so the 98.9% hit rate the recycle machinery delivers does
+#     nothing for this term. Context size is the term that was left unbounded.
+#   * At 700k, 49% of turns sat above 200k and therefore paid the long-context
+#     premium (input 2×, output 1.5×) — and those 49% were 87% of the
+#     premium-weighted spend.
+#   * Clipping each turn at 200k, holding turn count fixed, was 644M vs 1,645M
+#     input-equivalents: 2.6× cheaper, and that is a FLOOR (a real ceiling gives
+#     a sawtooth averaging well below its cap, not a flat line at it).
+#
+# The value is honoured with a bounded overshoot, not exactly: the trigger can
+# only see a turn that already happened, so a session arms at ceiling + ~30k
+# (T-0862 measured 13 arms in the audit week, median 5 min after crossing,
+# median max context 732k against the 700k ceiling). Expect the same ~30k at
+# 300k. Anything far above that is a GATE not firing, not the ceiling being
+# ignored — see recycle_gate's skip logging (T-0864).
+DEFAULT_CONTEXT_CEILING = 300_000
 CONTEXT_WARN_RATIO = 0.8
 MEMORY_WARN_TOKENS = 40_000  # per-agent memory footprint warn line
 

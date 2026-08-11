@@ -40,14 +40,87 @@ def test_enabled_default_on_and_kill_switch(monkeypatch):
 
 def test_window_default_and_override(monkeypatch):
     monkeypatch.delenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", raising=False)
-    assert IT.idle_timeout_sec() == IT.DEFAULT_IDLE_TIMEOUT_SEC == 3600
+    assert IT.idle_timeout_sec() == IT.DEFAULT_IDLE_TIMEOUT_SEC == 3300
     monkeypatch.setenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", "120")
     assert IT.idle_timeout_sec() == 120
     # garbage / non-positive falls back to the default (never collapse to 0)
     monkeypatch.setenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", "-5")
-    assert IT.idle_timeout_sec() == 3600
+    assert IT.idle_timeout_sec() == 3300
     monkeypatch.setenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", "nope")
-    assert IT.idle_timeout_sec() == 3600
+    assert IT.idle_timeout_sec() == 3300
+
+
+# --- T-0856: the window must fire INSIDE the prompt-cache TTL ---------------
+
+def test_window_fires_before_the_cache_ttl(monkeypatch, tmp_config_dir):
+    """T-0856. The defect this pins: the window WAS 3600 — exactly the 1h
+    prompt-cache TTL — so with a 60s tick a fire landed at 3600..3660s, always
+    after expiry. 33 of 33 keep-alive wake-ups measured on the live install were
+    a full cache MISS.
+
+    The invariant is `window + tick + turn-margin <= cache TTL`. It is asserted
+    against the tick the SCHEDULER actually registers, not a copy of `60` in
+    this file, so re-crossing it by slowing the tick reds this test too — that
+    is the half a hand-written constant would miss.
+    """
+    from bot_squad_worker.config import Config
+    from bot_squad_worker.scheduler import build_scheduler
+
+    monkeypatch.delenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", raising=False)
+
+    sched = build_scheduler(Config.load(tmp_config_dir))
+    job = next(j for j in sched.get_jobs() if j.id == "idle_timeout")
+    tick = job.trigger.interval.total_seconds()
+    # If this ever stops being an interval trigger the arithmetic below is
+    # meaningless, so say so rather than reading a plausible-looking 0.
+    assert tick > 0, "idle_timeout job carries no interval — cannot size the window"
+
+    window = IT.idle_timeout_sec()
+    assert IT.window_fits_cache_ttl(window, tick), (
+        f"idle window {window}s + {tick:.0f}s tick + "
+        f"{IT.CACHE_TURN_MARGIN_SEC}s turn-margin exceeds the "
+        f"{IT.CACHE_TTL_SEC}s prompt-cache TTL — every keep-alive wake-up and "
+        f"every recycle arm would land after the cache expired (T-0856)"
+    )
+    # The margin exists because `_idle_age` is measured from the jsonl mtime
+    # (turn END) while the TTL clock starts at the request's START. A margin of
+    # 0 would be the same bug wearing a different constant.
+    assert IT.CACHE_TURN_MARGIN_SEC > 0
+
+
+def test_window_fits_cache_ttl_rejects_the_old_default():
+    """The green above proves nothing unless the predicate can go red. 3600 —
+    this module's own default until T-0856 — is the input that must fail it."""
+    assert IT.window_fits_cache_ttl(3300, 60) is True
+    assert IT.window_fits_cache_ttl(3600, 60) is False   # the pre-T-0856 default
+    assert IT.window_fits_cache_ttl(3540, 60) is False   # 59 min: still too late
+    # exactly on the line is allowed; one second past it is not
+    assert IT.window_fits_cache_ttl(
+        IT.CACHE_TTL_SEC - 60 - IT.CACHE_TURN_MARGIN_SEC, 60) is True
+    assert IT.window_fits_cache_ttl(
+        IT.CACHE_TTL_SEC - 60 - IT.CACHE_TURN_MARGIN_SEC + 1, 60) is False
+
+
+def test_ttl_crossing_env_override_is_honoured_but_warned(monkeypatch, caplog):
+    """An operator may still set a longer window; what must not happen again is
+    it being honoured SILENTLY, which is how 3600 ran cache-cold for a week."""
+    import logging
+
+    monkeypatch.setattr(IT, "_warned_windows", set())
+    monkeypatch.setenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", "3600")
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.idle_timeout"):
+        assert IT.idle_timeout_sec() == 3600          # honoured, not clamped
+        assert IT.idle_timeout_sec() == 3600          # second call: no new line
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warns) == 1, f"expected exactly one debounced warning, got {len(warns)}"
+    assert "prompt-cache TTL" in warns[0].getMessage()
+
+    # A conforming override says nothing at all.
+    caplog.clear()
+    monkeypatch.setenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", "1800")
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.idle_timeout"):
+        assert IT.idle_timeout_sec() == 1800
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 # --- pure decision helpers --------------------------------------------------

@@ -109,22 +109,27 @@ def test_scan_lines_boundary_without_post_tokens_measures_none():
 
 
 def test_context_and_memory_levels(monkeypatch):
-    # T-0210 (stakeholder 2026-06-19): default ceiling 700k, warn at the same
-    # 0.8 warn:urgent ratio → 560k. Ensure no env override is set.
+    # T-0857 (stakeholder 2026-08-11): default ceiling 300k (was 700k, T-0210),
+    # warn at the same 0.8 warn:urgent ratio → 240k. No env override set.
     monkeypatch.delenv("BOT_SQUAD_CONTEXT_CEILING", raising=False)
-    assert T.context_level(559_999) == "none"
-    assert T.context_level(560_000) == "warn"
-    assert T.context_level(699_999) == "warn"
-    assert T.context_level(700_000) == "urgent"
+    assert T.context_level(239_999) == "none"
+    assert T.context_level(240_000) == "warn"
+    assert T.context_level(299_999) == "warn"
+    assert T.context_level(300_000) == "urgent"
     assert T.memory_level(T.MEMORY_WARN_TOKENS - 1) == "none"
     assert T.memory_level(T.MEMORY_WARN_TOKENS) == "warn"
 
 
-def test_context_ceiling_default_is_700k(monkeypatch):
+def test_context_ceiling_default_is_300k(monkeypatch):
+    """T-0857: lowered 700k → 300k on the stakeholder's decision. The warn line
+    is DERIVED from the ceiling (0.8), so it moves with it — the failure mode
+    this pins is a ceiling change leaving an absolute warn behind at 560k, which
+    at a 300k ceiling would sit above 'urgent' and never fire."""
     monkeypatch.delenv("BOT_SQUAD_CONTEXT_CEILING", raising=False)
-    assert T.context_ceiling() == 700_000
-    assert T.context_warn() == 560_000      # 0.8 ratio preserved
-    assert T.context_urgent() == 700_000
+    assert T.context_ceiling() == 300_000
+    assert T.context_warn() == 240_000      # 0.8 ratio preserved
+    assert T.context_urgent() == 300_000
+    assert T.context_warn() < T.context_urgent()
 
 
 def test_context_ceiling_env_override_scales_warn(monkeypatch):
@@ -140,7 +145,7 @@ def test_context_ceiling_env_override_scales_warn(monkeypatch):
 
 def test_context_ceiling_bad_env_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_CONTEXT_CEILING", "not-a-number")
-    assert T.context_ceiling() == 700_000
+    assert T.context_ceiling() == 300_000
 
 
 def test_crossed_only_on_strictly_worse_level():
@@ -352,14 +357,28 @@ def test_sample_carries_compact_phase_across_ticks(tmp_path, fake_session):
 
 def test_context_alert_fires_once_per_crossing(tmp_path, fake_session):
     cfg = _make_cfg(tmp_path)
+    # Sizes are DERIVED from the live thresholds, not hardcoded: this test is
+    # about the crossing/dedupe machinery, so a ceiling change (T-0857 moved it
+    # 700k → 300k) must not silently turn the "warn" sample into an "urgent" one
+    # and leave the test asserting a property it is no longer exercising.
+    # `_assistant` window = input + cache_read + cache_creation = 2 + N + 100.
+    def _at(window: int) -> int:
+        return window - 102
+
+    quiet, warn_1, warn_2 = (T.context_warn() // 4,
+                             T.context_warn() + 20_000,
+                             T.context_warn() + 30_000)
+    assert quiet < T.context_warn() <= warn_1 < warn_2 < T.context_urgent(), (
+        "sample sizes no longer straddle the thresholds they are named for")
+
     f = _write_transcript(fake_session["home"], fake_session["uuid"],
-                          [_assistant((2, 70000, 100), 500)])  # ~70k → none
+                          [_assistant((2, _at(quiet), 100), 500)])  # → none
     T.sample(cfg, "proj")
     assert fake_session["sent"] == []  # no crossing yet
 
-    # cross into warn (>=560k at the 700k ceiling)
+    # cross into warn (>= 0.8 × the ceiling)
     with f.open("a") as fh:
-        fh.write(_assistant((2, 580000, 100), 100) + "\n")
+        fh.write(_assistant((2, _at(warn_1), 100), 100) + "\n")
     T.sample(cfg, "proj")
     warn_alerts = [s for s in fake_session["sent"] if "context high" in s[1]]
     assert len(warn_alerts) == 0  # no team/operator target in this fixture
@@ -371,7 +390,7 @@ def test_context_alert_fires_once_per_crossing(tmp_path, fake_session):
     # staying in warn must NOT re-alert (record level unchanged, no new crossing)
     before = len(fake_session["sent"])
     with f.open("a") as fh:
-        fh.write(_assistant((2, 590000, 100), 100) + "\n")
+        fh.write(_assistant((2, _at(warn_2), 100), 100) + "\n")
     T.sample(cfg, "proj")
     assert len(fake_session["sent"]) == before
 

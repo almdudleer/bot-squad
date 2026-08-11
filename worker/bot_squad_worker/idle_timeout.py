@@ -11,7 +11,9 @@ which is expected to finish within known time boundaries."*
 SIBLING of :mod:`autocompact` (T-0467), not a rival. autocompact recycles a
 session when its CONTEXT crosses the ceiling; idle_timeout recycles a session
 that has been *waiting* — no Claude turn means no API call, so the subscription
-cache window goes cold — past the ~1h cache-invalidation window. Both end in the
+cache window is about to go cold. T-0856: *about to*, not *has* — the window
+fires at 55 min, strictly BEFORE the 1h TTL rather than on it; see the
+CACHE_TTL_SEC block below for why equality was the defect. Both end in the
 SAME "record results and exit": the universal-compact handoff (write the full
 forward-state to the role artifact → clear the pane → relaunch a fresh
 incarnation that boots from the artifact, re-bound to the same assignment).
@@ -157,8 +159,67 @@ from bot_squad_worker import autocompact, lifecycle_events, recycle_gate, sessio
 
 log = logging.getLogger(__name__)
 
-# Default recycle window = the Claude subscription cache-invalidation window (~1h).
-DEFAULT_IDLE_TIMEOUT_SEC = 3600
+# --- the cache window, and why the recycle window is NOT equal to it (T-0856) -
+#
+# CACHE_TTL_SEC is a fact about Anthropic's prompt cache, not a tunable of ours:
+# these sessions run on the 1h TTL (every usage record carries
+# `ephemeral_1h_input_tokens`). Everything below is arithmetic against it.
+#
+# Until T-0856 the recycle window WAS 3600 — exactly the TTL — and because the
+# tick is 60s a fire lands at 3600..3660s after the last turn, i.e. ALWAYS after
+# expiry and never before it. Measured on the live install 2026-08-04 → 08-11
+# (audit D-0071 §a3/b5): all 33 drive=on keep-alive wake-ups in the window had a
+# 60/61/62-min gap since the previous turn and 33 of 33 were a full cache MISS —
+# the wake-up turn re-wrote the whole context as cache_creation. 17.18M
+# cache_creation tokens ≈ 68.7M input-equivalents = 4.2% of the week's spend for
+# zero delivered work, and 23.5% of every cache-write token spent that week.
+#
+# The three subtractions, in the order they bite:
+#
+#   IDLE_TICK_SEC — the scheduler only evaluates the window every 60s, so a
+#   window of W fires somewhere in [W, W+60]. Budget the whole tick, not zero.
+#
+#   CACHE_TURN_MARGIN_SEC — the subtle one, and the reason a 60s margin is not
+#   enough. The TTL clock starts at the START of the request that last read the
+#   cache, but `_idle_age` measures from the transcript jsonl's mtime, stamped
+#   when that turn FINISHED. The generation time of the final assistant turn is
+#   therefore already spent before our clock begins.
+#
+#   240s is sized against that quantity's TAIL, measured rather than guessed
+#   (`data/bot-squad/artifacts/evidence/T-0856/final_turn_gap.py`, 3,415 transcripts over the 8
+#   days to 2026-08-11): final-turn generation is p50 1.8s, p90 3.9s, p99 49s,
+#   p99.9 94s; 17 of 3,415 exceed 60s, 3 exceed 120s, and exactly 1 exceeds 240s
+#   (an 11,362s outlier, i.e. a resumed transcript, not a turn). So 60s would
+#   lose the race for 0.5% of sessions and 240s for 0.03%. A session whose last
+#   turn ran longer still loses it — a bounded miss, not a systematic one, which
+#   is the whole difference from the 33/33 this ticket fixes.
+#
+#   That measurement rests on the assistant entry's `timestamp` being a
+#   COMPLETION stamp; if it were stamped at request start the delta would be
+#   queueing time and the sizing would be meaningless. Controlled for
+#   (`data/bot-squad/artifacts/evidence/T-0856/gap_control.py`): median delta rises
+#   monotonically with that turn's own output_tokens — 1.5s (<100 tok), 2.5s,
+#   4.4s, 11.6s, 35.2s (>4000 tok) — which only holds if the stamp lands at the
+#   end.
+#
+# What has to land inside the TTL is the ARM, not the exit. A cache hit
+# REFRESHES the TTL ("The cache is refreshed for no additional cost each time
+# the cached content is used" — Anthropic prompt-caching docs), so once the
+# keep-alive nudge or the T-0863 handoff prompt makes the session issue its next
+# request, that request is a hit and the clock restarts; every later request in
+# the write chain refreshes it again. This is why the finalize half's
+# `autocompact.DEFAULT_HANDOFF_TIMEOUT_SEC` (900s) is NOT a term here and must
+# not be lowered on this account: a session still working is riding refreshed
+# cache, and a session that ignores the arm issues no request at all, so its
+# cache expires with nothing charged against it either way.
+CACHE_TTL_SEC = 3600
+IDLE_TICK_SEC = 60
+CACHE_TURN_MARGIN_SEC = 240
+# 55 min — the stakeholder's own stated model of this mechanism, and exactly
+# CACHE_TTL_SEC - IDLE_TICK_SEC - CACHE_TURN_MARGIN_SEC. Written as a literal on
+# purpose: derived from the other three it would be true by construction and the
+# invariant test below could never fail, which is a check nobody can watch fail.
+DEFAULT_IDLE_TIMEOUT_SEC = 3300
 
 
 def idle_timeout_enabled() -> bool:
@@ -172,17 +233,51 @@ def idle_timeout_enabled() -> bool:
     return os.environ.get("BOT_SQUAD_IDLE_TIMEOUT", "1") != "0"
 
 
+def window_fits_cache_ttl(window: int, tick: int = IDLE_TICK_SEC) -> bool:
+    """True when a window of ``window`` seconds still fires INSIDE the cache TTL.
+
+    The one predicate this module's arithmetic reduces to (T-0856):
+    ``window + tick + CACHE_TURN_MARGIN_SEC <= CACHE_TTL_SEC``. Exported so the
+    invariant is checked in one place — the test, the env-override guard below,
+    and any future caller read the same function rather than three copies of the
+    same sum drifting apart.
+    """
+    return window + tick + CACHE_TURN_MARGIN_SEC <= CACHE_TTL_SEC
+
+
+# Values already warned about, so a per-tick-per-session call site can't turn one
+# misconfigured env into a log flood. Keyed by value: a LATER, different bad
+# override still gets its own line.
+_warned_windows: set[int] = set()
+
+
 def idle_timeout_sec() -> int:
-    """The idle/waiting recycle window in seconds (~1h cache window by default).
+    """The idle/waiting recycle window in seconds (55 min by default).
 
     Overridable via ``BOT_SQUAD_IDLE_TIMEOUT_SEC``; non-positive/garbage falls
     back to the default so a bad env can never collapse the window to zero (which
     would recycle every session on every tick).
+
+    An override that re-crosses the cache TTL is ACCEPTED (it stays a knob — an
+    operator may want it for a reason this module cannot see) but WARNED about
+    once per distinct value: silently honouring it is exactly how the 3600
+    default went 33/33 cache-miss for a week without anything saying so.
     """
     raw = os.environ.get("BOT_SQUAD_IDLE_TIMEOUT_SEC")
     if raw:
         try:
             v = int(raw)
+            if v > 0 and not window_fits_cache_ttl(v) and v not in _warned_windows:
+                _warned_windows.add(v)
+                log.warning(
+                    "idle_timeout: BOT_SQUAD_IDLE_TIMEOUT_SEC=%d re-crosses the "
+                    "prompt-cache TTL — %d + %ds tick + %ds turn-margin > %ds, so "
+                    "every keep-alive wake-up and every recycle arm lands AFTER "
+                    "the cache has expired and pays a full re-write (T-0856). "
+                    "Honouring it anyway; %d is the safe default.",
+                    v, v, IDLE_TICK_SEC, CACHE_TURN_MARGIN_SEC, CACHE_TTL_SEC,
+                    DEFAULT_IDLE_TIMEOUT_SEC,
+                )
             if v > 0:
                 return v
         except (TypeError, ValueError):

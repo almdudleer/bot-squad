@@ -144,6 +144,40 @@ done
 export TMPDIR="$REPO/.tmp-deploy"
 mkdir -p "$TMPDIR"
 
+# ── build identity (T-0553) ─────────────────────────────────────────────────
+# The image builds a library tarball that must be able to NAME ITSELF, and the
+# image must record the commit it came from. Both were previously absent:
+# `org.opencontainers.image.revision` read `unknown` on the live container
+# because nothing ever set VCS_REF, which is exactly WHY the deployed sha had
+# to be guessed from file content — and content-identification DRIFTS (the same
+# unrebuilt container read d42fcc35, then df6c01ae).
+#
+# Computed HERE, in the checkout being built: deploys are cherry-picks, so no
+# session's sha ever reaches origin — only the builder's HEAD is true.
+# Empty is not allowed: web/build-lib.sh FAILS rather than emit a placeholder,
+# so a missing value breaks the build loudly instead of shipping an anonymous
+# artifact. That refusal is the point; keep these lines in step with it.
+#
+# T-0587 — WHY THIS IS NOT `export X="$(git …)"`, which is what it read first.
+# Under `set -e` a failing command substitution inside an `export` is SWALLOWED:
+# `export x=$(false)` exits 0 (measured), a BARE assignment exits 1. With the
+# export form a git that could not answer would set an empty string and the
+# recipe would hand its own failure to the build — which is the exact shape of
+# the defect this block exists to remove. Assign first, export after.
+WR_LIB_COMMIT="$(git rev-parse HEAD)"
+WR_LIB_COUNT="$(git rev-list --count HEAD)"
+WR_LIB_VERSION="0.0.${WR_LIB_COUNT}+g${WR_LIB_COMMIT:0:12}"
+# `.dirty` exactly as web/vite.lib.config.ts derives it when it CAN see a
+# checkout, scoped to web/ for its stated reason: a peer's uncommitted backend
+# edit is not this package being dirty. Without it a version names a commit that
+# does not contain what was built. A deploy clone force-synced to origin never
+# carries it; if it appears, the stand was built from an edited tree and the
+# version says so instead of pretending otherwise.
+[ -z "$(git status --porcelain -- web/)" ] || WR_LIB_VERSION="${WR_LIB_VERSION}.dirty"
+export WR_LIB_COMMIT WR_LIB_VERSION
+export VCS_REF="$WR_LIB_COMMIT"
+echo "[staging] build identity: $WR_LIB_VERSION (VCS_REF=$VCS_REF)"
+
 # ══ PHASE 1: ACTIONS ════════════════════════════════════════════════════════
 docker compose build signal-tracker-staging
 # Force-remove any existing container with this name (--force-recreate alone

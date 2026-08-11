@@ -105,6 +105,30 @@ fi
 export TMPDIR="$REPO/.tmp-deploy"
 mkdir -p "$TMPDIR"
 
+# ── build identity (T-0553) ─────────────────────────────────────────────────
+# MIRRORS staging.sh — and prod needs it for the same reason, not as a copy:
+# both compose services build the SAME Dockerfile, whose lib-builder stage
+# REFUSES to run without these. Fixing only staging would leave prod
+# undeployable — including an emergency deploy under the freeze — and the
+# breakage would appear only at the moment someone needed it most.
+# Computed in the checkout being built (deploys are cherry-picks; only the
+# builder's HEAD is true). VCS_REF also cures the image's `revision=unknown`,
+# which is why the deployed sha had to be guessed from content at all.
+#
+# T-0587 — bare assignment, then export. `export x=$(false)` exits 0 under
+# `set -e` (measured) and would set an empty string on a git that could not
+# answer; a plain assignment exits 1. Same three lines as staging.sh, same
+# reason, and they must stay identical.
+WR_LIB_COMMIT="$(git rev-parse HEAD)"
+WR_LIB_COUNT="$(git rev-list --count HEAD)"
+WR_LIB_VERSION="0.0.${WR_LIB_COUNT}+g${WR_LIB_COMMIT:0:12}"
+# `.dirty` as web/vite.lib.config.ts derives it in-checkout, scoped to web/.
+# A version must not name a commit that does not contain what was built.
+[ -z "$(git status --porcelain -- web/)" ] || WR_LIB_VERSION="${WR_LIB_VERSION}.dirty"
+export WR_LIB_COMMIT WR_LIB_VERSION
+export VCS_REF="$WR_LIB_COMMIT"
+echo "[prod] build identity: $WR_LIB_VERSION (VCS_REF=$VCS_REF)"
+
 # ══ PHASE 1: ACTIONS ════════════════════════════════════════════════════════
 docker compose build signal-tracker
 docker rm -f "$APP_CONTAINER" 2>/dev/null || true

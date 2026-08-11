@@ -1528,12 +1528,16 @@ Why you (overlap with your prior work): {overlap}
 == REMINDERS (you know these; quick refresh) ==
 - This is a delta on your existing context — reuse it. If your memory of the
   paths/rules is stale, re-read AGENT_INSTRUCTIONS.md ({ai_path}).
-- Track ALL work on the ticket: `bsq ticket note <id> <text>` / `bsq ticket
-  update <id> <status>`. Never plan into superpowers/* docs (T-0152).
-- ANCHOR ON THE ASK (T-0483): read the new ticket's `## Verbatim request` FIRST —
-  that exact stakeholder string (relayed once, no paraphrase) is your target;
-  keep work anchored to it and don't let it drift as context accumulates. It is
-  HUMAN-ONLY — never edit it.
+- Track ALL work on the ticket. Durable state goes in the WORKING AREA —
+  `bsq ticket context <id> --file <f>` REPLACES `## Context` with what is true
+  now (T-0767). `bsq ticket note` is a 240-char checkpoint for the watchdog,
+  not where findings live. Never plan into superpowers/* docs (T-0152).
+- ANCHOR ON THE ASK (T-0483): read the new ticket's `## Stakeholder notes`
+  FIRST (`## Verbatim request` on older tickets) — his exact words (relayed
+  once, no paraphrase) are your target; keep work anchored to them and don't
+  let them drift as context accumulates. HUMAN-ONLY — never edit. Re-read
+  before asking him anything, and record any new answer with
+  `bsq ticket quote <id> '<verbatim>'`.
 - Verify MANUAL-FIRST (T-0158): write the user scenario, walk it through, then
   automate.
 - Git: edit the shared tree on bot_squad/dev (no worktree/stash). Commit ONLY
@@ -1996,13 +2000,31 @@ The full scope+DoD of each assigned ticket is INLINED below — this brief is
 self-contained, but FIRST also read AGENT_INSTRUCTIONS.md ({ai_path}) for
 paths/git-rules and your initiative file{f' ({init_path})' if init_path else ''}.
 
-START HERE — ANCHOR ON THE ASK (T-0483): read {primary}'s `## Verbatim request`
-below FIRST. That exact string is your target. It was recorded once, verbatim,
-from the stakeholder so it reaches you WITHOUT paraphrase loss — that is the
-whole point of the task: it defeats broken-telephone. Keep your work anchored to
-it; don't let the target drift to the evolved mental model your accumulated
-context will suggest (re-read it whenever you compact). It is the source of truth
-and HUMAN-ONLY — never edit it.
+START HERE — ANCHOR ON THE ASK (T-0483): read {primary}'s `## Stakeholder notes`
+below FIRST (older tickets spell that heading `## Verbatim request` — same
+section). That is his own words: the original ask, then every later quote. It was
+recorded verbatim so it reaches you WITHOUT paraphrase loss — that is the whole
+point: it defeats broken-telephone. Keep your work anchored to it; don't let the
+target drift to the evolved mental model your accumulated context will suggest
+(re-read it whenever you compact). It is the source of truth and HUMAN-ONLY —
+never edit it, and never summarise it into your own words elsewhere.
+
+CHECK IT BEFORE YOU ASK HIM ANYTHING (T-0767, his instruction): sessions
+routinely go to him with questions «которые там сто раз раскрыты» — already
+answered, in that section, on this ticket. Re-read it before any `bsq tg ping`.
+If he answers something new, record HIS WORDS with `bsq ticket quote {primary}
+'<verbatim>'` — never as a progress note, which is how his guidance used to get
+buried in session narration.
+
+A TICKET HAS TWO AUTHORED AREAS, AND THEY DO NOT OVERLAP (T-0767):
+  • `## Stakeholder notes` — his words. Human-only. You append quotes, never prose.
+  • `## Context` — the WORKING AREA, shared by every session on this ticket.
+    Keep it describing what is TRUE NOW: `bsq ticket context {primary} --file <f>`
+    REPLACES it. Edit the final state; do not narrate how it got there.
+`## Progress` is neither. It is a one-line-per-checkpoint machine feed the stall
+watchdog reads — notes are capped at 240 chars and the durable version of
+anything longer belongs in `## Context`, where the next session will actually
+read it.
 
 == ASSIGNED TICKET(S) ==
 {ticket_blocks}
@@ -2021,8 +2043,8 @@ AGENT_INSTRUCTIONS.md ({ai_path}) — read both rather than re-deriving from
 scratch.
 
 STAY ON TASK (T-0149): a drift-check tick watches time-since-commit and
-time-since-progress-note against {primary}'s `## Verbatim request` (your
-anchor, printed above). If you defer or descope anything, record WHY via
+time-since-progress-note against {primary}'s `## Stakeholder notes` (your
+anchor, printed above; `## Verbatim request` on older tickets). If you defer or descope anything, record WHY via
 `bsq ticket note` — don't silently drift.
 
 REPORT READY: when a ticket's DoD (incl. manual walkthrough) is green,
@@ -2472,9 +2494,17 @@ def cmd_operator_status(args) -> None:
     if live:
         print(f"operator re-drive: ▶ DRIVING for {slug} "
               f"(operator {live[0]}, {pending} pending)")
-    elif pending and pending > 0:
-        print(f"operator re-drive: ⏳ pending re-drive for {slug} "
-              f"({pending} pending, no live operator)")
+    elif res.get("state") == "direct-tier":
+        # T-0855: no operator ON PURPOSE — small flow, a user session drives the
+        # devs. Printing this as "pending re-drive" would read as a stuck project.
+        topo = res.get("topology") or {}
+        c = topo.get("counts") or {}
+        ucs = topo.get("attending_user_session_sids") or []
+        print(f"operator re-drive: ⇢ DIRECT TIER for {slug} — no operator by "
+              f"design ({pending} pending, {c.get('tasks_in_flight', '?')} task(s) "
+              f"in flight, {c.get('live_devs', '?')} live dev(s))")
+        print(f"  driven by: {ucs[0] if ucs else '(none)'}   ·   `bsq route` for "
+              f"the thresholds")
     else:
         print(f"operator re-drive: idle for {slug} (empty backlog)")
 
@@ -5142,6 +5172,56 @@ def cmd_ticket_note(args) -> None:
     print(f"noted on {args.id}: {res.get('line_appended', '(ok)')}")
 
 
+def cmd_ticket_context(args) -> None:
+    """T-0767: REPLACE a ticket's `## Context` — the shared working area.
+
+    The verb whose absence caused the bloat. `bsq ticket note` was one command
+    and editing the working area was a whole-body PATCH, so every session
+    appended narration instead of maintaining state. This makes the right thing
+    the easy thing.
+
+    Text comes from `--file` or stdin rather than argv on purpose: a working
+    area is paragraphs, and shell-quoting a multi-paragraph argument is exactly
+    the friction that pushes people back to one-line notes.
+    """
+    slug = resolve_slug()
+    tid = args.id.strip()
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        die("no text: pass --file <path> or pipe the new Context on stdin "
+            "(use --clear to empty the section)")
+    if args.clear:
+        text = ""
+    res = post("task_context_set", {"slug": slug, "task_id": tid, "text": text})
+    print(f"context set on {tid} ({res.get('bytes_written', 0)} bytes of body)")
+
+
+def cmd_ticket_quote(args) -> None:
+    """T-0767: record the STAKEHOLDER'S OWN WORDS under `## Stakeholder notes`.
+
+    Use this the moment he says something on a ticket — not `bsq ticket note`.
+    A note is your summary of your work and ages with the feed; a quote is his
+    words and is the thing later sessions are told to re-read. Filing his
+    guidance as a note is how it ended up diluted among session narration,
+    which is the failure this ticket was opened about.
+    """
+    slug = resolve_slug()
+    tid = args.id.strip()
+    text = args.text
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    if not (text or "").strip():
+        die("no quote text: pass it as an argument or use --file <path>")
+    res = post("task_stakeholder_note_add", {
+        "slug": slug, "task_id": tid, "text": text,
+        "source": args.source or "stakeholder",
+    })
+    print(f"stakeholder quote recorded on {tid}: {res.get('line_appended', '(ok)')}")
+
+
 # --------------------------------------------------------------------------
 # entity creation verbs (T-0174) — atomic, collision-free ids for EVERY
 # entity type. Each wraps the matching worker `*_new` action, which allocates
@@ -6014,6 +6094,19 @@ def build_parser() -> argparse.ArgumentParser:
     tkn.add_argument("body", help="progress note text")
     tkn.add_argument("--sid", help="override this session's SID")
     tkn.set_defaults(func=cmd_ticket_note)
+    tkc = tk_sub.add_parser(
+        "context", help="REPLACE a ticket's ## Context (the shared working area)")
+    tkc.add_argument("id", help="ticket id, e.g. T-0123")
+    tkc.add_argument("--file", help="read the new Context from this file (else stdin)")
+    tkc.add_argument("--clear", action="store_true", help="empty the section")
+    tkc.set_defaults(func=cmd_ticket_context)
+    tkq = tk_sub.add_parser(
+        "quote", help="record the STAKEHOLDER's own words under ## Stakeholder notes")
+    tkq.add_argument("id", help="ticket id, e.g. T-0123")
+    tkq.add_argument("text", nargs="?", default="", help="his verbatim words")
+    tkq.add_argument("--file", help="read the quote from this file instead")
+    tkq.add_argument("--source", help="where the words came from (default: stakeholder)")
+    tkq.set_defaults(func=cmd_ticket_quote)
 
     # scenario (T-0158: manual-testing-first discipline)
     sc = sub.add_parser("scenario", help="manual test scenario templates (T-0158)")

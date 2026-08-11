@@ -6,11 +6,14 @@ import pytest
 import hashlib
 
 from bot_squad_worker.task_body import (
+    STAKEHOLDER_HEADING,
     append_progress,
+    append_stakeholder_quote,
     compose_body,
     decode_progress_text,
     encode_progress_text,
     parse_body,
+    set_context,
 )
 
 
@@ -38,7 +41,7 @@ def test_parse_legacy_no_headings():
 
 
 def test_compose_skips_empty():
-    assert compose_body("v", "", "") == "## Verbatim request\n\nv\n"
+    assert compose_body("v", "", "") == "## Stakeholder notes\n\nv\n"
     assert compose_body("", "", "") == ""
 
 
@@ -65,10 +68,12 @@ def test_append_progress_preserves_sections():
 
 def test_append_progress_long_note_roundtrips_byte_identical():
     # Regression for F-2026-07-05-bsq-30844bca41: notes used to be silently
-    # clipped at 240 chars, losing sacred stakeholder verbatims.
-    body = "## Verbatim request\n\nv\n"
-    note = ("stakeholder verbatim word " * 20).strip()
-    assert len(note) > 300
+    # CLIPPED — that is the defect, not the cap's value. T-0767 restored the
+    # 240 the role contracts state; the >300-char sacred verbatim that
+    # motivated the report is pinned on `append_stakeholder_quote` below.
+    body = "## Stakeholder notes\n\nv\n"
+    note = ("stakeholder verbatim word " * 8).strip()
+    assert 200 < len(note) <= 240
     new = append_progress(body, "T1", "S1", note)
     parsed = parse_body(new)
     text_part = parsed["progress"].split(" · ", 2)[-1]
@@ -248,3 +253,28 @@ def test_append_progress_preserves_non_canonical_sections():
     assert parse_body(new)["verbatim"] == "ask"
     assert "- T0 · S0 · old" in parse_body(new)["progress"]
     assert "- T1 · S1 · new note" in parse_body(new)["progress"]
+
+
+# --- T-0767: worker-side copies of the two-artifact guarantees --------------
+
+def test_legacy_and_new_stakeholder_headings_both_parse():
+    assert parse_body("## Verbatim request\n\nask\n")["verbatim"] == "ask"
+    assert parse_body("## Stakeholder notes\n\nask\n")["verbatim"] == "ask"
+
+
+def test_sacred_verbatim_over_the_note_cap_roundtrips_as_a_stakeholder_quote():
+    """The F-2026-07-05-bsq-30844bca41 case on the writer that now owns it."""
+    quote = ("stakeholder verbatim word " * 40).strip()
+    assert len(quote) > 300
+    new = append_stakeholder_quote("## Stakeholder notes\n\nask\n",
+                                   "T1", "2026-08-11", quote)
+    assert "ask" in new
+    assert parse_body(new)["verbatim"].split(" · ", 2)[-1] == quote
+
+
+def test_set_context_replaces_and_keeps_the_feed():
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\nOLD\n\n"
+            "## Progress\n\n- a\n")
+    out = set_context(body, "NEW")
+    assert "OLD" not in out and "NEW" in out
+    assert "- a" in parse_body(out)["progress"]

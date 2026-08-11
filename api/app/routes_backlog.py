@@ -573,3 +573,87 @@ async def add_progress(
     except WorkerError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return result
+
+
+# T-0767: write paths for the two AUTHORED artifacts. Until these existed the
+# only ergonomic writer on a ticket was the progress feed, which is why it grew
+# to 57.4% of the backlog — sessions used the verb that existed, not the one
+# that fit.
+
+
+@router.put("/{task_id}/context")
+async def set_task_context(
+    slug: str,
+    task_id: str,
+    request: Request,
+    payload: dict,
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
+) -> dict:
+    """REPLACE `## Context` — the working area. Proxies to `task_context_set`.
+
+    PUT, not POST, and that is the contract rather than a preference: Context
+    holds what is TRUE NOW, so the write is idempotent and replacing. An empty
+    `text` clears the section — allowed, since a session that has finished
+    should be able to leave a clean final state, but it must be sent
+    explicitly (a missing field is a 400, not a silent wipe).
+    """
+    _validate_task_id(task_id)
+    if "text" not in payload:
+        raise HTTPException(status_code=400, detail="text is required (send \"\" to clear)")
+    text = payload["text"]
+    if not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="text must be a string")
+
+    backlog_dir = _backlog_dir(request, slug)
+    _find_task_file(backlog_dir, task_id)
+
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action("task_context_set", {
+            "slug": slug,
+            "task_id": task_id,
+            "text": text,
+        })
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result
+
+
+@router.post("/{task_id}/stakeholder-note")
+async def add_stakeholder_note(
+    slug: str,
+    task_id: str,
+    request: Request,
+    payload: dict,
+    user: dict = Depends(require_project_member),  # T-0381: project-write gate
+) -> dict:
+    """Append a stakeholder QUOTE. Proxies to `task_stakeholder_note_add`.
+
+    The board's comment kebab has posted the stakeholder's own words as a
+    Progress note since T-0238 (`S-stakeholder` sentinel). That is the overlap
+    T-0767 removes: his words and the sessions' narration shared one feed, so
+    his guidance aged and got trimmed along with it. This route is where they
+    go now.
+    """
+    _validate_task_id(task_id)
+    text = str_field(payload, "text")
+    if not text:
+        raise HTTPException(status_code=400, detail="text must not be empty")
+    source = payload.get("source") or "stakeholder"
+    if not isinstance(source, str):
+        raise HTTPException(status_code=400, detail="source must be a string")
+
+    backlog_dir = _backlog_dir(request, slug)
+    _find_task_file(backlog_dir, task_id)
+
+    client = request.app.state.worker_router.coordinator()
+    try:
+        result = await client.call_action("task_stakeholder_note_add", {
+            "slug": slug,
+            "task_id": task_id,
+            "text": text,
+            "source": source,
+        })
+    except WorkerError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result

@@ -55,11 +55,25 @@ def test_fresh_spawn_brief_hands_verbatim_and_anchors(tmp_path, monkeypatch):
     assert VERBATIM in brief
     # (b) explicit START anchor + STAY-ON-TASK both point at the verbatim ask.
     assert "START HERE" in brief and "ANCHOR ON THE ASK" in brief
-    assert f"{TICKET}'s `## Verbatim request`" in brief          # START anchor
     assert "STAY ON TASK" in brief
-    stay_on_task = brief[brief.index("STAY ON TASK"):]
-    assert f"{TICKET}'s `## Verbatim request`" in stay_on_task   # rule #4 anchor
+    # T-0767: each anchor is asserted INSIDE ITS OWN REGION. Searching the whole
+    # brief made this green off the OTHER anchor: when the START text was
+    # rewritten to name `## Stakeholder notes`, the unscoped assertion still
+    # passed on the STAY ON TASK line 20 lines below, so the check named a
+    # section it had stopped reading (measured: 0 occurrences in the START
+    # region, 1 in STAY ON TASK). Same defect the ticket exists to fix, in the
+    # test that guards it.
+    cut = brief.index("STAY ON TASK")
+    start_region, stay_on_task = brief[:cut], brief[cut:]
+    assert f"{TICKET}'s `## Stakeholder notes`" in start_region   # START anchor
+    assert f"{TICKET}'s `## Stakeholder notes`" in stay_on_task   # rule #4 anchor
+    # The legacy spelling must still be NAMED, or a session on one of the 809
+    # tickets that carry it cannot tell the two headings are one section.
+    assert "## Verbatim request" in start_region
     assert "{primary}" not in brief                              # f-string resolved
+    # T-0767 bullet 3: check his notes before going to him with a question.
+    assert "bsq ticket quote" in brief
+    assert "bsq ticket context" in brief
 
 
 def test_delta_brief_anchors_resumed_expert_on_verbatim(tmp_path):
@@ -69,4 +83,5 @@ def test_delta_brief_anchors_resumed_expert_on_verbatim(tmp_path):
                                       expert, "S-tl")
     assert VERBATIM in brief                                     # handed verbatim
     assert "ANCHOR ON THE ASK" in brief
-    assert "`## Verbatim request`" in brief
+    assert "`## Stakeholder notes`" in brief
+    assert "## Verbatim request" in brief        # legacy spelling still named

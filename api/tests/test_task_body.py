@@ -6,7 +6,9 @@ import pytest
 import hashlib
 
 from app.task_body import (
+    STAKEHOLDER_HEADING,
     append_progress,
+    append_stakeholder_quote,
     decode_progress_text,
     encode_progress_text,
     compose_body,
@@ -14,6 +16,7 @@ from app.task_body import (
     parse_body,
     regraft_progress,
     regraft_verbatim,
+    set_context,
 )
 
 
@@ -176,10 +179,10 @@ def test_parse_h3_is_not_a_boundary():
 
 
 def test_compose_skips_empty():
-    assert compose_body("v", "", "") == "## Verbatim request\n\nv\n"
+    assert compose_body("v", "", "") == "## Stakeholder notes\n\nv\n"
     assert compose_body("", "", "") == ""
     out = compose_body("v", "c", "- line")
-    assert "## Verbatim request" in out
+    assert STAKEHOLDER_HEADING in out
     assert "## Context" in out
     assert "## Progress" in out
 
@@ -206,22 +209,52 @@ def test_append_progress_preserves_other_sections():
     assert "- T1 · S1 · new line" in sections["progress"]
 
 
-def test_append_progress_long_note_roundtrips_byte_identical():
+def test_append_progress_note_roundtrips_byte_identical():
     # Regression for F-2026-07-05-bsq-30844bca41: notes used to be silently
-    # clipped at 240 chars, losing sacred stakeholder verbatims.
-    body = "## Verbatim request\n\nv\n"
-    note = ("stakeholder verbatim word " * 20).strip()
-    assert len(note) > 300
+    # CLIPPED, which is the defect — not the cap's value. T-0767 restored the
+    # 240 the role contracts state, so this exercises the no-silent-loss
+    # guarantee at a length a note is allowed to be; the >300-char sacred
+    # verbatim that motivated the report is pinned below on the writer that
+    # now owns it.
+    body = "## Stakeholder notes\n\nv\n"
+    note = ("stakeholder verbatim word " * 8).strip()
+    assert 200 < len(note) <= 240
     new = append_progress(body, "T1", "S1", note)
     parsed = parse_body(new)
     text_part = parsed["progress"].split(" · ", 2)[-1]
     assert text_part == note
 
 
-def test_append_progress_overflow_raises():
-    body = "## Verbatim request\n\nv\n"
-    with pytest.raises(ValueError, match="cap"):
+def test_sacred_verbatim_over_the_note_cap_roundtrips_as_a_stakeholder_quote():
+    """The F-2026-07-05-bsq-30844bca41 case itself, on its new writer (T-0767).
+
+    The report was about a >300-char stakeholder verbatim being clipped while
+    stored as a progress NOTE. T-0767's answer is that his words stop being
+    stored as notes at all — so the guarantee has to hold HERE now, or the
+    redesign silently re-opens the bug the 4000-char cap was raised to close.
+    """
+    body = "## Stakeholder notes\n\noriginal ask\n"
+    quote = ("stakeholder verbatim word " * 40).strip()
+    assert len(quote) > 300
+    new = append_stakeholder_quote(body, "T1", "2026-08-11", quote)
+    assert "original ask" in new          # the original formulation survives
+    text_part = parse_body(new)["verbatim"].split(" · ", 2)[-1]
+    assert text_part == quote
+
+
+def test_append_progress_overflow_raises_and_names_the_working_area():
+    body = "## Stakeholder notes\n\nv\n"
+    with pytest.raises(ValueError, match="cap") as e:
         append_progress(body, "T1", "S1", "x" * 5000)
+    # The refusal has to be actionable in one read, or a session just retries
+    # and burns the tokens T-0767 exists to save.
+    assert "context" in str(e.value).lower()
+
+
+def test_stakeholder_quote_overflow_still_refuses_rather_than_truncating():
+    body = "## Stakeholder notes\n\nv\n"
+    with pytest.raises(ValueError, match="cap"):
+        append_stakeholder_quote(body, "T1", "2026-08-11", "x" * 5000)
 
 
 def test_append_progress_single_line_prose_is_stored_unchanged():
@@ -467,3 +500,113 @@ def test_regraft_verbatim_protects_decorated_heading():
     out = regraft_verbatim(original, edited)
     assert "SACRED" in out and "TAMPER" not in out
     assert "new dod" in out
+
+
+# ---------------------------------------------------------------------------
+# T-0767: two authored artifacts (stakeholder notes + working-area Context),
+# with `## Verbatim request` kept as a parsing alias so 809 live tickets need
+# no migration.
+# ---------------------------------------------------------------------------
+
+def test_legacy_verbatim_heading_still_parses_as_the_stakeholder_section():
+    """The alias is what makes the rename free — if this breaks, every live
+    ticket loses the protection on the stakeholder's words at once."""
+    body = "## Verbatim request\n\nI want X.\n\n## Progress\n\n- a\n"
+    assert parse_body(body)["verbatim"] == "I want X."
+    assert not is_legacy_body(body)
+
+
+def test_new_stakeholder_heading_parses_as_the_same_section():
+    body = "## Stakeholder notes\n\nI want X.\n\n## Progress\n\n- a\n"
+    assert parse_body(body)["verbatim"] == "I want X."
+    assert not is_legacy_body(body)
+
+
+def test_a_ticket_carrying_BOTH_spellings_loses_neither():
+    """A transitional ticket can hold both headings. Whichever way the parser
+    resolves that, it must not DROP one — the original ask is the thing this
+    schema exists to protect, and a silent replace is how it would go."""
+    body = ("## Verbatim request\n\nTHE ORIGINAL ASK\n\n"
+            "## Stakeholder notes\n\n- T1 · 2026-08-11 · A LATER QUOTE\n")
+    parsed = parse_body(body)
+    assert "THE ORIGINAL ASK" in parsed["verbatim"]
+    assert "A LATER QUOTE" in parsed["verbatim"]
+
+
+def test_regraft_protects_the_new_heading_too():
+    """`regraft_verbatim` is the write-protection path. A caller must not be
+    able to put words in the stakeholder's mouth through the new spelling."""
+    on_disk = "## Stakeholder notes\n\nHIS WORDS\n\n## Context\n\nc\n"
+    hijack = "## Stakeholder notes\n\nWORDS HE NEVER SAID\n\n## Context\n\nnew c\n"
+    out = regraft_verbatim(on_disk, hijack)
+    assert "HIS WORDS" in out
+    assert "WORDS HE NEVER SAID" not in out
+    assert "new c" in out            # the legitimate Context edit still lands
+
+
+def test_regraft_removes_a_second_stakeholder_section_a_caller_invented():
+    """Excise EVERY stakeholder span, not just the first: a caller that keeps
+    the real section and ADDS a second one must not get the second through."""
+    on_disk = "## Stakeholder notes\n\nHIS WORDS\n"
+    hijack = ("## Stakeholder notes\n\nHIS WORDS\n\n"
+              "## Verbatim request\n\nSMUGGLED\n")
+    out = regraft_verbatim(on_disk, hijack)
+    assert "HIS WORDS" in out
+    assert "SMUGGLED" not in out
+
+
+def test_set_context_replaces_rather_than_appends():
+    """The working area records what is TRUE NOW — replacing is the point."""
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\nOLD STATE\n\n"
+            "## Progress\n\n- a\n")
+    out = set_context(body, "NEW STATE")
+    assert "NEW STATE" in out
+    assert "OLD STATE" not in out
+    parsed = parse_body(out)
+    assert parsed["verbatim"] == "v"
+    assert "- a" in parsed["progress"]
+
+
+def test_set_context_creates_the_section_before_progress():
+    body = "## Stakeholder notes\n\nv\n\n## Progress\n\n- a\n"
+    out = set_context(body, "STATE")
+    assert parse_body(out)["context"] == "STATE"
+    # the machine feed stays last, so the authored artifacts read first
+    assert out.index("## Context") < out.index("## Progress")
+
+
+def test_set_context_preserves_non_canonical_sections():
+    """Same hazard as T-0729: a recompose would delete `## DoD` on 414 live
+    tickets the moment anyone edited the working area."""
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\nold\n\n"
+            "## DoD\n\n- ship it\n")
+    out = set_context(body, "new")
+    assert "## DoD\n\n- ship it" in out
+    assert "new" in out
+
+
+def test_set_context_demotes_h2_so_the_working_area_survives_a_reparse():
+    """Found by using `set_context` on a real ticket, not by a unit test.
+
+    Any `## ` heading ends a section (T-0729), so a working area written with
+    the structure a working area wants would parse back as several bogus
+    top-level sections with only the preamble surfacing as Context. The file on
+    disk looks complete, which is what makes it dangerous — the loss is at the
+    READ layer, exactly where the brief and the board look. Measured on the
+    first real use: a 3.4KB handover parsed back as 182 chars.
+    """
+    body = "## Stakeholder notes\n\nv\n\n## Progress\n\n- a\n"
+    written = ("preamble\n\n## What shipped\n\ndetails here\n\n"
+               "## Open questions\n\nthe hard one\n")
+    out = set_context(body, written)
+    ctx = parse_body(out)["context"]
+    # every part of the working area round-trips into ONE section
+    assert "preamble" in ctx
+    assert "details here" in ctx
+    assert "the hard one" in ctx
+    # headings survive as headings, one level down
+    assert "### What shipped" in ctx
+    assert "### Open questions" in ctx
+    # and the ticket did not sprout new top-level sections
+    assert out.count("\n## ") + out.startswith("## ") == 3  # stakeholder, Context, Progress
+    assert parse_body(out)["progress"].strip() == "- a"

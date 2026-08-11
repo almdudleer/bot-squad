@@ -15,12 +15,16 @@ persistent session**.
   terminate. A fresh TL incarnation reads the artifact and continues.
   Continuity = **artifact + re-drive**, never a kept-alive process.
 - **Your artifact = task updates.** You do NOT keep a separate state-doc
-  (that's the operator's). You **document your progress and decisions into
-  the task/initiative you coordinate** — its `## Progress` section — via
-  `bsq ticket note <id> "<note>"` (the role-agnostic `task_progress_add`
-  path devs use). Record dispatches, review/accept/push decisions, blockers,
-  and plan changes there at each meaningful checkpoint. That log IS what a
-  fresh TL incarnation re-drives from — keep it future-useful, not chatty.
+  (that's the operator's). You **document the coordination state into the
+  task/initiative you coordinate** — its `## Context` **working area**, via
+  `bsq ticket context <id> --file <f>`, which REPLACES it (T-0767). Keep it
+  saying WHAT IS TRUE NOW: who is on what, review/accept/push decisions that
+  stand, live blockers, the current plan. That state IS what a fresh TL
+  incarnation re-drives from — so edit it in place rather than appending a
+  chronology, and never make the next incarnation reconstruct the present
+  from a log. Short checkpoints (240 chars, enforced) still go to
+  `## Progress` via `bsq ticket note <id> "<note>"`; that feed is for the
+  stall watchdog, not for your handover.
 - **NOT a mini-operator.** The **operator orchestrates** (triage, roadmap,
   spawn-vs-reuse across the whole project, deciding what ships) and does NOT
   explain/micro-manage. You coordinate ONE team's devs on the ONE
@@ -193,8 +197,9 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
 ## Task hygiene
 
 - When you create a new task (e.g. handling a DEV SPAWN REQUEST without
-  a bound task), put the stakeholder's exact words in the `## Verbatim
-  request` section. Never paraphrase.
+  a bound task), put the stakeholder's exact words in the `## Stakeholder
+  notes` section (older tickets spell it `## Verbatim request`; both parse
+  the same). Never paraphrase.
 - Never hand-pick the T-NNNN id when filing a new ticket. Call the
   `task_new` worker action (`{slug, title, provenance, initiative?,
   priority?, owner?}` → `{id, file_path}`), then edit the returned md. The
@@ -203,7 +208,8 @@ See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 —
 - **Stakeholder clarifications/decisions land on the task, immediately.**
   When the stakeholder answers a question, makes a call, or refines scope —
   in your pane, via TG, anywhere — record it on the relevant ticket
-  (`bsq ticket note <id>`, or `## Context` for longer text) right then.
+  with `bsq ticket quote <id> "<his exact words>"` right then — his words
+  belong in `## Stakeholder notes`, never in the session feed (T-0767).
   Never park it only in your compact artifact or a scratch md: handover
   docs are for context GOTCHAS, task-relevant detail lives on the task
   (T-0567; artifact-kind→home map: `docs/architecture/D-0045`). Deferred /

@@ -518,7 +518,11 @@ def test_create_with_verbatim_request_composes_body(tmp_bot_squad: Path, monkeyp
     assert r.status_code == 200
     t = r.json()
     assert t["verbatim"] == "I want the moon."
-    assert "## Verbatim request" in t["body"]
+    # T-0767: fresh tickets are composed under the new heading. What matters to
+    # every consumer is that it parses back as the stakeholder section, which
+    # `t["verbatim"]` above already proves — the heading assertion just pins
+    # which spelling we WRITE, now that two of them parse.
+    assert "## Stakeholder notes" in t["body"]
 
 
 # ---------------------------------------------------------------------------

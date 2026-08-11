@@ -486,6 +486,216 @@ def test_finalize_drops_stamp_when_pane_already_gone(tmp_path, seams):
     assert "idle_recycle_phase" not in meta
 
 
+# --- T-0858: the WHOLE idle window in one drive, through the REAL writer ----
+
+def _ticket_context(path: Path) -> str:
+    """A ticket's ``## Context`` as a reader sees it.
+
+    Extracted exactly the way :func:`autocompact.context_digest` extracts the
+    bytes it hashes — same frontmatter regex (never ``split("---", 2)``, which
+    breaks on a title containing a dash run, T-0286), same ``parse_body`` — so
+    the test and the mechanism cannot disagree about which bytes count as the
+    handoff.
+    """
+    from bot_squad_worker.task_body import parse_body
+    text = path.read_text()
+    m = A._TICKET_FM_RE.match(text)
+    return parse_body(m.group(2) if m else text).get("context", "")
+
+
+def test_idle_window_drive_writes_the_ticket_context_before_terminate(
+        tmp_path, seams, monkeypatch):
+    """T-0858's DoD: drive a task-bound session over the idle window and prove
+    the ticket's ``## Context`` held its forward-state BEFORE it was terminated.
+
+    Every other test in this section pins one half of the machine with a
+    hand-made mark. This one runs all the ticks against ONE ticket md and lets
+    the write happen the way the finalize prompt asks for it — through
+    ``task_context_set``, the action ``bsq ticket context`` calls. What that
+    catches and two half-tests cannot: an ARM whose snapshot is taken against a
+    different destination than FINALIZE re-resolves, a mark the real writer
+    does not actually move, and a terminate that races the write.
+
+    T-0858 was opened on 20 consecutive idle recycles that reported success
+    having recorded nothing, so "before terminate" is asserted as an ORDERING —
+    the Context is read at the instant ``sessions.suspend`` is called, not
+    after the drive is over, where a later tick's write would also pass.
+    """
+    from bot_squad_worker import actions
+
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    ticket = _ticket_md(data)
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    before = _ticket_context(ticket)
+    assert before.strip() == "state as of arm time"
+
+    # What the ticket's Context said at the instant the session was suspended.
+    inner_suspend = S.suspend  # the seams fixture's recorder, not the real one
+
+    def _recording_suspend(cfg_, slug_, sid_, **kw):
+        seen["context"] = _ticket_context(ticket)
+        return inner_suspend(cfg_, slug_, sid_, **kw)
+
+    seen: dict[str, str] = {}
+    monkeypatch.setattr(S, "suspend", _recording_suspend)
+
+    # tick 1 — the window has elapsed: the session is ASKED, never terminated,
+    # and the system does NOT author the Context on its behalf.
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["ctx_handoff"] == [(sid, "T-0042", False)]
+    assert seams["calls"]["terminate"] == []
+    assert _ticket_context(ticket) == before
+
+    # tick 2 — nothing written yet: the wait holds instead of terminating.
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["terminate"] == []
+
+    # the session obeys the prompt, through the one verb the prompt names
+    monkeypatch.setattr(actions, "_CONFIG", cfg)
+    handoff = "Rewired the widget; the flaky import remains — start there."
+    actions._action_task_context_set(
+        {"slug": "bot-squad", "task_id": "T-0042", "text": handoff, "sid": sid})
+
+    # tick 3 — the write landed: terminate + record.
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == [sid]
+
+    # THE assertion the ticket was opened for: the forward-state was already on
+    # the ticket when the session was cut, not merely present afterwards.
+    assert handoff in seen["context"]
+    assert seen["context"] != before
+    assert handoff in _ticket_context(ticket)   # and it survived the terminate
+
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["status"] == "suspended"
+    assert meta["resumable"] is True
+    assert "forward-state written to T-0042's ## Context" in meta["resume_hint"]
+    # …and across the whole drive, not one `/compact`: «никакого компакта».
+    assert seams["calls"]["compact"] == []
+
+
+def test_finalize_writes_the_executive_summary_through_its_own_action(
+        tmp_path, seams, monkeypatch):
+    """T-0863: the finalize prompt asks for TWO writes, and the second one has
+    to land on the same md without disturbing the first.
+
+    Driven through ``task_summary_set`` — the action ``bsq ticket summary``
+    calls — rather than through ``set_summary`` directly, because what is under
+    test here is the whole write path: the lock, the frontmatter re-stamp, and
+    the fact that the two writers share one file.
+    """
+    from bot_squad_worker import actions
+    from bot_squad_worker.task_body import parse_body
+
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    ticket = _ticket_md(data)
+    monkeypatch.setattr(actions, "_CONFIG", cfg)
+
+    actions._action_task_context_set(
+        {"slug": "bot-squad", "task_id": "T-0042",
+         "text": "Rewired the widget.\n\n### Next\n\nthe flaky import.", "sid": sid})
+    actions._action_task_summary_set(
+        {"slug": "bot-squad", "task_id": "T-0042",
+         "text": "Writer and CLI shipped; the board render remains.", "sid": sid})
+
+    parsed = parse_body(ticket.read_text().split("---\n", 2)[-1])
+    assert parsed["summary"] == "Writer and CLI shipped; the board render remains."
+    # the ask is untouched and the working area still holds ALL of its detail —
+    # a summary write that clipped either would be the T-0729 shape returning.
+    assert parsed["verbatim"] == "Do the thing."
+    assert "the flaky import." in parsed["context"]
+    assert "updated:" in ticket.read_text().split("---")[1]
+
+    # …and a non-paragraph is refused by the ACTION too, not only by the writer:
+    # the CLI/API callers never touch `set_summary`, so a refusal that stopped
+    # at the module boundary would not exist for either of them.
+    with pytest.raises(actions.ActionError) as e:
+        actions._action_task_summary_set(
+            {"slug": "bot-squad", "task_id": "T-0042", "text": "a\n\nb"})
+    assert "ONE paragraph" in str(e.value)
+
+
+def test_a_summary_only_write_does_NOT_release_the_finalize_wait(
+        tmp_path, seams, monkeypatch):
+    """The STATED BOUND of the digest design, pinned so it cannot drift.
+
+    FINALIZE watches the `## Context` digest alone. A summary is one cheap
+    paragraph, so if either-section-changed released the wait, a degraded
+    session could satisfy finalize with a status line and lose the forward
+    state — which is exactly the reported-success-stored-nothing failure
+    T-0858 was opened on, arriving through the new section.
+
+    So: write ONLY the summary, and the session must still be alive.
+    """
+    from bot_squad_worker import actions
+
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    monkeypatch.setattr(actions, "_CONFIG", cfg)
+
+    # tick 1 — asked, armed against the Context digest.
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+
+    actions._action_task_summary_set(
+        {"slug": "bot-squad", "task_id": "T-0042",
+         "text": "Nearly done, honest.", "sid": sid})
+
+    # the ticket md CHANGED — mtime and bytes both — and that must not count.
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["terminate"] == []
+
+    # the Context write is what releases it.
+    actions._action_task_context_set(
+        {"slug": "bot-squad", "task_id": "T-0042", "text": "the real state", "sid": sid})
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == [sid]
+
+
+def test_idle_window_drive_holds_when_the_context_is_never_written(
+        tmp_path, seams, monkeypatch):
+    """The falsifiable half of the drive above: identical, with the WRITE
+    REMOVED.
+
+    Same ticket, same seams, same ticks — the only difference is that nobody
+    calls ``task_context_set``. The session must still be alive, because what
+    releases the terminate is the write and not the clock. Without this arm the
+    green above would also pass a build that terminated on tick 3 regardless,
+    which is precisely the 20-recycles-recorded-nothing behaviour T-0858
+    measured.
+
+    The bounded timeout still applies and is deliberately NOT reached here —
+    ``test_finalize_timeout_terminates_anyway`` owns that end.
+    """
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
+    ticket = _ticket_md(data)
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    before = _ticket_context(ticket)
+
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True   # armed
+    for _ in range(10):
+        assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                                user_home="/home/x") is False
+
+    assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["compact"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["idle_recycle_phase"] == "finalizing"
+    assert meta["status"] == "active"
+    assert _ticket_context(ticket) == before
+
+
 def test_terminate_failure_is_retried_next_tick(tmp_path, seams, monkeypatch):
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")

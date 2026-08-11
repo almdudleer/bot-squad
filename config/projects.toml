@@ -132,3 +132,25 @@ test_build_cmd   = "`cd web && npm run build` (build only — no e2e yet)"
 # the workspace dir), so ops_path is the absolute install data dir.
 ops_path = "/home/www/bot-squad/data/bot-squad"
 stack    = "FastAPI API + uvicorn worker (Python), React + Vite + Bootstrap web UI, tmux + per-user unix-socket worker for session orchestration."
+
+[projects.guestent]
+slug           = "guestent"
+display_name   = "Guestent"
+repo_workspace = "/home/flomaster/guestent"
+repo_path      = "/home/flomaster/guestent/dev"
+repo_master    = "/home/flomaster/guestent/master"
+deploy_branch  = ""
+master_branch  = "master"
+prod_url       = ""
+staging_url    = ""
+dev_url        = ""
+deploy_targets = []
+tg_chat        = "-1004380986138"
+created_at     = 2026-08-08
+ops_path       = "ops"
+stack          = "Small, low-token-quota application project; deployment is managed directly by the user through Docker."
+stakeholders   = "flomaster (project/session owner) and almdudleer (trusted collaborator); both share flomaster's single user-conversation."
+extra_hard_rules = [
+  "Never spawn workers, subagents, team leads, operators, or autonomous sessions for this project. User-conversation sessions must perform the work directly.",
+  "Use bot-squad only for Telegram communication and task tracking; do not use its orchestration or delegation features.",
+]

@@ -150,7 +150,7 @@ def seams(monkeypatch):
 
     # T-0563/T-0564: default slug "bot-squad" is already allowlisted; no human
     # is attached in these tests.
-    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target: False)
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: False)
 
     # idle clock: jsonl mtime = now - idle_age
     monkeypatch.setattr(S, "_pane_activity_at",
@@ -760,7 +760,7 @@ def test_user_conversation_role_never_terminated_but_gets_compact_stay(tmp_path,
 def test_attached_session_never_recycled(tmp_path, seams, monkeypatch):
     """T-0564: a human tmux client attached to the pane blocks the recycle even
     in an allowlisted project with a non-exempt role."""
-    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target: True)
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: True)
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
     row = _row(sid, cwd_repo=data.parent / "repo")

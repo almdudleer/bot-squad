@@ -50,6 +50,19 @@ directly (like :func:`user_session_exempt`, not folded into
 :func:`recycle_allowed`) and, for a drive=on operator, sends a "continue"
 nudge in place of the compact/terminate machinery. See ``idle_timeout``'s
 module docstring for the full state machine.
+
+T-0864 pane-scoping the attach check: :func:`is_attached` used to ask
+``tmux list-clients -t <pane_id>``, and **tmux resolves a pane id to its
+enclosing SESSION, not the pane**. Every session of one project shares ONE
+tmux session, so a single human attached anywhere in a project reported
+"attached" for EVERY pane in it and froze autocompact/idle_timeout/recovery
+fleet-wide, whatever the context ceiling was set to. A per-pane check was
+intended; a per-session check shipped. The fix compares the target's tmux
+WINDOW against the window each attached client is actually viewing (see
+:func:`is_attached`). Same ticket: this gate and ``autocompact.composer_ready``
+now emit a debounced INFO line when they defer a tick — neither logged anything
+on skip, which is why the 158-minute ``S-almdudleer-operator-p50`` overshoot
+could not be attributed past "one of these two gates".
 """
 from __future__ import annotations
 
@@ -57,19 +70,50 @@ import logging
 import os
 import re
 import subprocess
+import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 DEFAULT_RECYCLE_PROJECTS = ("bot-squad", "watchrobot")
 
-# Skip-log debounce: at most one INFO line per slug within this window. All
+# Skip-log debounce: at most one INFO line per KEY within this window. All
 # three ticks run on a ~60s cadence and call the gate once PER SESSION, so
 # without this a busy allowlisted-out project would log once per session per
 # tick. A window comfortably under 60s guarantees at most one line per tick per
-# project regardless of how many sessions/rows are checked within it.
+# key regardless of how many sessions/rows are checked within it.
+#
+# Keys are namespaced by gate (``project:``/``attached:``/``composer:``) so the
+# three skip reasons debounce independently: an attach skip on one session must
+# never suppress the allowlist line for its project, or the log stops answering
+# "which gate held this session up" — the T-0864 question.
 _SKIP_LOG_WINDOW_SEC = 30.0
+# Keyed by sid for the per-session gates, so the dict grows with sessions seen
+# over a worker's lifetime rather than staying slug-bounded. Prune on write once
+# it passes this size; entries outside the debounce window carry no information.
+_SKIP_LOG_MAX_KEYS = 512
 _last_skip_log: dict[str, float] = {}
+
+
+def should_log_skip(key: str, now: float | None = None) -> bool:
+    """True at most once per ``key`` per :data:`_SKIP_LOG_WINDOW_SEC`, stamping
+    the key as logged. The shared debounce behind every gate's skip line
+    (``project_allowed``, :func:`is_attached`, ``autocompact.composer_ready``).
+
+    ``now`` is the tick's clock when the caller has one (every recycle tick
+    does); ``None`` falls back to wall-clock for the few callers that don't.
+    """
+    ts = time.time() if now is None else float(now)
+    last = _last_skip_log.get(key)
+    if last is not None and (ts - last) < _SKIP_LOG_WINDOW_SEC:
+        return False
+    if len(_last_skip_log) >= _SKIP_LOG_MAX_KEYS:
+        cutoff = ts - _SKIP_LOG_WINDOW_SEC
+        for k, v in list(_last_skip_log.items()):
+            if v < cutoff:
+                del _last_skip_log[k]
+    _last_skip_log[key] = ts
+    return True
 
 
 def recycle_allowlist(cfg: Any) -> tuple[str, ...]:
@@ -96,9 +140,7 @@ def project_allowed(cfg: Any, slug: str, now: float) -> bool:
     """
     if slug in recycle_allowlist(cfg):
         return True
-    last = _last_skip_log.get(slug)
-    if last is None or (now - last) >= _SKIP_LOG_WINDOW_SEC:
-        _last_skip_log[slug] = now
+    if should_log_skip(f"project:{slug}", now):
         log.info("recycle: skipping non-allowlisted project %s", slug)
     return False
 
@@ -173,9 +215,42 @@ def operator_drive_on(role: str | None = None, meta: dict | None = None) -> bool
     return val != "off"
 
 
-def is_attached(tmux_target: str | None) -> bool:
-    """True iff a human tmux client is attached to ``tmux_target`` (a pane id
-    or session name — tmux resolves either to its enclosing session).
+def _tmux(args: list[str]) -> subprocess.CompletedProcess | None:
+    """Run a read-only tmux query. ``None`` means the invocation itself failed
+    (timeout / no binary) — the caller must fail CLOSED on that, never confuse
+    it with a clean "no clients" answer."""
+    try:
+        return subprocess.run(["tmux", *args], capture_output=True, text=True,
+                              timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def is_attached(tmux_target: str | None, *, sid: str | None = None,
+                now: float | None = None) -> bool:
+    """True iff a human tmux client is currently LOOKING AT ``tmux_target``
+    (a pane id, or a session/window name).
+
+    T-0864 — what this used to get wrong. The old implementation ran
+    ``tmux list-clients -t <pane_id>``, and **tmux resolves any target down to
+    its enclosing SESSION**: a client attached to window ``w1`` is returned for
+    a pane in ``w2`` of the same tmux session. Measured 2026-08-11 on a
+    throwaway server (``tmux -L``): one client viewing ``w1``,
+    ``list-clients -t <pane in w2>`` printed it. Since every session of one
+    project shares ONE tmux session (``tmux_session: "watchrobot"``), that made
+    one attached human freeze autocompact, idle_timeout AND recovery for the
+    whole project fleet.
+
+    So the check is done the other way round: resolve the TARGET's window id,
+    then ask each attached client which window IT is displaying
+    (``list-clients -F '#{window_id}'`` resolves per client, verified on the
+    same throwaway server by switching the client between windows). Attached =
+    some client's current window is the target's window.
+
+    WINDOW-level, deliberately, not pane-level: a split window shows all of its
+    panes at once, so a human in that window really is watching every pane in
+    it. Live layout is one pane per window per session anyway, where the two
+    coincide.
 
     - No target (nothing to check, e.g. a dead-pane session) → False. The
       caller's own pane-liveness gate already handles the "nothing there"
@@ -183,25 +258,43 @@ def is_attached(tmux_target: str | None) -> bool:
     - tmux invocation error (timeout/OSError) → True. Fail CLOSED: treat as
       attached (skip) rather than risk killing a session a human is looking
       at because of a transient tmux hiccup.
-    - Clean non-zero exit (target doesn't exist) → False (no session, no
-      client possible).
-    - Clean zero exit → True iff ``tmux list-clients`` printed at least one
-      client line.
+    - Target doesn't exist — non-zero exit, or the clean-but-EMPTY output tmux
+      3.x gives for an unknown pane id → False. A pane that isn't there cannot
+      have anyone watching it, and failing closed here would wedge exactly the
+      recovery path that exists to clean dead panes up.
+    - No tmux server / no clients → False.
+
+    Logs one debounced INFO line naming the session and the window a client is
+    holding, so a stuck session is a log lookup (T-0864 DoD 3).
     """
     if not tmux_target:
         return False
-    try:
-        out = subprocess.run(
-            ["tmux", "list-clients", "-t", tmux_target],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+    tgt = _tmux(["display-message", "-p", "-t", str(tmux_target),
+                 "-F", "#{window_id}"])
+    if tgt is None:
+        log.warning("recycle: tmux display-message failed for %s — treating as "
+                    "attached (fail-closed)", tmux_target)
+        return True
+    if tgt.returncode != 0:
+        return False
+    target_window = tgt.stdout.strip()
+    if not target_window:
+        return False  # unknown target: tmux 3.x exits 0 and prints nothing
+    clients = _tmux(["list-clients", "-F", "#{window_id}"])
+    if clients is None:
         log.warning("recycle: tmux list-clients failed for %s — treating as "
                     "attached (fail-closed)", tmux_target)
         return True
-    if out.returncode != 0:
+    if clients.returncode != 0:
+        return False  # no server → no client possible
+    viewing = {ln.strip() for ln in clients.stdout.splitlines() if ln.strip()}
+    if target_window not in viewing:
         return False
-    return bool(out.stdout.strip())
+    if should_log_skip(f"attached:{sid or tmux_target}", now):
+        log.info("recycle: skipping %s — a human client is viewing its tmux "
+                 "window %s (target %s)", sid or "<unknown sid>",
+                 target_window, tmux_target)
+    return True
 
 
 def recycle_allowed(cfg: Any, *, slug: str, role: str | None,
@@ -219,6 +312,6 @@ def recycle_allowed(cfg: Any, *, slug: str, role: str | None,
         return False
     if user_session_exempt(role=role, window=window, meta=meta):
         return False
-    if is_attached(tmux_target):
+    if is_attached(tmux_target, now=now):
         return False
     return True

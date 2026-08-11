@@ -52,6 +52,45 @@ def test_composer_ready_pure():
     assert A.composer_ready("❯\n· Working… (esc to interrupt)") is False
 
 
+# --- T-0864 DoD 3: composer_ready was as silent as recycle_gate.is_attached ---
+
+def test_composer_ready_verdicts_unchanged_when_a_sid_is_passed():
+    """The T-0864 logging is additive — sid/now must not move any verdict."""
+    for buf in ("some output\n❯ \n", "", "just bash $ no rune",
+                "❯\n· Working… (esc to interrupt)"):
+        assert (A.composer_ready(buf, sid="S-alpha", now=1000.0)
+                is A.composer_ready(buf))
+
+
+def test_composer_ready_logs_a_debounced_skip_naming_the_reason(caplog):
+    from bot_squad_worker import recycle_gate
+    recycle_gate._last_skip_log.clear()
+    caplog.set_level("INFO")
+    # a permission dialog / stale render: no ❯ on screen
+    assert A.composer_ready("[y/n]?", sid="S-alpha", now=1000.0) is False
+    assert A.composer_ready("[y/n]?", sid="S-alpha", now=1000.1) is False  # same tick
+    assert A.composer_ready("❯ · Working… (esc to interrupt)",
+                            sid="S-alpha", now=1035.0) is False  # window elapsed
+    lines = [r.getMessage() for r in caplog.records
+             if "not composer-ready" in r.getMessage()]
+    assert len(lines) == 2
+    assert "S-alpha" in lines[0] and "❯" in lines[0]
+    assert "mid-generation" in lines[1]
+
+
+def test_composer_ready_logs_nothing_without_a_sid(caplog):
+    """input_mux reuses this predicate per keystroke batch to decide whether a
+    pane can be typed into — a "not ready" there is the normal case, not a
+    deferred recycle, and must not fill the log."""
+    from bot_squad_worker import recycle_gate
+    recycle_gate._last_skip_log.clear()
+    caplog.set_level("INFO")
+    assert A.composer_ready("") is False
+    assert A.composer_ready("❯ (esc to interrupt)") is False
+    assert [r for r in caplog.records if "composer-ready" in r.getMessage()] == []
+    assert recycle_gate._last_skip_log == {}
+
+
 def test_autocompact_enabled_default_on_kill_switch_off(monkeypatch):
     monkeypatch.delenv("BOT_SQUAD_AUTOCOMPACT", raising=False)
     assert A.autocompact_enabled() is True
@@ -80,7 +119,7 @@ def harness(monkeypatch):
     # (recycle_gate.recycle_allowed) doesn't touch real tmux or the default
     # bot-squad-only allowlist. The gate itself has its own test module.
     monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "proj")
-    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target: False)
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target, **kw: False)
     return {"sent": sent, "state": state}
 
 
@@ -170,7 +209,7 @@ def test_user_conversation_role_never_gets_the_handoff_path(harness):
 def test_attached_pane_is_never_compacted(harness, monkeypatch):
     """T-0564: a human client attached to the pane blocks the /compact even
     when everything else says "go"."""
-    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target: True)
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target, **kw: True)
     rec = _rec()
     assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is False
     assert harness["sent"] == []
@@ -198,7 +237,7 @@ def stay_harness(monkeypatch):
     monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))
     monkeypatch.setattr(A, "autocompact_enabled", lambda: True)
     monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "bot-squad")
-    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target: False)
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target, **kw: False)
     return {"sent": sent, "state": state}
 
 

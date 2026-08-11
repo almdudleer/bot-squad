@@ -136,18 +136,45 @@ def compact_due(level: str, fired_at: dict, now: float, cooldown: int | None = N
         return True
 
 
-def composer_ready(buf: str) -> bool:
+def composer_ready(buf: str, *, sid: str | None = None,
+                   now: float | None = None) -> bool:
     """True when the captured pane buffer shows the composer ready for input.
 
     The ``❯`` rune is rendered by Claude Code's input box only when it accepts
     keystrokes (T-0126). A mid-generation pane shows an "esc to interrupt"
     marker — never /compact then, even if a stale ``❯`` lingers in scrollback.
+
+    T-0864: pass ``sid`` (and the tick's ``now``) from a RECYCLE path to get one
+    debounced INFO line naming which of the two reasons deferred this tick — a
+    permission dialog or a stale render can hold this gate closed for hours, and
+    it used to be as silent as ``recycle_gate.is_attached``. Callers that are
+    not a recycle gate — ``input_mux``, which reuses this predicate per keystroke
+    batch to decide whether a pane can be typed into — pass no ``sid`` and log
+    nothing; a "not ready" there is the normal case, not a deferred recycle.
+    The return value is unchanged either way: this stays a pure predicate over
+    ``buf``.
     """
     if not buf or "❯" not in buf:
+        _log_not_composer_ready(sid, "no ❯ composer rune in the captured pane "
+                                "(empty capture, or a dialog/alt-screen over it)",
+                                now)
         return False
     if "esc to interrupt" in buf.lower():
+        _log_not_composer_ready(sid, "pane is mid-generation "
+                                "('esc to interrupt' on screen)", now)
         return False
     return True
+
+
+def _log_not_composer_ready(sid: str | None, reason: str,
+                            now: float | None) -> None:
+    """One debounced INFO line per session per window, matching
+    ``recycle_gate.project_allowed``'s pattern (T-0864 DoD 3)."""
+    if not sid:
+        return
+    if recycle_gate.should_log_skip(f"composer:{sid}", now):
+        log.info("recycle: %s not composer-ready — %s; gate deferred this tick",
+                 sid, reason)
 
 
 # --- prompts (the "ask the session to write everything down" + the reload) --
@@ -322,7 +349,7 @@ def _do_claude_compact(cfg: Any, slug: str, rec: dict, now: float) -> bool:
     pane = _pane_for(sid)
     if not pane:
         return False
-    if not composer_ready(_capture_pane(pane)):
+    if not composer_ready(_capture_pane(pane), sid=sid, now=now):
         return False
     try:
         _send_compact(sid)
@@ -360,7 +387,7 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
     if not compact_safe(rec.get("activity", "")):
         return False
     pane = _pane_for(sid)
-    if pane and not composer_ready(_capture_pane(pane)):
+    if pane and not composer_ready(_capture_pane(pane), sid=sid, now=now):
         return False
 
     # CLEAR + RELAUNCH: close the old pane, boot a fresh incarnation from the
@@ -411,7 +438,7 @@ def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: 
     if not idle_timeout.compact_stay_due(meta.get("compact_stay_last_at"), now,
                                          idle_timeout.idle_timeout_sec()):
         return False  # already compacted-and-stayed this cache window
-    if not pane or not composer_ready(_capture_pane(pane)):
+    if not pane or not composer_ready(_capture_pane(pane), sid=sid, now=now):
         return False
 
     try:
@@ -461,7 +488,7 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     if not recycle_gate.project_allowed(cfg, slug, now):
         return False
     pane = _pane_for(sid) if sid else None
-    if recycle_gate.is_attached(pane):
+    if recycle_gate.is_attached(pane, sid=sid, now=now):
         return False
 
     role = rec.get("role") or meta.get("role")
@@ -498,7 +525,7 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     pane = _pane_for(sid)
     if not pane:
         return False
-    if not composer_ready(_capture_pane(pane)):
+    if not composer_ready(_capture_pane(pane), sid=sid, now=now):
         return False
 
     # Handoff mode + a resolvable role artifact → ARM the write-to-artifact flow.

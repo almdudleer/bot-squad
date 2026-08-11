@@ -357,7 +357,7 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
         return False
     # T-0564: never touch a pane a human is currently attached to — applies
     # to every session, exempt or not.
-    if recycle_gate.is_attached(pane):
+    if recycle_gate.is_attached(pane, sid=sid, now=now):
         return False
 
     # T-0564/T-0616: the human's own sessions (user-conversation role,
@@ -430,7 +430,8 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     T-0655: ``role`` is threaded through to :func:`_terminate_and_remember` so
     a drive=off operator (the only way an operator reaches this function at
     all — see :func:`maybe_recycle`) self-terminates without resume bait."""
-    if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
+    if not pane or not autocompact.composer_ready(
+            autocompact._capture_pane(pane), sid=sid, now=now):
         return False
 
     # T-0470: the stall crossed the window → record the timeout lifecycle event
@@ -472,7 +473,8 @@ def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: f
         sessions._write_session_metadata(md_path, meta, atomic=True)
         return False
 
-    ready = autocompact.composer_ready(autocompact._capture_pane(pane))
+    ready = autocompact.composer_ready(autocompact._capture_pane(pane),
+                                       sid=sid, now=now)
     if not ready and not timed_out:
         return False  # still compacting — retry next tick
 
@@ -562,7 +564,8 @@ def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict
         log.info("idle_timeout: compact-and-stay auto-postpone %s — waiting "
                  "on a tracked long job", sid)
         return False
-    if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
+    if not pane or not autocompact.composer_ready(
+            autocompact._capture_pane(pane), sid=sid, now=now):
         return False
 
     tokens = _context_tokens(cfg, slug, sid)
@@ -604,7 +607,8 @@ def _finalize_compact_stay(sid: str, meta: dict, md_path, now: float,
         sessions._write_session_metadata(md_path, meta, atomic=True)
         return False
 
-    ready = autocompact.composer_ready(autocompact._capture_pane(pane))
+    ready = autocompact.composer_ready(autocompact._capture_pane(pane),
+                                       sid=sid, now=now)
     if not ready and not timed_out:
         return False  # still compacting — retry next tick
 
@@ -689,7 +693,8 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         log.info("idle_timeout: keepalive auto-postpone %s — waiting on a "
                  "tracked long job", sid)
         return False
-    if not pane or not autocompact.composer_ready(autocompact._capture_pane(pane)):
+    if not pane or not autocompact.composer_ready(
+            autocompact._capture_pane(pane), sid=sid, now=now):
         return False
 
     try:

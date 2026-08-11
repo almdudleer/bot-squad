@@ -184,7 +184,7 @@ def seams(monkeypatch):
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: calls["compact"].append(sid))
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: state["tokens"])
-    monkeypatch.setattr(G, "is_attached", lambda target: False)
+    monkeypatch.setattr(G, "is_attached", lambda target, **kw: False)
     monkeypatch.setattr(S, "_pane_activity_at",
                         lambda cwd, uuid, home: time.time() - state["idle_age"])
 

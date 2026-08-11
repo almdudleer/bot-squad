@@ -403,7 +403,7 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "_capture_pane", lambda pane: "❯ ready\n")
     monkeypatch.setattr(A, "_send_compact", lambda sid: compacted.append(sid))
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: 25000)
-    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target: False)
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: False)
     monkeypatch.setattr(S, "_pane_activity_at",
                         lambda cwd, uuid, home: time.time() - 5000.0)
     monkeypatch.delenv("BOT_SQUAD_IDLE_TIMEOUT", raising=False)

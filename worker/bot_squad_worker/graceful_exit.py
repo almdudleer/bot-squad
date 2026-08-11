@@ -286,7 +286,8 @@ def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bo
     pane = autocompact._pane_for(sid)
     if not pane:
         return False
-    if not autocompact.composer_ready(autocompact._capture_pane(pane)):
+    if not autocompact.composer_ready(autocompact._capture_pane(pane),
+                                      sid=sid, now=now):
         return False
 
     try:

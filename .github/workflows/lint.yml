@@ -27,6 +27,7 @@ jobs:
           python3 scripts/lint/backlog_frontmatter.py /nonexistent
           python3 scripts/lint/backlog_ids.py /nonexistent
           python3 scripts/lint/backlog_provenance.py /nonexistent
+          python3 scripts/lint/backlog_priority.py /nonexistent
       - name: Cross-module attribute smoke (T-0186 absorption-split gate)
         # Stdlib-only AST check — proves every cfg.<attr> access in a consumer
         # resolves to a real Config member. Catches a wide-add split that ships
@@ -169,3 +170,23 @@ jobs:
         run: |
           cd worker && PYTHONPATH=. BOT_SQUAD_REQUIRE_CROSS_TREE=1 pytest \
             "tests/test_sessions.py::test_session_history_ts_preserved_on_api_patch_roundtrip" -x -q -rs
+      - name: The priority WRITER and the priority READER share one vocabulary (T-0877)
+        # The defect this pins was not in either half. `bsq task new --priority`
+        # stored any string ("priority value, verbatim"); pickup's ranking read
+        # only p1/p2/p3; and NOTHING compared the two. So `--priority high`
+        # exited 0 on a ticket the board could never surface again — 86 of them
+        # on the watchrobot board, its whole needs-triage band there for the
+        # FORMAT of one field, the oldest invisible 20.6 days (T-0586).
+        #
+        # It runs HERE, on every push, and not only in the nightly worker suite,
+        # for T-0738's reason: a guard nothing runs is not a guard. The test is
+        # stdlib-clean at import (bot_squad_worker.pickup/priority pull nothing
+        # in), so PYTHONPATH plus the api[dev] pytest installed above is enough.
+        #
+        # `-k` deliberately selects the cross-gate invariant and the pinned
+        # word→band table only: the rest of the file drives task_new through a
+        # Config fixture, which is the nightly's job. This step answers ONE
+        # question — can the writer accept a value the reader cannot rank.
+        run: |
+          cd worker && PYTHONPATH=. pytest tests/test_priority_vocabulary.py \
+            -k "reader_can_rank or words_the_board or one_rung" -x -q

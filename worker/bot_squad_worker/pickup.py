@@ -144,6 +144,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from bot_squad_worker import priority as _priority
+
 log = logging.getLogger(__name__)
 
 #: Statuses whose tickets are candidates for pickup. ``totest`` is deliberately
@@ -231,10 +233,6 @@ DEFERRAL_WORDS = ("deferred", "parked", "wontfix", "superseded", "on hold")
 #: recording a decision, and the two cannot both be right.
 _TITLE_PRIORITY_RE = re.compile(r"(?<![\w-])[Pp]([0-9])(?![\w-])")
 
-#: ``P<n>`` or a bare ``<n>`` — the two shapes the board actually carries (the
-#: mds are hand-written ``P1``; the API's PATCH writes an int).
-_PRIORITY_RE = re.compile(r"\A[Pp]?([0-9])\Z")
-
 #: ``T-0719-some-slug.md`` -> ``T-0719``. Only used when an md omits its own
 #: ``id`` field, which none on this board does.
 _FILENAME_ID_RE = re.compile(r"\A([A-Z]+-\d+)-")
@@ -275,21 +273,18 @@ def _parse_iso(value: Any) -> Optional[float]:
 
 
 def parse_priority(raw: Any) -> tuple[Optional[int], Optional[str]]:
-    """``(band, flag)`` for a stored priority field.
+    """``(band, flag)`` for a stored priority field — see
+    :func:`bot_squad_worker.priority.parse_priority`, which is the SSOT.
 
-    ``band`` is the integer urgency (``P1`` -> 1) or None when it cannot be read;
-    ``flag`` names the problem when there is one, so a caller reports WHY a
-    ticket is unranked instead of showing a silent default. The board carries
-    ``''``, ``0``, ``P1`` and ``high`` today — the last of those is exactly the
-    case that must not be guessed at.
+    Kept as a name on this module because it is what the pickup tests and the
+    ranking below read. The vocabulary itself moved out in T-0877: the writer
+    (``task_new``) and this reader now share ONE table, and
+    ``test_priority_vocabulary.py`` fails if they ever stop agreeing — which is
+    the whole defect. Until then this module read only ``p1``/``p2``/``p3``
+    while ``bsq task new`` stored any string at all, and 86 tickets on one board
+    fell out of the queue for up to 20.6 days with nothing reporting it.
     """
-    s = str(raw if raw is not None else "").strip()
-    if not s:
-        return None, "priority-missing"
-    m = _PRIORITY_RE.match(s)
-    if not m:
-        return None, f"priority-unparseable:{s}"
-    return int(m.group(1)), None
+    return _priority.parse_priority(raw)
 
 
 def title_priority(title: str) -> Optional[int]:

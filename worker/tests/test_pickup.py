@@ -199,12 +199,21 @@ def test_created_is_the_fallback_when_updated_is_absent():
     ("P0", 0, None), ("P4", 4, None), ("p1", 1, None),
     (0, 0, None), (3, 3, None), ("2", 2, None),
     ("", None, "priority-missing"), (None, None, "priority-missing"),
-    ("high", None, "priority-unparseable:high"),
+    ("high", 1, None), ("Medium", 2, None), ("low", 3, None),
     ("P12", None, "priority-unparseable:P12"),
+    ("высокий", None, "priority-unparseable:высокий"),
+    ("200", None, "priority-ordering-key:200"),
 ])
 def test_parse_priority_reads_the_shapes_the_board_carries(raw, band, flag):
-    """``high`` is on the real board and is NOT guessed at — an unreadable
-    urgency is reported as unreadable, never mapped to a plausible band."""
+    """T-0877 REPLACED this case for ``high``, deliberately — it used to pin
+    ``priority-unparseable:high`` on the reasoning that an unreadable urgency
+    must never be guessed at. Measurement overturned it: ``high`` was not
+    unreadable, it was a WRITTEN judgement in the other of the two vocabularies
+    the same field carries, and refusing to read it hid 86 tickets on the
+    watchrobot board for up to 20.6 days. The guess-nothing principle survives
+    intact one step out — ``высокий`` is in no vocabulary and is still reported
+    as itself, and ``200`` is the web UI's ordering key, named as that rather
+    than folded into a band. See ``test_priority_vocabulary.py``."""
     assert pickup.parse_priority(raw) == (band, flag)
 
 

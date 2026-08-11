@@ -4856,6 +4856,28 @@ def _load_task_search():
     return mod
 
 
+def _load_priority():
+    """Load the sibling ``priority.py`` helper (T-0877) — the ONE priority
+    vocabulary, byte-identical to ``worker/bot_squad_worker/priority.py`` and
+    pinned against it by the module-mirror gate.
+
+    Loaded the same way as ``task_search.py`` above: the worker package is not
+    importable from here, and a hand-copied second table is exactly the drift
+    this ticket exists to end — the writer accepting words the reader could not
+    rank is what hid 86 tickets on the watchrobot board."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    p = Path(__file__).resolve().parent / "priority.py"
+    if "bsq_priority" in sys.modules:
+        return sys.modules["bsq_priority"]
+    loader = SourceFileLoader("bsq_priority", str(p))
+    spec = importlib.util.spec_from_loader("bsq_priority", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["bsq_priority"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
 def _load_backlog_tickets(slug: str) -> list:
     """Read every backlog ticket into ``task_search.Ticket`` records
     (id/title/status from frontmatter, body = md minus frontmatter)."""
@@ -5339,11 +5361,27 @@ def cmd_task_new(args) -> None:
             "  see data/<slug>/docs/roadmap/provenance.md")
     if not _provenance_valid(prov):
         die(f"task new: invalid --provenance {prov!r}\n  allowed: {_PROVENANCE_HELP}")
+    # T-0877: reject a priority the queue cannot rank HERE too, not only at the
+    # worker gate — a client-side die() is what the caller reads, and this is the
+    # surface that used to accept anything ("priority value, verbatim") and lose
+    # the ticket without a word. Same table the reader ranks by; `high` is
+    # accepted and stored as `p1`, `срочно` is refused with the allowed list.
+    prio_in = (getattr(args, "priority", None) or "").strip()
+    prio_norm = ""
+    if prio_in:
+        _prio = _load_priority()
+        try:
+            prio_norm = _prio.normalize_priority(prio_in)
+        except ValueError as e:
+            die(f"task new: {e}")
+
     params = {"slug": slug, "title": args.title}
     for k in ("initiative", "priority", "owner"):
         v = getattr(args, k, None)
         if v:
             params[k] = v
+    if prio_norm:
+        params["priority"] = prio_norm
     # T-0577: only sent when the user opts in, so an unpatched worker (no
     # dedupe gate yet) still accepts the call unchanged.
     if getattr(args, "force", False):
@@ -5368,7 +5406,14 @@ def cmd_task_new(args) -> None:
             _write_atomic(path, _stamp_provenance(path.read_text(encoding="utf-8"), prov))
         except OSError as ex:
             die(f"task new: created {res['id']} but failed to stamp provenance: {ex}")
-    print(f"{res['id']}  ->  {res['file_path']}  (provenance: {prov})")
+    # Say what was STORED when it differs from what was typed — a normalisation
+    # the caller cannot see is the same silence this ticket is about, pointed
+    # the other way.
+    prio_note = ""
+    if prio_norm:
+        prio_note = (f"  (priority: {prio_in} -> {prio_norm})" if prio_norm != prio_in
+                     else f"  (priority: {prio_norm})")
+    print(f"{res['id']}  ->  {res['file_path']}  (provenance: {prov}){prio_note}")
 
 
 def cmd_task_digest(args) -> None:
@@ -6214,7 +6259,18 @@ def build_parser() -> argparse.ArgumentParser:
              "corpus:<token> | F-NNNN | T-NNNN | stakeholder:YYYY-MM-DD (comma-separated)",
     )
     tnn.add_argument("--initiative", help="initiative basename, e.g. operator-ux-and-session-mgmt.md")
-    tnn.add_argument("--priority", help="priority value (frontmatter, verbatim)")
+    # T-0877: this help used to read "priority value (frontmatter, verbatim)",
+    # and verbatim is exactly what it did — any string, stored as typed, unread
+    # by the queue. It now names the vocabulary it will accept, taken from the
+    # module that also does the accepting so the text cannot drift from the gate.
+    # (Guarded: a missing helper must not break every `bsq` invocation, since the
+    # parser is built on all of them — the fallback deliberately enumerates
+    # nothing rather than risk stating a stale list.)
+    try:
+        _priority_help = f"urgency band — one of: {_load_priority().ALLOWED_HELP}"
+    except Exception:  # noqa: BLE001
+        _priority_help = "urgency band (validated against the queue's vocabulary)"
+    tnn.add_argument("--priority", help=_priority_help)
     tnn.add_argument("--owner", help="owner role/name (frontmatter)")
     tnn.add_argument(
         "--force", action="store_true",

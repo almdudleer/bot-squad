@@ -4109,6 +4109,27 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
             f"task_new: invalid provenance {prov!r} — allowed: {_prov.ALLOWED_HELP}"
         )
 
+    # T-0877 (the damage was measured on watchrobot as T-0586): the priority
+    # gate. This param used to be stored VERBATIM — "priority value
+    # (frontmatter, verbatim)" was the documented contract — while the pickup
+    # reader ranked only p1/p2/p3. So `--priority high` returned success, wrote
+    # a normal-looking ticket, and dropped it out of the queue forever with
+    # `priority-unparseable:high`: 86 tickets on ONE board, the oldest invisible
+    # 20.6 days, none of it reported anywhere. Validated against the SAME table
+    # the reader ranks by (bot_squad_worker.priority — words included) and
+    # stored canonical, so a value the queue cannot rank can no longer be
+    # written at all. HERE, beside the provenance gate, rather than at the
+    # frontmatter-assembly loop below: a rejected value must not first burn an
+    # allocated id.
+    from bot_squad_worker import priority as _priority
+    prio_raw = params.get("priority")
+    prio_norm: str | None = None
+    if prio_raw is not None and str(prio_raw).strip():
+        try:
+            prio_norm = _priority.normalize_priority(prio_raw)
+        except ValueError as e:
+            raise ActionError(f"task_new: {e}") from e
+
     cfg = _get_config()
     if cfg.projects.get(slug) is None:
         raise ActionError(f"task_new: unknown project slug {slug!r}")
@@ -4171,7 +4192,11 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
             if val is None or (isinstance(val, str) and not val.strip()):
                 continue
             sval = str(val)
-            if opt_key == "initiative":
+            if opt_key == "priority":
+                # Validated at the gate above, before the id was allocated; this
+                # stores the canonical pN it resolved to.
+                sval = prio_norm or sval
+            elif opt_key == "initiative":
                 # T-0424 canonicalize-on-store: persist the .md FILE form so a
                 # bare stem matches the initiative file + the FE option.basename
                 # (no false orphan). normalize_id strips one trailing .md, then

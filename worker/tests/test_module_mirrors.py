@@ -111,6 +111,13 @@ MIRRORS: tuple[Mirror, ...] = (
         why="cross-store parent/child resolution (T-0283) — T-0290 gave `bsq doc new` a parent, and a split lets the CLI accept a parent the web says does not exist",
     ),
     Mirror(
+        name="priority",
+        left="worker/bot_squad_worker/priority.py",
+        right="scripts/cli/priority.py",
+        split_marker=None,
+        why="the ONE priority vocabulary (T-0877/T-0586) — the writer's gate and the reader's ranking; a split is exactly the drift that hid 86 tickets",
+    ),
+    Mirror(
         name="task_search",
         left="scripts/cli/task_search.py",
         right="worker/bot_squad_worker/task_search.py",

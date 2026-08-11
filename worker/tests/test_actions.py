@@ -3363,7 +3363,12 @@ def test_task_new_writes_optional_frontmatter_fields(tmp_path, tmp_config_dir, m
     })
     body = Path(out["file_path"]).read_text()
     assert 'initiative: "multi-server-installation-process.md"' in body
-    assert 'priority: "P1"' in body
+    # T-0877 canonicalize-on-store (same shape as the --initiative case below):
+    # priority is now validated against the vocabulary the queue RANKS by and
+    # stored canonical, so `P1` lands as `p1` and `high` lands as `p1` too. It
+    # used to be stored verbatim, whatever it was — which is how `high` became
+    # 86 tickets the queue could not see. See test_priority_vocabulary.py.
+    assert 'priority: "p1"' in body
     assert 'owner: "alexey"' in body
 
 

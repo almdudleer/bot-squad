@@ -41,6 +41,21 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # T-0877: a ticket created on/after the cutoff must carry a priority the
+      # QUEUE CAN RANK (p0..p9 | critical | high | medium | normal | low). The
+      # tool writers are gated in code (`bsq task new` + the worker action share
+      # one vocabulary with pickup's ranking); this covers the writer no gate can
+      # reach — a session hand-editing frontmatter. `priority: срочно` costs
+      # nothing visible and silently drops the ticket out of `bsq pickup`, which
+      # is how 86 of them went missing on watchrobot for up to 20.6 days
+      # (T-0586). Forward-only: the pre-cutoff board is grandfathered, and a
+      # multi-digit value (the web UI's kanban ordering key) is NOT an offence.
+      - id: backlog-priority
+        name: backlog ticket priority is one the queue can rank
+        entry: python3 scripts/lint/backlog_priority.py
+        language: system
+        pass_filenames: false
+        always_run: true
       # T-0716: a role-contract pointer must name the git SSOT
       # (api/app/resources/roles/<role>.md), never the per-project
       # data/<slug>/vision/roles/ copy — seeded once at scaffold, display-only,

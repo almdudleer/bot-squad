@@ -3700,6 +3700,13 @@ def test_private_voice_rejection_replies_to_the_note(tmp_path, monkeypatch):
         lambda c, slug, msg: {"ok": False, "reason": "too_long", "transcript": "",
                               "duration": 900})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    # T-0802: this seam is not optional. Without it handle_update reaches the
+    # REAL ensure_user_conversation action, and when an earlier test in the run
+    # has left a fixture Config in actions._CONFIG the spawn goes all the way
+    # through to `tmux new-session -s test-project` + a live claude window on
+    # the host. That is the leak this ticket exists for; the conftest fixture
+    # and fake_bin/tmux stop it for every test, this line stops it here.
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
     notified = []
     monkeypatch.setattr(TL, "_notify",
                         lambda c, chat, text, **kw: notified.append((chat, kw)))

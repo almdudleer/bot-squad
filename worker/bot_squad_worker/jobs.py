@@ -586,6 +586,10 @@ def binding_gc_tick(cfg: Config) -> None:
          grace) so they stop cluttering the host's ``tmux ls``. Runs after
          ``reconcile_teams`` so the durable Team md is already written before its
          (now-idle) tmux shell is removed.
+      7. ``gc_orphan_tmux_sessions`` (T-0802) — ONCE per tick, after the
+         per-project loop: surface (and, past a long quarantine, reap) tmux
+         sessions bot-squad created for a project that is not registered. Every
+         pass 1–6 is keyed on a registered slug and therefore cannot see them.
 
     ``gc_sessions`` runs first so the freshly-suspended sessions inform the
     stale-binding race resolution (a live-pane claimant beats a dead one);
@@ -650,6 +654,65 @@ def binding_gc_tick(cfg: Config) -> None:
                     _surface_live_dup_reconciles(cfg, slug, res)
             except Exception:
                 log.exception("binding_gc_tick: %s failed for %s", name, slug)
+
+    # T-0802: ONCE per tick, not once per project. Every pass above is keyed on
+    # a registered slug, which is exactly why a tmux session belonging to NO
+    # project was nobody's job for three days while it accumulated 70 live
+    # claude processes. This one sweeps the sessions no slug claims.
+    try:
+        _surface_orphan_tmux(cfg, _sessions.gc_orphan_tmux_sessions(cfg))
+    except Exception:
+        log.exception("binding_gc_tick: gc_orphan_tmux_sessions failed")
+
+
+def _surface_orphan_tmux(cfg: Config, result: object) -> None:
+    """Alert on what the orphan sweep found — on FIRST sighting, and again when
+    one is actually reaped.
+
+    The alert is the half of T-0802 that does not depend on the reap being
+    right. The quarantine is deliberately long (hours), so without this the
+    operator learns nothing until the kill; with it, the first tick that sees an
+    unclaimed session says so, and a human who recognises it as legitimate has
+    the whole quarantine to say so. Best-effort; never raises into the tick.
+    """
+    if not isinstance(result, dict):
+        return
+    slug = "bot-squad" if "bot-squad" in cfg.projects else next(iter(cfg.projects), "")
+    if not slug:
+        return
+    project = cfg.projects.get(slug)
+
+    for d in result.get("sighted", []):
+        panes = d.get("claude_panes") or 0
+        hours = (d.get("reap_after_sec") or 0) / 3600.0
+        try:
+            _alert_operators(
+                cfg, slug, project,
+                f"⚠️ orphan tmux session — '{d.get('session')}' was created by "
+                f"bot-squad (it carries the _init placeholder) but belongs to NO "
+                f"registered project, and holds {panes} live claude pane(s). It "
+                f"will be killed if it is still unclaimed in {hours:.0f}h. If it "
+                f"is legitimate, register the project (or set "
+                f"BOT_SQUAD_ORPHAN_TMUX_REAP=0); if it is not, kill it now — "
+                f"every claude pane in it is burning host RAM. This is the "
+                f"T-0802 class: 70 such panes once ate all of RAM + swap.")
+        except Exception:
+            log.exception("binding_gc_tick: orphan-tmux sighting alert failed for %s",
+                          d.get("session"))
+
+    for d in result.get("reaped", []):
+        try:
+            _alert_operators(
+                cfg, slug, project,
+                f"🧹 orphan tmux session reaped — '{d.get('session')}' had been "
+                f"unclaimed by any registered project for "
+                f"{(d.get('orphaned_for') or 0) / 3600.0:.1f}h, holding "
+                f"{d.get('claude_panes') or 0} claude pane(s). If that project "
+                f"was real, it was NOT in projects.toml at any point in that "
+                f"window — re-register it before respawning (T-0802).")
+        except Exception:
+            log.exception("binding_gc_tick: orphan-tmux reap alert failed for %s",
+                          d.get("session"))
 
 
 def _surface_live_dup_reconciles(cfg: Config, slug: str, result: object) -> None:

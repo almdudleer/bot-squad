@@ -4536,6 +4536,206 @@ def gc_tmux_sessions(cfg: Any, slug: str) -> dict:
     return {"ok": True, "reaped": reaped}
 
 
+# T-0802: how long a session must stay orphaned before it is reaped. Long on
+# purpose — the failure mode we must not have is reaping a LIVE project's
+# sessions during a transient de-registration (a deploy that ships a
+# projects.toml missing a slug does exactly that, and has: see 2d7d427). Those
+# windows are minutes; six hours is not reachable by one. The operator is
+# alerted on the FIRST sighting, so the quarantine is also the human's window
+# to intervene, not just a timer.
+_ORPHAN_TMUX_QUARANTINE_SEC = float(
+    os.environ.get("BOT_SQUAD_ORPHAN_TMUX_QUARANTINE_SEC") or 21600)
+#: Set to 0 to alert but never kill (an install that would rather triage by hand).
+_ORPHAN_TMUX_REAP = (os.environ.get("BOT_SQUAD_ORPHAN_TMUX_REAP") or "1").strip().lower() \
+    not in {"0", "false", "no", "off"}
+#: The placeholder window `_ensure_project_tmux_session` parks in every session
+#: it creates. Nothing else in this codebase — and nothing a human types — makes
+#: a window with this name, which is what makes it usable as proof of ownership.
+_BOT_SQUAD_INIT_WINDOW = "_init"
+
+
+def _orphan_ledger_path(cfg: Any) -> Path:
+    """Cross-project worker state (the per-slug dirs are the wrong home: an
+    orphan by definition belongs to no slug)."""
+    return Path(cfg.data_dir) / "_worker" / "orphan_tmux.json"
+
+
+def gc_orphan_tmux_sessions(cfg: Any) -> dict:
+    """T-0802: reap (or at minimum SURFACE) tmux sessions that bot-squad created
+    and that belong to no registered project.
+
+    WHY THIS EXISTS AS A SEPARATE PASS. ``gc_tmux_sessions`` above is
+    per-project and structurally cannot see this class of session — twice over:
+
+      1. It is called as ``fn(cfg, slug)`` for ``slug in cfg.projects``, and its
+         first act is ``cfg.projects.get(slug)`` → ``ActionError`` on an unknown
+         slug. An unregistered session's name is never any registered slug, so
+         no tick ever passes it.
+      2. Even reached, its loop skips any name that is not ``<slug>-``prefixed,
+         requires a pane rooted in that project's repo, and spares any session
+         holding a live claude pane.
+
+    The incident this comes from: a stray session named for the test fixture
+    slug ``test-project`` accumulated one live ``claude`` process per worker
+    suite run — 70 of them over three days, the host's RAM and all 8 GB of swap
+    consumed — while every reconciler in the tick ran normally, because there
+    was nothing in the system whose job was to look at a session no project
+    claims. The suite leak itself is fixed at source (``tests/conftest.py``
+    ``_isolate_actions_config`` + ``tests/fake_bin/tmux``); this is the half
+    that makes the NEXT unclaimed session someone's problem within a tick
+    instead of nobody's for three days.
+
+    A SESSION IS ONLY TOUCHED WHEN ALL OF THESE HOLD — the point is that
+    "unregistered" alone is nowhere near sufficient:
+
+      * its name is neither a registered slug nor ``<registered-slug>-*`` (so a
+        sibling session is left to the T-0200 reaper that understands it);
+      * it carries the ``_init`` placeholder window, which only
+        ``_ensure_project_tmux_session`` creates — this is the ownership proof,
+        and it is what keeps a human's own tmux session (``work``, ``vim``,
+        anything) out of scope no matter what it is called;
+      * no pane in it is rooted in ANY registered project's repo;
+      * it is not the session this process is running in;
+      * it has been continuously orphaned for ``_ORPHAN_TMUX_QUARANTINE_SEC``.
+
+    A LIVE CLAUDE PANE IS NOT A REPRIEVE HERE, and that is the deliberate
+    inversion of the T-0200 rule. There, a claude pane means a staffed team
+    doing work. Here, the four conditions above have already established that
+    bot-squad made this session for a project that does not exist — so a claude
+    pane in it is not work, it is precisely the runaway process the ticket is
+    about. Sparing it would reproduce the bug: all 70 leaked sessions held one.
+
+    Returns ``{"ok": True, "reaped": [...], "sighted": [...], "quarantined":
+    [...]}`` — ``sighted`` is the first-tick-seen set the caller alerts on
+    (``jobs.binding_gc_tick``), ``quarantined`` those still inside the grace.
+    """
+    registered = set(cfg.projects or {})
+    prefixes = tuple(f"{s}-" for s in registered)
+
+    res = _run(["tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}"])
+    if res.returncode != 0:
+        return {"ok": True, "reaped": [], "sighted": [], "quarantined": []}
+
+    names: list[str] = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = line.partition("|")[0]
+        if not name or name in registered or name.startswith(prefixes):
+            continue
+        names.append(name)
+    if not names:
+        _prune_orphan_ledger(cfg, set())
+        return {"ok": True, "reaped": [], "sighted": [], "quarantined": []}
+
+    # Which of those carry bot-squad's own placeholder window.
+    wres = _run(["tmux", "list-windows", "-a", "-F", "#{session_name}|#{window_name}"])
+    ours = {ln.partition("|")[0] for ln in wres.stdout.splitlines()
+            if ln.strip().partition("|")[2].strip() == _BOT_SQUAD_INIT_WINDOW}
+
+    # Repo roots of every registered project, resolved once.
+    repos: list[tuple[Path, Path]] = []
+    for project in (cfg.projects or {}).values():
+        rp = Path(getattr(project, "repo_path", "") or "")
+        if not str(rp):
+            continue
+        try:
+            repos.append((rp, rp.resolve()))
+        except OSError:
+            repos.append((rp, rp))
+
+    self_pane = os.environ.get("TMUX_PANE") or ""
+    self_session = ""
+    rooted: set[str] = set()
+    claude_panes: dict[str, int] = {}
+    for p in list_panes():
+        if not p.session:
+            continue
+        if self_pane and p.pane_id == self_pane:
+            self_session = p.session
+        if _is_claude_command(p.command):
+            claude_panes[p.session] = claude_panes.get(p.session, 0) + 1
+        if p.cwd and p.session not in rooted:
+            if any(_cwd_matches_repo(Path(p.cwd), rp, rr) for rp, rr in repos):
+                rooted.add(p.session)
+
+    candidates = [n for n in names
+                  if n in ours and n not in rooted and n != self_session]
+
+    now = time.time()
+    ledger = _read_orphan_ledger(cfg)
+    reaped: list[dict] = []
+    sighted: list[dict] = []
+    quarantined: list[dict] = []
+    for name in candidates:
+        entry = ledger.get(name)
+        if not isinstance(entry, dict) or not entry.get("first_seen"):
+            # FIRST SIGHTING — never reaped on the same tick it is discovered.
+            # The alert goes out now precisely so the quarantine below is a
+            # human's window to say "that one is mine", not a silent countdown.
+            ledger[name] = {"first_seen": now, "claude_panes": claude_panes.get(name, 0)}
+            sighted.append({"session": name,
+                            "claude_panes": claude_panes.get(name, 0),
+                            "reap_after_sec": _ORPHAN_TMUX_QUARANTINE_SEC})
+            continue
+        try:
+            first_seen = float(entry.get("first_seen") or 0.0)
+        except (TypeError, ValueError):
+            first_seen = now
+        orphaned_for = now - first_seen
+        entry["claude_panes"] = claude_panes.get(name, 0)
+        if orphaned_for < _ORPHAN_TMUX_QUARANTINE_SEC or not _ORPHAN_TMUX_REAP:
+            quarantined.append({"session": name, "orphaned_for": orphaned_for,
+                                "claude_panes": claude_panes.get(name, 0)})
+            continue
+        kill = _run(["tmux", "kill-session", "-t", name])
+        if kill.returncode == 0:
+            reaped.append({"session": name, "orphaned_for": orphaned_for,
+                           "claude_panes": claude_panes.get(name, 0)})
+            ledger.pop(name, None)
+        else:
+            log.warning("gc_orphan_tmux_sessions: kill-session %s failed: %s",
+                        name, kill.stderr.strip())
+
+    _write_orphan_ledger(cfg, ledger, keep=set(candidates))
+    return {"ok": True, "reaped": reaped, "sighted": sighted,
+            "quarantined": quarantined}
+
+
+def _read_orphan_ledger(cfg: Any) -> dict:
+    try:
+        data = json.loads(_orphan_ledger_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_orphan_ledger(cfg: Any, ledger: dict, keep: set[str]) -> None:
+    """Persist the ledger, dropping names that are no longer orphaned.
+
+    IT MUST BE PERSISTENT, not a module global: the clock that matters is how
+    long the SESSION has been orphaned, and a worker restart (or a deploy —
+    they are frequent here) would otherwise reset every candidate's timer to
+    zero and the quarantine would never elapse. That is the failure mode where
+    a reaper exists, looks healthy, and reaps nothing, forever.
+    """
+    ledger = {k: v for k, v in ledger.items() if k in keep}
+    path = _orphan_ledger_path(cfg)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        log.exception("gc_orphan_tmux_sessions: could not persist %s", path)
+
+
+def _prune_orphan_ledger(cfg: Any, keep: set[str]) -> None:
+    if _orphan_ledger_path(cfg).exists():
+        _write_orphan_ledger(cfg, _read_orphan_ledger(cfg), keep=keep)
+
+
 def _started_at_key(value: Any) -> tuple[int, str]:
     """Sort key for ``started_at`` — newer wins. Missing values rank lowest."""
     if not value or value == "~":

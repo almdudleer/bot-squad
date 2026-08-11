@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# T-0802 test-suite PATH shim — the suite must NEVER mutate the host's tmux.
+#
+# WHAT HAPPENED WITHOUT IT. A full worker-suite run reached the REAL tmux and
+# created a real session named for the FIXTURE slug (`test-project`) holding a
+# real `claude` window (`gu_1-user-conversation`). One per run, nothing ever
+# reaped it — 70 live claude processes over three days, host RAM and all 8 GB
+# of swap consumed. Measured, not inferred: an instrumented run logged exactly
+#     tmux new-session -d -s test-project -c /tmp/test-repo -n _init
+#     tmux new-window  -d -t test-project: -n gu_1-user-conversation ... claude
+#
+# WHY A PATH SHIM AND NOT A monkeypatch. The suite reaches tmux through several
+# layers Python patching cannot cover at once: sessions._run, generated scripts
+# run under bash, and scripts/hooks/session_start.sh. PATH is the one seam every
+# one of them resolves through — the same reasoning (and the same directory) as
+# the T-0574 systemctl/systemd-run shims beside this file.
+#
+# ALLOWLIST, NOT BLOCKLIST. Read-only verbs pass through to the real tmux so
+# behaviour is unchanged; everything else is refused. Fail-closed on purpose:
+# an unrecognised verb refused costs one legible test error, an unrecognised
+# MUTATING verb allowed costs another three-day host leak — tmux has plenty of
+# them (break-pane, respawn-pane, kill-server, …) and a blocklist would have to
+# stay exhaustive forever.
+#
+# tests/test_tmux_hermeticity.py pins this guarantee.
+LOG="${BOT_SQUAD_TEST_FAKE_TMUX_LOG:-}"
+if [ -n "$LOG" ]; then
+  printf 'tmux %s\n' "$*" >> "$LOG" 2>/dev/null || true
+fi
+
+case "${1:-}" in
+  list-*|has-session|display-message|display|show-*|info|server-info|lsp|lsw|ls)
+    # Read-only: resolve the REAL tmux (skipping this shim's own directory) and
+    # hand off. No real tmux (CI without it) → exit 1, which every caller in
+    # worker/ already treats as "no tmux server" and turns into an empty result.
+    self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+    real=""
+    IFS=':' read -ra _path_parts <<< "${PATH:-}"
+    for d in "${_path_parts[@]}"; do
+      [ -n "$d" ] || continue
+      [ "$d" = "$self_dir" ] && continue
+      if [ -x "$d/tmux" ]; then real="$d/tmux"; break; fi
+    done
+    [ -n "$real" ] || exit 1
+    exec "$real" "$@"
+    ;;
+  *)
+    echo "tmux: refused by the T-0802 test-suite shim (worker/tests/fake_bin/tmux):" \
+         "a test tried to MUTATE the host's tmux with '${1:-<no verb>}'." \
+         "Stub the tmux seam in your test (monkeypatch sessions._run, or the" \
+         "caller above it) instead of letting it reach the real server." >&2
+    exit 1
+    ;;
+esac

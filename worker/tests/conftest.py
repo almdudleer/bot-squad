@@ -17,12 +17,21 @@ os.environ.setdefault("BOT_SQUAD_DISABLE_QUIET_HOURS", "1")
 # monkeypatching. Prepend the committed fake_bin recording shims so no test
 # can restart the LIVE bot-squad-worker service or spawn real systemd scopes.
 # test_suite_hermeticity.py pins this guarantee.
+#
+# T-0802 rides the SAME directory for `tmux`, for the same reason and after the
+# same class of incident: a suite run reached the real tmux and left a live
+# `claude` window behind, one per run, until 70 of them had eaten the host's
+# RAM and swap. See fake_bin/tmux; test_tmux_hermeticity.py pins it.
 _FAKE_BIN = str(Path(__file__).resolve().parent / "fake_bin")
 if os.environ.get("PATH", "").split(os.pathsep)[0] != _FAKE_BIN:
     os.environ["PATH"] = _FAKE_BIN + os.pathsep + os.environ.get("PATH", "")
 os.environ.setdefault(
     "BOT_SQUAD_TEST_FAKE_SYSTEMCTL_LOG",
     os.path.join(tempfile.gettempdir(), f"bot-squad-fake-systemctl-{os.getpid()}.log"),
+)
+os.environ.setdefault(
+    "BOT_SQUAD_TEST_FAKE_TMUX_LOG",
+    os.path.join(tempfile.gettempdir(), f"bot-squad-fake-tmux-{os.getpid()}.log"),
 )
 
 
@@ -130,6 +139,56 @@ def _isolate_deploy_sha_globals():
     yield
     _deploy._BOOT_GIT_SHA = None
     _deploy._EFFECTIVE_SHA_CACHE = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_actions_config():
+    """T-0802: restore ``actions._CONFIG`` after EVERY worker test.
+
+    ``actions._CONFIG`` is the worker's process-global Config singleton, set
+    once at startup by ``__main__`` and read by ``_get_config()`` inside every
+    action handler. In a test process "once at startup" becomes "whichever test
+    set it first", and it stays set for the rest of the run.
+
+    THAT IS THE CONDITION THAT MADE THE T-0802 HOST LEAK REACHABLE, measured on
+    the full suite rather than reasoned about:
+
+    * ``tests/test_tg_listener.py::test_private_voice_rejection_replies_to_the_note``
+      drives ``TL.handle_update``, which calls ``_ensure_user_conversation`` →
+      ``A.dispatch("ensure_user_conversation", …)``. The test stubs the TG
+      transport but not that seam.
+    * Run ALONE the dispatch dies immediately on ``worker config not
+      initialised`` and nothing happens. Run inside the SUITE it finds the
+      Config that ``tests/test_actions.py::test_reload_projects_picks_up_new_slug``
+      (and its ``…_rejects_params`` neighbour) put there via ``A.set_config``
+      and never took back — built from the ``tmp_config_dir`` fixture, whose
+      ``projects`` holds the fixture slug ``test-project`` at ``/tmp/test-repo``.
+      The slug check then passes and ``sessions.spawn`` runs for real: ``tmux
+      new-session -d -s test-project -c /tmp/test-repo`` plus a real ``claude``
+      window. The leaked spawn's own ``-c /tmp/test-repo`` is what identifies
+      that fixture as the source. One live claude per suite run, 70 of them over
+      three days, host RAM + all 8 GB of swap consumed.
+
+    So the same test is inert alone and destructive in a suite, which is why it
+    survived every targeted run anyone did. Same shape as the ``DROPS`` and
+    deploy-sha globals above: the polluter is any test anywhere, and the victim
+    has no reason to know the global exists.
+
+    WHY RESTORE RATHER THAN CLEAR-AND-RESTORE. ``_CONFIG`` starts as ``None`` at
+    import, so restoring each test's pre-test value makes ``None`` the state
+    every test opens with unless it sets the config itself — which is exactly
+    the property needed, and it keeps working for tests that set it in a
+    module-scoped fixture (clearing would break those).
+
+    This is the belt; ``fake_bin/tmux`` is the braces — that shim stops the
+    mutation whatever leaks it. ``tests/test_actions_config_isolation.py`` pins
+    this fixture.
+    """
+    from bot_squad_worker import actions as _actions
+
+    before = _actions._CONFIG
+    yield
+    _actions._CONFIG = before
 
 
 @pytest.fixture

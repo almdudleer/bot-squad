@@ -312,6 +312,39 @@ Dispatch-specific, not in `--help`:
 - **`--window` names the FEATURE, not the ticket id** (the id is already
   bound); that name is what the board shows.
 
+### Size the model to the ticket — `--model sonnet` on simple work (T-0866)
+
+Every spawn now lands an explicit `--model` and `--effort` (T-0871): omitting
+them no longer means "whatever the CLI picks", it means **bot-squad's own
+configured default for that role**, from `system_settings.toml` `[models]` /
+`[effort]`. So the defaults are safe — but they are keyed to ROLE, and role is
+a poor proxy for how hard a ticket is. That gap is yours to close at dispatch:
+
+> «надо почаще юзать соннет для простых задач» — stakeholder, 2026-08-11
+
+**Pass `--model sonnet` when the ticket is simple.** Measured on T-0866: 74.7%
+of a 30-day bill ran on Opus, on a spend that is 70.5% cache-read — and because
+cache-read, cache-write and input are all priced off the model's *input* rate,
+Opus → Sonnet is ~-40% across the whole line, not just on output. It is the
+largest single lever available at dispatch time, roughly 6x the effort knob.
+
+Simple enough for `sonnet` — reach for it by default on these:
+
+- a one-file edit, a copy/wording change, a config or constant change
+- a mechanical refactor or rename with a test already pinning the behavior
+- adding a test to a spec somebody else already wrote
+- a read-only audit or a "check whether X is true" investigation
+- anything where the ticket already states the fix and the DoD is the diff
+
+Keep the `opus` default (just omit `--model`) when the ticket needs judgement
+the brief does not contain: cross-module design, a bug whose CAUSE is unknown,
+anything touching the spawn/recycle lifecycle or the message bus, or a scope
+where being wrong is expensive to unwind.
+
+Wrong once is cheap — the dev tells you, and a re-spawn costs one command.
+Systematically defaulting every ticket to Opus is what the measurement caught,
+so **when it is a close call, take Sonnet.**
+
 ## Decision discipline
 
 Same as everyone: no brainstorming skill, no spec docs, choose+ship.

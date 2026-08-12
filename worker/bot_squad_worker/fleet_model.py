@@ -199,26 +199,65 @@ def _settings_path() -> Path:
     return Path(_sessions._get_user_home()) / ".claude" / "settings.json"
 
 
-def _provider_path(config_dir: Path | None = None) -> Path:
+def _provider_path(
+    config_dir: Path | None = None,
+    linux_user: str | None = None,
+) -> Path:
     if config_dir is not None:
         # Workers are systemd-hardened with config read-only and data writable.
         # Keep this runtime selector beside the other mutable worker state.
+        if linux_user:
+            clean_user = str(linux_user).strip()
+            if (
+                not clean_user
+                or clean_user in {".", ".."}
+                or "/" in clean_user
+                or "\\" in clean_user
+            ):
+                raise ValueError(f"invalid linux_user: {linux_user!r}")
+            return (
+                Path(config_dir).parent
+                / "data"
+                / "_state"
+                / "agent_providers"
+                / f"{clean_user}.json"
+            )
         return Path(config_dir).parent / "data" / "_state" / "agent_provider.json"
     return Path(_sessions._get_user_home()) / ".config" / "bot-squad" / "agent.json"
 
 
-def get_provider(config_dir: Path | None = None) -> str:
-    """Fleet-default agent provider. Missing/invalid state means Claude."""
-    try:
-        raw = json.loads(_provider_path(config_dir).read_text())
-    except (OSError, ValueError):
-        return "claude"
-    return "codex" if isinstance(raw, dict) and raw.get("provider") == "codex" else "claude"
+def get_provider(
+    config_dir: Path | None = None,
+    linux_user: str | None = None,
+) -> str:
+    """Resolve the provider default for one worker user.
+
+    A per-user selector wins when present. Otherwise the legacy fleet-wide
+    selector remains the fallback, preserving existing installations and the
+    admin-facing fleet-model control. Missing/invalid state means Claude.
+    """
+    paths = [_provider_path(config_dir, linux_user)]
+    if config_dir is not None and linux_user:
+        paths.append(_provider_path(config_dir))
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        return (
+            "codex"
+            if isinstance(raw, dict) and raw.get("provider") == "codex"
+            else "claude"
+        )
+    return "claude"
 
 
-def get_model(config_dir: Path | None = None) -> str:
+def get_model(
+    config_dir: Path | None = None,
+    linux_user: str | None = None,
+) -> str:
     """Current fleet choice. ``codex`` is the provider pseudo-model."""
-    if get_provider(config_dir) == "codex":
+    if get_provider(config_dir, linux_user) == "codex":
         return "codex"
     try:
         raw = json.loads(_settings_path().read_text())
@@ -229,7 +268,11 @@ def get_model(config_dir: Path | None = None) -> str:
     return str(raw.get("model") or "")
 
 
-def set_model(model: str, config_dir: Path | None = None) -> None:
+def set_model(
+    model: str,
+    config_dir: Path | None = None,
+    linux_user: str | None = None,
+) -> None:
     """Set (or clear, for ``model == ""``) the ``model`` key.
 
     Atomic read-modify-write (unique tmp + ``os.replace``, T-0373 convention)
@@ -249,7 +292,7 @@ def set_model(model: str, config_dir: Path | None = None) -> None:
     )
     model = resolve_model(requested, provider=provider)
 
-    provider_path = _provider_path(config_dir)
+    provider_path = _provider_path(config_dir, linux_user)
     provider_path.parent.mkdir(parents=True, exist_ok=True)
     with task_lock(provider_path):
         atomic_write(

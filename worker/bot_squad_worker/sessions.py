@@ -2553,7 +2553,7 @@ def spawn(
     try:
         _provider_name = _agent_provider.provider_for_model(
             _explicit_choice,
-            _fleet_model.get_provider(_caps_config_dir(cfg)),
+            _fleet_model.get_provider(_caps_config_dir(cfg), linux_user=user),
             provider,
         )
     except ValueError as exc:

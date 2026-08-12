@@ -80,6 +80,92 @@ def _locus_key(slug: str, global_user_id: str, thread_id: Any = None) -> str:
     return f"{slug}:{global_user_id}:{thread_id}"
 
 
+def _threadless(thread_id: Any) -> bool:
+    """Whether ``thread_id`` names no topic — the single spelling of that test,
+    used by both the locus lookup and the resolver so they cannot disagree
+    about what "no thread" means (``None``, ``""`` and ``"  "`` all count)."""
+    return thread_id is None or str(thread_id).strip() == ""
+
+
+def _effective_thread_id(body_value: Any, query_value: str) -> Any:
+    """T-0606: the ONE ``thread_id`` an append acts on, from its two spellings.
+
+    ``append_message`` took its thread from the body only and declared no query
+    parameters, so ``?thread_id=11`` was accepted and discarded — leaving the
+    relay to guess a destination from the collapsed locus key. Both spellings
+    now mean the same thing, and the two ways of getting this wrong are loud:
+
+    * a value that is not an integer names no Telegram ``message_thread_id``
+      that can exist, so it is rejected at the edge rather than carried into
+      the store and the locus key;
+    * body and query disagreeing is not a preference to resolve — picking
+      either one silently is exactly the class of defect this ticket is about.
+
+    Raises ``HTTPException(400)`` for both. Returns the body value untouched
+    when no query value is given, so every pre-T-0606 caller is unaffected.
+    """
+    q = (query_value or "").strip()
+    if not q:
+        return body_value
+    try:
+        parsed: Any = int(q)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"thread_id must be an integer, got {q!r}",
+        )
+    if _threadless(body_value):
+        return parsed
+    if str(body_value).strip() != str(parsed):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"thread_id given twice and they disagree: body {body_value!r} "
+                f"vs query {q!r} — which topic this message belongs to cannot "
+                f"be guessed"
+            ),
+        )
+    return body_value
+
+
+def _load_locus_map(request: Request) -> dict:
+    """The worker-owned locus map as it is on disk, or ``{}``.
+
+    Best-effort by contract: this sits inside the relay path, which NEVER
+    raises and NEVER blocks the append, so a missing or corrupt file is "no
+    locus recorded" rather than an error.
+    """
+    cfg = request.app.state.api_config
+    path = cfg.data_dir / "_worker" / "conversation_locus.json"
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("routes_conversations: could not parse %s: %s", path, e)
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _has_thread_scoped_locus(locus_map: dict, slug: str, global_user_id: str) -> bool:
+    """Whether this ``(slug, gid)`` has ANY per-topic locus entry — i.e. the
+    user has written in a bound forum topic since T-0676 moved records onto the
+    thread-scoped key.
+
+    T-0606: this is the discriminator that tells a genuinely thread-less
+    conversation apart from one whose thread was LOST on the way here. For a
+    user with no such entry the collapsed key is the only record there is and
+    keeps deciding (the whole pre-T-0676 world); for a user who lives in topics
+    it is stale by construction, because every message they have sent since has
+    been written somewhere else.
+    """
+    prefix = f"{slug}:{global_user_id}:"
+    return any(
+        str(k).startswith(prefix) and isinstance(v, dict) and v.get("chat_id")
+        for k, v in locus_map.items()
+    )
+
+
 def _read_conversation_locus(
     request: Request, slug: str, global_user_id: str, thread_id: Any = None,
 ) -> dict | None:
@@ -99,18 +185,7 @@ def _read_conversation_locus(
     isolated locus entry rather than the project's single collapsed one —
     see :func:`_locus_key`.
     """
-    cfg = request.app.state.api_config
-    path = cfg.data_dir / "_worker" / "conversation_locus.json"
-    if not path.is_file():
-        return None
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        log.warning("routes_conversations: could not parse %s: %s", path, e)
-        return None
-    if not isinstance(raw, dict):
-        return None
-    rec = raw.get(_locus_key(slug, global_user_id, thread_id))
+    rec = _load_locus_map(request).get(_locus_key(slug, global_user_id, thread_id))
     if not isinstance(rec, dict) or not rec.get("chat_id"):
         return None
     return {"chat_id": rec["chat_id"], "thread_id": rec.get("thread_id")}
@@ -360,8 +435,19 @@ def _inbound_capture(
 def _resolve_relay_target(
     request: Request, slug: str, global_user_id: str, thread_id: Any = None,
 ) -> tuple[str, int | None]:
+    """The ``(chat_id, topic_id)`` half of :func:`_resolve_relay_destination` —
+    kept as the resolver's public shape because a caller that only needs the
+    destination should not have to unpack a refusal it is going to ignore."""
+    chat_id, topic_id, _refusal = _resolve_relay_destination(
+        request, slug, global_user_id, thread_id)
+    return chat_id, topic_id
+
+
+def _resolve_relay_destination(
+    request: Request, slug: str, global_user_id: str, thread_id: Any = None,
+) -> tuple[str, int | None, dict]:
     """T-0569 / T-0667: resolve the ``(chat_id, topic_id)`` to relay a session
-    reply to.
+    reply to, plus a REFUSAL naming why when nothing may be resolved.
 
     Priority (T-0667 — "one coherent dialogue", D-0055 Addendum 3):
     1. The conversation LOCUS — the ``(chat_id, thread_id)`` the user's most
@@ -378,7 +464,42 @@ def _resolve_relay_target(
     4. The project's configured ``tg_chat``/``tg_topic_id`` (legacy static
        fallback, e.g. when the user record predates linkage).
     ``("", None)`` when nothing resolves — the caller treats that as "can't
-    relay" (``relayed: false``), never an error.
+    relay" (``relayed: false``), never an error. The third element is a
+    ``{"reason", "detail"}`` dict whenever the chat id is empty, so a caller
+    can say WHY nothing was sent instead of failing mutely.
+
+    T-0606 — the collapsed locus key is no longer a silent fallback
+    --------------------------------------------------------------
+    Rung 1 keys on ``thread_id``, and before T-0676 there was only ONE key per
+    ``(slug, gid)`` — the collapsed ``slug:gid``, holding whatever topic that
+    user last wrote in. T-0676 moved every new record onto the thread-scoped
+    key without rewriting or expiring the old one, so a collapsed entry FREEZES
+    on the topic that happened to be current the day the user's traffic moved.
+
+    Any path that lost ``thread_id`` then resolved that frozen entry and
+    delivered into a topic the request never named — and reported
+    ``relayed: true``, because it did deliver, somewhere. That ran for three
+    weeks on the stakeholder's only channel: replies into a topic closed on
+    2026-08-07 while he watched a live one. **Success and miss were
+    indistinguishable, which is the property that let it survive**, not the bad
+    JSON value; hand-editing the entry would only re-arm the trap for the next
+    user who writes in a second topic.
+
+    So for a thread-less relay, exactly one of three things is true:
+
+    * the collapsed record names NO topic (``thread_id`` null) — a genuine DM
+      or an explicit General-feed binding (T-0693). "No topic" is a real
+      answer, not a lost one: deliver, as before.
+    * this user has thread-scoped locus entries — they converse in topics, and
+      a reply that names none of them cannot be placed. **Refuse.** Not the
+      collapsed key's stale topic, and not the DM either: an answer in the
+      wrong place reads as an answer to a question he did not ask.
+    * neither — the entire pre-T-0676 world, where the collapsed key is the
+      only record in existence and no newer signal contradicts it. Unchanged.
+
+    A relay that DOES name its thread is untouched by all of this, which is
+    what keeps the ``thread_id``-in-the-body path (the live workaround) working
+    exactly as it does today.
 
     Rung 2 is the T-0740 fix, and it is about ``thread_id`` being an INPUT to
     this function that rung 1 used only as a lookup KEY. When the user has
@@ -394,12 +515,37 @@ def _resolve_relay_target(
     """
     cfg = request.app.state.api_config
     locus = _read_conversation_locus(request, slug, global_user_id, thread_id)
+    if locus and not (_threadless(thread_id) and not _threadless(locus.get("thread_id"))):
+        # Every case but one: the locus answers. The exception is the T-0606
+        # trap — a THREAD-LESS request served by a collapsed record that names
+        # a topic, i.e. a destination the caller never asked for. That falls to
+        # the ambiguity check below rather than being delivered.
+        return locus["chat_id"], locus.get("thread_id"), {}
+    if _threadless(thread_id) and _has_thread_scoped_locus(
+        _load_locus_map(request), slug, global_user_id,
+    ):
+        log.warning(
+            "routes_conversations: refusing a thread-less relay for %s/%s — the "
+            "user has per-topic loci, so no destination can be inferred (T-0606)",
+            slug, global_user_id,
+        )
+        return "", None, {
+            "reason": "thread_undetermined",
+            "detail": (
+                "this user's conversation is bound to forum topics and this "
+                "relay named none, so its destination is unknown — pass "
+                "thread_id (body or ?thread_id=) to deliver it"
+            ),
+        }
     if locus:
-        return locus["chat_id"], locus.get("thread_id")
+        # Pre-T-0676 only: a collapsed record naming a topic, for a user with
+        # no thread-scoped entry to contradict it. The sole record in
+        # existence, and the behaviour every such user has had since T-0667.
+        return locus["chat_id"], locus.get("thread_id"), {}
     bound_chat = _read_topic_binding_chat(request, slug, thread_id)
     if bound_chat:
         try:
-            return bound_chat, int(thread_id)
+            return bound_chat, int(thread_id), {}
         except (TypeError, ValueError):
             # A binding key whose thread segment isn't an integer can't name a
             # real TG forum topic — fall through rather than send a bad topic_id.
@@ -410,17 +556,23 @@ def _resolve_relay_target(
     except (OSError, ValueError):
         user = None
     if user is not None and (user.tg_user_id or "").strip():
-        return user.tg_user_id.strip(), None
+        return user.tg_user_id.strip(), None, {}
     project = cfg.project(slug)
     if project is not None and (project.tg_chat or "").strip():
-        return project.tg_chat.strip(), getattr(project, "tg_topic_id", None)
-    return "", None
+        return project.tg_chat.strip(), getattr(project, "tg_topic_id", None), {}
+    return "", None, {
+        "reason": "no_destination",
+        "detail": (
+            f"no locus, topic binding, linked Telegram account or configured "
+            f"tg_chat resolves a destination for {slug}/{global_user_id}"
+        ),
+    }
 
 
 async def _relay_to_telegram(
     request: Request, slug: str, global_user_id: str, text: str, thread_id: Any = None,
     sender_sid: str = "",
-) -> tuple[bool, dict]:
+) -> tuple[bool, dict, dict]:
     """Best-effort writeback (T-0569): relay a session-authored conversation
     reply to the user's Telegram chat via the worker's ``tg_notify`` action, so
     the user actually SEES the reply (before this, nothing surfaced a
@@ -454,9 +606,13 @@ async def _relay_to_telegram(
     the user's next quoted reply down the direct-to-session path instead of
     the attendant's — a change this ticket has no business making.
     """
-    chat_id, topic_id = _resolve_relay_target(request, slug, global_user_id, thread_id)
+    chat_id, topic_id, refusal = _resolve_relay_destination(
+        request, slug, global_user_id, thread_id)
     if not chat_id:
-        return False, {}
+        # T-0606: the third element is why. An unrelayed reply that says
+        # nothing is the shape this ticket exists to remove — the caller
+        # holding the thread is the only party that can supply it.
+        return False, {}, refusal
     client = request.app.state.worker_router.coordinator()
     params: dict = {
         "chat_id": chat_id, "message": text, "urgent": True, "debounce": False,
@@ -472,17 +628,22 @@ async def _relay_to_telegram(
         params["topic_id"] = topic_id
     try:
         result = await client.call_action("tg_notify", params)
-    except WorkerError:
-        return False, {}
+    except WorkerError as e:
+        return False, {}, {"reason": "transport_error", "detail": str(e)}
     except Exception:  # noqa: BLE001 — best-effort; must never fail the append
-        return False, {}
+        return False, {}, {"reason": "transport_error", "detail": "relay raised"}
     relayed = bool(result.get("ok")) and bool(result.get("sent", True))
     # T-0761: the destination Telegram itself reported, so `relayed` stops being
     # a confirmation that cannot fail. It was true in BOTH outcomes — a reply
     # that fell back to the private DM instead of the resolved topic still
     # returned true — which is why T-0740 ran unnoticed for as long as it did.
     delivery = result.get("delivery")
-    return relayed, delivery if isinstance(delivery, dict) else {}
+    refusal = {} if relayed else {
+        "reason": "transport_declined",
+        "detail": str(result.get("error") or result.get("reason") or
+                      "the transport accepted the call but did not send"),
+    }
+    return relayed, delivery if isinstance(delivery, dict) else {}, refusal
 
 
 async def _ensure_attendant(
@@ -558,7 +719,10 @@ async def _ensure_attendant(
 
 
 @worker_router.post("/conversations/{slug}/{global_user_id}/messages")
-async def append_message(slug: str, global_user_id: str, request: Request, payload: dict) -> dict:
+async def append_message(
+    slug: str, global_user_id: str, request: Request, payload: dict,
+    thread_id_query: str = Query(default="", alias="thread_id"),
+) -> dict:
     """Append one message to the (slug, global_user_id) thread. Worker-only.
 
     T-0631: this endpoint IS the channel-generic user-mail intake seam — every
@@ -603,6 +767,24 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     mixed history. Omitted / ``None`` (DM, non-topic message — every
     pre-T-0676 caller) behaves byte-identically to before this change.
 
+    T-0606: ``thread_id`` may equally be given as the ``?thread_id=`` QUERY
+    parameter. This endpoint declared no query parameters at all, so a caller
+    that spelled it that way got a 200 and had it dropped on the floor — the
+    thread then resolved off the collapsed locus key and the reply was
+    delivered into a topic nobody named (see ``_resolve_relay_destination``).
+    A silently-ignored routing parameter is the same defect as a silently-wrong
+    destination, so the two spellings are now equivalent, a non-integer value
+    is a 400, and giving BOTH with different values is a 400 rather than a coin
+    toss over where the message lands.
+
+    ``relay_error`` (T-0606): present only when a relay was attempted and did
+    not deliver — ``{reason, detail}``, where ``reason`` is
+    ``thread_undetermined`` (this user converses in topics and the append named
+    none — pass ``thread_id``), ``no_destination`` (nothing resolves a chat at
+    all), ``transport_error`` or ``transport_declined``. Absent means either
+    "delivered" or "no relay was due"; it is never a substitute for
+    ``relayed``, which stays the single answer to "did it go".
+
     ``forwarded_from`` (T-0746 item c): where the content came from when the
     SENDER did not compose it (``"bot"`` for our own output echoed back,
     ``"user:<id>"``/``"chat:<id>"``/a hidden-sender name for a relayed
@@ -634,7 +816,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
         raise HTTPException(status_code=400, detail="text required")
     fyi = bool(payload.get("fyi", False))
     transport_managed_ensure = payload.get("ensure_attendant") is False
-    thread_id = payload.get("thread_id")
+    thread_id = _effective_thread_id(payload.get("thread_id"), thread_id_query)
     general_feed = bool(payload.get("general_feed", False))
     direction = payload.get("direction")
     delivered = bool(payload.get("delivered", False))
@@ -672,9 +854,10 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     # two. Note this is NOT the same question as `direction`: a session
     # writeback is outbound AND still needs delivering.
     relayed_to: dict = {}
+    relay_error: dict = {}
     if author.startswith("session:") and text and not fyi and not delivered:
         try:
-            relayed, relayed_to = await _relay_to_telegram(
+            relayed, relayed_to, relay_error = await _relay_to_telegram(
                 request, slug, global_user_id, text, thread_id,
                 # T-0758: `author` is `session:<sid>` here by the branch
                 # condition above, so the SID is the part after the colon.
@@ -683,6 +866,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
         except Exception:  # noqa: BLE001 — the append already succeeded; never fail it
             relayed = False
             relayed_to = {}
+            relay_error = {"reason": "transport_error", "detail": "relay raised"}
 
     out = dict(record)
     # T-0755: the RESPONSE always states the effective direction, even when the
@@ -698,6 +882,12 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     # separates "Telegram named a topic" from "Telegram did not say".
     if relayed_to:
         out["relayed_to"] = relayed_to
+    # T-0606: a relay that did NOT deliver says why, in the same response that
+    # says it didn't. `relayed: false` alone is a fact with no owner — the
+    # caller holds the thread this path could not infer, and is the only party
+    # that can act on the answer.
+    if relay_error and not relayed:
+        out["relay_error"] = relay_error
     if author == "user":
         if fyi:
             out["ensured"] = {"ok": True, "skipped": "fyi"}

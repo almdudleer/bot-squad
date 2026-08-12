@@ -369,8 +369,13 @@ def test_the_relay_never_raises_when_the_worker_call_explodes(
     monkeypatch.setattr(WorkerClient, "call_action", boom)
 
     request = _api_request(tmp_bot_squad, monkeypatch)
-    relayed, delivery = asyncio.run(
+    relayed, delivery, relay_error = asyncio.run(
         _relay_to_telegram(request, SLUG, GID, "answer", thread_id=278)
     )
     assert relayed is False
+    # T-0606 widened the return with WHY it did not deliver. A transport that
+    # exploded is still a miss the caller must be able to see — the point of
+    # that ticket is that no undelivered reply reports as delivered OR reports
+    # nothing at all.
+    assert relay_error.get("reason") == "transport_error"
     assert delivery == {}

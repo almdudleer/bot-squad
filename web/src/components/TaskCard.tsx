@@ -3,6 +3,8 @@ import { Task } from "../api";
 import {
   CANONICAL_LABELS,
   CANONICAL_STATE,
+  INTERNAL_LABELS,
+  statusRefinesItsColumn,
   type CanonicalState,
 } from "../canonicalStatus";
 import { relativeTime } from "../utils/relativeTime";
@@ -70,6 +72,20 @@ export function TaskCard({ task, slug, hideInitiative = false }: TaskCardProps) 
     <div className="mc-task-card" onClick={handleCardClick}>
       <div className="d-flex justify-content-between align-items-start">
         <div className="mc-task-id">{task.id}</div>
+        {/* T-0889: the board collapsed to the canonical four columns, so the
+            internal status has to be visible somewhere or `reopened` would
+            vanish from the board entirely. It renders ONLY where it refines its
+            column (today: the three that share "Backlog"); printing it on a card
+            already sitting in a 1:1 column would just re-create the duplicate
+            label he asked us to remove. */}
+        {statusRefinesItsColumn(task.status) && (
+          <span
+            className="mc-task-status-badge"
+            title={`Status: ${INTERNAL_LABELS[task.status]}`}
+          >
+            {INTERNAL_LABELS[task.status]}
+          </span>
+        )}
       </div>
       <div className="mc-task-title">{task.title}</div>
       <div className="mc-task-meta">

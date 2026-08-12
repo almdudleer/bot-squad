@@ -1373,6 +1373,25 @@ pre.bg-light {
   font-weight: 700;
   margin-bottom: 0.2rem;
 }
+/* T-0889: the internal status, shown on the CARD instead of as a second column
+   label. Deliberately quiet — it refines the column it sits in, it does not
+   compete with it. Rendered only where it adds information (see
+   statusRefinesItsColumn), so it never restates its own column's name. */
+.mc-task-status-badge {
+  font-family: var(--mc-mono);
+  font-size: 0.55rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--mc-text-faint);
+  border: 1px solid var(--mc-border);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 1.5;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  margin-left: 0.35rem;
+}
+
 .mc-board-col-header {
   font-family: var(--mc-mono);
   font-size: 0.66rem;

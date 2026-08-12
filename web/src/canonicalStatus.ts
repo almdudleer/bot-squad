@@ -36,6 +36,40 @@ export const CANONICAL_LABELS: Record<CanonicalState, string> = {
   done: "Done",
 };
 
+// T-0889: labels for the SIX internal statuses. Lives here, beside the canonical
+// map, because this module is the status vocabulary — Project.tsx used to carry
+// its own COLUMN_LABELS, and two lists of labels for one vocabulary is how the
+// board ended up showing «двойные состояния» in the first place.
+// `Record<Task["status"], string>` makes tsc refuse a new status without a label.
+export const INTERNAL_LABELS: Record<Task["status"], string> = {
+  planned: "Planned",
+  open: "Open",
+  in_progress: "In progress",
+  totest: "To Test",
+  reopened: "Reopened",
+  closed: "Closed",
+};
+
+// T-0889: does this internal status ADD anything to the canonical column it sits
+// in? True only when its canonical state has more than one internal status
+// rolling into it — today that is `backlog` (planned/open/reopened); the other
+// three are 1:1.
+//
+// This is the whole point of the card badge, and it is DERIVED rather than
+// hardcoded: rendering the badge unconditionally would print "In progress" on a
+// card inside the "In progress" column, i.e. it would recreate the exact
+// duplicate-label defect he reported one level down. Deriving it also means a
+// new status (e.g. `paused` rolling into in-progress) automatically starts
+// showing the badge on BOTH statuses in that column, with no edit here.
+export function statusRefinesItsColumn(status: Task["status"]): boolean {
+  const canon = CANONICAL_STATE[status];
+  let n = 0;
+  for (const s of Object.keys(CANONICAL_STATE) as Task["status"][]) {
+    if (CANONICAL_STATE[s] === canon) n++;
+  }
+  return n > 1;
+}
+
 export function canonicalOf(status: Task["status"]): CanonicalState {
   return CANONICAL_STATE[status];
 }

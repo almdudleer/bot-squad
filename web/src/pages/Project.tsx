@@ -24,29 +24,35 @@ import {
 } from "../onboarding/copy";
 
 import { PageHelp } from "../components/PageHelp";
-import { CANONICAL_LABELS, CANONICAL_STATE } from "../canonicalStatus";
-// T-0479: column order tracks the canonical 4-state model (backlog →
-// in-progress → validating → done), so the internal statuses that roll up into
-// the same canonical state sit adjacent. backlog = planned/open/reopened;
-// in-progress = in_progress; validating = totest; done = closed.
-// T-0889: EXPORTED so the invariant below can be machine-checked. Four places in
-// this file group tasks with `if (COLUMNS.includes(t.status))`, which silently
-// DROPS any task whose status isn't listed here — it vanishes from the board and
-// from the counts. Adding a status to the model without adding it here therefore
-// hides tickets rather than failing, and `canonicalStatus.test.ts` now asserts
-// this list against the canonical map so that can't ship quietly.
-export const COLUMNS = ["planned", "open", "reopened", "in_progress", "totest", "closed"] as const;
-const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
-  planned: "Planned",
-  open: "Open",
-  in_progress: "In progress",
-  totest: "To Test",
-  reopened: "Reopened",
-  closed: "Closed",
-};
+import {
+  CANONICAL_LABELS,
+  CANONICAL_STATE,
+  CANONICAL_STATES,
+  type CanonicalState,
+} from "../canonicalStatus";
+// T-0889: the board renders the CANONICAL FOUR, one label per column.
+//
+// He reported «двойные состояния» — Backlog/Planned, Backlog/Open,
+// Backlog/Reopened, In progress/In progress, Validating/To Test — and asked
+// «Надо свести к одному». Every pair he listed was ONE column labelled twice:
+// each rendered a canonical kicker AND an internal-status title.
+//
+// The fix is structural, not cosmetic. A column IS a canonical state and its
+// label comes from CANONICAL_LABELS — the same SSOT the rollup uses — so there
+// is no second label that can disagree with the first. The defect cannot recur
+// by someone editing one of two lists, because there is only one.
+//
+// The refinement that collapsing would otherwise lose (planned vs open vs
+// reopened all become "Backlog") is NOT dropped: it moves onto the card as a
+// small badge, i.e. it is shown where it refines instead of where it duplicates.
+// Grouping is by CANONICAL_STATE[t.status]; a status missing from that map is
+// dropped from the board silently, which is exactly what the invariant in
+// `canonicalStatus.test.ts` exists to prevent.
+export const BOARD_COLUMNS = CANONICAL_STATES;
 // T-0058: the two "rail" columns — render as a thin drop-strip by default,
 // expand on click. Only one is expanded at a time (other auto-collapses).
-const RAIL_STATUSES: ReadonlySet<typeof COLUMNS[number]> = new Set(["planned", "closed"]);
+// Canonical equivalents of the old planned/closed rails.
+const RAIL_STATUSES: ReadonlySet<CanonicalState> = new Set<CanonicalState>(["backlog", "done"]);
 
 // T-0512 (M9 / Part A): subtask nesting. A task whose `parent_task` points at
 // another VISIBLE task renders nested under that parent (and is suppressed as a
@@ -202,8 +208,8 @@ export function Project() {
   // T-0058: which rail (planned|closed) is currently expanded. null = both
   // collapsed to thin strips. Shared across the ungrouped board AND every
   // initiative lane, so toggling one place toggles them all (consistent UX).
-  const [expandedRail, setExpandedRail] = useState<typeof COLUMNS[number] | null>(null);
-  function toggleRail(status: typeof COLUMNS[number]) {
+  const [expandedRail, setExpandedRail] = useState<CanonicalState | null>(null);
+  function toggleRail(status: CanonicalState) {
     setExpandedRail((prev) => (prev === status ? null : status));
   }
 
@@ -363,12 +369,11 @@ export function Project() {
 
   // Ungrouped — current 5-column behavior. T-0104: enrichedTasks
   // so the activity-flip propagates without a board reload.
-  const grouped = COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
+  const grouped = BOARD_COLUMNS.reduce<Record<string, Task[]>>((acc, c) => ({ ...acc, [c]: [] }), {});
   const ungroupedTasks = (enrichedTasks ?? []).filter(passesFilter);
   for (const t of ungroupedTasks) {
-    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
-      grouped[t.status].push(t);
-    }
+    const col = CANONICAL_STATE[t.status];
+    if (col) grouped[col].push(t);
   }
   // T-0512 (M9): subtask nesting for the ungrouped board.
   const ungroupedNesting = buildNesting(ungroupedTasks);
@@ -494,12 +499,11 @@ export function Project() {
       {groupBy === "none" ? (
         viewMode === "board" ? (
           <div className="mc-board-row mt-1">
-            {COLUMNS.map((c) => (
+            {BOARD_COLUMNS.map((c) => (
               <BoardColumn
                 key={c}
-                title={COLUMN_LABELS[c]}
+                title={CANONICAL_LABELS[c]}
                 status={c}
-                canonical={CANONICAL_LABELS[CANONICAL_STATE[c]]}
                 tasks={grouped[c]}
                 slug={slug}
                 // T-0674: board is pure read-first — no menu/drag mutation.
@@ -607,8 +611,8 @@ interface InitiativeLaneProps {
   collapsed: boolean;
   onToggleCollapsed: () => void;
   // T-0058: rail expansion is shared across lanes — the parent owns the state.
-  expandedRail: typeof COLUMNS[number] | null;
-  onToggleRail: (status: typeof COLUMNS[number]) => void;
+  expandedRail: CanonicalState | null;
+  onToggleRail: (status: CanonicalState) => void;
 }
 
 function InitiativeLane({
@@ -622,23 +626,23 @@ function InitiativeLane({
   onToggleRail,
 }: InitiativeLaneProps) {
   const navigate = useNavigate();
-  const counts = COLUMNS.reduce<Record<string, number>>(
+  const counts = BOARD_COLUMNS.reduce<Record<string, number>>(
     (acc, c) => ({ ...acc, [c]: 0 }),
     {},
   );
   for (const t of tasks) {
-    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) counts[t.status]++;
+    const col = CANONICAL_STATE[t.status];
+    if (col) counts[col]++;
   }
   const pill = STATUS_PILL_COLOR(meta.status);
 
-  const grouped = COLUMNS.reduce<Record<string, Task[]>>(
+  const grouped = BOARD_COLUMNS.reduce<Record<string, Task[]>>(
     (acc, c) => ({ ...acc, [c]: [] }),
     {},
   );
   for (const t of tasks) {
-    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
-      grouped[t.status].push(t);
-    }
+    const col = CANONICAL_STATE[t.status];
+    if (col) grouped[col].push(t);
   }
   // T-0512 (M9): subtask nesting within this lane's task set.
   const nesting = buildNesting(tasks);
@@ -717,9 +721,9 @@ function InitiativeLane({
             color: "var(--mc-text-dim)",
             marginLeft: "0.5rem",
           }}
-          title="planned / open / reopened / in-progress / to-test / closed"
+          title="backlog / in-progress / validating / done"
         >
-          {COLUMNS.map((c) => `${counts[c]}`).join(" / ")}
+          {BOARD_COLUMNS.map((c) => `${counts[c]}`).join(" / ")}
         </span>
         <span
           style={{
@@ -734,12 +738,11 @@ function InitiativeLane({
       </div>
       {!collapsed && (viewMode === "board" ? (
         <div className="mc-board-row">
-          {COLUMNS.map((c) => (
+          {BOARD_COLUMNS.map((c) => (
             <BoardColumn
               key={c}
-              title={COLUMN_LABELS[c]}
+              title={CANONICAL_LABELS[c]}
               status={c}
-              canonical={CANONICAL_LABELS[CANONICAL_STATE[c]]}
               tasks={grouped[c]}
               slug={slug}
               // T-0674: pure read-first — see the ungrouped board's comment.
@@ -781,24 +784,22 @@ interface ListBoardProps {
  * stacked into a single column. Pure read (T-0674) — no drag, no menu.
  */
 function ListBoard({ tasks, slug, hideInitiative = false }: ListBoardProps) {
-  const grouped = COLUMNS.reduce<Record<string, Task[]>>(
+  const grouped = BOARD_COLUMNS.reduce<Record<string, Task[]>>(
     (acc, c) => ({ ...acc, [c]: [] }),
     {},
   );
   for (const t of tasks) {
-    if (COLUMNS.includes(t.status as typeof COLUMNS[number])) {
-      grouped[t.status].push(t);
-    }
+    const col = CANONICAL_STATE[t.status];
+    if (col) grouped[col].push(t);
   }
   return (
     <div className="mt-1">
-      {COLUMNS.map((c) => {
+      {BOARD_COLUMNS.map((c) => {
         const sorted = sortByPriority(grouped[c]);
         return (
           <div key={c} className="mb-3">
-            <div className="mc-board-canonical-kicker">{CANONICAL_LABELS[CANONICAL_STATE[c]]}</div>
             <div className="mc-board-col-header" style={{ marginBottom: "0.35rem" }}>
-              <span>{COLUMN_LABELS[c]}</span>
+              <span>{CANONICAL_LABELS[c]}</span>
               <span className="mc-board-count">{sorted.length}</span>
             </div>
             {sorted.length === 0 ? (

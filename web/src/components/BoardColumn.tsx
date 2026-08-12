@@ -1,21 +1,24 @@
 import { useRef, useState } from "react";
 import { Task } from "../api";
-import { canonicalOf } from "../canonicalStatus";
+import { canonicalOf, type CanonicalState } from "../canonicalStatus";
 import { TaskCard, MenuAction, SubtaskRow } from "./TaskCard";
+
+// T-0889: a column is keyed by an internal status OR by a canonical state.
+// The board now renders the canonical four (he asked for «свести к одному»),
+// while other surfaces may still key a column by an internal status. Drag is
+// the only consumer that cares which it is, and drag is inert on every current
+// caller (T-0674, board is read-first), so the union is safe here rather than
+// being a cast waiting to be wrong.
+export type ColumnKey = Task["status"] | CanonicalState;
 
 interface BoardColumnProps {
   title: string;
-  status: Task["status"];
-  // T-0479: the canonical 4-state label this internal column rolls up into
-  // (e.g. "Backlog" for planned/open/reopened). Rendered as a small kicker
-  // above the column title so the board presents the canonical model while
-  // keeping the richer internal statuses. Omitted on the collapsed rail strip.
-  canonical?: string;
+  status: ColumnKey;
   tasks: Task[];
   slug: string;
   onMenuAction: (task: Task, action: MenuAction) => void;
-  onMove: (taskId: string, fromStatus: Task["status"], toStatus: Task["status"]) => void;
-  onReorder: (taskId: string, status: Task["status"], targetIndex: number) => void;
+  onMove: (taskId: string, fromStatus: Task["status"], toStatus: ColumnKey) => void;
+  onReorder: (taskId: string, status: ColumnKey, targetIndex: number) => void;
   // T-0058: rail mode. `null`/undefined = normal column. "collapsed" = thin
   // vertical drop-strip with a rotated label. "expanded" = normal width but
   // clickable header to collapse back. Toggled via onToggleRail.
@@ -67,7 +70,6 @@ export function sortByPriority(tasks: Task[]): Task[] {
 export function BoardColumn({
   title,
   status,
-  canonical,
   tasks,
   slug,
   onMenuAction,
@@ -196,9 +198,6 @@ export function BoardColumn({
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {canonical && (
-        <div className="mc-board-canonical-kicker">{canonical}</div>
-      )}
       <div
         className="mc-board-col-header"
         onClick={railMode === "expanded" ? onToggleRail : undefined}

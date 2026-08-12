@@ -9,10 +9,12 @@ import {
   CANONICAL_LABELS,
   CANONICAL_STATE,
   CANONICAL_STATES,
+  INTERNAL_LABELS,
   canonicalOf,
   deriveParentStatus,
+  statusRefinesItsColumn,
 } from "./canonicalStatus";
-import { COLUMNS } from "./pages/Project";
+import { BOARD_COLUMNS } from "./pages/Project";
 
 // The six internal statuses, kept in sync with Task["status"] in api.ts.
 const INTERNAL_STATUSES = [
@@ -114,30 +116,70 @@ describe("deriveParentStatus (abstract parent rollup)", () => {
 
 // T-0889: the board must be able to RENDER every status the model knows about.
 //
-// Why this is here and not a comment: Project.tsx groups tasks with
-// `if (COLUMNS.includes(t.status))` in four places, so a status missing from
-// COLUMNS does not render as "other" or throw — the ticket disappears from the
-// board and from the per-column counts, silently. Measured 2026-08-12: 11 of the
+// Why this is here and not a comment: Project.tsx buckets tasks by
+// `CANONICAL_STATE[t.status]` in FOUR places (the ungrouped board, the
+// initiative lane's counts and its board, and ListBoard), and each one drops a
+// task whose status has no bucket. A status missing from the model therefore
+// does not render as "other" and does not throw — the ticket disappears from the
+// board AND from the per-column counts, silently. Measured 2026-08-12: 11 of the
 // 13 tickets then at `in_progress` were held by no live session, i.e. exactly the
 // population a new `paused` status would move. Adding that status to the model
-// without adding a column would therefore have removed 11 tickets from his board
-// and called it a feature.
+// without a column would have removed 11 tickets from his board and called it a
+// feature.
 //
-// This is the ordering constraint expressed where a machine checks it: green
-// today (six statuses, six columns), red the moment the two sets diverge in
-// either direction.
+// RE-EXPRESSED when the board collapsed to the canonical four (same commit).
+// The columns are now canonical STATES, not internal statuses, so the invariant
+// is one hop longer: every internal status must map to a canonical state, and
+// every canonical state must have a column. The hazard is unchanged and so is
+// the guarantee — a status the board cannot render still fails here, loudly.
 describe("board columns cover the whole status model", () => {
-  test("every canonical-mapped status has a board column", () => {
-    const missing = Object.keys(CANONICAL_STATE).filter(
-      (s) => !(COLUMNS as readonly string[]).includes(s),
-    );
-    expect(missing).toEqual([]);
+  test("every internal status lands in a canonical state that HAS a column", () => {
+    const unrenderable = Object.keys(CANONICAL_STATE).filter((s) => {
+      const canon = CANONICAL_STATE[s as keyof typeof CANONICAL_STATE];
+      return !(BOARD_COLUMNS as readonly string[]).includes(canon);
+    });
+    expect(unrenderable).toEqual([]);
   });
 
-  test("no board column names a status the model does not know", () => {
-    const phantom = (COLUMNS as readonly string[]).filter(
-      (c) => !(c in CANONICAL_STATE),
+  test("no board column is a canonical state the model never produces", () => {
+    const produced = new Set(Object.values(CANONICAL_STATE));
+    const phantom = (BOARD_COLUMNS as readonly string[]).filter(
+      (c) => !produced.has(c as never),
     );
     expect(phantom).toEqual([]);
+  });
+
+  test("the board renders exactly one label per column — no duplicate pairs", () => {
+    // His actual report was «двойные состояния»: Backlog/Planned, Backlog/Open,
+    // Backlog/Reopened, In progress/In progress, Validating/To Test. Pin that
+    // the column set is the canonical four and each has exactly one label, so a
+    // second label source cannot be reintroduced without this going red.
+    const labels = (BOARD_COLUMNS as readonly string[]).map(
+      (c) => CANONICAL_LABELS[c as keyof typeof CANONICAL_LABELS],
+    );
+    expect(labels).toEqual(["Backlog", "In progress", "Validating", "Done"]);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+});
+
+// T-0889: the card badge must not restate the column it sits in — doing so
+// would recreate the duplicate he reported, one level down.
+describe("internal-status badge only shows where it refines the column", () => {
+  test("the three statuses sharing Backlog DO show a badge", () => {
+    for (const s of ["planned", "open", "reopened"] as const) {
+      expect(statusRefinesItsColumn(s)).toBe(true);
+    }
+  });
+
+  test("the 1:1 statuses do NOT — that would print the column's own name", () => {
+    for (const s of ["in_progress", "totest", "closed"] as const) {
+      expect(statusRefinesItsColumn(s)).toBe(false);
+    }
+  });
+
+  test("every internal status has a label, so a badge can never render blank", () => {
+    for (const s of Object.keys(CANONICAL_STATE) as (keyof typeof CANONICAL_STATE)[]) {
+      expect(INTERNAL_LABELS[s]).toBeTruthy();
+    }
   });
 });

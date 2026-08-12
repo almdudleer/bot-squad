@@ -92,13 +92,19 @@ def is_pinned(data_dir: Path, slug: str, sid: str) -> bool:
 # ---------------------------------------------------------------------------
 # T-0492: per-(user, server) CURRENT-PROJECT routing map.
 #
-# Distinct from the per-session sid pins above: this is the user's sticky "I'm
-# talking to project X" target — the hardwired routing destination for unquoted
-# inbound messages (voice-04: "user pins a project or clicks a button; subsequent
-# messages auto-attach to it"). Keyed by ``global_user_id`` (the cross-server
-# mothership identity, T-0488); the file lives on THIS server's data_dir, so the
-# map is inherently per-(user, server) without a server_id in the key. One user
-# has exactly one current project per server (a switch REPLACES it).
+# Distinct from the per-session sid pins above: this is the user's "I'm talking
+# to project X" target. It shipped as T-0492's AUTO-STICKY routing destination
+# for unquoted inbound messages (voice-04: "user pins a project or clicks a
+# button; subsequent messages auto-attach to it"); T-0640 retired that on the
+# stakeholder's instruction (D-0055 Addendum 3) and no routing path reads it any
+# more. It is kept as the store for his newer, explicitly user-driven
+# `pin-project <slug>` / `unpin-project` control (D-0055 "T-0660 Addendum 1"),
+# which is T-0660's build, not T-0640's.
+#
+# Keyed by ``global_user_id`` (the cross-server mothership identity, T-0488);
+# the file lives on THIS server's data_dir, so the map is inherently
+# per-(user, server) without a server_id in the key. One user has exactly one
+# current project per server (a switch REPLACES it).
 #
 # Stored at the mothership level (the bot's user-communication is centralized
 # there, voice-04) rather than under a project dir, since the whole point is to

@@ -154,7 +154,7 @@ def test_tg_channel_forwards_reply_markup_and_debounce(monkeypatch):
     ftg = _FakeTgClientOpt()
     monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: ftg)
     c = channels.get_channel(_FakeCfg(), name="tg")
-    markup = {"keyboard": [[{"text": "/project a"}]]}
+    markup = {"keyboard": [[{"text": "/sessions"}]]}
     c.send("pick", chat_id="C1", sid="", urgent=True,
            debounce=False, reply_markup=markup)
     assert ftg.calls[-1]["reply_markup"] == markup

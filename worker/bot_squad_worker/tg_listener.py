@@ -401,8 +401,11 @@ def extract_reply_target(message: dict, cfg: Any = None) -> Optional[tuple[str, 
 
 
 def extract_slash_command(message: dict) -> Optional[tuple[str, str]]:
-    """Extract (cmd, args_str) if this is a /sessions, /say, /help, /project,
-    /state, /pin-session or /remote-control command."""
+    """Extract (cmd, args_str) if this is a /sessions, /say, /help, /state,
+    /pin-session or /remote-control command.
+
+    T-0640 removed ``/project`` with the sticky pin it set; an unknown command
+    falls through to ``_handle_slash``'s existing unknown-command handling."""
     text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return None
@@ -846,13 +849,30 @@ def append_conversation_fyi(cfg, slug: str, global_user_id: str, *, author: str,
     return _post_conversation(cfg, slug, global_user_id, payload)
 
 
-# ---- T-0492: hardwired project routing --------------------------------------
-# A user pins a CURRENT project (a button / ``/project <slug>``); subsequent
-# unquoted messages sticky-route to it; the bot ASKS which project when unset
-# (voice-04: "the bot should be hardwired to ask the user which project he's
-# talking to"). The pin is owned by the API (single-writer = pins_store); the
-# worker reads/sets it through the token-gated routing endpoints, env-gated +
-# best-effort so a routing-store outage never crashes inbound handling.
+# ---- T-0492 sticky pin: RETIRED as a routing authority (T-0640) -------------
+# T-0492 pinned a CURRENT project (a button / ``/project <slug>``) and
+# sticky-routed every subsequent unquoted message to it. The stakeholder
+# retired that mechanism outright (D-0055 Addendum 3, verbatim: "эту механику с
+# закреплением проекта, давай мы ее уберем") in favour of per-message dynamic
+# routing — see ``_resolve_por`` below, which is now the routing authority for
+# the DM firehose. ``/project``, its reply-keyboard picker and the
+# read-the-pin-before-routing call are GONE.
+#
+# What survives, and why it is not dead code: the two accessors below and the
+# API-side store/endpoints they wrap (``pins_store`` current-project,
+# ``/routing/{gid}/current-project``) are the transport for the stakeholder's
+# NEWER, different control — the explicit plain-phrase ``pin-project <slug>`` /
+# ``unpin-project`` default target (D-0055 "T-0660 Addendum 1"). That control
+# is deliberately NOT built here (it is T-0660's scope, not this slice's); this
+# slice retires the AUTO-STICKY mechanism and leaves the storage it will reuse.
+# The distinction is the whole point of the stakeholder's two instructions:
+# T-0492 attached EVERY unquoted message to a persisted pin implicitly;
+# ``pin-project`` is an explicit default the user sets and clears by name.
+#
+# The property that matters — that no routing path reads the pin — is pinned by
+# a test (``test_pin_is_not_a_routing_authority_anywhere``), not by this
+# comment: an unwired accessor is exactly the kind of thing a later reader
+# rewires by accident.
 
 
 def _routing_url(base: str, global_user_id: str) -> str:
@@ -861,7 +881,10 @@ def _routing_url(base: str, global_user_id: str) -> str:
 
 def get_current_project(cfg, global_user_id: str) -> Optional[str]:
     """The user's pinned current-project slug, or ``None`` when unset / the
-    routing store is unreachable / linkage isn't configured (best-effort)."""
+    routing store is unreachable / linkage isn't configured (best-effort).
+
+    NOT wired to routing (T-0640). Retained as the read side of the store the
+    explicit ``pin-project`` control will reuse — see the section comment."""
     gid = str(global_user_id or "").strip()
     if not gid:
         return None
@@ -887,7 +910,11 @@ def get_current_project(cfg, global_user_id: str) -> Optional[str]:
 
 def set_current_project(cfg, global_user_id: str, slug: str) -> Optional[bool]:
     """Pin (or switch) the user's current project via the API. Returns ``True``
-    on success, ``None`` on a no-op / failure (best-effort + env-gated)."""
+    on success, ``None`` on a no-op / failure (best-effort + env-gated).
+
+    No caller in the worker since T-0640 removed ``/project``. Retained as the
+    write side of the store the explicit ``pin-project`` control will reuse —
+    see the section comment."""
     gid = str(global_user_id or "").strip()
     if not gid or not str(slug or ""):
         return None
@@ -909,50 +936,34 @@ def set_current_project(cfg, global_user_id: str, slug: str) -> Optional[bool]:
 
 
 def _ask_which_project(cfg, chat_id: str, *, thread_id: Any = None) -> None:
-    """Hardwired 'which project?' prompt — a reply-keyboard listing every
-    project. Each button sends ``/project <slug>`` as a NORMAL message, so the
-    selection arrives under ``allowed_updates:["message"]`` (no poll-contract
-    change; mirrors the voice-intake constraint). Best-effort."""
+    """The ask-when-ambiguous safety net (D-0055 §2 step 3) — kept from T-0492,
+    but it now asks about THIS MESSAGE rather than about a pin to set.
+
+    The reply-keyboard is gone with the pin it fed: its buttons emitted
+    ``/project <slug>``, a command that no longer exists, and the stakeholder's
+    later addressing design is plain phrases rather than slash commands or
+    keyboards (D-0055 "T-0660 Addendum 1"). So this is a plain-text question
+    naming the projects, answered by typing a project's name — which the same
+    ``_resolve_por`` that failed on the original message then resolves,
+    replaying the parked message into it (``pending_project``).
+
+    The wording promises the replay on purpose. A user who is asked "which
+    project?" and is not told his message was kept will simply re-type it, and
+    the answer then routes a duplicate. Best-effort, like every notify on the
+    inbound path: a messenger outage must not break routing."""
     if not cfg.tg_bot_token:
         return
-    keyboard = [[{"text": f"/project {slug}"}] for slug in cfg.projects]
-    reply_markup = {
-        "keyboard": keyboard,
-        "one_time_keyboard": True,
-        "resize_keyboard": True,
-    }
+    names = ", ".join(cfg.projects) or "—"
     # T-0513: route through the channel abstraction (was a raw httpx sendMessage
-    # that bypassed get_channel). Interactive group reply → urgent=True (don't
-    # quiet-hours-drop the picker a user just triggered), sid="" (no prefix),
-    # debounce=False (offer the picker every time it's needed). Best-effort: a
-    # messenger outage must not break inbound routing (channel.send raises).
-    _channel_notify(cfg, chat_id, "Which project are you talking to? Pick one:",
-                    reply_markup=reply_markup, thread_id=thread_id)
-
-
-def _handle_project(cfg, chat_id: str, gid: str, args: str, *, thread_id: Any = None) -> dict:
-    """``/project [slug]`` — pin/switch the current project, or (no arg / unknown
-    slug) re-offer the picker."""
-    if not gid:
-        _notify(cfg, chat_id, "Couldn't identify you yet — try again in a moment.",
-                thread_id=thread_id)
-        return {"ok": False, "action": "project_no_identity"}
-    slug = args.strip()
-    if not slug:
-        _ask_which_project(cfg, chat_id, thread_id=thread_id)
-        return {"ok": True, "action": "ask_project"}
-    if slug not in cfg.projects:
-        _notify(cfg, chat_id, f"Unknown project: {slug}", thread_id=thread_id)
-        _ask_which_project(cfg, chat_id, thread_id=thread_id)
-        return {"ok": False, "action": "project_unknown", "slug": slug}
-    ok = set_current_project(cfg, gid, slug)
-    if not ok:
-        _notify(cfg, chat_id, f"Couldn't switch to {slug} right now — try again.",
-                thread_id=thread_id)
-        return {"ok": False, "action": "project_set_failed", "slug": slug}
-    _notify(cfg, chat_id, f"You're on project {slug}. Messages now go there.",
-            thread_id=thread_id)
-    return {"ok": True, "action": "project_set", "slug": slug}
+    # that bypassed get_channel). Interactive reply → urgent=True (don't
+    # quiet-hours-drop a prompt the user just triggered), debounce=False (ask
+    # every time it is needed). Best-effort: channel.send raises.
+    _channel_notify(
+        cfg, chat_id,
+        "Про какой проект это сообщение? Напиши название одним словом — "
+        f"{names}. Сообщение я сохранил: как ответишь, отправлю его туда.",
+        thread_id=thread_id,
+    )
 
 
 def _ensure_user_conversation(
@@ -1145,36 +1156,48 @@ def _dispatch_user_conversation(cfg: Any, gid: str, params: dict) -> dict:
     return _worker_action_over_socket(sock_path, params)
 
 
-# ---- T-0494: misattribution guard (detector retained, prompt removed T-0666) -
-# A pinned user may write a message that EXPLICITLY targets a DIFFERENT project
-# than the pinned one ("in bot-squad I see ...", voice-02). T-0494 originally
-# offered a reroute-confirm prompt before committing the slug; the stakeholder
-# found that prompt disruptive ("отключи, мешаются") and T-0666 removes it
-# outright — a cross-project mention now just routes to the project-of-record
-# like any other unquoted message, no confirm. ``_detect_cross_project_target``
-# is KEPT (not orphaned): D-0055 §2 reuses it as the per-message classifier for
-# the gated Slice 2 (T-0640) per-message dynamic routing.
+# ---- T-0494 detector, PROMOTED to the routing authority (T-0640) ------------
+# History, because the same regex has now had three jobs. T-0494 used it to
+# offer a reroute-CONFIRM prompt when a pinned user wrote about a different
+# project ("in bot-squad I see ...", voice-02); the stakeholder found that
+# prompt disruptive ("отключи, мешаются") and T-0666 removed the prompt while
+# explicitly keeping the detector for this slice. T-0640 now promotes it from
+# "offer a reroute" to "route" (D-0055 §2 step 2) — with the pin gone there is
+# no current project to reroute FROM, so an explicit in-text target is simply
+# where the message goes.
 
 _CROSS_PROJECT_CUE = r"(?:in|on|for|about|regarding|project)"
+
+
+def _slug_body_re(slug: str) -> str:
+    """The slug itself, tolerating its dashes typed as spaces ("bot-squad" ~
+    "bot squad", voice-02)."""
+    return r"[\s-]+".join(re.escape(p) for p in slug.split("-"))
 
 
 def _slug_mention_re(slug: str):
     """A regex matching an EXPLICIT mention of ``slug`` as a routing target: a
     targeting cue word (in/on/for/about/regarding/project) immediately followed
-    by the slug, tolerating the slug's dashes typed as spaces ("bot-squad" ~
-    "bot squad", voice-02)."""
-    body = r"[\s-]+".join(re.escape(p) for p in slug.split("-"))
-    return re.compile(rf"\b{_CROSS_PROJECT_CUE}\s+{body}\b", re.IGNORECASE)
+    by the slug."""
+    return re.compile(rf"\b{_CROSS_PROJECT_CUE}\s+{_slug_body_re(slug)}\b", re.IGNORECASE)
+
+
+def _bare_mention_re(slug: str):
+    """A regex matching the slug ANYWHERE in the text, with no cue word — the
+    weaker signal step 3 classifies on."""
+    return re.compile(rf"\b{_slug_body_re(slug)}\b", re.IGNORECASE)
 
 
 def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
     """Return a registered project slug (≠ ``current``) the message EXPLICITLY
     targets, else ``None``. Conservative (cue-prefixed mention) to avoid
-    false-positive reroutes on incidental mentions — the deep intent analysis
+    false-positive routing on incidental mentions — the deep intent analysis
     stays in the session.
 
-    Retained for D-0055 §2 / T-0640's per-message routing classifier (see
-    module comment above) — not currently wired to any prompt (T-0666)."""
+    Kept with its original ``current``-excluding signature because that is what
+    a CROSS-project detection means; the routing resolver below calls
+    :func:`_explicit_targets` instead, which considers every project (with no
+    pin there is no "current" to exclude)."""
     t = text or ""
     for slug in cfg.projects:
         if slug == current:
@@ -1182,6 +1205,98 @@ def _detect_cross_project_target(cfg, text: str, current: str) -> Optional[str]:
         if _slug_mention_re(slug).search(t):
             return slug
     return None
+
+
+def _explicit_targets(cfg, text: str) -> list[str]:
+    """Every registered project the text explicitly targets with a cue word,
+    in registry order.
+
+    A LIST, not the first hit: as an offer, picking one of two candidates cost
+    the user a "no, the other one" tap; as the routing authority it would
+    silently deliver the message to whichever project happens to sort first in
+    ``projects.toml``. Two targets is ambiguity, and ambiguity is what the ask
+    fallback is for."""
+    t = text or ""
+    return [slug for slug in cfg.projects if _slug_mention_re(slug).search(t)]
+
+
+def _mentioned_projects(cfg, text: str) -> list[str]:
+    """Every registered project whose name appears in the text at all, in
+    registry order — the cue-less signal (D-0055 §2 step 3, "per-message
+    dynamic classification")."""
+    t = text or ""
+    return [slug for slug in cfg.projects if _bare_mention_re(slug).search(t)]
+
+
+def _resolve_por(cfg, text: str) -> tuple[Optional[str], str]:
+    """Resolve the PROJECT-OF-RECORD for one DM-firehose message from its
+    content alone. Returns ``(slug, how)``, or ``(None, why-not)``.
+
+    This is D-0055 §2 steps 2-4; step 1 (an explicit ``(chat_id, thread_id)``
+    topic binding) never reaches here — ``handle_update`` routes a bound topic
+    via ``_handle_topic_bound`` before this path (T-0639).
+
+    Deliberately NOT a signal: the chat's own static ``tg_chat`` slug. One
+    physical DM is shared across all of a user's projects, which is exactly why
+    T-0492 called that slug "incidental" and why appending to it produced the
+    T-0659 confused-reply bug. It stays what it has always been — where an
+    UNRESOLVED message is recorded so it is not lost — never where one is
+    routed.
+
+    Conservative by construction: every step that can name two projects returns
+    none of them. The cost of asking is one message; the cost of a wrong
+    confident route is a dump delivered to a session that cannot act on it,
+    with nothing in the thread saying it went to the wrong place.
+
+    KNOWN LIMIT of step 3, stated because it is a property of the design and
+    not a bug to be found later: a project whose slug is also an ordinary word
+    ("core", "web") will match text that was never about it, and the
+    two-matches-means-ask guard does not help when only that one slug matches.
+    Today's registered slugs (bot-squad, watchrobot) are distinctive enough
+    that this cannot fire, so no heuristic is invented for it here; a slug like
+    that is a reason to prefer the explicit ``pin-project`` control (T-0660
+    Addendum 1) or a bound topic, both of which outrank content entirely."""
+    explicit = _explicit_targets(cfg, text)
+    if len(explicit) == 1:
+        return explicit[0], "explicit_target"
+    if len(explicit) > 1:
+        return None, "ambiguous_explicit_targets"
+
+    mentioned = _mentioned_projects(cfg, text)
+    if len(mentioned) == 1:
+        return mentioned[0], "content_mention"
+    if len(mentioned) > 1:
+        return None, "ambiguous_mentions"
+
+    # A server with exactly one project has nothing to disambiguate — asking
+    # "which project?" when there is only one is a question with one possible
+    # answer, and the pin never had to be set on such an install either.
+    if len(cfg.projects) == 1:
+        return next(iter(cfg.projects)), "sole_project"
+
+    return None, "no_project_named"
+
+
+#: Words a user may put in front of a bare project name when ANSWERING the
+#: "which project?" question ("проект alpha", "project alpha"). Anything longer
+#: than that is treated as content, not as an answer.
+_ANSWER_PREFIX_RE = re.compile(r"^\s*(?:проект|project|в|in|to)\s+", re.IGNORECASE)
+
+
+def _is_bare_project_answer(cfg, text: str) -> bool:
+    """Whether the whole message is nothing but a project name — i.e. it is an
+    ANSWER to the "which project?" question rather than a message to route.
+
+    Matters because the two are handled differently: a bare answer releases the
+    parked messages and is itself discarded (delivering the literal word
+    "alpha" to alpha's attendant tells it nothing), while a real message that
+    happens to name a project releases the parked ones AND routes on its own
+    merits."""
+    t = (text or "").strip().strip(".!?,;:")
+    if not t:
+        return False
+    t = _ANSWER_PREFIX_RE.sub("", t).strip()
+    return any(_bare_mention_re(slug).fullmatch(t) for slug in cfg.projects)
 
 
 def _warn_if_general_feed_collides(cfg, slug: str, chat_id: str) -> None:
@@ -1611,8 +1726,10 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     """T-0639/T-0660: an unquoted message arriving in a BOUND forum topic.
 
     The topic binding IS the routing signal (D-0055 §2 step 1) — the
-    strongest, zero-ambiguity one there is — so this bypasses the sticky-pin
-    resolution `_handle_unquoted` does for the DM firehose entirely.
+    strongest, zero-ambiguity one there is — so this bypasses the per-message
+    content resolution `_handle_unquoted` does for the DM firehose entirely
+    (T-0640: step 1 outranks steps 2-4, and always did — this branch is why
+    `_resolve_por` never has to consider a topic binding).
     Unrecognized senders keep the same skip as the rest of the listener (no
     identity to anchor on).
 
@@ -1775,68 +1892,29 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
     return {"ok": True, "action": "route_bound_topic", "slug": slug}
 
 
-def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
-    """An unquoted (non-reply, non-command) message — the firehose dump path.
+def _route_to_project(cfg, chat_id: str, gid: str, por: str, msg: dict,
+                      *, notify_parked: bool = True) -> dict:
+    """Land ONE message on its resolved project-of-record: the durable record
+    (T-0489), the reply locus (T-0667), and the attending user-conversation
+    session (T-0485/T-0478) — all on the SAME project, so the dump isn't lost
+    to a session reading a different thread.
 
-    Resolves the PROJECT-OF-RECORD (the pinned project is the routing authority,
-    T-0492; the chat slug is incidental) and lands BOTH the durable record
-    (T-0489) and the attending user-conversation session (T-0485/T-0478) on that
-    SAME project, so the dump isn't lost to a session reading a different thread.
-    Asks which project when unpinned. Unrecognized senders keep the pre-T-0492
-    skip (no identity to anchor routing on). A message in a BOUND forum topic
-    never reaches here — `handle_update` routes it via `_handle_topic_bound`
-    instead (T-0639: the topic binding outranks this pin-based resolution).
+    Extracted from ``_handle_unquoted`` by T-0640 because a message parked
+    waiting for "which project?" has to be delivered by exactly this path when
+    the answer arrives — a replay that only appended, or only woke the
+    attendant, would be a second, subtly different routing path to keep in sync
+    with this one.
 
-    T-0883: a project's OWN dedicated group chat outranks the pin, which is
-    the live bug this fixes. The pin is keyed on the global user ALONE — it
-    knows nothing about which chat the message arrived in — so a stakeholder
-    pinned to bot-squad had every message he typed in guestent's own group
-    chat (`-1004380986138`, guestent's static `tg_chat`) recorded in
-    bot-squad's store, waking bot-squad's attendant, which then answered him
-    back inside guestent's chat. His words: «чат должен быть жестко привязан
-    именно к проекту». A negative-id chat named by exactly one project IS
-    that rigid binding (see `_dedicated_static_group_chat_slug`), so it is
-    consulted BEFORE the pin and the pin is never read for such a chat —
-    neither read nor written, so nothing about this path can drift with it."""
-    if not gid:
-        return {"ok": True, "action": "skip", "reason": "not a reply or command"}
-
-    # A unique static SUPERGROUP chat is an explicit project boundary, unlike
-    # a positive-id private chat which may be shared by several projects for
-    # one person.
-    por = _dedicated_static_group_chat_slug(cfg, chat_id)
-    if not por:
-        sticky = get_current_project(cfg, gid)
-        if not sticky:
-            # Unpinned: hardwired ask (voice-04). Record under the chat's project
-            # so the message isn't lost while we wait for the pin.
-            append_conversation(cfg, chat_slug, gid, msg)
-            _ask_which_project(cfg, chat_id, thread_id=msg.get("message_thread_id"))
-            return {"ok": True, "action": "ask_project"}
-        # The pinned project is the project-of-record.
-        por = sticky
-
-    # T-0666: a message explicitly mentioning a different project (T-0494's
-    # _detect_cross_project_target) no longer intercepts routing with a
-    # confirm prompt — it just routes to the project-of-record below, same as
-    # any other unquoted message.
-
-    # T-0489 + T-0485: record the dump under the project-of-record, then hand it
-    # to the (continued-or-spawned) user-conversation session on the SAME
-    # project. message_ref points at that just-appended store record (its
-    # timestamp keys it in the (por, gid) thread).
-    #
-    # T-0693 Finding B (case "thread_id dropped/omitted by mistake"): the
-    # SAME real thread_id must reach append_conversation, conversation_locus,
-    # AND _ensure_user_conversation below — not just the locus call. Before
-    # this fix, append_conversation's call here omitted it while the locus
-    # call two lines down did not, so the durable record landed in the bare
-    # per-user file while the locus claimed a real thread — exactly the
-    # append/locus mismatch the live T-0693 incident needed a manual store
-    # backfill to untangle. (The only way this function still sees a
-    # non-None thread_id at all is a legacy chat with native TG topics that
-    # has never used tg_bindings — any ALREADY topic-routed chat's unbound
-    # topics are now held earlier in handle_update, never reaching here.)
+    T-0693 Finding B (case "thread_id dropped/omitted by mistake"): the SAME
+    real thread_id must reach append_conversation, conversation_locus AND
+    _ensure_user_conversation — not just the locus call. Before that fix the
+    append omitted it while the locus two lines down did not, so the durable
+    record landed in the bare per-user file while the locus claimed a real
+    thread — the append/locus mismatch the live T-0693 incident needed a manual
+    store backfill to untangle. (The only way this still sees a non-None
+    thread_id at all is a legacy chat with native TG topics that has never used
+    tg_bindings — any ALREADY topic-routed chat's unbound topics are held
+    earlier in handle_update and never reach here.)"""
     bound_thread_id = msg.get("message_thread_id")
     append_conversation(cfg, por, gid, msg, thread_id=bound_thread_id)
     # T-0848: the second T-0830 drive-scope call site was here. Removed with the
@@ -1854,14 +1932,120 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
         # yields one notice per cooldown, not one per message.
         # T-0676 item 3: preserve the originating thread (a legacy per-project
         # supergroup can still carry topics even without a T-0639 binding).
-        _channel_notify(
-            cfg, chat_id,
-            "Принял и записал. Сейчас все воркеры заняты — займусь, как только "
-            "освободится слот (обычно пара минут).",
-            thread_id=msg.get("message_thread_id"),
-        )
+        #
+        # `notify_parked=False` for a REPLAY: the user is being answered about
+        # the batch as a whole right now, and one saturation notice per replayed
+        # message would be the burst the debounce exists to prevent.
+        if notify_parked:
+            _channel_notify(
+                cfg, chat_id,
+                "Принял и записал. Сейчас все воркеры заняты — займусь, как только "
+                "освободится слот (обычно пара минут).",
+                thread_id=bound_thread_id,
+            )
         return {"ok": True, "action": "route_parked", "slug": por}
     return {"ok": True, "action": "route", "slug": por}
+
+
+def _replay_parked(cfg, chat_id: str, gid: str, por: str) -> int:
+    """Deliver every message parked on "which project?" into ``por``, oldest
+    first. Returns how many were delivered.
+
+    Best-effort per message and best-effort as a whole: the user's CURRENT
+    message still has to route even if a replay of an older one fails, so a
+    failure here is logged and does not propagate."""
+    from bot_squad_worker import pending_project
+    try:
+        entries = pending_project.take(cfg, gid)
+    except Exception:  # noqa: BLE001 — a park-store hiccup must not break routing
+        log.exception("pending_project: could not take parked messages for %s", gid)
+        return 0
+    delivered = 0
+    for entry in entries:
+        try:
+            _route_to_project(cfg, entry.get("chat_id") or chat_id, gid, por,
+                              entry["msg"], notify_parked=False)
+            delivered += 1
+        except Exception:  # noqa: BLE001
+            log.exception("pending_project: replay into %s failed for %s", por, gid)
+    return delivered
+
+
+def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> dict:
+    """An unquoted (non-reply, non-command) message — the firehose dump path.
+
+    T-0640 (D-0055 §2, stakeholder verbatim "эту механику с закреплением
+    проекта, давай мы ее уберем"): the PROJECT-OF-RECORD is resolved PER
+    MESSAGE from what the message says (``_resolve_por``), not read from a
+    persisted pin. A message in a BOUND forum topic never reaches here —
+    ``handle_update`` routes it via ``_handle_topic_bound`` (T-0639), which is
+    §2 step 1 and outranks everything below.
+
+    T-0883 sits ABOVE both, and this change does not weaken it — it removes
+    the thing it was defending against. T-0883 was the live incident where a
+    stakeholder pinned to bot-squad had every message he typed in guestent's
+    own group chat (`-1004380986138`, guestent's static `tg_chat`) recorded in
+    bot-squad's store, waking bot-squad's attendant, which then answered him
+    inside guestent's chat. Its cause was that the pin is keyed on the global
+    user ALONE and knows nothing about which chat a message arrived in. His
+    words: «чат должен быть жестко привязан именно к проекту». A negative-id
+    chat named by exactly one project IS that rigid binding (see
+    `_dedicated_static_group_chat_slug`), so it is still consulted FIRST —
+    and after T-0640 there is no pin left underneath it to lose to.
+
+    Unresolvable → the message is recorded under the chat's incidental project
+    so it is not lost, PARKED, and the user is asked which project. The next
+    message that does resolve replays the parked ones into it. Unrecognized
+    senders keep the pre-T-0492 skip (no identity to anchor routing on)."""
+    if not gid:
+        return {"ok": True, "action": "skip", "reason": "not a reply or command"}
+
+    text = msg.get("text") or ""
+    # A unique static SUPERGROUP chat is an explicit project boundary, unlike
+    # a positive-id private chat which may be shared by several projects for
+    # one person. Content classification in a dedicated project room both adds
+    # pointless friction and leaks the names of unrelated projects.
+    por = _dedicated_static_group_chat_slug(cfg, chat_id)
+    if por:
+        how = "dedicated_static_group_chat"
+    else:
+        por, how = _resolve_por(cfg, text)
+
+    if por is None:
+        # Record under the chat's incidental project so the message isn't lost
+        # while we wait for the answer — unchanged from T-0492's unpinned path.
+        # The park store is NOT a substitute for this: a user who never answers
+        # must still find his own message in a thread he can read.
+        thread_id = msg.get("message_thread_id")
+        append_conversation(cfg, chat_slug, gid, msg, thread_id=thread_id)
+        from bot_squad_worker import pending_project
+        try:
+            pending_project.park(cfg, gid, chat_id, thread_id, msg)
+        except Exception:  # noqa: BLE001 — best-effort; still ask
+            log.exception("pending_project: could not park message for %s", gid)
+        _ask_which_project(cfg, chat_id, thread_id=thread_id)
+        return {"ok": True, "action": "ask_project", "reason": how}
+
+    replayed = _replay_parked(cfg, chat_id, gid, por)
+
+    if replayed and _is_bare_project_answer(cfg, text):
+        # The message is the ANSWER and nothing else. It is control, not
+        # content (the T-0659 principle): appending the bare word "alpha" into
+        # alpha's thread would wake its attendant with a message it cannot act
+        # on. Confirm instead, so the user knows where his dump went.
+        _channel_notify(
+            cfg, chat_id,
+            f"Понял — отправил в «{por}» (сообщений: {replayed}).",
+            thread_id=msg.get("message_thread_id"),
+        )
+        return {"ok": True, "action": "route_answer", "slug": por,
+                "replayed": replayed, "resolved_by": how}
+
+    result = _route_to_project(cfg, chat_id, gid, por, msg)
+    result["resolved_by"] = how
+    if replayed:
+        result["replayed"] = replayed
+    return result
 
 
 def _voice_reject_text(cfg, reason: str, out: dict) -> str:
@@ -1921,9 +2105,18 @@ def _record_voice_rejection(cfg, chat_slug: str, gid: str, msg: dict, reason: st
     simply correcting the attribution would have silently un-done T-0586's
     entire point (the attendant seeing the drop). The voice ATTACHMENT is
     preserved for the same reason it was added: the ``file_id`` is what makes
-    late recovery from TG possible at all."""
+    late recovery from TG possible at all.
+
+    T-0640: this used to read the sticky pin (``get_current_project(...) or
+    chat_slug``) and now records under ``chat_slug`` unconditionally. Not a
+    downgrade dressed up as a simplification — a REJECTED voice note has no
+    transcript, so there is no content for ``_resolve_por`` to classify and no
+    per-message signal to replace the pin with. ``chat_slug`` was already the
+    fallback whenever no pin was set, which was the common case. The
+    alternative — parking the rejection on "which project?" — would ask the
+    user to file a note about a message he could not send in the first place."""
     dur = int(out.get("duration") or (msg.get("voice") or {}).get("duration") or 0)
-    por = get_current_project(cfg, gid) or chat_slug
+    por = chat_slug
     message_ref = _msg_ts(msg)
     _post_conversation(cfg, por, gid, {
         "author": "system:voice-rejected",
@@ -1942,7 +2135,7 @@ def _handle_private_voice(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict
     """T-0569: a DM voice note. Transcribes (voice_intake.transcribe_only —
     NOT process_voice, so it never becomes a feedback artifact), echoes the
     transcript back (undebounced), then hands the transcript to the SAME
-    routing as an unquoted text message (sticky-project pin +
+    routing as an unquoted text message (per-message content resolution +
     ensure_user_conversation, via ``_handle_unquoted``) so it lands in the
     per-(project, user) conversation thread with the voice attachment
     descriptor preserved (``msg`` still carries ``msg["voice"]``; only its
@@ -2131,21 +2324,31 @@ def handle_update(cfg, update: dict) -> dict:
 
     if slash or reply or is_voice_group:
         # T-0489: record reply/group-voice under the chat's project — the slug
-        # is incidental for these (they don't sticky-route). The unquoted
-        # firehose path (below, including private voice) resolves the
+        # is incidental for these (they carry their own routing target). The
+        # unquoted firehose path (below, including private voice) resolves the
         # project-of-record itself and records there, so its dump and attending
-        # session land on the SAME project (TL-D, T-0492).
+        # session land on the SAME project (TL-D, T-0492; T-0640 changes HOW
+        # that project is resolved, not that the path owns its own record).
         #
-        # T-0659: do NOT append SLASH commands. /project, /state, /sessions,
-        # /say, /help are pure control/routing, not project-directed content.
-        # Appending a bare command into the statically-mapped (_slug_for_chat)
-        # project's store — the "incidental" slug the pin design says NOT to
-        # trust — spuriously wakes THAT project's user-conversation attendant
-        # (the append endpoint auto-wakes on any user-authored append, T-0631),
-        # which sees a contextless "/project" and replies with a confused
-        # clarification it can't act on (the slash-routing context lives only
-        # here, never in the store). The stakeholder hit this every time he
-        # used /project to switch.
+        # T-0659: do NOT append SLASH commands. /state, /sessions, /say, /help,
+        # /pin-session, /remote-control are pure control/routing, not
+        # project-directed content. Appending a bare command into the
+        # statically-mapped (_slug_for_chat) project's store — the "incidental"
+        # slug this design says NOT to trust — spuriously wakes THAT project's
+        # user-conversation attendant (the append endpoint auto-wakes on any
+        # user-authored append, T-0631), which sees a contextless "/sessions"
+        # and replies with a confused clarification it can't act on (the
+        # slash-routing context lives only here, never in the store).
+        #
+        # T-0640 KEPT this guard although the command that PRODUCED the field
+        # report (`/project`) is now gone. The ticket's own progress note
+        # predicted the guard would become dead code and could be removed with
+        # the command; it does not — the `not slash` condition covers all six
+        # surviving commands, and T-0659's root cause is generic to any of
+        # them. Dropping it would restore the exact confused-reply bug for
+        # `/sessions`, `/state`, `/say`, `/help`, `/pin-session` and
+        # `/remote-control`. `test_slash_command_not_appended_to_conversation`
+        # is what actually holds this.
         #
         # T-0740: pass `thread_id` — this branch was the one inbound path that
         # DROPPED it. `_handle_topic_bound` and `_handle_unquoted` below both
@@ -2199,13 +2402,13 @@ def handle_update(cfg, update: dict) -> dict:
                 conversation_locus.set_locus(cfg, chat_slug, gid, chat_id, thread_id)
         if slash:
             cmd, args = slash
-            # T-0492: /project pins/switches the user's current project (needs
-            # the sender identity, which _handle_slash doesn't carry).
-            # T-0676 item 3: thread_id (computed above) so the command's reply
+            # T-0640: the `/project` branch that lived here is gone with the
+            # sticky pin — the project is now resolved per message from its
+            # content (`_resolve_por`), so there is nothing for the user to
+            # pin or switch.
+            # T-0676 item 3: thread_id (computed above) so a command's reply
             # lands back in the topic it was typed in, not the general feed.
-            if cmd == "project":
-                result = _handle_project(cfg, chat_id, gid, args, thread_id=thread_id)
-            elif cmd == "pin-session":
+            if cmd == "pin-session":
                 # T-0677: needs the TOPIC context (chat_id + thread_id + the
                 # binding already resolved above) — it toggles that binding's
                 # direct-mode session_id, so it can't live in the
@@ -2270,9 +2473,10 @@ def handle_update(cfg, update: dict) -> dict:
         result = _handle_private_voice(cfg, chat_id, chat_slug, gid, msg)
     elif binding:
         # T-0639: an unquoted message in a BOUND forum topic — the binding IS
-        # the routing signal (D-0055 §2 step 1), stronger than the sticky pin,
-        # so this bypasses `_handle_unquoted`'s pin-based resolution entirely
-        # and routes straight to the bound project via the same durable path.
+        # the routing signal (D-0055 §2 step 1), stronger than anything the
+        # message's own text can say, so this bypasses `_handle_unquoted`'s
+        # per-message resolution entirely and routes straight to the bound
+        # project via the same durable path.
         result = _handle_topic_bound(cfg, chat_id, gid, binding, msg)
     else:
         # T-0485/T-0494: the unquoted firehose path owns its own record (under
@@ -2584,8 +2788,9 @@ def _handle_slash(
 
     ``sender`` (T-0773): the writer's DISPLAY NAME, for ``/say``'s provenance
     envelope. Deliberately just a label — this function stays identity-less in
-    the sense that matters (it resolves no GlobalUser and pins nothing; that is
-    why ``/project`` and ``/pin-session`` still live in ``handle_update``). A
+    the sense that matters (it resolves no GlobalUser and reads no topic
+    binding; that is why ``/pin-session`` and ``/remote-control`` still live in
+    ``handle_update``). A
     provenance line saying "a human, via Telegram" is the whole use."""
     from bot_squad_worker import actions as A, sessions as S
     if cmd == "sessions":

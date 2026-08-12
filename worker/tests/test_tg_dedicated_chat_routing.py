@@ -87,6 +87,10 @@ class Spy:
         self.asked = 0
 
     def install(self, monkeypatch, *, pin: str | None = None):
+        # ``pin`` survives only so a still-installed stub can PROVE the retired
+        # T-0492 pin is never read (T-0640): every test now asserts
+        # ``pin_reads == []``, which a removed stub could not distinguish from
+        # a pin that was read and ignored.
         monkeypatch.setattr(TL, "append_conversation",
                             lambda c, slug, gid, msg, **k: self.appended.append((slug, gid)))
         monkeypatch.setattr(TL, "append_conversation_fyi",
@@ -161,6 +165,42 @@ def test_dedicated_group_chat_never_reads_the_pin(tmp_path, monkeypatch):
     assert spy.pin_reads == []
 
 
+def test_a_dedicated_room_does_not_classify_the_message_at_all(tmp_path, monkeypatch):
+    """The chat is the answer, so the per-message classifier must never run.
+
+    Distinct from the tests either side of it, which assert WHERE the message
+    landed: this one asserts that the T-0640 resolution ladder is not entered.
+    Running it in a dedicated room costs nothing when it agrees and, when it
+    does not, either adds friction or names other projects to people who are
+    only in this one.
+
+    Lives here rather than in `test_tg_user_worker_routing.py`, where it
+    arrived: it drives `_resolve_por` / `_route_to_project` / `_replay_parked`,
+    which are T-0640's symbols, and `monkeypatch.setattr` RAISES on a missing
+    attribute — so in a commit without T-0640 it fails on its first line
+    (caught in review by p194, whose measurement I reproduced).
+    """
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(
+        TL, "_resolve_por",
+        lambda *_a: pytest.fail("a dedicated room must not classify content"),
+    )
+    seen = {}
+    monkeypatch.setattr(
+        TL, "_route_to_project",
+        lambda cfg, chat, gid, por, msg: seen.update(por=por) or {"ok": True, "slug": por},
+    )
+    monkeypatch.setattr(TL, "_replay_parked", lambda *_a: 0)
+
+    result = TL._handle_unquoted(cfg, GUESTENT_CHAT, "guestent", HIM, {"text": "hello"})
+
+    assert result == {
+        "ok": True, "slug": "guestent",
+        "resolved_by": "dedicated_static_group_chat",
+    }
+    assert seen["por"] == "guestent"
+
+
 def test_dedicated_group_chat_routes_even_when_unpinned(tmp_path, monkeypatch):
     """Unpinned in a dedicated chat must ROUTE, not ask which project — the
     room already answered that question."""
@@ -174,34 +214,54 @@ def test_dedicated_group_chat_routes_even_when_unpinned(tmp_path, monkeypatch):
     assert spy.ensured == [("guestent", HIM)]
 
 
-def test_shared_private_chat_still_uses_the_pin(tmp_path, monkeypatch):
+def test_shared_private_chat_is_decided_by_the_message_not_the_chat(tmp_path, monkeypatch):
     """The negative-id rule must not touch his DM: bot-squad and watchrobot
-    share that positive id deliberately, so only the pin can separate them."""
+    share that positive id deliberately, so the CHAT cannot separate them.
+
+    T-0640 changed this test's ANSWER, not its question. It used to assert
+    that the pin separated them; the stakeholder retired the pin («эту
+    механику с закреплением проекта, давай мы ее уберем») and what separates
+    them now is the message itself. The claim under test is the same one and
+    is still the one that matters: a shared room is not a boundary, so the
+    room does not get to decide. Two messages, one chat, two projects — which
+    the pin could never have expressed either."""
     cfg = _make_cfg(tmp_path)
     _identity(monkeypatch, HIM)
-    spy = Spy().install(monkeypatch, pin="bot-squad")
+    spy = Spy().install(monkeypatch)
 
-    TL.handle_update(cfg, _update(DM_CHAT))
+    TL.handle_update(cfg, _update(DM_CHAT, "in watchrobot сайт лагает"))
+    TL.handle_update(cfg, _update(DM_CHAT, "in bot-squad доска не грузится"))
 
-    assert spy.pin_reads == [HIM]
-    assert spy.ensured == [("bot-squad", HIM)]
+    assert spy.ensured == [("watchrobot", HIM), ("bot-squad", HIM)]
+    assert spy.pin_reads == []   # the retired pin is not consulted at all
 
 
-def test_group_chat_claimed_by_two_projects_falls_back_to_the_pin(tmp_path, monkeypatch):
+def test_group_chat_claimed_by_two_projects_is_not_a_boundary(tmp_path, monkeypatch):
     """A negative id named by TWO projects is evidence for neither — the room
-    stops being a boundary and the previous resolution stands."""
+    stops being a boundary and resolution falls through to the message.
+
+    T-0640 changed what it falls through TO (per-message content resolution,
+    then the ask-when-ambiguous net) but not the claim: an ambiguous room must
+    not quietly pick one of its own claimants. That claim is now checked more
+    directly than it was against the pin — a message naming no project wakes
+    NOBODY and produces a question, instead of landing on whichever project
+    happened to be pinned."""
     cfg = _make_cfg(tmp_path, projects={
         "bot-squad": DM_CHAT,
         "guestent": GUESTENT_CHAT,
         "other": GUESTENT_CHAT,
     })
     _identity(monkeypatch, HIM)
-    spy = Spy().install(monkeypatch, pin="bot-squad")
+    spy = Spy().install(monkeypatch)
 
-    TL.handle_update(cfg, _update(GUESTENT_CHAT))
+    result = TL.handle_update(cfg, _update(GUESTENT_CHAT))
 
-    assert spy.pin_reads == [HIM]
-    assert spy.ensured == [("bot-squad", HIM)]
+    assert result["action"] == "ask_project"
+    assert spy.asked == 1
+    assert spy.ensured == []          # no attendant woken on a guess
+    assert spy.pin_reads == []
+    # …but the message is still recorded, so it is not lost while we wait.
+    assert spy.appended == [("guestent", HIM)]
 
 
 # ---------------------------------------------------------------------------

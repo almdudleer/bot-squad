@@ -179,7 +179,7 @@ def test_debounce_default_still_collapses(tmp_path: Path) -> None:
 
 def test_send_passes_reply_markup_to_post(tmp_path: Path) -> None:
     client, mock_post = _make_client_with_mock_post(tmp_path)
-    markup = {"keyboard": [[{"text": "/project a"}]]}
+    markup = {"keyboard": [[{"text": "/sessions"}]]}
     client.send(chat_id="123", text="pick", reply_markup=markup)
     assert mock_post.call_args.kwargs["reply_markup"] == markup
 
@@ -193,7 +193,7 @@ def test_send_omits_reply_markup_when_none(tmp_path: Path) -> None:
 def test_post_includes_reply_markup_in_payload(tmp_path: Path) -> None:
     cfg = _FakeCfg(token="T:ok", data_dir=tmp_path)
     client = TgClient(cfg)
-    markup = {"keyboard": [[{"text": "/project a"}]], "one_time_keyboard": True}
+    markup = {"keyboard": [[{"text": "/sessions"}]], "one_time_keyboard": True}
     captured: dict = {}
 
     def fake_httpx_post(url, json=None, timeout=None):  # noqa: A002

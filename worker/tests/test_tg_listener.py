@@ -692,31 +692,39 @@ def test_handle_update_skips_plain_message(tmp_path):
     assert result["action"] == "skip"
 
 
-def test_handle_update_project_slash_not_appended_to_store(tmp_path, monkeypatch):
-    """T-0659: a /project control command must NOT be append_conversation()'d
-    into the statically-mapped project's store. Doing so spuriously wakes that
-    project's user-conversation attendant (the append endpoint auto-wakes on
-    any user-authored append, T-0631) with a contextless '/project' it can't
-    interpret — the confused-clarification reply the stakeholder hit every time
-    he used /project to switch."""
+def test_slash_command_not_appended_to_conversation(tmp_path, monkeypatch):
+    """T-0659: a control command must NOT be append_conversation()'d into the
+    statically-mapped project's store. Doing so spuriously wakes that project's
+    user-conversation attendant (the append endpoint auto-wakes on any
+    user-authored append, T-0631) with a contextless command it can't
+    interpret — the confused-clarification reply the stakeholder hit.
+
+    T-0640 note: the command in the original field report was `/project`, which
+    is now retired. T-0640's own ticket predicted this guard would become dead
+    code and could be removed with that command — it does NOT. The `not slash`
+    condition covers every surviving command, and T-0659's cause is generic to
+    all of them, so this is re-pointed at `/sessions` rather than deleted. Each
+    surviving command is checked, so removing the guard cannot pass."""
     cfg = _make_cfg(tmp_path, tg_chat="12345")
-    msg = _slash_message("/project other-project", chat_id=12345)
-    update = {"update_id": 20, "message": msg}
 
     # Resolve a real gid so the `if gid` guard passes — the ONLY thing that must
-    # now prevent the append is the T-0659 `not slash` condition.
+    # prevent the append is the T-0659 `not slash` condition.
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda *a, **k: {"global_user_id": "gu_test"})
     append_calls = []
     monkeypatch.setattr(TL, "append_conversation",
                         lambda cfg, slug, gid, m, **k: append_calls.append((slug, gid)))
-    # _handle_project reads/sets the pin over HTTP — stub it out.
-    monkeypatch.setattr(TL, "_handle_project",
-                        lambda cfg, chat_id, gid, args, **k: {"ok": True, "action": "project", "slug": args})
+    monkeypatch.setattr(TL, "_handle_slash",
+                        lambda *a, **k: {"ok": True, "action": "slash"})
+    monkeypatch.setattr(TL, "_handle_pin_session", lambda *a, **k: {"ok": True, "action": "slash"})
+    monkeypatch.setattr(TL, "_handle_remote_control", lambda *a, **k: {"ok": True, "action": "slash"})
 
-    result = TL.handle_update(cfg, update)
-    assert result["action"] == "project"
-    assert append_calls == []  # no spurious append for a control/routing command
+    for cmd in ("/sessions", "/state", "/say S-x hi", "/help",
+                "/pin-session", "/remote-control"):
+        TL.handle_update(cfg, {"update_id": 20,
+                               "message": _slash_message(cmd, chat_id=12345)})
+
+    assert append_calls == []  # no spurious append for any control command
 
 
 def test_handle_update_reply_does_not_wake_the_attendant(tmp_path, monkeypatch):
@@ -924,20 +932,21 @@ def test_resolve_or_link_does_not_use_tg_proxy(tmp_path, monkeypatch):
 def test_handle_update_links_sender_and_records_identity(tmp_path, monkeypatch):
     """handle_update resolves the sender and surfaces (slug, global_user_id).
 
-    T-0492: a recognized sender's unquoted message no longer just 'skips' — with
-    no current project pinned it asks which project. The identity-surfacing
-    invariant (global_user_id on the result) still holds."""
+    T-0492: a recognized sender's unquoted message no longer just 'skips'.
+    T-0640: this cfg registers exactly ONE project, so per-message resolution
+    has nothing to disambiguate and routes ("sole_project"). The
+    identity-surfacing invariant (global_user_id on the result) still holds."""
     cfg = _make_cfg(tmp_path, tg_chat="12345")
     monkeypatch.setattr(
         TL, "resolve_or_link_sender",
         lambda c, m, slug: {"global_user_id": "gu_zzz", "created": True, "slug": slug},
     )
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: None)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
     result = TL.handle_update(cfg, update)
-    assert result["action"] == "ask_project"     # recognized + unpinned -> asks
+    assert result["action"] == "route"
+    assert result["resolved_by"] == "sole_project"
     assert result["global_user_id"] == "gu_zzz"  # identity still surfaced
 
 
@@ -951,8 +960,7 @@ def test_handle_update_first_contact_affirms_free_form_steering(tmp_path, monkey
         lambda c, m, slug: {"global_user_id": "gu_new", "created": True, "slug": slug},
     )
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: None)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
     echoes = []
     monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
@@ -969,8 +977,7 @@ def test_handle_update_returning_sender_no_welcome(tmp_path, monkeypatch):
         lambda c, m, slug: {"global_user_id": "gu_old", "created": False, "slug": slug},
     )
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: None)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
     echoes = []
     monkeypatch.setattr(TL, "_channel_notify", lambda c, chat, text, **kw: echoes.append(text))
     update = {"update_id": 10, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello again"}}
@@ -1435,8 +1442,9 @@ def test_handle_update_records_conversation(tmp_path, monkeypatch):
     recorded = []
     monkeypatch.setattr(
         TL, "append_conversation",
-        lambda c, slug, gid, msg: recorded.append((slug, gid, msg.get("text"))),
+        lambda c, slug, gid, msg, **k: recorded.append((slug, gid, msg.get("text"))),
     )
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
     update = {"update_id": 9, "message": {"chat": {"id": 12345}, "from": _from(), "text": "hello"}}
     TL.handle_update(cfg, update)
     assert recorded == [("test-project", "gu_zzz", "hello")]
@@ -1455,10 +1463,16 @@ def test_handle_update_no_record_without_identity(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# T-0492: hardwired project routing. A user pins a current project (button /
-# /project <slug>); subsequent unquoted messages sticky-route to it; the bot
-# ASKS which project when unset. The pin is read/written through the API
-# (single-writer = API, pins_store), env-gated + best-effort.
+# T-0640 (D-0055 §2, stakeholder "эту механику с закреплением проекта, давай мы
+# ее уберем"): per-message routing REPLACES T-0492's sticky pin. The
+# project-of-record is resolved from what each message says — explicit
+# cue-prefixed target, then a bare project mention, then a sole registered
+# project — and an unresolvable message is parked and asked about rather than
+# attached to remembered state.
+#
+# The pin's HTTP accessors survive UNWIRED, as the store the stakeholder's
+# newer explicit `pin-project` control will reuse (D-0055 "T-0660 Addendum 1").
+# `test_pin_is_not_a_routing_authority_anywhere` is what keeps "unwired" true.
 # ---------------------------------------------------------------------------
 
 
@@ -1471,9 +1485,24 @@ def _make_multi_cfg(tmp_path, *, chat="111"):
     return cfg
 
 
-def test_extract_slash_command_project():
-    assert TL.extract_slash_command(_slash_message("/project beta")) == ("project", "beta")
-    assert TL.extract_slash_command(_slash_message("/project")) == ("project", "")
+def test_project_command_is_retired(monkeypatch, tmp_path):
+    """T-0640: `/project` is gone with the pin it set. `extract_slash_command`
+    is generic, so it still SPLITS the text — what must be gone is the handler
+    and the dispatch branch, so a user typing it gets the ordinary
+    unknown-command path instead of pinning anything."""
+    assert not hasattr(TL, "_handle_project")
+
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    seen = []
+    monkeypatch.setattr(TL, "_handle_slash",
+                        lambda c, chat, cmd, args, **k: seen.append(cmd) or {"ok": True, "action": "slash"})
+    monkeypatch.setattr(TL, "set_current_project",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not pin")))
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _slash_message("/project beta", chat_id=111)})
+    assert seen == ["project"]  # fell through to the generic handler, pinned nothing
 
 
 def test_get_current_project_http(tmp_path, monkeypatch):
@@ -1519,118 +1548,293 @@ def test_set_current_project_http(tmp_path, monkeypatch):
     assert captured["json"] == {"slug": "beta"}
 
 
-def test_handle_update_project_command_pins(tmp_path, monkeypatch):
+def test_pin_is_not_a_routing_authority_anywhere(tmp_path, monkeypatch):
+    """T-0640, the load-bearing removal. The pin accessors are deliberately
+    KEPT (they are the store the explicit `pin-project` control will reuse,
+    D-0055 "T-0660 Addendum 1"), and an accessor that still exists is exactly
+    the kind of thing a later reader re-wires by accident. So: no inbound path
+    may call them.
+
+    Every accessor is booby-trapped, then the three inbound shapes are driven —
+    a plain DM, a message in an unbound topic, and a slash command. A single
+    read of the pin fails this."""
+    def _boom(*a, **k):
+        raise AssertionError("routing read/wrote the retired T-0492 pin")
+
+    monkeypatch.setattr(TL, "get_current_project", _boom)
+    monkeypatch.setattr(TL, "set_current_project", _boom)
+
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_handle_slash", lambda *a, **k: {"ok": True, "action": "slash"})
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg(text="in beta fix it")})
+    TL.handle_update(cfg, {"update_id": 2, "message": _dated_msg(text="something vague")})
+    TL.handle_update(cfg, {"update_id": 3,
+                           "message": _topic_msg("in alpha fix it", chat_id=111, thread_id=999)})
+    TL.handle_update(cfg, {"update_id": 4,
+                           "message": _slash_message("/sessions", chat_id=111)})
+
+
+def test_handle_update_unquoted_explicit_target_routes(tmp_path, monkeypatch):
+    """D-0055 §2 step 2, promoted from offer to authority (T-0640): a
+    cue-prefixed target in the text IS where the message goes — even though the
+    message arrived in alpha's chat, and with no pin in the picture at all."""
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    set_calls = []
-    monkeypatch.setattr(TL, "set_current_project",
-                        lambda c, gid, slug: set_calls.append((gid, slug)) or True)
-    notify = []
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text, **k: notify.append(text))
-
-    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project beta"}}
-    result = TL.handle_update(cfg, update)
-    assert result["action"] == "project_set"
-    assert result["slug"] == "beta"
-    assert set_calls == [("gu_1", "beta")]
-    assert any("beta" in t for t in notify)  # "you're on project beta"
-
-
-def test_handle_update_project_command_in_topic_replies_into_same_topic(tmp_path, monkeypatch):
-    """T-0676 item 3 (misrouted reply): a /project command typed inside a
-    forum topic must get its confirmation delivered back into THAT topic —
-    before this fix, _notify/_channel_notify dropped message_thread_id
-    entirely, so every command reply landed in the chat's general feed no
-    matter which topic triggered it."""
-    cfg = _make_multi_cfg(tmp_path, chat="111")
-    monkeypatch.setattr(TL, "resolve_or_link_sender",
-                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    monkeypatch.setattr(TL, "set_current_project", lambda c, gid, slug: True)
-    notices = []
-    monkeypatch.setattr(TL, "_channel_notify",
-                        lambda c, chat, text, **k: notices.append((chat, text, k)))
-
-    msg = _topic_msg("/project beta", chat_id=111, thread_id=42)
-    result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
-
-    assert result["action"] == "project_set"
-    assert notices and notices[-1][2].get("thread_id") == 42
-
-
-def test_handle_update_project_command_unknown_slug(tmp_path, monkeypatch):
-    cfg = _make_multi_cfg(tmp_path, chat="111")
-    monkeypatch.setattr(TL, "resolve_or_link_sender",
-                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    monkeypatch.setattr(TL, "set_current_project",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not set")))
-    asks = []
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
-    monkeypatch.setattr(TL, "_notify", lambda c, chat, text, **k: None)
-
-    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project ghost"}}
-    result = TL.handle_update(cfg, update)
-    assert result["action"] == "project_unknown"
-    assert asks == ["111"]  # re-offered the picker
-
-
-def test_handle_update_project_command_no_args_asks(tmp_path, monkeypatch):
-    cfg = _make_multi_cfg(tmp_path, chat="111")
-    monkeypatch.setattr(TL, "resolve_or_link_sender",
-                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    asks = []
-    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
-
-    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "/project"}}
-    result = TL.handle_update(cfg, update)
-    assert result["action"] == "ask_project"
-    assert asks == ["111"]
-
-
-def test_handle_update_unquoted_sticky_routes_to_pinned(tmp_path, monkeypatch):
-    cfg = _make_multi_cfg(tmp_path, chat="111")
-    monkeypatch.setattr(TL, "resolve_or_link_sender",
-                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    # The user's pinned project is beta — even though the message arrived in
-    # alpha's chat, sticky routing wins (hardwired, voice-04).
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
 
-    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "do the thing"}}
+    update = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(),
+                                         "text": "in beta do the thing"}}
     result = TL.handle_update(cfg, update)
     assert result["action"] == "route"
     assert result["slug"] == "beta"
+    assert result["resolved_by"] == "explicit_target"
     assert result["global_user_id"] == "gu_1"
 
 
-def test_handle_update_unquoted_switch_reroutes(tmp_path, monkeypatch):
-    """pin -> route -> switch -> route: the second message follows the switch."""
+def test_handle_update_unquoted_routes_per_message_not_stickily(tmp_path, monkeypatch):
+    """The behaviour change the stakeholder asked for, stated directly: two
+    consecutive messages from the SAME user in the SAME chat go to DIFFERENT
+    projects because they SAY different projects. Nothing is remembered
+    between them — the pin's whole job."""
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    pinned = {"slug": "alpha"}
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: pinned["slug"])
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
 
-    u1 = {"update_id": 1, "message": {"chat": {"id": 111}, "from": _from(), "text": "m1"}}
+    u1 = {"update_id": 1, "message": _dated_msg(text="in alpha the build is red")}
+    u2 = {"update_id": 2, "message": _dated_msg(text="in beta the buttons overlap")}
     assert TL.handle_update(cfg, u1)["slug"] == "alpha"
-    pinned["slug"] = "beta"  # user switched
-    u2 = {"update_id": 2, "message": {"chat": {"id": 111}, "from": _from(), "text": "m2"}}
     assert TL.handle_update(cfg, u2)["slug"] == "beta"
 
 
-def test_handle_update_unquoted_unset_asks(tmp_path, monkeypatch):
+def test_handle_update_unquoted_bare_mention_classifies(tmp_path, monkeypatch):
+    """D-0055 §2 step 3: no cue word, but exactly one registered project is
+    named — that is the per-message content classification, and it routes."""
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: None)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _dated_msg(text="beta looks broken today")})
+    assert result["slug"] == "beta" and result["resolved_by"] == "content_mention"
+
+
+def test_handle_update_unquoted_two_projects_named_asks_rather_than_guessing(tmp_path, monkeypatch):
+    """Ambiguity resolves to NOBODY. Naming two projects must not deliver the
+    message to whichever sorts first in the registry — that is a silent
+    misroute with nothing in either thread saying so, and it is precisely what
+    the ask fallback exists to prevent."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not route")))
+    asks = []
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1,
+              "message": _dated_msg(text="in alpha and in beta the same bug")})
+    assert result["action"] == "ask_project"
+    assert result["reason"] == "ambiguous_explicit_targets"
+    assert asks == ["111"]
+
+
+# ---------------------------------------------------------------------------
+# T-0640: the ask fallback, END TO END. Retiring the pin changes what the
+# question MEANS — it used to ask the user to set state that later messages
+# would ride, and now asks about THIS message. That only works if the message
+# survives the question, so these drive the whole exchange rather than each
+# half: ask -> park -> answer -> replay into the named project.
+# ---------------------------------------------------------------------------
+
+
+def test_unresolvable_message_is_parked_and_asked_about(tmp_path, monkeypatch):
+    from bot_squad_worker import pending_project
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ask_which_project", lambda *a, **k: None)
+
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _dated_msg(text="the deploy is stuck")})
+
+    parked = pending_project.take(cfg, "gu_1")
+    assert [e["msg"]["text"] for e in parked] == ["the deploy is stuck"]
+
+
+def test_answering_which_project_replays_the_parked_message(tmp_path, monkeypatch):
+    """The walkthrough the DoD asks for, as a test. Without the replay the
+    fallback is a prompt that leads nowhere — strictly worse than the pin it
+    replaced, because the user answers and nothing happens."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, m.get("text"))) or True)
+    ensures = []
+    monkeypatch.setattr(TL, "_ensure_user_conversation",
+                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat, text, **k: notices.append(text))
+
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _dated_msg(text="the deploy is stuck")})
+    result = TL.handle_update(cfg, {"update_id": 2, "message": _dated_msg(text="beta")})
+
+    assert result["action"] == "route_answer"
+    assert result["slug"] == "beta" and result["replayed"] == 1
+    # The PARKED message — not the word "beta" — is what reached beta.
+    assert ("beta", "the deploy is stuck") in appended
+    assert ensures == [("beta", "gu_1")]
+    assert any("beta" in t for t in notices)   # the user is told where it went
+
+
+def test_a_bare_answer_is_control_not_content(tmp_path, monkeypatch):
+    """T-0659's principle, applied to the answer: delivering the literal word
+    "beta" into beta's thread wakes its attendant with a message it cannot act
+    on. The answer selects a destination; it is not itself a message."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(m.get("text")) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg(text="the deploy is stuck")})
+    TL.handle_update(cfg, {"update_id": 2, "message": _dated_msg(text="beta")})
+
+    assert "beta" not in appended
+
+
+def test_a_real_message_naming_a_project_releases_the_parked_ones_and_routes_itself(
+        tmp_path, monkeypatch):
+    """A user who answers by simply carrying on ("in beta the build is red")
+    has both answered the question and sent a message. Both must land."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, m.get("text"))) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+
+    TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg(text="the deploy is stuck")})
+    result = TL.handle_update(cfg, {"update_id": 2,
+                                    "message": _dated_msg(text="in beta the build is red")})
+
+    assert result["action"] == "route" and result["replayed"] == 1
+    assert ("beta", "the deploy is stuck") in appended    # the parked one
+    assert ("beta", "in beta the build is red") in appended  # and this one
+
+
+def test_a_burst_of_parked_messages_replays_in_order(tmp_path, monkeypatch):
+    """One question was asked about all of them, so one answer must route all
+    of them — oldest first, or the attendant reads the dump backwards."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, m.get("text"))) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+
+    for i, txt in enumerate(["one", "two", "three"]):
+        TL.handle_update(cfg, {"update_id": i, "message": _dated_msg(text=txt)})
+    result = TL.handle_update(cfg, {"update_id": 9, "message": _dated_msg(text="beta")})
+
+    assert result["replayed"] == 3
+    assert [t for slug, t in appended if slug == "beta"] == ["one", "two", "three"]
+
+
+def test_a_replayed_message_keeps_its_own_thread(tmp_path, monkeypatch):
+    """The replay re-drives the ordinary routing path, so T-0693's
+    append/locus thread agreement has to hold for a message delivered minutes
+    after it arrived, not just for a live one."""
+    from bot_squad_worker import conversation_locus
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, k.get("thread_id"))) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+    monkeypatch.setattr(TL, "_channel_notify", lambda *a, **k: None)
+
+    TL.handle_update(cfg, {"update_id": 1,
+                           "message": _topic_msg("the deploy is stuck", chat_id=111,
+                                                 thread_id=999)})
+    TL.handle_update(cfg, {"update_id": 2, "message": _dated_msg(text="beta")})
+
+    assert ("beta", 999) in appended
+    assert conversation_locus.get_locus(cfg, "beta", "gu_1", 999)["thread_id"] == 999
+
+
+def test_nothing_parked_means_a_bare_project_name_is_still_a_message(tmp_path, monkeypatch):
+    """No question was asked, so "beta" is not an answer — it is something the
+    user typed, and dropping user content is the one failure this path must
+    not have."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append((slug, m.get("text"))) or True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
+
+    result = TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg(text="beta")})
+
+    assert result["action"] == "route" and result["slug"] == "beta"
+    assert appended == [("beta", "beta")]
+
+
+def test_park_failure_still_asks(tmp_path, monkeypatch):
+    """Best-effort: a park-store hiccup must degrade to T-0492's old behaviour
+    (recorded + asked), never to a silently swallowed message."""
+    from bot_squad_worker import pending_project
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(slug) or True)
+    monkeypatch.setattr(pending_project, "park",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    asks = []
+    monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
+
+    result = TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg(text="vague")})
+
+    assert result["action"] == "ask_project"
+    assert appended == ["alpha"] and asks == ["111"]
+
+
+def test_handle_update_unquoted_unset_asks(tmp_path, monkeypatch):
+    """The ask-when-ambiguous safety net the DoD says to KEEP: a message that
+    names no project is asked about rather than routed on a guess."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: None)
     asks = []
     monkeypatch.setattr(TL, "_ask_which_project", lambda c, chat, **k: asks.append(chat))
 
@@ -1670,12 +1874,11 @@ def test_handle_update_unquoted_routes_to_user_conversation(tmp_path, monkeypatc
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
     calls = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: calls.append((slug, gid, ref)))
 
-    msg = _dated_msg()
+    msg = _dated_msg(text="in beta do the thing")
     update = {"update_id": 1, "message": msg}
     result = TL.handle_update(cfg, update)
 
@@ -1692,12 +1895,12 @@ def test_handle_update_unquoted_burst_routes_to_one_session(tmp_path, monkeypatc
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
     routed = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: routed.append((slug, gid)))
 
-    for i, txt in enumerate(["problem 1", "problem 2", "problem 3"]):
+    for i, txt in enumerate(["in beta problem 1", "in beta problem 2",
+                             "in beta problem 3"]):
         TL.handle_update(cfg, {"update_id": i, "message": _dated_msg(text=txt)})
 
     # Every message in the burst targets the same (slug, gid) attendant key.
@@ -1773,10 +1976,14 @@ def test_detect_cross_project_target_no_false_positive(tmp_path):
 def test_handle_update_unquoted_cross_project_mention_routes_no_reroute(tmp_path, monkeypatch):
     """T-0666: a message explicitly mentioning another project no longer
     triggers a reroute-confirm prompt (stakeholder found it disruptive,
-    'отключи, мешаются') — it routes straight to the pinned project-of-record
-    like any other unquoted message. ``_offer_reroute``/``_user_can_access_project``
-    are gone entirely; ``_detect_cross_project_target`` is retained (D-0055 §2 /
-    T-0640 reuse) but no longer wired to any prompt."""
+    'отключи, мешаются'). ``_offer_reroute``/``_user_can_access_project`` are
+    gone entirely.
+
+    T-0640 changes the DESTINATION, not the no-prompt property: with the pin
+    retired there is no "current" project to reroute FROM, so an explicit
+    mention is simply where the message goes. The assertion that survives
+    unchanged — and the one this test is really about — is that nothing is
+    asked."""
     assert not hasattr(TL, "_offer_reroute")
     assert not hasattr(TL, "_user_can_access_project")
 
@@ -1784,7 +1991,6 @@ def test_handle_update_unquoted_cross_project_mention_routes_no_reroute(tmp_path
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")  # pinned alpha
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
@@ -1794,27 +2000,34 @@ def test_handle_update_unquoted_cross_project_mention_routes_no_reroute(tmp_path
     msg = _dated_msg(text="in beta I see the buttons overlap")
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
-    assert result["action"] == "route" and result["slug"] == "alpha"
-    assert ensures == [("alpha", "gu_1")]  # routed straight to the POR, no confirm gate
+    assert result["action"] == "route" and result["slug"] == "beta"
+    assert ensures == [("beta", "gu_1")]  # routed straight there, no confirm gate
     assert notified == []  # no reroute-confirm prompt sent
 
 
-def test_handle_update_unquoted_no_cross_mention_routes_normally(tmp_path, monkeypatch):
-    """No explicit cross-project mention -> ordinary T-0485 routing, unchanged."""
+def test_handle_update_unquoted_names_no_project_asks(tmp_path, monkeypatch):
+    """The honest cost of retiring the pin, pinned as a test: a message that
+    names no project used to ride the pin silently and now produces a
+    question. The chat's own static slug is deliberately NOT used to fill the
+    gap — one physical DM is shared across a user's projects, which is why
+    T-0492 called that slug incidental and why trusting it produced T-0659."""
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
-    ensures = []
+    appended = []
+    monkeypatch.setattr(TL, "append_conversation",
+                        lambda c, slug, gid, m, **k: appended.append(slug) or True)
     monkeypatch.setattr(TL, "_ensure_user_conversation",
-                        lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not route")))
+    monkeypatch.setattr(TL, "_ask_which_project", lambda *a, **k: None)
 
     msg = _dated_msg(text="fix the deploy timeout bug")
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
-    assert result["action"] == "route" and result["slug"] == "alpha"
-    assert ensures == [("alpha", "gu_1")]
+    assert result["action"] == "ask_project" and result["reason"] == "no_project_named"
+    # …but it is still RECORDED under the incidental slug, so it is not lost
+    # to a user who never answers.
+    assert appended == ["alpha"]
 
 
 # ---------------------------------------------------------------------------
@@ -1890,18 +2103,23 @@ def test_handle_update_bound_topic_wins_over_static_slug_and_pin(tmp_path, monke
 
 
 def test_handle_update_unbound_thread_falls_back_to_static_slug(tmp_path, monkeypatch):
-    """No binding for this (chat_id, thread_id) -> legacy static tg_chat
-    resolution + the existing pin-based routing, unaffected."""
+    """No binding for this (chat_id, thread_id) -> the message is NOT held; it
+    falls through to the DM-firehose path and is resolved there.
+
+    T-0640: what "falls back" means changed. It used to mean "the static
+    tg_chat slug plus the pin"; it now means the message reaches
+    `_handle_unquoted` and is resolved per-message, so the text names its
+    project. The property under test — an unbound thread in a never-bound chat
+    is not HELD — is unchanged."""
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
-    msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    msg = _topic_msg("in alpha no binding for this thread", chat_id=111, thread_id=999)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert result["action"] == "route" and result["slug"] == "alpha"
@@ -2007,12 +2225,11 @@ def test_handle_update_topic_in_never_bound_chat_still_falls_back(tmp_path, monk
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
-    msg = _topic_msg("some other topic message", chat_id=111, thread_id=42)
+    msg = _topic_msg("in alpha some other topic message", chat_id=111, thread_id=42)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert result["action"] == "route" and result["slug"] == "alpha"
@@ -2076,12 +2293,11 @@ def test_handle_update_general_feed_single_project_chat_still_falls_back(tmp_pat
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
-    msg = _topic_msg("general feed message", chat_id=111, thread_id=None)
+    msg = _topic_msg("in alpha general feed message", chat_id=111, thread_id=None)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert result["action"] == "route" and result["slug"] == "alpha"
@@ -2096,12 +2312,11 @@ def test_handle_update_general_feed_genuine_dm_unaffected(tmp_path, monkeypatch)
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     ensures = []
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda c, slug, gid, ref, **k: ensures.append((slug, gid)))
 
-    msg = _topic_msg("hi", chat_id=111, thread_id=None)
+    msg = _topic_msg("hi in alpha", chat_id=111, thread_id=None)
     result = TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert result["action"] == "route" and result["slug"] == "alpha"
@@ -2809,10 +3024,9 @@ def test_handle_unquoted_records_locus(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
 
-    msg = _dated_msg(text="hi", chat_id=111)
+    msg = _dated_msg(text="hi in alpha", chat_id=111)
     TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     rec = conversation_locus.get_locus(cfg, "alpha", "gu_1")
@@ -2829,10 +3043,9 @@ def test_handle_unquoted_records_locus_thread_id_when_present(tmp_path, monkeypa
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
 
-    msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    msg = _topic_msg("in alpha no binding for this thread", chat_id=111, thread_id=999)
     TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     rec = conversation_locus.get_locus(cfg, "alpha", "gu_1", 999)
@@ -2849,13 +3062,12 @@ def test_handle_unquoted_forwards_thread_id_to_append_matching_locus(tmp_path, m
     cfg = _make_multi_cfg(tmp_path, chat="111")
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "alpha")
     monkeypatch.setattr(TL, "_ensure_user_conversation", lambda *a, **k: None)
     appended = []
     monkeypatch.setattr(TL, "append_conversation",
                         lambda c, slug, gid, m, **k: appended.append(k.get("thread_id")) or True)
 
-    msg = _topic_msg("no binding for this thread", chat_id=111, thread_id=999)
+    msg = _topic_msg("in alpha no binding for this thread", chat_id=111, thread_id=999)
     TL.handle_update(cfg, {"update_id": 1, "message": msg})
 
     assert appended == [999]  # matches the locus's thread_id (999), not omitted/None
@@ -3084,10 +3296,19 @@ def test_handle_topic_bound_general_feed_different_slugs_no_collision_warning(tm
     assert not any("General-feed" in r.message for r in caplog.records)
 
 
-def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
-    """T-0513: the picker now routes through the channel abstraction (was a raw
-    httpx sendMessage). The keyboard must reach the TG client via the channel,
-    with the interactive-reply flags (urgent, no SID prefix, no debounce)."""
+def test_ask_which_project_asks_in_plain_text_naming_the_projects(tmp_path, monkeypatch):
+    """T-0513: the prompt routes through the channel abstraction (was a raw
+    httpx sendMessage), with the interactive-reply flags (urgent, no SID
+    prefix, no debounce).
+
+    T-0640 replaces the reply-keyboard with plain text. The buttons emitted
+    `/project <slug>`, a command that no longer exists, so leaving the keyboard
+    would offer the user a control that pins nothing; and the stakeholder's own
+    addressing design is plain phrases rather than keyboards (D-0055 "T-0660
+    Addendum 1"). The prompt must NAME the projects — "which project?" with no
+    list is unanswerable by someone who does not know the slugs — and must say
+    the message was kept, or a user re-types it and the answer routes a
+    duplicate."""
     import bot_squad_worker.actions as A
     cfg = _make_multi_cfg(tmp_path, chat="111")
     calls: list[dict] = []
@@ -3108,14 +3329,13 @@ def test_ask_which_project_sends_button_keyboard(tmp_path, monkeypatch):
 
     TL._ask_which_project(cfg, "111")
 
-    assert calls, "picker did not route through the channel"
+    assert calls, "the prompt did not route through the channel"
     kw = calls[-1]
-    # A reply-keyboard whose buttons send "/project <slug>" as a normal message
-    # (so it arrives under allowed_updates:["message"], no poll-contract change).
-    markup = kw["reply_markup"]
-    btn_texts = [btn["text"] for row in markup["keyboard"] for btn in row]
-    assert "/project alpha" in btn_texts
-    assert "/project beta" in btn_texts
+    assert "reply_markup" not in kw or not kw.get("reply_markup")  # keyboard retired
+    text = kw["text"]
+    assert "alpha" in text and "beta" in text  # answerable without knowing slugs
+    assert "сохранил" in text                  # the replay promise
+    assert "/project" not in text              # no retired command offered
     assert kw["urgent"] is True and kw["sid"] == "" and kw["debounce"] is False
 
 
@@ -3925,14 +4145,14 @@ def test_handle_update_unquoted_parked_notifies_user(tmp_path, monkeypatch):
     monkeypatch.setattr(TL, "resolve_or_link_sender",
                         lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
     monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
-    monkeypatch.setattr(TL, "get_current_project", lambda c, gid: "beta")
     monkeypatch.setattr(TL, "_ensure_user_conversation",
                         lambda *a, **k: {"ok": False, "parked": True})
     notices = []
     monkeypatch.setattr(TL, "_channel_notify",
                         lambda c, chat_id, text, **k: notices.append((chat_id, text)))
 
-    result = TL.handle_update(cfg, {"update_id": 1, "message": _dated_msg()})
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _dated_msg(text="in beta do the thing")})
 
     assert result["action"] == "route_parked"
     assert len(notices) == 1 and notices[0][0] == "111"

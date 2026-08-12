@@ -958,10 +958,21 @@ def worker_list_conversation(
     return page
 
 
-# ---- T-0492: per-(user, server) current-project routing (worker-token) -------
-# The same user-communication module owns conversation history AND the hardwired
-# routing of unquoted messages to a user's pinned project (voice-04). The worker
-# reads/sets the pin through these endpoints; single-writer = API (pins_store).
+# ---- current-project pin (worker-token) -------------------------------------
+# T-0492 shipped these as the transport for the sticky pin that routed every
+# unquoted inbound message to a user's pinned project (voice-04). T-0640
+# retired that mechanism on the stakeholder's instruction (D-0055 Addendum 3,
+# "эту механику с закреплением проекта, давай мы ее уберем") — the worker now
+# resolves the project per message from the message's own content and NO
+# INBOUND ROUTING PATH CALLS THESE ANY MORE.
+#
+# They are kept, not deleted, because the stakeholder's newer and different
+# control needs exactly this store: the explicit plain-phrase
+# `pin-project <slug>` / `unpin-project` default target (D-0055 "T-0660
+# Addendum 1"), which a user sets and clears by name rather than having every
+# message implicitly attach to it. Building that control is T-0660's scope, not
+# T-0640's; this slice retires the auto-sticky mechanism and leaves the storage.
+# Single-writer = API (pins_store), unchanged.
 
 
 @worker_router.post("/routing/{global_user_id}/current-project")

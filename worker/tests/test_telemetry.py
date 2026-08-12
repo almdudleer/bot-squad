@@ -116,8 +116,23 @@ def test_context_and_memory_levels(monkeypatch):
     assert T.context_level(240_000) == "warn"
     assert T.context_level(299_999) == "warn"
     assert T.context_level(300_000) == "urgent"
-    assert T.memory_level(T.MEMORY_WARN_TOKENS - 1) == "none"
-    assert T.memory_level(T.MEMORY_WARN_TOKENS) == "warn"
+    # T-0834: the memory level is taken on LOADED tokens (MEMORY.md), not the
+    # whole store.
+    monkeypatch.delenv("BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS", raising=False)
+    assert T.memory_loaded_level(T.MEMORY_LOADED_WARN_TOKENS - 1) == "none"
+    assert T.memory_loaded_level(T.MEMORY_LOADED_WARN_TOKENS) == "warn"
+
+
+def test_memory_loaded_warn_env_override(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS", "9000")
+    assert T.memory_loaded_warn() == 9_000
+    assert T.memory_loaded_level(8_999) == "none"
+    assert T.memory_loaded_level(9_000) == "warn"
+    # garbage / non-positive can never disable the alert
+    monkeypatch.setenv("BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS", "nope")
+    assert T.memory_loaded_warn() == T.MEMORY_LOADED_WARN_TOKENS
+    monkeypatch.setenv("BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS", "0")
+    assert T.memory_loaded_warn() == T.MEMORY_LOADED_WARN_TOKENS
 
 
 def test_context_ceiling_default_is_300k(monkeypatch):
@@ -189,8 +204,44 @@ def test_memory_stats_counts_files_and_estimates_tokens(tmp_path: Path):
     assert stats["tokens_est"] == 200  # 800 // 4
 
 
+def test_memory_stats_splits_loaded_index_from_recall_only(tmp_path: Path):
+    """T-0834 defect 1: the flat total is the WHOLE store, and only MEMORY.md is
+    loaded into a session. The two must be reported as separate, labelled
+    figures — the old alert named the loaded one while measuring the total, and
+    overstated by 13x on the live install.
+    """
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    (mem / "MEMORY.md").write_text("x" * 400)          # the loaded index
+    for i in range(12):
+        (mem / f"fact{i}.md").write_text("y" * 400)    # recall-only
+    stats = T.memory_stats(mem)
+    assert stats["files"] == 13 and stats["tokens_est"] == 1300      # whole store
+    assert stats["loaded"] == {"files": 1, "bytes": 400, "tokens_est": 100}
+    assert stats["recall"] == {"files": 12, "bytes": 4800, "tokens_est": 1200}
+    # the split is the point: the total is 13x the loaded figure here, and the
+    # test says so in the same shape the live measurement did.
+    assert stats["tokens_est"] == 13 * stats["loaded"]["tokens_est"]
+    assert stats["path"] == str(mem)
+
+
+def test_memory_stats_store_with_no_index_reports_zero_loaded(tmp_path: Path):
+    """A store carrying only recall files loads NOTHING into a session. It must
+    read as zero loaded, not fall back to the total."""
+    mem = tmp_path / "memory"
+    mem.mkdir()
+    (mem / "fact.md").write_text("y" * 4000)
+    stats = T.memory_stats(mem)
+    assert stats["loaded"]["tokens_est"] == 0
+    assert stats["recall"]["tokens_est"] == 1000
+    assert T.memory_loaded_level(stats["loaded"]["tokens_est"]) == "none"
+
+
 def test_memory_stats_missing_dir_is_zero(tmp_path: Path):
-    assert T.memory_stats(tmp_path / "nope") == {"files": 0, "bytes": 0, "tokens_est": 0}
+    zero = {"files": 0, "bytes": 0, "tokens_est": 0}
+    assert T.memory_stats(tmp_path / "nope") == {
+        **zero, "loaded": zero, "recall": zero, "path": str(tmp_path / "nope"),
+    }
 
 
 def test_shared_memory_stats_counts_project_dev_clone_memory(tmp_path: Path):
@@ -202,16 +253,18 @@ def test_shared_memory_stats_counts_project_dev_clone_memory(tmp_path: Path):
     (mem / "MEMORY.md").write_text("x" * 400)
     (mem / "fact.md").write_text("y" * 400)
     (mem / "ignore.txt").write_text("z" * 4000)  # non-.md, not counted
-    assert T.shared_memory_stats(cfg, "proj") == {
-        "files": 2, "bytes": 800, "tokens_est": 200,
-    }
+    stats = T.shared_memory_stats(cfg, "proj")
+    assert (stats["files"], stats["bytes"], stats["tokens_est"]) == (2, 800, 200)
+    assert stats["loaded"] == {"files": 1, "bytes": 400, "tokens_est": 100}
 
 
 def test_shared_memory_stats_unknown_slug_or_missing_dir_is_zero(tmp_path: Path):
     cfg = _make_cfg(tmp_path)
     zero = {"files": 0, "bytes": 0, "tokens_est": 0}
-    assert T.shared_memory_stats(cfg, "no-such-slug") == zero  # unknown project
-    assert T.shared_memory_stats(cfg, "proj") == zero  # dir absent
+    for stats in (T.shared_memory_stats(cfg, "no-such-slug"),   # unknown project
+                  T.shared_memory_stats(cfg, "proj")):          # dir absent
+        assert (stats["files"], stats["bytes"], stats["tokens_est"]) == (0, 0, 0)
+        assert stats["loaded"] == zero and stats["recall"] == zero
 
 
 def test_compute_burn_over_window():
@@ -395,39 +448,262 @@ def test_context_alert_fires_once_per_crossing(tmp_path, fake_session):
     assert len(fake_session["sent"]) == before
 
 
-def test_alerts_are_targeted_to_operator_and_tl_never_broadcast(tmp_path, fake_session, monkeypatch):
-    """A (memory) crossing pings the specific operator SID + the session's TL SID.
-
-    Context no longer alerts a human at all (T-0333 auto-compacts); the
-    targeting guardrail is exercised via the memory crossing, which still uses
-    the same ``_alert_session`` fan-out (operator SID + session TL, never a
-    role/broadcast)."""
-    cfg = _make_cfg(tmp_path)
-    # add an operator row + a TL for the dev
+def _add_operator_row(fake_session, sid="S-almdudleer-operator-p1", status="active",
+                      uuid="op-uuid"):
     fake_session["rows"].append({
-        "sid": "S-almdudleer-operator-p1", "status": "active",
-        "claude_uuid": "op-uuid", "linux_user": "almdudleer",
+        "sid": sid, "status": status,
+        "claude_uuid": uuid, "linux_user": "almdudleer",
         "role": "operator", "task_id": None, "tmux_session": "proj",
     })
+
+
+def _big_index(f: Path, chars: int = 200_000) -> Path:
+    """Give the transcript's memory store a MEMORY.md over the loaded warn line."""
+    mem = f.parent / "memory"
+    mem.mkdir(exist_ok=True)
+    (mem / "MEMORY.md").write_text("m" * chars)
+    return mem
+
+
+def test_memory_alert_goes_to_the_operator_only_never_broadcast(tmp_path, fake_session, monkeypatch):
+    """T-0834 defect 3: the advice is addressed to whoever can act.
+
+    The store is the operator's to curate; a dev session complying with
+    "consider pruning" would be editing another actor's durable state. So the
+    TL and the affected session get nothing, and the targeting guardrail
+    (stakeholder 2026-06-18: never a role/broadcast target) still holds.
+    """
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
     import bot_squad_worker.teams as _teams
     monkeypatch.setattr(_teams, "tl_for_sid",
                         lambda cfg, slug, sid: "S-almdudleer-TL-p9")
-    # operator's transcript so its own sampling doesn't crash (optional)
     _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
 
     f = _write_transcript(fake_session["home"], fake_session["uuid"],
                           [_assistant((2, 70000, 100), 500)])
-    # a memory dir over the 40k-token warn line (>160KB) → a memory crossing
-    (f.parent / "memory").mkdir()
-    (f.parent / "memory" / "MEMORY.md").write_text("m" * 200_000)
+    _big_index(f)
+    T.sample(cfg, "proj")
+
+    mem_sent = [(sid, t) for sid, t in fake_session["sent"] if "memory store" in t]
+    targets = [sid for sid, _ in mem_sent]
+    assert targets == ["S-almdudleer-operator-p1"]  # operator, and ONLY the operator
+    assert "S-almdudleer-TL-p9" not in targets      # cannot act on it — not told
+    assert "S-almdudleer-dev-p5" not in targets     # nor the session it used to name
+    assert "all" not in targets and "teamlead" not in targets  # never a role/broadcast
+
+
+def test_memory_alert_fires_once_for_a_store_many_sessions_share(tmp_path, fake_session):
+    """T-0834 defect 2 + 4, the measured one: six sessions reading ONE store
+    produce ONE alert, not six.
+
+    All six transcripts sit in the same project dir, so they read the same
+    ``memory/`` — which is why the live install reported the byte-identical
+    ``~40,138 tok across 61 files`` for nine different SIDs. Alerting per
+    session sends one fact once per reader.
+    """
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    _big_index(f)
+    for i in range(5):
+        uuid = f"peer-uuid-{i}"
+        _write_transcript(fake_session["home"], uuid, [_assistant((2, 70000, 100), 500)])
+        fake_session["rows"].append({
+            "sid": f"S-almdudleer-drive-p{i}", "status": "active", "claude_uuid": uuid,
+            "linux_user": "almdudleer", "role": "dev", "task_id": None,
+            "tmux_session": "proj",
+        })
+
+    T.sample(cfg, "proj")
+
+    mem_sent = [t for _, t in fake_session["sent"] if "memory store" in t]
+    assert len(mem_sent) == 1, f"one store, one alert — got {len(mem_sent)}"
+    # and it says how many are reading it, instead of naming one of them
+    assert "7 session(s) are reading it" in mem_sent[0]  # 6 devs + the operator
+
+
+def test_memory_alert_does_not_refire_while_the_store_stays_over(tmp_path, fake_session):
+    """Crossing-only + cooldown, held at STORE granularity — the state lives in
+    _memory.json, so sessions appearing and being reaped can't re-arm it."""
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    mem = _big_index(f)
+    T.sample(cfg, "proj")
+    assert len([t for _, t in fake_session["sent"] if "memory store" in t]) == 1
+
+    # store grows further, and a NEW session joins it — still no second alert
+    (mem / "MEMORY.md").write_text("m" * 260_000)
+    _write_transcript(fake_session["home"], "late-uuid", [_assistant((2, 1, 0), 1)])
+    fake_session["rows"].append({
+        "sid": "S-almdudleer-late-p9", "status": "active", "claude_uuid": "late-uuid",
+        "linux_user": "almdudleer", "role": "dev", "task_id": None,
+        "tmux_session": "proj",
+    })
+    T.sample(cfg, "proj")
+    T.sample(cfg, "proj")
+    assert len([t for _, t in fake_session["sent"] if "memory store" in t]) == 1
+
+
+def test_memory_alert_state_is_keyed_by_store_not_by_session(tmp_path, fake_session):
+    """The alert level is written per store path in _memory.json, and nothing
+    memory-shaped is left decaying in the per-session records."""
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    mem = _big_index(f)
+    T.sample(cfg, "proj")
+
+    tdir = cfg.data_dir / "proj" / "_worker" / "telemetry"
+    state = json.loads((tdir / "_memory.json").read_text())
+    assert list(state) == [str(mem)]
+    assert state[str(mem)]["level"] == "warn"
+    assert "memory:warn" in state[str(mem)]["fired_at"]
+    rec = json.loads((tdir / "S-almdudleer-dev-p5.json").read_text())
+    assert "memory" not in rec["last_alert"]
+
+
+def test_a_session_with_no_transcript_contributes_no_store(tmp_path, fake_session):
+    """A session whose transcript wasn't found carries zeroes and an EMPTY path.
+    That is an absence of a reading, not a store, and must not appear in the
+    state file — a "" key there is an invented store that would then carry its
+    own level and cooldown."""
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    mem = _big_index(f)
+    fake_session["rows"].append({
+        "sid": "S-almdudleer-ghost-p7", "status": "active", "claude_uuid": "no-such-uuid",
+        "linux_user": "almdudleer", "role": "dev", "task_id": None,
+        "tmux_session": "proj",
+    })
+    T.sample(cfg, "proj")
+    T.sample(cfg, "proj")
+
+    state = json.loads((cfg.data_dir / "proj" / "_worker" / "telemetry"
+                        / "_memory.json").read_text())
+    assert list(state) == [str(mem)]  # exactly one store; no "" key
+    assert state[str(mem)]["level"] == "warn"
+    assert len([t for _, t in fake_session["sent"] if "memory store" in t]) == 1
+
+
+def test_an_emptied_store_reads_none_not_its_old_level(tmp_path, fake_session):
+    """Zero files at a REAL path is a reading of "nothing loaded", not a missing
+    reading. It must drop a warned store straight to none.
+
+    Distinct from the pathless case above, and it has to go warn → empty in one
+    step: a draft of this walked warn → small → empty, and the small step had
+    already set none, so a guard that skipped empty stores entirely stayed
+    invisible.
+    """
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    mem = _big_index(f)
+    T.sample(cfg, "proj")
+    spath = cfg.data_dir / "proj" / "_worker" / "telemetry" / "_memory.json"
+    assert json.loads(spath.read_text())[str(mem)]["level"] == "warn"
+
+    (mem / "MEMORY.md").unlink()  # store emptied outright, still at its path
+    T.sample(cfg, "proj")
+    state = json.loads(spath.read_text())
+    assert str(mem) in state, "an emptied store is still a store"
+    assert state[str(mem)]["level"] == "none"
+
+
+def test_pruning_the_store_rearms_the_crossing(tmp_path, fake_session):
+    """The signal must come BACK after a prune. An empty/shrunk store is a real
+    reading of 'nothing loaded' — it drops the level to none, so the next real
+    growth alerts again instead of being swallowed by a level that never reset.
+    """
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    mem = _big_index(f)
+    T.sample(cfg, "proj")
+    assert len([t for _, t in fake_session["sent"] if "memory store" in t]) == 1
+
+    spath = cfg.data_dir / "proj" / "_worker" / "telemetry" / "_memory.json"
+
+    (mem / "MEMORY.md").write_text("m" * 100)  # pruned, well under the line
+    T.sample(cfg, "proj")
+    state = json.loads(spath.read_text())
+    assert state[str(mem)]["level"] == "none"  # re-armed
+
+    # It grows back — and the alert fires AGAIN, which is the whole point of
+    # re-arming. Backdate the fire epoch past the cooldown rather than sleeping:
+    # the crossing is what's under test here, the cooldown has its own test.
+    state[str(mem)]["fired_at"]["memory:warn"] = 0
+    spath.write_text(json.dumps(state))
+    (mem / "MEMORY.md").write_text("m" * 200_000)
+    T.sample(cfg, "proj")
+    assert json.loads(spath.read_text())[str(mem)]["level"] == "warn"
+    sent = [t for _, t in fake_session["sent"] if "memory store" in t]
+    assert len(sent) == 2, "a real prune-then-regrow must alert again"
+
+
+def test_alerts_never_reach_dead_operator_sessions(tmp_path, fake_session):
+    """T-0834 defect 4, the MEASURED amplifier: the operator target list was
+    built from every row, with no status filter, while the sampling loop three
+    lines above it filtered status=='active'.
+
+    Live measurement 2026-07-30, one alert: 42 inbox writes across 19 operator
+    SIDs, 18 dead — and 24 of those dead inboxes redirect to the live operator's
+    successor, so one alert landed 24 times in the one inbox a human reads.
+    """
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session, "S-almdudleer-operator-live-p9", "active", "op-live")
+    for i, status in enumerate(("suspended", "historical", "archived")):
+        _add_operator_row(fake_session, f"S-almdudleer-operator-dead-p{i}", status,
+                          f"op-dead-{i}")
+    _write_transcript(fake_session["home"], "op-live", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    _big_index(f)
     T.sample(cfg, "proj")
 
     targets = {sid for sid, _ in fake_session["sent"]}
-    assert "S-almdudleer-operator-p1" in targets   # operator SID targeted
-    assert "S-almdudleer-TL-p9" in targets         # session's TL targeted
-    assert "S-almdudleer-dev-p5" not in targets    # affected session not self-pinged
-    assert "all" not in targets and "teamlead" not in targets  # never a role/broadcast
-    assert any("memory footprint high" in text for _, text in fake_session["sent"])
+    assert "S-almdudleer-operator-live-p9" in targets
+    assert not [s for s in targets if "dead" in s]
+
+
+def test_memory_alert_names_the_store_not_a_session(tmp_path, fake_session):
+    """T-0834 defect 2 + 1, in the text the operator actually reads: it names the
+    store's path, labels the loaded figure as the loaded one, and labels the
+    whole-store total as NOT loaded context."""
+    cfg = _make_cfg(tmp_path)
+    _add_operator_row(fake_session)
+    _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((2, 70000, 100), 500)])
+    mem = _big_index(f)
+    (mem / "recall-one.md").write_text("r" * 40_000)
+    T.sample(cfg, "proj")
+
+    texts = [t for _, t in fake_session["sent"] if "memory store" in t]
+    assert len(texts) == 1
+    text = texts[0]
+    assert str(mem) in text                       # the store is named as itself
+    assert "S-almdudleer-dev-p5" not in text      # NOT attributed to a session
+    assert "~50,000 tok" in text                  # the LOADED figure (200k // 4)
+    assert "10,000 tok" in text                   # the recall-only figure, separate
+    assert "60,000 tok" in text                   # the whole store, labelled as such
+    assert "SHARED" in text and "NOT loaded context" in text
+    # the old message's two wrong words are gone
+    assert "footprint high" not in text
 
 
 def test_read_telemetry_returns_sessions_and_quota_without_internal_fields(tmp_path, fake_session):
@@ -451,7 +727,9 @@ def test_read_telemetry_includes_shared_memory_block(tmp_path, fake_session):
     mem.mkdir(parents=True)
     (mem / "MEMORY.md").write_text("m" * 400)
     wire = T.read_telemetry(cfg, "proj")
-    assert wire["shared_memory"] == {"files": 1, "bytes": 400, "tokens_est": 100}
+    sm = wire["shared_memory"]
+    assert (sm["files"], sm["bytes"], sm["tokens_est"]) == (1, 400, 100)
+    assert sm["loaded"] == {"files": 1, "bytes": 400, "tokens_est": 100}  # T-0834
 
 
 def test_read_telemetry_includes_enforced_caps_block(tmp_path, fake_session):
@@ -542,29 +820,25 @@ def test_urgent_context_triggers_autocompact_not_a_human_ping(tmp_path, fake_ses
 
 
 def test_memory_alert_does_not_ping_the_human(tmp_path, fake_session, monkeypatch):
-    """T-0387: memory-footprint is a ROUTINE resource alert — it must NOT ping
+    """T-0387: the memory advisory is a ROUTINE resource alert — it must NOT ping
     the human (same closed-loop rule as T-0333 context). It stays an internal
-    operator/TL advisory: the human channel is silent, the agents still get it."""
+    operator advisory: the human channel is silent, the operator still gets it.
+    T-0834 narrowed the addressee to the operator and kept this rule."""
     cfg = _make_cfg(tmp_path)
     calls = _capture_human_tg(monkeypatch)
-    fake_session["rows"].append({
-        "sid": "S-almdudleer-operator-p1", "status": "active",
-        "claude_uuid": "op-uuid", "linux_user": "almdudleer",
-        "role": "operator", "task_id": None, "tmux_session": "proj",
-    })
+    _add_operator_row(fake_session)
     import bot_squad_worker.teams as _teams
     monkeypatch.setattr(_teams, "tl_for_sid",
                         lambda cfg, slug, sid: "S-almdudleer-TL-p9")
     _write_transcript(fake_session["home"], "op-uuid", [_assistant((1, 1, 0), 1)])
     f = _write_transcript(fake_session["home"], fake_session["uuid"],
                           [_assistant((2, 70000, 100), 500)])
-    (f.parent / "memory").mkdir()
-    (f.parent / "memory" / "MEMORY.md").write_text("m" * 200_000)  # over the warn line
+    _big_index(f)  # over the loaded warn line
     T.sample(cfg, "proj")
-    # The human is NOT pinged about routine memory footprint:
-    assert [c for c in calls if "memory footprint" in c["text"].lower()] == []
-    # ...but the internal operator/TL advisory is still delivered:
-    assert any("memory footprint high" in text for _, text in fake_session["sent"])
+    # The human is NOT pinged about a routine memory advisory:
+    assert [c for c in calls if "memory store" in c["text"].lower()] == []
+    # ...but the internal operator advisory is still delivered:
+    assert any("memory store" in text for _, text in fake_session["sent"])
 
 
 def test_fresh_tail_read_does_not_redetect_429(tmp_path, fake_session, monkeypatch):

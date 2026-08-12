@@ -27,13 +27,35 @@ Research (full notes on the ticket) bottomed out three data sources:
   budget anchor in ``system_settings.toml [quota]``. The 429 throttle flag is
   surfaced regardless.
 
-* **Memory usage** — per agent, the per-session memory dir next to the
-  transcript (``memory/*.md`` + ``MEMORY.md``): file count + byte size + a
+* **Memory usage** — the agent memory dir beside the transcript
+  (``<home>/.claude/projects/<project>/memory/``): file count + byte size + a
   ~bytes/4 token estimate. T-0502 adds a project-level count of the SHARED,
   git-ignored ``<dev-clone>/memory`` dir (``shared_memory_stats``), surfaced
   on ``read_telemetry`` — the memory substrate shared across all
-  sessions/users of the project (see D-0041), distinct from the per-session
-  dir above.
+  sessions/users of the project (see D-0041), a different directory from the
+  one above.
+
+  **T-0834 — two corrections, both measured, because the old alert got both
+  wrong while sounding precise:**
+
+  1. **The dir total is NOT loaded context.** Only ``MEMORY.md`` (the index)
+     enters every session; the other ``*.md`` files are loaded ONLY when a
+     session recalls one, selectively, and most never in a given session.
+     Measured 2026-07-30 on this install: MEMORY.md 16,846 B ≈ 4,211 tok
+     against a 219,226 B ≈ 54,806 tok directory — the total overstates
+     loaded context by **13.0x**. So ``memory_stats`` reports ``loaded``
+     (MEMORY.md) and ``recall`` (everything else) as SEPARATE, LABELLED
+     sub-blocks and the alert fires on ``loaded``. The flat
+     ``files``/``bytes``/``tokens_est`` keys stay for the wire's existing
+     readers, and now mean the whole store, explicitly.
+  2. **This dir is NOT per-session.** It hangs off the *project path*
+     (``transcript.parent``), so every session of one linux user on one
+     project shares ONE store. Proof from the live records: 9 different
+     sessions reported the byte-identical ``~40,138 tok across 61 files``.
+     So the alert is fired ONCE PER STORE (keyed by its path, state in
+     ``_memory.json``), names the store rather than a SID, and goes to the
+     operator — the one actor who curates it. A dev session cannot act on
+     "consider pruning": that store is another actor's durable state.
 
 All alerts are SYSTEM pings → ``urgent=True`` so the quiet-hours gate (17–05
 UTC) can't silently drop them, and they fire only when a threshold is *newly
@@ -85,7 +107,20 @@ log = logging.getLogger(__name__)
 # ignored — see recycle_gate's skip logging (T-0864).
 DEFAULT_CONTEXT_CEILING = 300_000
 CONTEXT_WARN_RATIO = 0.8
-MEMORY_WARN_TOKENS = 40_000  # per-agent memory footprint warn line
+# T-0834: the warn line is on LOADED memory — MEMORY.md, the only file that
+# enters every session — NOT on the whole store. The old 40k line was a
+# whole-directory figure and is deleted rather than kept alongside: a threshold
+# nothing reads is a threshold the next reader will wire back up (T-0848).
+#
+# 4k is deliberately BELOW today's measured 4,211 tok, so this fires on the
+# current state instead of muting it. The stakeholder's own severity check on
+# T-0834: "3,157 tok of MEMORY.md in every session on this project is not
+# nothing … the failure mode to avoid is the T-0820 one, where the fix is
+# silence and the one true positive is lost." The defect was the number, the
+# addressee and the volume — never that the signal was false. What the loaded
+# figure costs is paid PER SESSION: at ~4k tok with 8 sessions live, the index
+# alone occupies ~32k tok of window across the fleet, every one of them.
+MEMORY_LOADED_WARN_TOKENS = 4_000
 
 
 def context_ceiling() -> int:
@@ -293,22 +328,77 @@ def find_transcript(home: str, claude_uuid: str) -> Path | None:
 # Memory footprint (pure-ish, unit-testable)
 # ---------------------------------------------------------------------------
 
-def memory_stats(memory_dir: Path) -> dict:
-    """Count + byte/token-size the agent memory files in ``memory_dir``.
+#: The one memory file that is loaded into EVERY session on a project. Every
+#: other ``*.md`` in the store is recall-only. (Both halves of that sentence are
+#: what T-0834 is about — see the module docstring.)
+MEMORY_INDEX_FILE = "MEMORY.md"
 
-    Includes ``MEMORY.md`` and every ``*.md`` under the dir. Token estimate is
-    ~bytes/4 (no tiktoken dep in the worker). Missing dir → zeroes.
+
+def zero_memory_stats() -> dict:
+    """The "no reading" memory block, in the FULL ``memory_stats`` shape.
+
+    Every producer of a memory block returns this shape or none at all — a
+    caller must never have to ask which variant it got. ``path`` is empty, and
+    `_fire_memory_alerts` treats a pathless block as an ABSENCE of a reading
+    rather than a store measuring zero.
+    """
+    zero = {"files": 0, "bytes": 0, "tokens_est": 0}
+    return {**zero, "loaded": dict(zero), "recall": dict(zero), "path": ""}
+
+
+def memory_stats(memory_dir: Path) -> dict:
+    """Count + byte/token-size the agent memory files in ``memory_dir``, SPLIT
+    into what a session actually loads and what it merely might.
+
+    Token estimate is ~bytes/4 (no tiktoken dep in the worker). Missing dir →
+    zeroes. Returns::
+
+        {"files", "bytes", "tokens_est",   # the WHOLE store (all *.md)
+         "loaded": {...},                  # MEMORY.md — in every session
+         "recall": {...},                  # the rest — only when recalled
+         "path": "<memory_dir>"}           # the store's identity (T-0834)
+
+    The three flat keys are the pre-T-0834 contract and keep their meaning
+    (whole directory) for existing wire readers. **They are not loaded context**
+    and nothing may alert on them as though they were: on this install the total
+    is 13.0x the loaded figure. Alert on ``loaded``.
+
+    ``path`` is what makes the store addressable as itself. It is the field that
+    lets the alert say WHICH store grew and lets `_fire_memory_alerts` collapse
+    the N sessions sharing one directory into one alert — the store is shared,
+    so the alert must be too.
     """
     files = 0
     total = 0
+    loaded_files = 0
+    loaded_bytes = 0
     if memory_dir.exists():
         for md in sorted(memory_dir.glob("*.md")):
             try:
-                total += md.stat().st_size
-                files += 1
+                size = md.stat().st_size
             except OSError:
                 continue
-    return {"files": files, "bytes": total, "tokens_est": total // 4}
+            total += size
+            files += 1
+            if md.name == MEMORY_INDEX_FILE:
+                loaded_bytes += size
+                loaded_files += 1
+    return {
+        "files": files,
+        "bytes": total,
+        "tokens_est": total // 4,
+        "loaded": {
+            "files": loaded_files,
+            "bytes": loaded_bytes,
+            "tokens_est": loaded_bytes // 4,
+        },
+        "recall": {
+            "files": files - loaded_files,
+            "bytes": total - loaded_bytes,
+            "tokens_est": (total - loaded_bytes) // 4,
+        },
+        "path": str(memory_dir),
+    }
 
 
 def shared_memory_stats(cfg: Any, slug: str) -> dict:
@@ -322,7 +412,7 @@ def shared_memory_stats(cfg: Any, slug: str) -> dict:
     missing dir → zeroes, like ``memory_stats``."""
     proj = (getattr(cfg, "projects", {}) or {}).get(slug)
     if proj is None:
-        return {"files": 0, "bytes": 0, "tokens_est": 0}
+        return zero_memory_stats()
     return memory_stats(Path(proj.repo_path) / "memory")
 
 
@@ -338,8 +428,30 @@ def context_level(tokens: int) -> str:
     return "none"
 
 
-def memory_level(tokens_est: int) -> str:
-    return "warn" if tokens_est >= MEMORY_WARN_TOKENS else "none"
+def memory_loaded_warn() -> int:
+    """Warn line for LOADED memory (MEMORY.md) in tokens. Overridable per-install
+    via ``BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS``; non-positive/garbage falls back
+    to the default, so a bad env can never disable the alert."""
+    raw = os.environ.get("BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return MEMORY_LOADED_WARN_TOKENS
+
+
+def memory_loaded_level(loaded_tokens_est: int) -> str:
+    """Level for the LOADED half of a memory store.
+
+    T-0834: takes ``memory["loaded"]["tokens_est"]``, NOT ``memory["tokens_est"]``.
+    Passing the whole-store figure here is the original defect — it reads as a
+    correct call and overstates by ~13x. The parameter is named for the only
+    quantity that belongs in it.
+    """
+    return "warn" if loaded_tokens_est >= memory_loaded_warn() else "none"
 
 
 def crossed(prev: str, new: str) -> bool:
@@ -362,6 +474,16 @@ def _record_path(cfg: Any, slug: str, sid: str) -> Path:
 
 def _quota_path(cfg: Any, slug: str) -> Path:
     return _telemetry_dir(cfg, slug) / "_quota.json"
+
+
+def _memory_state_path(cfg: Any, slug: str) -> Path:
+    """T-0834: alert state for the SHARED memory stores, keyed by store path.
+
+    Deliberately NOT in the per-session records. Alert state has to live at the
+    granularity of the thing it describes: kept per session, the level re-armed
+    every time a session appeared or was reaped, and N sessions each carried
+    their own copy of one store's state."""
+    return _telemetry_dir(cfg, slug) / "_memory.json"
 
 
 def reap_record(cfg: Any, slug: str, sid: str) -> Path | None:
@@ -533,8 +655,18 @@ def sample(cfg: Any, slug: str) -> dict:
     # guardrail (2026-06-18): alerts are targeted peer_sends to the specific
     # operator SID + each specific TL SID, NEVER a broadcast (role=all), which
     # historically interrupted every live session.
+    # T-0834: LIVE operators only. This list was built from every row — the
+    # sampling loop above filters status=='active', this one did not — so it
+    # accumulated every operator session the project had ever had. Measured
+    # 2026-07-30 on one alert: 42 inbox writes across 19 operator SIDs, 18 of
+    # them dead; 24 of those dead inboxes redirect to the live operator's
+    # successor, so ONE alert landed 24 times in the one inbox a human reads.
+    # That, not a missing cooldown, was the volume defect — the cooldown held,
+    # each session fired exactly once. Fixing it here fixes quota + throttle
+    # alerts too, which fan out through the same list.
     operator_sids = [r.get("sid") for r in rows
-                     if r.get("role") == "operator" and r.get("sid")]
+                     if r.get("role") == "operator" and r.get("sid")
+                     and str(r.get("status", "")).lower() in ("active", "paused")]
 
     # Alerts (crossing-only). Done after persistence so a crash mid-alert
     # doesn't re-fire next tick.
@@ -559,7 +691,7 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
     output_cum = int(prev.get("output_tokens_cum", 0)) if not fresh else 0
     offset = int(prev.get("transcript_offset", 0)) if not fresh else 0
     saw_429 = False
-    memory = {"files": 0, "bytes": 0, "tokens_est": 0}
+    memory = zero_memory_stats()
 
     if transcript is not None:
         try:
@@ -763,7 +895,6 @@ def _fire_alerts(
         fired = rec.get("alert_fired_at") or {}
         ctx_tokens = rec["context"]["tokens"]
         ctx_new = context_level(ctx_tokens)
-        mem_new = memory_level(rec["memory"]["tokens_est"])
         changed = False
 
         # T-0333/T-0334: context-high is SELF-HEALING — the SYSTEM /compacts the
@@ -778,27 +909,27 @@ def _fire_alerts(
             last["context"] = ctx_new
             changed = True
 
-        mem_key = f"memory:{mem_new}"
-        if crossed(last.get("memory", "none"), mem_new) and cooldown_ok(fired, mem_key, now):
-            # T-0387: routine resource alert — operator/TL advisory only, NEVER
-            # the human (humans only for decisions; same closed-loop as T-0333).
-            _alert_session(
-                cfg, slug, sid, operator_sids,
-                f"🧠 memory footprint high — {sid} ~{rec['memory']['tokens_est']:,} tok "
-                f"across {rec['memory']['files']} files. Consider pruning.",
-                urgent=alert_urgent("memory", mem_new),
-                human=False,
-            )
-            fired[mem_key] = now
-            changed = True
-        if last.get("memory") != mem_new:
-            last["memory"] = mem_new
+        # T-0834: the memory crossing USED to fire here, per session. It cannot:
+        # the store is shared by every session on the project path, so a
+        # per-session loop over it re-sends one fact once per reader. It now
+        # fires once per STORE, below, after this loop.
+        if last.get("memory") is not None:
+            # Retire the per-session memory level rather than leave it decaying
+            # in the record — a stale "warn" here would re-arm a crossing for
+            # whatever reads it next.
+            last.pop("memory", None)
             changed = True
 
         if changed:
             rec["last_alert"] = last
             rec["alert_fired_at"] = fired
             _write_json(_record_path(cfg, slug, sid), rec)
+
+    # --- shared memory-store crossing (T-0834), once per store, to the operator
+    try:
+        _fire_memory_alerts(cfg, slug, sampled, operator_sids, now)
+    except Exception:
+        log.exception("telemetry: memory-store alerting failed for %s", slug)
 
     # --- project quota crossings (anchor projection + 429 throttle) ---
     qlast = quota.get("last_alert") or {"quota": "none", "throttle_seen": None}
@@ -839,6 +970,104 @@ def _fire_alerts(
         quota["last_alert"] = qlast
         quota["alert_fired_at"] = qfired
         _write_json(_quota_path(cfg, slug), quota)
+
+
+def _fire_memory_alerts(
+    cfg: Any, slug: str, sampled: list[dict], operator_sids: list[str], now: float,
+) -> None:
+    """T-0834: one crossing alert per SHARED memory store, to the operator only.
+
+    Three things this does differently from the per-session alert it replaced,
+    each answering a measured defect:
+
+    * **Groups by ``memory["path"]``.** Sessions on one project path read one
+      directory; grouping is what turns N identical messages into one. The
+      grouping key is the store's own identity, not a SID and not a count.
+    * **Alerts on ``loaded``** (MEMORY.md) and reports ``recall`` beside it,
+      labelled — the two are different quantities and the old message named the
+      second while measuring the first.
+    * **Addresses the operator**, who curates the store, and says so. The
+      previous text told dev sessions to prune a directory they must not touch.
+
+    State (level + fire epochs) lives per store path in ``_memory.json``, so the
+    crossing survives sessions coming and going. Never raises out.
+    """
+    stores: dict[str, list[dict]] = {}
+    for rec in sampled:
+        mem = rec.get("memory") or {}
+        path = mem.get("path")
+        # A session whose transcript wasn't found carries `zero_memory_stats()`:
+        # an ABSENCE of a reading, with an empty path. Skip it — it is not a
+        # store, and keying state under "" would invent one.
+        #
+        # An EMPTY store, by contrast, has a real path and files == 0, and is
+        # kept: that is a true reading of "nothing loaded", and letting it set
+        # the level to "none" is what re-arms the crossing after a real prune.
+        # (An earlier draft skipped those too. Its test passed; a mutation run
+        # showed the test could not tell the two cases apart, and reading the
+        # guard again showed it would have pinned a pruned store at "warn"
+        # forever.)
+        if not path:
+            continue
+        stores.setdefault(path, []).append(rec)
+    if not stores:
+        return
+
+    state = _read_json(_memory_state_path(cfg, slug)) or {}
+    changed = False
+
+    for path, recs in sorted(stores.items()):
+        mem = recs[0]["memory"]
+        loaded = mem.get("loaded") or {}
+        recall = mem.get("recall") or {}
+        loaded_tok = int(loaded.get("tokens_est", 0))
+        new = memory_loaded_level(loaded_tok)
+
+        st = state.get(path) or {"level": "none", "fired_at": {}}
+        fired = st.get("fired_at") or {}
+        key = f"memory:{new}"
+
+        if crossed(st.get("level", "none"), new) and cooldown_ok(fired, key, now):
+            readers = len(recs)
+            # T-0387 still holds: routine resource advisory, never the human.
+            _alert_operators(
+                cfg, slug, operator_sids,
+                f"🧠 memory store — {path}\n"
+                f"LOADED into every session on this project: {MEMORY_INDEX_FILE} "
+                f"~{loaded_tok:,} tok (warn line {memory_loaded_warn():,}); "
+                f"{readers} session(s) are reading it right now, each paying it in full.\n"
+                f"RECALL-ONLY, not loaded unless a session recalls one: "
+                f"{recall.get('files', 0)} files ~{int(recall.get('tokens_est', 0)):,} tok. "
+                f"Whole store {mem.get('files', 0)} files ~{int(mem.get('tokens_est', 0)):,} tok — "
+                f"that total is NOT loaded context, don't read it as one.\n"
+                f"This store is SHARED across those sessions, not any one of theirs. "
+                f"Pruning it is yours: trim {MEMORY_INDEX_FILE}, or move entries out of the "
+                f"index into recall-only files.",
+            )
+            fired[key] = now
+            st["fired_at"] = fired
+            changed = True
+
+        if st.get("level") != new:
+            st["level"] = new
+            changed = True
+        state[path] = st
+
+    if changed:
+        _write_json(_memory_state_path(cfg, slug), state)
+
+
+def _alert_operators(cfg: Any, slug: str, operator_sids: list[str], text: str) -> None:
+    """Targeted advisory to the operator SID(s) only — no TLs, no dev sessions,
+    no human page (T-0387 routine-resource rule).
+
+    T-0834: the addressee list IS part of the fix. An advisory whose action only
+    the operator can take must not reach sessions that would have to edit another
+    actor's durable state to comply.
+    """
+    for target in dict.fromkeys(operator_sids):
+        if target:
+            _peer_to(cfg, slug, target, text)
 
 
 def _alert_session(
@@ -941,7 +1170,7 @@ def read_telemetry(cfg: Any, slug: str) -> dict:
         shared_memory = shared_memory_stats(cfg, slug)
     except Exception:  # noqa: BLE001 — telemetry read must never hard-fail
         log.exception("read_telemetry: shared_memory_stats failed for %s", slug)
-        shared_memory = {"files": 0, "bytes": 0, "tokens_est": 0}
+        shared_memory = zero_memory_stats()
     # T-0470: hook-driven lifecycle measurement — per-live-session
     # stall/timeout/recycle event summary (last-ts + counts per kind), the
     # operator-facing surface of the unified hook/event signals.

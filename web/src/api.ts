@@ -492,7 +492,18 @@ export type TelemetrySession = {
     ceiling: number;    // tunable contract ceiling (300_000 since T-0857; 700_000 before), worker-stamped
     model?: string | null;
   };
-  memory: { files: number; bytes: number; tokens_est: number };
+  // T-0834: files/bytes/tokens_est are the WHOLE memory store — NOT loaded
+  // context. Only `loaded` (MEMORY.md) enters a session; `recall` is read only
+  // when a session recalls an entry. On the live install the total ran 13x the
+  // loaded figure, so anything rendering "context cost" must use `loaded`.
+  // `path` identifies the store, which is SHARED by every session on the
+  // project path — it is not this session's alone.
+  memory: {
+    files: number; bytes: number; tokens_est: number;
+    loaded?: { files: number; bytes: number; tokens_est: number };
+    recall?: { files: number; bytes: number; tokens_est: number };
+    path?: string;
+  };
   output_tokens_cum?: number;
   rate_limited?: boolean;
   sampled_at?: string;

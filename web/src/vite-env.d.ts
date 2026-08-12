@@ -22,3 +22,11 @@ declare module "*.txt?raw" {
   const content: string;
   export default content;
 }
+
+// T-0889: canonicalStatusMirror.test.ts reads the API-side canonical-status
+// SSOT (`api/app/canonical_status.py`) as text so the Python and TypeScript
+// status models can be compared by a machine instead of by a docstring.
+declare module "*.py?raw" {
+  const content: string;
+  export default content;
+}

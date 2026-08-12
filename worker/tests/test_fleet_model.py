@@ -38,6 +38,18 @@ def test_set_model_creates_file_and_dir(_home):
     assert fleet_model.get_model() == "claude-sonnet-5"
 
 
+def test_codex_is_a_persisted_provider_choice(_home):
+    fleet_model.set_model("codex")
+
+    assert fleet_model.get_model() == "codex"
+    assert fleet_model.get_provider() == "codex"
+    assert not _settings_path(_home).exists()
+
+    fleet_model.set_model("")
+    assert fleet_model.get_provider() == "claude"
+    assert fleet_model.get_model() == ""
+
+
 def test_set_model_preserves_unrelated_keys(_home):
     p = _settings_path(_home)
     p.parent.mkdir(parents=True)
@@ -99,7 +111,8 @@ def test_get_model_non_dict_json_returns_empty(_home):
     "model", sorted(m for m in fleet_model.ALLOWED_MODELS if fleet_model.is_available(m)))
 def test_all_allowed_models_accepted(_home, model):
     fleet_model.set_model(model)
-    assert fleet_model.get_model() == model
+    expected = "codex" if model in fleet_model.CODEX_MODELS else model
+    assert fleet_model.get_model() == expected
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +137,25 @@ def test_resolve_model_passes_class_alias_through_unchanged(alias):
 @pytest.mark.parametrize(
     "model", sorted(m for m in fleet_model.ALLOWED_MODELS if m and fleet_model.is_available(m)))
 def test_resolve_model_passes_through_allowed_values(model):
-    assert fleet_model.resolve_model(model) == model
+    expected = fleet_model.agent_provider.CODEX_MODEL_ALIASES.get(model, model)
+    if model == "codex":
+        expected = ""
+    assert fleet_model.resolve_model(model) == expected
+
+
+@pytest.mark.parametrize(
+    ("alias", "model"),
+    [("sol", "gpt-5.6-sol"), ("terra", "gpt-5.6-terra"), ("luna", "gpt-5.6-luna")],
+)
+def test_resolve_codex_aliases(alias, model):
+    assert fleet_model.resolve_model(alias, provider="codex") == model
+
+
+def test_provider_specific_validation_rejects_cross_provider_model():
+    with pytest.raises(ValueError, match="project default is Codex"):
+        fleet_model.resolve_model("sonnet", provider="codex")
+    with pytest.raises(ValueError, match="belongs to provider 'codex'"):
+        fleet_model.resolve_model("terra", provider="claude")
 
 
 def test_resolve_model_empty_string_passes_through():

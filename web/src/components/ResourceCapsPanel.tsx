@@ -212,6 +212,9 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
   const [caps, setCaps] = useState<TelemetryCaps | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [agentChoice, setAgentChoice] = useState<string>("");
+  const [agentLoaded, setAgentLoaded] = useState(false);
+  const [savingAgent, setSavingAgent] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -251,6 +254,16 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       })
       .catch(() => {
         /* non-admin / anon — inputs stay read-only */
+      });
+    api
+      .getWorkerModel(slug)
+      .then((result) => {
+        if (!alive) return;
+        setAgentChoice(result.model);
+        setAgentLoaded(true);
+      })
+      .catch(() => {
+        /* leave the provider control unavailable; caps remain usable */
       });
     return () => {
       alive = false;
@@ -351,6 +364,25 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
       setError(String(e));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function saveAgentChoice() {
+    setNotice(null);
+    setError(null);
+    setSavingAgent(true);
+    try {
+      const result = await api.putWorkerModel(slug, agentChoice);
+      setAgentChoice(result.model);
+      setNotice(
+        result.model === "codex"
+          ? "Saved. New operator, user, and dev sessions will use Codex."
+          : "Saved. New sessions will use the selected Claude default.",
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSavingAgent(false);
     }
   }
 
@@ -539,7 +571,7 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
           onClick={() => setExpanded((e) => !e)}
           data-testid="caps-toggle"
         >
-          {expanded ? "▾ hide" : "▸ set caps"}
+          {expanded ? "▾ hide" : "▸ settings"}
         </button>
       </div>
 
@@ -555,6 +587,47 @@ export function ResourceCapsPanel({ slug }: { slug: string }) {
               {notice}
             </div>
           )}
+
+          <div
+            className="d-flex gap-2 align-items-end flex-wrap"
+            style={{ marginBottom: "0.75rem" }}
+            data-testid="agent-default-control"
+          >
+            <div>
+              <label
+                htmlFor="pc-agent-default"
+                className="form-label"
+                style={{ fontSize: "0.7rem" }}
+              >
+                Default agent / model
+              </label>
+              <select
+                id="pc-agent-default"
+                className="form-select form-select-sm"
+                value={agentChoice}
+                disabled={!isAdmin || !agentLoaded || savingAgent}
+                onChange={(e) => setAgentChoice(e.target.value)}
+                style={{ width: "14rem" }}
+              >
+                <option value="">Claude (built-in default)</option>
+                <option value="codex">Codex</option>
+                <option value="sonnet">Claude Sonnet</option>
+                <option value="opus">Claude Opus</option>
+              </select>
+            </div>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              disabled={!isAdmin || !agentLoaded || savingAgent}
+              onClick={saveAgentChoice}
+            >
+              {savingAgent ? "Saving…" : "Save agent"}
+            </button>
+            <small style={{ color: "var(--mc-text-dim)", maxWidth: "23rem" }}>
+              Server-wide default for newly spawned operator, user-conversation,
+              and dev sessions. Existing sessions keep their provider when resumed.
+            </small>
+          </div>
 
           {/* Task-Manager meters — the ENFORCED server-wide numbers (T-0389
               items 7+22): live count vs the cap, and output_since_anchor (the

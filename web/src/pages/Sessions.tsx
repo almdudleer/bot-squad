@@ -1657,7 +1657,7 @@ export function Sessions() {
         </h2>
       </div>
       <PageHelp>
-        Live status board for the Claude tmux sessions whose CWD is this
+        Live status board for the Claude/Codex tmux sessions whose CWD is this
         project&apos;s repo — the system spawns, reuses and reaps them for
         you. Steer day-to-day via the Telegram dialog: reply to a
         <code> [SID] needs your input</code> notification and your reply lands

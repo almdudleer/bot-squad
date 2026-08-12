@@ -25,12 +25,14 @@ services:
       - COOKIE_SECURE=1
       - BUILD_AT_IMPORT=1
       - CLAUDE_PROJECTS_DIR=/home/almdudleer/.claude/projects
+      - CODEX_SESSIONS_DIR=/home/almdudleer/.codex/sessions
       - MOTHERSHIP=${MOTHERSHIP:-0}
       - MOTHERSHIP_BASE_URL=${MOTHERSHIP_BASE_URL:-}
     volumes:
       - ./config:/config:rw
       - ./data:/data:rw
       - /home/almdudleer/.claude/projects:/home/almdudleer/.claude/projects:ro
+      - /home/almdudleer/.codex/sessions:/home/almdudleer/.codex/sessions:ro
       # Project repo paths — needed for AGENTS.md read/write through the API.
       # signal-tracker/dev is a symlink → signal_tracker_mgmt; mount both so
       # the symlink resolves inside the container.

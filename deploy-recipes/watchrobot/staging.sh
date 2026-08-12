@@ -57,6 +57,11 @@
 #       the ownership block below; a foreign container answering /health is the
 #       failure this code exists to name
 #   26  the `stt` sidecar's PHASE-1 actions (reclaim/build/up) failed
+#   27  the browser gate's ASSERTIONS failed — the deployed build serves the
+#       wrong rows/geometry. This is the app, and the deploy must not stand.
+#   28  the browser gate COULD NOT RUN (missing playwright / browsers in this
+#       checkout's tests/). Says NOTHING about the build — fix the machine. It
+#       still fails: a gate that cannot run must never be read as green.
 set -euo pipefail
 
 DEPLOY_START_S=$SECONDS
@@ -275,6 +280,40 @@ else
     echo "[staging-route] SKIPPED: the app is not ready inside its container, so a public failure would tell us nothing new."
 fi
 
+# BROWSER GATE (T-0548) — the one thing every gate above is blind to: WHICH ROWS
+# CAME BACK. Everything before this asks whether something answers. Twice in one
+# day a fully green suite said nothing about the screen: the web unit suite
+# cannot import .tsx at all, so 415 green tests missed a typo `tsc` caught in the
+# same minute, and the two defects the stakeholder found by eye — a transition
+# flash and two filter controls that did not filter — were invisible to
+# everything we ran. A filter returning the wrong rows looks perfect: full feed,
+# intact layout, clean console. Only an assertion about the rows can fail on it.
+#
+# ⚠ Skipped (not failed) when the public route is red, for the same reason the
+# route gate is skipped when the app is red: a browser failure against an
+# unreachable stand names the wrong layer.
+#
+# ⚠ THE TWO FAILURE MODES ARE DIFFERENT NEWS AND GET DIFFERENT EXIT CODES:
+#   rc=5  the assertions failed         -> the BUILD is bad, stop the deploy (27)
+#   rc=6  the gate could not RUN at all -> the MACHINE is bad, says nothing about
+#         the build (28). It still fails the deploy: a gate that cannot run must
+#         never read as green. WHAT IS ACTUALLY MISSING WHEN IT FIRES, checked
+#         rather than assumed (2026-08-12): `tests/deploy-gate.sh` itself is
+#         TRACKED in watchrobot git and travels with any clone — do not go
+#         looking for a missing script. What does NOT travel is `tests/`'s
+#         gitignored `node_modules/` (fix: `npm ci` in this checkout's tests/)
+#         and playwright's browser binaries, which live outside the repo
+#         entirely in ~/.cache/ms-playwright (fix: `npx playwright install`).
+# Collapsing these two into one code is how "fix the machine" gets read as "the
+# app is broken" at 3am.
+browser_rc=0
+if [ "$route_rc" -eq 0 ] && [ "$app_rc" -eq 0 ]; then
+    BASE_URL="${APP_PUBLIC_URL%/api/version}" bash "$REPO/tests/deploy-gate.sh" || browser_rc=$?
+    [ "$browser_rc" -eq 0 ] || failed="$failed browser-gate"
+else
+    echo "[staging-browser] SKIPPED: the stand is not publicly reachable, so a browser failure would name the wrong layer."
+fi
+
 ELAPSED=$((SECONDS - DEPLOY_START_S))
 # Always record wall clock WITH the load average. The ~90s window this gate
 # replaced was sized off an idle-box figure; the deploy that exposed it took
@@ -284,7 +323,7 @@ ELAPSED=$((SECONDS - DEPLOY_START_S))
 echo "[staging] wall clock ${ELAPSED}s; load $(_loadavg) at finish"
 
 if [ -n "$failed" ]; then
-    echo "[staging] FATAL: deploy failed —$failed (app_rc=$app_rc stt_rc=$stt_rc stt_own_rc=$stt_own_rc stt_action_rc=$stt_action_rc route_rc=$route_rc)" >&2
+    echo "[staging] FATAL: deploy failed —$failed (app_rc=$app_rc stt_rc=$stt_rc stt_own_rc=$stt_own_rc stt_action_rc=$stt_action_rc route_rc=$route_rc browser_rc=$browser_rc)" >&2
     echo "[staging] every gate above was RUN; see its own lines for which signal it got." >&2
     # App down is the most severe, then the voice path, then ownership, then
     # routing. Every branch is explicit: an unlisted failure must not fall
@@ -293,6 +332,10 @@ if [ -n "$failed" ]; then
     [ "$stt_rc" -eq 0 ]        || exit 23
     [ "$stt_own_rc" -eq 0 ]    || exit 25
     [ "$stt_action_rc" -eq 0 ] || exit 26
+    # Browser gate: the build is bad (27) versus this machine cannot check (28).
+    # 28 is deliberately NOT a "soft" pass — see the block where it is set.
+    [ "$browser_rc" -ne 5 ] || exit 27
+    [ "$browser_rc" -eq 0 ] || exit 28
     exit 24
 fi
 

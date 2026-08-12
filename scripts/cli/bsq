@@ -5123,7 +5123,7 @@ def cmd_cluster_launch(args) -> None:
 # Canonical backlog statuses. Source of truth: api/app/routes_backlog.py
 # ::_VALID_STATUSES (enforced on every PATCH). Mirrored here so `bsq ticket
 # update` can validate offline without an API round-trip. Keep in sync.
-TICKET_STATUSES = ("planned", "open", "in_progress", "totest", "reopened", "closed")
+TICKET_STATUSES = ("planned", "open", "in_progress", "paused", "totest", "reopened", "closed")
 
 
 def _write_atomic(path: Path, content: str) -> None:

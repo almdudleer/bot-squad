@@ -16,18 +16,20 @@ import {
 } from "./canonicalStatus";
 import { BOARD_COLUMNS } from "./pages/Project";
 
-// The six internal statuses, kept in sync with Task["status"] in api.ts.
+// The internal statuses, kept in sync with Task["status"] in api.ts.
+// T-0889 added `paused`.
 const INTERNAL_STATUSES = [
   "planned",
   "open",
   "in_progress",
+  "paused",
   "totest",
   "reopened",
   "closed",
 ] as const;
 
 describe("canonical 4-state mapping", () => {
-  test("maps exactly the six internal statuses", () => {
+  test("maps exactly the internal statuses", () => {
     expect(new Set(Object.keys(CANONICAL_STATE))).toEqual(
       new Set(INTERNAL_STATUSES),
     );
@@ -60,6 +62,7 @@ describe("canonical 4-state mapping", () => {
       open: "backlog",
       reopened: "backlog",
       in_progress: "in-progress",
+      paused: "in-progress",
       totest: "validating",
       closed: "done",
     });
@@ -171,8 +174,18 @@ describe("internal-status badge only shows where it refines the column", () => {
     }
   });
 
-  test("the 1:1 statuses do NOT — that would print the column's own name", () => {
-    for (const s of ["in_progress", "totest", "closed"] as const) {
+  // T-0889: this pair is the rule EARNING its keep rather than a fixture edit.
+  // `paused` joined in_progress under the "In progress" column, and because the
+  // rule is derived from CANONICAL_STATE rather than hardcoded, BOTH of them
+  // started badging on their own — no edit to TaskCard, no list to remember.
+  // Before paused existed, in_progress was 1:1 and correctly showed nothing.
+  test("adding paused makes in_progress badge too — the rule is derived", () => {
+    expect(statusRefinesItsColumn("in_progress")).toBe(true);
+    expect(statusRefinesItsColumn("paused")).toBe(true);
+  });
+
+  test("the still-1:1 statuses do NOT — that would print the column's own name", () => {
+    for (const s of ["totest", "closed"] as const) {
       expect(statusRefinesItsColumn(s)).toBe(false);
     }
   });

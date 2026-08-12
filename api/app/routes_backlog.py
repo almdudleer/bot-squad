@@ -40,7 +40,7 @@ router = APIRouter(
 # refinement of the stakeholder's canonical 4-state model (backlog/in-progress/
 # validating/done) — see app.canonical_status for the non-destructive mapping
 # layer (T-0479) and docs/design/status-canonical-mapping.md.
-_VALID_STATUSES = {"planned", "open", "in_progress", "totest", "reopened", "closed"}
+_VALID_STATUSES = {"planned", "open", "in_progress", "paused", "totest", "reopened", "closed"}
 
 
 def _invalid_status_detail(value: object) -> str:

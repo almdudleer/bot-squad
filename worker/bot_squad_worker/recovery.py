@@ -74,7 +74,7 @@ from bot_squad_worker import recycle_gate
 log = logging.getLogger(__name__)
 
 # Canonical task statuses (see reference_task_status_schema).
-ACTIVE_STATUSES = {"open", "in_progress", "reopened"}  # still needs work → recover
+ACTIVE_STATUSES = {"open", "in_progress", "reopened", "paused"}  # still needs work → recover
 DONE_STATUSES = {"totest", "closed"}                   # deliverable exists → leave it
 
 

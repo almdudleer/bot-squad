@@ -121,6 +121,20 @@ def test_no_scope_can_widen_the_queue_or_readmit_totest(scope):
 # DoD 4 — absent scope is today's behaviour, bit-identical
 # ---------------------------------------------------------------------------
 
+# T-0889: these are derived from ``pickup.PICKUP_STATUSES``, not hand-typed.
+# ``_full_board`` already builds its tickets from that set, so a hardcoded
+# expectation pins a set the fixture no longer produces — which is exactly what
+# broke here when ``paused`` joined the band: the fixture grew a T-paused and six
+# assertions still expected the old four.
+def _all_pickup_ids():
+    return [f"T-{s}" for s in sorted(pickup.PICKUP_STATUSES)]
+
+
+def _full_board_size():
+    """Every pickup ticket plus the two that are in no scope (totest, closed)."""
+    return len(pickup.PICKUP_STATUSES) + 2
+
+
 def _full_board(cfg, slug):
     """One takeable ticket per pickup status, plus the two that are in no scope."""
     for status in sorted(pickup.PICKUP_STATUSES):
@@ -137,8 +151,13 @@ def test_with_no_drive_block_the_queue_is_exactly_what_it_was_before(board):
 
     q = pickup.pickup_queue(cfg, slug, now_epoch=NOW)
 
-    assert _ids(q["pickup"]) == ["T-in_progress", "T-open", "T-planned", "T-reopened"]
-    assert q["counts"] == {"pickup": 4, "triage": 0, "excluded": 2, "board": 6}
+    assert _ids(q["pickup"]) == _all_pickup_ids()
+    assert q["counts"] == {
+        "pickup": len(pickup.PICKUP_STATUSES),
+        "triage": 0,
+        "excluded": 2,  # totest + closed, the two in no scope
+        "board": _full_board_size(),
+    }
     assert not [r for r in q["excluded"]
                 if str(r["reject"]).startswith("out-of-drive-scope")]
     assert q["drive_scope"]["out_of_scope"] == 0
@@ -173,8 +192,11 @@ def test_the_whole_board_is_still_counted_when_a_scope_filters(board):
 
     q = pickup.pickup_queue(cfg, slug, now_epoch=NOW, scope="in_progress")
 
-    assert q["counts"]["board"] == 6
-    assert q["counts"]["pickup"] + q["counts"]["triage"] + q["counts"]["excluded"] == 6
+    assert q["counts"]["board"] == _full_board_size()
+    assert (
+        q["counts"]["pickup"] + q["counts"]["triage"] + q["counts"]["excluded"]
+        == _full_board_size()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +207,11 @@ def test_the_whole_board_is_still_counted_when_a_scope_filters(board):
 _SCOPE_CASES = {
     "open_reopened": (["open", "reopened"], ["in_progress", "planned"]),
     "in_progress": (["in_progress"], ["open", "reopened", "planned"]),
-    "all": (["in_progress", "open", "planned", "reopened"], []),
+    # T-0889: "all" IS the pickup band by definition (see
+    # test_all_is_the_pickup_statuses_...), so it derives. The two NAMED scopes
+    # above stay hand-written on purpose — spelling them out is what makes them a
+    # real expectation rather than a restatement of the code under test.
+    "all": (sorted(pickup.PICKUP_STATUSES), []),
 }
 
 
@@ -301,7 +327,7 @@ def test_a_stored_scope_pace_rejects_widens_and_names_the_raw_value(board):
 
     assert q["drive_scope"]["scope"] == "all"
     assert "opne" in q["drive_scope"]["problem"]
-    assert _ids(q["pickup"]) == ["T-in_progress", "T-open", "T-planned", "T-reopened"]
+    assert _ids(q["pickup"]) == _all_pickup_ids()
     assert "DID NOT TAKE EFFECT" in pickup.pickup_brief(q)
 
 
@@ -319,7 +345,7 @@ def test_a_scope_pace_knows_and_pickup_does_not_widens_and_names_itself(board, m
 
     assert q["drive_scope"]["scope"] == "all"
     assert q["drive_scope"]["problem"] == "unknown-scope:'closed_only'"
-    assert q["counts"]["pickup"] == 4
+    assert q["counts"]["pickup"] == len(pickup.PICKUP_STATUSES)
 
 
 def test_an_unreadable_config_never_empties_the_board(board, monkeypatch):
@@ -336,7 +362,7 @@ def test_an_unreadable_config_never_empties_the_board(board, monkeypatch):
 
     q = pickup.pickup_queue(cfg, slug, now_epoch=NOW)
 
-    assert q["counts"]["pickup"] == 4
+    assert q["counts"]["pickup"] == len(pickup.PICKUP_STATUSES)
     assert q["drive_scope"]["scope"] == "all"
     assert q["drive_scope"]["problem"] == "drive-config-unreadable:RuntimeError"
 

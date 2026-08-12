@@ -5214,7 +5214,7 @@ def reconcile_primary_from_history(cfg: Any, slug: str) -> dict:
     user = _get_current_user()
     user_prefix = f"S-{user}-"
     live_sids = {compute_sid(user, p.window, p.pane_id) for p in list_panes()}
-    LIVE_STATUSES = {"open", "in_progress", "totest", "reopened", "planned"}
+    LIVE_STATUSES = {"open", "in_progress", "paused", "totest", "reopened", "planned"}
 
     # Index every backlog ticket → (status, set(session_history SIDs)). Built once
     # so the per-session scan is a cheap dict lookup. Keyed by the ticket's `id`
@@ -5488,7 +5488,7 @@ def gc_dead_bindings(cfg: Any, slug: str) -> dict:
     user = _get_current_user()
     user_prefix = f"S-{user}-"
     # statuses that mean the binding is still legitimately held
-    LIVE_STATUSES = {"open", "in_progress", "totest", "reopened", "planned"}
+    LIVE_STATUSES = {"open", "in_progress", "paused", "totest", "reopened", "planned"}
 
     scanned = 0
     details: list[dict] = []

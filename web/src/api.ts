@@ -78,7 +78,14 @@ export type ProjectDetail = Project & {
 export type Task = {
   id: string;
   title: string;
-  status: "planned" | "open" | "in_progress" | "totest" | "reopened" | "closed";
+  status:
+    | "planned"
+    | "open"
+    | "in_progress"
+    | "paused"
+    | "totest"
+    | "reopened"
+    | "closed";
   body: string;
   // Phase 7: parsed body sections — verbatim is the stakeholder's exact words.
   verbatim?: string;

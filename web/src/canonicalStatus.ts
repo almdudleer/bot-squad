@@ -17,6 +17,8 @@ export const CANONICAL_STATE: Record<Task["status"], CanonicalState> = {
   open: "backlog",
   reopened: "backlog",
   in_progress: "in-progress",
+  // T-0889 — see api/app/canonical_status.py for why in-progress.
+  paused: "in-progress",
   totest: "validating",
   closed: "done",
 };
@@ -45,6 +47,7 @@ export const INTERNAL_LABELS: Record<Task["status"], string> = {
   planned: "Planned",
   open: "Open",
   in_progress: "In progress",
+  paused: "Paused",
   totest: "To Test",
   reopened: "Reopened",
   closed: "Closed",

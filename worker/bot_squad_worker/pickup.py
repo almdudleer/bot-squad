@@ -154,7 +154,10 @@ log = logging.getLogger(__name__)
 #: because an in_progress ticket with no live holder is precisely the
 #: "ready-but-idle" half of the complaint: work that was started, abandoned when
 #: its session was reaped, and never taken up again.
-PICKUP_STATUSES = frozenset({"reopened", "open", "planned", "in_progress"})
+# T-0889: `paused` IS pickable. Omitting it would make a paused ticket
+# unpickable — it would silently leave the working set, the exact opposite of
+# what he asked the status for.
+PICKUP_STATUSES = frozenset({"reopened", "open", "planned", "in_progress", "paused"})
 
 #: AXIS A of the drive modes (T-0829, design D-0069): the configured SCOPE ->
 #: the statuses it puts in play. Each value is a NARROWING filter over
@@ -437,7 +440,10 @@ def classify_ticket(
 #: ``reopened`` ticket is work the stakeholder already reported once and had to
 #: report again, so it leads; an idle ``in_progress`` is abandoned mid-flight
 #: work, which is cheaper to resume than to start; ``planned`` trails ``open``.
-STATUS_ORDER = {"reopened": 0, "in_progress": 1, "open": 2, "planned": 3}
+# T-0889: paused ranks just below in_progress — it is started work waiting to
+# resume, so it outranks never-started open/planned. A status with no rank here
+# would sort undefined against the rest.
+STATUS_ORDER = {"reopened": 0, "in_progress": 1, "paused": 2, "open": 3, "planned": 4}
 
 
 def _rank_key(status: str, effective: int, idle_days: Optional[float]) -> list:

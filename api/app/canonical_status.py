@@ -36,6 +36,11 @@ CANONICAL_STATE: dict[str, str] = {
     "open": "backlog",
     "reopened": "backlog",
     "in_progress": "in-progress",
+    # T-0889: work that was STARTED and has no live session on it any more —
+    # distinct from planned (never started) and in_progress (actively worked).
+    # Rolls up into in-progress because it is started work, and because his own
+    # working-set sentence pairs them: «только in-progress/paused, without open».
+    "paused": "in-progress",
     "totest": "validating",
     "closed": "done",
 }

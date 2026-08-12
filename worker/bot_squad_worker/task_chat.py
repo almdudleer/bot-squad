@@ -47,7 +47,7 @@ DIGEST_TITLE_MAX = 60
 
 #: canonical statuses (T-0479), in the order the digest counts/ranks them:
 #: in-flight first, then queued, then not-started.
-_STATUS_ORDER = ("in_progress", "reopened", "totest", "open", "planned")
+_STATUS_ORDER = ("in_progress", "paused", "reopened", "totest", "open", "planned")
 
 #: transitions the stakeholder is told about (T-0589 verbatim scope:
 #: "open->in_progress, ->totest, ->closed"). Anything else (planned->open,

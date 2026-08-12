@@ -40,6 +40,7 @@ def test_decided_mapping_is_stable():
         "open": "backlog",
         "reopened": "backlog",
         "in_progress": "in-progress",
+        "paused": "in-progress",
         "totest": "validating",
         "closed": "done",
     }

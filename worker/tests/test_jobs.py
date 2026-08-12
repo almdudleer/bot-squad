@@ -1073,6 +1073,52 @@ def test_binding_gc_tick_runs_gc_stale_tasks(
     assert stale_calls == [proj.slug]
 
 
+def test_binding_gc_tick_runs_auto_pause_unheld_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0889: the auto-pause has no other trigger. It is the 60s reconcile tick
+    or it never runs — which is what a status "auto-set when the last session
+    working a ticket terminates" means."""
+    from bot_squad_worker.jobs import binding_gc_tick
+    from bot_squad_worker import task_gc as _task_gc
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    pause_calls: list[str] = []
+    monkeypatch.setattr(
+        _task_gc, "auto_pause_unheld_tasks",
+        lambda c, s: pause_calls.append(s) or {"paused": []},
+    )
+
+    binding_gc_tick(cfg)
+    assert pause_calls == [proj.slug]
+
+
+def test_binding_gc_tick_swallows_auto_pause_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-0889: a bad board file must cost the auto-pause, not the whole sweep —
+    every session-graph reconciler in this tick runs after it."""
+    from bot_squad_worker.jobs import binding_gc_tick
+    from bot_squad_worker import task_gc as _task_gc
+    from bot_squad_worker import teams as _teams
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    monkeypatch.setattr(
+        _task_gc, "auto_pause_unheld_tasks",
+        lambda c, s: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    later: list[str] = []
+    monkeypatch.setattr(
+        _teams, "reconcile_teams", lambda c, s: later.append(s) or {"ok": True})
+
+    binding_gc_tick(cfg)  # must not raise
+    assert later == [proj.slug]  # and the passes AFTER it still ran
+
+
 def test_binding_gc_tick_swallows_gc_tmux_exceptions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

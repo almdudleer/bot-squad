@@ -628,6 +628,14 @@ def binding_gc_tick(cfg: Config) -> None:
         # (inactive + past the long grace) off-board to backlog/_gc/ (reversible),
         # generalizing the throwaway GC into the real task-cleanup process.
         ("gc_stale_tasks", _task_gc.gc_stale_tasks),
+        # T-0889 (his 2026-08-04 ask): a ticket at in_progress that NO live
+        # session holds — and that nobody has touched for the grace — becomes
+        # `paused`. Measured 2026-08-12: 84% of the in_progress column was
+        # exactly that, a label a reaped session left behind. Ordered here on
+        # purpose: gc_sessions / archive_dead_teammates / gc_dead_bindings have
+        # already run this tick, so the live-holder set it reads is the
+        # reconciled truth rather than last tick's.
+        ("auto_pause_unheld_tasks", _task_gc.auto_pause_unheld_tasks),
         # T-0568: repair generic/blank tmux window names (the naming SSOT) from
         # the registry/binding — runs just before reconcile_teams so the roster
         # is rebuilt with the rotated SIDs in the same tick.

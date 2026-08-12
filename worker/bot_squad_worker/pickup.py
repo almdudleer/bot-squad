@@ -159,6 +159,23 @@ log = logging.getLogger(__name__)
 # what he asked the status for.
 PICKUP_STATUSES = frozenset({"reopened", "open", "planned", "in_progress", "paused"})
 
+#: T-0889 DoD 4 — THE OPERATOR'S WORKING SET, answered rather than defaulted.
+#: His question, verbatim (2026-08-04): "We need to define clearly what's the
+#: working set for the operator for the last one, maybe only in-progress/paused,
+#: without open."
+#:
+#: **Answer: exactly his own sentence — {in_progress, paused}, without open.**
+#: Taken literally because it is the only reading that names one thing: work that
+#: has been STARTED and is not finished. ``open``/``planned``/``reopened`` are the
+#: backlog — a pool to pick FROM, not work in flight; ``totest`` is awaiting a
+#: verifier, not a doer (the same reason it is in no scope below); ``closed`` is
+#: done. And the two members are one thing seen twice: after the auto-pause
+#: (``task_gc.auto_pause_unheld_tasks``) ``in_progress`` means "started, somebody
+#: is on it" and ``paused`` means "started, nobody is on it" — which is why they
+#: roll up to the SAME canonical column (``in-progress``) and why watching one
+#: without the other would hide half the started work.
+OPERATOR_WORKING_SET_STATUSES = frozenset({"in_progress", "paused"})
+
 #: AXIS A of the drive modes (T-0829, design D-0069): the configured SCOPE ->
 #: the statuses it puts in play. Each value is a NARROWING filter over
 #: :data:`PICKUP_STATUSES`, in the stakeholder's own bullet order:
@@ -177,9 +194,19 @@ PICKUP_STATUSES = frozenset({"reopened", "open", "planned", "in_progress", "paus
 #: ``totest`` is in NO scope, for the reason stated above: review work awaiting a
 #: verifier, not work awaiting a doer. A scope mode may only ever REMOVE statuses
 #: from the pickup band; it can never readmit one.
+#:
+#: T-0889: the ``in_progress`` scope is :data:`OPERATOR_WORKING_SET_STATUSES`,
+#: NOT the bare ``in_progress`` status. His bullet names the BOARD COLUMN «все
+#: задачи в In Progress», and that column's canonical rollup now holds both
+#: statuses. Without this, shipping the auto-pause would have silently DRAINED
+#: this scope: the 7 tickets it moves out of ``in_progress`` are precisely the
+#: abandoned ones a drive configured to «закрыть все задачи в In Progress»
+#: exists to close, and they would have left its queue on the first reconcile
+#: tick with nothing said. Still a narrowing of PICKUP_STATUSES, so the
+#: never-readmit invariant above holds.
 SCOPE_STATUSES: dict[str, frozenset] = {
     "open_reopened": frozenset({"open", "reopened"}),
-    "in_progress": frozenset({"in_progress"}),
+    "in_progress": OPERATOR_WORKING_SET_STATUSES,
     "all": PICKUP_STATUSES,
 }
 

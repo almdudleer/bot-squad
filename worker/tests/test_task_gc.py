@@ -5,6 +5,7 @@ real ticket that merely *mentions* the convention is left alone."""
 from __future__ import annotations
 
 import os
+import time
 import types
 from pathlib import Path
 
@@ -224,3 +225,215 @@ def test_merge_tasks_reports_missing_ids(tmp_path):
     out = task_gc.merge_tasks(_cfg(tmp_path), "proj", "T-0600", ["T-9999"])
     assert out["merged"] == []
     assert "T-9999" in out["missing"]
+
+
+# ---------------------------------------------------------------------------
+# T-0889 — auto-pause: a ticket at in_progress that no live session holds
+# ---------------------------------------------------------------------------
+# His ask, 2026-08-04: "When all sessions working on a ticket are terminated,
+# the ticket is automatically passed to another 'started' / 'paused' status".
+# Two conditions gate it and each has its own test below: NOBODY HOLDS IT (the
+# binding) and NOBODY HAS TOUCHED IT (the grace) — the second because a session
+# that recycles loses its task binding while its successor keeps working, which
+# is not hypothetical: it was true of T-0889 itself on the day this was built.
+
+NOW = 1_000_000.0
+FAR = 5 * 3600  # older than the 4h default grace
+
+
+def _write_session(tmp_path: Path, sid: str, *, status: str = "active",
+                   role: str = "dev", task_id: str = "~",
+                   extra_task_ids: str = "[]", archived: str | None = None):
+    sess = tmp_path / "proj" / "sessions"
+    sess.mkdir(parents=True, exist_ok=True)
+    fm = (f"---\nsid: {sid}\nstatus: {status}\nwindow: w-{sid}\n"
+          f"role: {role}\ntask_id: {task_id}\nextra_task_ids: {extra_task_ids}\n")
+    if archived is not None:
+        fm += f"archived: '{archived}'\n"
+    fm += "---\n\nbody\n"
+    p = sess / f"{sid}.md"
+    p.write_text(fm, encoding="utf-8")
+    return p
+
+
+def _status_of(p: Path) -> str:
+    from bot_squad_worker import frontmatter as fm
+    return str((fm.parse_or_none(p.read_text(encoding="utf-8"))[0] or {}).get("status"))
+
+
+def test_auto_pause_moves_an_unheld_in_progress_ticket(tmp_path):
+    """The whole feature in one case: in_progress + no live holder + past the
+    grace -> paused, with the reason left in the Progress feed."""
+    p = _write_task(tmp_path, "T-0551", title="Real work", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    out = task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    assert out["paused"] == ["T-0551"]
+    assert _status_of(p) == "paused"
+    body = p.read_text(encoding="utf-8")
+    assert "## Progress" in body
+    assert "auto-paused" in body
+
+
+def test_auto_pause_stamps_updated(tmp_path):
+    """The board sorts and reports on ``updated``; a status change nobody
+    stamped would read as untouched since its last human edit."""
+    p = _write_task(tmp_path, "T-0551", title="Real work", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    from bot_squad_worker import frontmatter as fm
+    meta = fm.parse_or_none(p.read_text(encoding="utf-8"))[0]
+    assert meta["updated"] == time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW))
+
+
+def test_auto_pause_spares_a_ticket_a_live_session_holds(tmp_path):
+    p = _write_task(tmp_path, "T-0883", title="Held", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    _write_session(tmp_path, "S-dev-1", task_id="T-0883")
+    out = task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    assert out["paused"] == []
+    assert _status_of(p) == "in_progress"
+
+
+def test_auto_pause_spares_a_ticket_held_only_via_extra_task_ids(tmp_path):
+    """A dev's bundled tickets live in ``extra_task_ids``, not ``task_id`` —
+    reading the primary alone would pause every bundled ticket under a live dev."""
+    p = _write_task(tmp_path, "T-0885", title="Bundled", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    _write_session(tmp_path, "S-dev-1", task_id="T-0001",
+                   extra_task_ids="[T-0885, T-0887]")
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == []
+    assert _status_of(p) == "in_progress"
+
+
+def test_auto_pause_spares_a_ticket_held_by_a_NON_dev_session(tmp_path):
+    """Role-agnostic by design: his words are "all sessions working on a
+    ticket", so a TL or user-conversation holder counts. The dev-only set the
+    routing gate uses would have paused this one."""
+    p = _write_task(tmp_path, "T-0612", title="TL-held", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    _write_session(tmp_path, "S-tl-1", role="teamlead", task_id="T-0612")
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == []
+
+
+def test_auto_pause_counts_a_PAUSED_session_as_a_holder(tmp_path):
+    """``_is_live_holder`` counts active AND paused sessions — a parked process
+    still holds its task. (Session ``paused`` and ticket ``paused`` are two
+    different vocabularies; this is the session one.)"""
+    _write_task(tmp_path, "T-0612", title="x", status="in_progress", age_sec=FAR, now=NOW)
+    _write_session(tmp_path, "S-dev-1", status="paused", task_id="T-0612")
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == []
+
+
+def test_auto_pause_ignores_a_suspended_holder(tmp_path):
+    """The point of the feature: the session that held it is GONE. A suspended
+    md is the reaped session's historical record, not a holder."""
+    p = _write_task(tmp_path, "T-0551", title="x", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    _write_session(tmp_path, "S-dev-dead", status="suspended", task_id="T-0551")
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == ["T-0551"]
+    assert _status_of(p) == "paused"
+
+
+def test_auto_pause_ignores_an_archived_holder(tmp_path):
+    _write_task(tmp_path, "T-0551", title="x", status="in_progress", age_sec=FAR, now=NOW)
+    _write_session(tmp_path, "S-dev-old", status="active", task_id="T-0551",
+                   archived="true")
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == ["T-0551"]
+
+
+def test_auto_pause_withholds_inside_the_grace(tmp_path):
+    """The measured case: T-0889 itself was in_progress, actively being built,
+    and held by NO live session (its holder had recycled and the successor
+    inherited no binding). The recent WRITE is what spares it."""
+    p = _write_task(tmp_path, "T-0889", title="Being worked right now",
+                    status="in_progress", age_sec=60, now=NOW)
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == []
+    assert _status_of(p) == "in_progress"
+
+
+def test_auto_pause_grace_is_env_tunable(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_AUTO_PAUSE_GRACE_SEC", "30")
+    _write_task(tmp_path, "T-0889", title="x", status="in_progress", age_sec=60, now=NOW)
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == ["T-0889"]
+
+
+def test_auto_pause_grace_ignores_garbage_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_AUTO_PAUSE_GRACE_SEC", "not-a-number")
+    assert task_gc.auto_pause_grace_sec() == task_gc.DEFAULT_AUTO_PAUSE_GRACE_SEC
+
+
+def test_auto_pause_moves_ONLY_in_progress(tmp_path):
+    """``totest`` is the one that matters: a session ending there is a HANDOFF
+    to a verifier, not an abandonment, and pausing it would recall shipped work
+    into the doer band."""
+    for status in ("open", "planned", "reopened", "totest", "closed", "paused"):
+        _write_task(tmp_path, f"T-{status}", title="x", status=status,
+                    age_sec=FAR, now=NOW)
+    out = task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    assert out["paused"] == []
+    backlog = tmp_path / "proj" / "backlog"
+    for status in ("open", "planned", "reopened", "totest", "closed", "paused"):
+        assert _status_of(backlog / f"T-{status}.md") == status
+
+
+def test_auto_pause_is_idempotent(tmp_path):
+    """Second tick must be a no-op — a ticket that keeps re-announcing itself
+    would spam the Progress feed and re-stamp ``updated`` every 60s."""
+    p = _write_task(tmp_path, "T-0551", title="x", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    first = task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    after_first = p.read_text(encoding="utf-8")
+    second = task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW + 600)
+    assert first["paused"] == ["T-0551"] and second["paused"] == []
+    assert p.read_text(encoding="utf-8") == after_first
+
+
+def test_auto_pause_skips_throwaway_and_archived_tickets(tmp_path):
+    _write_task(tmp_path, "T-0900", title="QA-TEST-DELETEME-x", status="in_progress",
+                age_sec=FAR, now=NOW)
+    backlog = tmp_path / "proj" / "backlog"
+    (backlog / "T-0901.md").write_text(
+        "---\nid: T-0901\ntitle: x\nstatus: in_progress\narchived: 'true'\n---\n\n",
+        encoding="utf-8")
+    os.utime(backlog / "T-0901.md", (NOW - FAR, NOW - FAR))
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == []
+
+
+def test_auto_pause_preserves_non_canonical_body_sections(tmp_path):
+    """T-0729's lesson: a parse->compose round-trip would delete ``## DoD`` and
+    every other non-canonical section. ``append_progress`` splices."""
+    body = "## Verbatim request\n\nhis words\n\n## DoD\n\n- [ ] a thing\n"
+    p = _write_task(tmp_path, "T-0551", title="x", status="in_progress",
+                    body=body, age_sec=FAR, now=NOW)
+    task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    after = p.read_text(encoding="utf-8")
+    assert "## DoD" in after and "- [ ] a thing" in after and "his words" in after
+
+
+def test_auto_pause_survives_an_unparseable_ticket(tmp_path):
+    """One bad file must not cost the rest of the sweep — the tick runs every
+    60s over every project."""
+    backlog = tmp_path / "proj" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-bad.md").write_text("no frontmatter here\n", encoding="utf-8")
+    _write_task(tmp_path, "T-0551", title="x", status="in_progress", age_sec=FAR, now=NOW)
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)["paused"] == ["T-0551"]
+
+
+def test_auto_pause_no_backlog_dir_is_a_noop(tmp_path):
+    assert task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "nosuch", now=NOW) == {"paused": []}
+
+
+def test_live_held_task_ids_unions_primary_and_extras_across_sessions(tmp_path):
+    _write_session(tmp_path, "S-a", task_id="T-1", extra_task_ids="[T-2]")
+    _write_session(tmp_path, "S-b", task_id="T-3", extra_task_ids="[]")
+    _write_session(tmp_path, "S-c", status="suspended", task_id="T-4")
+    assert task_gc.live_held_task_ids(_cfg(tmp_path), "proj") == {"T-1", "T-2", "T-3"}
+
+
+def test_live_held_task_ids_drops_the_unset_sentinel(tmp_path):
+    """``task_id: ~`` is the UNSET sentinel — a session holding nothing. Left in,
+    it would be a task id no ticket has, which is harmless, but it also masks
+    the real question this set answers."""
+    _write_session(tmp_path, "S-a", task_id="~")
+    assert task_gc.live_held_task_ids(_cfg(tmp_path), "proj") == set()

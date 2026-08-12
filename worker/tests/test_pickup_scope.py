@@ -206,7 +206,12 @@ def test_the_whole_board_is_still_counted_when_a_scope_filters(board):
 #: scope -> (statuses that must surface, statuses that must be filtered out)
 _SCOPE_CASES = {
     "open_reopened": (["open", "reopened"], ["in_progress", "planned"]),
-    "in_progress": (["in_progress"], ["open", "reopened", "planned"]),
+    # T-0889: the `in_progress` scope is his BOARD COLUMN, not the bare status —
+    # `paused` rolls up into that same canonical column, and it is where the
+    # auto-pause puts the abandoned in_progress tickets this scope exists to
+    # close. Pinned here rather than derived from the constant so that draining
+    # the scope stays a RED test, not a silently-restated one.
+    "in_progress": (["in_progress", "paused"], ["open", "reopened", "planned"]),
     # T-0889: "all" IS the pickup band by definition (see
     # test_all_is_the_pickup_statuses_...), so it derives. The two NAMED scopes
     # above stay hand-written on purpose — spelling them out is what makes them a
@@ -305,7 +310,11 @@ def test_an_explicit_scope_overrides_the_stored_one(board):
 
     q = pickup.pickup_queue(cfg, slug, now_epoch=NOW, scope="in_progress")
 
-    assert _ids(q["pickup"]) == ["T-in_progress"]
+    # Derived from the scope, not hand-typed: this test is about which scope
+    # WINS, so pinning that scope's membership here would just be a second place
+    # to update (T-0889 already broke six such assertions in this file).
+    assert _ids(q["pickup"]) == sorted(
+        f"T-{s}" for s in pickup.SCOPE_STATUSES["in_progress"])
     assert q["drive_scope"]["source"] == "explicit"
 
 
@@ -548,3 +557,37 @@ def test_the_scope_block_is_json_serialisable(board):
     pace.set_drive(cfg, slug, scope="in_progress", set_by="stakeholder")
     q = pickup.pickup_queue(cfg, slug, now_epoch=NOW)
     assert json.loads(json.dumps(q["drive_scope"]))["scope"] == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# T-0889 DoD 4 — the operator's working set, answered and pinned
+# ---------------------------------------------------------------------------
+# "We need to define clearly what's the working set for the operator ... maybe
+# only in-progress/paused, without open" (2026-08-04). Answered as his own
+# sentence: started-and-unfinished work, both halves of it. These tests exist so
+# the answer is a machine-checked fact rather than a paragraph in a ticket.
+
+def test_the_operator_working_set_is_in_progress_plus_paused_without_open():
+    assert pickup.OPERATOR_WORKING_SET_STATUSES == {"in_progress", "paused"}
+    for backlog_status in ("open", "planned", "reopened"):
+        assert backlog_status not in pickup.OPERATOR_WORKING_SET_STATUSES
+    for done_ish in ("totest", "closed"):
+        assert done_ish not in pickup.OPERATOR_WORKING_SET_STATUSES
+
+
+def test_the_working_set_is_a_subset_of_the_pickup_band():
+    """Every member must be takeable, or the operator watches work no session
+    may pick up — the "unpickable paused ticket" failure one level down."""
+    assert pickup.OPERATOR_WORKING_SET_STATUSES <= pickup.PICKUP_STATUSES
+
+
+def test_the_in_progress_drive_scope_is_the_working_set(board):
+    """The regression this prevents: the auto-pause moves abandoned tickets out
+    of ``in_progress``, so a drive configured to «закрыть все задачи в In
+    Progress» would have quietly emptied out on the first reconcile tick."""
+    assert pickup.SCOPE_STATUSES["in_progress"] == pickup.OPERATOR_WORKING_SET_STATUSES
+
+    cfg, slug = board
+    _write_task(cfg, slug, "T-was-abandoned", status="paused", priority="P1")
+    q = pickup.pickup_queue(cfg, slug, now_epoch=NOW, scope="in_progress")
+    assert _ids(q["pickup"]) == ["T-was-abandoned"]

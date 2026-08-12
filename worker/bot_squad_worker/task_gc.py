@@ -365,3 +365,175 @@ def merge_tasks(cfg: Any, slug: str, keep: Any, dups: Any,
             log.exception("task_gc: failed to annotate keeper %s", keep_md)
 
     return {"kept": keep, "merged": merged, "missing": missing}
+
+
+# === T-0889: auto-pause a ticket nobody is working ==========================
+# His ask, verbatim (2026-08-04, relayed forward into T-0889): "When all
+# sessions working on a ticket are terminated, the ticket is automatically
+# passed to another 'started' / 'paused' status".
+#
+# MEASURED 2026-08-12: 11 of the 13 tickets at ``in_progress`` were held by NO
+# live session — 84% of the board's busiest-looking column was a label a dead
+# session left behind. ``dispatch.py``'s own note says the same thing from its
+# own 2026-08-11 measurement: "The status is a LABEL a dev leaves behind when it
+# dies or forgets to move the ticket; it drifts up and never comes down on its
+# own."
+#
+# This pass is the board CATCHING UP to what the routing gate already computes,
+# not a new opinion: ``dispatch.decide_topology`` derives ``tasks_in_flight``
+# from live sessions' bound task sets and carries ``board_in_progress`` beside it
+# marked "Reported, never gated on" — precisely because of this drift. Built
+# from the same primitives (``sessions._is_live_holder`` + ``_full_task_set``)
+# so there is no third answer to "is anyone on this ticket".
+
+#: The only status the auto-pause may move. "while work is incomplete" is what
+#: separates ``in_progress`` from ``totest`` (work delivered, awaiting a
+#: verifier — a session ending there is a HANDOFF, not an abandonment) and from
+#: ``closed``; ``open``/``planned``/``reopened`` were never started, so they have
+#: no session to lose; ``paused`` is the destination. One status, deliberately.
+_AUTO_PAUSE_FROM_STATUSES = frozenset({"in_progress"})
+
+#: What an unheld ``in_progress`` ticket becomes. Its canonical (4-state) home is
+#: ``in-progress`` — see ``api/app/canonical_status.py`` — so a paused ticket
+#: stays in the column the operator watches instead of vanishing into backlog.
+_AUTO_PAUSE_TO_STATUS = "paused"
+
+#: Quiet period on the TICKET FILE before an unheld ``in_progress`` ticket is
+#: paused. This second condition is MEASURED, not defensive: on 2026-08-12
+#: T-0889 itself sat at ``in_progress``, actively being built, held by NO live
+#: session — its holder (``…-p207``) had recycled and the successor sessions
+#: inherited none of its task binding. On the binding alone this pass would have
+#: paused the ticket it was written for.
+#:
+#: The binding is therefore necessary but not sufficient, and ticket mtime is the
+#: second instrument: a ticket somebody is working gets WRITTEN to (progress
+#: notes, context, summary). Note what this does NOT claim — ``pickup``'s module
+#: docstring is right that "staleness measures the last WRITE, not the last
+#: work", so a fresh mtime is no evidence that work is moving. It is used only to
+#: WITHHOLD a pause, never to justify one, and requiring both conditions can only
+#: DELAY a correct pause — it can never mislabel live work. Env-tunable.
+DEFAULT_AUTO_PAUSE_GRACE_SEC = 4 * 3600  # 4h
+
+
+def auto_pause_grace_sec() -> int:
+    raw = os.environ.get("BOT_SQUAD_AUTO_PAUSE_GRACE_SEC")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_AUTO_PAUSE_GRACE_SEC
+
+
+def live_held_task_ids(cfg: Any, slug: str) -> set[str]:
+    """Every task id held by a LIVE session of ANY role in ``slug``.
+
+    Composed from the same two primitives the routing gate uses
+    (``sessions._is_live_holder`` — status active/paused and not archived, kept
+    tick-synced with real tmux panes by ``gc_sessions`` — and
+    ``sessions._full_task_set`` — primary + extras).
+
+    ROLE-AGNOSTIC on purpose, where ``dispatch.live_role_sids(cfg, slug, "dev")``
+    filters to devs: his sentence is "all sessions working on a ticket", and a TL
+    or user-conversation session holding a ticket is somebody working it. The
+    result is a SUPERSET of the gate's dev-only set, so it can only ever spare a
+    ticket the dev-only rule would have paused — never the reverse. Measured
+    2026-08-12 across all three live projects: for every ticket at
+    ``in_progress`` the two sets agreed, so the widening costs nothing today and
+    is insurance against the day a non-dev session holds one.
+    """
+    from bot_squad_worker import sessions as _sessions
+
+    out: set[str] = set()
+    sess_dir = cfg.data_dir / slug / "sessions"
+    if not sess_dir.exists():
+        return out
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = _sessions._read_session_metadata(md)
+        if meta is None or not _sessions._is_live_holder(meta):
+            continue
+        out |= {t for t in _sessions._full_task_set(meta) if t and t != "~"}
+    return out
+
+
+def _pause_one(md, tid: str, ts: str, note: str) -> bool:
+    """Re-check under the task lock, then write ``status: paused`` + a Progress
+    line. Returns True if this call is what moved the ticket.
+
+    The re-read inside the lock is not ceremony: the candidate scan runs unlocked
+    (13 board mds per project per tick), so between the scan and the write a dev
+    may have moved the ticket itself. Locking with ``mdlock.task_lock`` is what
+    makes this mutually exclusive with the API's writer, which flocks the same
+    ``<task>.md.lock``.
+    """
+    from bot_squad_worker import frontmatter as fm
+    from bot_squad_worker import task_body as _task_body
+    from bot_squad_worker.mdlock import task_lock, atomic_write
+
+    try:
+        with task_lock(md):
+            parsed = fm.parse_or_none(md.read_text(encoding="utf-8"))
+            if not parsed:
+                return False
+            meta, body = parsed
+            meta = dict(meta or {})
+            if str(meta.get("status", "")).strip().lower() not in _AUTO_PAUSE_FROM_STATUSES:
+                return False  # somebody moved it between the scan and this write
+            meta["status"] = _AUTO_PAUSE_TO_STATUS
+            meta["updated"] = ts
+            new_body = _task_body.append_progress(body or "", ts, "task_gc", note)
+            atomic_write(md, fm.dump(meta, new_body))
+    except (OSError, ValueError):
+        log.exception("task_gc: failed to auto-pause %s", md)
+        return False
+    return True
+
+
+def auto_pause_unheld_tasks(cfg: Any, slug: str, now: float | None = None) -> dict:
+    """Move ``in_progress`` tickets that no live session holds to ``paused``.
+
+    Two conditions, both required (see :data:`DEFAULT_AUTO_PAUSE_GRACE_SEC` for
+    why the second exists): no live session of any role holds the ticket, AND the
+    ticket file has been untouched for the grace. Throwaway and archived tickets
+    are skipped — they own other paths.
+
+    Returns ``{"paused": [task_id, ...]}``. Never raises on a single bad file:
+    one unreadable ticket must not kill the tick.
+    """
+    if now is None:
+        now = time.time()
+    backlog = cfg.data_dir / slug / "backlog"
+    if not backlog.exists():
+        return {"paused": []}
+
+    grace = auto_pause_grace_sec()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    held = live_held_task_ids(cfg, slug)
+    paused: list[str] = []
+
+    for md, meta, _body in _iter_board_tasks(backlog):
+        if str(meta.get("status", "")).strip().lower() not in _AUTO_PAUSE_FROM_STATUSES:
+            continue
+        if str(meta.get("archived", "")).strip().lower() in ("true", "yes", "1", "on"):
+            continue
+        if is_throwaway_task(meta.get("title", ""), meta):
+            continue
+        tid = str(meta.get("id") or md.stem)
+        if tid in held:
+            continue
+        try:
+            age = now - md.stat().st_mtime
+        except OSError:
+            continue  # can't age it → can't honour the grace → leave it alone
+        if age < grace:
+            continue
+        note = (f"auto-paused: no live session holds this ticket and it has been "
+                f"untouched for {int(age // 3600)}h. Set it back to in_progress "
+                f"when work resumes (`bsq ticket update {tid} in_progress`).")
+        if _pause_one(md, tid, ts, note):
+            paused.append(tid)
+            log.info("task_gc: auto-paused %s (%s, unheld, age=%.0fs)", tid, slug, age)
+
+    return {"paused": paused}

@@ -317,3 +317,46 @@ def _raiser(A):
     def _dispatch(name, params):
         raise A.ActionError(f"inject_input: no live pane for sid {params['sid']!r}")
     return _dispatch
+
+
+# ---------------------------------------------------------------------------
+# T-0884 — the fallback must not claim a handover that was REFUSED
+#
+# The third copy of the same defect, and the one that lies hardest. This path
+# already had a truthful failure line for a store failure and a truthful
+# deferral line for saturation — but on the DELIBERATE fail-closed refusal it
+# fell through to «передал сообщение в user-conversation», stating as fact a
+# handover that had just been declined, and returned ok:True with it.
+# ---------------------------------------------------------------------------
+
+def test_fallback_does_not_claim_delivery_when_the_user_worker_refused(
+        tmp_path, monkeypatch, spy):
+    """A refusal must read as a failure to BOTH audiences: ok:False to the
+    caller, and a notice that does not say the message was passed on."""
+    import bot_squad_worker.actions as A
+    cfg = _cfg(tmp_path, sessions={"watchrobot": [REAPED]})
+    monkeypatch.setattr(A, "dispatch", _raiser(A))
+    monkeypatch.setattr(
+        TL, "_ensure_user_conversation",
+        lambda *a, **k: {"ok": False, "user_worker_unavailable": True})
+
+    result = TL._handle_reply(cfg, "-100123", REAPED, TEXT, gid=GID)
+
+    assert result["ok"] is False, "a refused handover must not report success"
+    assert result["action"] == "inject_failed"
+    assert result["fallback"] == "user_worker_unavailable"
+
+    assert len(spy["notices"]) == 1
+    told = spy["notices"][0][2]
+    assert "передал сообщение" not in told, (
+        "this is the false claim the fix removes — nothing was passed on"
+    )
+    assert "не будет" in told, "it must say the message will NOT be handled on its own"
+    assert "освободится слот" not in told, "that is the PARKED promise; this path never retries"
+
+    # The words themselves are NOT lost — both records are written before the
+    # handover is attempted, so a refusal costs visibility, never content.
+    # Two posts, per item (c): the system's account and the human's words are
+    # kept separate, and BOTH belong to the target session's project.
+    assert [p[0] for p in spy["posts"]] == ["watchrobot", "watchrobot"]
+    assert any(TEXT in str(p[2]) for p in spy["posts"])

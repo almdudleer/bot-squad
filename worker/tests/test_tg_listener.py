@@ -5229,3 +5229,111 @@ def test_the_intake_path_has_no_drive_scope_writer_left(tmp_path, monkeypatch):
         "the drive-scope call site is back — removed by T-0848 on the "
         "stakeholder's ruling; see dispatch.py's tombstone"
     )
+
+
+# ---- T-0884: the fail-closed refusal is VISIBLE, not just diagnosable -------
+# `9a3c0e7` gave the refusal a log line and a `user_worker_unavailable` marker
+# and explicitly deferred the user-facing half to T-0640's `_route_to_project`,
+# which was gated above it in the branch. These pin the half that was owed.
+#
+# What makes them worth having: before this, EVERY one of these paths returned
+# `{"ok": True, "action": "route..."}` on a delivery that was deliberately
+# refused — so the caller was told "routed" and the user was told nothing. That
+# is T-0883's reported symptom, «came through empty», reproduced from the
+# inside.
+
+def _refused(*_a, **_k):
+    """What `_ensure_user_conversation` returns on the DELIBERATE refusal."""
+    return {"ok": False, "user_worker_unavailable": True}
+
+
+def test_unquoted_user_worker_unavailable_tells_the_user_and_admits_failure(
+        tmp_path, monkeypatch):
+    """The consolidated `_route_to_project` path: notice sent, `ok` FALSE."""
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", _refused)
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat_id, text, **k: notices.append((chat_id, text)))
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _dated_msg(text="in beta do the thing")})
+
+    assert result["ok"] is False, "a refused delivery must not report success"
+    assert result["action"] == "route_undelivered"
+    assert result["reason"] == "user_worker_unavailable"
+    assert len(notices) == 1 and notices[0][0] == "111"
+
+
+def test_bound_topic_user_worker_unavailable_tells_the_user_and_admits_failure(
+        tmp_path, monkeypatch):
+    """The SECOND copy of the same defect — the bound-topic path never reached
+    `_route_to_project`, so fixing only that one would have left this silent."""
+    from bot_squad_worker import tg_bindings
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    tg_bindings.set_binding(cfg, "111", 7, "beta")
+    monkeypatch.setattr(TL, "resolve_or_link_sender",
+                        lambda c, m, slug: {"global_user_id": "gu_1", "slug": slug})
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", _refused)
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda c, chat_id, text, **k: notices.append((chat_id, text, k)))
+
+    result = TL.handle_update(
+        cfg, {"update_id": 1, "message": _topic_msg("x", chat_id=111, thread_id=7)})
+
+    assert result["ok"] is False and result["action"] == "route_undelivered"
+    # T-0676 item 3 parity: the refusal lands back in the SAME topic.
+    assert len(notices) == 1 and notices[0][2].get("thread_id") == 7
+
+
+def test_a_replay_suppresses_the_notice_but_NOT_the_failure(tmp_path, monkeypatch):
+    """`notify_parked=False` marks a replay, where one notice per replayed
+    message would be the burst the debounce exists to prevent.
+
+    The distinction this pins: suppressing the courtesy line must not also
+    launder the RESULT. A replay caller counting successes has to still see the
+    refusal, or the batch reports as delivered and we are back to a silent
+    failure with extra steps.
+    """
+    cfg = _make_multi_cfg(tmp_path, chat="111")
+    monkeypatch.setattr(TL, "append_conversation", lambda *a, **k: True)
+    monkeypatch.setattr(TL, "_ensure_user_conversation", _refused)
+    notices = []
+    monkeypatch.setattr(TL, "_channel_notify",
+                        lambda *a, **k: notices.append(a))
+
+    result = TL._route_to_project(
+        cfg, "111", "gu_1", "beta", _dated_msg(text="x"), notify_parked=False)
+
+    assert notices == [], "a replay must not emit one notice per message"
+    assert result["ok"] is False and result["action"] == "route_undelivered"
+
+
+def test_the_refusal_notice_promises_no_retry(tmp_path, monkeypatch):
+    """Wording contract, and the reason it is a test rather than a comment.
+
+    `parked` retries on ramp-up and its notice truthfully says so («займусь,
+    как только освободится слот»). THIS refusal does not retry — per T-0880
+    nothing restarts a per-user worker — so borrowing that reassurance would
+    tell the user to wait for something that is never coming. The two notices
+    sit four lines apart in the same functions, which is exactly how one gets
+    copied onto the other.
+    """
+    text = TL._USER_WORKER_UNAVAILABLE_NOTICE
+    assert "освободится слот" not in text, "that is the PARKED promise; this path never retries"
+    assert "займусь" not in text
+    assert "не будет" in text, "it has to say the message will NOT be handled on its own"
+
+
+def test_only_the_deliberate_refusal_counts_as_unavailable():
+    """The explicit-UNKNOWN rule: an accident (`None`) and a deferral
+    (`parked`) must not be read as the deliberate fail-closed refusal."""
+    assert TL._user_worker_unavailable({"ok": False, "user_worker_unavailable": True})
+    assert not TL._user_worker_unavailable(None)
+    assert not TL._user_worker_unavailable({"ok": False, "parked": True})
+    assert not TL._user_worker_unavailable({"ok": True})

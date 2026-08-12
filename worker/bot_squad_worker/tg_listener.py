@@ -1022,6 +1022,38 @@ class _UserConversationActionError(RuntimeError):
     """A rejected local or per-user worker action."""
 
 
+# T-0884, the half `9a3c0e7` left owed. That commit made the fail-closed refusal
+# DIAGNOSABLE (a `log.error` plus the `user_worker_unavailable` marker) and said
+# so; it could not make it VISIBLE, because the wording belongs at the call site
+# that owns the chat and one of those call sites arrives with T-0640, which sat
+# gated above it in the branch. With T-0640 landed the home exists, so it lands.
+#
+# Three call sites read that marker, not one. Each of them USED to fall through
+# to an `{"ok": True, ...}` — a delivery that was deliberately refused reported
+# as routed, to a user who heard nothing. That is T-0883's symptom exactly: «It
+# looks like your message came through empty».
+#
+# The wording promises nothing that is not true. `parked` (saturation) retries on
+# ramp-up and its notice says so; THIS refusal does not retry — per T-0880 nothing
+# restarts a per-user worker — so it must not borrow the reassuring half of the
+# parked line.
+_USER_WORKER_UNAVAILABLE_NOTICE = (
+    "Принял и записал, но ответить сейчас некому: воркер, который ведёт этот "
+    "разговор, не запущен и сам не поднимется. Сообщение сохранено и не "
+    "потеряно, но автоматически обработано не будет — нужно поднять воркера."
+)
+
+
+def _user_worker_unavailable(ensured: Any) -> bool:
+    """True when `_ensure_user_conversation` DELIBERATELY refused delivery.
+
+    Distinct from a falsy/`None` return, which means an accident nobody chose
+    (the explicit-UNKNOWN rule: an absent field must not read as a real
+    negative), and from `parked`, which means "tried, deferred, will retry".
+    """
+    return isinstance(ensured, dict) and bool(ensured.get("user_worker_unavailable"))
+
+
 def _linux_user_for_global_user(cfg: Any, global_user_id: str) -> str:
     """Return the attached account's Linux user, or ``""`` when unknown.
 
@@ -1889,6 +1921,13 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
             thread_id=msg.get("message_thread_id"),
         )
         return {"ok": True, "action": "route_parked", "slug": slug}
+    if _user_worker_unavailable(ensured):
+        _channel_notify(
+            cfg, chat_id, _USER_WORKER_UNAVAILABLE_NOTICE,
+            thread_id=msg.get("message_thread_id"),
+        )
+        return {"ok": False, "action": "route_undelivered", "slug": slug,
+                "reason": "user_worker_unavailable"}
     return {"ok": True, "action": "route_bound_topic", "slug": slug}
 
 
@@ -1944,6 +1983,19 @@ def _route_to_project(cfg, chat_id: str, gid: str, por: str, msg: dict,
                 thread_id=bound_thread_id,
             )
         return {"ok": True, "action": "route_parked", "slug": por}
+    if _user_worker_unavailable(ensured):
+        # `notify_parked=False` marks a REPLAY, where the user is being answered
+        # about the whole batch right now — one notice per replayed message is
+        # the burst its debounce exists to prevent. The RESULT still says
+        # undelivered either way; only the courtesy line is suppressed, because
+        # a caller counting successes must not be told a refusal was a route.
+        if notify_parked:
+            _channel_notify(
+                cfg, chat_id, _USER_WORKER_UNAVAILABLE_NOTICE,
+                thread_id=bound_thread_id,
+            )
+        return {"ok": False, "action": "route_undelivered", "slug": por,
+                "reason": "user_worker_unavailable"}
     return {"ok": True, "action": "route", "slug": por}
 
 
@@ -2738,6 +2790,22 @@ def _fallback_undelivered(
         )
         return {"ok": True, "action": "inject_fallback", "fallback": "parked",
                 "fallback_slug": slug}
+    if _user_worker_unavailable(ensured):
+        # The THIRD copy, and the one that lies hardest: the line below states
+        # «передал сообщение в user-conversation» as an accomplished fact. On a
+        # refusal nothing was handed anywhere — the record exists, no attendant
+        # was woken — so the user is told the opposite of what happened, in the
+        # one place they cannot check.
+        _notify(
+            cfg, chat_id,
+            f"⚠️ Сессия {sid} не активна. Сообщение записано в "
+            f"user-conversation проекта «{slug}», но ответить сейчас некому: "
+            f"воркер этого разговора не запущен и сам не поднимется. "
+            f"Автоматически оно обработано не будет — нужно поднять воркера.",
+            thread_id=thread_id,
+        )
+        return {"ok": False, "action": "inject_failed",
+                "fallback": "user_worker_unavailable", "fallback_slug": slug}
     _notify(
         cfg, chat_id,
         f"⚠️ Сессия {sid} не активна — передал сообщение в user-conversation "

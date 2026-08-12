@@ -437,3 +437,29 @@ def test_live_held_task_ids_drops_the_unset_sentinel(tmp_path):
     the real question this set answers."""
     _write_session(tmp_path, "S-a", task_id="~")
     assert task_gc.live_held_task_ids(_cfg(tmp_path), "proj") == set()
+
+
+def test_auto_pause_kill_switch_stops_the_pass(tmp_path, monkeypatch):
+    """The one pass in the tick that changes what HE sees needs an off switch
+    that is not a revert. Off means "stop moving them" — nothing is moved back."""
+    monkeypatch.setenv("BOT_SQUAD_AUTO_PAUSE", "0")
+    p = _write_task(tmp_path, "T-0551", title="x", status="in_progress",
+                    age_sec=FAR, now=NOW)
+    out = task_gc.auto_pause_unheld_tasks(_cfg(tmp_path), "proj", now=NOW)
+    assert out == {"paused": [], "disabled": True}
+    assert _status_of(p) == "in_progress"
+    assert "auto-paused" not in p.read_text(encoding="utf-8")
+
+
+def test_auto_pause_is_on_by_default_and_only_0_disables_it(tmp_path, monkeypatch):
+    """Default ON (the feature he asked for must not need an env var to work),
+    and a garbage value must not silently disable it — same shape as
+    ``recovery.boot_reconcile_enabled``."""
+    monkeypatch.delenv("BOT_SQUAD_AUTO_PAUSE", raising=False)
+    assert task_gc.auto_pause_enabled() is True
+    for value in ("1", "yes", "", "  "):
+        monkeypatch.setenv("BOT_SQUAD_AUTO_PAUSE", value)
+        assert task_gc.auto_pause_enabled() is True, value
+    for value in ("0", " 0 "):
+        monkeypatch.setenv("BOT_SQUAD_AUTO_PAUSE", value)
+        assert task_gc.auto_pause_enabled() is False, value

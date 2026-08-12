@@ -415,6 +415,20 @@ _AUTO_PAUSE_TO_STATUS = "paused"
 DEFAULT_AUTO_PAUSE_GRACE_SEC = 4 * 3600  # 4h
 
 
+def auto_pause_enabled() -> bool:
+    """Kill switch — default ON, same shape as ``recovery.boot_reconcile_enabled``.
+
+    Exists because this is the one pass in the tick that changes what the
+    STAKEHOLDER sees: its first tick moves 84% of a column. The grace above only
+    tunes *when* it fires, so without this the answer to "turn it off" would be a
+    revert and a deploy rather than an environment variable. Set
+    ``BOT_SQUAD_AUTO_PAUSE=0`` wherever the worker's other ``BOT_SQUAD_*`` vars
+    are set; a worker restart is needed for it to take effect, and no ticket is
+    moved back — off means "stop moving them", not "undo".
+    """
+    return os.environ.get("BOT_SQUAD_AUTO_PAUSE", "1").strip() != "0"
+
+
 def auto_pause_grace_sec() -> int:
     raw = os.environ.get("BOT_SQUAD_AUTO_PAUSE_GRACE_SEC")
     if raw:
@@ -497,11 +511,16 @@ def auto_pause_unheld_tasks(cfg: Any, slug: str, now: float | None = None) -> di
     Two conditions, both required (see :data:`DEFAULT_AUTO_PAUSE_GRACE_SEC` for
     why the second exists): no live session of any role holds the ticket, AND the
     ticket file has been untouched for the grace. Throwaway and archived tickets
-    are skipped — they own other paths.
+    are skipped — they own other paths. ``BOT_SQUAD_AUTO_PAUSE=0`` disables the
+    whole pass (:func:`auto_pause_enabled`).
 
     Returns ``{"paused": [task_id, ...]}``. Never raises on a single bad file:
     one unreadable ticket must not kill the tick.
     """
+    if not auto_pause_enabled():
+        # The ``disabled`` key appears ONLY when the switch is off, so the
+        # result shape a caller sees in normal operation never changes.
+        return {"paused": [], "disabled": True}
     if now is None:
         now = time.time()
     backlog = cfg.data_dir / slug / "backlog"

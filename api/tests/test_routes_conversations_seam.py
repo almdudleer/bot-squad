@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app import conversation_store as CS
+from app.worker_client import WorkerClient
 
 from test_routes_conversations import CONV, _client, _mock_call_action, _worker_auth
 
@@ -44,6 +45,57 @@ def test_user_authored_append_triggers_ensure_user_conversation(
         "global_user_id": "gu_abc",
         "message_ref": "2026-07-18T00:00:00Z",
     }
+
+
+def test_attached_global_user_wake_uses_strict_per_user_worker(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    auth = tmp_bot_squad / "config" / "auth.toml"
+    auth.write_text(
+        auth.read_text().replace(
+            'linux_user = "almdudleer"',
+            'linux_user = "flomaster"\nattached_to_global_user = "gu_abc"',
+        )
+    )
+    user_sock = tmp_bot_squad / "data" / "_sock" / "user-flomaster.sock"
+    user_sock.touch()
+    seen = []
+
+    async def fake_call_action(self, name, params, timeout=None):
+        seen.append((self.sock_path, name, params))
+        return {"ok": True, "sid": "S-flomaster-x-p1", "spawned": True}
+
+    monkeypatch.setattr(WorkerClient, "call_action", fake_call_action)
+    client = _client(tmp_bot_squad, monkeypatch)
+    response = client.post(
+        CONV,
+        json={"author": "user", "text": "hello"},
+        headers=_worker_auth(),
+    )
+    assert response.status_code == 200
+    assert seen[0][0] == user_sock
+
+
+def test_transport_managed_append_skips_generic_api_wake(
+    tmp_bot_squad: Path, monkeypatch,
+):
+    calls = _mock_call_action(monkeypatch)
+    client = _client(tmp_bot_squad, monkeypatch)
+    response = client.post(
+        CONV,
+        json={
+            "author": "user",
+            "text": "from telegram",
+            "ensure_attendant": False,
+        },
+        headers=_worker_auth(),
+    )
+    assert response.status_code == 200
+    assert response.json()["ensured"] == {
+        "ok": True,
+        "skipped": "transport_managed",
+    }
+    assert calls == []
 
 
 def test_ensure_failure_does_not_fail_append(tmp_bot_squad: Path, monkeypatch):

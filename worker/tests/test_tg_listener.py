@@ -4563,10 +4563,19 @@ def test_append_conversation_annotates_someone_elses_forward(tmp_path, monkeypat
     assert "direction" not in captured["json"]
 
 
-def test_append_conversation_payload_unchanged_for_a_typed_message(tmp_path, monkeypatch):
-    """NEGATIVE GUARD — passes before AND after T-0746. A genuine message's
-    request body must be byte-identical to the pre-fix one; this is the
-    overwhelming common case and the fix must not touch it."""
+def test_append_conversation_marks_tg_wake_as_transport_managed(tmp_path, monkeypatch):
+    """Telegram records durably, then performs ONE identity-aware wake itself,
+    so it tells the API not to run its generic one.
+
+    This is still T-0746's NEGATIVE GUARD, with its baseline moved by exactly
+    one key — not a new test that happens to live here. Its job is unchanged:
+    assert the whole request body by equality, so that any future change to a
+    genuine typed message's payload has to come here and say so. The original
+    claim was "byte-identical to the pre-T-0746 body"; the claim now is
+    "byte-identical plus `ensure_attendant: False`, and nothing else". Keep the
+    `==` — weakening it to a subset check would let the next stray field ride
+    along invisibly, which is the failure this test was written to catch.
+    """
     cfg = _make_cfg(tmp_path, bot_token="8206895402:SECRET")
     _link_env(monkeypatch)
     captured, fake_post = _capture_post(monkeypatch)
@@ -4577,6 +4586,7 @@ def test_append_conversation_payload_unchanged_for_a_typed_message(tmp_path, mon
     assert captured["json"] == {
         "author": "user", "text": "deploy please",
         "attachments": [], "timestamp": TL._msg_ts(msg),
+        "ensure_attendant": False,
     }
 
 

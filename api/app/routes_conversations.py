@@ -501,17 +501,42 @@ async def _ensure_attendant(
     the trigger HERE means every channel that lands a user message through this
     ONE append endpoint gets the same wake, not just TG.
 
-    ``ensure_user_conversation`` is a tmux_only action; it runs on the
-    coordinator because that's also where ``tg_listener`` (and its scheduler
-    tick) run (T-0119 __main__ coordinator-only scheduler), so the coordinator
-    client is the right target — same one the TG relay call below uses.
+    ``ensure_user_conversation`` is a tmux_only action.  For an attached
+    GlobalUser it must run on that account's per-user worker, not on the
+    coordinator: the latter has a different tmux server, credentials and agent
+    provider.  An unavailable attached-user worker fails closed (the durable
+    append remains) instead of spawning under the coordinator.  Unattached
+    identities retain the legacy coordinator route.
 
     Never raises: a spawn/pane hiccup, or the worker being briefly unreachable,
     must never fail the append (the message is already durable in the store).
     Mirrors tg_listener's own ``_ensure_user_conversation`` backoff detection so
     a saturation refusal is still distinguishable (``parked: True``) from any
     other failure."""
-    client = request.app.state.worker_router.coordinator()
+    # The `and global_user_id` guard: most accounts carry NO
+    # ``attached_to_global_user``, so an empty gid compares equal to every
+    # unattached entry and this would pick whichever one auth.toml lists first
+    # — a routing decision made by file order. UNREACHABLE from HTTP (an empty
+    # path segment 404s here — measured, not assumed), so this is symmetry with
+    # the worker's `_linux_user_for_global_user`, where the same input IS
+    # reachable because identity resolution hands back "" on failure. Kept so
+    # the two halves cannot drift into disagreeing about the same input.
+    linux_user = next(
+        (
+            meta.linux_user
+            for meta in request.app.state.auth_config.user_meta.values()
+            if global_user_id and meta.attached_to_global_user == global_user_id
+        ),
+        "",
+    )
+    try:
+        client = (
+            request.app.state.worker_router.for_user_strict(linux_user)
+            if linux_user
+            else request.app.state.worker_router.coordinator()
+        )
+    except WorkerError:
+        return {"ok": False}
     params: dict = {"slug": slug, "global_user_id": global_user_id, "message_ref": message_ref}
     if thread_id is not None and thread_id != "":
         params["thread_id"] = thread_id
@@ -601,6 +626,7 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     if "text" not in payload:
         raise HTTPException(status_code=400, detail="text required")
     fyi = bool(payload.get("fyi", False))
+    transport_managed_ensure = payload.get("ensure_attendant") is False
     thread_id = payload.get("thread_id")
     general_feed = bool(payload.get("general_feed", False))
     direction = payload.get("direction")
@@ -668,6 +694,15 @@ async def append_message(slug: str, global_user_id: str, request: Request, paylo
     if author == "user":
         if fyi:
             out["ensured"] = {"ok": True, "skipped": "fyi"}
+        elif transport_managed_ensure:
+            # Telegram's listener records first, then performs its own
+            # identity-aware ensure. ONE writer for the wake: the transport
+            # that already resolved the sender owns it, so the two ensures
+            # cannot race to spawn or double-nudge the same (slug, gid).
+            # (Historically the second one also landed on the coordinator; the
+            # per-user routing above fixes that independently, so what this
+            # flag is for now is the single-writer property, not the account.)
+            out["ensured"] = {"ok": True, "skipped": "transport_managed"}
         else:
             out["ensured"] = await _ensure_attendant(
                 request, slug, global_user_id, str(record.get("timestamp") or ""),

@@ -1,9 +1,12 @@
 """Listen for Telegram updates and route replies into sessions."""
 from __future__ import annotations
 
+import json
 import logging
 import os
+import pwd
 import re
+import tomllib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -731,6 +734,10 @@ def append_conversation(
         "text": _tg.msg_text(msg),
         "attachments": _msg_attachments(msg),
         "timestamp": _msg_ts(msg),
+        # This listener performs the identity-aware ensure after the durable
+        # append. Suppress the API's generic auto-wake or every Telegram
+        # message nudges twice (and historically spawned once as coordinator).
+        "ensure_attendant": False,
     }
     quote = reply_quote.extract(msg)
     if quote:
@@ -971,7 +978,6 @@ def _ensure_user_conversation(
     (``{"ok": False, "parked": True}`` for a backoff/saturation spawn refusal,
     ``None`` for anything else) so ``_handle_unquoted`` can tell the chat the
     message is parked rather than dropping into dead air."""
-    from bot_squad_worker import actions as A
     params = {
         "slug": slug,
         "global_user_id": gid,
@@ -980,13 +986,112 @@ def _ensure_user_conversation(
     if thread_id is not None and str(thread_id).strip() != "":
         params["thread_id"] = thread_id
     try:
-        return A.dispatch("ensure_user_conversation", params)
-    except A.ActionError as e:
+        return _dispatch_user_conversation(cfg, gid, params)
+    except _UserConversationActionError as e:
         if "backoff" in str(e):
             return {"ok": False, "parked": True}
         return None
     except Exception:  # noqa: BLE001 — best-effort; never break inbound routing
+        log.exception("ensure_user_conversation failed for %s/%s", slug, gid)
         return None
+
+
+class _UserConversationActionError(RuntimeError):
+    """A rejected local or per-user worker action."""
+
+
+def _linux_user_for_global_user(cfg: Any, global_user_id: str) -> str:
+    """Return the attached account's Linux user, or ``""`` when unknown.
+
+    Telegram polling runs only in the coordinator worker.  A user-conversation
+    is nevertheless a tmux action and must execute in the attached user's
+    worker; otherwise the coordinator's provider, credentials and tmux server
+    leak into that user's project.
+    """
+    if not str(global_user_id or "").strip():
+        # Identity resolution is best-effort and hands back "" when it fails,
+        # and MOST accounts have no `attached_to_global_user` at all — so an
+        # empty gid compares equal to every unattached entry and the match
+        # below would return whichever one auth.toml happens to list first.
+        # That is a coin-flip routing decision made by file order; on this
+        # install it lands on the coordinator's own account and looks fine.
+        # No gid means no user-worker route, so say so.
+        return ""
+    config_dir = getattr(cfg, "config_dir", None)
+    if config_dir is None:
+        # Small test/embedded configs predate account attachment.  With no
+        # authority file there is no user-worker route to resolve.
+        return ""
+    auth_path = Path(config_dir) / "auth.toml"
+    try:
+        raw = tomllib.loads(auth_path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        log.warning("user-conversation routing: failed to read auth.toml: %s", e)
+        return ""
+    for username, value in (raw.get("user_meta", {}) or {}).items():
+        meta = value if isinstance(value, dict) else {}
+        if str(meta.get("attached_to_global_user", "") or "") != global_user_id:
+            continue
+        linux_user = str(meta.get("linux_user", "") or username).strip()
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", linux_user):
+            return linux_user
+        log.error("user-conversation routing: invalid linux_user %r", linux_user)
+        return ""
+    return ""
+
+
+def _worker_action_over_socket(sock_path: Path, params: dict) -> dict:
+    """Synchronously call ensure_user_conversation on a user-worker UDS."""
+    transport = httpx.HTTPTransport(uds=str(sock_path))
+    try:
+        with httpx.Client(
+            transport=transport, base_url="http://w", timeout=10.0
+        ) as client:
+            response = client.post("/actions/ensure_user_conversation", json=params)
+    except httpx.RequestError as e:
+        raise _UserConversationActionError(
+            f"user worker request failed via {sock_path}: {e}"
+        ) from e
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("detail", response.text)
+        except (ValueError, AttributeError):
+            detail = response.text
+        raise _UserConversationActionError(
+            f"user worker rejected ensure_user_conversation: {detail}"
+        )
+    body = response.json()
+    if not isinstance(body, dict):
+        raise _UserConversationActionError("user worker returned a non-object response")
+    return body
+
+
+def _dispatch_user_conversation(cfg: Any, gid: str, params: dict) -> dict:
+    """Dispatch locally or to the attached user's worker without fallback."""
+    from bot_squad_worker import actions as A
+
+    target_user = _linux_user_for_global_user(cfg, gid)
+    current_user = pwd.getpwuid(os.geteuid()).pw_name
+    if not target_user or target_user == current_user:
+        try:
+            return A.dispatch("ensure_user_conversation", params)
+        except A.ActionError as e:
+            raise _UserConversationActionError(str(e)) from e
+
+    sock_path = Path(cfg.data_dir) / "_sock" / f"user-{target_user}.sock"
+    if not sock_path.exists():
+        # Never fall back to the coordinator: doing so launches the wrong
+        # provider with the wrong credentials under the wrong Linux account.
+        raise _UserConversationActionError(
+            f"user worker unavailable for {target_user}: {sock_path}"
+        )
+    log.info(
+        "routing user conversation gid=%s to linux_user=%s via %s",
+        gid,
+        target_user,
+        sock_path,
+    )
+    return _worker_action_over_socket(sock_path, params)
 
 
 # ---- T-0494: misattribution guard (detector retained, prompt removed T-0666) -

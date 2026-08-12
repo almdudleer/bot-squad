@@ -106,6 +106,22 @@ class WorkerRouter:
             return WorkerClient(self._coordinator_sock)
         return WorkerClient(user_sock)
 
+    def for_user_strict(self, linux_user: str) -> WorkerClient:
+        """Route to ``linux_user`` without cross-user coordinator fallback.
+
+        Use this for identity-bound automatic spawns.  Falling back is unsafe
+        there: it changes the Linux account, tmux server, credentials and agent
+        provider while retaining the requested user's conversation identity.
+        """
+        if linux_user == self.coordinator_user:
+            return WorkerClient(self._coordinator_sock)
+        user_sock = _user_sock(self._sock_dir, linux_user)
+        if not user_sock.exists():
+            raise WorkerError(
+                f"user worker unavailable for {linux_user}: {user_sock}"
+            )
+        return WorkerClient(user_sock)
+
     def for_sid(self, sid: str) -> WorkerClient:
         """Resolve via SID format S-<linux_user>-<rest>. Falls back to coordinator."""
         if sid.startswith("S-"):

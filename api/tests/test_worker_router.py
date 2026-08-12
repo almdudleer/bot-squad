@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.worker_client import WorkerRouter
+from app.worker_client import WorkerError
 
 
 def test_for_user_returns_coordinator_client_for_coordinator(tmp_path: Path):
@@ -37,6 +40,20 @@ def test_for_user_falls_back_to_coordinator_when_socket_missing(tmp_path: Path):
                      known_users={"edem"})
     c = r.for_user("edem")
     assert c.sock_path == sock
+
+
+def test_for_user_strict_refuses_missing_socket_instead_of_cross_user_fallback(
+    tmp_path: Path,
+):
+    sock = tmp_path / "_sock" / "worker.sock"
+    sock.parent.mkdir(parents=True)
+    router = WorkerRouter(
+        coordinator_sock=sock,
+        coordinator_user="almdudleer",
+        known_users={"flomaster"},
+    )
+    with pytest.raises(WorkerError, match="user worker unavailable"):
+        router.for_user_strict("flomaster")
 
 
 def test_for_sid_routes_via_linux_user(tmp_path: Path):

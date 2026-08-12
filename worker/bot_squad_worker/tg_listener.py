@@ -990,6 +990,17 @@ def _ensure_user_conversation(
     except _UserConversationActionError as e:
         if "backoff" in str(e):
             return {"ok": False, "parked": True}
+        # Say WHICH failure this was rather than collapsing every rejection to
+        # a bare None, which callers cannot tell from "no attempt was made"
+        # (the explicit-UNKNOWN rule). `unavailable` is the deliberate
+        # fail-closed refusal above; the user-facing courtesy line for it
+        # belongs at the call site that owns the chat, and that call site is
+        # consolidated by T-0640's `_route_to_project` — which sits ABOVE this
+        # commit in the branch, so the wording lands there rather than being
+        # written three times into code T-0640 deletes.
+        log.error("user-conversation ensure refused for %s/%s: %s", slug, gid, e)
+        if "unavailable" in str(e):
+            return {"ok": False, "user_worker_unavailable": True}
         return None
     except Exception:  # noqa: BLE001 — best-effort; never break inbound routing
         log.exception("ensure_user_conversation failed for %s/%s", slug, gid)
@@ -1040,12 +1051,38 @@ def _linux_user_for_global_user(cfg: Any, global_user_id: str) -> str:
     return ""
 
 
+def _user_worker_timeout() -> float:
+    """Client timeout for a user-worker ensure, DERIVED from the callee's own
+    wait so the two cannot drift apart again.
+
+    ``ensure_user_conversation`` may SPAWN, and `sessions.spawn` then blocks on
+    `_wait_for_agent_composer_ready` for `_COMPOSER_READY_TIMEOUT_SEC` before
+    tmux window creation and the agent launch are even counted. A client
+    timeout at or below that number can ONLY ever time out on a cold spawn —
+    and worse, the spawn on the other side has very likely SUCCEEDED, so the
+    caller reports a failure for work that completed. This was hardcoded 10.0
+    against a 15.0 wait, i.e. guaranteed to lose that race (found in review by
+    p192; the fleet has paid for "a failure signal is not proof the work
+    failed" before).
+
+    The +25s covers window creation and agent launch on top of the composer
+    wait, with margin. Falls back to the same total if the constant moves out
+    of reach, since an over-long timeout costs a slow failure while an
+    under-long one costs a false one.
+    """
+    try:
+        from bot_squad_worker.sessions import _COMPOSER_READY_TIMEOUT_SEC as composer
+    except Exception:  # noqa: BLE001 — a missing constant must not break routing
+        composer = 15.0
+    return float(composer) + 25.0
+
+
 def _worker_action_over_socket(sock_path: Path, params: dict) -> dict:
     """Synchronously call ensure_user_conversation on a user-worker UDS."""
     transport = httpx.HTTPTransport(uds=str(sock_path))
     try:
         with httpx.Client(
-            transport=transport, base_url="http://w", timeout=10.0
+            transport=transport, base_url="http://w", timeout=_user_worker_timeout()
         ) as client:
             response = client.post("/actions/ensure_user_conversation", json=params)
     except httpx.RequestError as e:
@@ -1082,6 +1119,20 @@ def _dispatch_user_conversation(cfg: Any, gid: str, params: dict) -> dict:
     if not sock_path.exists():
         # Never fall back to the coordinator: doing so launches the wrong
         # provider with the wrong credentials under the wrong Linux account.
+        #
+        # LOUD, because this is the deliberate path, not the accident. Refusing
+        # in silence is the failure this whole change exists to remove: the
+        # message stays durably recorded, but nobody is woken and the user is
+        # answered by nothing. Per T-0880 nothing restarts a per-user worker,
+        # so "that worker is gone" is live-reachable, not hypothetical — and
+        # without this line there is nothing to reconstruct it from.
+        log.error(
+            "user-conversation NOT delivered: no worker for %s (%s). The "
+            "message is recorded but NO attendant was woken — start that "
+            "user's worker.",
+            target_user,
+            sock_path,
+        )
         raise _UserConversationActionError(
             f"user worker unavailable for {target_user}: {sock_path}"
         )

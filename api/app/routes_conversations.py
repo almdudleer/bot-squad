@@ -535,8 +535,15 @@ async def _ensure_attendant(
             if linux_user
             else request.app.state.worker_router.coordinator()
         )
-    except WorkerError:
-        return {"ok": False}
+    except WorkerError as e:
+        # Same posture as the worker half: fail closed, but never silently.
+        # The append above is already durable, so what is lost here is the
+        # WAKE — nobody is attending the message the user just sent.
+        log.error(
+            "attendant NOT woken for %s/%s: no worker for %s (%s)",
+            slug, global_user_id, linux_user, e,
+        )
+        return {"ok": False, "user_worker_unavailable": True}
     params: dict = {"slug": slug, "global_user_id": global_user_id, "message_ref": message_ref}
     if thread_id is not None and thread_id != "":
         params["thread_id"] = thread_id

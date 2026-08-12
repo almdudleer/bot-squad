@@ -123,6 +123,54 @@ def test_missing_user_worker_does_not_fall_back_to_coordinator(
         )
 
 
+def test_the_fail_closed_refusal_is_loud(tmp_path: Path, monkeypatch, caplog) -> None:
+    """Fail-closed is right; failing closed INVISIBLY is not (p192 review).
+
+    The refusal is the deliberate path, so it is the one that must be
+    reconstructible: the message stays durably recorded, nobody is woken, and
+    without this line there is nothing in the log to explain the silence. Per
+    T-0880 nothing restarts a per-user worker, so this state is live-reachable.
+    """
+    import logging
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(
+        listener.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_name="coordinator")
+    )
+    with caplog.at_level(logging.ERROR, logger=listener.log.name):
+        with pytest.raises(listener._UserConversationActionError):
+            listener._dispatch_user_conversation(
+                cfg, "gu_flomaster", {"slug": "guestent"}
+            )
+    assert [r for r in caplog.records if "NO attendant was woken" in r.getMessage()]
+
+
+def test_an_unavailable_worker_is_distinguishable_from_no_attempt(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """A bare None reads identically to "nothing was tried". The caller that
+    owns the chat has to be able to tell the two apart to say anything useful,
+    so the refusal carries its own marker."""
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(
+        listener.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_name="coordinator")
+    )
+    out = listener._ensure_user_conversation(cfg, "guestent", "gu_flomaster", "ref")
+    assert out == {"ok": False, "user_worker_unavailable": True}
+
+
+def test_the_socket_timeout_outlasts_the_callees_own_wait(monkeypatch) -> None:
+    """A client timeout at or below the callee's composer wait can ONLY time
+    out on a cold spawn — while the spawn on the other side very likely
+    SUCCEEDED. It was hardcoded 10.0 against a 15.0 wait. Derived now, so the
+    two constants cannot drift apart again."""
+    from bot_squad_worker.sessions import _COMPOSER_READY_TIMEOUT_SEC
+
+    assert listener._user_worker_timeout() > _COMPOSER_READY_TIMEOUT_SEC
+    # and by a margin that covers window creation + agent launch, not by 1s
+    assert listener._user_worker_timeout() >= _COMPOSER_READY_TIMEOUT_SEC + 20
+
+
 def test_coordinator_owned_or_unattached_user_stays_local(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1629,19 +1629,36 @@ def _handle_unquoted(cfg, chat_id: str, chat_slug: str, gid: str, msg: dict) -> 
     Asks which project when unpinned. Unrecognized senders keep the pre-T-0492
     skip (no identity to anchor routing on). A message in a BOUND forum topic
     never reaches here — `handle_update` routes it via `_handle_topic_bound`
-    instead (T-0639: the topic binding outranks this pin-based resolution)."""
+    instead (T-0639: the topic binding outranks this pin-based resolution).
+
+    T-0883: a project's OWN dedicated group chat outranks the pin, which is
+    the live bug this fixes. The pin is keyed on the global user ALONE — it
+    knows nothing about which chat the message arrived in — so a stakeholder
+    pinned to bot-squad had every message he typed in guestent's own group
+    chat (`-1004380986138`, guestent's static `tg_chat`) recorded in
+    bot-squad's store, waking bot-squad's attendant, which then answered him
+    back inside guestent's chat. His words: «чат должен быть жестко привязан
+    именно к проекту». A negative-id chat named by exactly one project IS
+    that rigid binding (see `_dedicated_static_group_chat_slug`), so it is
+    consulted BEFORE the pin and the pin is never read for such a chat —
+    neither read nor written, so nothing about this path can drift with it."""
     if not gid:
         return {"ok": True, "action": "skip", "reason": "not a reply or command"}
-    sticky = get_current_project(cfg, gid)
-    if not sticky:
-        # Unpinned: hardwired ask (voice-04). Record under the chat's project so
-        # the message isn't lost while we wait for the pin.
-        append_conversation(cfg, chat_slug, gid, msg)
-        _ask_which_project(cfg, chat_id, thread_id=msg.get("message_thread_id"))
-        return {"ok": True, "action": "ask_project"}
 
-    # The pinned project is the project-of-record.
-    por = sticky
+    # A unique static SUPERGROUP chat is an explicit project boundary, unlike
+    # a positive-id private chat which may be shared by several projects for
+    # one person.
+    por = _dedicated_static_group_chat_slug(cfg, chat_id)
+    if not por:
+        sticky = get_current_project(cfg, gid)
+        if not sticky:
+            # Unpinned: hardwired ask (voice-04). Record under the chat's project
+            # so the message isn't lost while we wait for the pin.
+            append_conversation(cfg, chat_slug, gid, msg)
+            _ask_which_project(cfg, chat_id, thread_id=msg.get("message_thread_id"))
+            return {"ok": True, "action": "ask_project"}
+        # The pinned project is the project-of-record.
+        por = sticky
 
     # T-0666: a message explicitly mentioning a different project (T-0494's
     # _detect_cross_project_target) no longer intercepts routing with a
@@ -1899,6 +1916,32 @@ def handle_update(cfg, update: dict) -> dict:
     identity = resolve_or_link_sender(cfg, msg, chat_slug)
     gid = identity.get("global_user_id") if identity else ""
 
+    # T-0883, second half of his ask: «И договорились что в этом чате всё будет
+    # падать на воркера юзера flomaster … это должно идти от юзера flomaster, в
+    # guestent, и эта сессия должна быть codex, целиком этот чат так должен быть
+    # привязан». A project may trust several senders while deliberately running
+    # only ONE user-conversation (guestent's `stakeholders` says so, and its
+    # `groups.json` already names the owner). The conversation store is keyed
+    # (slug, global_user_id), so the OWNER's gid is the whole mechanism: route
+    # the sender's message through it and the message lands in the owner's
+    # thread, which wakes the attendant that already exists for it —
+    # flomaster's live codex session — instead of provisioning a second
+    # per-sender attendant for the same project. Deliberately placed BEFORE the
+    # slash/reply/voice/unquoted fork so it holds for the whole chat, not just
+    # the firehose path («целиком этот чат»).
+    dedicated_chat_slug = _dedicated_static_group_chat_slug(cfg, chat_id)
+    if dedicated_chat_slug and gid:
+        routed_gid = _dedicated_chat_conversation_gid(cfg, dedicated_chat_slug, gid)
+        if routed_gid != gid:
+            log.info(
+                "dedicated chat %s: routing trusted sender %s through canonical "
+                "conversation owner %s",
+                chat_id,
+                gid,
+                routed_gid,
+            )
+            gid = routed_gid
+
     # T-0634: affirm free-form steering on FIRST contact — a stakeholder must
     # never have to guess whether typing a request/feedback/steering comment
     # here "just works". Fires once per sender (gated on the linkage layer's
@@ -2092,6 +2135,74 @@ def _slug_for_chat(cfg, chat_id: str) -> str:
         if str(getattr(p, "tg_chat", "")) == str(chat_id):
             return slug
     return ""
+
+
+def _dedicated_static_group_chat_slug(cfg, chat_id: str) -> str:
+    """The sole project owning a negative-id static chat, else ``""``.
+
+    Telegram private chats have positive ids and may deliberately be reused as
+    one person's inbox across projects — bot-squad and watchrobot both name the
+    SAME positive id (`404580642`) today, which is exactly why `_slug_for_chat`
+    can't be treated as authoritative in general. Groups/supergroups have
+    negative ids; when exactly one project names one, that room itself is an
+    authoritative routing boundary and must not fall through to the
+    per-global-user pin (T-0883).
+
+    Returns "" — deliberately not the first match — when TWO projects name the
+    same negative id, because then the room is not evidence for either of them
+    and the caller's existing resolution is still the better answer.
+    """
+    chat = str(chat_id or "")
+    if not chat.startswith("-"):
+        return ""
+    matches = [
+        slug
+        for slug, project in cfg.projects.items()
+        if str(getattr(project, "tg_chat", "")) == chat
+    ]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _dedicated_chat_conversation_gid(cfg, slug: str, sender_gid: str) -> str:
+    """Canonical shared attendant identity for a dedicated project chat.
+
+    A project may trust several senders while deliberately running only one
+    low-token user-conversation; `data/<slug>/groups.json` names it in
+    ``conversation_owner_global_user_id``. Returns that gid, or ``sender_gid``
+    unchanged when the project declares no owner (every project but the opted-in
+    one, so this is a no-op by default).
+
+    The owner is accepted only when it is itself an explicit member of the
+    project's groups: a stale or mistyped owner id would otherwise silently
+    redirect one project's conversations into a gid nobody owns, creating a
+    thread no session attends. Malformed/absent config falls back to the sender
+    — the sender's own thread is the pre-T-0883 behaviour, so a broken file
+    degrades to "as before", never to "routed somewhere unintended".
+    """
+    import json as _json
+
+    groups_path = Path(cfg.data_dir) / slug / "groups.json"
+    try:
+        raw = _json.loads(groups_path.read_text())
+    except (OSError, _json.JSONDecodeError):
+        return sender_gid
+    if not isinstance(raw, dict):
+        return sender_gid
+    owner_gid = str(raw.get("conversation_owner_global_user_id") or "").strip()
+    if not owner_gid:
+        return sender_gid
+    from bot_squad_worker import project_groups_store
+
+    if project_groups_store.group_for_user(Path(cfg.data_dir), slug, owner_gid) is None:
+        log.error(
+            "dedicated chat %s has non-member conversation owner %s — routing "
+            "sender %s to their own thread instead",
+            slug,
+            owner_gid,
+            sender_gid,
+        )
+        return sender_gid
+    return owner_gid
 
 
 def _msg_ts(msg: dict) -> str:

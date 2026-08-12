@@ -12,6 +12,7 @@ import {
   canonicalOf,
   deriveParentStatus,
 } from "./canonicalStatus";
+import { COLUMNS } from "./pages/Project";
 
 // The six internal statuses, kept in sync with Task["status"] in api.ts.
 const INTERNAL_STATUSES = [
@@ -108,5 +109,35 @@ describe("deriveParentStatus (abstract parent rollup)", () => {
     ]) {
       expect(CANONICAL_STATES).toContain(deriveParentStatus(combo));
     }
+  });
+});
+
+// T-0889: the board must be able to RENDER every status the model knows about.
+//
+// Why this is here and not a comment: Project.tsx groups tasks with
+// `if (COLUMNS.includes(t.status))` in four places, so a status missing from
+// COLUMNS does not render as "other" or throw — the ticket disappears from the
+// board and from the per-column counts, silently. Measured 2026-08-12: 11 of the
+// 13 tickets then at `in_progress` were held by no live session, i.e. exactly the
+// population a new `paused` status would move. Adding that status to the model
+// without adding a column would therefore have removed 11 tickets from his board
+// and called it a feature.
+//
+// This is the ordering constraint expressed where a machine checks it: green
+// today (six statuses, six columns), red the moment the two sets diverge in
+// either direction.
+describe("board columns cover the whole status model", () => {
+  test("every canonical-mapped status has a board column", () => {
+    const missing = Object.keys(CANONICAL_STATE).filter(
+      (s) => !(COLUMNS as readonly string[]).includes(s),
+    );
+    expect(missing).toEqual([]);
+  });
+
+  test("no board column names a status the model does not know", () => {
+    const phantom = (COLUMNS as readonly string[]).filter(
+      (c) => !(c in CANONICAL_STATE),
+    );
+    expect(phantom).toEqual([]);
   });
 });

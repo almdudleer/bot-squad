@@ -29,7 +29,13 @@ import { CANONICAL_LABELS, CANONICAL_STATE } from "../canonicalStatus";
 // in-progress → validating → done), so the internal statuses that roll up into
 // the same canonical state sit adjacent. backlog = planned/open/reopened;
 // in-progress = in_progress; validating = totest; done = closed.
-const COLUMNS = ["planned", "open", "reopened", "in_progress", "totest", "closed"] as const;
+// T-0889: EXPORTED so the invariant below can be machine-checked. Four places in
+// this file group tasks with `if (COLUMNS.includes(t.status))`, which silently
+// DROPS any task whose status isn't listed here — it vanishes from the board and
+// from the counts. Adding a status to the model without adding it here therefore
+// hides tickets rather than failing, and `canonicalStatus.test.ts` now asserts
+// this list against the canonical map so that can't ship quietly.
+export const COLUMNS = ["planned", "open", "reopened", "in_progress", "totest", "closed"] as const;
 const COLUMN_LABELS: Record<typeof COLUMNS[number], string> = {
   planned: "Planned",
   open: "Open",

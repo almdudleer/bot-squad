@@ -680,6 +680,63 @@ def test_spawn_session_with_prompt(tmp_bot_squad: Path, monkeypatch, fake_worker
     assert r.json()["ok"] is True
 
 
+def test_spawn_session_forwards_model_and_provider(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """The two fields exist ONLY to reach the worker, so assert what the worker
+    was handed — not that the request returned 200.
+
+    A passthrough is exactly the shape where an exit-code assertion cannot
+    fail: drop both `if body.<x>` blocks and every other spawn test here still
+    passes, because the endpoint happily returns ok while silently spawning on
+    the fleet default. `--provider` crossing providers by accident is the thing
+    the operator role contract calls out by name.
+    """
+    from app.worker_client import WorkerClient
+
+    seen: list[tuple[str, dict]] = []
+
+    async def fake_call_action(self, name, params, timeout=None):
+        seen.append((name, params))
+        return {"ok": True, "sid": "S-x-p1"}
+
+    monkeypatch.setattr(WorkerClient, "call_action", fake_call_action)
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.post(
+            "/api/projects/test-project/sessions",
+            json={"window": "w", "model": "terra", "provider": "codex"},
+        )
+    assert r.status_code == 200, r.text
+    name, params = seen[-1]
+    assert name == "spawn_session"
+    assert params["model"] == "terra"
+    assert params["provider"] == "codex"
+
+
+def test_spawn_session_omits_model_and_provider_when_unset(
+    tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path,
+):
+    """Absent must stay ABSENT, not become "". The worker applies the project
+    default only when the key is missing, so a always-present empty string
+    would silently take that choice away from every existing caller."""
+    from app.worker_client import WorkerClient
+
+    seen: list[tuple[str, dict]] = []
+
+    async def fake_call_action(self, name, params, timeout=None):
+        seen.append((name, params))
+        return {"ok": True, "sid": "S-x-p1"}
+
+    monkeypatch.setattr(WorkerClient, "call_action", fake_call_action)
+    with _client_logged_in(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
+        r = client.post(
+            "/api/projects/test-project/sessions", json={"window": "w"},
+        )
+    assert r.status_code == 200, r.text
+    _, params = seen[-1]
+    assert "model" not in params and "provider" not in params
+
+
 def test_spawn_session_requires_auth(tmp_bot_squad: Path, monkeypatch, fake_worker_sessions: Path):
     with _anon_client(tmp_bot_squad, monkeypatch, fake_worker_sessions) as client:
         r = client.post(

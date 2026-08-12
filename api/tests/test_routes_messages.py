@@ -62,6 +62,26 @@ def test_get_messages_success(tmp_bot_squad: Path, monkeypatch):
     assert "assistant" in roles
 
 
+def test_get_messages_parses_codex_rollout(tmp_bot_squad: Path, monkeypatch):
+    import app.routes_messages as RM
+
+    monkeypatch.setattr(
+        RM, "_resolve_jsonl",
+        lambda uuid: FIXTURES / "sample_codex_session.jsonl",
+    )
+
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.get(
+            "/api/projects/test-project/sessions/"
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/messages"
+        )
+    assert r.status_code == 200
+    assert [(m["role"], m["text"]) for m in r.json()] == [
+        ("user", "Please inspect the worker."),
+        ("assistant", "I found the provider seam."),
+    ]
+
+
 def test_get_messages_returns_expected_fields(tmp_bot_squad: Path, monkeypatch):
     """Each message has role, ts, text fields."""
     import app.routes_messages as RM

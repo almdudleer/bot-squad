@@ -47,6 +47,7 @@ router = APIRouter(
 # allowed for deliberate pinning.
 _ALLOWED_MODELS = frozenset({
     "",
+    "codex",
     "sonnet", "opus", "fable",
     "claude-sonnet-5", "claude-opus-5",
     "claude-opus-4-8", "claude-fable-5", "opus[1m]",

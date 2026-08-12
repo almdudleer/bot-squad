@@ -518,6 +518,8 @@ class SpawnRequest(BaseModel):
     initial_prompt: Optional[str] = None
     task_id: Optional[str] = None
     initiative: Optional[str] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
 
 
 @router.post("")
@@ -558,6 +560,10 @@ async def spawn_session(
         params["task_id"] = body.task_id
     if body.initiative:
         params["initiative"] = body.initiative
+    if body.model:
+        params["model"] = body.model
+    if body.provider:
+        params["provider"] = body.provider
 
     try:
         return await client.call_action("spawn_session", params)

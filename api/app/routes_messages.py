@@ -48,6 +48,13 @@ def _get_claude_projects_dir() -> Path:
     return Path(os.path.expanduser("~")) / ".claude" / "projects"
 
 
+def _get_codex_sessions_dir() -> Path:
+    env_override = os.environ.get("CODEX_SESSIONS_DIR")
+    if env_override:
+        return Path(env_override)
+    return Path(os.path.expanduser("~")) / ".codex" / "sessions"
+
+
 def _resolve_jsonl(claude_uuid: str) -> Path | None:
     """Resolve a .jsonl path by UUID, globbing across every project subdir.
 
@@ -61,9 +68,14 @@ def _resolve_jsonl(claude_uuid: str) -> Path | None:
     scoping was always best-effort anyway.
     """
     projects_dir = _get_claude_projects_dir()
-    if not projects_dir.exists():
-        return None
-    matches = list(projects_dir.glob(f"*/{claude_uuid}.jsonl"))
+    matches = (
+        list(projects_dir.glob(f"*/{claude_uuid}.jsonl"))
+        if projects_dir.exists()
+        else []
+    )
+    codex_dir = _get_codex_sessions_dir()
+    if codex_dir.exists():
+        matches.extend(codex_dir.glob(f"*/*/*/rollout-*-{claude_uuid}.jsonl"))
     if not matches:
         return None
     # Newest first — duplicate UUIDs across encoded dirs would be a Claude

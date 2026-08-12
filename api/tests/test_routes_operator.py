@@ -194,6 +194,18 @@ def test_put_model_clears_with_empty_string(tmp_bot_squad, monkeypatch, fake_wor
     assert state["model"] == ""
 
 
+def test_put_model_accepts_codex_provider_choice(
+    tmp_bot_squad, monkeypatch, fake_worker_operator
+):
+    sock, calls, state = fake_worker_operator
+    with _client(tmp_bot_squad, monkeypatch, sock) as client:
+        _login(client)
+        r = client.put(f"{_P}/worker/model", json={"model": "codex"})
+    assert r.status_code == 200, r.text
+    assert state["model"] == "codex"
+    assert calls[-1] == ("fleet_model_set", {"model": "codex"})
+
+
 def test_put_model_rejects_bad_value_without_hitting_worker(tmp_bot_squad, monkeypatch, fake_worker_operator):
     sock, calls, _ = fake_worker_operator
     with _client(tmp_bot_squad, monkeypatch, sock) as client:

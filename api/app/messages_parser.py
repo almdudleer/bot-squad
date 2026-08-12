@@ -85,6 +85,40 @@ def parse_messages(
 
             rec_type = rec.get("type")
 
+            # Codex rollout record. Keep the endpoint's stable message shape;
+            # tool telemetry can be added later without blocking readable
+            # user/assistant transcripts for provider-switched sessions.
+            if rec_type == "response_item":
+                payload = rec.get("payload") or {}
+                if payload.get("type") != "message":
+                    continue
+                raw_role = payload.get("role")
+                if raw_role not in ("user", "assistant"):
+                    continue
+                parts = []
+                for block in payload.get("content") or []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in ("input_text", "output_text", "text"):
+                        parts.append(str(block.get("text") or ""))
+                text = "\n".join(part for part in parts if part)
+                if max_bytes:
+                    text = _truncate(text, max_bytes)
+                if not text.strip():
+                    continue
+                mapped = {
+                    "role": raw_role,
+                    "ts": rec.get("timestamp", ""),
+                    "text": text,
+                }
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                if len(out) >= limit:
+                    return out
+                out.append(mapped)
+                continue
+
             # ----------------------------------------------------------------
             # user record — may contain plain text or tool_result content
             # ----------------------------------------------------------------

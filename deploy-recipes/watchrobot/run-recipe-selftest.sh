@@ -33,6 +33,25 @@
 #   K  `prod --dry-run`                        -> rc 0 without WR_PROD_CONFIRM,
 #                                                because it cannot deploy
 #
+# L-O cover T-0654: the wrapper used to take its log from a bare `mktemp`, i.e.
+# from /tmp — which is NOT writable in the mount namespace a deploy job runs in
+# (`/` is mounted ro there). The log name became the empty string, `tee ""`
+# wrote nothing, and the FATAL cross-check then grepped a file that did not
+# exist, got zero, and printed `DEPLOY_RC=0 — deploy OK`. Cases A-K could not
+# see any of it: they run from an ordinary agent shell, where /tmp is writable.
+#
+#   L  unwritable TMPDIR, FATAL then exit 0    -> NON-ZERO. Before the fix this
+#                                                printed DEPLOY_RC=0 — measured.
+#   M  unwritable TMPDIR, clean recipe         -> rc 0 AND a real log with the
+#                                                recipe's output in it (a green
+#                                                that skipped the check is the
+#                                                defect, not the fix)
+#   N  no writable log dir anywhere            -> refuses loudly, runs nothing
+#   O  log deleted before the cross-check      -> NON-ZERO. The same blindness
+#                                                reached without mktemp: "no
+#                                                FATAL found" and "nowhere to
+#                                                look" must not be one answer.
+#
 # Runs in ~5s, builds nothing, deploys nothing: every recipe here is a scratch
 # file in a temp dir.
 set -uo pipefail
@@ -151,6 +170,53 @@ else
 fi
 assert "K --dry-run prod needs no WR_PROD_CONFIRM (it cannot deploy)" 0 skip \
     env -u WR_PROD_CONFIRM bash "$WRAPPER" prod --dry-run
+
+# ── L-O: an UNWRITABLE TMPDIR (T-0654) ──────────────────────────────────────
+# The condition every case above is blind to, because they inherit a writable
+# /tmp from the shell running them. /proc/nonexistent is the stand-in for the
+# ro-mounted / of a deploy namespace: mktemp cannot create anything under it.
+# FAKE_ROOT gives the wrapper's fallback somewhere writable that is inside this
+# selftest's own temp dir, so the run leaves nothing behind in the data dir.
+NOTMP=/proc/nonexistent
+FAKE_ROOT="$TMP/fake-bot-squad-root"
+
+assert "L unwritable TMPDIR: FATAL with a zero exit is still NOT success" nonzero yes \
+    env TMPDIR="$NOTMP" BOT_SQUAD_ROOT="$FAKE_ROOT" bash "$WRAPPER" "$TMP/fatal0.sh"
+
+# M is the control in the other direction: an unwritable TMPDIR must not turn a
+# healthy deploy into a refusal. And the rc alone would not prove it — a wrapper
+# that silently skipped the cross-check would also pass — so this asserts the
+# log EXISTS and holds the recipe's output.
+assert "M unwritable TMPDIR: a clean recipe still succeeds" 0 no \
+    env TMPDIR="$NOTMP" BOT_SQUAD_ROOT="$FAKE_ROOT" bash "$WRAPPER" "$TMP/ok.sh"
+M_LOG=$(find "$FAKE_ROOT" -name 'wr-deploy-ok.sh-*.log' 2>/dev/null | head -1)
+if [ -n "$M_LOG" ] && grep -q '\[fake\] all good' "$M_LOG"; then
+    echo "ok   M2 the fallback log is real and holds the recipe's output"
+    pass=$((pass + 1))
+else
+    echo "FAIL M2: no fallback log with the recipe's output — the run reported a green without recording one"
+    fail=$((fail + 1))
+fi
+
+# N: nowhere writable at all. The wrapper may not quietly carry on with an empty
+# log name; it has to refuse before running anything.
+N_OUT=$(env TMPDIR="$NOTMP" BOT_SQUAD_ROOT="$NOTMP" bash "$WRAPPER" "$TMP/ok.sh" 2>&1)
+N_RC=$?
+if [ "$N_RC" -ne 0 ] && ! grep -q 'DEPLOY_RC=0' <<<"$N_OUT" && ! grep -q '\[fake\] all good' <<<"$N_OUT"; then
+    echo "ok   N no writable log dir is refused before the recipe runs (rc=$N_RC)"
+    pass=$((pass + 1))
+else
+    echo "FAIL N: expected a refusal with no recipe output, got rc=$N_RC"
+    sed 's/^/      | /' <<<"$N_OUT" | tail -20
+    fail=$((fail + 1))
+fi
+
+# O: the cross-check's own blind spot, reached without touching mktemp — the log
+# is created fine and then disappears. "grep found no FATAL" and "grep had no
+# file" must not collapse into the same green.
+mkrecipe eatlog 'echo "[fake] working"; rm -f "$WR_RUN_LOG"; exit 0'
+assert "O a missing log at cross-check time is a refusal, not 'no FATALs'" nonzero yes \
+    env WR_RUN_LOG="$TMP/eaten.log" bash "$WRAPPER" "$TMP/eatlog.sh"
 
 echo
 echo "== $pass passed, $fail failed =="

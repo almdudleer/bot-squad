@@ -29,7 +29,9 @@
 #   3. An INDEPENDENT cross-check: if the log contains a FATAL line while rc is
 #      0, that disagreement is itself reported as a failure rather than
 #      resolved in favour of the comfortable answer. The false green above would
-#      have been caught by this check alone.
+#      have been caught by this check alone. And if there is no log to read, THAT
+#      is a failure too — "I found no FATAL" and "I had nowhere to look" are not
+#      the same answer (T-0654).
 #   4. Output is tee'd UNFILTERED to a log file. Nothing is grepped away, so the
 #      evidence survives the run.
 #
@@ -108,7 +110,29 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
     LOG="(none — dry run)"
 else
-    LOG="${WR_RUN_LOG:-$(mktemp -t "wr-deploy-$LABEL-XXXXXX.log")}"
+    # NOT a bare `mktemp` (T-0654). A deploy job runs in a mount namespace with
+    # `/` mounted ro, so `/tmp` is NOT writable there, and this script is
+    # deliberately without `set -e` — a failed `mktemp` therefore used to leave
+    # LOG as the EMPTY STRING. `tee ""` then wrote nothing and the independent
+    # FATAL cross-check below had no file to read, which is the one check this
+    # wrapper exists for. Third instrument here with that illness: the staging
+    # recipe works around it by exporting TMPDIR into the repo, the ops probes
+    # by `mktemp -p "$SCRATCH" || fail`.
+    #
+    # So: `-p` an explicitly chosen directory — first writable candidate wins —
+    # and a loud refusal if the file still does not appear. An empty LOG must
+    # never reach `tee`.
+    LOG_DIR=""
+    for cand in "${TMPDIR:-/tmp}" "$BOT_SQUAD_ROOT/data/$SLUG/_run-recipe-logs"; do
+        mkdir -p "$cand" 2>/dev/null
+        [ -d "$cand" ] && [ -w "$cand" ] || continue
+        LOG_DIR="$cand"
+        break
+    done
+    [ -n "$LOG_DIR" ] || die "no writable directory for the run log (tried '${TMPDIR:-/tmp}' and '$BOT_SQUAD_ROOT/data/$SLUG/_run-recipe-logs'); a deploy namespace mounts / read-only, so /tmp is not writable there — pass WR_RUN_LOG=<path> to choose one"
+    LOG="${WR_RUN_LOG:-$(mktemp -p "$LOG_DIR" "wr-deploy-$LABEL-XXXXXX.log")}"
+    [ -n "$LOG" ] || die "could not create a run log in '$LOG_DIR' — refusing, because a deploy whose output nothing records is a deploy whose FATAL cross-check is disarmed"
+    touch "$LOG" || die "run log '$LOG' cannot be written — refusing rather than deploying with the FATAL cross-check disarmed"
 fi
 
 # State WHICH file is about to run, with its hash. Four times in one morning
@@ -139,19 +163,45 @@ rc=${PIPESTATUS[0]}
 
 ELAPSED=$((SECONDS - START_S))
 
-# Independent cross-check on the rc, deliberately not derived from it. This is
-# the check that would have caught the original false green on its own.
-fatal_lines=$(grep -c 'FATAL' "$LOG" 2>/dev/null || true)
-: "${fatal_lines:=0}"
-
 echo
 echo "    finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)  wall clock ${ELAPSED}s  load $(cut -d' ' -f1-3 /proc/loadavg)"
 
 if [ "$rc" -ne 0 ]; then
     echo "=== DEPLOY_RC=$rc — DEPLOY FAILED ($LABEL) ==="
+    [ -r "$LOG" ] || echo "    NOTE: the run log '$LOG' is missing or unreadable — the evidence for this failure was not recorded (T-0654)."
     echo "    full log: $LOG"
     exit "$rc"
 fi
+
+# Independent cross-check on the rc, deliberately not derived from it. This is
+# the check that would have caught the original false green on its own — so it
+# runs BELOW the rc branch, which makes `DEPLOY_RC=0` unreachable without a log
+# that was actually read.
+#
+# It must tell "no FATAL in the log" apart from "there was nowhere to look"
+# (T-0654). The old form — `grep -c 'FATAL' "$LOG" 2>/dev/null || true` with
+# `: "${fatal_lines:=0}"` — answered ZERO for a missing log: it reported "no
+# FATALs" without having read anything, silently, with the stderr that would
+# have said so redirected away. A check that cannot see its own blindness is
+# not a check, so absence of a log is a REFUSAL, not a clean bill of health.
+if [ ! -f "$LOG" ] || [ ! -r "$LOG" ]; then
+    echo "=== DEPLOY_RC=1 — DEPLOY FAILED ($LABEL) ===" >&2
+    echo "    The run log '$LOG' is missing or unreadable, so the independent FATAL cross-check never ran." >&2
+    echo "    The recipe's own exit status was $rc, but this wrapper exists precisely because a recipe's own" >&2
+    echo "    rc is not trusted alone — an unread log cannot corroborate it, so no green is claimed here." >&2
+    echo "    A read-only /tmp in a deploy namespace is the usual cause; pass WR_RUN_LOG=<writable path>." >&2
+    exit 1
+fi
+
+fatal_lines=$(grep -c 'FATAL' "$LOG")
+grep_rc=$?
+if [ "$grep_rc" -gt 1 ]; then    # 0 = matched, 1 = no match, >1 = grep itself failed
+    echo "=== DEPLOY_RC=1 — DEPLOY FAILED ($LABEL) ===" >&2
+    echo "    grep exited $grep_rc reading '$LOG': the FATAL cross-check did not complete, so nothing here" >&2
+    echo "    is entitled to report a green. The recipe's own exit status was $rc." >&2
+    exit 1
+fi
+: "${fatal_lines:=0}"
 
 if [ "$fatal_lines" -gt 0 ]; then
     # Deliberately does NOT print the token `DEPLOY_RC=0`, even though the

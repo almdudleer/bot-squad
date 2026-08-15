@@ -52,14 +52,55 @@
 #                                                FATAL found" and "nowhere to
 #                                                look" must not be one answer.
 #
+#   P  THIS script with an unwritable TMPDIR   -> refuses at the mktemp with
+#                                                rc 91, never reaches a case, so
+#                                                nothing is written to / (T-0675)
+#
 # Runs in ~5s, builds nothing, deploys nothing: every recipe here is a scratch
 # file in a temp dir.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WRAPPER="$HERE/run-recipe.sh"
+
+# A failed `mktemp -d` is a REFUSAL here, not a continuation (T-0675; same form
+# and same rc as the guard T-0655 put on prod-rollback-selftest.sh).
+#
+# `set -u` does not catch this and never could: the variable IS assigned — to
+# the empty string. And this script is deliberately without `set -e`, so the
+# failure carried straight on. Every scratch path below is built as "$TMP/…",
+# so an EMPTY $TMP turns a sandbox-relative path into an ABSOLUTE one and the
+# writes land in the FILESYSTEM ROOT of whatever box this runs on.
+#
+# Measured before this guard existed, with `mktemp` shimmed to fail and the run
+# confined to a bwrap sandbox whose / was a scratch dir: the script ran to
+# completion (9 passed, 9 failed) and left NINE entries at the sandbox root —
+# ok.sh, silentfail.sh, fatal0.sh, fatal22.sh, noisy.sh, suicide.sh, eatlog.sh,
+# noisy-run.log and the directory fake-bot-squad-root/. Under uid 1000 on a real
+# box those writes are Permission denied and the suite merely reddens, which is
+# exactly why it survived; run once as root and it litters /.
 TMP="$(mktemp -d -t wr-run-recipe-selftest-XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+if [ -z "${TMP:-}" ] || [ ! -d "$TMP" ]; then
+    echo "FATAL: mktemp -d produced no usable directory (TMP='${TMP:-}', TMPDIR='${TMPDIR:-<unset>}')." >&2
+    echo "       Refusing to run. Every scratch path here is built as \"\$TMP/<name>\", so an empty" >&2
+    echo "       TMP makes them absolute (/ok.sh, /fatal0.sh, /fake-bot-squad-root/, …) and this" >&2
+    echo "       selftest would write into the filesystem root." >&2
+    echo "       A deploy namespace mounts / read-only, so /tmp is not writable there — set TMPDIR" >&2
+    echo "       to a writable directory and re-run." >&2
+    exit 91
+fi
+
+# The trap gets the same question asked of it. `rm -rf ""` is harmless today —
+# and that is the problem: a silent no-op is indistinguishable from a cleanup
+# that worked. It says which one happened instead.
+_cleanup() {
+    if [ -n "${TMP:-}" ] && [ -d "$TMP" ]; then
+        rm -rf "$TMP"
+    else
+        echo "WARN: no cleanup performed — TMP was '${TMP:-}', which is not a directory." >&2
+    fi
+}
+trap _cleanup EXIT
 
 pass=0
 fail=0
@@ -217,6 +258,49 @@ fi
 mkrecipe eatlog 'echo "[fake] working"; rm -f "$WR_RUN_LOG"; exit 0'
 assert "O a missing log at cross-check time is a refusal, not 'no FATALs'" nonzero yes \
     env WR_RUN_LOG="$TMP/eaten.log" bash "$WRAPPER" "$TMP/eatlog.sh"
+
+
+# ── P: an unwritable TMPDIR refuses instead of writing into / (T-0675) ───────
+# The guard at the top of this file is the only thing between a failed
+# `mktemp -d` and nine files in the filesystem root, and a guard that has never
+# been made to fire is an untested claim. So: run THIS script again with TMPDIR
+# unwritable. The child must refuse with the guard's OWN rc, name the reason,
+# and never reach the case list. It exits at the guard, so it cannot recurse;
+# WR_RRS_NO_RECURSE is the backstop for the day the guard regresses.
+#
+# The sentinel is deliberately NOT the name prod-rollback-selftest.sh uses: one
+# shared mute switch would silently skip this case in both files the day
+# anything exports it.
+#
+# "any non-zero rc" would be VACUOUS here — a child that ran the whole suite and
+# merely failed it also exits non-zero. It must be 91, the guard's own code.
+if [ -z "${WR_RRS_NO_RECURSE:-}" ]; then
+    P_OUT="$(env TMPDIR=/proc/nonexistent WR_RRS_NO_RECURSE=1 \
+                 bash "${BASH_SOURCE[0]}" 2>&1)"
+    P_RC=$?
+    if [ "$P_RC" = "91" ]; then
+        echo "ok   P unwritable TMPDIR: refused with the mktemp guard's own rc=91"
+        pass=$((pass + 1))
+    else
+        echo "FAIL P: expected rc 91 from the mktemp guard, got $P_RC"
+        sed 's/^/      | /' <<<"$P_OUT" | tail -10
+        fail=$((fail + 1))
+    fi
+    if grep -qF 'mktemp -d produced no usable directory' <<<"$P_OUT"; then
+        echo "ok   P2 the refusal names the failed mktemp"
+        pass=$((pass + 1))
+    else
+        echo "FAIL P2: refused without naming the reason"
+        fail=$((fail + 1))
+    fi
+    if grep -qF '== run-recipe.sh selftest ==' <<<"$P_OUT"; then
+        echo "FAIL P3: the child started the case list anyway — the guard let it through"
+        fail=$((fail + 1))
+    else
+        echo "ok   P3 the child never reached a single case (nothing was written)"
+        pass=$((pass + 1))
+    fi
+fi
 
 echo
 echo "== $pass passed, $fail failed =="

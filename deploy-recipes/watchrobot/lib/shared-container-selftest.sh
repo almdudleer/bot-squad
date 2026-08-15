@@ -12,6 +12,10 @@
 #     Error response from daemon: Conflict. The container name "/..." is
 #     already in use by container "..."
 #
+#   T   THIS script with an unwritable TMPDIR -> refuses at the mktemp with
+#                                               rc 91, never reaches a case, so
+#                                               nothing is written to / (T-0675)
+#
 #   R1  reclaim, no such container            -> rc 0, no-op
 #   R2  reclaim, foreign compose project      -> rc 0 AND the container is gone
 #   R3  reclaim, correct compose project      -> rc 0 AND the SAME container id
@@ -60,12 +64,46 @@ SC="$HERE/shared-container.sh"
 C="wr-t0427-sc-$$"          # scratch container name under test
 OURS="wr-t0427-ours-$$"     # the pinned ("our") compose project
 THEIRS="wr-t0427-theirs-$$" # a foreign compose project
-TMP="$(mktemp -d -t wr-shared-container-selftest-XXXXXX)"
 
+# A failed `mktemp -d` is a REFUSAL here, not a continuation (T-0675; same form
+# and same rc as the guard T-0655 put on prod-rollback-selftest.sh).
+#
+# `set -u` does not catch this and never could: the variable IS assigned — to
+# the empty string. And this script is deliberately without `set -e`, so the
+# failure carried straight on. `cat > "$TMP/compose.yml"` then becomes
+# `cat > /compose.yml`: a write into the FILESYSTEM ROOT of whatever box this
+# runs on, and `docker compose -f /compose.yml` reads it back from there.
+#
+# Measured before this guard existed, with `mktemp` shimmed to fail and the run
+# confined to a bwrap sandbox whose / was a scratch dir: the script ran to
+# completion (9 passed, 11 failed) and left /compose.yml at the sandbox root.
+# Under uid 1000 on a real box that write is Permission denied and the suite
+# merely reddens, which is exactly why it survived; run once as root and it
+# lands in /.
+TMP="$(mktemp -d -t wr-shared-container-selftest-XXXXXX)"
+if [ -z "${TMP:-}" ] || [ ! -d "$TMP" ]; then
+    echo "FATAL: mktemp -d produced no usable directory (TMP='${TMP:-}', TMPDIR='${TMPDIR:-<unset>}')." >&2
+    echo "       Refusing to run. The compose file here is written as \"\$TMP/compose.yml\", so an" >&2
+    echo "       empty TMP makes that path absolute (/compose.yml) and this selftest would write" >&2
+    echo "       into the filesystem root." >&2
+    echo "       A deploy namespace mounts / read-only, so /tmp is not writable there — set TMPDIR" >&2
+    echo "       to a writable directory and re-run." >&2
+    exit 91
+fi
+
+# The cleanup gets the same question asked of it. `rm -rf ""` is harmless today
+# — and that is the problem: a silent no-op is indistinguishable from a cleanup
+# that worked. It says which one happened instead, and it does not hand an
+# absolute /compose.yml to `docker compose` on the way out either.
 cleanup() {
-    docker compose -p "$OURS" -f "$TMP/compose.yml" down -t 1 >/dev/null 2>&1
-    docker rm -f "$C" >/dev/null 2>&1
-    rm -rf "$TMP"
+    if [ -n "${TMP:-}" ] && [ -d "$TMP" ]; then
+        docker compose -p "$OURS" -f "$TMP/compose.yml" down -t 1 >/dev/null 2>&1
+        docker rm -f "$C" >/dev/null 2>&1
+        rm -rf "$TMP"
+    else
+        docker rm -f "$C" >/dev/null 2>&1
+        echo "WARN: no temp-dir cleanup performed — TMP was '${TMP:-}', which is not a directory." >&2
+    fi
 }
 trap cleanup EXIT
 
@@ -233,6 +271,36 @@ if [ "$before_id" = "$after_id" ] && [ "$after_id" != "MISSING" ]; then
     ok "E5 a repeat run is a true no-op (same container id)"
 else
     bad "E5: a repeat run recreated the container ($before_id -> $after_id)"
+fi
+
+
+# ── T: an unwritable TMPDIR refuses instead of writing /compose.yml (T-0675) ─
+# The guard at the top of this file is the only thing between a failed
+# `mktemp -d` and a write into the filesystem root, and a guard that has never
+# been made to fire is an untested claim. So: run THIS script again with TMPDIR
+# unwritable. The child must refuse with the guard's OWN rc, name the reason,
+# and never reach the docker preflight. It exits at the guard, so it cannot
+# recurse; WR_SCS_NO_RECURSE is the backstop for the day the guard regresses.
+#
+# The sentinel is deliberately NOT the name the other two selftests use: one
+# shared mute switch would silently skip this case in every file the day
+# anything exports it.
+#
+# "any non-zero rc" would be VACUOUS here — a child that ran the whole suite and
+# merely failed it also exits non-zero. It must be 91, the guard's own code.
+if [ -z "${WR_SCS_NO_RECURSE:-}" ]; then
+    T_OUT="$(env TMPDIR=/proc/nonexistent WR_SCS_NO_RECURSE=1 \
+                 bash "${BASH_SOURCE[0]}" 2>&1)"
+    T_RC=$?
+    [ "$T_RC" = "91" ] \
+        && ok "T unwritable TMPDIR: refused with the mktemp guard's own rc=91" \
+        || { bad "T: expected rc 91 from the mktemp guard, got $T_RC"; sed 's/^/      | /' <<<"$T_OUT" | tail -10; }
+    grep -qF 'mktemp -d produced no usable directory' <<<"$T_OUT" \
+        && ok "T2 the refusal names the failed mktemp" \
+        || bad "T2: refused without naming the reason"
+    grep -qF '== shared-container.sh selftest ==' <<<"$T_OUT" \
+        && bad "T3: the child started the case list anyway — the guard let it through" \
+        || ok "T3 the child never reached a single case (nothing was written)"
 fi
 
 echo

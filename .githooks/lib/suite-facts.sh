@@ -182,3 +182,98 @@ sf_resolve_pre() {
     fi
     return 1
 }
+
+# ===========================================================================
+# THE SHARED-TREE LEAK GUARD
+# ===========================================================================
+#
+# ONE copy, for every harness that carries these guards. It used to be two, and
+# they had already drifted before anyone looked: `need_sandbox` in the commit
+# suite accepted only a directory `.git`, the push suite's also accepted a
+# `.git` FILE and a bare repo's `objects/`; `need_under_work` existed in one
+# suite only; and the selftest had two arms in one and four in the other. Two
+# copies of the guard that catches a run being redirected into a live tree drift
+# exactly like everything else does — and the one that drifts is the one nobody
+# has watched fire. This file is what both suites already source, so it is where
+# the single copy belongs.
+#
+# WHAT IT IS FOR. On 2026-08-15 a helper written as
+#     local n="$1" src="$2" inst="$3" d="$W/$n"
+# died on its first call: bash expands every right-hand side on a `local` line
+# BEFORE assigning any of them, so under `set -u` `$n` was still unbound. The
+# path came back EMPTY, and every `git -C ""` and `cd ""` after it ran against
+# the shared watchrobot clone — unsetting core.hooksPath for a moment and
+# writing `user.name=t` / `user.email=t@t` into its config. What stopped it
+# becoming a commit was the identity gate, not the harness.
+#
+# AND THE PART WORTH REMEMBERING: this guard already existed that day, with
+# these same self-tests, since T-0657. It was not missing — it simply was not
+# used, because the run was "just a quick probe" and a quick probe did not feel
+# worth a harness. That is the whole lesson. A one-off probe against a live tree
+# is exactly the run that has no reviewer, no second pair of eyes and no test
+# around it, which makes it the run that most needs the guard, not the least.
+#
+# `$WORK` is read at CALL time, so a suite may set it after sourcing this file;
+# it must be set before the first call.
+
+# sbx <dir> <git args…>  — git, but only ever inside the sandbox.
+sbx() {
+    local d
+    d="${1-}"
+    shift
+    case "$d" in
+        "$WORK"/*) ;;
+        *) printf '\n\033[31mFATAL\033[0m: refusing git outside the sandbox: %q\n' "$d" >&2
+           printf 'sandbox is %q — this is the shared-tree leak guard, do not remove it.\n' "$WORK" >&2
+           exit 99 ;;
+    esac
+    git -C "$d" "$@"
+}
+
+# need_sandbox <dir> — abort unless <dir> is a live sandbox repo. Accepts a
+# `.git` directory, a `.git` FILE (a worktree) and a bare repo's `objects/`:
+# the push suite needs the last two for its remotes, and a guard that is stricter
+# in one harness than another is two guards.
+need_sandbox() {
+    local d
+    d="${1-}"
+    case "$d" in
+        "$WORK"/*) [ -e "$d/.git" ] || [ -d "$d/objects" ] && return 0 ;;
+    esac
+    printf '\n\033[31mFATAL\033[0m: sandbox path is not usable: %q\n' "$d" >&2
+    exit 99
+}
+
+# need_under_work <dir> — abort unless a WRITE target is inside the sandbox.
+# Separate from need_sandbox because a directory that does not exist yet is a
+# legitimate write target and not yet a repo.
+need_under_work() {
+    local d
+    d="${1-}"
+    case "$d" in
+        "$WORK"/*) return 0 ;;
+    esac
+    printf '\n\033[31mFATAL\033[0m: refusing to write outside the sandbox: %q\n' "$d" >&2
+    exit 99
+}
+
+# sbx_selftest — prove the guard fires, BEFORE anything relies on it.
+#
+# It must be the first thing a suite runs. A guard checked after it has already
+# been used is not a guard, it is a report on damage. Needs `ok`/`bad` from the
+# calling suite; both define them before section 0.
+sbx_selftest() {
+    local rc
+    ( sbx "$REPO" status >/dev/null 2>&1 ) ; rc=$?
+    [ "$rc" -eq 99 ] && ok "sandbox guard refuses a git call aimed at the real clone" \
+                     || bad "sandbox guard did NOT fire on the real clone (rc=$rc) — harness is unsafe"
+    ( sbx "" status >/dev/null 2>&1 ) ; rc=$?
+    [ "$rc" -eq 99 ] && ok "sandbox guard refuses an EMPTY path (the exact 2026-08-15 failure)" \
+                     || bad "sandbox guard did NOT fire on an empty path (rc=$rc) — harness is unsafe"
+    ( need_sandbox "$REPO" >/dev/null 2>&1 ) ; rc=$?
+    [ "$rc" -eq 99 ] && ok "need_sandbox refuses the real clone too" \
+                     || bad "need_sandbox did NOT fire on the real clone (rc=$rc)"
+    ( need_under_work "$REPO/.githooks" >/dev/null 2>&1 ) ; rc=$?
+    [ "$rc" -eq 99 ] && ok "need_under_work refuses writing into the real clone's .githooks" \
+                     || bad "need_under_work did NOT fire on the real .githooks (rc=$rc) — an edit there is live for every peer"
+}

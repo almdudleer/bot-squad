@@ -107,6 +107,14 @@ The alternative costs an instrument that everybody trusts and nobody can use —
 and an instrument that lies towards alarm gets switched off exactly as fast as
 one that lies towards calm.
 
+**A second lesson from the same day, and it is not about arms.** The sandbox
+guard that would have stopped the shared-tree leak on 2026-08-15 already
+existed, with these same self-tests, since T-0657. Nothing was missing. It was
+simply not used, because the run was "just a quick probe" and a quick probe did
+not feel worth a harness. That is backwards: a one-off probe against a live tree
+has no reviewer, no second pair of eyes and no test around it, which makes it
+the run that needs the guard most, not least.
+
 ## A declared exception needs a stated reason, or it is not a declaration (T-0659)
 
 `repo-facts` can declare a secret-like path that is **deliberately** left out of

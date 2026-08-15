@@ -94,41 +94,15 @@ skip()  { SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m  %s\n' "$1"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # ---------------------------------------------------------------------------
-# sbx <dir> <git args...>  — git, but only ever inside the sandbox.
+# sbx / need_sandbox / need_under_work / sbx_selftest now live ONE copy over in
+# `.githooks/lib/suite-facts.sh`, which this suite already sources above. They
+# were two copies here and in the sibling suite, and they had already drifted —
+# different `need_sandbox`, `need_under_work` in only one of them, two selftest
+# arms against four. A guard that catches a run being redirected into a live
+# tree is the last thing that should exist in two versions. Read that file for
+# what the guard is for and why a "quick probe" is the run that needs it most.
 # ---------------------------------------------------------------------------
-sbx() {
-    local d
-    d="${1-}"
-    shift
-    case "$d" in
-        "$WORK"/*) ;;
-        *) printf '\n\033[31mFATAL\033[0m: refusing git outside the sandbox: %q\n' "$d" >&2
-           printf 'sandbox is %q — this is the shared-tree leak guard, do not remove it.\n' "$WORK" >&2
-           exit 99 ;;
-    esac
-    git -C "$d" "$@"
-}
 
-# need_sandbox <dir> — abort unless <dir> is a live sandbox repo
-need_sandbox() {
-    local d
-    d="${1-}"
-    case "$d" in
-        "$WORK"/*) [ -d "$d/.git" ] && return 0 ;;
-    esac
-    printf '\n\033[31mFATAL\033[0m: sandbox path is not usable: %q\n' "$d" >&2
-    exit 99
-}
-
-sbx_selftest() {
-    local rc
-    ( sbx "$REPO" status >/dev/null 2>&1 ) ; rc=$?
-    [ "$rc" -eq 99 ] && ok "sandbox guard refuses a git call aimed at the real clone" \
-                     || bad "sandbox guard did NOT fire on the real clone (rc=$rc) — harness is unsafe"
-    ( sbx "" status >/dev/null 2>&1 ) ; rc=$?
-    [ "$rc" -eq 99 ] && ok "sandbox guard refuses an EMPTY path (the exact 2026-08-15 failure)" \
-                     || bad "sandbox guard did NOT fire on an empty path (rc=$rc) — harness is unsafe"
-}
 
 # ---------------------------------------------------------------------------
 # new_clone <name> [old|new]   — sets the global D

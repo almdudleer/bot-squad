@@ -166,7 +166,16 @@ def resolve_slug(cwd: str | None = None) -> str:
 
 
 def my_sid() -> str | None:
-    """Compute this session's SID from tmux (mirrors hook_my_sid.sh)."""
+    """Compute this session's SID from tmux (mirrors hook_my_sid.sh).
+
+    ``BSQ_SID`` overrides, for callers that have no tmux to be asked — the
+    T-0891 project-resolution tests drive the real CLI as a subprocess, and a
+    guard whose decisive signal cannot be set in a test is a guard nobody has
+    watched fail.
+    """
+    env_sid = os.environ.get("BSQ_SID", "").strip()
+    if env_sid:
+        return env_sid
     hook = f"{BOT_SQUAD}/scripts/hooks/hook_my_sid.sh"
     if os.path.exists(hook):
         try:
@@ -251,6 +260,240 @@ def find_ticket(slug: str, ticket: str) -> Path:
         f"{len(exact)} declare id: {ticket} in frontmatter (need exactly 1) — "
         f"{', '.join(str(p) for p in matches)} (see T-0231)"
     )
+
+
+# --------------------------------------------------------------------------
+# WHICH PROJECT does a ticket id belong to (T-0891)
+# --------------------------------------------------------------------------
+# T-0231 made `find_ticket` strict about picking the right file WITHIN one
+# project. It cannot see the other half of the problem: the same `T-NNNN`
+# exists in several projects (measured 2026-08-15 on this install: 480 of 883
+# distinct ids live in more than one slug), the slug was picked from `$PWD`
+# alone, and nothing in the output named it. So a session working a watchrobot
+# ticket that `cd`s into the bot-squad repo — which it MUST, to commit code
+# that lives there — silently addressed bot-squad's same-numbered ticket. That
+# happened for real on 2026-08-14: `## Executive summary` and `## Context` of a
+# closed foreign ticket were REPLACED and the originals are gone, because
+# `data/` is outside git.
+#
+# The fix is a second, cd-immune signal. A session is REGISTERED under the slug
+# it was spawned for (`data/<slug>/sessions/<SID>.md`); that binding does not
+# move when the session changes directory, so it is the one signal that
+# disagrees with `$PWD` exactly in the situation that goes wrong. Rules below
+# in `resolve_ticket_ref`.
+
+def registered_slugs() -> list[str]:
+    """Every project slug in the registry, in file order."""
+    try:
+        with open(PROJECTS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+    except OSError as e:
+        die(f"cannot read {PROJECTS_TOML}: {e}")
+    return list(cfg.get("projects", {}))
+
+
+def resolve_slug_soft(cwd: str | None = None) -> str | None:
+    """`resolve_slug` that returns None instead of exiting.
+
+    A cwd outside every registered project is a normal state here (a session
+    running from its scratchpad) — it means "no signal", not "fatal".
+    """
+    try:
+        with open(PROJECTS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+    except OSError:
+        return None
+    cwd = cwd or os.getcwd()
+    real_cwd = os.path.realpath(cwd)
+
+    def _match(target: str) -> bool:
+        if not target:
+            return False
+        rt = os.path.realpath(target)
+        t = target.rstrip("/")
+        return (
+            cwd == target
+            or cwd.startswith(t + "/")
+            or real_cwd == rt
+            or real_cwd.startswith(rt + "/")
+        )
+
+    for slug, p in cfg.get("projects", {}).items():
+        for key in ("repo_path", "repo_master", "repo_workspace"):
+            if _match(p.get(key, "")):
+                return slug
+    return None
+
+
+def session_slug(sid: str | None = None) -> str | None:
+    """The slug THIS SESSION was spawned under, from its registry md.
+
+    Immune to `cd` — which is the entire point: it is the only signal that
+    still says "watchrobot" while `$PWD` says "bot-squad".
+    """
+    sid = sid or my_sid()
+    if not sid:
+        return None
+    for slug in registered_slugs():
+        if (Path(BOT_SQUAD) / "data" / slug / "sessions" / f"{sid}.md").exists():
+            return slug
+    return None
+
+
+def split_ticket_ref(ref: str) -> tuple[str, str | None]:
+    """``T-0655@watchrobot`` -> ``('T-0655', 'watchrobot')``; plain id -> slug None."""
+    ref = (ref or "").strip()
+    tid, sep, slug = ref.partition("@")
+    return tid.strip(), (slug.strip() or None) if sep else None
+
+
+def _ticket_file_in(slug: str, ticket: str) -> Path | None:
+    """The ticket's file inside `slug`, or None. Never exits (unlike find_ticket)."""
+    d = backlog_dir(slug)
+    if not d.is_dir():
+        return None
+    matches = sorted(d.glob(f"{ticket}-*.md"))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    exact = [p for p in matches if read_frontmatter(p).get("id") == ticket]
+    return exact[0] if len(exact) == 1 else matches[0]
+
+
+def _ticket_title(path: Path) -> str:
+    return str(read_frontmatter(path).get("title", "") or "").strip()
+
+
+def _candidate_projects(ticket: str) -> list[tuple[str, Path]]:
+    """(slug, path) for every registered project holding this id."""
+    out = []
+    for slug in registered_slugs():
+        p = _ticket_file_in(slug, ticket)
+        if p is not None:
+            out.append((slug, p))
+    return out
+
+
+def _refuse_ambiguous(ticket: str, candidates: list[tuple[str, Path]],
+                      why: str) -> None:
+    lines = [
+        f"refusing to guess which project {ticket} means — {why}.",
+        "",
+        f"{ticket} exists in {len(candidates)} projects:",
+    ]
+    for slug, path in candidates:
+        title = _ticket_title(path)
+        lines.append(f"  {slug:14s} {title[:72]}")
+        lines.append(f"  {'':14s} {path}")
+    lines += [
+        "",
+        "Name the project explicitly and re-run:",
+        f"  bsq ticket <verb> {ticket}@{candidates[0][0]} ...",
+        f"  bsq ticket <verb> {ticket} --slug {candidates[0][0]} ...",
+    ]
+    die("\n".join(lines), code=3)
+
+
+def resolve_ticket_ref(ref: str, explicit_slug: str | None = None,
+                       *, verb: str = "ticket", announce: bool = True
+                       ) -> tuple[str, str, Path]:
+    """Resolve a ticket reference to (slug, ticket_id, path) — or refuse.
+
+    Order of authority:
+
+    1. **Explicit** — ``T-0655@watchrobot`` or ``--slug/--project``. Always
+       obeyed; the caller has said which board they mean.
+    2. **The session's own project**, from the session registry. Wins over
+       ``$PWD``, because ``$PWD`` is what moves when you go and commit code in
+       another repo. If the cwd names a DIFFERENT project that also holds this
+       id, the two signals conflict and we refuse — that conflict is precisely
+       the 2026-08-14 incident.
+    3. **`$PWD`**, and only when the id is unique across projects. A colliding
+       id backed by nothing but the cwd is refused (this ticket's DoD 3).
+
+    Nothing here is silent: the resolved slug and file are announced on stderr
+    BEFORE the caller writes, so a wrong target is visible in the transcript
+    even on the paths that legitimately pass. stderr rather than stdout so
+    `--json` output stays machine-parseable and the announcement survives a
+    pipe that swallows stdout.
+    """
+    tid, ref_slug = split_ticket_ref(ref)
+    if not tid:
+        die(f"empty ticket id in {ref!r}")
+    if ref_slug and explicit_slug and ref_slug != explicit_slug:
+        die(f"conflicting project: {ref!r} says {ref_slug!r} but "
+            f"--slug says {explicit_slug!r} — pass one of them")
+    chosen = ref_slug or explicit_slug
+
+    if chosen:
+        known = registered_slugs()
+        if chosen not in known:
+            die(f"unknown project slug {chosen!r} — registered: {', '.join(known)}")
+        path = find_ticket(chosen, tid)
+        if announce:
+            _announce_target(verb, chosen, tid, path, "explicit")
+        return chosen, tid, path
+
+    candidates = _candidate_projects(tid)
+    if not candidates:
+        die(f"ticket not found in any registered project: {tid} "
+            f"(looked in {', '.join(registered_slugs())})")
+    cand_slugs = {s for s, _ in candidates}
+    by_slug = dict(candidates)
+
+    sess = session_slug()
+    cwd = resolve_slug_soft()
+
+    if sess and sess in cand_slugs:
+        if cwd and cwd != sess and cwd in cand_slugs:
+            _refuse_ambiguous(
+                tid, candidates,
+                f"your session belongs to {sess!r} but your cwd is in {cwd!r}, "
+                f"and both hold this id")
+        if announce:
+            _announce_target(verb, sess, tid, by_slug[sess], "your session's project")
+        return sess, tid, by_slug[sess]
+
+    if sess and sess not in cand_slugs:
+        _refuse_ambiguous(
+            tid, candidates,
+            f"your session belongs to {sess!r}, which has no {tid} — so this "
+            f"would write to another project's board")
+
+    if cwd and cwd in cand_slugs:
+        if len(candidates) > 1:
+            _refuse_ambiguous(
+                tid, candidates,
+                "the only signal is your cwd, and this id is not unique")
+        if announce:
+            _announce_target(verb, cwd, tid, by_slug[cwd], "cwd (id is unique)")
+        return cwd, tid, by_slug[cwd]
+
+    if len(candidates) == 1 and not sess and not cwd:
+        slug, path = candidates[0]
+        if announce:
+            _announce_target(verb, slug, tid, path, "only project holding this id")
+        return slug, tid, path
+
+    _refuse_ambiguous(
+        tid, candidates,
+        "no session binding and no cwd inside a registered project")
+
+
+def _announce_target(verb: str, slug: str, ticket: str, path: Path,
+                     basis: str) -> None:
+    """DoD 1: name the slug and the FILE before the write, never after.
+
+    «context set on T-0655» is what the incident printed, and it is true of
+    both tickets. Print what distinguishes them.
+    """
+    title = _ticket_title(path)
+    head = f"bsq {verb}: {ticket} -> project {slug} ({basis})"
+    print(head, file=sys.stderr)
+    if title:
+        print(f"  title: {title[:96]}", file=sys.stderr)
+    print(f"  file:  {path}", file=sys.stderr)
 
 
 def _strip_surrounding_quotes(v: str) -> str:
@@ -5132,14 +5375,30 @@ def _write_atomic(path: Path, content: str) -> None:
     os.rename(tmp, path)
 
 
+def _print_rollback(res: dict) -> None:
+    """Name the pre-write snapshot a REPLACE verb just left behind (T-0891 DoD 4).
+
+    `data/` is outside git, so `context`/`summary` used to be the only edits in
+    the system with no undo of any kind. The worker now snapshots the whole
+    ticket before it rewrites it; printing the path is what makes that snapshot
+    reachable by whoever needs it, at the moment they still remember what they
+    overwrote.
+    """
+    bak = res.get("backup_path")
+    if bak:
+        print(f"  previous version: {bak}")
+
+
 def cmd_ticket_status(args) -> None:
-    slug = resolve_slug()
-    path = find_ticket(slug, args.id.strip())
+    slug, tid, path = resolve_ticket_ref(
+        args.id, getattr(args, "slug", None), verb="ticket status",
+        announce=not args.json)
     fm = read_frontmatter(path)
     if args.json:
-        print(json.dumps({"id": args.id, "file": str(path), **fm}))
+        print(json.dumps({"id": tid, "slug": slug, "file": str(path), **fm}))
         return
-    print(f"{fm.get('id', args.id)}  {fm.get('title', '')}")
+    print(f"{fm.get('id', tid)}  {fm.get('title', '')}")
+    print(f"  project:    {slug}")
     print(f"  status:     {fm.get('status', '?')}")
     print(f"  owner:      {fm.get('owner', '-')}")
     print(f"  initiative: {fm.get('initiative', '-')}")
@@ -5148,11 +5407,11 @@ def cmd_ticket_status(args) -> None:
 
 
 def cmd_ticket_update(args) -> None:
-    slug = resolve_slug()
     status = args.status.strip()
     if status not in TICKET_STATUSES:
         die(f"invalid status {status!r}; canonical: {', '.join(TICKET_STATUSES)}")
-    path = find_ticket(slug, args.id.strip())
+    slug, tid, path = resolve_ticket_ref(
+        args.id, getattr(args, "slug", None), verb="ticket update")
     # T-0591 (F3.3): gate the planned/open -> in_progress transition — the
     # moment real build work starts — on a stakeholder-sourced ticket having
     # ACTUAL verbatim words, not the task_new stub. Later transitions
@@ -5164,7 +5423,7 @@ def cmd_ticket_update(args) -> None:
             verbatim = _extract_verbatim_section(path)
             if _verbatim_is_placeholder(verbatim):
                 die(
-                    f"{args.id}: refusing planned/open -> in_progress — "
+                    f"{tid}: refusing planned/open -> in_progress — "
                     "this is a stakeholder-sourced ticket but its "
                     "'## Verbatim request' section is empty or still the "
                     "task_new placeholder. Paste the stakeholder's actual "
@@ -5191,7 +5450,7 @@ def cmd_ticket_update(args) -> None:
     new_fm = "\n".join(lines)
     new_text = text[:m.start(1)] + new_fm + text[m.end(1):]
     _write_atomic(path, new_text)
-    print(f"{args.id}: status {old} -> {status}")
+    print(f"{tid}: status {old} -> {status}")
     # No tree-wide lint here: the status value was validated against
     # TICKET_STATUSES before the write, so the file we just wrote is
     # canonical by construction. (scripts/lint/backlog_frontmatter.py scans
@@ -5204,21 +5463,22 @@ def cmd_ticket_update(args) -> None:
     # succeeded.
     if status == "closed":
         try:
-            res = post("tg_topic_close_for_ticket", {"ticket_id": args.id.strip()}, fatal=False)
+            res = post("tg_topic_close_for_ticket", {"ticket_id": tid}, fatal=False)
         except WorkerError:
             res = {}
         if res.get("closed"):
-            print(f"{args.id}: closed its forum topic (chat_id={res.get('chat_id')} "
+            print(f"{tid}: closed its forum topic (chat_id={res.get('chat_id')} "
                   f"thread_id={res.get('thread_id')})")
 
 
 def cmd_ticket_note(args) -> None:
-    slug = resolve_slug()
+    slug, tid, _path = resolve_ticket_ref(
+        args.id, getattr(args, "slug", None), verb="ticket note")
     sid = require_sid(args.sid)
     res = post("task_progress_add", {
-        "slug": slug, "sid": sid, "task_id": args.id.strip(), "text": args.body,
+        "slug": slug, "sid": sid, "task_id": tid, "text": args.body,
     })
-    print(f"noted on {args.id}: {res.get('line_appended', '(ok)')}")
+    print(f"noted on {tid}: {res.get('line_appended', '(ok)')}")
 
 
 def cmd_ticket_context(args) -> None:
@@ -5233,8 +5493,8 @@ def cmd_ticket_context(args) -> None:
     area is paragraphs, and shell-quoting a multi-paragraph argument is exactly
     the friction that pushes people back to one-line notes.
     """
-    slug = resolve_slug()
-    tid = args.id.strip()
+    slug, tid, _path = resolve_ticket_ref(
+        args.id, getattr(args, "slug", None), verb="ticket context")
     if args.file:
         text = Path(args.file).read_text(encoding="utf-8")
     elif not sys.stdin.isatty():
@@ -5245,7 +5505,8 @@ def cmd_ticket_context(args) -> None:
     if args.clear:
         text = ""
     res = post("task_context_set", {"slug": slug, "task_id": tid, "text": text})
-    print(f"context set on {tid} ({res.get('bytes_written', 0)} bytes of body)")
+    print(f"context set on {slug}/{tid} ({res.get('bytes_written', 0)} bytes of body)")
+    _print_rollback(res)
 
 
 def cmd_ticket_summary(args) -> None:
@@ -5263,8 +5524,8 @@ def cmd_ticket_summary(args) -> None:
     file for it would push people back to a progress note. `--file` and stdin
     still work for the awkward-quoting cases.
     """
-    slug = resolve_slug()
-    tid = args.id.strip()
+    slug, tid, _path = resolve_ticket_ref(
+        args.id, getattr(args, "slug", None), verb="ticket summary")
     if args.clear:
         text = ""
     elif args.file:
@@ -5277,8 +5538,9 @@ def cmd_ticket_summary(args) -> None:
         die("no text: pass the paragraph as an argument, use --file <path>, "
             "pipe it on stdin, or --clear to empty the section")
     res = post("task_summary_set", {"slug": slug, "task_id": tid, "text": text})
-    print(f"executive summary set on {tid} "
+    print(f"executive summary set on {slug}/{tid} "
           f"({res.get('bytes_written', 0)} bytes of body)")
+    _print_rollback(res)
 
 
 def cmd_ticket_quote(args) -> None:
@@ -5290,8 +5552,8 @@ def cmd_ticket_quote(args) -> None:
     guidance as a note is how it ended up diluted among session narration,
     which is the failure this ticket was opened about.
     """
-    slug = resolve_slug()
-    tid = args.id.strip()
+    slug, tid, _path = resolve_ticket_ref(
+        args.id, getattr(args, "slug", None), verb="ticket quote")
     text = args.text
     if args.file:
         text = Path(args.file).read_text(encoding="utf-8")
@@ -6190,41 +6452,59 @@ def build_parser() -> argparse.ArgumentParser:
     # ticket (T-0152: native bot-squad-ticket task management)
     tk = sub.add_parser("ticket", help="bot-squad backlog ticket status / update / note")
     tk_sub = tk.add_subparsers(dest="sub", required=True)
+
+    def _tk_project_flag(p) -> None:
+        """T-0891: say WHICH project's board, when the id is not unique.
+
+        Equivalent to the `T-0655@watchrobot` suffix accepted by every id
+        argument below; both exist because the incident this guards against was
+        a session typing a bare id from another project's repo.
+        """
+        p.add_argument(
+            "--slug", "--project", dest="slug",
+            help="project slug this ticket id belongs to (same as T-NNNN@<slug>)")
+
     tks = tk_sub.add_parser("status", help="show a ticket's status + bindings")
-    tks.add_argument("id", help="ticket id, e.g. T-0149")
+    tks.add_argument("id", help="ticket id, e.g. T-0149 or T-0149@watchrobot")
     tks.add_argument("--json", action="store_true", help="raw JSON output")
+    _tk_project_flag(tks)
     tks.set_defaults(func=cmd_ticket_status)
     tku = tk_sub.add_parser("update", help="set a ticket's status (canonical schema)")
-    tku.add_argument("id", help="ticket id")
+    tku.add_argument("id", help="ticket id, e.g. T-0149 or T-0149@watchrobot")
     tku.add_argument("status", help="new status: " + "/".join(TICKET_STATUSES))
+    _tk_project_flag(tku)
     tku.set_defaults(func=cmd_ticket_update)
     tkn = tk_sub.add_parser("note", help="append a progress note to a ticket")
-    tkn.add_argument("id", help="ticket id")
+    tkn.add_argument("id", help="ticket id, e.g. T-0149 or T-0149@watchrobot")
     tkn.add_argument("body", help="progress note text")
     tkn.add_argument("--sid", help="override this session's SID")
+    _tk_project_flag(tkn)
     tkn.set_defaults(func=cmd_ticket_note)
     tkc = tk_sub.add_parser(
         "context", help="REPLACE a ticket's ## Context (the shared working area)")
-    tkc.add_argument("id", help="ticket id, e.g. T-0123")
+    tkc.add_argument("id", help="ticket id, e.g. T-0123 or T-0123@watchrobot")
     tkc.add_argument("--file", help="read the new Context from this file (else stdin)")
     tkc.add_argument("--clear", action="store_true", help="empty the section")
+    _tk_project_flag(tkc)
     tkc.set_defaults(func=cmd_ticket_context)
     tksm = tk_sub.add_parser(
         "summary",
         help="REPLACE a ticket's ## Executive summary (ONE paragraph: progress "
              "made + what remains — the status the stakeholder reads)")
-    tksm.add_argument("id", help="ticket id, e.g. T-0123")
+    tksm.add_argument("id", help="ticket id, e.g. T-0123 or T-0123@watchrobot")
     tksm.add_argument("text", nargs="?", default="",
                       help="the one-paragraph status (else --file or stdin)")
     tksm.add_argument("--file", help="read the summary from this file instead")
     tksm.add_argument("--clear", action="store_true", help="empty the section")
+    _tk_project_flag(tksm)
     tksm.set_defaults(func=cmd_ticket_summary)
     tkq = tk_sub.add_parser(
         "quote", help="record the STAKEHOLDER's own words under ## Stakeholder notes")
-    tkq.add_argument("id", help="ticket id, e.g. T-0123")
+    tkq.add_argument("id", help="ticket id, e.g. T-0123 or T-0123@watchrobot")
     tkq.add_argument("text", nargs="?", default="", help="his verbatim words")
     tkq.add_argument("--file", help="read the quote from this file instead")
     tkq.add_argument("--source", help="where the words came from (default: stakeholder)")
+    _tk_project_flag(tkq)
     tkq.set_defaults(func=cmd_ticket_quote)
 
     # scenario (T-0158: manual-testing-first discipline)

@@ -3168,8 +3168,53 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
 # existed. These two close that gap.
 # ---------------------------------------------------------------------------
 
+_TASK_SNAPSHOT_KEEP = 20
+
+
+def _snapshot_task_file(path: "Path", prev_text: str, action: str,
+                        ts: str) -> "Path":
+    """Save a ticket's pre-write bytes next to it, so a REPLACE can be undone.
+
+    T-0891: `data/` is outside git, so `task_context_set` / `task_summary_set`
+    were the only writes in the system with no undo anywhere — not `git
+    checkout`, not review, not history. On 2026-08-14 that cost a closed
+    ticket's `## Executive summary` and `## Context` permanently. Every REPLACE
+    now leaves the WHOLE previous file (frontmatter included) under
+    ``<backlog>/.versions/<ticket-stem>/``, newest last, keeping the most
+    recent `_TASK_SNAPSHOT_KEEP`.
+
+    Snapshotting the whole file rather than the one section is deliberate:
+    restoring is then `cp`, with no parser in the recovery path — and a
+    recovery path that needs the code that just misfired is not a recovery
+    path.
+
+    Called INSIDE the caller's `task_lock`, before `atomic_write`.
+    """
+    vdir = path.parent / ".versions" / path.stem
+    vdir.mkdir(parents=True, exist_ok=True)
+    stamp = ts.replace("-", "").replace(":", "")
+    # The sequence number is ZERO-PADDED and always present. Filename order IS
+    # chronological order here — the prune below keeps the newest by sorting —
+    # and a bare-vs-suffixed pair (`…set.md`, `…set.1.md`) sorts the ORIGINAL
+    # last, which quietly deletes the newest snapshots instead of the oldest.
+    seq = 1 + len(list(vdir.glob(f"{stamp}-*.md")))
+    dest = vdir / f"{stamp}-{seq:04d}-{action}.md"
+    while dest.exists():  # concurrent writers in the same second
+        seq += 1
+        dest = vdir / f"{stamp}-{seq:04d}-{action}.md"
+    dest.write_text(prev_text, encoding="utf-8")
+    keep = sorted(vdir.glob("*.md"))[:-_TASK_SNAPSHOT_KEEP]
+    for old in keep:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return dest
+
+
 def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
-                       transform) -> tuple["Path", str]:
+                       transform, snapshot: bool = False
+                       ) -> tuple["Path", str, "Path | None"]:
     """Read → `transform(body)` → atomically write one backlog task md.
 
     Factored out of `_action_task_progress_add`'s body rather than copied a
@@ -3179,6 +3224,11 @@ def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
 
     Holds `task_lock` across the whole read-modify-write so concurrent writers
     (worker AND api, T-0373) can never lose each other's edits.
+
+    `snapshot=True` keeps the pre-write bytes recoverable (T-0891) — set it for
+    the REPLACE writers, where a wrong target destroys authored text, and leave
+    it off for the append-only ones, where the previous content is still there
+    above what was appended.
     """
     cfg = _get_config()
     if cfg.projects.get(slug) is None:
@@ -3209,6 +3259,8 @@ def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
         except ValueError as e:
             raise ActionError(f"{action}: {e}") from e
 
+        backup = _snapshot_task_file(path, text_raw, action, ts) if snapshot else None
+
         fm_lines = fm_block.splitlines()
         for i, ln in enumerate(fm_lines):
             if ln.lstrip().startswith("updated:"):
@@ -3218,7 +3270,7 @@ def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
             fm_lines.append(f"updated: {ts}")
 
         atomic_write(path, f"---\n{chr(10).join(fm_lines)}\n---\n\n{new_body}")
-    return path, new_body
+    return path, new_body, backup
 
 
 _TASK_CONTEXT_SET_REQUIRED = {"slug", "task_id", "text"}
@@ -3229,7 +3281,7 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     """REPLACE a task's `## Context` — the working area every session shares.
 
     Required params: slug, task_id, text (optional: sid, for the audit line)
-    Returns: {ok, task_id, bytes_written}
+    Returns: {ok, task_id, bytes_written, path, backup_path}
 
     Replaces rather than appends, deliberately: Context is meant to say what is
     TRUE NOW, so the next session reads a current state instead of
@@ -3239,6 +3291,10 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     An empty `text` CLEARS the section, which is a legitimate edit and not an
     error — but it is also the one call that can lose work, so it must be
     explicit rather than a side effect of a missing field.
+
+    T-0891: the replaced bytes are snapshotted first and `backup_path` names
+    where — `data/` is outside git, so this write had no undo at all until a
+    mis-resolved id destroyed a closed ticket's authored sections for good.
     """
     extra = set(params) - _TASK_CONTEXT_SET_ALLOWED
     if extra:
@@ -3254,11 +3310,12 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     from bot_squad_worker.task_body import set_context
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    path, new_body = _rewrite_task_body(
+    path, new_body, backup = _rewrite_task_body(
         "task_context_set", params["slug"], params["task_id"], ts,
-        lambda body: set_context(body, text))
+        lambda body: set_context(body, text), snapshot=True)
     return {"ok": True, "task_id": params["task_id"],
-            "bytes_written": len(new_body), "path": str(path)}
+            "bytes_written": len(new_body), "path": str(path),
+            "backup_path": str(backup) if backup else None}
 
 
 _TASK_SUMMARY_SET_REQUIRED = {"slug", "task_id", "text"}
@@ -3269,7 +3326,7 @@ def _action_task_summary_set(params: dict[str, Any]) -> dict[str, Any]:
     """REPLACE a task's `## Executive summary` — the one-paragraph status (T-0863).
 
     Required params: slug, task_id, text (optional: sid, for the audit line)
-    Returns: {ok, task_id, bytes_written}
+    Returns: {ok, task_id, bytes_written, path, backup_path}
 
     The third section, and the only one written for the STAKEHOLDER to read
     rather than for the next session to work from: «жестко один параграф,
@@ -3296,11 +3353,12 @@ def _action_task_summary_set(params: dict[str, Any]) -> dict[str, Any]:
     from bot_squad_worker.task_body import set_summary
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    path, new_body = _rewrite_task_body(
+    path, new_body, backup = _rewrite_task_body(
         "task_summary_set", params["slug"], params["task_id"], ts,
-        lambda body: set_summary(body, text))
+        lambda body: set_summary(body, text), snapshot=True)
     return {"ok": True, "task_id": params["task_id"],
-            "bytes_written": len(new_body), "path": str(path)}
+            "bytes_written": len(new_body), "path": str(path),
+            "backup_path": str(backup) if backup else None}
 
 
 _TASK_STAKEHOLDER_NOTE_REQUIRED = {"slug", "task_id", "text"}

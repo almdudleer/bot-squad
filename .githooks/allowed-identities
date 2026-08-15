@@ -29,6 +29,15 @@
 # address: one address per clone here is what the history says today, not a
 # constraint the gate imposes.
 
+# `/home/almdudleer/bot-squad/dev` is a SYMLINK to `/home/almdudleer/bot-squad-mgmt`,
+# and `git rev-parse --show-toplevel` reports the TARGET, not the path anyone
+# types. So the line that answers for the shared dev clone is the mgmt one; a
+# `*/bot-squad/dev` glob here would never match and would sit in this file
+# looking effective. Measured 2026-08-15 the minute the gate first ran there:
+# the refusal named `clone: /home/almdudleer/bot-squad-mgmt`. Both lines are
+# kept — the second costs nothing and covers a future non-symlinked checkout —
+# but the FIRST is the live one.
+*/bot-squad-mgmt        leshaserdyukov@gmail.com
 */bot-squad/dev         leshaserdyukov@gmail.com
 */bot-squad/master      leshaserdyukov@gmail.com
 */bot-squad/deploy      leshaserdyukov@gmail.com

@@ -270,7 +270,7 @@ cat > secrets.toml <<'EOF'
 # Do NOT mount this into the API container.
 
 [telegram]
-bot_token = "8036906248:AAGSZYha1vNkKvA3FYoy_tS7YuTQhbo84c4"
+bot_token = "<TG_BOT_TOKEN>"
 auth_age_max = 86400
 EOF
 chmod 640 secrets.toml

@@ -59,10 +59,12 @@ every ref, across all four clones (`dev`, `master`, `deploy`,
 commit here. It is deliberately **not** in the list.
 
 `allowed-lookalike-paths` — exactly four paths in the whole history match the
-gate's predicate. Three are listed; the fourth, `.env.example`, is deliberately
-**absent** because its `TG_BOT_TOKEN` line currently holds the live bot token —
-see T-0663. Until that is replaced with a placeholder, editing `.env.example`
-reds, for a formally correct reason.
+gate's predicate, and all four are now listed. `.env.example` was held OUT of
+the list until 2026-08-15 because its `TG_BOT_TOKEN` line carried the live bot
+token; T-0663 part 1 replaced that value with a placeholder, which is what makes
+the exception legitimate. **The live value is still in the history behind HEAD**
+— rotating it at BotFather is T-0663 part 2 and needs the stakeholder, because
+the same token serves the prod bot.
 
 `repo-facts` — the historical facts the guard suites cannot derive. An empty
 value there is not a defect: the section that needs it SKIPS, loudly, with its
@@ -124,9 +126,12 @@ difference between an honest exception and a quiet silencing:
   the one thing it will not accept.
 
 The reason lives in a tracked file, so adding one is visible in a diff and
-reversible in one line. bot-squad declares exactly one: `.env.example`, whose
-`TG_BOT_TOKEN` currently holds a live token, so reddening a push that touches it
-is the intended outcome and not a false positive.
+reversible in one line. bot-squad declared exactly one — `.env.example`, while
+its `TG_BOT_TOKEN` held a live token, so that reddening a push touching it read
+as the intended outcome rather than a false positive. T-0663 part 1 replaced the
+value, the path moved into the exception list, and the declaration was emptied
+the same day: a declaration that outlives its reason is how a waiver becomes
+permanent by accident.
 
 ## What these gates do NOT close
 

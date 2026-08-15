@@ -47,5 +47,11 @@ SUITE_LIVE_SECRET_PATH=""
 # live credential, so a push touching it REDS, and that is the intended outcome
 # until T-0663 replaces the value with a placeholder. Declared here rather than
 # excepted so the decision is visible and reversible in one line.
-SUITE_KNOWN_UNLISTED=".env.example"
-SUITE_KNOWN_UNLISTED_WHY="live TG_BOT_TOKEN in a tracked template — T-0663 replaces it with a placeholder; excepting it would bless a live credential"
+# Empty since T-0663 part 1 (2026-08-15): `.env.example` was declared here while
+# its TG_BOT_TOKEN held a live token, so that section 6a would report it as a
+# decided exception rather than red on it forever. The value is now a
+# placeholder and the path is in allowed-lookalike-paths, so the declaration has
+# nothing left to cover. Emptied rather than left standing — a declaration that
+# outlives its reason is how a waiver becomes permanent by accident.
+SUITE_KNOWN_UNLISTED=""
+SUITE_KNOWN_UNLISTED_WHY=""

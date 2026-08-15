@@ -17,15 +17,19 @@
 # match the secret-like predicate. Three are below; each is ordinary source with
 # no literal value in it — checked, not assumed.
 #
-# THE FOURTH IS DELIBERATELY ABSENT: `.env.example` is tracked and looks like a
-# template, but its TG_BOT_TOKEN line currently holds the LIVE bot token, byte
-# for byte the same value as /home/www/bot-squad/.env and both watchrobot .env
-# files (compared without printing it). It has been in history since 7aec85a,
-# 2026-05-10. Listing it would mean this gate blessing a file carrying a live
-# credential, so until T-0663 replaces that value with a placeholder the file
-# reds — for a formally correct reason. Add the line here once T-0663 has
-# landed, not before.
+# `.env.example` was DELIBERATELY ABSENT from this list until 2026-08-15. Its
+# TG_BOT_TOKEN line held the LIVE bot token — byte for byte the same value as
+# /home/www/bot-squad/.env and both watchrobot .env files, compared without
+# printing it — in history since 7aec85a, 2026-05-10. Listing it then would have
+# meant this gate blessing a file that carried a live credential.
+#
+# T-0663 part 1 replaced that value with a placeholder, so the file is now what
+# its name claims and the exception is legitimate. THE LIVE VALUE IS STILL IN
+# HISTORY: removing it from HEAD does not remove it from the commits behind, and
+# rotating the token at BotFather is T-0663 part 2 — the stakeholder's call,
+# because the same token serves the prod bot.
 
+.env.example
 api/app/secret_crypto.py
 worker/bot_squad_worker/secret_crypto.py
 worker/tests/test_secret_crypto.py

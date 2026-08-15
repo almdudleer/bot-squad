@@ -376,7 +376,16 @@ def _candidate_projects(ticket: str) -> list[tuple[str, Path]]:
 
 
 def _refuse_ambiguous(ticket: str, candidates: list[tuple[str, Path]],
-                      why: str) -> None:
+                      why: str, verb: str = "ticket <verb>") -> None:
+    """Refuse, and hand back the command that would have worked (T-0892).
+
+    The escape hatch is printed as the verb the caller actually typed. It used
+    to be hardcoded `bsq ticket <verb>`, which was right while only `bsq ticket`
+    resolved ids and became a wrong instruction the moment `spawn`,
+    `scenario new`, `docs link` and `cluster-launch` started refusing too — a
+    refusal that names the wrong verb costs the reader another round trip,
+    which is the tax that gets guards removed.
+    """
     lines = [
         f"refusing to guess which project {ticket} means — {why}.",
         "",
@@ -388,9 +397,9 @@ def _refuse_ambiguous(ticket: str, candidates: list[tuple[str, Path]],
         lines.append(f"  {'':14s} {path}")
     lines += [
         "",
-        "Name the project explicitly and re-run:",
-        f"  bsq ticket <verb> {ticket}@{candidates[0][0]} ...",
-        f"  bsq ticket <verb> {ticket} --slug {candidates[0][0]} ...",
+        f"Name the project explicitly and re-run `bsq {verb}` with either:",
+        f"  the ticket id suffixed:  {ticket}@{candidates[0][0]}",
+        f"  or the flag:             --slug {candidates[0][0]}",
     ]
     die("\n".join(lines), code=3)
 
@@ -450,7 +459,7 @@ def resolve_ticket_ref(ref: str, explicit_slug: str | None = None,
             _refuse_ambiguous(
                 tid, candidates,
                 f"your session belongs to {sess!r} but your cwd is in {cwd!r}, "
-                f"and both hold this id")
+                f"and both hold this id", verb)
         if announce:
             _announce_target(verb, sess, tid, by_slug[sess], "your session's project")
         return sess, tid, by_slug[sess]
@@ -459,13 +468,13 @@ def resolve_ticket_ref(ref: str, explicit_slug: str | None = None,
         _refuse_ambiguous(
             tid, candidates,
             f"your session belongs to {sess!r}, which has no {tid} — so this "
-            f"would write to another project's board")
+            f"would write to another project's board", verb)
 
     if cwd and cwd in cand_slugs:
         if len(candidates) > 1:
             _refuse_ambiguous(
                 tid, candidates,
-                "the only signal is your cwd, and this id is not unique")
+                "the only signal is your cwd, and this id is not unique", verb)
         if announce:
             _announce_target(verb, cwd, tid, by_slug[cwd], "cwd (id is unique)")
         return cwd, tid, by_slug[cwd]
@@ -478,7 +487,7 @@ def resolve_ticket_ref(ref: str, explicit_slug: str | None = None,
 
     _refuse_ambiguous(
         tid, candidates,
-        "no session binding and no cwd inside a registered project")
+        "no session binding and no cwd inside a registered project", verb)
 
 
 def _announce_target(verb: str, slug: str, ticket: str, path: Path,
@@ -494,6 +503,49 @@ def _announce_target(verb: str, slug: str, ticket: str, path: Path,
     if title:
         print(f"  title: {title[:96]}", file=sys.stderr)
     print(f"  file:  {path}", file=sys.stderr)
+
+
+def _project_flag(p) -> None:
+    """T-0891/T-0892: say WHICH project's board, when the id is not unique.
+
+    Equivalent to the ``T-0655@watchrobot`` suffix every ticket-id argument
+    accepts; both exist because the incident this guards against was a session
+    typing a bare id while standing in another project's repo.
+    """
+    p.add_argument(
+        "--slug", "--project", dest="slug",
+        help="project slug this ticket id belongs to (same as T-NNNN@<slug>)")
+
+
+def resolve_bundle_ids(slug: str, raw: str | None, primary: str,
+                       *, verb: str) -> list[str]:
+    """The EXTRA ids of a ``--bundle``, all checked against ONE board (T-0892).
+
+    A session is bound to one project, so a bundle spanning two boards has no
+    correct reading: half its ids would bind to tickets that do not exist under
+    the slug the session actually runs in. An explicit ``@other`` inside a
+    bundle entry is therefore refused rather than honoured — the alternative is
+    a paid session bound to a ticket nobody meant.
+
+    The primary id is dropped if it is repeated in the bundle (callers pass the
+    seed in both places), and each remaining id is resolved with `find_ticket`,
+    which dies naming the board it looked in.
+    """
+    out: list[str] = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        bid, bslug = split_ticket_ref(entry)
+        if bslug and bslug != slug:
+            die(f"bsq {verb}: --bundle names {entry!r}, but this session binds to "
+                f"project {slug!r} — one session, one board. Spawn a separate "
+                f"session for {bslug}'s tickets.")
+        if bid == primary or bid in out:
+            continue
+        find_ticket(slug, bid)  # dies with a clear message if this board lacks it
+        out.append(bid)
+    return out
 
 
 def _strip_surrounding_quotes(v: str) -> str:
@@ -754,7 +806,14 @@ def cmd_topic_bind(args) -> None:
     thread_id = None if args.thread_id in (None, "", "none", "None") else args.thread_id
     params = {"chat_id": args.chat_id, "thread_id": thread_id, "slug": args.slug}
     if args.ticket:
-        params["ticket_id"] = args.ticket
+        # T-0892: this verb never guessed the project — the slug is positional
+        # — but `--ticket` rode through unchecked, so a topic could be hung off
+        # an id this board does not have (and, with 54% of ids shared between
+        # boards, off the same-numbered ticket of a different project). The
+        # shared resolver checks it against the slug that was named here.
+        _bind_slug, ticket_id, _p = resolve_ticket_ref(
+            args.ticket, args.slug, verb="topic bind")
+        params["ticket_id"] = ticket_id
     if args.session:
         params["session_id"] = args.session
     if args.clear_ticket:
@@ -929,7 +988,15 @@ def cmd_topic_create(args) -> None:
     if args.name:
         params["name"] = args.name
     if args.ticket:
-        params["ticket_id"] = args.ticket
+        # T-0892: this one was already sound — the worker derives the topic
+        # NAME from the ticket, so it resolves the id against this same slug
+        # before creating anything (`_derive_task_topic_name`). Routing it
+        # through the shared resolver anyway buys the `T-NNNN@slug` grammar,
+        # the same announcement as its siblings, and a failure that costs a
+        # local lookup instead of a Telegram round trip.
+        _create_slug, ticket_id, _p = resolve_ticket_ref(
+            args.ticket, args.slug, verb="topic create")
+        params["ticket_id"] = ticket_id
     if args.session:
         params["session_id"] = args.session
     caller_sid = my_sid()
@@ -938,7 +1005,7 @@ def cmd_topic_create(args) -> None:
     res = post("tg_topic_create", params)
     extra = ""
     if args.ticket:
-        extra += f" ticket_id={args.ticket}"
+        extra += f" ticket_id={params['ticket_id']}"
     if args.session:
         extra += f" session_id={args.session}"
     print(f"created topic '{res.get('name')}' chat_id={res.get('chat_id')} "
@@ -1217,9 +1284,12 @@ def _spawn_provider(args) -> str:
 
 
 def cmd_spawn(args) -> None:
-    slug = resolve_slug()
-    ticket = args.ticket.strip()
-    path = find_ticket(slug, ticket)
+    # T-0892: WHICH project's T-NNNN. Resolving it by `$PWD` spawned a paid
+    # session onto the same-numbered ticket of another board — the shared
+    # resolver (T-0891) refuses when the session's own project and the cwd
+    # disagree, and names the candidates.
+    slug, ticket, path = resolve_ticket_ref(
+        args.ticket, getattr(args, "slug", None), verb="spawn")
     fm = read_frontmatter(path)
 
     # window: feature slug after the ticket id, overridable.
@@ -1228,10 +1298,11 @@ def cmd_spawn(args) -> None:
     window = args.window or feature[:40]
 
     initiative = args.initiative or fm.get("initiative") or None
-    bundle = [b.strip() for b in args.bundle.split(",") if b.strip()] if args.bundle else []
     # T-0160: the extra (bundled) tickets to BIND after the session comes up.
     # The primary rides in via task_id; extras must be bind_task'd explicitly.
-    extras = [b for b in bundle if b != ticket]
+    # T-0892: resolved against the SAME board as the primary, never the cwd.
+    extras = resolve_bundle_ids(slug, args.bundle, ticket, verb="spawn")
+    bundle = extras
 
     # All tickets are loaded up front: both the prompt assembler (T-0149) and
     # the expert scan (T-0150) need the bundle's frontmatter + bodies.
@@ -1894,12 +1965,13 @@ def _deliver_brief_via_bus(slug: str, sid: str, brief: str) -> None:
 
 
 def cmd_expert_find(args) -> None:
-    slug = resolve_slug()
-    ticket = args.ticket.strip()
-    path = find_ticket(slug, ticket)
+    # T-0892: same resolution as `spawn` — this verb's answer is what `spawn`
+    # then acts on, so a cwd-picked board here misdirects the dispatch too.
+    slug, ticket, path = resolve_ticket_ref(
+        args.ticket, getattr(args, "slug", None), verb="expert find",
+        announce=not args.json)
     fm = read_frontmatter(path)
-    bundle = [b.strip() for b in args.bundle.split(",") if b.strip()] if args.bundle else []
-    extras = [b for b in bundle if b != ticket]
+    extras = resolve_bundle_ids(slug, args.bundle, ticket, verb="expert find")
     all_tickets = [ticket] + extras
     paths = {ticket: path}
     fms = {ticket: fm}
@@ -3024,10 +3096,27 @@ def cmd_assignment_write_result(args) -> None:
 
     Works for both assignment kinds: a TASK (default) and a ROUTINE
     (``--kind routine``). The artifact is the ONE reusable seam at
-    ``artifacts/<assignment-id>.md``."""
-    slug = resolve_slug()
+    ``artifacts/<assignment-id>.md``.
+
+    T-0892: for ``kind=task`` the assignment id IS a backlog ticket id, so it
+    gets the same resolution as every other ticket-id verb — a cwd-picked slug
+    files this session's work product under another project's `artifacts/`.
+    ``kind=routine`` keeps `resolve_slug`: an ``R-NNNN`` is not on any backlog,
+    so there is nothing for the shared resolver to look up.
+
+    (This verb was NOT in T-0892's list of seven — that enumeration keyed on the
+    argument being named `ticket`, and this one is named `--id`. Found by
+    re-deriving the list from what each verb DOES.)
+    """
+    kind = (getattr(args, "kind", None) or "task").strip().lower()
+    if kind == "task":
+        slug, assignment_id, _path = resolve_ticket_ref(
+            args.id, getattr(args, "slug", None), verb="assignment write-result")
+    else:
+        slug, assignment_id = resolve_slug(), args.id
     sid = require_sid(getattr(args, "sid", None))
-    params = {"slug": slug, "assignment_id": args.id, "content": args.content, "sid": sid}
+    params = {"slug": slug, "assignment_id": assignment_id,
+              "content": args.content, "sid": sid}
     if getattr(args, "kind", None):
         params["kind"] = args.kind
     res = post("assignment_write_result", params)
@@ -5257,11 +5346,16 @@ def _filter_cluster(candidates, *, min_score=1, limit=5, include_closed=False):
 
 
 def cmd_cluster_launch(args) -> None:
-    slug = resolve_slug()
-    seed = _norm_task_id(args.seed)
+    # T-0892: the seed decides the board — for the similarity scan, for every
+    # picked id, and for the session this ends up launching. Picking it from
+    # `$PWD` bundled a whole cluster of another project's tickets.
+    raw_seed, seed_slug = split_ticket_ref(args.seed)
+    seed = _norm_task_id(raw_seed)
     if not re.fullmatch(r"T-\d+", seed):
         die("cluster-launch needs a seed TICKET id, e.g. `bsq cluster-launch T-0487`")
-    find_ticket(slug, seed)  # existence check (dies w/ a clear msg if absent)
+    slug, seed, _seed_path = resolve_ticket_ref(
+        f"{seed}@{seed_slug}" if seed_slug else seed,
+        getattr(args, "slug", None), verb="cluster-launch")
 
     ts = _load_task_search()
     tickets = _load_backlog_tickets(slug)
@@ -5282,7 +5376,13 @@ def cmd_cluster_launch(args) -> None:
         # related task the lightweight ranker missed) — shown with score 0.
         cluster = []
         for raw in args.pick.split(","):
-            pid = _norm_task_id(raw)
+            # T-0892: a pick naming another board is refused, not silently
+            # re-read against this one — same rule as `spawn --bundle`.
+            praw, pslug = split_ticket_ref(raw)
+            if pslug and pslug != slug:
+                die(f"cluster-launch: --pick names {raw.strip()!r}, but the seed "
+                    f"{seed} is on project {slug!r} — one session, one board.")
+            pid = _norm_task_id(praw)
             if not pid or pid == seed:
                 continue
             find_ticket(slug, pid)  # dies if a picked id doesn't exist
@@ -5343,6 +5443,9 @@ def cmd_cluster_launch(args) -> None:
     # --- launch via the existing spawn --bundle path (reuse, do NOT rebuild) ---
     spawn_args = argparse.Namespace(
         ticket=seed,
+        # T-0892: hand `spawn` the board this seed already resolved to, rather
+        # than letting it re-resolve from a cwd that may name a different one.
+        slug=slug,
         bundle=",".join(bundle_ids),
         window=args.window,
         initiative=args.initiative,
@@ -5353,6 +5456,14 @@ def cmd_cluster_launch(args) -> None:
         fresh=args.fresh,
         resume_sid=None,
         dry_run=args.spawn_dry_run,
+        # `cmd_spawn` reads these unguarded, so a Namespace without them raised
+        # AttributeError the moment this path got past the worker call —
+        # measured by driving cmd_spawn with this exact Namespace. The launch
+        # arm of cluster-launch could not have worked; carrying the project
+        # defaults (None = "no override") is what makes it reachable.
+        model=None,
+        provider=None,
+        effort=None,
     )
     print(f"\nLaunching ONE session bound to {len(bundle_ids)} tasks: "
           f"{', '.join(bundle_ids)}")
@@ -5812,22 +5923,29 @@ def cmd_doc_list(args) -> None:
 
 
 def cmd_doc_link(args) -> None:
-    slug = resolve_slug()
     doc_id = args.doc_id
     # T-0371: ids cross 9999. T-0751: only an ALLOCATED id is case-normalised —
     # every other doc id is a filename stem (`03-docs-artifacts`,
     # `verbatim-contract`), and upper-casing those makes them unresolvable.
     if re.match(r"^[dD]-\d{4,}$", doc_id):
         doc_id = doc_id.upper()
-    ticket = args.ticket.upper()
+    # T-0892: the id, then the board it belongs to. Uppercasing has to happen
+    # BEFORE the `@slug` is split off, or `T-1@watchrobot` becomes
+    # `T-1@WATCHROBOT` and no such project exists.
+    raw_ticket, ref_slug = split_ticket_ref(args.ticket)
+    ticket = raw_ticket.upper()
     if not _doc_id_is_linkable(doc_id):
         die(f"invalid doc id: {doc_id!r}")
     if not re.match(r"^T-\d{4,}$", ticket):  # T-0371
         die(f"invalid ticket id: {ticket!r} (expect T-NNNN)")
+    slug, ticket, ticket_path = resolve_ticket_ref(
+        f"{ticket}@{ref_slug}" if ref_slug else ticket,
+        getattr(args, "slug", None), verb="docs link")
+    # BOTH sides of the link live on the board the ticket resolved to: a doc
+    # and a ticket from different projects cannot reference each other.
     doc_path = _find_doc_file(slug, doc_id)
     if doc_path is None:
-        die(f"doc not found: {doc_id}")
-    ticket_path = find_ticket(slug, ticket)  # dies if missing
+        die(f"doc not found: {doc_id} (looked in {_docs_dir(slug)})")
     add = not args.unlink
     _mutate_fm_list(doc_path, "related_tickets", ticket, add=add)
     _mutate_fm_list(ticket_path, "related_docs", doc_id, add=add)
@@ -5924,9 +6042,10 @@ _SCENARIO_TEMPLATE = """\
 
 
 def cmd_scenario_new(args) -> None:
-    slug = resolve_slug()
-    ticket = args.ticket.strip()
-    path = find_ticket(slug, ticket)  # validates the ticket exists
+    # T-0892: the scenario file lands in `data/<slug>/scenarios/`, so a
+    # cwd-picked slug files the manual walkthrough under another project.
+    slug, ticket, path = resolve_ticket_ref(
+        args.ticket, getattr(args, "slug", None), verb="scenario new")
     fm = read_frontmatter(path)
     stem = path.stem
     feature = stem.split("-", 2)[2] if stem.count("-") >= 2 else stem
@@ -6258,7 +6377,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # spawn
     sp = sub.add_parser("spawn", help="spawn a dev session for a backlog ticket")
-    sp.add_argument("ticket", help="ticket id, e.g. T-0150")
+    sp.add_argument("ticket", help="ticket id, e.g. T-0150 or T-0150@watchrobot")
+    _project_flag(sp)
     sp.add_argument("--bundle", help="comma-separated extra ticket ids bound to the same session")
     sp.add_argument("--window", help="tmux window name (default: ticket feature slug)")
     sp.add_argument("--initiative", help="initiative md (default: from ticket frontmatter)")
@@ -6290,7 +6410,9 @@ def build_parser() -> argparse.ArgumentParser:
     cl = sub.add_parser(
         "cluster-launch",
         help="seed a problem → suggest a similar cluster → launch ONE bundled session (T-0487)")
-    cl.add_argument("seed", help="seed ticket id, e.g. T-0487 (the observed problem)")
+    cl.add_argument("seed", help="seed ticket id, e.g. T-0487 (the observed problem); "
+                                 "T-0487@<slug> names the board explicitly")
+    _project_flag(cl)
     cl.add_argument("--limit", type=int, default=5,
                     help="max similar tasks in the auto-cluster (default 5)")
     cl.add_argument("--min-score", type=int, default=1, dest="min_score",
@@ -6321,8 +6443,9 @@ def build_parser() -> argparse.ArgumentParser:
     ex_sub = ex.add_subparsers(dest="sub", required=True)
     exf = ex_sub.add_parser("find",
                             help="rank suspended/archived sessions by overlap with a ticket")
-    exf.add_argument("ticket", help="ticket id, e.g. T-0150")
+    exf.add_argument("ticket", help="ticket id, e.g. T-0150 or T-0150@watchrobot")
     exf.add_argument("--bundle", help="comma-separated extra ticket ids (same as spawn)")
+    _project_flag(exf)
     exf.add_argument("--json", action="store_true", help="raw JSON output")
     exf.set_defaults(func=cmd_expert_find)
 
@@ -6453,16 +6576,9 @@ def build_parser() -> argparse.ArgumentParser:
     tk = sub.add_parser("ticket", help="bot-squad backlog ticket status / update / note")
     tk_sub = tk.add_subparsers(dest="sub", required=True)
 
-    def _tk_project_flag(p) -> None:
-        """T-0891: say WHICH project's board, when the id is not unique.
-
-        Equivalent to the `T-0655@watchrobot` suffix accepted by every id
-        argument below; both exist because the incident this guards against was
-        a session typing a bare id from another project's repo.
-        """
-        p.add_argument(
-            "--slug", "--project", dest="slug",
-            help="project slug this ticket id belongs to (same as T-NNNN@<slug>)")
+    # T-0892: hoisted to module scope as `_project_flag` — the same flag now
+    # rides on every verb that takes a ticket id, not just `bsq ticket`.
+    _tk_project_flag = _project_flag
 
     tks = tk_sub.add_parser("status", help="show a ticket's status + bindings")
     tks.add_argument("id", help="ticket id, e.g. T-0149 or T-0149@watchrobot")
@@ -6511,8 +6627,9 @@ def build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser("scenario", help="manual test scenario templates (T-0158)")
     sc_sub = sc.add_subparsers(dest="sub", required=True)
     scn = sc_sub.add_parser("new", help="write a scenario template for a ticket")
-    scn.add_argument("ticket", help="ticket id, e.g. T-0149")
+    scn.add_argument("ticket", help="ticket id, e.g. T-0149 or T-0149@watchrobot")
     scn.add_argument("--force", action="store_true", help="overwrite an existing scenario file")
+    _project_flag(scn)
     scn.set_defaults(func=cmd_scenario_new)
 
     # feedback (T-0154: friction-submission channel for in-project agents)
@@ -6604,8 +6721,9 @@ def build_parser() -> argparse.ArgumentParser:
     dnl.set_defaults(func=cmd_doc_list)
     dnk = dn_sub.add_parser("link", help="bidirectionally link a doc <-> ticket")
     dnk.add_argument("doc_id", help="doc id, e.g. D-0001")
-    dnk.add_argument("ticket", help="ticket id, e.g. T-0123")
+    dnk.add_argument("ticket", help="ticket id, e.g. T-0123 or T-0123@watchrobot")
     dnk.add_argument("--unlink", action="store_true", help="remove the link instead of adding it")
+    _project_flag(dnk)
     dnk.set_defaults(func=cmd_doc_link)
     dns = dn_sub.add_parser("sync", help="symlink docs/ into the dev + master clones")
     dns.set_defaults(func=cmd_doc_sync)
@@ -6737,7 +6855,9 @@ def build_parser() -> argparse.ArgumentParser:
              "(task or --kind routine)")
     awr.add_argument("content", help="your result markdown")
     awr.add_argument("--id", required=True, dest="id",
-                     help="assignment id (T-NNNN task or R-NNNN routine)")
+                     help="assignment id (T-NNNN task, also T-NNNN@<slug>; "
+                          "or R-NNNN routine)")
+    _project_flag(awr)
     awr.add_argument("--kind", choices=["task", "routine"], default="task",
                      help="assignment kind (default: task)")
     awr.add_argument("--sid", help="session SID (default: derived from tmux)")

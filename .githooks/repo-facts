@@ -1,0 +1,51 @@
+# repo-facts — what the guard suites cannot derive about THIS repository. (T-0659)
+#
+# Everything derivable is derived: the fixture identity comes out of
+# .githooks/allowed-identities through the gate's own reader. Only historical
+# facts of one repository live here. An empty value is not a defect — it means
+# this clone cannot supply that input, and the section that needs it SKIPS,
+# loudly, with its own counter. See .githooks/lib/suite-facts.sh.
+
+# The pre-commit hook as it stood DURING the 2026-08-14 incident, when it warned
+# about peers and looked at neither the identity nor the index. This repository
+# HAS that state in its history, so the before/after arm runs here rather than
+# skipping — the hook at this commit is a self-contained file with no
+# lib/peer-activity.sh beside it, which the suite resolves for.
+SUITE_PRE_GUARD_REF="09479aa"
+
+# Empty on purpose: the T-0657 and T-0662 libraries never existed in THIS
+# repository — the gates arrive here already fixed, so there is no local commit
+# carrying the broken reader to run as a "before". Those two arms SKIP, and that
+# is the honest answer. They can be made to run by naming a clone that does
+# carry that history in SUITE_PRE_DONOR_REPO; left empty deliberately, because
+# it would be a path on one machine in a file this repository publishes.
+SUITE_PRE_LIB_REF=""
+SUITE_PRE_T0662_LIB_REF=""
+SUITE_PRE_DONOR_REPO=""
+
+# The branch whose REAL history is the live input for the push suite.
+SUITE_LIVE_BRANCH="bot_squad/dev"
+
+# Empty, and the reason is worth writing down rather than leaving as a blank.
+# This repository DOES have a real commit that introduces a secret-like path:
+# 4576a03 ('init', 2026-08-14 22:49:46Z, author `t <t@t>`, 425 files) carries
+# api/_t/cfg/secrets.toml. But it was reset away at 22:57:32 the same night, so
+# it survives only as an unreachable object — `merge-base --is-ancestor` says it
+# is not on this branch, an ordinary push would never scan it, and naming it
+# here would make the arm SKIP with "not inside the pushable range" rather than
+# run. Measured 2026-08-15. If this repository ever acquires a reachable one,
+# name it here and the arm starts running by itself.
+SUITE_LIVE_SECRET_COMMIT=""
+SUITE_LIVE_SECRET_PATH=""
+
+# Secret-like, still in the published tip, and deliberately NOT excepted.
+# `.env.example` is tracked and looks like a template, but its TG_BOT_TOKEN line
+# currently holds the LIVE bot token — byte for byte the same value as
+# /home/www/bot-squad/.env and both sibling .env files, compared without printing
+# it, in history since 7aec85a on 2026-05-10. Listing it in
+# allowed-lookalike-paths would mean this gate blessing a file that carries a
+# live credential, so a push touching it REDS, and that is the intended outcome
+# until T-0663 replaces the value with a placeholder. Declared here rather than
+# excepted so the decision is visible and reversible in one line.
+SUITE_KNOWN_UNLISTED=".env.example"
+SUITE_KNOWN_UNLISTED_WHY="live TG_BOT_TOKEN in a tracked template — T-0663 replaces it with a placeholder; excepting it would bless a live credential"

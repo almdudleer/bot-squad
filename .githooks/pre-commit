@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
 #
+# pre-commit hook — THREE checks, of two different kinds.
+#
+#   1. identity        REFUSES (T-0659)
+#   2. secret-like     REFUSES (T-0659)
+#   3. peer activity   warns, and asks for a re-run (T-0093) — unchanged
+#
+# The two refusing gates are new and live in `.githooks/lib/commit-policy.sh`;
+# read that file for why they refuse instead of warning, and for what the
+# 2026-08-14 `4576a03` commit did to this clone. They run FIRST and are released
+# by their OWN named keys — never by BOT_SQUAD_ACK_PEERS and never by
+# BOT_SQUAD_SKIP_PEER_CHECK, both of which belong to check 3 alone.
+#
+# --- check 3, unchanged from here down ------------------------------------
+#
 # pre-commit hook — surface recent peer activity on files being committed.
 #
 # Bot-squad sessions share a single working tree per project and all
@@ -21,6 +35,31 @@
 # T-0093 baked it into every bot-squad-managed clone.
 
 set -uo pipefail
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/commit-policy.sh
+. "${HOOK_DIR}/lib/commit-policy.sh"
+
+# ---------------------------------------------------------------------------
+# The refusing gates run BEFORE anything that can exit 0 early. Placement is
+# load-bearing: every `exit 0` below (BOT_SQUAD_SKIP_PEER_CHECK / no staged
+# paths / no peer warnings) is an answer about PEERS, and letting any of them
+# short-circuit the identity and secret gates would mean the quietest commits —
+# the ones touching nothing a peer has touched — are the ones checked least.
+# ---------------------------------------------------------------------------
+cp_check_identity || exit 1
+
+# Additions/modifications/renames only: staging a DELETION of a secret-like path
+# is the thing we WANT people to do, and must not be refused.
+secret_scan_paths=()
+while IFS= read -r -d '' f; do
+    [ -n "$f" ] && secret_scan_paths+=("$f")
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+if [ "${#secret_scan_paths[@]}" -gt 0 ]; then
+    cp_check_secret_paths "${secret_scan_paths[@]}" || exit 1
+fi
+
+# ---- check 3: peer activity (T-0093) — behaviour unchanged ----------------
 
 [ "${BOT_SQUAD_SKIP_PEER_CHECK:-}" = "1" ] && exit 0
 

@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 #
-# pre-push hook — the invariant gates (T-0186 attr smoke, T-0738/T-0743 mirrors).
+# pre-push hook — a REFUSING secret gate (T-0659), then the invariant gates
+# (T-0186 attr smoke, T-0738/T-0743 mirrors).
+#
+# GATE 0 — NO PUSHED COMMIT MAY INTRODUCE A SECRET-LIKE PATH (T-0659)
+# -------------------------------------------------------------------
+# Ported whole from the sibling repository, where T-0658 built it. It exists
+# because `pre-commit` is only ever run by `git commit`: cherry-pick, merge,
+# rebase, am, `--no-verify`, `commit-tree` and a clone with `core.hooksPath`
+# unset all reach history without it — measured there, not assumed. A release is
+# a cherry-pick by construction, so that is not an exotic path, it is the
+# shipping path. On 2026-08-14 this repository took `4576a03` — 425 files as
+# `t <t@t>`, `api/_t/cfg/secrets.toml` among them.
+#
+# It runs FIRST and is released only by its OWN key, which must NAME every path:
+#   BOT_SQUAD_ALLOW_SECRET_PUSH='<path>[,<path>…]' git push …
+# Never by BOT_SQUAD_SKIP_ATTR_SMOKE, which belongs to the lint gates below: one
+# habitual variable must not disarm two unrelated defences, and that one is
+# typed whenever the lint gates are in the way. Its placement above that
+# variable's early exit is load-bearing for exactly the same reason.
+#
+# --- the invariant gates, unchanged from here down -------------------------
 #
 # The shared dev clone is edited by many concurrent bot-squad sessions. A
 # peer's raw `git add -A` / `git add <dir>` can sweep ANOTHER session's
@@ -40,6 +60,34 @@
 # (the historical name, kept working; it is the documented override).
 
 set -uo pipefail
+
+# ---- gate 0: the secret gate (T-0659) — before ANY early exit --------------
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/commit-policy.sh
+. "${HOOK_DIR}/lib/commit-policy.sh"   # cp__is_secretlike, cp__strip, pa_* fallbacks
+# shellcheck source=lib/push-policy.sh
+. "${HOOK_DIR}/lib/push-policy.sh"
+
+PP_REMOTE="${1:-}"
+
+# Slurp stdin BEFORE running any git: git subprocesses inherit this stdin and
+# would eat the ref lines out from under the loop.
+pp_ref_lines=()
+while IFS= read -r pp_line; do
+    [ -n "$pp_line" ] && pp_ref_lines+=("$pp_line")
+done
+
+pp_rc=0
+if [ "${#pp_ref_lines[@]}" -gt 0 ]; then
+    for pp_line in "${pp_ref_lines[@]}"; do
+        # shellcheck disable=SC2086  # deliberate word split of the 4-field line
+        set -- $pp_line
+        pp_check_push "$PP_REMOTE" "${1:-}" "${2:-}" "${3:-}" "${4:-}" </dev/null || pp_rc=1
+    done
+fi
+[ "$pp_rc" -eq 0 ] || exit 1
+
+# ---- the invariant gates (T-0186 / T-0738 / T-0743) — unchanged ------------
 
 [ "${BOT_SQUAD_SKIP_ATTR_SMOKE:-}" = "1" ] && exit 0
 

@@ -1,0 +1,31 @@
+# Paths that LOOK like secrets by name but are legitimately tracked.  (T-0659)
+#
+# Read by .githooks/lib/commit-policy.sh from HEAD — an edit here has no effect
+# until it is COMMITTED. That is deliberate: otherwise the same `git add -A`
+# that sweeps up a secret would also sweep up the line permitting it, and the
+# gate would be consulting the attacker's own copy of its policy.
+#
+# EXACT repo-relative paths only, one per line. No globs — an exception has to
+# be a named file someone chose, not a pattern that quietly widens over time.
+# Adding a line is a reviewed act: it shows up in the diff as a policy change.
+#
+# An absent or empty file is NOT an error here and must never become one: this
+# list names what may PASS, so having none is the strictest policy there is.
+# That is the opposite of allowed-identities, which IS the policy (T-0662).
+#
+# MEASURED (2026-08-15). Exactly four paths in the WHOLE history of this repo
+# match the secret-like predicate. Three are below; each is ordinary source with
+# no literal value in it — checked, not assumed.
+#
+# THE FOURTH IS DELIBERATELY ABSENT: `.env.example` is tracked and looks like a
+# template, but its TG_BOT_TOKEN line currently holds the LIVE bot token, byte
+# for byte the same value as /home/www/bot-squad/.env and both watchrobot .env
+# files (compared without printing it). It has been in history since 7aec85a,
+# 2026-05-10. Listing it would mean this gate blessing a file carrying a live
+# credential, so until T-0663 replaces that value with a placeholder the file
+# reds — for a formally correct reason. Add the line here once T-0663 has
+# landed, not before.
+
+api/app/secret_crypto.py
+worker/bot_squad_worker/secret_crypto.py
+worker/tests/test_secret_crypto.py

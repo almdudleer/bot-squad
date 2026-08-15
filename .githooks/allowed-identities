@@ -1,0 +1,37 @@
+# Which git identities may commit, per clone.  (T-0659)
+#
+# Read by .githooks/lib/commit-policy.sh from HEAD — an edit here has no effect
+# until it is COMMITTED, so a wide `git add -A` cannot sweep in its own
+# permission alongside the thing it is permitting. An absent, empty or
+# unreadable list is a REFUSAL, not a quiet pass (T-0662).
+#
+# Format:  <glob matched against `git rev-parse --show-toplevel`>  <email>[,<email>…]
+# First matching line wins.  `*` is the fallback and MUST stay last.
+#
+# MEASURED, NOT COPIED (2026-08-15). Every line below comes from counting the
+# history of this repo, not from the sibling watchrobot repo whose table is
+# different. All 1020 commits reachable from every ref, across all four clones,
+# are authored AND committed by leshaserdyukov@gmail.com — `dev` included, which
+# takes its address from the global ~/.gitconfig like the other three.
+#
+# WHY almdudleer@dev.local IS NOT HERE. It sits in the sibling repo's table as
+# the legitimate `dev` identity, and it was written into THIS clone's
+# .git/config at 22:57 on 2026-08-14 — the minute the `t <t@t>` commit was reset
+# away — while the incident was being cleaned up. It has never signed a commit
+# in this repo. Blessing it would mean the gate approving an address that
+# arrived in the incident window and authored nothing; the config was restored
+# to the measured identity instead.
+#
+# The `*` fallback carries the union, so an unrecognised path — a fresh clone, a
+# `git worktree`, a throwaway — is still default-deny against an unknown
+# identity (this is what stops a `t@t`). Give a new long-lived clone its own
+# line rather than leaning on the fallback, and re-measure before adding an
+# address: one address per clone here is what the history says today, not a
+# constraint the gate imposes.
+
+*/bot-squad/dev         leshaserdyukov@gmail.com
+*/bot-squad/master      leshaserdyukov@gmail.com
+*/bot-squad/deploy      leshaserdyukov@gmail.com
+/home/www/bot-squad     leshaserdyukov@gmail.com
+
+*                       leshaserdyukov@gmail.com

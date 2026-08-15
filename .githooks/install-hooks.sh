@@ -60,15 +60,40 @@ EOF
        exit 5 ;;
 esac
 
-REQUIRED=(
-    "pre-commit"
-    "pre-push"
-    "lib/peer-activity.sh"
-    "lib/commit-policy.sh"
-    "lib/push-policy.sh"
-    "allowed-identities"
-    "allowed-lookalike-paths"
-)
+# What every clone must carry: the two hook wrappers and the two policy lists.
+WRAPPERS=("pre-commit" "pre-push")
+REQUIRED=("${WRAPPERS[@]}" "allowed-identities" "allowed-lookalike-paths")
+
+# …plus the libraries the wrappers ACTUALLY SOURCE — derived from the files in
+# this checkout, never listed here.
+#
+# WHY DERIVED (T-0659). This list used to name `lib/peer-activity.sh` outright.
+# That file is watchrobot's: its `pre-commit` factors the peer-activity report
+# into a library, while bot-squad's keeps the same report inline and has no such
+# file by design. So in bot-squad this script REFUSED with rc=3 — "MISSING
+# lib/peer-activity.sh, bring the files in first" — for a file that repository
+# is not supposed to have and cannot obtain. Measured on a fresh clone
+# 2026-08-15; it went unseen in the shared bot-squad tree only because
+# `core.hooksPath` had been set there long before, so the gates ran on an
+# INHERITED setting rather than because this installer had ever succeeded.
+#
+# The behaviour was right and the list was wrong: refusing is correct when a
+# hook cannot source its library, so the fix is to ask the hooks what they need
+# instead of remembering it for them. Whole-line comments are stripped first, so
+# a `# shellcheck source=…` line above the real one — or a source left behind a
+# `#` — does not invent a requirement.
+for w in "${WRAPPERS[@]}"; do
+    [ -f "$TOP/.githooks/$w" ] || continue
+    while IFS= read -r lib; do
+        [ -n "$lib" ] || continue
+        case " ${REQUIRED[*]} " in
+            *" $lib "*) ;;
+            *) REQUIRED+=("$lib") ;;
+        esac
+    done < <(sed -e 's/^[[:space:]]*#.*$//' "$TOP/.githooks/$w" \
+             | grep -oE '(^|[[:space:]])(\.|source)[[:space:]]+[^[:space:]]*/lib/[A-Za-z0-9_.-]+\.sh' \
+             | grep -oE 'lib/[A-Za-z0-9_.-]+\.sh' | sort -u)
+done
 
 missing=()
 for f in "${REQUIRED[@]}"; do
@@ -96,7 +121,7 @@ EOF
     exit 3
 fi
 
-printf 'guard files:      all present\n'
+printf 'guard files:      all present (%s)\n' "${REQUIRED[*]}"
 
 if [ "$current" = ".githooks" ]; then
     printf '\nAlready armed — nothing to do.\n'

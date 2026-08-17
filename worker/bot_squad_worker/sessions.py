@@ -2331,7 +2331,14 @@ def _deliver_prompt_unlocked(pane_id: str, text: str) -> None:
 #: sentinel, or a TL SID. Colon-free ON PURPOSE — owner lands in a shell
 #: env-var assignment (`BOT_SQUAD_OWNER=…`), so this class is a security
 #: boundary, not a formality.
-_OWNER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+#:
+#: ``\Z``, NOT ``$`` (T-0895, operator p322 review): in Python ``$`` also
+#: matches BEFORE a trailing newline, so ``^…+$`` accepted ``"dev\n"`` —
+#: measured True on both classes here. Today the ``.strip()`` above makes that
+#: unreachable, but these patterns are declared the PRIMARY boundary rather
+#: than a backstop to ``shlex.quote``, so they must hold for a caller that
+#: hands over an unsanitized string. ``\Z`` is a true end-of-string anchor.
+_OWNER_RE = re.compile(r"^[A-Za-z0-9_.-]+\Z")
 #: T-0895: the ONE exception that may carry a colon — a routine binding.
 #: `routines._spawn_for_routine` spawns with ``owner=routine:R-NNNN``, and that
 #: exact string is the dedup/attribution KEY three other places already read
@@ -2342,8 +2349,8 @@ _OWNER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 #: gains a colon — `routine:R-1; rm -rf /`, `routine:$(id)` and
 #: `routine:R-0001 x` all still fail. (shlex.quote still wraps the result;
 #: this keeps the *validator* as the primary boundary rather than leaning on
-#: quoting alone.)
-_ROUTINE_OWNER_RE = re.compile(r"^routine:R-\d{4,}$")
+#: quoting alone.) ``\Z`` not ``$`` — see the note on `_OWNER_RE` above.
+_ROUTINE_OWNER_RE = re.compile(r"^routine:R-\d{4,}\Z")
 
 
 def _valid_owner(owner_clean: str) -> bool:
@@ -2558,8 +2565,12 @@ def spawn(
     if owner_user:
         # T-0321: the human UI username for per-user scoping (distinct from
         # `owner`, which doubles as the constant-team/TL-SID binding sentinel).
+        # T-0895: the SAME class as `owner`, so it shares `_OWNER_RE` instead of
+        # keeping a second copy of the literal — the copy had the `$`
+        # trailing-newline hole after the owner one was fixed, which is how a
+        # duplicated boundary regex normally rots.
         ou_clean = owner_user.strip()
-        if not ou_clean or not re.match(r"^[A-Za-z0-9_.-]+$", ou_clean):
+        if not ou_clean or not _OWNER_RE.match(ou_clean):
             from bot_squad_worker.actions import ActionError
             raise ActionError(f"spawn: invalid owner_user {owner_user!r}")
         env_prefix_parts.append(f"BOT_SQUAD_OWNER_USER={shlex.quote(ou_clean)}")
@@ -2961,7 +2972,11 @@ def _live_task_owner(
 # could drop. `ensure_user_conversation` (actions.py) computes the expected
 # window for a known gid and matches it, so the gid is never parsed back OUT of
 # the window (robust regardless of gid content).
-_GLOBAL_USER_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+#: ``\Z`` not ``$`` (T-0895): this guard's own docstring below calls itself the
+#: thing that stops a crafted value smuggling a shell/tmux metacharacter into a
+#: spawn command or a path — the third copy of the trailing-newline hole fixed
+#: on the owner validators.
+_GLOBAL_USER_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 
 
 def user_conversation_window(global_user_id: str) -> str:

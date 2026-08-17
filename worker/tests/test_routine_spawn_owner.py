@@ -387,3 +387,58 @@ def test_schedule_routine_capacity_deferral_stays_quiet(tmp_path, monkeypatch):
     assert dms == []
     assert _events(cfg, project.slug) == []
     assert R.load(cfg, project.slug, rid).next_run_at == before
+
+
+# ---------------------------------------------------------------------------
+# The validator must hold WITHOUT the caller's .strip() (operator p322 review
+# of the T-0895 fix). In Python `$` also matches BEFORE a trailing newline, so
+# `^…$` accepted "routine:R-0001\n" / "dev\n" — measured True on both classes.
+# spawn() strips first, so nothing reachable today was wrong; but these patterns
+# are declared the PRIMARY boundary, not a backstop to shlex.quote, so they are
+# tested DIRECTLY, unstripped. Anchors are now \Z.
+#
+# Written on the inputs that PASSED before the anchor change — each of these
+# would have gone green against the previous commit, i.e. there was no arm here.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    "routine:R-0001\n",          # the reviewed case
+    "dev\n",                     # the same hole in the GENERAL class
+    "alexey\n",
+    "constant-team\n",
+    "S-almdudleer-operator-p322\n",
+    "routine:R-0001\r",
+    "routine:R-0001\n\n",
+    "routine:R-0001 ",
+    "\nroutine:R-0001",
+])
+def test_valid_owner_rejects_trailing_whitespace_unstripped(bad):
+    assert S._valid_owner(bad) is False, (
+        f"{bad!r} must fail the validator itself, not only after .strip()")
+
+
+def test_valid_owner_still_accepts_the_clean_forms():
+    """Positive control: tightening the anchor must not reject anything real."""
+    for good in ("routine:R-0001", "routine:R-10000", "dev", "operator",
+                 "alexey", "constant-team", "S-almdudleer-operator-p322",
+                 "a.b-c_d"):
+        assert S._valid_owner(good) is True, good
+
+
+def test_owner_user_shares_the_owner_class(real_spawn_cfg):
+    """owner_user kept a SECOND copy of the same literal, which is how the hole
+    survives a fix applied to one of them. It now reuses _OWNER_RE."""
+    cfg, slug, captured = real_spawn_cfg
+    with pytest.raises(ActionError, match="invalid owner_user"):
+        S.spawn(cfg, slug, "dev", owner="dev", owner_user="alexey:admin")
+    assert captured == []
+    assert S._OWNER_RE.match("alexey\n") is None
+
+
+def test_global_user_id_guard_rejects_a_trailing_newline():
+    """Third copy of the same anchor bug — its own docstring calls it the guard
+    against smuggling a shell/tmux metacharacter into the spawn command."""
+    assert S._GLOBAL_USER_ID_RE.match("gu_abc\n") is None
+    assert S.user_conversation_window("gu_abc") == "gu_abc-user-conversation"
+    with pytest.raises(ActionError, match="invalid global_user_id"):
+        S.user_conversation_window("gu_abc\nx")

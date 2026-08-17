@@ -182,8 +182,26 @@ def _session_status(cfg: Any, slug: str, sid: str) -> dict | None:
     return parsed[0] if parsed else None
 
 
-def live_successor_sid(cfg: Any, slug: str, sid: str) -> str | None:
-    """T-0790: the LIVE session now holding ``sid``'s seat, or None.
+# T-0896: WHY a successor lookup came back empty. ``live_successor_sid``
+# answers only "who", which is all the peer bus ever needed — a redirect either
+# happens or the caller keeps its existing behaviour. The TG inbound path has a
+# harder job: when no successor exists it must tell a human WHAT went wrong
+# (DoD 4 — "недоставка перестаёт быть тишиной"), and a lookup that returns a
+# bare ``None`` forces that caller to re-derive the cause from the same session
+# mds. That re-derivation would be a SECOND copy of this boundary, and two
+# copies of a boundary is the defect class this ticket's sibling (T-0712) is
+# about. So the reason is decided HERE, once, and ``live_successor_sid`` stays
+# the thin "who" view over the same single implementation.
+SUCCESSOR_FOUND = "found"
+SUCCESSOR_TARGET_LIVE = "target_live"
+SUCCESSOR_NO_SESSION_MD = "no_session_md"
+SUCCESSOR_UNPARSEABLE_SID = "unparseable_sid"
+SUCCESSOR_NONE_LIVE = "none_live"
+SUCCESSOR_AMBIGUOUS = "ambiguous"
+
+
+def successor_lookup(cfg: Any, slug: str, sid: str) -> dict:
+    """T-0790/T-0896: who now holds ``sid``'s seat — and, when nobody does, why.
 
     A session that is recycled is not resumed — it is REPLACED: a brand-new SID
     is minted in the SAME tmux window (measured on the live install: operator
@@ -192,38 +210,62 @@ def live_successor_sid(cfg: Any, slug: str, sid: str) -> str | None:
     renamed (``rebind_sid`` only fires on ``resume()``, which rotates in place),
     so every later write to it is a black hole.
 
-    Returns a successor only when the answer is UNAMBIGUOUS — exactly one live
+    Names a successor only when the answer is UNAMBIGUOUS — exactly one live
     holder shares the target's window stem and linux user, and it is not the
     target itself. Ambiguity (two live sessions in one window) or absence
-    resolves to None and the caller keeps its existing behaviour: a wrong
-    redirect on this bus is worse than the loss it would prevent.
+    resolves to no successor and the caller keeps its existing behaviour: a
+    wrong redirect is worse than the loss it would prevent.
 
     Deliberately NOT applied to a live target: a live holder reads its own
     inbox, so there is nothing to redirect. That check is also FIRST on purpose
     — every literal-SID send runs this, and the common case (a live target) costs
     one file read and never reaches the sessions-dir walk below.
+
+    Returns ``{"sid": <successor|None>, "reason": <SUCCESSOR_*>, "candidates":
+    [<live sids sharing the window>]}``. The two reasons that are NOT "there is
+    simply nobody there" are the ones T-0896 measured and the ones a refusal
+    has to be able to name apart:
+
+    * ``no_session_md`` — the predecessor's own md is gone (session mds are
+      reaped; the lifecycle json outlives them), so there is no window stem to
+      match against and NO lookup is possible. Not "no successor exists".
+    * ``ambiguous`` — two live sessions share the window and this function
+      REFUSES to guess. Correct behaviour, but silently it is worth no more
+      than the loss, which is why the reason has to travel to the caller.
     """
     from bot_squad_worker.sessions import _is_live_holder
 
     meta = _session_status(cfg, slug, sid)
-    if meta is None or _is_live_holder(meta):
-        return None
+    if meta is None:
+        return {"sid": None, "reason": SUCCESSOR_NO_SESSION_MD, "candidates": []}
+    if _is_live_holder(meta):
+        return {"sid": None, "reason": SUCCESSOR_TARGET_LIVE, "candidates": []}
     want = _sid_stem(sid)
     if want is None:
-        return None
+        return {"sid": None, "reason": SUCCESSOR_UNPARSEABLE_SID, "candidates": []}
     matches = [
         cand for cand, cand_meta in _list_session_sids(cfg, slug)
         if cand != sid and _is_live_holder(cand_meta) and _sid_stem(cand) == want
     ]
-    if len(matches) != 1:
-        if matches:
-            log.warning(
-                "intersession: %s is not live and %d live sessions share its "
-                "window %r — refusing to guess a successor (slug=%s)",
-                sid, len(matches), want[1], slug,
-            )
-        return None
-    return matches[0]
+    if len(matches) == 1:
+        return {"sid": matches[0], "reason": SUCCESSOR_FOUND, "candidates": matches}
+    if matches:
+        log.warning(
+            "intersession: %s is not live and %d live sessions share its "
+            "window %r — refusing to guess a successor (slug=%s)",
+            sid, len(matches), want[1], slug,
+        )
+        return {"sid": None, "reason": SUCCESSOR_AMBIGUOUS, "candidates": matches}
+    return {"sid": None, "reason": SUCCESSOR_NONE_LIVE, "candidates": []}
+
+
+def live_successor_sid(cfg: Any, slug: str, sid: str) -> str | None:
+    """The LIVE session now holding ``sid``'s seat, or None (T-0790).
+
+    The "who" view over :func:`successor_lookup` — same decision, same log
+    line, contract unchanged for the peer bus that has always called this.
+    """
+    return successor_lookup(cfg, slug, sid)["sid"]
 
 
 def _resolve_recipients(

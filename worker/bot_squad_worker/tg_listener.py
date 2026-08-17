@@ -1854,8 +1854,15 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
             # it owes. Only on success: a message the session never received is
             # not a debt it owes, and the T-0746 fallback above has already
             # handed that case to an attendant who WILL answer.
+            #
+            # T-0896: the debt belongs to whoever actually GOT it. This binding
+            # stores a mortal SID, so once its session recycles the message goes
+            # to the successor — and a debt filed against the dead SID would be
+            # nagged at a pane that no longer exists, which is the ticket's own
+            # failure mode wearing the ledger's clothes.
+            owed_sid = str(result.get("successor") or session_id)
             tg_direct_reply.record_owed(
-                cfg, sid=session_id, chat_id=chat_id, thread_id=thread_id,
+                cfg, sid=owed_sid, chat_id=chat_id, thread_id=thread_id,
                 text=text, slug=slug, gid=gid,
                 ticket_id=binding.get("ticket_id") or "",
             )
@@ -1879,7 +1886,13 @@ def _handle_topic_bound(cfg, chat_id: str, gid: str, binding: dict, msg: dict) -
             # was just woken for.
             append_conversation_fyi(
                 cfg, slug, gid, author="system:direct-reply",
-                text=f"Пользователь ответил сессии {session_id} напрямую: {text}",
+                # T-0896: name the session that actually received it. The
+                # binding's SID is mortal, so after a recycle this line would
+                # otherwise tell the attendant a dead session is handling the
+                # message — the one reader whose whole job is knowing who holds
+                # what.
+                text=(f"Пользователь ответил сессии "
+                      f"{result.get('successor') or session_id} напрямую: {text}"),
                 reply_to=quote,
             )
         return result
@@ -2629,6 +2642,182 @@ def _msg_ts(msg: dict) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+#: T-0896 — the CAUSE, in the language the sender reads, for each way
+#: ``intersession.successor_lookup`` can come back without a successor. Keyed by
+#: the reason constants rather than re-deriving anything here: the decision is
+#: that module's (see its ``successor_lookup`` docstring for why the reason has
+#: to travel at all), this map is only its rendering.
+_SUCCESSOR_REASON_RU = {
+    # NOT an `intersession` reason — this caller's own. It comes FIRST because
+    # `sessions.project_of_sid` reads the very md `successor_lookup` needs, so
+    # a deleted session card fails here and never reaches `no_session_md`
+    # below. Measured, not assumed: with the md removed the probe refuses with
+    # `no_project`. `no_session_md` stays mapped anyway — it is reachable for
+    # any caller that resolves the slug some other way, and a reason that
+    # renders as a bare code is the silence this ticket is about in miniature.
+    "no_project": "проект той сессии больше не определяется — её карточка удалена",
+    "no_session_md": "карточка той сессии уже удалена, и опознать её преемника не по чему",
+    "unparseable_sid": "имя той сессии не разбирается на окно",
+    "none_live": "её окно сейчас никем не занято",
+    "ambiguous": "её окно делят несколько живых сессий, и угадывать между ними нельзя",
+    "target_live": "она числится живой (значит, отказала сама доставка, а не адресация)",
+}
+
+#: Who the peer-bus line is FROM. Not a SID: the author is the human, and the
+#: bus already tolerates a non-SID sender for exactly this case.
+_TG_INBOUND_SENDER = "stakeholder"
+
+
+def _successor_refusal(reason: str) -> str:
+    """One sentence naming why no successor could be addressed."""
+    return _SUCCESSOR_REASON_RU.get(reason, f"причина не распознана ({reason})")
+
+
+def _route_to_successor(
+    cfg, chat_id: str, dead_sid: str, text: str, *, thread_id: Any = None,
+    quote: Optional[dict] = None, error: str = "",
+) -> tuple[Optional[dict], str]:
+    """T-0896: hand a message aimed at a RECYCLED session to the session that
+    now holds its seat. Returns ``(result | None, refusal_reason)``.
+
+    The failure this closes. A SID is mortal by construction — sessions are
+    recycled on the cache window — so addressing one is addressing a name that
+    expires. Until now the TG inbound path had no notion of a successor at all:
+    ``_handle_reply``'s T-0746 fallback handed an undeliverable message to the
+    project's user-conversation ATTENDANT and told the SENDER about it. Measured
+    on 2026-08-17 (T-0896): the stakeholder's production sanction, answered at
+    16:26:18Z to an operator recycled 90 seconds earlier, landed in watchrobot's
+    conversation store; the successor operator's inbox — no inbox file, no
+    seen, no heartbeat — never learned the message or the failure existed. The
+    attendant relayed it BY HAND, and without that hand the sanction was lost
+    with both sides believing the ball was with the other.
+
+    The peer bus already solved this exact lookup (T-0790,
+    ``intersession.live_successor_sid``): measured in one process on one dead
+    SID, ``intersession.send`` redirects to the successor and creates its inbox
+    while ``handle_update`` creates nothing. So this calls THAT resolver rather
+    than growing a second notion of session identity.
+
+    Delivery is the peer inbox, not the successor's composer, and the reason is
+    what we are carrying: a SANCTION needs a durable record of who allowed
+    what, and a paste into a pane leaves none and dies with the pane (operator
+    ruling, T-0896). Measured caveat that shaped the second half: the peer_send
+    ACTION does NOT nudge the recipient's pane — the ``bsq`` CLI does, and only
+    the CLI (probe: bus write created the inbox file, the pane received
+    nothing; positive control on the same pane with ``inject_input`` landed).
+    So the nudge is sent here as its own best-effort step, or the successor
+    would sit on a sanction until its next mail check.
+
+    Returns ``(None, <reason>)`` when nothing was delivered — the caller then
+    keeps the existing store fallback AND says the cause out loud. Deliberately
+    also returns ``(None, ...)`` when the composed bus line would exceed the
+    bus's 4000-char cap: the store fallback has no such limit, so falling
+    through loses nothing, whereas letting the cap raise here would lose the
+    message entirely.
+    """
+    from bot_squad_worker import actions as A, intersession as _is, sessions as S
+
+    slug = ""
+    try:
+        slug = S.project_of_sid(cfg, dead_sid)
+    except Exception:  # noqa: BLE001 — an unreadable data dir is "no project"
+        log.exception("tg_listener: project_of_sid failed for %s", dead_sid)
+    if not slug:
+        return None, "no_project"
+
+    look = _is.successor_lookup(cfg, slug, dead_sid)
+    successor = look.get("sid")
+    if not successor:
+        log.warning(
+            "tg_listener: message for RECYCLED %s has no addressable successor "
+            "(slug=%s, reason=%s, candidates=%s)",
+            dead_sid, slug, look.get("reason"), look.get("candidates"),
+        )
+        _emit_lifecycle(cfg, slug, dead_sid, "tg_inbound_no_successor")
+        return None, str(look.get("reason") or "none_live")
+
+    # The bus's OWN cap, read from the bus — a local literal here would be a
+    # second copy of a number that only `intersession` gets to choose, and the
+    # copy is what goes stale. A rename fails loudly (and
+    # `test_bus_cap_is_read_from_intersession` is what watches for it).
+    cap = _is._MAX_TEXT_LEN
+
+    quoted = str((quote or {}).get("text") or "").strip()
+    body = str(text or "").strip()
+    line = (
+        f"[ОТВЕТ ЧЕЛОВЕКА В TELEGRAM — ПЕРЕАДРЕСОВАН ТЕБЕ] Он адресовал его "
+        f"сессии {dead_sid}; та переработана, её окно держишь ты. "
+        f"Отвечал он на: «{quoted}». Его слова дословно: «{body}». "
+        f"Ответить ему: bsq tg ping \"<твой ответ>\""
+    )
+    if len(line) > cap:
+        # Drop the quoted original first — it is context, his words are the
+        # message — and only then give up on the bus.
+        line = (
+            f"[ОТВЕТ ЧЕЛОВЕКА В TELEGRAM — ПЕРЕАДРЕСОВАН ТЕБЕ] Он адресовал его "
+            f"сессии {dead_sid}; та переработана, её окно держишь ты. "
+            f"Его слова дословно: «{body}». "
+            f"Ответить ему: bsq tg ping \"<твой ответ>\""
+        )
+    if len(line) > cap:
+        log.warning(
+            "tg_listener: successor %s found for %s but the message is %d chars, "
+            "over the peer-bus cap — keeping the store fallback",
+            successor, dead_sid, len(line),
+        )
+        return None, "over_bus_cap"
+
+    try:
+        sent = _is.send(cfg, slug, _TG_INBOUND_SENDER, successor, line)
+    except Exception as e:  # noqa: BLE001 — a bus failure must keep the fallback
+        log.exception("tg_listener: peer-bus delivery to successor %s failed", successor)
+        return None, f"bus_failed: {e}"
+    if not sent.get("ok", False):
+        return None, f"bus_refused: {sent.get('error', 'refused')}"
+
+    # The bus write is durable but SILENT — the pane nudge is the CLI's job and
+    # this is not the CLI. Best-effort: a successor with no live pane still has
+    # the inbox line waiting, which is the whole point of writing it first.
+    nudged = False
+    try:
+        A.dispatch("inject_input", {"sid": successor, "text": "check mail"})
+        nudged = True
+    except Exception:  # noqa: BLE001
+        log.info("tg_listener: successor %s has no live pane to nudge", successor)
+
+    log.warning(
+        "tg_listener: message for RECYCLED %s REROUTED to its successor %s "
+        "(slug=%s, nudged=%s, original error=%s)",
+        dead_sid, successor, slug, nudged, error,
+    )
+    _emit_lifecycle(cfg, slug, successor, "tg_inbound_rerouted")
+    _notify(
+        cfg, chat_id,
+        f"↪️ Сессия {dead_sid} переработана — передал сообщение её преемнику "
+        f"{successor} (проект «{slug}»).",
+        thread_id=thread_id,
+    )
+    return {
+        "ok": True, "action": "inject_successor", "sid": dead_sid,
+        "successor": successor, "successor_slug": slug, "successor_nudged": nudged,
+        "error": error,
+    }, ""
+
+
+def _emit_lifecycle(cfg, slug: str, sid: str, event: str) -> None:
+    """Record a routing outcome where it OUTLIVES the session (T-0896 DoD 4).
+
+    ``data/<slug>/_worker/lifecycle/<sid>.json`` rather than the session md:
+    the md is reaped, that json is not, and the whole subject here is a session
+    that no longer exists. Best-effort — a journal write must never cost the
+    delivery it is journalling."""
+    try:
+        from bot_squad_worker import lifecycle_events
+        lifecycle_events.emit(cfg, slug, sid, event)
+    except Exception:  # noqa: BLE001
+        log.exception("tg_listener: lifecycle event %r for %s failed", event, sid)
+
+
 def _handle_reply(
     cfg, chat_id: str, sid: str, text: str, *, thread_id: Any = None, gid: str = "",
     block_text: str = "", quote: Optional[dict] = None,
@@ -2673,11 +2862,22 @@ def _handle_reply(
         _clear_stall(cfg, chat_id, sid, thread_id=thread_id)
         return {"ok": True, "action": "inject", "sid": sid, "result": result}
     except A.ActionError as e:
+        # T-0896: the SID is dead, but the seat may not be. Ask who holds it
+        # BEFORE handing the message to an attendant — the successor is the one
+        # party that can act on it, and until now it was the one party never
+        # told. Only when nobody holds the seat does the T-0746 fallback run,
+        # and then it says the cause out loud instead of just "не активна".
+        routed, refusal = _route_to_successor(
+            cfg, chat_id, sid, text, thread_id=thread_id, quote=quote, error=str(e),
+        )
+        if routed is not None:
+            _clear_stall(cfg, chat_id, sid, thread_id=thread_id)
+            return routed
         fb = _fallback_undelivered(
             cfg, chat_id, sid, text, gid=gid, thread_id=thread_id, error=str(e),
-            quote=quote,
+            quote=quote, successor_note=_successor_refusal(refusal),
         )
-        out = {"sid": sid, "error": str(e)}
+        out = {"sid": sid, "error": str(e), "successor_refusal": refusal}
         out.update(fb)  # carries `ok` + `action` for both outcomes
         return out
 
@@ -2692,6 +2892,7 @@ _UNDELIVERED_AUTHOR = "system:undelivered"
 def _fallback_undelivered(
     cfg, chat_id: str, sid: str, text: str, *, gid: str = "",
     thread_id: Any = None, error: str = "", quote: Optional[dict] = None,
+    successor_note: str = "",
 ) -> dict:
     """Hand a message we could not deliver to ``sid`` to that project's
     user-conversation attendant, and tell the sender what happened.
@@ -2721,8 +2922,17 @@ def _fallback_undelivered(
     project claims — nothing is written to the store at all and the sender is
     told plainly that the message was NOT delivered. The failure is surfaced as
     a failure; it is never smuggled into the thread as content.
+
+    ``successor_note`` (T-0896): reaching here now means the successor question
+    was ASKED and came back empty, so every notice below says WHY as well as
+    that. "Сессия не активна" alone reads as routine; "и её преемника не
+    опознать — карточка сессии удалена" is a fault someone can act on. The
+    cause is decided by ``intersession.successor_lookup`` and rendered by
+    ``_successor_refusal`` — nothing here re-derives it.
     """
     from bot_squad_worker import sessions as S
+
+    note = f" Преемника адресовать не удалось: {successor_note}." if successor_note else ""
 
     body = str(text or "").strip()
     slug = ""
@@ -2741,7 +2951,7 @@ def _fallback_undelivered(
         _notify(
             cfg, chat_id,
             f"❌ Сессия {sid} не активна, и передать сообщение в "
-            f"user-conversation не удалось: {reason}. Сообщение НЕ доставлено — "
+            f"user-conversation не удалось: {reason}.{note} Сообщение НЕ доставлено — "
             f"напиши его обычным сообщением в нужном топике.",
             thread_id=thread_id,
         )
@@ -2772,7 +2982,7 @@ def _fallback_undelivered(
         _notify(
             cfg, chat_id,
             f"❌ Сессия {sid} не активна, и записать сообщение в "
-            f"user-conversation проекта «{slug}» не удалось. Сообщение НЕ "
+            f"user-conversation проекта «{slug}» не удалось.{note} Сообщение НЕ "
             f"доставлено — напиши его обычным сообщением в нужном топике.",
             thread_id=thread_id,
         )
@@ -2783,7 +2993,7 @@ def _fallback_undelivered(
     if isinstance(ensured, dict) and ensured.get("parked"):
         _notify(
             cfg, chat_id,
-            f"⚠️ Сессия {sid} не активна. Сообщение записано в "
+            f"⚠️ Сессия {sid} не активна.{note} Сообщение записано в "
             f"user-conversation проекта «{slug}», но все воркеры сейчас заняты — "
             f"займусь, как только освободится слот.",
             thread_id=thread_id,
@@ -2798,7 +3008,7 @@ def _fallback_undelivered(
         # one place they cannot check.
         _notify(
             cfg, chat_id,
-            f"⚠️ Сессия {sid} не активна. Сообщение записано в "
+            f"⚠️ Сессия {sid} не активна.{note} Сообщение записано в "
             f"user-conversation проекта «{slug}», но ответить сейчас некому: "
             f"воркер этого разговора не запущен и сам не поднимется. "
             f"Автоматически оно обработано не будет — нужно поднять воркера.",
@@ -2808,7 +3018,7 @@ def _fallback_undelivered(
                 "fallback": "user_worker_unavailable", "fallback_slug": slug}
     _notify(
         cfg, chat_id,
-        f"⚠️ Сессия {sid} не активна — передал сообщение в user-conversation "
+        f"⚠️ Сессия {sid} не активна.{note} Передал сообщение в user-conversation "
         f"проекта «{slug}».",
         thread_id=thread_id,
     )
@@ -2902,8 +3112,21 @@ def _handle_slash(
             # that rule is about routinely dumping contextless control commands
             # into a project's store, and this appends only the message BODY,
             # only when delivery has already failed.
+            #
+            # T-0896: and the successor hop first, for the same reason this
+            # branch got the fallback — leaving `/say` on the mortal-SID route
+            # while fixing the reply path would recreate the unfixed twin the
+            # comment above is about. Measured as one of the three inbound
+            # types that lose a message silently.
+            routed, refusal = _route_to_successor(
+                cfg, chat_id, sid, text, thread_id=thread_id, error=str(e),
+            )
+            if routed is not None:
+                routed["action"] = "say_successor"
+                return routed
             fb = _fallback_undelivered(
                 cfg, chat_id, sid, text, gid=gid, thread_id=thread_id, error=str(e),
+                successor_note=_successor_refusal(refusal),
             )
             out = dict(fb)
             out.update({

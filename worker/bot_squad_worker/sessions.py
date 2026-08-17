@@ -2327,6 +2327,35 @@ def _deliver_prompt_unlocked(pane_id: str, text: str) -> None:
     )
 
 
+#: The general `owner` shape: a UI username (JWT claim), the `constant-team`
+#: sentinel, or a TL SID. Colon-free ON PURPOSE — owner lands in a shell
+#: env-var assignment (`BOT_SQUAD_OWNER=…`), so this class is a security
+#: boundary, not a formality.
+_OWNER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+#: T-0895: the ONE exception that may carry a colon — a routine binding.
+#: `routines._spawn_for_routine` spawns with ``owner=routine:R-NNNN``, and that
+#: exact string is the dedup/attribution KEY three other places already read
+#: (`routines._live_routine_session`, the input_mux nudge source, the
+#: `_send_stakeholder_dm(sid=…)` label), so it cannot be reshaped away without
+#: a second field at all three sites. It is therefore allowed WHOLE-STRING:
+#: the pattern is anchored and its tail is `R-<digits>` only, so nothing else
+#: gains a colon — `routine:R-1; rm -rf /`, `routine:$(id)` and
+#: `routine:R-0001 x` all still fail. (shlex.quote still wraps the result;
+#: this keeps the *validator* as the primary boundary rather than leaning on
+#: quoting alone.)
+_ROUTINE_OWNER_RE = re.compile(r"^routine:R-\d{4,}$")
+
+
+def _valid_owner(owner_clean: str) -> bool:
+    """True for an owner string safe to put in a shell env assignment.
+
+    Either the general colon-free class or the narrow ``routine:R-NNNN`` form
+    (T-0895) — matched as a whole, never as a prefix/substring.
+    """
+    return bool(_OWNER_RE.match(owner_clean)
+                or _ROUTINE_OWNER_RE.match(owner_clean))
+
+
 def spawn(
     cfg: Any,
     slug: str,
@@ -2522,7 +2551,7 @@ def spawn(
         # (JWT claim) but we still defence-in-depth-validate before shoving
         # it into a shell env-var assignment.
         owner_clean = owner.strip()
-        if not owner_clean or not re.match(r"^[A-Za-z0-9_.-]+$", owner_clean):
+        if not owner_clean or not _valid_owner(owner_clean):
             from bot_squad_worker.actions import ActionError
             raise ActionError(f"spawn: invalid owner {owner!r}")
         env_prefix_parts.append(f"BOT_SQUAD_OWNER={shlex.quote(owner_clean)}")
@@ -3589,12 +3618,18 @@ def _derive_owner_user(cfg: Any, slug: str, owner: str | None) -> str | None:
       * ``constant-team`` → the coordinator user (system-managed teams);
       * a TL-SID (``S-…``) → the TL's own human (its md owner_user/owner),
         resolved one hop (mirrors the T-0135 API-side hop);
+      * ``routine:R-NNNN`` → None: a routine binding is not a person, and the
+        derived value would land in ``BOT_SQUAD_OWNER_USER`` where the
+        colon-free owner_user validator rejects it — the SECOND half of the
+        T-0895 spawn failure, hit right after the owner class was widened;
       * anything else / unresolvable → None (legacy → owner-based scoping).
     """
     if not owner or owner == "~":
         return None
     if owner == "constant-team":
         return _coordinator_user(cfg) or None
+    if _ROUTINE_OWNER_RE.match(owner):
+        return None
     if owner.startswith("S-"):
         meta = _read_session_metadata(_session_file(cfg.data_dir, slug, owner))
         if meta:

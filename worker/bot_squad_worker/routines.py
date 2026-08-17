@@ -911,9 +911,33 @@ def spawn_brief(cfg: Any, slug: str, routine: Routine,
 # Tick — fire due routines, exactly one session per due tick.
 # ---------------------------------------------------------------------------
 
+#: T-0895: ``_spawn_for_routine``'s failure reason for parallel-session /
+#: token-budget backpressure — the ONE failure where a quiet retry is the
+#: intended behaviour (bounded by ``SPAWN_DEFER_QUIET_S`` below, so "quiet" is
+#: never "forever"). Every other reason degrades the fire to a notify.
+SPAWN_DEFER_CAPACITY = "capacity"
+
+#: T-0895 (DoD 4): how long a breach may stay unattended under capacity
+#: backpressure before the stakeholder is told. Silence under the cap is
+#: deliberate; UNBOUNDED silence is the defect. One alert per window.
+SPAWN_DEFER_QUIET_S = float(
+    os.environ.get("BOT_SQUAD_ROUTINE_SPAWN_DEFER_QUIET_S") or 900)
+
+
 def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
                        event: Optional[FireEvent] = None, *,
-                       now: Optional[datetime] = None) -> Optional[str]:
+                       now: Optional[datetime] = None
+                       ) -> tuple[Optional[str], Optional[str]]:
+    """Spawn the session bound to this routine. Returns ``(sid, failure)``.
+
+    T-0895: it used to return a bare ``Optional[str]``, which made EVERY
+    failure indistinguishable from capacity backpressure at the call site — so
+    a permanent failure (the rejected ``owner=routine:R-NNNN``, a missing pane,
+    a bad brief) was swallowed as "deferred, retry later" and the breach went
+    unreported forever. The reason now travels with the result:
+    ``SPAWN_DEFER_CAPACITY`` for backpressure, else a one-line description the
+    caller puts in front of the stakeholder.
+    """
     from bot_squad_worker import sessions as S
     from bot_squad_worker.actions import ActionError
 
@@ -921,18 +945,25 @@ def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
         res = S.spawn(cfg, slug, "dev",
                       initial_prompt=spawn_brief(cfg, slug, routine, event, now=now),
                       owner=f"routine:{routine.id}")
-        return res.get("sid")
+        sid = res.get("sid")
+        if not sid:
+            # spawn returned without a SID — not an exception, but no session
+            # exists either. Naming it beats reporting a phantom success.
+            log.error("routine %s spawn returned no sid for %s (%r)",
+                      routine.id, slug, res)
+            return None, "spawn returned no sid"
+        return sid, None
     except ActionError as e:
         # Parallel-session cap / quota backpressure is normal — defer quietly;
         # next_run_at is NOT advanced (below), so a later tick retries.
         if "capacity reached" in str(e):
             log.debug("routine %s spawn deferred for %s (%s)", routine.id, slug, e)
-        else:
-            log.exception("routine %s spawn failed for %s", routine.id, slug)
-        return None
-    except Exception:  # noqa: BLE001 — one bad routine never kills the sweep
+            return None, SPAWN_DEFER_CAPACITY
         log.exception("routine %s spawn failed for %s", routine.id, slug)
-        return None
+        return None, str(e) or e.__class__.__name__
+    except Exception as e:  # noqa: BLE001 — one bad routine never kills the sweep
+        log.exception("routine %s spawn failed for %s", routine.id, slug)
+        return None, f"{e.__class__.__name__}: {e}"
 
 
 def tick(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dict:
@@ -957,9 +988,29 @@ def tick(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dict:
             continue  # monitor routines belong to monitor_tick (D-0048 §4)
         if not routine.is_due(now):
             continue
-        sid = _spawn_for_routine(cfg, slug, routine, now=now)
+        sid, failure = _spawn_for_routine(cfg, slug, routine, now=now)
         if not sid:
-            continue  # deferred — retry next tick, next_run_at untouched
+            if failure == SPAWN_DEFER_CAPACITY:
+                continue  # deferred — retry next tick, next_run_at untouched
+            # T-0895: a NON-capacity failure is permanent for this occurrence —
+            # retrying it every 60s in silence is what made a broken routine
+            # look armed. Tell the stakeholder and advance the schedule so the
+            # routine degrades to an alert, not to nothing.
+            _monitor_notify(
+                cfg, slug, routine.id,
+                f"🔴 routine {routine.id} ({routine.title}) was due but NO "
+                f"session could be attached: {failure}. Nothing is working on "
+                f"it; the schedule was advanced to the next occurrence.")
+            nxt_failed = routine.trigger().next_fire(now, inclusive=False)
+            _write_run_times(cfg, slug, routine.id, last_run_at=_iso(now),
+                             next_run_at=_iso(nxt_failed))
+            append_event(cfg, slug, ts=_iso(now), routine=routine.id,
+                         kind="notify",
+                         note=f"schedule fire: spawn failed ({failure}) — "
+                              f"alerted instead of attaching AI")
+            log.error("routine %s due but spawn failed for %s: %s",
+                      routine.id, slug, failure)
+            continue
         nxt = routine.trigger().next_fire(now, inclusive=False)
         _write_run_times(cfg, slug, routine.id,
                          last_run_at=_iso(now), next_run_at=_iso(nxt))
@@ -1308,9 +1359,17 @@ def _handle_fire(cfg: Any, slug: str, routine: Routine, event: FireEvent,
                  routine.id, live_sid, slug)
         return True
 
-    sid = _spawn_for_routine(cfg, slug, routine, event=event, now=now)
+    sid, failure = _spawn_for_routine(cfg, slug, routine, event=event, now=now)
     if not sid:
-        return False  # deferred under backpressure — cooldown NOT stamped
+        # T-0895: the fire is NOT over just because the spawn failed. Capacity
+        # backpressure keeps the intended quiet retry (bounded); any other
+        # reason degrades this fire to the `notify` path, because the one thing
+        # `on_breach: spawn` must never do is behave like a disarmed routine.
+        if failure == SPAWN_DEFER_CAPACITY:
+            return _defer_under_capacity(cfg, slug, routine, event, state, now)
+        return _spawn_failed_notify(cfg, slug, routine, event, failure, now)
+    state.pop("spawn_defer_since", None)
+    state.pop("spawn_defer_count", None)
     # md keeps only the slow field: the AI actually attached (§3.2)
     _write_run_times(cfg, slug, routine.id,
                      last_run_at=_iso(now), next_run_at=None)
@@ -1319,6 +1378,70 @@ def _handle_fire(cfg: Any, slug: str, routine: Routine, event: FireEvent,
     log.info("monitor fired: %s -> %s (value %s vs %s) [%s]",
              routine.id, sid, event.value, event.threshold, slug)
     return True
+
+
+def _spawn_failed_notify(cfg: Any, slug: str, routine: Routine,
+                         event: FireEvent, failure: Optional[str],
+                         now: datetime) -> bool:
+    """T-0895 (DoD 4): ``on_breach: spawn`` degrades to ``notify``, never to
+    silence, when the agent could not be attached for a NON-capacity reason.
+
+    Returns True when the alert was delivered — the caller then stamps
+    fired/cooldown exactly as for a plain ``notify``, so a permanently broken
+    spawn alerts once per cooldown instead of retrying mutely forever. An
+    UNDELIVERED alert returns False and retries next tick, like ``_notify_breach``.
+    """
+    text = (f"🔴 monitor {routine.id} ({routine.title}) breach: "
+            f"value {event.value} vs threshold {event.threshold} "
+            f"(judge {event.judge}), since {event.breach_first_seen}. "
+            f"on_breach=spawn BUT NO AI COULD BE ATTACHED: {failure}. "
+            f"Degraded to this code-only alert — nobody is working on it.")
+    if not _monitor_notify(cfg, slug, routine.id, text):
+        return False
+    append_event(cfg, slug, ts=_iso(now), routine=routine.id, kind="notify",
+                 value=event.value, threshold=event.threshold,
+                 note=f"on_breach=spawn: attach failed ({failure}) — "
+                      f"degraded to code-only alert")
+    log.error("monitor breach could NOT attach AI: %s (%s) — alerted "
+              "instead [%s]", routine.id, failure, slug)
+    return True
+
+
+def _defer_under_capacity(cfg: Any, slug: str, routine: Routine,
+                          event: FireEvent, state: dict, now: datetime) -> bool:
+    """T-0895 (DoD 4, the ⚠ carve-out): a spawn deferred by the parallel-session
+    / token cap keeps retrying QUIETLY — that part is deliberate — but the
+    silence is now BOUNDED by ``SPAWN_DEFER_QUIET_S``.
+
+    Always returns False: cooldown stays unstamped so the next tick retries the
+    attach. The bookkeeping lives in the monitor state dict the caller saves.
+    """
+    state["spawn_defer_count"] = int(state.get("spawn_defer_count") or 0) + 1
+    since_raw = state.get("spawn_defer_since") or _iso(now)
+    state["spawn_defer_since"] = since_raw
+    since = _parse_iso(since_raw)
+    waited = (now - since).total_seconds() if since is not None else 0.0
+    if waited >= SPAWN_DEFER_QUIET_S:
+        delivered = _monitor_notify(
+            cfg, slug, routine.id,
+            f"🔴 monitor {routine.id} ({routine.title}) has been breaching "
+            f"since {event.breach_first_seen} (value {event.value} vs "
+            f"threshold {event.threshold}) and STILL has no AI attached: "
+            f"{state['spawn_defer_count']} spawn attempts deferred over "
+            f"{int(waited)}s by the parallel-session/token cap. Raise the cap "
+            f"or free a slot.")
+        if delivered:
+            append_event(cfg, slug, ts=_iso(now), routine=routine.id,
+                         kind="notify", value=event.value,
+                         threshold=event.threshold,
+                         note=f"on_breach=spawn: unattended {int(waited)}s "
+                              f"under capacity backpressure")
+            # restart the quiet window — one alert per window, not per tick
+            state["spawn_defer_since"] = _iso(now)
+        log.warning("monitor %s: breach unattended %ds under capacity "
+                    "backpressure (%s attempts) [%s]", routine.id, int(waited),
+                    state["spawn_defer_count"], slug)
+    return False
 
 
 def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dict:
@@ -1368,6 +1491,17 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
         for r, trig, st in due:
             try:
                 ev = trig.poll(now, {"state": st, "probe": probes[r.id]})
+                if not st.get("breach_first_seen"):
+                    # T-0895: no breach in flight -> the unattended-spawn
+                    # bookkeeping of the previous one must not outlive it, or
+                    # the NEXT breach's first capacity deferral would alert
+                    # immediately instead of waiting out its quiet window.
+                    # Keyed on the breach state, not on the `recover` event:
+                    # poll emits recover ONLY for a breach that fired, and a
+                    # breach whose spawn never landed is exactly the one
+                    # carrying these markers.
+                    st.pop("spawn_defer_since", None)
+                    st.pop("spawn_defer_count", None)
                 if ev is not None:
                     if ev.kind == "fire" and r.is_muted(now):
                         # T-0604 mute: probes but never fires — fired/cooldown

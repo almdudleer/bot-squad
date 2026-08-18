@@ -33,6 +33,8 @@ Even when the four hold, weigh the cost of being wrong:
 - **Reversible / cheap to fix** → decide, ship, see. This project is explicitly **low cost-of-mistake → full speed** (clarification-05; staging breakage is fine — constitution). Do NOT add "are you sure?" gates.
 - **Irreversible** (data loss, destructive migration, credential change, prod-breaking-without-rollback) → that's the genuine ask. Page deliberately.
 
+**A restart or a deploy is NOT in that bucket on his projects — he took it out himself.** 2026-08-18 (T-0903): «хватит ждать моих разрешений на рестарт … bot-squad должен рестартить и как можно скорее до меня докатывать все изменения что я прошу, я единственный пользователь пока что», and when asked whether that meant only low-risk restarts or literally any change including DB schema and prod data, «про любые!». So a change that is ready by its own bar (review, green tests, DoD) ships now — no «можно рестартить?», and **silence is not a hold**: there is no answer coming, and a session that pings once and then waits is the failure this rule names (T-0895 sat finished for a day that way). The bar itself, backups/rollback, the destroy-guard on unpushed commits, and his authority over what gets BUILT are all unchanged; report what you shipped afterwards. Full text: the same section in `operator.md` / `teamlead.md` / `prod-teamlead.md`. Where a project's own config reserves deploys to its owner (`deploy_targets = []`), this grants you nothing — it removes a waiting habit, not a project's rule.
+
 ## Ground first — the moves
 
 Before deciding "I need to ask," exhaust grounding:

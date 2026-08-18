@@ -36,8 +36,14 @@ records the full binding set; the SessionStart hook surfaces it on resume.
 - Do NOT deploy, push, or merge yourself. After you signal `READY`, your
   TL reviews the commits, runs tests, pushes `origin/bot_squad/dev`, and
   gates the staging deploy + any worker restart. Staging deploys are
-  TL-owned; prod deploys are stakeholder-owned. (This keeps the quality
-  bar: nothing reaches staging unreviewed.)
+  TL-owned; prod deploys go to the prod TL. (This keeps the quality bar:
+  nothing reaches staging unreviewed.) **Neither of them waits for the
+  stakeholder's permission to restart or deploy** — he removed that
+  round-trip (2026-08-18, T-0903: «хватит ждать моих разрешений на
+  рестарт», scope «про любые!»), so once your DoD is green the only thing
+  between your commit and the install is your TL's review. Signalling
+  `READY` is therefore the whole of your part; do not add a "waiting for
+  his go-ahead" step to your own ticket.
 - If you're blocked: `bsq peer send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
 - **Idle vs. explicit page (T-0034).** When you sit idle/blocked under a

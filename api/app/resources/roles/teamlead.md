@@ -72,6 +72,44 @@ it on resume.
   (`bsq peer send` to the SID; the worker reads with `bsq inbox check` /
   `bsq inbox wait`).
 
+## Ship it — his standing authorization, no permission round-trip (stakeholder 2026-08-18, T-0903)
+
+> «так, деплой, пожалуйста, хватит ждать моих разрешений на рестарт в этом
+> проекте. bot-squad должен рестартить и как можно скорее до меня докатывать
+> все изменения что я прошу, я единственный пользователь пока что»
+
+**When a change is ready by the bar it already had, restart and deploy it —
+now, and without asking him.** Do not send «можно рестартить?»; do not park
+finished work waiting for a yes. There is no answer coming, so **silence is
+not a hold** — a session that pings once and then sits is the exact failure
+this replaces: T-0895 sat done, reviewed and pushed for a day because its
+operator asked for restart permission, got silence, and read that as "not
+approved". He found out by noticing the symptom.
+
+**Scope: any change category.** He was asked the narrowing question directly —
+only restarts of reviewed low-risk fixes, or literally any change including DB
+schema and prod data — and answered «про любые!» (2026-08-18T09:24:14Z). Do not
+re-narrow it; that narrowing was put to him and rejected. Same direction as
+«всё деплой что я просил, никаких гейтов» (T-0640, 2026-08-12).
+
+**What this does NOT remove** — none of it is a wait on him:
+
+- The bar for "ready": review, green tests, the ticket's DoD. What is deleted
+  is the permission round-trip ON TOP of that bar, not the bar.
+- Backups, rollback plans, the destroy-guard on unpushed commits in the deploy
+  clone. Every safety practice that protects the system rather than deferring
+  to him stays until he says otherwise.
+- His authority over WHAT gets built. A captured wish is still not a build
+  directive (drive-mode, T-0656). This is about shipping what he asked for,
+  not about widening what you decide to make.
+- A capability the project itself withholds: where a project's config reserves
+  deploys to its owner (`deploy_targets = []`), there is nothing here for you
+  to ship. This removes a waiting habit, not a project's own rule.
+
+**Tell him after, not before.** Report what you restarted or deployed, so he
+learns it shipped instead of discovering the symptom. That is a report, and it
+never becomes a request for permission you already have.
+
 ## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
 
 A release notice, a status answer, a blocker you escalate — each opens on the

@@ -1007,18 +1007,68 @@ def test_run_next_no_progress_watchdog_kills_hung_build(
     assert "WATCHDOG" in log_text and "no run-log output" in log_text
 
 
-def test_run_next_hard_timeout_kills_long_build(tmp_path: Path, monkeypatch) -> None:
-    """A build that keeps printing (no-progress never fires) but runs too long
-    is killed by the wall-clock backstop with RC_TIMEOUT."""
-    from bot_squad_worker.deploy import RC_TIMEOUT
+def test_wall_clock_budget_no_longer_kills_a_progressing_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """★ T-0919 REGRESSION TEST — this is run 311ba682, reproduced.
 
+    A recipe that keeps producing output past the wall-clock budget must NOT be
+    killed. Before T-0919 this exact shape died rc=124: the 1800s cap fired on a
+    build whose log was still growing (`npm run build` had printed 54s earlier),
+    because the cap measured SLOWNESS, which is not the failure a watchdog
+    exists to catch.
+
+    The budget is now a NOTICE: it is recorded and the run continues to its own
+    successful exit.
+    """
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "2")            # budget: notice only
     monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "60")  # never fires
-    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "1")
-    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "2")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_CEILING_SECONDS", "60")      # never fires
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "0.2")
 
     proj = _make_project(tmp_path)
     cfg = _make_config(tmp_path, proj)
-    # Chatty recipe: emits output continuously so only the hard timeout can fire.
+    recipe_dir = cfg.data_dir / proj.slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / "staging.sh"
+    # Chatty and finite: overruns the 2s budget, then succeeds on its own.
+    recipe.write_text(
+        "#!/usr/bin/env bash\n"
+        "for i in $(seq 1 25); do echo \"#7 $i.00 still building\"; sleep 0.2; done\n"
+        "exit 0\n"
+    )
+    recipe.chmod(0o755)
+
+    enqueue(cfg, proj.slug, "staging", "slow but progressing", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    # THE point of the ticket: a slow, live build succeeds.
+    assert result.ok is True
+    assert result.returncode == 0
+    assert result.killed_reason is None
+    # ...and the overrun is still reported, so slowness stays visible.
+    assert result.budget_exceeded is True
+    assert result.budget_s == 2
+    assert "WATCHDOG" not in result.log_path.read_text()
+
+
+def test_absolute_ceiling_kills_a_chatty_runaway(tmp_path: Path, monkeypatch) -> None:
+    """The one wall-clock kill that remains, and the one case no silence budget
+    can ever catch: a recipe looping forever while still printing.
+
+    It must report itself AS a ceiling, not as a wedge — the run was never
+    silent, and `silence_s` proves it.
+    """
+    from bot_squad_worker.deploy import RC_TIMEOUT
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")             # budget: never
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "60")  # never fires
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_CEILING_SECONDS", "3")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "0.2")
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
     recipe_dir = cfg.data_dir / proj.slug / "deploy"
     recipe_dir.mkdir(parents=True, exist_ok=True)
     recipe = recipe_dir / "staging.sh"
@@ -1027,14 +1077,224 @@ def test_run_next_hard_timeout_kills_long_build(tmp_path: Path, monkeypatch) -> 
     )
     recipe.chmod(0o755)
 
-    enqueue(cfg, proj.slug, "staging", "slow build", "user")
+    enqueue(cfg, proj.slug, "staging", "runaway loop", "user")
     result = run_next(cfg, proj.slug)
 
     assert result is not None and result.ok is False
     assert result.returncode == RC_TIMEOUT
-    assert result.killed_reason == "timeout"
-    assert "WATCHDOG" in result.log_path.read_text()
+    assert result.killed_reason == "ceiling"
+    assert result.killed_limit_name == "absolute ceiling"
+    assert result.killed_limit_s == 3
+    assert result.killed_elapsed_s >= 3
+    # Still printing at the moment of the kill — the marker must not call this a
+    # wedge, and the number that proves it is silence_s.
+    assert result.silence_s < 1.5
+    log_text = result.log_path.read_text()
+    assert "absolute ceiling" in log_text
+    assert "STILL ARRIVING" in log_text
 
+
+def test_silence_budget_scales_with_this_run_s_own_step_tempo(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """★ THE BOUND. A silence LONGER than the floor is tolerated when the run has
+    already demonstrated it is running slow steps.
+
+    This is what stops the fix from being "a bigger constant": the extra rope is
+    computed from the run's own measurements. On run 311ba682 a 718.4s step had
+    completed before the 583.7s silence began — the evidence was in the log, in
+    time to be used, and the old watchdog threw it away.
+
+    Floor 2s, tempo x2.0, one completed 20.0s step → budget 40s. The 6s silence
+    below is 3x the floor and must survive.
+    """
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "2")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TEMPO_MULTIPLIER", "2.0")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_CEILING_SECONDS", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "0.2")
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    recipe_dir = cfg.data_dir / proj.slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / "staging.sh"
+    # Real buildkit plain-progress shape: a header, then DONE with a duration,
+    # then the dead silence a COPY step produces.
+    recipe.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "#5 [web-builder 4/8] COPY web/ ./"\n'
+        'echo "#5 DONE 20.0s"\n'
+        "sleep 6\n"
+        'echo "#6 DONE 1.0s"\n'
+        "exit 0\n"
+    )
+    recipe.chmod(0o755)
+
+    enqueue(cfg, proj.slug, "staging", "slow steps then a long quiet copy", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None
+    assert result.ok is True, "a 6s silence must survive a floor of 2s once a 20s step has completed"
+    assert result.killed_reason is None
+    assert result.completed_steps == 2
+    assert "20.0s" in result.last_completed_step or "1.0s" in result.last_completed_step
+
+
+def test_silence_budget_still_kills_a_wedge_at_the_floor_on_a_fast_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The other half of the bound: a run that has NOT demonstrated slowness gets
+    no extra rope, so a wedge is still caught at the floor exactly as before.
+
+    Floor 2s, tempo x2.0, longest completed step 0.5s → budget max(2, 1.0) = 2s.
+    """
+    from bot_squad_worker.deploy import RC_NO_PROGRESS
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "2")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TEMPO_MULTIPLIER", "2.0")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_CEILING_SECONDS", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "0.2")
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    recipe_dir = cfg.data_dir / proj.slug / "deploy"
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe = recipe_dir / "staging.sh"
+    recipe.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "#5 [api 2/8] WORKDIR /app"\n'
+        'echo "#5 DONE 0.5s"\n'
+        "while true; do sleep 60; done\n"
+    )
+    recipe.chmod(0o755)
+
+    enqueue(cfg, proj.slug, "staging", "fast run that then wedges", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.ok is False
+    assert result.returncode == RC_NO_PROGRESS
+    assert result.killed_reason == "no_progress"
+    assert result.killed_limit_name == "no-progress budget"
+    assert result.killed_limit_s == 2, "a fast run must not earn tempo headroom"
+    # A real wedge: the silence at the kill is the whole budget.
+    assert result.silence_s >= 2
+    assert result.completed_steps == 1
+    assert "#5" in result.last_completed_step
+
+
+def test_kill_after_the_tree_sync_flags_install_sha_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """T-0919 item 3 / T-0839 item 3 — the outcome that actually costs.
+
+    The recipe ff-merges the install tree as one of its first acts (measured on
+    run 311ba682: 13 seconds into a 1802-second run) and then builds for the rest
+    of the run, and `_should_restart_worker` returns False whenever ok is False.
+    So a killed deploy leaves the install tree on new code with the worker still
+    executing the old, and nothing automatic repairs it. The killed path must
+    detect and surface that.
+    """
+    from bot_squad_worker import deploy as _d
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_CEILING_SECONDS", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "0.2")
+    monkeypatch.setattr(_d, "_git_head_sha", lambda root: "a" * 40)
+    monkeypatch.setattr(_d, "boot_git_sha", lambda: "b" * 40)
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_hanging_recipe(cfg, proj.slug, "staging")
+
+    enqueue(cfg, proj.slug, "staging", "killed after sync", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.killed_reason == "no_progress"
+    assert result.install_sha_drift is True
+    assert result.install_tree_sha == "a" * 40
+
+
+def test_no_install_sha_drift_when_the_tree_never_moved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Negative arm of the item-3 detector: a kill on a tree that is ALREADY on
+    the running sha is not drift, and must not be reported as one."""
+    from bot_squad_worker import deploy as _d
+
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "1")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_CEILING_SECONDS", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_TIMEOUT", "60")
+    monkeypatch.setenv("BOT_SQUAD_DEPLOY_POLL_SECONDS", "0.2")
+    monkeypatch.setattr(_d, "_git_head_sha", lambda root: "c" * 40)
+    monkeypatch.setattr(_d, "boot_git_sha", lambda: "c" * 40)
+
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_hanging_recipe(cfg, proj.slug, "staging")
+
+    enqueue(cfg, proj.slug, "staging", "killed, tree unchanged", "user")
+    result = run_next(cfg, proj.slug)
+
+    assert result is not None and result.killed_reason == "no_progress"
+    assert result.install_sha_drift is False
+    assert result.install_tree_sha == ""
+
+
+def test_silence_budget_is_computed_not_guessed() -> None:
+    """Unit-level pin on the bound itself, so the arithmetic is checkable without
+    running a build."""
+    from bot_squad_worker.deploy import _silence_budget
+
+    # A calm run never leaves the floor.
+    assert _silence_budget(600, 2.0, 0.0, 14400) == 600
+    assert _silence_budget(600, 2.0, 120.0, 14400) == 600
+    # Run 311ba682: a 718.4s step had completed before the 583.7s silence began.
+    assert _silence_budget(600, 2.0, 718.4, 14400) == 1436
+    assert _silence_budget(600, 2.0, 718.4, 14400) > 583.7, (
+        "the measured live-build silence must fit inside the budget it earned"
+    )
+    # The silence budget can never outlive the run itself.
+    assert _silence_budget(600, 2.0, 100000.0, 14400) == 14400
+
+
+def test_run_progress_parses_real_buildkit_output() -> None:
+    """The tempo signal is only as good as the parse, and it is fed the REAL
+    shape: buildkit re-prints a vertex header every time the vertex resumes, and
+    emits nothing at all between a COPY's header and its DONE."""
+    from bot_squad_worker.deploy import _RunProgress
+
+    p = _RunProgress()
+    p.feed(
+        "#14 [web-builder 5/8] COPY web/ ./\n"
+        "#14 ...\n"
+        "#8 [internal] load build context\n"
+        "#8 transferring context: 4.35MB 2.3s\n"
+        "#8 DONE 29.1s\n"
+        "#14 [web-builder 5/8] COPY web/ ./\n"
+        "#14 DONE 718.4s\n"
+        "#18 [web-builder 6/8] COPY scripts/install /scripts/install\n"
+    )
+    assert p.completed == 2
+    assert p.longest_done_s == 718.4
+    assert "718.4s" in p.last_completed_step
+    assert p.last_step == "#18 [web-builder 6/8] COPY scripts/install /scripts/install"
+
+
+def test_run_progress_holds_back_a_split_line() -> None:
+    """Fed incrementally from a live log, a vertex line can straddle two reads.
+    A half-parsed `DONE` would silently corrupt the tempo, so partial lines are
+    held back rather than parsed."""
+    from bot_squad_worker.deploy import _RunProgress
+
+    p = _RunProgress()
+    p.feed("#14 [web-builder 5/8] COPY web/ ./\n#14 DON")
+    assert p.completed == 0
+    p.feed("E 718.4s\n")
+    assert p.completed == 1
+    assert p.longest_done_s == 718.4
 
 def test_watchdog_kills_whole_process_group(tmp_path: Path, monkeypatch) -> None:
     """The recipe's CHILD (docker/npm stand-in) is killed too, not just bash.

@@ -1714,32 +1714,47 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     # Run recipe with cwd matching the target clone (dev clone for staging,
     # master clone for prod). Recipes assume their cwd is the right tree.
     #
-    # Two watchdogs guard the run (T-0212), because the old single
-    # `subprocess.run(timeout=)` both (a) let a hung build hold the whole
-    # serial monitor for up to 30 min, and (b) RAISED TimeoutExpired on a
-    # hang — uncaught, that stranded the file in processing/ forever (the
-    # 2-week-old watchrobot orphans):
-    #   - no-progress watchdog: kill the build when its run-log has produced
-    #     no new bytes for BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS (default 600s =
-    #     10 min). A healthy build emits layer/step progress continuously even
-    #     when slow; 10 min of total silence means it's wedged (buildx frozen
-    #     at `COPY web/ .` at 0% CPU, the live watchrobot symptom).
-    #   - hard timeout: wall-clock backstop. signal-tracker's fresh-cache image
-    #     build (vite + npm install + COPY backend) runs ~17 min, so the 1800s
-    #     (30 min) default leaves headroom. Override $BOT_SQUAD_DEPLOY_TIMEOUT.
-    # Either watchdog kills the whole process group (the recipe's children —
-    # docker build etc. — survive a kill of just the bash parent), appends a
-    # loud marker to the run-log, and returns a sentinel rc instead of raising,
-    # so the queue file always lands in processed/ and the queue is unblocked.
-    timeout_s = int(os.environ.get("BOT_SQUAD_DEPLOY_TIMEOUT", "1800"))
-    no_progress_s = int(os.environ.get("BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", "600"))
+    # Supervision (T-0212, reshaped by T-0919). The original design ran two
+    # watchdogs that both KILLED: a no-progress kill and a 1800s wall-clock cap.
+    # The cap fired on SLOWNESS, which is not the failure a watchdog exists to
+    # catch, and it demonstrably killed live builds (run 311ba682: rc=124 at
+    # 1802s with npm still printing). It is now a NOTICE, not a kill.
+    #
+    #   - silence budget (the wedge kill): kill when the run log has produced no
+    #     new bytes for longer than the budget. The budget is NOT the floor —
+    #     buildkit is completely silent during a COPY step, so a fixed floor came
+    #     within 16.3s of killing the live 311ba682 build. It scales with the
+    #     longest step this run has already completed. See _silence_budget.
+    #     Floor: $BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS (600s).
+    #   - wall-clock budget: crossing it records the fact and the run CONTINUES.
+    #     $BOT_SQUAD_DEPLOY_TIMEOUT (1800s), kept as the historical env name so
+    #     an existing override still means "how long we expect this to take".
+    #   - absolute ceiling (the only remaining wall-clock kill): exists solely so
+    #     the project's queue is eventually unblocked, and is the only bound that
+    #     can catch a recipe looping forever while still printing.
+    #     $BOT_SQUAD_DEPLOY_CEILING_SECONDS (14400s).
+    #
+    # A kill takes out the whole process group (the recipe's children — docker
+    # build etc. — survive a kill of just the bash parent), appends a loud marker
+    # to the run-log, and returns a sentinel rc instead of raising, so the queue
+    # file always lands in processed/ and the queue is unblocked.
+    budget_s = int(os.environ.get("BOT_SQUAD_DEPLOY_TIMEOUT", str(DEFAULT_BUDGET_SECONDS)))
+    no_progress_floor_s = int(os.environ.get(
+        "BOT_SQUAD_DEPLOY_NO_PROGRESS_SECONDS", str(DEFAULT_NO_PROGRESS_FLOOR)))
+    ceiling_s = int(os.environ.get(
+        "BOT_SQUAD_DEPLOY_CEILING_SECONDS", str(DEFAULT_CEILING_SECONDS)))
+    tempo_multiplier = float(os.environ.get(
+        "BOT_SQUAD_DEPLOY_TEMPO_MULTIPLIER", str(DEFAULT_TEMPO_MULTIPLIER)))
     log.info(
-        "deploy.run_next: running %s (recipe: %s, cwd: %s, timeout=%ds, no_progress=%ds)",
-        queue_id, recipe, repo, timeout_s, no_progress_s,
+        "deploy.run_next: running %s (recipe: %s, cwd: %s, budget=%ds [notice only], "
+        "no_progress floor=%ds x%.1f tempo, ceiling=%ds)",
+        queue_id, recipe, repo, budget_s, no_progress_floor_s, tempo_multiplier, ceiling_s,
     )
-    rc, killed_reason = _run_recipe_watchdog(
-        recipe, repo, log_path, timeout_s, no_progress_s, queue_id
+    wd = _run_recipe_watchdog(
+        recipe, repo, log_path, budget_s, no_progress_floor_s, queue_id,
+        ceiling_s=ceiling_s, tempo_multiplier=tempo_multiplier,
     )
+    rc, killed_reason = wd.returncode, wd.killed_reason
 
     # T-0243: record the terminal rc BEFORE the _finish move, for the winner and
     # every collapsed qid, so a worker restart racing this finalization can't
@@ -1836,11 +1851,47 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     worker_stale = bool(
         ok and not will_restart and (rate_limited or launch_failed or no_scope)
     )
+    # T-0919 item 3 — the invisible intermediate state, PROVEN reachable rather
+    # than argued. The recipe ff-merges the install tree to the new sha as one of
+    # its first acts and then spends the entire rest of the run building: on run
+    # 311ba682 the install-dir reflog stamps the merge at 12:48:15Z against a log
+    # born 12:48:02Z and killed at 13:18:08Z, i.e. the sync completed 13 seconds
+    # into a 1802-second run. `_should_restart_worker` returns False whenever
+    # `ok` is False, so a kill ALWAYS skips the restart. The result is an install
+    # tree on new code with the worker executing the old, and — unlike the
+    # rate-limited/launch-failed cases above — NOTHING is scheduled to repair it.
+    # (The same window exists for an honest recipe failure after the sync, e.g.
+    # exit 6/9; that is outside this ticket's killed-path scope and wants its own
+    # ticket rather than a silent widening here.)
+    install_tree_sha = _git_head_sha(_install_root()) if killed_reason else ""
+    running_sha = boot_git_sha() if killed_reason else ""
+    install_sha_drift = bool(
+        killed_reason and install_tree_sha and running_sha
+        and install_tree_sha != running_sha
+    )
+    if install_sha_drift:
+        log.error(
+            "deploy.run_next: %s/%s was KILLED after the install tree had already "
+            "been synced — install tree is on %s while this worker runs %s, and no "
+            "restart fires on a failed deploy. Nothing automatic will repair this.",
+            slug, target, install_tree_sha[:12], running_sha[:12],
+        )
     return DeployResult(
         ok=ok, returncode=rc, queue_id=queue_id, log_path=log_path,
         collapsed_count=1 + len(collapsed_processing),
         collapsed_reasons=tuple(collapsed_reasons),
         killed_reason=killed_reason,
+        killed_elapsed_s=wd.elapsed_s if killed_reason else 0.0,
+        killed_limit_s=wd.limit_s,
+        killed_limit_name=wd.limit_name,
+        silence_s=wd.silence_s,
+        completed_steps=wd.completed_steps,
+        last_step=wd.last_step,
+        last_completed_step=wd.last_completed_step,
+        budget_exceeded=wd.budget_exceeded,
+        budget_s=wd.budget_s,
+        install_sha_drift=install_sha_drift,
+        install_tree_sha=install_tree_sha if install_sha_drift else "",
         resolved_sha=_parse_resolved_sha(log_path),
         worker_restart_status=worker_restart_status,
         per_user_workers=per_user_workers,
@@ -1970,29 +2021,144 @@ def _queue_id_of(processing_file: Path) -> str:
     return qid
 
 
+_VERTEX = re.compile(r"^#(\d+)(?:\s+(.*))?$")
+_VERTEX_DONE = re.compile(r"^DONE\s+(\d+(?:\.\d+)?)s")
+
+
+class _RunProgress:
+    """Incrementally read a live run log and track the build's step tempo.
+
+    Fed only the bytes appended since the previous call, so cost is O(new
+    output) per poll rather than O(log) — a saturated run's log reaches ~150KB
+    and is polled every 5s.
+
+    What it extracts from buildkit's plain-progress vertex stream:
+      - ``longest_done_s`` — the longest step that has ALREADY COMPLETED. This
+        is what prices the silence budget: it is the run's own measurement of
+        how slow this box is right now, and crucially it is available BEFORE the
+        next long silence starts (on run 311ba682 a 718.4s step had completed
+        before the 583.7s silence began).
+      - ``completed`` / ``last_step`` / ``last_completed_step`` — the "what had
+        completed" terms the kill alert reports (T-0919 item 4).
+
+    A log with no buildkit output at all (a recipe that fails before `docker
+    compose build`, or a non-docker recipe) simply leaves every field at its
+    zero value, and the silence budget falls back to the floor.
+    """
+
+    def __init__(self) -> None:
+        self.longest_done_s: float = 0.0
+        self.completed: int = 0
+        self.last_step: str = ""
+        self.last_completed_step: str = ""
+        self._open_step: dict[str, str] = {}
+        self._tail: str = ""
+
+    def feed(self, chunk: str) -> None:
+        buf = self._tail + chunk
+        lines = buf.split("\n")
+        # The final element is a partial line unless the chunk ended on \n; hold
+        # it back so a vertex header split across two reads is not mis-parsed.
+        self._tail = lines.pop()
+        for line in lines:
+            self._line(line)
+
+    def _line(self, line: str) -> None:
+        m = _VERTEX.match(line)
+        if not m:
+            return
+        vid, rest = m.group(1), (m.group(2) or "")
+        if rest.startswith("["):
+            # Vertex header: "#20 [web-builder 8/8] RUN npm run build". Buildkit
+            # re-prints it whenever the vertex resumes after interleaving, so
+            # keep the newest sighting as "the step in flight".
+            self._open_step[vid] = line
+            self.last_step = line
+            return
+        d = _VERTEX_DONE.match(rest)
+        if d:
+            secs = float(d.group(1))
+            self.completed += 1
+            self.longest_done_s = max(self.longest_done_s, secs)
+            header = self._open_step.pop(vid, f"#{vid}")
+            self.last_completed_step = f"{header} ({secs:.1f}s)"
+            if self.last_step == header:
+                self.last_step = ""
+
+
+def _silence_budget(
+    floor_s: int, tempo_multiplier: float, longest_done_s: float, ceiling_s: int
+) -> int:
+    """The no-progress budget for RIGHT NOW, given the tempo the run has shown.
+
+    ``max(floor, multiplier * longest-step-already-completed)``, clamped to the
+    absolute ceiling so the silence budget can never outlive the run itself.
+
+    This is the whole T-0919 bound. It is deliberately NOT a constant: a calm
+    run never leaves the floor (so a wedge is still caught in 600s, exactly as
+    before), while a run that has PROVED it is running 12-minute steps earns
+    proportionally more rope — from its own measurements rather than from taste.
+    """
+    budget = max(float(floor_s), tempo_multiplier * max(0.0, longest_done_s))
+    if ceiling_s > 0:
+        budget = min(budget, float(ceiling_s))
+    return int(budget)
+
+
+@dataclass
+class WatchdogOutcome:
+    """Everything the run's supervision observed — see DeployResult for how each
+    field reaches the alert."""
+
+    returncode: int
+    killed_reason: str | None = None
+    elapsed_s: float = 0.0
+    limit_s: int = 0
+    limit_name: str = ""
+    silence_s: float = 0.0
+    completed_steps: int = 0
+    last_step: str = ""
+    last_completed_step: str = ""
+    budget_exceeded: bool = False
+    budget_s: int = 0
+
+
 def _run_recipe_watchdog(
     recipe: Path,
     repo: Path,
     log_path: Path,
-    timeout_s: int,
-    no_progress_s: int,
+    budget_s: int,
+    no_progress_floor_s: int,
     queue_id: str = "",
-) -> tuple[int, str | None]:
-    """Run ``bash <recipe>`` (cwd=repo, output→log_path) under two watchdogs.
+    ceiling_s: int = DEFAULT_CEILING_SECONDS,
+    tempo_multiplier: float = DEFAULT_TEMPO_MULTIPLIER,
+) -> WatchdogOutcome:
+    """Run ``bash <recipe>`` (cwd=repo, output→log_path) under supervision.
 
-    Returns ``(returncode, killed_reason)``:
-      - ``(rc, None)`` — the recipe exited on its own with code ``rc``.
-      - ``(RC_NO_PROGRESS, "no_progress")`` — the run-log produced no new bytes
-        for ``no_progress_s`` seconds; the build was killed.
-      - ``(RC_TIMEOUT, "timeout")`` — the run exceeded ``timeout_s`` wall-clock
-        seconds; the build was killed.
+    Returns a :class:`WatchdogOutcome`. The run ends one of three ways:
+      - the recipe exits on its own → ``killed_reason=None``, its real rc;
+      - the SILENCE BUDGET fires → ``RC_NO_PROGRESS`` / ``"no_progress"``. This
+        is the wedge kill and, after T-0919, effectively the only one;
+      - the ABSOLUTE CEILING fires → ``RC_TIMEOUT`` / ``"ceiling"``. Output was
+        still arriving; this exists only so a project's queue is eventually
+        unblocked. See DEFAULT_CEILING_SECONDS for why it sits so far out.
+
+    ``budget_s`` is the wall-clock BUDGET and DOES NOT KILL. Crossing it records
+    ``budget_exceeded`` + the step in flight and the run continues. It used to
+    kill, and it killed live builds — that is the whole of T-0919.
+
+    The silence budget is not ``no_progress_floor_s``; it is recomputed every
+    poll from the tempo the run has already demonstrated (see
+    :func:`_silence_budget`), because buildkit is FULLY SILENT during a COPY
+    step and a fixed floor came within 16.3s of killing a live build on run
+    311ba682. ``no_progress_floor_s``/``ceiling_s`` <= 0 disable that watchdog.
 
     The child is launched in its own process group (``start_new_session=True``)
     so a watchdog kill reaches the recipe's descendants (docker build, npm,
     …), not just the bash wrapper. A watchdog kill appends a loud marker to
     the run-log and NEVER raises — the caller relies on always getting an rc so
     the queue file is finished (moved out of processing/) and the queue
-    unblocked. ``no_progress_s``/``timeout_s`` <= 0 disable that watchdog.
+    unblocked.
 
     T-0213: when a user systemd manager is available the recipe is wrapped in a
     transient ``systemd-run --user --scope`` unit so it lives in its OWN cgroup
@@ -2014,14 +2180,37 @@ def _run_recipe_watchdog(
 
     start = time.monotonic()
     last_progress = start
-    last_size = -1
+    last_size = 0
+    progress = _RunProgress()
     killed_reason: str | None = None
+    limit_s = 0
+    limit_name = ""
+    budget_exceeded = False
+    budget_step = ""
     rc: int
+
+    def _outcome(code: int, *, now: float) -> WatchdogOutcome:
+        return WatchdogOutcome(
+            returncode=code,
+            killed_reason=killed_reason,
+            elapsed_s=now - start,
+            limit_s=limit_s,
+            limit_name=limit_name,
+            silence_s=now - last_progress,
+            completed_steps=progress.completed,
+            last_step=progress.last_step,
+            last_completed_step=progress.last_completed_step,
+            budget_exceeded=budget_exceeded,
+            budget_s=budget_s if budget_exceeded else 0,
+        )
 
     while True:
         try:
             rc = proc.wait(timeout=poll_interval)
-            return rc, None  # recipe finished on its own
+            # Recipe finished on its own. Drain whatever it wrote last so the
+            # step terms are complete even on a clean exit.
+            _drain(log_path, last_size, progress)
+            return _outcome(rc, now=time.monotonic())
         except subprocess.TimeoutExpired:
             pass
 
@@ -2031,41 +2220,99 @@ def _run_recipe_watchdog(
         except OSError:
             size = last_size
         if size != last_size:
-            last_size = size
+            # Bytes arrived: that IS the progress signal, and the new bytes also
+            # tell us how slow this box is running right now.
+            last_size = _drain(log_path, last_size, progress, size=size)
             last_progress = now
 
-        if no_progress_s > 0 and (now - last_progress) >= no_progress_s:
+        silence = now - last_progress
+        budget = _silence_budget(
+            no_progress_floor_s, tempo_multiplier, progress.longest_done_s, ceiling_s
+        )
+        if no_progress_floor_s > 0 and silence >= budget:
             killed_reason = "no_progress"
+            limit_s = budget
+            limit_name = "no-progress budget"
             rc = RC_NO_PROGRESS
             break
-        if timeout_s > 0 and (now - start) >= timeout_s:
-            killed_reason = "timeout"
+
+        # The wall-clock BUDGET NOTICE. Recorded once, never kills. Deliberately
+        # NOT written into the run log: the recipe's stdout fd holds its own
+        # offset in this same file, so a concurrent append would interleave into
+        # its output — and worse, it would grow the file and thereby reset
+        # last_progress, making the watchdog observe its own write as build
+        # progress. It travels out on the result instead.
+        if budget_s > 0 and not budget_exceeded and (now - start) >= budget_s:
+            budget_exceeded = True
+            budget_step = progress.last_step or progress.last_completed_step or "(no build step parsed)"
+            log.warning(
+                "deploy._run_recipe_watchdog: %s passed its %ds wall-clock budget "
+                "(elapsed %.0fs) and is STILL PROGRESSING — not killing. In flight: %s",
+                recipe, budget_s, now - start, budget_step,
+            )
+
+        if ceiling_s > 0 and (now - start) >= ceiling_s:
+            killed_reason = "ceiling"
+            limit_s = ceiling_s
+            limit_name = "absolute ceiling"
             rc = RC_TIMEOUT
             break
 
     _kill_process_group(proc)
-    elapsed = time.monotonic() - start
+    now = time.monotonic()
+    elapsed = now - start
+    silence = now - last_progress
+    outcome = _outcome(rc, now=now)
     if killed_reason == "no_progress":
         marker = (
-            f"\n\n❌ WATCHDOG: killed — no run-log output for "
-            f"{no_progress_s}s (build wedged). Elapsed {elapsed:.0f}s. "
-            f"rc={rc}.\n"
+            f"\n\n❌ WATCHDOG: killed — no run-log output for {limit_s}s "
+            f"(silence budget; floor {no_progress_floor_s}s, scaled to this run's "
+            f"longest completed step {progress.longest_done_s:.0f}s). "
+            f"Elapsed {elapsed:.0f}s. rc={rc}.\n"
         )
     else:
         marker = (
-            f"\n\n❌ WATCHDOG: killed — exceeded hard timeout of "
-            f"{timeout_s}s. Elapsed {elapsed:.0f}s. rc={rc}.\n"
+            f"\n\n❌ WATCHDOG: killed — passed the absolute ceiling of {limit_s}s. "
+            f"Output was STILL ARRIVING ({silence:.0f}s since the last write), so "
+            f"this is not a wedge: the ceiling exists only to unblock the queue. "
+            f"Elapsed {elapsed:.0f}s. rc={rc}.\n"
         )
     log.error(
-        "deploy._run_recipe_watchdog: killed %s (reason=%s, elapsed=%.0fs)",
-        recipe, killed_reason, elapsed,
+        "deploy._run_recipe_watchdog: killed %s (reason=%s, limit=%ds, elapsed=%.0fs, "
+        "silent for %.0fs, %d steps done, in flight: %s)",
+        recipe, killed_reason, limit_s, elapsed, silence, progress.completed,
+        progress.last_step or "(none parsed)",
     )
     try:
         with log_path.open("a") as lf:
             lf.write(marker)
     except OSError:
         log.exception("deploy._run_recipe_watchdog: could not append marker to %s", log_path)
-    return rc, killed_reason
+    return outcome
+
+
+def _drain(
+    log_path: Path, offset: int, progress: "_RunProgress", size: int | None = None
+) -> int:
+    """Feed the bytes appended since ``offset`` into ``progress``; return the new
+    offset. Never raises — a log we cannot read simply leaves the tempo where it
+    was, which falls back to the floor rather than to an unbounded budget.
+
+    Binary IO on purpose: ``offset`` is a byte count from ``st_size``, and a
+    text-mode ``seek`` only accepts opaque ``tell()`` values, so reading this
+    incrementally through a text handle would be unsound the moment the build
+    emits a non-ASCII byte.
+    """
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read()
+    except OSError:
+        return offset if size is None else size
+    # A multi-byte character can straddle the read boundary; decode leniently
+    # and let _RunProgress hold back the partial trailing line.
+    progress.feed(chunk.decode("utf-8", "replace"))
+    return offset + len(chunk)
 
 
 def _kill_process_group(proc: "subprocess.Popen") -> None:

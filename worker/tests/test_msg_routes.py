@@ -436,6 +436,14 @@ def _deploy_cfg(tmp_path, monkeypatch, *, ok=True, killed_reason=""):
             # T-0878: the failure branch now tells the SESSION that asked, so
             # this stub has to carry the field a real DeployResult always has.
             requested_by="",
+            # T-0880: the success path reads BOTH of these unconditionally
+            # (jobs.py builds the per-user-worker clause before deciding how
+            # loud to be), so a stub without them raises AttributeError and
+            # these tests stop exercising the notice they exist for. Values
+            # mirror the real DeployResult defaults: no per-user worker was
+            # left behind, which is the case these routing tests are about.
+            per_user_workers="",
+            per_user_workers_stale=False,
         ),
     )
     return cfg

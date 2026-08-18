@@ -415,9 +415,20 @@ def test_tg_notify_needs_input_without_an_address_follows_the_route(
 
 # --- the deploy sender: two types out of one call site, T-0188 intact --------
 
-def _deploy_cfg(tmp_path, monkeypatch, *, ok=True, killed_reason=""):
+def _deploy_cfg(tmp_path, monkeypatch, *, ok=True, killed_reason=None):
     """A cfg + patched deploy module that runs ``jobs._run_project_deploy``
-    through to its notices without touching a real queue or recipe."""
+    through to its notices without touching a real queue or recipe.
+
+    The result is a REAL ``DeployResult``, not a hand-mirrored SimpleNamespace.
+    That mirror broke this file twice — T-0878 added ``requested_by`` and T-0880
+    added ``per_user_workers``/``per_user_workers_stale``, and each time these
+    routing tests stopped exercising the notice they exist for, raising
+    AttributeError on a path that had nothing to do with the change (`15f4d01`).
+    A mirror of a dataclass is a copy of a definition, so it can only ever be
+    correct until the next field; constructing the dataclass makes every future
+    field arrive with its real default and removes the failure mode rather than
+    re-paying it (T-0920).
+    """
     from bot_squad_worker import deploy as D
 
     cfg = _cfg(tmp_path, slug="demo")
@@ -426,26 +437,12 @@ def _deploy_cfg(tmp_path, monkeypatch, *, ok=True, killed_reason=""):
     monkeypatch.setattr(D, "list_queued", lambda c, s: [queue_head])
     monkeypatch.setattr(D, "is_paused", lambda c, s: None)
     monkeypatch.setattr(D, "is_clean_for_target", lambda c, s, t: True)
-    monkeypatch.setattr(
-        D, "run_next",
-        lambda c, s: SimpleNamespace(
-            ok=ok, returncode=0 if ok else 1, collapsed_count=1,
-            resolved_sha="abc123def456", worker_restart_status="",
-            worker_stale=False, worker_boot_sha="", killed_reason=killed_reason,
-            log_path="/tmp/x.log",
-            # T-0878: the failure branch now tells the SESSION that asked, so
-            # this stub has to carry the field a real DeployResult always has.
-            requested_by="",
-            # T-0880: the success path reads BOTH of these unconditionally
-            # (jobs.py builds the per-user-worker clause before deciding how
-            # loud to be), so a stub without them raises AttributeError and
-            # these tests stop exercising the notice they exist for. Values
-            # mirror the real DeployResult defaults: no per-user worker was
-            # left behind, which is the case these routing tests are about.
-            per_user_workers="",
-            per_user_workers_stale=False,
-        ),
+    result = D.DeployResult(
+        ok=ok, returncode=0 if ok else 1, queue_id="q-1",
+        log_path=Path("/tmp/x.log"), resolved_sha="abc123def456",
+        killed_reason=killed_reason,
     )
+    monkeypatch.setattr(D, "run_next", lambda c, s: result)
     return cfg
 
 

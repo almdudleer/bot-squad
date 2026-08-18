@@ -780,14 +780,33 @@ def test_deploy_monitor_watchdog_fires_targeted_operator_alert(
     from bot_squad_worker import actions as A
     monkeypatch.setattr(A, "_get_tg_client", lambda _cfg: fake_tg)
 
-    # One operator-role session + capture peer_sends.
-    import bot_squad_worker.sessions as S
+    # A real roster on disk: one LIVE operator, one dev, and one SUPERSEDED
+    # operator in the SAME tmux window as the live one.
+    #
+    # T-0920 moved the recipient resolution off a hand-rolled list_sessions walk
+    # and onto dispatch.live_operator_sids (the T-0523 identity SSOT), so this
+    # writes session mds and lets the REAL filter run rather than stubbing the
+    # answer. That is a stronger test than the stub it replaces: the stub could
+    # only show the caller passing through whatever it was handed, while the
+    # suspended predecessor below is the thing that actually broke — its literal
+    # SID resolves to the live successor (T-0790), which is how ONE kill became
+    # 32 identical lines in one operator's inbox on 2026-08-18 13:18Z.
+    import bot_squad_worker.dispatch as DISP
     import bot_squad_worker.intersession as IS
-    monkeypatch.setattr(
-        S, "list_sessions",
-        lambda _cfg, _slug: [{"sid": "S-op-1", "role": "operator"},
-                             {"sid": "S-dev-9", "role": "dev"}],
-    )
+    sess = cfg.data_dir / proj.slug / "sessions"
+    sess.mkdir(parents=True, exist_ok=True)
+    for sid, window, role, status in (
+        ("S-u-operator-p2", "operator", "operator", "active"),
+        ("S-u-operator-p1", "operator", "operator", "suspended"),
+        ("S-u-dev-p9", "dev", "dev", "active"),
+    ):
+        (sess / f"{sid}.md").write_text(
+            f"---\nsid: {sid}\nwindow: {window}\nrole: {role}\n"
+            f"status: {status}\narchived: false\nlinux_user: u\n---\n"
+        )
+    # No tmux in a test env — pin the SSOT's pane-scan half so the md scan is
+    # what the assertions read.
+    monkeypatch.setattr(DISP, "_live_operator_sids_from_tmux", lambda slug, seen: [])
     peers: list[tuple[str, str]] = []
     monkeypatch.setattr(
         IS, "send",
@@ -799,8 +818,10 @@ def test_deploy_monitor_watchdog_fires_targeted_operator_alert(
     # Urgent TG carried the loud KILLED marker.
     kill_tgs = [c for c in fake_tg.calls if "KILLED" in c["text"]]
     assert kill_tgs and all(c["urgent"] is True for c in kill_tgs)
-    # Targeted peer_send went to the operator SID ONLY (never the dev / role=all).
-    assert peers and all(to == "S-op-1" for to, _ in peers)
+    # Targeted peer_send went to the LIVE operator SID only — never the dev,
+    # never role=all, and never the suspended predecessor (which would land a
+    # SECOND copy in the same live inbox).
+    assert [to for to, _ in peers] == ["S-u-operator-p2"], peers
     assert all("KILLED" in t for _, t in peers)
 
 

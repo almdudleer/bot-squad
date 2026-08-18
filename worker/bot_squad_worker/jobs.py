@@ -395,6 +395,25 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
         if result.collapsed_count > 1
         else ""
     )
+    # T-0919 turned the 1800s wall-clock cap from a KILL into a NOTICE, so a
+    # slow-but-working build now runs to completion. That is only an improvement
+    # if somebody is told it happened — an unreported notice is the cap silently
+    # deleted. Folded into `suffix` deliberately: `suffix` is carried by EVERY
+    # terminal line below, so the notice cannot go missing on the branch nobody
+    # thought to wire it into, and it reaches the case that matters most — a
+    # deploy that crossed the budget and then SUCCEEDED, which no failure path
+    # would ever have reported.
+    #
+    # The KILLED branch is the one exception, and it takes `collapsed` instead:
+    # "was allowed to continue" reads as a contradiction inside a sentence that
+    # says the run was killed, so that branch states the same fact in its own
+    # words and in the right ORDER (crossed the budget, kept going, then died).
+    collapsed = suffix
+    if result.budget_exceeded:
+        suffix += (
+            f" — ⚠️ this run passed its {_secs(result.budget_s)} wall-clock budget "
+            f"and was allowed to continue (the budget is a notice, not a kill)"
+        )
     if result.ok:
         # T-0446: echo WHICH commit shipped + the worker-restart decision, so a
         # green SUCCESS that precedes the async detached restart is self-explaining
@@ -466,17 +485,32 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
     elif result.killed_reason:
         # A watchdog (not the recipe) killed this build — the loud, TARGETED
         # operator alert path (T-0212), not the routine project-channel ping.
-        kind = (
-            "no-progress watchdog (build made no log output)"
-            if result.killed_reason == "no_progress"
-            else "hard timeout (build ran too long)"
-        )
-        _alert_operators(
-            cfg, slug, project,
-            f"❌ deploy {slug}/{target} KILLED by {kind} (rc={result.returncode})"
-            f"{suffix}. The build was terminated and the queue is now unblocked. "
-            f"Log: {result.log_path}",
-        )
+        #
+        # T-0920. The branch itself is not new (T-0839's "a killed deploy
+        # presents as a plain recipe failure" is half wrong, and saying so is
+        # part of that ticket) — what it said was. In full, for the 1802s kill
+        # of run 311ba682 on 2026-08-18 13:18Z:
+        #
+        #   ❌ deploy bot-squad/staging KILLED by hard timeout (build ran too
+        #   long) (rc=124). The build was terminated and the queue is now
+        #   unblocked. Log: …/311ba682-….log
+        #
+        # Three things wrong with that, in rising order of cost. It carries no
+        # numbers — not the elapsed time, not the limit, not what had run. It
+        # quotes nothing of the log, so every reader has to go and tail it,
+        # which is the same defect T-0878 fixed one branch down. And "build ran
+        # too long" is a WRONG DIAGNOSIS: the log was still growing when the
+        # kill landed (npm run build had been printing 54s earlier), so it
+        # points the reader at a slow build step when the actual cause was a
+        # wall-clock budget consumed by host I/O contention.
+        #
+        # It also told the REQUESTER nothing. Every other bad-deploy path here
+        # calls _notify_requester (T-0453, restated for rc!=0 by T-0878); the
+        # watchdog branch was the last failure path still leaving the session
+        # that asked holding an {"ok": true, queue_id} nothing would contradict.
+        text = _killed_deploy_report(slug, result.target or target, result, collapsed)
+        _alert_operators(cfg, slug, project, text)
+        _notify_requester(cfg, slug, result.requested_by, text)
     else:
         # T-0878 DoD 5. Until now this branch said exactly
         # "❌ deploy bot-squad/staging FAILED rc=8" — no reason, no remediation,
@@ -552,6 +586,180 @@ def _recipe_failure_detail(log_path: object) -> str:
     return out
 
 
+#: Human term for each watchdog, used when the result does not carry one of its
+#: own. ``killed_limit_name`` is populated by T-0919; a run recorded before it
+#: (or after a rollback) has "", and a kill must still name what killed it.
+_KILL_LIMIT_NAMES = {
+    "no_progress": "no-progress budget",
+    "ceiling": "absolute ceiling",
+    # RETIRED by T-0919 — no new run produces it. Kept because the archive is
+    # full of records that do, and a rollback would produce it again.
+    "timeout": "wall-clock timeout",
+}
+
+
+def _killed_deploy_report(slug: str, target: str, result: object, suffix: str) -> str:
+    """What a human is told when a WATCHDOG, not the recipe, ended a deploy.
+
+    Built around one number: **how long the run log had been silent when the run
+    ended** (``silence_s``). That is the whole discriminator, and it is why this
+    function exists rather than a second wording of the old line.
+
+    T-0919 measured all 100 run logs on this host. The longest silent stretch on
+    a live, healthy build was **583.7s** — the 600s no-progress budget was 16
+    seconds from killing a build that was working. So "the log went quiet" does
+    NOT prove a wedge, and "the run was long" does not prove a slow step. Only
+    the two numbers side by side separate *we killed a working build* from *we
+    killed a dead one*, and until now neither reached the reader.
+
+    Every clause is conditional on its evidence existing. A run recorded before
+    T-0919 carries zeros for all of it, and a zero rendered as "0.0s silent"
+    would read as a real measurement of a wedged build — the exact inversion of
+    the fact. So the absence is stated as an absence instead (T-0453's principle
+    applied to a number: an unpopulated field must never be printed as a value).
+    """
+    reason = str(result.killed_reason or "")
+    limit_name = result.killed_limit_name or _KILL_LIMIT_NAMES.get(reason, "watchdog")
+    elapsed = float(result.killed_elapsed_s or 0.0)
+    limit_s = int(result.killed_limit_s or 0)
+    # `killed_elapsed_s` is the presence flag for the whole telemetry group: a
+    # run that was killed necessarily ran for a non-zero time, so 0.0 here can
+    # only mean "this result predates the fields", never "it ran for no time".
+    measured = elapsed > 0
+
+    head = (
+        f"❌ deploy {slug}/{target} KILLED by the {limit_name} "
+        f"(rc={result.returncode}){suffix} — a WATCHDOG ended this run. The "
+        f"recipe did not fail and the build did not error."
+    )
+
+    lines = [head, ""]
+    if measured:
+        limit = f" against a limit of {_secs(limit_s)}" if limit_s > 0 else ""
+        lines.append(f"Ran {_secs(elapsed)}{limit}.")
+        lines.append(_kill_liveness_clause(reason, float(result.silence_s or 0.0)))
+    else:
+        lines.append(
+            "Elapsed time, the limit that fired and the log-silence at the kill "
+            "are NOT RECORDED for this run — it predates the watchdog telemetry. "
+            "Read the log below rather than assuming which limit this was."
+        )
+
+    progress = _completed_work_clause(result)
+    if progress:
+        lines.append(progress)
+
+    if result.budget_exceeded:
+        # Stated AFTER the liveness clause so it reads in the order it happened:
+        # the run crossed its wall-clock budget, was deliberately allowed to keep
+        # going (T-0919), and only then hit whatever finally killed it.
+        lines.append(
+            f"It had already passed its {_secs(result.budget_s)} wall-clock budget "
+            f"before this kill and was deliberately allowed to continue — that "
+            f"budget is a notice, not the limit that ended the run."
+        )
+
+    drift = _install_drift_clause(result)
+    if drift:
+        lines.append("")
+        lines.append(drift)
+
+    lines.append("")
+    lines.append("The queue is now unblocked.")
+    detail = _recipe_failure_detail(result.log_path)
+    if detail:
+        lines.append("")
+        lines.append(detail)
+    lines.append("")
+    lines.append(f"Log: {result.log_path}")
+    return "\n".join(lines)
+
+
+def _kill_liveness_clause(reason: str, silence_s: float) -> str:
+    """Was the build ALIVE when it was killed? — the sentence T-0920 is for.
+
+    Stated from the measurement rather than from the reason code, because the
+    reason code is what was wrong before: "hard timeout" was rendered as "build
+    ran too long" on a run whose log was still being written to.
+    """
+    if reason == "no_progress":
+        return (
+            f"The run log had produced nothing for {_secs(silence_s)} when it was "
+            f"killed — the build was WEDGED, which is what this budget exists to "
+            f"catch. Note buildkit prints nothing at all during a COPY step, so a "
+            f"long silence is not by itself proof the build was doing nothing."
+        )
+    # A wall-clock kill (the retired "timeout", or the "ceiling" that replaced
+    # it). Here the silence is the whole story — but "short silence" needs a
+    # scale, and inventing one (say, half the limit) would put a guess in a
+    # sentence whose entire job is to replace a guess.
+    #
+    # The scale the system already uses is T-0919's no-progress FLOOR: below it,
+    # a run is BY THIS SYSTEM'S OWN RULE not considered wedged — that is what the
+    # floor means. So a wall-clock kill whose silence never reached the floor
+    # killed a build the wedge-detector would have left alone. Read from
+    # deploy.py rather than restated here, so raising the floor moves this
+    # sentence with it instead of leaving a second, stale copy of the number.
+    from bot_squad_worker.deploy import DEFAULT_NO_PROGRESS_FLOOR
+
+    if silence_s < DEFAULT_NO_PROGRESS_FLOOR:
+        return (
+            f"The run log was still being written to — the last line landed "
+            f"{_secs(silence_s)} before the kill, so the build was ALIVE and was "
+            f"ended by a WALL-CLOCK budget, not by anything that hung. Do NOT go "
+            f"looking for a slow build step: a budget exhausted by host slowness "
+            f"(I/O contention, load) looks exactly like this, and the same build "
+            f"finishes in minutes on a quiet box."
+        )
+    return (
+        f"The run log had been silent for {_secs(silence_s)} when the limit fired."
+    )
+
+
+def _completed_work_clause(result: object) -> str:
+    """"…and say what had completed" (T-0839 item 2), from T-0919's fields."""
+    parts: list[str] = []
+    if result.completed_steps:
+        parts.append(f"{result.completed_steps} build step(s) had completed.")
+    if result.last_completed_step:
+        parts.append(f"Last finished: {result.last_completed_step}")
+    if result.last_step:
+        parts.append(f"In flight when it died: {result.last_step}")
+    return "\n".join(parts)
+
+
+def _install_drift_clause(result: object) -> str:
+    """The invisible intermediate state T-0839 item 3 named, now MEASURED.
+
+    T-0919's evidence for run 311ba682: the install tree's ff-merge landed at
+    12:48:15Z, 13 seconds into a run that was killed at 13:18:08Z — so 99.3% of
+    the kill window sits after the sync. And ``_should_restart_worker`` returns
+    False whenever ``ok`` is False, so a kill ALWAYS skips the restart. This is
+    not a rare race; it is the default outcome of killing a deploy, and per
+    T-0824 ``/api/health`` has no term for the install tree, so nothing else
+    surfaces it.
+    """
+    if not result.install_sha_drift:
+        return ""
+    sha = f" (now at {result.install_tree_sha[:12]})" if result.install_tree_sha else ""
+    return (
+        f"⚠️ The install tree was ALREADY updated{sha} before the kill, and a kill "
+        f"always skips the worker restart — so the worker is running the OLD code "
+        f"against the NEW tree and nothing will correct that on its own. Fix now: "
+        f"systemctl --user restart bot-squad-worker.service"
+    )
+
+
+def _secs(value: float) -> str:
+    """``1802.0`` → ``"1802s (30m2s)"``. Both, because the raw number is what
+    matches the log and the limit, and the human one is what makes 1802 vs 1800
+    legible at a glance."""
+    total = int(round(float(value)))
+    if total < 60:
+        return f"{total}s"
+    return f"{total}s ({total // 60}m{total % 60}s)"
+
+
 def _notify_requester(cfg: Config, slug: str, requested_by: str, text: str) -> None:
     """Tell the SESSION that asked for the deploy that it did not happen (T-0453).
 
@@ -609,20 +817,49 @@ def _alert_operators(cfg: Config, slug: str, project: object, text: str) -> None
 
 
 def _peer_to_operators(cfg: Config, slug: str, text: str) -> None:
-    """Targeted peer_send to each operator-role SID for ``slug`` (no broadcast)."""
-    from bot_squad_worker import sessions as _sessions
+    """Targeted peer_send to each LIVE operator SID for ``slug`` (no broadcast).
+
+    T-0920 — resolution moved from a hand-rolled ``list_sessions`` walk to
+    ``dispatch.live_operator_sids``, the operator-identity SSOT (T-0523), and the
+    reason is a measurement rather than a tidiness argument.
+
+    ``list_sessions`` returns EVERY session md ever written for the project,
+    archived ones included, so ``role == "operator"`` matched the whole history
+    of the role. Measured on this install for ``bot-squad`` at 2026-08-18 20:18Z:
+    **50 SIDs**, of which **one** was live. The old ``dict.fromkeys`` deduped the
+    REQUESTED sids, which is the wrong end — ``intersession.send`` then resolves
+    each recycled predecessor to its live successor (T-0790), and 31 of those 50
+    resolve to the SAME live operator. So one alert became 31 identical lines in
+    one inbox plus 18 writes to inboxes no session drains.
+
+    That is the "~30 duplicate peer alerts" recorded on T-0839, traced on the
+    2026-08-18 13:18Z ``311ba682`` kill: 50 sends in one tick (13:18:06–13:18:13),
+    32 of them into ``S-almdudleer-operator-p381``. It is NOT a legitimate fanout
+    to N operators and it is NOT re-firing across ticks — the following
+    ``deploy_monitor_one`` ticks at 13:18:40 and 13:19:40 emitted nothing.
+
+    The SSOT is also a superset of what the old walk found live: it adds the
+    canonical md-less operator pane a session-md scan misses (T-0523). Reaching
+    NOBODY is reported rather than papered over — the alert has already gone out
+    on the stakeholder DM leg, and a silent zero here is the thing that would let
+    a broken roster look like a delivered alert.
+    """
+    from bot_squad_worker.dispatch import live_operator_sids
     from bot_squad_worker import intersession as _is
 
     try:
-        rows = _sessions.list_sessions(cfg, slug)
+        sids = live_operator_sids(cfg, slug)
     except Exception:
-        log.exception("deploy_monitor: list_sessions failed for %s", slug)
+        log.exception("deploy_monitor: live_operator_sids failed for %s", slug)
         return
-    operator_sids = [
-        r.get("sid") for r in rows
-        if r.get("role") == "operator" and r.get("sid")
-    ]
-    for sid in dict.fromkeys(operator_sids):  # dedupe, preserve order
+    if not sids:
+        log.warning(
+            "deploy_monitor: no LIVE operator session for %s — this alert reached "
+            "no operator pane (the stakeholder DM leg still fired): %.200s",
+            slug, text,
+        )
+        return
+    for sid in dict.fromkeys(sids):  # dedupe, preserve order
         try:
             # T-0827: send_notice — a deploy alert is machine-composed and
             # this loop has nobody to report a refusal to. Splits, never drops.

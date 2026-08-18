@@ -960,3 +960,74 @@ def test_read_telemetry_includes_lifecycle_block(tmp_path, fake_session):
     assert set(wire["lifecycle"]) == {"S-almdudleer-dev-p5"}  # ghost filtered out
     lc = wire["lifecycle"]["S-almdudleer-dev-p5"]
     assert lc["counts"] == {LE.SESSION_TIMEOUT: 1, LE.SESSION_RECYCLED: 1}
+
+
+# --- T-0905: the handoff phase dict must survive a no-action tick ------------
+
+def test_a_compact_phase_transition_is_persisted_even_with_no_action_taken(
+        tmp_path, monkeypatch):
+    """``rec['compact']`` is the handoff state machine's ONLY cross-tick memory
+    (``_sample_one`` carries it forward with ``prev.get("compact")``), and it
+    transitions on ticks where no action is taken — dropping a timed-out phase
+    is not an "action". Persisting only on a True return silently reverted
+    those transitions: the phase came back next tick, timed out again, and
+    re-logged the same WARNING every 60s (6 for one timeout on p355,
+    2026-08-18T07:53-07:58).
+    """
+    from bot_squad_worker import telemetry as T
+    from bot_squad_worker import autocompact as A
+
+    written: dict = {}
+    monkeypatch.setattr(T, "_write_json", lambda path, data: written.__setitem__(
+        path.name, data))
+    monkeypatch.setattr(T, "_fire_memory_alerts",
+                        lambda cfg, slug, sampled, ops, now: None)
+    monkeypatch.setattr(T, "_record_path",
+                        lambda cfg, slug, sid: tmp_path / f"{sid}.json")
+    monkeypatch.setattr(T, "_quota_path", lambda cfg, slug: tmp_path / "_quota.json")
+
+    def _drop_the_phase(cfg, slug, rec, level, now):
+        rec["compact"] = {}          # a real transition…
+        return False                 # …on a tick that took no action
+    monkeypatch.setattr(A, "maybe_compact", _drop_the_phase)
+
+    # last_alert already agrees with the level a 1-token context derives, and
+    # memory is explicitly None — so the ONLY thing that can mark this record
+    # dirty is the compact phase. Without that isolation the assertion below
+    # would pass on a write nothing to do with this ticket.
+    rec = {"sid": "S-demo", "context": {"tokens": 1},
+           "last_alert": {"context": T.context_level(1), "memory": None},
+           "compact": {"phase": "writing", "armed_at": 1.0}}
+    T._fire_alerts(None, "bot-squad", [rec], {}, [], now=1000.0)
+
+    assert "S-demo.json" in written, "the dropped phase was never persisted"
+    assert written["S-demo.json"]["compact"] == {}
+
+
+def test_an_unchanged_compact_phase_does_not_force_a_write(tmp_path, monkeypatch):
+    """The negative control for the line above — the check must key on the
+    phase dict actually MOVING, not on it merely being present. Without this a
+    quiet fleet rewrites every telemetry record on every 60s tick."""
+    from bot_squad_worker import telemetry as T
+    from bot_squad_worker import autocompact as A
+
+    written: dict = {}
+    monkeypatch.setattr(T, "_write_json", lambda path, data: written.__setitem__(
+        path.name, data))
+    monkeypatch.setattr(T, "_fire_memory_alerts",
+                        lambda cfg, slug, sampled, ops, now: None)
+    monkeypatch.setattr(T, "_record_path",
+                        lambda cfg, slug, sid: tmp_path / f"{sid}.json")
+    monkeypatch.setattr(T, "_quota_path", lambda cfg, slug: tmp_path / "_quota.json")
+    monkeypatch.setattr(A, "maybe_compact", lambda cfg, slug, rec, level, now: False)
+
+    # last_alert already agrees with the level a 1-token context derives, and
+    # memory is explicitly None — so the ONLY thing that can mark this record
+    # dirty is the compact phase. Without that isolation the assertion below
+    # would pass on a write nothing to do with this ticket.
+    rec = {"sid": "S-demo", "context": {"tokens": 1},
+           "last_alert": {"context": T.context_level(1), "memory": None},
+           "compact": {"phase": "writing", "armed_at": 1.0}}
+    T._fire_alerts(None, "bot-squad", [rec], {}, [], now=1000.0)
+
+    assert "S-demo.json" not in written

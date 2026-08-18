@@ -627,3 +627,165 @@ def test_resolve_target_refuses_to_resurrect_the_task_sidecar(tmp_path):
     t = A._resolve_compact_target(_target_cfg(tmp_path), "bot-squad",
                                   {"sid": "S-x-p1", "role": "dev", "task_id": "T-9999"})
     assert t["kind"] == "none"
+
+
+# --- T-0905: the timeout fallback, split by WHETHER ANYTHING WAS WRITTEN -----
+#
+# Measured on the live worker journal (2026-08-12..18, 6 days):
+#   74 completed handoffs, ARM→complete max 719s — so 900s is a fine deadline
+#      for the question "did this session write anything at all".
+#   4 timed-out arms. Two of them are S-almdudleer-operator-p355 on 2026-08-18,
+#      and in BOTH the forward-state was already on disk (operator-state.md
+#      rewritten at 07:48/07:50/07:55/07:58 after a 07:39 ARM) — the pane was
+#      simply mid-generation for the whole window. Each fallback bought a
+#      compact_boundary of preTokens 389,980 and 396,913 respectively, fired
+#      294s and 54s past the deadline and within seconds of the pane first
+#      going composer-ready — i.e. at the exact moment the clean relaunch
+#      became possible.
+
+def test_finalize_does_not_fall_back_when_the_forward_state_is_already_written(harness):
+    """The core T-0905 claim: past the deadline with the state ON DISK and a
+    busy pane, NOTHING happens — no /compact, no clear, the handoff stays armed.
+
+    ``_do_claude_compact`` is gated on the same composer-ready pane the finalize
+    is, so the fallback can never take context down sooner than the relaunch
+    would have; it can only spend a summarization instead of doing the relaunch.
+    """
+    rec = _rec(activity="running",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-after-write"   # it DID write
+    late = 1000.0 + A.handoff_timeout_sec() + 60
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is False
+    assert harness["calls"]["compact"] == []      # the whole point
+    assert harness["calls"]["suspend"] == []
+    assert rec["compact"]["phase"] == "writing"   # still armed, not dropped
+
+
+def test_finalize_relaunches_when_the_pane_frees_after_the_deadline(harness):
+    """p355 replayed: the pane went composer-ready 294s PAST the deadline with
+    the state long since written. That tick must produce the clean
+    clear+relaunch, not the ~390k-token /compact it produced live."""
+    rec = _rec(activity="idle",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    late = 1000.0 + A.handoff_timeout_sec() + 294
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is True
+    assert harness["calls"]["compact"] == []
+    assert harness["calls"]["suspend"] == [rec["sid"]]
+    assert harness["calls"]["spawn_ticket"] == [(rec["sid"], "/backlog/T-0042-demo.md")]
+    assert rec["compact"] == {}
+
+
+def test_the_operator_shape_does_not_fall_back_either(harness):
+    """p355 is task-LESS (role artifact, not a ticket Context), and the
+    artifact half must take the same branch — that is the session shape the
+    whole ticket was filed about."""
+    harness["taskless"]()
+    rec = _rec(activity="running", role="operator", task_id=None,
+               compact={"phase": "writing", "kind": "artifact", "armed_at": 1000.0,
+                        "artifact_path": "/art/operator-state.md",
+                        "arm_mtime": 100.0, "role": "operator"})
+    harness["state"]["artifact_mtime"] = 200.0   # its drive cycle rewrote it
+    late = 1000.0 + A.handoff_timeout_sec() + 60
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is False
+    assert harness["calls"]["compact"] == []
+    assert rec["compact"]["phase"] == "writing"
+
+
+def test_finalize_is_forced_at_the_hard_cap_against_a_busy_pane(harness):
+    """Never wedge, the other way round: waiting for an idle pane is bounded
+    too. Past the hard cap the state is on disk, so clearing the pane costs
+    only the in-flight turn — cheaper than staying over the ceiling forever."""
+    rec = _rec(activity="running",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    way_late = 1000.0 + A.handoff_hard_timeout_sec() + 1
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=way_late) is True
+    assert harness["calls"]["compact"] == []
+    assert harness["calls"]["suspend"] == [rec["sid"]]
+    assert harness["calls"]["spawn_ticket"] == [(rec["sid"], "/backlog/T-0042-demo.md")]
+
+
+def test_the_hard_cap_does_not_apply_to_a_handoff_that_wrote_nothing(harness):
+    """The hard cap is a licence to relaunch, and it is earned by having
+    written. A session that wrote nothing must never be relaunched at any age —
+    there is nothing for the successor to boot from."""
+    rec = _rec(activity="running",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-at-arm"        # never written
+    harness["state"]["buf"] = "working… esc to interrupt"   # pane busy
+    way_late = 1000.0 + A.handoff_hard_timeout_sec() + 1
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=way_late) is False
+    assert harness["calls"]["suspend"] == []
+    assert harness["calls"]["spawn_ticket"] == []
+
+
+def test_a_failed_fallback_send_leaves_the_handoff_armed(harness):
+    """The old code cleared ``rec['compact']`` BEFORE knowing the /compact send
+    landed. Telemetry only persists the record when an action was taken, so on
+    the failed-send path that clear was reverted and the same WARNING re-fired
+    every tick — 6 of them for one timeout on p355. Keeping the phase also lets
+    a LATE write finalize cleanly instead of being locked out."""
+    rec = _rec(activity="idle",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-at-arm"        # never written
+    harness["state"]["buf"] = "working… esc to interrupt"   # send can't land
+    late = 1000.0 + A.handoff_timeout_sec() + 1
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is False
+    assert harness["calls"]["compact"] == []
+    assert rec["compact"]["phase"] == "writing"
+
+
+def test_a_late_write_still_finalizes_instead_of_being_locked_out(harness):
+    """Consequence of the line above, and the one that closes the repeat loop:
+    a session that misses the deadline while its pane is busy and writes
+    afterwards gets the clean relaunch on the next tick."""
+    rec = _rec(activity="idle",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-at-arm"
+    harness["state"]["buf"] = "working… esc to interrupt"
+    late = 1000.0 + A.handoff_timeout_sec() + 1
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is False
+
+    harness["state"]["ctx_digest"] = "digest-after-write"   # it wrote, late
+    harness["state"]["buf"] = "❯ ready\n"
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late + 60) is True
+    assert harness["calls"]["compact"] == []
+    assert harness["calls"]["spawn_ticket"] == [(rec["sid"], "/backlog/T-0042-demo.md")]
+
+
+def test_hard_timeout_can_never_undercut_the_soft_one(monkeypatch):
+    """A hard cap below the soft deadline would invert the two halves — a
+    handoff would be force-finalized before the "wrote nothing" branch it
+    belongs to could be evaluated."""
+    monkeypatch.setenv("BOT_SQUAD_HANDOFF_HARD_TIMEOUT_SEC", "5")
+    assert A.handoff_hard_timeout_sec() == A.handoff_timeout_sec()
+    monkeypatch.setenv("BOT_SQUAD_HANDOFF_HARD_TIMEOUT_SEC", "9999")
+    assert A.handoff_hard_timeout_sec() == 9999
+    monkeypatch.setenv("BOT_SQUAD_HANDOFF_HARD_TIMEOUT_SEC", "nonsense")
+    assert A.handoff_hard_timeout_sec() == A.DEFAULT_HANDOFF_HARD_TIMEOUT_SEC
+    monkeypatch.delenv("BOT_SQUAD_HANDOFF_HARD_TIMEOUT_SEC")
+    assert A.handoff_hard_timeout_sec() == A.DEFAULT_HANDOFF_HARD_TIMEOUT_SEC
+
+
+def test_the_soft_deadline_still_covers_every_completed_handoff_measured():
+    """The soft deadline is now only "did it write anything" — and it is sized
+    off a real distribution: over 2026-08-12..18 the slowest of 74 completed
+    handoffs had its forward-state on disk 719s after ARM. If someone lowers
+    this below that, sessions that WOULD have written get the /compact branch."""
+    assert A.DEFAULT_HANDOFF_TIMEOUT_SEC >= 900
+    # and the hard cap has to clear the worst measured busy stretch (p355:
+    # 1194s from ARM to the pane first going composer-ready)
+    assert A.DEFAULT_HANDOFF_HARD_TIMEOUT_SEC >= 1194

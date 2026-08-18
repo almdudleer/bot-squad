@@ -149,6 +149,40 @@ def test_needs_prompt_orientation_tracks_the_capability_for_every_provider():
         assert B.needs_prompt_orientation(name) is expected, name
 
 
+def test_a_provider_that_forgets_the_flag_gets_the_orientation():
+    """FAIL-SAFE DEFAULT, and the direction matters. Firing bot-squad's
+    SessionStart hook is a property of exactly one CLI, so every provider added
+    later is by definition not that one. A provider whose author omits the
+    field must land on "needs orientation" — the cost of being wrong that way
+    is a preamble a hooked CLI would have duplicated; the cost of being wrong
+    the other way is this ticket."""
+
+    class NewCli(agent_provider.AgentProvider):
+        def __init__(self):
+            super().__init__("newcli", "newcli", ("$",))
+
+    assert NewCli().runs_session_start_hook is False
+    # ...and once it is registered like any real provider, the orientation
+    # actually follows from that default rather than needing a second edit.
+    registry = dict(agent_provider._REGISTRY)
+    registry["newcli"] = NewCli()
+    saved, agent_provider._REGISTRY = agent_provider._REGISTRY, registry
+    try:
+        assert B.needs_prompt_orientation("newcli") is True
+        assert "bsq inbox check" in B.mail_nudge("newcli")
+    finally:
+        agent_provider._REGISTRY = saved
+
+
+def test_claude_states_the_flag_rather_than_inheriting_it():
+    """The one provider that DOES fire the hook says so explicitly, so the
+    fail-safe default above can never silently switch claude's behaviour."""
+    import inspect
+
+    src = inspect.getsource(agent_provider.ClaudeProvider.__init__)
+    assert "runs_session_start_hook=True" in src
+
+
 def test_unknown_provider_falls_back_to_the_default_not_to_orientation():
     """Fail-SAFE, not fail-open: an unresolvable provider is treated as the
     default (claude), so a lookup miss can never rewrite a claude session's

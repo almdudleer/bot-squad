@@ -302,6 +302,55 @@ if [ -z "${WR_RRS_NO_RECURSE:-}" ]; then
     fi
 fi
 
+# ── Q..T: what counts as a FATAL LINE (T-0759) ──────────────────────────────
+# The cross-check used to grep the bare substring `FATAL`, so it fired on EVERY
+# prod deploy: buildkit echoes the TEXT of each `RUN`, and the watchrobot
+# Dockerfile's frontend-unit-gate step carries a `case` whose unreachable `*)`
+# branch contains the word. A guard that cries wolf on every healthy run trains
+# its readers to ignore it — and it is the only thing standing between us and a
+# real false green, so the permanent false positive DISARMED it.
+#
+# Q is the regression case and it uses the REAL line, byte for byte, from the
+# 2026-08-18 prod deploy (fixture next to this script) rather than a paraphrase
+# — a hand-typed approximation would not have proven anything about the log we
+# actually get. R/S/T pin the shapes that MUST still fail, so the narrowing
+# cannot quietly become "FATAL is never fatal".
+FIXTURE="$(dirname "$(readlink -f "$0")")/run-recipe-selftest.buildkit-echo.fixture"
+if [ ! -r "$FIXTURE" ]; then
+    echo "FAIL Q: fixture '$FIXTURE' is missing — the regression case cannot run, and a"
+    echo "        case that cannot run must not read as a pass"
+    fail=$((fail + 1))
+else
+    mkrecipe bkecho 'cat "$WR_SELFTEST_FIXTURE"; echo "#27 DONE 80.6s"; echo "[prod] release deployed: deadbeef"; exit 0'
+    assert "Q buildkit echo of a RUN containing FATAL is NOT a failure" 0 no \
+        env WR_SELFTEST_FIXTURE="$FIXTURE" bash "$WRAPPER" "$TMP/bkecho.sh"
+fi
+
+# R: a build step that PRINTS FATAL at run time and still exits 0 is exactly the
+# false green this wrapper exists for. buildkit prefixes such output `#NN <secs>`,
+# so the anchor must reach past that prefix — not stop at it.
+mkrecipe bkruntime 'echo "#30 11.36 FATAL: the gate refused but the build carried on"; exit 0'
+assert "R FATAL emitted INSIDE a build step (rc 0) is still a failure" nonzero yes \
+    bash "$WRAPPER" "$TMP/bkruntime.sh"
+
+# S: every bracket-label shape the recipes actually emit. Derived by reading
+# prod.sh, staging.sh and lib/*.sh, not invented: [prod], [staging],
+# [owner:<c>], [reclaim:<c>], and the bare unlabelled form.
+for shape in '[prod] FATAL: master clone has diverged from origin/master' \
+             '[staging] FATAL: gate library /x is missing or not executable.' \
+             '[owner:stt] FATAL: no container named stt exists.' \
+             '[reclaim:stt] FATAL: could not remove the foreign container' \
+             'FATAL: mktemp -d produced no usable directory'; do
+    mkrecipe shapefatal "echo '$shape' >&2; exit 0"
+    assert "S real report still fails: ${shape:0:38}" nonzero yes \
+        bash "$WRAPPER" "$TMP/shapefatal.sh"
+done
+
+# T: indentation must not smuggle a real report past the anchor.
+mkrecipe indented 'echo "    [prod] FATAL: indented but real" >&2; exit 0'
+assert "T an indented real report is still a failure" nonzero yes \
+    bash "$WRAPPER" "$TMP/indented.sh"
+
 echo
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

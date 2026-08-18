@@ -63,6 +63,38 @@ SLUG=watchrobot
 STAGING_CWD="${STAGING_CWD:-/home/almdudleer/watchrobot/deploy}"
 PROD_CWD="${PROD_CWD:-/home/almdudleer/watchrobot/master}"
 
+# ── what counts as a FATAL line (T-0759) ────────────────────────────────────
+# The cross-check below used to grep the bare substring `FATAL`, which made it
+# fire on EVERY prod deploy — a permanent false red on a healthy release.
+#
+# What it was matching: buildkit ECHOES THE TEXT OF EACH `RUN` back into the
+# log, and the watchrobot Dockerfile's frontend-unit-gate step contains a
+# `case` whose unreachable `*)` branch reads
+#     *) echo "FATAL: WR_FE_UNIT_GATE не задан..." >&2; exit 1 ;;
+# So the word arrives inside QUOTED SOURCE TEXT of a branch that never ran,
+# on a line the same log later closes with `#27 DONE 80.6s`.
+#
+# A guard that cries wolf on every healthy run trains its readers to ignore it,
+# and this is the only check standing between us and a genuine false green —
+# so a permanent false positive is not cosmetic, it disarms the guard.
+#
+# The rule: a FATAL *report* is written at the START of its line by whatever is
+# reporting it; a FATAL inside quoted command text is never at the start. So we
+# anchor, allowing only the two prefixes real reports legitimately carry:
+#   - a bracket label:  `[prod] FATAL:`, `[staging] FATAL:`, `[owner:stt] FATAL:`
+#   - a buildkit step prefix for output produced INSIDE a build step at run
+#     time: `#30 11.36 FATAL: ...`  (kept deliberately — a build step that
+#     prints FATAL without failing the build is exactly a false green)
+# and leading whitespace in both cases.
+#
+# ⚠ NAMED COST OF THIS NARROWING, so nobody rediscovers it as a surprise: a
+# genuine report emitted MID-LINE (`something: FATAL: ...`) is no longer seen.
+# No recipe emits that shape today — every emission in prod.sh, staging.sh and
+# lib/*.sh starts its line, with or without a bracket label — and
+# run-recipe-selftest.sh pins each of those shapes so a new one that breaks the
+# assumption fails there instead of silently going unwatched.
+FATAL_RE='^[[:space:]]*(#[0-9]+[[:space:]]+([0-9]+\.[0-9]+[[:space:]]+)?)?(\[[^]]*\][[:space:]]*)?FATAL'
+
 die() { echo "run-recipe: $*" >&2; exit 64; }
 
 TARGET="${1:-}"
@@ -193,7 +225,7 @@ if [ ! -f "$LOG" ] || [ ! -r "$LOG" ]; then
     exit 1
 fi
 
-fatal_lines=$(grep -c 'FATAL' "$LOG")
+fatal_lines=$(grep -cE "$FATAL_RE" "$LOG")
 grep_rc=$?
 if [ "$grep_rc" -gt 1 ]; then    # 0 = matched, 1 = no match, >1 = grep itself failed
     echo "=== DEPLOY_RC=1 — DEPLOY FAILED ($LABEL) ===" >&2
@@ -211,10 +243,11 @@ if [ "$fatal_lines" -gt 0 ]; then
     # exactly that, and caught this line saying it.
     echo "=== DEPLOY_RC=1 — DEPLOY FAILED ($LABEL) ===" >&2
     echo "    The recipe's own exit status was $rc, but its log contains $fatal_lines FATAL line(s):" >&2
-    grep -n 'FATAL' "$LOG" | sed 's/^/      /' >&2
+    grep -nE "$FATAL_RE" "$LOG" | sed 's/^/      /' >&2
     echo "    A zero exit alongside a FATAL is the exact false green this wrapper exists to catch," >&2
     echo "    so the disagreement is resolved AGAINST the comfortable answer." >&2
     echo "    Either the recipe swallowed a failure or it logs FATAL for something non-fatal; both are bugs." >&2
+    echo "    (Matched at line start only — buildkit's echo of a RUN's own text does not count; T-0759.)" >&2
     echo "    full log: $LOG" >&2
     exit 1
 fi

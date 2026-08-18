@@ -24,6 +24,7 @@ placeholders — never a KeyError and never another project's identity.
 from __future__ import annotations
 
 import difflib
+import os
 import re
 import sys
 import tomllib
@@ -258,14 +259,160 @@ def render_stack_paths(project: dict, slug: str, ops: str, data_dir: Path) -> st
 
 def render_telegram(project: dict) -> str:
     """'## Telegram' body. Names the project's bot only when `tg_bot` is
-    configured; otherwise stays generic (no @watchbot leaking everywhere)."""
+    configured; otherwise stays generic (no @watchbot leaking everywhere).
+
+    T-0726: the token location is config-driven (`tg_token_source`) and is
+    SILENT when unset. Until 2026-08-18 this line told EVERY project its token
+    was "in `.env` / `secrets.toml`", which is a guess the template cannot
+    make — measured, neither half is universally true: watchrobot has no
+    `secrets.toml` anywhere (`find -maxdepth 2` — empty) and reads
+    `TELEGRAM_BOT_TOKEN` from `.env` (`backend/config.py:127`), while
+    bot-squad has no project `.env` and reads `config/secrets.toml`. Naming a
+    file that does not exist costs a reader a search that can only fail, so an
+    unconfigured project now gets the bot name and no claim about where its
+    secret lives.
+    """
     bot = project.get("tg_bot")
-    intro = f"Bot `{bot}` (token in `.env` / `secrets.toml`). " if bot else ""
+    source = project.get("tg_token_source")
+    if bot and source:
+        intro = f"Bot `{bot}` (token: {source}). "
+    elif bot:
+        intro = f"Bot `{bot}`. "
+    else:
+        intro = ""
     return (
         f"{intro}Ping the stakeholder rarely — hard blockers, prod errors,\n"
         'finished long-running work — via `bsq tg ping "<message>"` (worker\n'
         "action `tg_notify`)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Path resolvability gate (T-0726)
+# ---------------------------------------------------------------------------
+
+# The rendered AGENTS.md is a map, and until 2026-08-18 nothing ever walked it.
+# `ops_path` had pointed watchrobot's clone symlink at `data/signal-tracker` —
+# a directory renamed away on 2026-06-02 (T-0189) — so `ops/bot-squad` was a
+# DANGLING SYMLINK for ~2.5 months while the every-turn file kept naming 23
+# paths under it. Nothing reddened, because nothing touched it. Worse, a
+# RELATIVE `ops_path` is only ever planted in the clone someone happened to
+# plant it in: measured the same day, `~/watchrobot/master/ops/` and
+# `~/watchrobot/deploy/ops/` held only `.gitignore`, so every one of those 23
+# paths was dead for a session doing prod hotfixes in the master clone.
+#
+# Hence this predicate, and the shape it has:
+#   * it follows symlinks, so a DANGLING one is "broken", not merely missing —
+#     that is the failure that actually happened;
+#   * a relative `ops_path` is checked in EVERY registered clone
+#     (`repo_path`/`repo_master`/`repo_deploy`), because that is where the hole
+#     was;
+#   * "cannot read" is NOT "broken". `os.path.exists()` answers False for a
+#     PermissionError just as it does for a deletion, and the registry holds a
+#     project owned by another unix user (guestent, under /home/flomaster) — a
+#     gate that cannot tell those apart reds on something no one can fix and is
+#     then muted, which is how the 2.5 months happened in the first place.
+
+_UNVERIFIABLE = "unverifiable"
+
+# Statuses that mean the map lies. Anything else is fine or unknowable.
+RED_STATUSES = ("missing", "broken")
+
+
+def probe_path(path: str | Path) -> tuple[str, str]:
+    """(status, detail) for one filesystem path.
+
+    status is "ok" | "missing" | "broken" | "unverifiable".
+
+    Deliberately NOT `os.path.exists()`: that swallows PermissionError and
+    answers False, making another user's unreadable clone indistinguishable
+    from a deleted directory. We stat explicitly and keep the errno.
+    """
+    path = os.fspath(path)
+    try:
+        os.stat(path)  # follows symlinks
+        return "ok", ""
+    except FileNotFoundError:
+        # Either nothing is there, or a symlink is there pointing at nothing.
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return "missing", "no such path"
+        except OSError as exc:
+            return _UNVERIFIABLE, f"lstat: {exc.strerror}"
+        try:
+            target = os.readlink(path)
+        except OSError:
+            target = "?"
+        return "broken", f"dangling symlink -> {target}"
+    except OSError as exc:  # PermissionError, ELOOP, ENOTDIR, ...
+        return _UNVERIFIABLE, f"stat: {exc.strerror}"
+
+
+def check_project_paths(project: dict, slug: str) -> list[dict]:
+    """Every path the rendered AGENTS.md promises, probed where it must resolve.
+
+    Returns one finding dict per probe:
+    `{slug, what, path, where, status, detail}`. Callers red on
+    `status in RED_STATUSES`; `unverifiable` is reported and never fails.
+    """
+    findings: list[dict] = []
+    ops = project.get("ops_path", "ops")
+
+    def add(what, path, where, status, detail):
+        findings.append({
+            "slug": slug, "what": what, "path": str(path),
+            "where": where, "status": status, "detail": detail,
+        })
+
+    if os.path.isabs(ops):
+        # One absolute path, named identically from every clone.
+        status, detail = probe_path(ops)
+        add("ops_path", ops, "absolute", status, detail)
+        return findings
+
+    # Relative: it has to resolve in EVERY clone a session may be working in.
+    for field in ("repo_path", "repo_master", "repo_deploy"):
+        clone = project.get(field)
+        if not clone:
+            continue
+        clone_status, clone_detail = probe_path(clone)
+        if clone_status != "ok":
+            # A clone that is absent or unreadable says nothing about ops_path.
+            # repo_deploy in particular is created on the first deploy.
+            add("ops_path", f"{clone}/{ops}", field, _UNVERIFIABLE,
+                f"clone {clone_status}: {clone_detail}")
+            continue
+        status, detail = probe_path(Path(clone) / ops)
+        add("ops_path", f"{clone}/{ops}", field, status, detail)
+
+    return findings
+
+
+def check_install_paths(install_root: str | Path = "/home/www/bot-squad") -> list[dict]:
+    """The install-rooted scripts the rendered '## Deploy' section names."""
+    findings: list[dict] = []
+    for name in ("deploy.sh", "pause-deploys.sh", "resume-deploys.sh"):
+        target = Path(install_root) / "scripts" / "cli" / name
+        status, detail = probe_path(target)
+        findings.append({
+            "slug": "-", "what": "deploy shim", "path": str(target),
+            "where": "install", "status": status, "detail": detail,
+        })
+    return findings
+
+
+def format_findings(findings: list[dict]) -> str:
+    lines = []
+    for f in findings:
+        mark = {"ok": "ok  ", "missing": "RED ", "broken": "RED ",
+                _UNVERIFIABLE: "??  "}.get(f["status"], "??  ")
+        tail = f" — {f['detail']}" if f["detail"] else ""
+        lines.append(
+            f"{mark}{f['slug']:<12} {f['what']:<11} [{f['where']}] "
+            f"{f['path']}{tail}"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +480,18 @@ full texts under `{ops}/vision/initiatives/`.)
 
 ## Deploy
 
-`ops/bot-squad-bin/deploy <target> "<reason>"` — targets: {deploy_targets_md}.
+`$BOT_SQUAD/scripts/cli/deploy.sh <target> "<reason>"` — targets:
+{deploy_targets_md} (`$BOT_SQUAD` = the bot-squad install root, default
+`/home/www/bot-squad`).
+- **Run it from inside `{repo_path}`.** The shim resolves the project from
+  `$PWD` against `repo_path` in `projects.toml` — that field ONLY — so the
+  same command from a master or deploy clone exits `CWD ... not in any
+  registered project` before it queues anything (T-0726).
+- Older docs named an in-clone `ops/…-bin/deploy` symlink. **The scaffold does
+  not plant one** (`project_scaffold._link_ops` creates the `ops` data symlink
+  and nothing else), so on any clone that lacks a hand-made copy that path is
+  simply absent. Name the install path above instead — it resolves from every
+  clone and cannot rot per-clone.
 - Queues a deploy; the monitor picks it up within ~60s. TG-pings on
   success/failure. You don't manage the loop — commit, squash, request, walk away.
 - **The clean-tree gate is PER TARGET — check yours before you wait on it.**
@@ -358,11 +516,11 @@ full texts under `{ops}/vision/initiatives/`.)
   local ref resolved without a fetch, while the recipe re-fetches origin at
   build time (T-0699).
 
-Hold deploys without killing the worker: `ops/bot-squad-bin/pause-deploys
+Hold deploys without killing the worker: `$BOT_SQUAD/scripts/cli/pause-deploys.sh
 "<reason>"` writes a `PAUSED.json` marker the monitor honors — queued + new
 deploys defer silently (one TG ping at pause, no per-tick spam, queue
-preserved). `ops/bot-squad-bin/resume-deploys` clears it and the next tick
-runs. Per-project; use it to investigate, coordinate, or land a sensitive
+preserved). `$BOT_SQUAD/scripts/cli/resume-deploys.sh` clears it and the next
+tick runs. Per-project; use it to investigate, coordinate, or land a sensitive
 multi-commit ship.
 
 Manual prod release: stakeholder reviews staging → merges `{deploy_branch}`
@@ -430,6 +588,7 @@ def render(slug: str, config_dir: Path, data_dir: Path) -> str:
     return TEMPLATE.format(
         display_name=project.get("display_name", slug),
         ops=ops,
+        repo_path=project.get("repo_path", ""),
         product_body=product_body,
         initiatives_block=render_active_initiatives(
             vision_dir, data_dir / slug / "backlog", ops
@@ -448,7 +607,12 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("slug", help="Project slug (matches projects.toml key)")
+    parser.add_argument(
+        "slug",
+        nargs="?",
+        help="Project slug (matches projects.toml key). Optional with "
+             "--check-paths, which then walks the whole registry.",
+    )
     parser.add_argument(
         "--config-dir",
         default="/home/www/bot-squad/config",
@@ -465,6 +629,19 @@ def main() -> None:
         help="Print rendered content without writing",
     )
     parser.add_argument(
+        "--check-paths",
+        action="store_true",
+        help="Probe every path the rendered AGENTS.md promises (`ops_path` in "
+             "EVERY registered clone, plus the install's deploy shims) and "
+             "exit 1 if any is missing or a dangling symlink. Renders and "
+             "writes nothing. Omit the slug to walk the whole registry.",
+    )
+    parser.add_argument(
+        "--install-root",
+        default="/home/www/bot-squad",
+        help="Install root the '## Deploy' block's $BOT_SQUAD expands to",
+    )
+    parser.add_argument(
         "--diff",
         action="store_true",
         help="Print the unified diff against the on-disk AGENTS.md and exit "
@@ -475,6 +652,36 @@ def main() -> None:
 
     config_dir = Path(args.config_dir)
     data_dir = Path(args.data_dir)
+
+    if args.check_paths:
+        try:
+            projects = load_projects(config_dir)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if args.slug:
+            if args.slug not in projects:
+                print(f"error: slug '{args.slug}' not found in projects.toml",
+                      file=sys.stderr)
+                sys.exit(1)
+            projects = {args.slug: projects[args.slug]}
+        findings: list[dict] = []
+        for slug, project in sorted(projects.items()):
+            findings.extend(check_project_paths(project, slug))
+        findings.extend(check_install_paths(args.install_root))
+        print(format_findings(findings))
+        red = [f for f in findings if f["status"] in RED_STATUSES]
+        if red:
+            print(f"\n{len(red)} unresolvable path(s) — AGENTS.md names paths "
+                  f"that do not resolve.", file=sys.stderr)
+            sys.exit(1)
+        unknown = sum(1 for f in findings if f["status"] == _UNVERIFIABLE)
+        print(f"\nAll {len(findings) - unknown} checked path(s) resolve"
+              + (f"; {unknown} unverifiable (see ?? above)." if unknown else "."))
+        return
+
+    if not args.slug:
+        parser.error("slug is required unless --check-paths is given")
 
     try:
         new_content = render(args.slug, config_dir, data_dir)

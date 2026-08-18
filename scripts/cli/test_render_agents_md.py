@@ -330,6 +330,249 @@ def test_deploy_block_is_true_for_a_project_without_a_deploy_clone(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Deploy shim + Telegram token source (T-0726)
+# ---------------------------------------------------------------------------
+
+# The exact strings the template shipped until T-0726. `ops/…-bin/` is planted
+# by nothing — `project_scaffold._link_ops` creates the `ops` data symlink and
+# stops — so a fresh project got three commands it does not have, and
+# watchrobot got them in two of its three clones. Kept VERBATIM so a revert
+# reds here rather than shipping quietly.
+_REVERTED_BIN_PATHS = (
+    "ops/bot-squad-bin/deploy",
+    "ops/bot-squad-bin/pause-deploys",
+    "ops/bot-squad-bin/resume-deploys",
+)
+
+
+def test_deploy_commands_name_the_install_not_an_in_clone_symlink(tmp_path):
+    """T-0726 DoD 1: the three deploy commands resolve from every clone."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    for reverted in _REVERTED_BIN_PATHS:
+        assert reverted not in out, reverted
+    assert "`$BOT_SQUAD/scripts/cli/deploy.sh <target>" in out
+    assert "$BOT_SQUAD/scripts/cli/pause-deploys.sh" in out
+    assert "$BOT_SQUAD/scripts/cli/resume-deploys.sh" in out
+    # $BOT_SQUAD is expanded where it is first used, not only 60 lines later.
+    assert _flat(out).index("the bot-squad install root, default") < \
+        _flat(out).index("`$BOT_SQUAD/api/app/resources/roles/`")
+
+
+def test_deploy_block_states_the_cwd_constraint(tmp_path):
+    """Measured 2026-08-18: `deploy.sh` resolves the slug from `$PWD` against
+    `repo_path` and ONLY that field, so the command cannot work from a master
+    or deploy clone even where the path resolves. A path that resolves in front
+    of a command that always refuses is worse than a missing path, so the
+    rendered file says which clone to run it from — and names THIS project's."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    block = _flat(_deploy_block(ram.render("synthetic", cfg, tmp_path)))
+    assert "Run it from inside `/tmp/syn`" in block
+    assert "that field ONLY" in block
+    assert "not in any registered project" in block
+
+
+def test_telegram_makes_no_token_claim_when_unconfigured(tmp_path):
+    """T-0726 DoD 3: the template used to tell EVERY project its token was in
+    "`.env` / `secrets.toml`". watchrobot has no `secrets.toml` at all. An
+    unconfigured project now gets the bot name and no location guess."""
+    cfg = _synthetic_config(tmp_path, 'tg_bot = "@synbot"\n')
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "Bot `@synbot`. Ping the stakeholder" in out
+    assert "secrets.toml" not in out
+    assert "token in `.env`" not in out
+
+
+def test_telegram_token_source_is_config_driven(tmp_path):
+    cfg = _synthetic_config(
+        tmp_path, 'tg_bot = "@synbot"\ntg_token_source = "`BOT_TOKEN` in `.envrc`"\n')
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "Bot `@synbot` (token: `BOT_TOKEN` in `.envrc`)." in out
+
+
+def test_no_bot_no_token_line(tmp_path):
+    """A `tg_token_source` without a `tg_bot` renders nothing — the sentence
+    it belongs to is the bot sentence."""
+    cfg = _synthetic_config(tmp_path, 'tg_token_source = "`X` in `.env`"\n')
+    _seed_vision(tmp_path, "synthetic")
+    out = ram.render("synthetic", cfg, tmp_path)
+    assert "token:" not in out
+    assert "Ping the stakeholder rarely" in out
+
+
+def test_real_projects_name_their_own_token_source(tmp_path):
+    """The two real projects are exactly why the old hardcoded phrase could not
+    be right for both: watchrobot's token is `TELEGRAM_BOT_TOKEN` in `.env`
+    (`backend/config.py:127`) and it has no `secrets.toml` anywhere, while
+    bot-squad's own token IS in `config/secrets.toml` — and bot-squad registers
+    no `tg_bot`, so it must get no bot sentence and no token claim at all."""
+    _seed_vision(tmp_path, "watchrobot")
+    wr = ram.render("watchrobot", _CONFIG_DIR, tmp_path)
+    assert ("Bot `@watchbot` (token: `TELEGRAM_BOT_TOKEN` in `.env`, "
+            "read at `backend/config.py:127`)." in wr)
+    assert "secrets.toml" not in wr
+
+    _seed_vision(tmp_path, "bot-squad")
+    bs = ram.render("bot-squad", _CONFIG_DIR, tmp_path)
+    assert "Bot `" not in bs
+    assert "token" not in bs.split("## Telegram")[1]
+
+
+# ---------------------------------------------------------------------------
+# Path resolvability gate (T-0726)
+# ---------------------------------------------------------------------------
+
+# The rendered file names paths; until T-0726 nothing ever walked them. A
+# dangling `ops/bot-squad` symlink (-> `data/signal-tracker`, renamed away by
+# T-0189 on 2026-06-02) survived ~2.5 months, and the same prefix was simply
+# ABSENT from watchrobot's master and deploy clones the whole time — so all 23
+# `ops/bot-squad/...` paths in the every-turn file were dead for a session
+# doing prod hotfixes. These tests exist to make that state RED, so the first
+# two build the exact failures and assert the colour, and the rest pin the one
+# way this predicate could go quietly vacuous (treating "cannot read" as "ok"
+# or as "broken").
+
+
+def _clone_config(tmp_path: Path, clones: dict[str, Path], ops: str = "ops") -> Path:
+    """projects.toml for one project whose clones are real dirs on disk."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir(exist_ok=True)
+    body = ['[projects.probe]', 'slug = "probe"', f'ops_path = "{ops}"']
+    for field, path in clones.items():
+        body.append(f'{field} = "{path}"')
+    (cfg / "projects.toml").write_text("\n".join(body) + "\n")
+    return cfg
+
+
+def _statuses(findings: list[dict]) -> dict[str, str]:
+    """{where: status} — the findings keyed by the clone they were probed in."""
+    return {f["where"]: f["status"] for f in findings}
+
+
+def test_gate_reds_on_a_dangling_symlink(tmp_path):
+    """THE failure that actually happened: `ops` is a symlink whose target was
+    renamed away. It is present to `lstat`, absent to `stat`, and a naive
+    `Path.exists()` check calls it missing without saying why — so assert both
+    the red AND that the detail names the dead target."""
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    (clone / "ops").symlink_to(tmp_path / "data-renamed-away")
+    project = {"repo_path": str(clone)}
+
+    findings = ram.check_project_paths(project, "probe")
+    assert _statuses(findings) == {"repo_path": "broken"}
+    assert "dangling symlink" in findings[0]["detail"]
+    assert "data-renamed-away" in findings[0]["detail"]
+    assert findings[0]["status"] in ram.RED_STATUSES
+
+
+def test_gate_reds_when_a_relative_ops_path_is_missing_from_a_SECOND_clone(tmp_path):
+    """The 2.5-month hole in full: the prefix resolves in the clone someone
+    planted it in and is absent from the others. A gate that only ever looked
+    at `repo_path` would have been green for all of it."""
+    dev, master, deploy = (tmp_path / n for n in ("dev", "master", "deploy"))
+    for d in (dev, master, deploy):
+        d.mkdir()
+    (tmp_path / "data").mkdir()
+    (dev / "ops").symlink_to(tmp_path / "data")  # planted here only
+    project = {"repo_path": str(dev), "repo_master": str(master),
+               "repo_deploy": str(deploy)}
+
+    findings = ram.check_project_paths(project, "probe")
+    assert _statuses(findings) == {
+        "repo_path": "ok", "repo_master": "missing", "repo_deploy": "missing",
+    }
+    assert sum(f["status"] in ram.RED_STATUSES for f in findings) == 2
+
+
+def test_gate_is_green_once_the_symlink_points_somewhere_real(tmp_path):
+    """Positive control on the SAME layout as the two reds above — the
+    predicate distinguishes, rather than always failing."""
+    dev, master = tmp_path / "dev", tmp_path / "master"
+    for d in (dev, master):
+        d.mkdir()
+    (tmp_path / "data").mkdir()
+    for d in (dev, master):
+        (d / "ops").symlink_to(tmp_path / "data")
+    project = {"repo_path": str(dev), "repo_master": str(master)}
+
+    findings = ram.check_project_paths(project, "probe")
+    assert _statuses(findings) == {"repo_path": "ok", "repo_master": "ok"}
+    assert not [f for f in findings if f["status"] in ram.RED_STATUSES]
+
+
+def test_an_absolute_ops_path_is_probed_once_not_per_clone(tmp_path):
+    """T-0726's fix for watchrobot: an absolute `ops_path` is the same path
+    from every clone, so it is checked once — and still reds when it is gone."""
+    data = tmp_path / "data"
+    data.mkdir()
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    ok = ram.check_project_paths(
+        {"repo_path": str(dev), "ops_path": str(data)}, "probe")
+    assert _statuses(ok) == {"absolute": "ok"}
+    assert len(ok) == 1
+
+    gone = ram.check_project_paths(
+        {"repo_path": str(dev), "ops_path": str(tmp_path / "nope")}, "probe")
+    assert _statuses(gone) == {"absolute": "missing"}
+
+
+def test_unreadable_clone_is_unverifiable_not_red(tmp_path):
+    """`os.path.exists()` answers False for PermissionError exactly as it does
+    for a deletion, and the live registry holds a project owned by another
+    unix user (guestent, under /home/flomaster). A gate that reds on a path
+    nobody here can fix gets muted, which is how a silent 2.5 months happens —
+    so 'cannot read' must be its own answer and must NOT fail the run."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "ops").mkdir()
+    locked.chmod(0o000)
+    try:
+        findings = ram.check_project_paths({"repo_path": str(locked)}, "probe")
+        status = _statuses(findings)["repo_path"]
+    finally:
+        locked.chmod(0o755)
+    assert status == "unverifiable"
+    assert status not in ram.RED_STATUSES
+
+
+def test_probe_path_reports_a_plain_missing_path(tmp_path):
+    assert ram.probe_path(tmp_path / "nothing")[0] == "missing"
+    assert ram.probe_path(tmp_path)[0] == "ok"
+
+
+def test_install_shims_are_checked(tmp_path):
+    """The '## Deploy' block names `$BOT_SQUAD/scripts/cli/*.sh`; those are
+    paths too, and an install missing them reds."""
+    root = tmp_path / "install"
+    (root / "scripts" / "cli").mkdir(parents=True)
+    assert [f["status"] for f in ram.check_install_paths(root)] == \
+        ["missing", "missing", "missing"]
+    for name in ("deploy.sh", "pause-deploys.sh", "resume-deploys.sh"):
+        (root / "scripts" / "cli" / name).write_text("#!/bin/sh\n")
+    assert {f["status"] for f in ram.check_install_paths(root)} == {"ok"}
+
+
+def test_live_registry_names_no_unresolvable_path():
+    """The watchdog itself: every path the SHIPPED registry promises resolves
+    where a session would look for it. This is the assertion that was missing
+    for 2.5 months. Unreadable clones (another unix user's) are reported as
+    unverifiable and deliberately do not fail this."""
+    projects = ram.load_projects(_CONFIG_DIR)
+    findings: list[dict] = []
+    for slug, project in sorted(projects.items()):
+        findings.extend(ram.check_project_paths(project, slug))
+    red = [f for f in findings if f["status"] in ram.RED_STATUSES]
+    assert not red, "unresolvable paths in projects.toml:\n" + \
+        ram.format_findings(red)
+
+
+# ---------------------------------------------------------------------------
 # The two REAL projects against the REAL registry
 # ---------------------------------------------------------------------------
 
@@ -341,12 +584,16 @@ def _test_block(rendered: str) -> str:
 
 
 def test_watchrobot_real_config(tmp_path):
-    """watchrobot renders with ITS identity: legacy ops/bot-squad prefix, the
-    signal-tracker-old hard rule (now config-driven), @watchbot, and the
+    """watchrobot renders with ITS identity: the absolute ops prefix (T-0726),
+    the signal-tracker-old hard rule (now config-driven), @watchbot, and the
     test-commands block CORRECTED by T-0724."""
     _seed_vision(tmp_path, "watchrobot")
     out = ram.render("watchrobot", _CONFIG_DIR, tmp_path)
-    assert "`ops/bot-squad/vision/constitution.md`" in out
+    assert "`/home/www/bot-squad/data/watchrobot/vision/constitution.md`" in out
+    # T-0726: the in-clone prefix exists ONLY in the dev clone (untracked), so
+    # naming it made 23 paths dead for a session in the master clone. Reds on a
+    # revert of ops_path, not merely on a wording change.
+    assert "ops/bot-squad/" not in out
     assert "archived/signal-tracker-old" in out
     assert "Bot `@watchbot`" in out
     assert "Tailwind" in out
@@ -354,7 +601,8 @@ def test_watchrobot_real_config(tmp_path):
         "## Test commands\n\n"
         "- Backend: `backend/run_tests.sh` (T-0338 — manages its own venv and "
         "defaults `DATABASE_URL` to `signal_tracker_dev`; bare `pytest` points "
-        "at PROD). Caveats: `ops/bot-squad/AGENT_INSTRUCTIONS.md`.\n"
+        "at PROD). Caveats: "
+        "`/home/www/bot-squad/data/watchrobot/AGENT_INSTRUCTIONS.md`.\n"
         "- Frontend unit: `web/run_tests.sh` (= `npm test` from `web/`; "
         "`node:test`, NOT vitest — needs node >= 22.6, the script finds it). "
         "Gates the staging image build (T-0677).\n"

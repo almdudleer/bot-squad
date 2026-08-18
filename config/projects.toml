@@ -67,21 +67,36 @@ created_at    = 2026-05-10
 # (T-0338 lock, known-red tests, the node:test-not-vitest trap, the
 # frontend-unit build gate) deliberately live in AGENT_INSTRUCTIONS.md, per
 # AGENTS.md's own "What NOT to put here".
-test_backend_cmd       = "`backend/run_tests.sh` (T-0338 — manages its own venv and defaults `DATABASE_URL` to `signal_tracker_dev`; bare `pytest` points at PROD). Caveats: `ops/bot-squad/AGENT_INSTRUCTIONS.md`."
+test_backend_cmd       = "`backend/run_tests.sh` (T-0338 — manages its own venv and defaults `DATABASE_URL` to `signal_tracker_dev`; bare `pytest` points at PROD). Caveats: `/home/www/bot-squad/data/watchrobot/AGENT_INSTRUCTIONS.md`."
 test_frontend_unit_cmd = "`web/run_tests.sh` (= `npm test` from `web/`; `node:test`, NOT vitest — needs node >= 22.6, the script finds it). Gates the staging image build (T-0677)."
 test_e2e_cmd           = "`npm test` from `tests/` (a separate package — there is no `test:e2e` in `web/` and never has been)"
 test_typecheck_cmd     = "from `web/`, `npx tsc -b` — `-p tsconfig.json` checks ZERO files and always exits 0 (T-0471)"
 test_lint_cmd          = "**not wired up** — no `lint` script and no `eslint.config.*` in `web/`, though the toolchain is in devDependencies (T-0375)"
 # T-0199: per-project identity for the generated AGENTS.md (render_agents_md.py).
 # All optional — an absent field renders a neutral placeholder / omitted line,
-# never another project's identity. ops_path = in-clone prefix of the data-dir
-# symlink; watchrobot predates the plain-`ops` scaffold convention
-# (project_scaffold._link_ops) — its clone has `ops/bot-squad ->
-# data/signal-tracker`.
-ops_path     = "ops/bot-squad"
+# never another project's identity.
+#
+# T-0726 (2026-08-18): ops_path is now the ABSOLUTE data dir, not the in-clone
+# `ops/bot-squad` symlink. Measured: that symlink exists ONLY in the dev clone
+# (untracked, `.gitignore:56`), while `~/watchrobot/master/ops/` and
+# `~/watchrobot/deploy/ops/` hold nothing but `.gitignore` — so all 23
+# `ops/bot-squad/...` paths in the every-turn file were dead for a session
+# doing prod hotfixes in the master clone. It had also been a DANGLING symlink
+# (-> `data/signal-tracker`, renamed away by T-0189 on 2026-06-02) for ~2.5
+# months with nothing reddening. Planting copies in the other two clones was
+# rejected: the deploy clone is force-synced to origin on every staging run, an
+# untracked symlink is invisible to git and rots exactly as this one did, and
+# `ops/` is a real directory in these clones so `project_scaffold._link_ops`
+# skips it by design. The absolute path resolves from every clone and from any
+# cwd, and `render_agents_md.py --check-paths` now walks it (T-0726 DoD 2).
+ops_path     = "/home/www/bot-squad/data/watchrobot"
 stack        = "FastAPI + asyncpg backend, React 19 + Vite + TS + Tailwind frontend, PostgreSQL, Docker + traefik."
 stakeholders = "Alexey (chat 404580642, @alexeysdk) and Timofey (@timpo). Equal authority — see the constitution."
 tg_bot       = "@watchbot"
+# T-0726: where the bot token actually lives. The template used to tell EVERY
+# project "token in `.env` / `secrets.toml`"; watchrobot has no `secrets.toml`
+# at all (`find -maxdepth 2` — empty). Absent field = the render makes no claim.
+tg_token_source = "`TELEGRAM_BOT_TOKEN` in `.env`, read at `backend/config.py:127`"
 extra_hard_rules = [
   "Don't read or copy from `/home/www/bot-squad/archived/signal-tracker-old/` — that's the deprecated multi-role flow. Patterns there don't apply.",
   # T-0724: compact restatement of the stakeholder's 2026-08-07 brevity
@@ -95,8 +110,8 @@ extra_hard_rules = [
   # покрыты вовсе — новый ARG выше apt/pip не покраснит НИЧЕГО. Сосед по этому
   # инциденту, T-0454, сюда НЕ добавлен: там гейт отказывает на постановке в
   # очередь (deploy.py compose_env_gaps) и сам называет недостающие переменные.
-  "**Новый `ARG` в `Dockerfile` — только НЕПОСРЕДСТВЕННО над своим `RUN` и ниже\n  apt/pip (T-0678).** Объявленный `ARG` входит в ключ кэша КАЖДОГО `RUN` ниже\n  него: `ARG VCS_REF` наверху пересобирал apt и pip на каждом выкате (98-170 с,\n  однажды 1800 с и убитый выкат). Сторож знает по имени только\n  `ARG CLAUDE_CODE_VERSION` — новый ARG он НЕ ловит. Разбор:\n  `ops/bot-squad/AGENT_INSTRUCTIONS.md`.",
-  "**Краткость — требование стейкхолдера (2026-08-07): он платит за длину.**\n  Ему: ответ ПЕРВОЙ строкой, число вместо прилагательного, один закрытый\n  вопрос за раз. Не пересказывать его просьбу и не описывать процесс.\n  Оператору: сделано / чем доказано / осталось — три строки. Полный текст:\n  `ops/bot-squad/AGENT_INSTRUCTIONS.md`.",
+  "**Новый `ARG` в `Dockerfile` — только НЕПОСРЕДСТВЕННО над своим `RUN` и ниже\n  apt/pip (T-0678).** Объявленный `ARG` входит в ключ кэша КАЖДОГО `RUN` ниже\n  него: `ARG VCS_REF` наверху пересобирал apt и pip на каждом выкате (98-170 с,\n  однажды 1800 с и убитый выкат). Сторож знает по имени только\n  `ARG CLAUDE_CODE_VERSION` — новый ARG он НЕ ловит. Разбор:\n  `/home/www/bot-squad/data/watchrobot/AGENT_INSTRUCTIONS.md`.",
+  "**Краткость — требование стейкхолдера (2026-08-07): он платит за длину.**\n  Ему: ответ ПЕРВОЙ строкой, число вместо прилагательного, один закрытый\n  вопрос за раз. Не пересказывать его просьбу и не описывать процесс.\n  Оператору: сделано / чем доказано / осталось — три строки. Полный текст:\n  `/home/www/bot-squad/data/watchrobot/AGENT_INSTRUCTIONS.md`.",
 ]
 
 [projects.bot-squad]

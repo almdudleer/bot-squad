@@ -902,8 +902,17 @@ def _fire_alerts(
         # human about routine resource management. No human is in this loop; no
         # session (incl. the operator, T-0334) is exempt from its own close.
         rec["alert_fired_at"] = fired  # share the cooldown dict with autocompact
+        # T-0905: the handoff state machine spans ticks through rec['compact'],
+        # and it transitions on ticks where NO action was taken (arming a phase
+        # is an action; dropping one after a timeout is not). Persisting only on
+        # a True return silently reverted those transitions, so a cleared phase
+        # came back next tick and re-fired its own warning every 60s. Compare
+        # the phase dict itself and persist whenever it moved.
+        compact_before = dict(rec.get("compact") or {})
         if autocompact.maybe_compact(cfg, slug, rec, ctx_new, now):
             fired = rec["alert_fired_at"]
+            changed = True
+        if (rec.get("compact") or {}) != compact_before:
             changed = True
         if last.get("context") != ctx_new:
             last["context"] = ctx_new

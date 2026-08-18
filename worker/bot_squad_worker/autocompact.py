@@ -49,10 +49,19 @@ active work, a Ctrl-C'd (paused) pane, or a confirmation dialog:
   the artifact half is factored for reuse by T-0471 (crash recovery).
 
 * **claude (legacy, fallback)** — Claude's in-context ``/compact``. Used when no
-  handoff destination resolves at all, when the handoff times out (never wedge),
-  or when ``BOT_SQUAD_COMPACT_MODE=claude`` forces it. A per-session cooldown stops a
+  handoff destination resolves at all, when an armed handoff produced NO
+  forward-state at all within :func:`handoff_timeout_sec` (never wedge), or when
+  ``BOT_SQUAD_COMPACT_MODE=claude`` forces it. A per-session cooldown stops a
   re-/compact while a compaction is still in flight (it rotates the transcript,
   so context only resets a tick or two later).
+
+  T-0905 narrowed the timeout half of that list, and the narrowing is the whole
+  ticket: a handoff whose forward-state IS written and is only waiting for a
+  quiet pane must NOT fall back. ``/compact`` is gated on the same idle,
+  composer-ready pane the finalize is, so the fallback can never take context
+  down earlier than the clean relaunch would have — it can only burn a full
+  summarization at the moment the clean path became available. See
+  :func:`_maybe_finalize`.
 
 Neither strategy above ever runs against the human's own exempt sessions
 (:func:`recycle_gate.user_session_exempt`) — T-0649 (2026-07-18) gives them a
@@ -84,7 +93,20 @@ DEFAULT_COMPACT_COOLDOWN_SEC = 600  # 10 min
 
 # How long to wait for a session to write its forward-state after the handoff
 # prompt before falling back to Claude's /compact (never wedge over-ceiling).
+# T-0905 narrowed what this deadline decides: it now only bounds the wait for a
+# session that has written NOTHING. 900s is generous for that question — over
+# the 6 days of worker journal that ticket measured, all 74 completed handoffs
+# had their forward-state on disk within 719s of ARM.
 DEFAULT_HANDOFF_TIMEOUT_SEC = 900  # 15 min
+
+# T-0905: the SECOND deadline, for the other half of the split — a session whose
+# forward-state IS written but whose pane has not gone idle+composer-ready yet.
+# Waiting there is free (the state is safe on disk) and is strictly better than
+# /compact, so the wait is long; this is the "never wedge" cap on it, after
+# which the finalize is forced even against a busy pane. Sized off the measured
+# worst case: S-almdudleer-operator-p355 needed 1194s of ARM-to-composer-ready
+# on 2026-08-18, so 2700s is ~2.3x the longest busy stretch ever observed.
+DEFAULT_HANDOFF_HARD_TIMEOUT_SEC = 2700  # 45 min
 
 
 def autocompact_enabled() -> bool:
@@ -115,6 +137,28 @@ def handoff_timeout_sec() -> int:
         except (TypeError, ValueError):
             pass
     return DEFAULT_HANDOFF_TIMEOUT_SEC
+
+
+def handoff_hard_timeout_sec() -> int:
+    """T-0905: cap on the "state written, pane still busy" wait — after this the
+    handoff is finalized against a busy pane rather than held open forever.
+
+    Never below :func:`handoff_timeout_sec`: a hard cap under the soft one would
+    invert the two halves of the split (a session would be force-finalized
+    before the "wrote nothing" branch it belongs to could even be evaluated).
+    Overridable via ``BOT_SQUAD_HANDOFF_HARD_TIMEOUT_SEC``; non-positive/garbage
+    → default.
+    """
+    raw = os.environ.get("BOT_SQUAD_HANDOFF_HARD_TIMEOUT_SEC")
+    v = DEFAULT_HANDOFF_HARD_TIMEOUT_SEC
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                v = parsed
+        except (TypeError, ValueError):
+            pass
+    return max(v, handoff_timeout_sec())
 
 
 def compact_cooldown_sec() -> int:
@@ -653,7 +697,30 @@ def handoff_written(compact: dict) -> bool:
 
 def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -> bool:
     """A handoff is in flight (``phase == writing``). Finalize once the session
-    has written its forward-state and the pane is idle; fall back on timeout.
+    has written its forward-state and the pane is idle.
+
+    T-0905 SPLIT THE ONE DEADLINE IN TWO, because "the handoff did not finish"
+    hides two failures with opposite remedies:
+
+      nothing written   the session ignored the handoff. Nothing exists for a
+                        successor to boot from, so after
+                        :func:`handoff_timeout_sec` the only non-destructive
+                        move is Claude's ``/compact`` — keep the session, take
+                        its context down. UNCHANGED behaviour.
+      written, pane busy the state IS on disk and only an idle pane is missing.
+                        ``/compact`` needs that same idle, composer-ready pane,
+                        so falling back cannot compact one second earlier than
+                        the clean relaunch — it only spends a full
+                        summarization instead of doing the relaunch. So wait,
+                        up to :func:`handoff_hard_timeout_sec`, then finalize
+                        against the busy pane anyway.
+
+    The un-split version took the ``/compact`` branch for BOTH, which is how a
+    continuously-driving operator (whose role artifact is rewritten every few
+    minutes by its own drive cycle, and whose pane is rarely quiet for a whole
+    15-minute window) ended up paying ~390k tokens of summarization, twice in
+    two hours, for a handoff that was already written and would have relaunched
+    cleanly seconds later.
 
     T-0863: ``compact['kind']`` selects the destination — ``context`` (the
     ticket's ``## Context``, for a task-bound session) or ``artifact`` (the role
@@ -664,25 +731,75 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
     sid = rec.get("sid")
     armed_at = float(compact.get("armed_at", now))
     kind = compact.get("kind") or "artifact"
+    age = now - armed_at
+    wrote = handoff_written(compact)
 
-    # Never wedge: the session didn't write its state in time → drop the handoff
-    # and let Claude's /compact take the context back down.
-    if now - armed_at > handoff_timeout_sec():
+    # --- half 1: NOTHING was written -----------------------------------------
+    # Never wedge over-ceiling with no forward-state anywhere: the session
+    # ignored the handoff → drop it and let Claude's /compact take the context
+    # back down. Relaunching is NOT an option here and never becomes one — there
+    # is nothing on disk for a successor to boot from, so /compact (which keeps
+    # the session, summarized) is the only move that does not destroy state.
+    if age > handoff_timeout_sec() and not wrote:
+        if not _do_claude_compact(cfg, slug, rec, now):
+            # Pane busy — keep the handoff ARMED and retry next tick. The old
+            # code cleared ``rec['compact']`` here before knowing whether the
+            # send landed; on the False path telemetry never persisted that
+            # clear (it only writes the record when an action was taken), so
+            # the phase came back next tick and re-logged the same warning
+            # every 60s for as long as the pane stayed busy — 6 identical
+            # WARNINGs for one timeout on p355, 2026-08-18T07:53-07:58.
+            # Leaving it armed is also what lets a LATE write still finalize
+            # cleanly instead of being locked out of its own handoff.
+            return False
         rec["compact"] = {}
-        log.warning("autocompact: handoff timed out for %s — falling back to "
-                    "/compact", sid)
-        return _do_claude_compact(cfg, slug, rec, now)
+        log.warning("autocompact: handoff timed out for %s with no forward-state "
+                    "written — fell back to /compact", sid)
+        return True
 
     # Wait until the session has actually written its forward-state.
-    if not handoff_written(compact):
+    if not wrote:
         return False
 
-    # Only clear an idle, composer-ready pane (don't cut mid-turn).
-    if not compact_safe(rec.get("activity", "")):
-        return False
-    pane = _pane_for(sid)
-    if pane and not composer_ready(_capture_pane(pane), sid=sid, now=now):
-        return False
+    # --- half 2: the forward-state IS on disk ---------------------------------
+    # Only the pane is missing. Do NOT fall back to /compact here, however long
+    # this takes (T-0905). ``_do_claude_compact`` needs a composer-ready pane —
+    # a PRECONDITION this finalize needs too — so the fallback can never take
+    # the context down any sooner than the clean relaunch would have. All it can
+    # do is spend a full summarization at the exact tick the clean path became
+    # possible. Measured on S-almdudleer-operator-p355 (2026-08-18): two
+    # fallbacks, 389,980 and 396,913 pre-compact tokens, fired 294s and 54s
+    # after the deadline and within seconds of the pane first going ready, with
+    # operator-state.md already rewritten four times since ARM. Both were a
+    # clean handoff+relaunch converted into ~390k tokens of summarization.
+    idle = compact_safe(rec.get("activity", ""))
+    if idle:
+        pane = _pane_for(sid)
+        if pane and not composer_ready(_capture_pane(pane), sid=sid, now=now):
+            idle = False
+    elif age > handoff_timeout_sec() and recycle_gate.should_log_skip(
+            f"handoff-busy:{sid}", now):
+        # Only past the soft deadline: before it this is the ordinary wait every
+        # handoff goes through (p50 300s), and logging it per tick would bury
+        # the case worth seeing. ``composer_ready`` logs its own deferral; the
+        # activity gate was silent, which is the T-0864 attribution gap for
+        # exactly this session shape.
+        log.info("autocompact: %s has written its forward-state but its pane is "
+                 "%s — holding the handoff open (%ds since arm, hard cap %ds)",
+                 sid, rec.get("activity") or "unknown", int(age),
+                 handoff_hard_timeout_sec())
+
+    if not idle:
+        if age <= handoff_hard_timeout_sec():
+            return False
+        # Never wedge, the other way round: a continuously-busy pane cannot be
+        # waited on forever. The forward-state is on disk, so clearing this pane
+        # loses only the in-flight turn — cheaper than leaving the session
+        # running over the ceiling indefinitely.
+        log.warning("autocompact: %s never went idle in %ds and its "
+                    "forward-state is already written — finalizing against a "
+                    "busy pane (hard cap %ds)", sid, int(age),
+                    handoff_hard_timeout_sec())
 
     # CLEAR + RELAUNCH: close the old pane, boot a fresh incarnation from what
     # the predecessor wrote, re-bound to the same assignment.

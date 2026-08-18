@@ -2448,14 +2448,12 @@ def test_deploy_monitor_sends_carry_deploy_logs_topic(tmp_config_dir, tmp_path, 
     monkeypatch.setattr(_deploy, "list_queued", lambda c, s: [qfile])
     monkeypatch.setattr(_deploy, "is_paused", lambda c, s: None)
     monkeypatch.setattr(_deploy, "is_clean_for_target", lambda c, s, t: True)
-    from types import SimpleNamespace
+    # T-0920: the real dataclass, not a mirror of its fields — see
+    # _monitor_ping_text for why (`15f4d01`, and the T-0919 fields after it).
     monkeypatch.setattr(
         _deploy, "run_next",
-        lambda c, s: SimpleNamespace(
-            ok=True, returncode=0, collapsed_count=1, killed_reason=None,
-            resolved_sha="", worker_restart_status="",  # T-0446: terminal-ping fields
-            worker_stale=False, worker_boot_sha="",  # T-0717 leg 3
-            per_user_workers="", per_user_workers_stale=False,  # T-0880
+        lambda c, s: _deploy.DeployResult(
+            ok=True, returncode=0, queue_id="q-1", log_path=None,
         ),
     )
     rec = _RecordingTg()
@@ -3202,16 +3200,17 @@ def _monitor_ping_text(tmp_config_dir, tmp_path, monkeypatch, **result_fields) -
     monkeypatch.setattr(_deploy, "list_queued", lambda c, s: [qfile])
     monkeypatch.setattr(_deploy, "is_paused", lambda c, s: None)
     monkeypatch.setattr(_deploy, "is_clean_for_target", lambda c, s, t: True)
-    fields = dict(
-        ok=True, returncode=0, collapsed_count=1, killed_reason=None,
-        resolved_sha="", worker_restart_status="", worker_stale=False,
-        worker_boot_sha="",
-        # T-0880: this stand-in must carry every DeployResult field the ping
-        # reads, or a new field reads as an AttributeError in an unrelated test.
-        per_user_workers="", per_user_workers_stale=False,
-    )
+    # T-0920: a REAL DeployResult, not a SimpleNamespace mirroring its fields.
+    # The mirror was a standing liability — T-0880 added two fields and this
+    # helper raised AttributeError on the success path (`15f4d01`), and the
+    # T-0919 watchdog fields would have done it again. A mirror of a dataclass
+    # is a copy of a definition and can only be right until the next field;
+    # constructing the dataclass makes each new one arrive with its real
+    # default, so a field addition can no longer break tests that are about
+    # something else.
+    fields = dict(ok=True, returncode=0, queue_id="q-1", log_path=None)
     fields.update(result_fields)
-    monkeypatch.setattr(_deploy, "run_next", lambda c, s: SimpleNamespace(**fields))
+    monkeypatch.setattr(_deploy, "run_next", lambda c, s: _deploy.DeployResult(**fields))
     rec = _RecordingTg()
     monkeypatch.setattr(A, "_get_tg_client", lambda c: rec)
 

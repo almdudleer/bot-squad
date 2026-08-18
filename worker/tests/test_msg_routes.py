@@ -433,6 +433,9 @@ def _deploy_cfg(tmp_path, monkeypatch, *, ok=True, killed_reason=""):
             resolved_sha="abc123def456", worker_restart_status="",
             worker_stale=False, worker_boot_sha="", killed_reason=killed_reason,
             log_path="/tmp/x.log",
+            # T-0878: the failure branch now tells the SESSION that asked, so
+            # this stub has to carry the field a real DeployResult always has.
+            requested_by="",
         ),
     )
     return cfg

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json as _json
 import logging
 import time as _time
+from pathlib import Path
 
 from bot_squad_worker.config import Config
 
@@ -477,8 +478,78 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
             f"Log: {result.log_path}",
         )
     else:
-        _tg_safe(f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}",
-                 "deploy_failed")
+        # T-0878 DoD 5. Until now this branch said exactly
+        # "❌ deploy bot-squad/staging FAILED rc=8" — no reason, no remediation,
+        # and nothing to the session that asked. The two measured rc=8 refusals
+        # (2026-08-06 08:27, 2026-08-11 14:23) both fired this line and both
+        # reached nobody who acted; the install stayed undeployable for five
+        # days and the defect was found by accident. Three changes, all here:
+        # carry the recipe's own FATAL block so no one has to tail a run log,
+        # tell the requester (who is holding an {"ok": true, queue_id} nothing
+        # else will ever contradict — the T-0453 principle, never applied to
+        # this path), and escalate a pre-flight REFUSAL to the loud operator
+        # channel because it re-fires identically on every retry.
+        detail = _recipe_failure_detail(result.log_path)
+        refusal = result.returncode in RECIPE_REFUSAL_RCS
+        head = (
+            f"❌ deploy {slug}/{target} REFUSED before shipping anything "
+            f"(rc={result.returncode}){suffix} — this does NOT clear on its own; "
+            f"every retry fails identically until a human clears it."
+            if refusal
+            else f"❌ deploy {slug}/{target} FAILED rc={result.returncode}{suffix}"
+        )
+        text = head + (f"\n\n{detail}" if detail else "") + f"\n\nLog: {result.log_path}"
+        _tg_safe(text, "deploy_failed")
+        _notify_requester(cfg, slug, result.requested_by, text)
+        if refusal:
+            _alert_operators(cfg, slug, project, text)
+
+
+#: Recipe exit codes that mean the deploy was REFUSED at pre-flight — a state a
+#: human has to clear — rather than a build that might pass on the next try.
+#: Read off deploy-recipes/bot-squad/{staging,prod}.sh: 3 wrong branch, 4 dev
+#: clone diverged, 5 install diverged, 7 local-only install commits, 8 dirty
+#: install, 10 T-0878 migration assertion. Build/verify failures (6 no image,
+#: 9 running sha != deployed sha) are deliberately NOT here: they can pass on a
+#: retry, so they get the ordinary channel notice.
+#:
+#: Another project's recipe is free to use these numbers for something else.
+#: The cost of that collision is one extra operator alert — never a dropped
+#: one — which is the direction this ticket wants the error to lean.
+RECIPE_REFUSAL_RCS = frozenset({3, 4, 5, 7, 8, 10})
+
+#: How much of the run log to carry into the alert when no FATAL line is found.
+_LOG_TAIL_LINES = 12
+#: Hard cap on the quoted block, so a runaway log can't blow the message limit.
+_DETAIL_MAX_CHARS = 1200
+
+
+def _recipe_failure_detail(log_path: object) -> str:
+    """The part of the run log a human needs, quoted into the alert (T-0878).
+
+    Prefers the recipe's own ``FATAL`` block — every refusal in the bot-squad
+    recipes prints ``FATAL:`` followed by the specifics and the remediation, and
+    that block IS the diagnosis. Falls back to the log tail when a recipe fails
+    without one (a compose/build error). Best-effort: an unreadable log degrades
+    to an empty string, which only costs the alert its detail — never the alert.
+    """
+    if not log_path:
+        return ""
+    try:
+        text = Path(str(log_path)).read_text(errors="replace")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    fatal_at = next(
+        (i for i in range(len(lines) - 1, -1, -1) if "FATAL" in lines[i]), None
+    )
+    block = lines[fatal_at:] if fatal_at is not None else lines[-_LOG_TAIL_LINES:]
+    out = "\n".join(block).strip()
+    if len(out) > _DETAIL_MAX_CHARS:
+        out = out[:_DETAIL_MAX_CHARS] + "\n… (truncated — full log above)"
+    return out
 
 
 def _notify_requester(cfg: Config, slug: str, requested_by: str, text: str) -> None:

@@ -71,6 +71,80 @@ RC_NO_PROGRESS = 125   # no-progress watchdog: zero run-log output for N minutes
 RC_ORPHAN = 126        # stale-orphan reaper: file stranded in processing/ swept
 RC_CLONE_WEDGED = 127  # T-0453: the deploy clone could not be synced to origin
 
+# --------------------------------------------------------------------------
+# T-0919: the bound. Measured, not guessed — read the numbers before editing.
+# --------------------------------------------------------------------------
+#
+# The 1800s wall-clock cap USED TO KILL, and it killed live builds. Run
+# 311ba682 (2026-08-18) died rc=124 at 1802s with `npm run build` actively
+# printing; the budget had been eaten by COPY steps under host I/O saturation
+# (`COPY web/` 718.4s for 1.7M, ~50x its unsaturated 14.2s). A wall-clock cap
+# fires on SLOWNESS, and slowness is not the failure a watchdog exists to catch.
+#
+# What the corpus of 100 real runs (bot-squad 50 + watchrobot 50) actually says:
+#
+#   wall-clock, rc=0 runs   bot-squad  p50   71s  p95  231s  max  353s
+#                           watchrobot p50  408s  p95  852s  max 1242s
+#   longest SILENT stretch  rc=0 runs                        max  186.6s
+#   longest SILENT stretch  on the two rc=124 runs      583.7s and 416.1s
+#
+# Two findings from that, both of which contradict the obvious design:
+#
+#  1. BUILDKIT GOES FULLY SILENT DURING A STEP. Under the default plain progress
+#     a COPY vertex emits exactly two lines — its header and `DONE <x>s` — and
+#     nothing in between. On run 311ba682 those two lines are ADJACENT in the
+#     file with 583.7s between them. So run-log byte growth, which is all
+#     `no_progress` watches, is blind during precisely the steps that get slow.
+#
+#  2. `no_progress=600s` CAME WITHIN 16.3 SECONDS of killing that same live
+#     build. It did not "discriminate properly" — it lost the race to the hard
+#     cap by sixteen seconds. Promoting it to sole kill signal AT A FIXED VALUE
+#     would have re-created the very defect this ticket exists to remove.
+#
+# So the silence budget is not a constant: it scales with the tempo THIS RUN has
+# already demonstrated. Buildkit reports every finished step's duration, so by
+# the time a long silence starts, the log usually already contains the evidence
+# that this box is currently running very slow steps — on 311ba682 a 718.4s step
+# had completed BEFORE the 583.7s silence began. The budget is
+#
+#     max(NO_PROGRESS_FLOOR, TEMPO_MULTIPLIER * longest step already completed)
+#
+# On a calm run the tempo term is small, the floor governs, and a wedge is still
+# caught in 600s exactly as before. Only a run that has PROVED it is slow earns
+# more rope, and it earns it from its own measurements rather than from taste.
+DEFAULT_NO_PROGRESS_FLOOR = 600
+
+# Priced from the corpus: of every measurable silence, only ONE exceeded the
+# 600s floor (583.7s on 311ba682) and its ratio to the longest already-completed
+# step was 0.81. 2.0 clears that by ~2.5x. The smaller silences that show wilder
+# ratios (up to 60x) are all far below the floor, so the floor — not this
+# multiplier — is what covers them. CAVEAT, stated because it prices the number:
+# there is exactly ONE corpus observation above the floor, so this multiplier is
+# fitted to n=1. It is deliberately generous for that reason.
+DEFAULT_TEMPO_MULTIPLIER = 2.0
+
+# The wall-clock budget. NO LONGER A KILL — crossing it records a notice
+# (elapsed, budget, the step in flight) and the run CONTINUES. Same 1800s value
+# it always had, now used as what it always actually was: an expectation, not a
+# verdict.
+DEFAULT_BUDGET_SECONDS = 1800
+
+# The far absolute ceiling. This one still kills, and it is the ONLY remaining
+# wall-clock kill. It is not a judgement about how long a build may take; it
+# exists to guarantee a project's deploy queue is eventually unblocked, and it
+# is the only bound that can catch the one failure `no_progress` genuinely
+# cannot see: a recipe stuck in an infinite loop that KEEPS PRINTING. Such a
+# run is never silent, so no silence budget of any size will ever stop it.
+#
+# Priced from the same distribution: 14400s is 11.6x the longest SUCCESSFUL run
+# ever recorded on this box (1242s) and 8x the old cap. It is set far out on
+# purpose, because the two errors are not symmetric — too low kills a live build
+# (the defect this ticket exists to fix), while too high costs one project a
+# delayed queue and nothing else: T-0212 gives each project its own
+# `deploy_monitor_one` scheduler job, so a run sitting here head-of-line-blocks
+# only its own project, never another's.
+DEFAULT_CEILING_SECONDS = 14400
+
 # next-wave #11 (T-0451): keep-last-N retention horizon for the deploy job
 # archive (processed/ + runs/). Override via BOT_SQUAD_DEPLOY_RETENTION_N; a
 # value <= 0 disables pruning. Keep-last-N (NOT age-prune) so recent forensics
@@ -904,6 +978,70 @@ class DeployResult:
     # head, which is not necessarily what actually failed once a wedge fails the
     # whole blocked queue in one sweep).
     target: str = ""
+
+    # -- T-0919 / T-0920 field contract -------------------------------------
+    # Everything the reporting half (jobs.py) needs so a human reading the alert
+    # learns WHICH limit fired, HOW LONG it ran, and WHAT HAD COMPLETED, without
+    # opening the run log. Every field is additive with a safe default so an
+    # unrelated caller that mirrors this dataclass by hand still constructs
+    # (that stub broke once already — see 15f4d01).
+    #
+    # `killed_reason` above keeps its type and its existing values; the T-0919
+    # bound changes WHICH of them occur:
+    #   "no_progress" — the silence budget fired. The wedge kill, and now the
+    #                   primary one.
+    #   "ceiling"     — NEW. The far absolute ceiling fired: output was still
+    #                   arriving, but the run passed the queue-protection limit.
+    #   "timeout"     — RETIRED. The 1800s cap no longer kills, so no new run
+    #                   produces this. Kept for old records and rollback.
+
+    # Wall-clock seconds the recipe ran before the kill. 0.0 when not killed.
+    killed_elapsed_s: float = 0.0
+    # The value of the limit that ACTUALLY fired, in seconds. For "no_progress"
+    # this is the EFFECTIVE budget applied to this run (floor or tempo-scaled),
+    # never the bare floor constant — reporting "600s" when a 1437s budget was
+    # applied would be a lie about the thing the reader is trying to judge.
+    killed_limit_s: int = 0
+    # Human term for that limit, ready to drop straight into a sentence:
+    # "no-progress budget" | "absolute ceiling". Saves the caller a lookup table.
+    killed_limit_name: str = ""
+    # ★ THE DISCRIMINATOR. How long the run log had been silent at the moment the
+    # run ended. Near zero means the build was ALIVE and got killed anyway (run
+    # 311ba682 measures ~15s: npm had just printed). Near `killed_limit_s` means
+    # genuinely wedged. Without this number an alert cannot tell those apart, and
+    # today nothing reports it — which is how a live build was killed twice with
+    # nobody able to see it from the alert.
+    silence_s: float = 0.0
+
+    # "What had completed", parsed from the run log's buildkit vertex stream.
+    # How many build steps reached DONE.
+    completed_steps: int = 0
+    # The step in flight when the run ended, verbatim vertex header, e.g.
+    # "#20 [web-builder 8/8] RUN npm run build". "" when nothing parsed.
+    last_step: str = ""
+    # The last step that FINISHED, with its measured duration, e.g.
+    # "#19 [web-builder 7/8] COPY api/response_shapes.json (102.2s)".
+    last_completed_step: str = ""
+
+    # The wall-clock BUDGET NOTICE — fires with no kill, and can therefore be
+    # True on a run that goes on to SUCCEED. That is the point: overrunning the
+    # expectation is now information, not a verdict.
+    budget_exceeded: bool = False
+    # The budget that was crossed, in seconds.
+    budget_s: int = 0
+
+    # T-0919 item 3 — the invisible intermediate state, and it is the DEFAULT
+    # outcome of a kill rather than a rare race. The recipe ff-merges the install
+    # tree to the new sha as one of its FIRST acts and then spends the whole rest
+    # of the run building; `_should_restart_worker` returns False whenever
+    # ok is False, so a kill ALWAYS skips the restart. The install tree is
+    # therefore on new code while the running worker executes the old, and
+    # nothing automatic repairs it.
+    install_sha_drift: bool = False
+    # The install tree's HEAD at the end of the run; populated only when
+    # install_sha_drift, so the alert can name what is on disk vs. what is
+    # executing (the latter is `worker_boot_sha`).
+    install_tree_sha: str = ""
 
 
 # ---------------------------------------------------------------------------

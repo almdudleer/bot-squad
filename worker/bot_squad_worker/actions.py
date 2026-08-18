@@ -29,6 +29,9 @@ from typing import Any, Callable
 # splitter (see tg.split_for_tg). Import-safe at module level — tg imports
 # nothing from this package at import time.
 from bot_squad_worker import tg as _tg_mod
+# T-0904: provider-neutral boot orientation + the self-describing peer-bus
+# nudge. Import-safe at module level — it imports only agent_provider.
+from bot_squad_worker import boot_orientation as _boot
 
 log = logging.getLogger(__name__)
 
@@ -2573,6 +2576,41 @@ _INJECT_INPUT_REQUIRED = {"sid", "text"}
 _INJECT_INPUT_ALLOWED = _INJECT_INPUT_REQUIRED
 
 
+def _provider_for_pane(cfg: Any, sid: str, pane: Any) -> str | None:
+    """Which agent CLI is running in ``sid``'s pane (T-0904).
+
+    Two readings, most-live first, because neither alone is reliable:
+
+    - the tmux pane's current command, which is the ground truth WHILE the
+      agent's TUI is in the foreground, but reads ``bash`` (or ``git``, or
+      ``rg``) whenever the agent has shelled out;
+    - the ``provider`` field the session md was stamped with at spawn, which
+      is always populated but can lag a manual relaunch.
+
+    ``None`` when neither answers — every caller then falls through to the
+    default provider's behaviour, so an unresolvable session is never a
+    behaviour change.
+    """
+    from bot_squad_worker import sessions as S
+
+    live = S._provider_from_command(getattr(pane, "command", "") or "")
+    if live:
+        return live
+    try:
+        from bot_squad_worker.park import _slug_for_sid
+
+        slug = _slug_for_sid(cfg, sid)
+        if not slug:
+            return None
+        meta = S._read_session_metadata(
+            cfg.data_dir / slug / "sessions" / f"{sid}.md"
+        )
+    except (OSError, AttributeError):
+        return None
+    value = str((meta or {}).get("provider") or "").strip().lower()
+    return value or None
+
+
 def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     """Send text to the tmux pane for a SID (one Enter per line).
 
@@ -2610,6 +2648,18 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
 
     from bot_squad_worker import input_mux
     cfg = _get_config()
+
+    # T-0904: the peer-bus nudge is the ONE piece of bot-squad convention that
+    # arrives with no explanation attached — `check mail` is bare text that
+    # only means "run `bsq inbox check`" to a session that was told so at boot.
+    # A provider with no SessionStart hook was never told, and a codex operator
+    # answered it three times by hunting for a mail connector. For those
+    # providers the nudge carries its own instruction; `check mail` stays
+    # byte-identical everywhere else (the string is load-bearing for claude
+    # sessions and pinned by tests).
+    if text == _boot.MAIL_SIGNAL:
+        text = _boot.mail_nudge(_provider_for_pane(cfg, sid, pane))
+
     lines_sent = input_mux.deliver_direct(
         cfg.data_dir, sid, pane.pane_id, text,
     )

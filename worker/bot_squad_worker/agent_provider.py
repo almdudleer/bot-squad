@@ -35,6 +35,16 @@ class AgentProvider:
     name: str
     executable: str
     composer_markers: tuple[str, ...]
+    # T-0904: does this CLI fire bot-squad's ``SessionStart`` hook
+    # (``scripts/hooks/session_start.sh``, wired in ``.claude/settings.json``)?
+    # That hook is where a spawned session is TOLD it is a bot-squad session —
+    # the bsq CLI, its SID, and the peer bus's "check mail" -> ``bsq inbox
+    # check`` mapping. Claude Code fires it; Codex has no hooks section in
+    # ``~/.codex/config.toml`` and no equivalent, so nothing calls it and a
+    # codex session boots with ZERO bot-squad orientation. False here means the
+    # orientation has to ride the one channel that reaches every provider — the
+    # composer-delivered prompt (see ``boot_orientation``).
+    runs_session_start_hook: bool = True
 
     def command_matches(self, command: str) -> bool:
         return command == self.executable
@@ -135,7 +145,8 @@ class CodexProvider(AgentProvider):
     def __init__(self) -> None:
         # Current Codex TUI uses ›; accept Claude's rune as a harmless fallback
         # for mixed-version installs.
-        super().__init__(CODEX, "codex", ("›", "❯"))
+        super().__init__(CODEX, "codex", ("›", "❯"),
+                         runs_session_start_hook=False)
 
     def launch_command(
         self,

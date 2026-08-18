@@ -24,6 +24,7 @@ from typing import Any
 
 from bot_squad_worker import frontmatter as _frontmatter
 from bot_squad_worker import agent_provider as _agent_provider
+from bot_squad_worker import boot_orientation as _boot
 
 log = logging.getLogger(__name__)
 
@@ -2017,7 +2018,17 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # path spawn() uses (composer-ready poll, then bracketed paste-buffer + a
     # separate Enter). If the composer never shows ❯, raise so the caller can
     # recover via inject_input — the pane is up, only the prompt didn't land.
-    if initial_prompt:
+    # T-0904: same provider-neutral orientation as spawn(). A resume is where
+    # the reported incident actually happened — the operator re-drive resumes
+    # (or respawns) the operator with `dispatch.operator_standing_task`, which
+    # mentions neither bsq nor the peer bus.
+    _prompt = initial_prompt
+    if _boot.needs_prompt_orientation(provider_name):
+        _prompt = _boot.with_orientation(
+            initial_prompt, sid=new_sid, slug=slug,
+            role=str(meta.get("role") or ""), data_dir=data_dir,
+        )
+    if _prompt:
         if not _wait_for_agent_composer_ready(new_pane.pane_id, provider_name):
             from bot_squad_worker.actions import ActionError
             raise ActionError(
@@ -2025,7 +2036,7 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
-        _deliver_prompt(new_pane.pane_id, initial_prompt,
+        _deliver_prompt(new_pane.pane_id, _prompt,
                         data_dir=data_dir, sid=new_sid)
 
     return {"ok": True, "sid": new_sid}
@@ -2811,7 +2822,19 @@ def spawn(
     # `_deliver_prompt`. The composer-ready poll still guards against typing
     # before claude's TUI exists; if `❯` never appears, raise so the caller can
     # recover via inject_input (the pane is up).
-    if initial_prompt:
+    # T-0904: a provider whose CLI fires no SessionStart hook (codex) never
+    # receives the MESSAGE BUS / bsq orientation that hook prints, so it rides
+    # the prompt instead — the one channel that reaches EVERY provider. Note
+    # the delivery is no longer gated on the caller having supplied a brief: a
+    # hook-less session spawned with no initial_prompt still has to be told
+    # what it is sitting in, and used to be told nothing at all.
+    _prompt = initial_prompt
+    if _boot.needs_prompt_orientation(_provider_name):
+        _prompt = _boot.with_orientation(
+            initial_prompt, sid=new_sid, slug=slug, role=_role,
+            data_dir=cfg.data_dir,
+        )
+    if _prompt:
         if not _wait_for_agent_composer_ready(new_pane.pane_id, _provider_name):
             from bot_squad_worker.actions import ActionError
             raise ActionError(
@@ -2819,7 +2842,7 @@ def spawn(
                 f"{_COMPOSER_READY_TIMEOUT_SEC:.0f}s — initial_prompt not delivered "
                 "(pane is up; recover via inject_input)"
             )
-        _deliver_prompt(new_pane.pane_id, initial_prompt,
+        _deliver_prompt(new_pane.pane_id, _prompt,
                         data_dir=cfg.data_dir, sid=new_sid)
 
     return {"ok": True, "sid": new_sid}

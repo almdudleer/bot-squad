@@ -607,3 +607,366 @@ def test_token_cap_zero_does_not_stamp_anchor(tmp_bot_squad: Path, monkeypatch) 
     assert r.status_code == 200, r.text
     raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
     assert not (raw.get("quota") or {}).get("set_at", ""), "an unarmed token cap must not stamp an anchor"
+
+
+# ---------------------------------------------------------------------------
+# T-0894: [operator].weekly_quota_target_pct — the operator's weekly quota-
+# utilization target. Before this, the endpoint hand-emitted exactly four
+# sections and preserved everything else UNREAD, so there was no write path for
+# this value from any session or role: it could only be set by hand-editing
+# config/system_settings.toml on the host. The worker
+# (operator_redrive.weekly_quota_target_pct) reads it fresh per call, so a PUT
+# takes effect without a restart.
+# ---------------------------------------------------------------------------
+
+def test_get_operator_target_unset_is_null(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Fresh install: the field is in the GET contract and is null, not 0.
+
+    null and 0 are DIFFERENT states — the reader spells "no target" as an absent
+    key, while 0 would be a live 0% target that pins pace_verdict to "over"."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.get("/api/system-settings")
+    assert r.status_code == 200, r.text
+    assert r.json()["operator"]["weekly_quota_target_pct"] is None
+
+
+def test_put_operator_target_roundtrip(tmp_bot_squad: Path, monkeypatch) -> None:
+    """PUT persists it into [operator] and GET returns it — and the TOML holds
+    the value under the exact key the worker's reader looks up."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": 81}})
+        assert r.status_code == 200, r.text
+        assert r.json()["operator"]["weekly_quota_target_pct"] == 81.0
+        again = client.get("/api/system-settings")
+        assert again.json()["operator"]["weekly_quota_target_pct"] == 81.0
+    raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
+    assert raw["operator"]["weekly_quota_target_pct"] == 81.0
+
+
+def test_put_operator_target_accepts_float(tmp_bot_squad: Path, monkeypatch) -> None:
+    """A percent is not a count — unlike [caps], a fractional value is valid."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": 20.5}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads((tmp_bot_squad / "config" / "system_settings.toml").read_text())
+    assert raw["operator"]["weekly_quota_target_pct"] == 20.5
+
+
+def test_put_operator_target_null_clears_it(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Explicit null REMOVES the key — TOML has no null, and the worker's reader
+    keys off absence. Writing 0 instead would be a live 0% target."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text("[operator]\nweekly_quota_target_pct = 81.0\n")
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": None}})
+        assert r.status_code == 200, r.text
+        assert r.json()["operator"]["weekly_quota_target_pct"] is None
+    raw = tomllib.loads(cfg.read_text())
+    assert "weekly_quota_target_pct" not in (raw.get("operator") or {})
+
+
+def test_put_unrelated_section_keeps_operator_target(tmp_bot_squad: Path, monkeypatch) -> None:
+    """A caps-only save must not drop a target someone already set — the
+    T-0368 shape, now for a section this endpoint has started managing.
+
+    This one passes on the pre-fix code too, by design: [operator] was already
+    preserved as an unmanaged section, and the risk being pinned is that
+    STARTING to manage it silently converts a preserved section into a
+    hand-emitted one. It is a regression guard, not evidence of the new path."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text("[operator]\nweekly_quota_target_pct = 81.0\n")
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings", json={"caps": {"max_parallel_sessions": 3}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert raw["operator"]["weekly_quota_target_pct"] == 81.0
+    assert raw["caps"]["max_parallel_sessions"] == 3
+
+
+def test_put_operator_target_preserves_sibling_keys(tmp_bot_squad: Path, monkeypatch) -> None:
+    """[operator] is only PARTIALLY managed: this endpoint owns
+    weekly_quota_target_pct and must leave every other key in that section
+    alone. Adding "operator" to _MANAGED_SECTIONS would pass every other test
+    here while silently dropping these — which is exactly the T-0368 bug."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        "[operator]\n"
+        "weekly_quota_target_pct = 20.0\n"
+        'some_future_knob = "keep-me"\n'
+        "another_future_knob = 7\n"
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": 81}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert raw["operator"]["weekly_quota_target_pct"] == 81.0   # managed key changed
+    assert raw["operator"]["some_future_knob"] == "keep-me"     # unmanaged PRESERVED
+    assert raw["operator"]["another_future_knob"] == 7
+
+
+def test_clearing_operator_target_preserves_sibling_keys(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Clearing the target drops only that key, never the section around it."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        '[operator]\nweekly_quota_target_pct = 20.0\nsome_future_knob = "keep-me"\n'
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": None}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert "weekly_quota_target_pct" not in raw["operator"]
+    assert raw["operator"]["some_future_knob"] == "keep-me"
+
+
+def test_put_operator_target_rejects_non_number(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        for bad in ("81", [81], {"pct": 81}):
+            r = client.put("/api/system-settings",
+                           json={"operator": {"weekly_quota_target_pct": bad}})
+            assert r.status_code == 400, f"{bad!r} must be rejected: {r.text}"
+
+
+def test_put_operator_target_rejects_bool(tmp_bot_squad: Path, monkeypatch) -> None:
+    """isinstance(True, int) is True, so a bare number check would accept it and
+    write `weekly_quota_target_pct = true` — same trap [caps] guards against."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": True}})
+    assert r.status_code == 400, r.text
+
+
+def test_put_operator_target_rejects_out_of_range(tmp_bot_squad: Path, monkeypatch) -> None:
+    """It is compared against a spend-to-date PERCENT, so outside 0–100 it can
+    only be a typo — and an unreachable target pins the verdict to "under"."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        for bad in (-1, 101, 8100):
+            r = client.put("/api/system-settings",
+                           json={"operator": {"weekly_quota_target_pct": bad}})
+            assert r.status_code == 400, f"{bad!r} must be rejected: {r.text}"
+
+
+def test_put_operator_target_accepts_the_bounds(tmp_bot_squad: Path, monkeypatch) -> None:
+    """0 and 100 are legal targets — 0 means "spend nothing more this week"."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        for good in (0, 100):
+            r = client.put("/api/system-settings",
+                           json={"operator": {"weekly_quota_target_pct": good}})
+            assert r.status_code == 200, r.text
+            assert r.json()["operator"]["weekly_quota_target_pct"] == float(good)
+
+
+def test_operator_target_save_needs_no_restart(tmp_bot_squad: Path, monkeypatch) -> None:
+    """operator_redrive re-reads the TOML on every call (no boot cache), so the
+    new target is live immediately — the endpoint must not claim otherwise.
+
+    Asserts the WRITE as well as the flag on purpose: an endpoint that ignored
+    the field entirely would also report restart_required False, so the flag
+    alone passes vacuously (it does, on the pre-fix code)."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": 81}})
+    assert r.status_code == 200, r.text
+    assert r.json()["operator"]["weekly_quota_target_pct"] == 81.0
+    assert r.json()["restart_required"] is False
+
+
+def test_rejected_operator_target_persists_nothing(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0367 atomicity, extended to the new field: a PUT mixing a VALID caps
+    change with an INVALID target must 400 and write NOTHING."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        "[caps]\nmax_parallel_sessions = 7\nmax_total_tokens = 0\n"
+        "[operator]\nweekly_quota_target_pct = 20.0\n"
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put(
+            "/api/system-settings",
+            json={"caps": {"max_parallel_sessions": 99},
+                  "operator": {"weekly_quota_target_pct": 900}},
+        )
+        assert r.status_code == 400, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert raw["caps"]["max_parallel_sessions"] == 7
+    assert raw["operator"]["weekly_quota_target_pct"] == 20.0
+
+
+def test_get_degrades_unusable_operator_target_to_null(tmp_bot_squad: Path, monkeypatch) -> None:
+    """A hand-edited garbage value must not 500 the whole settings GET — the
+    worker's reader already degrades it to "no target", so this agrees."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    (tmp_bot_squad / "config" / "system_settings.toml").write_text(
+        '[operator]\nweekly_quota_target_pct = "not-a-number"\n'
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.get("/api/system-settings")
+    assert r.status_code == 200, r.text
+    assert r.json()["operator"]["weekly_quota_target_pct"] is None
+
+
+def test_put_normalizes_away_an_unusable_operator_target(tmp_bot_squad: Path, monkeypatch) -> None:
+    """A garbage value in a MANAGED key is already "no target" to the worker, so
+    the next write drops it rather than carrying a lie forward. Deliberate, and
+    only for the managed key — the sibling is still untouched."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        '[operator]\nweekly_quota_target_pct = "not-a-number"\nsome_future_knob = "keep-me"\n'
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings", json={"caps": {"max_parallel_sessions": 3}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert "weekly_quota_target_pct" not in raw["operator"]
+    assert raw["operator"]["some_future_knob"] == "keep-me"
+
+
+# ---------------------------------------------------------------------------
+# T-0910: the preserve loop emitted every key of an unmanaged section BARE, and
+# a TOML bare key is limited to A-Za-z0-9_- . Since T-0866 the live config
+# carries a catch-all key "*" in BOTH [models] and [effort], so ANY successful
+# save re-emitted `* = "sonnet"` and the file stopped parsing for every reader
+# — worker config load, fleet_model's role->model/effort resolution,
+# GET /api/system-settings itself (500), and operator_redrive, which swallows
+# the decode error and reports "no target". The PUT still returned ok:true,
+# because nothing re-parses what it wrote.
+#
+# The suite was green over this because the only preserve fixture ([max]) has
+# all-bare-legal keys. These fixtures carry the LIVE shape instead.
+# ---------------------------------------------------------------------------
+
+_LIVE_SHAPE_TOML = (
+    '[caps]\nmax_parallel_sessions = 0\nmax_total_tokens = 0\nidle_suspend_sec = 0\n\n'
+    '[operator]\nweekly_quota_target_pct = 70\n\n'
+    '[models]\ndev = "opus"\nteamlead = "sonnet"\n"*" = "sonnet"\n\n'
+    '[effort]\ndev = "high"\n"*" = "medium"\n'
+)
+
+
+def test_put_does_not_corrupt_a_config_with_quoted_keys(tmp_bot_squad: Path, monkeypatch) -> None:
+    """The whole ticket in one assertion: after a save, the file must still
+    PARSE. Without _toml_key this raises TOMLDecodeError on the `*` line."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(_LIVE_SHAPE_TOML)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings", json={"caps": {"max_parallel_sessions": 3}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())          # <- the failing line pre-fix
+    assert raw["models"]["*"] == "sonnet"
+    assert raw["effort"]["*"] == "medium"
+    assert raw["models"]["dev"] == "opus"          # bare keys still bare
+    assert raw["caps"]["max_parallel_sessions"] == 3
+
+
+def test_get_still_works_after_a_put_on_the_live_shape(tmp_bot_squad: Path, monkeypatch) -> None:
+    """The corruption was silent at write time — the PUT reported ok:true and
+    only the NEXT read failed. Pin that the next read succeeds."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    (tmp_bot_squad / "config" / "system_settings.toml").write_text(_LIVE_SHAPE_TOML)
+    with TestClient(build_app()) as client:
+        _login(client)
+        assert client.put("/api/system-settings",
+                          json={"session": {"ttl": "3d"}}).status_code == 200
+        g = client.get("/api/system-settings")
+    assert g.status_code == 200, g.text
+    assert g.json()["session"]["ttl"] == "3d"
+
+
+def test_operator_target_write_survives_the_live_shape(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0894 x T-0910: the first-ever writer of weekly_quota_target_pct goes
+    through the same preserve loop, so on the real config it would have set the
+    target AND made it unreadable in the same call — and operator_redrive
+    reports an unparseable file as "no target", i.e. exactly the symptom
+    T-0894 exists to remove. 70 -> 81 is the live change."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(_LIVE_SHAPE_TOML)
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"operator": {"weekly_quota_target_pct": 81}})
+        assert r.status_code == 200, r.text
+    raw = tomllib.loads(cfg.read_text())
+    assert raw["operator"]["weekly_quota_target_pct"] == 81.0
+    assert raw["models"]["*"] == "sonnet"
+    assert raw["effort"]["*"] == "medium"
+
+
+def test_put_preserves_list_and_table_values(tmp_bot_squad: Path, monkeypatch) -> None:
+    """T-0910: list/dict values used to fall through to the str() branch and be
+    rewritten as a Python repr INSIDE a quoted string — it parses, so nothing
+    complained, but the reader got text where it had written a list."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        '[future]\n'
+        'allowed = ["a", "b"]\n'
+        'counts = [1, 2, 3]\n'
+        'nested = { left = "l", right = 2 }\n'
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        assert client.put("/api/system-settings",
+                          json={"session": {"ttl": "3d"}}).status_code == 200
+    raw = tomllib.loads(cfg.read_text())
+    assert raw["future"]["allowed"] == ["a", "b"], "must stay a list, not become its repr"
+    assert raw["future"]["counts"] == [1, 2, 3]
+    assert raw["future"]["nested"] == {"left": "l", "right": 2}
+
+
+def test_put_quotes_other_non_bare_keys_too(tmp_bot_squad: Path, monkeypatch) -> None:
+    """The fix is a general predicate on the key, not a special case for "*" —
+    a dotted or spaced key round-trips as one key, not as a path."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        '[future]\n'
+        '"a.b" = "dotted"\n'
+        '"has space" = "spaced"\n'
+        '"*" = "star"\n'
+        'plain-key_1 = "bare"\n'
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        assert client.put("/api/system-settings",
+                          json={"session": {"ttl": "3d"}}).status_code == 200
+    text = cfg.read_text()
+    raw = tomllib.loads(text)
+    assert raw["future"] == {
+        "a.b": "dotted", "has space": "spaced", "*": "star", "plain-key_1": "bare",
+    }
+    assert "\nplain-key_1 = " in text, "a bare-legal key must NOT be needlessly quoted"

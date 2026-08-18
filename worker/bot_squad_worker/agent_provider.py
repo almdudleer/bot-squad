@@ -44,7 +44,14 @@ class AgentProvider:
     # codex session boots with ZERO bot-squad orientation. False here means the
     # orientation has to ride the one channel that reaches every provider — the
     # composer-delivered prompt (see ``boot_orientation``).
-    runs_session_start_hook: bool = True
+    #
+    # THE DEFAULT IS FALSE ON PURPOSE. Firing bot-squad's hook is a property of
+    # exactly one CLI today and every provider added later is, by definition,
+    # not that one — so a provider whose author forgets this field gets the
+    # orientation (at worst a preamble a hooked CLI would have duplicated)
+    # rather than silence, which is the whole of T-0904. ``ClaudeProvider``
+    # therefore states ``True`` explicitly instead of inheriting it.
+    runs_session_start_hook: bool = False
 
     def command_matches(self, command: str) -> bool:
         return command == self.executable
@@ -78,7 +85,8 @@ class AgentProvider:
 
 class ClaudeProvider(AgentProvider):
     def __init__(self) -> None:
-        super().__init__(CLAUDE, "claude", ("❯",))
+        super().__init__(CLAUDE, "claude", ("❯",),
+                         runs_session_start_hook=True)
 
     def command_matches(self, command: str) -> bool:
         # Claude's version-managed binary can be reported by tmux as 2.1.220.
@@ -145,8 +153,7 @@ class CodexProvider(AgentProvider):
     def __init__(self) -> None:
         # Current Codex TUI uses ›; accept Claude's rune as a harmless fallback
         # for mixed-version installs.
-        super().__init__(CODEX, "codex", ("›", "❯"),
-                         runs_session_start_hook=False)
+        super().__init__(CODEX, "codex", ("›", "❯"))
 
     def launch_command(
         self,

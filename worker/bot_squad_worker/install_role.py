@@ -17,6 +17,8 @@ import os
 import tomllib
 from pathlib import Path
 
+from . import registry
+
 # Hardcoded so a misconfig / flag-drop on the actual mothership can't turn
 # it into a consumer of its own releases.
 MOTHERSHIP_URL = "https://botsquad.dev"
@@ -38,7 +40,8 @@ def is_mothership(slug: str = "bot-squad", config_dir: Path | None = None) -> bo
     mothership" from "config missing" should check the file separately.
     """
     cfg_dir = config_dir if config_dir is not None else _default_config_dir()
-    projects_toml = cfg_dir / "projects.toml"
+    # T-0878: live registry (git-ignored) with the tracked seed as fallback.
+    projects_toml = registry.resolve(cfg_dir)
     if not projects_toml.exists():
         return False
     try:
@@ -78,7 +81,7 @@ def warn_if_misconfigured(
     if log is None:
         log = logging.getLogger("bot-squad-worker.install_role")
 
-    projects_toml = config_dir / "projects.toml"
+    projects_toml = registry.resolve(config_dir)
     if not projects_toml.exists():
         return
     try:

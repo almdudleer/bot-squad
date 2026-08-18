@@ -1,3 +1,16 @@
+# TRACKED SEED — not this install's registry (T-0878).
+#
+# The LIVE registry an install reads and the API writes is
+# config/projects.toml, which is git-IGNORED (like auth.toml, secrets.toml and
+# system_settings.toml beside it). It is install-owned state: registering a
+# project writes into it, and a deploy must never be able to overwrite or
+# delete it. Before T-0878 that file was tracked, so every registration left
+# the install either undeployable (the recipe's dirty guard, exit 8) or one
+# fast-forward away from a silent de-registration.
+#
+# This file is only ever READ, and only when an install has no live registry
+# yet — a first boot copies it to config/projects.toml and never looks at it
+# again. Editing it does NOT change any existing install.
 # bot-squad project registry. Add a new project via:
 #   scripts/cli/bot-squad project init <slug> --repo <path>
 

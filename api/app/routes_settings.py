@@ -76,9 +76,21 @@ def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# Sections this endpoint hand-emits; everything else in the file is preserved
-# verbatim on write (T-0368).
+# Sections this endpoint hand-emits WHOLE; everything else in the file is
+# preserved verbatim on write (T-0368).
+#
+# T-0894: [operator] is deliberately NOT here. It is a *partially* managed
+# section — this endpoint owns exactly the keys in _OPERATOR_MANAGED_KEYS and
+# must leave any other key in it untouched (there will be more operator knobs).
+# Listing it here would make _write_system_settings skip it in the preserve
+# loop and hand-emit only the managed key, i.e. silently DROP the rest — the
+# exact T-0368 regression shape. Instead the managed key is merged INTO the
+# preserved section body; see _apply_operator_section.
 _MANAGED_SECTIONS = ("tg", "session", "admin", "caps")
+
+# T-0894: the [operator] keys this endpoint reads/writes. Everything else under
+# [operator] is unmanaged and preserved.
+_OPERATOR_MANAGED_KEYS = ("weekly_quota_target_pct",)
 
 
 def _now_iso() -> str:
@@ -102,14 +114,47 @@ def _read_quota(config_dir: Path) -> dict:
     return dict(q) if isinstance(q, dict) else {}
 
 
+# T-0910: a TOML *bare* key may only contain A-Za-z0-9_- . Anything else has to
+# be quoted, and the preserve loop below used to emit every key bare.
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_key(k: object) -> str:
+    """Render a key for a preserved (unmanaged) section, quoting it when it is
+    not bare-legal (T-0910).
+
+    This was a silent config-corrupter: since T-0866 the live config carries a
+    catch-all key ``"*"`` in BOTH ``[models]`` and ``[effort]``, so ANY
+    successful save — a caps change, a TTL, a chat id — re-emitted it as
+    ``* = "sonnet"`` and the whole file stopped parsing for every reader. The
+    PUT still returned ``ok: true`` because nothing re-parses what it wrote,
+    and ``operator_redrive`` swallows the decode error and reports "no target",
+    so the failure looked like an unset setting rather than a broken file.
+    """
+    s = str(k)
+    if _BARE_KEY_RE.match(s):
+        return s
+    return f'"{_toml_escape(s)}"'
+
+
 def _toml_value(v: object) -> str:
-    """Render a scalar TOML value for a preserved (unmanaged) section."""
+    """Render a TOML value for a preserved (unmanaged) section."""
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, int):
         return str(v)
     if isinstance(v, float):
         return repr(v)
+    # T-0910: containers used to fall through to the str() branch below and come
+    # back as a Python repr inside a quoted string ('["a", "b"]' as TEXT) — it
+    # parses, so nothing complained, and the reader silently got a str where it
+    # had written a list. Emit real TOML instead: an array, and an inline table
+    # for a sub-table (semantically identical to the [parent.child] form).
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in v) + "]"
+    if isinstance(v, dict):
+        inner = ", ".join(f"{_toml_key(k)} = {_toml_value(val)}" for k, val in v.items())
+        return "{" + inner + "}"
     return f'"{_toml_escape(str(v))}"'
 
 
@@ -121,12 +166,17 @@ def _read_system_settings(config_dir: Path) -> dict:
             "session": dict(_DEFAULTS["session"]),
             "admin": dict(_DEFAULTS["admin"]),
             "caps": dict(_DEFAULTS["caps"]),
+            # T-0894: no default — the target is explicitly OPTIONAL, and the
+            # worker's reader treats absence as "no target" rather than as a
+            # value. A 0.0 default would read as a live 0% target.
+            "operator": {"weekly_quota_target_pct": None},
         }
     raw = tomllib.loads(path.read_text())
     tg = raw.get("tg", {}) or {}
     sess = raw.get("session", {}) or {}
     admin = raw.get("admin", {}) or {}
     caps = raw.get("caps", {}) or {}
+    operator = raw.get("operator", {}) or {}
 
     def _cap(key: str) -> int:
         try:
@@ -159,7 +209,53 @@ def _read_system_settings(config_dir: Path) -> dict:
             "max_total_tokens": _cap("max_total_tokens"),
             "idle_suspend_sec": _cap("idle_suspend_sec"),
         },
+        # T-0894: mirrors operator_redrive.weekly_quota_target_pct's own
+        # coercion — float() the value, and degrade an unusable one to None
+        # (= no target) rather than raising, so a hand-edited garbage value
+        # cannot 500 the whole settings GET.
+        "operator": {
+            "weekly_quota_target_pct": _target_pct(
+                operator.get("weekly_quota_target_pct")
+            )
+        },
     }
+
+
+def _target_pct(v: object) -> float | None:
+    """Coerce a raw [operator].weekly_quota_target_pct to float, or None when
+    unset/unusable. Same shape as the worker-side reader, deliberately: the two
+    must agree on what "no target" means, since this endpoint's whole job is to
+    write a value that reader will pick up."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_operator_section(existing: dict, operator_settings: dict) -> dict:
+    """Return ``existing`` with [operator]'s MANAGED keys set from
+    ``operator_settings``, preserving every unmanaged key already in it (T-0894).
+
+    A managed key set to None is *removed*, not written as a literal — TOML has
+    no null, and the worker's reader spells "no target" as an absent key. When
+    that empties the section entirely it is dropped, so clearing the target
+    leaves the file exactly as it was before anyone set one.
+    """
+    body = existing.get("operator")
+    merged = dict(body) if isinstance(body, dict) else {}
+    for key in _OPERATOR_MANAGED_KEYS:
+        if key not in operator_settings:
+            continue
+        value = operator_settings[key]
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    if merged:
+        return {**existing, "operator": merged}
+    return {k: v for k, v in existing.items() if k != "operator"}
 
 
 def _write_system_settings(config_dir: Path, settings: dict, quota_override: dict | None = None) -> None:
@@ -196,12 +292,17 @@ def _write_system_settings(config_dir: Path, settings: dict, quota_override: dic
     # free) while every OTHER unmanaged section is still preserved verbatim.
     if quota_override is not None:
         existing = {**existing, "quota": quota_override}
+    # T-0894: [operator] is partially managed — merge this endpoint's key into
+    # whatever else that section already holds, then let the preserve loop below
+    # emit the section as a whole. That way the managed key round-trips AND an
+    # unmanaged sibling key survives the write.
+    existing = _apply_operator_section(existing, settings.get("operator") or {})
     for name, body in existing.items():
         if name in _MANAGED_SECTIONS or not isinstance(body, dict):
             continue
         out.append(f"[{name}]")
         for key, value in body.items():
-            out.append(f"{key} = {_toml_value(value)}")
+            out.append(f"{_toml_key(key)} = {_toml_value(value)}")
         out.append("")
     tmp = path.with_suffix(".toml.tmp")
     tmp.write_text("\n".join(out))
@@ -267,6 +368,11 @@ def _shape(config_dir: Path) -> dict:
             "max_parallel_sessions": s["caps"]["max_parallel_sessions"],
             "max_total_tokens": s["caps"]["max_total_tokens"],
             "idle_suspend_sec": s["caps"]["idle_suspend_sec"],
+        },
+        # T-0894: the operator's weekly quota-utilization target. null = unset
+        # (no target), which is a real and normal state — not 0.
+        "operator": {
+            "weekly_quota_target_pct": s["operator"]["weekly_quota_target_pct"]
         },
     }
 
@@ -372,6 +478,34 @@ def put_settings(request: Request, payload: dict) -> dict:
                     status_code=400, detail=f"caps.{key} must be a non-negative int"
                 )
             current["caps"][key] = v
+
+    # T-0894: [operator].weekly_quota_target_pct — the operator's weekly
+    # quota-utilization target, in percent. Nullable: explicit null CLEARS it
+    # (removing the key), which is how "no target" is spelled — the worker's
+    # reader keys off absence, and a 0 would be a live 0% target, the opposite
+    # of unset. Same rejection shape as [caps] (bool refused despite
+    # isinstance(True, int)), widened to accept a float since a percent is not
+    # a count. Bounded 0–100: it is compared against a spend-to-date percent by
+    # operator_redrive.pace_verdict, so a value outside that range can never be
+    # anything but a typo, and an unreachable target silently pins the pacing
+    # verdict to "under" forever.
+    op_in = (payload.get("operator") or {}) if isinstance(payload.get("operator"), dict) else {}
+    if "weekly_quota_target_pct" in op_in:
+        v = op_in["weekly_quota_target_pct"]
+        if v is None:
+            current["operator"]["weekly_quota_target_pct"] = None
+        else:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise HTTPException(
+                    status_code=400,
+                    detail="operator.weekly_quota_target_pct must be a number or null",
+                )
+            if not (0 <= float(v) <= 100):
+                raise HTTPException(
+                    status_code=400,
+                    detail="operator.weekly_quota_target_pct must be between 0 and 100",
+                )
+            current["operator"]["weekly_quota_target_pct"] = float(v)
 
     # T-0418 (PASS-2 P2-20): a token cap with no [quota] anchor is a permanent
     # ratchet — the worker's _output_since_anchor pins its baseline on the empty

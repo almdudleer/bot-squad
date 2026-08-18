@@ -42,6 +42,12 @@ echo "[bot-squad/prod] install dir:  $INSTALL_DIR"
 # the wrong call here is "consumer server cuts its own release line" which
 # corrupts the artifact stream for every attached server.
 # ---------------------------------------------------------------------------
+# T-0878: the live registry is install-owned and git-ignored; an install that
+# has never registered anything only has the tracked seed. Read whichever is
+# present — this recipe only READS the mothership flag.
+if [ ! -f "$PROJECTS_TOML" ] && [ -f "$INSTALL_DIR/config/projects.default.toml" ]; then
+    PROJECTS_TOML="$INSTALL_DIR/config/projects.default.toml"
+fi
 if [ ! -f "$PROJECTS_TOML" ]; then
     echo "[bot-squad/prod] FATAL: projects.toml not found: $PROJECTS_TOML" >&2
     exit 2

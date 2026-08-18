@@ -5,7 +5,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import secret_crypto
+from . import registry, secret_crypto
 from .recycle_gate import DEFAULT_RECYCLE_PROJECTS
 
 
@@ -240,7 +240,11 @@ class Config:
 
     @classmethod
     def load(cls, config_dir: Path) -> "Config":
-        projects_toml = config_dir / "projects.toml"
+        # T-0878: the live registry is install-owned and git-IGNORED; the repo
+        # ships config/projects.default.toml as the tracked seed. seed=True so
+        # the shell readers (scripts/cli/*.sh, scripts/hooks/*.sh), which know
+        # only $BOT_SQUAD/config/projects.toml, find a file where they look.
+        projects_toml = registry.resolve(config_dir, seed=True)
         if not projects_toml.exists():
             raise FileNotFoundError(f"projects.toml not found: {projects_toml}")
         secrets_toml = config_dir / "secrets.toml"

@@ -6,6 +6,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app import registry
 from app.roles import ServerRole, parse_server_role
 
 
@@ -81,7 +82,10 @@ class ApiConfig:
 
     @classmethod
     def load(cls, config_dir: Path) -> "ApiConfig":
-        raw = tomllib.loads((config_dir / "projects.toml").read_text())
+        # T-0878: read through the registry resolver — the live registry is
+        # install-owned and git-ignored, with config/projects.default.toml as
+        # the tracked seed a fresh install starts from.
+        raw = tomllib.loads(registry.resolve(config_dir, seed=True).read_text())
         projects = {
             slug: Project.from_toml(p)
             for slug, p in raw.get("projects", {}).items()

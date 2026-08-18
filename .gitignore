@@ -14,6 +14,21 @@ config/secrets.toml
 # Runtime system settings (managed by admin UI, not source)
 config/system_settings.toml
 
+# T-0878: the LIVE project registry is install-owned state, not source. The
+# install mutates it on every project registration; the repo ships
+# config/projects.default.toml as the tracked seed a fresh install copies from.
+# Tracking this file meant every registration either blocked the next deploy
+# (the staging recipe's dirty guard, exit 8) or was one `merge --ff-only` away
+# from silently de-registering the project. Do NOT re-track it, and do NOT
+# "fix" a dirty install by widening the recipe's dirty-check to skip config/ —
+# that re-arms the silent de-registration the guard is what caught.
+config/projects.toml
+# …and the atomic-write temporaries beside it (registry._seed and
+# routes_projects._write_projects_toml both write `<name>.tmp` then rename).
+# They exist for microseconds, but a deploy's dirty check runs once a minute
+# and would report `?? config/projects.toml.tmp` as somebody's stray edit.
+config/projects.toml.*
+
 # Python
 __pycache__/
 *.pyc

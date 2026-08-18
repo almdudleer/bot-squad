@@ -657,3 +657,51 @@ def test_botsquad_real_config_no_watchrobot_leak(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Registry resolution (T-0878)
+# ---------------------------------------------------------------------------
+
+# `config/projects.toml` is the install-owned LIVE registry and is git-ignored;
+# the repo tracks `config/projects.default.toml` as the seed. Every test above
+# loads `_CONFIG_DIR`, so in a fresh clone (and in CI, which is exactly that)
+# there is no live file at all — the fallback below is what keeps them from all
+# going red on a checkout, and it is invisible on a dev box where the live file
+# happens to exist.
+
+
+def test_registry_falls_back_to_the_tracked_seed(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "projects.default.toml").write_text(
+        '[projects.seeded]\nslug = "seeded"\nrepo_path = "/tmp/s"\n'
+    )
+    assert ram.registry_file(cfg).name == "projects.default.toml"
+    assert set(ram.load_projects(cfg)) == {"seeded"}
+
+
+def test_live_registry_wins_over_the_seed(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "projects.default.toml").write_text(
+        '[projects.seeded]\nslug = "seeded"\nrepo_path = "/tmp/s"\n'
+    )
+    (cfg / "projects.toml").write_text(
+        '[projects.live]\nslug = "live"\nrepo_path = "/tmp/l"\n'
+    )
+    assert ram.registry_file(cfg).name == "projects.toml"
+    assert set(ram.load_projects(cfg)) == {"live"}
+
+
+def test_the_shipped_seed_is_what_the_real_registry_tests_read_in_a_clone():
+    """The 34 tests above must work off the TRACKED file, not off a live file
+    that only exists on a machine someone has already deployed. Assert the seed
+    is present and carries the two real projects they assert against."""
+    import tomllib
+
+    seed = _CONFIG_DIR / "projects.default.toml"
+    assert seed.exists(), "config/projects.default.toml missing from the repo"
+    with open(seed, "rb") as fh:
+        seeded = tomllib.load(fh).get("projects", {})
+    assert {"bot-squad", "watchrobot"} <= set(seeded)

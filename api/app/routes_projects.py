@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app import registry
 from app.config import ApiConfig
 from app.payload_guard import str_field
 from app.project_scaffold import (
@@ -103,6 +104,10 @@ def _serialize_projects_toml(projects_raw: dict[str, dict]) -> str:
     """
     out: list[str] = []
     out.append("# bot-squad project registry. Managed by /api/projects.")
+    out.append("# INSTALL-OWNED LIVE STATE — git-ignored on purpose (T-0878).")
+    out.append("# The tracked seed a fresh install starts from is")
+    out.append("# config/projects.default.toml; editing that does NOT change")
+    out.append("# this install, and a deploy can no longer overwrite this file.")
     out.append("")
     for slug in sorted(projects_raw):
         p = projects_raw[slug]
@@ -131,7 +136,17 @@ def _serialize_projects_toml(projects_raw: dict[str, dict]) -> str:
 
 
 def _read_projects_toml(config_dir: Path) -> dict[str, dict]:
-    raw = tomllib.loads((config_dir / "projects.toml").read_text())
+    """Current registry contents, read through the T-0878 resolver.
+
+    On an install that has never registered anything this reads the tracked
+    seed; the first write below then materialises the LIVE (git-ignored) file
+    with the seed's projects plus the new one, so seeding is never a way to
+    lose the defaults.
+    """
+    path = registry.resolve(config_dir)
+    if not path.exists():
+        return {}
+    raw = tomllib.loads(path.read_text())
     return dict(raw.get("projects", {}))
 
 
@@ -353,11 +368,7 @@ async def create_project(
         "repo_workspace": repo_workspace_str,
     }
 
-    text = _serialize_projects_toml(new_raw)
-    path = config_dir / "projects.toml"
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text(text)
-    os.rename(tmp, path)
+    _write_projects_toml(config_dir, new_raw)
 
     # Hot-reload the API's view, then nudge the worker so its in-memory
     # project list picks up the new slug without a restart (T-0054). On-disk
@@ -487,10 +498,16 @@ def _count(path) -> int:
 
 
 def _write_projects_toml(config_dir: Path, projects_raw: dict[str, dict]) -> None:
-    """Atomically rewrite projects.toml from a raw project dict."""
+    """Atomically rewrite the LIVE registry from a raw project dict.
+
+    T-0878: always ``registry.live_path`` — never the tracked seed. This is the
+    ONE writer (create_project and put_project_tg both land here), so the
+    "registration never touches a git-tracked path" property has a single
+    place it can be broken, and a single place it is tested.
+    """
     text = _serialize_projects_toml(projects_raw)
-    path = config_dir / "projects.toml"
-    tmp = path.with_suffix(".toml.tmp")
+    path = registry.live_path(config_dir)
+    tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
     os.rename(tmp, path)
 

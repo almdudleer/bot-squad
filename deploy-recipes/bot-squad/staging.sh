@@ -40,6 +40,44 @@ fi
 INSTALL_BRANCH=$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD)
 git -C "$INSTALL_DIR" fetch origin
 
+# T-0878 — detach the LIVE project registry from git, once, per install.
+#
+# config/projects.toml is the registry the install MUTATES: every project
+# registered through the API writes a [projects.<slug>] block into it. While it
+# was git-tracked, that guaranteed one of two bad outcomes on the very next
+# deploy — the dirty guard below refusing (measured: 2026-08-06 08:27 and
+# 2026-08-11 14:23, five days apart, both reaching nobody), or, without the
+# guard, the ff-merge silently de-registering the project. It is git-ignored
+# from this commit on; the repo ships config/projects.default.toml as the seed.
+#
+# This block runs BEFORE the guards on purpose: the live file is exactly the
+# thing that makes the tree dirty, and reverting it (the first instinct on
+# reading that guard's message) is what destroys the registration. So: keep the
+# live content aside, restore the tracked copy so the tree is clean, let the
+# ff-merge remove the now-untracked path, then put the live content back.
+# Idempotent — `ls-files` is empty on every install that has already migrated.
+# >>> T-0878-MIGRATION-STASH (extracted verbatim by
+#     worker/tests/test_t0878_recipe_migration.py — keep the markers)
+REGISTRY_STASH=""
+if git -C "$INSTALL_DIR" ls-files --error-unmatch config/projects.toml >/dev/null 2>&1; then
+    # Parked under data/ — the ops surface, git-ignored in full. Parking it in
+    # config/ would surface as `?? config/...` and trip the very dirty guard
+    # this migration exists to stop tripping.
+    mkdir -p "$INSTALL_DIR/data/_worker"
+    REGISTRY_STASH="$INSTALL_DIR/data/_worker/projects.toml.t0878-migration"
+    echo "[bot-squad/staging] T-0878: config/projects.toml is still git-tracked here — migrating it to install-owned state"
+    cp -p "$INSTALL_DIR/config/projects.toml" "$REGISTRY_STASH"
+    # The window between this checkout and the restore below is the ONLY moment
+    # the live registry is not at its live content. Every exit path out of that
+    # window — the dirty guard (8), the diverged-install guard (5), a signal —
+    # must put it back, or the migration itself becomes the de-registration this
+    # ticket exists to prevent. The restore clears REGISTRY_STASH, so the trap
+    # is a no-op on the happy path.
+    trap 'if [ -n "${REGISTRY_STASH:-}" ] && [ -f "$REGISTRY_STASH" ]; then mv -f "$REGISTRY_STASH" "$INSTALL_DIR/config/projects.toml"; echo "[bot-squad/staging] T-0878: live registry restored after an early exit" >&2; fi' EXIT
+    git -C "$INSTALL_DIR" checkout -- config/projects.toml
+fi
+# <<< T-0878-MIGRATION-STASH
+
 # T-0110 — direct-install-commit guard. The install is a deploy TARGET, not
 # an editing surface. Any local-only commits on the install branch are about
 # to be lost (we ff-merge from origin); list them loudly so the agent who
@@ -71,6 +109,27 @@ else
         exit 5
     fi
 fi
+
+# >>> T-0878-MIGRATION-RESTORE
+# T-0878 (cont.) — the sync above is the last moment git could ever have
+# touched the registry. Put the live content back, and seed a fresh install
+# that has none. From here on the file is untracked + ignored, so no future
+# deploy can block on it or delete it.
+if [ -n "$REGISTRY_STASH" ] && [ -f "$REGISTRY_STASH" ]; then
+    mv -f "$REGISTRY_STASH" "$INSTALL_DIR/config/projects.toml"
+    REGISTRY_STASH=""
+    trap - EXIT
+    echo "[bot-squad/staging] T-0878: live registry restored, now install-owned (untracked)"
+fi
+if [ ! -f "$INSTALL_DIR/config/projects.toml" ] && [ -f "$INSTALL_DIR/config/projects.default.toml" ]; then
+    cp -p "$INSTALL_DIR/config/projects.default.toml" "$INSTALL_DIR/config/projects.toml"
+    echo "[bot-squad/staging] T-0878: seeded config/projects.toml from the tracked default"
+fi
+if [ -n "$(git -C "$INSTALL_DIR" status --porcelain -- config/projects.toml)" ]; then
+    echo "[bot-squad/staging] FATAL: config/projects.toml is still visible to git after the T-0878 migration" >&2
+    exit 10
+fi
+# <<< T-0878-MIGRATION-RESTORE
 
 # 3. Rebuild + restart containers. Picks up new docker-compose.yml + new
 #    Dockerfile + new web/dist baked into the api image.

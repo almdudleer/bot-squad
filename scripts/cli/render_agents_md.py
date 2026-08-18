@@ -50,8 +50,23 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
 # Config helpers
 # ---------------------------------------------------------------------------
 
+def registry_file(config_dir: Path) -> Path:
+    """The registry to read — live file first, tracked seed as fallback.
+
+    T-0878: ``config/projects.toml`` is install-owned live state and is
+    git-ignored, so a fresh clone (and CI) only has the tracked seed
+    ``config/projects.default.toml``. Mirrors
+    ``worker/bot_squad_worker/registry.resolve`` — this script is standalone
+    (imported by path, no package) so it cannot import it.
+    """
+    live = config_dir / "projects.toml"
+    if live.exists():
+        return live
+    return config_dir / "projects.default.toml"
+
+
 def load_projects(config_dir: Path) -> dict:
-    p = config_dir / "projects.toml"
+    p = registry_file(config_dir)
     if not p.exists():
         raise FileNotFoundError(f"projects.toml not found: {p}")
     with open(p, "rb") as fh:

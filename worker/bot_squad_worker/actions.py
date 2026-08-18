@@ -1899,6 +1899,12 @@ def _action_deploy(params: dict[str, Any]) -> dict[str, Any]:
     # requester sees WHICH commit this deploy will ship up front. Best-effort —
     # "" if it can't be resolved; the authoritative sha is re-parsed post-build.
     #
+    # T-0723: "can't be resolved" now INCLUDES every in-place target (prod). Its
+    # recipe fetches origin inside the run, so no commit is knowable here — and
+    # the field used to fill that gap with the master clone's un-fetched
+    # `origin/<deploy_branch>`, i.e. a stale commit of the OTHER branch. An
+    # empty echo means "unknown", which is what it is.
+    #
     # T-0754 moved this ABOVE the enqueue and hands the same value in, so the
     # echoed sha and the one persisted in the queue payload are one resolution.
     # Resolving twice around a push landing in between would let /api/health

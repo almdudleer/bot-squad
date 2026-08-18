@@ -1256,11 +1256,45 @@ def resolve_target_sha(cfg: "Config", slug: str, target: str) -> str:
     authoritative resolved sha is re-parsed from the build log for the terminal
     #deploy-logs ping, T-0446). Returns a 40-hex sha, or "" if it can't be read
     (unknown slug/target, no origin ref, git error) — never raises.
+
+    T-0723: ONLY the deploy-clone path gets a value, and the ``deploy_branch``
+    above is why. This resolved ``origin/<deploy_branch>`` for EVERY target,
+    including in-place ones whose editing clone is the MASTER clone — a clone
+    nothing ever fetches the deploy branch into. So a prod job's field named a
+    commit of the STAGING branch, as that clone last saw it: measured on
+    watchrobot 2026-08-18, ``origin/bot_squad/dev`` in
+    /home/almdudleer/watchrobot/master was ``2b3a2dd5`` (22 Jun, the other
+    branch) while ``origin/master`` = HEAD = ``4bb21ae1``. T-0699 read that
+    value off a prod job and concluded its release had not shipped; it had.
+
+    The in-place path returns "" instead of a right-branch value, deliberately.
+    That recipe runs ``git fetch origin`` + ``merge --ff-only origin/<branch>``
+    INSIDE the run, so the commit it will ship is not knowable here without
+    network — and the only value available without one, this clone's un-fetched
+    ``origin/<master_branch>``, is the release ALREADY RUNNING. Publishing that
+    would be worse than the stale foreign sha, not better: it is the sha most
+    likely to equal a side ``_deploy_row`` compares against
+    (api/app/routes_health.py), so a queued prod deploy could buy a blanket
+    excuse for an unrelated api/worker drift. "" cannot be read as a bound and
+    cannot match anything: health falls back to the bare ``sha_drift`` alarm
+    (pinned by test_health.py::test_a_payload_without_a_target_sha_buys_no_excuse)
+    and ``_action_deploy``'s echo already documents "" as its best-effort miss.
+
+    The predicate is ``editing_repo_for_target(target) != repo_path``, derived
+    rather than a ``target == "prod"`` literal, and it is deliberately NARROWER
+    than ``uses_deploy_clone``. It is true exactly when the target's editing
+    clone is the master clone — the pair of conditions that make the echo a lie:
+    that clone builds a DIFFERENT branch from ``deploy_branch``, and no agent
+    works or fetches in it. A legacy in-place STAGING target (no ``repo_deploy``)
+    fails the predicate and keeps its value, correctly: it builds the deploy
+    branch out of the shared dev clone, where agents push and fetch constantly.
     """
     project = cfg.projects.get(slug)
     if project is None or target not in project.deploy_targets:
         return ""
     edit_repo = project.editing_repo_for_target(target)
+    if edit_repo != project.repo_path:
+        return ""
     ref = f"origin/{project.deploy_branch}"
     try:
         proc = subprocess.run(

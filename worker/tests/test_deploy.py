@@ -583,6 +583,163 @@ def test_resolve_target_sha_empty_on_unknown_slug_or_target(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
+# T-0723: the enqueue echo must not name a FOREIGN branch's commit
+#
+# resolve_target_sha resolved `origin/<deploy_branch>` for EVERY target. For a
+# prod target that ref is read in the MASTER clone, which nothing ever fetches
+# it into — so the field carried a commit of the STAGING branch, months old,
+# that prod neither ships nor has ever shipped. Measured on watchrobot
+# 2026-08-18 in /home/almdudleer/watchrobot/master: origin/bot_squad/dev =
+# 2b3a2dd5 (22 Jun, the other branch) while origin/master = HEAD = 4bb21ae1.
+# T-0699 read exactly that value off a prod job and concluded its work had not
+# shipped; it had.
+#
+# The decision (T-0723 DoD 1): for a target the recipe builds IN PLACE — it
+# runs `git fetch origin` + `merge --ff-only origin/<branch>` INSIDE the run —
+# the to-be-built commit is not knowable at enqueue without network, so the
+# field stays EMPTY. Silence degrades safely everywhere ("" buys no drift
+# excuse in api/app/routes_health.py, and is already the documented
+# best-effort miss for the action's echo); a sha does not, because a sha is
+# read as a bound.
+# ---------------------------------------------------------------------------
+
+
+def _make_prod_project(tmp_path: Path) -> tuple[Project, Path]:
+    """Watchrobot's measured SHAPE: a master clone whose `origin/<deploy_branch>`
+    is a stale commit of the OTHER branch, and whose `origin/<master_branch>` is
+    its own HEAD. Returns (project, master_clone_path).
+
+    Built the way the real one got that way: the master clone is cloned once
+    (so it picks up every branch ref as it stood THEN) and never fetched again,
+    while the dev clone keeps pushing the deploy branch forward.
+    """
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+
+    dev = tmp_path / "devclone"
+    dev.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "bot_squad/dev"], cwd=str(dev), check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(dev), check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(dev), check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=str(dev), check=True)
+    (dev / "README.md").write_text("hi")
+    subprocess.run(["git", "add", "README.md"], cwd=str(dev), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(dev), check=True)
+    # The commit the deploy branch stood at when the master clone was made —
+    # the analogue of watchrobot's 2b3a2dd5.
+    subprocess.run(["git", "push", "-q", "origin", "bot_squad/dev"], cwd=str(dev), check=True)
+    # master carries its own release commit on top.
+    subprocess.run(["git", "checkout", "-q", "-b", "master"], cwd=str(dev), check=True)
+    (dev / "RELEASE").write_text("prod release")
+    subprocess.run(["git", "add", "RELEASE"], cwd=str(dev), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "release"], cwd=str(dev), check=True)
+    subprocess.run(["git", "push", "-q", "origin", "master"], cwd=str(dev), check=True)
+    subprocess.run(["git", "checkout", "-q", "bot_squad/dev"], cwd=str(dev), check=True)
+
+    master = tmp_path / "masterclone"
+    subprocess.run(
+        ["git", "clone", "-q", "--branch", "master", str(bare), str(master)], check=True
+    )
+
+    # …and now the deploy branch moves on. The master clone never fetches, so
+    # its origin/bot_squad/dev stays pinned at the old commit — the whole bug.
+    (dev / "feature.txt").write_text("staging work, months later")
+    subprocess.run(["git", "add", "feature.txt"], cwd=str(dev), check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "feature"], cwd=str(dev), check=True)
+    subprocess.run(["git", "push", "-q", "origin", "bot_squad/dev"], cwd=str(dev), check=True)
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=str(dev), check=True)
+
+    project = Project(
+        slug="test-deploy",
+        display_name="Test Deploy",
+        repo_path=dev,
+        deploy_branch="bot_squad/dev",
+        master_branch="master",
+        prod_url="",
+        staging_url="",
+        dev_url="",
+        deploy_targets=("staging", "prod"),
+        tg_chat="0",
+        repo_master=master,
+        repo_deploy=tmp_path / "deployclone",
+    )
+    return project, master
+
+
+def _rev(repo: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_t0723_prod_target_sha_is_empty_not_a_foreign_branch_commit(tmp_path: Path) -> None:
+    """The arm that was RED before the fix: prod echoed the staging branch's
+    stale tip, as read in the master clone."""
+    from bot_squad_worker.deploy import resolve_target_sha
+
+    proj, master = _make_prod_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+
+    # The fixture must be able to FAIL: prove the master clone really does hold
+    # a stale, foreign-branch ref that differs from the branch prod builds.
+    stale_foreign = _rev(master, "origin/bot_squad/dev")
+    prod_branch_tip = _rev(master, "origin/master")
+    assert stale_foreign != prod_branch_tip
+    assert prod_branch_tip == _rev(master, "HEAD")
+    # …and that it is genuinely NOT on the branch prod ships (a commit of the
+    # other branch, not merely an older master).
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", prod_branch_tip, stale_foreign],
+        cwd=str(master),
+    ).returncode != 0
+
+    sha = resolve_target_sha(cfg, proj.slug, "prod")
+    assert sha != stale_foreign, (
+        "prod's target_sha named a commit of the DEPLOY branch as the master "
+        "clone last saw it — the T-0723 defect"
+    )
+    assert sha == "", (
+        "an in-place target fetches origin INSIDE the run, so the to-be-built "
+        "commit is not knowable at enqueue — the field must stay silent"
+    )
+
+
+def test_t0723_staging_target_sha_still_echoes_the_deploy_branch(tmp_path: Path) -> None:
+    """The half that was never broken and is load-bearing (T-0754 / /api/health):
+    a deploy-clone target still echoes origin/<deploy_branch> from the EDITING
+    clone, which is the ref _ensure_deploy_clone force-checks-out."""
+    from bot_squad_worker.deploy import resolve_target_sha
+
+    proj, _master = _make_prod_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+
+    assert resolve_target_sha(cfg, proj.slug, "staging") == _rev(
+        proj.repo_path, "origin/bot_squad/dev"
+    )
+
+
+def test_t0723_enqueued_prod_payload_records_an_empty_target_sha(tmp_path: Path) -> None:
+    """DoD 3: what the CONSUMERS get. An empty string is the value
+    api/app/routes_health.py::_deploy_row already refuses to build an excuse on
+    (test_health.py::test_a_payload_without_a_target_sha_buys_no_excuse pins
+    ""), so the drift alarm stands instead of being silenced by a prod deploy
+    that never had a knowable target. It is recorded, not omitted, so a reader
+    can tell this worker from a pre-T-0754 one."""
+    from bot_squad_worker.deploy import enqueue
+
+    proj, master = _make_prod_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+
+    enqueue(cfg, proj.slug, "prod", "release", "user")
+    queue_dir = cfg.data_dir / proj.slug / "_jobs" / "deploy" / "queue"
+    (payload,) = list(queue_dir.glob("*.json"))
+    data = json.loads(payload.read_text())
+    assert "target_sha" in data
+    assert data["target_sha"] == ""
+    assert data["target_sha"] != _rev(master, "origin/bot_squad/dev")
+
+
+# ---------------------------------------------------------------------------
 # T-0754: the queue payload PERSISTS target_sha
 #
 # T-0458 resolved the to-be-built commit and echoed it to the requester, then

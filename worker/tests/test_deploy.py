@@ -1260,6 +1260,61 @@ def test_silence_budget_is_computed_not_guessed() -> None:
     assert _silence_budget(600, 2.0, 100000.0, 14400) == 14400
 
 
+def test_an_absurd_step_duration_cannot_inflate_the_silence_budget() -> None:
+    """The tempo term is the ONE input this design takes on faith — it is read
+    out of the build's own stdout. Unbounded, a single erroneous or forged
+    `#5 DONE 7200.0s` would raise the silence allowance straight to the 14400s
+    clamp and quietly degrade wedge detection from 600s to FOUR HOURS.
+
+    The invariant that closes it needs no trust: a completed step cannot be older
+    than the run that contains it.
+    """
+    from bot_squad_worker.deploy import (
+        DEFAULT_CEILING_SECONDS, _RunProgress, _silence_budget,
+    )
+
+    p = _RunProgress()
+    p.feed("#5 [web-builder 4/8] COPY web/ ./\n#5 DONE 7200.0s\n", elapsed_s=30.0)
+
+    # The step DID happen and is still reported — only its duration is refused.
+    assert p.completed == 1
+    assert "7200.0s" in p.last_completed_step
+    assert p.implausible_durations == 1
+    # ...and it bought no silence budget whatsoever.
+    assert p.longest_done_s == 0.0
+    budget = _silence_budget(600, 2.0, p.longest_done_s, DEFAULT_CEILING_SECONDS)
+    assert budget == 600, "an impossible duration must not widen the allowance"
+    assert budget < DEFAULT_CEILING_SECONDS, "and must not reach the 4h clamp"
+
+    # A duration this run could actually have produced is still trusted, so the
+    # bound rejects the impossible without disarming the tempo term.
+    q = _RunProgress()
+    q.feed("#5 DONE 700.0s\n", elapsed_s=800.0)
+    assert q.longest_done_s == 700.0
+    assert q.implausible_durations == 0
+    assert _silence_budget(600, 2.0, q.longest_done_s, DEFAULT_CEILING_SECONDS) == 1400
+
+
+def test_the_plausibility_tolerance_is_a_named_constant() -> None:
+    """The slack between the run clock and buildkit's per-vertex clock is real
+    (one poll interval, 0.1s rounding, a different clock origin), so the bound
+    needs a tolerance — but it must be a named, explained constant rather than a
+    bare number, and small enough that 718.4s (the largest step ever measured on
+    this box) stays comfortably inside while an absurd claim does not."""
+    from bot_squad_worker.deploy import TEMPO_DURATION_TOLERANCE_S, _RunProgress
+
+    assert 0 < TEMPO_DURATION_TOLERANCE_S <= 300
+
+    # A step that finishes just inside the tolerance is still trusted...
+    p = _RunProgress()
+    p.feed("#5 DONE 100.0s\n", elapsed_s=100.0 - TEMPO_DURATION_TOLERANCE_S / 2)
+    assert p.longest_done_s == 100.0
+    # ...and one just outside it is not.
+    q = _RunProgress()
+    q.feed("#5 DONE 100.0s\n", elapsed_s=100.0 - TEMPO_DURATION_TOLERANCE_S - 1)
+    assert q.longest_done_s == 0.0
+
+
 def test_run_progress_parses_real_buildkit_output() -> None:
     """The tempo signal is only as good as the parse, and it is fed the REAL
     shape: buildkit re-prints a vertex header every time the vertex resumes, and
@@ -1275,7 +1330,8 @@ def test_run_progress_parses_real_buildkit_output() -> None:
         "#8 DONE 29.1s\n"
         "#14 [web-builder 5/8] COPY web/ ./\n"
         "#14 DONE 718.4s\n"
-        "#18 [web-builder 6/8] COPY scripts/install /scripts/install\n"
+        "#18 [web-builder 6/8] COPY scripts/install /scripts/install\n",
+        elapsed_s=800.0,
     )
     assert p.completed == 2
     assert p.longest_done_s == 718.4
@@ -1290,9 +1346,9 @@ def test_run_progress_holds_back_a_split_line() -> None:
     from bot_squad_worker.deploy import _RunProgress
 
     p = _RunProgress()
-    p.feed("#14 [web-builder 5/8] COPY web/ ./\n#14 DON")
+    p.feed("#14 [web-builder 5/8] COPY web/ ./\n#14 DON", elapsed_s=800.0)
     assert p.completed == 0
-    p.feed("E 718.4s\n")
+    p.feed("E 718.4s\n", elapsed_s=800.0)
     assert p.completed == 1
     assert p.longest_done_s == 718.4
 

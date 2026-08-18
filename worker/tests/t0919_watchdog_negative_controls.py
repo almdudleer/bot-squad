@@ -80,6 +80,18 @@ MUTATIONS = [
         ("        self._tail = lines.pop()",
          "        lines.pop()\n        self._tail = \"\""),
     ),
+    (
+        "M8", "the step-duration plausibility bound is removed — one forged "
+              "`DONE 7200.0s` buys a 4-hour silence allowance",
+        "test_an_absurd_step_duration_cannot_inflate_the_silence_budget",
+        ("            if secs > elapsed_s + TEMPO_DURATION_TOLERANCE_S:",
+         "            if False and secs > elapsed_s + TEMPO_DURATION_TOLERANCE_S:"),
+    ),
+    (
+        "M9", "the tolerance is widened until the bound stops rejecting anything",
+        "test_the_plausibility_tolerance_is_a_named_constant",
+        ("TEMPO_DURATION_TOLERANCE_S = 60.0", "TEMPO_DURATION_TOLERANCE_S = 99999.0"),
+    ),
 ]
 
 

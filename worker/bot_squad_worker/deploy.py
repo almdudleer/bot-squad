@@ -145,6 +145,25 @@ DEFAULT_BUDGET_SECONDS = 1800
 # only its own project, never another's.
 DEFAULT_CEILING_SECONDS = 14400
 
+# The tempo term is the ONE input this design takes on faith: it is read out of
+# the build's own stdout. Left unbounded, a single erroneous or forged
+# `#5 DONE 7200.0s` line would raise the silence allowance straight to the
+# ceiling clamp and quietly degrade wedge detection from 600s to four hours —
+# bounded, but wrong, and invisible.
+#
+# The invariant that closes it needs no trust: **a completed step cannot be
+# older than the run that contains it.** Any `DONE <x>s` claiming more than this
+# run's own elapsed wall-clock is impossible, so it is refused as tempo (the
+# step is still counted and still reported — only its duration is untrustworthy).
+#
+# The tolerance absorbs the legitimate slack between the two clocks, which is
+# small and enumerable: we notice a line up to one poll interval after it was
+# written (BOT_SQUAD_DEPLOY_POLL_SECONDS, default 5s), buildkit rounds durations
+# to 0.1s, and the daemon's per-vertex clock is not our monotonic start. 60s
+# covers all of that with room to spare while still making an implausible
+# duration implausible: the largest step ever measured on this box is 718.4s.
+TEMPO_DURATION_TOLERANCE_S = 60.0
+
 # next-wave #11 (T-0451): keep-last-N retention horizon for the deploy job
 # archive (processed/ + runs/). Override via BOT_SQUAD_DEPLOY_RETENTION_N; a
 # value <= 0 disables pruning. Keep-last-N (NOT age-prune) so recent forensics
@@ -2051,19 +2070,27 @@ class _RunProgress:
         self.completed: int = 0
         self.last_step: str = ""
         self.last_completed_step: str = ""
+        # How many `DONE` durations were refused as tempo for claiming to be
+        # older than the run containing them. Non-zero means the build's output
+        # is lying to us about time; it never widens the budget, but it should
+        # be visible rather than silently swallowed.
+        self.implausible_durations: int = 0
         self._open_step: dict[str, str] = {}
         self._tail: str = ""
 
-    def feed(self, chunk: str) -> None:
+    def feed(self, chunk: str, elapsed_s: float) -> None:
+        """``elapsed_s`` is the run's own wall-clock so far — the upper bound any
+        honest step duration must respect. Required, not defaulted: a caller that
+        forgets it must fail loudly rather than silently disable the bound."""
         buf = self._tail + chunk
         lines = buf.split("\n")
         # The final element is a partial line unless the chunk ended on \n; hold
         # it back so a vertex header split across two reads is not mis-parsed.
         self._tail = lines.pop()
         for line in lines:
-            self._line(line)
+            self._line(line, elapsed_s)
 
-    def _line(self, line: str) -> None:
+    def _line(self, line: str, elapsed_s: float) -> None:
         m = _VERTEX.match(line)
         if not m:
             return
@@ -2079,11 +2106,24 @@ class _RunProgress:
         if d:
             secs = float(d.group(1))
             self.completed += 1
-            self.longest_done_s = max(self.longest_done_s, secs)
             header = self._open_step.pop(vid, f"#{vid}")
             self.last_completed_step = f"{header} ({secs:.1f}s)"
             if self.last_step == header:
                 self.last_step = ""
+            # The step happened — count it and report it either way. But a step
+            # cannot be older than the run that contains it, so a duration past
+            # that is refused as TEMPO: it must never buy silence budget. See
+            # TEMPO_DURATION_TOLERANCE_S.
+            if secs > elapsed_s + TEMPO_DURATION_TOLERANCE_S:
+                self.implausible_durations += 1
+                log.warning(
+                    "deploy._RunProgress: ignoring an impossible step duration for "
+                    "tempo — %r claims %.1fs on a run that has only been going "
+                    "%.1fs. Not widening the silence budget.",
+                    header, secs, elapsed_s,
+                )
+                return
+            self.longest_done_s = max(self.longest_done_s, secs)
 
 
 def _silence_budget(
@@ -2209,8 +2249,9 @@ def _run_recipe_watchdog(
             rc = proc.wait(timeout=poll_interval)
             # Recipe finished on its own. Drain whatever it wrote last so the
             # step terms are complete even on a clean exit.
-            _drain(log_path, last_size, progress)
-            return _outcome(rc, now=time.monotonic())
+            done_at = time.monotonic()
+            _drain(log_path, last_size, progress, done_at - start)
+            return _outcome(rc, now=done_at)
         except subprocess.TimeoutExpired:
             pass
 
@@ -2222,7 +2263,7 @@ def _run_recipe_watchdog(
         if size != last_size:
             # Bytes arrived: that IS the progress signal, and the new bytes also
             # tell us how slow this box is running right now.
-            last_size = _drain(log_path, last_size, progress, size=size)
+            last_size = _drain(log_path, last_size, progress, now - start, size=size)
             last_progress = now
 
         silence = now - last_progress
@@ -2292,7 +2333,8 @@ def _run_recipe_watchdog(
 
 
 def _drain(
-    log_path: Path, offset: int, progress: "_RunProgress", size: int | None = None
+    log_path: Path, offset: int, progress: "_RunProgress", elapsed_s: float,
+    size: int | None = None,
 ) -> int:
     """Feed the bytes appended since ``offset`` into ``progress``; return the new
     offset. Never raises — a log we cannot read simply leaves the tempo where it
@@ -2311,7 +2353,7 @@ def _drain(
         return offset if size is None else size
     # A multi-byte character can straddle the read boundary; decode leniently
     # and let _RunProgress hold back the partial trailing line.
-    progress.feed(chunk.decode("utf-8", "replace"))
+    progress.feed(chunk.decode("utf-8", "replace"), elapsed_s)
     return offset + len(chunk)
 
 

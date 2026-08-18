@@ -12,12 +12,22 @@ Flaw-watch (assert by identity + path-param name match): the enumeration guard
 asserts the management routes carry ``require_manage`` BY IDENTITY, and the
 behavioural tests assert the gate actually FIRES (a 403, not a silent 404 from a
 mis-named path param).
+
+Flaw-watch 2 (T-0900): the enumeration must not depend on the FastAPI route
+SHAPE. ``fastapi>=0.110`` is unpinned, and the shapes disagree — 0.136 (what the
+install's api venv runs) flattens included routers, 0.139+ (what the api image
+runs) hides them behind ``_IncludedRouter``. Reading one shape only enumerates
+NOTHING on the other, which is why this file was red on the install's fastapi
+from the day it was written. ``_all_api_routes`` handles both, and
+``test_enumeration_flags_an_ungated_management_route`` is the negative control
+that keeps a green here from meaning "the walker saw nothing".
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 
+from fastapi import APIRouter, Depends
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
@@ -25,6 +35,7 @@ from app.install_tokens import hash_token, mint_server_bearer
 from app.main import build_app
 from app.mothership_store import AttachedServer, MothershipStore
 from app.roles import GlobalRole
+from app.routes_auth import require_auth
 
 
 _BCRYPT_TEST = "$2b$12$brMg3j40OitJrhlJAmnzlu/U09ybQSGcrfWx.HriIFALc59M.jP1W"
@@ -209,39 +220,58 @@ def test_owner_can_list_grants_200(tmp_bot_squad: Path, monkeypatch):
 
 # ---- enumeration guard: management routes carry require_manage BY IDENTITY ---
 
+# The mothership router mounts under ``/api/m``; every path below is the FULL
+# mounted path, because the router-RELATIVE form is not stable across the
+# FastAPI versions this repo runs (see ``_all_api_routes``).
+_MANAGE_SCOPE = "/api/m/servers/{server_id}"
+
 # Cookie-auth server-scoped write routes that are deliberately the ACCESS tier
-# (a grantee may invoke them) — NOT management. Documented exceptions. Paths are
-# router-RELATIVE (the mothership router is mounted under /api/m).
+# (a grantee may invoke them) — NOT management. Documented exceptions.
 _ACCESS_TIER_ALLOWLIST = {
     # proxy passthrough into the server's own API (the server's own auth re-applies)
-    "/servers/{server_id}/api/{rest:path}",
+    _MANAGE_SCOPE + "/api/{rest:path}",
     # refresh the projects cache — a viewer's read-through, not management
-    "/servers/{server_id}/projects/refresh",
+    _MANAGE_SCOPE + "/projects/refresh",
 }
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
-def _all_api_routes(app) -> list[APIRoute]:
-    """Collect every APIRoute, descending FastAPI's ``_IncludedRouter`` lazy
-    include wrappers (this FastAPI version stores included routers as opaque
-    placeholders in ``app.routes`` rather than flattening them — a naive
-    ``isinstance(r, APIRoute)`` sweep over ``app.routes`` would see ZERO routed
-    endpoints and pass vacuously). Paths are router-relative.
-    """
-    seen: set[int] = set()
-    out: list[APIRoute] = []
+def _all_api_routes(app) -> list[tuple[APIRoute, str]]:
+    """Every ``APIRoute`` paired with its FULL mounted path.
 
-    def walk(router) -> None:
-        if id(router) in seen:
+    TWO FastAPI route shapes are live at once — ``api/pyproject.toml`` pins only
+    ``fastapi>=0.110``, so the install's api venv (0.136) and the api docker
+    image / a fresh CI install (0.141) disagree — and reading only one of them
+    fails SILENTLY, with an empty list, i.e. a vacuous pass in the suite that
+    guards write authz (T-0900, and this is exactly what went red):
+
+    * fastapi 0.136 FLATTENS on include — ``app.routes`` holds every ``APIRoute``
+      already carrying its full path.
+    * fastapi 0.141 appends opaque ``_IncludedRouter`` placeholders instead; the
+      routes sit on ``original_router`` with router-RELATIVE paths and the mount
+      prefix lives on ``include_context.prefix``.
+
+    This walker descends the placeholders while ACCUMULATING that prefix, so both
+    shapes yield the same full paths. Callers assert the result is non-empty, and
+    ``test_enumeration_flags_an_ungated_management_route`` keeps the whole
+    instrument from passing dead.
+    """
+    seen: set[tuple[int, str]] = set()
+    out: list[tuple[APIRoute, str]] = []
+
+    def walk(router, prefix: str) -> None:
+        key = (id(router), prefix)
+        if key in seen:
             return
-        seen.add(id(router))
+        seen.add(key)
         for r in getattr(router, "routes", []):
             if type(r).__name__ == "_IncludedRouter":
-                walk(r.original_router)
+                sub = getattr(getattr(r, "include_context", None), "prefix", "") or ""
+                walk(r.original_router, prefix + sub)
             elif isinstance(r, APIRoute):
-                out.append(r)
+                out.append((r, prefix + r.path))
 
-    walk(app.router)
+    walk(app.router, "")
     return out
 
 
@@ -258,61 +288,97 @@ def _dep_callables(route: APIRoute) -> set:
     return out
 
 
-def test_every_server_management_write_route_is_gated(tmp_bot_squad, monkeypatch):
-    """No cookie-auth server-scoped write route is require_auth-only: it must
-    carry ``require_manage`` (owner SSOT) or ``_require_super_admin``, else be an
-    allowlisted access-tier exception. A new management route that forgets the
-    gate goes RED here."""
+def _gate_env(tmp_bot_squad: Path, monkeypatch) -> None:
     monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
     monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
     monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     monkeypatch.setenv("COOKIE_SECURE", "0")
     monkeypatch.setenv("MOTHERSHIP", "1")
+
+
+def _ungated_management_writes(app) -> list[str]:
+    """``["<METHOD> <full path>", ...]`` for every cookie-auth server-scoped
+    write route carrying neither ``require_manage`` (owner SSOT) nor
+    ``_require_super_admin``, minus the allowlisted access-tier exceptions.
+
+    Shared by the guard and by its negative control so the control exercises the
+    SAME instrument, not a lookalike.
+    """
     from app.routes_mothership import require_manage, _require_super_admin
 
-    app = build_app()
     routes = _all_api_routes(app)
-    # guard against a future FastAPI that flattens — make sure we actually saw routes
-    assert any(r.path.startswith("/servers/{server_id}") for r in routes), "walker found no server routes"
-    ungated = []
-    for route in routes:
+    # Vacuity guard: an enumeration that sees no server routes at all reports
+    # "nothing ungated" and is indistinguishable from a clean gate.
+    assert any(p.startswith(_MANAGE_SCOPE) for _, p in routes), (
+        f"walker found no {_MANAGE_SCOPE} routes among {len(routes)} routes — "
+        "the FastAPI route shape moved again; the enumeration is vacuous"
+    )
+    ungated: list[str] = []
+    for route, path in routes:
         if not (route.methods & _WRITE_METHODS):
             continue
-        if not route.path.startswith("/servers/{server_id}"):
+        if not path.startswith(_MANAGE_SCOPE):
             continue
-        if route.path in _ACCESS_TIER_ALLOWLIST:
+        if path in _ACCESS_TIER_ALLOWLIST:
             continue
         deps = _dep_callables(route)
         if require_manage not in deps and _require_super_admin not in deps:
             for m in sorted(route.methods & _WRITE_METHODS):
-                ungated.append(f"{m} {route.path}")
+                ungated.append(f"{m} {path}")
+    return ungated
+
+
+def test_every_server_management_write_route_is_gated(tmp_bot_squad: Path, monkeypatch):
+    """No cookie-auth server-scoped write route is require_auth-only: it must
+    carry ``require_manage`` (owner SSOT) or ``_require_super_admin``, else be an
+    allowlisted access-tier exception. A new management route that forgets the
+    gate goes RED here."""
+    _gate_env(tmp_bot_squad, monkeypatch)
+    ungated = _ungated_management_writes(build_app())
     assert not ungated, "server-management write routes missing require_manage:\n" + "\n".join(ungated)
 
 
-def test_management_routes_carry_require_manage_by_identity(tmp_bot_squad, monkeypatch):
-    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
-    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
-    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
-    monkeypatch.setenv("JWT_SECRET", "test-secret")
-    monkeypatch.setenv("COOKIE_SECURE", "0")
-    monkeypatch.setenv("MOTHERSHIP", "1")
+def test_enumeration_flags_an_ungated_management_route(tmp_bot_squad: Path, monkeypatch):
+    """Negative control for the guard above (T-0900).
+
+    Plant a require_auth-only write route inside the management scope and assert
+    the SAME instrument names it. Without this, the green above is worth nothing:
+    the walker it runs on enumerated ZERO routes on the install's fastapi for
+    weeks, and a dead check looks exactly like a clean gate.
+    """
+    _gate_env(tmp_bot_squad, monkeypatch)
+    app = build_app()
+    planted = APIRouter()
+
+    @planted.post("/servers/{server_id}/t0900-negative-control")
+    def _ungated_route(server_id: str, user: dict = Depends(require_auth)) -> dict:
+        return {"server_id": server_id}
+
+    app.include_router(planted, prefix="/api/m")
+    assert (
+        "POST " + _MANAGE_SCOPE + "/t0900-negative-control"
+        in _ungated_management_writes(app)
+    )
+
+
+def test_management_routes_carry_require_manage_by_identity(tmp_bot_squad: Path, monkeypatch):
+    _gate_env(tmp_bot_squad, monkeypatch)
     from app.routes_mothership import require_manage
 
-    # router-relative paths (the mothership router mounts under /api/m)
     expected = {
-        ("POST", "/servers/{server_id}/invites"),
-        ("GET", "/servers/{server_id}/grants"),
-        ("POST", "/servers/{server_id}/grants"),
-        ("DELETE", "/servers/{server_id}/grants/{username}"),
-        ("POST", "/servers/{server_id}/hold"),
-        ("POST", "/servers/{server_id}/unhold"),
+        ("POST", _MANAGE_SCOPE + "/invites"),
+        ("GET", _MANAGE_SCOPE + "/grants"),
+        ("POST", _MANAGE_SCOPE + "/grants"),
+        ("DELETE", _MANAGE_SCOPE + "/grants/{username}"),
+        ("POST", _MANAGE_SCOPE + "/hold"),
+        ("POST", _MANAGE_SCOPE + "/unhold"),
     }
     app = build_app()
     seen = set()
-    for route in _all_api_routes(app):
+    for route, path in _all_api_routes(app):
         for m in route.methods:
-            if (m, route.path) in expected:
-                assert require_manage in _dep_callables(route), f"{m} {route.path} not gated by require_manage"
-                seen.add((m, route.path))
+            if (m, path) in expected:
+                assert require_manage in _dep_callables(route), f"{m} {path} not gated by require_manage"
+                seen.add((m, path))
     assert seen == expected, f"missing management routes: {expected - seen}"

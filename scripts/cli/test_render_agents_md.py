@@ -342,8 +342,8 @@ def _test_block(rendered: str) -> str:
 
 def test_watchrobot_real_config(tmp_path):
     """watchrobot renders with ITS identity: legacy ops/bot-squad prefix, the
-    signal-tracker-old hard rule (now config-driven), @watchbot, and the exact
-    pre-T-0195 test-commands block."""
+    signal-tracker-old hard rule (now config-driven), @watchbot, and the
+    test-commands block CORRECTED by T-0724."""
     _seed_vision(tmp_path, "watchrobot")
     out = ram.render("watchrobot", _CONFIG_DIR, tmp_path)
     assert "`ops/bot-squad/vision/constitution.md`" in out
@@ -352,14 +352,45 @@ def test_watchrobot_real_config(tmp_path):
     assert "Tailwind" in out
     assert _test_block(out) == (
         "## Test commands\n\n"
-        "- Backend: `docker exec signal-tracker python test_api.py`\n"
-        "- Frontend e2e: `npm run test:e2e` (from `web/`)\n"
-        "- Type-check: from `web/`, `npx tsc -b --noEmit`\n"
-        "- Lint: from `web/`, `npm run lint`"
+        "- Backend: `backend/run_tests.sh` (T-0338 — manages its own venv and "
+        "defaults `DATABASE_URL` to `signal_tracker_dev`; bare `pytest` points "
+        "at PROD). Caveats: `ops/bot-squad/AGENT_INSTRUCTIONS.md`.\n"
+        "- Frontend unit: `web/run_tests.sh` (= `npm test` from `web/`; "
+        "`node:test`, NOT vitest — needs node >= 22.6, the script finds it). "
+        "Gates the staging image build (T-0677).\n"
+        "- Frontend e2e: `npm test` from `tests/` (a separate package — there "
+        "is no `test:e2e` in `web/` and never has been)\n"
+        "- Type-check: from `web/`, `npx tsc -b` — `-p tsconfig.json` checks "
+        "ZERO files and always exits 0 (T-0471)\n"
+        "- Lint: **not wired up** — no `lint` script and no `eslint.config.*` "
+        "in `web/`, though the toolchain is in devDependencies (T-0375)"
     )
+    # T-0724: the three commands that were configured here until 2026-08-18 do
+    # not exist in the watchrobot tree — `signal-tracker` is the PROD container
+    # and carries no pytest, and `web/package.json` has neither `test:e2e` nor
+    # `lint`. Reds on a revert of the config, which is how they got shipped.
+    for refuted in ("docker exec signal-tracker python test_api.py",
+                    "`npm run test:e2e`",
+                    "- Lint: from `web/`, `npm run lint`"):
+        assert refuted not in out, refuted
     # No bot-squad-project identity in watchrobot's render.
     for leaked in ("cd api && pytest", "/home/almdudleer/bot-squad", "Bootstrap"):
         assert leaked not in out, leaked
+
+
+def test_frontend_unit_field_is_rendered_and_optional(tmp_path):
+    """T-0724 added `test_frontend_unit_cmd`. It renders under its own label,
+    sits between Build and Frontend e2e, and stays absent for a project that
+    does not configure it (bot-squad) — no KeyError, no empty bullet."""
+    _seed_vision(tmp_path, "watchrobot")
+    wr = ram.render("watchrobot", _CONFIG_DIR, tmp_path)
+    block = _test_block(wr)
+    assert "- Frontend unit: " in block
+    assert block.index("- Frontend unit:") < block.index("- Frontend e2e:")
+
+    _seed_vision(tmp_path, "bot-squad")
+    bs = ram.render("bot-squad", _CONFIG_DIR, tmp_path)
+    assert "Frontend unit" not in bs
 
 
 def test_botsquad_real_config_no_watchrobot_leak(tmp_path):

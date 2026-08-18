@@ -180,6 +180,11 @@ _NO_PRODUCT = (
 _TEST_COMMAND_FIELDS: tuple[tuple[str, str], ...] = (
     ("test_backend_cmd", "Backend"),
     ("test_build_cmd", "Build"),
+    # T-0724: watchrobot has a real frontend UNIT suite (node:test) that is a
+    # separate command from e2e and gates the staging image build. Without a
+    # field for it the only way to name it in AGENTS.md was a hand edit — i.e.
+    # exactly the drift this field exists to stop.
+    ("test_frontend_unit_cmd", "Frontend unit"),
     ("test_e2e_cmd", "Frontend e2e"),
     ("test_typecheck_cmd", "Type-check"),
     ("test_lint_cmd", "Lint"),

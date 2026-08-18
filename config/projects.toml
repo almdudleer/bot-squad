@@ -54,12 +54,24 @@ created_at    = 2026-05-10
 # T-0195: per-project test commands for the generated AGENTS.md "## Test
 # commands" block (render_agents_md.py). Optional `test_*_cmd` fields — each
 # value is the rendered markdown for the command part (carries its own
-# backticks/annotations). Absent fields render no line. These four reproduce
-# watchrobot's existing AGENTS.md block exactly.
-test_backend_cmd   = "`docker exec signal-tracker python test_api.py`"
-test_e2e_cmd       = "`npm run test:e2e` (from `web/`)"
-test_typecheck_cmd = "from `web/`, `npx tsc -b --noEmit`"
-test_lint_cmd      = "from `web/`, `npm run lint`"
+# backticks/annotations). Absent fields render no line.
+#
+# T-0724 (2026-08-18): all four values were WRONG and had been since T-0195 —
+# they were copied from an AGENTS.md block that was already stale, and the
+# on-disk file was then hand-corrected while this config was not. Measured in
+# the dev clone: `signal-tracker` is the PROD container and pytest is not in
+# the image (`requirements.txt` is the production dependency list), so the old
+# backend line could never run; `web/package.json` has NO `test:e2e` and NO
+# `lint` script and there is no `eslint.config.*` in `web/`. A render would
+# have restored three false claims into the every-turn file. Long-form caveats
+# (T-0338 lock, known-red tests, the node:test-not-vitest trap, the
+# frontend-unit build gate) deliberately live in AGENT_INSTRUCTIONS.md, per
+# AGENTS.md's own "What NOT to put here".
+test_backend_cmd       = "`backend/run_tests.sh` (T-0338 — manages its own venv and defaults `DATABASE_URL` to `signal_tracker_dev`; bare `pytest` points at PROD). Caveats: `ops/bot-squad/AGENT_INSTRUCTIONS.md`."
+test_frontend_unit_cmd = "`web/run_tests.sh` (= `npm test` from `web/`; `node:test`, NOT vitest — needs node >= 22.6, the script finds it). Gates the staging image build (T-0677)."
+test_e2e_cmd           = "`npm test` from `tests/` (a separate package — there is no `test:e2e` in `web/` and never has been)"
+test_typecheck_cmd     = "from `web/`, `npx tsc -b` — `-p tsconfig.json` checks ZERO files and always exits 0 (T-0471)"
+test_lint_cmd          = "**not wired up** — no `lint` script and no `eslint.config.*` in `web/`, though the toolchain is in devDependencies (T-0375)"
 # T-0199: per-project identity for the generated AGENTS.md (render_agents_md.py).
 # All optional — an absent field renders a neutral placeholder / omitted line,
 # never another project's identity. ops_path = in-clone prefix of the data-dir
@@ -72,6 +84,11 @@ stakeholders = "Alexey (chat 404580642, @alexeysdk) and Timofey (@timpo). Equal 
 tg_bot       = "@watchbot"
 extra_hard_rules = [
   "Don't read or copy from `/home/www/bot-squad/archived/signal-tracker-old/` — that's the deprecated multi-role flow. Patterns there don't apply.",
+  # T-0724: compact restatement of the stakeholder's 2026-08-07 brevity
+  # requirement, which lived as a 16-line hand-added section in AGENTS.md and
+  # would have been wiped by the first honest render. Full text:
+  # AGENT_INSTRUCTIONS.md + ops/bot-squad/ops/brevity.md.
+  "**Краткость — требование стейкхолдера (2026-08-07): он платит за длину.**\n  Ему: ответ ПЕРВОЙ строкой, число вместо прилагательного, один закрытый\n  вопрос за раз. Не пересказывать его просьбу и не описывать процесс.\n  Оператору: сделано / чем доказано / осталось — три строки. Полный текст:\n  `ops/bot-squad/AGENT_INSTRUCTIONS.md`.",
 ]
 
 [projects.bot-squad]

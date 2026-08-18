@@ -72,6 +72,7 @@ def heartbeat(cfg: Config) -> None:
     tmp.write_text(sha + "\n")
     os.replace(tmp, cfg.heartbeat_path)
     _publish_install_tree_sha(cfg)
+    _publish_worker_census(cfg)
     _clear_landed_restart(cfg)
 
 
@@ -97,6 +98,57 @@ def _publish_install_tree_sha(cfg: Config) -> None:
         publish_install_tree_sha(cfg)
     except Exception:
         log.exception("heartbeat: publishing the install tree sha failed")
+
+
+def _publish_worker_census(cfg: Config) -> None:
+    """Publish the PER-WORKER census beside the heartbeat (T-0880).
+
+    The heartbeat carries ONE sha and it is this process's. Per-user workers
+    (``data/_sock/user-*.sock``) run from the same install tree, are never
+    restarted by a deploy, and appear in no health field — so an install could
+    report converged on every signal it had while a four-day-old per-user worker
+    served the path the deploy was FOR.
+
+    Published from here, on the coordinator's existing tick, rather than probed
+    by the API on demand: ``/api/health`` is polled, and fanning out a socket
+    round-trip per worker per poll would make the health endpoint's latency a
+    function of how many workers are wedged. It also keeps ONE implementation of
+    "who is serving this install" instead of a second copy in the api container
+    that could drift from this one.
+
+    A separate file for the same reason as ``install_tree.json`` (T-0824): a new
+    file is invisible to an api container that predates it, whereas widening an
+    existing body breaks the old reader.
+
+    Best-effort and last, like its neighbours — a diagnostic must never cost the
+    liveness signal it sits beside.
+    """
+    import json
+    import os
+    import time
+
+    try:
+        from bot_squad_worker import worker_census
+        from bot_squad_worker.deploy import install_tree_git_sha
+
+        deployed = (install_tree_git_sha() or "").strip()
+        summary = worker_census.summarize(
+            worker_census.census(cfg.data_dir, deployed_sha=deployed)
+        )
+        body = {
+            "at": time.time(),
+            "deployed_git_sha": deployed,
+            "all_converged": summary["all_converged"],
+            "counts": summary["counts"],
+            "line": summary["line"],
+            "workers": summary["workers"],
+        }
+        path = cfg.heartbeat_path.parent / "workers.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(body, indent=2, sort_keys=True))
+        os.replace(tmp, path)
+    except Exception:
+        log.exception("heartbeat: publishing the worker census failed")
 
 
 def _clear_landed_restart(cfg: Config) -> None:
@@ -348,6 +400,10 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
         # (no false stale-worker panic — the T-0436 operational residue).
         sha = f" @{result.resolved_sha[:12]}" if result.resolved_sha else ""
         wr = f" — worker restart: {result.worker_restart_status}" if result.worker_restart_status else ""
+        # T-0880: the restart above is the COORDINATOR's. Carry what happened to
+        # the workers it cannot reach into the SAME line, because this ping is
+        # where "release deployed" gets read.
+        pu = f" — {result.per_user_workers}" if result.per_user_workers else ""
         if result.worker_stale:
             # T-0717 leg 3: the recipe succeeded but the worker is still running the
             # PREVIOUS commit's code, so a green ✅ would be a lie — an operator who
@@ -366,16 +422,28 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
                 f"⚠️ deploy {slug}/{target} SUCCESS but WORKER STALE "
                 f"(rc={result.returncode}){sha}{suffix}{wr}. The worker is still on"
                 f"{boot or ' the previous commit'} — new worker/ code is NOT executing "
-                f"yet. {fix}systemctl --user restart bot-squad-worker.service",
+                f"yet. {fix}systemctl --user restart bot-squad-worker.service{pu}",
                 # A green recipe whose worker is still on the previous commit is
                 # a FAILURE for every purpose he cares about — the fix is a
                 # command he has to run (T-0717). Classified with the failures,
                 # not with the successes it is printed next to.
                 "deploy_failed",
             )
+        elif result.per_user_workers_stale:
+            # T-0880: the recipe succeeded and the coordinator was handled, but a
+            # per-user worker is still on the replaced code (or could not say what
+            # it is on). A bare ✅ here is the exact reading that let a four-day-old
+            # worker serve the path this deploy was for. Not classified as a
+            # failure — the deploy DID succeed and declining the bounce is by
+            # design — but it must not look unqualified.
+            _tg_safe(
+                f"⚠️ deploy {slug}/{target} SUCCESS, COORDINATOR ONLY "
+                f"(rc={result.returncode}){sha}{suffix}{wr}{pu}",
+                "deploy_status",
+            )
         else:
             _tg_safe(
-                f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}",
+                f"✅ deploy {slug}/{target} SUCCESS (rc={result.returncode}){sha}{suffix}{wr}{pu}",
                 "deploy_status",
             )
     elif result.returncode == _deploy.RC_CLONE_WEDGED:

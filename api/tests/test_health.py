@@ -912,3 +912,145 @@ def test_the_install_term_is_always_on_the_surface(
         body = _payload(app)
         assert "install" in body, (install, worker, api)
         assert "git_sha" in body["install"], (install, worker, api)
+
+
+# ---------------------------------------------------------------------------
+# T-0880: `worker.git_sha` is the COORDINATOR's, and it was the only one. A
+# per-user worker (data/_sock/user-*.sock) runs from the same install tree, no
+# deploy restarts it, and nothing here could see it — measured live: an install
+# that reported converged on every signal while flomaster's four-day-old worker
+# served the exact path the deploy was for.
+# ---------------------------------------------------------------------------
+
+def _census_env(tmp_bot_squad: Path, monkeypatch) -> Path:
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_bot_squad / "config"))
+    monkeypatch.setenv("DATA_DIR", str(tmp_bot_squad / "data"))
+    monkeypatch.setenv("WORKER_SOCK", str(tmp_bot_squad / "data" / "_sock" / "worker.sock"))
+    monkeypatch.setenv("JWT_SECRET", "test-secret")
+    hb = tmp_bot_squad / "data" / "_worker" / "heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text("d" * 40 + "\n")
+    return hb
+
+
+def _write_census(hb: Path, rows: list[dict], *, age: float = 0.0, converged: bool = False) -> None:
+    (hb.parent / "workers.json").write_text(json.dumps({
+        "at": time.time() - age,
+        "deployed_git_sha": "d" * 40,
+        "all_converged": converged,
+        "counts": {},
+        "line": "test",
+        "workers": rows,
+    }))
+
+
+def _get(tmp_bot_squad: Path) -> dict:
+    app = build_app()
+    with TestClient(app) as client:
+        return client.get("/api/health").json()
+
+
+def test_health_reports_a_sha_per_worker(tmp_bot_squad: Path, monkeypatch) -> None:
+    """DoD 2: a stale per-user worker is visible WITHOUT running ps."""
+    hb = _census_env(tmp_bot_squad, monkeypatch)
+    _write_census(hb, [
+        {"kind": "coordinator", "linux_user": "almdudleer", "label": "coordinator:almdudleer",
+         "state": "converged", "git_sha": "d" * 40, "detail": ""},
+        {"kind": "user", "linux_user": "flomaster", "label": "user:flomaster",
+         "state": "stale", "git_sha": "5" * 40, "detail": "running 555, deployed ddd"},
+    ])
+    body = _get(tmp_bot_squad)
+
+    rows = body["workers"]["workers"]
+    assert [r["label"] for r in rows] == ["coordinator:almdudleer", "user:flomaster"]
+    # each worker carries its OWN sha, not one field meaning "the coordinator"
+    assert {r["label"]: r["git_sha"] for r in rows} == {
+        "coordinator:almdudleer": "d" * 40, "user:flomaster": "5" * 40,
+    }
+    assert "per_user_worker_stale" in body["worker"]["health"]
+
+
+def test_a_stale_per_user_worker_is_not_hidden_by_a_converged_coordinator(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """The exact failure: the coordinator matches the deployed sha, so every
+    pre-T-0880 field reads healthy. The payload must still say something is
+    wrong."""
+    hb = _census_env(tmp_bot_squad, monkeypatch)
+    (hb.parent / "install_tree.json").write_text(
+        json.dumps({"git_sha": "d" * 40, "at": time.time()})
+    )
+    _write_census(hb, [
+        {"kind": "coordinator", "linux_user": "almdudleer", "label": "coordinator:almdudleer",
+         "state": "converged", "git_sha": "d" * 40, "detail": ""},
+        {"kind": "user", "linux_user": "flomaster", "label": "user:flomaster",
+         "state": "stale", "git_sha": "5" * 40, "detail": "stale"},
+    ])
+    body = _get(tmp_bot_squad)
+
+    # the coordinator-only view is clean...
+    assert body["worker"]["git_sha"] == "d" * 40
+    assert "worker_stale" not in body["worker"].get("health", [])
+    # ...and the payload still refuses to read as converged
+    assert "per_user_worker_stale" in body["worker"]["health"]
+
+
+def test_a_worker_that_cannot_report_is_flagged_separately_from_stale(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """Pre-T-0880 every per-user worker answered "" for its sha (git refuses a
+    tree owned by another user). "Cannot tell us" is a different action from
+    "running the wrong code" and must not be reported as the same thing."""
+    hb = _census_env(tmp_bot_squad, monkeypatch)
+    _write_census(hb, [
+        {"kind": "user", "linux_user": "flomaster", "label": "user:flomaster",
+         "state": "unknown", "git_sha": "", "detail": "reports no git sha"},
+    ])
+    flags = _get(tmp_bot_squad)["worker"]["health"]
+    assert "per_user_worker_unmeasured" in flags
+    assert "per_user_worker_stale" not in flags
+
+
+def test_a_missing_census_is_an_explicit_unknown_not_an_empty_list(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    """"We cannot see the other workers" must never render as "there are none" —
+    that identity IS this ticket."""
+    _census_env(tmp_bot_squad, monkeypatch)
+    body = _get(tmp_bot_squad)
+    assert body["workers"]["workers"] is None
+    assert body["workers"]["reason"] == "no_census"
+    # Explicit, but NOT a flag: "no census yet" is a coordinator predating
+    # T-0880 and clears on its next restart. Flagging it would light the whole
+    # fleet at rollout and train the flag into noise. A census that is present
+    # but unreadable or stale DOES flag — see the stale-census test.
+    assert "worker_census_unknown" not in body["worker"].get("health", [])
+
+
+def test_a_stale_census_is_not_a_census(tmp_bot_squad: Path, monkeypatch) -> None:
+    """Rows describing processes that may be gone are worse than no rows."""
+    hb = _census_env(tmp_bot_squad, monkeypatch)
+    _write_census(hb, [
+        {"kind": "user", "linux_user": "flomaster", "label": "user:flomaster",
+         "state": "converged", "git_sha": "d" * 40, "detail": ""},
+    ], age=4000.0, converged=True)
+    body = _get(tmp_bot_squad)
+    assert body["workers"]["workers"] is None
+    assert body["workers"]["reason"] == "stale_census"
+    assert "worker_census_unknown" in body["worker"]["health"]
+
+
+def test_a_fully_converged_census_raises_no_per_worker_flags(
+    tmp_bot_squad: Path, monkeypatch
+) -> None:
+    hb = _census_env(tmp_bot_squad, monkeypatch)
+    _write_census(hb, [
+        {"kind": "coordinator", "linux_user": "almdudleer", "label": "coordinator:almdudleer",
+         "state": "converged", "git_sha": "d" * 40, "detail": ""},
+        {"kind": "user", "linux_user": "flomaster", "label": "user:flomaster",
+         "state": "converged", "git_sha": "d" * 40, "detail": ""},
+    ], converged=True)
+    flags = _get(tmp_bot_squad)["worker"].get("health", [])
+    assert "per_user_worker_stale" not in flags
+    assert "per_user_worker_unmeasured" not in flags
+    assert "worker_census_unknown" not in flags

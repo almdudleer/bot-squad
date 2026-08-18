@@ -82,11 +82,33 @@ DEFAULT_RETENTION_N = 50
 # git-sha helpers (T-0335 item-13, Fork-5: detect running != deployed worker)
 # ---------------------------------------------------------------------------
 
+def _git_argv(root: Path, *args: str) -> list[str]:
+    """``git`` argv for a command run against ``root``, marking that tree trusted.
+
+    T-0880. A PER-USER worker runs as a different linux user than the one owning
+    the install tree, and git then refuses EVERY command in it with "detected
+    dubious ownership". Measured on the live install: flomaster's worker answered
+    /health with git_sha, boot_git_sha and install_git_sha all "" — the
+    contractual UNKNOWN — while the coordinator answered with real shas. So the
+    process this ticket is about was not merely un-restarted, it was
+    UNMEASURABLE: asking it what code it holds could not return an answer.
+
+    Trusting the tree here grants nothing the process does not already have — it
+    IMPORTS AND EXECUTES its own Python from this very tree. ``-c`` is "protected
+    configuration", the only kind git honours for ``safe.directory``, so a repo
+    cannot set this for itself from its own config.
+
+    Every git call reachable from a per-user worker goes through here so the
+    trust flag cannot be added to one probe and forgotten on its twin.
+    """
+    return ["git", "-c", f"safe.directory={root}", "-C", str(root), *args]
+
+
 def _git_head_sha(root: Path) -> str:
     """``git -C <root> rev-parse HEAD`` (40-hex), or "" if it can't be read."""
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            _git_argv(root, "rev-parse", "HEAD"),
             capture_output=True, text=True, timeout=5,
         )
     except Exception:  # noqa: BLE001 — git absent / not a repo / timeout
@@ -232,7 +254,7 @@ def _worker_subtree_changed(root: Path, a: str, b: str) -> bool:
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "diff", "--quiet", a, b, "--", "worker/"],
+            _git_argv(root, "diff", "--quiet", a, b, "--", "worker/"),
             capture_output=True, timeout=10,
         )
     except Exception:  # noqa: BLE001
@@ -251,7 +273,7 @@ def _worker_subtree_identical(root: Path, a: str, b: str) -> bool:
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "diff", "--quiet", a, b, "--", "worker/"],
+            _git_argv(root, "diff", "--quiet", a, b, "--", "worker/"),
             capture_output=True, timeout=10,
         )
     except Exception:  # noqa: BLE001
@@ -860,6 +882,16 @@ class DeployResult:
     # The sha the running worker is actually on, populated only when worker_stale
     # — so the alert can name what's executing vs. what was just deployed.
     worker_boot_sha: str = ""
+    # T-0880: what this deploy did about the workers the restart above CANNOT
+    # reach. `restart_worker` bounces the systemd unit `bot-squad-worker` — the
+    # coordinator, and only it — so per-user workers keep executing the files the
+    # deploy just replaced under them. "" only when there are none running; a
+    # deploy that leaves a stale one behind must SAY so rather than report an
+    # unqualified success.
+    per_user_workers: str = ""
+    # The same fact as a boolean, so the caller decides how loud to be without
+    # sniffing the sentence above for keywords.
+    per_user_workers_stale: bool = False
     # T-0453: why the job failed, in words a human can act on — the underlying
     # git stderr plus the remediation. Populated for failures the RECIPE never
     # got to see (a wedged deploy clone), where the run log alone says nothing
@@ -1641,6 +1673,11 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
                     "deploy.run_next: %s/%s post-deploy worker restart launch failed "
                     "(deploy itself succeeded — the catch-up tick will retry)", slug, target,
                 )
+    # T-0880: the restart decision above is the COORDINATOR's, whichever way it
+    # went. Measure the workers it cannot reach and carry the answer out with the
+    # result, so "release deployed" can never quietly mean "one of N reloaded".
+    per_user_workers, per_user_workers_stale = _per_user_worker_report(cfg)
+
     # T-0446: surface which commit shipped + the worker-restart decision so the
     # terminal #deploy-logs ping is self-explaining (no false stale-worker panic).
     worker_restart_status = (
@@ -1668,6 +1705,8 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         killed_reason=killed_reason,
         resolved_sha=_parse_resolved_sha(log_path),
         worker_restart_status=worker_restart_status,
+        per_user_workers=per_user_workers,
+        per_user_workers_stale=per_user_workers_stale,
         worker_stale=worker_stale,
         worker_boot_sha=boot_git_sha() if worker_stale else "",
         requested_by=payload.get("requested_by", "") or "",
@@ -2037,6 +2076,53 @@ case "$act" in
   *) echo "[worker-restart] SMOKE_ACTION_FAILED" >> "$LOG"; : > {fail}; exit 1;;
 esac
 """
+
+
+def _per_user_worker_report(cfg: "Config") -> tuple[str, bool]:
+    """One line naming the workers this deploy did NOT restart (T-0880).
+
+    The post-deploy restart bounces the systemd unit ``bot-squad-worker`` — the
+    COORDINATOR. Per-user workers (``data/_sock/user-*.sock``) are separate
+    long-lived processes running from the SAME install tree, and nothing in the
+    deploy path touches them. Measured live: a four-day-old per-user worker on an
+    install that had converged by every signal the system offered, serving the
+    exact path the deploy was for.
+
+    This DECLINES rather than bounces, deliberately. Restarting another user's
+    worker kills that user's live sessions — a decision with an owner (DoD 5),
+    not something a deploy should do behind their back. What changes here is that
+    the decline is STATED: silence was being read as "everything converged".
+
+    Returns (line, any_unconverged). ``line`` is "" only when no per-user worker
+    is running, i.e. when there is genuinely nothing to qualify.
+    """
+    try:
+        from bot_squad_worker import worker_census
+
+        rows = worker_census.census(
+            cfg.data_dir, deployed_sha=_git_head_sha(_install_root())
+        )
+    except Exception:  # noqa: BLE001 — a diagnostic must not fail a deploy
+        log.exception("deploy._per_user_worker_report: census failed")
+        # An unmeasured worker is NOT a converged one: say so, and be loud.
+        return (
+            "per-user workers: NOT MEASURED (census failed) — cannot say whether "
+            "any is running stale code"
+        ), True
+    others = [r for r in rows if r.get("kind") != "coordinator"]
+    if not others:
+        return "", False
+    unconverged = [r for r in others if r.get("state") != worker_census.CONVERGED]
+    if not unconverged:
+        return f"per-user workers: {len(others)} running, all already converged", False
+    named = "; ".join(
+        f"{r['label']} {r['state']}" + (f" ({r['detail']})" if r.get("detail") else "")
+        for r in unconverged
+    )
+    return (
+        f"per-user workers NOT restarted by this deploy (by design — bouncing one "
+        f"kills that user's live sessions; see T-0880): {named}"
+    ), True
 
 
 def _restart_worker_detached(

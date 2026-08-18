@@ -2139,6 +2139,7 @@ def test_deploy_monitor_sends_carry_deploy_logs_topic(tmp_config_dir, tmp_path, 
             ok=True, returncode=0, collapsed_count=1, killed_reason=None,
             resolved_sha="", worker_restart_status="",  # T-0446: terminal-ping fields
             worker_stale=False, worker_boot_sha="",  # T-0717 leg 3
+            per_user_workers="", per_user_workers_stale=False,  # T-0880
         ),
     )
     rec = _RecordingTg()
@@ -2889,6 +2890,9 @@ def _monitor_ping_text(tmp_config_dir, tmp_path, monkeypatch, **result_fields) -
         ok=True, returncode=0, collapsed_count=1, killed_reason=None,
         resolved_sha="", worker_restart_status="", worker_stale=False,
         worker_boot_sha="",
+        # T-0880: this stand-in must carry every DeployResult field the ping
+        # reads, or a new field reads as an AttributeError in an unrelated test.
+        per_user_workers="", per_user_workers_stale=False,
     )
     fields.update(result_fields)
     monkeypatch.setattr(_deploy, "run_next", lambda c, s: SimpleNamespace(**fields))
@@ -3422,3 +3426,226 @@ def test_an_unreadable_tree_publishes_NOTHING_rather_than_a_guess(
 
     assert d.publish_install_tree_sha(cfg) == ""
     assert not (hb.parent / "install_tree.json").exists()
+
+
+# --------------------------------------------------------------------------
+# T-0880: a per-user worker runs as a DIFFERENT linux user than the one owning
+# the install tree. git then refuses every command in that tree with "detected
+# dubious ownership", so the probes below returned "" / "unknown" — and the
+# stale per-user worker this ticket is about could not report what code it held.
+#
+# Reproduced without a second uid via GIT_TEST_ASSUME_DIFFERENT_OWNER, git's own
+# switch for forcing that check. Each test asserts the harness is OPERATIVE
+# first: on a git that ignores the switch these would pass no matter what the
+# code does, which is a green that read nothing.
+# --------------------------------------------------------------------------
+
+def _init_repo(root: Path) -> str:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "worker").mkdir(parents=True, exist_ok=True)
+    (root / "worker" / "mod.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "-m", "one"],
+        check=True,
+    )
+    out = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+def _require_foreign_owner_harness(root: Path, monkeypatch) -> None:
+    """Turn on the forced dubious-ownership check AND prove it bites.
+
+    Without this control a git that ignores the switch would let every test
+    below pass against the unfixed code — the exact shape of a green that
+    measured nothing.
+    """
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    probe = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode == 0:
+        pytest.skip(
+            "GIT_TEST_ASSUME_DIFFERENT_OWNER is not honoured by this git "
+            f"({subprocess.run(['git', '--version'], capture_output=True, text=True).stdout.strip()}) "
+            "— the foreign-owner harness cannot reproduce the failure, so this "
+            "test would be a false green"
+        )
+
+
+def test_git_head_sha_reads_a_tree_owned_by_another_user(tmp_path, monkeypatch) -> None:
+    """The exact live symptom: boot_git_sha/install_git_sha came back "" from a
+    per-user worker because git refused the tree it was executing from."""
+    import bot_squad_worker.deploy as d
+
+    root = tmp_path / "install"
+    sha = _init_repo(root)
+    _require_foreign_owner_harness(root, monkeypatch)
+
+    assert d._git_head_sha(root) == sha
+
+
+def test_worker_subtree_probes_read_a_tree_owned_by_another_user(tmp_path, monkeypatch) -> None:
+    """The twin. effective_worker_git_sha() reaches worker/ diff probes, which
+    map a git error to "unknown" — indistinguishable from a real answer, so the
+    reported sha silently never advanced."""
+    import bot_squad_worker.deploy as d
+
+    root = tmp_path / "install"
+    a = _init_repo(root)
+    (root / "worker" / "mod.py").write_text("x = 2\n")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "-m", "two"],
+        check=True,
+    )
+    b = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    _require_foreign_owner_harness(root, monkeypatch)
+
+    assert d._worker_subtree_changed(root, a, b) is True
+    assert d._worker_subtree_identical(root, a, b) is False
+    assert d._worker_subtree_identical(root, a, a) is True
+
+
+def test_git_argv_marks_only_the_named_tree_trusted(tmp_path) -> None:
+    """safe.directory is scoped to the tree being read — not a blanket '*'."""
+    import bot_squad_worker.deploy as d
+
+    argv = d._git_argv(Path("/home/www/bot-squad"), "rev-parse", "HEAD")
+    assert argv[:4] == ["git", "-c", "safe.directory=/home/www/bot-squad", "-C"]
+    assert "*" not in argv
+
+
+# --------------------------------------------------------------------------
+# T-0880 DoD 1 + 3: `restart_worker` bounces the systemd unit — the COORDINATOR.
+# A deploy that leaves a per-user worker on the code it just replaced must SAY
+# so; silence was being read as "everything converged".
+# --------------------------------------------------------------------------
+
+def _cfg_with_data(tmp_path: Path):
+    from types import SimpleNamespace
+    d = tmp_path / "data"
+    (d / "_sock").mkdir(parents=True)
+    return SimpleNamespace(data_dir=d)
+
+
+def test_deploy_report_names_the_per_user_worker_it_did_not_restart(tmp_path, monkeypatch):
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import worker_census
+
+    monkeypatch.setattr(worker_census, "census", lambda *a, **k: [
+        {"kind": "coordinator", "label": "coordinator:almdudleer",
+         "state": worker_census.CONVERGED, "detail": ""},
+        {"kind": "user", "label": "user:flomaster", "state": worker_census.STALE,
+         "detail": "running a4fac346, deployed 93960baa"},
+    ])
+    line, stale = d._per_user_worker_report(_cfg_with_data(tmp_path))
+
+    assert stale is True
+    assert "user:flomaster" in line
+    assert "NOT restarted" in line
+    # the decline must carry its REASON, or it reads as an oversight
+    assert "live sessions" in line
+    # and it must not implicate the coordinator, which WAS handled
+    assert "coordinator" not in line
+
+
+def test_a_converged_per_user_worker_does_not_qualify_the_success(tmp_path, monkeypatch):
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import worker_census
+
+    monkeypatch.setattr(worker_census, "census", lambda *a, **k: [
+        {"kind": "coordinator", "label": "c", "state": worker_census.CONVERGED, "detail": ""},
+        {"kind": "user", "label": "user:flomaster",
+         "state": worker_census.CONVERGED, "detail": ""},
+    ])
+    line, stale = d._per_user_worker_report(_cfg_with_data(tmp_path))
+    assert stale is False
+    assert "all already converged" in line
+
+
+def test_no_per_user_workers_says_nothing_at_all(tmp_path, monkeypatch):
+    """A single-user install must not grow a new line of deploy noise."""
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import worker_census
+
+    monkeypatch.setattr(worker_census, "census", lambda *a, **k: [
+        {"kind": "coordinator", "label": "c", "state": worker_census.CONVERGED, "detail": ""},
+    ])
+    assert d._per_user_worker_report(_cfg_with_data(tmp_path)) == ("", False)
+
+
+def test_an_unmeasurable_per_user_worker_is_not_treated_as_converged(tmp_path, monkeypatch):
+    """The live pre-fix reading. A census that cannot answer must be loud, not
+    silently optimistic — that identity is the whole ticket."""
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import worker_census
+
+    def _boom(*a, **k):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(worker_census, "census", _boom)
+    line, stale = d._per_user_worker_report(_cfg_with_data(tmp_path))
+    assert stale is True
+    assert "NOT MEASURED" in line
+
+
+def test_a_census_failure_cannot_fail_the_deploy(tmp_path, monkeypatch):
+    import bot_squad_worker.deploy as d
+    from bot_squad_worker import worker_census
+
+    def _boom(*a, **k):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(worker_census, "census", _boom)
+    d._per_user_worker_report(_cfg_with_data(tmp_path))  # must not raise
+
+
+def test_deploy_ping_says_coordinator_only_when_a_per_user_worker_is_left_behind(
+    tmp_config_dir, tmp_path, monkeypatch
+):
+    """T-0880 DoD 1: a deploy that restarts only the coordinator must not report
+    an unqualified success. It has to NAME what it left on the old code."""
+    text = _monitor_ping_text(
+        tmp_config_dir, tmp_path, monkeypatch,
+        resolved_sha="3df3402e844336b5d338d0a35621660e2c286032",
+        worker_restart_status="fired",
+        per_user_workers=(
+            "per-user workers NOT restarted by this deploy (by design — bouncing "
+            "one kills that user's live sessions; see T-0880): user:flomaster "
+            "stale (running a4fac346, deployed 3df3402e)"
+        ),
+        per_user_workers_stale=True,
+    )
+
+    assert not text.startswith("✅"), text
+    assert "COORDINATOR ONLY" in text
+    assert "user:flomaster" in text
+    # the coordinator's own restart still gets reported, not swallowed
+    assert "worker restart: fired" in text
+
+
+def test_deploy_ping_stays_green_when_every_per_user_worker_is_current(
+    tmp_config_dir, tmp_path, monkeypatch
+):
+    """No new noise on the healthy path — the qualifier is earned, not default."""
+    text = _monitor_ping_text(
+        tmp_config_dir, tmp_path, monkeypatch,
+        resolved_sha="3df3402e844336b5d338d0a35621660e2c286032",
+        worker_restart_status="fired",
+        per_user_workers="per-user workers: 1 running, all already converged",
+        per_user_workers_stale=False,
+    )
+    assert text.startswith("✅ deploy test-project/staging SUCCESS")
+    assert "COORDINATOR ONLY" not in text
+    assert "all already converged" in text

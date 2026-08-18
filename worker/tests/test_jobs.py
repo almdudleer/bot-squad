@@ -1283,3 +1283,105 @@ def test_a_failed_install_publish_never_costs_the_heartbeat(
 
     assert cfg.heartbeat_path.read_text().strip() == "a" * 40
     assert not (cfg.heartbeat_path.parent / "install_tree.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# T-0880: the heartbeat carries ONE sha and it is the coordinator's. A per-user
+# worker running four-day-old code appeared in no field the system had, so an
+# install reported converged while the process serving the deploy's own target
+# path was days behind. The heartbeat now publishes a census beside itself.
+# ---------------------------------------------------------------------------
+
+def _serve_health(sock_path: Path, sha: str):
+    """A real worker-shaped /health on a real UDS (see test_worker_census)."""
+    import http.server
+    import json as _json
+    import socket
+    import socketserver
+    import threading
+
+    class Srv(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        address_family = socket.AF_UNIX
+        daemon_threads = True
+
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = 0
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            payload = _json.dumps(
+                {"ok": True, "git_sha": sha, "boot_git_sha": sha, "uptime": 1.0}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    s = Srv(str(sock_path), H)
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+    return s
+
+
+def test_heartbeat_publishes_a_census_naming_a_stale_per_user_worker(
+    tmp_config_dir: Path, monkeypatch
+) -> None:
+    """DoD 4: two workers on ONE config — a converged coordinator and a stale
+    per-user worker — and the published report must distinguish them.
+
+    Goes red against pre-T-0880 behaviour for the reason the ticket names: there
+    was no per-worker report at all, so "release deployed" could mean "one of N
+    workers reloaded"."""
+    import json
+
+    import bot_squad_worker.deploy as D
+
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    sock_dir = cfg.data_dir / "_sock"
+    sock_dir.mkdir(parents=True, exist_ok=True)
+
+    deployed = "d" * 40
+    monkeypatch.setattr(D, "install_tree_git_sha", lambda: deployed)
+    monkeypatch.setattr(D, "effective_worker_git_sha", lambda: deployed)
+
+    servers = [
+        _serve_health(sock_dir / "worker.sock", deployed),
+        _serve_health(sock_dir / "user-flomaster.sock", "5" * 40),
+    ]
+    try:
+        heartbeat(cfg)
+        body = json.loads((cfg.heartbeat_path.parent / "workers.json").read_text())
+    finally:
+        for s in servers:
+            s.shutdown()
+
+    assert body["all_converged"] is False
+    states = {w["kind"]: w["state"] for w in body["workers"]}
+    assert states == {"coordinator": "converged", "user": "stale"}
+    # NAMED, not just counted.
+    assert "flomaster" in body["line"]
+
+
+def test_census_failure_never_costs_the_heartbeat(tmp_config_dir: Path, monkeypatch) -> None:
+    """The census sits beside the liveness signal and must never be able to take
+    it down — same contract as the install-tree marker it follows."""
+    from bot_squad_worker import worker_census
+
+    cfg = Config.load(tmp_config_dir)
+    cfg.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _boom(*a, **k):
+        raise RuntimeError("census exploded")
+
+    monkeypatch.setattr(worker_census, "census", _boom)
+
+    heartbeat(cfg)
+
+    assert cfg.heartbeat_path.exists()
+    assert not (cfg.heartbeat_path.parent / "workers.json").exists()

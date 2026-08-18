@@ -147,6 +147,20 @@ _DEPLOY_PROGRESS_DEADLINE_SECONDS = 300
 # there is no git tree inside it.
 _INSTALL_MARKER = "install_tree.json"
 
+# T-0880. `worker.git_sha` is ONE sha and it is the coordinator's. Per-user
+# workers run from the same install tree, no deploy restarts them, and no field
+# here could see them — so this payload could report a converged install while a
+# four-day-old per-user worker served the exact path the deploy was for. The
+# coordinator publishes a census of every worker socket beside the heartbeat;
+# this reads it.
+_WORKERS_MARKER = "workers.json"
+
+# Generous next to the 60s heartbeat tick that writes it: this term exists to
+# catch a census that stopped being written (a coordinator that died, or one
+# running code older than T-0880), not to re-measure liveness — `dead_heartbeat`
+# already does that, from the file whose whole job it is.
+_CENSUS_MAX_AGE_SEC = 300.0
+
 
 def _install_state(worker_dir: Path) -> dict:
     """What the install tree is at, or an EXPLICIT unknown.
@@ -181,6 +195,43 @@ def _install_state(worker_dir: Path) -> dict:
     except (TypeError, ValueError):
         at = 0.0
     return {"git_sha": sha.strip().lower(), "at": at}
+
+
+def _workers_state(worker_dir: Path, now: float) -> dict:
+    """The per-worker census, or an explicit reason it is unavailable (T-0880).
+
+    Same discipline as ``_install_state``, for the same reason: a payload that
+    cannot answer "is every worker running the deployed code?" must not be
+    shaped like one that answered "yes". Absence carries a ``reason``; it never
+    degrades to an empty list, which would read as "no other workers exist" —
+    the precise false negative this ticket is about.
+    """
+    path = worker_dir / _WORKERS_MARKER
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        # Overwhelmingly likely cause: a worker running code older than T-0880.
+        # Clears on the next worker restart.
+        return {"workers": None, "reason": "no_census"}
+    except (OSError, ValueError):
+        return {"workers": None, "reason": "unreadable_census"}
+    if not isinstance(raw, dict) or not isinstance(raw.get("workers"), list):
+        return {"workers": None, "reason": "malformed_census"}
+    try:
+        at = float(raw.get("at") or 0.0)
+    except (TypeError, ValueError):
+        at = 0.0
+    if not at or (now - at) > _CENSUS_MAX_AGE_SEC:
+        # A stale census is not a census. Reporting its rows as current would be
+        # worse than reporting none: they describe processes that may be gone.
+        return {"workers": None, "reason": "stale_census", "at": at}
+    return {
+        "workers": raw["workers"],
+        "at": at,
+        "all_converged": bool(raw.get("all_converged")),
+        "line": str(raw.get("line") or ""),
+        "deployed_git_sha": str(raw.get("deployed_git_sha") or ""),
+    }
 
 
 def _deploy_row(
@@ -354,6 +405,7 @@ def health(request: Request) -> dict:
     # CONTAINER is behind. Both can hold at once, and either can hold alone.
     install = _install_state(heartbeat.parent)
     install_sha = install.get("git_sha")
+    workers = _workers_state(heartbeat.parent, time.time())
 
     problems: list[str] = []
     restart = None
@@ -406,6 +458,35 @@ def health(request: Request) -> dict:
                 # restart closes both); report it once.
                 if flag not in problems:
                     problems.append(flag)
+
+    # T-0880: flags for the workers every field above is blind to. Named for the
+    # PER-USER case specifically rather than folded into `worker_stale`: that
+    # flag is the coordinator's, and one shared flag would let a stale per-user
+    # worker hide behind a converged coordinator — which is how this went unseen
+    # for four days. Evaluated whether or not the heartbeat is alive, because a
+    # per-user worker's staleness does not depend on the coordinator's.
+    census_rows = workers.get("workers")
+    if census_rows is None:
+        # Absence is reported through `workers.reason` (never as an empty list),
+        # but only an ACTIVE malfunction earns a flag. `no_census` means the
+        # coordinator predates T-0880 and clears on its next restart — flagging
+        # it would light every install in the fleet with "you have not restarted
+        # yet", which is how a health flag gets trained into background noise.
+        # A census that is present but unreadable or stale is different: the
+        # publisher ran and something is wrong with it now.
+        if workers.get("reason") != "no_census":
+            problems.append("worker_census_unknown")
+    else:
+        others = [w for w in census_rows if w.get("kind") != "coordinator"]
+        if any(w.get("state") == "stale" for w in others):
+            problems.append("per_user_worker_stale")
+        if any(w.get("state") in ("unknown", "unreachable") for w in others):
+            # Distinct from `stale` on purpose: "it is running the wrong code"
+            # and "it cannot tell us what it is running" call for different
+            # actions, and before T-0880 every per-user worker answered the
+            # second way.
+            problems.append("per_user_worker_unmeasured")
+
     if problems:
         worker["health"] = problems
     if deploy:
@@ -435,6 +516,13 @@ def health(request: Request) -> dict:
         # carrying `{"git_sha": null, "reason": ...}` when it could not be read —
         # an absent key would put a consumer back to guessing.
         "install": install,
+        # T-0880: every worker serving this install, each with its OWN sha and
+        # verdict — the coordinator plus one row per `data/_sock/user-*.sock`.
+        # Top-level beside `install` and `worker` because it is a property of the
+        # INSTALL, not of the coordinator. Carries `{"workers": null, "reason":
+        # ...}` when the census could not be read, so "we cannot see the other
+        # workers" never renders as "there are none".
+        "workers": workers,
         "uptime": time.monotonic() - _STARTED_AT,
         "worker": worker,
     }
